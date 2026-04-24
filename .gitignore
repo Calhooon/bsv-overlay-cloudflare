@@ -1,0 +1,12 @@
+/target
+.DS_Store
+*.swp
+*.swo
+.env
+.dev.vars
+node_modules/
+secrets.md
+# Wrangler local dev state (local D1 SQLite, caches, etc.)
+.wrangler/
+# Docker volumes + container state (reference stack)
+reference/.docker/

@@ -1,0 +1,6 @@
+{
+  "name": "root_dashboard",
+  "method": "GET",
+  "path": "/",
+  "note": "Expected divergence: root HTML dashboard is platform-specific. Both sides serve 200 text/html; the page content differs because mainline renders via @bsv/overlay-express.makeUserInterface() while rust-overlay has its own server-rendered dashboard. Harness diff is cosmetic, not a bug."
+}

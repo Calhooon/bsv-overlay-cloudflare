@@ -1,0 +1,8 @@
+{
+  "name": "admin_startGASPSync_bad_bearer",
+  "method": "POST",
+  "path": "/admin/startGASPSync",
+  "headers": {
+    "Authorization": "Bearer nope"
+  }
+}

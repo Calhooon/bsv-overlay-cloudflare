@@ -1,0 +1,9 @@
+{
+  "name": "admin_janitor_authed",
+  "method": "POST",
+  "path": "/admin/janitor",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026"
+  },
+  "note": "State-dependent: mainline admits SHIP/SLAP records that rust-overlay correctly rejects. Over successive harness runs within one reference lifetime, the two stores drift \u2014 mainline accumulates, Rust stays empty. Deterministic only after `make parity-clean` (fresh Mongo+MySQL + wrangler D1) AND running BEFORE the submit_* corpus entries execute. "
+}

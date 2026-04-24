@@ -1,0 +1,17 @@
+{
+  "name": "lookup_ls_ship_by_topic",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_ship",
+    "query": {
+      "topics": [
+        "tm_uhrp"
+      ]
+    }
+  },
+  "note": "State-dependent: both sides return an output-list of the SHIP records they've ingested matching the topic filter. Each side's ingested set depends on GASP sync timing + admission rules, so the returned subsets diverge. Run `make parity-clean` for a deterministic baseline."
+}

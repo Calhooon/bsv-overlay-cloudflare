@@ -1,0 +1,13 @@
+{
+  "name": "submit_empty_body",
+  "method": "POST",
+  "path": "/submit",
+  "headers": {
+    "Content-Type": "application/octet-stream",
+    "X-Topics": "[\"tm_ship\"]"
+  },
+  "note": "Expected divergence vs mainline — Mainline overlay-express 2.2.0 leaks a raw JS TypeError (\"undefined is not iterable (cannot read property Symbol(Symbol.iterator))\") when the /submit body is empty. rust-overlay returns a clean `BEEF parsing failed: reader underflow` message. 
+  "body": {
+    "base64": ""
+  }
+}

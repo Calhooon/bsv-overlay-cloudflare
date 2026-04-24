@@ -1,0 +1,8 @@
+{
+  "name": "admin_janitor_bad_bearer",
+  "method": "POST",
+  "path": "/admin/janitor",
+  "headers": {
+    "Authorization": "Bearer nope"
+  }
+}

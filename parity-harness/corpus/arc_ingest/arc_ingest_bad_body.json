@@ -1,0 +1,12 @@
+{
+  "name": "arc_ingest_bad_body",
+  "method": "POST",
+  "path": "/arc-ingest",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "bogus": "payload"
+  },
+  "note": "Non-conformant body \u2014 expect 400 error on both sides."
+}

@@ -1,0 +1,6 @@
+{
+  "name": "admin_syncAdvertisements_no_auth",
+  "method": "POST",
+  "path": "/admin/syncAdvertisements",
+  "headers": {}
+}

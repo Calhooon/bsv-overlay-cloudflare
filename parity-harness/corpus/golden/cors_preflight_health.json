@@ -1,0 +1,9 @@
+{
+  "name": "cors_preflight_health",
+  "method": "OPTIONS",
+  "path": "/health",
+  "headers": {
+    "Origin": "https://example.com",
+    "Access-Control-Request-Method": "GET"
+  }
+}

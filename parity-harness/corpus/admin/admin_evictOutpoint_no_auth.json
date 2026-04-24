@@ -1,0 +1,6 @@
+{
+  "name": "admin_evictOutpoint_no_auth",
+  "method": "POST",
+  "path": "/admin/evictOutpoint",
+  "headers": {}
+}

@@ -1,0 +1,15 @@
+{
+  "name": "request_foreign_gasp_node_unknown",
+  "method": "POST",
+  "path": "/requestForeignGASPNode",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-BSV-Topic": "tm_ship"
+  },
+  "body": {
+    "graphID": "0000000000000000000000000000000000000000000000000000000000000000.0",
+    "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+    "outputIndex": 0
+  },
+  "note": "Unknown graph node \u2014 both sides should error (txid not found)."
+}

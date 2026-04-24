@@ -1,0 +1,13 @@
+{
+  "name": "admin_unban_authed",
+  "method": "POST",
+  "path": "/admin/unban",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "host": "https://example.com"
+  },
+  "note": "Implemented in wave-6. Rust matches mainline shape."
+}

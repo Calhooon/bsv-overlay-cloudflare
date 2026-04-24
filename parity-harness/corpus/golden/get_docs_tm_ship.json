@@ -1,0 +1,5 @@
+{
+  "name": "get_docs_tm_ship",
+  "method": "GET",
+  "path": "/getDocumentationForTopicManager?manager=tm_ship"
+}

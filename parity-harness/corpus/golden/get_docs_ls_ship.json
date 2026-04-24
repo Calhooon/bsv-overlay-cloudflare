@@ -1,0 +1,5 @@
+{
+  "name": "get_docs_ls_ship",
+  "method": "GET",
+  "path": "/getDocumentationForLookupServiceProvider?lookupService=ls_ship"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "list_lookup_service_providers",
+  "method": "GET",
+  "path": "/listLookupServiceProviders"
+}

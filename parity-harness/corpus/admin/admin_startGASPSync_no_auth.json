@@ -1,0 +1,6 @@
+{
+  "name": "admin_startGASPSync_no_auth",
+  "method": "POST",
+  "path": "/admin/startGASPSync",
+  "headers": {}
+}

@@ -1,0 +1,15 @@
+{
+  "name": "request_sync_response_unknown_topic",
+  "method": "POST",
+  "path": "/requestSyncResponse",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-BSV-Topic": "tm_unknown_topic"
+  },
+  "body": {
+    "version": 1,
+    "since": 0,
+    "limit": 10
+  },
+  "note": "GASP sync request for an unregistered topic \u2014 both sides should either 400 or return empty UTXOList."
+}

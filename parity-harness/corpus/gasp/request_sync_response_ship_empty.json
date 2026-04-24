@@ -1,0 +1,15 @@
+{
+  "name": "request_sync_response_ship_empty",
+  "method": "POST",
+  "path": "/requestSyncResponse",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-BSV-Topic": "tm_ship"
+  },
+  "body": {
+    "version": 1,
+    "since": 0,
+    "limit": 10
+  },
+  "note": "State-dependent: mainline admits SHIP/SLAP records that rust-overlay correctly rejects. Over successive harness runs within one reference lifetime, the two stores drift \u2014 mainline accumulates, Rust stays empty. Deterministic only after `make parity-clean` (fresh Mongo+MySQL + wrangler D1) AND running BEFORE the submit_* corpus entries execute. "
+}

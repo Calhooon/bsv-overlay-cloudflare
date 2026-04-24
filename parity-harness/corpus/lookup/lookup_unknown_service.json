@@ -1,0 +1,13 @@
+{
+  "name": "lookup_unknown_service",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_not_registered",
+    "query": "findAll"
+  },
+  "note": "Expected divergence vs mainline \u2014 Mainline returns \"Lookup service not found for provider: ls_not_registered \" with a stray trailing space. rust-overlay drops the space. 
+}

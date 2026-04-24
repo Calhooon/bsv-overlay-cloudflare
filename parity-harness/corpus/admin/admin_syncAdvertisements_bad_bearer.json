@@ -1,0 +1,8 @@
+{
+  "name": "admin_syncAdvertisements_bad_bearer",
+  "method": "POST",
+  "path": "/admin/syncAdvertisements",
+  "headers": {
+    "Authorization": "Bearer nope"
+  }
+}

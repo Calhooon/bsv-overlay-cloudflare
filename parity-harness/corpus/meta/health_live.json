@@ -1,0 +1,6 @@
+{
+  "name": "health_live",
+  "method": "GET",
+  "path": "/health/live",
+  "note": "RO-001: liveness subroute not yet on rust-overlay."
+}

@@ -1,0 +1,9 @@
+{
+  "name": "admin_health_check_authed",
+  "method": "POST",
+  "path": "/admin/health-check",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026"
+  },
+  "note": "Expected divergence vs mainline \u2014 Mainline overlay-express 2.2.0 leaks a raw JS destructuring TypeError (\"Cannot destructure property 'url' of 'req.body' as it is undefined.\") when /admin/health-check body is missing. rust-overlay returns a clean deserialization error.  
+}

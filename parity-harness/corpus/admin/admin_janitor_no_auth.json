@@ -1,0 +1,6 @@
+{
+  "name": "admin_janitor_no_auth",
+  "method": "POST",
+  "path": "/admin/janitor",
+  "headers": {}
+}

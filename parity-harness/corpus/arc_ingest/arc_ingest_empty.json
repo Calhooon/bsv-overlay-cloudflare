@@ -1,0 +1,6 @@
+{
+  "name": "arc_ingest_empty",
+  "method": "POST",
+  "path": "/arc-ingest",
+  "note": "Empty body \u2014 expect 400 error on both sides."
+}

@@ -1,0 +1,9 @@
+{
+  "name": "admin_stats_authed",
+  "method": "GET",
+  "path": "/admin/stats",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026"
+  },
+  "note": "State-dependent: both sides have the stats route + shape, but shipRecordCount/slapRecordCount reflect each side's own ingested stores. Run `make parity-clean` for a deterministic baseline."
+}

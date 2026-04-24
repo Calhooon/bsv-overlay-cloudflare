@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_ship_findAll",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_ship",
+    "query": "findAll"
+  },
+  "note": "State-dependent: mainline admits SHIP/SLAP records that rust-overlay correctly rejects. Over successive harness runs within one reference lifetime, the two stores drift \u2014 mainline accumulates, Rust stays empty. Deterministic only after `make parity-clean` (fresh Mongo+MySQL + wrangler D1) AND running BEFORE the submit_* corpus entries execute. "
+}

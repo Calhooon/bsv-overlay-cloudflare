@@ -1,0 +1,9 @@
+{
+  "name": "admin_config",
+  "method": "GET",
+  "path": "/admin/config",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026"
+  },
+  "note": "Implemented in wave-6. Rust matches mainline shape."
+}

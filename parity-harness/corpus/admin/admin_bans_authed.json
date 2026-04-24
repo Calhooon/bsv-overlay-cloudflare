@@ -1,0 +1,9 @@
+{
+  "name": "admin_bans_authed",
+  "method": "GET",
+  "path": "/admin/bans",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026"
+  },
+  "note": "State-dependent (janitor asymmetry): rust has the route and matches shape. Content diverges because mainline's background janitor auto-bans unresponsive hosts detected during GASP sync at docker startup; rust's janitor runs via cron, which wrangler dev explicitly does not fire (warning at wrangler startup: 'Scheduled Workers are not automatically triggered during local development'). Triggering rust's janitor via POST /admin/janitor before the harness would populate the list. Shape parity verified; state parity requires matching sync orchestration."
+}

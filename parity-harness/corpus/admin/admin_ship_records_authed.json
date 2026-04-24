@@ -1,0 +1,9 @@
+{
+  "name": "admin_ship_records_authed",
+  "method": "GET",
+  "path": "/admin/ship-records",
+  "headers": {
+    "Authorization": "Bearer parity-harness-test-token-2026"
+  },
+  "note": "State-dependent: both sides have the route + shape, but the records[] array reflects each side's own ingested SHIP store. State drifts with each submit + GASP sync cycle. Run `make parity-clean` for a deterministic baseline."
+}

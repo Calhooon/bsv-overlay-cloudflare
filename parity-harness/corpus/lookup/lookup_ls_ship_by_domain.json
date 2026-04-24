@@ -1,0 +1,15 @@
+{
+  "name": "lookup_ls_ship_by_domain",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_ship",
+    "query": {
+      "domain": "https://example.com"
+    }
+  },
+  "note": "No records match \u2014 expect empty output-list on both sides."
+}

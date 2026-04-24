@@ -1,0 +1,58 @@
+# Local parity reference stack — mainline @bsv/overlay-express@2.2.0.
+# Brought up by `make reference-up` (or `docker compose up -d` from this dir).
+# Exposes overlay-express on :8090 for the differential parity harness.
+# (:8080 is taken by dolphinmilk on this host.)
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mysql:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: overlay
+      MYSQL_DATABASE: overlay
+      MYSQL_USER: overlay
+      MYSQL_PASSWORD: overlay
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "overlay", "-poverlay"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  overlay-express:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    environment:
+      # Known dev-only identity key. Do NOT use in production.
+      SERVER_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      HOSTING_URL: "http://localhost:8090"
+      KNEX_URL: "mysql://overlay:overlay@mysql:3306/overlay"
+      MONGO_URL: "mongodb://mongo:27017/overlay"
+      PORT: "8080"
+      NODE_NAME: "parityref"
+      # Known harness token — same value seeded into wrangler dev. Keeps
+      # /admin/* Bearer happy-path corpus deterministic on both sides.
+      ADMIN_TOKEN: "parity-harness-test-token-2026"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  mysql-data:

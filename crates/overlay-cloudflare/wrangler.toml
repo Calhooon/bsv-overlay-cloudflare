@@ -1,0 +1,50 @@
+name = "bsv-overlay-cloudflare"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-12-01"
+
+account_id = "<your-cloudflare-account-id>"
+
+[build]
+# Pin worker-build to ^0.7 — newer 0.8+ requires worker crate ≥0.8 but the
+# project pins worker 0.7.5. Without the version pin, `cargo install` grabs
+# the latest worker-build and the build fails with "Unsupported version
+# worker@0.7.5, expected at least worker@0.8.0".
+command = "cargo install -q --version ^0.7 worker-build && worker-build --release"
+
+[[d1_databases]]
+binding = "OVERLAY_DB"
+database_name = "<your-d1-name>"
+database_id = "<your-d1-id>"
+
+[vars]
+ENVIRONMENT = "production"
+CHAIN_TRACKER_URL = "https://<your-chain-tracker-api>"
+HOSTING_URL = "https://<your-overlay>.workers.dev"
+# wallet-infra endpoint the CloudflareAdvertiser uses for createAction /
+# processAction when it issues SHIP/SLAP tokens. Matches what
+# bsv-storage-cloudflare uses — same admin wallet account, same backend.
+WALLET_STORAGE_URL = "https://<your-wallet-storage>"
+# Registration surface. The production worker carries the full dolphinmilk
+# stack (UHRP / Agent / DmDelegation) on top of the mainline SHIP+SLAP
+# parity set. Default (unset or empty) = SHIP+SLAP only, which is what the
+# parity harness exercises via `wrangler dev --var TOPIC_MANAGERS:` etc.
+TOPIC_MANAGERS = "tm_ship,tm_slap,tm_uhrp,tm_agent,tm_dm_delegation"
+LOOKUP_SERVICES = "ls_ship,ls_slap,ls_uhrp,ls_agent,ls_dm_delegation"
+ENABLE_EXTENSIONS = "true"
+# ADMIN_TOKEN: set via `wrangler secret put ADMIN_TOKEN` (not stored in git)
+# TAAL_API_KEY: set via `wrangler secret put TAAL_API_KEY` (ARC broadcast to miners)
+# SERVER_PRIVATE_KEY: set via `wrangler secret put SERVER_PRIVATE_KEY` (not stored in git)
+#   Required by CloudflareAdvertiser to sign SHIP/SLAP PushDrop tokens.
+#   Same key that identifies this overlay to peers on BRC-103 auth calls.
+
+[[queues.producers]]
+queue = "overlay-mutations"
+binding = "MUTATION_QUEUE"
+
+[[queues.consumers]]
+queue = "overlay-mutations"
+max_batch_size = 1
+max_retries = 3
+
+[triggers]
+crons = ["*/15 * * * *"]

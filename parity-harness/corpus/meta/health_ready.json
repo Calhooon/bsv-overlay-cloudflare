@@ -1,0 +1,6 @@
+{
+  "name": "health_ready",
+  "method": "GET",
+  "path": "/health/ready",
+  "note": "RO-001: readiness subroute not yet on rust-overlay."
+}

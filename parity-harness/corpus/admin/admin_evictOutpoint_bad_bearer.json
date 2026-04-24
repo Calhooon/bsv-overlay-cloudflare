@@ -1,0 +1,8 @@
+{
+  "name": "admin_evictOutpoint_bad_bearer",
+  "method": "POST",
+  "path": "/admin/evictOutpoint",
+  "headers": {
+    "Authorization": "Bearer nope"
+  }
+}
