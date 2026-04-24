@@ -1,5 +1,5 @@
 [package]
-name = "overlay-discovery"
+name = "bsv-overlay-discovery"
 description = "SHIP/SLAP topic managers and lookup services for BSV overlay network"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-overlay-engine = { path = "../overlay-engine" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
 bsv-rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

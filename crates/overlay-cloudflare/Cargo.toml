@@ -1,5 +1,5 @@
 [package]
-name = "overlay-cloudflare"
+name = "bsv-overlay-cloudflare"
 description = "Cloudflare Workers deployment for BSV Overlay Services"
 version.workspace = true
 edition.workspace = true
@@ -16,8 +16,8 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-overlay-engine = { path = "../overlay-engine" }
-overlay-discovery = { path = "../overlay-discovery" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 bsv-rs = { workspace = true, features = ["wasm"] }
 bsv-middleware-cloudflare = "0.1"
 async-trait.workspace = true

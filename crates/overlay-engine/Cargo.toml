@@ -1,5 +1,5 @@
 [package]
-name = "overlay-engine"
+name = "bsv-overlay-engine"
 description = "BSV Overlay Services Engine — transaction admission, lookup, GASP sync"
 version.workspace = true
 edition.workspace = true
@@ -25,5 +25,5 @@ js-sys = "0.3"
 tokio = { workspace = true, features = ["rt", "macros"] }
 proptest = "1"
 reqwest = { version = "0.12", features = ["json"] }
-overlay-discovery = { path = "../overlay-discovery" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 hex = "0.4"

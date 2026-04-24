@@ -1,4 +1,4 @@
-# rust-overlay — top-level developer entrypoints.
+# bsv-overlay-cloudflare — top-level developer entrypoints.
 #
 # The headline command is `make parity`: stands up the mainline
 # `@bsv/overlay-express@2.2.0` reference in Docker + `wrangler dev` locally
@@ -9,7 +9,7 @@
         wrangler-dev harness test extensions-build e2e-bsv-storage clean help
 
 help:
-	@echo "rust-overlay make targets:"
+	@echo "bsv-overlay-cloudflare make targets:"
 	@echo "  parity           Full harness run (assumes wrangler dev + reference up)"
 	@echo "  reference-up     docker compose up the TS overlay-express 2.2.0 reference on :8090"
 	@echo "  reference-down   Tear the reference stack down (keeps volumes)"
@@ -78,10 +78,10 @@ parity-clean:
 ## -- Tests + builds -----------------------------------------------------------
 
 test:
-	cargo test --workspace --features overlay-engine/memory-storage
+	cargo test --workspace --features bsv-overlay-engine/memory-storage
 
 extensions-build:
-	cargo build -p overlay-cloudflare --features extensions
+	cargo build -p bsv-overlay-cloudflare --features extensions
 
 ## -- End-to-end ---------------------------------------------------------------
 
