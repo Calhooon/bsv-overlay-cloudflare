@@ -10,3 +10,6 @@ secrets.md
 .wrangler/
 # Docker volumes + container state (reference stack)
 reference/.docker/
+# Third-party TS reference material (sonicstar plugin source-of-truth from
+# sonicstar.net). Used as design reference; not ours to redistribute.
+ruth/
