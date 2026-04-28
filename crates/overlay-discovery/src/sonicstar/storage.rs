@@ -17,6 +17,15 @@
 //! - `find_by_search_text`: case insensitive substring across three fields
 //!   only — `song_title`, `artist_name`, `album`. The TS docstring claims
 //!   four; the TS code does three. We mirror the code.
+//!
+//! ## Multi-criterion filters
+//!
+//! [`SonicstarStorage::find_records`] composes any subset of the filter
+//! fields via AND. This is the path used by `ls_sonicstar` lookups so that
+//! TS-parity queries like `{artistName: "...", genre: "..."}` work
+//! end-to-end. The single-criterion `find_by_*` methods remain on the
+//! trait as ergonomic shortcuts; they delegate to `find_records` in the
+//! in-memory backend.
 
 use async_trait::async_trait;
 use overlay_engine::types::UTXOReference;
@@ -135,6 +144,48 @@ pub trait SonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError>;
+
+    /// AND-compose any subset of the filter fields and return matching
+    /// outpoints, newest first. An empty filter is equivalent to
+    /// [`Self::find_all`].
+    ///
+    /// This is the primary query path used by `ls_sonicstar` so that
+    /// multi-criterion TS Mongo queries (`{artistName, genre}`,
+    /// `{txid, searchText}`, ...) work end-to-end. D1 backends can push
+    /// the filter to SQL; the in-memory backend filters in place.
+    async fn find_records(
+        &self,
+        filter: &SonicstarFilter,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError>;
+}
+
+/// Composable filter for [`SonicstarStorage::find_records`]. Any field
+/// left as `None` is ignored; set fields combine via AND.
+#[derive(Debug, Default, Clone)]
+pub struct SonicstarFilter {
+    /// Exact-match `txid`.
+    pub txid: Option<String>,
+    /// Case-insensitive substring against `artist_name`.
+    pub artist_name_contains: Option<String>,
+    /// Exact-match `genre` (case sensitive, matches Mongo equality).
+    pub genre_eq: Option<String>,
+    /// Case-insensitive substring across `song_title`, `artist_name`,
+    /// `album`. Three fields only, matches the TS code (not the
+    /// out-of-date TS docstring that claims four).
+    pub search_text: Option<String>,
+}
+
+impl SonicstarFilter {
+    /// `true` when every filter field is `None`. Lookup callers use this
+    /// to short-circuit to a `findAll`-style enumeration.
+    pub fn is_empty(&self) -> bool {
+        self.txid.is_none()
+            && self.artist_name_contains.is_none()
+            && self.genre_eq.is_none()
+            && self.search_text.is_none()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -192,6 +243,44 @@ fn to_outpoint(r: &SonicstarRecord) -> UTXOReference {
     }
 }
 
+/// AND-composed match against a [`SonicstarFilter`]. Mirrors Ruth's TS
+/// Mongo filter object semantics: every set field must hold for the
+/// record to be included.
+fn matches_filter(record: &SonicstarRecord, filter: &SonicstarFilter) -> bool {
+    if let Some(t) = &filter.txid {
+        if record.txid != *t {
+            return false;
+        }
+    }
+    if let Some(needle) = &filter.artist_name_contains {
+        if !record
+            .artist_name
+            .to_lowercase()
+            .contains(&needle.to_lowercase())
+        {
+            return false;
+        }
+    }
+    if let Some(g) = &filter.genre_eq {
+        if record.genre.as_deref() != Some(g.as_str()) {
+            return false;
+        }
+    }
+    if let Some(q) = &filter.search_text {
+        let needle = q.to_lowercase();
+        let in_title = record.song_title.to_lowercase().contains(&needle);
+        let in_artist = record.artist_name.to_lowercase().contains(&needle);
+        let in_album = record
+            .album
+            .as_deref()
+            .is_some_and(|a| a.to_lowercase().contains(&needle));
+        if !(in_title || in_artist || in_album) {
+            return false;
+        }
+    }
+    true
+}
+
 #[async_trait(?Send)]
 impl SonicstarStorage for MemorySonicstarStorage {
     async fn has_duplicate_record(
@@ -247,16 +336,13 @@ impl SonicstarStorage for MemorySonicstarStorage {
         &self,
         txid: &str,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
-        let mut hits: Vec<SonicstarRecord> = self
-            .rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.txid == txid)
-            .cloned()
-            .collect();
-        sort_desc_by_admitted_at(&mut hits);
-        Ok(hits.iter().map(to_outpoint).collect())
+        // Note: find_by_txid is documented as unpaginated (one tx has at
+        // most a handful of admissible outputs). Pass None/None to match.
+        let filter = SonicstarFilter {
+            txid: Some(txid.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, None, None).await
     }
 
     async fn find_by_artist_name(
@@ -265,17 +351,11 @@ impl SonicstarStorage for MemorySonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
-        let needle = name_substr.to_lowercase();
-        let mut hits: Vec<SonicstarRecord> = self
-            .rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.artist_name.to_lowercase().contains(&needle))
-            .cloned()
-            .collect();
-        sort_desc_by_admitted_at(&mut hits);
-        Ok(page(hits.iter().map(to_outpoint).collect(), limit, skip))
+        let filter = SonicstarFilter {
+            artist_name_contains: Some(name_substr.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, limit, skip).await
     }
 
     async fn find_by_genre(
@@ -284,16 +364,11 @@ impl SonicstarStorage for MemorySonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
-        let mut hits: Vec<SonicstarRecord> = self
-            .rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.genre.as_deref() == Some(genre))
-            .cloned()
-            .collect();
-        sort_desc_by_admitted_at(&mut hits);
-        Ok(page(hits.iter().map(to_outpoint).collect(), limit, skip))
+        let filter = SonicstarFilter {
+            genre_eq: Some(genre.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, limit, skip).await
     }
 
     async fn find_by_search_text(
@@ -302,31 +377,11 @@ impl SonicstarStorage for MemorySonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
-        let needle = q.to_lowercase();
-        let matches = |r: &SonicstarRecord| -> bool {
-            if r.song_title.to_lowercase().contains(&needle) {
-                return true;
-            }
-            if r.artist_name.to_lowercase().contains(&needle) {
-                return true;
-            }
-            if let Some(album) = r.album.as_deref() {
-                if album.to_lowercase().contains(&needle) {
-                    return true;
-                }
-            }
-            false
+        let filter = SonicstarFilter {
+            search_text: Some(q.to_string()),
+            ..Default::default()
         };
-        let mut hits: Vec<SonicstarRecord> = self
-            .rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| matches(r))
-            .cloned()
-            .collect();
-        sort_desc_by_admitted_at(&mut hits);
-        Ok(page(hits.iter().map(to_outpoint).collect(), limit, skip))
+        self.find_records(&filter, limit, skip).await
     }
 
     async fn find_all(
@@ -334,7 +389,24 @@ impl SonicstarStorage for MemorySonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
-        let mut hits = self.rows.lock().unwrap().clone();
+        self.find_records(&SonicstarFilter::default(), limit, skip)
+            .await
+    }
+
+    async fn find_records(
+        &self,
+        filter: &SonicstarFilter,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let mut hits: Vec<SonicstarRecord> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches_filter(r, filter))
+            .cloned()
+            .collect();
         sort_desc_by_admitted_at(&mut hits);
         Ok(page(hits.iter().map(to_outpoint).collect(), limit, skip))
     }
@@ -601,6 +673,134 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn filter_is_empty_helper() {
+        assert!(SonicstarFilter::default().is_empty());
+        assert!(!SonicstarFilter {
+            txid: Some("x".into()),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!SonicstarFilter {
+            search_text: Some("y".into()),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_records_empty_filter_returns_all() {
+        let store = MemorySonicstarStorage::new();
+        store.store_record(&make_record("tx1", 0, 100)).await.unwrap();
+        store.store_record(&make_record("tx2", 0, 200)).await.unwrap();
+
+        let hits = store
+            .find_records(&SonicstarFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // Newest first.
+        assert_eq!(hits[0].txid, "tx2");
+    }
+
+    #[tokio::test]
+    async fn find_records_combines_artist_and_genre_via_and() {
+        let store = MemorySonicstarStorage::new();
+        // Same artist, different genre.
+        store
+            .store_record(&record_with("tx1", 100, "Adele", "t1", Some("Pop"), None))
+            .await
+            .unwrap();
+        store
+            .store_record(&record_with("tx2", 200, "Adele", "t2", Some("Jazz"), None))
+            .await
+            .unwrap();
+        // Different artist, matching genre.
+        store
+            .store_record(&record_with("tx3", 300, "Beatles", "t3", Some("Pop"), None))
+            .await
+            .unwrap();
+
+        let filter = SonicstarFilter {
+            artist_name_contains: Some("adele".into()),
+            genre_eq: Some("Pop".into()),
+            ..Default::default()
+        };
+        let hits = store.find_records(&filter, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "AND must reject non-Pop Adele and non-Adele Pop");
+        assert_eq!(hits[0].txid, "tx1");
+    }
+
+    #[tokio::test]
+    async fn find_records_combines_txid_and_search_text() {
+        let store = MemorySonicstarStorage::new();
+        // Same txid, different titles.
+        let mut a = make_record("txA", 0, 100);
+        a.song_title = "Hello World".into();
+        store.store_record(&a).await.unwrap();
+        let mut b = make_record("txA", 1, 200);
+        b.song_title = "Goodbye Moon".into();
+        store.store_record(&b).await.unwrap();
+        // Different txid, matching search.
+        let mut c = make_record("txB", 0, 300);
+        c.song_title = "Hello Friend".into();
+        store.store_record(&c).await.unwrap();
+
+        let filter = SonicstarFilter {
+            txid: Some("txA".into()),
+            search_text: Some("hello".into()),
+            ..Default::default()
+        };
+        let hits = store.find_records(&filter, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].txid, "txA");
+        assert_eq!(hits[0].output_index, 0);
+    }
+
+    #[tokio::test]
+    async fn find_records_no_match_returns_empty() {
+        let store = MemorySonicstarStorage::new();
+        store
+            .store_record(&record_with("tx1", 100, "Adele", "Hello", Some("Pop"), None))
+            .await
+            .unwrap();
+
+        let filter = SonicstarFilter {
+            artist_name_contains: Some("missing-artist".into()),
+            ..Default::default()
+        };
+        assert!(store.find_records(&filter, None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_records_paginates_after_filtering() {
+        let store = MemorySonicstarStorage::new();
+        // 5 records, all with artist "Adele", strictly increasing admittedAt.
+        for i in 0..5i64 {
+            let r = record_with(&format!("tx{i}"), 1000 + i, "Adele", "song", None, None);
+            store.store_record(&r).await.unwrap();
+        }
+        // 1 record with a different artist; must be excluded by the filter
+        // before pagination so page sizes still match.
+        store
+            .store_record(&record_with("noise", 1003, "Beatles", "song", None, None))
+            .await
+            .unwrap();
+
+        let filter = SonicstarFilter {
+            artist_name_contains: Some("adele".into()),
+            ..Default::default()
+        };
+        let page1 = store.find_records(&filter, Some(2), Some(0)).await.unwrap();
+        let page2 = store.find_records(&filter, Some(2), Some(2)).await.unwrap();
+        let page3 = store.find_records(&filter, Some(2), Some(4)).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page3.len(), 1);
+        // Newest first across the Adele subset.
+        assert_eq!(page1[0].txid, "tx4");
     }
 
     #[tokio::test]
