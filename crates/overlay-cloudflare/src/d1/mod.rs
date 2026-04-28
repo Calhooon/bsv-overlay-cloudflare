@@ -220,7 +220,7 @@ pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), 
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 23;
+pub const OVERLAY_MIGRATION_COUNT: usize = 27;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -331,6 +331,37 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_uhrp_url ON uhrp_records(uhrpUrl)",
     "CREATE INDEX IF NOT EXISTS idx_uhrp_identity ON uhrp_records(identityKey)",
+    // SonicStar Song Source Protocol records (tm_sonicstar / ls_sonicstar).
+    // One row per admitted `OP_RETURN <utf-8 JSON>` track output. Unlike
+    // every other plugin in this crate, sonicstar uses bare OP_RETURN
+    // rather than PushDrop. `admittedAt` is unix millis (matches
+    // `Date.now()` in Ruth's TS reference) and is the DESC sort key for
+    // every paginated lookup. Optional fields (artFileURL, previewURL,
+    // genre, album, releaseDate, description) use SQL NULL so the TS
+    // "undefined keys are absent" behavior round-trips cleanly.
+    "CREATE TABLE IF NOT EXISTS sonicstar_records (
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        satoshis INTEGER NOT NULL,
+        admittedAt INTEGER NOT NULL,
+        songTitle TEXT NOT NULL,
+        artistName TEXT NOT NULL,
+        artistIdentityKey TEXT NOT NULL DEFAULT '',
+        description TEXT,
+        duration INTEGER NOT NULL DEFAULT 0,
+        songFileURL TEXT NOT NULL,
+        artFileURL TEXT,
+        previewURL TEXT,
+        genre TEXT,
+        album TEXT,
+        releaseDate TEXT,
+        pricePerPlay INTEGER NOT NULL DEFAULT 1000,
+        royaltyRate INTEGER NOT NULL DEFAULT 75,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_sonicstar_artist_name ON sonicstar_records(artistName)",
+    "CREATE INDEX IF NOT EXISTS idx_sonicstar_genre ON sonicstar_records(genre)",
+    "CREATE INDEX IF NOT EXISTS idx_sonicstar_admitted_at ON sonicstar_records(admittedAt DESC)",
     // Banned hosts / outpoints — mainline overlay-express 2.2.0 BanService
     // equivalent. `type` is "domain" or "outpoint". `value` is the
     // advertised URL (domain type) or `<txid>.<outputIndex>` (outpoint type).
@@ -433,6 +464,7 @@ mod tests {
             "agent_capabilities",
             "dm_delegation_records",
             "uhrp_records",
+            "sonicstar_records",
         ] {
             assert!(
                 joined.contains(table),
@@ -457,6 +489,9 @@ mod tests {
             "idx_dm_delegation_certifier",
             "idx_uhrp_url",
             "idx_uhrp_identity",
+            "idx_sonicstar_artist_name",
+            "idx_sonicstar_genre",
+            "idx_sonicstar_admitted_at",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

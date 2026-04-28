@@ -15,6 +15,9 @@ use overlay_discovery::dm_delegation::storage::{
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
 };
+use overlay_discovery::sonicstar::storage::{
+    SonicstarFilter, SonicstarRecord, SonicstarStorage, SonicstarStorageError,
+};
 use overlay_discovery::slap::storage::{
     SLAPDiscoveryRecord, SLAPQuery, SLAPStorage, SLAPStorageError,
 };
@@ -966,6 +969,258 @@ impl UHRPStorage for D1UHRPStorage {
 }
 
 // =============================================================================
+// D1 implementation of SonicstarStorage trait.
+// =============================================================================
+//
+// Backs `tm_sonicstar` / `ls_sonicstar` for SonicStar Song Source Protocol
+// track records. Schema lives in `d1::OVERLAY_MIGRATIONS` (camelCase
+// columns: `outputIndex`, `admittedAt`, `songTitle`, `songFileURL`, etc.).
+//
+// All paginated reads use `ORDER BY admittedAt DESC` to match Ruth's TS
+// reference (`sonicstarLookup.ts:154`, `.sort({ admittedAt: -1 })`).
+//
+// Substring filters use SQLite `LOWER(col) LIKE ? ESCAPE '\'` with a
+// `\`-escaped lowercased pattern. Note that SQLite's `LOWER()` only
+// lowercases ASCII; the in-memory backend uses Rust's Unicode-aware
+// `to_lowercase()`. For sonicstar's predominantly Latin track metadata
+// this divergence is invisible. Track records with non-ASCII content
+// (e.g. Japanese titles) may exhibit slightly stricter substring
+// matching on D1 than in unit tests, which is documented in the
+// migration block above.
+
+pub struct D1SonicstarStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1SonicstarStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn sonicstar_err(e: String) -> SonicstarStorageError {
+    SonicstarStorageError::Database(e)
+}
+
+/// Escape SQL `LIKE` wildcards (`%`, `_`) and the escape character itself
+/// so user-supplied substring queries can't accidentally match more than
+/// they intend. Pairs with `LIKE ? ESCAPE '\'` in the SQL.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[async_trait(?Send)]
+impl SonicstarStorage for D1SonicstarStorage {
+    async fn has_duplicate_record(
+        &self,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<bool, SonicstarStorageError> {
+        let row: Option<CountRow> = Query::new(
+            "SELECT COUNT(*) as cnt FROM sonicstar_records \
+             WHERE txid = ? AND outputIndex = ?",
+        )
+        .bind(txid)
+        .bind(output_index)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(sonicstar_err)?;
+        Ok(row.is_some_and(|r| r.cnt > 0.0))
+    }
+
+    async fn store_record(
+        &self,
+        record: &SonicstarRecord,
+    ) -> Result<(), SonicstarStorageError> {
+        // INSERT OR REPLACE upserts on the (txid, outputIndex) PK. Matches
+        // the in-memory backend's upsert behavior, which itself mirrors
+        // the TS `updateOne(..., { upsert: true })` (sonicstarLookup.ts:121).
+        Query::new(
+            "INSERT OR REPLACE INTO sonicstar_records (\
+                 txid, outputIndex, satoshis, admittedAt, \
+                 songTitle, artistName, artistIdentityKey, description, \
+                 duration, songFileURL, artFileURL, previewURL, \
+                 genre, album, releaseDate, pricePerPlay, royaltyRate\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&*record.txid)
+        .bind(record.output_index)
+        .bind(record.satoshis)
+        .bind(record.admitted_at)
+        .bind(&*record.song_title)
+        .bind(&*record.artist_name)
+        .bind(&*record.artist_identity_key)
+        .bind(record.description.clone())
+        .bind(record.duration)
+        .bind(&*record.song_file_url)
+        .bind(record.art_file_url.clone())
+        .bind(record.preview_url.clone())
+        .bind(record.genre.clone())
+        .bind(record.album.clone())
+        .bind(record.release_date.clone())
+        .bind(record.price_per_play)
+        .bind(record.royalty_rate as u32)
+        .execute(&self.db)
+        .await
+        .map_err(sonicstar_err)?;
+        Ok(())
+    }
+
+    async fn delete_record(
+        &self,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<(), SonicstarStorageError> {
+        Query::new("DELETE FROM sonicstar_records WHERE txid = ? AND outputIndex = ?")
+            .bind(txid)
+            .bind(output_index)
+            .execute(&self.db)
+            .await
+            .map_err(sonicstar_err)
+    }
+
+    async fn find_by_outpoint(
+        &self,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let rows: Vec<UTXORow> = Query::new(
+            "SELECT txid, outputIndex FROM sonicstar_records \
+             WHERE txid = ? AND outputIndex = ?",
+        )
+        .bind(txid)
+        .bind(output_index)
+        .fetch_all(&self.db)
+        .await
+        .map_err(sonicstar_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+
+    async fn find_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let filter = SonicstarFilter {
+            txid: Some(txid.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, None, None).await
+    }
+
+    async fn find_by_artist_name(
+        &self,
+        name_substr: &str,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let filter = SonicstarFilter {
+            artist_name_contains: Some(name_substr.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, limit, skip).await
+    }
+
+    async fn find_by_genre(
+        &self,
+        genre: &str,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let filter = SonicstarFilter {
+            genre_eq: Some(genre.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, limit, skip).await
+    }
+
+    async fn find_by_search_text(
+        &self,
+        q: &str,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let filter = SonicstarFilter {
+            search_text: Some(q.to_string()),
+            ..Default::default()
+        };
+        self.find_records(&filter, limit, skip).await
+    }
+
+    async fn find_all(
+        &self,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        self.find_records(&SonicstarFilter::default(), limit, skip)
+            .await
+    }
+
+    async fn find_records(
+        &self,
+        filter: &SonicstarFilter,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
+        let mut wb = WhereBuilder::new();
+        if let Some(t) = &filter.txid {
+            wb = wb.eq("txid", t.as_str());
+        }
+        if let Some(needle) = &filter.artist_name_contains {
+            let pattern = format!("%{}%", escape_like(&needle.to_lowercase()));
+            wb = wb.raw(
+                "LOWER(artistName) LIKE ? ESCAPE '\\'",
+                vec![pattern.into()],
+            );
+        }
+        if let Some(g) = &filter.genre_eq {
+            wb = wb.eq("genre", g.as_str());
+        }
+        if let Some(q) = &filter.search_text {
+            let pattern = format!("%{}%", escape_like(&q.to_lowercase()));
+            // Three identical patterns for the three OR'd columns. Matches
+            // the in-memory backend's three-field substring (the TS code
+            // does three; the TS docstring claims four).
+            wb = wb.raw(
+                "(LOWER(songTitle) LIKE ? ESCAPE '\\' \
+                  OR LOWER(artistName) LIKE ? ESCAPE '\\' \
+                  OR LOWER(album) LIKE ? ESCAPE '\\')",
+                vec![
+                    pattern.clone().into(),
+                    pattern.clone().into(),
+                    pattern.into(),
+                ],
+            );
+        }
+
+        let (where_clause, params) = wb.build();
+        let mut sql = format!(
+            "SELECT txid, outputIndex FROM sonicstar_records{where_clause} \
+             ORDER BY admittedAt DESC"
+        );
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {l}"));
+        }
+        if let Some(s) = skip {
+            sql.push_str(&format!(" OFFSET {s}"));
+        }
+
+        let mut q = Query::new(sql);
+        for p in params {
+            q = q.bind(p);
+        }
+        let rows: Vec<UTXORow> = q.fetch_all(&self.db).await.map_err(sonicstar_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -992,5 +1247,27 @@ mod tests {
         };
         let r = row.into_ref();
         assert_eq!(r.output_index, 0);
+    }
+
+    #[test]
+    fn escape_like_passes_through_safe_chars() {
+        assert_eq!(escape_like("hello"), "hello");
+        assert_eq!(escape_like("Adele 25"), "Adele 25");
+    }
+
+    #[test]
+    fn escape_like_escapes_percent_underscore_and_backslash() {
+        assert_eq!(escape_like("a%b"), "a\\%b");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+        // All three together so a malicious pattern can't widen results.
+        assert_eq!(escape_like("100%_off\\"), "100\\%\\_off\\\\");
+    }
+
+    #[test]
+    fn escape_like_handles_unicode_pass_through() {
+        // Non-ASCII chars are not LIKE wildcards, so they pass through unchanged.
+        assert_eq!(escape_like("日本語"), "日本語");
+        assert_eq!(escape_like("café"), "café");
     }
 }
