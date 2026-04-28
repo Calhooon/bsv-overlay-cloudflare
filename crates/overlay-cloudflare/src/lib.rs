@@ -37,6 +37,9 @@ use overlay_discovery::ship::topic_manager::SHIPTopicManager;
 use overlay_discovery::slap::lookup_service::SLAPLookupService;
 use overlay_discovery::slap::storage::SLAPStorage;
 use overlay_discovery::slap::topic_manager::SLAPTopicManager;
+use overlay_discovery::sonicstar::lookup_service::SonicstarLookupService;
+use overlay_discovery::sonicstar::storage::SonicstarStorage;
+use overlay_discovery::sonicstar::topic_manager::SonicstarTopicManager;
 use overlay_discovery::uhrp::lookup_service::UHRPLookupService;
 use overlay_discovery::uhrp::storage::UHRPStorage;
 use overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
@@ -49,7 +52,8 @@ use crate::broadcaster::{WorkerArcBroadcaster, WorkerBroadcaster};
 use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::{run_migrations, OVERLAY_MIGRATIONS};
 use crate::d1_discovery::{
-    D1AgentStorage, D1DmDelegationStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
+    D1AgentStorage, D1DmDelegationStorage, D1SHIPStorage, D1SLAPStorage, D1SonicstarStorage,
+    D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
 use crate::health_checker::WorkerHealthChecker;
@@ -116,6 +120,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
     let dm_delegation_storage: Rc<dyn DmDelegationStorage> =
         Rc::new(D1DmDelegationStorage::new(db.clone()));
     let uhrp_storage: Rc<dyn UHRPStorage> = Rc::new(D1UHRPStorage::new(db.clone()));
+    let sonicstar_storage: Rc<dyn SonicstarStorage> =
+        Rc::new(D1SonicstarStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -124,6 +130,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         agent_storage.clone(),
         dm_delegation_storage.clone(),
         uhrp_storage.clone(),
+        sonicstar_storage.clone(),
     );
 
     // Hosting URL for web UI
@@ -242,6 +249,8 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     let dm_delegation_storage: Rc<dyn DmDelegationStorage> =
         Rc::new(D1DmDelegationStorage::new(db.clone()));
     let uhrp_storage: Rc<dyn UHRPStorage> = Rc::new(D1UHRPStorage::new(db.clone()));
+    let sonicstar_storage: Rc<dyn SonicstarStorage> =
+        Rc::new(D1SonicstarStorage::new(db.clone()));
     Ok(build_engine_with_storage(
         db,
         env,
@@ -250,6 +259,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         agent_storage,
         dm_delegation_storage,
         uhrp_storage,
+        sonicstar_storage,
     ))
 }
 
@@ -257,6 +267,11 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
 ///
 /// The discovery storage references are passed in so they can be shared with
 /// the Janitor service (which needs direct access to discovery records).
+///
+// TODO: as more plugins land we should bundle the discovery storages into a
+// single `DiscoveryStorages` struct rather than keep growing the parameter
+// list. Sonicstar pushed this past clippy's 7-arg threshold (now at 8).
+#[allow(clippy::too_many_arguments)]
 fn build_engine_with_storage(
     db: Rc<worker::D1Database>,
     env: &Env,
@@ -265,6 +280,7 @@ fn build_engine_with_storage(
     agent_storage: Rc<dyn AgentStorage>,
     dm_delegation_storage: Rc<dyn DmDelegationStorage>,
     uhrp_storage: Rc<dyn UHRPStorage>,
+    sonicstar_storage: Rc<dyn SonicstarStorage>,
 ) -> Engine {
     // Storage
     let storage = Box::new(D1Storage::new(db));
@@ -319,6 +335,12 @@ fn build_engine_with_storage(
                     Box::new(DmDelegationTopicManager::new()),
                 );
             }
+            "tm_sonicstar" => {
+                managers.insert(
+                    "tm_sonicstar".into(),
+                    Box::new(SonicstarTopicManager::new()),
+                );
+            }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
         }
     }
@@ -358,6 +380,12 @@ fn build_engine_with_storage(
                 lookup_services.insert(
                     "ls_dm_delegation".into(),
                     Box::new(DmDelegationLookupService::new(dm_delegation_storage.clone())),
+                );
+            }
+            "ls_sonicstar" => {
+                lookup_services.insert(
+                    "ls_sonicstar".into(),
+                    Box::new(SonicstarLookupService::new(sonicstar_storage.clone())),
                 );
             }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),
@@ -540,6 +568,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let dm_delegation_storage: Rc<dyn DmDelegationStorage> =
         Rc::new(D1DmDelegationStorage::new(db.clone()));
     let uhrp_storage: Rc<dyn UHRPStorage> = Rc::new(D1UHRPStorage::new(db.clone()));
+    let sonicstar_storage: Rc<dyn SonicstarStorage> =
+        Rc::new(D1SonicstarStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -548,6 +578,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         agent_storage.clone(),
         dm_delegation_storage.clone(),
         uhrp_storage.clone(),
+        sonicstar_storage.clone(),
     );
 
     // Sync advertisements (if advertiser + hosting URL are configured).

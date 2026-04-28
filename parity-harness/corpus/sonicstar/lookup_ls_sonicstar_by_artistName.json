@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_by_artistName",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": { "artistName": "Adele" }
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. Rust-overlay applies a case-insensitive substring match on artist_name (mirrors the TS regex with $options: 'i'). Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

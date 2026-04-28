@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_invalid_null_query",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": null
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. Both rust-overlay and Ruth's TS reference reject a null query (the TS throws 'A valid query must be provided!'). This scenario confirms our worker returns InvalidQuery rather than crashing. Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

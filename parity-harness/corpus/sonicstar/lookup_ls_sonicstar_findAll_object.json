@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_findAll_object",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": { "findAll": true }
+  },
+  "note": "Expected divergence: same as the 'findAll' string variant. Both forms must enumerate all admitted tracks per Ruth's TS reference at sonicstarLookup.ts:174. Vanilla 2.2.0 has no ls_sonicstar; live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

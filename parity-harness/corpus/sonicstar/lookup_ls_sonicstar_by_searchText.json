@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_by_searchText",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": { "searchText": "love" }
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. Rust-overlay searches songTitle, artistName, album for a case-insensitive substring (three fields only, mirroring the TS code; the TS docstring claims four). Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

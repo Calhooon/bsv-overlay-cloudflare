@@ -1,0 +1,17 @@
+{
+  "name": "lookup_ls_sonicstar_pagination",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": {
+      "findAll": true,
+      "limit": 5,
+      "skip": 0
+    }
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. limit clamps to [1, 200] (default 50); skip defaults to 0. Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

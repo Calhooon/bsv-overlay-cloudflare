@@ -1,0 +1,6 @@
+{
+  "name": "get_docs_ls_sonicstar",
+  "method": "GET",
+  "path": "/getDocumentationForLookupServiceProvider?lookupService=ls_sonicstar",
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar registered. Rust-overlay returns the docstring assembled in SonicstarLookupService::get_documentation when sonicstar is enabled. Live parity via tests/sonicstar_live_parity.rs against sonicstar.net /api/overlay-parity/docs (step 10)."
+}

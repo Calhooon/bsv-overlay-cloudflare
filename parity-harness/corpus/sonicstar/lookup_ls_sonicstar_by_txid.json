@@ -1,0 +1,15 @@
+{
+  "name": "lookup_ls_sonicstar_by_txid",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": {
+      "txid": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. The all-zeros txid is a placeholder that will return zero hits on any real worker since no admitted record matches; the point is to confirm the txid filter path responds without crashing. Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

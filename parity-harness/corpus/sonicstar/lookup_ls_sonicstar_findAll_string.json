@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_findAll_string",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": "findAll"
+  },
+  "note": "Expected divergence: tm_sonicstar / ls_sonicstar are not part of vanilla @bsv/overlay-express@2.2.0, so the reference returns a 'service not found' style error. Rust-overlay returns the proper findAll response when LOOKUP_SERVICES env contains ls_sonicstar. True byte parity for sonicstar is exercised in crates/overlay-cloudflare/tests/sonicstar_live_parity.rs against sonicstar.net /api/overlay-parity/lookup (step 10)."
+}

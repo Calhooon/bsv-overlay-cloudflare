@@ -1,0 +1,16 @@
+{
+  "name": "lookup_ls_sonicstar_combined_artistName_and_genre",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": {
+      "artistName": "Adele",
+      "genre": "Pop"
+    }
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. This scenario exercises the multi-criterion AND path: the TS Mongo filter combines both fields, and rust-overlay's storage layer composes them via the SonicstarFilter introduced in step 4 (design call A). Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_by_genre",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": { "genre": "Pop" }
+  },
+  "note": "Expected divergence: vanilla 2.2.0 has no ls_sonicstar. Rust-overlay applies an exact match on genre (case sensitive, matches the TS Mongo equality filter). Live parity via tests/sonicstar_live_parity.rs (step 10)."
+}

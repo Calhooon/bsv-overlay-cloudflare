@@ -1,0 +1,13 @@
+{
+  "name": "lookup_ls_sonicstar_empty_object",
+  "method": "POST",
+  "path": "/lookup",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "service": "ls_sonicstar",
+    "query": {}
+  },
+  "note": "Expected divergence: empty-object query is the third findAll form (TS Mongo treats an empty filter object as match-all). Vanilla 2.2.0 has no ls_sonicstar; live parity via tests/sonicstar_live_parity.rs (step 10)."
+}
