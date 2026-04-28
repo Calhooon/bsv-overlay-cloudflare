@@ -76,6 +76,45 @@ const DEFAULT_REFERENCE_URL: &str = "https://sonicstar.net/api/overlay-parity";
 const DEFAULT_WOC_URL: &str = "https://api.whatsonchain.com";
 const DEFAULT_TOPIC_HEADER: &str = "[\"tm_sonicstar\"]";
 
+/// Mainnet sssp txids supplied by Ruth as the live-corpus seed. Each
+/// carries a single sssp OP_RETURN at output index 0; all 12 are
+/// expected to be admitted by `SonicStarTopicManager`. Fetched via
+/// WhatsOnChain `/v1/bsv/main/tx/{txid}/beef` in
+/// [`live_admit_diff_for_known_txids`].
+///
+/// Track titles + genres at provisioning time (2026-04-28):
+///
+/// | txid (first 8) | title              | genre      |
+/// |---------------:|--------------------|------------|
+/// | 3917b258       | The Appointment    | ambient    |
+/// | 5fc3e0c2       | Invincible Today   | electronic |
+/// | b0ffb426       | And I Love Her     | ambient    |
+/// | 7343c53e       | You Will Be Happy  | (none)     |
+/// | b32dc791       | Angel              | ambient    |
+/// | 8111ec67       | Until I Die        | rock       |
+/// | 7d3ae601       | Bliss              | ambient    |
+/// | d50fc614       | Constant Goodbyes  | electronic |
+/// | 825f92ba       | Brave Your Heart   | ambient    |
+/// | 1ee05185       | Nature's Solace    | ambient    |
+/// | 0646601c       | Built to Rule      | (none)     |
+/// | 6637937e       | Clipped Wings      | ambient    |
+///
+/// Override or extend via [`ENV_TXIDS`] (CSV).
+const DEFAULT_REFERENCE_TXIDS: &[&str] = &[
+    "3917b2584bda33f7607249f34626067c8771119872f9971e0cf468731ef78cc3",
+    "5fc3e0c23963ce7b0a4d01b617c7913d1e8c0e99ca3540f301cca18f40261eaf",
+    "b0ffb42684f77afb63f3bcef86d56272b8ab7b57dae7ed486f2960969e7270a3",
+    "7343c53ec13abdb9c98fd749ccbe3bcb4993b49d93126eeaf36eea74e3982eef",
+    "b32dc79180d33c0bc490d11a4e9778d49ab9237bdc35bf5ebf0fdbe343928d2d",
+    "8111ec677cecd4d68c1fa62e48c5b636d2928db356115903add836636aee8921",
+    "7d3ae601134e7acc478b0bfa55aa0f201dec5a2da67352d701947562b813e5c9",
+    "d50fc6147ee00258c99775b088b10c67fc228964aec5cc4f6433665d4a591f47",
+    "825f92baa2b9bf6947f58bb63e00ac14b4dc7de37fc508ef837aaa82f4b09f5d",
+    "1ee051850f90204e33334cc3670d15474e843e86115c373340bb641ce318ad9c",
+    "0646601ca08ba495c5a709a0f8217921c280e8044f7afe6bb2875b58efff3b9d",
+    "6637937e2e19803afab738085764c4275af7ef7839498e2705ed7660a0a4ee18",
+];
+
 fn require_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| {
         panic!(
@@ -199,6 +238,33 @@ fn assert_outpoint_sets_match(
     }
 }
 
+/// Assert `ours` is a subset of `theirs`. The right semantics for any
+/// content-bearing lookup query when our index has admitted a strict
+/// subset of Ruth's corpus: every outpoint we surface must also be one
+/// Ruth surfaces for the same query, but Ruth may legitimately return
+/// more (records she's seen that we haven't yet ingested).
+///
+/// Failure mode that this catches: a record we wrongly admit that Ruth
+/// rejects, or a query our lookup answers with a different record-shape
+/// than the wire txid.
+fn assert_outpoint_subset(
+    label: &str,
+    ours: Vec<Outpoint>,
+    theirs: Vec<Outpoint>,
+) {
+    let ours = dedup_sorted(sort_outpoints(ours));
+    let theirs = dedup_sorted(sort_outpoints(theirs));
+    let theirs_set: std::collections::BTreeSet<_> = theirs.iter().collect();
+    let only_ours: Vec<_> = ours.iter().filter(|o| !theirs_set.contains(o)).collect();
+    if !only_ours.is_empty() {
+        eprintln!("\n[{label}] subset check failed:");
+        eprintln!("  ours   ({}): {:?}", ours.len(), ours);
+        eprintln!("  theirs ({}): {:?}", theirs.len(), theirs);
+        eprintln!("  only ours: {only_ours:?}");
+        panic!("[{label}] our results contain outpoints not present in Ruth's reference");
+    }
+}
+
 // ---------- shared HTTP helpers ------------------------------------
 
 async fn post_lookup(client: &Client, base: &str, query: Value) -> Value {
@@ -232,7 +298,7 @@ async fn post_lookup(client: &Client, base: &str, query: Value) -> Value {
     })
 }
 
-async fn fetch_beef_from_woc(client: &Client, txid: &str) -> Result<Vec<u8>, String> {
+async fn fetch_beef_hex_from_woc(client: &Client, txid: &str) -> Result<String, String> {
     let base = env::var(ENV_WOC_URL).unwrap_or_else(|_| DEFAULT_WOC_URL.to_string());
     let url = format!("{}/v1/bsv/main/tx/{txid}/beef", base.trim_end_matches('/'));
     let resp = client
@@ -243,22 +309,32 @@ async fn fetch_beef_from_woc(client: &Client, txid: &str) -> Result<Vec<u8>, Str
     if !resp.status().is_success() {
         return Err(format!("GET {url} -> HTTP {}", resp.status()));
     }
-    Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    Ok(body.trim().to_string())
 }
 
 async fn submit_beef_to_our_worker(
     client: &Client,
     overlay_url: &str,
-    beef: &[u8],
+    beef_hex: &str,
 ) -> (StatusCode, Value) {
     let url = format!("{}/submit", overlay_url.trim_end_matches('/'));
     let topics_header = env::var(ENV_TOPIC_HEADER)
         .unwrap_or_else(|_| DEFAULT_TOPIC_HEADER.to_string());
+    // Our /submit takes raw BEEF bytes with X-Topics header. WoC returns
+    // hex; decode here.
+    let beef_bytes = hex::decode(beef_hex)
+        .unwrap_or_else(|e| panic!("hex-decode WoC BEEF body: {e}"));
+    // X-Submit-Mode: historical-tx avoids the ARC broadcast path. These
+    // BEEFs are already-confirmed mainnet txs; re-broadcasting via TAAL
+    // ARC is wasted work. We just want the topic-manager admission
+    // decision + index write.
     let resp = client
         .post(&url)
         .header("X-Topics", topics_header)
+        .header("X-Submit-Mode", "historical-tx")
         .header("Content-Type", "application/octet-stream")
-        .body(beef.to_vec())
+        .body(beef_bytes)
         .send()
         .await
         .unwrap_or_else(|e| panic!("POST {url}: {e}"));
@@ -273,17 +349,17 @@ async fn submit_beef_to_our_worker(
 async fn submit_beef_to_ruth(
     client: &Client,
     reference_url: &str,
-    beef: &[u8],
+    beef_hex: &str,
 ) -> (StatusCode, Value) {
-    // Ruth's `/api/overlay-parity/admit` accepts the BEEF as raw bytes
-    // (the same shape our `/submit` accepts); see plan §5 Layer C. If the
-    // production endpoint expects a JSON wrapper (`{ "beef": [...] }`)
-    // instead, this is the single place to flip the convention.
+    // Ruth's `/api/overlay-parity/admit` takes JSON: one of `beef`
+    // (number[]), `beefHex` (hex string), or `beefBase64`. Confirmed by
+    // her endpoint's 400 message:
+    //   "Provide BEEF as `beef` (number[]), `beefHex` (hex string) or `beefBase64`."
     let url = format!("{}/admit", reference_url.trim_end_matches('/'));
+    let body = json!({ "beefHex": beef_hex });
     let resp = client
         .post(&url)
-        .header("Content-Type", "application/octet-stream")
-        .body(beef.to_vec())
+        .json(&body)
         .send()
         .await
         .unwrap_or_else(|e| panic!("POST {url}: {e}"));
@@ -297,13 +373,15 @@ async fn submit_beef_to_ruth(
 
 // ---------- tests ----------------------------------------------------
 
-/// Diff the full enumeration. `findAll` (string) is the canonical TS
-/// sentinel, so we use that form here. Empty store → both sides return
-/// `[]` and the diff is trivially equal, which still validates that
-/// both endpoints are reachable and respond.
+/// Subset check on full enumeration. Our deployed worker has admitted
+/// a strict subset of Ruth's mainnet sonicstar corpus (we ingested the
+/// 12-txid seed; she's been running production for far longer). The
+/// right invariant is: every outpoint we surface for `findAll` is one
+/// Ruth's reference also surfaces. Strict-equality parity is provided
+/// by [`live_admit_diff_for_known_txids`] for the seed set specifically.
 #[ignore]
 #[tokio::test]
-async fn live_lookup_findall_diff() {
+async fn live_lookup_findall_subset() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -311,7 +389,7 @@ async fn live_lookup_findall_diff() {
     let ours = post_lookup(&client, &overlay, json!("findAll")).await;
     let theirs = post_lookup(&client, &reference, json!("findAll")).await;
 
-    assert_outpoint_sets_match(
+    assert_outpoint_subset(
         "lookup_findall",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -320,7 +398,7 @@ async fn live_lookup_findall_diff() {
 
 #[ignore]
 #[tokio::test]
-async fn live_lookup_findall_object_diff() {
+async fn live_lookup_findall_object_subset() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -328,7 +406,7 @@ async fn live_lookup_findall_object_diff() {
     let ours = post_lookup(&client, &overlay, json!({ "findAll": true })).await;
     let theirs = post_lookup(&client, &reference, json!({ "findAll": true })).await;
 
-    assert_outpoint_sets_match(
+    assert_outpoint_subset(
         "lookup_findall_object",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -337,7 +415,7 @@ async fn live_lookup_findall_object_diff() {
 
 #[ignore]
 #[tokio::test]
-async fn live_lookup_by_artist_name_diff() {
+async fn live_lookup_by_artist_name_subset() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -350,7 +428,7 @@ async fn live_lookup_by_artist_name_diff() {
     let ours = post_lookup(&client, &overlay, q.clone()).await;
     let theirs = post_lookup(&client, &reference, q).await;
 
-    assert_outpoint_sets_match(
+    assert_outpoint_subset(
         "lookup_by_artist",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -359,25 +437,57 @@ async fn live_lookup_by_artist_name_diff() {
 
 #[ignore]
 #[tokio::test]
-async fn live_lookup_by_search_text_diff() {
+async fn live_lookup_by_search_text_subset() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
 
+    // "the" matches "The Appointment" in the seed; "love" matches
+    // "And I Love Her". Pick one that's known to hit so the diff is
+    // substantive rather than trivially-empty-vs-empty.
     let q = json!({ "searchText": "the" });
     let ours = post_lookup(&client, &overlay, q.clone()).await;
     let theirs = post_lookup(&client, &reference, q).await;
 
-    assert_outpoint_sets_match(
+    assert_outpoint_subset(
         "lookup_by_search_text",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
     );
 }
 
+/// Genre filter against a value known to be present in the seed. Seven
+/// of the twelve seeded txids carry `genre: "ambient"`, so this exercises
+/// the exact-match path against a non-trivial result set.
 #[ignore]
 #[tokio::test]
-async fn live_lookup_pagination_consistent() {
+async fn live_lookup_by_genre_subset() {
+    let reference = reference_url();
+    let overlay = require_env(ENV_OVERLAY_URL);
+    let client = http_client();
+
+    let q = json!({ "genre": "ambient" });
+    let ours = post_lookup(&client, &overlay, q.clone()).await;
+    let theirs = post_lookup(&client, &reference, q).await;
+
+    assert_outpoint_subset(
+        "lookup_by_genre",
+        outpoints_from_our_lookup(&ours),
+        outpoints_from_ruths_lookup(&theirs),
+    );
+}
+
+/// Shape-only check on pagination. Strict result-set equality across two
+/// independent stores is structurally impossible: each side's
+/// `admittedAt` is set when *that* deployment ingested the record, so
+/// "newest 5" surfaces different records on each side even when both
+/// indexes are correct. We verify both endpoints respect the requested
+/// `limit`. Strict ordering parity, if ever needed, would require
+/// sharing `admittedAt` (e.g. computing it from blockHeight) — out of
+/// scope per plan §10 / open question Q5.
+#[ignore]
+#[tokio::test]
+async fn live_lookup_pagination_respects_limit() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -385,10 +495,13 @@ async fn live_lookup_pagination_consistent() {
     let q = json!({ "findAll": true, "limit": 5, "skip": 0 });
     let ours = post_lookup(&client, &overlay, q.clone()).await;
     let theirs = post_lookup(&client, &reference, q).await;
-    assert_outpoint_sets_match(
-        "lookup_pagination",
-        outpoints_from_our_lookup(&ours),
-        outpoints_from_ruths_lookup(&theirs),
+
+    let ours_n = outpoints_from_our_lookup(&ours).len();
+    let theirs_n = outpoints_from_ruths_lookup(&theirs).len();
+    assert!(ours_n <= 5, "[lookup_pagination] our endpoint returned {ours_n} > limit");
+    assert!(
+        theirs_n <= 5,
+        "[lookup_pagination] reference returned {theirs_n} > limit"
     );
 }
 
@@ -429,31 +542,31 @@ async fn live_admit_diff_for_known_txids() {
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
 
-    let txids_csv = match env::var(ENV_TXIDS) {
-        Ok(v) if !v.trim().is_empty() => v,
+    let txids: Vec<String> = match env::var(ENV_TXIDS) {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
         _ => {
             eprintln!(
-                "{ENV_TXIDS} unset — skipping admit diff. Populate with a CSV of mainnet sssp txids to enable."
+                "{ENV_TXIDS} unset — using DEFAULT_REFERENCE_TXIDS ({} mainnet txids).",
+                DEFAULT_REFERENCE_TXIDS.len()
             );
-            return;
+            DEFAULT_REFERENCE_TXIDS.iter().map(|s| s.to_string()).collect()
         }
     };
-    let txids: Vec<String> = txids_csv
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    assert!(!txids.is_empty(), "{ENV_TXIDS} must contain at least one txid");
+    assert!(!txids.is_empty(), "txid list must not be empty");
 
     for txid in &txids {
         eprintln!("[admit-diff] fetching BEEF for {txid}");
-        let beef = match fetch_beef_from_woc(&client, txid).await {
+        let beef_hex = match fetch_beef_hex_from_woc(&client, txid).await {
             Ok(b) => b,
             Err(e) => panic!("[admit-diff] WhatsOnChain BEEF fetch for {txid} failed: {e}"),
         };
 
-        let (ours_status, ours_body) = submit_beef_to_our_worker(&client, &overlay, &beef).await;
-        let (theirs_status, theirs_body) = submit_beef_to_ruth(&client, &reference, &beef).await;
+        let (ours_status, ours_body) = submit_beef_to_our_worker(&client, &overlay, &beef_hex).await;
+        let (theirs_status, theirs_body) = submit_beef_to_ruth(&client, &reference, &beef_hex).await;
 
         let admit_succeeded = ours_status.is_success() && theirs_status.is_success();
         if !admit_succeeded {
