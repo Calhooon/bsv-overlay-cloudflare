@@ -238,31 +238,58 @@ fn assert_outpoint_sets_match(
     }
 }
 
-/// Assert `ours` is a subset of `theirs`. The right semantics for any
-/// content-bearing lookup query when our index has admitted a strict
-/// subset of Ruth's corpus: every outpoint we surface must also be one
-/// Ruth surfaces for the same query, but Ruth may legitimately return
-/// more (records she's seen that we haven't yet ingested).
+/// Assert that on the **intersection** of txids both sides know about,
+/// they agree on the per-txid outputIndex (i.e. there's no txid where
+/// we say output N and Ruth says output M).
 ///
-/// Failure mode that this catches: a record we wrongly admit that Ruth
-/// rejects, or a query our lookup answers with a different record-shape
-/// than the wire txid.
-fn assert_outpoint_subset(
+/// This is the correct invariant once we start minting fresh sssp txs
+/// in this test suite: each side's "newest" set will inevitably
+/// diverge because Ruth's `/admit` parity endpoint is admission-
+/// decision-only — it does NOT write through to her lookup index.
+/// (Empirical finding 2026-04-28; see notes on
+/// `live_e2e_mint_and_admit_parity` for the full picture.)
+///
+/// What this check still catches:
+///   * A txid where both indexes have a record but pin it to different
+///     output indices — that would be a real per-record divergence.
+///   * Either side returning malformed output (we'd see an empty
+///     intersection on a query that should match shared content).
+fn assert_no_outpoint_conflicts_on_intersection(
     label: &str,
     ours: Vec<Outpoint>,
     theirs: Vec<Outpoint>,
 ) {
-    let ours = dedup_sorted(sort_outpoints(ours));
-    let theirs = dedup_sorted(sort_outpoints(theirs));
-    let theirs_set: std::collections::BTreeSet<_> = theirs.iter().collect();
-    let only_ours: Vec<_> = ours.iter().filter(|o| !theirs_set.contains(o)).collect();
-    if !only_ours.is_empty() {
-        eprintln!("\n[{label}] subset check failed:");
-        eprintln!("  ours   ({}): {:?}", ours.len(), ours);
-        eprintln!("  theirs ({}): {:?}", theirs.len(), theirs);
-        eprintln!("  only ours: {only_ours:?}");
-        panic!("[{label}] our results contain outpoints not present in Ruth's reference");
+    use std::collections::BTreeMap;
+    let ours_by_txid: BTreeMap<&str, u32> = ours.iter().map(|(t, i)| (t.as_str(), *i)).collect();
+    let theirs_by_txid: BTreeMap<&str, u32> =
+        theirs.iter().map(|(t, i)| (t.as_str(), *i)).collect();
+
+    let mut conflicts: Vec<String> = Vec::new();
+    for (txid, ours_i) in &ours_by_txid {
+        if let Some(theirs_i) = theirs_by_txid.get(txid) {
+            if ours_i != theirs_i {
+                conflicts.push(format!(
+                    "{txid}: ours says outputIndex={ours_i}, theirs says {theirs_i}"
+                ));
+            }
+        }
     }
+    if !conflicts.is_empty() {
+        eprintln!("\n[{label}] intersection check found {} conflict(s):", conflicts.len());
+        for c in &conflicts {
+            eprintln!("  - {c}");
+        }
+        panic!("[{label}] outpoint indices diverge on shared txids");
+    }
+    let intersect_size = ours_by_txid
+        .keys()
+        .filter(|t| theirs_by_txid.contains_key(*t))
+        .count();
+    eprintln!(
+        "[{label}] intersection check ok — {intersect_size} shared txid(s), no conflicts (ours={}, theirs={})",
+        ours.len(),
+        theirs.len()
+    );
 }
 
 // ---------- shared HTTP helpers ------------------------------------
@@ -381,7 +408,7 @@ async fn submit_beef_to_ruth(
 /// by [`live_admit_diff_for_known_txids`] for the seed set specifically.
 #[ignore]
 #[tokio::test]
-async fn live_lookup_findall_subset() {
+async fn live_lookup_findall_no_conflicts() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -389,7 +416,7 @@ async fn live_lookup_findall_subset() {
     let ours = post_lookup(&client, &overlay, json!("findAll")).await;
     let theirs = post_lookup(&client, &reference, json!("findAll")).await;
 
-    assert_outpoint_subset(
+    assert_no_outpoint_conflicts_on_intersection(
         "lookup_findall",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -398,7 +425,7 @@ async fn live_lookup_findall_subset() {
 
 #[ignore]
 #[tokio::test]
-async fn live_lookup_findall_object_subset() {
+async fn live_lookup_findall_object_no_conflicts() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -406,7 +433,7 @@ async fn live_lookup_findall_object_subset() {
     let ours = post_lookup(&client, &overlay, json!({ "findAll": true })).await;
     let theirs = post_lookup(&client, &reference, json!({ "findAll": true })).await;
 
-    assert_outpoint_subset(
+    assert_no_outpoint_conflicts_on_intersection(
         "lookup_findall_object",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -415,7 +442,7 @@ async fn live_lookup_findall_object_subset() {
 
 #[ignore]
 #[tokio::test]
-async fn live_lookup_by_artist_name_subset() {
+async fn live_lookup_by_artist_name_no_conflicts() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -428,7 +455,7 @@ async fn live_lookup_by_artist_name_subset() {
     let ours = post_lookup(&client, &overlay, q.clone()).await;
     let theirs = post_lookup(&client, &reference, q).await;
 
-    assert_outpoint_subset(
+    assert_no_outpoint_conflicts_on_intersection(
         "lookup_by_artist",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -437,7 +464,7 @@ async fn live_lookup_by_artist_name_subset() {
 
 #[ignore]
 #[tokio::test]
-async fn live_lookup_by_search_text_subset() {
+async fn live_lookup_by_search_text_no_conflicts() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -449,7 +476,7 @@ async fn live_lookup_by_search_text_subset() {
     let ours = post_lookup(&client, &overlay, q.clone()).await;
     let theirs = post_lookup(&client, &reference, q).await;
 
-    assert_outpoint_subset(
+    assert_no_outpoint_conflicts_on_intersection(
         "lookup_by_search_text",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -461,7 +488,7 @@ async fn live_lookup_by_search_text_subset() {
 /// the exact-match path against a non-trivial result set.
 #[ignore]
 #[tokio::test]
-async fn live_lookup_by_genre_subset() {
+async fn live_lookup_by_genre_no_conflicts() {
     let reference = reference_url();
     let overlay = require_env(ENV_OVERLAY_URL);
     let client = http_client();
@@ -470,7 +497,7 @@ async fn live_lookup_by_genre_subset() {
     let ours = post_lookup(&client, &overlay, q.clone()).await;
     let theirs = post_lookup(&client, &reference, q).await;
 
-    assert_outpoint_subset(
+    assert_no_outpoint_conflicts_on_intersection(
         "lookup_by_genre",
         outpoints_from_our_lookup(&ours),
         outpoints_from_ruths_lookup(&theirs),
@@ -976,6 +1003,229 @@ async fn live_docs_both_endpoints_non_empty() {
     assert!(!body.is_empty(), "[docs:theirs] empty body from {theirs_url}");
 }
 
+// =============================================================================
+// Real-sat e2e: mint a fresh sssp tx and prove admission parity end-to-end.
+// =============================================================================
+
+const ENV_E2E_MINT: &str = "SONICSTAR_E2E_MINT";
+const ENV_WALLET_URL: &str = "SONICSTAR_E2E_WALLET_URL";
+const DEFAULT_WALLET_URL: &str = "http://localhost:3321";
+
+/// Ask the local MetaNet Client wallet to mint a brand-new sssp tx and
+/// broadcast it, then submit the resulting BEEF to **both** our worker
+/// and Ruth's reference. Asserts that:
+///
+/// 1. Both endpoints agree on which output index carries the sssp
+///    payload (the wallet decides where to place the OP_RETURN — could
+///    be index 0, 1, 2, depending on change/payment outputs).
+/// 2. Our worker successfully indexes the record so a follow-up
+///    `/sonicstar/records` lookup returns it.
+/// 3. Re-decoding the BEEF locally produces the same metadata our
+///    worker stored (decoder-fidelity check on a fresh tx).
+///
+/// **NOTE on Ruth's side**: empirical finding (2026-04-28) — her
+/// `/api/overlay-parity/admit` endpoint runs her topic manager and
+/// returns the admission decision but does NOT write through to her
+/// lookup-service Mongo. Her stored `records[]` come from her live
+/// production overlay's `outputAdmittedByTopic`, not from `/admit`.
+/// So this test asserts admission-decision parity but does NOT assert
+/// her store gets written. That matches the contract her endpoint
+/// actually implements, not what we'd assume from the route name.
+///
+/// **Spends real sats**. Gated behind `SONICSTAR_E2E_MINT=yes` so it
+/// only runs when explicitly opted in. Defaults to the MetaNet Client
+/// at `http://localhost:3321`; override via `SONICSTAR_E2E_WALLET_URL`.
+#[ignore]
+#[tokio::test]
+async fn live_e2e_mint_and_admit_parity() {
+    use overlay_discovery::sonicstar::topic_manager::SonicstarTopicManager;
+
+    if env::var(ENV_E2E_MINT).ok().as_deref() != Some("yes") {
+        eprintln!(
+            "{ENV_E2E_MINT} != \"yes\" — skipping mainnet-mint test. \
+             Spends real sats; opt in explicitly when ready."
+        );
+        return;
+    }
+
+    let reference = reference_url();
+    let overlay = require_env(ENV_OVERLAY_URL);
+    let wallet_url = env::var(ENV_WALLET_URL).unwrap_or_else(|_| DEFAULT_WALLET_URL.to_string());
+    let client = http_client();
+
+    // ---- Step 1: build the sssp envelope + locking script ----
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let envelope = json!({
+        "protocol": "sssp",
+        "securityLevel": 2,
+        "songTitle": format!("rust-overlay e2e {unique}"),
+        "artistName": "rust-overlay parity bot",
+        "duration": 42,
+        "songFileURL": "https://example.invalid/test.mp3",
+        "genre": "e2e-proof",
+        "pricePerPlay": 1000,
+        "royaltyRate": 75,
+    });
+    let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+    let locking_hex = build_op_return_locking_script_hex(&envelope_bytes);
+    eprintln!(
+        "[e2e-mint] envelope: title=\"{}\"",
+        envelope["songTitle"].as_str().unwrap()
+    );
+
+    // ---- Step 2: ask the MetaNet Client wallet to createAction ----
+    let create_resp: Value = client
+        .post(format!("{}/createAction", wallet_url.trim_end_matches('/')))
+        .header("Origin", "https://localhost")
+        .json(&json!({
+            "description": format!("sonicstar e2e {unique}"),
+            "outputs": [{
+                "lockingScript": locking_hex,
+                "satoshis": 1,
+                "outputDescription": "sssp envelope",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("[e2e-mint] createAction POST: {e}"))
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("[e2e-mint] createAction JSON: {e}"));
+    let txid = create_resp
+        .get("txid")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("[e2e-mint] createAction missing txid: {create_resp:?}"))
+        .to_string();
+    eprintln!("[e2e-mint] minted txid: {txid}");
+
+    // The wallet returns `tx` as a number array (BEEF bytes).
+    let beef_bytes: Vec<u8> = create_resp
+        .get("tx")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("[e2e-mint] createAction missing tx array"))
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as u8))
+        .collect();
+    let beef_hex = hex::encode(&beef_bytes);
+
+    // ---- Step 3: submit to both overlays and diff admission ----
+    eprintln!("[e2e-mint] submitting BEEF to both overlays");
+    let (ours_status, ours_body) = submit_beef_to_our_worker(&client, &overlay, &beef_hex).await;
+    let (theirs_status, theirs_body) = submit_beef_to_ruth(&client, &reference, &beef_hex).await;
+    assert!(
+        ours_status.is_success(),
+        "[e2e-mint] our /submit failed: {ours_status} {ours_body:?}"
+    );
+    assert!(
+        theirs_status.is_success(),
+        "[e2e-mint] Ruth's /admit failed: {theirs_status} {theirs_body:?}"
+    );
+
+    // Extract `outputsToAdmit` from each side. Our /submit response is
+    // keyed by topic name (Steak shape); Ruth's is flat with `topic`.
+    let ours_admitted: Vec<u64> = ours_body
+        .get("tm_sonicstar")
+        .and_then(|v| v.get("outputsToAdmit"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    let theirs_admitted: Vec<u64> = theirs_body
+        .get("outputsToAdmit")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        ours_admitted, theirs_admitted,
+        "[e2e-mint] outputsToAdmit divergence — ours={ours_admitted:?}, theirs={theirs_admitted:?}"
+    );
+    assert!(
+        !ours_admitted.is_empty(),
+        "[e2e-mint] both sides agreed but admitted nothing — wallet placed OP_RETURN somewhere unexpected?"
+    );
+    let admitted_index = ours_admitted[0] as u32;
+    eprintln!(
+        "[e2e-mint] BOTH SIDES ADMIT output {admitted_index} — admission parity proven on a fresh mainnet tx"
+    );
+
+    // ---- Step 4: confirm our worker indexed the record ----
+    let lookup_resp: Value = client
+        .post(format!(
+            "{}/sonicstar/records",
+            overlay.trim_end_matches('/')
+        ))
+        .json(&json!({
+            "service": "ls_sonicstar",
+            "query": { "txid": txid },
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("[e2e-mint] /sonicstar/records POST: {e}"))
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("[e2e-mint] /sonicstar/records JSON: {e}"));
+    let stored = lookup_resp
+        .get("records")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .unwrap_or_else(|| {
+            panic!("[e2e-mint] our worker indexed admission but lookup returned no record: {lookup_resp:?}")
+        });
+    assert_eq!(stored["txid"].as_str(), Some(txid.as_str()));
+    assert_eq!(stored["outputIndex"].as_u64(), Some(admitted_index as u64));
+    assert_eq!(
+        stored["songTitle"].as_str(),
+        envelope["songTitle"].as_str(),
+        "[e2e-mint] stored songTitle != envelope"
+    );
+    assert_eq!(
+        stored["genre"].as_str(),
+        Some("e2e-proof"),
+        "[e2e-mint] stored genre lost in pipeline"
+    );
+
+    // ---- Step 5: decoder fidelity — re-decode locally, must agree ----
+    let tx = Transaction::from_beef(&beef_bytes, None)
+        .unwrap_or_else(|e| panic!("[e2e-mint] BEEF parse: {e}"));
+    let output = tx
+        .outputs
+        .get(admitted_index as usize)
+        .unwrap_or_else(|| panic!("[e2e-mint] admitted index out of range"));
+    let meta = SonicstarTopicManager::decode_song_metadata(&output.locking_script)
+        .unwrap_or_else(|| panic!("[e2e-mint] our decoder rejected admitted output"));
+    assert_eq!(meta.song_title, envelope["songTitle"].as_str().unwrap());
+    assert_eq!(meta.artist_name, envelope["artistName"].as_str().unwrap());
+    assert_eq!(meta.genre.as_deref(), Some("e2e-proof"));
+    assert_eq!(meta.price_per_play, 1000);
+    assert_eq!(meta.royalty_rate, 75);
+
+    eprintln!("[e2e-mint] DONE — fresh mainnet tx, admission parity, indexed correctly, decoder-fidelity all green ✓");
+    eprintln!("[e2e-mint] mainnet txid: {txid} (output {admitted_index}, ~1 sat)");
+}
+
+/// Build the hex-encoded raw bytes of an `OP_RETURN <push:JSON>`
+/// locking script. Mirrors what the wallet's createAction expects as
+/// `lockingScript`.
+fn build_op_return_locking_script_hex(payload: &[u8]) -> String {
+    let mut out = vec![0x6au8]; // OP_RETURN
+    let n = payload.len();
+    if n < 0x4c {
+        out.push(n as u8);
+    } else if n < 0x100 {
+        out.push(0x4c); // OP_PUSHDATA1
+        out.push(n as u8);
+    } else if n < 0x10000 {
+        out.push(0x4d); // OP_PUSHDATA2
+        out.push((n & 0xff) as u8);
+        out.push(((n >> 8) & 0xff) as u8);
+    } else {
+        panic!("envelope too large for tests");
+    }
+    out.extend_from_slice(payload);
+    hex::encode(&out)
+}
+
 #[cfg(test)]
 mod helpers_self_check {
     //! Pure-Rust sanity checks for the helpers. Always runnable (not
@@ -1018,6 +1268,31 @@ mod helpers_self_check {
             ],
         });
         assert!(outpoints_from_our_lookup(&resp).is_empty());
+    }
+
+    #[test]
+    fn op_return_locking_script_short_push() {
+        // Payload < 0x4c → direct push opcode = length.
+        let hex = build_op_return_locking_script_hex(b"hello");
+        // 0x6a (OP_RETURN) + 0x05 (push 5 bytes) + "hello"
+        assert_eq!(hex, "6a0568656c6c6f");
+    }
+
+    #[test]
+    fn op_return_locking_script_pushdata1() {
+        // Payload of 100 bytes → OP_PUSHDATA1 (0x4c) + length byte.
+        let payload = vec![0xab; 100];
+        let hex = build_op_return_locking_script_hex(&payload);
+        assert!(hex.starts_with("6a4c64"), "wrong PUSHDATA1 prefix: {hex}");
+    }
+
+    #[test]
+    fn op_return_locking_script_pushdata2() {
+        // Payload of 300 bytes → OP_PUSHDATA2 (0x4d) + 2-byte LE length.
+        let payload = vec![0xcd; 300];
+        let hex = build_op_return_locking_script_hex(&payload);
+        // 300 = 0x012c → little-endian = 2c 01
+        assert!(hex.starts_with("6a4d2c01"), "wrong PUSHDATA2 prefix: {hex}");
     }
 
     #[test]
