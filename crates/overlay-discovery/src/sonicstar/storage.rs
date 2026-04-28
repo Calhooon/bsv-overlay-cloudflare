@@ -159,6 +159,18 @@ pub trait SonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError>;
+
+    /// Same filter semantics as [`Self::find_records`] but returns the
+    /// full [`SonicstarRecord`] payload instead of just outpoints.
+    /// Backs the `/sonicstar/records` route, which mirrors the rich
+    /// `records[]` shape Ruth's TS reference returns alongside her
+    /// `outpoints[]` in `/api/overlay-parity/lookup`.
+    async fn find_records_full(
+        &self,
+        filter: &SonicstarFilter,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<SonicstarRecord>, SonicstarStorageError>;
 }
 
 /// Composable filter for [`SonicstarStorage::find_records`]. Any field
@@ -409,6 +421,24 @@ impl SonicstarStorage for MemorySonicstarStorage {
             .collect();
         sort_desc_by_admitted_at(&mut hits);
         Ok(page(hits.iter().map(to_outpoint).collect(), limit, skip))
+    }
+
+    async fn find_records_full(
+        &self,
+        filter: &SonicstarFilter,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<SonicstarRecord>, SonicstarStorageError> {
+        let mut hits: Vec<SonicstarRecord> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches_filter(r, filter))
+            .cloned()
+            .collect();
+        sort_desc_by_admitted_at(&mut hits);
+        Ok(page(hits, limit, skip))
     }
 }
 
@@ -772,6 +802,39 @@ mod tests {
             ..Default::default()
         };
         assert!(store.find_records(&filter, None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_records_full_returns_full_records_with_filter_and_paging() {
+        let store = MemorySonicstarStorage::new();
+        store
+            .store_record(&record_with("tx1", 100, "Adele", "Hello", Some("Pop"), None))
+            .await
+            .unwrap();
+        store
+            .store_record(&record_with("tx2", 200, "Beatles", "Hey Jude", Some("Rock"), None))
+            .await
+            .unwrap();
+        store
+            .store_record(&record_with("tx3", 300, "Adele", "Skyfall", Some("Pop"), None))
+            .await
+            .unwrap();
+
+        let filter = SonicstarFilter {
+            artist_name_contains: Some("adele".into()),
+            ..Default::default()
+        };
+        let hits = store
+            .find_records_full(&filter, Some(10), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // Newest first by admitted_at DESC.
+        assert_eq!(hits[0].txid, "tx3");
+        assert_eq!(hits[1].txid, "tx1");
+        // Records carry the full payload, not just outpoints.
+        assert_eq!(hits[0].artist_name, "Adele");
+        assert_eq!(hits[0].song_title, "Skyfall");
     }
 
     #[tokio::test]

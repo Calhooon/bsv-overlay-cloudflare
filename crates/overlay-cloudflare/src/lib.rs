@@ -151,6 +151,13 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         }
         (Method::Post, "/submit") => submit(&engine, req, hosting_url.as_deref()).await,
         (Method::Post, "/lookup") => lookup(&engine, req).await,
+        // sonicstar-specific extension. Returns the rich `SonicstarRecord`
+        // payload alongside `outpoints[]`, mirroring the `records[]` field
+        // Ruth's TS reference returns. NOT a standard overlay-express
+        // route — kept off the parity harness surface.
+        (Method::Post, "/sonicstar/records") => {
+            sonicstar_records(sonicstar_storage.as_ref(), req).await
+        }
         (Method::Post, "/arc-ingest") => {
             // Mainline only mounts /arc-ingest when arcApiKey is configured
             // (`OverlayExpress.ts` — gated on `typeof arcApiKey === 'string'

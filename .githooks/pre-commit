@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Pre-commit secrets scanner.
+#
+# Refuses to commit if any staged change introduces a known-sensitive
+# pattern: Cloudflare API tokens, account/database IDs known to be
+# private, deployed worker URLs that identify the operator account, or
+# any private-key hex.
+#
+# Install once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# (No automatic installer is provided — that would itself be a code
+# execution vector. Keep installation explicit.)
+
+set -e
+
+# Patterns to refuse. Any match in the staged diff aborts the commit.
+# Keep the list narrow: only deterministic values that should never
+# legitimately appear in repo content. Heuristic patterns (e.g. "any
+# 64-hex string") would produce too many false positives.
+patterns=(
+    # Cloudflare API token from secrets.md (literal-match safety net).
+    '61rJhtnCk2IhD04qIPT6-bkC1Io4h-jaGhfMglYS'
+    # Cloudflare account-id used by this deployment.
+    'ea3e6d176ed3893258fe34281f710c7f'
+    # D1 database id for `rust-overlay`.
+    '067a98af-1684-48b8-9417-4516ebda5862'
+    # Server identity private keys (current + rotated).
+    '317ca82ded7de085a1e539b2f75561f58ba3cd77d82c1b9cc95adaae070d9ee6'
+    'd6db75fecb84a3cb7ec2e8a8ebf826853da068679388803e9a119778d0839979'
+    # Wallet-infra + chain-tracker URLs (private infra).
+    'wallet-infra\.x402agency\.com'
+    'api\.calhouninfra\.com'
+    # Deployed worker URL — public-resolvable but identifies operator.
+    'rust-overlay\.dev-a3e\.workers\.dev'
+    # TAAL ARC mainnet key.
+    'mainnet_9596de07e92300c6287e4393594ae39c'
+)
+
+# Build one alternation regex.
+joined=""
+for p in "${patterns[@]}"; do
+    if [ -z "$joined" ]; then
+        joined="$p"
+    else
+        joined="$joined|$p"
+    fi
+done
+
+# Scan staged content (post-add, pre-commit). The hook itself contains
+# the pattern literals (it has to, to detect them), so we exclude its
+# own diff via `git diff -- :(exclude)`. Same for any other file in
+# `.githooks/` since they may legitimately reference the patterns for
+# testing.
+hits=$(git diff --cached --no-color -- ':(exclude).githooks/*' \
+        | grep -E "^\+" \
+        | grep -E "$joined" \
+        || true)
+
+if [ -n "$hits" ]; then
+    echo "✖ pre-commit: refusing to commit — staged change includes a known-sensitive pattern." >&2
+    echo >&2
+    echo "$hits" | head -20 >&2
+    echo >&2
+    echo "If this is a deliberate, redacted reference (e.g. example file), use a placeholder instead." >&2
+    echo "Bypass (only for emergency, audit afterward):" >&2
+    echo "    git commit --no-verify" >&2
+    exit 1
+fi
+
+# Also refuse a commit that adds the real wrangler.toml back into git.
+if git diff --cached --name-only | grep -qE '^crates/overlay-cloudflare/wrangler\.toml$'; then
+    echo "✖ pre-commit: crates/overlay-cloudflare/wrangler.toml is gitignored on purpose." >&2
+    echo "  This file holds account-id / D1 IDs / deployed URLs that should not be public." >&2
+    echo "  Use \`crates/overlay-cloudflare/wrangler.toml.example\` for the placeholder template." >&2
+    exit 1
+fi
+
+exit 0

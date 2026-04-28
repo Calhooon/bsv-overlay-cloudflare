@@ -68,6 +68,9 @@ impl SonicstarLookupService {
     /// `(SonicstarFilter, limit, skip)` triple, applying every TS-parity
     /// rule in one place.
     ///
+    /// Public so the `/sonicstar/records` route in `overlay-cloudflare`
+    /// can apply the same parsing without duplicating the rules.
+    ///
     /// - `Value::String("findAll")` → empty filter, default paging.
     /// - `Value::Object(_)` → `txid` / `artistName` / `genre` /
     ///   `searchText` string fields populate the filter; non-string
@@ -75,7 +78,7 @@ impl SonicstarLookupService {
     /// - `Value::Null` → `InvalidQuery` (TS rejects null/undefined).
     /// - Anything else (number, bool, array) → `InvalidQuery` ("Invalid
     ///   query format" in the TS reference).
-    fn parse_query(
+    pub fn parse_query(
         value: &Value,
     ) -> Result<(SonicstarFilter, u32, u32), LookupServiceError> {
         let map = match value {

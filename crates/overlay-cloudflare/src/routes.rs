@@ -5,6 +5,8 @@
 
 use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::slap::storage::SLAPStorage;
+use overlay_discovery::sonicstar::lookup_service::SonicstarLookupService;
+use overlay_discovery::sonicstar::storage::SonicstarStorage;
 use overlay_engine::engine::{Engine, EngineError};
 use overlay_engine::health_checker::JanitorConfig;
 use overlay_engine::types::{GASPInitialRequest, LookupAnswer, LookupQuestion, TaggedBEEF};
@@ -1679,6 +1681,119 @@ pub fn not_found() -> worker::Result<Response> {
         }),
         404,
     )
+}
+
+// =============================================================================
+// Sonicstar rich-record route
+// =============================================================================
+//
+// `POST /sonicstar/records` — sonicstar-specific extension that returns
+// the full `SonicstarRecord` shape rather than the engine's outpoint-only
+// `LookupAnswer::OutputList`. Mirrors the `records[]` field Ruth's TS
+// reference returns alongside `outpoints[]` in
+// `/api/overlay-parity/lookup`.
+//
+// Request body shape (compatible with `/lookup`):
+//
+// ```json
+// { "service": "ls_sonicstar", "query": "findAll" }
+// { "service": "ls_sonicstar", "query": { "artistName": "ruth", "limit": 10 } }
+// ```
+//
+// The `service` field is optional (the route is sonicstar-specific) but
+// when supplied must equal `ls_sonicstar`.
+//
+// Response shape:
+//
+// ```json
+// { "service": "ls_sonicstar", "count": 3, "records": [ ... ] }
+// ```
+//
+// This route is NOT a standard overlay-express endpoint; it lives outside
+// the parity surface. The engine's `/lookup` continues to return the
+// canonical `OutputList` shape, which keeps SHIP/SLAP/UHRP/etc. clients
+// unaffected.
+
+#[derive(Deserialize)]
+struct SonicstarRecordsRequest {
+    /// When present, must be `"ls_sonicstar"`.
+    #[serde(default)]
+    service: Option<String>,
+    /// Same shape as `LookupQuestion::query` so the existing parser is
+    /// reused.
+    #[serde(default = "default_query_value")]
+    query: serde_json::Value,
+}
+
+fn default_query_value() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+pub async fn sonicstar_records(
+    sonicstar_storage: &dyn SonicstarStorage,
+    mut req: Request,
+) -> worker::Result<Response> {
+    let body: SonicstarRecordsRequest = match req.json().await {
+        Ok(b) => b,
+        Err(e) => return json_error(&format!("Invalid request body: {e}"), 400),
+    };
+
+    if let Some(s) = &body.service {
+        if s != "ls_sonicstar" {
+            return json_error(
+                &format!("Expected service=\"ls_sonicstar\", got {s:?}"),
+                400,
+            );
+        }
+    }
+
+    let (filter, limit, skip) = match SonicstarLookupService::parse_query(&body.query) {
+        Ok(t) => t,
+        Err(e) => return json_error(&e.to_string(), 400),
+    };
+
+    worker::console_log!(
+        "POST /sonicstar/records limit={limit} skip={skip} filter_keys={}",
+        filter_summary(&filter)
+    );
+
+    match sonicstar_storage
+        .find_records_full(&filter, Some(limit), Some(skip))
+        .await
+    {
+        Ok(records) => {
+            let count = records.len();
+            let resp = serde_json::json!({
+                "service": "ls_sonicstar",
+                "count": count,
+                "records": records,
+            });
+            worker::console_log!("POST /sonicstar/records -> 200 ({count} records)");
+            json_ok(&resp)
+        }
+        Err(e) => json_error(&e.to_string(), 500),
+    }
+}
+
+fn filter_summary(filter: &overlay_discovery::sonicstar::storage::SonicstarFilter) -> String {
+    let mut parts = Vec::new();
+    if filter.txid.is_some() {
+        parts.push("txid");
+    }
+    if filter.artist_name_contains.is_some() {
+        parts.push("artistName");
+    }
+    if filter.genre_eq.is_some() {
+        parts.push("genre");
+    }
+    if filter.search_text.is_some() {
+        parts.push("searchText");
+    }
+    if parts.is_empty() {
+        "(none)".into()
+    } else {
+        parts.join(",")
+    }
 }
 
 // =============================================================================

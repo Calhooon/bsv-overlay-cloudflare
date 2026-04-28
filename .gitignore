@@ -13,3 +13,8 @@ reference/.docker/
 # Third-party TS reference material (sonicstar plugin source-of-truth from
 # sonicstar.net). Used as design reference; not ours to redistribute.
 ruth/
+# Real wrangler config — contains account-id, D1 IDs, deployed URLs, and
+# any environment-specific values. Public repo carries `wrangler.toml.example`
+# instead. Copy `crates/overlay-cloudflare/wrangler.toml.example` to
+# `wrangler.toml` and fill in your own values to deploy.
+crates/overlay-cloudflare/wrangler.toml

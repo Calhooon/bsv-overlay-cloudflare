@@ -1168,38 +1168,7 @@ impl SonicstarStorage for D1SonicstarStorage {
         limit: Option<u32>,
         skip: Option<u32>,
     ) -> Result<Vec<UTXOReference>, SonicstarStorageError> {
-        let mut wb = WhereBuilder::new();
-        if let Some(t) = &filter.txid {
-            wb = wb.eq("txid", t.as_str());
-        }
-        if let Some(needle) = &filter.artist_name_contains {
-            let pattern = format!("%{}%", escape_like(&needle.to_lowercase()));
-            wb = wb.raw(
-                "LOWER(artistName) LIKE ? ESCAPE '\\'",
-                vec![pattern.into()],
-            );
-        }
-        if let Some(g) = &filter.genre_eq {
-            wb = wb.eq("genre", g.as_str());
-        }
-        if let Some(q) = &filter.search_text {
-            let pattern = format!("%{}%", escape_like(&q.to_lowercase()));
-            // Three identical patterns for the three OR'd columns. Matches
-            // the in-memory backend's three-field substring (the TS code
-            // does three; the TS docstring claims four).
-            wb = wb.raw(
-                "(LOWER(songTitle) LIKE ? ESCAPE '\\' \
-                  OR LOWER(artistName) LIKE ? ESCAPE '\\' \
-                  OR LOWER(album) LIKE ? ESCAPE '\\')",
-                vec![
-                    pattern.clone().into(),
-                    pattern.clone().into(),
-                    pattern.into(),
-                ],
-            );
-        }
-
-        let (where_clause, params) = wb.build();
+        let (where_clause, params) = build_sonicstar_where(filter);
         let mut sql = format!(
             "SELECT txid, outputIndex FROM sonicstar_records{where_clause} \
              ORDER BY admittedAt DESC"
@@ -1217,6 +1186,133 @@ impl SonicstarStorage for D1SonicstarStorage {
         }
         let rows: Vec<UTXORow> = q.fetch_all(&self.db).await.map_err(sonicstar_err)?;
         Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+
+    async fn find_records_full(
+        &self,
+        filter: &SonicstarFilter,
+        limit: Option<u32>,
+        skip: Option<u32>,
+    ) -> Result<Vec<SonicstarRecord>, SonicstarStorageError> {
+        let (where_clause, params) = build_sonicstar_where(filter);
+        let mut sql = format!(
+            "SELECT txid, outputIndex, satoshis, admittedAt, \
+                    songTitle, artistName, artistIdentityKey, description, \
+                    duration, songFileURL, artFileURL, previewURL, \
+                    genre, album, releaseDate, pricePerPlay, royaltyRate \
+             FROM sonicstar_records{where_clause} ORDER BY admittedAt DESC"
+        );
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {l}"));
+        }
+        if let Some(s) = skip {
+            sql.push_str(&format!(" OFFSET {s}"));
+        }
+        let mut q = Query::new(sql);
+        for p in params {
+            q = q.bind(p);
+        }
+        let rows: Vec<SonicstarRecordRow> =
+            q.fetch_all(&self.db).await.map_err(sonicstar_err)?;
+        Ok(rows.into_iter().map(SonicstarRecordRow::into_record).collect())
+    }
+}
+
+/// Build the parameterized WHERE clause for sonicstar queries. Shared by
+/// `find_records` (outpoints) and `find_records_full` (rich records) so
+/// the AND-composition logic lives in one place.
+fn build_sonicstar_where(filter: &SonicstarFilter) -> (String, Vec<QVal>) {
+    let mut wb = WhereBuilder::new();
+    if let Some(t) = &filter.txid {
+        wb = wb.eq("txid", t.as_str());
+    }
+    if let Some(needle) = &filter.artist_name_contains {
+        let pattern = format!("%{}%", escape_like(&needle.to_lowercase()));
+        wb = wb.raw(
+            "LOWER(artistName) LIKE ? ESCAPE '\\'",
+            vec![pattern.into()],
+        );
+    }
+    if let Some(g) = &filter.genre_eq {
+        wb = wb.eq("genre", g.as_str());
+    }
+    if let Some(q) = &filter.search_text {
+        let pattern = format!("%{}%", escape_like(&q.to_lowercase()));
+        // Three identical patterns for the three OR'd columns. Matches
+        // the in-memory backend's three-field substring (the TS code
+        // does three; the TS docstring claims four).
+        wb = wb.raw(
+            "(LOWER(songTitle) LIKE ? ESCAPE '\\' \
+              OR LOWER(artistName) LIKE ? ESCAPE '\\' \
+              OR LOWER(album) LIKE ? ESCAPE '\\')",
+            vec![
+                pattern.clone().into(),
+                pattern.clone().into(),
+                pattern.into(),
+            ],
+        );
+    }
+    wb.build()
+}
+
+/// Row deserializer for the full sonicstar record. Mirrors the table
+/// shape in `d1::OVERLAY_MIGRATIONS`. D1 returns numbers as f64 across
+/// the wasm/JS boundary, so integer columns are received that way and
+/// cast back. Optional columns deserialize as `Option<String>` against
+/// SQL `NULL`.
+#[derive(serde::Deserialize)]
+struct SonicstarRecordRow {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    satoshis: f64,
+    #[serde(rename = "admittedAt")]
+    admitted_at: f64,
+    #[serde(rename = "songTitle")]
+    song_title: String,
+    #[serde(rename = "artistName")]
+    artist_name: String,
+    #[serde(rename = "artistIdentityKey")]
+    artist_identity_key: String,
+    description: Option<String>,
+    duration: f64,
+    #[serde(rename = "songFileURL")]
+    song_file_url: String,
+    #[serde(rename = "artFileURL")]
+    art_file_url: Option<String>,
+    #[serde(rename = "previewURL")]
+    preview_url: Option<String>,
+    genre: Option<String>,
+    album: Option<String>,
+    #[serde(rename = "releaseDate")]
+    release_date: Option<String>,
+    #[serde(rename = "pricePerPlay")]
+    price_per_play: f64,
+    #[serde(rename = "royaltyRate")]
+    royalty_rate: f64,
+}
+
+impl SonicstarRecordRow {
+    fn into_record(self) -> SonicstarRecord {
+        SonicstarRecord {
+            song_title: self.song_title,
+            artist_name: self.artist_name,
+            artist_identity_key: self.artist_identity_key,
+            description: self.description,
+            duration: self.duration as u64,
+            song_file_url: self.song_file_url,
+            art_file_url: self.art_file_url,
+            preview_url: self.preview_url,
+            genre: self.genre,
+            album: self.album,
+            release_date: self.release_date,
+            price_per_play: self.price_per_play as u64,
+            royalty_rate: self.royalty_rate as u8,
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            satoshis: self.satoshis as u64,
+            admitted_at: self.admitted_at as i64,
+        }
     }
 }
 
