@@ -4,8 +4,8 @@
 //! graph discard on validation failure, timestamp filtering, multiple graphs.
 
 use async_trait::async_trait;
-use overlay_engine::gasp::*;
-use overlay_engine::types::*;
+use bsv_overlay_engine::gasp::*;
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 

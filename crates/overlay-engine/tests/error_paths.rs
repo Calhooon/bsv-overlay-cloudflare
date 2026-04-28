@@ -4,12 +4,12 @@
 //! when individual components fail.
 
 use async_trait::async_trait;
-use overlay_engine::engine::*;
-use overlay_engine::lookup_service::*;
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::storage::*;
-use overlay_engine::topic_manager::*;
-use overlay_engine::types::*;
+use bsv_overlay_engine::engine::*;
+use bsv_overlay_engine::lookup_service::*;
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::*;
+use bsv_overlay_engine::topic_manager::*;
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 
 // ============================================================================

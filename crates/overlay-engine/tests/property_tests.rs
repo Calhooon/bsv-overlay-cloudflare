@@ -2,7 +2,7 @@
 //!
 //! Verifies serde roundtrips, Outpoint invariants, and MemoryStorage invariants.
 
-use overlay_engine::types::*;
+use bsv_overlay_engine::types::*;
 use proptest::prelude::*;
 
 // ============================================================================
@@ -218,8 +218,8 @@ proptest! {
 // MemoryStorage invariant tests
 // ============================================================================
 
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::storage::Storage;
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::Storage;
 
 fn make_test_output(txid: &str, index: u32, topic: &str) -> Output {
     Output {

@@ -48,7 +48,7 @@ use bsv_rs::transaction::TransactionOutput;
 use bsv_rs::wallet::{
     Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
 };
-use overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
+use bsv_overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;

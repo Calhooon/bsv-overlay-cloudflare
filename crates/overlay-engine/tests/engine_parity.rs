@@ -5,13 +5,13 @@
 //! deleteUTXODeep, consumedBy updates, handleNewMerkleProof, and getUTXOHistory.
 
 use async_trait::async_trait;
-use overlay_engine::advertiser::*;
-use overlay_engine::engine::*;
-use overlay_engine::lookup_service::*;
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::storage::*;
-use overlay_engine::topic_manager::*;
-use overlay_engine::types::*;
+use bsv_overlay_engine::advertiser::*;
+use bsv_overlay_engine::engine::*;
+use bsv_overlay_engine::lookup_service::*;
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::*;
+use bsv_overlay_engine::topic_manager::*;
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -1026,7 +1026,7 @@ fn build_engine_with_tracker(
     )
 }
 
-use overlay_engine::storage::Storage;
+use bsv_overlay_engine::storage::Storage;
 
 // ============================================================================
 // TS Test: "Verifies the BEEF for the provided transaction"
@@ -1868,20 +1868,20 @@ async fn ts_lookup_batched_output_loading() {
         async fn output_admitted_by_topic(
             &self,
             _: &OutputAdmittedByTopic,
-        ) -> Result<(), overlay_engine::lookup_service::LookupServiceError> {
+        ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
             Ok(())
         }
         async fn output_evicted(
             &self,
             _: &str,
             _: u32,
-        ) -> Result<(), overlay_engine::lookup_service::LookupServiceError> {
+        ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
             Ok(())
         }
         async fn lookup(
             &self,
             _: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, overlay_engine::lookup_service::LookupServiceError>
+        ) -> Result<Vec<UTXOReference>, bsv_overlay_engine::lookup_service::LookupServiceError>
         {
             Ok(self.refs.clone())
         }

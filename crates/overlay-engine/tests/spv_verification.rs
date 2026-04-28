@@ -4,10 +4,10 @@
 //! Test-driven for #46.
 
 use async_trait::async_trait;
-use overlay_engine::engine::{Engine, EngineConfig, EngineError};
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
-use overlay_engine::types::*;
+use bsv_overlay_engine::engine::{Engine, EngineConfig, EngineError};
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::topic_manager::{TopicManager, TopicManagerError};
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 
 // ============================================================================

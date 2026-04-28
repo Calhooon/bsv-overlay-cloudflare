@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use overlay_discovery::ship::storage::MemorySHIPStorage;
 use overlay_discovery::slap::storage::MemorySLAPStorage;
-use overlay_engine::health_checker::{HealthChecker, JanitorConfig, JanitorResult};
+use bsv_overlay_engine::health_checker::{HealthChecker, JanitorConfig, JanitorResult};
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -81,7 +81,7 @@ impl HealthChecker for MockHealthChecker {
 
 use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::slap::storage::SLAPStorage;
-use overlay_engine::health_checker::DomainHealthResult;
+use bsv_overlay_engine::health_checker::DomainHealthResult;
 use std::collections::HashMap;
 
 /// Normalize a URL for domain comparison: lowercase, strip trailing slash.

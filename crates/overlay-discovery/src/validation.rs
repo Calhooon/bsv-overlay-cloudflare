@@ -15,7 +15,7 @@
 ///
 /// # Examples
 /// ```
-/// use overlay_discovery::validation::is_valid_topic_or_service_name;
+/// use bsv_overlay_discovery::validation::is_valid_topic_or_service_name;
 /// assert!(is_valid_topic_or_service_name("tm_ship"));
 /// assert!(is_valid_topic_or_service_name("ls_slap"));
 /// assert!(is_valid_topic_or_service_name("tm_my_custom_topic"));

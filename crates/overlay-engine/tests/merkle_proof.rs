@@ -3,15 +3,15 @@
 //!
 //! Test-driven for #45.
 
-use overlay_engine::engine::{Engine, EngineConfig, EngineError};
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::storage::Storage;
-use overlay_engine::topic_manager::TopicManager;
-use overlay_engine::types::*;
+use bsv_overlay_engine::engine::{Engine, EngineConfig, EngineError};
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::Storage;
+use bsv_overlay_engine::topic_manager::TopicManager;
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use overlay_engine::topic_manager::TopicManagerError;
+use bsv_overlay_engine::topic_manager::TopicManagerError;
 
 // ============================================================================
 // Real BEEF from TS tests

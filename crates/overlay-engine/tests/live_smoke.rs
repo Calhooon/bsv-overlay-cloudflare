@@ -5,7 +5,7 @@
 
 use bsv_rs::overlay::decode_overlay_admin_token;
 use bsv_rs::transaction::Transaction;
-use overlay_engine::types::*;
+use bsv_overlay_engine::types::*;
 
 // ============================================================================
 // Fixture tests (run in CI, no network needed)
@@ -192,7 +192,7 @@ fn fixture_gasp_response_deserializes() {
 
 #[test]
 fn fixture_gasp_response_parses_as_gasp_types() {
-    use overlay_engine::types::GASPInitialResponse;
+    use bsv_overlay_engine::types::GASPInitialResponse;
 
     // The live response may not have `score` or `since` at the top level in the expected format.
     // Let's parse manually since the live format has no scores.
@@ -200,9 +200,9 @@ fn fixture_gasp_response_parses_as_gasp_types() {
     let utxos = value["UTXOList"].as_array().unwrap();
     let since = value.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let gasp_outputs: Vec<overlay_engine::types::GASPOutput> = utxos
+    let gasp_outputs: Vec<bsv_overlay_engine::types::GASPOutput> = utxos
         .iter()
-        .map(|u| overlay_engine::types::GASPOutput {
+        .map(|u| bsv_overlay_engine::types::GASPOutput {
             txid: u["txid"].as_str().unwrap().to_string(),
             output_index: u["outputIndex"].as_u64().unwrap() as u32,
             score: u.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),

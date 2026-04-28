@@ -237,7 +237,7 @@ fn deprecated_create_overlay_admin_token_still_emits_4_field_unsigned() {
 
 use bsv_rs::script::LockingScript;
 use bsv_rs::transaction::TransactionOutput;
-use overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
+use bsv_overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 
 #[derive(Deserialize)]
 struct TranscriptCase {

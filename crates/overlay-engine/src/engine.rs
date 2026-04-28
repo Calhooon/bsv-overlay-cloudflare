@@ -2170,7 +2170,7 @@ mod tests {
         let txid = TEST_TXID;
         let output = engine
             .storage()
-            .find_output(&txid, 0, Some("tm_test"), None, false)
+            .find_output(txid, 0, Some("tm_test"), None, false)
             .await
             .unwrap()
             .unwrap();
@@ -2181,7 +2181,7 @@ mod tests {
         // Should be gone
         let found = engine
             .storage()
-            .find_output(&txid, 0, Some("tm_test"), None, false)
+            .find_output(txid, 0, Some("tm_test"), None, false)
             .await
             .unwrap();
         assert!(found.is_none());
@@ -2303,8 +2303,10 @@ mod tests {
     use crate::broadcaster::Broadcaster;
     use std::sync::Arc;
 
+    type BroadcastCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
     struct MockBroadcaster {
-        calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        calls: BroadcastCalls,
     }
 
     impl MockBroadcaster {
