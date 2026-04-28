@@ -48,7 +48,7 @@ Four Rust crates, each with its own README:
 | Crate | What it is |
 |---|---|
 | [`crates/overlay-engine`](./crates/overlay-engine) | **Core library.** Platform-agnostic Engine — the 3-phase `submit()` pipeline, `lookup()`, GASP sync orchestration, merkle proofs. Defines the `Storage`, `TopicManager`, `LookupService`, `Advertiser`, `Broadcaster` traits. No HTTP, no storage implementation. |
-| [`crates/overlay-discovery`](./crates/overlay-discovery) | **Topic managers + lookup services.** SHIP, SLAP, UHRP, Agent-Registry, DmDelegation. Each implements `TopicManager` and `LookupService` from `overlay-engine`. PushDrop admission rules, BRC-87 name + URI validation, WalletAdvertiser for on-chain SHIP/SLAP issuance. |
+| [`crates/overlay-discovery`](./crates/overlay-discovery) | **Topic managers + lookup services.** SHIP, SLAP, UHRP, Agent-Registry, DmDelegation, SonicStar. Each implements `TopicManager` and `LookupService` from `overlay-engine`. PushDrop admission rules (or bare-OP_RETURN UTF-8 JSON for SonicStar), BRC-87 name + URI validation, WalletAdvertiser for on-chain SHIP/SLAP issuance. |
 | [`crates/overlay-cloudflare`](./crates/overlay-cloudflare) | **Cloudflare Worker binary.** Wires the engine + discovery plugins into `#[event(fetch)]` (HTTP), `#[event(scheduled)]` (cron), and `#[event(queue)]` (mutation queue). D1-backed `Storage` and discovery-storage impls. BRC-31 wallet client for advertiser signing. |
 | [`parity-harness`](./parity-harness) | **Differential test oracle.** Replays a 43-entry JSON corpus against both a mainline `@bsv/overlay-express@2.2.0` reference (running in Docker) and this worker (`wrangler dev`), canonicalises responses, diffs byte-for-byte. Exits non-zero on any unnoted divergence. |
 

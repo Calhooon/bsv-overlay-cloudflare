@@ -26,7 +26,7 @@ Part of the [`bsv-overlay-cloudflare`][root] workspace.
 ### D1-backed trait implementations
 
 - **`D1Storage`** — `overlay_engine::Storage` over Cloudflare D1 (SQLite).
-- **`D1SHIPStorage` / `D1SLAPStorage` / `D1UHRPStorage` / `D1AgentStorage` / `D1DmDelegationStorage`** — per-plugin discovery storage.
+- **`D1SHIPStorage` / `D1SLAPStorage` / `D1UHRPStorage` / `D1AgentStorage` / `D1DmDelegationStorage` / `D1SonicstarStorage`** — per-plugin discovery storage.
 - **`D1BanStorage`** — BanService equivalent (tracks `{type, value, bannedAt, bannedBy, reason}`).
 
 ### Cloudflare-native adapters
@@ -48,7 +48,13 @@ Part of the [`bsv-overlay-cloudflare`][root] workspace.
 
 ## Configuration
 
-Fully env-var driven via `wrangler.toml` `[vars]` + CF secrets:
+Fully env-var driven via `wrangler.toml` `[vars]` + CF secrets. The
+real `wrangler.toml` is gitignored on purpose — copy the tracked
+`wrangler.toml.example` and fill in your own values:
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
 
 ```
 Vars (in wrangler.toml):
@@ -56,8 +62,8 @@ Vars (in wrangler.toml):
   HOSTING_URL          this worker's public URL (FQDN we advertise as)
   CHAIN_TRACKER_URL    ChainTracks-compatible SPV endpoint
   WALLET_STORAGE_URL   @bsv/wallet-toolbox storage backend
-  TOPIC_MANAGERS       csv: tm_ship,tm_slap[,tm_uhrp,tm_agent,tm_dm_delegation]
-  LOOKUP_SERVICES      csv: ls_ship,ls_slap[,ls_uhrp,ls_agent,ls_dm_delegation]
+  TOPIC_MANAGERS       csv: tm_ship,tm_slap[,tm_uhrp,tm_agent,tm_dm_delegation,tm_sonicstar]
+  LOOKUP_SERVICES      csv: ls_ship,ls_slap[,ls_uhrp,ls_agent,ls_dm_delegation,ls_sonicstar]
   ENABLE_EXTENSIONS    "true" / "false"
 
 Secrets (via `wrangler secret put`):
