@@ -299,9 +299,7 @@ impl UHRPStorage for MemoryUHRPStorage {
             .filter(|r| {
                 if let Some(ref u) = query.uhrp_url {
                     let matches = r.uhrp_url == *u
-                        || hex_form_of_query
-                            .as_ref()
-                            .is_some_and(|h| &r.uhrp_url == h);
+                        || hex_form_of_query.as_ref().is_some_and(|h| &r.uhrp_url == h);
                     if !matches {
                         return false;
                     }

@@ -10,7 +10,13 @@ pub struct Outcome {
     pub content_type_matches: bool,
     /// Unified diff of canonicalised bodies (empty if they match).
     pub body_diff: String,
+    /// TS canonical body — captured for future debug introspection (e.g.,
+    /// when a parity diff needs the literal pre-diff form for a bug report).
+    /// Currently unused by `report.rs`; kept to avoid losing the value
+    /// when `compare()` already computed it.
+    #[allow(dead_code, reason = "kept for parity-harness debug introspection")]
     pub ts_canonical: String,
+    #[allow(dead_code, reason = "kept for parity-harness debug introspection")]
     pub rust_canonical: String,
 }
 
@@ -69,7 +75,11 @@ fn content_type(c: &Captured) -> String {
 }
 
 fn strip_charset(ct: &str) -> String {
-    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+    ct.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Myers diff is O((N+M)D). For intentionally divergent responses (e.g.
@@ -104,9 +114,7 @@ fn unified_diff(a: &str, b: &str) -> String {
     }
 
     let deadline = std::time::Instant::now() + DIFF_TIMEOUT;
-    let diff = TextDiff::configure()
-        .deadline(deadline)
-        .diff_lines(a, b);
+    let diff = TextDiff::configure().deadline(deadline).diff_lines(a, b);
     for change in diff.iter_all_changes() {
         let sign = match change.tag() {
             ChangeTag::Delete => "-",

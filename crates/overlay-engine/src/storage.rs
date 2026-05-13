@@ -686,7 +686,7 @@ mod tests {
             .unwrap();
 
         store
-            .update_output_block_height("abc", 0, "tm_test", 850000)
+            .update_output_block_height("abc", 0, "tm_test", 850_000)
             .await
             .unwrap();
 
@@ -695,7 +695,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(found.block_height, Some(850000));
+        assert_eq!(found.block_height, Some(850_000));
     }
 
     #[tokio::test]

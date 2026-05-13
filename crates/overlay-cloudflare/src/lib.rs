@@ -357,7 +357,9 @@ fn build_engine_with_storage(
             "ls_dm_delegation" => {
                 lookup_services.insert(
                     "ls_dm_delegation".into(),
-                    Box::new(DmDelegationLookupService::new(dm_delegation_storage.clone())),
+                    Box::new(DmDelegationLookupService::new(
+                        dm_delegation_storage.clone(),
+                    )),
                 );
             }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),

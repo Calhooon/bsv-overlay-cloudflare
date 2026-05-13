@@ -362,7 +362,7 @@ mod tests {
         let _ = QVal::from("hello".to_string());
         let _ = QVal::from(true);
         let _ = QVal::from(vec![0u8, 1, 2]);
-        let _ = QVal::from(3.14f64);
+        let _ = QVal::from(2.5f64);
         let _ = QVal::from(None::<i64>);
         let _ = QVal::from(Some(42i64));
     }

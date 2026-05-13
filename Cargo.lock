@@ -247,6 +247,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bsv-overlay-discovery",
+ "bsv-overlay-engine",
  "bsv-rs",
  "hex",
  "js-sys",

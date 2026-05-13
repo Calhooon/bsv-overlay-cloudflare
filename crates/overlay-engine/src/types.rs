@@ -407,6 +407,87 @@ pub struct UTXOReference {
 }
 
 // ============================================================================
+// LookupResult (returned by LookupService::lookup)
+// ============================================================================
+
+/// What a `LookupService::lookup` call returns to the Engine.
+///
+/// Two shapes:
+///
+/// - `OutputList(Vec<UTXOReference>)` — the common case. The service
+///   yields outpoints; the Engine hydrates each with the BEEF from
+///   storage and assembles a `LookupAnswer::OutputList`. This is the
+///   cheap path: the service doesn't need access to BEEF storage, and
+///   the Engine can apply uniform history-selector hydration / sort /
+///   pagination on top.
+///
+/// - `Answer(LookupAnswer)` — the escape hatch. Services that return
+///   `Freeform` (aggregate stats like popular-tag counts) or `Formula`
+///   (cross-service lookup chains) emit the full answer themselves; the
+///   Engine passes it through verbatim. This avoids the
+///   `Vec<UTXOReference>` → `OutputList` shape mismatch that previously
+///   forced services to do hex tricks or hold back functionality.
+///
+/// Migration note: prior to this enum, the trait method returned
+/// `Vec<UTXOReference>` and the Engine always wrapped it in
+/// `LookupAnswer::OutputList`. Existing impls migrate mechanically by
+/// wrapping their result in `LookupResult::OutputList(refs)`. New impls
+/// that need freeform or formula answers return `LookupResult::Answer(...)`.
+#[derive(Debug, Clone)]
+pub enum LookupResult {
+    /// Outpoints to hydrate. The Engine will load BEEF per reference
+    /// (and optional history-selector ancestry) and assemble
+    /// `LookupAnswer::OutputList`.
+    OutputList(Vec<UTXOReference>),
+    /// Pre-formed `LookupAnswer` — Engine passes it through. Use for
+    /// `Freeform` (aggregate stats) and `Formula` (formula chains).
+    Answer(LookupAnswer),
+}
+
+impl LookupResult {
+    /// Convenience: wrap a `Vec<UTXOReference>` (the common path).
+    pub fn outputs(refs: Vec<UTXOReference>) -> Self {
+        Self::OutputList(refs)
+    }
+
+    /// Convenience: wrap a `LookupAnswer` (freeform / formula path).
+    pub fn answer(answer: LookupAnswer) -> Self {
+        Self::Answer(answer)
+    }
+
+    /// Borrow the `OutputList` variant, or `None` if `Answer`. Primarily
+    /// used by tests that want to assert on the reference list directly.
+    pub fn as_outputs(&self) -> Option<&[UTXOReference]> {
+        match self {
+            Self::OutputList(refs) => Some(refs),
+            Self::Answer(_) => None,
+        }
+    }
+
+    /// Consume self and extract `Vec<UTXOReference>`, or `None` if
+    /// `Answer`. Primarily used by tests + the small set of callers that
+    /// want references without going through Engine BEEF hydration.
+    pub fn into_outputs(self) -> Option<Vec<UTXOReference>> {
+        match self {
+            Self::OutputList(refs) => Some(refs),
+            Self::Answer(_) => None,
+        }
+    }
+}
+
+impl From<Vec<UTXOReference>> for LookupResult {
+    fn from(refs: Vec<UTXOReference>) -> Self {
+        Self::OutputList(refs)
+    }
+}
+
+impl From<LookupAnswer> for LookupResult {
+    fn from(answer: LookupAnswer) -> Self {
+        Self::Answer(answer)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -441,7 +522,7 @@ mod tests {
             outputs_consumed: vec![Outpoint::new("prev", 1)],
             consumed_by: vec![],
             beef: None,
-            block_height: Some(800000),
+            block_height: Some(800_000),
             score: Some(1.0),
         };
         let json = serde_json::to_string(&output).unwrap();
@@ -452,7 +533,7 @@ mod tests {
         assert_eq!(back.topic, "tm_test");
         assert!(!back.spent);
         assert_eq!(back.outputs_consumed.len(), 1);
-        assert_eq!(back.block_height, Some(800000));
+        assert_eq!(back.block_height, Some(800_000));
     }
 
     #[test]
@@ -484,14 +565,14 @@ mod tests {
     fn test_gasp_initial_request_serde() {
         let req = GASPInitialRequest {
             version: 1,
-            since: 1700000000,
-            limit: Some(10000),
+            since: 1_700_000_000,
+            limit: Some(10_000),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: GASPInitialRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.version, 1);
-        assert_eq!(back.since, 1700000000);
-        assert_eq!(back.limit, Some(10000));
+        assert_eq!(back.since, 1_700_000_000);
+        assert_eq!(back.limit, Some(10_000));
     }
 
     #[test]

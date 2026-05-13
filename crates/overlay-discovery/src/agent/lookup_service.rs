@@ -197,10 +197,7 @@ impl LookupService for AgentLookupService {
         Ok(())
     }
 
-    async fn lookup(
-        &self,
-        question: &LookupQuestion,
-    ) -> Result<Vec<UTXOReference>, LookupServiceError> {
+    async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
         if question.service != "ls_agent" {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_agent, got {}",
@@ -214,6 +211,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_all(Some(1000), None)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -241,6 +239,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_all(Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -249,6 +248,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_by_capability(capability, Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -257,6 +257,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_by_identity_key(identity_key)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -265,6 +266,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_by_certifier(certifier_key, Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -273,6 +275,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_by_name(name)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -285,6 +288,7 @@ impl LookupService for AgentLookupService {
                 .storage
                 .find_all(Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -444,7 +448,12 @@ mod tests {
 
         // Query by identity key to verify it was stored correctly
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findByIdentityKey": ik_hex}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "deadbeef");
         assert_eq!(results[0].output_index, 7);
@@ -477,7 +486,12 @@ mod tests {
         // Each capability should be findable
         for cap in &["image-generation", "upscaling", "text-to-speech"] {
             let q = LookupQuestion::new("ls_agent", serde_json::json!({"findByCapability": cap}));
-            let results = svc.lookup(&q).await.unwrap();
+            let results = svc
+                .lookup(&q)
+                .await
+                .unwrap()
+                .into_outputs()
+                .expect("expected OutputList");
             assert_eq!(results.len(), 1, "capability {cap} should be findable");
         }
     }
@@ -782,7 +796,12 @@ mod tests {
     async fn lookup_empty_returns_empty() {
         let svc = make_service();
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findAll": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -809,7 +828,12 @@ mod tests {
         storage.store_record(&record).await.unwrap();
 
         let q = LookupQuestion::new("ls_agent", serde_json::json!("findAll"));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
     }
 
@@ -830,7 +854,12 @@ mod tests {
         }
 
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findAll": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
     }
 
@@ -862,7 +891,12 @@ mod tests {
             "ls_agent",
             serde_json::json!({"findByCapability": "image-generation"}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -895,7 +929,12 @@ mod tests {
             "ls_agent",
             serde_json::json!({"findByIdentityKey": "key_bbb"}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx2");
     }
@@ -928,7 +967,12 @@ mod tests {
             "ls_agent",
             serde_json::json!({"findByCertifier": "certifier_a"}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -958,7 +1002,12 @@ mod tests {
         storage.store_record(&rec2).await.unwrap();
 
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findByName": "agent-1"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -983,7 +1032,12 @@ mod tests {
             "ls_agent",
             serde_json::json!({"findAll": true, "limit": 3, "skip": 2}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
     }
 
@@ -1013,7 +1067,12 @@ mod tests {
 
         // Empty {} should behave like findAll
         let q = LookupQuestion::new("ls_agent", serde_json::json!({}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
     }
 
@@ -1035,7 +1094,12 @@ mod tests {
 
         // {} with limit/skip should paginate
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"limit": 3, "skip": 2}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
     }
 
@@ -1074,7 +1138,12 @@ mod tests {
             "ls_agent",
             serde_json::json!({"findByCapability": "nonexistent"}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -1110,7 +1179,12 @@ mod tests {
 
         // Step 2: Query — should find the record
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findByIdentityKey": ik_hex}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "admit_tx");
         assert_eq!(results[0].output_index, 0);
@@ -1125,7 +1199,12 @@ mod tests {
         assert_eq!(storage.record_count(), 0);
 
         // Step 4: Query again — empty
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -1151,7 +1230,12 @@ mod tests {
 
         // Query
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findAll": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
 
         // Evict
@@ -1159,7 +1243,12 @@ mod tests {
         assert_eq!(storage.record_count(), 0);
 
         // Query again
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -1200,7 +1289,12 @@ mod tests {
 
         // Query — should only find tx_b
         let q = LookupQuestion::new("ls_agent", serde_json::json!({"findAll": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx_b");
     }

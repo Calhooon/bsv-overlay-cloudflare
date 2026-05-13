@@ -30,10 +30,10 @@ pub fn walk(root: &Path) -> Result<Vec<Entry>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let mut entry: Entry = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut entry: Entry =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         entry.source = path
             .strip_prefix(root)
             .unwrap_or(path)

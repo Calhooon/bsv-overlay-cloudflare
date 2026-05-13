@@ -198,8 +198,8 @@ mod tests {
         async fn lookup(
             &self,
             _: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, crate::lookup_service::LookupServiceError> {
-            Ok(vec![])
+        ) -> Result<LookupResult, crate::lookup_service::LookupServiceError> {
+            Ok(LookupResult::OutputList(vec![]))
         }
         async fn get_documentation(&self) -> String {
             "Dummy".into()

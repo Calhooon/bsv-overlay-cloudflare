@@ -5,13 +5,12 @@
 //! deleteUTXODeep, consumedBy updates, handleNewMerkleProof, and getUTXOHistory.
 
 use async_trait::async_trait;
-use overlay_engine::advertiser::*;
-use overlay_engine::engine::*;
-use overlay_engine::lookup_service::*;
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::storage::*;
-use overlay_engine::topic_manager::*;
-use overlay_engine::types::*;
+use bsv_overlay_engine::advertiser::*;
+use bsv_overlay_engine::engine::*;
+use bsv_overlay_engine::lookup_service::*;
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::topic_manager::*;
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -94,6 +93,7 @@ impl TopicManager for MockTopicManager {
 // Mock LookupService (tracks all calls)
 // ============================================================================
 
+#[allow(dead_code, reason = "kept for future test extension")]
 struct TrackingLookupService {
     admitted: Mutex<Vec<(String, u32, String)>>, // (txid, outputIndex, topic)
     spent_calls: Mutex<Vec<(String, u32)>>,
@@ -109,10 +109,12 @@ impl TrackingLookupService {
         }
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn admitted_count(&self) -> usize {
         self.admitted.lock().unwrap().len()
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn admitted_txids(&self) -> Vec<String> {
         self.admitted
             .lock()
@@ -176,17 +178,18 @@ impl LookupService for TrackingLookupService {
         Ok(())
     }
 
-    async fn lookup(&self, _q: &LookupQuestion) -> Result<Vec<UTXOReference>, LookupServiceError> {
-        Ok(self
-            .admitted
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(txid, oi, _)| UTXOReference {
-                txid: txid.clone(),
-                output_index: *oi,
-            })
-            .collect())
+    async fn lookup(&self, _q: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
+        Ok(LookupResult::OutputList(
+            self.admitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(txid, oi, _)| UTXOReference {
+                    txid: txid.clone(),
+                    output_index: *oi,
+                })
+                .collect(),
+        ))
     }
 
     async fn get_documentation(&self) -> String {
@@ -221,6 +224,7 @@ impl TrackingAdvertiser {
         }
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn was_create_called(&self) -> bool {
         !self.created.lock().unwrap().is_empty()
     }
@@ -523,7 +527,7 @@ async fn ts_submit_notifies_lookup_services() {
     mgrs.insert("Hello".into(), Box::new(MockTopicManager::new(vec![0])));
 
     let ls = TrackingLookupService::new();
-    let ls_ptr = &ls as *const TrackingLookupService;
+    let _ls_ptr = &ls as *const TrackingLookupService;
     let mut lss: HashMap<String, Box<dyn LookupService>> = HashMap::new();
     lss.insert("ls_hello".into(), Box::new(TrackingLookupService::new()));
 
@@ -693,7 +697,7 @@ async fn ts_sync_ads_noop_without_hosting_url() {
     let mut mgrs: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
     mgrs.insert("tm_hw".into(), Box::new(MockTopicManager::new(vec![])));
 
-    let adv = TrackingAdvertiser::new();
+    let _adv = TrackingAdvertiser::new();
     let engine = build_engine(
         mgrs,
         HashMap::new(),
@@ -984,17 +988,18 @@ impl LookupService for SpentTrackingLookupService {
         Ok(())
     }
 
-    async fn lookup(&self, _: &LookupQuestion) -> Result<Vec<UTXOReference>, LookupServiceError> {
-        Ok(self
-            .admitted
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(t, o, _)| UTXOReference {
-                txid: t.clone(),
-                output_index: *o,
-            })
-            .collect())
+    async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
+        Ok(LookupResult::OutputList(
+            self.admitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, o, _)| UTXOReference {
+                    txid: t.clone(),
+                    output_index: *o,
+                })
+                .collect(),
+        ))
     }
 
     async fn get_documentation(&self) -> String {
@@ -1026,7 +1031,7 @@ fn build_engine_with_tracker(
     )
 }
 
-use overlay_engine::storage::Storage;
+use bsv_overlay_engine::storage::Storage;
 
 // ============================================================================
 // TS Test: "Verifies the BEEF for the provided transaction"
@@ -1267,7 +1272,7 @@ async fn ts_submit_notifies_lookup_services_about_spent() {
     );
 
     let ls = SpentTrackingLookupService::new();
-    let ls_ptr = &ls as *const SpentTrackingLookupService;
+    let _ls_ptr = &ls as *const SpentTrackingLookupService;
     let mut lss: HashMap<String, Box<dyn LookupService>> = HashMap::new();
     lss.insert(
         "ls_hello".into(),
@@ -1868,22 +1873,21 @@ async fn ts_lookup_batched_output_loading() {
         async fn output_admitted_by_topic(
             &self,
             _: &OutputAdmittedByTopic,
-        ) -> Result<(), overlay_engine::lookup_service::LookupServiceError> {
+        ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
             Ok(())
         }
         async fn output_evicted(
             &self,
             _: &str,
             _: u32,
-        ) -> Result<(), overlay_engine::lookup_service::LookupServiceError> {
+        ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
             Ok(())
         }
         async fn lookup(
             &self,
             _: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, overlay_engine::lookup_service::LookupServiceError>
-        {
-            Ok(self.refs.clone())
+        ) -> Result<LookupResult, bsv_overlay_engine::lookup_service::LookupServiceError> {
+            Ok(LookupResult::OutputList(self.refs.clone()))
         }
         async fn get_documentation(&self) -> String {
             "multi".into()

@@ -768,10 +768,12 @@ fn agent_verify_pushdrop_roundtrip() {
             }
         }
 
-        let pushdrop = found_pushdrop.expect(&format!(
-            "Should find an output with capabilities '{expected_caps}' among {} outputs",
-            outputs.len()
-        ));
+        let pushdrop = found_pushdrop.unwrap_or_else(|| {
+            panic!(
+                "Should find an output with capabilities '{expected_caps}' among {} outputs",
+                outputs.len()
+            )
+        });
 
         // Verify 6 fields
         assert_eq!(

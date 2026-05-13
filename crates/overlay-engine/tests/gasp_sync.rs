@@ -4,8 +4,8 @@
 //! graph discard on validation failure, timestamp filtering, multiple graphs.
 
 use async_trait::async_trait;
-use overlay_engine::gasp::*;
-use overlay_engine::types::*;
+use bsv_overlay_engine::gasp::*;
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -39,10 +39,12 @@ impl TrackingGASPStorage {
         self
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn finalized_graphs(&self) -> Vec<String> {
         self.finalized.lock().unwrap().clone()
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn discarded_graphs(&self) -> Vec<String> {
         self.discarded.lock().unwrap().clone()
     }
@@ -597,6 +599,7 @@ async fn ts_gasp_deep_utxo_ancestor_chain() {
                 discarded: std::sync::Mutex::new(Vec::new()),
             }
         }
+        #[allow(dead_code, reason = "kept for future test extension")]
         fn graph_node_count(&self) -> usize {
             self.graphs.lock().unwrap().values().map(|v| v.len()).sum()
         }
@@ -630,7 +633,7 @@ async fn ts_gasp_deep_utxo_ancestor_chain() {
         }
         async fn find_needed_inputs(
             &self,
-            node: &GASPNode,
+            _node: &GASPNode,
         ) -> Result<Option<GASPNodeResponse>, GASPError> {
             let mut depth = self.depth.lock().unwrap();
             if *depth < 3 {
@@ -898,6 +901,7 @@ async fn ts_gasp_unidirectional_no_outgoing() {
                 submitted: std::sync::Mutex::new(Vec::new()),
             }
         }
+        #[allow(dead_code, reason = "kept for future test extension")]
         fn submit_count(&self) -> usize {
             self.submitted.lock().unwrap().len()
         }

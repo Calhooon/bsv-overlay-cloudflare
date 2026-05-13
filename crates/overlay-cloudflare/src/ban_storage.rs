@@ -74,18 +74,25 @@ impl D1BanStorage {
                 ban_type: r.ban_type,
                 value: r.value,
                 banned_at: r.banned_at,
-                banned_by: if r.banned_by.as_deref() == Some("") { None } else { r.banned_by },
-                reason: if r.reason.as_deref() == Some("") { None } else { r.reason },
+                banned_by: if r.banned_by.as_deref() == Some("") {
+                    None
+                } else {
+                    r.banned_by
+                },
+                reason: if r.reason.as_deref() == Some("") {
+                    None
+                } else {
+                    r.reason
+                },
             })
             .collect())
     }
 
     pub async fn counts(&self) -> Result<(u64, u64), String> {
-        let rows: Vec<BanCountRow> = Query::new(
-            "SELECT type, COUNT(*) as count FROM banned_hosts GROUP BY type",
-        )
-        .fetch_all(&self.db)
-        .await?;
+        let rows: Vec<BanCountRow> =
+            Query::new("SELECT type, COUNT(*) as count FROM banned_hosts GROUP BY type")
+                .fetch_all(&self.db)
+                .await?;
         let mut domains = 0u64;
         let mut outpoints = 0u64;
         for r in rows {

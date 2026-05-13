@@ -5,12 +5,12 @@
 //! Test-driven: tests written first, then implementation.
 
 use async_trait::async_trait;
-use overlay_engine::engine::{Engine, EngineConfig};
-use overlay_engine::lookup_service::{LookupService, LookupServiceError};
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::storage::Storage;
-use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
-use overlay_engine::types::*;
+use bsv_overlay_engine::engine::{Engine, EngineConfig};
+use bsv_overlay_engine::lookup_service::{LookupService, LookupServiceError};
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::Storage;
+use bsv_overlay_engine::topic_manager::{TopicManager, TopicManagerError};
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -108,10 +108,12 @@ impl SpentTrackingLookupService {
         }
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn spent_count(&self) -> usize {
         self.spent_calls.lock().unwrap().len()
     }
 
+    #[allow(dead_code, reason = "kept for future test extension")]
     fn was_spent_called_for(&self, txid: &str, output_index: u32) -> bool {
         self.spent_calls.lock().unwrap().iter().any(|s| match s {
             OutputSpent::None {
@@ -180,17 +182,18 @@ impl LookupService for SpentTrackingLookupService {
         Ok(())
     }
 
-    async fn lookup(&self, _: &LookupQuestion) -> Result<Vec<UTXOReference>, LookupServiceError> {
-        Ok(self
-            .admitted
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(t, o, _)| UTXOReference {
-                txid: t.clone(),
-                output_index: *o,
-            })
-            .collect())
+    async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
+        Ok(LookupResult::OutputList(
+            self.admitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, o, _)| UTXOReference {
+                    txid: t.clone(),
+                    output_index: *o,
+                })
+                .collect(),
+        ))
     }
 
     async fn get_documentation(&self) -> String {

@@ -192,10 +192,7 @@ impl LookupService for DmDelegationLookupService {
         Ok(())
     }
 
-    async fn lookup(
-        &self,
-        question: &LookupQuestion,
-    ) -> Result<Vec<UTXOReference>, LookupServiceError> {
+    async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
         if question.service != "ls_dm_delegation" {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_dm_delegation, got {}",
@@ -220,13 +217,14 @@ impl LookupService for DmDelegationLookupService {
                 None => {
                     // Malformed outpoint → empty result (caller treats as
                     // "not found", which means revoked from their POV).
-                    return Ok(vec![]);
+                    return Ok(LookupResult::OutputList(vec![]));
                 }
             };
             return self
                 .storage
                 .find_by_outpoint(&txid, vout)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -235,6 +233,7 @@ impl LookupService for DmDelegationLookupService {
                 .storage
                 .find_by_serial(serial)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -243,6 +242,7 @@ impl LookupService for DmDelegationLookupService {
                 .storage
                 .find_by_certifier(certifier, Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -251,6 +251,7 @@ impl LookupService for DmDelegationLookupService {
                 .storage
                 .find_all(Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -263,6 +264,7 @@ impl LookupService for DmDelegationLookupService {
                 .storage
                 .find_all(Some(limit), Some(skip))
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -394,7 +396,12 @@ mod tests {
             service: "ls_dm_delegation".into(),
             query: serde_json::json!({"findByOutpoint": format!("{txid}.0")}),
         };
-        let hits = svc.lookup(&q).await.unwrap();
+        let hits = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].txid, txid);
     }
@@ -408,7 +415,12 @@ mod tests {
             service: "ls_dm_delegation".into(),
             query: serde_json::json!({"findByOutpoint": format!("{txid}.0")}),
         };
-        let hits = svc.lookup(&q).await.unwrap();
+        let hits = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(hits.is_empty());
     }
 
@@ -419,7 +431,12 @@ mod tests {
             service: "ls_dm_delegation".into(),
             query: serde_json::json!({"findByOutpoint": "not-an-outpoint"}),
         };
-        let hits = svc.lookup(&q).await.unwrap();
+        let hits = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(hits.is_empty());
     }
 
@@ -443,7 +460,12 @@ mod tests {
             service: "ls_dm_delegation".into(),
             query: serde_json::json!({"findBySerial": "ser-target"}),
         };
-        let hits = svc.lookup(&q).await.unwrap();
+        let hits = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].txid, "tx1");
     }
@@ -470,7 +492,12 @@ mod tests {
             service: "ls_dm_delegation".into(),
             query: serde_json::json!({"findByCertifier": cert, "limit": 3, "skip": 2}),
         };
-        let hits = svc.lookup(&q).await.unwrap();
+        let hits = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(hits.len(), 3);
     }
 
@@ -493,7 +520,12 @@ mod tests {
             service: "ls_dm_delegation".into(),
             query: serde_json::json!({}),
         };
-        let hits = svc.lookup(&q).await.unwrap();
+        let hits = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(hits.len(), 1);
     }
 

@@ -126,10 +126,7 @@ pub async fn fan_out(tagged: &TaggedBEEF, self_host: Option<&str>) {
 /// - `field[2]` = host HTTPS URL (UTF-8)
 /// - `field[3]` = topic name (UTF-8)
 /// - `field[4]` = signature (ECDSA DER + sighash flag)
-async fn discover_peers_from_tracker(
-    tracker: &str,
-    topic: &str,
-) -> Result<Vec<String>, String> {
+async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<String>, String> {
     let url = format!("{}/lookup", tracker.trim_end_matches('/'));
     let body = serde_json::json!({
         "service": LS_SHIP,
@@ -173,8 +170,7 @@ async fn discover_peers_from_tracker(
         outputs: Vec<LookupOutput>,
     }
 
-    let answer: LookupAnswer =
-        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    let answer: LookupAnswer = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     if answer.answer_type != "output-list" {
         return Ok(Vec::new());
     }
@@ -269,7 +265,10 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let ours: Vec<String> = DEFAULT_SLAP_TRACKERS.iter().map(|s| s.to_string()).collect();
+        let ours: Vec<String> = DEFAULT_SLAP_TRACKERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
             ours, canonical,
             "DEFAULT_SLAP_TRACKERS drifted from bsv_rs::overlay::NetworkPreset::Mainnet"

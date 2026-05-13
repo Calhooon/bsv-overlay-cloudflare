@@ -206,7 +206,7 @@ async fn build_health_response(
         .var("HOSTING_URL")
         .ok()
         .map(|v| v.to_string())
-        .unwrap_or_else(|| String::new());
+        .unwrap_or_default();
     let network = env
         .var("NETWORK")
         .ok()
@@ -495,13 +495,16 @@ pub async fn submit(
             if !steak.contains_key(topic) {
                 continue;
             }
-            let Ok(tx) = bsv_rs::transaction::Transaction::from_beef(&tagged_beef.beef, None) else {
+            let Ok(tx) = bsv_rs::transaction::Transaction::from_beef(&tagged_beef.beef, None)
+            else {
                 worker::console_log!("{} diag: Transaction::from_beef FAILED", topic);
                 continue;
             };
             for (i, output) in tx.outputs.iter().enumerate() {
                 match bsv_rs::script::templates::PushDrop::decode(&output.locking_script) {
-                    Err(e) => worker::console_log!("{} diag: output[{}] NOT-PUSHDROP ({})", topic, i, e),
+                    Err(e) => {
+                        worker::console_log!("{} diag: output[{}] NOT-PUSHDROP ({})", topic, i, e)
+                    }
                     Ok(pd) => {
                         let field_count = pd.fields.len();
                         let proto = pd
@@ -522,7 +525,8 @@ pub async fn submit(
                                     );
                                 worker::console_log!(
                                     "{} diag: output[{}] {} (mainline admission differs)",
-                                    topic, i,
+                                    topic,
+                                    i,
                                     match result {
                                         Ok(true) => "ADMIT".to_string(),
                                         Ok(false) => "REJECT".to_string(),
@@ -1131,8 +1135,16 @@ pub async fn admin_stats(
 
     let topics = parse_csv_env(env, "TOPIC_MANAGERS", "tm_ship,tm_slap");
     let services = parse_csv_env(env, "LOOKUP_SERVICES", "ls_ship,ls_slap");
-    let ship_count = ship_storage.find_all_records().await.map(|v| v.len()).unwrap_or(0);
-    let slap_count = slap_storage.find_all_records().await.map(|v| v.len()).unwrap_or(0);
+    let ship_count = ship_storage
+        .find_all_records()
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let slap_count = slap_storage
+        .find_all_records()
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
     let (banned_domains, banned_outpoints) = ban_storage.counts().await.unwrap_or((0, 0));
 
     json_ok(&serde_json::json!({
@@ -1178,16 +1190,18 @@ pub async fn admin_ship_records(
         Ok(records) => {
             let rows: Vec<_> = records
                 .into_iter()
-                .map(|r| serde_json::json!({
-                    "_id": format!("{}:{}", r.txid, r.output_index),
-                    "txid": r.txid,
-                    "outputIndex": r.output_index,
-                    "identityKey": r.identity_key,
-                    "domain": r.domain,
-                    "topic": r.topic,
-                    "createdAt": "",
-                    "down": 0,
-                }))
+                .map(|r| {
+                    serde_json::json!({
+                        "_id": format!("{}:{}", r.txid, r.output_index),
+                        "txid": r.txid,
+                        "outputIndex": r.output_index,
+                        "identityKey": r.identity_key,
+                        "domain": r.domain,
+                        "topic": r.topic,
+                        "createdAt": "",
+                        "down": 0,
+                    })
+                })
                 .collect();
             paginated_records_response(rows)
         }
@@ -1203,16 +1217,18 @@ pub async fn admin_slap_records(
         Ok(records) => {
             let rows: Vec<_> = records
                 .into_iter()
-                .map(|r| serde_json::json!({
-                    "_id": format!("{}:{}", r.txid, r.output_index),
-                    "txid": r.txid,
-                    "outputIndex": r.output_index,
-                    "identityKey": r.identity_key,
-                    "domain": r.domain,
-                    "service": r.service,
-                    "createdAt": "",
-                    "down": 0,
-                }))
+                .map(|r| {
+                    serde_json::json!({
+                        "_id": format!("{}:{}", r.txid, r.output_index),
+                        "txid": r.txid,
+                        "outputIndex": r.output_index,
+                        "identityKey": r.identity_key,
+                        "domain": r.domain,
+                        "service": r.service,
+                        "createdAt": "",
+                        "down": 0,
+                    })
+                })
                 .collect();
             paginated_records_response(rows)
         }
@@ -1225,7 +1241,7 @@ fn paginated_records_response(rows: Vec<serde_json::Value>) -> worker::Result<Re
     // page 1. Matches mainline's shape (`{records, total, page, limit, pages}`).
     let total = rows.len();
     let limit = 50usize;
-    let pages = if total == 0 { 0 } else { (total + limit - 1) / limit };
+    let pages = if total == 0 { 0 } else { total.div_ceil(limit) };
     json_ok(&serde_json::json!({
         "status": "success",
         "data": {
@@ -1315,7 +1331,11 @@ pub async fn admin_ban(
         (0usize, 0usize)
     };
 
-    let kind_titled = if body.ban_type == "domain" { "Domain" } else { "Outpoint" };
+    let kind_titled = if body.ban_type == "domain" {
+        "Domain"
+    } else {
+        "Outpoint"
+    };
     let message = format!(
         "{} \"{}\" banned. Removed {} SHIP and {} SLAP records.",
         kind_titled, body.value, ship_removed, slap_removed
@@ -1411,7 +1431,9 @@ pub async fn admin_remove_token(engine: &Engine, mut req: Request) -> worker::Re
     };
     worker::console_log!(
         "POST /admin/remove-token txid={} outputIndex={} topic={:?}",
-        body.txid, body.output_index, body.topic
+        body.txid,
+        body.output_index,
+        body.topic
     );
     match engine
         .evict_output(&body.txid, body.output_index, body.topic.as_deref())

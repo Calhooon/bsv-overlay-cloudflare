@@ -184,10 +184,7 @@ impl LookupService for UHRPLookupService {
         Ok(())
     }
 
-    async fn lookup(
-        &self,
-        question: &LookupQuestion,
-    ) -> Result<Vec<UTXOReference>, LookupServiceError> {
+    async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
         if question.service != "ls_uhrp" {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_uhrp, got {}",
@@ -208,6 +205,7 @@ impl LookupService for UHRPLookupService {
                     ..Default::default()
                 })
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -230,6 +228,7 @@ impl LookupService for UHRPLookupService {
         self.storage
             .find_record(&query)
             .await
+            .map(LookupResult::OutputList)
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))
     }
 
@@ -463,7 +462,12 @@ mod tests {
             .await
             .unwrap();
         let q = LookupQuestion::new("ls_uhrp", serde_json::json!("findAll"));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
     }
 
@@ -480,7 +484,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_uhrp", serde_json::json!({"uhrpUrl": "aa"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -498,7 +507,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_uhrp", serde_json::json!({"hostIdentityKey": "keyB"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx2");
     }
@@ -516,7 +530,12 @@ mod tests {
             "ls_uhrp",
             serde_json::json!({"findAll": true, "limit": 3, "skip": 2}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
     }
 
@@ -557,7 +576,12 @@ mod tests {
                 "nowUnixSeconds": 1_700_000_000i64,
             }),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(
             results.len(),
             1,
@@ -578,7 +602,12 @@ mod tests {
                 "nowUnixSeconds": 1_700_000_000i64,
             }),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(
             results.len(),
             2,
@@ -602,7 +631,12 @@ mod tests {
                 "nowUnixSeconds": 4_000_000_000i64, // year 2096
             }),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx_forever");
     }
@@ -631,7 +665,12 @@ mod tests {
                 "nowUnixSeconds": 1_700_000_000i64,
             }),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx_a_live");
     }
@@ -659,7 +698,12 @@ mod tests {
         assert_eq!(storage.record_count(), 1);
 
         let q = LookupQuestion::new("ls_uhrp", serde_json::json!({"hostIdentityKey": ident_hex}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "live_tx");
 

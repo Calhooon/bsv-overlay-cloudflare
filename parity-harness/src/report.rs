@@ -35,7 +35,10 @@ pub fn write(
 
     writeln!(md, "## Summary")?;
     writeln!(md)?;
-    writeln!(md, "| Status | Name | Method | Path | TS status | Rust status |")?;
+    writeln!(
+        md,
+        "| Status | Name | Method | Path | TS status | Rust status |"
+    )?;
     writeln!(md, "|---|---|---|---|---|---|")?;
     for (entry, ts, rust, outcome) in results {
         let tag = if outcome.matches { "✅" } else { "❌" };
@@ -53,17 +56,45 @@ pub fn write(
         writeln!(md, "## Divergences")?;
         writeln!(md)?;
         for (entry, ts, rust, outcome) in reds {
-            writeln!(md, "### ❌ `{}` — {} `{}`", entry.name, entry.method, entry.path)?;
+            writeln!(
+                md,
+                "### ❌ `{}` — {} `{}`",
+                entry.name, entry.method, entry.path
+            )?;
             writeln!(md)?;
             writeln!(md, "- Source: `{}`", entry.source)?;
             if let Some(note) = &entry.note {
                 writeln!(md, "- **Note**: {note}")?;
             }
-            writeln!(md, "- Status: ts={} rust={} — {}",
-                ts.status, rust.status,
-                if outcome.status_matches { "match" } else { "**MISMATCH**" })?;
-            writeln!(md, "- Content-Type: {}", if outcome.content_type_matches { "match" } else { "**MISMATCH**" })?;
-            writeln!(md, "- Body: {}", if outcome.body_matches { "match" } else { "**MISMATCH**" })?;
+            writeln!(
+                md,
+                "- Status: ts={} rust={} — {}",
+                ts.status,
+                rust.status,
+                if outcome.status_matches {
+                    "match"
+                } else {
+                    "**MISMATCH**"
+                }
+            )?;
+            writeln!(
+                md,
+                "- Content-Type: {}",
+                if outcome.content_type_matches {
+                    "match"
+                } else {
+                    "**MISMATCH**"
+                }
+            )?;
+            writeln!(
+                md,
+                "- Body: {}",
+                if outcome.body_matches {
+                    "match"
+                } else {
+                    "**MISMATCH**"
+                }
+            )?;
             if let Some(err) = &ts.error {
                 writeln!(md, "- ts error: `{}`", err)?;
             }

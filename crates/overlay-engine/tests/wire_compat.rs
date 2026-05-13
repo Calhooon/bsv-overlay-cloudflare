@@ -4,22 +4,22 @@
 //! Engine.submit() with our SHIPTopicManager/SLAPTopicManager to verify
 //! we produce the same admittance results as the TS overlay.
 
-use overlay_engine::engine::{Engine, EngineConfig};
-use overlay_engine::types::*;
+use bsv_overlay_engine::engine::{Engine, EngineConfig};
+use bsv_overlay_engine::types::*;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 // Import discovery crate components
-use overlay_discovery::ship::lookup_service::SHIPLookupService;
-use overlay_discovery::ship::storage::MemorySHIPStorage;
-use overlay_discovery::ship::topic_manager::SHIPTopicManager;
-use overlay_discovery::slap::lookup_service::SLAPLookupService;
-use overlay_discovery::slap::storage::MemorySLAPStorage;
-use overlay_discovery::slap::topic_manager::SLAPTopicManager;
+use bsv_overlay_discovery::ship::lookup_service::SHIPLookupService;
+use bsv_overlay_discovery::ship::storage::MemorySHIPStorage;
+use bsv_overlay_discovery::ship::topic_manager::SHIPTopicManager;
+use bsv_overlay_discovery::slap::lookup_service::SLAPLookupService;
+use bsv_overlay_discovery::slap::storage::MemorySLAPStorage;
+use bsv_overlay_discovery::slap::topic_manager::SLAPTopicManager;
 
-use overlay_engine::lookup_service::LookupService;
-use overlay_engine::storage::memory::MemoryStorage;
-use overlay_engine::topic_manager::TopicManager;
+use bsv_overlay_engine::lookup_service::LookupService;
+use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::topic_manager::TopicManager;
 
 const SHIP_FIXTURE: &str = include_str!("fixtures/ship_lookup_response.json");
 const SLAP_FIXTURE: &str = include_str!("fixtures/slap_lookup_response.json");
@@ -364,7 +364,7 @@ fn lookup_answer_output_list_wire_format() {
 /// and camelCase field names inside AdmittanceInstructions.
 #[test]
 fn steak_wire_format() {
-    use overlay_engine::types::{AdmittanceInstructions, Steak};
+    use bsv_overlay_engine::types::{AdmittanceInstructions, Steak};
 
     let mut steak: Steak = HashMap::new();
     steak.insert(
@@ -451,7 +451,7 @@ fn service_metadata_includes_all_fields_when_set() {
 /// GASPInitialRequest serde roundtrip + field names.
 #[test]
 fn gasp_initial_request_serde_roundtrip() {
-    use overlay_engine::types::GASPInitialRequest;
+    use bsv_overlay_engine::types::GASPInitialRequest;
 
     let req = GASPInitialRequest {
         version: 1,
@@ -488,7 +488,7 @@ fn gasp_initial_request_serde_roundtrip() {
 /// GASPInitialResponse serde roundtrip + "UTXOList" field name.
 #[test]
 fn gasp_initial_response_serde_roundtrip() {
-    use overlay_engine::types::{GASPInitialResponse, GASPOutput};
+    use bsv_overlay_engine::types::{GASPInitialResponse, GASPOutput};
 
     let resp = GASPInitialResponse {
         utxo_list: vec![GASPOutput {
@@ -525,7 +525,7 @@ fn gasp_initial_response_serde_roundtrip() {
 /// GASPNode serde roundtrip — verify graphID, rawTx, outputIndex, optional fields omitted.
 #[test]
 fn gasp_node_serde_roundtrip() {
-    use overlay_engine::types::{GASPInputRef, GASPNode};
+    use bsv_overlay_engine::types::{GASPInputRef, GASPNode};
 
     // Minimal node (optional fields None)
     let node = GASPNode {

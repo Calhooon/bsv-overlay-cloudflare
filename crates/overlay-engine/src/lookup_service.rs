@@ -9,9 +9,12 @@
 use async_trait::async_trait;
 
 use crate::types::{
-    AdmissionMode, LookupQuestion, OutputAdmittedByTopic, OutputSpent, ServiceMetadata,
-    SpendNotificationMode, UTXOReference,
+    AdmissionMode, LookupQuestion, LookupResult, OutputAdmittedByTopic, OutputSpent,
+    ServiceMetadata, SpendNotificationMode,
 };
+
+#[cfg(test)]
+use crate::types::UTXOReference;
 
 /// Indexes overlay outputs and answers lookup queries.
 ///
@@ -80,13 +83,22 @@ pub trait LookupService {
 
     /// Answer a lookup query.
     ///
-    /// Returns a list of UTXO references matching the query. The Engine will
-    /// then load the full BEEF for each referenced output and return them
-    /// to the client as a LookupAnswer.
-    async fn lookup(
-        &self,
-        question: &LookupQuestion,
-    ) -> Result<Vec<UTXOReference>, LookupServiceError>;
+    /// Returns a [`LookupResult`] in one of two shapes:
+    ///
+    /// - `LookupResult::OutputList(refs)` — common case. The Engine
+    ///   hydrates each `UTXOReference` with the BEEF from storage and
+    ///   assembles a `LookupAnswer::OutputList`. This is the cheap path:
+    ///   services don't need direct access to BEEF storage.
+    ///
+    /// - `LookupResult::Answer(answer)` — escape hatch. Services that
+    ///   return aggregate stats (`Freeform`) or formula chains
+    ///   (`Formula`) emit the full answer themselves; the Engine passes
+    ///   it through verbatim.
+    ///
+    /// Existing impls that returned `Vec<UTXOReference>` migrate
+    /// mechanically by wrapping in `LookupResult::OutputList(refs)` (or
+    /// using the `From<Vec<UTXOReference>>` impl).
+    async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError>;
 
     // ========================================================================
     // Documentation
@@ -188,8 +200,10 @@ mod tests {
         async fn lookup(
             &self,
             _question: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, LookupServiceError> {
-            Ok(self.records.lock().unwrap().clone())
+        ) -> Result<LookupResult, LookupServiceError> {
+            Ok(LookupResult::OutputList(
+                self.records.lock().unwrap().clone(),
+            ))
         }
 
         async fn get_documentation(&self) -> String {
@@ -221,10 +235,13 @@ mod tests {
         assert_eq!(svc.record_count(), 1);
 
         let question = LookupQuestion::new("ls_test", serde_json::json!({}));
-        let results = svc.lookup(&question).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].txid, "abc");
-        assert_eq!(results[0].output_index, 0);
+        let result = svc.lookup(&question).await.unwrap();
+        let LookupResult::OutputList(refs) = result else {
+            panic!("expected OutputList");
+        };
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].txid, "abc");
+        assert_eq!(refs[0].output_index, 0);
     }
 
     #[tokio::test]
@@ -247,8 +264,11 @@ mod tests {
 
         // Lookup should return empty
         let question = LookupQuestion::new("ls_test", serde_json::json!({}));
-        let results = svc.lookup(&question).await.unwrap();
-        assert!(results.is_empty());
+        let result = svc.lookup(&question).await.unwrap();
+        let LookupResult::OutputList(refs) = result else {
+            panic!("expected OutputList");
+        };
+        assert!(refs.is_empty());
     }
 
     #[tokio::test]
@@ -302,10 +322,13 @@ mod tests {
         svc.output_evicted("tx2", 0).await.unwrap();
         assert_eq!(svc.record_count(), 4);
 
-        let results = svc
+        let result = svc
             .lookup(&LookupQuestion::new("ls_test", serde_json::json!({})))
             .await
             .unwrap();
-        assert!(!results.iter().any(|r| r.txid == "tx2"));
+        let LookupResult::OutputList(refs) = result else {
+            panic!("expected OutputList");
+        };
+        assert!(!refs.iter().any(|r| r.txid == "tx2"));
     }
 }

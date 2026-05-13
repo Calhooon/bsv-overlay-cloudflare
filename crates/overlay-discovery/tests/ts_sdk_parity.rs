@@ -235,9 +235,9 @@ fn deprecated_create_overlay_admin_token_still_emits_4_field_unsigned() {
 // without documenting exactly why the TS verdict is not reproducible
 // under our validator.
 
+use bsv_overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 use bsv_rs::script::LockingScript;
 use bsv_rs::transaction::TransactionOutput;
-use overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 
 #[derive(Deserialize)]
 struct TranscriptCase {

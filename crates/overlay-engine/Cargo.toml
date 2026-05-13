@@ -25,5 +25,13 @@ js-sys = "0.3"
 tokio = { workspace = true, features = ["rt", "macros"] }
 proptest = "1"
 reqwest = { version = "0.12", features = ["json"] }
-overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 hex = "0.4"
+# Integration tests instantiate SHIP / SLAP / Agent services to drive
+# parity + wire-compat scenarios against the engine. Direct dep (no alias)
+# so the test imports use the published crate name.
+bsv-overlay-discovery = { version = "0.1", path = "../overlay-discovery" }
+# Integration tests use the in-process `MemoryStorage` backend. The
+# `memory-storage` feature is opt-in for the lib (production deployments
+# wire D1 / SQLite) — but every integration test instantiates it, so we
+# enable it for `cargo test` via a self-feature dev-dep.
+bsv-overlay-engine = { path = ".", features = ["memory-storage"] }

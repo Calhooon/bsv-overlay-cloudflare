@@ -15,7 +15,7 @@
 ///
 /// # Examples
 /// ```
-/// use overlay_discovery::validation::is_valid_topic_or_service_name;
+/// use bsv_overlay_discovery::validation::is_valid_topic_or_service_name;
 /// assert!(is_valid_topic_or_service_name("tm_ship"));
 /// assert!(is_valid_topic_or_service_name("ls_slap"));
 /// assert!(is_valid_topic_or_service_name("tm_my_custom_topic"));
@@ -365,13 +365,13 @@ pub fn is_token_signature_correctly_linked_verbose(
             if verbose {
                 eprintln!("  CHECK 1 (signature): PASS");
             }
-            log(format!("  CHECK 1 (signature): PASS"));
+            log("  CHECK 1 (signature): PASS".to_string());
         }
         Ok(_) => {
             if verbose {
                 eprintln!("  CHECK 1 (signature): FAIL (valid=false)");
             }
-            log(format!("  CHECK 1 (signature): FAIL (valid=false)"));
+            log("  CHECK 1 (signature): FAIL (valid=false)".to_string());
             return Ok(false);
         }
         Err(ref e) => {

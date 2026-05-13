@@ -3,9 +3,9 @@
 //! Tests the janitor logic using mock HealthChecker and in-memory SHIP/SLAP storage.
 
 use async_trait::async_trait;
-use overlay_discovery::ship::storage::MemorySHIPStorage;
-use overlay_discovery::slap::storage::MemorySLAPStorage;
-use overlay_engine::health_checker::{HealthChecker, JanitorConfig, JanitorResult};
+use bsv_overlay_discovery::ship::storage::MemorySHIPStorage;
+use bsv_overlay_discovery::slap::storage::MemorySLAPStorage;
+use bsv_overlay_engine::health_checker::{HealthChecker, JanitorConfig, JanitorResult};
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -79,9 +79,9 @@ impl HealthChecker for MockHealthChecker {
 // depend on overlay-cloudflare (which is a cdylib). This keeps the test
 // self-contained while verifying the same algorithm.
 
-use overlay_discovery::ship::storage::SHIPStorage;
-use overlay_discovery::slap::storage::SLAPStorage;
-use overlay_engine::health_checker::DomainHealthResult;
+use bsv_overlay_discovery::ship::storage::SHIPStorage;
+use bsv_overlay_discovery::slap::storage::SLAPStorage;
+use bsv_overlay_engine::health_checker::DomainHealthResult;
 use std::collections::HashMap;
 
 /// Normalize a URL for domain comparison: lowercase, strip trailing slash.
@@ -503,15 +503,9 @@ async fn janitor_skips_own_hosting_url() {
     // Our own domain should be marked healthy without a health check,
     // even if the checker would report it as down (issue #14).
     let ship = MemorySHIPStorage::new();
-    ship.store_record(
-        "tx1",
-        0,
-        "k1",
-        "https://<your-overlay>.workers.dev",
-        "tm_a",
-    )
-    .await
-    .unwrap();
+    ship.store_record("tx1", 0, "k1", "https://<your-overlay>.workers.dev", "tm_a")
+        .await
+        .unwrap();
     ship.store_record("tx2", 0, "k2", "https://other-host.com", "tm_b")
         .await
         .unwrap();
@@ -543,10 +537,7 @@ async fn janitor_skips_own_hosting_url() {
     // Our own record should still exist
     assert_eq!(ship.record_count(), 1);
     let remaining = ship.find_all_records().await.unwrap();
-    assert_eq!(
-        remaining[0].domain,
-        "https://<your-overlay>.workers.dev"
-    );
+    assert_eq!(remaining[0].domain, "https://<your-overlay>.workers.dev");
 
     // The health checker should NOT have been called for our own domain
     assert_eq!(checker.checked_count(), 1);

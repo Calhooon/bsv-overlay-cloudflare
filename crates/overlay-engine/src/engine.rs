@@ -668,7 +668,7 @@ impl Engine {
                                 serde_json::json!({ "topics": [topic] }),
                             );
                             match ship_ls.lookup(&question).await {
-                                Ok(refs) => {
+                                Ok(LookupResult::OutputList(refs)) => {
                                     for reference in &refs {
                                         if let Ok(Some(output)) = self
                                             .storage
@@ -702,6 +702,15 @@ impl Engine {
                                             }
                                         }
                                     }
+                                }
+                                Ok(LookupResult::Answer(_)) => {
+                                    // SHIP only ever returns OutputList; an Answer here means
+                                    // a misconfigured replacement service. Skip rather than
+                                    // attempt to extract refs from a freeform/formula payload.
+                                    error!(
+                                        "SHIP lookup for topic {topic} returned a pre-formed \
+                                         LookupAnswer; expected OutputList. Skipping fanout."
+                                    );
                                 }
                                 Err(e) => {
                                     error!("SHIP lookup for topic {topic} failed: {e}");
@@ -737,14 +746,27 @@ impl Engine {
             .get(&question.service)
             .ok_or_else(|| EngineError::LookupServiceNotFound(question.service.clone()))?;
 
-        let formula = service
+        let result = service
             .lookup(question)
             .await
             .map_err(|e| EngineError::LookupFailed(e.to_string()))?;
 
+        // Two paths per LookupResult:
+        // - OutputList(refs): the LS yields outpoints; we hydrate each with
+        //   BEEF (and optional ancestor chain via history_selector) and
+        //   assemble LookupAnswer::OutputList.
+        // - Answer(answer): the LS already produced the full answer
+        //   (Freeform/Formula); pass through verbatim. The Engine does NOT
+        //   apply history-selector hydration to a pre-formed Answer — the
+        //   LS is presumed to have embedded whatever ancestry it wants.
+        let refs = match result {
+            LookupResult::OutputList(refs) => refs,
+            LookupResult::Answer(answer) => return Ok(answer),
+        };
+
         // Hydrate each result with BEEF from storage
         let mut outputs = Vec::new();
-        for reference in &formula {
+        for reference in &refs {
             if let Ok(Some(output)) = self
                 .storage
                 .find_output(&reference.txid, reference.output_index, None, None, true)
@@ -995,10 +1017,7 @@ impl Engine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GASPNode, EngineError>> + 'a>>
     {
         Box::pin(async move {
-            let beef_data = output
-                .beef
-                .as_ref()
-                .ok_or(EngineError::NodeNotFound)?;
+            let beef_data = output.beef.as_ref().ok_or(EngineError::NodeNotFound)?;
 
             let root_tx = Transaction::from_beef(beef_data, None)
                 .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
@@ -1661,7 +1680,14 @@ impl Engine {
         let question = LookupQuestion::new("ls_ship", serde_json::json!({ "topics": [topic] }));
 
         let refs = match ship_ls.lookup(&question).await {
-            Ok(refs) => refs,
+            Ok(LookupResult::OutputList(refs)) => refs,
+            Ok(LookupResult::Answer(_)) => {
+                error!(
+                    "[GASP SYNC] SHIP lookup for topic {topic} returned a pre-formed \
+                     LookupAnswer; expected OutputList. Skipping."
+                );
+                return Vec::new();
+            }
             Err(e) => {
                 error!("[GASP SYNC] SHIP lookup for topic {topic} failed: {e}");
                 return Vec::new();
@@ -1945,8 +1971,10 @@ mod tests {
         async fn lookup(
             &self,
             _question: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, LookupServiceError> {
-            Ok(self.records.lock().unwrap().clone())
+        ) -> Result<LookupResult, LookupServiceError> {
+            Ok(LookupResult::OutputList(
+                self.records.lock().unwrap().clone(),
+            ))
         }
 
         async fn get_documentation(&self) -> String {
@@ -1981,7 +2009,7 @@ mod tests {
     fn test_tagged_beef(topics: Vec<&str>) -> TaggedBEEF {
         TaggedBEEF::new(
             test_beef(),
-            topics.into_iter().map(|s| s.to_string()).collect(),
+            topics.into_iter().map(str::to_string).collect(),
         )
     }
 
@@ -2170,7 +2198,7 @@ mod tests {
         let txid = TEST_TXID;
         let output = engine
             .storage()
-            .find_output(&txid, 0, Some("tm_test"), None, false)
+            .find_output(txid, 0, Some("tm_test"), None, false)
             .await
             .unwrap()
             .unwrap();
@@ -2181,7 +2209,7 @@ mod tests {
         // Should be gone
         let found = engine
             .storage()
-            .find_output(&txid, 0, Some("tm_test"), None, false)
+            .find_output(txid, 0, Some("tm_test"), None, false)
             .await
             .unwrap();
         assert!(found.is_none());
@@ -2303,8 +2331,10 @@ mod tests {
     use crate::broadcaster::Broadcaster;
     use std::sync::Arc;
 
+    type BroadcastCallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
     struct MockBroadcaster {
-        calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        calls: BroadcastCallLog,
     }
 
     impl MockBroadcaster {
@@ -2314,10 +2344,12 @@ mod tests {
             }
         }
 
+        #[allow(dead_code, reason = "kept for future test extension")]
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
         }
 
+        #[allow(dead_code, reason = "kept for future test extension")]
         fn calls(&self) -> Vec<(String, Vec<String>)> {
             self.calls.lock().unwrap().clone()
         }
@@ -2384,7 +2416,7 @@ mod tests {
         async fn lookup(
             &self,
             question: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, LookupServiceError> {
+        ) -> Result<LookupResult, LookupServiceError> {
             // Parse the topics from the query
             if let Some(topics) = question.query.get("topics").and_then(|v| v.as_array()) {
                 let records = self.records.lock().unwrap();
@@ -2396,9 +2428,9 @@ mod tests {
                         }
                     }
                 }
-                return Ok(results);
+                return Ok(LookupResult::OutputList(results));
             }
-            Ok(vec![])
+            Ok(LookupResult::OutputList(vec![]))
         }
 
         async fn get_documentation(&self) -> String {
@@ -2464,7 +2496,7 @@ mod tests {
             let fake_txid = format!("{:064x}", {
                 let mut h: u64 = 0;
                 for b in domain.bytes().chain(topic.bytes()) {
-                    h = h.wrapping_mul(31).wrapping_add(b as u64);
+                    h = h.wrapping_mul(31).wrapping_add(u64::from(b));
                 }
                 h
             });
@@ -2506,7 +2538,7 @@ mod tests {
         );
 
         let config = EngineConfig {
-            hosting_url: hosting_url.map(|s| s.to_string()),
+            hosting_url: hosting_url.map(str::to_string),
             ..Default::default()
         };
 
@@ -2749,8 +2781,10 @@ mod tests {
         async fn lookup(
             &self,
             _question: &LookupQuestion,
-        ) -> Result<Vec<UTXOReference>, LookupServiceError> {
-            Ok(self.records.lock().unwrap().clone())
+        ) -> Result<LookupResult, LookupServiceError> {
+            Ok(LookupResult::OutputList(
+                self.records.lock().unwrap().clone(),
+            ))
         }
 
         async fn get_documentation(&self) -> String {
@@ -2850,9 +2884,9 @@ mod tests {
                     "Unlocking script should be non-empty"
                 );
                 // Standard final sequence number
-                assert_eq!(*sequence_number, 0xffffffff);
+                assert_eq!(*sequence_number, 0xffff_ffff);
             }
-            other => panic!("Expected OutputSpent::Script, got: {:?}", other),
+            other => panic!("Expected OutputSpent::Script, got: {other:?}"),
         }
     }
 
@@ -2882,7 +2916,7 @@ mod tests {
                 // The spending BEEF should be the entire BEEF we submitted
                 assert_eq!(spending_atomic_beef, &test_beef());
             }
-            other => panic!("Expected OutputSpent::WholeTx, got: {:?}", other),
+            other => panic!("Expected OutputSpent::WholeTx, got: {other:?}"),
         }
     }
 
@@ -2910,7 +2944,7 @@ mod tests {
                 assert_eq!(topic, "tm_test");
                 assert_eq!(spending_txid, TEST_TXID);
             }
-            other => panic!("Expected OutputSpent::Txid, got: {:?}", other),
+            other => panic!("Expected OutputSpent::Txid, got: {other:?}"),
         }
     }
 
@@ -2936,7 +2970,7 @@ mod tests {
                 assert_eq!(*output_index, 0);
                 assert_eq!(topic, "tm_test");
             }
-            other => panic!("Expected OutputSpent::None, got: {:?}", other),
+            other => panic!("Expected OutputSpent::None, got: {other:?}"),
         }
     }
 
@@ -3717,7 +3751,7 @@ mod tests {
             Box::new(MemoryStorage::new()),
             Some(Box::new(adv)),
             EngineConfig {
-                hosting_url: Some("".to_string()), // empty string — invalid
+                hosting_url: Some(String::new()), // empty string — invalid
                 ..Default::default()
             },
         );

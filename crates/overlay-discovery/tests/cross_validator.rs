@@ -41,6 +41,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
+use bsv_overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 use bsv_rs::primitives::ec::{PrivateKey, PublicKey};
 use bsv_rs::primitives::encoding::Writer;
 use bsv_rs::script::templates::PushDrop as PushDropTemplate;
@@ -48,7 +49,6 @@ use bsv_rs::transaction::TransactionOutput;
 use bsv_rs::wallet::{
     Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
 };
-use overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;

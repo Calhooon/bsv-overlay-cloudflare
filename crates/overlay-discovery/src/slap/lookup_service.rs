@@ -143,10 +143,7 @@ impl LookupService for SLAPLookupService {
         Ok(())
     }
 
-    async fn lookup(
-        &self,
-        question: &LookupQuestion,
-    ) -> Result<Vec<UTXOReference>, LookupServiceError> {
+    async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
         if question.service != "ls_slap" {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_slap, got {}",
@@ -159,6 +156,7 @@ impl LookupService for SLAPLookupService {
                 .storage
                 .find_all(None, None, None)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
@@ -170,12 +168,14 @@ impl LookupService for SLAPLookupService {
                 .storage
                 .find_all(query.limit, query.skip, query.sort_order)
                 .await
+                .map(LookupResult::OutputList)
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
         self.storage
             .find_record(&query)
             .await
+            .map(LookupResult::OutputList)
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))
     }
 
@@ -308,7 +308,12 @@ mod tests {
 
         // Query by identity key
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"identity_key": ik_hex}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "deadbeef");
         assert_eq!(results[0].output_index, 3);
@@ -612,7 +617,12 @@ mod tests {
     async fn lookup_empty_returns_empty() {
         let svc = make_service();
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"find_all": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -629,7 +639,12 @@ mod tests {
         storage.store_record("tx1", 0, "k", "d", "s").await.unwrap();
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!("findAll"));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
     }
 
@@ -646,7 +661,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"find_all": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 2);
     }
 
@@ -663,7 +683,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"service": "ls_test"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -681,7 +706,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"domain": "https://a.com"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -699,7 +729,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"identity_key": "key_bbb"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx2");
     }
@@ -724,7 +759,12 @@ mod tests {
             "ls_slap",
             serde_json::json!({"domain": "https://a.com", "service": "ls_foo"}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
     }
@@ -740,7 +780,12 @@ mod tests {
         }
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"find_all": true, "limit": 2}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 2);
     }
 
@@ -755,7 +800,12 @@ mod tests {
         }
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"find_all": true, "skip": 3}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 2);
     }
 
@@ -773,7 +823,12 @@ mod tests {
             "ls_slap",
             serde_json::json!({"find_all": true, "limit": 3, "skip": 2}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
     }
 
@@ -791,7 +846,12 @@ mod tests {
             "ls_slap",
             serde_json::json!({"find_all": true, "sort_order": "asc"}),
         );
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 3);
         let txids: Vec<&str> = results.iter().map(|r| r.txid.as_str()).collect();
         assert!(txids.contains(&"tx0"));
@@ -816,7 +876,12 @@ mod tests {
             .unwrap();
 
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"service": "ls_nonexistent"}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -845,7 +910,12 @@ mod tests {
 
         // Step 2: Query
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"identity_key": ik_hex}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "admit_tx");
         assert_eq!(results[0].output_index, 0);
@@ -860,7 +930,12 @@ mod tests {
         assert_eq!(storage.record_count(), 0);
 
         // Step 4: Query again — empty
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -884,7 +959,12 @@ mod tests {
 
         // Query
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"find_all": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
 
         // Evict
@@ -892,7 +972,12 @@ mod tests {
         assert_eq!(storage.record_count(), 0);
 
         // Query again
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert!(results.is_empty());
     }
 
@@ -932,7 +1017,12 @@ mod tests {
 
         // Query — should only find tx_b
         let q = LookupQuestion::new("ls_slap", serde_json::json!({"find_all": true}));
-        let results = svc.lookup(&q).await.unwrap();
+        let results = svc
+            .lookup(&q)
+            .await
+            .unwrap()
+            .into_outputs()
+            .expect("expected OutputList");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx_b");
     }
