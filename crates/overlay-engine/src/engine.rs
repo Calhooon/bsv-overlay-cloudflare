@@ -1588,7 +1588,7 @@ impl Engine {
                         gasp_remote,
                         last_interaction,
                         &log_prefix,
-                        false, // bidirectional
+                        true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     );
 
                     match sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await {
@@ -1600,19 +1600,20 @@ impl Engine {
                                 .drain(..)
                                 .collect();
 
+                            let mut any_submitted = false;
                             for graph in &finalized {
                                 for beef_bytes in &graph.beefs {
                                     let tagged = TaggedBEEF::new(
                                         beef_bytes.clone(),
                                         vec![graph.topic.clone()],
                                     );
-                                    if let Err(e) =
-                                        self.submit(&tagged, SubmitMode::HistoricalTxNoSpv).await
+                                    match self.submit(&tagged, SubmitMode::HistoricalTxNoSpv).await
                                     {
-                                        warn!(
+                                        Ok(_) => any_submitted = true,
+                                        Err(e) => warn!(
                                             "[GASP SYNC] Failed to submit BEEF for topic {}: {e}",
                                             graph.topic
-                                        );
+                                        ),
                                     }
                                 }
                             }
@@ -1624,15 +1625,20 @@ impl Engine {
                                 );
                             }
 
-                            // Update last interaction score
-                            if let Err(e) = self
-                                .storage
-                                .update_last_interaction(peer_url, topic, sync.last_interaction)
-                                .await
-                            {
-                                warn!(
-                                    "[GASP SYNC] Failed to update last_interaction for {peer_url}/{topic}: {e}"
-                                );
+                            // Only advance the persisted cursor if we actually ingested
+                            // (and it moved forward). Prevents poisoning the cursor on an
+                            // empty/failed bootstrap so the next cron can re-pull from the
+                            // same `since`. Mirrors TS `if (gasp.lastInteraction > lastInteraction)`.
+                            if any_submitted && sync.last_interaction > last_interaction {
+                                if let Err(e) = self
+                                    .storage
+                                    .update_last_interaction(peer_url, topic, sync.last_interaction)
+                                    .await
+                                {
+                                    warn!(
+                                        "[GASP SYNC] Failed to update last_interaction for {peer_url}/{topic}: {e}"
+                                    );
+                                }
                             }
                             info!(
                                 "[GASP SYNC] Sync with {peer_url} for {topic} completed (last_interaction={})",

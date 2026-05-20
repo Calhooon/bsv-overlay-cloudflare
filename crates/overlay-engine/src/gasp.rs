@@ -286,7 +286,18 @@ impl<'a> GASPSync<'a> {
         seen: &'b mut std::collections::HashSet<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GASPError>> + 'b>> {
         Box::pin(async move {
-            let node_id = format!("{}.{}", node.graph_id, node.output_index);
+            // Key by the node's own TXID (computed from raw_tx), NOT graph_id (which
+            // is constant across a whole graph) and NOT the raw_tx hex. Mirrors TS
+            // @bsv/gasp processIncomingNode: nodeId = `${computeTXID(rawTx)}.${oi}`
+            // (GASP.js:319) and spentBy = compute36ByteStructure(computeTXID(rawTx), oi)
+            // (GASP.js:335). Matches the append-side key in gasp_overlay.rs
+            // (Transaction::from_hex(raw_tx).id()). Using graph_id/raw_tx here orphaned
+            // every child node → multi-node graphs never assembled → stranded sync.
+            let node_txid = match bsv_rs::transaction::Transaction::from_hex(&node.raw_tx) {
+                Ok(tx) => tx.id(),
+                Err(_) => node.raw_tx[..node.raw_tx.len().min(64)].to_string(),
+            };
+            let node_id = format!("{}.{}", node_txid, node.output_index);
             if seen.contains(&node_id) {
                 return Ok(());
             }
@@ -302,7 +313,7 @@ impl<'a> GASPSync<'a> {
                             .request_node(&node.graph_id, &txid, oi, input_req.metadata)
                             .await?;
 
-                        let spent_by_str = format!("{}.{}", node.raw_tx, node.output_index);
+                        let spent_by_str = format!("{}.{}", node_txid, node.output_index);
                         self.process_incoming_node(&child_node, Some(&spent_by_str), seen)
                             .await?;
                     }
