@@ -67,6 +67,11 @@ pub struct Engine {
     arc_broadcaster: Option<Box<dyn ArcBroadcaster>>,
     chain_tracker: Option<Box<dyn bsv_rs::transaction::ChainTracker>>,
     gasp_remote_factory: Option<Box<dyn crate::gasp::GASPRemoteFactory>>,
+    /// OPT-IN / OFF BY DEFAULT chain-backed ancestor fetcher for GASP ingest.
+    /// When `None` (default / production), GASP ingest is byte-identical to
+    /// today. A platform crate may set `Some` (one-time-migration only) to let
+    /// ingest self-heal missing ancestry by fetching it from chain.
+    ancestor_fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>>,
     config: EngineConfig,
 }
 
@@ -196,6 +201,7 @@ impl Engine {
             arc_broadcaster,
             chain_tracker,
             gasp_remote_factory: None,
+            ancestor_fetcher: None,
             config,
         }
     }
@@ -214,6 +220,19 @@ impl Engine {
     /// that creates HTTP-based remotes using their native fetch API.
     pub fn set_gasp_remote_factory(&mut self, factory: Box<dyn crate::gasp::GASPRemoteFactory>) {
         self.gasp_remote_factory = Some(factory);
+    }
+
+    /// Set the OPT-IN chain-backed ancestor fetcher for GASP ingest.
+    ///
+    /// **OFF BY DEFAULT.** When set, a peer's failure to serve a needed
+    /// ancestor during GASP ingest falls back to fetching that ancestor's raw
+    /// tx from chain (via the supplied fetcher), self-healing the graph and
+    /// also enabling strict-BEEF finalize so missing ancestry fails loud.
+    ///
+    /// This is a deliberate one-time-migration escape hatch. Production must
+    /// NOT call this — when unset, GASP ingest behavior is unchanged.
+    pub fn set_ancestor_fetcher(&mut self, fetcher: std::rc::Rc<dyn crate::gasp::AncestorFetcher>) {
+        self.ancestor_fetcher = Some(fetcher);
     }
 
     // ========================================================================
@@ -1577,9 +1596,16 @@ impl Engine {
                     // Create shared sink for finalized graphs
                     let sink = crate::gasp_overlay::new_finalized_graph_sink();
 
+                    // OPT-IN ancestor hydration: only when a fetcher is
+                    // configured do we enable chain-backed ancestor fallback +
+                    // strict-BEEF finalize. Default (None) = byte-identical to
+                    // today (tolerant BEEF, peer errors abandon the graph).
+                    let hydration_on = self.ancestor_fetcher.is_some();
+
                     // Create storage adapter and remote
                     let gasp_storage =
-                        OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone());
+                        OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone())
+                            .with_strict_beef(hydration_on);
                     let gasp_remote = factory.create_remote(peer_url, topic);
 
                     let log_prefix = format!("[GASP {topic} <-> {peer_url}]");
@@ -1589,7 +1615,8 @@ impl Engine {
                         last_interaction,
                         &log_prefix,
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
-                    );
+                    )
+                    .with_ancestor_fetcher(self.ancestor_fetcher.clone());
 
                     match sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await {
                         Ok(()) => {

@@ -121,6 +121,37 @@ pub trait GASPRemoteFactory {
 }
 
 // ============================================================================
+// AncestorFetcher trait (OPT-IN, OFF by default)
+// ============================================================================
+
+/// Optional chain-backed ancestor fetcher for GASP ingest self-healing.
+///
+/// **OPT-IN / OFF BY DEFAULT.** When a peer (e.g. legacy TS beta) cannot serve
+/// a needed ancestor node during graph ingest (it returns HTTP 400 "Incomplete
+/// SPV data!" because its stored BEEF is minimal), the orchestrator normally
+/// abandons that graph. If — and ONLY if — an `AncestorFetcher` is configured,
+/// `process_incoming_node` falls back to fetching the ancestor's raw tx from
+/// chain (e.g. WhatsOnChain) and synthesizing a no-proof `GASPNode` that the
+/// existing recursion stitches into the graph.
+///
+/// This is a deliberate one-time-migration escape hatch. Production must NOT
+/// configure a fetcher: when the fetcher is `None` the ingest path is
+/// byte-identical to today (peer errors propagate / are swallowed upstream).
+///
+/// The orchestrator stays platform-agnostic; the concrete WoC/`worker::Fetch`
+/// implementation lives in the platform crate (e.g. zanaadu `overlay`), never
+/// in this engine crate (no `reqwest`/`std::time` — must stay wasm-clean).
+#[async_trait(?Send)]
+pub trait AncestorFetcher {
+    /// Fetch a raw transaction (hex) by txid from chain.
+    ///
+    /// The implementation MUST verify that the returned bytes hash to the
+    /// requested `txid` before returning them (integrity check) so a
+    /// malicious/garbled response cannot inject a forged ancestor.
+    async fn fetch_raw_tx(&self, txid: &str) -> Result<String, GASPError>;
+}
+
+// ============================================================================
 // GASP orchestrator
 // ============================================================================
 
@@ -139,10 +170,18 @@ pub struct GASPSync<'a> {
     /// If true, only pull from remote — don't push local UTXOs.
     pub unidirectional: bool,
     log_prefix: String,
+    /// OPT-IN / OFF BY DEFAULT chain-backed ancestor fetcher. When `None`
+    /// (the default), the ingest path is byte-identical to today: a peer's
+    /// `request_node` error propagates and the graph is abandoned upstream.
+    /// When `Some`, a peer ancestor-serve failure falls back to chain.
+    ancestor_fetcher: Option<std::rc::Rc<dyn AncestorFetcher + 'a>>,
 }
 
 impl<'a> GASPSync<'a> {
     /// Create a new GASP sync orchestrator.
+    ///
+    /// The ancestor fetcher is OFF by default. Use `with_ancestor_fetcher` to
+    /// opt in to chain-backed ancestry hydration (one-time-migration only).
     pub fn new(
         storage: Box<dyn GASPStorage + 'a>,
         remote: Box<dyn GASPRemote + 'a>,
@@ -156,7 +195,23 @@ impl<'a> GASPSync<'a> {
             last_interaction,
             unidirectional,
             log_prefix: log_prefix.into(),
+            ancestor_fetcher: None,
         }
+    }
+
+    /// Opt in to chain-backed ancestor hydration (OFF by default).
+    ///
+    /// When set, a peer's inability to serve a needed ancestor during ingest
+    /// triggers a fallback fetch of that ancestor's raw tx from chain. This is
+    /// a deliberate one-time-migration escape hatch — production should NOT
+    /// call this. Without it, behavior is unchanged.
+    #[must_use]
+    pub fn with_ancestor_fetcher(
+        mut self,
+        fetcher: Option<std::rc::Rc<dyn AncestorFetcher + 'a>>,
+    ) -> Self {
+        self.ancestor_fetcher = fetcher;
+        self
     }
 
     /// Run the sync protocol with the remote peer.
@@ -308,10 +363,52 @@ impl<'a> GASPSync<'a> {
             if let Some(needed) = self.storage.find_needed_inputs(node).await? {
                 for (outpoint, input_req) in &needed.requested_inputs {
                     if let Some((txid, oi)) = parse_outpoint(outpoint) {
-                        let child_node = self
+                        let child_node = match self
                             .remote
                             .request_node(&node.graph_id, &txid, oi, input_req.metadata)
-                            .await?;
+                            .await
+                        {
+                            Ok(n) => n,
+                            Err(peer_err) => {
+                                // The peer cannot serve this ancestor (e.g. legacy
+                                // beta returns HTTP 400 "Incomplete SPV data!"
+                                // because its stored BEEF is minimal).
+                                //
+                                // OPT-IN self-heal: if — and ONLY if — an ancestor
+                                // fetcher is configured, fetch the ancestor's raw tx
+                                // from chain and synthesize a no-proof node. The
+                                // existing recursion then walks ITS parents until the
+                                // chain is self-contained (all inputs locally-known or
+                                // coinbase). When no fetcher is configured (the
+                                // default / production), we preserve today's exact
+                                // behavior: propagate the peer error.
+                                match &self.ancestor_fetcher {
+                                    Some(fetcher) => {
+                                        warn!(
+                                            "{} Peer cannot serve ancestor {}.{}: {}. Falling back to chain fetch.",
+                                            self.log_prefix, txid, oi, peer_err
+                                        );
+                                        let raw_hex = fetcher.fetch_raw_tx(&txid).await?;
+                                        // No proof: this is a non-leaf ancestor; the
+                                        // descendant tip's BUMP roots the subtree
+                                        // (BRC-62), so only the rawtx is required for
+                                        // input-script/value resolution. find_needed_inputs
+                                        // on this synthesized node recurses to ITS
+                                        // parents if it, too, lacks a local proof.
+                                        GASPNode {
+                                            graph_id: node.graph_id.clone(),
+                                            raw_tx: raw_hex,
+                                            output_index: oi,
+                                            proof: None,
+                                            tx_metadata: None,
+                                            output_metadata: None,
+                                            inputs: None,
+                                        }
+                                    }
+                                    None => return Err(peer_err),
+                                }
+                            }
+                        };
 
                         let spent_by_str = format!("{}.{}", node_txid, node.output_index);
                         self.process_incoming_node(&child_node, Some(&spent_by_str), seen)
@@ -756,6 +853,238 @@ mod tests {
 
         // Should not error — discards instead of finalizing
         gasp.complete_graph("bad_graph.0").await.unwrap();
+    }
+
+    // ── AncestorFetcher fallback tests ─────────────────────────────────
+
+    /// Build a minimal valid tx hex with one input referencing `source_txid`.
+    fn make_tx_hex(source_txid: &str, source_oi: u32) -> String {
+        let mut tx = bsv_rs::transaction::Transaction::new();
+        tx.inputs.push(bsv_rs::transaction::TransactionInput::new(
+            source_txid.to_string(),
+            source_oi,
+        ));
+        tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+            100,
+            bsv_rs::script::LockingScript::from_hex(
+                "76a914000000000000000000000000000000000000000088ac",
+            )
+            .unwrap(),
+        ));
+        tx.to_hex()
+    }
+
+    /// Storage that records appended nodes and requests exactly one ancestor
+    /// (the first input) on the FIRST node it sees, then nothing further.
+    struct RecordingStorage {
+        appended: Mutex<Vec<GASPNode>>,
+        request_once: Mutex<bool>,
+        ancestor_outpoint: String,
+    }
+
+    #[async_trait(?Send)]
+    impl GASPStorage for RecordingStorage {
+        async fn find_known_utxos(
+            &self,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<Vec<GASPOutput>, GASPError> {
+            Ok(vec![])
+        }
+        async fn hydrate_gasp_node(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: bool,
+        ) -> Result<GASPNode, GASPError> {
+            unreachable!()
+        }
+        async fn find_needed_inputs(
+            &self,
+            _: &GASPNode,
+        ) -> Result<Option<GASPNodeResponse>, GASPError> {
+            let mut once = self.request_once.lock().unwrap();
+            if *once {
+                *once = false;
+                let mut requested_inputs = HashMap::new();
+                requested_inputs.insert(
+                    self.ancestor_outpoint.clone(),
+                    crate::types::GASPInputRequest { metadata: false },
+                );
+                Ok(Some(GASPNodeResponse { requested_inputs }))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn append_to_graph(&self, node: &GASPNode, _: Option<&str>) -> Result<(), GASPError> {
+            self.appended.lock().unwrap().push(node.clone());
+            Ok(())
+        }
+        async fn validate_graph_anchor(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
+        async fn finalize_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
+        async fn discard_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
+    }
+
+    /// Remote that always errors on `request_node` (mimics beta's HTTP 400
+    /// "Incomplete SPV data!").
+    struct FailingNodeRemote;
+
+    #[async_trait(?Send)]
+    impl GASPRemote for FailingNodeRemote {
+        async fn get_initial_response(
+            &self,
+            _: &GASPInitialRequest,
+        ) -> Result<GASPInitialResponse, GASPError> {
+            Ok(GASPInitialResponse {
+                utxo_list: vec![],
+                since: 0,
+            })
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &GASPInitialResponse,
+        ) -> Result<GASPInitialReply, GASPError> {
+            Ok(GASPInitialReply { utxo_list: vec![] })
+        }
+        async fn request_node(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: bool,
+        ) -> Result<GASPNode, GASPError> {
+            Err(GASPError::RemoteError(
+                "Peer returned HTTP 400: Incomplete SPV data!".to_string(),
+            ))
+        }
+        async fn submit_node(&self, _: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+            Ok(None)
+        }
+    }
+
+    /// Mock fetcher that returns a pre-built ancestor rawtx.
+    struct MockFetcher {
+        ancestor_hex: String,
+        called: Mutex<u32>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for MockFetcher {
+        async fn fetch_raw_tx(&self, _txid: &str) -> Result<String, GASPError> {
+            *self.called.lock().unwrap() += 1;
+            Ok(self.ancestor_hex.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestor_fetcher_none_preserves_peer_error() {
+        // Build a tip tx whose input references some ancestor.
+        let ancestor_hex = make_tx_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            0,
+        );
+        let ancestor_txid = bsv_rs::transaction::Transaction::from_hex(&ancestor_hex)
+            .unwrap()
+            .id();
+        let tip_hex = make_tx_hex(&ancestor_txid, 0);
+
+        let storage = RecordingStorage {
+            appended: Mutex::new(vec![]),
+            request_once: Mutex::new(true),
+            ancestor_outpoint: format!("{ancestor_txid}.0"),
+        };
+
+        // No fetcher configured → default path → peer error must propagate.
+        let gasp = GASPSync::new(
+            Box::new(storage),
+            Box::new(FailingNodeRemote),
+            0,
+            "[TEST]",
+            true,
+        );
+
+        let tip_node = GASPNode {
+            graph_id: format!("{}.0", "deadbeef"),
+            raw_tx: tip_hex,
+            output_index: 0,
+            proof: None,
+            tx_metadata: None,
+            output_metadata: None,
+            inputs: None,
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        let result = gasp.process_incoming_node(&tip_node, None, &mut seen).await;
+        assert!(
+            result.is_err(),
+            "with no fetcher, the peer error must propagate (default path unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestor_fetcher_some_self_heals_missing_ancestor() {
+        let ancestor_hex = make_tx_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            0,
+        );
+        let ancestor_txid = bsv_rs::transaction::Transaction::from_hex(&ancestor_hex)
+            .unwrap()
+            .id();
+        let tip_hex = make_tx_hex(&ancestor_txid, 0);
+
+        let storage = RecordingStorage {
+            appended: Mutex::new(vec![]),
+            request_once: Mutex::new(true),
+            ancestor_outpoint: format!("{ancestor_txid}.0"),
+        };
+
+        let fetcher = std::rc::Rc::new(MockFetcher {
+            ancestor_hex: ancestor_hex.clone(),
+            called: Mutex::new(0),
+        });
+
+        let gasp = GASPSync::new(
+            Box::new(storage),
+            Box::new(FailingNodeRemote),
+            0,
+            "[TEST]",
+            true,
+        )
+        .with_ancestor_fetcher(Some(fetcher.clone()));
+
+        let tip_node = GASPNode {
+            graph_id: "deadbeef.0".to_string(),
+            raw_tx: tip_hex.clone(),
+            output_index: 0,
+            proof: None,
+            tx_metadata: None,
+            output_metadata: None,
+            inputs: None,
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        gasp.process_incoming_node(&tip_node, None, &mut seen)
+            .await
+            .expect("with fetcher, missing ancestor self-heals from chain");
+
+        assert_eq!(
+            *fetcher.called.lock().unwrap(),
+            1,
+            "fetcher should fire once"
+        );
+
+        // The synthesized ancestor node must have been appended to the graph,
+        // with proof: None so the existing recursion would continue upward.
+        // (We can't reach into the boxed storage here, but the Ok(()) above
+        // proves the synthesized node flowed through process_incoming_node and
+        // append_to_graph without error.)
     }
 
     #[test]

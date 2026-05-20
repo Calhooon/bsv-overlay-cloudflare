@@ -83,6 +83,12 @@ pub struct OverlayGASPStorage<'a> {
     pending_graphs: Mutex<HashMap<String, PendingNode>>,
     /// Shared sink for completed graphs ready for Engine submission.
     finalized_sink: FinalizedGraphSink,
+    /// If true, finalize uses strict `to_beef(false)` so a missing ancestor
+    /// fails loud rather than silently emitting a partial BEEF. Defaults to
+    /// `false` (tolerant `to_beef(true)`) — byte-identical to today. Only set
+    /// `true` when ancestor hydration is enabled, so post-hydration
+    /// completeness is enforced.
+    strict_beef: bool,
 }
 
 impl<'a> OverlayGASPStorage<'a> {
@@ -100,7 +106,20 @@ impl<'a> OverlayGASPStorage<'a> {
             topic: topic.into(),
             pending_graphs: Mutex::new(HashMap::new()),
             finalized_sink: sink,
+            strict_beef: false,
         }
+    }
+
+    /// Enable strict-BEEF finalize (`to_beef(false)`), failing loud on a
+    /// missing ancestor instead of silently emitting a partial BEEF.
+    ///
+    /// Defaults to OFF (tolerant). Only enable this together with ancestor
+    /// hydration so that, after the chain fallback has spliced in ancestors,
+    /// an incomplete graph is discarded + retried rather than stored partial.
+    #[must_use]
+    pub fn with_strict_beef(mut self, strict: bool) -> Self {
+        self.strict_beef = strict;
+        self
     }
 
     /// Take all finalized graphs from the shared sink, leaving it empty.
@@ -138,6 +157,7 @@ impl<'a> OverlayGASPStorage<'a> {
     fn get_beef_for_node(
         node_key: &str,
         refs: &HashMap<String, PendingNode>,
+        strict_beef: bool,
     ) -> Result<(Transaction, Vec<u8>), GASPError> {
         let pending = refs
             .get(node_key)
@@ -173,12 +193,18 @@ impl<'a> OverlayGASPStorage<'a> {
                 .collect();
 
             for (input_idx, child_key) in child_info {
-                let (child_tx, _) = Self::get_beef_for_node(&child_key, refs)?;
+                let (child_tx, _) = Self::get_beef_for_node(&child_key, refs, strict_beef)?;
                 tx.inputs[input_idx].source_transaction = Some(Box::new(child_tx));
             }
         }
 
-        let beef = tx.to_beef(true).map_err(|e| {
+        // `allow_partial`: in tolerant mode (default, byte-identical to today)
+        // we pass `true` so missing-ancestor inputs are dropped silently. When
+        // strict mode is enabled (only alongside ancestor hydration), pass
+        // `false` so a still-missing ancestor fails loud and the graph is
+        // discarded + retried rather than stored as a partial BEEF.
+        let allow_partial = !strict_beef;
+        let beef = tx.to_beef(allow_partial).map_err(|e| {
             GASPError::Other(format!("Failed to serialize BEEF for {node_key}: {e}"))
         })?;
 
@@ -192,6 +218,7 @@ impl<'a> OverlayGASPStorage<'a> {
     fn compute_ordered_beefs(
         graph_id: &str,
         refs: &HashMap<String, PendingNode>,
+        strict_beef: bool,
     ) -> Result<Vec<Vec<u8>>, GASPError> {
         let mut beefs: Vec<Vec<u8>> = Vec::new();
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -201,6 +228,7 @@ impl<'a> OverlayGASPStorage<'a> {
             refs: &HashMap<String, PendingNode>,
             beefs: &mut Vec<Vec<u8>>,
             visited: &mut std::collections::HashSet<String>,
+            strict_beef: bool,
         ) -> Result<(), GASPError> {
             if visited.contains(node_key) {
                 return Ok(());
@@ -213,16 +241,16 @@ impl<'a> OverlayGASPStorage<'a> {
 
             // First, recurse into children (they go before us in order)
             for child_key in &pending.children {
-                hydrate(child_key, refs, beefs, visited)?;
+                hydrate(child_key, refs, beefs, visited, strict_beef)?;
             }
 
             // Then add our own BEEF
-            let (_, beef) = OverlayGASPStorage::get_beef_for_node(node_key, refs)?;
+            let (_, beef) = OverlayGASPStorage::get_beef_for_node(node_key, refs, strict_beef)?;
             beefs.push(beef);
             Ok(())
         }
 
-        hydrate(graph_id, refs, &mut beefs, &mut visited)?;
+        hydrate(graph_id, refs, &mut beefs, &mut visited, strict_beef)?;
         Ok(beefs)
     }
 }
@@ -511,7 +539,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         debug!("Finalizing graph {graph_id} ({node_count} nodes). Computing ordered BEEFs.");
 
         // Compute ordered BEEFs for the graph.
-        let beefs = Self::compute_ordered_beefs(graph_id, &refs)?;
+        let beefs = Self::compute_ordered_beefs(graph_id, &refs, self.strict_beef)?;
 
         // Push to shared sink for later Engine submission.
         drop(refs);
