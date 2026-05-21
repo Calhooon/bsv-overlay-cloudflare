@@ -143,12 +143,31 @@ pub trait GASPRemoteFactory {
 /// in this engine crate (no `reqwest`/`std::time` — must stay wasm-clean).
 #[async_trait(?Send)]
 pub trait AncestorFetcher {
-    /// Fetch a raw transaction (hex) by txid from chain.
+    /// Fetch an ancestor transaction by txid from chain.
+    ///
+    /// Returns the raw tx hex plus, when the ancestor is mined, its BUMP merkle
+    /// proof hex. Supplying the proof is important: a synthesized node WITH a
+    /// proof terminates the ingest recursion (it is a mined SPV leaf —
+    /// `find_needed_inputs` returns `None`), so the graph walk stops at the
+    /// first proven layer instead of recursing through every input (including
+    /// funding/fee inputs) back toward coinbase. Omitting it would make a deep
+    /// chain's graph effectively unbounded.
     ///
     /// The implementation MUST verify that the returned bytes hash to the
     /// requested `txid` before returning them (integrity check) so a
     /// malicious/garbled response cannot inject a forged ancestor.
-    async fn fetch_raw_tx(&self, txid: &str) -> Result<String, GASPError>;
+    async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError>;
+}
+
+/// An ancestor transaction fetched from chain: its raw tx hex plus an optional
+/// BUMP merkle proof hex (present when the tx is mined).
+#[derive(Debug, Clone)]
+pub struct FetchedAncestor {
+    /// Raw transaction hex.
+    pub raw_tx: String,
+    /// BUMP merkle proof hex, if the ancestor is mined. When `Some`, the
+    /// synthesized node is a proven SPV leaf and the recursion terminates.
+    pub proof: Option<String>,
 }
 
 // ============================================================================
@@ -375,19 +394,21 @@ impl<'a> GASPSync<'a> {
                             // user_registry chain → ~90 round-trips), enough to
                             // exhaust a worker invocation before the graph finalizes.
                             //
-                            // The synthesized node carries no proof: it is a
-                            // non-leaf ancestor; the descendant tip's BUMP roots the
-                            // subtree (BRC-62), so only the rawtx is required for
-                            // input-script/value resolution. find_needed_inputs on
-                            // this node recurses to ITS parents until the chain is
-                            // self-contained (all inputs locally-known or coinbase).
+                            // The fetcher returns the ancestor's rawtx and, when it
+                            // is mined, its BUMP proof. A proven node is an SPV leaf
+                            // — find_needed_inputs returns None for it — so the walk
+                            // TERMINATES at the first proven layer instead of
+                            // recursing through every input (incl. funding/fee
+                            // inputs) toward coinbase, keeping the graph bounded. If
+                            // proof is None (unmined ancestor), the recursion
+                            // continues to ITS parents as before.
                             Some(fetcher) => {
-                                let raw_hex = fetcher.fetch_raw_tx(&txid).await?;
+                                let fetched = fetcher.fetch_ancestor(&txid).await?;
                                 GASPNode {
                                     graph_id: node.graph_id.clone(),
-                                    raw_tx: raw_hex,
+                                    raw_tx: fetched.raw_tx,
                                     output_index: oi,
-                                    proof: None,
+                                    proof: fetched.proof,
                                     tx_metadata: None,
                                     output_metadata: None,
                                     inputs: None,
@@ -961,17 +982,21 @@ mod tests {
         }
     }
 
-    /// Mock fetcher that returns a pre-built ancestor rawtx.
+    /// Mock fetcher that returns a pre-built ancestor rawtx (+ optional proof).
     struct MockFetcher {
         ancestor_hex: String,
+        proof: Option<String>,
         called: Mutex<u32>,
     }
 
     #[async_trait(?Send)]
     impl AncestorFetcher for MockFetcher {
-        async fn fetch_raw_tx(&self, _txid: &str) -> Result<String, GASPError> {
+        async fn fetch_ancestor(&self, _txid: &str) -> Result<FetchedAncestor, GASPError> {
             *self.called.lock().unwrap() += 1;
-            Ok(self.ancestor_hex.clone())
+            Ok(FetchedAncestor {
+                raw_tx: self.ancestor_hex.clone(),
+                proof: self.proof.clone(),
+            })
         }
     }
 
@@ -1080,6 +1105,7 @@ mod tests {
 
         let fetcher = std::rc::Rc::new(MockFetcher {
             ancestor_hex: ancestor_hex.clone(),
+            proof: None,
             called: Mutex::new(0),
         });
 
@@ -1147,6 +1173,7 @@ mod tests {
         };
         let fetcher = std::rc::Rc::new(MockFetcher {
             ancestor_hex: ancestor_hex.clone(),
+            proof: None,
             called: Mutex::new(0),
         });
 
