@@ -377,6 +377,33 @@ impl<'a> GASPSync<'a> {
             }
             seen.insert(node_id);
 
+            // GOD-TIER proof-anchoring (#126): if the peer served this node WITHOUT
+            // a merkle proof but the tx is mined, hydrate its OWN proof via the
+            // ancestor fetcher (WoC `/beef`). A proven node is a self-anchored SPV
+            // leaf — `find_needed_inputs` returns None for it — so we NEVER walk into
+            // the spent prior contract-state (a 2-tx-pattern template, or a covenant's
+            // previous UTXO). Without this, the walk reaches a spent input whose output
+            // record exists in storage (so `find_needed_inputs` strips it) but whose tx
+            // is absent from the in-memory graph → `get_beef_for_node` fails "Missing
+            // source transaction" and the whole graph is discarded. Legacy beta's
+            // GASP-serve omits proofs, so this is required cross-stack. No-op when no
+            // fetcher is configured (production default unchanged) or the node already
+            // carries a proof (children fetched via the walk already do).
+            // Only the GRAPH ROOT arrives from the peer (spent_by == None); children
+            // come from the ancestry walk already carrying their proofs, so gate on
+            // the root to avoid redundant re-fetches.
+            let mut node_owned = node.clone();
+            if spent_by.is_none() && node_owned.proof.is_none() {
+                if let Some(fetcher) = &self.ancestor_fetcher {
+                    if let Ok(fetched) = fetcher.fetch_ancestor(&node_txid).await {
+                        if fetched.proof.is_some() {
+                            node_owned.proof = fetched.proof;
+                        }
+                    }
+                }
+            }
+            let node = &node_owned;
+
             self.storage.append_to_graph(node, spent_by).await?;
 
             if let Some(needed) = self.storage.find_needed_inputs(node).await? {
@@ -1135,8 +1162,10 @@ mod tests {
 
         assert_eq!(
             *fetcher.called.lock().unwrap(),
-            1,
-            "fetcher should fire once"
+            2,
+            "fetcher fires twice: once to hydrate the root's OWN proof (mock returns \
+             proof:None here, so the root stays proofless + the walk continues), then \
+             once to self-heal the missing ancestor (#126 root proof-anchoring)"
         );
 
         // The synthesized ancestor node must have been appended to the graph,
@@ -1202,8 +1231,9 @@ mod tests {
         );
         assert_eq!(
             *fetcher.called.lock().unwrap(),
-            1,
-            "fetcher should serve the ancestor directly"
+            2,
+            "fetcher fires twice: root's OWN proof hydration (#126) + serving the \
+             ancestor directly (peer request_node still skipped)"
         );
     }
 
