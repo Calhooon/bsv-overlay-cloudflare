@@ -3395,9 +3395,15 @@ mod tests {
             .get_last_interaction("https://peer1.example.com", "tm_test")
             .await
             .unwrap();
+        // The mock remote serves synthetic `rawtx_*` nodes that cannot assemble
+        // into a real BEEF, so both graphs fail to INGEST (a transient-class
+        // error). The cursor is therefore capped at 99 — strictly below the
+        // lowest un-ingested score (remote_tx1@100) — so the next sync re-pulls
+        // them rather than skipping past. (Pre-#43 this advanced to 200, the
+        // highest *seen* score, silently stranding both graphs.)
         assert_eq!(
-            last, 200,
-            "last_interaction should be updated to highest score"
+            last, 99,
+            "cursor must cap below the lowest un-ingested score, not skip to the seen tip"
         );
     }
 
@@ -3551,8 +3557,11 @@ mod tests {
             .get_last_interaction("https://peer2.example.com", "tm_test")
             .await
             .unwrap();
-        assert_eq!(last1, 200);
-        assert_eq!(last2, 200);
+        // Capped at 99 (below the lowest un-ingested score@100), not 200 — the
+        // synthetic mock graphs fail to ingest, so the cursor must not skip past
+        // them. See `test_start_gasp_sync_with_factory_runs_sync` (#43 gap-guard).
+        assert_eq!(last1, 99);
+        assert_eq!(last2, 99);
     }
 
     // ── Mock ARC Broadcaster ─────────────────────────────────────────

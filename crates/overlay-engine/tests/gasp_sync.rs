@@ -387,9 +387,104 @@ async fn mixed_success_and_failure() {
     let local = TrackingGASPStorage::new(vec![]);
     let mut gasp = GASPSync::new(Box::new(local), Box::new(MixedRemote), 0, "[TEST]", true);
 
-    // Should succeed — bad UTXO is skipped, good ones sync
+    // Should succeed — bad UTXO is skipped, good ones sync.
     gasp.sync(None).await.unwrap();
-    assert_eq!(gasp.last_interaction, 300);
+    // The cursor is CAPPED at 199 — strictly below the failed `bad`@200 — so the
+    // next sync (`since=199`) re-pulls `bad`. Were it left at 300 (the highest
+    // SEEN score), `bad` would be permanently stranded: the peer serves
+    // `score >= since`, so `bad`@200 < 300 would never be re-served. Proven by
+    // the zanaadu `parity-harness` GASP chaos suite (#43).
+    assert_eq!(gasp.last_interaction, 199);
+}
+
+// ============================================================================
+// #43 (chaos): a transient ingest failure must not skip the cursor past the
+// failed output — the next sync must re-pull it.
+// ============================================================================
+
+#[tokio::test]
+async fn transient_failure_caps_cursor_and_recovers() {
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Fails `request_node` for `tx2` only while `heal` is false. The flag is
+    // shared so a fresh remote can be built per tick (GASPSync consumes it).
+    struct FlakyRemote {
+        heal: Rc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl GASPRemote for FlakyRemote {
+        async fn get_initial_response(
+            &self,
+            request: &GASPInitialRequest,
+        ) -> Result<GASPInitialResponse, GASPError> {
+            let utxos = [utxo("tx1", 0, 10.0), utxo("tx2", 0, 20.0), utxo("tx3", 0, 30.0)]
+                .into_iter()
+                .filter(|u| u.score as u64 >= request.since)
+                .collect();
+            Ok(GASPInitialResponse {
+                utxo_list: utxos,
+                since: request.since,
+            })
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &GASPInitialResponse,
+        ) -> Result<GASPInitialReply, GASPError> {
+            Ok(GASPInitialReply { utxo_list: Vec::new() })
+        }
+        async fn request_node(
+            &self,
+            graph_id: &str,
+            txid: &str,
+            oi: u32,
+            _: bool,
+        ) -> Result<GASPNode, GASPError> {
+            if txid == "tx2" && !self.heal.load(Ordering::SeqCst) {
+                return Err(GASPError::NodeNotFound("transient".into()));
+            }
+            Ok(GASPNode {
+                graph_id: graph_id.to_string(),
+                raw_tx: format!("rawtx_{txid}"),
+                output_index: oi,
+                proof: None,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            })
+        }
+        async fn submit_node(&self, _: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+            Ok(None)
+        }
+    }
+
+    let heal = Rc::new(AtomicBool::new(false));
+
+    // Tick 1 — tx2 blips. Cursor must be capped strictly below tx2@20.
+    let mut cursor = {
+        let local = TrackingGASPStorage::new(vec![]);
+        let remote = FlakyRemote { heal: heal.clone() };
+        let mut gasp = GASPSync::new(Box::new(local), Box::new(remote), 0, "[TEST]", true);
+        gasp.sync(None).await.unwrap();
+        assert!(
+            gasp.last_interaction < 20,
+            "cursor advanced to {} past the failed tx2@20 — tx2 would be stranded",
+            gasp.last_interaction
+        );
+        gasp.last_interaction
+    };
+
+    // Tick 2 — heal. since=cursor(<20) re-serves tx2; it must finalize now.
+    heal.store(true, Ordering::SeqCst);
+    {
+        let local = TrackingGASPStorage::new(vec![]);
+        let remote = FlakyRemote { heal: heal.clone() };
+        let mut gasp = GASPSync::new(Box::new(local), Box::new(remote), cursor, "[TEST]", true);
+        gasp.sync(None).await.unwrap();
+        cursor = gasp.last_interaction;
+    }
+    assert_eq!(cursor, 30, "after heal the cursor reaches the tip");
 }
 
 // ============================================================================

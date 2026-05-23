@@ -253,6 +253,20 @@ impl<'a> GASPSync<'a> {
         let mut shared_outpoints: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
+        // The cursor we entered with. The persisted cursor must never regress
+        // below it (a failed RE-ingest of an already-synced range is not a new
+        // gap), and the gap-guard below is floored at it.
+        let initial_interaction = self.last_interaction;
+        // Lowest score of any UTXO whose graph ingest FAILED this run. The
+        // in-loop `last_interaction` advance below is by max-seen-score so
+        // pagination terminates, but a transient ingest failure must NOT let the
+        // PERSISTED cursor skip past that output — else the peer never re-serves
+        // it (next `since` excludes scores below the cursor) and it is stranded
+        // forever. After the loop we cap the cursor strictly below this score so
+        // the next sync re-requests the failed graph. (Without this, a single
+        // blipped graph fetch silently drops that UTXO from continuous sync.)
+        let mut min_failed_score: Option<u64> = None;
+
         // Paginated pull from remote
         loop {
             let request = GASPInitialRequest {
@@ -289,6 +303,11 @@ impl<'a> GASPSync<'a> {
                                 "{} Error ingesting UTXO {}: {}",
                                 self.log_prefix, outpoint, e
                             );
+                            // Remember the lowest failed score so the persisted
+                            // cursor cannot skip past it (see cap below).
+                            let s = utxo.score as u64;
+                            min_failed_score =
+                                Some(min_failed_score.map_or(s, |cur| cur.min(s)));
                         }
                     }
                 }
@@ -297,6 +316,22 @@ impl<'a> GASPSync<'a> {
             // Continue pagination if we got a full page
             if limit.is_none() || (page_size as u64) < limit.unwrap_or(u64::MAX) {
                 break;
+            }
+        }
+
+        // Gap-guard: if any graph ingest failed transiently, cap the cursor
+        // strictly below the lowest failed score so the next sync re-pulls it
+        // (the remote serves `score >= since`). Floored at `initial_interaction`
+        // so the cursor never regresses — a failure within the already-synced
+        // range is not a new gap and must not rewind the cursor.
+        if let Some(failed) = min_failed_score {
+            let cap = failed.saturating_sub(1).max(initial_interaction);
+            if self.last_interaction > cap {
+                warn!(
+                    "{} Capping cursor {} -> {} (transient ingest failure at score {}); next sync will re-pull",
+                    self.log_prefix, self.last_interaction, cap, failed
+                );
+                self.last_interaction = cap;
             }
         }
 

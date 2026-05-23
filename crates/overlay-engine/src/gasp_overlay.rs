@@ -1115,7 +1115,10 @@ mod tests {
         );
 
         sync.sync(None).await.unwrap();
-        assert_eq!(sync.last_interaction, 200);
+        // Capped below the lowest un-ingested score (the synthetic test graph
+        // cannot assemble a BEEF, so ingest fails transiently) rather than
+        // skipping to the seen tip@200. See the #43 gap-guard in `gasp.rs::sync`.
+        assert_eq!(sync.last_interaction, 99);
     }
 
     /// Integration test: full sync with valid transactions produces submittable BEEFs.
