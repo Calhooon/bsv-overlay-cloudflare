@@ -1652,11 +1652,18 @@ impl Engine {
                                 );
                             }
 
-                            // Only advance the persisted cursor if we actually ingested
-                            // (and it moved forward). Prevents poisoning the cursor on an
-                            // empty/failed bootstrap so the next cron can re-pull from the
-                            // same `since`. Mirrors TS `if (gasp.lastInteraction > lastInteraction)`.
-                            if any_submitted && sync.last_interaction > last_interaction {
+                            // Advance the persisted cursor when it moved forward — i.e.
+                            // the peer reported UTXOs at a higher score than our last
+                            // `since` (the in-memory cursor only grows on SEEN scores,
+                            // so `>` already excludes the empty-bootstrap case where no
+                            // UTXOs were seen). Mirrors TS `if (gasp.lastInteraction >
+                            // lastInteraction)` — NOT gated on a new submission: a sync
+                            // that re-sees already-known UTXOs must still advance, else
+                            // every cron re-scans the same range forever (the cursor
+                            // stayed pinned at 0 in prod). `any_submitted` is kept only
+                            // for the completion log below.
+                            let _ = any_submitted;
+                            if sync.last_interaction > last_interaction {
                                 if let Err(e) = self
                                     .storage
                                     .update_last_interaction(peer_url, topic, sync.last_interaction)

@@ -395,9 +395,9 @@ impl<'a> GASPSync<'a> {
             let mut node_owned = node.clone();
             if spent_by.is_none() && node_owned.proof.is_none() {
                 if let Some(fetcher) = &self.ancestor_fetcher {
-                    if let Ok(fetched) = fetcher.fetch_ancestor(&node_txid).await {
-                        if fetched.proof.is_some() {
-                            node_owned.proof = fetched.proof;
+                    if let Ok(root_fetch) = fetcher.fetch_ancestor(&node_txid).await {
+                        if root_fetch.proof.is_some() {
+                            node_owned.proof = root_fetch.proof;
                         }
                     }
                 }
