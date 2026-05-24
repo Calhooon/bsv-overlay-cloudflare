@@ -10,6 +10,18 @@ use async_trait::async_trait;
 
 use crate::types::{AppliedTransaction, Outpoint, Output};
 
+/// A stored transaction's txid plus its serialized BEEF bytes.
+///
+/// Returned by [`Storage::find_transactions_for_proof_check`] so the engine can
+/// parse the BEEF and decide whether the target tx still needs a merkle proof.
+#[derive(Debug, Clone)]
+pub struct TransactionBeef {
+    /// The transaction id (hex, lowercase).
+    pub txid: String,
+    /// The serialized BEEF bytes for this transaction.
+    pub beef: Vec<u8>,
+}
+
 /// Overlay Services storage backend.
 ///
 /// All methods are async. Uses `?Send` futures for wasm32 compatibility
@@ -137,6 +149,27 @@ pub trait Storage {
         limit: Option<u64>,
         include_beef: bool,
     ) -> Result<Vec<Output>, StorageError>;
+
+    /// Return a bounded page of stored transactions (txid + BEEF bytes) for
+    /// proof-completion scanning.
+    ///
+    /// The engine's [`Engine::complete_missing_proofs`](crate::Engine::complete_missing_proofs)
+    /// parses each returned BEEF and keeps only those whose target tx still
+    /// lacks a merkle proof, so this method does NOT need to filter — it just
+    /// hands back a budget-bounded slice of the `transactions` table. Backends
+    /// that cannot enumerate transactions (or have nothing to complete) may
+    /// return an empty `Vec` via this default, in which case proof completion
+    /// is a no-op.
+    ///
+    /// `limit` bounds the returned page (and therefore the per-tick WoC fetch /
+    /// CPU budget). Ordering is backend-defined.
+    async fn find_transactions_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<TransactionBeef>, StorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
 
     // ========================================================================
     // GASP sync state
@@ -461,6 +494,22 @@ pub mod memory {
                 results.truncate(limit as usize);
             }
 
+            Ok(results)
+        }
+
+        async fn find_transactions_for_proof_check(
+            &self,
+            limit: u64,
+        ) -> Result<Vec<TransactionBeef>, StorageError> {
+            let transactions = self.transactions.lock().unwrap();
+            let results = transactions
+                .iter()
+                .take(limit as usize)
+                .map(|(txid, beef)| TransactionBeef {
+                    txid: txid.clone(),
+                    beef: beef.clone(),
+                })
+                .collect();
             Ok(results)
         }
 

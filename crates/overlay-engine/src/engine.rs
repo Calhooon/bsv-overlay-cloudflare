@@ -75,6 +75,28 @@ pub struct Engine {
     config: EngineConfig,
 }
 
+/// Summary of an [`Engine::complete_missing_proofs`] pass.
+///
+/// All counts are over the single bounded page scanned this tick. A no-fetcher
+/// (production) build returns the all-zero default.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProofCompletionSummary {
+    /// Stored transactions inspected this tick (the bounded page size).
+    pub scanned: usize,
+    /// Of `scanned`, how many still lacked a merkle proof for their own tx.
+    pub proofless: usize,
+    /// Proofless txs whose BUMP was fetched + stitched into the stored BEEF.
+    pub completed: usize,
+    /// Proofless txs the fetcher could serve but that are not yet mined
+    /// (no BUMP yet) — retried on a later tick.
+    pub still_unconfirmed: usize,
+    /// Proofless txs the fetcher errored on (e.g. budget exhausted, 429) —
+    /// retried on a later tick.
+    pub fetch_failed: usize,
+    /// Proofless txs whose proof came back but failed to stitch into storage.
+    pub stitch_failed: usize,
+}
+
 /// Internal result from Phase 1 + 2 validation.
 ///
 /// Carries per-topic admittance decisions, previous coins, and the parsed
@@ -1243,6 +1265,117 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    /// Complete missing merkle proofs for stored, confirmed transactions.
+    ///
+    /// The `/submit`-admitted ingest path stores a proofless BEEF for each
+    /// transaction (the submitter does not yet have a merkle proof at submit
+    /// time). When such a transaction later mines, nothing in the overlay
+    /// re-fetches its proof, so its stored BEEF stays proofless forever — and a
+    /// frontend that trims `inputBEEF` to `{source tx + its BUMP}` for a P2PKH
+    /// payment-import spend has no BUMP to trim to, hanging the import (#130).
+    ///
+    /// This pass closes that gap from chain (the one blessed server-side WoC
+    /// use). It:
+    /// 1. Pulls a bounded page (`limit`) of stored `(txid, beef)` from storage.
+    /// 2. Parses each BEEF and keeps only those whose target tx still lacks a
+    ///    merkle proof (`Beef::find_txid(txid).has_proof() == false`).
+    /// 3. For each proofless candidate, fetches its BUMP via the configured
+    ///    [`AncestorFetcher`](crate::gasp::AncestorFetcher). If a proof comes
+    ///    back, it calls [`Self::handle_new_merkle_proof`], which stitches the
+    ///    BUMP into the stored BEEF (D1 + R2 mirror), updates output block
+    ///    height, and recurses the `consumedBy` chain.
+    /// 4. Skips (does NOT error) txs the fetcher can't prove yet (still
+    ///    unconfirmed) — those are simply retried on a later tick.
+    ///
+    /// **No-op when no [`AncestorFetcher`] is configured** — production-safe
+    /// default (the same opt-in switch as GASP ancestor hydration). Bounded by
+    /// `limit` (a per-tick budget, like the platform fetcher's own budget).
+    pub async fn complete_missing_proofs(
+        &self,
+        limit: u64,
+    ) -> Result<ProofCompletionSummary, EngineError> {
+        let mut summary = ProofCompletionSummary::default();
+
+        // Production-safe: with no fetcher there is no chain source to complete
+        // from, so this is a pure no-op (matches GASP-hydration opt-in).
+        let Some(fetcher) = self.ancestor_fetcher.clone() else {
+            return Ok(summary);
+        };
+
+        let candidates = self
+            .storage
+            .find_transactions_for_proof_check(limit)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
+        summary.scanned = candidates.len();
+
+        for cand in candidates {
+            // Parse the stored BEEF; skip anything unparseable (don't error the
+            // whole pass on one bad row).
+            let beef = match bsv_rs::transaction::Beef::from_binary(&cand.beef) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] unparseable BEEF, skipping");
+                    continue;
+                },
+            };
+
+            // Already proven? Nothing to do.
+            if beef
+                .find_txid(&cand.txid)
+                .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
+            {
+                continue;
+            }
+            summary.proofless += 1;
+
+            // Fetch this tx's own BUMP from chain. A tx with no proof yet (still
+            // unconfirmed) is skipped, not errored.
+            let chain_anc = match fetcher.fetch_ancestor(&cand.txid).await {
+                Ok(f) => f,
+                Err(e) => {
+                    info!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] fetch failed, will retry next tick");
+                    summary.fetch_failed += 1;
+                    continue;
+                },
+            };
+
+            let Some(proof_hex) = chain_anc.proof else {
+                // No BUMP yet — the tx is fetchable but unmined. Retry later.
+                summary.still_unconfirmed += 1;
+                continue;
+            };
+
+            // Pull the block height out of the BUMP so the output rows update too.
+            let block_height = bsv_rs::transaction::MerklePath::from_hex(&proof_hex)
+                .ok()
+                .map(|mp| mp.block_height);
+
+            match self
+                .handle_new_merkle_proof(&cand.txid, &proof_hex, block_height)
+                .await
+            {
+                Ok(()) => summary.completed += 1,
+                Err(e) => {
+                    warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] stitch failed");
+                    summary.stitch_failed += 1;
+                },
+            }
+        }
+
+        info!(
+            scanned = summary.scanned,
+            proofless = summary.proofless,
+            completed = summary.completed,
+            still_unconfirmed = summary.still_unconfirmed,
+            fetch_failed = summary.fetch_failed,
+            stitch_failed = summary.stitch_failed,
+            "[PROOF COMPLETION] pass complete"
+        );
+
+        Ok(summary)
     }
 
     /// Recursively update merkle paths in a transaction's input tree.
@@ -3848,5 +3981,206 @@ mod tests {
             ads.iter().any(|a| a.topic_or_service_name == "tm_test"),
             "tm_test should get a SHIP advertisement"
         );
+    }
+
+    // ── complete_missing_proofs (#130) ─────────────────────────────────
+
+    use crate::gasp::{AncestorFetcher, FetchedAncestor, GASPError};
+    use std::cell::Cell;
+
+    /// A single raw mainnet tx (no proof) — used to build a proofless BEEF.
+    const PROOFLESS_RAW_TX: &str = "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000";
+
+    /// Build a proofless single-tx BEEF + return `(beef_bytes, txid)`.
+    fn proofless_beef() -> (Vec<u8>, String) {
+        use bsv_rs::transaction::{Beef, Transaction};
+        let tx = Transaction::from_hex(PROOFLESS_RAW_TX).unwrap();
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    /// A minimal valid single-leaf BUMP hex proving `txid` at `height`.
+    fn single_leaf_bump_hex(txid: &str, height: u32) -> String {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
+        let leaf = MerklePathLeaf::new_txid(0, txid.to_string());
+        MerklePath::new_unchecked(height, vec![vec![leaf]])
+            .unwrap()
+            .to_hex()
+    }
+
+    /// Mock fetcher: returns a configured proof (or none) for any txid, and
+    /// counts how many times it was asked.
+    struct StubFetcher {
+        proof: Option<String>,
+        calls: Cell<u32>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for StubFetcher {
+        async fn fetch_ancestor(&self, _txid: &str) -> Result<FetchedAncestor, GASPError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(FetchedAncestor {
+                raw_tx: PROOFLESS_RAW_TX.to_string(),
+                proof: self.proof.clone(),
+            })
+        }
+    }
+
+    /// Build an engine over a storage holding one proofless output, with an
+    /// optional ancestor fetcher.
+    async fn engine_with_proofless_output(
+        fetcher: Option<std::rc::Rc<StubFetcher>>,
+    ) -> (Engine, String) {
+        let (beef, txid) = proofless_beef();
+        let storage = MemoryStorage::new();
+        storage
+            .insert_output(&Output {
+                txid: txid.clone(),
+                output_index: 0,
+                output_script: vec![0x76],
+                satoshis: 1_000_000_000,
+                topic: "Hello".to_string(),
+                spent: false,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: Some(beef),
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+
+        let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
+        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        let mut engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(storage),
+            None,
+            EngineConfig::default(),
+        );
+        if let Some(f) = fetcher {
+            engine.set_ancestor_fetcher(f);
+        }
+        (engine, txid)
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_noop_without_fetcher() {
+        // No ancestor fetcher configured → pure no-op (production default).
+        let (engine, _txid) = engine_with_proofless_output(None).await;
+        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        assert_eq!(summary, ProofCompletionSummary::default());
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_stitches_when_fetcher_returns_proof() {
+        let (_beef, txid) = proofless_beef();
+        let proof_hex = single_leaf_bump_hex(&txid, 850_000);
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: Some(proof_hex),
+            calls: Cell::new(0),
+        });
+        let (engine, txid) = engine_with_proofless_output(Some(fetcher.clone())).await;
+
+        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.proofless, 1);
+        assert_eq!(summary.completed, 1, "the proofless BEEF should be completed");
+        assert_eq!(fetcher.calls.get(), 1);
+
+        // The stored BEEF now carries a proof for the target tx + the output
+        // got its block height.
+        let out = engine
+            .storage()
+            .find_output(&txid, 0, Some("Hello"), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.block_height, Some(850_000));
+        let beef = bsv_rs::transaction::Beef::from_binary(out.beef.as_ref().unwrap()).unwrap();
+        assert!(
+            beef.find_txid(&txid).is_some_and(bsv_rs::transaction::BeefTx::has_proof),
+            "completed BEEF must prove the target tx"
+        );
+
+        // A second pass is a no-op: the tx is now proven, so it is not counted
+        // proofless and the fetcher is not asked again.
+        let summary2 = engine.complete_missing_proofs(50).await.unwrap();
+        assert_eq!(summary2.proofless, 0);
+        assert_eq!(summary2.completed, 0);
+        assert_eq!(fetcher.calls.get(), 1, "no re-fetch once proven");
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_skips_unconfirmed() {
+        // Fetcher reachable but the tx is unmined (no BUMP) → skipped, not
+        // errored, and counted still_unconfirmed for retry.
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: None,
+            calls: Cell::new(0),
+        });
+        let (engine, _txid) = engine_with_proofless_output(Some(fetcher.clone())).await;
+        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        assert_eq!(summary.proofless, 1);
+        assert_eq!(summary.completed, 0);
+        assert_eq!(summary.still_unconfirmed, 1);
+        assert_eq!(fetcher.calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_respects_limit() {
+        // Two proofless txs, limit 1 → only one row is scanned this tick.
+        let (beef1, txid1) = proofless_beef();
+        // A second distinct proofless tx (different raw tx → different txid).
+        let raw2 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2803dc7e0e0499170e6a0003cf341b017e0000152f476f72696c6c61506f6f6c2e696f20f09fa68d2f0000000003000000000000000032006a0547504f4f4c08dc7e0e0000000000200158a2360a03939451e72c3a9302f5d48712bf54a5b2edf8f3c69aed35a668e312236000000000001976a914068a58835bb93b152c901ffb18f6578824f9d5b788ac6eb66612000000001976a91402fd5a91155231d5799e2d22c490d1664cde62cb88ac00000000";
+        let (beef2, txid2) = {
+            use bsv_rs::transaction::{Beef, Transaction};
+            let tx = Transaction::from_hex(raw2).unwrap();
+            let id = tx.id();
+            let mut b = Beef::new();
+            b.merge_transaction(tx);
+            (b.to_binary(), id)
+        };
+
+        let storage = MemoryStorage::new();
+        for (txid, beef) in [(&txid1, beef1), (&txid2, beef2)] {
+            storage
+                .insert_output(&Output {
+                    txid: txid.clone(),
+                    output_index: 0,
+                    output_script: vec![0x76],
+                    satoshis: 1000,
+                    topic: "Hello".to_string(),
+                    spent: false,
+                    outputs_consumed: vec![],
+                    consumed_by: vec![],
+                    beef: Some(beef),
+                    block_height: None,
+                    score: Some(1.0),
+                })
+                .await
+                .unwrap();
+        }
+
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: None,
+            calls: Cell::new(0),
+        });
+        let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
+        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        let mut engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(storage),
+            None,
+            EngineConfig::default(),
+        );
+        engine.set_ancestor_fetcher(fetcher.clone());
+
+        let summary = engine.complete_missing_proofs(1).await.unwrap();
+        assert_eq!(summary.scanned, 1, "limit 1 → only one row scanned");
     }
 }
