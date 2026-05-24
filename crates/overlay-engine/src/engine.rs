@@ -4183,4 +4183,114 @@ mod tests {
         let summary = engine.complete_missing_proofs(1).await.unwrap();
         assert_eq!(summary.scanned, 1, "limit 1 → only one row scanned");
     }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_reaches_old_proofless_tx_behind_proven_rows() {
+        // Regression for the cursor/`ORDER BY rowid DESC` reach bug: a
+        // proofless tx that is NOT among the newest rows must still be
+        // found + completed. We seed several ALREADY-PROVEN txs plus one
+        // historical proofless tx, then run with a small limit. Storage
+        // filters proven rows out (real D1: `WHERE has_proof = 0`), so the
+        // proofless tx is reachable regardless of how many proven txs exist.
+        use bsv_rs::transaction::{Beef, Transaction};
+
+        let storage = MemoryStorage::new();
+
+        // Insert several proven txs (the "newest N" that used to crowd out
+        // the backlog). Each gets its own single-leaf BUMP stitched in.
+        let proven_raws = [
+            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2803dc7e0e0499170e6a0003cf341b017e0000152f476f72696c6c61506f6f6c2e696f20f09fa68d2f0000000003000000000000000032006a0547504f4f4c08dc7e0e0000000000200158a2360a03939451e72c3a9302f5d48712bf54a5b2edf8f3c69aed35a668e312236000000000001976a914068a58835bb93b152c901ffb18f6578824f9d5b788ac6eb66612000000001976a91402fd5a91155231d5799e2d22c490d1664cde62cb88ac00000000",
+        ];
+        for raw in proven_raws {
+            let mut tx = Transaction::from_hex(raw).unwrap();
+            let id = tx.id();
+            let bump = bsv_rs::transaction::MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap();
+            tx.merkle_path = Some(bump);
+            // to_beef(true) carries the merkle proof into the BEEF so the row
+            // is genuinely proven (has_proof == true) and gets filtered out of
+            // the proof-check candidate set.
+            let proven_beef = tx.to_beef(true).unwrap();
+            // Sanity: the row really is proven, so storage filters it out.
+            assert_eq!(
+                Beef::from_binary(&proven_beef)
+                    .unwrap()
+                    .find_txid(&id)
+                    .map(bsv_rs::transaction::BeefTx::has_proof),
+                Some(true),
+                "proven fixture row must carry its proof"
+            );
+            storage
+                .insert_output(&Output {
+                    txid: id.clone(),
+                    output_index: 0,
+                    output_script: vec![0x76],
+                    satoshis: 1000,
+                    topic: "Hello".to_string(),
+                    spent: false,
+                    outputs_consumed: vec![],
+                    consumed_by: vec![],
+                    beef: Some(proven_beef),
+                    block_height: Some(800_000),
+                    score: Some(1.0),
+                })
+                .await
+                .unwrap();
+        }
+
+        // The historical proofless tx (the f584f846-style backlog row).
+        let (proofless, proofless_txid) = proofless_beef();
+        storage
+            .insert_output(&Output {
+                txid: proofless_txid.clone(),
+                output_index: 0,
+                output_script: vec![0x76],
+                satoshis: 1000,
+                topic: "Hello".to_string(),
+                spent: false,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: Some(proofless),
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+
+        let proof_hex = single_leaf_bump_hex(&proofless_txid, 850_000);
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: Some(proof_hex),
+            calls: Cell::new(0),
+        });
+        let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
+        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        let mut engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(storage),
+            None,
+            EngineConfig::default(),
+        );
+        engine.set_ancestor_fetcher(fetcher.clone());
+
+        // Even with a limit of 1, the proven rows are filtered out by storage
+        // so the one proofless tx is the only candidate — found + completed.
+        let summary = engine.complete_missing_proofs(1).await.unwrap();
+        assert_eq!(summary.scanned, 1, "only the proofless tx is a candidate");
+        assert_eq!(summary.proofless, 1);
+        assert_eq!(summary.completed, 1, "the historical proofless tx is completed");
+
+        let out = engine
+            .storage()
+            .find_output(&proofless_txid, 0, Some("Hello"), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let beef = bsv_rs::transaction::Beef::from_binary(out.beef.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            beef.find_txid(&proofless_txid)
+                .map(bsv_rs::transaction::BeefTx::has_proof),
+            Some(true),
+            "the old proofless tx now carries its proof"
+        );
+    }
 }

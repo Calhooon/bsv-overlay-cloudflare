@@ -150,19 +150,26 @@ pub trait Storage {
         include_beef: bool,
     ) -> Result<Vec<Output>, StorageError>;
 
-    /// Return a bounded page of stored transactions (txid + BEEF bytes) for
-    /// proof-completion scanning.
+    /// Return a bounded page of *proofless* stored transactions (txid + BEEF
+    /// bytes) for proof-completion scanning.
     ///
-    /// The engine's [`Engine::complete_missing_proofs`](crate::Engine::complete_missing_proofs)
-    /// parses each returned BEEF and keeps only those whose target tx still
-    /// lacks a merkle proof, so this method does NOT need to filter — it just
-    /// hands back a budget-bounded slice of the `transactions` table. Backends
-    /// that cannot enumerate transactions (or have nothing to complete) may
-    /// return an empty `Vec` via this default, in which case proof completion
-    /// is a no-op.
+    /// Backends MUST return only transactions whose own merkle proof is still
+    /// missing — i.e. the historical/recent backlog the
+    /// [`Engine::complete_missing_proofs`](crate::Engine::complete_missing_proofs)
+    /// cron is meant to clear. The reference D1 backend keeps a `has_proof`
+    /// flag (overlay migration 0010), set on every BEEF write, and answers this
+    /// with `WHERE has_proof = 0 LIMIT {limit}` — so every proofless tx is
+    /// eventually reached (no "newest N rows only" starvation) and proven rows
+    /// are never re-fetched. The engine still defensively re-parses each
+    /// returned BEEF and skips any that turn out already-proven, so an
+    /// over-inclusive backend is merely less efficient, not incorrect.
+    ///
+    /// Backends that cannot enumerate transactions (or have nothing to
+    /// complete) may return an empty `Vec` via this default, in which case
+    /// proof completion is a no-op.
     ///
     /// `limit` bounds the returned page (and therefore the per-tick WoC fetch /
-    /// CPU budget). Ordering is backend-defined.
+    /// CPU budget).
     async fn find_transactions_for_proof_check(
         &self,
         limit: u64,
@@ -501,9 +508,25 @@ pub mod memory {
             &self,
             limit: u64,
         ) -> Result<Vec<TransactionBeef>, StorageError> {
+            // Models the real D1 `WHERE has_proof = 0 LIMIT {limit}` query
+            // (overlay migration 0010): return only txs whose own proof is
+            // still missing. Proven rows are filtered out *before* the limit
+            // is applied, so a single proofless tx is always reachable no
+            // matter how many proven txs sit alongside it — which is exactly
+            // the historical-backlog reach the cron must guarantee.
             let transactions = self.transactions.lock().unwrap();
             let results = transactions
                 .iter()
+                .filter(|(txid, beef)| {
+                    // Keep only txs that do NOT yet carry their own proof.
+                    bsv_rs::transaction::Beef::from_binary(beef)
+                        .ok()
+                        .and_then(|b| {
+                            b.find_txid(txid)
+                                .map(bsv_rs::transaction::BeefTx::has_proof)
+                        })
+                        != Some(true)
+                })
                 .take(limit as usize)
                 .map(|(txid, beef)| TransactionBeef {
                     txid: txid.clone(),
