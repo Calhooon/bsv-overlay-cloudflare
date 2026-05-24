@@ -70,6 +70,28 @@ pub trait Storage {
     /// Update the BEEF data for a transaction (used when merkle proofs arrive).
     async fn update_transaction_beef(&self, txid: &str, beef: &[u8]) -> Result<(), StorageError>;
 
+    /// Mark a transaction as already carrying its own merkle proof, WITHOUT
+    /// rewriting its BEEF.
+    ///
+    /// This is the lightweight flag-flip used by
+    /// [`Engine::complete_missing_proofs`](crate::Engine::complete_missing_proofs)
+    /// when a scanned candidate turns out to ALREADY be proven (its stored BEEF
+    /// proves the target tx) yet its backend `has_proof` flag is still `0` —
+    /// e.g. a GASP-synced tx that arrived with a proof, written before overlay
+    /// migration 0010 added the flag (the migration defaulted every existing
+    /// row to `0`). Such rows are returned by
+    /// [`Storage::find_transactions_for_proof_check`] every tick and skipped by
+    /// the engine, clogging the candidate window and starving genuinely
+    /// proofless rows behind them. Flipping the flag here drops them out.
+    ///
+    /// The reference D1 backend runs
+    /// `UPDATE transactions SET has_proof = 1 WHERE txid = ?`. Backends that do
+    /// not track a proof flag may use this no-op default. Idempotent.
+    async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
+        let _ = txid;
+        Ok(())
+    }
+
     /// Update the block height on an output (when it gets mined).
     ///
     /// Optional — backends that don't track block height can provide a no-op default.
@@ -236,6 +258,14 @@ pub mod memory {
         outputs: Mutex<HashMap<(String, u32, String), Output>>,
         /// BEEF data keyed by txid
         transactions: Mutex<HashMap<String, Vec<u8>>>,
+        /// txids whose `has_proof` flag is set. Models the real D1
+        /// `transactions.has_proof` column (overlay migration 0010), which is
+        /// the source of truth for `find_transactions_for_proof_check` — NOT a
+        /// live re-parse of the BEEF. A txid is absent here (flag = 0) until
+        /// something explicitly proves it, so a BEEF that already carries a
+        /// proof but is not in this set is still returned as a candidate — the
+        /// exact window-clog the cron must clear via `mark_transaction_proven`.
+        proven: Mutex<std::collections::HashSet<String>>,
         /// applied transactions keyed by (txid, topic)
         applied: Mutex<HashMap<(String, String), bool>>,
         /// GASP sync state keyed by (host, topic)
@@ -312,6 +342,7 @@ pub mod memory {
             let has_remaining = outputs.keys().any(|(t, _, _)| t == txid);
             if !has_remaining {
                 self.transactions.lock().unwrap().remove(txid);
+                self.proven.lock().unwrap().remove(txid);
             }
 
             Ok(())
@@ -349,10 +380,28 @@ pub mod memory {
             txid: &str,
             beef: &[u8],
         ) -> Result<(), StorageError> {
+            // Model the D1 backend: keep the proof flag accurate on every BEEF
+            // write by inspecting whether the new BEEF proves the target tx.
+            // (The proof-completion stitch calls back here with a proven BEEF,
+            // which is how a row legitimately flips proofless → proven.)
+            let has_proof = bsv_rs::transaction::Beef::from_binary(beef)
+                .ok()
+                .and_then(|b| b.find_txid(txid).map(bsv_rs::transaction::BeefTx::has_proof))
+                .unwrap_or(false);
+            if has_proof {
+                self.proven.lock().unwrap().insert(txid.to_string());
+            }
             self.transactions
                 .lock()
                 .unwrap()
                 .insert(txid.to_string(), beef.to_vec());
+            Ok(())
+        }
+
+        async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
+            // Lightweight flag-flip (no BEEF rewrite), idempotent. Mirrors the
+            // D1 `UPDATE transactions SET has_proof = 1 WHERE txid = ?`.
+            self.proven.lock().unwrap().insert(txid.to_string());
             Ok(())
         }
 
@@ -509,24 +558,18 @@ pub mod memory {
             limit: u64,
         ) -> Result<Vec<TransactionBeef>, StorageError> {
             // Models the real D1 `WHERE has_proof = 0 LIMIT {limit}` query
-            // (overlay migration 0010): return only txs whose own proof is
-            // still missing. Proven rows are filtered out *before* the limit
-            // is applied, so a single proofless tx is always reachable no
-            // matter how many proven txs sit alongside it — which is exactly
-            // the historical-backlog reach the cron must guarantee.
+            // (overlay migration 0010): the candidate set is driven by the
+            // `has_proof` FLAG, not a live re-parse of the BEEF. A row whose
+            // BEEF already carries a proof but whose flag is still 0 (e.g. a
+            // GASP-synced proof written before the migration, which defaulted
+            // every existing row to 0) is therefore STILL returned here — it
+            // only drops out once `mark_transaction_proven` flips the flag.
+            // This reproduces the window-clog the engine must clear.
             let transactions = self.transactions.lock().unwrap();
+            let proven = self.proven.lock().unwrap();
             let results = transactions
                 .iter()
-                .filter(|(txid, beef)| {
-                    // Keep only txs that do NOT yet carry their own proof.
-                    bsv_rs::transaction::Beef::from_binary(beef)
-                        .ok()
-                        .and_then(|b| {
-                            b.find_txid(txid)
-                                .map(bsv_rs::transaction::BeefTx::has_proof)
-                        })
-                        != Some(true)
-                })
+                .filter(|(txid, _)| !proven.contains(*txid))
                 .take(limit as usize)
                 .map(|(txid, beef)| TransactionBeef {
                     txid: txid.clone(),

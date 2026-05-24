@@ -95,6 +95,10 @@ pub struct ProofCompletionSummary {
     pub fetch_failed: usize,
     /// Proofless txs whose proof came back but failed to stitch into storage.
     pub stitch_failed: usize,
+    /// Scanned rows that ALREADY carried a valid proof (stale `has_proof = 0`
+    /// flag) and were marked proven this tick so they drop out of the candidate
+    /// window — clearing the window-clog (#130).
+    pub already_proven: usize,
 }
 
 /// Internal result from Phase 1 + 2 validation.
@@ -1322,11 +1326,24 @@ impl Engine {
                 },
             };
 
-            // Already proven? Nothing to do.
+            // Already proven? The stored BEEF proves the target tx, but its
+            // backend `has_proof` flag may still be 0 (e.g. a GASP-synced proof
+            // written before overlay migration 0010, which defaulted every
+            // existing row to 0). Such rows are returned by
+            // `find_transactions_for_proof_check` every tick and would clog the
+            // bounded candidate window forever, starving genuinely-proofless
+            // rows behind them. Flip the flag (no BEEF rewrite) so the row drops
+            // out of the next pass. Idempotent + best-effort: a failure here is
+            // logged, not fatal — the row simply lingers one more tick.
             if beef
                 .find_txid(&cand.txid)
                 .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
             {
+                if let Err(e) = self.storage.mark_transaction_proven(&cand.txid).await {
+                    warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] failed to mark already-proven row");
+                } else {
+                    summary.already_proven += 1;
+                }
                 continue;
             }
             summary.proofless += 1;
@@ -1372,6 +1389,7 @@ impl Engine {
             still_unconfirmed = summary.still_unconfirmed,
             fetch_failed = summary.fetch_failed,
             stitch_failed = summary.stitch_failed,
+            already_proven = summary.already_proven,
             "[PROOF COMPLETION] pass complete"
         );
 
@@ -4185,32 +4203,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_missing_proofs_reaches_old_proofless_tx_behind_proven_rows() {
-        // Regression for the cursor/`ORDER BY rowid DESC` reach bug: a
-        // proofless tx that is NOT among the newest rows must still be
-        // found + completed. We seed several ALREADY-PROVEN txs plus one
-        // historical proofless tx, then run with a small limit. Storage
-        // filters proven rows out (real D1: `WHERE has_proof = 0`), so the
-        // proofless tx is reachable regardless of how many proven txs exist.
-        use bsv_rs::transaction::{Beef, Transaction};
+    async fn complete_missing_proofs_marks_already_proven_rows_so_window_advances() {
+        // Window-clog regression (#130): migration 0010 defaulted EVERY
+        // existing `transactions` row to has_proof = 0, including rows whose
+        // stored BEEF already carries a proof (e.g. GASP-synced txs). The
+        // candidate query (`WHERE has_proof = 0 LIMIT n`) returns those rows
+        // every tick; the engine skips them but — before this fix — never
+        // flipped the flag, so they lingered in the bounded window forever and
+        // starved genuinely-proofless rows behind them. The fix marks each
+        // already-proven scanned row so it drops out of the NEXT pass.
+        use bsv_rs::transaction::{Beef, MerklePath, Transaction};
 
         let storage = MemoryStorage::new();
 
-        // Insert several proven txs (the "newest N" that used to crowd out
-        // the backlog). Each gets its own single-leaf BUMP stitched in.
+        // Seed several ALREADY-PROVEN rows. They are inserted via
+        // `insert_output`, which (modeling migration 0010's default) does NOT
+        // set the proof flag — so despite carrying a valid proof they show up
+        // as has_proof = 0 candidates: the exact clog.
         let proven_raws = [
             "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2803dc7e0e0499170e6a0003cf341b017e0000152f476f72696c6c61506f6f6c2e696f20f09fa68d2f0000000003000000000000000032006a0547504f4f4c08dc7e0e0000000000200158a2360a03939451e72c3a9302f5d48712bf54a5b2edf8f3c69aed35a668e312236000000000001976a914068a58835bb93b152c901ffb18f6578824f9d5b788ac6eb66612000000001976a91402fd5a91155231d5799e2d22c490d1664cde62cb88ac00000000",
+            "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000",
         ];
+        let mut proven_ids = Vec::new();
         for raw in proven_raws {
             let mut tx = Transaction::from_hex(raw).unwrap();
             let id = tx.id();
-            let bump = bsv_rs::transaction::MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap();
-            tx.merkle_path = Some(bump);
-            // to_beef(true) carries the merkle proof into the BEEF so the row
-            // is genuinely proven (has_proof == true) and gets filtered out of
-            // the proof-check candidate set.
+            tx.merkle_path = Some(
+                MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap(),
+            );
+            // to_beef(true) carries the merkle proof into the BEEF, so the row
+            // genuinely IS proven — yet its flag stays 0 (insert path).
             let proven_beef = tx.to_beef(true).unwrap();
-            // Sanity: the row really is proven, so storage filters it out.
             assert_eq!(
                 Beef::from_binary(&proven_beef)
                     .unwrap()
@@ -4219,9 +4242,84 @@ mod tests {
                 Some(true),
                 "proven fixture row must carry its proof"
             );
+            proven_ids.push(id.clone());
             storage
                 .insert_output(&Output {
-                    txid: id.clone(),
+                    txid: id,
+                    output_index: 0,
+                    output_script: vec![0x76],
+                    satoshis: 1000,
+                    topic: "Hello".to_string(),
+                    spent: false,
+                    outputs_consumed: vec![],
+                    consumed_by: vec![],
+                    beef: Some(proven_beef),
+                    block_height: Some(800_000),
+                    score: Some(1.0),
+                })
+                .await
+                .unwrap();
+        }
+
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: None,
+            calls: Cell::new(0),
+        });
+        let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
+        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        let mut engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(storage),
+            None,
+            EngineConfig::default(),
+        );
+        engine.set_ancestor_fetcher(fetcher.clone());
+
+        // First pass over a window covering both proven rows: each is detected
+        // already-proven and marked. Nothing proofless, nothing fetched.
+        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        assert_eq!(summary.scanned, proven_ids.len());
+        assert_eq!(summary.proofless, 0);
+        assert_eq!(summary.completed, 0);
+        assert_eq!(
+            summary.already_proven,
+            proven_ids.len(),
+            "every already-proven row is marked this pass"
+        );
+        assert_eq!(fetcher.calls.get(), 0, "no fetch for already-proven rows");
+
+        // Window has advanced: the NEXT candidate query no longer returns the
+        // marked rows, so the pass scans nothing.
+        let summary2 = engine.complete_missing_proofs(50).await.unwrap();
+        assert_eq!(summary2.scanned, 0, "marked rows dropped out of the window");
+        assert_eq!(summary2.already_proven, 0);
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_reaches_proofless_tx_behind_clogging_proven_rows() {
+        // The window-clog in action with a small limit: a genuinely-proofless
+        // backlog row sits behind already-proven (stale-flag) rows. Each tick
+        // marks the proven rows it scans (dropping them out), so over a few
+        // bounded ticks the window advances until the proofless tx is reached
+        // + completed — instead of being starved forever.
+        use bsv_rs::transaction::{MerklePath, Transaction};
+
+        let storage = MemoryStorage::new();
+
+        let proven_raws = [
+            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2803dc7e0e0499170e6a0003cf341b017e0000152f476f72696c6c61506f6f6c2e696f20f09fa68d2f0000000003000000000000000032006a0547504f4f4c08dc7e0e0000000000200158a2360a03939451e72c3a9302f5d48712bf54a5b2edf8f3c69aed35a668e312236000000000001976a914068a58835bb93b152c901ffb18f6578824f9d5b788ac6eb66612000000001976a91402fd5a91155231d5799e2d22c490d1664cde62cb88ac00000000",
+        ];
+        for raw in proven_raws {
+            let mut tx = Transaction::from_hex(raw).unwrap();
+            let id = tx.id();
+            tx.merkle_path = Some(
+                MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap(),
+            );
+            let proven_beef = tx.to_beef(true).unwrap();
+            storage
+                .insert_output(&Output {
+                    txid: id,
                     output_index: 0,
                     output_script: vec![0x76],
                     satoshis: 1000,
@@ -4272,12 +4370,20 @@ mod tests {
         );
         engine.set_ancestor_fetcher(fetcher.clone());
 
-        // Even with a limit of 1, the proven rows are filtered out by storage
-        // so the one proofless tx is the only candidate — found + completed.
-        let summary = engine.complete_missing_proofs(1).await.unwrap();
-        assert_eq!(summary.scanned, 1, "only the proofless tx is a candidate");
-        assert_eq!(summary.proofless, 1);
-        assert_eq!(summary.completed, 1, "the historical proofless tx is completed");
+        // Run bounded ticks (limit 1) until the proofless tx is completed. With
+        // 2 rows total a couple of ticks suffice; cap iterations defensively.
+        let mut completed_total = 0;
+        for _ in 0..5 {
+            let s = engine.complete_missing_proofs(1).await.unwrap();
+            completed_total += s.completed;
+            if completed_total > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            completed_total, 1,
+            "the proofless backlog tx is reached + completed once the proven rows are marked out of the window"
+        );
 
         let out = engine
             .storage()
