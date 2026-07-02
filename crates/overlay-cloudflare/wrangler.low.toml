@@ -1,0 +1,51 @@
+# low-overlay — LOW poker lobby overlay instance (bsv-low #39/#40).
+#
+# A SEPARATE worker + D1 + queue from the main rust-overlay deployment so
+# the lobby can't disturb the mainline parity instance. Deploy with:
+#
+#   npx wrangler deploy --config wrangler.low.toml
+#
+# account_id comes from the CLOUDFLARE_ACCOUNT_ID environment variable.
+# Secrets (set via `wrangler secret put <NAME> --config wrangler.low.toml`):
+#   SERVER_PRIVATE_KEY — fresh key for this instance (NOT rust-overlay's)
+#   ADMIN_TOKEN        — fresh token for this instance
+#   TAAL_API_KEY       — ARC broadcast key (shared with the fleet)
+
+name = "low-overlay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-12-01"
+
+[build]
+# Pin worker-build to ^0.7 — newer 0.8+ requires worker crate ≥0.8 but the
+# project pins worker 0.7.5. Without the version pin, `cargo install` grabs
+# the latest worker-build and the build fails with "Unsupported version
+# worker@0.7.5, expected at least worker@0.8.0".
+command = "cargo install -q --version ^0.7 worker-build && worker-build --release"
+
+[[d1_databases]]
+binding = "OVERLAY_DB"
+database_name = "low-overlay-db"
+database_id = "9930afce-6154-4d1e-b2a0-71a90065db0a"
+
+[vars]
+ENVIRONMENT = "production"
+CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
+HOSTING_URL = "https://low-overlay.dev-a3e.workers.dev"
+WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+# Lobby surface: mainline SHIP/SLAP (so the node can be discovered and can
+# index peer ads if ever needed) + the LOW poker lobby topic.
+TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low"
+LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low"
+ENABLE_EXTENSIONS = "true"
+
+[[queues.producers]]
+queue = "low-overlay-mutations"
+binding = "MUTATION_QUEUE"
+
+[[queues.consumers]]
+queue = "low-overlay-mutations"
+max_batch_size = 1
+max_retries = 3
+
+[triggers]
+crons = ["*/15 * * * *"]
