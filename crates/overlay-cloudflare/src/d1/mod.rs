@@ -220,7 +220,7 @@ pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), 
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 23;
+pub const OVERLAY_MIGRATION_COUNT: usize = 27;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -342,6 +342,30 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         reason TEXT,
         PRIMARY KEY (type, value)
     )",
+    // LOW poker lobby records (tm_low / ls_low) — bsv-low #39/#40.
+    // One row per admitted LOW token UTXO. `recordType` is "table"
+    // (TABLE_OPEN announcement) or "gameutxo" (live pot-outpoint
+    // pointer). Table metadata columns are NULL for pointer rows —
+    // the pot outpoint lives in the token's PushDrop fields, which
+    // clients read from the BEEF that /lookup returns. Rows are
+    // deleted on spend/eviction: spent TABLE_OPEN = table closed,
+    // spent GAME_UTXO = superseded.
+    "CREATE TABLE IF NOT EXISTS low_records (
+        recordType TEXT NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        hostIdentity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        stakeSats INTEGER,
+        rulesHash TEXT,
+        relayUrl TEXT,
+        expiryHeight INTEGER,
+        createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_low_game ON low_records(gameId)",
+    "CREATE INDEX IF NOT EXISTS idx_low_host ON low_records(hostIdentity)",
+    "CREATE INDEX IF NOT EXISTS idx_low_type_stake ON low_records(recordType, stakeSats)",
 ];
 
 // =============================================================================

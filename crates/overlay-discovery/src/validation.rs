@@ -316,6 +316,9 @@ pub fn is_token_signature_correctly_linked_verbose(
         "SHIP" => "service host interconnect",
         "SLAP" => "service lookup availability",
         "AGENT" => "agent registry",
+        // LOW poker lobby tokens (tm_low): TABLE_OPEN + GAME_UTXO records.
+        // BRC-43 protocol ID on the signer side is [2, "low poker lobby"].
+        "LOW" => "low poker lobby",
         other => return Err(format!("unknown protocol: {other}")),
     };
 

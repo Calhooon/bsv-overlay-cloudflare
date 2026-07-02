@@ -12,6 +12,7 @@ use overlay_discovery::agent::storage::{
 use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
+use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
 };
@@ -962,6 +963,112 @@ impl UHRPStorage for D1UHRPStorage {
                 content_length: r.content_length as i64,
             })
             .collect())
+    }
+}
+
+// =============================================================================
+// D1LowStorage
+// =============================================================================
+
+/// Cloudflare D1 implementation of the LowStorage trait (tm_low / ls_low).
+///
+/// Schema: `low_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by
+/// (txid, outputIndex); `INSERT OR REPLACE` keeps re-admission idempotent.
+pub struct D1LowStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1LowStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn low_err(e: String) -> LowStorageError {
+    LowStorageError::Database(e)
+}
+
+#[async_trait(?Send)]
+impl LowStorage for D1LowStorage {
+    async fn store_record(&self, record: &LowRecord) -> Result<(), LowStorageError> {
+        Query::new(
+            "INSERT OR REPLACE INTO low_records \
+             (recordType, txid, outputIndex, hostIdentity, gameId, stakeSats, rulesHash, relayUrl, expiryHeight) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.record_type.as_str())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(record.host_identity.as_str())
+        .bind(record.game_id.as_str())
+        // u64 → i64: poker stakes fit comfortably; D1 INTEGER is i64.
+        .bind(record.stake_sats.map(|s| s as i64))
+        .bind(record.rules_hash.as_deref())
+        .bind(record.relay_url.as_deref())
+        .bind(record.expiry_height.map(|h| h as i64))
+        .execute(&self.db)
+        .await
+        .map_err(low_err)
+    }
+
+    async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), LowStorageError> {
+        Query::new("DELETE FROM low_records WHERE txid = ? AND outputIndex = ?")
+            .bind(txid)
+            .bind(output_index)
+            .execute(&self.db)
+            .await
+            .map_err(low_err)
+    }
+
+    async fn find_open_tables(
+        &self,
+        stake_min: Option<u64>,
+        stake_max: Option<u64>,
+    ) -> Result<Vec<UTXOReference>, LowStorageError> {
+        let mut wb = WhereBuilder::new().eq("recordType", "table");
+        if let Some(min) = stake_min {
+            wb = wb.gte("stakeSats", min as i64);
+        }
+        if let Some(max) = stake_max {
+            wb = wb.raw("stakeSats <= ?", vec![(max as i64).into()]);
+        }
+        let (where_clause, params) = wb.build();
+
+        let sql = format!(
+            "SELECT txid, outputIndex FROM low_records{where_clause} ORDER BY createdAt DESC"
+        );
+        let mut q = Query::new(sql);
+        for p in params {
+            q = q.bind(p);
+        }
+        let rows: Vec<UTXORow> = q.fetch_all(&self.db).await.map_err(low_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+
+    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<UTXOReference>, LowStorageError> {
+        let rows: Vec<UTXORow> = Query::new(
+            "SELECT txid, outputIndex FROM low_records WHERE gameId = ? ORDER BY createdAt DESC",
+        )
+        .bind(game_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(low_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+
+    async fn find_by_host(
+        &self,
+        identity_key: &str,
+    ) -> Result<Vec<UTXOReference>, LowStorageError> {
+        let rows: Vec<UTXORow> = Query::new(
+            "SELECT txid, outputIndex FROM low_records WHERE hostIdentity = ? \
+             ORDER BY createdAt DESC",
+        )
+        .bind(identity_key)
+        .fetch_all(&self.db)
+        .await
+        .map_err(low_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
     }
 }
 
