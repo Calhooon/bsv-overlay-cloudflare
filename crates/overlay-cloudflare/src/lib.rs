@@ -34,6 +34,9 @@ use overlay_discovery::dm_delegation::topic_manager::DmDelegationTopicManager;
 use overlay_discovery::low::lookup_service::LowLookupService;
 use overlay_discovery::low::storage::LowStorage;
 use overlay_discovery::low::topic_manager::LowTopicManager;
+use overlay_discovery::reveal::lookup_service::RevealLookupService;
+use overlay_discovery::reveal::storage::RevealStorage;
+use overlay_discovery::reveal::topic_manager::RevealTopicManager;
 use overlay_discovery::ship::lookup_service::SHIPLookupService;
 use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::ship::topic_manager::SHIPTopicManager;
@@ -52,8 +55,8 @@ use crate::broadcaster::{WorkerArcBroadcaster, WorkerBroadcaster};
 use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::{run_migrations, OVERLAY_MIGRATIONS};
 use crate::d1_discovery::{
-    D1AgentStorage, D1DmDelegationStorage, D1LowStorage, D1SHIPStorage, D1SLAPStorage,
-    D1UHRPStorage,
+    D1AgentStorage, D1DmDelegationStorage, D1LowStorage, D1RevealStorage, D1SHIPStorage,
+    D1SLAPStorage, D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
 use crate::health_checker::WorkerHealthChecker;
@@ -121,6 +124,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         Rc::new(D1DmDelegationStorage::new(db.clone()));
     let uhrp_storage: Rc<dyn UHRPStorage> = Rc::new(D1UHRPStorage::new(db.clone()));
     let low_storage: Rc<dyn LowStorage> = Rc::new(D1LowStorage::new(db.clone()));
+    let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -130,6 +134,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         dm_delegation_storage.clone(),
         uhrp_storage.clone(),
         low_storage.clone(),
+        reveal_storage.clone(),
     );
 
     // Hosting URL for web UI
@@ -249,6 +254,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         Rc::new(D1DmDelegationStorage::new(db.clone()));
     let uhrp_storage: Rc<dyn UHRPStorage> = Rc::new(D1UHRPStorage::new(db.clone()));
     let low_storage: Rc<dyn LowStorage> = Rc::new(D1LowStorage::new(db.clone()));
+    let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     Ok(build_engine_with_storage(
         db,
         env,
@@ -258,6 +264,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         dm_delegation_storage,
         uhrp_storage,
         low_storage,
+        reveal_storage,
     ))
 }
 
@@ -275,6 +282,7 @@ fn build_engine_with_storage(
     dm_delegation_storage: Rc<dyn DmDelegationStorage>,
     uhrp_storage: Rc<dyn UHRPStorage>,
     low_storage: Rc<dyn LowStorage>,
+    reveal_storage: Rc<dyn RevealStorage>,
 ) -> Engine {
     // Storage
     let storage = Box::new(D1Storage::new(db));
@@ -332,6 +340,9 @@ fn build_engine_with_storage(
             "tm_low" => {
                 managers.insert("tm_low".into(), Box::new(LowTopicManager::new()));
             }
+            "tm_reveal" => {
+                managers.insert("tm_reveal".into(), Box::new(RevealTopicManager::new()));
+            }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
         }
     }
@@ -379,6 +390,12 @@ fn build_engine_with_storage(
                 lookup_services.insert(
                     "ls_low".into(),
                     Box::new(LowLookupService::new(low_storage.clone())),
+                );
+            }
+            "ls_reveal" => {
+                lookup_services.insert(
+                    "ls_reveal".into(),
+                    Box::new(RevealLookupService::new(reveal_storage.clone())),
                 );
             }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),
@@ -450,6 +467,15 @@ fn build_engine_with_storage(
     // (rather than Ship) until a second lobby node exists.
     sync_configuration.insert(
         "tm_low".to_string(),
+        overlay_engine::types::SyncTarget::Disabled,
+    );
+
+    // tm_reveal (LOW break-glass reveal index) is likewise single-node: the
+    // low-overlay worker is the only host carrying it and the watchtower
+    // queries this instance directly. Disabled until a second reveal node
+    // exists (mirrors tm_low).
+    sync_configuration.insert(
+        "tm_reveal".to_string(),
         overlay_engine::types::SyncTarget::Disabled,
     );
 
@@ -572,6 +598,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         Rc::new(D1DmDelegationStorage::new(db.clone()));
     let uhrp_storage: Rc<dyn UHRPStorage> = Rc::new(D1UHRPStorage::new(db.clone()));
     let low_storage: Rc<dyn LowStorage> = Rc::new(D1LowStorage::new(db.clone()));
+    let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -581,6 +608,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         dm_delegation_storage.clone(),
         uhrp_storage.clone(),
         low_storage.clone(),
+        reveal_storage.clone(),
     );
 
     // Sync advertisements (if advertiser + hosting URL are configured).
