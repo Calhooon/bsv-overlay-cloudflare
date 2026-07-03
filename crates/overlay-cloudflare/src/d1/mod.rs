@@ -220,7 +220,7 @@ pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), 
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 27;
+pub const OVERLAY_MIGRATION_COUNT: usize = 30;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -366,6 +366,24 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_low_game ON low_records(gameId)",
     "CREATE INDEX IF NOT EXISTS idx_low_host ON low_records(hostIdentity)",
     "CREATE INDEX IF NOT EXISTS idx_low_type_stake ON low_records(recordType, stakeSats)",
+    // LOW break-glass reveal records (tm_reveal / ls_reveal). One row per
+    // admitted LOW/reveal/v2 OP_RETURN artifact UTXO. Keyed by the on-chain
+    // outpoint; queried by (gameId, seat) so the watchtower can look up
+    // "did the accused seat reveal?" without scanning WoC address history.
+    // Rows are NEVER deleted: a reveal is a permanent fact and the admitted
+    // output is a provably-unspendable OP_RETURN (the lookup service's
+    // spend/eviction hooks are no-ops). The reveal opening (positions +
+    // scalars) lives in the token BEEF that /lookup returns, not here.
+    "CREATE TABLE IF NOT EXISTS reveal_records (
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        gameId TEXT NOT NULL,
+        seat INTEGER NOT NULL,
+        createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_reveal_game ON reveal_records(gameId)",
+    "CREATE INDEX IF NOT EXISTS idx_reveal_game_seat ON reveal_records(gameId, seat)",
 ];
 
 // =============================================================================
@@ -457,6 +475,8 @@ mod tests {
             "agent_capabilities",
             "dm_delegation_records",
             "uhrp_records",
+            "low_records",
+            "reveal_records",
         ] {
             assert!(
                 joined.contains(table),
@@ -481,6 +501,8 @@ mod tests {
             "idx_dm_delegation_certifier",
             "idx_uhrp_url",
             "idx_uhrp_identity",
+            "idx_reveal_game",
+            "idx_reveal_game_seat",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

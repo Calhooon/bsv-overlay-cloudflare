@@ -13,6 +13,7 @@ use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
 use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
+use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
 };
@@ -1068,6 +1069,91 @@ impl LowStorage for D1LowStorage {
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+}
+
+// =============================================================================
+// D1RevealStorage
+// =============================================================================
+
+/// Cloudflare D1 implementation of the RevealStorage trait (tm_reveal /
+/// ls_reveal).
+///
+/// Schema: `reveal_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by
+/// (txid, outputIndex); `INSERT OR REPLACE` keeps re-admission idempotent.
+/// Rows are NEVER deleted on spend/eviction — a reveal is a permanent fact
+/// (the lookup service's spend/eviction hooks are no-ops). `delete_record`
+/// exists for API symmetry / manual operator use only.
+pub struct D1RevealStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1RevealStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn reveal_err(e: String) -> RevealStorageError {
+    RevealStorageError::Database(e)
+}
+
+#[async_trait(?Send)]
+impl RevealStorage for D1RevealStorage {
+    async fn store_record(&self, record: &RevealRecord) -> Result<(), RevealStorageError> {
+        Query::new(
+            "INSERT OR REPLACE INTO reveal_records \
+             (txid, outputIndex, gameId, seat) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(record.game_id.as_str())
+        .bind(record.seat as u32)
+        .execute(&self.db)
+        .await
+        .map_err(reveal_err)
+    }
+
+    async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), RevealStorageError> {
+        Query::new("DELETE FROM reveal_records WHERE txid = ? AND outputIndex = ?")
+            .bind(txid)
+            .bind(output_index)
+            .execute(&self.db)
+            .await
+            .map_err(reveal_err)
+    }
+
+    async fn find_by_game_seat(
+        &self,
+        game_id: &str,
+        seat: u8,
+    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
+        let rows: Vec<UTXORow> = Query::new(
+            "SELECT txid, outputIndex FROM reveal_records \
+             WHERE gameId = ? AND seat = ? ORDER BY createdAt DESC",
+        )
+        .bind(game_id)
+        .bind(seat as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(reveal_err)?;
+        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+    }
+
+    async fn find_by_game_id(
+        &self,
+        game_id: &str,
+    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
+        let rows: Vec<UTXORow> = Query::new(
+            "SELECT txid, outputIndex FROM reveal_records WHERE gameId = ? \
+             ORDER BY createdAt DESC",
+        )
+        .bind(game_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(reveal_err)?;
         Ok(rows.into_iter().map(UTXORow::into_ref).collect())
     }
 }
