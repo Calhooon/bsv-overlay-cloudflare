@@ -389,14 +389,34 @@ fn build_engine_with_storage(
             "ls_low" => {
                 // Wire the chain tip into ls_low so findOpenTables enforces
                 // table expiry at query time (bsv-low #148). LOW-local: only
-                // this service consults the tracker. If CHAIN_TRACKER_URL is
-                // unset, no tracker is attached and the query fails open (no
-                // expiry filter) rather than blanking the lobby.
+                // this service consults the tracker.
+                //
+                // ChainTracks is another Worker on the SAME account, so a plain
+                // `workers.dev` URL fetch loops back to THIS worker (404) and the
+                // tip never resolves — the filter silently fails open. We route
+                // through the CHAINTRACKS service binding instead, which reaches
+                // the real ChainTracks worker. Falls back to a URL tracker (or no
+                // tracker → fail-open) if the binding/var is absent.
                 let mut low_svc = LowLookupService::new(low_storage.clone());
-                if let Ok(url) = env.var("CHAIN_TRACKER_URL") {
-                    let tracker: Rc<dyn bsv_rs::transaction::ChainTracker> =
-                        Rc::new(WorkerChainTracker::new(url.to_string()));
-                    low_svc = low_svc.with_chain_tracker(tracker);
+                let ct_url = env
+                    .var("CHAIN_TRACKER_URL")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
+                let tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>> =
+                    match env.service("CHAINTRACKS") {
+                        Ok(svc) => Some(Rc::new(WorkerChainTracker::with_service(ct_url, svc))),
+                        // No binding configured: fall back to the URL path (works
+                        // only if ChainTracks is off-account; otherwise fails open).
+                        Err(_) => env
+                            .var("CHAIN_TRACKER_URL")
+                            .ok()
+                            .map(|u| {
+                                Rc::new(WorkerChainTracker::new(u.to_string()))
+                                    as Rc<dyn bsv_rs::transaction::ChainTracker>
+                            }),
+                    };
+                if let Some(t) = tracker {
+                    low_svc = low_svc.with_chain_tracker(t);
                 }
                 lookup_services.insert("ls_low".into(), Box::new(low_svc));
             }

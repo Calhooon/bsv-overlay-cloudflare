@@ -14,7 +14,7 @@ use bsv_rs::script::templates::PushDrop;
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::storage::{LowQuery, LowRecord, LowRecordType, LowStorage};
 use super::topic_manager::{
@@ -61,7 +61,20 @@ impl LowLookupService {
     /// table lingering is a lesser evil than a lobby that shows nothing.
     async fn resolve_tip(&self) -> Option<u32> {
         match &self.chain_tracker {
-            Some(ct) => ct.current_height().await.ok(),
+            Some(ct) => match ct.current_height().await {
+                Ok(h) => Some(h),
+                // Fail-open, but NEVER silently. A swallowed tip fetch is exactly
+                // how this filter became a no-op in production: the worker's
+                // same-account `workers.dev` subrequest to ChainTracks 404s
+                // (loopback), so `current_height()` errors and the filter falls
+                // open. Surfacing it here is what makes that diagnosable. The
+                // real fix is a Cloudflare service binding to ChainTracks (it
+                // also affects the engine's SPV via the same tracker).
+                Err(e) => {
+                    warn!("ls_low: chain-tip fetch failed, expiry filter falling open: {e}");
+                    None
+                }
+            },
             None => None,
         }
     }

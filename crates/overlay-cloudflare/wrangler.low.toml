@@ -39,6 +39,15 @@ TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal"
 LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal"
 ENABLE_EXTENSIONS = "true"
 
+# Service binding to the ChainTracks worker (same account). ls_low uses this to
+# resolve the chain tip for query-time table-expiry filtering (#148): a plain
+# workers.dev URL fetch to a same-account worker loops back to this worker (404),
+# so the binding is required for the tip fetch to reach ChainTracks. `service` is
+# a worker name, not a secret.
+[[services]]
+binding = "CHAINTRACKS"
+service = "rust-chaintracks"
+
 [[queues.producers]]
 queue = "low-overlay-mutations"
 binding = "MUTATION_QUEUE"

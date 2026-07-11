@@ -31,6 +31,14 @@ use serde::Deserialize;
 /// - `GET /getPresentHeight` — returns current chain height
 pub struct WorkerChainTracker {
     base_url: String,
+    /// When set, requests route through a Cloudflare SERVICE BINDING instead of a
+    /// public-URL fetch. This matters when ChainTracks is another Worker on the
+    /// SAME account: a `workers.dev` subrequest to a same-account Worker loops
+    /// back to the CALLER (returns the caller's own 404), so a plain URL fetch
+    /// silently fails. A service binding routes to the target Worker correctly.
+    /// `base_url` still supplies the request URL (only its PATH is used by the
+    /// bound service; the host is resolved via the binding).
+    service: Option<worker::Fetcher>,
 }
 
 // SAFETY: wasm32 is single-threaded. There are no other threads to send to.
@@ -38,9 +46,51 @@ unsafe impl Send for WorkerChainTracker {}
 unsafe impl Sync for WorkerChainTracker {}
 
 impl WorkerChainTracker {
-    /// Create a new WorkerChainTracker pointing at the given ChainTracks API URL.
+    /// Create a WorkerChainTracker that fetches ChainTracks over a public URL.
+    /// Correct for a ChainTracks on a DIFFERENT origin/account; for a
+    /// same-account Worker use [`WorkerChainTracker::with_service`].
     pub fn new(base_url: String) -> Self {
-        Self { base_url }
+        Self {
+            base_url,
+            service: None,
+        }
+    }
+
+    /// Route ChainTracks requests through a Cloudflare service binding, avoiding
+    /// the same-account `workers.dev` loopback (bsv-low #148). `base_url` still
+    /// supplies the request path.
+    pub fn with_service(base_url: String, service: worker::Fetcher) -> Self {
+        Self {
+            base_url,
+            service: Some(service),
+        }
+    }
+}
+
+/// Send a GET either through a service binding (no same-account loopback) or a
+/// plain URL fetch, returning the worker Response for uniform handling.
+async fn ct_get(
+    url: String,
+    service: &Option<worker::Fetcher>,
+    ctx: &str,
+) -> Result<worker::Response, ChainTrackerError> {
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Get);
+    let headers = worker::Headers::new();
+    let _ = headers.set("Accept", "application/json");
+    init.with_headers(headers);
+
+    match service {
+        Some(f) => f.fetch(url, Some(init)).await.map_err(|e| {
+            ChainTrackerError::NetworkError(format!("ChainTracks {ctx} (service binding) failed: {e}"))
+        }),
+        None => {
+            let request = worker::Request::new_with_init(&url, &init)
+                .map_err(|e| ChainTrackerError::Other(format!("Failed to create request: {e}")))?;
+            worker::Fetch::Request(request).send().await.map_err(|e| {
+                ChainTrackerError::NetworkError(format!("ChainTracks {ctx} failed: {e}"))
+            })
+        }
     }
 }
 
@@ -89,6 +139,7 @@ impl<F: Future> Future for UnsafeSendFuture<F> {
 /// Fetch a block header from ChainTracks and check if the merkle root matches.
 async fn fetch_is_valid_root(
     base_url: String,
+    service: Option<worker::Fetcher>,
     root: String,
     height: u32,
 ) -> Result<bool, ChainTrackerError> {
@@ -98,19 +149,7 @@ async fn fetch_is_valid_root(
         height
     );
 
-    let mut init = worker::RequestInit::new();
-    init.with_method(worker::Method::Get);
-
-    let headers = worker::Headers::new();
-    let _ = headers.set("Accept", "application/json");
-    init.with_headers(headers);
-
-    let request = worker::Request::new_with_init(&url, &init)
-        .map_err(|e| ChainTrackerError::Other(format!("Failed to create request: {e}")))?;
-
-    let mut response = worker::Fetch::Request(request).send().await.map_err(|e| {
-        ChainTrackerError::NetworkError(format!("ChainTracks findHeaderHexForHeight failed: {e}"))
-    })?;
+    let mut response = ct_get(url, &service, "findHeaderHexForHeight").await?;
 
     let status = response.status_code();
     if !(200..300).contains(&status) {
@@ -146,22 +185,13 @@ async fn fetch_is_valid_root(
 }
 
 /// Fetch the current chain height from ChainTracks.
-async fn fetch_current_height(base_url: String) -> Result<u32, ChainTrackerError> {
+async fn fetch_current_height(
+    base_url: String,
+    service: Option<worker::Fetcher>,
+) -> Result<u32, ChainTrackerError> {
     let url = format!("{}/getPresentHeight", base_url.trim_end_matches('/'));
 
-    let mut init = worker::RequestInit::new();
-    init.with_method(worker::Method::Get);
-
-    let headers = worker::Headers::new();
-    let _ = headers.set("Accept", "application/json");
-    init.with_headers(headers);
-
-    let request = worker::Request::new_with_init(&url, &init)
-        .map_err(|e| ChainTrackerError::Other(format!("Failed to create request: {e}")))?;
-
-    let mut response = worker::Fetch::Request(request).send().await.map_err(|e| {
-        ChainTrackerError::NetworkError(format!("ChainTracks getPresentHeight failed: {e}"))
-    })?;
+    let mut response = ct_get(url, &service, "getPresentHeight").await?;
 
     let status = response.status_code();
     if !(200..300).contains(&status) {
@@ -207,9 +237,10 @@ impl ChainTracker for WorkerChainTracker {
     {
         // Clone data to avoid lifetime issues — the async fn owns its data.
         let base_url = self.base_url.clone();
+        let service = self.service.clone();
         let root = root.to_string();
         Box::pin(UnsafeSendFuture(async move {
-            fetch_is_valid_root(base_url, root, height).await
+            fetch_is_valid_root(base_url, service, root, height).await
         }))
     }
 
@@ -221,8 +252,9 @@ impl ChainTracker for WorkerChainTracker {
         Self: 'async_trait,
     {
         let base_url = self.base_url.clone();
+        let service = self.service.clone();
         Box::pin(UnsafeSendFuture(async move {
-            fetch_current_height(base_url).await
+            fetch_current_height(base_url, service).await
         }))
     }
 }
