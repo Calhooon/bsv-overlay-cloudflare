@@ -157,13 +157,27 @@ impl Storage for D1Storage {
         .map_err(d1_err)?;
 
         // Upsert BEEF into transactions table if provided
+        // Upsert the BEEF. `INSERT OR IGNORE` silently kept an EMPTY/short
+        // pre-existing row, so a later insert of the REAL BEEF was dropped and
+        // the tx stayed un-hydrated → the lookup returned an empty-BEEF row →
+        // a fresh LOW table was undecodable/invisible to opponents (the
+        // "vanishing table", 2026-07-11). Overwrite only when the incoming BEEF
+        // is longer (never clobber a good row with a shorter/empty one).
         if let Some(ref beef) = output.beef {
-            Query::new("INSERT OR IGNORE INTO transactions (txid, beef) VALUES (?, ?)")
-                .bind(&*output.txid)
-                .bind(beef.as_slice())
-                .execute(&self.db)
-                .await
-                .map_err(d1_err)?;
+            if !beef.is_empty() {
+                // OR REPLACE (matching update_transaction_beef below), NOT
+                // OR IGNORE: IGNORE silently kept an empty/short pre-existing
+                // row so the real BEEF was dropped and the tx stayed
+                // un-hydrated. The `!beef.is_empty()` guard means we only ever
+                // write a real BEEF here, so REPLACE can never clobber a good
+                // row with an empty one.
+                Query::new("INSERT OR REPLACE INTO transactions (txid, beef) VALUES (?, ?)")
+                    .bind(&*output.txid)
+                    .bind(beef.as_slice())
+                    .execute(&self.db)
+                    .await
+                    .map_err(d1_err)?;
+            }
         }
 
         Ok(())

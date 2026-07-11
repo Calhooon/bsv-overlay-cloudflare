@@ -830,12 +830,20 @@ impl Engine {
                     output
                 };
 
+                // Skip an output whose BEEF is missing OR empty: a lookup item
+                // without decodable BEEF is useless to the client (it can only
+                // drop it), and returning an empty-BEEF row is what made a fresh
+                // LOW table show up in a query yet be undecodable/invisible to
+                // opponents (the "vanishing table" — 2026-07-11). Only ever
+                // return fully-hydrated, decodable outputs.
                 if let Some(beef) = final_output.beef {
-                    outputs.push(OutputListItem {
-                        beef,
-                        output_index: final_output.output_index,
-                        context: None,
-                    });
+                    if !beef.is_empty() {
+                        outputs.push(OutputListItem {
+                            beef,
+                            output_index: final_output.output_index,
+                            context: None,
+                        });
+                    }
                 }
             }
         }
