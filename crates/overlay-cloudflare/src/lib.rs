@@ -387,10 +387,18 @@ fn build_engine_with_storage(
                 );
             }
             "ls_low" => {
-                lookup_services.insert(
-                    "ls_low".into(),
-                    Box::new(LowLookupService::new(low_storage.clone())),
-                );
+                // Wire the chain tip into ls_low so findOpenTables enforces
+                // table expiry at query time (bsv-low #148). LOW-local: only
+                // this service consults the tracker. If CHAIN_TRACKER_URL is
+                // unset, no tracker is attached and the query fails open (no
+                // expiry filter) rather than blanking the lobby.
+                let mut low_svc = LowLookupService::new(low_storage.clone());
+                if let Ok(url) = env.var("CHAIN_TRACKER_URL") {
+                    let tracker: Rc<dyn bsv_rs::transaction::ChainTracker> =
+                        Rc::new(WorkerChainTracker::new(url.to_string()));
+                    low_svc = low_svc.with_chain_tracker(tracker);
+                }
+                lookup_services.insert("ls_low".into(), Box::new(low_svc));
             }
             "ls_reveal" => {
                 lookup_services.insert(

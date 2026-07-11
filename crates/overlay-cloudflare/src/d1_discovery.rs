@@ -1025,6 +1025,7 @@ impl LowStorage for D1LowStorage {
         &self,
         stake_min: Option<u64>,
         stake_max: Option<u64>,
+        tip_height: Option<u32>,
     ) -> Result<Vec<UTXOReference>, LowStorageError> {
         let mut wb = WhereBuilder::new().eq("recordType", "table");
         if let Some(min) = stake_min {
@@ -1032,6 +1033,16 @@ impl LowStorage for D1LowStorage {
         }
         if let Some(max) = stake_max {
             wb = wb.raw("stakeSats <= ?", vec![(max as i64).into()]);
+        }
+        // Query-time expiry enforcement (bsv-low #148): the overlay has no
+        // passive spend watcher, so an expired-but-unspent TABLE_OPEN would
+        // linger forever. When the tip is known, drop rows with
+        // `expiryHeight <= tip`. STRICTLY greater, mirroring the client
+        // (`expiryHeight > tip` at Lobby.tsx) so server and client agree. A
+        // NULL expiryHeight fails `NULL > ?` and is dropped — same as the
+        // in-memory impl. `None` tip => no clause (fail-open, lobby stays up).
+        if let Some(tip) = tip_height {
+            wb = wb.raw("expiryHeight > ?", vec![(tip as i64).into()]);
         }
         let (where_clause, params) = wb.build();
 

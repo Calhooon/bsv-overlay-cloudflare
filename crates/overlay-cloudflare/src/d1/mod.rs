@@ -220,7 +220,7 @@ pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), 
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 30;
+pub const OVERLAY_MIGRATION_COUNT: usize = 31;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -366,6 +366,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_low_game ON low_records(gameId)",
     "CREATE INDEX IF NOT EXISTS idx_low_host ON low_records(hostIdentity)",
     "CREATE INDEX IF NOT EXISTS idx_low_type_stake ON low_records(recordType, stakeSats)",
+    // Query-time table-expiry filter (bsv-low #148): findOpenTables adds
+    // `AND expiryHeight > ?`. Additive, IF NOT EXISTS — reveal-safe.
+    "CREATE INDEX IF NOT EXISTS idx_low_expiry ON low_records(recordType, expiryHeight)",
     // LOW break-glass reveal records (tm_reveal / ls_reveal). One row per
     // admitted LOW/reveal/v2 OP_RETURN artifact UTXO. Keyed by the on-chain
     // outpoint; queried by (gameId, seat) so the watchtower can look up

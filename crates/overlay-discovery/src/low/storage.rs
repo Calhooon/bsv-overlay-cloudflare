@@ -108,10 +108,19 @@ pub trait LowStorage {
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), LowStorageError>;
 
     /// Unspent TABLE_OPEN records, optionally filtered by stake range.
+    ///
+    /// `tip_height` enforces expiry at QUERY TIME: when `Some(tip)`, a row is
+    /// returned only if its `expiryHeight > tip` (strictly greater, mirroring
+    /// the client's `expiryHeight > tip` guard). When `None` (tip unavailable)
+    /// no expiry filter is applied — fail-open so the lobby degrades to showing
+    /// tables rather than hiding everything. The overlay has no passive spend
+    /// watcher, so an expired-but-unspent TABLE_OPEN token would otherwise
+    /// linger in the lobby forever (bsv-low #148).
     async fn find_open_tables(
         &self,
         stake_min: Option<u64>,
         stake_max: Option<u64>,
+        tip_height: Option<u32>,
     ) -> Result<Vec<UTXOReference>, LowStorageError>;
 
     /// All records for a game ID (lowercase hex).
@@ -173,6 +182,7 @@ impl LowStorage for MemoryLowStorage {
         &self,
         stake_min: Option<u64>,
         stake_max: Option<u64>,
+        tip_height: Option<u32>,
     ) -> Result<Vec<UTXOReference>, LowStorageError> {
         Ok(self
             .records
@@ -184,6 +194,14 @@ impl LowStorage for MemoryLowStorage {
                 let stake = r.stake_sats.unwrap_or(0);
                 stake_min.is_none_or(|min| stake >= min)
                     && stake_max.is_none_or(|max| stake <= max)
+            })
+            // Query-time expiry (bsv-low #148): with a known tip, keep only
+            // rows with `expiryHeight > tip` (strictly greater, mirroring the
+            // client's `expiryHeight > tip` and the D1 `expiryHeight > ?`).
+            // Tip absent => no filter (fail-open). A table row missing an
+            // expiry is excluded under a tip, matching SQL `NULL > ?`.
+            .filter(|r| {
+                tip_height.is_none_or(|tip| r.expiry_height.is_some_and(|e| e > tip))
             })
             .map(|r| UTXOReference {
                 txid: r.txid.clone(),
@@ -246,6 +264,12 @@ mod tests {
         }
     }
 
+    fn table_record_expiry(txid: &str, stake: u64, expiry: u32) -> LowRecord {
+        let mut r = table_record(txid, stake);
+        r.expiry_height = Some(expiry);
+        r
+    }
+
     fn gameutxo_record(txid: &str, game_id: &str) -> LowRecord {
         LowRecord {
             record_type: LowRecordType::GameUtxo,
@@ -271,23 +295,84 @@ mod tests {
             .unwrap();
 
         // No filter → both tables, not the pointer
-        let all = store.find_open_tables(None, None).await.unwrap();
+        let all = store.find_open_tables(None, None, None).await.unwrap();
         assert_eq!(all.len(), 2);
 
         // Stake range filters
-        let low = store.find_open_tables(None, Some(2000)).await.unwrap();
+        let low = store.find_open_tables(None, Some(2000), None).await.unwrap();
         assert_eq!(low.len(), 1);
         assert_eq!(low[0].txid, "tx1");
 
-        let high = store.find_open_tables(Some(2000), None).await.unwrap();
+        let high = store.find_open_tables(Some(2000), None, None).await.unwrap();
         assert_eq!(high.len(), 1);
         assert_eq!(high[0].txid, "tx2");
 
         let none = store
-            .find_open_tables(Some(6000), Some(9000))
+            .find_open_tables(Some(6000), Some(9000), None)
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_open_tables_excludes_expired_when_tip_present() {
+        let store = MemoryLowStorage::new();
+        // fresh: expiry 900_000 is ABOVE tip → visible.
+        store
+            .store_record(&table_record_expiry("fresh", 1000, 900_000))
+            .await
+            .unwrap();
+        // stale: expiry 899_000 is BELOW tip → hidden (expired-but-unspent).
+        store
+            .store_record(&table_record_expiry("stale", 1000, 899_000))
+            .await
+            .unwrap();
+
+        let tip = 899_500u32;
+        let visible = store
+            .find_open_tables(None, None, Some(tip))
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1, "only the non-expired table should return");
+        assert_eq!(visible[0].txid, "fresh");
+    }
+
+    #[tokio::test]
+    async fn find_open_tables_strictly_greater_at_tip_boundary() {
+        let store = MemoryLowStorage::new();
+        // expiry == tip must be EXCLUDED (strictly-greater, mirrors client).
+        store
+            .store_record(&table_record_expiry("at_tip", 1000, 900_000))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record_expiry("above_tip", 1000, 900_001))
+            .await
+            .unwrap();
+
+        let visible = store
+            .find_open_tables(None, None, Some(900_000))
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].txid, "above_tip");
+    }
+
+    #[tokio::test]
+    async fn find_open_tables_no_tip_shows_all_fail_open() {
+        let store = MemoryLowStorage::new();
+        store
+            .store_record(&table_record_expiry("fresh", 1000, 900_000))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record_expiry("stale", 1000, 1))
+            .await
+            .unwrap();
+
+        // tip unavailable → NO expiry filter → both visible (never hide all).
+        let visible = store.find_open_tables(None, None, None).await.unwrap();
+        assert_eq!(visible.len(), 2, "tip=None must fail open (show all tables)");
     }
 
     #[tokio::test]
@@ -332,7 +417,7 @@ mod tests {
         assert_eq!(store.record_count(), 1);
 
         // Latest write wins
-        let results = store.find_open_tables(Some(1500), None).await.unwrap();
+        let results = store.find_open_tables(Some(1500), None, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 

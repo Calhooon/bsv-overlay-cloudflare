@@ -24,12 +24,46 @@ use super::topic_manager::{
 /// LOW Lookup Service — indexes lobby records and answers queries.
 pub struct LowLookupService {
     storage: Rc<dyn LowStorage>,
+    /// Optional chain-tip source used to enforce table-expiry at query time
+    /// (bsv-low #148). When present, `findOpenTables` hides rows whose
+    /// `expiryHeight <= tip`. When absent (or the fetch fails) the query
+    /// fails open — no expiry filter — so the lobby never goes dark on a
+    /// transient ChainTracks outage.
+    chain_tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>>,
 }
 
 impl LowLookupService {
     /// Create a new LOW lookup service backed by the given storage.
+    ///
+    /// Constructed without a chain-tip source: `findOpenTables` applies no
+    /// expiry filter until [`LowLookupService::with_chain_tracker`] wires one
+    /// in (the deployed worker does; unit tests opt in via a mock).
     pub fn new(storage: Rc<dyn LowStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            chain_tracker: None,
+        }
+    }
+
+    /// Attach a chain-tip source so `findOpenTables` enforces table expiry.
+    /// LOW-local: only the LOW lobby query consults it — the reveal index and
+    /// all other services are untouched.
+    pub fn with_chain_tracker(
+        mut self,
+        chain_tracker: Rc<dyn bsv_rs::transaction::ChainTracker>,
+    ) -> Self {
+        self.chain_tracker = Some(chain_tracker);
+        self
+    }
+
+    /// Resolve the current chain tip for expiry filtering. Returns `None`
+    /// (fail-open) when no source is wired or the fetch errors — an expired
+    /// table lingering is a lesser evil than a lobby that shows nothing.
+    async fn resolve_tip(&self) -> Option<u32> {
+        match &self.chain_tracker {
+            Some(ct) => ct.current_height().await.ok(),
+            None => None,
+        }
     }
 }
 
@@ -150,7 +184,12 @@ impl LookupService for LowLookupService {
                         ));
                     }
                 }
-                self.storage.find_open_tables(stake_min, stake_max).await
+                // Enforce table expiry at query time against the live chain
+                // tip (bsv-low #148). `None` => fail-open (no expiry filter).
+                let tip = self.resolve_tip().await;
+                self.storage
+                    .find_open_tables(stake_min, stake_max, tip)
+                    .await
             }
             LowQuery::ByGameId { game_id } => {
                 let game_id = normalize_hex(&game_id, 32, "gameId")?;
@@ -444,6 +483,72 @@ mod tests {
         let q = LookupQuestion::new("ls_low", serde_json::json!({"type": "findOpenTables"}));
         let results = svc.lookup(&q).await.unwrap().into_outputs().unwrap();
         assert!(results.is_empty());
+    }
+
+    // ── Query-time expiry enforcement (bsv-low #148) ──────────────────────
+
+    /// Admit a TABLE_OPEN with an explicit expiry block height.
+    fn table_open_script_expiry(signer: &PrivateKey, stake: u64, expiry: u32) -> Vec<u8> {
+        let fields = table_open_data_fields(signer, stake, "https://relay.example.com", expiry);
+        make_signed_low_output(signer, fields)
+            .locking_script
+            .to_binary()
+    }
+
+    #[tokio::test]
+    async fn find_open_tables_hides_expired_with_chain_tip() {
+        let storage = Rc::new(MemoryLowStorage::new());
+        // Chain tip = 899_500: the 899_000 table is expired, the 900_000 fresh.
+        let svc = LowLookupService::new(storage.clone())
+            .with_chain_tracker(Rc::new(bsv_rs::transaction::MockChainTracker::new(899_500)));
+        let signer = PrivateKey::random();
+
+        svc.output_admitted_by_topic(&admit(
+            "fresh",
+            0,
+            table_open_script_expiry(&signer, 1000, 900_000),
+        ))
+        .await
+        .unwrap();
+        svc.output_admitted_by_topic(&admit(
+            "stale",
+            0,
+            table_open_script_expiry(&signer, 1000, 899_000),
+        ))
+        .await
+        .unwrap();
+
+        let q = LookupQuestion::new("ls_low", serde_json::json!({"type": "findOpenTables"}));
+        let results = svc.lookup(&q).await.unwrap().into_outputs().unwrap();
+        assert_eq!(results.len(), 1, "expired table must be excluded at query time");
+        assert_eq!(results[0].txid, "fresh");
+    }
+
+    #[tokio::test]
+    async fn find_open_tables_no_chain_tip_shows_all() {
+        // No chain tracker wired → fail-open: both tables (even the expired
+        // one) return rather than blanking the lobby.
+        let (svc, _storage) = make_service_with_storage();
+        let signer = PrivateKey::random();
+
+        svc.output_admitted_by_topic(&admit(
+            "fresh",
+            0,
+            table_open_script_expiry(&signer, 1000, 900_000),
+        ))
+        .await
+        .unwrap();
+        svc.output_admitted_by_topic(&admit(
+            "stale",
+            0,
+            table_open_script_expiry(&signer, 1000, 1),
+        ))
+        .await
+        .unwrap();
+
+        let q = LookupQuestion::new("ls_low", serde_json::json!({"type": "findOpenTables"}));
+        let results = svc.lookup(&q).await.unwrap().into_outputs().unwrap();
+        assert_eq!(results.len(), 2, "tip unavailable must fail open");
     }
 
     // ── Full lifecycle: admit → query → spend → query empty ─────────────
