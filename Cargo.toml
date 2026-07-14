@@ -3,6 +3,7 @@ members = [
     "crates/overlay-engine",
     "crates/overlay-discovery",
     "crates/overlay-cloudflare",
+    "crates/low-app-layer",
     "parity-harness",
 ]
 resolver = "2"

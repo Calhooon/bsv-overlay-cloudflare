@@ -220,7 +220,7 @@ pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), 
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 33;
+pub const OVERLAY_MIGRATION_COUNT: usize = 34;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -403,6 +403,19 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (txid, outputIndex)
     )",
     "CREATE INDEX IF NOT EXISTS idx_pot_spending ON pot_records(spendingTxid)",
+    // Durable pot BEEF store (tm_pot / ls_pot). One row per pot FUNDING tx
+    // and per pot-SPENDING (settle/refund/sweep) tx, keyed by that tx's OWN
+    // txid. Exists because the engine's `transactions` table is
+    // lifecycle-managed: a BEEF row is only written by insert_output (a
+    // settle admits no outputs, so it never gets one) and is DELETED by the
+    // deep-delete when a spent unretained coin is cleaned up. Rows here are
+    // NEVER deleted; writes are longer-wins/never-clobber (the "vanishing
+    // table" lesson). `low-app-layer /beef/:txid` serves this table first.
+    "CREATE TABLE IF NOT EXISTS pot_beefs (
+        txid TEXT PRIMARY KEY,
+        beef BLOB NOT NULL,
+        createdAt INTEGER
+    )",
 ];
 
 // =============================================================================
@@ -497,6 +510,7 @@ mod tests {
             "low_records",
             "reveal_records",
             "pot_records",
+            "pot_beefs",
         ] {
             assert!(
                 joined.contains(table),

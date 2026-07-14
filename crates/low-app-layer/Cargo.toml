@@ -1,0 +1,26 @@
+[package]
+name = "low-app-layer"
+description = "LOW app-layer — read-only, browser-facing chain-facts Worker over the low-overlay D1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `cdylib` for the Cloudflare Workers wasm32 build (worker-build consumes
+# this). `rlib` so `cargo test -p low-app-layer` can link and run the pure
+# helper unit tests natively (same rationale as overlay-cloudflare's lib).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to the exact worker version the sibling overlay-cloudflare crate
+# resolves (0.7.5 in the workspace Cargo.lock) so the shared `[build]`
+# command `cargo install -q --version ^0.7 worker-build` works — worker-build
+# 0.8+ requires worker >= 0.8. Only `d1` is needed: this worker is a pure
+# READ surface (no queues, no durable objects, no secrets).
+worker = { version = "0.7.5", features = ["d1"] }
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+# Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
+console_error_panic_hook = "0.1"

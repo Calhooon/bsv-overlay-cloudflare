@@ -27,8 +27,9 @@
 //! spend/eviction as no-ops (a reveal is a permanent fact that is never
 //! spent). The pot output, by contrast, IS spent — that spend is the whole
 //! point. So `ls_pot` opts into spend notifications
-//! ([`SpendNotificationMode::Txid`]) and, on spend, PERSISTS the spender:
-//! it marks the record `spent = true` and records the `spendingTxid`. The
+//! ([`SpendNotificationMode::WholeTx`](overlay_engine::types::SpendNotificationMode))
+//! and, on spend, PERSISTS the spender: it marks the record `spent = true`
+//! and records the `spendingTxid` (parsed out of the spending BEEF). The
 //! record is NEVER deleted — a landing proof is permanent history the way
 //! a reveal is, just with an extra "and here is the tx that spent it" fact.
 //!
@@ -36,6 +37,18 @@
 //! SPENDING (settle) tx is submitted, regardless of whether the spender
 //! admits any new outputs — so submitting the settle to `tm_pot` (its
 //! P2PKH outputs admit nothing) still records the spend against the pot.
+//!
+//! # The durable BEEF store (`pot_beefs`)
+//!
+//! Both hooks run in whole-tx mode so the service also durably stores the
+//! full BEEF of every pot FUNDING tx (on admit) and every pot-SPENDING
+//! settle/refund tx (on spend), keyed by each tx's own txid. This exists
+//! because the engine's `transactions` table is lifecycle-managed — a BEEF
+//! row is only written by `insert_output` (a settle admits no outputs, so it
+//! never gets one) and is deleted by the deep-delete when a spent unretained
+//! coin is cleaned up. `pot_beefs` is the durable source `low-app-layer`'s
+//! `/beef/:txid` serves. See [`storage::PotStorage::store_beef`] for the
+//! longer-wins/never-clobber write rule.
 //!
 //! # Lookup (`ls_pot`)
 //!

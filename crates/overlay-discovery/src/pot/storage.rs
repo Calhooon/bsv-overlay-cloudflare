@@ -18,6 +18,22 @@
 //! - [`PotStorage::mark_spent`] updates an existing row only (mirrors the D1
 //!   `UPDATE ... WHERE`); an outpoint must be admitted before it can be
 //!   marked spent.
+//!
+//! # The BEEF store (`pot_beefs`)
+//!
+//! Alongside the spend records, this trait durably stores the BEEF of every
+//! pot funding AND every pot-spending (settle/refund/sweep) tx, keyed by that
+//! tx's own txid. It exists because the engine's `transactions` table is
+//! LIFECYCLE-MANAGED: a BEEF row is only written by `insert_output` (a
+//! settle, which admits no outputs, never gets one) and is DELETED by the
+//! deep-delete when a spent unretained coin is cleaned up. `pot_beefs` is
+//! OURS — never deleted — and is the durable source `low-app-layer`'s
+//! `/beef/:txid` serves.
+//!
+//! Store rule (the "vanishing table" lesson — see the engine's
+//! `insert_output` BEEF upsert): [`PotStorage::store_beef`] NEVER overwrites
+//! an existing row with a shorter/empty beef — it writes only when no row
+//! exists or the new beef is LONGER.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,6 +104,18 @@ pub trait PotStorage {
         txid: &str,
         output_index: u32,
     ) -> Result<Option<PotRecord>, PotStorageError>;
+
+    /// Durably store `beef` under `txid` (the stored tx's OWN txid — the
+    /// funding txid for a funding beef, the SETTLE txid for a settle beef).
+    ///
+    /// Longer-wins, never-clobber (the "vanishing table" lesson): the write
+    /// happens only when no row exists or the new beef is strictly LONGER
+    /// than the stored one; an empty `beef` is rejected (no-op). A good row
+    /// is therefore never replaced by a shorter/empty one.
+    async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError>;
+
+    /// The stored BEEF for `txid`, or `None` if we never stored one.
+    async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError>;
 }
 
 /// POT storage errors.
@@ -107,6 +135,7 @@ pub enum PotStorageError {
 #[derive(Debug, Default)]
 pub struct MemoryPotStorage {
     records: std::sync::Mutex<Vec<PotRecord>>,
+    beefs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryPotStorage {
@@ -116,6 +145,10 @@ impl MemoryPotStorage {
 
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
+    }
+
+    pub fn beef_count(&self) -> usize {
+        self.beefs.lock().unwrap().len()
     }
 }
 
@@ -162,6 +195,27 @@ impl PotStorage for MemoryPotStorage {
             .iter()
             .find(|r| r.txid == txid && r.output_index == output_index)
             .cloned())
+    }
+
+    async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
+        // Empty is rejected — never store unusable bytes.
+        if beef.is_empty() {
+            return Ok(());
+        }
+        let mut beefs = self.beefs.lock().unwrap();
+        // Longer-wins: write only when absent or strictly longer (a good row
+        // is never clobbered by a shorter one).
+        match beefs.get(txid) {
+            Some(existing) if existing.len() >= beef.len() => {}
+            _ => {
+                beefs.insert(txid.to_string(), beef.to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+        Ok(self.beefs.lock().unwrap().get(txid).cloned())
     }
 }
 
@@ -257,6 +311,73 @@ mod tests {
         let b = store.get_spent_status("potB", 0).await.unwrap().unwrap();
         assert!(a.spent);
         assert!(!b.spent, "spending potA must not affect potB");
+    }
+
+    // ── BEEF store ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_beef_then_get_roundtrips() {
+        let store = MemoryPotStorage::new();
+        store.store_beef("fundingTx", &[1, 2, 3]).await.unwrap();
+        assert_eq!(store.beef_count(), 1);
+        assert_eq!(
+            store.get_beef("fundingTx").await.unwrap().as_deref(),
+            Some(&[1u8, 2, 3][..])
+        );
+        // A txid we never stored is None.
+        assert!(store.get_beef("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn store_beef_longer_wins() {
+        let store = MemoryPotStorage::new();
+        store.store_beef("tx", &[1, 2]).await.unwrap();
+        // A strictly longer beef replaces the stored one (re-hydration).
+        store.store_beef("tx", &[9, 9, 9, 9]).await.unwrap();
+        assert_eq!(
+            store.get_beef("tx").await.unwrap().as_deref(),
+            Some(&[9u8, 9, 9, 9][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn store_beef_shorter_never_clobbers() {
+        let store = MemoryPotStorage::new();
+        store.store_beef("tx", &[1, 2, 3, 4]).await.unwrap();
+        // Shorter must NOT clobber (the "vanishing table" lesson)…
+        store.store_beef("tx", &[7]).await.unwrap();
+        // …and equal-length must not either (write only when strictly longer).
+        store.store_beef("tx", &[7, 7, 7, 7]).await.unwrap();
+        assert_eq!(
+            store.get_beef("tx").await.unwrap().as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn store_beef_empty_rejected() {
+        let store = MemoryPotStorage::new();
+        // Empty on a fresh key stores nothing…
+        store.store_beef("tx", &[]).await.unwrap();
+        assert_eq!(store.beef_count(), 0);
+        assert!(store.get_beef("tx").await.unwrap().is_none());
+        // …and empty never erases a good row.
+        store.store_beef("tx", &[1, 2, 3]).await.unwrap();
+        store.store_beef("tx", &[]).await.unwrap();
+        assert_eq!(
+            store.get_beef("tx").await.unwrap().as_deref(),
+            Some(&[1u8, 2, 3][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn store_beef_distinct_txids_independent() {
+        let store = MemoryPotStorage::new();
+        store.store_beef("funding", &[1]).await.unwrap();
+        store.store_beef("settle", &[2, 2]).await.unwrap();
+        assert_eq!(store.beef_count(), 2);
+        assert_eq!(store.get_beef("funding").await.unwrap().as_deref(), Some(&[1u8][..]));
+        assert_eq!(store.get_beef("settle").await.unwrap().as_deref(), Some(&[2u8, 2][..]));
     }
 
     #[test]

@@ -1197,13 +1197,52 @@ impl PotRow {
     }
 }
 
+/// Row for the `pot_beefs` length probe (`length(beef) AS len`). D1 returns
+/// numbers as f64.
+#[derive(Deserialize)]
+struct BeefLenRow {
+    len: f64,
+}
+
+/// Row for the `pot_beefs` read-back: the BLOB as hex (`hex(beef) AS beef`) —
+/// the same read-back idiom the engine (`d1_storage.rs` `hex(t.beef)`) and
+/// low-app-layer use, avoiding D1 BLOB→JS deserialization quirks. `hex(NULL)`
+/// is NULL, so the column arrives `Option`.
+#[derive(Deserialize)]
+struct BeefHexRow {
+    beef: Option<String>,
+}
+
+/// Decode a `hex(beef)` read-back (SQLite `hex()` emits UPPERCASE;
+/// `hex::decode` accepts either case). Empty/undecodable → `None` — an
+/// unusable row is never served as bytes.
+fn decode_pot_beef_hex(row_beef: Option<String>) -> Option<Vec<u8>> {
+    let bytes = hex::decode(row_beef?).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+/// The `store_beef` write gate — longer-wins, never-clobber (the "vanishing
+/// table" lesson, see `d1_storage.rs::insert_output`): write only when the
+/// incoming beef is non-empty AND (no row exists OR the incoming beef is
+/// strictly LONGER than the stored one).
+fn beef_write_allowed(existing_len: Option<usize>, new_len: usize) -> bool {
+    new_len > 0 && existing_len.is_none_or(|len| new_len > len)
+}
+
 /// Cloudflare D1 implementation of the PotStorage trait (tm_pot / ls_pot).
 ///
-/// Schema: `pot_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by
-/// (txid, outputIndex) = the pot funding outpoint. `store_record` is
-/// `INSERT OR IGNORE` so a re-admission never clobbers a spent row back to
-/// unspent; `mark_spent` is an `UPDATE`; neither ever DELETEs — a spent pot
-/// is the permanent landing proof.
+/// Schema: `pot_records` + `pot_beefs` in `d1::OVERLAY_MIGRATIONS`.
+/// `pot_records` is keyed by (txid, outputIndex) = the pot funding outpoint.
+/// `store_record` is `INSERT OR IGNORE` so a re-admission never clobbers a
+/// spent row back to unspent; `mark_spent` is an `UPDATE`; neither ever
+/// DELETEs — a spent pot is the permanent landing proof. `pot_beefs` (keyed
+/// by the stored tx's own txid) durably holds the funding AND spending
+/// (settle/refund) BEEFs; `store_beef` writes only when absent-or-longer
+/// ([`beef_write_allowed`]) and nothing ever deletes a row.
 pub struct D1PotStorage {
     db: Rc<D1Database>,
 }
@@ -1273,6 +1312,42 @@ impl PotStorage for D1PotStorage {
         .map_err(pot_err)?;
         Ok(row.map(PotRow::into_record))
     }
+
+    async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
+        // Probe the existing row's length first; write only when absent or
+        // strictly longer ([`beef_write_allowed`] — never clobber a good row
+        // with a shorter/empty one).
+        let existing: Option<BeefLenRow> =
+            Query::new("SELECT length(beef) AS len FROM pot_beefs WHERE txid = ?")
+                .bind(txid)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(pot_err)?;
+        if !beef_write_allowed(existing.map(|r| r.len as usize), beef.len()) {
+            return Ok(());
+        }
+
+        // OR REPLACE + BLOB bind — the same idiom as the engine's
+        // transactions upsert (`d1_storage.rs::insert_output`): the guard
+        // above means we only ever replace with a strictly longer beef.
+        Query::new("INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt) VALUES (?, ?, ?)")
+            .bind(txid)
+            .bind(beef)
+            .bind(current_unix_seconds_i64())
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
+    }
+
+    async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+        let row: Option<BeefHexRow> =
+            Query::new("SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?")
+                .bind(txid)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(pot_err)?;
+        Ok(row.and_then(|r| decode_pot_beef_hex(r.beef)))
+    }
 }
 
 // =============================================================================
@@ -1333,5 +1408,46 @@ mod tests {
         assert_eq!(r.output_index, 2);
         assert!(r.spent);
         assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
+    }
+
+    #[test]
+    fn pot_beef_hex_readback_decodes() {
+        // SQLite hex() emits UPPERCASE — must decode; lowercase too.
+        assert_eq!(
+            decode_pot_beef_hex(Some("BEEF".into())),
+            Some(vec![0xBE, 0xEF])
+        );
+        assert_eq!(
+            decode_pot_beef_hex(Some("beef".into())),
+            Some(vec![0xbe, 0xef])
+        );
+        // NULL column / empty / undecodable → None (never served as bytes).
+        assert_eq!(decode_pot_beef_hex(None), None);
+        assert_eq!(decode_pot_beef_hex(Some("".into())), None);
+        assert_eq!(decode_pot_beef_hex(Some("abc".into())), None);
+        assert_eq!(decode_pot_beef_hex(Some("zz".into())), None);
+    }
+
+    #[test]
+    fn pot_beef_write_gate_longer_wins_never_clobbers() {
+        // No row yet → any non-empty beef writes.
+        assert!(beef_write_allowed(None, 1));
+        assert!(beef_write_allowed(None, 100));
+        // Empty is rejected even on a fresh key.
+        assert!(!beef_write_allowed(None, 0));
+        assert!(!beef_write_allowed(Some(4), 0));
+        // Strictly longer wins…
+        assert!(beef_write_allowed(Some(4), 5));
+        // …shorter/equal never clobbers (the "vanishing table" lesson).
+        assert!(!beef_write_allowed(Some(4), 3));
+        assert!(!beef_write_allowed(Some(4), 4));
+    }
+
+    #[test]
+    fn pot_beef_len_row_converts() {
+        // D1 returns length(beef) as f64 — the usize cast the write gate
+        // consumes.
+        let row = BeefLenRow { len: 1234.0 };
+        assert_eq!(row.len as usize, 1234);
     }
 }
