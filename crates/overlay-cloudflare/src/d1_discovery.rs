@@ -13,6 +13,7 @@ use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
 use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
+use overlay_discovery::pot::storage::{PotRecord, PotStorage, PotStorageError};
 use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
@@ -1170,6 +1171,111 @@ impl RevealStorage for D1RevealStorage {
 }
 
 // =============================================================================
+// D1PotStorage
+// =============================================================================
+
+/// Row for pot-spend record queries. D1 returns numbers as f64 and a
+/// nullable TEXT column as `Option<String>`.
+#[derive(Deserialize)]
+struct PotRow {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    spent: f64,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+}
+
+impl PotRow {
+    fn into_record(self) -> PotRecord {
+        PotRecord {
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            spent: self.spent != 0.0,
+            spending_txid: self.spending_txid,
+        }
+    }
+}
+
+/// Cloudflare D1 implementation of the PotStorage trait (tm_pot / ls_pot).
+///
+/// Schema: `pot_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by
+/// (txid, outputIndex) = the pot funding outpoint. `store_record` is
+/// `INSERT OR IGNORE` so a re-admission never clobbers a spent row back to
+/// unspent; `mark_spent` is an `UPDATE`; neither ever DELETEs — a spent pot
+/// is the permanent landing proof.
+pub struct D1PotStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1PotStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn pot_err(e: String) -> PotStorageError {
+    PotStorageError::Database(e)
+}
+
+#[async_trait(?Send)]
+impl PotStorage for D1PotStorage {
+    async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
+        // INSERT OR IGNORE: insert-if-absent, never clobber a spent row.
+        Query::new(
+            "INSERT OR IGNORE INTO pot_records \
+             (txid, outputIndex, spent, spendingTxid, createdAt) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(if record.spent { 1u32 } else { 0u32 })
+        .bind(record.spending_txid.as_deref())
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(pot_err)
+    }
+
+    async fn mark_spent(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+    ) -> Result<(), PotStorageError> {
+        // UPDATE-only: records the spender on an existing row (a nonexistent
+        // outpoint is a no-op — an output must be admitted before it spends).
+        Query::new(
+            "UPDATE pot_records SET spent = 1, spendingTxid = ? \
+             WHERE txid = ? AND outputIndex = ?",
+        )
+        .bind(spending_txid)
+        .bind(txid)
+        .bind(output_index)
+        .execute(&self.db)
+        .await
+        .map_err(pot_err)
+    }
+
+    async fn get_spent_status(
+        &self,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<Option<PotRecord>, PotStorageError> {
+        let row: Option<PotRow> = Query::new(
+            "SELECT txid, outputIndex, spent, spendingTxid FROM pot_records \
+             WHERE txid = ? AND outputIndex = ?",
+        )
+        .bind(txid)
+        .bind(output_index)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(pot_err)?;
+        Ok(row.map(PotRow::into_record))
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1196,5 +1302,36 @@ mod tests {
         };
         let r = row.into_ref();
         assert_eq!(r.output_index, 0);
+    }
+
+    #[test]
+    fn pot_row_unspent_conversion() {
+        // spent=0, spendingTxid NULL → unspent record.
+        let row = PotRow {
+            txid: "pot1".into(),
+            output_index: 0.0,
+            spent: 0.0,
+            spending_txid: None,
+        };
+        let r = row.into_record();
+        assert_eq!(r.txid, "pot1");
+        assert_eq!(r.output_index, 0);
+        assert!(!r.spent);
+        assert_eq!(r.spending_txid, None);
+    }
+
+    #[test]
+    fn pot_row_spent_conversion() {
+        // spent=1, spendingTxid set → landing proof.
+        let row = PotRow {
+            txid: "pot1".into(),
+            output_index: 2.0,
+            spent: 1.0,
+            spending_txid: Some("settleTx".into()),
+        };
+        let r = row.into_record();
+        assert_eq!(r.output_index, 2);
+        assert!(r.spent);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
     }
 }

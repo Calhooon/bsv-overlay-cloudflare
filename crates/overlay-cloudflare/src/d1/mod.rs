@@ -220,7 +220,7 @@ pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), 
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 31;
+pub const OVERLAY_MIGRATION_COUNT: usize = 33;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -387,6 +387,22 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_reveal_game ON reveal_records(gameId)",
     "CREATE INDEX IF NOT EXISTS idx_reveal_game_seat ON reveal_records(gameId, seat)",
+    // LOW pot-spend landing-proof records (tm_pot / ls_pot). One row per
+    // admitted Poc5TemplatePot covenant UTXO. Keyed by the pot funding
+    // outpoint (txid, outputIndex); `spent` + `spendingTxid` carry the
+    // on-chain landing proof once the settle/refund/sweep is seen. Unlike
+    // reveal, this row IS updated (on spend) but is NEVER deleted — a spent
+    // pot is the permanent landing proof a client queries before crediting a
+    // payout. INSERT OR IGNORE on admission never clobbers a spent row.
+    "CREATE TABLE IF NOT EXISTS pot_records (
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        spent INTEGER NOT NULL DEFAULT 0,
+        spendingTxid TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_pot_spending ON pot_records(spendingTxid)",
 ];
 
 // =============================================================================
@@ -480,6 +496,7 @@ mod tests {
             "uhrp_records",
             "low_records",
             "reveal_records",
+            "pot_records",
         ] {
             assert!(
                 joined.contains(table),
@@ -506,6 +523,7 @@ mod tests {
             "idx_uhrp_identity",
             "idx_reveal_game",
             "idx_reveal_game_seat",
+            "idx_pot_spending",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

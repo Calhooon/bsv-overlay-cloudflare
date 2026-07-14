@@ -34,9 +34,10 @@ HOSTING_URL = "https://low-overlay.dev-a3e.workers.dev"
 WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # Lobby surface: mainline SHIP/SLAP (so the node can be discovered and can
 # index peer ads if ever needed) + the LOW poker lobby topic + the LOW
-# break-glass reveal index (tm_reveal / ls_reveal, bsv-low watchtower).
-TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal"
-LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal"
+# break-glass reveal index (tm_reveal / ls_reveal, bsv-low watchtower) + the
+# LOW pot-spend landing-proof index (tm_pot / ls_pot).
+TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot"
+LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot"
 ENABLE_EXTENSIONS = "true"
 
 # Service binding to the ChainTracks worker (same account). ls_low uses this to
