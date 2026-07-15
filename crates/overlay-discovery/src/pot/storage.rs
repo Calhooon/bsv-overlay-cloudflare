@@ -18,6 +18,13 @@
 //! - [`PotStorage::mark_spent`] updates an existing row only (mirrors the D1
 //!   `UPDATE ... WHERE`); an outpoint must be admitted before it can be
 //!   marked spent.
+//! - **Prefer-confirmed / never-clobber-with-unconfirmed** (the `/submit`
+//!   surface is PUBLIC and `historical-tx-no-spv` skips SPV, so an arbitrary
+//!   submitter can claim to spend a pot): a spend marked `confirmed` (SPV
+//!   verified against a pinned chain tracker) ALWAYS wins; an UNCONFIRMED
+//!   spend claim can never overwrite a confirmed pointer. Last-writer-wins
+//!   among unconfirmed claims is deliberately preserved so an honest later
+//!   submit can still set the pointer.
 //!
 //! # The BEEF store (`pot_beefs`)
 //!
@@ -56,6 +63,13 @@ pub struct PotRecord {
     /// until the spend is recorded.
     #[serde(rename = "spendingTxid")]
     pub spending_txid: Option<String>,
+    /// Whether the recorded spend was SPV-CONFIRMED (the spending tx carried
+    /// a merkle path whose root the chain tracker validated) when it was
+    /// recorded. A confirmed pointer is chain truth: an unconfirmed claim can
+    /// never overwrite it (see [`PotStorage::mark_spent`]). `serde(default)`
+    /// keeps pre-upgrade rows/payloads readable (absent → `false`).
+    #[serde(rename = "spentConfirmed", default)]
+    pub spent_confirmed: bool,
 }
 
 /// One outpoint in a `spentStatus` query.
@@ -88,14 +102,27 @@ pub trait PotStorage {
 
     /// Mark an admitted outpoint spent by `spending_txid`.
     ///
-    /// Updates an existing row only (mirrors D1 `UPDATE ... WHERE`); a
-    /// nonexistent outpoint is a no-op (an output must be admitted before it
-    /// can be spent).
+    /// Prefer-confirmed / never-clobber-with-unconfirmed semantics:
+    ///
+    /// - `confirmed == true` → ALWAYS write: `spent = true`,
+    ///   `spending_txid = <new>`, `spent_confirmed = true`. A confirmed
+    ///   spend is chain truth; last-confirmed-wins.
+    /// - `confirmed == false` → write `spent = true`,
+    ///   `spending_txid = <new>` ONLY IF the existing row has
+    ///   `spent_confirmed = false`. An unconfirmed claim must NEVER clobber
+    ///   a confirmed pointer; last-writer-wins among unconfirmed claims is
+    ///   deliberately preserved so an honest later submit can still set the
+    ///   pointer. `spent_confirmed` is never touched in this branch.
+    ///
+    /// Still UPDATE-only (mirrors D1 `UPDATE ... WHERE`): a nonexistent
+    /// outpoint is a no-op (an output must be admitted before it can be
+    /// spent). Never deletes.
     async fn mark_spent(
         &self,
         txid: &str,
         output_index: u32,
         spending_txid: &str,
+        confirmed: bool,
     ) -> Result<(), PotStorageError>;
 
     /// The record for an outpoint, or `None` if we never admitted it.
@@ -171,13 +198,26 @@ impl PotStorage for MemoryPotStorage {
         txid: &str,
         output_index: u32,
         spending_txid: &str,
+        confirmed: bool,
     ) -> Result<(), PotStorageError> {
         let mut records = self.records.lock().unwrap();
         // UPDATE-only: touch an existing row; absent outpoint is a no-op.
         for r in records.iter_mut() {
             if r.txid == txid && r.output_index == output_index {
-                r.spent = true;
-                r.spending_txid = Some(spending_txid.to_string());
+                if confirmed {
+                    // Chain truth: always write, latch spent_confirmed
+                    // (last-confirmed-wins).
+                    r.spent = true;
+                    r.spending_txid = Some(spending_txid.to_string());
+                    r.spent_confirmed = true;
+                } else if !r.spent_confirmed {
+                    // Unconfirmed claim: only allowed while no confirmed
+                    // pointer exists (last-writer among unconfirmed);
+                    // spent_confirmed is never touched here.
+                    r.spent = true;
+                    r.spending_txid = Some(spending_txid.to_string());
+                }
+                // else: unconfirmed claim vs confirmed pointer → REFUSED.
             }
         }
         Ok(())
@@ -233,6 +273,7 @@ mod tests {
             output_index: vout,
             spent: false,
             spending_txid: None,
+            spent_confirmed: false,
         }
     }
 
@@ -260,11 +301,12 @@ mod tests {
     async fn mark_spent_sets_spender() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleTx").await.unwrap();
+        store.mark_spent("potA", 0, "settleTx", false).await.unwrap();
 
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent);
         assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
+        assert!(!r.spent_confirmed, "unconfirmed spend must not latch the flag");
         // No new row was created.
         assert_eq!(store.record_count(), 1);
     }
@@ -281,7 +323,7 @@ mod tests {
     async fn store_never_clobbers_a_spent_row_back_to_unspent() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleTx").await.unwrap();
+        store.mark_spent("potA", 0, "settleTx", false).await.unwrap();
 
         // A re-admission (e.g. GASP replay) must NOT erase the spender.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
@@ -294,8 +336,10 @@ mod tests {
     #[tokio::test]
     async fn mark_spent_on_unknown_outpoint_is_noop() {
         let store = MemoryPotStorage::new();
-        // No admission first → mark_spent creates nothing (mirrors D1 UPDATE).
-        store.mark_spent("ghost", 0, "settleTx").await.unwrap();
+        // No admission first → mark_spent creates nothing (mirrors D1 UPDATE),
+        // whether confirmed or not.
+        store.mark_spent("ghost", 0, "settleTx", false).await.unwrap();
+        store.mark_spent("ghost", 0, "settleTx", true).await.unwrap();
         assert_eq!(store.record_count(), 0);
         assert!(store.get_spent_status("ghost", 0).await.unwrap().is_none());
     }
@@ -305,12 +349,108 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store.store_record(&pot_record("potB", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleA").await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
 
         let a = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         let b = store.get_spent_status("potB", 0).await.unwrap().unwrap();
         assert!(a.spent);
         assert!(!b.spent, "spending potA must not affect potB");
+    }
+
+    // ── Prefer-confirmed / never-clobber-with-unconfirmed matrix ─────────
+
+    #[tokio::test]
+    async fn unconfirmed_overwrites_unconfirmed_last_writer_wins() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+
+        // First unconfirmed claim on an unspent row → recorded.
+        store.mark_spent("potA", 0, "claim1", false).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert_eq!(r.spending_txid.as_deref(), Some("claim1"));
+        assert!(!r.spent_confirmed);
+
+        // A second unconfirmed claim by a DIFFERENT spender overwrites —
+        // last-writer-wins among unconfirmed is deliberately preserved so an
+        // honest later submit can still set the pointer.
+        store.mark_spent("potA", 0, "claim2", false).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("claim2"));
+        assert!(!r.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirmed_spend_latches_flag() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "settleTx", true).await.unwrap();
+
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
+        assert!(r.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_never_clobbers_confirmed_pointer() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "realSettle", true).await.unwrap();
+
+        // An attacker's unconfirmed claim must be REFUSED: pointer AND flag
+        // unchanged.
+        store.mark_spent("potA", 0, "forgedSpend", false).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("realSettle"),
+            "unconfirmed claim must never clobber a confirmed pointer"
+        );
+        assert!(r.spent_confirmed, "the confirmed flag must survive");
+    }
+
+    #[tokio::test]
+    async fn confirmed_overwrites_confirmed_last_confirmed_wins() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "settle1", true).await.unwrap();
+
+        // A later CONFIRMED spend (e.g. reorg / better proof) still writes —
+        // chain truth is last-confirmed-wins.
+        store.mark_spent("potA", 0, "settle2", true).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("settle2"));
+        assert!(r.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirmed_overwrites_unconfirmed_claim() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "unconfirmedClaim", false).await.unwrap();
+
+        // The confirmed spend replaces the unconfirmed pointer and latches
+        // the flag.
+        store.mark_spent("potA", 0, "realSettle", true).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("realSettle"));
+        assert!(r.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn store_never_clobbers_confirmed_flag_on_readmission() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "settleTx", true).await.unwrap();
+
+        // A re-admission (GASP replay) must not erase the confirmed flag.
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert!(r.spent_confirmed);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
     }
 
     // ── BEEF store ───────────────────────────────────────────────────────
@@ -378,6 +518,17 @@ mod tests {
         assert_eq!(store.beef_count(), 2);
         assert_eq!(store.get_beef("funding").await.unwrap().as_deref(), Some(&[1u8][..]));
         assert_eq!(store.get_beef("settle").await.unwrap().as_deref(), Some(&[2u8, 2][..]));
+    }
+
+    #[test]
+    fn record_deserializes_without_spent_confirmed_field() {
+        // Backward-compat: a pre-upgrade payload without `spentConfirmed`
+        // still deserializes (serde default → false).
+        let r: PotRecord = serde_json::from_value(serde_json::json!({
+            "txid": "potA", "outputIndex": 0, "spent": true, "spendingTxid": "settleTx"
+        }))
+        .unwrap();
+        assert!(!r.spent_confirmed);
     }
 
     #[test]

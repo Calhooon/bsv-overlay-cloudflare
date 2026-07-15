@@ -212,15 +212,38 @@ impl WhereBuilder {
 // =============================================================================
 
 /// Run a list of SQL migration statements against D1.
+///
+/// The runner executes EVERY statement on EVERY cold start and propagates
+/// errors — so an additive `ALTER TABLE ... ADD COLUMN` would fail with
+/// "duplicate column name" on the second start. Exactly that case (and only
+/// that case) is ignored via [`migration_error_is_benign`].
 pub async fn run_migrations(db: &D1Database, statements: &[&str]) -> Result<(), String> {
     for sql in statements {
-        Query::new(*sql).execute(db).await?;
+        if let Err(e) = Query::new(*sql).execute(db).await {
+            if migration_error_is_benign(sql, &e) {
+                continue;
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }
 
+/// Whether a migration-statement error is the expected re-run outcome of an
+/// additive migration rather than a real fault: true IFF the statement is an
+/// `ALTER TABLE` (case-insensitive, leading whitespace ignored) AND the
+/// error message reports a duplicate column (case-insensitive). Any other
+/// error — or a duplicate-column report from a non-ALTER statement — is NOT
+/// benign and must propagate.
+pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
+    sql.trim_start()
+        .to_ascii_uppercase()
+        .starts_with("ALTER TABLE")
+        && err.to_ascii_lowercase().contains("duplicate column")
+}
+
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 34;
+pub const OVERLAY_MIGRATION_COUNT: usize = 35;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -416,6 +439,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         beef BLOB NOT NULL,
         createdAt INTEGER
     )",
+    // Prefer-confirmed / never-clobber-with-unconfirmed spend pointers
+    // (bsv-low pot landing proof): 1 when the recorded spendingTxid was
+    // SPV-confirmed (merkle path validated against the chain tracker) at
+    // record time. An unconfirmed claim never overwrites a row with
+    // spentConfirmed = 1 (see `D1PotStorage::mark_spent`). Additive ALTER:
+    // the runner ignores the re-run "duplicate column" error
+    // (`migration_error_is_benign`).
+    "ALTER TABLE pot_records ADD COLUMN spentConfirmed INTEGER NOT NULL DEFAULT 0",
 ];
 
 // =============================================================================
@@ -483,14 +514,51 @@ mod tests {
         assert_eq!(OVERLAY_MIGRATIONS.len(), OVERLAY_MIGRATION_COUNT);
         for (i, sql) in OVERLAY_MIGRATIONS.iter().enumerate() {
             assert!(!sql.is_empty(), "Migration {i} is empty");
-            // Should start with CREATE
+            // Should start with CREATE (idempotent IF NOT EXISTS) or ALTER
+            // (additive; the runner ignores the re-run duplicate-column
+            // error via migration_error_is_benign).
             let trimmed = sql.trim().to_uppercase();
             assert!(
-                trimmed.starts_with("CREATE"),
-                "Migration {i} should start with CREATE, got: {}",
+                trimmed.starts_with("CREATE") || trimmed.starts_with("ALTER TABLE"),
+                "Migration {i} should start with CREATE or ALTER TABLE, got: {}",
                 &trimmed[..30.min(trimmed.len())]
             );
         }
+    }
+
+    #[test]
+    fn migration_benign_error_is_duplicate_column_on_alter_only() {
+        let alter = "ALTER TABLE pot_records ADD COLUMN spentConfirmed INTEGER NOT NULL DEFAULT 0";
+        // The expected re-run outcome of an additive ALTER → benign.
+        assert!(migration_error_is_benign(
+            alter,
+            "duplicate column name: spentConfirmed"
+        ));
+        // Case-insensitive on both sides, leading whitespace tolerated.
+        assert!(migration_error_is_benign(
+            "  alter table pot_records ADD COLUMN x INTEGER",
+            "D1_ERROR: Duplicate Column name: x"
+        ));
+        // Any OTHER error on an ALTER is NOT benign.
+        assert!(!migration_error_is_benign(alter, "no such table: pot_records"));
+        assert!(!migration_error_is_benign(alter, "syntax error near ADD"));
+        // A duplicate-column report from a non-ALTER statement is NOT benign.
+        assert!(!migration_error_is_benign(
+            "CREATE TABLE t (a INTEGER, a INTEGER)",
+            "duplicate column name: a"
+        ));
+        // Empty inputs are never benign.
+        assert!(!migration_error_is_benign("", "duplicate column"));
+        assert!(!migration_error_is_benign(alter, ""));
+    }
+
+    #[test]
+    fn pot_records_spent_confirmed_migration_present() {
+        // The additive column migration exists and targets pot_records.
+        assert!(OVERLAY_MIGRATIONS.iter().any(|sql| {
+            sql.trim_start().starts_with("ALTER TABLE pot_records")
+                && sql.contains("spentConfirmed INTEGER NOT NULL DEFAULT 0")
+        }));
     }
 
     #[test]

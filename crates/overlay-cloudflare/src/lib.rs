@@ -275,6 +275,33 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     ))
 }
 
+/// Chain tracker for the LOW lookup services (ls_low table expiry, ls_pot
+/// spend-confirmation) — CHAINTRACKS service binding preferred, plain
+/// `CHAIN_TRACKER_URL` fallback, `None` when neither is configured.
+///
+/// ChainTracks is another Worker on the SAME account, so a plain
+/// `workers.dev` URL fetch loops back to THIS worker (404) and the check
+/// never resolves — we route through the CHAINTRACKS service binding
+/// instead, which reaches the real ChainTracks worker. The URL fallback
+/// works only if ChainTracks is off-account; with no tracker at all each
+/// consumer fails open/safe (ls_low: no expiry filter; ls_pot: spends record
+/// as unconfirmed hints).
+fn lookup_service_chain_tracker(env: &Env) -> Option<Rc<dyn bsv_rs::transaction::ChainTracker>> {
+    let ct_url = env
+        .var("CHAIN_TRACKER_URL")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
+    match env.service("CHAINTRACKS") {
+        Ok(svc) => Some(Rc::new(WorkerChainTracker::with_service(ct_url, svc))),
+        // No binding configured: fall back to the URL path (works only if
+        // ChainTracks is off-account; otherwise fails open).
+        Err(_) => env.var("CHAIN_TRACKER_URL").ok().map(|u| {
+            Rc::new(WorkerChainTracker::new(u.to_string()))
+                as Rc<dyn bsv_rs::transaction::ChainTracker>
+        }),
+    }
+}
+
 /// Build the overlay Engine with D1-backed storage and pre-built SHIP/SLAP/Agent storage.
 ///
 /// The discovery storage references are passed in so they can be shared with
@@ -400,33 +427,9 @@ fn build_engine_with_storage(
             "ls_low" => {
                 // Wire the chain tip into ls_low so findOpenTables enforces
                 // table expiry at query time (bsv-low #148). LOW-local: only
-                // this service consults the tracker.
-                //
-                // ChainTracks is another Worker on the SAME account, so a plain
-                // `workers.dev` URL fetch loops back to THIS worker (404) and the
-                // tip never resolves — the filter silently fails open. We route
-                // through the CHAINTRACKS service binding instead, which reaches
-                // the real ChainTracks worker. Falls back to a URL tracker (or no
-                // tracker → fail-open) if the binding/var is absent.
+                // the LOW services consult the tracker.
                 let mut low_svc = LowLookupService::new(low_storage.clone());
-                let ct_url = env
-                    .var("CHAIN_TRACKER_URL")
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
-                let tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>> =
-                    match env.service("CHAINTRACKS") {
-                        Ok(svc) => Some(Rc::new(WorkerChainTracker::with_service(ct_url, svc))),
-                        // No binding configured: fall back to the URL path (works
-                        // only if ChainTracks is off-account; otherwise fails open).
-                        Err(_) => env
-                            .var("CHAIN_TRACKER_URL")
-                            .ok()
-                            .map(|u| {
-                                Rc::new(WorkerChainTracker::new(u.to_string()))
-                                    as Rc<dyn bsv_rs::transaction::ChainTracker>
-                            }),
-                    };
-                if let Some(t) = tracker {
+                if let Some(t) = lookup_service_chain_tracker(env) {
                     low_svc = low_svc.with_chain_tracker(t);
                 }
                 lookup_services.insert("ls_low".into(), Box::new(low_svc));
@@ -438,10 +441,17 @@ fn build_engine_with_storage(
                 );
             }
             "ls_pot" => {
-                lookup_services.insert(
-                    "ls_pot".into(),
-                    Box::new(PotLookupService::new(pot_storage.clone())),
-                );
+                // Wire the same SPV source into ls_pot so output_spent can
+                // derive the CONFIRMED hint (prefer-confirmed /
+                // never-clobber-with-unconfirmed spend pointers): a
+                // bump-carrying spend the tracker validates is recorded as
+                // chain truth an unconfirmed /submit can never overwrite.
+                // No tracker → every spend degrades to an unconfirmed hint.
+                let mut pot_svc = PotLookupService::new(pot_storage.clone());
+                if let Some(t) = lookup_service_chain_tracker(env) {
+                    pot_svc = pot_svc.with_chain_tracker(t);
+                }
+                lookup_services.insert("ls_pot".into(), Box::new(pot_svc));
             }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),
         }

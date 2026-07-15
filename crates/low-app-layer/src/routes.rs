@@ -49,6 +49,10 @@ struct PotRowD1 {
     spent: f64,
     #[serde(rename = "spendingTxid")]
     spending_txid: Option<String>,
+    /// `serde(default)` (0.0) tolerates a read that races the overlay's
+    /// additive `spentConfirmed` migration.
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: f64,
 }
 
 impl PotRowD1 {
@@ -58,6 +62,7 @@ impl PotRowD1 {
             vout: self.output_index as u32,
             spent: self.spent != 0.0,
             spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed != 0.0,
         }
     }
 }

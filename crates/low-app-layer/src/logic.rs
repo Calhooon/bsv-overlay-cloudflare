@@ -84,10 +84,16 @@ pub struct OutpointStatus {
     pub spent: Option<bool>,
     /// The landing-proof spender, when the row records one.
     pub spending_txid: Option<String>,
+    /// Whether the recorded spend was SPV-CONFIRMED when recorded (an
+    /// unconfirmed claim can never overwrite a confirmed pointer — see the
+    /// overlay's pot `mark_spent`). `Some(bool)` for a known row, `None`
+    /// (wire `null`) when unknown — same fail-safe shape as `spent`.
+    pub spent_confirmed: Option<bool>,
 }
 
 impl OutpointStatus {
-    /// No `pot_records` row: `known:false, spent:null, spendingTxid:null`.
+    /// No `pot_records` row: `known:false, spent:null, spendingTxid:null,
+    /// spentConfirmed:null`.
     pub fn unknown(op: &Outpoint) -> Self {
         Self {
             txid: op.txid.clone(),
@@ -95,17 +101,25 @@ impl OutpointStatus {
             known: false,
             spent: None,
             spending_txid: None,
+            spent_confirmed: None,
         }
     }
 
-    /// A found row: `known:true` with the row's spent flag + spender.
-    pub fn known(op: &Outpoint, spent: bool, spending_txid: Option<String>) -> Self {
+    /// A found row: `known:true` with the row's spent flag + spender +
+    /// confirmation flag.
+    pub fn known(
+        op: &Outpoint,
+        spent: bool,
+        spending_txid: Option<String>,
+        spent_confirmed: bool,
+    ) -> Self {
         Self {
             txid: op.txid.clone(),
             vout: op.vout,
             known: true,
             spent: Some(spent),
             spending_txid,
+            spent_confirmed: Some(spent_confirmed),
         }
     }
 }
@@ -123,6 +137,7 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
                 "known": e.known,
                 "spent": e.spent,
                 "spendingTxid": e.spending_txid,
+                "spentConfirmed": e.spent_confirmed,
             })
         })
         .collect();
@@ -136,7 +151,10 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
 pub fn batch_where_sql(n: usize) -> String {
     debug_assert!((1..=MAX_OUTPOINTS).contains(&n), "parse_outpoints bounds n");
     let clause = vec!["(txid = ? AND outputIndex = ?)"; n].join(" OR ");
-    format!("SELECT txid, outputIndex, spent, spendingTxid FROM pot_records WHERE {clause}")
+    format!(
+        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed \
+         FROM pot_records WHERE {clause}"
+    )
 }
 
 /// One `pot_records` row, host-typed (the route converts D1's f64s here).
@@ -147,6 +165,8 @@ pub struct PotRecordRow {
     pub vout: u32,
     pub spent: bool,
     pub spending_txid: Option<String>,
+    /// Whether the recorded spend was SPV-confirmed when recorded.
+    pub spent_confirmed: bool,
 }
 
 /// Map the batch-query rows back onto the REQUESTED outpoints, input-ordered.
@@ -161,7 +181,9 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
                 .iter()
                 .find(|r| r.txid.eq_ignore_ascii_case(&key_txid) && r.vout == op.vout)
             {
-                Some(r) => OutpointStatus::known(op, r.spent, r.spending_txid.clone()),
+                Some(r) => {
+                    OutpointStatus::known(op, r.spent, r.spending_txid.clone(), r.spent_confirmed)
+                }
                 None => OutpointStatus::unknown(op),
             }
         })
@@ -316,8 +338,8 @@ mod tests {
             vout: 1,
         };
         let entries = vec![
-            OutpointStatus::known(&op_a, true, Some("f0".repeat(32))),
-            OutpointStatus::known(&op_a, false, None),
+            OutpointStatus::known(&op_a, true, Some("f0".repeat(32)), true),
+            OutpointStatus::known(&op_a, false, None, false),
             OutpointStatus::unknown(&op_b),
         ];
         let v: serde_json::Value = serde_json::from_str(&utxo_status_body(&entries)).unwrap();
@@ -329,16 +351,19 @@ mod tests {
         assert_eq!(arr[0]["known"], true);
         assert_eq!(arr[0]["spent"], true);
         assert_eq!(arr[0]["spendingTxid"], "f0".repeat(32));
+        assert_eq!(arr[0]["spentConfirmed"], true);
         // Known-unspent row.
         assert_eq!(arr[1]["known"], true);
         assert_eq!(arr[1]["spent"], false);
         assert!(arr[1]["spendingTxid"].is_null());
+        assert_eq!(arr[1]["spentConfirmed"], false);
         // Unknown row: fail-safe nulls, never asserted unspent.
         assert_eq!(arr[2]["txid"], txid_b());
         assert_eq!(arr[2]["vout"], 1);
         assert_eq!(arr[2]["known"], false);
         assert!(arr[2]["spent"].is_null());
         assert!(arr[2]["spendingTxid"].is_null());
+        assert!(arr[2]["spentConfirmed"].is_null());
     }
 
     #[test]
@@ -359,7 +384,7 @@ mod tests {
     fn batch_sql_shapes() {
         assert_eq!(
             batch_where_sql(1),
-            "SELECT txid, outputIndex, spent, spendingTxid FROM pot_records \
+            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
              WHERE (txid = ? AND outputIndex = ?)"
         );
         let three = batch_where_sql(3);
@@ -381,21 +406,27 @@ mod tests {
                 vout: 2,
                 spent: false,
                 spending_txid: None,
+                spent_confirmed: false,
             },
             PotRecordRow {
                 txid: txid_b(),
                 vout: 1,
                 spent: true,
                 spending_txid: Some("f0".repeat(32)),
+                spent_confirmed: true,
             },
         ];
         let out = assemble_statuses(&ops, &rows);
         assert_eq!(out.len(), 3);
         assert_eq!((out[0].known, out[0].spent), (true, Some(true)));
         assert_eq!(out[0].spending_txid.as_deref(), Some("f0".repeat(32).as_str()));
-        // Fail-safe middle: no row → known:false, spent:null.
+        assert_eq!(out[0].spent_confirmed, Some(true));
+        // Fail-safe middle: no row → known:false, spent:null,
+        // spentConfirmed:null.
         assert_eq!((out[1].known, out[1].spent), (false, None));
+        assert_eq!(out[1].spent_confirmed, None);
         assert_eq!((out[2].known, out[2].spent), (true, Some(false)));
+        assert_eq!(out[2].spent_confirmed, Some(false));
     }
 
     #[test]
@@ -409,6 +440,7 @@ mod tests {
             vout: 0,
             spent: true,
             spending_txid: None,
+            spent_confirmed: false,
         }];
         let out = assemble_statuses(&ops, &rows);
         assert!(out[0].known);

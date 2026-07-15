@@ -1184,6 +1184,10 @@ struct PotRow {
     spent: f64,
     #[serde(rename = "spendingTxid")]
     spending_txid: Option<String>,
+    /// `serde(default)` (0.0) tolerates a read that races the additive
+    /// `spentConfirmed` migration.
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: f64,
 }
 
 impl PotRow {
@@ -1193,6 +1197,7 @@ impl PotRow {
             output_index: self.output_index as u32,
             spent: self.spent != 0.0,
             spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed != 0.0,
         }
     }
 }
@@ -1238,8 +1243,10 @@ fn beef_write_allowed(existing_len: Option<usize>, new_len: usize) -> bool {
 /// Schema: `pot_records` + `pot_beefs` in `d1::OVERLAY_MIGRATIONS`.
 /// `pot_records` is keyed by (txid, outputIndex) = the pot funding outpoint.
 /// `store_record` is `INSERT OR IGNORE` so a re-admission never clobbers a
-/// spent row back to unspent; `mark_spent` is an `UPDATE`; neither ever
-/// DELETEs — a spent pot is the permanent landing proof. `pot_beefs` (keyed
+/// spent row back to unspent; `mark_spent` is an `UPDATE` with
+/// prefer-confirmed / never-clobber-with-unconfirmed semantics
+/// ([`mark_spent_sql`]); neither ever DELETEs — a spent pot is the permanent
+/// landing proof. `pot_beefs` (keyed
 /// by the stored tx's own txid) durably holds the funding AND spending
 /// (settle/refund) BEEFs; `store_beef` writes only when absent-or-longer
 /// ([`beef_write_allowed`]) and nothing ever deletes a row.
@@ -1257,19 +1264,40 @@ fn pot_err(e: String) -> PotStorageError {
     PotStorageError::Database(e)
 }
 
+/// The `mark_spent` UPDATE, by confirmation (prefer-confirmed /
+/// never-clobber-with-unconfirmed — see the `PotStorage::mark_spent` trait
+/// doc). Both are UPDATE-only (nonexistent outpoint = 0 rows touched) and
+/// never DELETE:
+///
+/// - confirmed: always writes and latches `spentConfirmed = 1`
+///   (last-confirmed-wins).
+/// - unconfirmed: the `AND spentConfirmed = 0` guard makes an unconfirmed
+///   claim a no-op against a confirmed pointer, while preserving
+///   last-writer-wins among unconfirmed claims; `spentConfirmed` untouched.
+fn mark_spent_sql(confirmed: bool) -> &'static str {
+    if confirmed {
+        "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1 \
+         WHERE txid = ? AND outputIndex = ?"
+    } else {
+        "UPDATE pot_records SET spent = 1, spendingTxid = ? \
+         WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
+    }
+}
+
 #[async_trait(?Send)]
 impl PotStorage for D1PotStorage {
     async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
         // INSERT OR IGNORE: insert-if-absent, never clobber a spent row.
         Query::new(
             "INSERT OR IGNORE INTO pot_records \
-             (txid, outputIndex, spent, spendingTxid, createdAt) \
-             VALUES (?, ?, ?, ?, ?)",
+             (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(record.txid.as_str())
         .bind(record.output_index)
         .bind(if record.spent { 1u32 } else { 0u32 })
         .bind(record.spending_txid.as_deref())
+        .bind(if record.spent_confirmed { 1u32 } else { 0u32 })
         .bind(current_unix_seconds_i64())
         .execute(&self.db)
         .await
@@ -1281,19 +1309,24 @@ impl PotStorage for D1PotStorage {
         txid: &str,
         output_index: u32,
         spending_txid: &str,
+        confirmed: bool,
     ) -> Result<(), PotStorageError> {
         // UPDATE-only: records the spender on an existing row (a nonexistent
         // outpoint is a no-op — an output must be admitted before it spends).
-        Query::new(
-            "UPDATE pot_records SET spent = 1, spendingTxid = ? \
-             WHERE txid = ? AND outputIndex = ?",
-        )
-        .bind(spending_txid)
-        .bind(txid)
-        .bind(output_index)
-        .execute(&self.db)
-        .await
-        .map_err(pot_err)
+        //
+        // Prefer-confirmed / never-clobber-with-unconfirmed (trait doc):
+        // - confirmed → ALWAYS write + latch spentConfirmed = 1
+        //   (chain truth; last-confirmed-wins).
+        // - unconfirmed → write ONLY IF spentConfirmed = 0 (an unconfirmed
+        //   claim never clobbers a confirmed pointer; last-writer-wins among
+        //   unconfirmed claims is preserved); spentConfirmed untouched.
+        Query::new(mark_spent_sql(confirmed))
+            .bind(spending_txid)
+            .bind(txid)
+            .bind(output_index)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
     }
 
     async fn get_spent_status(
@@ -1302,7 +1335,7 @@ impl PotStorage for D1PotStorage {
         output_index: u32,
     ) -> Result<Option<PotRecord>, PotStorageError> {
         let row: Option<PotRow> = Query::new(
-            "SELECT txid, outputIndex, spent, spendingTxid FROM pot_records \
+            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
              WHERE txid = ? AND outputIndex = ?",
         )
         .bind(txid)
@@ -1387,12 +1420,14 @@ mod tests {
             output_index: 0.0,
             spent: 0.0,
             spending_txid: None,
+            spent_confirmed: 0.0,
         };
         let r = row.into_record();
         assert_eq!(r.txid, "pot1");
         assert_eq!(r.output_index, 0);
         assert!(!r.spent);
         assert_eq!(r.spending_txid, None);
+        assert!(!r.spent_confirmed);
     }
 
     #[test]
@@ -1403,11 +1438,52 @@ mod tests {
             output_index: 2.0,
             spent: 1.0,
             spending_txid: Some("settleTx".into()),
+            spent_confirmed: 1.0,
         };
         let r = row.into_record();
         assert_eq!(r.output_index, 2);
         assert!(r.spent);
         assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
+        assert!(r.spent_confirmed);
+    }
+
+    #[test]
+    fn pot_row_spent_confirmed_defaults_when_column_absent() {
+        // A read that races the additive migration (row JSON without the
+        // spentConfirmed column) still deserializes → false.
+        let r: PotRow = serde_json::from_value(serde_json::json!({
+            "txid": "pot1", "outputIndex": 0.0, "spent": 1.0, "spendingTxid": "settleTx"
+        }))
+        .unwrap();
+        assert!(!r.into_record().spent_confirmed);
+    }
+
+    // ── mark_spent SQL (prefer-confirmed / never-clobber-with-unconfirmed) ──
+
+    #[test]
+    fn mark_spent_sql_confirmed_always_writes_and_latches_flag() {
+        let sql = mark_spent_sql(true);
+        // Chain truth: sets the pointer AND the flag…
+        assert!(sql.contains("SET spent = 1, spendingTxid = ?, spentConfirmed = 1"));
+        // …with no confirmation guard (last-confirmed-wins), UPDATE-only,
+        // never DELETE.
+        assert!(!sql.contains("spentConfirmed = 0"));
+        assert!(sql.starts_with("UPDATE pot_records"));
+        assert!(sql.contains("WHERE txid = ? AND outputIndex = ?"));
+        assert!(!sql.to_uppercase().contains("DELETE"));
+    }
+
+    #[test]
+    fn mark_spent_sql_unconfirmed_guarded_and_never_touches_flag() {
+        let sql = mark_spent_sql(false);
+        // The guard: an unconfirmed claim only lands while no confirmed
+        // pointer exists (spentConfirmed = 0)…
+        assert!(sql.contains("WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"));
+        // …and the SET clause never touches the flag.
+        assert!(sql.contains("SET spent = 1, spendingTxid = ? WHERE"));
+        assert!(!sql.contains("spentConfirmed = 1"));
+        assert!(sql.starts_with("UPDATE pot_records"));
+        assert!(!sql.to_uppercase().contains("DELETE"));
     }
 
     #[test]

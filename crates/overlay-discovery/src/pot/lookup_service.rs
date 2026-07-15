@@ -32,7 +32,7 @@
 //! `low-app-layer`'s `/beef/:txid` serves.
 
 use async_trait::async_trait;
-use bsv_rs::transaction::Transaction;
+use bsv_rs::transaction::{Beef, ChainTracker, MerklePath, Transaction};
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
@@ -44,12 +44,87 @@ use super::storage::{PotQuery, PotRecord, PotStorage};
 /// POT Lookup Service — indexes pot spends and answers spent-status queries.
 pub struct PotLookupService {
     storage: Rc<dyn PotStorage>,
+    /// Optional SPV source used to derive the `confirmed` hint on spends
+    /// (prefer-confirmed / never-clobber-with-unconfirmed — see
+    /// [`PotStorage::mark_spent`]). When present, a spending BEEF whose
+    /// subject tx carries a merkle path that this tracker validates records
+    /// the spend as CONFIRMED. When absent (or any verification hiccup) the
+    /// spend degrades fail-safe to an UNCONFIRMED hint — never an error that
+    /// blocks the spend record.
+    chain_tracker: Option<Rc<dyn ChainTracker>>,
 }
 
 impl PotLookupService {
     /// Create a new POT lookup service backed by the given storage.
+    ///
+    /// Constructed without an SPV source: every spend records as
+    /// UNCONFIRMED until [`PotLookupService::with_chain_tracker`] wires one
+    /// in (the deployed worker does; unit tests opt in via a mock).
     pub fn new(storage: Rc<dyn PotStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            chain_tracker: None,
+        }
+    }
+
+    /// Attach a chain tracker so `output_spent` can SPV-verify the spending
+    /// tx's merkle path and record the spend as CONFIRMED (mirrors
+    /// `LowLookupService::with_chain_tracker`).
+    pub fn with_chain_tracker(mut self, chain_tracker: Rc<dyn ChainTracker>) -> Self {
+        self.chain_tracker = Some(chain_tracker);
+        self
+    }
+
+    /// Derive the `confirmed` hint for a spend: `true` ONLY when a tracker
+    /// is configured AND the spending BEEF carries a bump containing
+    /// `spending_txid` AND the bump's root computes AND the tracker answers
+    /// `Ok(true)` for it at the bump's height. EVERY other outcome (no
+    /// tracker, no bump, compute error, tracker error/false) → `false` —
+    /// FAIL-SAFE: a verification hiccup degrades to "unconfirmed hint",
+    /// never an error that blocks the spend record.
+    ///
+    /// NOTE: `Transaction::from_beef` never populates the returned tx's
+    /// `merkle_path` (bsv-rs keeps the bump as a `bump_index` into
+    /// `Beef.bumps`), so we re-parse the BEEF and look the bump up directly.
+    async fn spend_confirmed(&self, spending_atomic_beef: &[u8], spending_txid: &str) -> bool {
+        let Some(tracker) = &self.chain_tracker else {
+            return false;
+        };
+        let beef = match Beef::from_binary(spending_atomic_beef) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("POT: spending beef re-parse for SPV failed — unconfirmed: {e}");
+                return false;
+            }
+        };
+        let Some(bump) = beef.find_bump(spending_txid) else {
+            // No merkle path for the SPENDING tx itself (0-conf spend).
+            return false;
+        };
+        bump_verifies(tracker.as_ref(), bump, spending_txid).await
+    }
+}
+
+/// SPV-check one bump against the tracker: compute the root from
+/// `txid`'s leaf and ask the tracker whether it is the root at the bump's
+/// height. Any error (txid not a leaf, tracker fault) → `false` (fail-safe).
+async fn bump_verifies(tracker: &dyn ChainTracker, bump: &MerklePath, txid: &str) -> bool {
+    let root = match bump.compute_root(Some(txid)) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("POT: bump root computation failed — unconfirmed: {e}");
+            return false;
+        }
+    };
+    match tracker
+        .is_valid_root_for_height(&root, bump.block_height)
+        .await
+    {
+        Ok(valid) => valid,
+        Err(e) => {
+            debug!("POT: chain-tracker root check failed — unconfirmed: {e}");
+            false
+        }
     }
 }
 
@@ -118,6 +193,7 @@ impl LookupService for PotLookupService {
             output_index,
             spent: false,
             spending_txid: None,
+            spent_confirmed: false,
         };
 
         self.storage
@@ -169,9 +245,18 @@ impl LookupService for PotLookupService {
         };
         let spending_txid = spending_tx.id();
 
+        // Derive the CONFIRMED hint (SPV against the pinned tracker); any
+        // hiccup degrades fail-safe to `false` — never blocks the record.
+        // This is what makes the public /submit surface safe: an arbitrary
+        // unconfirmed claim can never clobber a confirmed pointer
+        // (`PotStorage::mark_spent` semantics).
+        let confirmed = self
+            .spend_confirmed(spending_atomic_beef, &spending_txid)
+            .await;
+
         // PERSIST the spender — never delete. This is the landing proof.
         self.storage
-            .mark_spent(txid, output_index, &spending_txid)
+            .mark_spent(txid, output_index, &spending_txid, confirmed)
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
@@ -222,18 +307,20 @@ impl LookupService for PotLookupService {
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
             // Fail-safe: an outpoint we never admitted is `known:false` with
-            // null spent/spendingTxid — never assert "unspent" for an output
-            // we never saw.
-            let (known, spent, spending_txid) = match record {
+            // null spent/spendingTxid/spentConfirmed — never assert
+            // "unspent" for an output we never saw.
+            let (known, spent, spending_txid, spent_confirmed) = match record {
                 Some(r) => (
                     true,
                     serde_json::Value::Bool(r.spent),
                     r.spending_txid
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
+                    serde_json::Value::Bool(r.spent_confirmed),
                 ),
                 None => (
                     false,
+                    serde_json::Value::Null,
                     serde_json::Value::Null,
                     serde_json::Value::Null,
                 ),
@@ -245,6 +332,7 @@ impl LookupService for PotLookupService {
                 "known": known,
                 "spent": spent,
                 "spendingTxid": spending_txid,
+                "spentConfirmed": spent_confirmed,
             }));
         }
 
@@ -280,12 +368,49 @@ mod tests {
     use super::super::topic_manager::tests::{dummy_params, make_covenant_output};
     use super::*;
     use bsv_rs::script::LockingScript;
-    use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput};
+    use bsv_rs::transaction::{
+        ChainTrackerError, MerklePathLeaf, MockChainTracker, Transaction as Tx, TransactionInput,
+        TransactionOutput,
+    };
 
     fn make_service_with_storage() -> (PotLookupService, Rc<MemoryPotStorage>) {
         let storage = Rc::new(MemoryPotStorage::new());
         let svc = PotLookupService::new(storage.clone());
         (svc, storage)
+    }
+
+    /// A tracker that always FAULTS — the "verification hiccup" case that
+    /// must degrade to an unconfirmed hint, never a blocked spend record.
+    struct FailingTracker;
+
+    #[async_trait::async_trait]
+    impl ChainTracker for FailingTracker {
+        async fn is_valid_root_for_height(
+            &self,
+            _root: &str,
+            _height: u32,
+        ) -> Result<bool, ChainTrackerError> {
+            Err(ChainTrackerError::NetworkError("boom".into()))
+        }
+
+        async fn current_height(&self) -> Result<u32, ChainTrackerError> {
+            Err(ChainTrackerError::NetworkError("boom".into()))
+        }
+    }
+
+    /// A minimal valid BUMP proving `txid` as the sole tx of a block at
+    /// `height` — the single-tx-block special case, whose root IS the txid.
+    fn single_tx_bump(txid: &str, height: u32) -> MerklePath {
+        MerklePath::new(height, vec![vec![MerklePathLeaf::new_txid(0, txid.into())]])
+            .expect("valid single-leaf merkle path")
+    }
+
+    /// A tracker that accepts exactly the single-tx-block proof for `txid`
+    /// at `height` (root == txid).
+    fn tracker_accepting(txid: &str, height: u32) -> Rc<dyn ChainTracker> {
+        let mut t = MockChainTracker::new(height + 6);
+        t.add_root(height, txid.to_string());
+        Rc::new(t)
     }
 
     fn make_service() -> PotLookupService {
@@ -394,6 +519,7 @@ mod tests {
         assert_eq!(e["known"], true);
         assert_eq!(e["spent"], false);
         assert!(e["spendingTxid"].is_null());
+        assert_eq!(e["spentConfirmed"], false);
     }
 
     #[tokio::test]
@@ -436,6 +562,8 @@ mod tests {
         assert_eq!(e["known"], true);
         assert_eq!(e["spent"], true);
         assert_eq!(e["spendingTxid"], settle.id());
+        // No tracker configured → the spend is an UNCONFIRMED hint.
+        assert_eq!(e["spentConfirmed"], false);
     }
 
     #[tokio::test]
@@ -476,6 +604,167 @@ mod tests {
         assert_eq!(e["known"], false);
         assert!(e["spent"].is_null());
         assert!(e["spendingTxid"].is_null());
+        // Fail-safe: unknown outpoint → spentConfirmed is NULL, not false.
+        assert!(e["spentConfirmed"].is_null());
+    }
+
+    // ── spentConfirmed derivation (SPV against the chain tracker) ────────
+
+    /// Admit a pot, then spend it with a settle carrying `merkle_path`
+    /// (or not) through the REAL producer path (`output_spent`), and return
+    /// what the storage recorded.
+    async fn run_spend(
+        tracker: Option<Rc<dyn ChainTracker>>,
+        bump: Option<MerklePath>,
+    ) -> (PotRecord, String) {
+        let storage = Rc::new(MemoryPotStorage::new());
+        let mut svc = PotLookupService::new(storage.clone());
+        if let Some(t) = tracker {
+            svc = svc.with_chain_tracker(t);
+        }
+
+        let funding = funding_tx(1);
+        let pot_txid = funding.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+
+        let mut settle = settle_tx(&pot_txid, 0);
+        settle.merkle_path = bump;
+        let settle_txid = settle.id();
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&settle)))
+            .await
+            .unwrap();
+
+        let rec = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        (rec, settle_txid)
+    }
+
+    #[tokio::test]
+    async fn spend_with_valid_bump_and_tracker_true_records_confirmed() {
+        // Pre-compute the settle txid so the tracker can pin its root: the
+        // settle shape is deterministic for a given pot outpoint.
+        let pot_txid = funding_tx(1).id();
+        let settle_txid = settle_tx(&pot_txid, 0).id();
+
+        let (rec, spender) = run_spend(
+            Some(tracker_accepting(&settle_txid, 800_000)),
+            Some(single_tx_bump(&settle_txid, 800_000)),
+        )
+        .await;
+        assert_eq!(spender, settle_txid);
+        assert!(rec.spent);
+        assert_eq!(rec.spending_txid.as_deref(), Some(settle_txid.as_str()));
+        assert!(
+            rec.spent_confirmed,
+            "valid bump + tracker-true must record CONFIRMED"
+        );
+    }
+
+    #[tokio::test]
+    async fn spend_without_bump_records_unconfirmed() {
+        // Tracker configured but the spending tx carries no merkle path
+        // (0-conf spend) → unconfirmed hint.
+        let pot_txid = funding_tx(1).id();
+        let settle_txid = settle_tx(&pot_txid, 0).id();
+
+        let (rec, _) = run_spend(Some(tracker_accepting(&settle_txid, 800_000)), None).await;
+        assert!(rec.spent, "the spend is still recorded");
+        assert!(!rec.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn spend_with_bump_but_tracker_false_records_unconfirmed() {
+        // The tracker knows no root at that height → Ok(false) → unconfirmed.
+        let pot_txid = funding_tx(1).id();
+        let settle_txid = settle_tx(&pot_txid, 0).id();
+
+        let (rec, _) = run_spend(
+            Some(Rc::new(MockChainTracker::new(900_000))),
+            Some(single_tx_bump(&settle_txid, 800_000)),
+        )
+        .await;
+        assert!(rec.spent, "the spend is still recorded");
+        assert!(!rec.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn spend_with_bump_but_tracker_error_records_unconfirmed() {
+        // FAIL-SAFE: a tracker fault degrades to an unconfirmed hint — it
+        // must never error out and block the spend record.
+        let pot_txid = funding_tx(1).id();
+        let settle_txid = settle_tx(&pot_txid, 0).id();
+
+        let (rec, _) = run_spend(
+            Some(Rc::new(FailingTracker)),
+            Some(single_tx_bump(&settle_txid, 800_000)),
+        )
+        .await;
+        assert!(rec.spent, "a tracker fault must not block the spend record");
+        assert!(!rec.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn spend_without_tracker_records_unconfirmed_even_with_bump() {
+        // No tracker configured → confirmed can never be derived, even for a
+        // bump-carrying spend (we can't validate the root against anything).
+        let pot_txid = funding_tx(1).id();
+        let settle_txid = settle_tx(&pot_txid, 0).id();
+
+        let (rec, _) = run_spend(None, Some(single_tx_bump(&settle_txid, 800_000))).await;
+        assert!(rec.spent);
+        assert!(!rec.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn bump_verifies_rejects_txid_not_a_leaf() {
+        // compute_root errors when the txid is not a leaf of the path →
+        // fail-safe false, even under an always-accepting tracker.
+        let bump = single_tx_bump(&"aa".repeat(32), 800_000);
+        let tracker = bsv_rs::transaction::AlwaysValidChainTracker::new(800_100);
+        assert!(!bump_verifies(&tracker, &bump, &"bb".repeat(32)).await);
+        // Sanity: the actual leaf DOES verify under the same tracker.
+        assert!(bump_verifies(&tracker, &bump, &"aa".repeat(32)).await);
+    }
+
+    #[tokio::test]
+    async fn confirmed_pointer_survives_later_unconfirmed_claim_end_to_end() {
+        // Through the REAL producer path: a confirmed settle lands first,
+        // then an attacker submits an unconfirmed tx claiming the same pot —
+        // the pointer and flag must be unchanged.
+        let storage = Rc::new(MemoryPotStorage::new());
+        let funding = funding_tx(1);
+        let pot_txid = funding.id();
+        let mut real_settle = settle_tx(&pot_txid, 0);
+        let settle_txid = real_settle.id();
+        real_settle.merkle_path = Some(single_tx_bump(&settle_txid, 800_000));
+
+        let svc = PotLookupService::new(storage.clone())
+            .with_chain_tracker(tracker_accepting(&settle_txid, 800_000));
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&real_settle)))
+            .await
+            .unwrap();
+
+        // The attacker's forged spend: same pot outpoint, different tx, no
+        // proof (the public /submit + historical-tx-no-spv path).
+        let mut forged = settle_tx(&pot_txid, 0);
+        forged.add_output(p2pkh_output()).unwrap(); // distinct txid
+        assert_ne!(forged.id(), settle_txid);
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&forged)))
+            .await
+            .unwrap();
+
+        let arr = spent_status(&svc, serde_json::json!([{"txid": pot_txid, "vout": 0}])).await;
+        let e = &arr[0];
+        assert_eq!(e["spent"], true);
+        assert_eq!(
+            e["spendingTxid"], settle_txid,
+            "an unconfirmed claim must never clobber the confirmed pointer"
+        );
+        assert_eq!(e["spentConfirmed"], true);
     }
 
     // ── Input-ordered, mixed batch ───────────────────────────────────────
