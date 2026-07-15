@@ -173,15 +173,57 @@ async fn fetch_is_valid_root(
         )));
     }
 
-    // If value is missing, the header hasn't been ingested yet (height is in the
-    // "live" range between heightBulk and heightLive). Treat as valid — the
-    // transaction is in a recent block that the bulk ingestor hasn't caught up to.
-    // This matches TS SDK behavior which gracefully handles missing headers.
-    let Some(header) = frame.value else {
-        return Ok(true);
-    };
+    root_matches_frame(frame.value.as_ref(), &root)
+}
 
-    Ok(header.merkle_root == root)
+/// Decide `is_valid_root_for_height` from a parsed `success` frame.
+///
+/// FAIL-SAFE on an absent header (a `{status:"success", value:null}` body):
+/// return `Ok(false)` — an unverifiable root is NOT valid. The former code
+/// fail-OPENED here (`Ok(true)`), which — now that `ls_pot`'s money
+/// confirmation depends on this check (bsv-low pot landing proof) — would let
+/// a forged single-leaf bump (`root == spending_txid`) at a live-range height
+/// be recorded as `spentConfirmed`, clobbering a real confirmed pointer.
+///
+/// This branch is DEAD against the deployed `rust-chaintracks`, which serves a
+/// FULL header on success (incl. a verified WoC read-through for fresh
+/// tip+1..+6 blocks) or a 404 for anything it cannot verify — it never emits
+/// `success + null`. So failing safe changes nothing in practice while closing
+/// the latent trap; a genuinely-recent block is served a real header (matched
+/// below) or 404s (→ `BlockNotFound` at the caller), never silently accepted.
+fn root_matches_frame(header: Option<&CtBlockHeader>, root: &str) -> Result<bool, ChainTrackerError> {
+    match header {
+        Some(h) => Ok(h.merkle_root == root),
+        None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod root_frame_tests {
+    use super::{root_matches_frame, CtBlockHeader};
+
+    fn header(merkle_root: &str) -> CtBlockHeader {
+        CtBlockHeader {
+            merkle_root: merkle_root.to_string(),
+        }
+    }
+
+    #[test]
+    fn matching_root_is_valid() {
+        assert_eq!(root_matches_frame(Some(&header("abc")), "abc"), Ok(true));
+    }
+
+    #[test]
+    fn differing_root_is_invalid() {
+        assert_eq!(root_matches_frame(Some(&header("abc")), "def"), Ok(false));
+    }
+
+    #[test]
+    fn absent_header_fails_safe_to_invalid_not_open() {
+        // The security fix: a success+null body is UNVERIFIABLE → false, never
+        // a fail-open true that would confirm an arbitrary root.
+        assert_eq!(root_matches_frame(None, "anything"), Ok(false));
+    }
 }
 
 /// Fetch the current chain height from ChainTracks.
