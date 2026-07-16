@@ -40,6 +40,9 @@ use overlay_discovery::low::topic_manager::LowTopicManager;
 use overlay_discovery::pot::lookup_service::PotLookupService;
 use overlay_discovery::pot::storage::PotStorage;
 use overlay_discovery::pot::topic_manager::PotTopicManager;
+use overlay_discovery::result::lookup_service::ResultLookupService;
+use overlay_discovery::result::storage::ResultStorage;
+use overlay_discovery::result::topic_manager::ResultTopicManager;
 use overlay_discovery::reveal::lookup_service::RevealLookupService;
 use overlay_discovery::reveal::storage::RevealStorage;
 use overlay_discovery::reveal::topic_manager::RevealTopicManager;
@@ -62,7 +65,7 @@ use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::{run_migrations, OVERLAY_MIGRATIONS};
 use crate::d1_discovery::{
     D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1LowStorage, D1PotStorage,
-    D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
+    D1ResultStorage, D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
 use crate::health_checker::WorkerHealthChecker;
@@ -133,6 +136,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
     let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
+    let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -145,6 +149,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         reveal_storage.clone(),
         pot_storage.clone(),
         collected_storage.clone(),
+        result_storage.clone(),
     );
 
     // Hosting URL for web UI
@@ -267,6 +272,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
+    let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     Ok(build_engine_with_storage(
         db,
         env,
@@ -279,6 +285,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         reveal_storage,
         pot_storage,
         collected_storage,
+        result_storage,
     ))
 }
 
@@ -326,6 +333,7 @@ fn build_engine_with_storage(
     reveal_storage: Rc<dyn RevealStorage>,
     pot_storage: Rc<dyn PotStorage>,
     collected_storage: Rc<dyn CollectedStorage>,
+    result_storage: Rc<dyn ResultStorage>,
 ) -> Engine {
     // Storage
     let storage = Box::new(D1Storage::new(db));
@@ -397,6 +405,9 @@ fn build_engine_with_storage(
             }
             "tm_collected" => {
                 managers.insert("tm_collected".into(), Box::new(CollectedTopicManager::new()));
+            }
+            "tm_result" => {
+                managers.insert("tm_result".into(), Box::new(ResultTopicManager::new()));
             }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
         }
@@ -474,6 +485,12 @@ fn build_engine_with_storage(
                 lookup_services.insert(
                     "ls_collected".into(),
                     Box::new(CollectedLookupService::new(collected_storage.clone())),
+                );
+            }
+            "ls_result" => {
+                lookup_services.insert(
+                    "ls_result".into(),
+                    Box::new(ResultLookupService::new(result_storage.clone())),
                 );
             }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),
@@ -562,8 +579,9 @@ fn build_engine_with_storage(
     // directly. Disabled until a second pot-index node exists. tm_lowfund
     // (the hop-side index into the same store) mirrors it, as does
     // tm_collected (the cross-device "already collected" marker index,
-    // bsv-low #161).
-    for topic in ["tm_pot", "tm_lowfund", "tm_collected"] {
+    // bsv-low #161), as does tm_result (the hand-result leaderboard
+    // marker index, bsv-low #38).
+    for topic in ["tm_pot", "tm_lowfund", "tm_collected", "tm_result"] {
         sync_configuration.insert(
             topic.to_string(),
             overlay_engine::types::SyncTarget::Disabled,
@@ -692,6 +710,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
+    let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -704,6 +723,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         reveal_storage.clone(),
         pot_storage.clone(),
         collected_storage.clone(),
+        result_storage.clone(),
     );
 
     // Sync advertisements (if advertiser + hosting URL are configured).

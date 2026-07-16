@@ -4,6 +4,7 @@ pub mod collected;
 pub mod dm_delegation;
 pub mod low;
 pub mod pot;
+pub mod result;
 pub mod reveal;
 pub mod ship;
 pub mod slap;

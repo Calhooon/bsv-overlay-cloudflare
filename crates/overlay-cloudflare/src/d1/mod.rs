@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 36;
+pub const OVERLAY_MIGRATION_COUNT: usize = 39;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -463,6 +463,33 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         createdAt INTEGER,
         PRIMARY KEY (identity, gameId)
     )",
+    // LOW hand-result leaderboard markers (tm_result / ls_result,
+    // bsv-low #38). One row per (gameId, winner) pair — FIRST MARKER
+    // WINS: the lookup service inserts with INSERT OR IGNORE on the
+    // primary key, so a later marker for the same pair never overwrites
+    // the first, and rows are NEVER deleted (a settled result is
+    // permanent, like a reveal; the OP_RETURN is provably unspendable).
+    // All byte fields are handed back verbatim to querying clients, which
+    // verify BOTH sigs client-side ('anyone' ProtoWallet round-trip) —
+    // the overlay never does and derives no "confirmed" flag. loserSigHex
+    // is NULL when the marker's loserSig push was empty (an unconfirmed
+    // claim).
+    "CREATE TABLE IF NOT EXISTS result_markers (
+        gameId TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        loser TEXT NOT NULL,
+        potTxid TEXT,
+        settleTxid TEXT,
+        winnerSigHex TEXT,
+        loserSigHex TEXT,
+        txid TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (gameId, winner)
+    )",
+    // The two ls_result list queries: resultsFor filters by winner,
+    // both order by createdAt DESC.
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_winner ON result_markers(winner)",
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_createdAt ON result_markers(createdAt)",
 ];
 
 // =============================================================================
@@ -596,6 +623,7 @@ mod tests {
             "pot_records",
             "pot_beefs",
             "collected_markers",
+            "result_markers",
         ] {
             assert!(
                 joined.contains(table),
@@ -623,6 +651,8 @@ mod tests {
             "idx_reveal_game",
             "idx_reveal_game_seat",
             "idx_pot_spending",
+            "idx_result_markers_winner",
+            "idx_result_markers_createdAt",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

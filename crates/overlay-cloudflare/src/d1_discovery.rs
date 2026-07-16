@@ -17,6 +17,7 @@ use overlay_discovery::dm_delegation::storage::{
 };
 use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
 use overlay_discovery::pot::storage::{PotRecord, PotStorage, PotStorageError};
+use overlay_discovery::result::storage::{ResultRecord, ResultStorage, ResultStorageError};
 use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
@@ -1470,6 +1471,131 @@ impl CollectedStorage for D1CollectedStorage {
         .await
         .map_err(collected_err)?;
         Ok(row.map(CollectedRow::into_record))
+    }
+}
+
+// =============================================================================
+// D1ResultStorage
+// =============================================================================
+
+/// Row for result-marker queries. TEXT columns arrive as `String` /
+/// `Option<String>` (loserSigHex is nullable — NULL = an unconfirmed
+/// claim); `createdAt` is an INTEGER column but D1 returns numbers as
+/// f64.
+#[derive(Deserialize)]
+struct ResultRow {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    loser: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "settleTxid")]
+    settle_txid: String,
+    #[serde(rename = "winnerSigHex")]
+    winner_sig_hex: String,
+    #[serde(rename = "loserSigHex")]
+    loser_sig_hex: Option<String>,
+    txid: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+}
+
+impl ResultRow {
+    fn into_record(self) -> ResultRecord {
+        ResultRecord {
+            game_id: self.game_id,
+            winner: self.winner,
+            loser: self.loser,
+            pot_txid: self.pot_txid,
+            settle_txid: self.settle_txid,
+            winner_sig_hex: self.winner_sig_hex,
+            loser_sig_hex: self.loser_sig_hex,
+            txid: self.txid,
+            created_at: self.created_at.unwrap_or(0.0) as i64,
+        }
+    }
+}
+
+/// Cloudflare D1 implementation of the ResultStorage trait
+/// (tm_result / ls_result, bsv-low #38).
+///
+/// Schema: `result_markers` in `d1::OVERLAY_MIGRATIONS`. Keyed by
+/// (gameId, winner); `INSERT OR IGNORE` makes the FIRST marker for a
+/// pair win — a later marker never overwrites it — and rows are NEVER
+/// deleted (a settled result is permanent, like a reveal; the lookup
+/// service's spend/eviction hooks are no-ops). `createdAt` is stamped
+/// here at insert (the record's value is ignored) and drives the
+/// newest-first list ordering; `rowid DESC` breaks same-second ties in
+/// insertion order.
+pub struct D1ResultStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1ResultStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn result_err(e: String) -> ResultStorageError {
+    ResultStorageError::Database(e)
+}
+
+const RESULT_SELECT: &str = "SELECT gameId, winner, loser, potTxid, settleTxid, \
+     winnerSigHex, loserSigHex, txid, createdAt FROM result_markers";
+
+#[async_trait(?Send)]
+impl ResultStorage for D1ResultStorage {
+    async fn store_record(&self, record: &ResultRecord) -> Result<(), ResultStorageError> {
+        // INSERT OR IGNORE on the (gameId, winner) primary key — first
+        // marker wins; never overwrite, never delete.
+        Query::new(
+            "INSERT OR IGNORE INTO result_markers \
+             (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+              loserSigHex, txid, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.game_id.as_str())
+        .bind(record.winner.as_str())
+        .bind(record.loser.as_str())
+        .bind(record.pot_txid.as_str())
+        .bind(record.settle_txid.as_str())
+        .bind(record.winner_sig_hex.as_str())
+        .bind(record.loser_sig_hex.as_deref())
+        .bind(record.txid.as_deref())
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(result_err)
+    }
+
+    async fn list_for_winner(
+        &self,
+        winner: &str,
+        limit: usize,
+    ) -> Result<Vec<ResultRecord>, ResultStorageError> {
+        let rows: Vec<ResultRow> = Query::new(format!(
+            "{RESULT_SELECT} WHERE winner = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        ))
+        .bind(winner)
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(result_err)?;
+        Ok(rows.into_iter().map(ResultRow::into_record).collect())
+    }
+
+    async fn list_recent(&self, limit: usize) -> Result<Vec<ResultRecord>, ResultStorageError> {
+        let rows: Vec<ResultRow> = Query::new(format!(
+            "{RESULT_SELECT} ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        ))
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(result_err)?;
+        Ok(rows.into_iter().map(ResultRow::into_record).collect())
     }
 }
 
