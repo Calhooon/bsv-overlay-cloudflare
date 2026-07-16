@@ -1,9 +1,11 @@
 //! RESULT Topic Manager — validates LOW hand-result markers.
 //!
-//! See [`super`] for the full on-wire format. A single record type is
+//! See [`super`] for the full on-wire formats. Two record versions are
 //! admitted: the `LOW/result/v1` `OP_RETURN` data carrier (8 pushes:
 //! tag / gameId / winnerIdentity / loserIdentity / potTxid / settleTxid /
-//! winnerSig / loserSig-or-empty).
+//! winnerSig / loserSig-or-empty) and `LOW/result/v2` (9 pushes — v1
+//! plus the winner's five revealed cards between settleTxid and
+//! winnerSig, for the "lowest winning hand" leaderboard).
 //!
 //! Like `tm_collected`, there is NO server-side signature verification:
 //! the marker is admitted by BYTE FORMAT ONLY (plus the structural
@@ -154,6 +156,17 @@ pub(crate) mod tests {
         // The unconfirmed shape (empty loserSig) is equally admissible.
         let out = make_result_output(&[0x42u8; 32], &[]);
         assert!(ResultTopicManager::validate_result_output(&out));
+    }
+
+    #[test]
+    fn v2_golden_vector_outputs_admitted() {
+        use super::super::tests::{GOLDEN_RESULT_V2_HEX, GOLDEN_RESULT_V2_UNCONFIRMED_HEX};
+        assert!(ResultTopicManager::validate_result_output(&golden_output(
+            GOLDEN_RESULT_V2_HEX
+        )));
+        assert!(ResultTopicManager::validate_result_output(&golden_output(
+            GOLDEN_RESULT_V2_UNCONFIRMED_HEX
+        )));
     }
 
     // ── Not-a-marker (skip) ───────────────────────────────────────────────

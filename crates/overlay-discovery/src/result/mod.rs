@@ -47,11 +47,38 @@
 //! | 7 | loserSig       | EMPTY push (0 bytes, opcode 0x00 — unconfirmed)|
 //! |   |                | OR DER ECDSA 68..=74 bytes (confirmed)         |
 //!
-//! The parser validates this shape strictly (exact tag + exact push
-//! lengths + exactly eight pushes + winner != loser) and extracts the
-//! fields. Wrong tag / wrong lengths / missing or extra pushes /
-//! truncated pushes / a self-paired marker → `None` (not a v1 result
-//! marker).
+//! # Marker wire format (`LOW/result/v2`)
+//!
+//! v2 adds the WINNER's five revealed cards (for the "lowest winning
+//! hand" leaderboard), countersigned by the loser exactly like the rest
+//! of the claim. `OP_FALSE OP_RETURN` followed by EXACTLY NINE minimal
+//! data pushes — v1 with a `cards` push inserted between `settleTxid`
+//! and `winnerSig`:
+//!
+//! | # | Push           | Encoding                                       |
+//! |---|----------------|------------------------------------------------|
+//! | 0 | tag            | UTF-8 `LOW/result/v2` (13 bytes)               |
+//! | 1 | gameId         | 32 bytes                                       |
+//! | 2 | winnerIdentity | 33 bytes (compressed pubkey)                   |
+//! | 3 | loserIdentity  | 33 bytes (compressed pubkey)                   |
+//! | 4 | potTxid        | 32 bytes                                       |
+//! | 5 | settleTxid     | 32 bytes                                       |
+//! | 6 | cards          | EXACTLY 5 bytes — card indices, each 0..=51,   |
+//! |   |                | all five DISTINCT (single deck)                |
+//! | 7 | winnerSig      | DER ECDSA, 68..=74 bytes                       |
+//! | 8 | loserSig       | EMPTY push (unconfirmed) OR DER 68..=74        |
+//!
+//! The cards DISTINCTNESS rule is structural like winner != loser:
+//! without it a fabricated marker could claim five copies of an ace.
+//! (Genuineness still lives in the client sig verify — the loser
+//! countersigns the cards along with the rest of the claim.)
+//!
+//! Both versions are admitted (v1 stays back-compatible — live rows
+//! exist). The parser validates each shape strictly (exact tag + exact
+//! push count + exact push lengths + winner != loser + the v2 cards
+//! rules) and extracts the fields. Wrong tag / wrong lengths / missing
+//! or extra pushes / truncated pushes / a self-paired marker /
+//! out-of-range or duplicate cards → `None` (not a result marker).
 //!
 //! # Lookup (`ls_result`)
 //!
@@ -69,8 +96,12 @@
 //! [{"gameId": "<hex>", "winner": "<hex>", "loser": "<hex>",
 //!   "potTxid": "<hex>", "settleTxid": "<hex>",
 //!   "winnerSigHex": "<hex>", "loserSigHex": "<hex|null>",
+//!   "cardsHex": "<10 hex|null>",
 //!   "txid": "<hex>", "outputIndex": 0, "createdAt": 1234567890}]
 //! ```
+//!
+//! `cardsHex` is the v2 cards push verbatim (10 lowercase hex chars);
+//! `null` for rows admitted from v1 markers.
 //!
 //! The index keeps EVERY admitted marker, keyed by its outpoint — the
 //! same `(gameId, winner)` may return multiple rows (e.g. a garbage-sig
@@ -86,8 +117,18 @@ pub mod topic_manager;
 /// 13 bytes of ASCII — the byte layout is the cross-repo CONTRACT
 /// (bsv-low #38); never change it without a version bump on both sides.
 pub const RESULT_TAG: &[u8] = b"LOW/result/v1";
+/// The v2 domain tag — v1 plus the winner's five revealed cards
+/// (`cards` push between settleTxid and winnerSig). Same 13-byte ASCII
+/// layout discipline as v1.
+pub const RESULT_TAG_V2: &[u8] = b"LOW/result/v2";
 /// Number of minimal data pushes in a well-formed v1 marker.
 pub const RESULT_FIELD_COUNT: usize = 8;
+/// Number of minimal data pushes in a well-formed v2 marker.
+pub const RESULT_FIELD_COUNT_V2: usize = 9;
+/// v2 cards push length (bytes) — the winner's five revealed cards.
+pub const RESULT_CARDS_LEN: usize = 5;
+/// Maximum card index (single 52-card deck, 0-based).
+pub const RESULT_CARD_MAX: u8 = 51;
 /// gameId push length (bytes).
 pub const RESULT_GAME_ID_LEN: usize = 32;
 /// winner/loser identity push length (bytes) — a compressed secp256k1
@@ -128,6 +169,11 @@ pub struct ResultMarker {
     /// The loser's DER ECDSA countersignature push (68..=74 bytes), or
     /// `None` when the marker's loserSig push was empty (unconfirmed).
     pub loser_sig: Option<Vec<u8>>,
+    /// v2 only: the winner's five revealed cards (indices 0..=51, all
+    /// distinct — validated at parse). `None` for a v1 marker. Present
+    /// on BOTH confirmed and unconfirmed v2 markers (only `loser_sig`
+    /// distinguishes those).
+    pub cards: Option<[u8; 5]>,
 }
 
 /// Walk minimal Bitcoin pushdata out of a byte slice → the pushed blobs,
@@ -189,21 +235,46 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// Parse one output locking script as a `LOW/result/v1` marker.
+/// Validate a v2 cards push: EXACTLY five bytes, each a card index
+/// 0..=51, all five DISTINCT (single deck — without distinctness a
+/// fabricated marker could claim five copies of an ace).
+fn parse_cards(cards_b: &[u8]) -> Option<[u8; 5]> {
+    if cards_b.len() != RESULT_CARDS_LEN {
+        return None;
+    }
+    let mut seen = 0u64;
+    for &c in cards_b {
+        if c > RESULT_CARD_MAX {
+            return None;
+        }
+        if seen & (1u64 << c) != 0 {
+            return None; // duplicate card
+        }
+        seen |= 1u64 << c;
+    }
+    let mut cards = [0u8; 5];
+    cards.copy_from_slice(cards_b);
+    Some(cards)
+}
+
+/// Parse one output locking script as a `LOW/result/v1` or
+/// `LOW/result/v2` marker.
 ///
 /// `Some(marker)` IFF the script is `OP_FALSE OP_RETURN` (0x00 0x6a)
-/// followed by EXACTLY eight minimal data pushes with the exact v1
-/// shape: tag == [`RESULT_TAG`] (13 bytes), gameId 32 bytes,
-/// winnerIdentity 33 bytes, loserIdentity 33 bytes, potTxid 32 bytes,
-/// settleTxid 32 bytes, winnerSig 68..=74 bytes, loserSig EMPTY (0
-/// bytes) or 68..=74 bytes — AND winnerIdentity != loserIdentity (a
-/// self-paired marker would let one key sign both slots and fake a
-/// "confirmed" win against itself). Everything else — a bare
-/// `OP_RETURN`, a different tag, a wrong length, extra/missing pushes —
-/// is `None`.
+/// followed by EXACTLY the version's push count with its exact shape —
+/// v1 (tag == [`RESULT_TAG`], 8 pushes): gameId 32 bytes, winnerIdentity
+/// 33 bytes, loserIdentity 33 bytes, potTxid 32 bytes, settleTxid 32
+/// bytes, winnerSig 68..=74 bytes, loserSig EMPTY (0 bytes) or 68..=74
+/// bytes; v2 (tag == [`RESULT_TAG_V2`], 9 pushes): the same with a
+/// `cards` push (exactly 5 bytes, each 0..=51, all distinct) between
+/// settleTxid and winnerSig — AND, in both versions, winnerIdentity !=
+/// loserIdentity (a self-paired marker would let one key sign both
+/// slots and fake a "confirmed" win against itself). Everything else —
+/// a bare `OP_RETURN`, a different tag, a wrong length, extra/missing
+/// pushes, out-of-range or duplicate cards — is `None`.
 ///
 /// Deliberately Option (not the reveal parser's three-way Result): the
-/// admit decision is binary "is this the exact v1 byte format?" and a
+/// admit decision is binary "is this an exact result byte format?" and a
 /// tagged-but-malformed script is simply not admitted.
 pub fn parse_result_marker(script: &[u8]) -> Option<ResultMarker> {
     // OP_FALSE OP_RETURN (0x00 0x6a) — the exact prefix the app's builder
@@ -213,17 +284,42 @@ pub fn parse_result_marker(script: &[u8]) -> Option<ResultMarker> {
         return None;
     }
     let data = read_pushes(&script[2..]);
+    if data.is_empty() {
+        return None;
+    }
 
-    // Exactly eight pushes, exact lengths, exact tag.
-    if data.len() != RESULT_FIELD_COUNT {
-        return None;
-    }
-    let (tag, game_id_b, winner_b, loser_b, pot_txid_b, settle_txid_b, winner_sig_b, loser_sig_b) = (
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    );
-    if tag != RESULT_TAG {
-        return None;
-    }
+    // Version dispatch on the tag push: each version pins its exact push
+    // count. A v1 tag with 9 pushes / a v2 tag with 8 pushes is malformed.
+    let (game_id_b, winner_b, loser_b, pot_txid_b, settle_txid_b, cards, winner_sig_b, loser_sig_b) =
+        match data[0] {
+            tag if tag == RESULT_TAG => {
+                if data.len() != RESULT_FIELD_COUNT {
+                    return None;
+                }
+                (
+                    data[1], data[2], data[3], data[4], data[5], None, data[6], data[7],
+                )
+            }
+            tag if tag == RESULT_TAG_V2 => {
+                if data.len() != RESULT_FIELD_COUNT_V2 {
+                    return None;
+                }
+                // cards: exactly 5 distinct indices 0..=51 — or not a marker.
+                let cards = parse_cards(data[6])?;
+                (
+                    data[1],
+                    data[2],
+                    data[3],
+                    data[4],
+                    data[5],
+                    Some(cards),
+                    data[7],
+                    data[8],
+                )
+            }
+            _ => return None,
+        };
+
     if game_id_b.len() != RESULT_GAME_ID_LEN {
         return None;
     }
@@ -270,10 +366,12 @@ pub fn parse_result_marker(script: &[u8]) -> Option<ResultMarker> {
         settle_txid,
         winner_sig: winner_sig_b.to_vec(),
         loser_sig,
+        cards,
     })
 }
 
-/// True iff `script` is a well-formed `LOW/result/v1` marker.
+/// True iff `script` is a well-formed `LOW/result/v1` or
+/// `LOW/result/v2` marker.
 pub fn is_result_marker_script(script: &[u8]) -> bool {
     parse_result_marker(script).is_some()
 }
@@ -305,6 +403,33 @@ pub(crate) mod tests {
         }
         out.extend_from_slice(blob);
         out
+    }
+
+    /// The app's v2 result-marker builder in bytes — v1 plus the cards
+    /// push between settleTxid and winnerSig. `loser_sig = &[]` encodes
+    /// the empty push (an unconfirmed claim).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn marker_script_v2(
+        game_id: &[u8; 32],
+        winner: &[u8],
+        loser: &[u8],
+        pot_txid: &[u8; 32],
+        settle_txid: &[u8; 32],
+        cards: &[u8],
+        winner_sig: &[u8],
+        loser_sig: &[u8],
+    ) -> Vec<u8> {
+        let mut s = vec![0x00, 0x6a]; // OP_FALSE OP_RETURN
+        s.extend(push_data(RESULT_TAG_V2));
+        s.extend(push_data(game_id));
+        s.extend(push_data(winner));
+        s.extend(push_data(loser));
+        s.extend(push_data(pot_txid));
+        s.extend(push_data(settle_txid));
+        s.extend(push_data(cards));
+        s.extend(push_data(winner_sig));
+        s.extend(push_data(loser_sig));
+        s
     }
 
     /// The app's result-marker builder in bytes. `loser_sig = &[]` encodes
@@ -345,6 +470,17 @@ pub(crate) mod tests {
     /// `loser_sig == None`.
     pub(crate) const GOLDEN_RESULT_UNCONFIRMED_HEX: &str = "006a0d4c4f572f726573756c742f76312011111111111111111111111111111111111111111111111111111111111111112102a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12103b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2202222222222222222222222222222222222222222222222222222222222222222203333333333333333333333333333333333333333333333333333333333333333473045ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab00";
 
+    /// The CONFIRMED v2 golden vector — the v1 golden inputs plus
+    /// cards = [0,1,2,3,4] (the `05 0001020304` push between settleTxid
+    /// and winnerSig). 332 bytes. Computed independently on both sides of
+    /// the cross-repo contract.
+    pub(crate) const GOLDEN_RESULT_V2_HEX: &str = "006a0d4c4f572f726573756c742f76322011111111111111111111111111111111111111111111111111111111111111112102a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12103b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2202222222222222222222222222222222222222222222222222222222222222222203333333333333333333333333333333333333333333333333333333333333333050001020304473045ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab463044cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+    /// The UNCONFIRMED v2 golden vector — same but loserSig is the EMPTY
+    /// push (trailing 0x00). 262 bytes. Parses with `loser_sig == None`
+    /// but cards STILL present (only the countersignature is missing).
+    pub(crate) const GOLDEN_RESULT_V2_UNCONFIRMED_HEX: &str = "006a0d4c4f572f726573756c742f76322011111111111111111111111111111111111111111111111111111111111111112102a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12103b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2202222222222222222222222222222222222222222222222222222222222222222203333333333333333333333333333333333333333333333333333333333333333050001020304473045ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab00";
+
     /// The golden vectors' expected fields.
     pub(crate) fn golden_game_id() -> [u8; 32] {
         [0x11u8; 32]
@@ -374,6 +510,28 @@ pub(crate) mod tests {
         let mut s = vec![0x30u8, 0x44];
         s.extend_from_slice(&[0xcdu8; 68]);
         s
+    }
+    pub(crate) fn golden_cards() -> [u8; 5] {
+        [0, 1, 2, 3, 4]
+    }
+
+    /// A valid v2 marker script over the golden identities with a chosen
+    /// gameId + cards + loserSig.
+    pub(crate) fn golden_marker_v2(
+        game_id: &[u8; 32],
+        cards: &[u8],
+        loser_sig: &[u8],
+    ) -> Vec<u8> {
+        marker_script_v2(
+            game_id,
+            &golden_winner(),
+            &golden_loser(),
+            &golden_pot_txid(),
+            &golden_settle_txid(),
+            cards,
+            &golden_winner_sig(),
+            loser_sig,
+        )
     }
 
     /// A valid marker script over the golden identities with a chosen
@@ -450,6 +608,157 @@ pub(crate) mod tests {
     fn tag_is_13_bytes() {
         assert_eq!(RESULT_TAG.len(), 13);
         assert_eq!(RESULT_TAG, b"LOW/result/v1");
+        assert_eq!(RESULT_TAG_V2.len(), 13);
+        assert_eq!(RESULT_TAG_V2, b"LOW/result/v2");
+    }
+
+    // ── The v2 golden interface vectors ───────────────────────────────────
+
+    #[test]
+    fn v2_golden_vector_parses_exactly() {
+        let script = hex::decode(GOLDEN_RESULT_V2_HEX).expect("v2 golden hex decodes");
+        assert_eq!(script.len(), 332, "confirmed v2 golden vector is exactly 332 bytes");
+
+        let m = parse_result_marker(&script).expect("v2 golden vector must parse");
+        assert_eq!(m.game_id, golden_game_id());
+        assert_eq!(m.winner, golden_winner());
+        assert_eq!(m.loser, golden_loser());
+        assert_eq!(m.pot_txid, golden_pot_txid());
+        assert_eq!(m.settle_txid, golden_settle_txid());
+        assert_eq!(m.cards, Some(golden_cards()), "v2 carries the cards");
+        assert_eq!(m.winner_sig, golden_winner_sig());
+        assert_eq!(m.loser_sig.as_deref(), Some(golden_loser_sig().as_slice()));
+        assert!(is_result_marker_script(&script));
+    }
+
+    #[test]
+    fn v2_golden_unconfirmed_vector_parses_with_cards_but_no_loser_sig() {
+        let script = hex::decode(GOLDEN_RESULT_V2_UNCONFIRMED_HEX)
+            .expect("v2 unconfirmed golden hex decodes");
+        assert_eq!(
+            script.len(),
+            262,
+            "unconfirmed v2 golden vector is exactly 262 bytes"
+        );
+        assert_eq!(*script.last().unwrap(), 0x00);
+
+        let m = parse_result_marker(&script).expect("v2 unconfirmed golden vector must parse");
+        // Unconfirmed still has cards — ONLY loserSig is empty.
+        assert_eq!(m.cards, Some(golden_cards()));
+        assert_eq!(m.loser_sig, None, "empty loserSig push ⇒ unconfirmed");
+        assert_eq!(m.winner_sig, golden_winner_sig());
+        assert!(is_result_marker_script(&script));
+    }
+
+    #[test]
+    fn builder_reproduces_the_v2_golden_vectors() {
+        let confirmed = golden_marker_v2(&golden_game_id(), &golden_cards(), &golden_loser_sig());
+        assert_eq!(hex::encode(&confirmed), GOLDEN_RESULT_V2_HEX);
+
+        let unconfirmed = golden_marker_v2(&golden_game_id(), &golden_cards(), &[]);
+        assert_eq!(hex::encode(&unconfirmed), GOLDEN_RESULT_V2_UNCONFIRMED_HEX);
+    }
+
+    #[test]
+    fn v1_goldens_still_parse_with_no_cards() {
+        // Back-compat: v1 markers remain admitted unchanged (live rows
+        // exist) and parse with cards == None.
+        for hex_v1 in [GOLDEN_RESULT_HEX, GOLDEN_RESULT_UNCONFIRMED_HEX] {
+            let m = parse_result_marker(&hex::decode(hex_v1).unwrap())
+                .expect("v1 golden must still parse");
+            assert_eq!(m.cards, None, "a v1 marker has no cards");
+        }
+    }
+
+    // ── v2 cards rules ────────────────────────────────────────────────────
+
+    #[test]
+    fn v2_card_index_out_of_range_rejected() {
+        // 51 is the highest card; 52 (and beyond) is not in the deck.
+        for bad in [[0u8, 1, 2, 3, 52], [52u8, 1, 2, 3, 4], [0u8, 1, 2, 3, 255]] {
+            let script = golden_marker_v2(&golden_game_id(), &bad, &golden_loser_sig());
+            assert!(
+                parse_result_marker(&script).is_none(),
+                "cards {bad:?} must be rejected"
+            );
+        }
+        // The boundary itself is fine.
+        let script = golden_marker_v2(&golden_game_id(), &[47, 48, 49, 50, 51], &golden_loser_sig());
+        assert!(parse_result_marker(&script).is_some(), "card 51 is valid");
+    }
+
+    #[test]
+    fn v2_duplicate_cards_rejected() {
+        // Single deck: five DISTINCT cards, or a fabricated marker could
+        // claim five copies of an ace.
+        for bad in [
+            [0u8, 0, 0, 0, 0],
+            [0u8, 1, 2, 3, 3],
+            [51u8, 1, 2, 51, 4],
+            [7u8, 7, 2, 3, 4],
+        ] {
+            let script = golden_marker_v2(&golden_game_id(), &bad, &golden_loser_sig());
+            assert!(
+                parse_result_marker(&script).is_none(),
+                "duplicate cards {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_wrong_cards_length_rejected() {
+        for bad in [&[0u8, 1, 2, 3][..], &[0u8, 1, 2, 3, 4, 5][..], &[][..]] {
+            let script = golden_marker_v2(&golden_game_id(), bad, &golden_loser_sig());
+            assert!(
+                parse_result_marker(&script).is_none(),
+                "cards push of {} bytes must be rejected",
+                bad.len()
+            );
+        }
+    }
+
+    #[test]
+    fn version_and_push_count_must_agree() {
+        // A v2 tag with the v1 body (8 pushes — no cards) is malformed.
+        let mut s = vec![0x00, 0x6a];
+        s.extend(push_data(RESULT_TAG_V2));
+        s.extend(push_data(&golden_game_id()));
+        s.extend(push_data(&golden_winner()));
+        s.extend(push_data(&golden_loser()));
+        s.extend(push_data(&golden_pot_txid()));
+        s.extend(push_data(&golden_settle_txid()));
+        s.extend(push_data(&golden_winner_sig()));
+        s.extend(push_data(&golden_loser_sig()));
+        assert!(parse_result_marker(&s).is_none(), "v2 tag + 8 pushes rejected");
+
+        // A v1 tag with the v2 body (9 pushes — a cards push) is malformed.
+        let mut s = vec![0x00, 0x6a];
+        s.extend(push_data(RESULT_TAG));
+        s.extend(push_data(&golden_game_id()));
+        s.extend(push_data(&golden_winner()));
+        s.extend(push_data(&golden_loser()));
+        s.extend(push_data(&golden_pot_txid()));
+        s.extend(push_data(&golden_settle_txid()));
+        s.extend(push_data(&golden_cards()));
+        s.extend(push_data(&golden_winner_sig()));
+        s.extend(push_data(&golden_loser_sig()));
+        assert!(parse_result_marker(&s).is_none(), "v1 tag + 9 pushes rejected");
+    }
+
+    #[test]
+    fn v2_self_paired_marker_rejected() {
+        // winner == loser applies to v2 exactly as to v1.
+        let script = marker_script_v2(
+            &golden_game_id(),
+            &golden_winner(),
+            &golden_winner(),
+            &golden_pot_txid(),
+            &golden_settle_txid(),
+            &golden_cards(),
+            &golden_winner_sig(),
+            &golden_loser_sig(),
+        );
+        assert!(parse_result_marker(&script).is_none());
     }
 
     #[test]

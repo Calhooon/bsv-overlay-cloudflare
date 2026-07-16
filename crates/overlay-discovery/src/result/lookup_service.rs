@@ -109,6 +109,9 @@ impl LookupService for ResultLookupService {
             // None when the marker's loserSig push was empty — an
             // UNCONFIRMED claim, preserved verbatim (never synthesized).
             loser_sig_hex: marker.loser_sig.as_deref().map(hex::encode),
+            // v2 markers carry the winner's five revealed cards; a v1
+            // marker has none (back-compat rows stay null).
+            cards_hex: marker.cards.map(hex::encode),
             txid: txid.to_string(),
             output_index,
             created_at: 0, // assigned by the storage layer at insert
@@ -182,6 +185,9 @@ impl LookupService for ResultLookupService {
                     "settleTxid": r.settle_txid,
                     "winnerSigHex": r.winner_sig_hex,
                     "loserSigHex": r.loser_sig_hex
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                    "cardsHex": r.cards_hex
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
                     "txid": r.txid,
@@ -519,8 +525,8 @@ mod tests {
             &golden_loser(),
             &golden_pot_txid(),
             &golden_settle_txid(),
-            &vec![0x30u8; 71], // garbage "winnerSig"
-            &vec![0x30u8; 70], // garbage "loserSig" — fakes "confirmed"
+            &[0x30u8; 71], // garbage "winnerSig"
+            &[0x30u8; 70], // garbage "loserSig" — fakes "confirmed"
         );
         svc.output_admitted_by_topic(&admit("txGARBAGE", 0, garbage))
             .await
@@ -546,6 +552,45 @@ mod tests {
         assert_eq!(arr[1]["winnerSigHex"], hex::encode(vec![0x30u8; 71]));
         // Bytes back verbatim for both — the CLIENT's sig verify is what
         // separates them.
+    }
+
+    // ── v1 + v2 coexistence through the producer path ─────────────────────
+
+    #[tokio::test]
+    async fn v1_and_v2_markers_both_indexed_with_cards() {
+        let (svc, storage) = make_service_with_storage();
+        // A v1 marker (no cards) …
+        svc.output_admitted_by_topic(&admit(
+            "txV1",
+            0,
+            golden_marker(&[0x11u8; 32], &golden_loser_sig()),
+        ))
+        .await
+        .unwrap();
+        // … and a v2 marker (cards [0,1,2,3,4]) for a different game.
+        svc.output_admitted_by_topic(&admit(
+            "txV2",
+            0,
+            super::super::tests::golden_marker_v2(
+                &[0x22u8; 32],
+                &super::super::tests::golden_cards(),
+                &golden_loser_sig(),
+            ),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(storage.record_count(), 2);
+        let arr = results_for(&svc, &golden_winner_hex(), None).await;
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // Newest first: the v2 row, cards verbatim as 10 hex chars.
+        assert_eq!(arr[0]["txid"], "txV2");
+        assert_eq!(arr[0]["cardsHex"], "0001020304");
+        // The v1 row: cardsHex is null (back-compat — never synthesized).
+        assert_eq!(arr[1]["txid"], "txV1");
+        assert!(arr[1]["cardsHex"].is_null(), "v1 row has null cardsHex");
     }
 
     // ── Admission filters ────────────────────────────────────────────────

@@ -1496,6 +1496,8 @@ struct ResultRow {
     winner_sig_hex: String,
     #[serde(rename = "loserSigHex")]
     loser_sig_hex: Option<String>,
+    #[serde(rename = "cardsHex")]
+    cards_hex: Option<String>,
     txid: String,
     #[serde(rename = "outputIndex")]
     output_index: f64,
@@ -1513,6 +1515,7 @@ impl ResultRow {
             settle_txid: self.settle_txid,
             winner_sig_hex: self.winner_sig_hex,
             loser_sig_hex: self.loser_sig_hex,
+            cards_hex: self.cards_hex,
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
@@ -1549,7 +1552,7 @@ fn result_err(e: String) -> ResultStorageError {
 }
 
 const RESULT_SELECT: &str = "SELECT gameId, winner, loser, potTxid, settleTxid, \
-     winnerSigHex, loserSigHex, txid, outputIndex, createdAt FROM result_markers_v2";
+     winnerSigHex, loserSigHex, cardsHex, txid, outputIndex, createdAt FROM result_markers_v2";
 
 #[async_trait(?Send)]
 impl ResultStorage for D1ResultStorage {
@@ -1561,8 +1564,8 @@ impl ResultStorage for D1ResultStorage {
         Query::new(
             "INSERT OR IGNORE INTO result_markers_v2 \
              (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
-              loserSigHex, txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              loserSigHex, cardsHex, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.game_id.as_str())
         .bind(record.winner.as_str())
@@ -1571,6 +1574,7 @@ impl ResultStorage for D1ResultStorage {
         .bind(record.settle_txid.as_str())
         .bind(record.winner_sig_hex.as_str())
         .bind(record.loser_sig_hex.as_deref())
+        .bind(record.cards_hex.as_deref())
         .bind(record.txid.as_str())
         .bind(record.output_index)
         .bind(current_unix_seconds_i64())

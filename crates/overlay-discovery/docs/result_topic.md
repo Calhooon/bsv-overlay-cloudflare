@@ -46,3 +46,29 @@ the claim "confirmed" — confirmed as judged by the verifying CLIENT, not
 by the overlay. Wrong tag / wrong lengths / extra or missing pushes /
 winner == loser → not admitted. The strict format check keeps junk out
 of the index; genuineness is the client's job.
+
+## Marker wire format (`LOW/result/v2`)
+
+v2 adds the WINNER's five revealed cards for the "lowest winning hand"
+leaderboard, countersigned by the loser exactly like the rest of the
+claim. Nine minimal pushes — v1 with a `cards` push inserted between
+`settleTxid` and `winnerSig`:
+
+| # | Push           | Encoding                                        |
+|---|----------------|-------------------------------------------------|
+| 0 | tag            | UTF-8 `LOW/result/v2` (13 bytes)                |
+| 1 | gameId         | 32 bytes                                        |
+| 2 | winnerIdentity | 33 bytes (compressed pubkey)                    |
+| 3 | loserIdentity  | 33 bytes (compressed pubkey)                    |
+| 4 | potTxid        | 32 bytes                                        |
+| 5 | settleTxid     | 32 bytes                                        |
+| 6 | cards          | EXACTLY 5 bytes — card indices, each 0..=51,    |
+|   |                | all five DISTINCT (single deck)                 |
+| 7 | winnerSig      | DER ECDSA, 68..=74 bytes                        |
+| 8 | loserSig       | EMPTY push (unconfirmed) OR DER ECDSA 68..=74   |
+
+The cards distinctness rule is structural like winner != loser: without
+it a fabricated marker could claim five copies of an ace. Both versions
+are admitted (v1 stays back-compatible — live rows exist); wrong push
+count for a version's tag, out-of-range or duplicate cards → not
+admitted.

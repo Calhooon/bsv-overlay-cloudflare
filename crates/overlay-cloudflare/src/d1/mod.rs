@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 43;
+pub const OVERLAY_MIGRATION_COUNT: usize = 44;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -536,6 +536,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // both order by createdAt DESC.
     "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_winner ON result_markers_v2(winner)",
     "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_createdAt ON result_markers_v2(createdAt)",
+    // LOW/result/v2 wire markers add the winner's five revealed cards
+    // (the "lowest winning hand" leaderboard): 10 lowercase hex chars —
+    // 5 card-index bytes, each 0..=51, distinct, parse-validated. NULL
+    // for rows admitted from v1 wire markers (still accepted —
+    // back-compat). Additive ALTER: the runner ignores the re-run
+    // "duplicate column" error (`migration_error_is_benign`).
+    "ALTER TABLE result_markers_v2 ADD COLUMN cardsHex TEXT",
 ];
 
 // =============================================================================
@@ -654,6 +661,16 @@ mod tests {
         assert!(OVERLAY_MIGRATIONS.iter().any(|sql| {
             sql.trim_start().starts_with("ALTER TABLE pot_records")
                 && sql.contains("spentConfirmed INTEGER NOT NULL DEFAULT 0")
+        }));
+    }
+
+    #[test]
+    fn result_markers_v2_cards_hex_migration_present() {
+        // The additive v2-cards column migration exists and targets
+        // result_markers_v2 (mirrors the pot_records spentConfirmed pin).
+        assert!(OVERLAY_MIGRATIONS.iter().any(|sql| {
+            sql.trim_start().starts_with("ALTER TABLE result_markers_v2")
+                && sql.contains("ADD COLUMN cardsHex TEXT")
         }));
     }
 

@@ -26,8 +26,16 @@ A freeform JSON array, newest first, one entry per stored marker:
 [{"gameId": "<hex>", "winner": "<hex>", "loser": "<hex>",
   "potTxid": "<hex>", "settleTxid": "<hex>",
   "winnerSigHex": "<hex>", "loserSigHex": "<hex|null>",
+  "cardsHex": "<10 hex|null>",
   "txid": "<hex>", "outputIndex": 0, "createdAt": 1234567890}]
 ```
+
+`cardsHex` is a `LOW/result/v2` marker's cards push verbatim — the
+winner's five revealed cards as 10 lowercase hex chars (5 card-index
+bytes, each 0..=51, distinct; parse-validated), countersigned by the
+loser along with the rest of the claim. It feeds the "lowest winning
+hand" leaderboard. `null` for rows admitted from v1 markers (still
+accepted — back-compat).
 
 The marker's bytes come back VERBATIM — there is **no derived
 "confirmed" flag**. `loserSigHex` is `null` when the marker's loserSig

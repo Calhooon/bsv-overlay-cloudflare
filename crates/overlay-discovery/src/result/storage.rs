@@ -63,6 +63,12 @@ pub struct ResultRecord {
     /// verified CLIENT-side only.
     #[serde(rename = "loserSigHex")]
     pub loser_sig_hex: Option<String>,
+    /// v2 markers only: the winner's five revealed cards (10 lowercase
+    /// hex chars — 5 card-index bytes, each 0..=51, distinct, validated
+    /// at parse). `None` for a v1 marker. Feeds the "lowest winning
+    /// hand" leaderboard; carried back verbatim like every other field.
+    #[serde(rename = "cardsHex")]
+    pub cards_hex: Option<String>,
     /// The txid carrying the marker OP_RETURN — half of the primary key.
     /// Always known at admission, so required (unlike collected's
     /// nullable txid).
@@ -216,6 +222,7 @@ mod tests {
             settle_txid: "33".repeat(32),
             winner_sig_hex: "3045ab".into(),
             loser_sig_hex: Some("3044cd".into()),
+            cards_hex: None,
             txid: txid.into(),
             output_index: 0,
             created_at: 0, // ignored — storage assigns
