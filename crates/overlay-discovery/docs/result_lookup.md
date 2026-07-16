@@ -26,7 +26,7 @@ A freeform JSON array, newest first, one entry per stored marker:
 [{"gameId": "<hex>", "winner": "<hex>", "loser": "<hex>",
   "potTxid": "<hex>", "settleTxid": "<hex>",
   "winnerSigHex": "<hex>", "loserSigHex": "<hex|null>",
-  "txid": "<hex|null>", "createdAt": 1234567890}]
+  "txid": "<hex>", "outputIndex": 0, "createdAt": 1234567890}]
 ```
 
 The marker's bytes come back VERBATIM — there is **no derived
@@ -39,9 +39,14 @@ never lie: bytes in, bytes out.
 
 ## Index semantics
 
-One row per `(gameId, winner)`; **first marker wins** (`INSERT OR
-IGNORE` — a later marker for the same pair never overwrites the first)
-and rows are **never deleted**. A settled result is a permanent fact and
+One row per marker **outpoint** `(txid, outputIndex)`; a replayed /
+duplicate submit of the same output is a no-op (`INSERT OR IGNORE`) and
+rows are **never deleted**. Markers for the same `(gameId, winner)` from
+DIFFERENT txs are ALL kept — deliberately: admission is byte-format-only,
+so keying on the pair would let a garbage-sig front-run (one OP_RETURN
+fee) permanently censor the real winner's genuine countersigned marker.
+Instead, garbage and genuine rows coexist and the CLIENT's sig verify
+separates them before counting. A settled result is a permanent fact and
 the admitted output is a provably-unspendable `OP_RETURN`;
 `spend_notification_mode` is `none` and spend/eviction are deliberate
 no-ops.

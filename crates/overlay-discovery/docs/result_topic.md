@@ -16,7 +16,9 @@ An output is admitted IFF its locking script is a well-formed
 an authority, and it carries the marker's bytes back verbatim. A forged
 marker is worthless client-side (its signatures fail the verify), and
 the carried `potTxid` / `settleTxid` let a client anchor the claim to a
-REAL settled pot via `/pots-view`.
+REAL settled pot via `/pots-view`. The index keeps EVERY admitted marker
+(keyed by outpoint) — a garbage-sig marker naming the real winner cannot
+occupy a slot and censor the later genuine one.
 
 One structural rule beyond lengths: `winnerIdentity != loserIdentity`
 (byte compare). A self-paired marker is rejected — it would let one key

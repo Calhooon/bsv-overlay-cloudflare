@@ -69,8 +69,13 @@
 //! [{"gameId": "<hex>", "winner": "<hex>", "loser": "<hex>",
 //!   "potTxid": "<hex>", "settleTxid": "<hex>",
 //!   "winnerSigHex": "<hex>", "loserSigHex": "<hex|null>",
-//!   "txid": "<hex|null>", "createdAt": 1234567890}]
+//!   "txid": "<hex>", "outputIndex": 0, "createdAt": 1234567890}]
 //! ```
+//!
+//! The index keeps EVERY admitted marker, keyed by its outpoint — the
+//! same `(gameId, winner)` may return multiple rows (e.g. a garbage-sig
+//! front-run AND the genuine marker), and clients drop the rows whose
+//! sigs fail their verify before counting.
 
 pub mod lookup_service;
 pub mod storage;

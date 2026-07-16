@@ -2,8 +2,15 @@
 //! for the on-chain leaderboard (bsv-low #38).
 //!
 //! When outputs are admitted to `tm_result`, this service parses the
-//! `LOW/result/v1` marker and stores one row per `(gameId, winner)` via
-//! [`ResultStorage`] (first marker wins). Leaderboard clients ask
+//! `LOW/result/v1` marker and stores one row per marker OUTPOINT
+//! `(txid, outputIndex)` via [`ResultStorage`] — EVERY admitted marker is
+//! kept (a duplicate submit of the same output is a no-op). Admission is
+//! byte-format-only, so a `(gameId, winner)`-keyed index would let a
+//! garbage-sig front-run permanently censor the genuine countersigned
+//! marker (adversarial-review HIGH, 2026-07-16); outpoint keying makes
+//! garbage and genuine rows coexist, and the client aggregation drops
+//! invalid-sig rows before dedup so the verifying one counts.
+//! Leaderboard clients ask
 //! `resultsFor` (one identity's wins) or `recentResults` (the global
 //! feed); the answer is a freeform, newest-first JSON array carrying the
 //! marker's bytes back VERBATIM — winnerSigHex / loserSigHex / potTxid /
@@ -64,13 +71,14 @@ impl LookupService for ResultLookupService {
         &self,
         payload: &OutputAdmittedByTopic,
     ) -> Result<(), LookupServiceError> {
-        let (txid, topic, locking_script) = match payload {
+        let (txid, output_index, topic, locking_script) = match payload {
             OutputAdmittedByTopic::LockingScript {
                 txid,
+                output_index,
                 topic,
                 locking_script,
                 ..
-            } => (txid, topic, locking_script),
+            } => (txid, *output_index, topic, locking_script),
             _ => {
                 return Err(LookupServiceError::Other(
                     "Expected locking-script mode".into(),
@@ -101,12 +109,15 @@ impl LookupService for ResultLookupService {
             // None when the marker's loserSig push was empty — an
             // UNCONFIRMED claim, preserved verbatim (never synthesized).
             loser_sig_hex: marker.loser_sig.as_deref().map(hex::encode),
-            txid: Some(txid.to_string()),
+            txid: txid.to_string(),
+            output_index,
             created_at: 0, // assigned by the storage layer at insert
         };
 
-        // First marker wins — the storage layer's insert-if-absent makes a
-        // replay / duplicate marker a harmless no-op.
+        // Keyed by the OUTPOINT: the storage layer's insert-if-absent makes
+        // a replayed submit of the same output a harmless no-op, while
+        // markers for the same (gameId, winner) from different txs are ALL
+        // kept (censorship fix — see the module docs).
         self.storage
             .store_record(&record)
             .await
@@ -173,9 +184,8 @@ impl LookupService for ResultLookupService {
                     "loserSigHex": r.loser_sig_hex
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
-                    "txid": r.txid
-                        .map(serde_json::Value::String)
-                        .unwrap_or(serde_json::Value::Null),
+                    "txid": r.txid,
+                    "outputIndex": r.output_index,
                     "createdAt": r.created_at,
                 })
             })
@@ -463,23 +473,79 @@ mod tests {
         assert_eq!(clamp_limit(Some(1_000_000)), MAX_LIMIT);
     }
 
-    // ── First marker wins through the producer path ──────────────────────
+    // ── Outpoint keying through the producer path ─────────────────────────
 
     #[tokio::test]
-    async fn duplicate_marker_first_wins() {
+    async fn same_outpoint_replay_is_a_noop() {
         let (svc, storage) = make_service_with_storage();
         let script = golden_marker(&[0x11u8; 32], &golden_loser_sig());
-        svc.output_admitted_by_topic(&admit("txFIRST", 0, script.clone()))
+        svc.output_admitted_by_topic(&admit("txSAME", 0, script.clone()))
             .await
             .unwrap();
-        // A second marker tx for the SAME (gameId, winner) — ignored.
-        svc.output_admitted_by_topic(&admit("txSECOND", 0, script))
+        // A replayed / duplicate SUBMIT of the SAME output — ignored.
+        svc.output_admitted_by_topic(&admit("txSAME", 0, script))
             .await
             .unwrap();
 
-        assert_eq!(storage.record_count(), 1);
+        assert_eq!(storage.record_count(), 1, "same-outpoint replay is a no-op");
         let arr = results_for(&svc, &golden_winner_hex(), None).await;
-        assert_eq!(arr[0]["txid"], "txFIRST", "first marker wins");
+        assert_eq!(arr.as_array().unwrap().len(), 1);
+        assert_eq!(arr[0]["txid"], "txSAME");
+        assert_eq!(arr[0]["outputIndex"], 0);
+    }
+
+    #[tokio::test]
+    async fn front_run_garbage_cannot_censor_a_later_genuine_marker() {
+        // THE CENSORSHIP REGRESSION (adversarial-review HIGH, 2026-07-16):
+        // admission is byte-format-only, so a sore loser who knows
+        // (gameId, realWinner, potTxid, settleTxid) can publish a
+        // well-formed marker naming the REAL winner with GARBAGE sigs for
+        // one OP_RETURN fee. Under (gameId, winner)-keyed first-marker-wins
+        // storage that row would permanently occupy the slot and the
+        // winner's later genuine countersigned marker would be silently
+        // dropped — the legitimately-won game shows NOTHING forever
+        // (clients verify sigs, so the garbage row fails their verify).
+        // Outpoint keying is the fix: BOTH rows must come back and the
+        // client counts the one that verifies.
+        let (svc, storage) = make_service_with_storage();
+        let game = [0x11u8; 32];
+
+        // The attacker's front-run: same (gameId, winner, loser, pot,
+        // settle) but garbage sig bytes — well-formed lengths, so the
+        // byte-format-only topic manager admits it.
+        let garbage = super::super::tests::marker_script(
+            &game,
+            &golden_winner(),
+            &golden_loser(),
+            &golden_pot_txid(),
+            &golden_settle_txid(),
+            &vec![0x30u8; 71], // garbage "winnerSig"
+            &vec![0x30u8; 70], // garbage "loserSig" — fakes "confirmed"
+        );
+        svc.output_admitted_by_topic(&admit("txGARBAGE", 0, garbage))
+            .await
+            .unwrap();
+
+        // The real winner's genuine countersigned marker lands later
+        // (the 45s countersign wait hands the attacker the race).
+        let genuine = golden_marker(&game, &golden_loser_sig());
+        svc.output_admitted_by_topic(&admit("txGENUINE", 0, genuine))
+            .await
+            .unwrap();
+
+        // BOTH rows are kept and returned — the genuine marker was NOT
+        // censored.
+        assert_eq!(storage.record_count(), 2);
+        let arr = results_for(&svc, &golden_winner_hex(), None).await;
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "garbage AND genuine rows coexist");
+        assert_eq!(arr[0]["txid"], "txGENUINE", "newest first");
+        assert_eq!(arr[0]["winnerSigHex"], hex::encode(golden_winner_sig()));
+        assert_eq!(arr[0]["loserSigHex"], hex::encode(golden_loser_sig()));
+        assert_eq!(arr[1]["txid"], "txGARBAGE");
+        assert_eq!(arr[1]["winnerSigHex"], hex::encode(vec![0x30u8; 71]));
+        // Bytes back verbatim for both — the CLIENT's sig verify is what
+        // separates them.
     }
 
     // ── Admission filters ────────────────────────────────────────────────

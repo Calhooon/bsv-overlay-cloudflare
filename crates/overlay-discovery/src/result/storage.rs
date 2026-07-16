@@ -1,17 +1,26 @@
 //! RESULT Storage trait — backend-agnostic storage for result-marker
 //! records.
 //!
-//! One row per `(gameId, winner)` pair (`result_markers` in D1). The
-//! concrete implementation (D1, in-memory) is provided by the deployment
-//! crate; [`MemoryResultStorage`] here backs the unit tests. Structure
-//! mirrors `collected::storage`, with the same behavioral pin:
+//! One row per marker OUTPOINT — `(txid, outputIndex)` (`result_markers_v2`
+//! in D1). The concrete implementation (D1, in-memory) is provided by the
+//! deployment crate; [`MemoryResultStorage`] here backs the unit tests.
+//! Structure mirrors `collected::storage`, with one deliberate divergence:
 //!
-//! **First marker wins.** [`ResultStorage::store_record`] is
-//! insert-if-absent (D1 `INSERT OR IGNORE` on the `(gameId, winner)`
-//! primary key) — a later marker for the same pair NEVER overwrites the
-//! first, and rows are NEVER deleted (a settled result is permanent, like
-//! a reveal). Replays / floods of markers for an already-recorded pair
-//! are therefore harmless no-ops.
+//! **Keyed by outpoint, NOT by `(gameId, winner)` — every admitted marker
+//! is kept.** Admission is byte-format-only (no sig check), so a
+//! `(gameId, winner)`-keyed first-marker-wins index would hand a censor a
+//! one-OP_RETURN-fee attack: publish a well-formed marker naming the REAL
+//! winner with GARBAGE sigs, permanently occupy the slot, and the genuine
+//! countersigned marker is silently dropped forever (adversarial-review
+//! HIGH, 2026-07-16). Keying on the outpoint closes it: garbage and
+//! genuine rows COEXIST, the client aggregation drops invalid-sig rows
+//! before dedup, and the verifying one counts.
+//!
+//! [`ResultStorage::store_record`] is insert-if-absent on the outpoint
+//! (D1 `INSERT OR IGNORE` on the `(txid, outputIndex)` primary key) — a
+//! replayed / duplicate SUBMIT of the SAME output is a harmless no-op,
+//! and rows are NEVER deleted (a settled result is permanent, like a
+//! reveal).
 //!
 //! `created_at` is assigned by the STORAGE layer at insert (D1 stamps the
 //! unix time, the memory impl an insertion counter) — the value on the
@@ -23,12 +32,13 @@ use serde::{Deserialize, Serialize};
 
 /// A result-marker record as stored in the index.
 ///
-/// Keyed by `(gameId, winner)` — one hand has one winner, so the pair is
-/// the natural primary key. All byte fields are carried back VERBATIM to
-/// querying clients (which verify the sigs with the 'anyone' ProtoWallet
-/// round-trip — the overlay never does, and it derives no "confirmed"
-/// flag). `loser_sig_hex` is `None` when the marker's loserSig push was
-/// empty (an unconfirmed claim).
+/// Keyed by the marker OUTPOINT `(txid, outputIndex)` — every admitted
+/// marker is kept, so a garbage-sig front-run naming the real winner can
+/// never censor the later genuine marker (see the module docs). All byte
+/// fields are carried back VERBATIM to querying clients (which verify
+/// the sigs with the 'anyone' ProtoWallet round-trip — the overlay never
+/// does, and it derives no "confirmed" flag). `loser_sig_hex` is `None`
+/// when the marker's loserSig push was empty (an unconfirmed claim).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultRecord {
     /// Game ID (32 bytes, lowercase hex).
@@ -53,8 +63,14 @@ pub struct ResultRecord {
     /// verified CLIENT-side only.
     #[serde(rename = "loserSigHex")]
     pub loser_sig_hex: Option<String>,
-    /// The txid carrying the marker OP_RETURN.
-    pub txid: Option<String>,
+    /// The txid carrying the marker OP_RETURN — half of the primary key.
+    /// Always known at admission, so required (unlike collected's
+    /// nullable txid).
+    pub txid: String,
+    /// The marker output's index within `txid` — the other half of the
+    /// primary key.
+    #[serde(rename = "outputIndex")]
+    pub output_index: u32,
     /// Unix seconds at insert — assigned by the storage layer (the value
     /// passed to `store_record` is ignored); recency ordering rides on it.
     #[serde(rename = "createdAt")]
@@ -80,11 +96,14 @@ pub enum ResultQuery {
 /// Backend-agnostic storage for result-marker records.
 #[async_trait(?Send)]
 pub trait ResultStorage {
-    /// Store a record keyed by `(gameId, winner)` — insert-if-absent
-    /// (FIRST MARKER WINS): if a row for the pair already exists it is
-    /// left untouched. Mirrors the D1 `INSERT OR IGNORE`. Never
-    /// overwrites, never deletes. `created_at` is assigned here (the
-    /// record's value is ignored).
+    /// Store a record keyed by its OUTPOINT `(txid, outputIndex)` —
+    /// insert-if-absent: a replayed / duplicate SUBMIT of the same output
+    /// is a no-op, but markers for the same `(gameId, winner)` from
+    /// DIFFERENT txs are ALL KEPT (a garbage front-run can never censor a
+    /// genuine marker — clients verify sigs and the genuine one counts).
+    /// Mirrors the D1 `INSERT OR IGNORE`. Never overwrites, never
+    /// deletes. `created_at` is assigned here (the record's value is
+    /// ignored).
     async fn store_record(&self, record: &ResultRecord) -> Result<(), ResultStorageError>;
 
     /// Up to `limit` records whose winner is `winner`, newest first.
@@ -133,11 +152,13 @@ impl MemoryResultStorage {
 impl ResultStorage for MemoryResultStorage {
     async fn store_record(&self, record: &ResultRecord) -> Result<(), ResultStorageError> {
         let mut records = self.records.lock().unwrap();
-        // Insert-if-absent on (gameId, winner) — FIRST MARKER WINS,
+        // Insert-if-absent on the OUTPOINT (txid, outputIndex) — a
+        // replayed submit of the same output is a no-op, but markers for
+        // the same (gameId, winner) from different txs are ALL kept,
         // matching D1's INSERT OR IGNORE on the primary key.
         let exists = records
             .iter()
-            .any(|r| r.game_id == record.game_id && r.winner == record.winner);
+            .any(|r| r.txid == record.txid && r.output_index == record.output_index);
         if !exists {
             let mut r = record.clone();
             // Storage assigns created_at: an insertion counter here (D1
@@ -195,7 +216,8 @@ mod tests {
             settle_txid: "33".repeat(32),
             winner_sig_hex: "3045ab".into(),
             loser_sig_hex: Some("3044cd".into()),
-            txid: Some(txid.into()),
+            txid: txid.into(),
+            output_index: 0,
             created_at: 0, // ignored — storage assigns
         }
     }
@@ -211,7 +233,8 @@ mod tests {
 
         let rows = store.list_for_winner("02aa", 100).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].txid.as_deref(), Some("tx1"));
+        assert_eq!(rows[0].txid, "tx1");
+        assert_eq!(rows[0].output_index, 0);
         assert_eq!(rows[0].loser, "03bb");
         assert_eq!(rows[0].loser_sig_hex.as_deref(), Some("3044cd"));
     }
@@ -231,7 +254,7 @@ mod tests {
         // Winner 02aa sees only its own win — NOT the hand it lost.
         let rows = store.list_for_winner("02aa", 100).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].txid.as_deref(), Some("tx1"));
+        assert_eq!(rows[0].txid, "tx1");
         // An identity that never won sees nothing.
         assert!(store.list_for_winner("02cc", 100).await.unwrap().is_empty());
     }
@@ -253,35 +276,61 @@ mod tests {
 
         let rows = store.list_recent(3).await.unwrap();
         assert_eq!(rows.len(), 3, "limit respected");
-        assert_eq!(rows[0].txid.as_deref(), Some("tx4"), "newest first");
-        assert_eq!(rows[1].txid.as_deref(), Some("tx3"));
-        assert_eq!(rows[2].txid.as_deref(), Some("tx2"));
+        assert_eq!(rows[0].txid, "tx4", "newest first");
+        assert_eq!(rows[1].txid, "tx3");
+        assert_eq!(rows[2].txid, "tx2");
         // created_at is monotone (storage-assigned).
         assert!(rows[0].created_at > rows[1].created_at);
 
         let rows = store.list_for_winner("02aa", 2).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].txid.as_deref(), Some("tx4"), "newest first");
+        assert_eq!(rows[0].txid, "tx4", "newest first");
     }
 
     #[tokio::test]
-    async fn first_marker_wins_never_overwritten() {
+    async fn same_outpoint_replay_is_a_noop() {
         let store = MemoryResultStorage::new();
         store
-            .store_record(&record(&"11".repeat(32), "02aa", "03bb", "txFIRST"))
+            .store_record(&record(&"11".repeat(32), "02aa", "03bb", "txSAME"))
             .await
             .unwrap();
-        // A second marker for the SAME (gameId, winner) must be ignored —
+        // A replayed / duplicate SUBMIT of the SAME output — ignored;
         // never overwrite, never delete.
-        store
-            .store_record(&record(&"11".repeat(32), "02aa", "03cc", "txSECOND"))
-            .await
-            .unwrap();
+        let mut replay = record(&"11".repeat(32), "02aa", "03cc", "txSAME");
+        replay.output_index = 0; // same outpoint
+        store.store_record(&replay).await.unwrap();
 
         assert_eq!(store.record_count(), 1);
         let rows = store.list_for_winner("02aa", 100).await.unwrap();
-        assert_eq!(rows[0].txid.as_deref(), Some("txFIRST"), "first marker wins");
-        assert_eq!(rows[0].loser, "03bb");
+        assert_eq!(rows[0].loser, "03bb", "first insert for the outpoint kept");
+    }
+
+    #[tokio::test]
+    async fn same_pair_from_different_outpoints_all_kept() {
+        // The censorship fix at the storage level: markers for the SAME
+        // (gameId, winner) from DIFFERENT txs (or vouts) are ALL kept — a
+        // garbage front-run can never occupy the pair and censor the
+        // genuine marker.
+        let store = MemoryResultStorage::new();
+        store
+            .store_record(&record(&"11".repeat(32), "02aa", "03bb", "txGARBAGE"))
+            .await
+            .unwrap();
+        store
+            .store_record(&record(&"11".repeat(32), "02aa", "03bb", "txGENUINE"))
+            .await
+            .unwrap();
+        // Same txid, different vout — also a distinct outpoint, also kept.
+        let mut vout1 = record(&"11".repeat(32), "02aa", "03bb", "txGENUINE");
+        vout1.output_index = 1;
+        store.store_record(&vout1).await.unwrap();
+
+        assert_eq!(store.record_count(), 3);
+        let rows = store.list_for_winner("02aa", 100).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].txid, "txGENUINE", "newest first");
+        assert_eq!(rows[0].output_index, 1);
+        assert_eq!(rows[2].txid, "txGARBAGE");
     }
 
     #[tokio::test]
@@ -303,7 +352,7 @@ mod tests {
 
         let rows = store.list_for_winner("03bb", 100).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].txid.as_deref(), Some("tx3"));
+        assert_eq!(rows[0].txid, "tx3");
     }
 
     #[test]

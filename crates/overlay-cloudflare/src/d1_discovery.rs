@@ -1480,8 +1480,8 @@ impl CollectedStorage for D1CollectedStorage {
 
 /// Row for result-marker queries. TEXT columns arrive as `String` /
 /// `Option<String>` (loserSigHex is nullable — NULL = an unconfirmed
-/// claim); `createdAt` is an INTEGER column but D1 returns numbers as
-/// f64.
+/// claim); `outputIndex` / `createdAt` are INTEGER columns but D1
+/// returns numbers as f64.
 #[derive(Deserialize)]
 struct ResultRow {
     #[serde(rename = "gameId")]
@@ -1496,7 +1496,9 @@ struct ResultRow {
     winner_sig_hex: String,
     #[serde(rename = "loserSigHex")]
     loser_sig_hex: Option<String>,
-    txid: Option<String>,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
     #[serde(rename = "createdAt")]
     created_at: Option<f64>,
 }
@@ -1512,6 +1514,7 @@ impl ResultRow {
             winner_sig_hex: self.winner_sig_hex,
             loser_sig_hex: self.loser_sig_hex,
             txid: self.txid,
+            output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
         }
     }
@@ -1520,14 +1523,17 @@ impl ResultRow {
 /// Cloudflare D1 implementation of the ResultStorage trait
 /// (tm_result / ls_result, bsv-low #38).
 ///
-/// Schema: `result_markers` in `d1::OVERLAY_MIGRATIONS`. Keyed by
-/// (gameId, winner); `INSERT OR IGNORE` makes the FIRST marker for a
-/// pair win — a later marker never overwrites it — and rows are NEVER
-/// deleted (a settled result is permanent, like a reveal; the lookup
-/// service's spend/eviction hooks are no-ops). `createdAt` is stamped
-/// here at insert (the record's value is ignored) and drives the
-/// newest-first list ordering; `rowid DESC` breaks same-second ties in
-/// insertion order.
+/// Schema: `result_markers_v2` in `d1::OVERLAY_MIGRATIONS`. Keyed by the
+/// marker OUTPOINT (txid, outputIndex); `INSERT OR IGNORE` makes a
+/// replayed submit of the same output a no-op, while markers for the
+/// same (gameId, winner) from DIFFERENT txs are ALL kept (the
+/// censorship-front-run fix — a garbage-sig marker can never occupy a
+/// pair slot and hide the genuine one; clients verify sigs and count the
+/// genuine row). Rows are NEVER deleted (a settled result is permanent,
+/// like a reveal; the lookup service's spend/eviction hooks are no-ops).
+/// `createdAt` is stamped here at insert (the record's value is ignored)
+/// and drives the newest-first list ordering; `rowid DESC` breaks
+/// same-second ties in insertion order.
 pub struct D1ResultStorage {
     db: Rc<D1Database>,
 }
@@ -1543,18 +1549,20 @@ fn result_err(e: String) -> ResultStorageError {
 }
 
 const RESULT_SELECT: &str = "SELECT gameId, winner, loser, potTxid, settleTxid, \
-     winnerSigHex, loserSigHex, txid, createdAt FROM result_markers";
+     winnerSigHex, loserSigHex, txid, outputIndex, createdAt FROM result_markers_v2";
 
 #[async_trait(?Send)]
 impl ResultStorage for D1ResultStorage {
     async fn store_record(&self, record: &ResultRecord) -> Result<(), ResultStorageError> {
-        // INSERT OR IGNORE on the (gameId, winner) primary key — first
-        // marker wins; never overwrite, never delete.
+        // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
+        // replayed submit of the same output is a no-op; markers for the
+        // same (gameId, winner) from different txs are ALL kept; never
+        // overwrite, never delete.
         Query::new(
-            "INSERT OR IGNORE INTO result_markers \
+            "INSERT OR IGNORE INTO result_markers_v2 \
              (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
-              loserSigHex, txid, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              loserSigHex, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.game_id.as_str())
         .bind(record.winner.as_str())
@@ -1563,7 +1571,8 @@ impl ResultStorage for D1ResultStorage {
         .bind(record.settle_txid.as_str())
         .bind(record.winner_sig_hex.as_str())
         .bind(record.loser_sig_hex.as_deref())
-        .bind(record.txid.as_deref())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
         .bind(current_unix_seconds_i64())
         .execute(&self.db)
         .await

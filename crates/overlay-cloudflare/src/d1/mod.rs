@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 39;
+pub const OVERLAY_MIGRATION_COUNT: usize = 43;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -463,17 +463,15 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         createdAt INTEGER,
         PRIMARY KEY (identity, gameId)
     )",
-    // LOW hand-result leaderboard markers (tm_result / ls_result,
-    // bsv-low #38). One row per (gameId, winner) pair — FIRST MARKER
-    // WINS: the lookup service inserts with INSERT OR IGNORE on the
-    // primary key, so a later marker for the same pair never overwrites
-    // the first, and rows are NEVER deleted (a settled result is
-    // permanent, like a reveal; the OP_RETURN is provably unspendable).
-    // All byte fields are handed back verbatim to querying clients, which
-    // verify BOTH sigs client-side ('anyone' ProtoWallet round-trip) —
-    // the overlay never does and derives no "confirmed" flag. loserSigHex
-    // is NULL when the marker's loserSig push was empty (an unconfirmed
-    // claim).
+    // LOW hand-result leaderboard markers, ORIGINAL (superseded) shape —
+    // kept verbatim because this runner re-executes every statement and
+    // shipped migrations are never edited. SUPERSEDED by
+    // `result_markers_v2` below: the (gameId, winner) first-marker-wins
+    // primary key was an adversarial-review HIGH (2026-07-16) — admission
+    // is byte-format-only, so a garbage-sig front-run naming the REAL
+    // winner could permanently occupy the pair slot and censor the
+    // genuine countersigned marker for one OP_RETURN fee. No code writes
+    // or reads this table anymore.
     "CREATE TABLE IF NOT EXISTS result_markers (
         gameId TEXT NOT NULL,
         winner TEXT NOT NULL,
@@ -486,10 +484,58 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         createdAt INTEGER,
         PRIMARY KEY (gameId, winner)
     )",
-    // The two ls_result list queries: resultsFor filters by winner,
-    // both order by createdAt DESC.
     "CREATE INDEX IF NOT EXISTS idx_result_markers_winner ON result_markers(winner)",
     "CREATE INDEX IF NOT EXISTS idx_result_markers_createdAt ON result_markers(createdAt)",
+    // LOW hand-result leaderboard markers (tm_result / ls_result,
+    // bsv-low #38), CURRENT shape. One row per marker OUTPOINT
+    // (txid, outputIndex) — EVERY admitted marker is kept: the lookup
+    // service inserts with INSERT OR IGNORE on the primary key, so a
+    // replayed submit of the same output is a no-op, but markers for the
+    // same (gameId, winner) from DIFFERENT txs are ALL kept — the
+    // censorship-front-run fix (garbage and genuine rows coexist; the
+    // CLIENT's sig verify separates them and the genuine one counts).
+    // Rows are NEVER deleted (a settled result is permanent, like a
+    // reveal; the OP_RETURN is provably unspendable). All byte fields are
+    // handed back verbatim to querying clients, which verify BOTH sigs
+    // client-side ('anyone' ProtoWallet round-trip) — the overlay never
+    // does and derives no "confirmed" flag. loserSigHex is NULL when the
+    // marker's loserSig push was empty (an unconfirmed claim).
+    //
+    // Why a NEW table instead of an in-place rebuild: the runner
+    // re-executes every statement on every cold start, so a
+    // copy/DROP/RENAME dance would re-run against the LIVE table on the
+    // next start (re-copying rows with outputIndex=0 → corruption, then
+    // dropping the real table). CREATE-only + a one-time INSERT OR IGNORE
+    // carry (below) is re-run-safe: nothing writes to the old table
+    // anymore, and OR IGNORE dedups on the new primary key.
+    "CREATE TABLE IF NOT EXISTS result_markers_v2 (
+        gameId TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        loser TEXT NOT NULL,
+        potTxid TEXT,
+        settleTxid TEXT,
+        winnerSigHex TEXT,
+        loserSigHex TEXT,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // Carry any rows admitted under the superseded shape into v2 with
+    // outputIndex 0 (the old schema never stored the vout; 0 is a
+    // harmless PK-only placeholder). Idempotent: OR IGNORE on the
+    // (txid, outputIndex) key + the source table is write-frozen, so
+    // re-runs are no-ops. Old rows with a NULL txid (nullable there,
+    // NOT NULL here) cannot be carried and are skipped.
+    "INSERT OR IGNORE INTO result_markers_v2 \
+     (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, loserSigHex, \
+      txid, outputIndex, createdAt) \
+     SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, loserSigHex, \
+      txid, 0, createdAt FROM result_markers WHERE txid IS NOT NULL",
+    // The two ls_result list queries: resultsFor filters by winner,
+    // both order by createdAt DESC.
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_winner ON result_markers_v2(winner)",
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_createdAt ON result_markers_v2(createdAt)",
 ];
 
 // =============================================================================
@@ -557,13 +603,20 @@ mod tests {
         assert_eq!(OVERLAY_MIGRATIONS.len(), OVERLAY_MIGRATION_COUNT);
         for (i, sql) in OVERLAY_MIGRATIONS.iter().enumerate() {
             assert!(!sql.is_empty(), "Migration {i} is empty");
-            // Should start with CREATE (idempotent IF NOT EXISTS) or ALTER
+            // Should start with CREATE (idempotent IF NOT EXISTS), ALTER
             // (additive; the runner ignores the re-run duplicate-column
-            // error via migration_error_is_benign).
+            // error via migration_error_is_benign), or INSERT OR IGNORE
+            // (a re-run-safe data carry: the PK dedups replays — used by
+            // the result_markers → result_markers_v2 carry, whose source
+            // table is write-frozen). Plain INSERT / DROP / RENAME are
+            // still banned: the runner re-executes every statement on
+            // every cold start.
             let trimmed = sql.trim().to_uppercase();
             assert!(
-                trimmed.starts_with("CREATE") || trimmed.starts_with("ALTER TABLE"),
-                "Migration {i} should start with CREATE or ALTER TABLE, got: {}",
+                trimmed.starts_with("CREATE")
+                    || trimmed.starts_with("ALTER TABLE")
+                    || trimmed.starts_with("INSERT OR IGNORE"),
+                "Migration {i} should start with CREATE, ALTER TABLE, or INSERT OR IGNORE, got: {}",
                 &trimmed[..30.min(trimmed.len())]
             );
         }
@@ -605,6 +658,24 @@ mod tests {
     }
 
     #[test]
+    fn result_markers_carry_migration_is_rerun_safe() {
+        // The one non-CREATE/ALTER migration: the result_markers →
+        // result_markers_v2 data carry. Pin the two properties that make
+        // it safe under the re-run-everything runner: OR IGNORE (PK
+        // dedups replays) and the NULL-txid filter (v2's txid is NOT
+        // NULL). And it must be the ONLY such statement.
+        let carries: Vec<&&str> = OVERLAY_MIGRATIONS
+            .iter()
+            .filter(|sql| sql.trim_start().to_uppercase().starts_with("INSERT"))
+            .collect();
+        assert_eq!(carries.len(), 1, "exactly one data-carry migration");
+        let carry = carries[0];
+        assert!(carry.trim_start().starts_with("INSERT OR IGNORE INTO result_markers_v2"));
+        assert!(carry.contains("FROM result_markers WHERE txid IS NOT NULL"));
+        assert!(carry.contains("outputIndex"));
+    }
+
+    #[test]
     fn migrations_cover_all_tables() {
         let joined = OVERLAY_MIGRATIONS.join(" ");
         for table in &[
@@ -624,6 +695,7 @@ mod tests {
             "pot_beefs",
             "collected_markers",
             "result_markers",
+            "result_markers_v2",
         ] {
             assert!(
                 joined.contains(table),
@@ -653,6 +725,8 @@ mod tests {
             "idx_pot_spending",
             "idx_result_markers_winner",
             "idx_result_markers_createdAt",
+            "idx_result_markers_v2_winner",
+            "idx_result_markers_v2_createdAt",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }
