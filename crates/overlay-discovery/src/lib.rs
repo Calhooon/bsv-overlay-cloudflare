@@ -1,5 +1,6 @@
 pub mod advertiser;
 pub mod agent;
+pub mod collected;
 pub mod dm_delegation;
 pub mod low;
 pub mod pot;

@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 35;
+pub const OVERLAY_MIGRATION_COUNT: usize = 36;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -447,6 +447,22 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // the runner ignores the re-run "duplicate column" error
     // (`migration_error_is_benign`).
     "ALTER TABLE pot_records ADD COLUMN spentConfirmed INTEGER NOT NULL DEFAULT 0",
+    // LOW cross-device "already collected" markers (tm_collected /
+    // ls_collected, bsv-low #161). One row per (identity, gameId) pair —
+    // FIRST MARKER WINS: the lookup service inserts with INSERT OR IGNORE
+    // on the primary key, so a later marker for the same pair never
+    // overwrites the first, and rows are NEVER deleted (a collected fact is
+    // permanent, like a reveal; the OP_RETURN is provably unspendable).
+    // txid + sigHex are handed back verbatim to querying clients, which
+    // verify the sig under their OWN wallet — the overlay never does.
+    "CREATE TABLE IF NOT EXISTS collected_markers (
+        identity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        txid TEXT,
+        sigHex TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (identity, gameId)
+    )",
 ];
 
 // =============================================================================
@@ -579,6 +595,7 @@ mod tests {
             "reveal_records",
             "pot_records",
             "pot_beefs",
+            "collected_markers",
         ] {
             assert!(
                 joined.contains(table),

@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use overlay_discovery::agent::storage::{
     AgentDiscoveryRecord, AgentRecord, AgentStorage, AgentStorageError,
 };
+use overlay_discovery::collected::storage::{
+    CollectedRecord, CollectedStorage, CollectedStorageError,
+};
 use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
@@ -1380,6 +1383,93 @@ impl PotStorage for D1PotStorage {
                 .await
                 .map_err(pot_err)?;
         Ok(row.and_then(|r| decode_pot_beef_hex(r.beef)))
+    }
+}
+
+// =============================================================================
+// D1CollectedStorage
+// =============================================================================
+
+/// Row for collected-marker queries. All columns are TEXT; `txid` /
+/// `sigHex` are nullable in the schema so they arrive `Option`.
+#[derive(Deserialize)]
+struct CollectedRow {
+    identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    txid: Option<String>,
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+}
+
+impl CollectedRow {
+    fn into_record(self) -> CollectedRecord {
+        CollectedRecord {
+            identity: self.identity,
+            game_id: self.game_id,
+            txid: self.txid,
+            sig_hex: self.sig_hex,
+        }
+    }
+}
+
+/// Cloudflare D1 implementation of the CollectedStorage trait
+/// (tm_collected / ls_collected, bsv-low #161).
+///
+/// Schema: `collected_markers` in `d1::OVERLAY_MIGRATIONS`. Keyed by
+/// (identity, gameId); `INSERT OR IGNORE` makes the FIRST marker for a
+/// pair win — a later marker never overwrites it — and rows are NEVER
+/// deleted (a collected fact is permanent, like a reveal; the lookup
+/// service's spend/eviction hooks are no-ops).
+pub struct D1CollectedStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1CollectedStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn collected_err(e: String) -> CollectedStorageError {
+    CollectedStorageError::Database(e)
+}
+
+#[async_trait(?Send)]
+impl CollectedStorage for D1CollectedStorage {
+    async fn store_record(&self, record: &CollectedRecord) -> Result<(), CollectedStorageError> {
+        // INSERT OR IGNORE on the (identity, gameId) primary key — first
+        // marker wins; never overwrite, never delete.
+        Query::new(
+            "INSERT OR IGNORE INTO collected_markers \
+             (identity, gameId, txid, sigHex, createdAt) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(record.identity.as_str())
+        .bind(record.game_id.as_str())
+        .bind(record.txid.as_deref())
+        .bind(record.sig_hex.as_deref())
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(collected_err)
+    }
+
+    async fn get_record(
+        &self,
+        identity: &str,
+        game_id: &str,
+    ) -> Result<Option<CollectedRecord>, CollectedStorageError> {
+        let row: Option<CollectedRow> = Query::new(
+            "SELECT identity, gameId, txid, sigHex FROM collected_markers \
+             WHERE identity = ? AND gameId = ?",
+        )
+        .bind(identity)
+        .bind(game_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(collected_err)?;
+        Ok(row.map(CollectedRow::into_record))
     }
 }
 
