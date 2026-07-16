@@ -97,12 +97,19 @@ pub struct CollectedMarker {
 /// Walk minimal Bitcoin pushdata out of a byte slice → the pushed blobs,
 /// in order, stopping at the first non-push opcode / a truncated push
 /// (mirrors the app's `readPushes` and `reveal`'s `read_pushes`).
+///
+/// EVERY offset advance uses CHECKED arithmetic. This worker runs on wasm32
+/// (`usize = u32`) with wrapping release arithmetic — an OP_PUSHDATA4 length
+/// of `0xFFFFFFFF` would make a naive `i + len` WRAP past the bounds guard and
+/// panic-trap the topic-manager `/submit` pass on a ~7-byte crafted script.
+/// `checked_add` → `None` on overflow → we stop cleanly (a malformed marker is
+/// simply skipped, never a trap). Adversarial-review MED, 2026-07-16.
 fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         let op = bytes[i];
-        i += 1;
+        i += 1; // safe: i < bytes.len()
         let len = match op {
             n if n < 0x4c => n as usize,
             0x4c => {
@@ -114,7 +121,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
                 l
             }
             0x4d => {
-                if i + 2 > bytes.len() {
+                if i.checked_add(2).map_or(true, |e| e > bytes.len()) {
                     return out;
                 }
                 let l = bytes[i] as usize | ((bytes[i + 1] as usize) << 8);
@@ -122,7 +129,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
                 l
             }
             0x4e => {
-                if i + 4 > bytes.len() {
+                if i.checked_add(4).map_or(true, |e| e > bytes.len()) {
                     return out;
                 }
                 let l = (bytes[i] as usize)
@@ -134,11 +141,14 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
             }
             _ => return out, // a non-push opcode — stop
         };
-        if i + len > bytes.len() {
-            return out;
+        // CHECKED: `i + len` can overflow u32 on wasm32; overflow ⇒ out of bounds ⇒ stop.
+        match i.checked_add(len) {
+            Some(end) if end <= bytes.len() => {
+                out.push(&bytes[i..end]);
+                i = end;
+            }
+            _ => return out,
         }
-        out.push(&bytes[i..i + len]);
-        i += len;
     }
     out
 }
@@ -282,6 +292,27 @@ pub(crate) mod tests {
     fn tag_is_16_bytes() {
         assert_eq!(COLLECTED_TAG.len(), 16);
         assert_eq!(COLLECTED_TAG, b"LOW/collected/v1");
+    }
+
+    #[test]
+    fn adversarial_pushdata_len_never_panics_or_wraps() {
+        // Adversarial-review MED: an OP_PUSHDATA4 (0x4e) with len 0xFFFFFFFF on
+        // wasm32 (usize=u32) would wrap `i + len` past the bounds guard → slice
+        // panic → topic-manager /submit trap. The crafted ~7-byte script must
+        // parse to None (no marker), never panic. Also probe OP_PUSHDATA2 and a
+        // truncated push. (parse_collected_marker skips the 006a prefix; call
+        // read_pushes semantics via the full parser so the guard is exercised.)
+        for script in [
+            vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff, 0xff], // PUSHDATA4 max len, no data
+            vec![0x00u8, 0x6a, 0x4d, 0xff, 0xff],             // PUSHDATA2 max len, no data
+            vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff],       // PUSHDATA4 header truncated
+            vec![0x00u8, 0x6a, 0x4b],                         // a 75-byte push with no data
+        ] {
+            assert_eq!(parse_collected_marker(&script), None, "crafted script must not parse");
+        }
+        // Direct read_pushes probe: the trap path is the len itself.
+        assert!(read_pushes(&[0x4e, 0xff, 0xff, 0xff, 0xff]).is_empty());
+        assert!(read_pushes(&[0x4d, 0xff, 0xff]).is_empty());
     }
 
     // ── Valid markers ─────────────────────────────────────────────────────
