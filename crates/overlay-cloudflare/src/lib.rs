@@ -381,6 +381,12 @@ fn build_engine_with_storage(
             "tm_pot" => {
                 managers.insert("tm_pot".into(), Box::new(PotTopicManager::new()));
             }
+            "tm_lowfund" => {
+                managers.insert(
+                    "tm_lowfund".into(),
+                    Box::new(overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new()),
+                );
+            }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
         }
     }
@@ -536,11 +542,14 @@ fn build_engine_with_storage(
 
     // tm_pot (LOW pot-spend landing-proof index) is single-node like tm_low /
     // tm_reveal: this worker is the only host and the LOW client queries it
-    // directly. Disabled until a second pot-index node exists.
-    sync_configuration.insert(
-        "tm_pot".to_string(),
-        overlay_engine::types::SyncTarget::Disabled,
-    );
+    // directly. Disabled until a second pot-index node exists. tm_lowfund
+    // (the hop-side index into the same store) mirrors it.
+    for topic in ["tm_pot", "tm_lowfund"] {
+        sync_configuration.insert(
+            topic.to_string(),
+            overlay_engine::types::SyncTarget::Disabled,
+        );
+    }
 
     let config = EngineConfig {
         hosting_url: hosting_url.clone(),

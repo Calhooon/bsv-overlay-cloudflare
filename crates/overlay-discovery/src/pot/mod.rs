@@ -71,9 +71,30 @@
 //! "spendingTxid": null}` (never assert "unspent" for an output we never
 //! saw).
 
+//! # `tm_lowfund` — the HOP (funding staging coin) side index (bsv-low #152)
+//!
+//! The LOW ante rides a two-step: wallet `createAction` funds a plain P2PKH
+//! HOP to the seat's derived stake key, then the JOIN spends both seats' hops
+//! into the pot covenant. The pot side is indexed by `tm_pot`; the HOP side
+//! was the client's last WhatsOnChain carve-out. `tm_lowfund` closes it: the
+//! client explicitly submits the hop-carrying funding tx under this topic
+//! (and the JOIN / hop-sweep under it too), so the hop outpoint's admit and
+//! spend land in the SAME `pot_records`/`pot_beefs` store — `ls_pot`
+//! processes both topics — and the app-layer's `/utxo-status`, `/pots-view`
+//! and `/beef/:txid` answer hop questions with zero new read surface.
+//!
+//! Recognition is structural: a standard 25-byte P2PKH lock
+//! ([`is_p2pkh_script`]). A hop is indistinguishable from any other P2PKH by
+//! design (it IS an ordinary P2PKH), so the topic admits every P2PKH output
+//! of an explicitly-submitted tx — wallet change rows are harmless extra
+//! facts about already-public txs, and the topic is single-node
+//! explicit-submit exactly like `tm_pot` (same public-/submit trust posture:
+//! rows are HINTS; money decisions anchor on ARC/SPV, never a bare pointer).
+
 use std::sync::OnceLock;
 
 pub mod lookup_service;
+pub mod lowfund_topic_manager;
 pub mod storage;
 pub mod topic_manager;
 
@@ -131,6 +152,18 @@ pub fn is_pot_covenant_script(s: &[u8]) -> bool {
     let head = head_bytes();
     let tail = tail_bytes();
     s.len() >= head.len() + tail.len() && s.starts_with(head) && s.ends_with(tail)
+}
+
+/// True iff `s` is a standard P2PKH locking script — the LOW hop lock shape
+/// (`tm_lowfund`): `OP_DUP OP_HASH160 <20-byte pkh> OP_EQUALVERIFY
+/// OP_CHECKSIG`, exactly 25 bytes.
+pub fn is_p2pkh_script(s: &[u8]) -> bool {
+    s.len() == 25
+        && s[0] == 0x76 // OP_DUP
+        && s[1] == 0xa9 // OP_HASH160
+        && s[2] == 0x14 // push 20
+        && s[23] == 0x88 // OP_EQUALVERIFY
+        && s[24] == 0xac // OP_CHECKSIG
 }
 
 #[cfg(test)]

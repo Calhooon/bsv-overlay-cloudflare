@@ -157,8 +157,10 @@ impl LookupService for PotLookupService {
             _ => return Err(LookupServiceError::Other("Expected whole-tx mode".into())),
         };
 
-        // Only index tm_pot outputs.
-        if topic != "tm_pot" {
+        // Index tm_pot (covenant) AND tm_lowfund (hop P2PKH) outputs — both
+        // land in the same pot_records/pot_beefs landing-proof store, so the
+        // app-layer's /utxo-status, /pots-view and /beef answer either kind.
+        if topic != "tm_pot" && topic != "tm_lowfund" {
             return Ok(());
         }
 
@@ -173,14 +175,18 @@ impl LookupService for PotLookupService {
             }
         };
 
-        // The topic manager already recognized the covenant; re-check
-        // defensively (the TM should never admit a non-covenant output here).
-        let is_covenant = tx
-            .outputs
-            .get(output_index as usize)
-            .is_some_and(|o| is_pot_covenant_script(&o.locking_script.to_binary()));
-        if !is_covenant {
-            debug!("POT: admitted output is not a pot covenant script — skipped");
+        // The topic manager already recognized the shape; re-check defensively
+        // per topic (the TM should never admit a mismatched output here):
+        // tm_pot admits the pot covenant, tm_lowfund the hop P2PKH.
+        let shape_ok = tx.outputs.get(output_index as usize).is_some_and(|o| {
+            let s = o.locking_script.to_binary();
+            match topic.as_str() {
+                "tm_pot" => is_pot_covenant_script(&s),
+                _ => crate::pot::is_p2pkh_script(&s), // tm_lowfund (gated above)
+            }
+        });
+        if !shape_ok {
+            debug!("POT: admitted output does not match its topic's script shape — skipped");
             return Ok(());
         }
 
@@ -229,7 +235,7 @@ impl LookupService for PotLookupService {
             _ => return Ok(()),
         };
 
-        if topic != "tm_pot" {
+        if topic != "tm_pot" && topic != "tm_lowfund" {
             return Ok(());
         }
 
@@ -855,6 +861,75 @@ mod tests {
             .unwrap();
         assert_eq!(storage.record_count(), 0);
         assert_eq!(storage.beef_count(), 0, "non-covenant must not store a beef");
+    }
+
+    // ── tm_lowfund (the hop-side index into the SAME store) ─────────────
+
+    /// Re-tag a payload with the tm_lowfund topic.
+    fn as_lowfund_admit(mut payload: OutputAdmittedByTopic) -> OutputAdmittedByTopic {
+        if let OutputAdmittedByTopic::WholeTx { ref mut topic, .. } = payload {
+            *topic = "tm_lowfund".into();
+        }
+        payload
+    }
+
+    #[tokio::test]
+    async fn lowfund_admits_p2pkh_hop_into_the_same_store() {
+        let (svc, storage) = make_service_with_storage();
+        // A hop-carrying funding tx: vout 0 = plain P2PKH (the hop).
+        let mut tx = Tx::new();
+        tx.add_input(TransactionInput::new("11".repeat(32), 0)).unwrap();
+        tx.add_output(p2pkh_output()).unwrap();
+        let hop_txid = tx.id();
+        svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&tx), 0)))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 1);
+        assert_eq!(storage.beef_count(), 1, "the hop funding beef is stored");
+
+        let arr = spent_status(&svc, serde_json::json!([{"txid": hop_txid, "vout": 0}])).await;
+        assert_eq!(arr[0]["known"], true);
+        assert_eq!(arr[0]["spent"], false);
+    }
+
+    #[tokio::test]
+    async fn lowfund_rejects_a_covenant_output_shape() {
+        let (svc, storage) = make_service_with_storage();
+        // The pot covenant admitted under tm_lowfund is a shape mismatch —
+        // the defensive per-topic re-check must skip it (tm_pot owns it).
+        svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&funding_tx(1)), 0)))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0);
+        assert_eq!(storage.beef_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn lowfund_spend_records_the_join_as_spender() {
+        let (svc, storage) = make_service_with_storage();
+        // Admit the hop under tm_lowfund…
+        let mut hop = Tx::new();
+        hop.add_input(TransactionInput::new("22".repeat(32), 0)).unwrap();
+        hop.add_output(p2pkh_output()).unwrap();
+        let hop_txid = hop.id();
+        svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&hop), 0)))
+            .await
+            .unwrap();
+        // …then the JOIN spends it, submitted under tm_lowfund.
+        let join = settle_tx(&hop_txid, 0);
+        let join_txid = join.id();
+        let mut payload = spent(&hop_txid, 0, beef_of(&join));
+        if let OutputSpent::WholeTx { ref mut topic, .. } = payload {
+            *topic = "tm_lowfund".into();
+        }
+        svc.output_spent(&payload).await.unwrap();
+
+        let arr = spent_status(&svc, serde_json::json!([{"txid": hop_txid, "vout": 0}])).await;
+        assert_eq!(arr[0]["known"], true);
+        assert_eq!(arr[0]["spent"], true);
+        assert_eq!(arr[0]["spendingTxid"], join_txid);
+        // The spender's beef is durably stored too (the /beef + /pots-view raw source).
+        assert!(storage.get_beef(&join_txid).await.unwrap().is_some());
     }
 
     #[tokio::test]
