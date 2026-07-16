@@ -16,8 +16,9 @@ use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
 
 use crate::logic::{
-    assemble_statuses, batch_where_sql, beef_body, decode_beef_hex, health_body, parse_outpoints,
-    parse_present_height, tip_body, utxo_status_body, valid_txid, PotRecordRow,
+    assemble_pots_view, assemble_statuses, batch_where_sql, beef_body, decode_beef_hex,
+    health_body, parse_outpoints, parse_present_height, pots_view_body, pots_view_join_sql,
+    tip_body, utxo_status_body, valid_txid, Outpoint, PotRecordRow, PotsViewRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -184,15 +185,19 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     json_error(&format!("BEEF not found for txid: {txid}"), 404)
 }
 
-/// `GET /tip` — present chain height via the `CHAINTRACKS` service binding
-/// (`GET /getPresentHeight`, the same route the overlay's chain tracker
-/// calls). A binding fault is 503, an upstream fault 502.
-pub async fn tip(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+/// Fetch the present chain height through the `CHAINTRACKS` service binding.
+/// `Err((msg, status))` carries the exact error mapping `/tip` has always
+/// served (binding 503, upstream 502); `/pots-view` maps any error to a
+/// `tip: null` body instead (the D1 facts are still worth serving).
+async fn chaintracks_present_height(
+    ctx: &RouteContext<()>,
+    tag: &str,
+) -> std::result::Result<u64, (&'static str, u16)> {
     let svc = match ctx.env.service("CHAINTRACKS") {
         Ok(svc) => svc,
         Err(e) => {
-            console_warn!("[tip] CHAINTRACKS binding unavailable: {e}");
-            return json_error("chaintracks binding unavailable", 503);
+            console_warn!("[{tag}] CHAINTRACKS binding unavailable: {e}");
+            return Err(("chaintracks binding unavailable", 503));
         },
     };
     let mut init = RequestInit::new();
@@ -204,28 +209,119 @@ pub async fn tip(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let mut resp = match svc.fetch(CHAINTRACKS_TIP_URL, Some(init)).await {
         Ok(resp) => resp,
         Err(e) => {
-            console_warn!("[tip] chaintracks fetch failed: {e}");
-            return json_error("chaintracks fetch failed", 502);
+            console_warn!("[{tag}] chaintracks fetch failed: {e}");
+            return Err(("chaintracks fetch failed", 502));
         },
     };
     if !(200..300).contains(&resp.status_code()) {
-        console_warn!("[tip] chaintracks returned HTTP {}", resp.status_code());
-        return json_error("chaintracks returned an error", 502);
+        console_warn!("[{tag}] chaintracks returned HTTP {}", resp.status_code());
+        return Err(("chaintracks returned an error", 502));
     }
     let frame: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            console_warn!("[tip] chaintracks response not JSON: {e}");
-            return json_error("chaintracks returned malformed JSON", 502);
+            console_warn!("[{tag}] chaintracks response not JSON: {e}");
+            return Err(("chaintracks returned malformed JSON", 502));
         },
     };
     match parse_present_height(&frame) {
-        Some(height) => json_response(tip_body(height), 200),
+        Some(height) => Ok(height),
         None => {
-            console_warn!("[tip] chaintracks frame not a success/height: {frame}");
-            json_error("chaintracks returned an unexpected frame", 502)
+            console_warn!("[{tag}] chaintracks frame not a success/height: {frame}");
+            Err(("chaintracks returned an unexpected frame", 502))
         },
     }
+}
+
+/// `GET /tip` — present chain height via the `CHAINTRACKS` service binding
+/// (`GET /getPresentHeight`, the same route the overlay's chain tracker
+/// calls). A binding fault is 503, an upstream fault 502.
+pub async fn tip(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    match chaintracks_present_height(&ctx, "tip").await {
+        Ok(height) => json_response(tip_body(height), 200),
+        Err((msg, status)) => json_error(msg, status),
+    }
+}
+
+/// `/pots-view` joined row as D1 returns it: the `PotRowD1` fields plus the
+/// LEFT-JOINed `hex(pot_beefs.beef)` for the recorded spender (NULL when the
+/// outpoint is unspent or the spender's BEEF was never stored).
+#[derive(Deserialize)]
+struct PotsViewRowD1 {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    spent: f64,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: f64,
+    #[serde(rename = "spenderBeef")]
+    spender_beef: Option<String>,
+}
+
+impl PotsViewRowD1 {
+    fn into_row(self) -> PotsViewRow {
+        PotsViewRow {
+            record: PotRecordRow {
+                txid: self.txid,
+                vout: self.output_index as u32,
+                spent: self.spent != 0.0,
+                spending_txid: self.spending_txid,
+                spent_confirmed: self.spent_confirmed != 0.0,
+            },
+            spender_beef_hex: self.spender_beef,
+        }
+    }
+}
+
+/// `GET /pots-view?outpoints=<txid>.<vout>,…` — the batched DERIVED view
+/// (GH bsv-low#163): everything a home/History surface pass needs in ONE
+/// request and ONE D1 query. Per outpoint: the `/utxo-status` facts plus
+/// `spenderRawHex` (the recorded spender's raw tx, extracted from its stored
+/// BEEF — a HINT the client hash-verifies against `spendingTxid`); plus the
+/// chain `tip` in the same body (`null` on a chaintracks fault — the D1
+/// facts still serve, and the client falls back to `/tip`).
+pub async fn pots_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let Some(param) = url
+        .query_pairs()
+        .find(|(k, _)| k == "outpoints")
+        .map(|(_, v)| v.into_owned())
+    else {
+        return json_error("missing outpoints query parameter", 400);
+    };
+    let outpoints: Vec<Outpoint> = match parse_outpoints(&param) {
+        Ok(ops) => ops,
+        Err(msg) => return json_error(&msg, 400),
+    };
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[pots-view] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        },
+    };
+
+    // ONE joined query for the whole batch (records + spender BEEFs).
+    let mut binds: Vec<JsValue> = Vec::with_capacity(outpoints.len() * 2);
+    for op in &outpoints {
+        binds.push(JsValue::from_str(&op.db_txid()));
+        binds.push(JsValue::from_f64(f64::from(op.vout)));
+    }
+    let stmt = db.prepare(pots_view_join_sql(outpoints.len())).bind(&binds)?;
+    let rows: Vec<PotsViewRow> = match stmt.all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
+        Ok(rows) => rows.into_iter().map(PotsViewRowD1::into_row).collect(),
+        Err(e) => {
+            console_warn!("[pots-view] pot_records join query failed: {e}");
+            return json_error("database query failed", 503);
+        },
+    };
+
+    let entries = assemble_pots_view(&outpoints, &rows);
+    let tip = chaintracks_present_height(&ctx, "pots-view").await.ok();
+    json_response(pots_view_body(&entries, tip), 200)
 }
 
 /// `GET /health` — liveness only (no DB touch).

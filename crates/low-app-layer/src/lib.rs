@@ -28,6 +28,11 @@
 //! - `GET /utxo-status?outpoints=<txid>.<vout>,…` — spent-status of up to 64
 //!   pot outpoints from `pot_records` in ONE batched D1 query (fail-safe: an
 //!   unknown outpoint is reported `known:false`, never asserted unspent).
+//! - `GET /pots-view?outpoints=…` — the batched DERIVED view (GH
+//!   bsv-low#163): the `/utxo-status` facts PLUS each recorded spender's raw
+//!   tx (extracted from its stored BEEF; client hash-verifies) PLUS the
+//!   chain tip, in one request / one D1 join — the query that replaces the
+//!   client's per-spender `/beef` fan-out.
 //! - `GET /beef/:txid` — the admitted BEEF bytes from `transactions`.
 //! - `GET /tip` — present chain height via the CHAINTRACKS service binding.
 //! - `GET /health` — liveness.
@@ -71,6 +76,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 fn router() -> Router<'static, ()> {
     Router::new()
         .get_async("/utxo-status", routes::utxo_status)
+        .get_async("/pots-view", routes::pots_view)
         .get_async("/beef/:txid", routes::beef)
         .get_async("/tip", routes::tip)
         .get("/health", routes::health)

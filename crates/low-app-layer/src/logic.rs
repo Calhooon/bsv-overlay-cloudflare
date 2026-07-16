@@ -190,6 +190,128 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
         .collect()
 }
 
+// ── /pots-view — the batched DERIVED view (GH bsv-low#163) ────────────────
+//
+// The zanaadu model completed: the app-layer serves the JOIN the client used
+// to assemble itself (per-outpoint /utxo-status + a /beef fan-out per
+// spender + /tip). One request → one D1 query answers "which pots moved, by
+// what, paying whom" for a whole home/History surface pass.
+//
+// TRUST POSTURE (unchanged): `spenderRawHex` is served from the same
+// `pot_beefs` store `/beef` reads — the CLIENT verifies it hashes to
+// `spendingTxid` before use (a lying server can't poison), and unconfirmed
+// pointers remain hints; money decisions still require anchored evidence.
+
+/// The single batched `/pots-view` SQL: the `/utxo-status` batch WHERE plus a
+/// LEFT JOIN to `pot_beefs` on the recorded spender, so the spender's stored
+/// BEEF rides back in the same query. `lower()` defends against a mixed-case
+/// spendingTxid write (pot_beefs keys are lowercase); the join still resolves
+/// via the pot_beefs PRIMARY KEY per matched row.
+pub fn pots_view_join_sql(n: usize) -> String {
+    debug_assert!((1..=MAX_OUTPOINTS).contains(&n), "parse_outpoints bounds n");
+    let clause = vec!["(p.txid = ? AND p.outputIndex = ?)"; n].join(" OR ");
+    format!(
+        "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
+                hex(b.beef) AS spenderBeef \
+         FROM pot_records p \
+         LEFT JOIN pot_beefs b ON b.txid = lower(p.spendingTxid) \
+         WHERE {clause}"
+    )
+}
+
+/// One `/pots-view` joined row, host-typed: the pot record plus the spender's
+/// stored BEEF (as the `hex(beef)` read-back), when the join found one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PotsViewRow {
+    pub record: PotRecordRow,
+    /// `hex(pot_beefs.beef)` for the recorded spender, `None` when the join
+    /// missed (no spender recorded, or its BEEF was never stored).
+    pub spender_beef_hex: Option<String>,
+}
+
+/// One `/pots-view` response entry: the `/utxo-status` fields plus the raw
+/// spending tx, extracted server-side from the spender's stored BEEF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PotsViewEntry {
+    pub status: OutpointStatus,
+    /// The spending tx's RAW bytes as lowercase hex — a HINT the client must
+    /// verify (hash == `spendingTxid`) before trusting. `None` whenever the
+    /// spender or its bytes aren't available; never a guessed value.
+    pub spender_raw_hex: Option<String>,
+}
+
+/// Extract the raw bytes of `txid`'s tx from BEEF bytes, as lowercase hex.
+/// `None` when the BEEF doesn't parse or carries the tx as txid-only. The
+/// BEEF's own txid index is computed by hashing each carried tx, so a hit
+/// here is hash-consistent by construction — the client still re-verifies.
+pub fn extract_raw_tx_hex(beef_bytes: &[u8], txid: &str) -> Option<String> {
+    let mut beef = bsv_rs::transaction::Beef::from_binary(beef_bytes).ok()?;
+    let btx = beef.find_txid_mut(&txid.to_ascii_lowercase())?;
+    btx.raw_tx_or_compute().map(hex::encode)
+}
+
+/// Map the joined batch-query rows back onto the REQUESTED outpoints,
+/// input-ordered, extracting each found spender's raw tx from its BEEF. The
+/// fail-safe shape mirrors [`assemble_statuses`]: a missing row is
+/// `known:false` with all-null facts, and any beef decode/extract failure
+/// degrades that entry's `spenderRawHex` to null (never a wrong byte).
+pub fn assemble_pots_view(outpoints: &[Outpoint], rows: &[PotsViewRow]) -> Vec<PotsViewEntry> {
+    outpoints
+        .iter()
+        .map(|op| {
+            let key_txid = op.db_txid();
+            match rows
+                .iter()
+                .find(|r| r.record.txid.eq_ignore_ascii_case(&key_txid) && r.record.vout == op.vout)
+            {
+                Some(r) => {
+                    let status = OutpointStatus::known(
+                        op,
+                        r.record.spent,
+                        r.record.spending_txid.clone(),
+                        r.record.spent_confirmed,
+                    );
+                    let spender_raw_hex = match (&r.record.spending_txid, &r.spender_beef_hex) {
+                        (Some(spender), Some(beef_hex)) => decode_beef_hex(beef_hex)
+                            .and_then(|bytes| extract_raw_tx_hex(&bytes, spender)),
+                        _ => None,
+                    };
+                    PotsViewEntry {
+                        status,
+                        spender_raw_hex,
+                    }
+                }
+                None => PotsViewEntry {
+                    status: OutpointStatus::unknown(op),
+                    spender_raw_hex: None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Assemble the `/pots-view` wire body:
+/// `{"tip":<height|null>,"entries":[{…utxo-status fields…,"spenderRawHex"}]}`.
+/// `tip` is `null` on a chaintracks fault — the entries are still served
+/// (spent-status is D1 truth), and the client falls back to its own `/tip`.
+pub fn pots_view_body(entries: &[PotsViewEntry], tip: Option<u64>) -> String {
+    let arr: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "txid": e.status.txid,
+                "vout": e.status.vout,
+                "known": e.status.known,
+                "spent": e.status.spent,
+                "spendingTxid": e.status.spending_txid,
+                "spentConfirmed": e.status.spent_confirmed,
+                "spenderRawHex": e.spender_raw_hex,
+            })
+        })
+        .collect();
+    json!({ "tip": tip, "entries": arr }).to_string()
+}
+
 /// Decode the `hex(beef)` column read back from D1 (SQLite `hex()` emits
 /// UPPERCASE; `hex::decode` accepts either case). An empty or undecodable
 /// value is `None` — the engine treats an empty BEEF row as un-hydrated, so
@@ -489,6 +611,166 @@ mod tests {
             parse_present_height(&serde_json::json!({"status": "success", "value": -1})),
             None
         );
+    }
+
+    // ── /pots-view ─────────────────────────────────────────────────────
+
+    /// A minimal real tx (1 input, 1 output) + its BEEF bytes + txid, built
+    /// with the same bsv-rs the extraction uses — the fixture exercises the
+    /// REAL producer path (BEEF round-trip), not hand-fed bytes.
+    fn beef_fixture() -> (Vec<u8>, String, String) {
+        use bsv_rs::transaction::Beef;
+        // A syntactically-valid raw tx: version 1, 1 input (null outpoint,
+        // empty script, seq ffffffff), 1 output (1 sat, empty script), lock 0.
+        let raw_hex = "0100000001".to_string()
+            + &"00".repeat(32)
+            + "ffffffff"
+            + "00"
+            + "ffffffff"
+            + "01"
+            + "0100000000000000"
+            + "00"
+            + "00000000";
+        let raw = hex::decode(&raw_hex).unwrap();
+        let mut beef = Beef::new();
+        let txid = beef.merge_raw_tx(raw.clone(), None).txid();
+        (beef.to_binary(), raw_hex, txid)
+    }
+
+    #[test]
+    fn pots_view_sql_shapes() {
+        let one = pots_view_join_sql(1);
+        assert!(one.contains("LEFT JOIN pot_beefs b ON b.txid = lower(p.spendingTxid)"));
+        assert!(one.contains("hex(b.beef) AS spenderBeef"));
+        assert_eq!(one.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 1);
+        let three = pots_view_join_sql(3);
+        assert_eq!(three.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 3);
+        assert_eq!(three.matches(" OR ").count(), 2);
+    }
+
+    #[test]
+    fn extract_raw_tx_hex_roundtrip_and_misses() {
+        let (beef_bytes, raw_hex, txid) = beef_fixture();
+        // The carried tx extracts to its exact raw bytes (either txid case).
+        assert_eq!(extract_raw_tx_hex(&beef_bytes, &txid), Some(raw_hex.clone()));
+        assert_eq!(
+            extract_raw_tx_hex(&beef_bytes, &txid.to_ascii_uppercase()),
+            Some(raw_hex)
+        );
+        // A txid the BEEF doesn't carry → None.
+        assert_eq!(extract_raw_tx_hex(&beef_bytes, &"ab".repeat(32)), None);
+        // Garbage bytes → None, never a panic.
+        assert_eq!(extract_raw_tx_hex(&[0x00, 0x01, 0x02], &txid), None);
+        assert_eq!(extract_raw_tx_hex(&[], &txid), None);
+    }
+
+    #[test]
+    fn assemble_pots_view_joins_and_fail_safes() {
+        let (beef_bytes, raw_hex, spender) = beef_fixture();
+        let beef_hex_upper = hex::encode(&beef_bytes).to_ascii_uppercase(); // SQLite hex() shape
+        let ops = vec![
+            Outpoint { txid: txid_a(), vout: 0 }, // spent, beef joined
+            Outpoint { txid: txid_a(), vout: 1 }, // spent, beef row MISSING
+            Outpoint { txid: txid_b(), vout: 0 }, // unknown outpoint
+            Outpoint { txid: txid_b(), vout: 2 }, // known-unspent
+        ];
+        let rows = vec![
+            PotsViewRow {
+                record: PotRecordRow {
+                    txid: txid_a(),
+                    vout: 0,
+                    spent: true,
+                    spending_txid: Some(spender.clone()),
+                    spent_confirmed: true,
+                },
+                spender_beef_hex: Some(beef_hex_upper),
+            },
+            PotsViewRow {
+                record: PotRecordRow {
+                    txid: txid_a(),
+                    vout: 1,
+                    spent: true,
+                    spending_txid: Some(spender.clone()),
+                    spent_confirmed: false,
+                },
+                spender_beef_hex: None,
+            },
+            PotsViewRow {
+                record: PotRecordRow {
+                    txid: txid_b(),
+                    vout: 2,
+                    spent: false,
+                    spending_txid: None,
+                    spent_confirmed: false,
+                },
+                spender_beef_hex: None,
+            },
+        ];
+        let out = assemble_pots_view(&ops, &rows);
+        assert_eq!(out.len(), 4);
+        // Joined: the raw rides back.
+        assert_eq!(out[0].status.spent, Some(true));
+        assert_eq!(out[0].status.spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(out[0].spender_raw_hex.as_deref(), Some(raw_hex.as_str()));
+        // Spender recorded but no stored BEEF → pointer yes, raw null.
+        assert_eq!(out[1].status.spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(out[1].spender_raw_hex, None);
+        // Unknown: fail-safe nulls (never asserted unspent).
+        assert_eq!((out[2].status.known, out[2].status.spent), (false, None));
+        assert_eq!(out[2].spender_raw_hex, None);
+        // Known-unspent: no spender, no raw.
+        assert_eq!((out[3].status.known, out[3].status.spent), (true, Some(false)));
+        assert_eq!(out[3].spender_raw_hex, None);
+    }
+
+    #[test]
+    fn assemble_pots_view_degrades_on_corrupt_beef() {
+        let ops = vec![Outpoint { txid: txid_a(), vout: 0 }];
+        let rows = vec![PotsViewRow {
+            record: PotRecordRow {
+                txid: txid_a(),
+                vout: 0,
+                spent: true,
+                spending_txid: Some("f0".repeat(32)),
+                spent_confirmed: true,
+            },
+            spender_beef_hex: Some("not-hex!!".to_string()),
+        }];
+        let out = assemble_pots_view(&ops, &rows);
+        // The pointer facts survive; only the raw degrades to null.
+        assert_eq!(out[0].status.spent, Some(true));
+        assert_eq!(out[0].spender_raw_hex, None);
+    }
+
+    #[test]
+    fn pots_view_body_shape() {
+        let op = Outpoint { txid: txid_a(), vout: 0 };
+        let entries = vec![
+            PotsViewEntry {
+                status: OutpointStatus::known(&op, true, Some("f0".repeat(32)), true),
+                spender_raw_hex: Some("aabb".to_string()),
+            },
+            PotsViewEntry {
+                status: OutpointStatus::unknown(&Outpoint { txid: txid_b(), vout: 1 }),
+                spender_raw_hex: None,
+            },
+        ];
+        let v: serde_json::Value = serde_json::from_str(&pots_view_body(&entries, Some(958_123))).unwrap();
+        assert_eq!(v["tip"], 958_123);
+        let arr = v["entries"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["txid"], txid_a());
+        assert_eq!(arr[0]["spent"], true);
+        assert_eq!(arr[0]["spendingTxid"], "f0".repeat(32));
+        assert_eq!(arr[0]["spentConfirmed"], true);
+        assert_eq!(arr[0]["spenderRawHex"], "aabb");
+        assert_eq!(arr[1]["known"], false);
+        assert!(arr[1]["spent"].is_null());
+        assert!(arr[1]["spenderRawHex"].is_null());
+        // A chaintracks fault serves entries with a null tip.
+        let v2: serde_json::Value = serde_json::from_str(&pots_view_body(&entries, None)).unwrap();
+        assert!(v2["tip"].is_null());
+        assert_eq!(v2["entries"].as_array().unwrap().len(), 2);
     }
 
     #[test]
