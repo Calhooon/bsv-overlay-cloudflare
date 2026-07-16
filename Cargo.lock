@@ -229,6 +229,7 @@ name = "bsv-overlay-discovery"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bsv-overlay-engine",
  "bsv-rs",
  "hex",

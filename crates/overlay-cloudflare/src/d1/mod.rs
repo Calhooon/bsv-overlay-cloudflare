@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 44;
+pub const OVERLAY_MIGRATION_COUNT: usize = 46;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -543,6 +543,32 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // back-compat). Additive ALTER: the runner ignores the re-run
     // "duplicate column" error (`migration_error_is_benign`).
     "ALTER TABLE result_markers_v2 ADD COLUMN cardsHex TEXT",
+    // LOW rung-3 transcript-proof bundle markers (tm_proof / ls_proof,
+    // bsv-low leaderboard ladder rung 3). One row per marker OUTPOINT
+    // (txid, outputIndex) — EVERY admitted marker kept via INSERT OR
+    // IGNORE on the primary key (the tm_result censorship lesson:
+    // admission is byte-format-only, so a (gameId, winner)-keyed
+    // first-marker-wins index would let a garbage bundle front-run the
+    // real proof for one OP_RETURN fee; with outpoint keying garbage and
+    // genuine bundles coexist and the CLIENT verifies each). Rows are
+    // NEVER deleted (a published proof is permanent; the OP_RETURN is
+    // provably unspendable). `bundle` is the canonical-JSON proof-bundle
+    // BYTES as a BLOB (the pot_beefs idiom — read back via hex());
+    // ~10–15 KB each, format-capped at 64 KiB. The overlay never parses
+    // or verifies it — clients check the transcript cryptography.
+    "CREATE TABLE IF NOT EXISTS proof_markers (
+        gameId TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        sigHex TEXT,
+        bundle BLOB NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // The ls_proof list query filters by (gameId, winner) and orders by
+    // createdAt DESC.
+    "CREATE INDEX IF NOT EXISTS idx_proof_markers_game_winner ON proof_markers(gameId, winner)",
 ];
 
 // =============================================================================
@@ -713,6 +739,7 @@ mod tests {
             "collected_markers",
             "result_markers",
             "result_markers_v2",
+            "proof_markers",
         ] {
             assert!(
                 joined.contains(table),
@@ -744,6 +771,7 @@ mod tests {
             "idx_result_markers_createdAt",
             "idx_result_markers_v2_winner",
             "idx_result_markers_v2_createdAt",
+            "idx_proof_markers_game_winner",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

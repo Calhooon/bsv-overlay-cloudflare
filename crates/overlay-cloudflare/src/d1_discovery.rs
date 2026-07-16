@@ -17,6 +17,7 @@ use overlay_discovery::dm_delegation::storage::{
 };
 use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
 use overlay_discovery::pot::storage::{PotRecord, PotStorage, PotStorageError};
+use overlay_discovery::proof::storage::{ProofRecord, ProofStorage, ProofStorageError};
 use overlay_discovery::result::storage::{ResultRecord, ResultStorage, ResultStorageError};
 use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
 use overlay_discovery::ship::storage::{
@@ -1613,12 +1614,148 @@ impl ResultStorage for D1ResultStorage {
 }
 
 // =============================================================================
+// D1ProofStorage
+// =============================================================================
+
+/// Row for proof-marker queries. The bundle BLOB is selected as
+/// `hex(bundle)` (the `pot_beefs` idiom) and decoded back to bytes;
+/// `outputIndex` / `createdAt` are INTEGER columns but D1 returns
+/// numbers as f64.
+#[derive(Deserialize)]
+struct ProofRow {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+    /// hex(bundle) — decoded in `into_record`.
+    bundle: String,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+}
+
+impl ProofRow {
+    fn into_record(self) -> ProofRecord {
+        ProofRecord {
+            game_id: self.game_id,
+            winner: self.winner,
+            // The column is nullable in the schema but the admit path
+            // always writes it; an impossible NULL reads back as "".
+            sig_hex: self.sig_hex.unwrap_or_default(),
+            // hex(bundle) → bytes. The column is NOT NULL and written
+            // from parse-validated bytes; undecodable hex is impossible,
+            // but fail toward an empty bundle (which no client verify
+            // ever accepts) rather than a panic.
+            bundle: hex::decode(&self.bundle).unwrap_or_default(),
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            created_at: self.created_at.unwrap_or(0.0) as i64,
+        }
+    }
+}
+
+/// Cloudflare D1 implementation of the ProofStorage trait
+/// (tm_proof / ls_proof, bsv-low leaderboard rung 3).
+///
+/// Schema: `proof_markers` in `d1::OVERLAY_MIGRATIONS`. Keyed by the
+/// marker OUTPOINT (txid, outputIndex); `INSERT OR IGNORE` makes a
+/// replayed submit of the same output a no-op, while bundles for the
+/// same (gameId, winner) from DIFFERENT txs are ALL kept (the tm_result
+/// censorship lesson — a garbage bundle can never front-run the real
+/// proof out of the index; clients verify each bundle). Rows are NEVER
+/// deleted (permanence — the lookup service's spend/eviction hooks are
+/// no-ops). The bundle is stored as a BLOB and read back via `hex()`
+/// (the `pot_beefs` idiom). `createdAt` is stamped here at insert;
+/// `rowid DESC` breaks same-second ties in insertion order.
+pub struct D1ProofStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1ProofStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn proof_err(e: String) -> ProofStorageError {
+    ProofStorageError::Database(e)
+}
+
+#[async_trait(?Send)]
+impl ProofStorage for D1ProofStorage {
+    async fn store_record(&self, record: &ProofRecord) -> Result<(), ProofStorageError> {
+        // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
+        // replayed submit of the same output is a no-op; bundles for the
+        // same (gameId, winner) from different txs are ALL kept; never
+        // overwrite, never delete.
+        Query::new(
+            "INSERT OR IGNORE INTO proof_markers \
+             (gameId, winner, sigHex, bundle, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.game_id.as_str())
+        .bind(record.winner.as_str())
+        .bind(record.sig_hex.as_str())
+        .bind(record.bundle.clone()) // BLOB bind, like pot_beefs
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(proof_err)
+    }
+
+    async fn list_for_game_winner(
+        &self,
+        game_id: &str,
+        winner: &str,
+        limit: usize,
+    ) -> Result<Vec<ProofRecord>, ProofStorageError> {
+        let rows: Vec<ProofRow> = Query::new(
+            "SELECT gameId, winner, sigHex, hex(bundle) AS bundle, txid, outputIndex, createdAt \
+             FROM proof_markers WHERE gameId = ? AND winner = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?",
+        )
+        .bind(game_id)
+        .bind(winner)
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(proof_err)?;
+        Ok(rows.into_iter().map(ProofRow::into_record).collect())
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_row_conversion_decodes_bundle_hex() {
+        // hex(bundle) round-trips to the raw bytes; numeric columns come
+        // back as f64 from D1.
+        let row = ProofRow {
+            game_id: "11".repeat(32),
+            winner: "02aa".into(),
+            sig_hex: Some("3045ab".into()),
+            bundle: hex::encode(b"{\"v\":1}").to_uppercase(), // SQLite hex() is uppercase
+            txid: "tx1".into(),
+            output_index: 2.0,
+            created_at: Some(1_234.0),
+        };
+        let r = row.into_record();
+        assert_eq!(r.bundle, b"{\"v\":1}");
+        assert_eq!(r.output_index, 2);
+        assert_eq!(r.created_at, 1_234);
+        assert_eq!(r.sig_hex, "3045ab");
+    }
 
     #[test]
     fn utxo_row_conversion() {

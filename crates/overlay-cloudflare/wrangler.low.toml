@@ -39,9 +39,10 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # index (tm_lowfund → the same ls_pot store, bsv-low #152) + the LOW
 # cross-device "already collected" marker index (tm_collected /
 # ls_collected, bsv-low #161) + the LOW hand-result leaderboard marker
-# index (tm_result / ls_result, bsv-low #38).
-TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_result"
-LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_result"
+# index (tm_result / ls_result, bsv-low #38) + the rung-3
+# transcript-proof bundle index (tm_proof / ls_proof).
+TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_result,tm_proof"
+LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_result,ls_proof"
 ENABLE_EXTENSIONS = "true"
 
 # Service binding to the ChainTracks worker (same account). ls_low uses this to
