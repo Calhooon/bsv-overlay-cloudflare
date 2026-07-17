@@ -103,44 +103,70 @@ pub enum ArcOutcome {
     Rejected(String),
 }
 
+/// "The network already has this exact tx" — a redundant re-broadcast is
+/// SUCCESS, whatever HTTP dress it arrives in (mirrors the bsv-low client's
+/// `alreadyKnown`, incl. the literal 257 txn-already-known node code).
+/// NEGATED forms are stripped first: "unknown"/"unseen" are failures.
+fn already_known(s: &str) -> bool {
+    let t = s.to_lowercase().replace("unknown", "").replace("unseen", "");
+    t.contains("already")
+        || t.contains("known")
+        || t.contains("257")
+        || t.contains("mined")
+        || t.contains("seen")
+}
+
 /// PURE: classify one ARC HTTP response into accept / reject / transport
-/// trouble. ARC signals real rejections BOTH ways: HTTP 4xx (465 fee-too-low
-/// class, 460/463/464 malformed class) AND HTTP-200-with-error-`txStatus` —
-/// both are DEFINITIVE rejections, never fallback fodder. 5xx / unparseable
-/// bodies are transport trouble (`Err`) — the caller may try a fallback host.
+/// trouble (adversarial review 2026-07-17, finding 1 — the classification is
+/// LOAD-BEARING: a definitive rejection refuses admission with NO fallback, so
+/// only ARC's actual PER-TX verdict class may land there):
+/// - "already known/mined" in any dress → `Accepted` (redundant re-broadcast);
+/// - HTTP 460–479 (ARC's per-tx validation codes: 460 malformed, 461 unlock
+///   invalid, 462/463/464, 465 fee floor, 473…) and 2xx-with-error-`txStatus`
+///   → `Rejected` (definitive — a second broadcaster would say the same);
+/// - EVERYTHING else non-2xx — 401/403 (a rotated/expired key), 404/405 (a
+///   gateway misroute), 400, 429, 5xx — is TRANSPORT trouble (`Err`): the
+///   caller tries the fallback host, and the client keeps its direct path.
+///   `MINED_IN_STALE_BLOCK` is transient (reorged txs normally re-mine) —
+///   transport, never a definitive refusal (finding 6).
 pub fn arc_verdict(status: u16, body: &str) -> Result<ArcOutcome, String> {
-    // Transport-level trouble: server errors / rate limits — retryable.
-    if status >= 500 || status == 429 {
-        return Err(format!("ARC HTTP {status}: {body}"));
+    if (200..300).contains(&status) {
+        // 2xx: the JSON txStatus is the verdict.
+        let arc_resp: ArcResponse = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("unparseable ARC response: {e} — body: {body}")),
+        };
+        let error_statuses = ["DOUBLE_SPEND_ATTEMPTED", "REJECTED", "INVALID", "MALFORMED"];
+        let upper_status = arc_resp.tx_status.to_uppercase();
+        let is_orphan = arc_resp.extra_info.to_uppercase().contains("ORPHAN")
+            || upper_status.contains("ORPHAN");
+        if error_statuses.iter().any(|s| upper_status == *s) || is_orphan {
+            // A redundant re-broadcast dressed as an error is SUCCESS.
+            if already_known(&arc_resp.extra_info) {
+                return Ok(ArcOutcome::Accepted(arc_resp.txid));
+            }
+            return Ok(ArcOutcome::Rejected(
+                format!("{} {}", arc_resp.tx_status, arc_resp.extra_info)
+                    .trim()
+                    .to_string(),
+            ));
+        }
+        if upper_status == "MINED_IN_STALE_BLOCK" {
+            return Err(format!("ARC transient: {upper_status}"));
+        }
+        return Ok(ArcOutcome::Accepted(arc_resp.txid));
     }
-    // Any other non-2xx from ARC is a definitive per-tx verdict (ARC uses
-    // 4xx statuses for validation failures: 460/461/462/463/464/465/473…).
-    if !(200..300).contains(&status) {
+    // Non-2xx: an already-known/mined body is a redundant re-broadcast = ok.
+    if already_known(body) {
+        let txid = serde_json::from_str::<ArcResponse>(body)
+            .map(|r| r.txid)
+            .unwrap_or_default();
+        return Ok(ArcOutcome::Accepted(txid));
+    }
+    if (460..480).contains(&status) {
         return Ok(ArcOutcome::Rejected(format!("ARC HTTP {status}: {body}")));
     }
-    // 2xx: the JSON txStatus is the verdict.
-    let arc_resp: ArcResponse = match serde_json::from_str(body) {
-        Ok(r) => r,
-        Err(e) => return Err(format!("unparseable ARC response: {e} — body: {body}")),
-    };
-    let error_statuses = [
-        "DOUBLE_SPEND_ATTEMPTED",
-        "REJECTED",
-        "INVALID",
-        "MALFORMED",
-        "MINED_IN_STALE_BLOCK",
-    ];
-    let upper_status = arc_resp.tx_status.to_uppercase();
-    let is_orphan =
-        arc_resp.extra_info.to_uppercase().contains("ORPHAN") || upper_status.contains("ORPHAN");
-    if error_statuses.iter().any(|s| upper_status == *s) || is_orphan {
-        return Ok(ArcOutcome::Rejected(
-            format!("{} {}", arc_resp.tx_status, arc_resp.extra_info)
-                .trim()
-                .to_string(),
-        ));
-    }
-    Ok(ArcOutcome::Accepted(arc_resp.txid))
+    Err(format!("ARC HTTP {status}: {body}"))
 }
 
 /// One raw `{ "rawTx": <hex> }` POST to an ARC-compatible `/v1/tx`, returning
@@ -220,13 +246,7 @@ mod tests {
 
     #[test]
     fn verdict_rejects_200_with_error_status() {
-        for s in [
-            "REJECTED",
-            "DOUBLE_SPEND_ATTEMPTED",
-            "INVALID",
-            "MALFORMED",
-            "MINED_IN_STALE_BLOCK",
-        ] {
+        for s in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED", "INVALID", "MALFORMED"] {
             let body = format!(r#"{{"txid":"ab","txStatus":"{s}","extraInfo":""}}"#);
             assert!(
                 matches!(arc_verdict(200, &body).unwrap(), ArcOutcome::Rejected(_)),
@@ -242,12 +262,55 @@ mod tests {
     }
 
     #[test]
-    fn verdict_4xx_is_a_definitive_rejection_never_fallback() {
-        // The 465 fee-floor class: a REAL per-tx verdict — the gate must refuse,
+    fn verdict_4xx_verdict_class_is_a_definitive_rejection_never_fallback() {
+        // The 460–479 class: a REAL per-tx verdict — the gate must refuse,
         // not shop for a second opinion.
         let v = arc_verdict(465, r#"{"detail":"fee too low"}"#).unwrap();
         assert!(matches!(v, ArcOutcome::Rejected(_)));
         assert!(matches!(arc_verdict(460, "bad").unwrap(), ArcOutcome::Rejected(_)));
+        assert!(matches!(arc_verdict(473, "policy").unwrap(), ArcOutcome::Rejected(_)));
+    }
+
+    #[test]
+    fn verdict_auth_and_routing_failures_are_transport_never_a_rejection() {
+        // Adversarial review 2026-07-17 finding 1 (HIGH): a rotated TAAL key
+        // (401/403) or a gateway misroute (404/405) must NEVER read as "the
+        // network rejected the tx" — that verdict blocks admission with no
+        // fallback. Transport ⇒ the GP fallback + the client's direct path run.
+        for status in [400u16, 401, 403, 404, 405, 410] {
+            assert!(
+                arc_verdict(status, "auth/misroute").is_err(),
+                "HTTP {status} must classify as transport trouble"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_already_known_is_success_in_any_dress() {
+        // Finding 2 (HIGH): a redundant re-broadcast of a tx the network
+        // already has is SUCCESS — the client's battle-tested `alreadyKnown`
+        // semantics, mirrored (incl. the literal 257 node code).
+        assert!(matches!(
+            arc_verdict(422, "txn-already-known (code 257)").unwrap(),
+            ArcOutcome::Accepted(_)
+        ));
+        assert!(matches!(
+            arc_verdict(465, "already in block chain").unwrap(),
+            ArcOutcome::Accepted(_)
+        ));
+        let dressed =
+            r#"{"txid":"ab","txStatus":"REJECTED","extraInfo":"transaction already mined"}"#;
+        assert!(matches!(arc_verdict(200, dressed).unwrap(), ArcOutcome::Accepted(_)));
+        // NEGATED forms are failures, not already-known.
+        assert!(arc_verdict(500, "unknown transaction").is_err());
+    }
+
+    #[test]
+    fn verdict_mined_in_stale_block_is_transient_not_definitive() {
+        // Finding 6: a reorged tx normally re-mines — transport, never a
+        // definitive refusal that would wedge a valid settle.
+        let body = r#"{"txid":"ab","txStatus":"MINED_IN_STALE_BLOCK","extraInfo":""}"#;
+        assert!(arc_verdict(200, body).is_err());
     }
 
     #[test]

@@ -457,29 +457,52 @@ pub async fn submit(
                 return json_error(&format!("broadcast-gated: {e}"), 400);
             }
         };
-        for ef in &efs {
+        // Abuse bound (review finding 3): this mode spends the operator's ARC
+        // key per unproven tx. A LOW money BEEF carries ≤4 unproven txs
+        // (hop A + hop B + JOIN + spend); 8 is generous headroom, and a bigger
+        // batch is not a LOW client.
+        if efs.len() > 8 {
+            worker::console_log!(
+                "POST /submit(broadcast-gated) -> 400 ({} unproven txs > 8)",
+                efs.len()
+            );
+            return json_error("broadcast-gated: too many unproven txs (max 8)", 400);
+        }
+        // Ancestors broadcast ADVISORY (review finding 2): they were put on
+        // the network long ago by construction, so their re-broadcast verdicts
+        // (already-mined dressed as REJECTED at some host, a store that aged
+        // them out, transport trouble) must never veto the SUBJECT. Only the
+        // SUBJECT's own verdict gates admission.
+        for crate::ef::EfTx { txid, ef } in &efs {
+            let is_subject = txid == &subject_txid;
             let ef_hex = hex::encode(ef);
             match crate::broadcaster::broadcast_tx_hex_gated(Some(key), &ef_hex).await {
-                Ok(crate::broadcaster::ArcOutcome::Accepted(txid)) => {
-                    worker::console_log!("broadcast-gated: network accepted {txid}");
+                Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
+                    worker::console_log!("broadcast-gated: network accepted {txid} ({accepted})");
                 }
-                Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
-                    // DEFINITIVE refusal → admit NOTHING (the whole point).
+                Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) if is_subject => {
+                    // DEFINITIVE refusal of the SUBJECT → admit NOTHING.
                     worker::console_log!(
                         "POST /submit(broadcast-gated) -> 422 (network rejected {subject_txid}: {reason})"
                     );
                     return json_error(&format!("network rejected: {reason}"), 422);
                 }
-                Err(transport) => {
+                Err(transport) if is_subject => {
                     worker::console_log!(
                         "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
                     );
                     return json_error(&format!("broadcast failed: {transport}"), 502);
                 }
+                Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
+                    worker::console_log!("broadcast-gated: ancestor {txid} verdict ignored: {reason}");
+                }
+                Err(transport) => {
+                    worker::console_log!("broadcast-gated: ancestor {txid} transport ignored: {transport}");
+                }
             }
         }
         worker::console_log!(
-            "broadcast-gated: {} tx(s) network-accepted (subject {subject_txid}) — admitting",
+            "broadcast-gated: subject {subject_txid} network-accepted ({} EF leg(s)) — admitting",
             efs.len()
         );
     }

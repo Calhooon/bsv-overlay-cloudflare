@@ -32,16 +32,29 @@ pub enum EfError {
     EfConversion(String),
 }
 
+/// One broadcastable Extended-Format entry from a BEEF.
+pub struct EfTx {
+    pub txid: String,
+    pub ef: Vec<u8>,
+}
+
 /// Convert BEEF bytes into Extended Format (BRC-30) binaries for ARC.
 ///
 /// # Returns
-/// `(efs, subject_txid)` — EF binaries for every **unproven** transaction in
+/// `(efs, subject_txid)` — EF entries for **unproven** transactions in
 /// dependency order, plus the txid of the BEEF's subject (last) transaction.
 /// `efs` is empty when every transaction already carries a merkle proof
 /// (already mined → nothing to broadcast; the caller treats this as a no-op
-/// success and admits directly, matching the engine's "skip ARC when the tx
-/// already has a merkle path" behaviour).
-pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<Vec<u8>>, String), EfError> {
+/// success and admits directly).
+///
+/// ANCESTOR conversion failures are SKIPPED, not fatal (adversarial review
+/// 2026-07-17, finding 5): a caller's BEEF often carries an ancestor raw
+/// without THAT ancestor's own parents (e.g. a recovery refund's BEEF carries
+/// the JOIN but not the hops) — those ancestors were broadcast long ago by
+/// construction, and if one truly never reached the network the SUBJECT's own
+/// broadcast fails with missing-inputs, which is exactly the right signal.
+/// Only the SUBJECT failing to convert is an error.
+pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfError> {
     let mut beef = Beef::from_binary(beef_bytes).map_err(|e| EfError::Parse(e.to_string()))?;
     beef.sort_txs();
 
@@ -52,43 +65,50 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<Vec<u8>>, String), EfE
             tx_map.insert(btx.txid(), tx.clone());
         }
     }
+    let subject_txid = beef.txs.last().map(|b| b.txid()).unwrap_or_default();
 
     let mut efs = Vec::new();
-    let mut subject_txid = String::new();
 
     for btx in &beef.txs {
         let txid = btx.txid();
-        subject_txid = txid.clone();
 
         if btx.has_proof() {
             // Already mined — provides source data for children, nothing to broadcast.
             continue;
         }
 
-        let tx = btx.tx().ok_or_else(|| {
-            EfError::EfConversion(format!("txid-only entry {txid} has no transaction data"))
-        })?;
-
-        let mut tx = tx.clone();
-        for input in &mut tx.inputs {
-            if input.source_transaction.is_some() {
-                continue;
+        let convert = || -> Result<Vec<u8>, EfError> {
+            let tx = btx.tx().ok_or_else(|| {
+                EfError::EfConversion(format!("txid-only entry {txid} has no transaction data"))
+            })?;
+            let mut tx = tx.clone();
+            for input in &mut tx.inputs {
+                if input.source_transaction.is_some() {
+                    continue;
+                }
+                let src_txid = input.source_txid.clone().ok_or_else(|| {
+                    EfError::EfConversion(format!("input in {txid} has no source txid"))
+                })?;
+                let src = tx_map.get(&src_txid).ok_or_else(|| {
+                    EfError::EfConversion(format!(
+                        "source tx {src_txid} for {txid} not present in BEEF"
+                    ))
+                })?;
+                input.source_transaction = Some(Box::new(src.clone()));
             }
-            let src_txid = input.source_txid.clone().ok_or_else(|| {
-                EfError::EfConversion(format!("input in {txid} has no source txid"))
-            })?;
-            let src = tx_map.get(&src_txid).ok_or_else(|| {
-                EfError::EfConversion(format!(
-                    "source tx {src_txid} for {txid} not present in BEEF"
-                ))
-            })?;
-            input.source_transaction = Some(Box::new(src.clone()));
-        }
+            tx.to_ef()
+                .map_err(|e| EfError::EfConversion(format!("{txid}: {e}")))
+        };
 
-        let ef = tx
-            .to_ef()
-            .map_err(|e| EfError::EfConversion(format!("{txid}: {e}")))?;
-        efs.push(ef);
+        match convert() {
+            Ok(ef) => efs.push(EfTx { txid: txid.clone(), ef }),
+            Err(e) if txid == subject_txid => return Err(e),
+            Err(e) => {
+                // Ancestor without its own sources — broadcast long ago by
+                // construction; the subject's verdict is the arbiter.
+                tracing::debug!("ef: skipping unconvertible ancestor {txid}: {e}");
+            }
+        }
     }
 
     Ok((efs, subject_txid))
@@ -132,8 +152,9 @@ mod tests {
 
         assert_eq!(efs.len(), 1, "only the unmined subject is broadcast as EF");
         assert_eq!(subject_txid, SUBJECT_TXID, "subject is the last (spending) tx");
+        assert_eq!(efs[0].txid, SUBJECT_TXID, "the EF entry carries its txid");
 
-        for ef in &efs {
+        for EfTx { ef, .. } in &efs {
             // BRC-30 marker: version (4 bytes LE) then `00 00 00 00 00 EF`.
             assert!(ef.len() > 10, "EF binary too short to hold the marker");
             assert_eq!(
@@ -169,5 +190,31 @@ mod tests {
     #[test]
     fn ef_batch_rejects_garbage_beef() {
         assert!(matches!(beef_to_ef_batch(&[0xde, 0xad]), Err(EfError::Parse(_))));
+    }
+
+    #[test]
+    fn ef_batch_skips_unconvertible_ancestor_but_still_emits_the_subject() {
+        // Adversarial review 2026-07-17, finding 5: a recovery-refund-shaped
+        // BEEF — the parent rides UNPROVEN and WITHOUT its own parents (its
+        // sources are absent), the subject spends it. The parent cannot be
+        // EF'd (no source data) and must be SKIPPED; the subject sources from
+        // the parent's raw and must still convert.
+        let mut beef = Beef::new();
+        let parent = Transaction::from_hex(
+            // Extract the parent raw from its BEEF fixture.
+            {
+                let pb = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+                &pb.txs.last().unwrap().tx().unwrap().to_hex()
+            },
+        )
+        .unwrap();
+        beef.merge_transaction(parent); // proofless, sources absent
+        let subject = Transaction::from_hex(SUBJECT_RAW_HEX.trim()).unwrap();
+        beef.merge_transaction(subject);
+        let (efs, subject_txid) = beef_to_ef_batch(&beef.to_binary())
+            .expect("subject must convert even when the ancestor cannot");
+        assert_eq!(subject_txid, SUBJECT_TXID);
+        assert_eq!(efs.len(), 1, "the unconvertible ancestor is skipped");
+        assert_eq!(efs[0].txid, SUBJECT_TXID);
     }
 }
