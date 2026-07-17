@@ -358,6 +358,8 @@ pub async fn submit(
     engine: &Engine,
     mut req: Request,
     hosting_url: Option<&str>,
+    // TAAL ARC key for the broadcast-gated mode (None disables that mode).
+    taal_api_key: Option<String>,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -422,11 +424,65 @@ pub async fn submit(
 
     // Parse optional submit mode header (matches TS 'mode' parameter).
     // Default: current-tx (broadcast + SPV). Alternatives for GASP sync and migration.
-    let mode = match req.headers().get("x-submit-mode").ok().flatten().as_deref() {
+    let mode_header = req.headers().get("x-submit-mode").ok().flatten();
+    let mode = match mode_header.as_deref() {
         Some("historical-tx") => overlay_engine::types::SubmitMode::HistoricalTx,
-        Some("historical-tx-no-spv") => overlay_engine::types::SubmitMode::HistoricalTxNoSpv,
+        // broadcast-gated admits with the exact same engine semantics as
+        // historical-tx-no-spv (0-conf, no SPV) — the network gate below is
+        // what makes it stronger, not the engine mode.
+        Some("historical-tx-no-spv") | Some("broadcast-gated") => {
+            overlay_engine::types::SubmitMode::HistoricalTxNoSpv
+        }
         _ => overlay_engine::types::SubmitMode::CurrentTx,
     };
+
+    // ── BROADCAST-GATED submit (bsv-low overlay-first, 2026-07-17; the
+    // zanaadu invariant): the OVERLAY broadcasts, and NOTHING is admitted
+    // unless the network accepted the tx. Every unproven tx in the BEEF is
+    // broadcast as Extended Format (ARC can't source unconfirmed parents from
+    // a bare raw); a DEFINITIVE network rejection returns 422 and admits
+    // nothing — the index can never contain a tx the network refused. A
+    // transport failure on both broadcasters returns 502 (the caller falls
+    // back to its own direct broadcast + historical submit). An all-proven
+    // BEEF (already mined) skips the broadcast and admits directly.
+    if mode_header.as_deref() == Some("broadcast-gated") {
+        let Some(ref key) = taal_api_key else {
+            worker::console_log!("POST /submit(broadcast-gated) -> 503 (no TAAL_API_KEY)");
+            return json_error("broadcast-gated submit unavailable: no ARC key configured", 503);
+        };
+        let (efs, subject_txid) = match crate::ef::beef_to_ef_batch(&tagged_beef.beef) {
+            Ok(v) => v,
+            Err(e) => {
+                worker::console_log!("POST /submit(broadcast-gated) -> 400 (EF: {e})");
+                return json_error(&format!("broadcast-gated: {e}"), 400);
+            }
+        };
+        for ef in &efs {
+            let ef_hex = hex::encode(ef);
+            match crate::broadcaster::broadcast_tx_hex_gated(Some(key), &ef_hex).await {
+                Ok(crate::broadcaster::ArcOutcome::Accepted(txid)) => {
+                    worker::console_log!("broadcast-gated: network accepted {txid}");
+                }
+                Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
+                    // DEFINITIVE refusal → admit NOTHING (the whole point).
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated) -> 422 (network rejected {subject_txid}: {reason})"
+                    );
+                    return json_error(&format!("network rejected: {reason}"), 422);
+                }
+                Err(transport) => {
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
+                    );
+                    return json_error(&format!("broadcast failed: {transport}"), 502);
+                }
+            }
+        }
+        worker::console_log!(
+            "broadcast-gated: {} tx(s) network-accepted (subject {subject_txid}) — admitting",
+            efs.len()
+        );
+    }
 
     // ── Synchronous write-through: full submit (Phase 1+2+3) ──
     // Admitted outputs are written to D1 before the response is sent,

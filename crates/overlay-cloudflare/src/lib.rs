@@ -10,6 +10,7 @@ pub mod ban_storage;
 pub mod broadcaster;
 pub mod chain_tracker;
 pub mod d1;
+pub mod ef;
 pub mod d1_discovery;
 pub mod d1_storage;
 pub mod error;
@@ -173,7 +174,12 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         (Method::Get, "/getDocumentationForLookupServiceProvider") => {
             get_doc_for_lookup_service(&engine, &req).await
         }
-        (Method::Post, "/submit") => submit(&engine, req, hosting_url.as_deref()).await,
+        (Method::Post, "/submit") => {
+            // broadcast-gated mode needs the ARC key (route-level; the engine's
+            // own broadcaster stays untouched).
+            let arc_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+            submit(&engine, req, hosting_url.as_deref(), arc_key).await
+        }
         (Method::Post, "/lookup") => lookup(&engine, req).await,
         (Method::Post, "/arc-ingest") => {
             // Mainline only mounts /arc-ingest when arcApiKey is configured
