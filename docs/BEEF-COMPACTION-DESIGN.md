@@ -25,14 +25,31 @@ LOW wired NONE of the legs (no fetcher, no `has_proof` column / candidate query,
 call, no callback). zanaadu's `WocAncestorFetcher` (`~/bsv/zanaadu/overlay/src/ancestor_fetcher.rs`)
 is a wasm-clean drop-in against this exact trait.
 
+## Broadcaster = Arcade V2 (wide propagation + free proofs)
+
+Owner decision (2026-07-19): the overlay broadcasts through **Arcade V2**
+(`https://arcade-v2-us-1.bsvblockchain.tech` / `arcade.gorillapool.io`), not TAAL ARC —
+because a tx submitted to Arcade **propagates to the whole mainnet** (empirically verified,
+visible on WoC) AND Arcade **delivers the merkle proof for free** in its MINED callback.
+Reference: `~/bsv/btc-relay-rs/docs/arcade-v2-integration.md` (Arcade V2 is btc-relay-rs's
+PRIMARY). Key facts: no auth; **EF-only** (Arcade never reads BEEF — every unmined ancestor
+must be individually submitted as EF); `POST /tx` → 202 async; status model is
+asynchronous (poll `GET /tx/{txid}`, SSE `GET /events?callbackToken=`, or webhook). The
+MINED callback carries `{blockHash, blockHeight, merklePath}` — free BRC-74 BUMPs. So the
+PUSH path is NOT optional here — it's the primary proof source.
+
 ## The god-tier fetcher — courier ladder + chaintracks verify
 
-`ChainProofFetcher: AncestorFetcher` — per txid, first VERIFIED wins, FAIL-CLOSED:
+`ChainProofFetcher: AncestorFetcher` — per txid, first VERIFIED wins, FAIL-CLOSED. Arcade
+primary because LOW BROADCASTS via Arcade (so Arcade has the status + BUMP for our own
+txs); WoC/Bitails are the "mined outside Arcade" anomaly fallback (btc-relay-rs
+`announce.rs:118`: "Arcade's status endpoint answers txStatus null forever" for a tx it
+never received):
 
-1. **ARC** (primary, LOW's own proxy): `GET /arc/v1/tx/{txid}` → if `txStatus == "MINED"`
-   and `merklePath` present, it's a ready BRC-74 BUMP (height inline). (Mirror
-   `broadcast.ts arcTxMinedProof` server-side.)
-2. **WoC** (fallback): `GET /tx/{txid}/proof/tsc` (TSC JSON) + height from
+1. **Arcade** (primary): `GET /tx/{txid}` → if `txStatus == "MINED"` and `merklePath`
+   present, it's a ready BRC-74 BUMP (height inline). Even better, the **MINED callback**
+   (`X-CallbackUrl` at broadcast) delivers the same `merklePath` push — zero poll.
+2. **WoC** (anomaly fallback): `GET /tx/{txid}/proof/tsc` (TSC JSON) + height from
    `GET /tx/hash/{txid}.blockheight` → `tsc_json_to_bump_hex(json, height)`
    (`rust-wallet-toolbox/src/tsc_proof.rs:38`).
 3. **Bitails** (tertiary): `GET /tx/{txid}/proof/tsc` (identical TSC shape) → same converter.
@@ -96,23 +113,34 @@ Proofless-cache defeat: a 0-conf cached blob carries no BUMP → treat as fallba
 (budget-bounded). No negative caching of the proofless answer (self-upgrades). Once-per-txid
 success latch (mirror `low_pot_pointer_healed`).
 
-## Optional push path (lower latency, later)
+## Push path = PRIMARY (Arcade's free-proof callback)
 
-Register `X-CallbackUrl: {HOSTING_URL}/arc-ingest` + `X-CallbackToken` at ARC broadcast
-(`broadcaster.rs post_arc_tx`); the existing `/arc-ingest` route (`routes.rs:801`) already
-calls `handle_new_merkle_proof`. Bearer-auth the callback (constant-time). The cron pull is
-the proven baseline and works alone; the callback is a latency optimization, not required.
+With Arcade the callback is the primary proof source, not an optional add-on. Register
+`X-CallbackUrl: {HOSTING_URL}/arc-ingest` + `X-CallbackToken` + `X-FullStatusUpdates: true`
+at every Arcade broadcast (`broadcaster.rs`); Arcade POSTs `{txid, txStatus:MINED,
+blockHeight, blockHash, merklePath}` when the tx mines. The existing `/arc-ingest` route
+(`routes.rs:801`) already calls `handle_new_merkle_proof` — wire the Arcade callback body to
+it (bearer-auth via `X-CallbackToken`, constant-time). **Still VERIFY the callback's
+merklePath against chaintracks before stitching** (a callback is a courier too — never trust
+a merklePath we didn't fold). The cron pull remains the backstop for a missed callback / a
+tx mined outside Arcade (WoC/Bitails).
 
 ## Phased plan
 
-- **P1 — the fetcher** (`ChainProofFetcher`: ARC→WoC→Bitails + chaintracks verify), unit-tested
-  (ARC hex path, TSC→BUMP, verify rejects a forged root, unmined → None).
+- **P0 — Arcade V2 broadcaster**: switch the overlay's broadcast from TAAL ARC → Arcade
+  (EF-only submit, `POST /tx`) + register `X-CallbackUrl`/`X-CallbackToken`/`X-FullStatusUpdates`.
+  (Scope note: this changes the OVERLAY's broadcast. Whether to also migrate the app/tower
+  broadcast off the TAAL-ARC proxy is a separate owner call — the overlay is the one that
+  needs the callback for compaction.)
+- **P1 — the fetcher** (`ChainProofFetcher`: Arcade→WoC→Bitails + chaintracks verify),
+  unit-tested (Arcade merklePath path, TSC→BUMP, verify rejects a forged root, unmined → None).
 - **P2 — transactions store**: migration + candidate query + `set_ancestor_fetcher` + cron call.
+- **P2.5 — Arcade callback push**: `/arc-ingest` wired to the Arcade callback body
+  (bearer-auth, verify-then-stitch) — the primary, low-latency proof path.
 - **P3 — pot_beefs store**: migration + candidate query + `compact_pot_beef` (bypass longer-wins) + cron tick.
 - **P4 — serve-time `trim_known_proven`** + observability (heartbeat/invariants).
-- **P5 — deploy + PROVE**: a stored BEEF for a mined tx gains its BUMP + shrinks; a
-  proofless one for an unmined tx is retried; `/health/invariants` green.
-- **P6 (optional) — ARC callback push.**
+- **P5 — deploy + PROVE**: a stored BEEF for a mined tx gains its BUMP + shrinks (via both
+  the callback and the cron); a proofless one for an unmined tx is retried; `/health/invariants` green.
 
 Gate: this is money-adjacent infra (recovery reads these BEEFs). `cargo test --workspace` +
 wasm build green; deploy both `low-overlay` + `low-app-layer`; prove compaction on mainnet.
