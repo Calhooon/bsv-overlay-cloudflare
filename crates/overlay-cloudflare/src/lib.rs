@@ -18,7 +18,9 @@ pub mod gasp_remote;
 pub mod health_checker;
 pub mod janitor;
 pub mod mainnet_fanout;
+pub mod ops;
 pub mod peer_crawler;
+pub mod proof_fetcher;
 pub mod queue;
 pub mod routes;
 pub mod wallet;
@@ -70,7 +72,7 @@ use overlay_engine::lookup_service::LookupService;
 use overlay_engine::topic_manager::TopicManager;
 use worker::{event, Context, Env, Method, Request, Response};
 
-use crate::broadcaster::{WorkerArcBroadcaster, WorkerBroadcaster};
+use crate::broadcaster::{ArcadeBroadcaster, WorkerBroadcaster};
 use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::{run_migrations, OVERLAY_MIGRATIONS};
 use crate::d1_discovery::{
@@ -152,6 +154,9 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
     let potrefund_storage: Rc<dyn PotrefundStorage> =
         Rc::new(D1PotrefundStorage::new(db.clone()));
+    // DB handle for GET /health/invariants (#192/#193, P4) — the engine build
+    // below consumes `db`.
+    let ops_db = db.clone();
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -176,6 +181,22 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
     // Route dispatch
     let result = match (req.method(), req.path().as_str()) {
         (Method::Get, "/") => web_ui(&engine, hosting_url.as_deref()).await,
+        (Method::Get, "/health/invariants") => {
+            // Proof-completion liveness (#192/#193, P4). strict=1 → 503 when the
+            // completion pass has been dead longer than the staleness budget
+            // (the alarm surface); otherwise 200 with the same verdict body.
+            let strict = req
+                .url()
+                .ok()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "strict")
+                        .map(|(_, v)| v.into_owned())
+                })
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            crate::ops::health_invariants(&ops_db, &env, strict).await
+        }
         (Method::Get, "/listTopicManagers") => list_topic_managers(&engine).await,
         (Method::Get, "/listLookupServiceProviders") => {
             list_lookup_service_providers(&engine).await
@@ -187,10 +208,12 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
             get_doc_for_lookup_service(&engine, &req).await
         }
         (Method::Post, "/submit") => {
-            // broadcast-gated mode needs the ARC key (route-level; the engine's
-            // own broadcaster stays untouched).
-            let arc_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-            submit(&engine, req, hosting_url.as_deref(), arc_key).await
+            // broadcast-gated mode broadcasts through Arcade V2 (the overlay's
+            // sole network broadcaster, #192/#193) — keyless. ARCADE_URL
+            // overrides the default endpoint; the callback is derived from
+            // HOSTING_URL inside the route.
+            let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
+            submit(&engine, req, hosting_url.as_deref(), arcade_url).await
         }
         (Method::Post, "/lookup") => lookup(&engine, req).await,
         (Method::Post, "/arc-ingest") => {
@@ -202,7 +225,10 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
             if env.secret("TAAL_API_KEY").is_err() {
                 not_found()
             } else {
-                arc_ingest(&engine, req).await
+                // The callback merklePath is re-verified against chaintracks
+                // before stitch (#192/#193) — a callback is a courier too.
+                let tracker = lookup_service_chain_tracker(&env);
+                arc_ingest(&engine, req, tracker.as_deref()).await
             }
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
@@ -678,12 +704,28 @@ fn build_engine_with_storage(
                 as Box<dyn bsv_rs::transaction::ChainTracker>
         });
 
-    // ARC Broadcaster — network broadcast to miners via TAAL's ARC API
+    // Network broadcaster — Arcade V2 is the overlay's SOLE network broadcaster
+    // (#192/#193): EF submit + a FREE merkle proof pushed in Arcade's MINED
+    // callback. Keyless (no TAAL_API_KEY needed). The X-CallbackUrl points at
+    // our own /arc-ingest so a MINED status pushes the merkle path back for
+    // proof completion (the primary proof source). ARCADE_URL overrides the
+    // endpoint (default: arcade-v2-us-1.bsvblockchain.tech).
+    //
+    // NOTE: this engine slot is only hit for generic `CurrentTx` submits; the
+    // LOW money path broadcasts through the broadcast-gated /submit route
+    // (`ArcadeBroadcaster::broadcast_efs_gated`), which is where the callback
+    // registration actually matters.
+    let arcade_url = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let mut arcade = ArcadeBroadcaster::new(arcade_url);
+    if let Some(ref h) = hosting_url {
+        arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
+    }
     let arc_broadcaster: Option<Box<dyn overlay_engine::broadcaster::ArcBroadcaster>> =
-        env.secret("TAAL_API_KEY").ok().map(|v| {
-            Box::new(WorkerArcBroadcaster::new(v.to_string()))
-                as Box<dyn overlay_engine::broadcaster::ArcBroadcaster>
-        });
+        Some(Box::new(arcade) as Box<dyn overlay_engine::broadcaster::ArcBroadcaster>);
 
     // Advertiser — issues SHIP/SLAP on-chain ads announcing what topics /
     // lookup services this overlay carries. Requires SERVER_PRIVATE_KEY +
@@ -755,6 +797,25 @@ fn build_engine_with_storage(
     // Enable GASP sync with HTTP-based peer communication
     engine.set_gasp_remote_factory(Box::new(crate::gasp_remote::WorkerGASPRemoteFactory));
 
+    // Chain-backed proof fetcher (#192/#193): the courier ladder
+    // (Arcade→WoC→Bitails) with a MANDATORY chaintracks re-verify before any
+    // BUMP is returned. This is the proof source the cron's
+    // `complete_missing_proofs` (transactions store) and the pot-store
+    // completion tick call to turn a proofless stored BEEF into a proven one.
+    // Without a chain tracker it degrades to a pure retry (no proof can ever be
+    // verified — fail-closed).
+    let proof_tracker = lookup_service_chain_tracker(env);
+    let mut proof_fetcher = crate::proof_fetcher::ChainProofFetcher::new(proof_tracker);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        proof_fetcher = proof_fetcher.with_arcade_url(u);
+    }
+    engine.set_ancestor_fetcher(std::rc::Rc::new(proof_fetcher));
+
     engine
 }
 
@@ -792,6 +853,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
     let potrefund_storage: Rc<dyn PotrefundStorage> =
         Rc::new(D1PotrefundStorage::new(db.clone()));
+    // Keep a DB handle for the observability writes (#192/#193, P4) — the
+    // engine build below consumes `db`.
+    let ops_db = db.clone();
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -878,6 +942,81 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     for (k, e) in &crawl_result.peer_errors {
         worker::console_log!("  Scheduled peer-crawl {k}: lookup failed: {e}");
     }
+
+    // BEEF proof completion (#192/#193). Two parallel passes, both bounded per
+    // tick and fail-closed (a BUMP is stitched only once its root is verified
+    // against chaintracks; an unmined/unverifiable candidate is retried, never
+    // written proofless).
+    //
+    // 1. Engine `transactions` store — uses the ancestor fetcher set in
+    //    build_engine_with_storage. A no-op if no fetcher/tracker is configured.
+    let engine_budget = u64::from(crate::proof_fetcher::DEFAULT_FETCH_BUDGET);
+    let (tx_completed, tx_fetch_failed) = match engine.complete_missing_proofs(engine_budget).await {
+        Ok(s) => {
+            worker::console_log!(
+                "Scheduled: proof-completion (transactions) — scanned={} proofless={} completed={} \
+                 still_unconfirmed={} fetch_failed={} stitch_failed={} already_proven={}",
+                s.scanned,
+                s.proofless,
+                s.completed,
+                s.still_unconfirmed,
+                s.fetch_failed,
+                s.stitch_failed,
+                s.already_proven,
+            );
+            (s.completed as u64, s.fetch_failed as u64)
+        }
+        Err(e) => {
+            worker::console_log!("Scheduled: proof-completion (transactions) error: {e}");
+            (0, 0)
+        }
+    };
+
+    // 2. LOW `pot_beefs` recovery store — the engine does NOT touch it, so this
+    //    parallel tick fetches → verifies → stitches → trims → compacts (bypass
+    //    longer-wins) each proofless pot BEEF. Its own fetcher (own per-tick
+    //    subrequest budget) so the two passes don't share a budget cell.
+    let pot_tracker = lookup_service_chain_tracker(&env);
+    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        pot_fetcher = pot_fetcher.with_arcade_url(u);
+    }
+    let pot_summary =
+        crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &pot_fetcher, 20).await;
+    worker::console_log!(
+        "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} still_unconfirmed={} \
+         fetch_failed={} stitch_failed={}",
+        pot_summary.scanned,
+        pot_summary.completed,
+        pot_summary.still_unconfirmed,
+        pot_summary.fetch_failed,
+        pot_summary.stitch_failed,
+    );
+
+    // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
+    // the persistent counters, and refresh the proofless first-seen ledger so a
+    // dead pass / a proof-not-landing surfaces via GET /health/invariants
+    // within a day (not weeks). Best-effort — never breaks the cron.
+    let proofs_completed = tx_completed + pot_summary.completed as u64;
+    let fetch_failed = tx_fetch_failed + pot_summary.fetch_failed as u64;
+    let pot_beefs_compacted = pot_summary.completed as u64;
+    crate::ops::record_completion_tick(
+        &ops_db,
+        proofs_completed,
+        fetch_failed,
+        pot_beefs_compacted,
+    )
+    .await;
+    let flagged = crate::ops::refresh_proofless_watch(&ops_db).await;
+    worker::console_log!(
+        "Scheduled: ops — proofs_completed+={proofs_completed} fetch_failed+={fetch_failed} \
+         pot_beefs_compacted+={pot_beefs_compacted} proofless_over_24h={flagged}"
+    );
 
     // Run janitor health checks
     let janitor_config = overlay_engine::health_checker::JanitorConfig::default();

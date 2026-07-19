@@ -143,6 +143,50 @@ pub trait PotStorage {
 
     /// The stored BEEF for `txid`, or `None` if we never stored one.
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError>;
+
+    /// Return a bounded page of PROOFLESS stored pot BEEFs (`(txid, beef)`) for
+    /// the proof-completion cron (#192/#193). A row is "proofless" when its
+    /// stored BEEF does NOT yet carry a chaintracks-verified merkle BUMP for its
+    /// OWN txid.
+    ///
+    /// Backends that track a `has_proof` flag answer with
+    /// `WHERE has_proof = 0 ORDER BY RANDOM() LIMIT n` (RANDOM defeats
+    /// head-of-queue starvation — a never-mineable head must not starve the
+    /// tail). Backends that can't enumerate (or have nothing to complete) may
+    /// return an empty `Vec` via this default → proof completion is a no-op.
+    async fn find_pot_beefs_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
+    /// Overwrite the stored BEEF for `txid` with a PROOF-BEARING `new_beef`,
+    /// BYPASSING the longer-wins guard of [`store_beef`](Self::store_beef) — a
+    /// bumped BEEF is authoritative even when SHORTER (its proven ancestry has
+    /// been trimmed). The write happens ONLY when `new_beef` actually proves
+    /// `txid` (its own BUMP is present, which also guarantees self-containment —
+    /// `find_txid(txid)` is `Some`); otherwise it is a NO-OP (fail-closed).
+    /// Backends that don't compact may use this no-op default.
+    async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
+        let _ = (txid, new_beef);
+        Ok(())
+    }
+}
+
+/// Whether `beef` carries a merkle proof for `txid`'s OWN tx (not an
+/// ancestor's). Unparseable/absent → `false` (treated as proofless / a compact
+/// no-op — fail-closed). Shared by the in-memory and D1 pot stores so the
+/// candidate query and the compaction write agree on "proven".
+pub fn pot_beef_has_proof(txid: &str, beef: &[u8]) -> bool {
+    bsv_rs::transaction::Beef::from_binary(beef)
+        .ok()
+        .and_then(|b| {
+            b.find_txid(txid)
+                .map(bsv_rs::transaction::BeefTx::has_proof)
+        })
+        .unwrap_or(false)
 }
 
 /// POT storage errors.
@@ -256,6 +300,37 @@ impl PotStorage for MemoryPotStorage {
 
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
         Ok(self.beefs.lock().unwrap().get(txid).cloned())
+    }
+
+    async fn find_pot_beefs_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        // Model the D1 `WHERE has_proof = 0` candidate set by re-deriving the
+        // flag from the stored bytes (the memory store keeps no flag column).
+        Ok(self
+            .beefs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(txid, beef)| !pot_beef_has_proof(txid, beef))
+            .take(limit as usize)
+            .map(|(txid, beef)| (txid.clone(), beef.clone()))
+            .collect())
+    }
+
+    async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
+        // Fail-closed: overwrite ONLY when the new beef actually proves txid
+        // (its own BUMP is present ⇒ self-contained). BYPASS the longer-wins
+        // guard — a bumped BEEF wins even when shorter.
+        if !pot_beef_has_proof(txid, new_beef) {
+            return Ok(());
+        }
+        self.beefs
+            .lock()
+            .unwrap()
+            .insert(txid.to_string(), new_beef.to_vec());
+        Ok(())
     }
 }
 

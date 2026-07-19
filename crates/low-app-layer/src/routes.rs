@@ -176,7 +176,16 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
             },
         };
         if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
-            return json_response(beef_body(&txid, &bytes), 200);
+            // Serve-time compaction (#192/#193, P4): once the overlay's
+            // completion pass / Arcade MINED callback has stitched a
+            // chaintracks-verified BUMP into this BEEF, its now-proven
+            // ancestry is dead weight the frontend `createAction` chokes on.
+            // `compact_beef` trims it — STRICTLY passthrough-on-failure, so a
+            // proofless (or already-minimal) BEEF is returned byte-for-byte
+            // unchanged. The subject is the lowercase DB key (BEEF txids are
+            // lowercase hex).
+            let compacted = crate::compaction::compact_beef(&key, &bytes);
+            return json_response(beef_body(&txid, &compacted), 200);
         }
     }
 

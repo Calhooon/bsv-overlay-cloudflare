@@ -358,8 +358,9 @@ pub async fn submit(
     engine: &Engine,
     mut req: Request,
     hosting_url: Option<&str>,
-    // TAAL ARC key for the broadcast-gated mode (None disables that mode).
-    taal_api_key: Option<String>,
+    // Arcade V2 endpoint override for the broadcast-gated mode (None → default
+    // endpoint). Arcade is keyless, so broadcast-gated is always available.
+    arcade_url: Option<String>,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -446,10 +447,14 @@ pub async fn submit(
     // back to its own direct broadcast + historical submit). An all-proven
     // BEEF (already mined) skips the broadcast and admits directly.
     if mode_header.as_deref() == Some("broadcast-gated") {
-        let Some(ref key) = taal_api_key else {
-            worker::console_log!("POST /submit(broadcast-gated) -> 503 (no TAAL_API_KEY)");
-            return json_error("broadcast-gated submit unavailable: no ARC key configured", 503);
-        };
+        // The OVERLAY is the sole network broadcaster (#192/#193): every
+        // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
+        // and NOTHING is admitted unless Arcade reports the SUBJECT
+        // SEEN_ON_NETWORK. A DEFINITIVE rejection → 422 (admit nothing);
+        // transport trouble / never-SEEN timeout → 502 (the client falls back
+        // to its own direct broadcast). Arcade also carries X-CallbackUrl
+        // (→ /arc-ingest) so a later MINED status pushes the free merkle path
+        // for proof completion.
         let (efs, subject_txid) = match crate::ef::beef_to_ef_batch(&tagged_beef.beef) {
             Ok(v) => v,
             Err(e) => {
@@ -457,10 +462,9 @@ pub async fn submit(
                 return json_error(&format!("broadcast-gated: {e}"), 400);
             }
         };
-        // Abuse bound (review finding 3): this mode spends the operator's ARC
-        // key per unproven tx. A LOW money BEEF carries ≤4 unproven txs
-        // (hop A + hop B + JOIN + spend); 8 is generous headroom, and a bigger
-        // batch is not a LOW client.
+        // Abuse bound: a LOW money BEEF carries ≤4 unproven txs (hop A + hop B +
+        // JOIN + spend); 8 is generous headroom, and a bigger batch is not a LOW
+        // client.
         if efs.len() > 8 {
             worker::console_log!(
                 "POST /submit(broadcast-gated) -> 400 ({} unproven txs > 8)",
@@ -468,43 +472,35 @@ pub async fn submit(
             );
             return json_error("broadcast-gated: too many unproven txs (max 8)", 400);
         }
-        // Ancestors broadcast ADVISORY (review finding 2): they were put on
-        // the network long ago by construction, so their re-broadcast verdicts
-        // (already-mined dressed as REJECTED at some host, a store that aged
-        // them out, transport trouble) must never veto the SUBJECT. Only the
-        // SUBJECT's own verdict gates admission.
-        for crate::ef::EfTx { txid, ef } in &efs {
-            let is_subject = txid == &subject_txid;
-            let ef_hex = hex::encode(ef);
-            match crate::broadcaster::broadcast_tx_hex_gated(Some(key), &ef_hex).await {
-                Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
-                    worker::console_log!("broadcast-gated: network accepted {txid} ({accepted})");
-                }
-                Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) if is_subject => {
-                    // DEFINITIVE refusal of the SUBJECT → admit NOTHING.
-                    worker::console_log!(
-                        "POST /submit(broadcast-gated) -> 422 (network rejected {subject_txid}: {reason})"
-                    );
-                    return json_error(&format!("network rejected: {reason}"), 422);
-                }
-                Err(transport) if is_subject => {
-                    worker::console_log!(
-                        "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
-                    );
-                    return json_error(&format!("broadcast failed: {transport}"), 502);
-                }
-                Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
-                    worker::console_log!("broadcast-gated: ancestor {txid} verdict ignored: {reason}");
-                }
-                Err(transport) => {
-                    worker::console_log!("broadcast-gated: ancestor {txid} transport ignored: {transport}");
-                }
+        // Ancestors are submitted in the same batch but do NOT gate admission —
+        // only the SUBJECT reaching SEEN_ON_NETWORK does (they were broadcast
+        // long ago by construction; Arcade dedupes their re-submit).
+        let mut arcade =
+            crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
+        if let Some(h) = hosting_url {
+            arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
+        }
+        match arcade.broadcast_efs_gated(&efs, &subject_txid).await {
+            Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
+                worker::console_log!(
+                    "broadcast-gated(arcade): network accepted {subject_txid} ({accepted}, {} EF leg(s)) — admitting",
+                    efs.len()
+                );
+            }
+            Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
+                // DEFINITIVE refusal of the SUBJECT → admit NOTHING.
+                worker::console_log!(
+                    "POST /submit(broadcast-gated) -> 422 (network rejected {subject_txid}: {reason})"
+                );
+                return json_error(&format!("network rejected: {reason}"), 422);
+            }
+            Err(transport) => {
+                worker::console_log!(
+                    "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
+                );
+                return json_error(&format!("broadcast failed: {transport}"), 502);
             }
         }
-        worker::console_log!(
-            "broadcast-gated: subject {subject_txid} network-accepted ({} EF leg(s)) — admitting",
-            efs.len()
-        );
     }
 
     // ── Synchronous write-through: full submit (Phase 1+2+3) ──
@@ -798,8 +794,33 @@ fn serialize_aggregated_lookup(
     Ok(buf)
 }
 
-/// POST /arc-ingest — merkle proof callback from ARC.
-pub async fn arc_ingest(engine: &Engine, mut req: Request) -> worker::Result<Response> {
+/// Constant-time byte compare (no early return on first mismatch). Used to
+/// check the `X-CallbackToken` bearer without leaking length/prefix timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// POST /arc-ingest — MINED merkle-proof callback (Arcade V2 push, #192/#193;
+/// TAAL ARC parity too). The Arcade broadcaster registers `X-CallbackToken`
+/// = the SUBJECT txid at broadcast, so the callback echoes it: we bearer-auth
+/// by requiring `X-CallbackToken` to match the body's `txid` (constant-time).
+///
+/// A callback is a COURIER — we NEVER trust a merklePath we didn't fold.
+/// Before stitching, the callback's merklePath is re-verified against
+/// chaintracks (same discipline as the cron fetcher). An unverifiable proof is
+/// refused (422) and nothing is stitched; the cron pull remains the backstop.
+pub async fn arc_ingest(
+    engine: &Engine,
+    mut req: Request,
+    tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+) -> worker::Result<Response> {
     #[derive(Deserialize)]
     struct Body {
         txid: String,
@@ -809,12 +830,34 @@ pub async fn arc_ingest(engine: &Engine, mut req: Request) -> worker::Result<Res
         block_height: Option<u32>,
     }
 
+    // Read the bearer token BEFORE consuming the body.
+    let callback_token = req.headers().get("x-callbacktoken").ok().flatten();
+
     let body: Body = match req.json().await {
         Ok(b) => b,
         Err(e) => return json_error(&format!("Invalid arc-ingest body: {e}"), 400),
     };
 
+    // Bearer-auth: the token must be present and equal the subject txid the
+    // broadcaster registered (constant-time). A missing/mismatched token means
+    // this isn't a callback we scheduled → 401.
+    match callback_token {
+        Some(tok) if constant_time_eq(tok.as_bytes(), body.txid.as_bytes()) => {}
+        _ => {
+            worker::console_log!("POST /arc-ingest -> 401 (bad X-CallbackToken)");
+            return json_error("Unauthorized arc-ingest callback", 401);
+        }
+    }
+
     worker::console_log!("POST /arc-ingest txid={}", body.txid);
+
+    // Verify the callback's merklePath against chaintracks BEFORE stitching —
+    // a courier's proof is only a fact once its root matches our PoW-anchored
+    // headers. Fail-closed: no tracker / unverifiable → refuse, do not stitch.
+    if !crate::proof_fetcher::verify_bump(tracker, &body.merkle_path, &body.txid).await {
+        worker::console_log!("POST /arc-ingest -> 422 (merklePath failed chaintracks verify)");
+        return json_error("Callback merklePath failed chaintracks verification", 422);
+    }
 
     match engine
         .handle_new_merkle_proof(&body.txid, &body.merkle_path, body.block_height)

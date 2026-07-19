@@ -49,6 +49,7 @@
 //! for a whole batch of outpoints — not a cache. Every response is
 //! `no-store`.
 
+pub mod compaction;
 pub mod cors;
 pub mod logic;
 mod routes;

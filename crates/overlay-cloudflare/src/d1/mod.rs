@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 53;
+pub const OVERLAY_MIGRATION_COUNT: usize = 60;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -266,6 +266,16 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         txid TEXT PRIMARY KEY,
         beef BLOB
     )",
+    // BEEF proof-completion flag (#192/#193): 1 once a transactions-store row's
+    // OWN merkle BUMP is stitched in (a proven, chaintracks-verified fact),
+    // else 0. Written on every BEEF write; the proof-completion cron enumerates
+    // ONLY proofless rows (`WHERE has_proof = 0 ORDER BY RANDOM()`), so it
+    // reaches the whole historical backlog (not just the newest N) and never
+    // re-fetches a proven row. Additive ALTER — the runner ignores the re-run
+    // "duplicate column" error (`migration_error_is_benign`); existing rows
+    // default to 0 (queued for completion).
+    "ALTER TABLE transactions ADD COLUMN has_proof INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_transactions_has_proof ON transactions(has_proof)",
     // applied transactions (deduplication)
     "CREATE TABLE IF NOT EXISTS applied_transactions (
         txid TEXT NOT NULL,
@@ -627,6 +637,47 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // both order by createdAt DESC.
     "CREATE INDEX IF NOT EXISTS idx_potrefund_pot ON potrefund_records(potTxid, potVout)",
     "CREATE INDEX IF NOT EXISTS idx_potrefund_identity ON potrefund_records(identity)",
+    // pot_beefs proof-completion flag (#192/#193): 1 once the stored BEEF
+    // carries a chaintracks-verified BUMP for its OWN txid, else 0. Written on
+    // every `store_beef`/`compact_pot_beef`; the pot-store completion cron
+    // enumerates ONLY proofless rows (`WHERE has_proof = 0 ORDER BY RANDOM()`).
+    // A `compact_pot_beef` write BYPASSES the longer-wins guard — a bumped BEEF
+    // is authoritative even when SHORTER (trimmed ancestry). Additive ALTER —
+    // the runner ignores the re-run "duplicate column" error
+    // (`migration_error_is_benign`); existing rows default to 0.
+    "ALTER TABLE pot_beefs ADD COLUMN has_proof INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_pot_beefs_has_proof ON pot_beefs(has_proof)",
+    // ── Observability (#192/#193, P4) ─────────────────────────────────────
+    // The proof-completion cron's most expensive omission in zanaadu was a
+    // dead pass hiding for WEEKS. These three tables make a dead completion
+    // pass surface in a DAY (see `crate::ops` + `GET /health/invariants`).
+    //
+    // ops_heartbeat: a SINGLETON (id = 0) upserted at the end of every cron
+    // completion pass — `last_tick_ms` is the wall-clock of the last live
+    // pass, `tick_count` the monotonic pass count. `/health/invariants`
+    // reads it to 503 when the pass has been dead too long.
+    "CREATE TABLE IF NOT EXISTS ops_heartbeat (
+        id INTEGER PRIMARY KEY,
+        last_tick_ms INTEGER NOT NULL DEFAULT 0,
+        tick_count INTEGER NOT NULL DEFAULT 0
+    )",
+    // ops_counters: persistent monotonic counters
+    // (proofs_completed_total / fetch_failed_total / pot_beefs_compacted_total),
+    // incremented each tick via an upsert. Name-keyed so new counters are
+    // additive without a schema change.
+    "CREATE TABLE IF NOT EXISTS ops_counters (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL DEFAULT 0
+    )",
+    // proofless_watch: first-seen ledger for proofless txids. A tx still
+    // proofless > 24h is flagged (logged + counted) — the signal that a
+    // proof genuinely isn't landing (vs. merely not-yet-mined). Rows are
+    // deleted once the tx proves, so the table stays bounded to the live
+    // proofless set.
+    "CREATE TABLE IF NOT EXISTS proofless_watch (
+        txid TEXT PRIMARY KEY,
+        first_seen_ms INTEGER NOT NULL
+    )",
 ];
 
 // =============================================================================
