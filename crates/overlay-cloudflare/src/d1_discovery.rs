@@ -17,6 +17,12 @@ use overlay_discovery::dm_delegation::storage::{
 };
 use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
 use overlay_discovery::pot::storage::{PotRecord, PotStorage, PotStorageError};
+use overlay_discovery::potparty::storage::{
+    PotpartyRecord, PotpartyStorage, PotpartyStorageError,
+};
+use overlay_discovery::potrefund::storage::{
+    PotrefundRecord, PotrefundStorage, PotrefundStorageError,
+};
 use overlay_discovery::proof::storage::{ProofRecord, ProofStorage, ProofStorageError};
 use overlay_discovery::result::storage::{ResultRecord, ResultStorage, ResultStorageError};
 use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
@@ -1610,6 +1616,286 @@ impl ResultStorage for D1ResultStorage {
         .await
         .map_err(result_err)?;
         Ok(rows.into_iter().map(ResultRow::into_record).collect())
+    }
+}
+
+// =============================================================================
+// D1PotpartyStorage
+// =============================================================================
+
+/// Row for potparty-marker queries. TEXT columns arrive as `String`;
+/// `potVout` / `recoveryHeight` / `outputIndex` / `createdAt` are INTEGER
+/// columns but D1 returns numbers as f64.
+#[derive(Deserialize)]
+struct PotpartyRow {
+    identity: String,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+}
+
+impl PotpartyRow {
+    fn into_record(self) -> PotpartyRecord {
+        PotpartyRecord {
+            identity: self.identity,
+            opponent_identity: self.opponent_identity,
+            game_id: self.game_id,
+            pot_txid: self.pot_txid,
+            pot_vout: self.pot_vout as u32,
+            recovery_height: self.recovery_height as u32,
+            // The column is nullable in the schema but the admit path always
+            // writes it; an impossible NULL reads back as "".
+            sig_hex: self.sig_hex.unwrap_or_default(),
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            created_at: self.created_at.unwrap_or(0.0) as i64,
+        }
+    }
+}
+
+/// Cloudflare D1 implementation of the PotpartyStorage trait
+/// (tm_potparty / ls_potparty, bsv-low #188).
+///
+/// Schema: `potparty_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by the
+/// marker OUTPOINT (txid, outputIndex); `INSERT OR IGNORE` makes a replayed
+/// submit of the same output a no-op, while markers for the same identity
+/// from DIFFERENT txs are ALL kept (the censorship-front-run fix). Rows are
+/// NEVER deleted (a pot-participation fact is permanent recovery history,
+/// like a pot record; the lookup service's spend/eviction hooks are
+/// no-ops). `createdAt` is stamped here at insert (the record's value is
+/// ignored) and drives the newest-first list ordering; `rowid DESC` breaks
+/// same-second ties in insertion order.
+pub struct D1PotpartyStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1PotpartyStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn potparty_err(e: String) -> PotpartyStorageError {
+    PotpartyStorageError::Database(e)
+}
+
+const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+     recoveryHeight, sigHex, txid, outputIndex, createdAt FROM potparty_records";
+
+#[async_trait(?Send)]
+impl PotpartyStorage for D1PotpartyStorage {
+    async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
+        // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
+        // replayed submit of the same output is a no-op; markers for the
+        // same identity from different txs are ALL kept; never overwrite,
+        // never delete.
+        Query::new(
+            "INSERT OR IGNORE INTO potparty_records \
+             (identity, opponentIdentity, gameId, potTxid, potVout, \
+              recoveryHeight, sigHex, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.identity.as_str())
+        .bind(record.opponent_identity.as_str())
+        .bind(record.game_id.as_str())
+        .bind(record.pot_txid.as_str())
+        .bind(record.pot_vout)
+        .bind(record.recovery_height)
+        .bind(record.sig_hex.as_str())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(potparty_err)
+    }
+
+    async fn list_for_identity(
+        &self,
+        identity: &str,
+        limit: usize,
+    ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
+        let rows: Vec<PotpartyRow> = Query::new(format!(
+            "{POTPARTY_SELECT} WHERE identity = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        ))
+        .bind(identity)
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(potparty_err)?;
+        Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
+    }
+
+    async fn list_for_pot(
+        &self,
+        pot_txid: &str,
+        pot_vout: u32,
+        limit: usize,
+    ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
+        let rows: Vec<PotpartyRow> = Query::new(format!(
+            "{POTPARTY_SELECT} WHERE potTxid = ? AND potVout = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        ))
+        .bind(pot_txid)
+        .bind(pot_vout)
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(potparty_err)?;
+        Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
+    }
+}
+
+// =============================================================================
+// D1PotrefundStorage
+// =============================================================================
+
+/// Row for potrefund-marker queries. TEXT columns arrive as `String`;
+/// `potVout` / `outputIndex` / `createdAt` are INTEGER columns but D1
+/// returns numbers as f64.
+#[derive(Deserialize)]
+struct PotrefundRow {
+    identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "refundRawHex")]
+    refund_raw_hex: Option<String>,
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+}
+
+impl PotrefundRow {
+    fn into_record(self) -> PotrefundRecord {
+        PotrefundRecord {
+            identity: self.identity,
+            game_id: self.game_id,
+            pot_txid: self.pot_txid,
+            pot_vout: self.pot_vout as u32,
+            // Both columns are nullable in the schema but the admit path
+            // always writes them; an impossible NULL reads back as "".
+            refund_raw_hex: self.refund_raw_hex.unwrap_or_default(),
+            sig_hex: self.sig_hex.unwrap_or_default(),
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            created_at: self.created_at.unwrap_or(0.0) as i64,
+        }
+    }
+}
+
+/// Cloudflare D1 implementation of the PotrefundStorage trait
+/// (tm_potrefund / ls_potrefund, bsv-low #191).
+///
+/// Schema: `potrefund_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by the
+/// marker OUTPOINT (txid, outputIndex); `INSERT OR IGNORE` makes a replayed
+/// submit of the same output a no-op, while markers for the same pot from
+/// DIFFERENT txs are ALL kept (the censorship-front-run fix, and both seats
+/// may publish a backup). Rows are NEVER deleted (a pre-signed refund backup
+/// is permanent recovery history; the lookup service's spend/eviction hooks
+/// are no-ops). `createdAt` is stamped here at insert (the record's value is
+/// ignored) and drives the newest-first list ordering; `rowid DESC` breaks
+/// same-second ties in insertion order.
+pub struct D1PotrefundStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1PotrefundStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn potrefund_err(e: String) -> PotrefundStorageError {
+    PotrefundStorageError::Database(e)
+}
+
+const POTREFUND_SELECT: &str = "SELECT identity, gameId, potTxid, potVout, refundRawHex, \
+     sigHex, txid, outputIndex, createdAt FROM potrefund_records";
+
+#[async_trait(?Send)]
+impl PotrefundStorage for D1PotrefundStorage {
+    async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError> {
+        // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
+        // replayed submit of the same output is a no-op; markers for the
+        // same pot from different txs are ALL kept; never overwrite, never
+        // delete.
+        Query::new(
+            "INSERT OR IGNORE INTO potrefund_records \
+             (identity, gameId, potTxid, potVout, refundRawHex, \
+              sigHex, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.identity.as_str())
+        .bind(record.game_id.as_str())
+        .bind(record.pot_txid.as_str())
+        .bind(record.pot_vout)
+        .bind(record.refund_raw_hex.as_str())
+        .bind(record.sig_hex.as_str())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(potrefund_err)
+    }
+
+    async fn list_for_identity(
+        &self,
+        identity: &str,
+        limit: usize,
+    ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
+        let rows: Vec<PotrefundRow> = Query::new(format!(
+            "{POTREFUND_SELECT} WHERE identity = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        ))
+        .bind(identity)
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(potrefund_err)?;
+        Ok(rows.into_iter().map(PotrefundRow::into_record).collect())
+    }
+
+    async fn list_for_pot(
+        &self,
+        pot_txid: &str,
+        pot_vout: u32,
+        limit: usize,
+    ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
+        let rows: Vec<PotrefundRow> = Query::new(format!(
+            "{POTREFUND_SELECT} WHERE potTxid = ? AND potVout = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        ))
+        .bind(pot_txid)
+        .bind(pot_vout)
+        .bind(limit as u32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(potrefund_err)?;
+        Ok(rows.into_iter().map(PotrefundRow::into_record).collect())
     }
 }
 

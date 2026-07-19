@@ -15,6 +15,15 @@ pub fn valid_txid(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A compressed secp256k1 identity pubkey is 33 bytes → 66 hex chars (either
+/// case accepted; `potparty_records.identity` is lowercase hex, so the query
+/// lowercases separately). An empty or wrong-width/non-hex value is NOT a
+/// valid identity — `/recovery-view` treats it as an empty result, never an
+/// error.
+pub fn valid_identity(s: &str) -> bool {
+    s.len() == 66 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// One parsed `<txid>.<vout>` entry from the `outpoints=` query parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outpoint {
@@ -323,6 +332,144 @@ pub fn decode_beef_hex(hex_str: &str) -> Option<Vec<u8>> {
     } else {
         Some(bytes)
     }
+}
+
+// ── /recovery-view — the seed-only BY-IDENTITY recovery view (bsv-low#189) ─
+//
+// A seed-only LOW client holds only its identity key. `tm_potparty` /
+// `ls_potparty` (bsv-low#188) index "identity X is a party to pot P"; the
+// overlay wrote those rows to `potparty_records`. This endpoint answers the
+// recovery question in ONE call: the caller's potparty rows JOINed to each
+// pot's on-chain spend status (`pot_records`) and its spender bytes
+// (`pot_beefs`) — so a recovering client gets its pots + their exit status
+// without a lookup-then-per-outpoint `/pots-view` fan-out.
+//
+// TRUST POSTURE (unchanged from `/pots-view`): `spenderRawHex` is a HINT the
+// client hash-verifies against `spendingTxid` before use; an un-indexed pot
+// output (no `pot_records` row) is `spent:null` — the fail-safe shape that
+// never asserts "unspent" for something this surface hasn't seen spent.
+
+/// The single `/recovery-view` SQL: the caller's `potparty_records` rows,
+/// LEFT-JOINed to `pot_records` on the pot outpoint (spend status) and to
+/// `pot_beefs` on the recorded spender (its stored BEEF), newest first.
+/// Keyed by ONE identity (not a batch of outpoints), so the WHERE is fixed
+/// (one `?` bind). `lower()` on the join key defends a mixed-case
+/// spendingTxid write (pot_beefs keys are lowercase). `rowid DESC` breaks
+/// same-second `createdAt` ties in insertion order (mirrors the overlay's
+/// own `list_for_identity`).
+pub fn recovery_view_sql() -> &'static str {
+    "SELECT pp.gameId, pp.potTxid, pp.potVout, pp.recoveryHeight, \
+            pp.opponentIdentity, \
+            r.spent, r.spendingTxid, r.spentConfirmed, \
+            hex(b.beef) AS spenderBeef \
+     FROM potparty_records pp \
+     LEFT JOIN pot_records r ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
+     LEFT JOIN pot_beefs b ON b.txid = lower(r.spendingTxid) \
+     WHERE pp.identity = ? \
+     ORDER BY pp.createdAt DESC, pp.rowid DESC"
+}
+
+/// One `/recovery-view` joined row, host-typed: the caller's potparty facts
+/// plus the LEFT-JOINed pot-spend status and the spender's stored BEEF. The
+/// spend fields are `Option` because the join can MISS — a pot the overlay
+/// has a party-marker for but no `pot_records` row yet (spend never indexed)
+/// yields `None` (fail-safe: never asserted unspent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRow {
+    /// Game ID (32 bytes, lowercase hex).
+    pub game_id: String,
+    /// The pot funding txid (32 bytes, lowercase hex).
+    pub pot_txid: String,
+    /// The pot output index within `pot_txid`.
+    pub pot_vout: u32,
+    /// The pre-signed refund's recovery height.
+    pub recovery_height: u32,
+    /// The opponent seat's compressed identity pubkey (33 bytes, lowercase
+    /// hex).
+    pub opponent_identity: String,
+    /// `pot_records.spent`, or `None` when the pot output has no row yet.
+    pub spent: Option<bool>,
+    /// The landing-proof spender, when the pot row records one.
+    pub spending_txid: Option<String>,
+    /// `pot_records.spentConfirmed`, or `None` when the pot output has no row.
+    pub spent_confirmed: Option<bool>,
+    /// `hex(pot_beefs.beef)` for the recorded spender, `None` when the join
+    /// missed (unspent, or the spender's BEEF was never stored).
+    pub spender_beef_hex: Option<String>,
+}
+
+/// One `/recovery-view` response entry: the caller's potparty facts plus the
+/// pot's spend status and the spender's raw tx (extracted server-side from
+/// its stored BEEF — a HINT the client hash-verifies against `spendingTxid`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryEntry {
+    pub game_id: String,
+    pub pot_txid: String,
+    pub pot_vout: u32,
+    pub recovery_height: u32,
+    pub opponent_identity: String,
+    pub spent: Option<bool>,
+    pub spending_txid: Option<String>,
+    pub spent_confirmed: Option<bool>,
+    /// The spending tx's RAW bytes as lowercase hex — a HINT the client must
+    /// verify (hash == `spendingTxid`) before trusting. `None` whenever the
+    /// spender or its bytes aren't available; never a guessed value.
+    pub spender_raw_hex: Option<String>,
+}
+
+/// Map the joined rows to response entries, extracting each recorded
+/// spender's raw tx from its stored BEEF. Order is preserved (the SQL already
+/// returns newest-first). Any beef decode/extract failure degrades that
+/// entry's `spenderRawHex` to null (never a wrong byte) — the same fail-safe
+/// as [`assemble_pots_view`].
+pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> Vec<RecoveryEntry> {
+    rows.into_iter()
+        .map(|r| {
+            let spender_raw_hex = match (&r.spending_txid, &r.spender_beef_hex) {
+                (Some(spender), Some(beef_hex)) => {
+                    decode_beef_hex(beef_hex).and_then(|bytes| extract_raw_tx_hex(&bytes, spender))
+                }
+                _ => None,
+            };
+            RecoveryEntry {
+                game_id: r.game_id,
+                pot_txid: r.pot_txid,
+                pot_vout: r.pot_vout,
+                recovery_height: r.recovery_height,
+                opponent_identity: r.opponent_identity,
+                spent: r.spent,
+                spending_txid: r.spending_txid,
+                spent_confirmed: r.spent_confirmed,
+                spender_raw_hex,
+            }
+        })
+        .collect()
+}
+
+/// Assemble the `/recovery-view` wire body:
+/// `{"tip":<height|null>,"entries":[{gameId,potTxid,potVout,recoveryHeight,
+/// opponentIdentity,spent,spendingTxid,spentConfirmed,spenderRawHex}]}`.
+/// `tip` mirrors `/pots-view` (the recovery-height gate needs it) and is
+/// `null` on a chaintracks fault — the D1 facts still serve, and the client
+/// falls back to its own `/tip`.
+pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>) -> String {
+    let arr: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "gameId": e.game_id,
+                "potTxid": e.pot_txid,
+                "potVout": e.pot_vout,
+                "recoveryHeight": e.recovery_height,
+                "opponentIdentity": e.opponent_identity,
+                "spent": e.spent,
+                "spendingTxid": e.spending_txid,
+                "spentConfirmed": e.spent_confirmed,
+                "spenderRawHex": e.spender_raw_hex,
+            })
+        })
+        .collect();
+    json!({ "tip": tip, "entries": arr }).to_string()
 }
 
 /// Assemble the `/beef/:txid` wire body: `{"txid","beef":[<bytes>]}` (bytes
@@ -780,5 +927,175 @@ mod tests {
         let h: serde_json::Value = serde_json::from_str(&health_body()).unwrap();
         assert_eq!(h["ok"], true);
         assert_eq!(h["service"], "low-app-layer");
+    }
+
+    // ── /recovery-view (bsv-low#189) ───────────────────────────────────
+
+    #[test]
+    fn identity_validation() {
+        // 66 hex chars (33-byte compressed pubkey), either case.
+        assert!(valid_identity(&format!("02{}", "a1".repeat(32))));
+        assert!(valid_identity(&"A".repeat(66)));
+        // Wrong width / non-hex / empty → not valid (→ empty result, not err).
+        assert!(!valid_identity(&"a".repeat(64))); // a txid is not an identity
+        assert!(!valid_identity(&"a".repeat(65)));
+        assert!(!valid_identity(&"a".repeat(67)));
+        assert!(!valid_identity(""));
+        assert!(!valid_identity(&"g".repeat(66)));
+    }
+
+    #[test]
+    fn recovery_view_sql_shape() {
+        let sql = recovery_view_sql();
+        // JOINs the pot outpoint for spend status and the spender's BEEF.
+        assert!(sql.contains(
+            "LEFT JOIN pot_records r ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout"
+        ));
+        assert!(sql.contains("LEFT JOIN pot_beefs b ON b.txid = lower(r.spendingTxid)"));
+        assert!(sql.contains("hex(b.beef) AS spenderBeef"));
+        // Keyed by ONE identity; newest first.
+        assert!(sql.contains("WHERE pp.identity = ?"));
+        assert!(sql.contains("ORDER BY pp.createdAt DESC"));
+        // Exactly one bind placeholder (single-identity query, not batched).
+        assert_eq!(sql.matches('?').count(), 1);
+    }
+
+    #[test]
+    fn assemble_recovery_view_joins_and_fail_safes() {
+        let (beef_bytes, raw_hex, spender) = beef_fixture();
+        let beef_hex_upper = hex::encode(&beef_bytes).to_ascii_uppercase(); // SQLite hex() shape
+        let rows = vec![
+            // Pot spent, spender BEEF joined → raw rides back.
+            RecoveryRow {
+                game_id: "11".repeat(32),
+                pot_txid: txid_a(),
+                pot_vout: 0,
+                recovery_height: 958_504,
+                opponent_identity: format!("03{}", "bb".repeat(32)),
+                spent: Some(true),
+                spending_txid: Some(spender.clone()),
+                spent_confirmed: Some(true),
+                spender_beef_hex: Some(beef_hex_upper),
+            },
+            // Pot spent, spender recorded but no stored BEEF → raw null.
+            RecoveryRow {
+                game_id: "22".repeat(32),
+                pot_txid: txid_b(),
+                pot_vout: 1,
+                recovery_height: 958_600,
+                opponent_identity: format!("03{}", "cc".repeat(32)),
+                spent: Some(true),
+                spending_txid: Some(spender.clone()),
+                spent_confirmed: Some(false),
+                spender_beef_hex: None,
+            },
+            // Party marker but NO pot_records row (spend never indexed) →
+            // fail-safe: spent:null, never asserted unspent.
+            RecoveryRow {
+                game_id: "33".repeat(32),
+                pot_txid: "ef".repeat(32),
+                pot_vout: 2,
+                recovery_height: 958_700,
+                opponent_identity: format!("03{}", "dd".repeat(32)),
+                spent: None,
+                spending_txid: None,
+                spent_confirmed: None,
+                spender_beef_hex: None,
+            },
+        ];
+        let out = assemble_recovery_view(rows);
+        assert_eq!(out.len(), 3);
+        // Joined spent pot: the raw rides back, order preserved.
+        assert_eq!(out[0].pot_txid, txid_a());
+        assert_eq!(out[0].recovery_height, 958_504);
+        assert_eq!(out[0].spent, Some(true));
+        assert_eq!(out[0].spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(out[0].spent_confirmed, Some(true));
+        assert_eq!(out[0].spender_raw_hex.as_deref(), Some(raw_hex.as_str()));
+        // Spender recorded, no BEEF stored → pointer yes, raw null.
+        assert_eq!(out[1].spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(out[1].spender_raw_hex, None);
+        // No pot row → fail-safe nulls (never asserted unspent).
+        assert_eq!(out[2].spent, None);
+        assert_eq!(out[2].spending_txid, None);
+        assert_eq!(out[2].spent_confirmed, None);
+        assert_eq!(out[2].spender_raw_hex, None);
+    }
+
+    #[test]
+    fn assemble_recovery_view_degrades_on_corrupt_beef() {
+        let rows = vec![RecoveryRow {
+            game_id: "11".repeat(32),
+            pot_txid: txid_a(),
+            pot_vout: 0,
+            recovery_height: 958_504,
+            opponent_identity: format!("03{}", "bb".repeat(32)),
+            spent: Some(true),
+            spending_txid: Some("f0".repeat(32)),
+            spent_confirmed: Some(true),
+            spender_beef_hex: Some("not-hex!!".to_string()),
+        }];
+        let out = assemble_recovery_view(rows);
+        // Pointer facts survive; only the raw degrades to null.
+        assert_eq!(out[0].spent, Some(true));
+        assert_eq!(out[0].spender_raw_hex, None);
+    }
+
+    #[test]
+    fn recovery_view_body_shape() {
+        let entries = vec![
+            RecoveryEntry {
+                game_id: "11".repeat(32),
+                pot_txid: txid_a(),
+                pot_vout: 0,
+                recovery_height: 958_504,
+                opponent_identity: format!("03{}", "bb".repeat(32)),
+                spent: Some(true),
+                spending_txid: Some("f0".repeat(32)),
+                spent_confirmed: Some(true),
+                spender_raw_hex: Some("aabb".to_string()),
+            },
+            RecoveryEntry {
+                game_id: "33".repeat(32),
+                pot_txid: "ef".repeat(32),
+                pot_vout: 2,
+                recovery_height: 958_700,
+                opponent_identity: format!("03{}", "dd".repeat(32)),
+                spent: None,
+                spending_txid: None,
+                spent_confirmed: None,
+                spender_raw_hex: None,
+            },
+        ];
+        let v: serde_json::Value =
+            serde_json::from_str(&recovery_view_body(&entries, Some(958_800))).unwrap();
+        assert_eq!(v["tip"], 958_800);
+        let arr = v["entries"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["gameId"], "11".repeat(32));
+        assert_eq!(arr[0]["potTxid"], txid_a());
+        assert_eq!(arr[0]["potVout"], 0);
+        assert_eq!(arr[0]["recoveryHeight"], 958_504);
+        assert_eq!(arr[0]["opponentIdentity"], format!("03{}", "bb".repeat(32)));
+        assert_eq!(arr[0]["spent"], true);
+        assert_eq!(arr[0]["spendingTxid"], "f0".repeat(32));
+        assert_eq!(arr[0]["spentConfirmed"], true);
+        assert_eq!(arr[0]["spenderRawHex"], "aabb");
+        // Un-indexed pot: fail-safe nulls.
+        assert_eq!(arr[1]["recoveryHeight"], 958_700);
+        assert!(arr[1]["spent"].is_null());
+        assert!(arr[1]["spendingTxid"].is_null());
+        assert!(arr[1]["spentConfirmed"].is_null());
+        assert!(arr[1]["spenderRawHex"].is_null());
+        // A chaintracks fault serves entries with a null tip.
+        let v2: serde_json::Value =
+            serde_json::from_str(&recovery_view_body(&entries, None)).unwrap();
+        assert!(v2["tip"].is_null());
+        assert_eq!(v2["entries"].as_array().unwrap().len(), 2);
+        // An empty result (invalid/empty identity) is a well-formed body.
+        let v3: serde_json::Value =
+            serde_json::from_str(&recovery_view_body(&[], None)).unwrap();
+        assert!(v3["tip"].is_null());
+        assert_eq!(v3["entries"].as_array().unwrap().len(), 0);
     }
 }

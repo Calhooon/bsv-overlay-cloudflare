@@ -41,6 +41,12 @@ use overlay_discovery::low::topic_manager::LowTopicManager;
 use overlay_discovery::pot::lookup_service::PotLookupService;
 use overlay_discovery::pot::storage::PotStorage;
 use overlay_discovery::pot::topic_manager::PotTopicManager;
+use overlay_discovery::potparty::lookup_service::PotpartyLookupService;
+use overlay_discovery::potparty::storage::PotpartyStorage;
+use overlay_discovery::potparty::topic_manager::PotpartyTopicManager;
+use overlay_discovery::potrefund::lookup_service::PotrefundLookupService;
+use overlay_discovery::potrefund::storage::PotrefundStorage;
+use overlay_discovery::potrefund::topic_manager::PotrefundTopicManager;
 use overlay_discovery::proof::lookup_service::ProofLookupService;
 use overlay_discovery::proof::storage::ProofStorage;
 use overlay_discovery::proof::topic_manager::ProofTopicManager;
@@ -69,7 +75,8 @@ use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::{run_migrations, OVERLAY_MIGRATIONS};
 use crate::d1_discovery::{
     D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1LowStorage, D1PotStorage,
-    D1ProofStorage, D1ResultStorage, D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
+    D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage, D1RevealStorage,
+    D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
 use crate::health_checker::WorkerHealthChecker;
@@ -142,6 +149,9 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
+    let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
+    let potrefund_storage: Rc<dyn PotrefundStorage> =
+        Rc::new(D1PotrefundStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -156,6 +166,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
         collected_storage.clone(),
         result_storage.clone(),
         proof_storage.clone(),
+        potparty_storage.clone(),
+        potrefund_storage.clone(),
     );
 
     // Hosting URL for web UI
@@ -285,6 +297,9 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
+    let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
+    let potrefund_storage: Rc<dyn PotrefundStorage> =
+        Rc::new(D1PotrefundStorage::new(db.clone()));
     Ok(build_engine_with_storage(
         db,
         env,
@@ -299,6 +314,8 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         collected_storage,
         result_storage,
         proof_storage,
+        potparty_storage,
+        potrefund_storage,
     ))
 }
 
@@ -348,6 +365,8 @@ fn build_engine_with_storage(
     collected_storage: Rc<dyn CollectedStorage>,
     result_storage: Rc<dyn ResultStorage>,
     proof_storage: Rc<dyn ProofStorage>,
+    potparty_storage: Rc<dyn PotpartyStorage>,
+    potrefund_storage: Rc<dyn PotrefundStorage>,
 ) -> Engine {
     // Storage
     let storage = Box::new(D1Storage::new(db));
@@ -425,6 +444,18 @@ fn build_engine_with_storage(
             }
             "tm_proof" => {
                 managers.insert("tm_proof".into(), Box::new(ProofTopicManager::new()));
+            }
+            "tm_potparty" => {
+                managers.insert(
+                    "tm_potparty".into(),
+                    Box::new(PotpartyTopicManager::new()),
+                );
+            }
+            "tm_potrefund" => {
+                managers.insert(
+                    "tm_potrefund".into(),
+                    Box::new(PotrefundTopicManager::new()),
+                );
             }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
         }
@@ -516,6 +547,18 @@ fn build_engine_with_storage(
                     Box::new(ProofLookupService::new(proof_storage.clone())),
                 );
             }
+            "ls_potparty" => {
+                lookup_services.insert(
+                    "ls_potparty".into(),
+                    Box::new(PotpartyLookupService::new(potparty_storage.clone())),
+                );
+            }
+            "ls_potrefund" => {
+                lookup_services.insert(
+                    "ls_potrefund".into(),
+                    Box::new(PotrefundLookupService::new(potrefund_storage.clone())),
+                );
+            }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),
         }
     }
@@ -604,8 +647,18 @@ fn build_engine_with_storage(
     // tm_collected (the cross-device "already collected" marker index,
     // bsv-low #161), as do tm_result (the hand-result leaderboard
     // marker index, bsv-low #38) and tm_proof (the rung-3
-    // transcript-proof bundle index).
-    for topic in ["tm_pot", "tm_lowfund", "tm_collected", "tm_result", "tm_proof"] {
+    // transcript-proof bundle index), as does tm_potparty (the by-identity
+    // pot-participation recovery index, bsv-low #188) and tm_potrefund (the
+    // pre-signed refund-backup recovery index, bsv-low #191).
+    for topic in [
+        "tm_pot",
+        "tm_lowfund",
+        "tm_collected",
+        "tm_result",
+        "tm_proof",
+        "tm_potparty",
+        "tm_potrefund",
+    ] {
         sync_configuration.insert(
             topic.to_string(),
             overlay_engine::types::SyncTarget::Disabled,
@@ -736,6 +789,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
+    let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
+    let potrefund_storage: Rc<dyn PotrefundStorage> =
+        Rc::new(D1PotrefundStorage::new(db.clone()));
     let engine = build_engine_with_storage(
         db,
         &env,
@@ -750,6 +806,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         collected_storage.clone(),
         result_storage.clone(),
         proof_storage.clone(),
+        potparty_storage.clone(),
+        potrefund_storage.clone(),
     );
 
     // Sync advertisements (if advertiser + hosting URL are configured).

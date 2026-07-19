@@ -16,9 +16,10 @@ use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
 
 use crate::logic::{
-    assemble_pots_view, assemble_statuses, batch_where_sql, beef_body, decode_beef_hex,
-    health_body, parse_outpoints, parse_present_height, pots_view_body, pots_view_join_sql,
-    tip_body, utxo_status_body, valid_txid, Outpoint, PotRecordRow, PotsViewRow,
+    assemble_pots_view, assemble_recovery_view, assemble_statuses, batch_where_sql, beef_body,
+    decode_beef_hex, health_body, parse_outpoints, parse_present_height, pots_view_body,
+    pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body, utxo_status_body,
+    valid_identity, valid_txid, Outpoint, PotRecordRow, PotsViewRow, RecoveryRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -322,6 +323,104 @@ pub async fn pots_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     let entries = assemble_pots_view(&outpoints, &rows);
     let tip = chaintracks_present_height(&ctx, "pots-view").await.ok();
     json_response(pots_view_body(&entries, tip), 200)
+}
+
+/// `/recovery-view` joined row as D1 returns it: the caller's potparty facts
+/// plus the LEFT-JOINed pot-spend status and the recorded spender's stored
+/// BEEF. The pot-spend columns are `Option` because the join can MISS (a
+/// party marker whose pot output isn't in `pot_records` yet — NULL columns).
+#[derive(Deserialize)]
+struct RecoveryRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    /// NULL when the pot output has no `pot_records` row yet.
+    spent: Option<f64>,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    /// NULL when no row; `serde(default)` also tolerates a read that races
+    /// the overlay's additive `spentConfirmed` migration.
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: Option<f64>,
+    #[serde(rename = "spenderBeef")]
+    spender_beef: Option<String>,
+}
+
+impl RecoveryRowD1 {
+    fn into_row(self) -> RecoveryRow {
+        RecoveryRow {
+            game_id: self.game_id,
+            pot_txid: self.pot_txid,
+            pot_vout: self.pot_vout as u32,
+            recovery_height: self.recovery_height as u32,
+            opponent_identity: self.opponent_identity,
+            spent: self.spent.map(|v| v != 0.0),
+            spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
+            spender_beef_hex: self.spender_beef,
+        }
+    }
+}
+
+/// `GET /recovery-view?identity=<66-hex>` — the seed-only BY-IDENTITY
+/// recovery view (bsv-low#189). A recovering client that holds only its
+/// identity key gets, in ONE request / ONE D1 query, every pot it is a party
+/// to (`potparty_records`, bsv-low#188) JOINed to that pot's on-chain spend
+/// status (`pot_records`) and the spender's raw tx (extracted from its stored
+/// BEEF — a HINT the client hash-verifies against `spendingTxid`); plus the
+/// chain `tip` in the same body (the recovery-height gate needs it; `null` on
+/// a chaintracks fault). This replaces a lookup-then-per-outpoint `/pots-view`
+/// fan-out.
+///
+/// Fail-safe shape: a missing/invalid/empty `identity` is an EMPTY result
+/// (`{"tip":null,"entries":[]}`, HTTP 200), never a 4xx — a seed-only client
+/// with nothing indexed sees the same well-formed empty answer. A pot with a
+/// party marker but no `pot_records` row yet is `spent:null` (never asserted
+/// unspent). Public data only, read-only, no secrets.
+pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let identity = url
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+
+    // Missing / empty / malformed identity → empty result, not an error.
+    if !valid_identity(&identity) {
+        return json_response(recovery_view_body(&[], None), 200);
+    }
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[recovery-view] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        },
+    };
+
+    // ONE query: the caller's potparty rows JOINed to pot spend-status +
+    // spender BEEFs. `potparty_records.identity` is lowercase hex.
+    let stmt = db
+        .prepare(recovery_view_sql())
+        .bind(&[JsValue::from_str(&identity.to_ascii_lowercase())])?;
+    let rows: Vec<RecoveryRow> = match stmt.all().await.and_then(|r| r.results::<RecoveryRowD1>()) {
+        Ok(rows) => rows.into_iter().map(RecoveryRowD1::into_row).collect(),
+        Err(e) => {
+            console_warn!("[recovery-view] potparty join query failed: {e}");
+            return json_error("database query failed", 503);
+        },
+    };
+
+    let entries = assemble_recovery_view(rows);
+    let tip = chaintracks_present_height(&ctx, "recovery-view").await.ok();
+    json_response(recovery_view_body(&entries, tip), 200)
 }
 
 /// `GET /health` — liveness only (no DB touch).

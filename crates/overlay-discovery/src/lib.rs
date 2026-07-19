@@ -4,6 +4,8 @@ pub mod collected;
 pub mod dm_delegation;
 pub mod low;
 pub mod pot;
+pub mod potparty;
+pub mod potrefund;
 pub mod proof;
 pub mod result;
 pub mod reveal;

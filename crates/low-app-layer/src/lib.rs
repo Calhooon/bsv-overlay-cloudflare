@@ -33,6 +33,12 @@
 //!   tx (extracted from its stored BEEF; client hash-verifies) PLUS the
 //!   chain tip, in one request / one D1 join — the query that replaces the
 //!   client's per-spender `/beef` fan-out.
+//! - `GET /recovery-view?identity=<66-hex>` — the seed-only BY-IDENTITY
+//!   recovery view (bsv-low#189): every pot the identity is a party to
+//!   (`potparty_records`, bsv-low#188) JOINed to its on-chain spend status
+//!   (`pot_records`) + spender bytes (`pot_beefs`) + the chain tip, in one
+//!   request / one D1 query. A missing/invalid identity is an empty result,
+//!   never an error.
 //! - `GET /beef/:txid` — the admitted BEEF bytes from `transactions`.
 //! - `GET /tip` — present chain height via the CHAINTRACKS service binding.
 //! - `GET /health` — liveness.
@@ -77,6 +83,7 @@ fn router() -> Router<'static, ()> {
     Router::new()
         .get_async("/utxo-status", routes::utxo_status)
         .get_async("/pots-view", routes::pots_view)
+        .get_async("/recovery-view", routes::recovery_view)
         .get_async("/beef/:txid", routes::beef)
         .get_async("/tip", routes::tip)
         .get("/health", routes::health)

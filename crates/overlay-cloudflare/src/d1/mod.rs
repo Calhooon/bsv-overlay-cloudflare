@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 46;
+pub const OVERLAY_MIGRATION_COUNT: usize = 53;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -569,6 +569,64 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // The ls_proof list query filters by (gameId, winner) and orders by
     // createdAt DESC.
     "CREATE INDEX IF NOT EXISTS idx_proof_markers_game_winner ON proof_markers(gameId, winner)",
+    // LOW by-identity pot-participation markers (tm_potparty / ls_potparty,
+    // bsv-low #188 — the seed-only recovery index). One row per marker
+    // OUTPOINT (txid, outputIndex) — EVERY admitted marker is kept via
+    // INSERT OR IGNORE on the primary key (the tm_result censorship lesson:
+    // admission is byte-format-only, so an identity-keyed first-marker-wins
+    // index would let a garbage marker front-run the real one for one
+    // OP_RETURN fee; with outpoint keying garbage and genuine rows coexist).
+    // Rows are NEVER deleted (a pot-participation fact is permanent recovery
+    // history, like a pot record; the OP_RETURN is provably unspendable).
+    // All byte fields are handed back verbatim to querying clients; the
+    // overlay never verifies the sig. Each seat publishes its OWN marker, so
+    // the (potTxid, potVout) index returns both parties.
+    "CREATE TABLE IF NOT EXISTS potparty_records (
+        identity TEXT NOT NULL,
+        opponentIdentity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        potTxid TEXT NOT NULL,
+        potVout INTEGER NOT NULL,
+        recoveryHeight INTEGER NOT NULL,
+        sigHex TEXT,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // partyFor filters by identity; byPot filters by (potTxid, potVout);
+    // both order by createdAt DESC.
+    "CREATE INDEX IF NOT EXISTS idx_potparty_identity ON potparty_records(identity)",
+    "CREATE INDEX IF NOT EXISTS idx_potparty_pot ON potparty_records(potTxid, potVout)",
+    "CREATE INDEX IF NOT EXISTS idx_potparty_createdAt ON potparty_records(createdAt)",
+    // LOW pre-signed refund-backup markers (tm_potrefund / ls_potrefund,
+    // bsv-low #191 — the keyless recovery re-broadcast index). One row per
+    // marker OUTPOINT (txid, outputIndex) — EVERY admitted marker is kept
+    // via INSERT OR IGNORE on the primary key (the tm_result censorship
+    // lesson: admission is byte-format-only, so an identity-/pot-keyed
+    // first-marker-wins index would let a garbage marker front-run the real
+    // one for one OP_RETURN fee; with outpoint keying garbage and genuine
+    // rows coexist). Rows are NEVER deleted (a pre-signed refund backup is
+    // permanent recovery history; the OP_RETURN is provably unspendable).
+    // All byte fields (refundRawHex + sigHex) are handed back verbatim; the
+    // overlay never parses or verifies them. BOTH seats may publish a backup
+    // for a pot, so the (potTxid, potVout) index returns every one.
+    "CREATE TABLE IF NOT EXISTS potrefund_records (
+        identity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        potTxid TEXT NOT NULL,
+        potVout INTEGER NOT NULL,
+        refundRawHex TEXT,
+        sigHex TEXT,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // byPot filters by (potTxid, potVout); partyFor filters by identity;
+    // both order by createdAt DESC.
+    "CREATE INDEX IF NOT EXISTS idx_potrefund_pot ON potrefund_records(potTxid, potVout)",
+    "CREATE INDEX IF NOT EXISTS idx_potrefund_identity ON potrefund_records(identity)",
 ];
 
 // =============================================================================
@@ -740,6 +798,8 @@ mod tests {
             "result_markers",
             "result_markers_v2",
             "proof_markers",
+            "potparty_records",
+            "potrefund_records",
         ] {
             assert!(
                 joined.contains(table),
@@ -772,6 +832,11 @@ mod tests {
             "idx_result_markers_v2_winner",
             "idx_result_markers_v2_createdAt",
             "idx_proof_markers_game_winner",
+            "idx_potparty_identity",
+            "idx_potparty_pot",
+            "idx_potparty_createdAt",
+            "idx_potrefund_pot",
+            "idx_potrefund_identity",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }
