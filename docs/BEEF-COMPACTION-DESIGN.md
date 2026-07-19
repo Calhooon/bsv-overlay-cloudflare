@@ -25,6 +25,24 @@ LOW wired NONE of the legs (no fetcher, no `has_proof` column / candidate query,
 call, no callback). zanaadu's `WocAncestorFetcher` (`~/bsv/zanaadu/overlay/src/ancestor_fetcher.rs`)
 is a wasm-clean drop-in against this exact trait.
 
+## Architecture: the OVERLAY is the sole broadcaster (owner, 2026-07-19)
+
+The client and the tower do NOT broadcast to the network directly — they **submit to the
+overlay**, and the overlay is the single point that broadcasts to Arcade, registers the
+callback, and compacts. Rationale (owner): "the client should hit the overlay… the tower
+should hit the overlay too." This makes the overlay the one place that owns broadcast +
+proof-fetch + compaction — no other component needs an Arcade client or a callback.
+
+- **Client → overlay:** already shipped (`broadcastPotTxOverlayFirst`, overlay-first
+  broadcast-gated). Verify it covers every money tx the client sends.
+- **Tower → overlay:** NEW. `workers/low-watchtower/src/broadcast.rs` currently broadcasts
+  co-signed settle/refund directly (ARC + Bitails fallback). Route it through the overlay's
+  broadcast-gated `/submit` instead, so the tower's txs also flow through the single Arcade
+  broadcaster + get the callback + compaction. (Keep the pre-signed-refund dead-man switch's
+  own broadcast as a last-resort fallback — the tower must still be able to bring money home
+  if the overlay is down; the overlay is the primary, not a hard dependency.)
+- **Overlay → Arcade V2:** the sole network broadcaster (below).
+
 ## Broadcaster = Arcade V2 (wide propagation + free proofs)
 
 Owner decision (2026-07-19): the overlay broadcasts through **Arcade V2**
@@ -127,11 +145,12 @@ tx mined outside Arcade (WoC/Bitails).
 
 ## Phased plan
 
-- **P0 — Arcade V2 broadcaster**: switch the overlay's broadcast from TAAL ARC → Arcade
-  (EF-only submit, `POST /tx`) + register `X-CallbackUrl`/`X-CallbackToken`/`X-FullStatusUpdates`.
-  (Scope note: this changes the OVERLAY's broadcast. Whether to also migrate the app/tower
-  broadcast off the TAAL-ARC proxy is a separate owner call — the overlay is the one that
-  needs the callback for compaction.)
+- **P0 — Arcade V2 broadcaster + overlay-as-sole-broadcaster**: switch the overlay's
+  broadcast from TAAL ARC → Arcade (EF-only submit, `POST /tx`) + register
+  `X-CallbackUrl`/`X-CallbackToken`/`X-FullStatusUpdates`. Route the **tower** through the
+  overlay's broadcast-gated `/submit` (keep the dead-man refund's own broadcast as last
+  resort). Verify the **client** overlay-first path covers every money tx. The overlay
+  becomes the single network broadcaster.
 - **P1 — the fetcher** (`ChainProofFetcher`: Arcade→WoC→Bitails + chaintracks verify),
   unit-tested (Arcade merklePath path, TSC→BUMP, verify rejects a forged root, unmined → None).
 - **P2 — transactions store**: migration + candidate query + `set_ancestor_fetcher` + cron call.
