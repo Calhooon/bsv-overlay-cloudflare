@@ -265,6 +265,14 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
                 return resp;
             }
             match path {
+                // #192/#193 — run the BEEF proof-completion passes on demand. The
+                // `*/15` cron that normally drives them is not firing on this worker
+                // (CF is not delivering the scheduled event — a queue+cron platform
+                // quirk; the handler/config/export are all correct), so this
+                // reliably-firing FETCH route is the durable trigger: an external
+                // cron (e.g. low-monitor) POSTs it every ~15 min. Same logic as the
+                // scheduled block; fail-closed.
+                "/admin/complete-proofs" => admin_complete_proofs(&env).await,
                 "/admin/syncAdvertisements" => admin_sync_advertisements(&engine).await,
                 "/admin/startGASPSync" => admin_start_gasp_sync(&engine).await,
                 "/admin/evictOutpoint" => admin_evict_outpoint(&engine, req).await,
@@ -1047,6 +1055,66 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     }
 
     worker::console_log!("Scheduled tasks completed");
+}
+
+/// POST /admin/complete-proofs (#192/#193) — run the BEEF proof-completion passes
+/// ON DEMAND, the SAME logic the `*/15` cron would run, from a reliably-firing
+/// FETCH route (the scheduled event is not delivered to this worker — a queue+cron
+/// platform quirk). Self-contained (builds its own db/engine/storages from env) +
+/// fail-closed: a BUMP is stitched only once chaintracks-verified; the `has_proof`
+/// latch + serve-time trim trust only verified proofs. An external cron POSTs this
+/// (bearer-authed via ADMIN_TOKEN, gated at the dispatch). Returns the counters.
+async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
+    let db = match env.d1("OVERLAY_DB") {
+        Ok(d) => Rc::new(d),
+        Err(e) => return Response::error(format!("complete-proofs: D1 binding: {e}"), 500),
+    };
+    if let Err(e) = run_migrations(&db, OVERLAY_MIGRATIONS).await {
+        return Response::error(format!("complete-proofs: migrations: {e}"), 500);
+    }
+    let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
+    let ops_db = db.clone();
+    let engine = match build_engine_from_env(env).await {
+        Ok(e) => e,
+        Err(e) => return Response::error(format!("complete-proofs: engine: {e}"), 500),
+    };
+    // 1. transactions store (engine + ancestor fetcher).
+    let budget = u64::from(crate::proof_fetcher::DEFAULT_FETCH_BUDGET);
+    let (tx_completed, tx_fetch_failed) = match engine.complete_missing_proofs(budget).await {
+        Ok(s) => (s.completed as u64, s.fetch_failed as u64),
+        Err(e) => {
+            worker::console_log!("complete-proofs: transactions error: {e}");
+            (0, 0)
+        }
+    };
+    // 2. pot_beefs recovery store (own fetcher + budget).
+    let pot_tracker = lookup_service_chain_tracker(env);
+    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        pot_fetcher = pot_fetcher.with_arcade_url(u);
+    }
+    let ps = crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &pot_fetcher, 20)
+        .await;
+    // 3. observability heartbeat + counters (same as the cron would stamp).
+    let proofs_completed = tx_completed + ps.completed as u64;
+    let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;
+    crate::ops::record_completion_tick(&ops_db, proofs_completed, fetch_failed, ps.completed as u64)
+        .await;
+    let flagged = crate::ops::refresh_proofless_watch(&ops_db).await;
+    Response::from_json(&serde_json::json!({
+        "status": "ok",
+        "tx_completed": tx_completed,
+        "pot_completed": ps.completed,
+        "pot_scanned": ps.scanned,
+        "pot_still_unconfirmed": ps.still_unconfirmed,
+        "fetch_failed": fetch_failed,
+        "proofless_over_24h": flagged,
+    }))
 }
 
 /// Queue consumer for the onSteakReady pattern.
