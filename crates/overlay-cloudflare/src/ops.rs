@@ -120,9 +120,16 @@ pub async fn refresh_proofless_watch(db: &D1Database) -> u64 {
     // 1. Enrol proofless txids from both stores (bounded). First-seen is only
     //    set on the FIRST sighting (INSERT OR IGNORE keeps the original stamp).
     for table in ["pot_beefs", "transactions"] {
+        // ORDER BY RANDOM(): the enrol page is bounded, so with a >500 backlog a
+        // fixed (insertion) order would keep sampling the same head every tick
+        // and UNDERCOUNT the dead-pass signal (never-mineable rows deeper in the
+        // backlog would go unwatched). Random sampling makes every proofless row
+        // eventually visible to the flag. (INSERT OR IGNORE still preserves each
+        // row's original first-seen stamp, so the age stays real.)
         let sql = format!(
             "INSERT OR IGNORE INTO proofless_watch (txid, first_seen_ms) \
-             SELECT txid, ? FROM {table} WHERE has_proof = 0 LIMIT {WATCH_ENROLL_LIMIT}"
+             SELECT txid, ? FROM {table} WHERE has_proof = 0 \
+             ORDER BY RANDOM() LIMIT {WATCH_ENROLL_LIMIT}"
         );
         if let Err(e) = Query::new(sql).bind(ts).execute(db).await {
             worker::console_log!("[ops] proofless_watch enrol ({table}) failed: {e}");

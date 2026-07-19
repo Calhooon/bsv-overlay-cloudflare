@@ -197,16 +197,21 @@ impl Storage for D1Storage {
                 // un-hydrated. The `!beef.is_empty()` guard means we only ever
                 // write a real BEEF here, so REPLACE can never clobber a good
                 // row with an empty one.
-                // Record has_proof up front (#192/#193): admit-time BEEFs are
-                // usually proofless (→ 0, queued for the cron), but if a proof
-                // is already present we record it so the cron never re-fetches.
-                let has_proof = i64::from(Self::beef_has_proof(&output.txid, beef));
+                // ADMIT-TIME BEEFs are NEVER trusted-proven (#192/#193 FIX 3).
+                // `/submit` skips SPV on historical topics, so a submitted BEEF
+                // may carry a merkle bump that is unverified — or outright
+                // forged. A STRUCTURAL bump here is NOT a fact, and serve-time
+                // BEEF trimming trusts `has_proof`, so latching one at admit
+                // would let a forged bump be trimmed on. Force `has_proof = 0`
+                // ALWAYS: the VERIFYING cron pass (`complete_missing_proofs` →
+                // ChainProofFetcher → chaintracks verify → `mark_transaction_proven`,
+                // or a genuine bump re-verified before it flips the flag) is the
+                // SOLE thing that ever latches `has_proof = 1`.
                 Query::new(
-                    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?, ?, 0)",
                 )
                 .bind(&*output.txid)
                 .bind(beef.as_slice())
-                .bind(has_proof)
                 .execute(&self.db)
                 .await
                 .map_err(d1_err)?;
@@ -291,9 +296,13 @@ impl Storage for D1Storage {
     }
 
     async fn update_transaction_beef(&self, txid: &str, beef: &[u8]) -> Result<(), StorageError> {
-        // Keep has_proof accurate on every write (#192/#193): this is the
-        // proof-completion callback path, so a stitched BUMP flips the row
-        // proofless → proven here.
+        // This is the proof-completion STITCH write-back — every caller
+        // (`handle_new_merkle_proof` via the `/arc-ingest` callback and the
+        // `complete_missing_proofs` cron) has ALREADY chaintracks-verified the
+        // bump before it reaches here, so the bump stitched into `beef` is a
+        // fact. It is therefore SAFE to latch has_proof from it (this is how a
+        // row legitimately flips proofless → proven). Contrast `insert_output`,
+        // which is the untrusted ADMIT path and always writes has_proof = 0.
         let has_proof = i64::from(Self::beef_has_proof(txid, beef));
 
         // INSERT OR REPLACE — txid is PRIMARY KEY, so this upserts

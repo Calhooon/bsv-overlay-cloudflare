@@ -157,6 +157,35 @@ pub trait AncestorFetcher {
     /// requested `txid` before returning them (integrity check) so a
     /// malicious/garbled response cannot inject a forged ancestor.
     async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError>;
+
+    /// Fetch (and chaintracks-verify) ONLY the merkle BUMP for `txid`, WITHOUT
+    /// fetching the raw tx.
+    ///
+    /// The proof-completion passes (`complete_missing_proofs`, the LOW pot-store
+    /// tick) already hold the raw in the stored BEEF, so the raw fetch that
+    /// [`Self::fetch_ancestor`] performs is a redundant network round-trip there
+    /// — and a free-tier WhatsOnChain raw fetch 429s (#192/#193). This method is
+    /// the raw-free path.
+    ///
+    /// Default: delegate to `fetch_ancestor` and drop the raw, so a fetcher that
+    /// only implements `fetch_ancestor` keeps working unchanged. The production
+    /// `ChainProofFetcher` overrides it to skip the raw fetch entirely. Returns
+    /// `None` for an unmined/unverifiable tx (fail-closed), never an error.
+    async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+        self.fetch_ancestor(txid).await.ok().and_then(|a| a.proof)
+    }
+
+    /// Verify that `bump_hex` is a chaintracks-valid merkle proof for `txid`.
+    ///
+    /// Used by proof completion to re-check a STORED structural bump before
+    /// trusting its `has_proof` flag: a structural bump admitted WITHOUT SPV (or
+    /// forged) must never be latched-proven and trimmed on (#192/#193). Default:
+    /// fail-closed `false` — a fetcher with no header source can prove nothing.
+    /// The production `ChainProofFetcher` overrides it against chaintracks.
+    async fn verify_proof(&self, txid: &str, bump_hex: &str) -> bool {
+        let _ = (txid, bump_hex);
+        false
+    }
 }
 
 /// An ancestor transaction fetched from chain: its raw tx hex plus an optional
@@ -465,12 +494,12 @@ impl<'a> GASPSync<'a> {
                             // proof is None (unmined ancestor), the recursion
                             // continues to ITS parents as before.
                             Some(fetcher) => {
-                                let fetched = fetcher.fetch_ancestor(&txid).await?;
+                                let ancestor = fetcher.fetch_ancestor(&txid).await?;
                                 GASPNode {
                                     graph_id: node.graph_id.clone(),
-                                    raw_tx: fetched.raw_tx,
+                                    raw_tx: ancestor.raw_tx,
                                     output_index: oi,
-                                    proof: fetched.proof,
+                                    proof: ancestor.proof,
                                     tx_metadata: None,
                                     output_metadata: None,
                                     inputs: None,

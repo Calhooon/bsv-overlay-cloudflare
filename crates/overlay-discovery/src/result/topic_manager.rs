@@ -33,8 +33,8 @@ impl ResultTopicManager {
     }
 
     /// Validate a single output as a LOW result marker: true IFF its
-    /// locking script is a well-formed `LOW/result/v1` marker (exact tag
-    /// + exact push lengths + winner != loser). Everything else (P2PKH
+    /// locking script is a well-formed `LOW/result/v1` marker (exact tag +
+    /// exact push lengths + winner != loser). Everything else (P2PKH
     /// change, foreign OP_RETURNs, malformed tags) is simply not admitted.
     pub fn validate_result_output(output: &bsv_rs::transaction::TransactionOutput) -> bool {
         is_result_marker_script(&output.locking_script.to_binary())

@@ -15,12 +15,16 @@
 //!
 //! ## courier ladder (per docs/BEEF-COMPACTION-DESIGN.md §"the god-tier fetcher")
 //!
-//! 1. **Arcade** (primary — LOW broadcasts via Arcade, so Arcade has our own
+//! Order matters: WhatsOnChain 429s on the free tier, so it is BREAK-GLASS ONLY
+//! (last resort) — it must never sit on the hot path.
+//!
+//! 1. **Arcade** (PRIMARY — LOW broadcasts via Arcade, so Arcade has our own
 //!    txs' status + free BUMP): `GET /tx/{txid}` → if `txStatus == MINED` and a
 //!    `merklePath` (a ready BRC-74 BUMP) is present.
-//! 2. **WoC** (anomaly fallback): `GET /tx/{txid}/proof/tsc` (TSC JSON) + height
-//!    from `GET /tx/hash/{txid}` → [`tsc_json_to_bump_hex`].
-//! 3. **Bitails** (tertiary): `GET /tx/{txid}/proof/tsc` (same TSC shape).
+//! 2. **Bitails** (SECONDARY): `GET /tx/{txid}/proof/tsc` (TSC JSON) + height
+//!    from `GET /tx/{txid}` → [`tsc_json_to_bump_hex`].
+//! 3. **WhatsOnChain** (BREAK-GLASS, LAST RESORT ONLY): `GET /tx/{txid}/proof/tsc`
+//!    (TSC JSON) + height from `GET /tx/hash/{txid}`.
 //!
 //! ## wasm safety
 //!
@@ -51,8 +55,9 @@ pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech"
 /// never starves the queue.
 pub const DEFAULT_FETCH_BUDGET: u32 = 40;
 
-/// `AncestorFetcher` backed by the Arcade→WoC→Bitails courier ladder with a
-/// mandatory chaintracks re-verify before ANY bump is returned.
+/// `AncestorFetcher` backed by the Arcade→Bitails→WoC courier ladder (WoC is
+/// break-glass/last-resort) with a mandatory chaintracks re-verify before ANY
+/// bump is returned.
 pub struct ChainProofFetcher {
     arcade_url: String,
     woc_base: String,
@@ -119,20 +124,20 @@ impl ChainProofFetcher {
             worker::console_log!("[proof] arcade bump for {txid} FAILED chaintracks verify");
         }
 
-        // 2. WoC TSC (anomaly fallback — tx mined outside Arcade).
-        if let Some(bump_hex) = self.woc_tsc_bump(txid).await {
-            if verify_bump(tracker, &bump_hex, txid).await {
-                return Some(bump_hex);
-            }
-            worker::console_log!("[proof] woc bump for {txid} FAILED chaintracks verify");
-        }
-
-        // 3. Bitails TSC (tertiary).
+        // 2. Bitails TSC (secondary — tx mined outside Arcade).
         if let Some(bump_hex) = self.bitails_tsc_bump(txid).await {
             if verify_bump(tracker, &bump_hex, txid).await {
                 return Some(bump_hex);
             }
             worker::console_log!("[proof] bitails bump for {txid} FAILED chaintracks verify");
+        }
+
+        // 3. WoC TSC (BREAK-GLASS, last resort — WoC 429s on the free tier).
+        if let Some(bump_hex) = self.woc_tsc_bump(txid).await {
+            if verify_bump(tracker, &bump_hex, txid).await {
+                return Some(bump_hex);
+            }
+            worker::console_log!("[proof] woc bump for {txid} FAILED chaintracks verify");
         }
 
         None
@@ -205,20 +210,50 @@ impl ChainProofFetcher {
         u32::try_from(h).ok()
     }
 
-    /// Fetch the raw tx hex from WoC (`GET /tx/{txid}/hex`), content-addressed.
+    /// Fetch the raw tx hex for `txid`, content-addressed, trying Bitails FIRST
+    /// and WhatsOnChain only as a LAST RESORT (WoC 429s on the free tier, so it
+    /// must never sit on the hot path). Used ONLY by the GASP-sync trait path
+    /// ([`AncestorFetcher::fetch_ancestor`]) where the raw genuinely is needed;
+    /// the proof-completion passes take the raw-free [`Self::verified_proof_for`].
     async fn fetch_raw_hex(&self, txid: &str) -> Result<String, GASPError> {
-        let url = format!("{}/tx/{}/hex", self.woc_base, txid);
+        // 1. Bitails raw download (non-WoC primary).
+        let bitails = format!("{}/download/tx/{}/hex", self.bitails_base, txid);
+        if let Some(raw) = self.raw_hex_content_addressed(txid, &bitails, None).await {
+            return Ok(raw);
+        }
+        // 2. WoC break-glass (last resort).
+        let woc = format!("{}/tx/{}/hex", self.woc_base, txid);
         let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        let (status, body) = http_get(&url, hdr)
-            .await
-            .map_err(|e| GASPError::RemoteError(format!("woc raw {txid}: {e}")))?;
-        if status == 404 {
-            return Err(GASPError::NodeNotFound(format!("WoC 404 raw {txid}")));
+        if let Some(raw) = self.raw_hex_content_addressed(txid, &woc, hdr).await {
+            return Ok(raw);
         }
+        Err(GASPError::NodeNotFound(format!(
+            "no raw tx for {txid} (bitails + woc exhausted)"
+        )))
+    }
+
+    /// GET raw tx hex from `url` and accept it ONLY if it parses to a tx whose
+    /// id is `txid` — content-addressing, so a garbled response or a
+    /// wrong-provider body can never inject a forged ancestor and the ladder
+    /// safely falls through to the next provider. `None` on any
+    /// transport/status/parse/mismatch.
+    async fn raw_hex_content_addressed(
+        &self,
+        txid: &str,
+        url: &str,
+        header: Option<(&str, &str)>,
+    ) -> Option<String> {
+        let (status, body) = http_get(url, header).await.ok()?;
         if !(200..300).contains(&status) {
-            return Err(GASPError::RemoteError(format!("WoC {status} raw {txid}")));
+            return None;
         }
-        Ok(body.trim().to_string())
+        let raw = body.trim().to_string();
+        let recomputed = Transaction::from_hex(&raw).ok()?.id();
+        if recomputed.eq_ignore_ascii_case(txid) {
+            Some(raw)
+        } else {
+            None
+        }
     }
 }
 
@@ -251,6 +286,32 @@ impl AncestorFetcher for ChainProofFetcher {
         // every tier → `None` (retry next tick), NEVER an error.
         let proof = self.fetch_verified_proof(txid).await;
         Ok(FetchedAncestor { raw_tx, proof })
+    }
+
+    /// PROOF-ONLY completion path (#192/#193 FIX 2): run the courier ladder +
+    /// chaintracks verify with NO raw-tx fetch — the completion passes already
+    /// hold the raw in the stored BEEF, so a raw fetch there is a redundant
+    /// round-trip (and a free-tier WoC raw fetch 429s). Budget-bounded exactly
+    /// like [`Self::fetch_ancestor`]. Fail-closed: budget-exhausted / unmined /
+    /// unverifiable → `None`.
+    async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+        let remaining = self.budget.get();
+        if remaining == 0 {
+            worker::console_log!(
+                "[proof] per-tick budget exhausted (skipping proof for {txid}; retried next tick)"
+            );
+            return None;
+        }
+        self.budget.set(remaining - 1);
+        self.fetch_verified_proof(txid).await
+    }
+
+    /// Re-verify a STORED bump against chaintracks (the header source is the
+    /// only arbiter of a merkle root). Used by proof completion to refuse
+    /// trusting an admit-time structural bump that was never SPV-verified or is
+    /// forged. Fail-closed via [`verify_bump`].
+    async fn verify_proof(&self, txid: &str, bump_hex: &str) -> bool {
+        verify_bump(self.tracker.as_deref(), bump_hex, txid).await
     }
 }
 
@@ -425,9 +486,11 @@ pub struct PotProofSummary {
 /// The engine's `complete_missing_proofs` only touches its OWN `transactions`
 /// table; `pot_beefs` (the `/beef` / `/recovery-view` recovery surface) is
 /// LOW-specific and needs this parallel pass. Per proofless candidate:
-/// fetch → chaintracks-verify (both inside [`ChainProofFetcher::fetch_ancestor`])
-/// → stitch the BUMP → `trim_known_proven` → [`PotStorage::compact_pot_beef`]
-/// (which BYPASSES the longer-wins guard AND re-checks the proof, fail-closed).
+/// PROOF-ONLY fetch → chaintracks-verify (both inside
+/// [`ChainProofFetcher::verified_proof_for`], reusing the raw already in the
+/// stored BEEF — no redundant raw fetch, #192/#193 FIX 2) → stitch the BUMP →
+/// `trim_known_proven` → [`PotStorage::compact_pot_beef`] (which BYPASSES the
+/// longer-wins guard AND re-checks the proof, fail-closed).
 ///
 /// FAIL-CLOSED throughout: a candidate the fetcher can't verify is skipped
 /// (retried next tick), never written proofless. Bounded by `limit`.
@@ -450,17 +513,12 @@ pub async fn complete_pot_beef_proofs(
     summary.scanned = candidates.len();
 
     for (txid, stored_beef) in candidates {
-        // fetch + chaintracks-verify (the fetcher returns a proof ONLY once its
-        // root is verified against our PoW-anchored header source).
-        let anc = match fetcher.fetch_ancestor(&txid).await {
-            Ok(a) => a,
-            Err(e) => {
-                worker::console_log!("[pot-proof] {txid} fetch failed (retry): {e}");
-                summary.fetch_failed += 1;
-                continue;
-            }
-        };
-        let Some(bump_hex) = anc.proof else {
+        // PROOF-ONLY fetch + chaintracks-verify (#192/#193 FIX 2): the raw is
+        // ALREADY in `stored_beef` (which `stitch_and_trim_pot_beef` reuses), so
+        // we never re-fetch it. The fetcher returns a bump ONLY once its root is
+        // verified against our PoW-anchored header source; unmined/unverifiable
+        // → `None` (retry next tick), fail-closed.
+        let Some(bump_hex) = fetcher.verified_proof_for(&txid).await else {
             summary.still_unconfirmed += 1;
             continue;
         };

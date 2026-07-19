@@ -30,8 +30,8 @@ impl CollectedTopicManager {
     }
 
     /// Validate a single output as a LOW collected marker: true IFF its
-    /// locking script is a well-formed `LOW/collected/v1` marker (exact tag
-    /// + exact push lengths). Everything else (P2PKH change, foreign
+    /// locking script is a well-formed `LOW/collected/v1` marker (exact tag +
+    /// exact push lengths). Everything else (P2PKH change, foreign
     /// OP_RETURNs, malformed tags) is simply not admitted.
     pub fn validate_collected_output(output: &bsv_rs::transaction::TransactionOutput) -> bool {
         is_collected_marker_script(&output.locking_script.to_binary())
