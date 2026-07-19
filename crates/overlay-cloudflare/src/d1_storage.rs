@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use async_trait::async_trait;
-use overlay_engine::storage::{Storage, StorageError};
+use overlay_engine::storage::{Storage, StorageError, TransactionBeef};
 use overlay_engine::types::{AppliedTransaction, Outpoint, Output};
 use serde::Deserialize;
 use worker::D1Database;
@@ -88,6 +88,14 @@ struct SyncStateRow {
     since: f64,
 }
 
+/// Row for proof-completion scanning: a stored transaction's txid + its BEEF
+/// read back as hex (`hex(beef) AS beef`, the same idiom as `OutputRow::beef`).
+#[derive(Deserialize)]
+struct TxBeefRow {
+    txid: String,
+    beef: Option<String>,
+}
+
 // =============================================================================
 // SQL fragments
 // =============================================================================
@@ -125,6 +133,24 @@ impl D1Storage {
         } else {
             format!("SELECT {OUTPUT_COLS} {FROM_OUTPUTS}")
         }
+    }
+
+    /// Parse a serialized BEEF and report whether it carries a merkle proof for
+    /// `txid` (the tx's OWN proof, not an ancestor's). Used to keep the
+    /// `transactions.has_proof` flag accurate on every BEEF write so the
+    /// proof-completion cron (#192/#193) can enumerate only proofless rows
+    /// (`WHERE has_proof = 0`) and thus reach the whole backlog without
+    /// re-parsing the entire table each tick. Unparseable BEEF → `false` (treat
+    /// as proofless so it stays in the candidate set, where the engine re-parses
+    /// + skips defensively).
+    fn beef_has_proof(txid: &str, beef: &[u8]) -> bool {
+        bsv_rs::transaction::Beef::from_binary(beef)
+            .ok()
+            .and_then(|b| {
+                b.find_txid(txid)
+                    .map(bsv_rs::transaction::BeefTx::has_proof)
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -171,12 +197,24 @@ impl Storage for D1Storage {
                 // un-hydrated. The `!beef.is_empty()` guard means we only ever
                 // write a real BEEF here, so REPLACE can never clobber a good
                 // row with an empty one.
-                Query::new("INSERT OR REPLACE INTO transactions (txid, beef) VALUES (?, ?)")
-                    .bind(&*output.txid)
-                    .bind(beef.as_slice())
-                    .execute(&self.db)
-                    .await
-                    .map_err(d1_err)?;
+                // ADMIT-TIME BEEFs are NEVER trusted-proven (#192/#193 FIX 3).
+                // `/submit` skips SPV on historical topics, so a submitted BEEF
+                // may carry a merkle bump that is unverified — or outright
+                // forged. A STRUCTURAL bump here is NOT a fact, and serve-time
+                // BEEF trimming trusts `has_proof`, so latching one at admit
+                // would let a forged bump be trimmed on. Force `has_proof = 0`
+                // ALWAYS: the VERIFYING cron pass (`complete_missing_proofs` →
+                // ChainProofFetcher → chaintracks verify → `mark_transaction_proven`,
+                // or a genuine bump re-verified before it flips the flag) is the
+                // SOLE thing that ever latches `has_proof = 1`.
+                Query::new(
+                    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?, ?, 0)",
+                )
+                .bind(&*output.txid)
+                .bind(beef.as_slice())
+                .execute(&self.db)
+                .await
+                .map_err(d1_err)?;
             }
         }
 
@@ -258,10 +296,36 @@ impl Storage for D1Storage {
     }
 
     async fn update_transaction_beef(&self, txid: &str, beef: &[u8]) -> Result<(), StorageError> {
+        // This is the proof-completion STITCH write-back — every caller
+        // (`handle_new_merkle_proof` via the `/arc-ingest` callback and the
+        // `complete_missing_proofs` cron) has ALREADY chaintracks-verified the
+        // bump before it reaches here, so the bump stitched into `beef` is a
+        // fact. It is therefore SAFE to latch has_proof from it (this is how a
+        // row legitimately flips proofless → proven). Contrast `insert_output`,
+        // which is the untrusted ADMIT path and always writes has_proof = 0.
+        let has_proof = i64::from(Self::beef_has_proof(txid, beef));
+
         // INSERT OR REPLACE — txid is PRIMARY KEY, so this upserts
-        Query::new("INSERT OR REPLACE INTO transactions (txid, beef) VALUES (?, ?)")
+        Query::new("INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?, ?, ?)")
             .bind(txid)
             .bind(beef)
+            .bind(has_proof)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
+        // Lightweight flag-flip — NO BEEF rewrite (#192/#193). The
+        // proof-completion cron calls this when a scanned candidate ALREADY
+        // carries a valid proof but its has_proof flag is still 0 (e.g. a row
+        // written before migration added the column, which defaulted every
+        // existing row to 0). Without this the row is returned by
+        // find_transactions_for_proof_check every tick and skipped, clogging the
+        // LIMIT-n candidate window. Idempotent: re-running on a proven row is a
+        // no-op.
+        Query::new("UPDATE transactions SET has_proof = 1 WHERE txid = ?")
+            .bind(txid)
             .execute(&self.db)
             .await
             .map_err(d1_err)
@@ -425,6 +489,39 @@ impl Storage for D1Storage {
                 .map_err(d1_err)?;
 
         Ok(row.map_or(0, |r| r.since as u64))
+    }
+
+    async fn find_transactions_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<TransactionBeef>, StorageError> {
+        // Return ONLY proofless rows (#192/#193). The has_proof flag is written
+        // on every BEEF write, so this is a direct, cheap, indexed scan that
+        // reaches the historical backlog — not just the newest N rows — and
+        // never re-fetches rows that are already proven. Existing rows from
+        // before the migration default to has_proof = 0, so the legacy backlog
+        // is naturally queued; as the cron completes proofs the matching rows
+        // flip to 1 and drop out.
+        //
+        // ORDER BY RANDOM(): the window is bounded, and a fixed (insertion)
+        // order lets never-mineable rows at the head starve the tail forever
+        // (zanaadu prod incident). Random sampling guarantees every proofless
+        // row is eventually visited regardless of backlog shape.
+        let sql = format!(
+            "SELECT txid, hex(beef) as beef FROM transactions \
+             WHERE has_proof = 0 ORDER BY RANDOM() LIMIT {limit}"
+        );
+        let rows: Vec<TxBeefRow> = Query::new(sql).fetch_all(&self.db).await.map_err(d1_err)?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                r.beef
+                    .and_then(|h| hex::decode(h).ok())
+                    .filter(|b| !b.is_empty())
+                    .map(|beef| TransactionBeef { txid: r.txid, beef })
+            })
+            .collect())
     }
 }
 

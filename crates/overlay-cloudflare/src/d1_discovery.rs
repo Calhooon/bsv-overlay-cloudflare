@@ -16,7 +16,9 @@ use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
 use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
-use overlay_discovery::pot::storage::{PotRecord, PotStorage, PotStorageError};
+use overlay_discovery::pot::storage::{
+    pot_beef_has_proof, PotRecord, PotStorage, PotStorageError,
+};
 use overlay_discovery::potparty::storage::{
     PotpartyRecord, PotpartyStorage, PotpartyStorageError,
 };
@@ -1229,6 +1231,14 @@ struct BeefHexRow {
     beef: Option<String>,
 }
 
+/// Row for the `pot_beefs` proof-completion candidate scan: the stored tx's
+/// own txid + its BEEF as hex (`hex(beef) AS beef`).
+#[derive(Deserialize)]
+struct PotBeefProofRow {
+    txid: String,
+    beef: Option<String>,
+}
+
 /// Decode a `hex(beef)` read-back (SQLite `hex()` emits UPPERCASE;
 /// `hex::decode` accepts either case). Empty/undecodable → `None` — an
 /// unusable row is never served as bytes.
@@ -1374,13 +1384,21 @@ impl PotStorage for D1PotStorage {
         // OR REPLACE + BLOB bind — the same idiom as the engine's
         // transactions upsert (`d1_storage.rs::insert_output`): the guard
         // above means we only ever replace with a strictly longer beef.
-        Query::new("INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt) VALUES (?, ?, ?)")
-            .bind(txid)
-            .bind(beef)
-            .bind(current_unix_seconds_i64())
-            .execute(&self.db)
-            .await
-            .map_err(pot_err)
+        // has_proof (#192/#193) records whether this beef already carries a
+        // BUMP for its own txid, so the completion cron enumerates only
+        // proofless rows.
+        let has_proof = i64::from(pot_beef_has_proof(txid, beef));
+        Query::new(
+            "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(txid)
+        .bind(beef)
+        .bind(current_unix_seconds_i64())
+        .bind(has_proof)
+        .execute(&self.db)
+        .await
+        .map_err(pot_err)
     }
 
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
@@ -1391,6 +1409,47 @@ impl PotStorage for D1PotStorage {
                 .await
                 .map_err(pot_err)?;
         Ok(row.and_then(|r| decode_pot_beef_hex(r.beef)))
+    }
+
+    async fn find_pot_beefs_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        // ONLY proofless rows (#192/#193), RANDOM-sampled so a never-mineable
+        // head cannot starve the tail (zanaadu prod incident). Reaches the whole
+        // historical backlog (rows written before the has_proof column default
+        // to 0). Bytes are read back as hex (the pot_beefs idiom).
+        let sql = format!(
+            "SELECT txid, hex(beef) AS beef FROM pot_beefs \
+             WHERE has_proof = 0 ORDER BY RANDOM() LIMIT {limit}"
+        );
+        let rows: Vec<PotBeefProofRow> =
+            Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| decode_pot_beef_hex(r.beef).map(|beef| (r.txid, beef)))
+            .collect())
+    }
+
+    async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
+        // Fail-closed: overwrite ONLY when the new beef actually proves txid
+        // (its own BUMP present ⇒ self-contained). This BYPASSES the longer-wins
+        // `beef_write_allowed` guard — a bumped BEEF is authoritative even when
+        // SHORTER (its proven ancestry has been trimmed away). has_proof is
+        // latched to 1 so the row drops out of the completion candidate set.
+        if !pot_beef_has_proof(txid, new_beef) {
+            return Ok(());
+        }
+        Query::new(
+            "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof) \
+             VALUES (?, ?, ?, 1)",
+        )
+        .bind(txid)
+        .bind(new_beef)
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(pot_err)
     }
 }
 

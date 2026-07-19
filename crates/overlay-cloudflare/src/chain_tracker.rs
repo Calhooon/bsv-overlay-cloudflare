@@ -198,34 +198,6 @@ fn root_matches_frame(header: Option<&CtBlockHeader>, root: &str) -> Result<bool
     }
 }
 
-#[cfg(test)]
-mod root_frame_tests {
-    use super::{root_matches_frame, CtBlockHeader};
-
-    fn header(merkle_root: &str) -> CtBlockHeader {
-        CtBlockHeader {
-            merkle_root: merkle_root.to_string(),
-        }
-    }
-
-    #[test]
-    fn matching_root_is_valid() {
-        assert_eq!(root_matches_frame(Some(&header("abc")), "abc"), Ok(true));
-    }
-
-    #[test]
-    fn differing_root_is_invalid() {
-        assert_eq!(root_matches_frame(Some(&header("abc")), "def"), Ok(false));
-    }
-
-    #[test]
-    fn absent_header_fails_safe_to_invalid_not_open() {
-        // The security fix: a success+null body is UNVERIFIABLE → false, never
-        // a fail-open true that would confirm an arbitrary root.
-        assert_eq!(root_matches_frame(None, "anything"), Ok(false));
-    }
-}
-
 /// Fetch the current chain height from ChainTracks.
 async fn fetch_current_height(
     base_url: String,
@@ -298,5 +270,33 @@ impl ChainTracker for WorkerChainTracker {
         Box::pin(UnsafeSendFuture(async move {
             fetch_current_height(base_url, service).await
         }))
+    }
+}
+
+#[cfg(test)]
+mod root_frame_tests {
+    use super::{root_matches_frame, CtBlockHeader};
+
+    fn header(merkle_root: &str) -> CtBlockHeader {
+        CtBlockHeader {
+            merkle_root: merkle_root.to_string(),
+        }
+    }
+
+    #[test]
+    fn matching_root_is_valid() {
+        assert_eq!(root_matches_frame(Some(&header("abc")), "abc"), Ok(true));
+    }
+
+    #[test]
+    fn differing_root_is_invalid() {
+        assert_eq!(root_matches_frame(Some(&header("abc")), "def"), Ok(false));
+    }
+
+    #[test]
+    fn absent_header_fails_safe_to_invalid_not_open() {
+        // The security fix: a success+null body is UNVERIFIABLE → false, never
+        // a fail-open true that would confirm an arbitrary root.
+        assert_eq!(root_matches_frame(None, "anything"), Ok(false));
     }
 }

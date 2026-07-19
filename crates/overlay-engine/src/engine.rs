@@ -1334,41 +1334,49 @@ impl Engine {
                 },
             };
 
-            // Already proven? The stored BEEF proves the target tx, but its
-            // backend `has_proof` flag may still be 0 (e.g. a GASP-synced proof
-            // written before overlay migration 0010, which defaulted every
-            // existing row to 0). Such rows are returned by
-            // `find_transactions_for_proof_check` every tick and would clog the
-            // bounded candidate window forever, starving genuinely-proofless
-            // rows behind them. Flip the flag (no BEEF rewrite) so the row drops
-            // out of the next pass. Idempotent + best-effort: a failure here is
-            // logged, not fatal — the row simply lingers one more tick.
+            // Already structurally proven? The stored BEEF carries a merkle bump
+            // for the target tx, but its backend `has_proof` flag may still be 0
+            // — EITHER a legitimate GASP-synced proof written before overlay
+            // migration 0010 (which defaulted every existing row to 0), OR an
+            // admit-time bump that was NEVER SPV-verified (`/submit` skips SPV on
+            // historical topics) or is outright forged. Serve-time BEEF trimming
+            // trusts the `has_proof` flag, so latching one on STRUCTURE ALONE
+            // would let a forged bump be trimmed on (#192/#193 MEDIUM). Re-verify
+            // the STORED bump against chaintracks (via the fetcher — its header
+            // source is the only arbiter of a merkle root). Genuine → latch
+            // (fast, no re-fetch). Otherwise DON'T trust it: fall through to the
+            // fetch+stitch path below, which overwrites the bump with a
+            // chaintracks-verified one (or leaves the row proofless for retry).
+            // Fail-closed throughout.
             if beef
                 .find_txid(&cand.txid)
                 .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
             {
-                if let Err(e) = self.storage.mark_transaction_proven(&cand.txid).await {
-                    warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] failed to mark already-proven row");
-                } else {
-                    summary.already_proven += 1;
+                let stored_bump = beef
+                    .find_bump(&cand.txid)
+                    .map(bsv_rs::transaction::MerklePath::to_hex);
+                if let Some(bump_hex) = stored_bump {
+                    if fetcher.verify_proof(&cand.txid, &bump_hex).await {
+                        // Idempotent + best-effort: a failure here is logged, not
+                        // fatal — the row simply lingers one more tick.
+                        if let Err(e) = self.storage.mark_transaction_proven(&cand.txid).await {
+                            warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] failed to mark verified-proven row");
+                        } else {
+                            summary.already_proven += 1;
+                        }
+                        continue;
+                    }
+                    warn!(txid = %cand.txid, "[PROOF COMPLETION] stored structural bump FAILED chaintracks re-verify — not trusting it, refetching");
                 }
-                continue;
+                // Unverifiable structural bump → treat as proofless (fall through).
             }
             summary.proofless += 1;
 
-            // Fetch this tx's own BUMP from chain. A tx with no proof yet (still
-            // unconfirmed) is skipped, not errored.
-            let chain_anc = match fetcher.fetch_ancestor(&cand.txid).await {
-                Ok(f) => f,
-                Err(e) => {
-                    info!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] fetch failed, will retry next tick");
-                    summary.fetch_failed += 1;
-                    continue;
-                },
-            };
-
-            let Some(proof_hex) = chain_anc.proof else {
-                // No BUMP yet — the tx is fetchable but unmined. Retry later.
+            // Fetch this tx's own VERIFIED bump from chain — PROOF ONLY (the raw
+            // is already in the stored BEEF, so no redundant raw fetch; #192/#193
+            // FIX 2). A tx with no verified proof yet (still unconfirmed, or an
+            // unverifiable/forged courier response) is skipped, not errored.
+            let Some(proof_hex) = fetcher.verified_proof_for(&cand.txid).await else {
                 summary.still_unconfirmed += 1;
                 continue;
             };
@@ -4051,6 +4059,15 @@ mod tests {
                 raw_tx: PROOFLESS_RAW_TX.to_string(),
                 proof: self.proof.clone(),
             })
+        }
+
+        /// Models a fetcher whose header source CONFIRMS a stored bump — so the
+        /// already-structurally-proven re-verify gate (the window-clog path)
+        /// latches without a re-fetch, exactly as before the #192/#193 hardening.
+        /// (`verified_proof_for` is left at its default: it delegates to
+        /// `fetch_ancestor` above, so the `calls` counter still tracks fetches.)
+        async fn verify_proof(&self, _txid: &str, _bump_hex: &str) -> bool {
+            true
         }
     }
 

@@ -30,8 +30,8 @@ impl ProofTopicManager {
     }
 
     /// Validate a single output as a LOW proof marker: true IFF its
-    /// locking script is a well-formed `LOW/proof/v1` marker (exact tag
-    /// + exact push lengths + bundle length in range). Everything else
+    /// locking script is a well-formed `LOW/proof/v1` marker (exact tag +
+    /// exact push lengths + bundle length in range). Everything else
     /// (P2PKH change, foreign OP_RETURNs, malformed tags) is simply not
     /// admitted.
     pub fn validate_proof_output(output: &bsv_rs::transaction::TransactionOutput) -> bool {

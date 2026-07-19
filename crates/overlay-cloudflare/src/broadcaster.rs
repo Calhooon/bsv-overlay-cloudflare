@@ -233,6 +233,349 @@ impl ArcBroadcaster for WorkerArcBroadcaster {
     }
 }
 
+// ============================================================================
+// Arcade V2 broadcaster — the overlay's SOLE network broadcaster (#192/#193)
+// ============================================================================
+//
+// Owner decision (2026-07-19): the overlay broadcasts through Arcade V2
+// (`arcade-v2-us-1.bsvblockchain.tech`), not TAAL ARC, because an Arcade submit
+// propagates to the whole mainnet AND Arcade delivers the merkle proof for free
+// in its MINED callback. Arcade is EF-only (`Arcade never reads BEEF`) and
+// asynchronous: `POST /tx` (single) / `POST /txs` (batch) returns 202, and the
+// verdict lands later. We gate admission on `SEEN_ON_NETWORK` by polling
+// `GET /tx/{txid}` (bounded), and register `X-CallbackUrl` (→ our /arc-ingest),
+// `X-CallbackToken`, `X-FullStatusUpdates:true` so a later MINED status pushes
+// the free merkle path back for proof completion (the PRIMARY proof source).
+//
+// Ported/adapted from `~/bsv/btc-relay-rs/src/broadcast.rs` (arcade_broadcast /
+// arcade_tx_status) + `~/bsv/zanaadu/overlay/src/broadcaster.rs`
+// (ArcadeBroadcaster). This uses bounded POLLING (worker setTimeout) rather
+// than an SSE stream so it stays wasm-clean with no extra deps.
+
+use crate::ef::{beef_to_ef_batch, EfTx};
+
+/// Default live Arcade V2 mainnet endpoint (overridable via `ARCADE_URL`).
+pub const ARCADE_DEFAULT_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech";
+
+/// Gate admission on this status (or better). `SEEN_ON_NETWORK` lands ~3s after
+/// submit and is reliable; `SEEN_MULTIPLE_NODES` is erratic so we do NOT gate on
+/// it (btc-relay-rs arcade-v2-integration.md §4).
+const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
+
+/// Arcade statuses that are hard rejects — never wait these out, never admit.
+const ARCADE_FATAL_STATUSES: &[&str] = &["REJECTED", "DOUBLE_SPEND_ATTEMPTED"];
+
+/// Give up waiting for propagation after this long — the tx was submitted but
+/// never became demonstrably SEEN, so the caller must NOT admit it (fail-closed).
+const ARCADE_WAIT_TIMEOUT_MS: u64 = 20_000;
+
+/// Poll `GET /tx/{txid}` at this cadence while gating.
+const ARCADE_POLL_INTERVAL_MS: u64 = 2_000;
+
+/// Rank Arcade lifecycle statuses so "target or better" comparisons work.
+/// Unknown statuses rank lowest (0).
+fn arcade_status_rank(status: &str) -> u8 {
+    match status {
+        "RECEIVED" => 1,
+        "STORED" => 2,
+        "ANNOUNCED_TO_NETWORK" => 3,
+        "REQUESTED_BY_NETWORK" => 4,
+        "SENT_TO_NETWORK" => 5,
+        "ACCEPTED_BY_NETWORK" => 6,
+        "SEEN_ON_NETWORK" => 7,
+        "SEEN_MULTIPLE_NODES" => 8,
+        "MINED" => 9,
+        "IMMUTABLE" => 10,
+        _ => 0,
+    }
+}
+
+/// Classify one Arcade status against the gate target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateVerdict {
+    /// Reached the target status (or better) → safe to admit.
+    Reached,
+    /// A fatal status (REJECTED / DOUBLE_SPEND_ATTEMPTED) → never admit.
+    Fatal,
+    /// A non-terminal status below the target → keep waiting.
+    Pending,
+}
+
+fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
+    if ARCADE_FATAL_STATUSES.contains(&status) {
+        return GateVerdict::Fatal;
+    }
+    if arcade_status_rank(target) > 0 && arcade_status_rank(status) >= arcade_status_rank(target) {
+        return GateVerdict::Reached;
+    }
+    GateVerdict::Pending
+}
+
+/// Async sleep via JS `setTimeout` (Cloudflare Workers runtime). Compiles on the
+/// host for unit tests (js-sys is a normal crate); only exercised at runtime on
+/// wasm — the pure classification tests never call it.
+async fn sleep_ms(ms: u64) {
+    use worker::js_sys;
+    use worker::wasm_bindgen::prelude::*;
+    use worker::wasm_bindgen::JsCast;
+    use worker::wasm_bindgen_futures::JsFuture;
+
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let global = js_sys::global();
+        let _ = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout")).and_then(
+            |set_timeout| {
+                let set_timeout = set_timeout.dyn_into::<js_sys::Function>()?;
+                set_timeout.call2(&JsValue::NULL, &resolve, &JsValue::from_f64(ms as f64))
+            },
+        );
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// Arcade `GET /tx/{txid}` / `POST /tx` JSON envelope (single submit).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArcadeStatusResponse {
+    #[serde(default)]
+    txid: String,
+    #[serde(default)]
+    tx_status: String,
+}
+
+/// Arcade V2 broadcaster (async EF, SEEN-gated, callback-registering).
+///
+/// Not an `ArcBroadcaster` by construction — the primary path takes the full
+/// BEEF's Extended-Format legs (`broadcast_efs_gated`) and gates D1 admission
+/// on the returned `ArcOutcome`. It ALSO implements `ArcBroadcaster` (best-effort
+/// single-tx submit) so it can occupy the engine's generic-broadcast slot.
+pub struct ArcadeBroadcaster {
+    /// Base URL, e.g. `https://arcade-v2-us-1.bsvblockchain.tech` (no trailing `/tx`).
+    base_url: String,
+    /// `X-CallbackUrl` for the MINED webhook (our `/arc-ingest`). `None` → no
+    /// callback registered (SEEN is still gated by polling).
+    callback_url: Option<String>,
+}
+
+impl ArcadeBroadcaster {
+    /// Create a broadcaster against `base_url` (default endpoint if empty).
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        let base_url = if base_url.trim().is_empty() {
+            ARCADE_DEFAULT_URL.to_string()
+        } else {
+            base_url.trim_end_matches('/').to_string()
+        };
+        Self {
+            base_url,
+            callback_url: None,
+        }
+    }
+
+    /// Register the MINED webhook (`X-CallbackUrl`), typically
+    /// `{HOSTING_URL}/arc-ingest`. Empty → no-op.
+    #[must_use]
+    pub fn with_callback(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        if !url.trim().is_empty() {
+            self.callback_url = Some(url);
+        }
+        self
+    }
+
+    fn tx_endpoint(&self) -> String {
+        format!("{}/tx", self.base_url)
+    }
+    fn txs_endpoint(&self) -> String {
+        format!("{}/txs", self.base_url)
+    }
+    fn status_endpoint(&self, txid: &str) -> String {
+        format!("{}/tx/{}", self.base_url, txid)
+    }
+
+    /// Convert a BEEF hex to its unproven EF legs and gate on SEEN. Convenience
+    /// wrapper over [`broadcast_efs_gated`](Self::broadcast_efs_gated).
+    pub async fn broadcast_beef_gated(&self, beef_hex: &str) -> Result<ArcOutcome, String> {
+        let beef_bytes = hex::decode(beef_hex.trim()).map_err(|e| format!("BEEF hex: {e}"))?;
+        let (efs, subject_txid) =
+            beef_to_ef_batch(&beef_bytes).map_err(|e| format!("EF conversion: {e}"))?;
+        self.broadcast_efs_gated(&efs, &subject_txid).await
+    }
+
+    /// Submit `efs` (unproven Extended-Format legs, dependency order) to Arcade
+    /// and gate on the SUBJECT reaching `SEEN_ON_NETWORK`.
+    ///
+    /// Mirrors [`broadcast_tx_hex_gated`]'s `Result<ArcOutcome, String>`
+    /// contract so the broadcast-gated route is a drop-in swap:
+    /// - `Ok(Accepted(txid))` — the network took the subject (admit may proceed);
+    /// - `Ok(Rejected(reason))` — Arcade definitively refused it (admit nothing);
+    /// - `Err(transport)` — submit/gate transport trouble or never-SEEN timeout
+    ///   (fail-closed: the caller falls back to its own direct broadcast).
+    ///
+    /// An empty `efs` (every tx already mined) is `Ok(Accepted(subject))` — a
+    /// no-op success, mirroring the engine's skip-broadcast-when-mined path.
+    pub async fn broadcast_efs_gated(
+        &self,
+        efs: &[EfTx],
+        subject_txid: &str,
+    ) -> Result<ArcOutcome, String> {
+        if efs.is_empty() {
+            worker::console_log!("[arcade] {subject_txid} already mined — skipping broadcast");
+            return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+        }
+
+        let (endpoint, body): (String, Vec<u8>) = if efs.len() == 1 {
+            (self.tx_endpoint(), efs[0].ef.clone())
+        } else {
+            let mut concat = Vec::with_capacity(efs.iter().map(|e| e.ef.len()).sum());
+            for e in efs {
+                concat.extend_from_slice(&e.ef);
+            }
+            (self.txs_endpoint(), concat)
+        };
+
+        let submit_body = self.post_ef(&endpoint, subject_txid, &body).await?;
+
+        // A single submit echoes the current status; a resubmit of a known tx
+        // can come back already SEEN/MINED, satisfying the gate without a poll.
+        if efs.len() == 1 {
+            if let Ok(parsed) = serde_json::from_str::<ArcadeStatusResponse>(&submit_body) {
+                if !parsed.txid.is_empty() && parsed.txid != subject_txid {
+                    // Never gate/admit under a mismatched identity.
+                    return Err(format!(
+                        "Arcade txid {} != local subject txid {subject_txid}",
+                        parsed.txid
+                    ));
+                }
+                match classify_arcade_status(&parsed.tx_status, ARCADE_GATE_STATUS) {
+                    GateVerdict::Reached => {
+                        worker::console_log!(
+                            "[arcade] {subject_txid} accepted at {} (no poll needed)",
+                            parsed.tx_status
+                        );
+                        return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+                    }
+                    GateVerdict::Fatal => {
+                        return Ok(ArcOutcome::Rejected(format!(
+                            "Arcade {} {subject_txid}",
+                            parsed.tx_status
+                        )));
+                    }
+                    GateVerdict::Pending => {}
+                }
+            }
+        }
+
+        worker::console_log!(
+            "[arcade] submitted {} EF leg(s) → gating {subject_txid} on {ARCADE_GATE_STATUS}",
+            efs.len()
+        );
+        self.poll_for_status(subject_txid).await
+    }
+
+    /// POST the EF body to `endpoint`, registering the callback headers.
+    /// Returns the response body on 2xx; any non-2xx is TRANSPORT trouble
+    /// (`Err`) — Arcade returns 202 for a valid-script submit and reports
+    /// REJECTED asynchronously, so an HTTP failure is never a per-tx verdict.
+    async fn post_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> Result<String, String> {
+        use worker::js_sys::Uint8Array;
+
+        let headers = worker::Headers::new();
+        let _ = headers.set("Content-Type", "application/octet-stream");
+        // Subject txid doubles as the callback token — scopes the status stream
+        // and (P2.5) authenticates the MINED webhook to /arc-ingest.
+        let _ = headers.set("X-CallbackToken", token);
+        // REQUIRED to receive the non-terminal SEEN_ON_NETWORK.
+        let _ = headers.set("X-FullStatusUpdates", "true");
+        if let Some(ref cb) = self.callback_url {
+            let _ = headers.set("X-CallbackUrl", cb);
+        }
+
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Post);
+        init.with_headers(headers);
+        init.with_body(Some(Uint8Array::from(body).into()));
+
+        let request = worker::Request::new_with_init(endpoint, &init)
+            .map_err(|e| format!("Failed to create Arcade request: {e}"))?;
+        let mut response = worker::Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|e| format!("Arcade fetch {endpoint} failed: {e}"))?;
+
+        let status = response.status_code();
+        let text = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(format!("Arcade submit HTTP {status}: {text}"));
+        }
+        Ok(text)
+    }
+
+    /// Poll `GET /tx/{txid}` until the subject reaches the gate (or better),
+    /// hits a fatal status, or the deadline elapses. Timeout → `Err` (never
+    /// admit a tx that never became SEEN).
+    async fn poll_for_status(&self, txid: &str) -> Result<ArcOutcome, String> {
+        let mut waited = 0u64;
+        loop {
+            if let Some(status) = self.tx_status(txid).await {
+                match classify_arcade_status(&status, ARCADE_GATE_STATUS) {
+                    GateVerdict::Reached => {
+                        worker::console_log!("[arcade] {txid} reached {status}");
+                        return Ok(ArcOutcome::Accepted(txid.to_string()));
+                    }
+                    GateVerdict::Fatal => {
+                        return Ok(ArcOutcome::Rejected(format!("Arcade {status} {txid}")));
+                    }
+                    GateVerdict::Pending => {}
+                }
+            }
+            if waited >= ARCADE_WAIT_TIMEOUT_MS {
+                return Err(format!(
+                    "Arcade {txid} never reached {ARCADE_GATE_STATUS} within {}s — do not admit",
+                    ARCADE_WAIT_TIMEOUT_MS / 1000
+                ));
+            }
+            sleep_ms(ARCADE_POLL_INTERVAL_MS).await;
+            waited += ARCADE_POLL_INTERVAL_MS;
+        }
+    }
+
+    /// `GET /tx/{txid}` → `Some(txStatus)` if Arcade knows the txid, else `None`.
+    async fn tx_status(&self, txid: &str) -> Option<String> {
+        let url = self.status_endpoint(txid);
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Get);
+        let request = worker::Request::new_with_init(&url, &init).ok()?;
+        let mut response = worker::Fetch::Request(request).send().await.ok()?;
+        if !(200..300).contains(&response.status_code()) {
+            return None;
+        }
+        let text = response.text().await.ok()?;
+        let parsed: ArcadeStatusResponse = serde_json::from_str(&text).ok()?;
+        if parsed.tx_status.is_empty() {
+            None
+        } else {
+            Some(parsed.tx_status)
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl ArcBroadcaster for ArcadeBroadcaster {
+    /// Engine generic-broadcast slot (non-money `CurrentTx` submits). Arcade is
+    /// EF-only, so a bare raw tx is submitted best-effort and this returns the
+    /// content-addressed txid on a 2xx accept-for-processing; the engine treats
+    /// any error here as non-fatal. The money path uses `broadcast_efs_gated`.
+    async fn broadcast(&self, raw_tx_hex: &str) -> Result<String, String> {
+        let bytes = hex::decode(raw_tx_hex.trim()).map_err(|e| format!("raw tx hex: {e}"))?;
+        let txid = bsv_rs::transaction::Transaction::from_hex(raw_tx_hex.trim())
+            .map_err(|e| format!("parse raw tx: {e}"))?
+            .id();
+        // 2xx accept-for-processing is success for the engine's non-fatal path.
+        let _ = self.post_ef(&self.tx_endpoint(), &txid, &bytes).await?;
+        Ok(txid)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, reason = "test code")]
 mod tests {
@@ -322,5 +665,98 @@ mod tests {
     #[test]
     fn verdict_unparseable_2xx_body_is_transport_trouble() {
         assert!(arc_verdict(200, "<html>gateway junk</html>").is_err());
+    }
+
+    // ── Arcade V2 broadcaster ────────────────────────────────────────────────
+
+    #[test]
+    fn arcade_status_rank_is_monotonic() {
+        let ladder = [
+            "RECEIVED",
+            "STORED",
+            "ANNOUNCED_TO_NETWORK",
+            "REQUESTED_BY_NETWORK",
+            "SENT_TO_NETWORK",
+            "ACCEPTED_BY_NETWORK",
+            "SEEN_ON_NETWORK",
+            "SEEN_MULTIPLE_NODES",
+            "MINED",
+            "IMMUTABLE",
+        ];
+        for pair in ladder.windows(2) {
+            assert!(
+                arcade_status_rank(pair[0]) < arcade_status_rank(pair[1]),
+                "{} should rank below {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(arcade_status_rank("WAT"), 0, "unknown ranks lowest");
+    }
+
+    #[test]
+    fn arcade_classify_gates_on_seen_and_above() {
+        assert_eq!(
+            classify_arcade_status("ACCEPTED_BY_NETWORK", ARCADE_GATE_STATUS),
+            GateVerdict::Pending
+        );
+        assert_eq!(
+            classify_arcade_status("SEEN_ON_NETWORK", ARCADE_GATE_STATUS),
+            GateVerdict::Reached
+        );
+        assert_eq!(
+            classify_arcade_status("MINED", ARCADE_GATE_STATUS),
+            GateVerdict::Reached
+        );
+    }
+
+    #[test]
+    fn arcade_classify_rejects_and_double_spend_are_fatal() {
+        assert_eq!(
+            classify_arcade_status("REJECTED", ARCADE_GATE_STATUS),
+            GateVerdict::Fatal
+        );
+        assert_eq!(
+            classify_arcade_status("DOUBLE_SPEND_ATTEMPTED", ARCADE_GATE_STATUS),
+            GateVerdict::Fatal
+        );
+    }
+
+    #[test]
+    fn arcade_new_normalizes_url_and_defaults_when_empty() {
+        assert_eq!(
+            ArcadeBroadcaster::new("https://host.example/").tx_endpoint(),
+            "https://host.example/tx"
+        );
+        assert_eq!(
+            ArcadeBroadcaster::new("").tx_endpoint(),
+            format!("{ARCADE_DEFAULT_URL}/tx")
+        );
+        let b = ArcadeBroadcaster::new("https://h.example");
+        assert_eq!(b.txs_endpoint(), "https://h.example/txs");
+        assert_eq!(b.status_endpoint("deadbeef"), "https://h.example/tx/deadbeef");
+    }
+
+    #[test]
+    fn arcade_with_callback_ignores_empty() {
+        let b = ArcadeBroadcaster::new("https://h.example").with_callback("");
+        assert!(b.callback_url.is_none());
+        let b = ArcadeBroadcaster::new("https://h.example")
+            .with_callback("https://h.example/arc-ingest");
+        assert_eq!(
+            b.callback_url.as_deref(),
+            Some("https://h.example/arc-ingest")
+        );
+    }
+
+    #[test]
+    fn arcade_submit_response_parses_received_below_gate() {
+        let json = r#"{"txid":"abc123","status":202,"txStatus":"RECEIVED"}"#;
+        let parsed: ArcadeStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.txid, "abc123");
+        assert_eq!(
+            classify_arcade_status(&parsed.tx_status, ARCADE_GATE_STATUS),
+            GateVerdict::Pending
+        );
     }
 }

@@ -203,7 +203,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
                 l
             }
             0x4d => {
-                if i.checked_add(2).map_or(true, |e| e > bytes.len()) {
+                if i.checked_add(2).is_none_or(|e| e > bytes.len()) {
                     return out;
                 }
                 let l = bytes[i] as usize | ((bytes[i + 1] as usize) << 8);
@@ -211,7 +211,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
                 l
             }
             0x4e => {
-                if i.checked_add(4).map_or(true, |e| e > bytes.len()) {
+                if i.checked_add(4).is_none_or(|e| e > bytes.len()) {
                     return out;
                 }
                 let l = (bytes[i] as usize)

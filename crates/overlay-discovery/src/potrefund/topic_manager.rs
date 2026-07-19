@@ -28,8 +28,8 @@ impl PotrefundTopicManager {
     }
 
     /// Validate a single output as a LOW potrefund marker: true IFF its
-    /// locking script is a well-formed `LOW/potrefund/v1` marker (exact tag
-    /// + exact fixed-field lengths + a non-empty, capped refund + a
+    /// locking script is a well-formed `LOW/potrefund/v1` marker (exact tag +
+    /// exact fixed-field lengths + a non-empty, capped refund + a
     /// DER-ranged sig). Everything else (P2PKH change, foreign OP_RETURNs,
     /// malformed tags) is simply not admitted.
     pub fn validate_potrefund_output(output: &bsv_rs::transaction::TransactionOutput) -> bool {

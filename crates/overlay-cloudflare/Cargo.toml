@@ -29,3 +29,6 @@ thiserror.workspace = true
 tracing.workspace = true
 worker = { version = "0.7", features = ["d1", "queue"] }
 js-sys = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -143,6 +143,50 @@ pub trait PotStorage {
 
     /// The stored BEEF for `txid`, or `None` if we never stored one.
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError>;
+
+    /// Return a bounded page of PROOFLESS stored pot BEEFs (`(txid, beef)`) for
+    /// the proof-completion cron (#192/#193). A row is "proofless" when its
+    /// stored BEEF does NOT yet carry a chaintracks-verified merkle BUMP for its
+    /// OWN txid.
+    ///
+    /// Backends that track a `has_proof` flag answer with
+    /// `WHERE has_proof = 0 ORDER BY RANDOM() LIMIT n` (RANDOM defeats
+    /// head-of-queue starvation — a never-mineable head must not starve the
+    /// tail). Backends that can't enumerate (or have nothing to complete) may
+    /// return an empty `Vec` via this default → proof completion is a no-op.
+    async fn find_pot_beefs_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
+    /// Overwrite the stored BEEF for `txid` with a PROOF-BEARING `new_beef`,
+    /// BYPASSING the longer-wins guard of [`store_beef`](Self::store_beef) — a
+    /// bumped BEEF is authoritative even when SHORTER (its proven ancestry has
+    /// been trimmed). The write happens ONLY when `new_beef` actually proves
+    /// `txid` (its own BUMP is present, which also guarantees self-containment —
+    /// `find_txid(txid)` is `Some`); otherwise it is a NO-OP (fail-closed).
+    /// Backends that don't compact may use this no-op default.
+    async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
+        let _ = (txid, new_beef);
+        Ok(())
+    }
+}
+
+/// Whether `beef` carries a merkle proof for `txid`'s OWN tx (not an
+/// ancestor's). Unparseable/absent → `false` (treated as proofless / a compact
+/// no-op — fail-closed). Shared by the in-memory and D1 pot stores so the
+/// candidate query and the compaction write agree on "proven".
+pub fn pot_beef_has_proof(txid: &str, beef: &[u8]) -> bool {
+    bsv_rs::transaction::Beef::from_binary(beef)
+        .ok()
+        .and_then(|b| {
+            b.find_txid(txid)
+                .map(bsv_rs::transaction::BeefTx::has_proof)
+        })
+        .unwrap_or(false)
 }
 
 /// POT storage errors.
@@ -256,6 +300,37 @@ impl PotStorage for MemoryPotStorage {
 
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
         Ok(self.beefs.lock().unwrap().get(txid).cloned())
+    }
+
+    async fn find_pot_beefs_for_proof_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        // Model the D1 `WHERE has_proof = 0` candidate set by re-deriving the
+        // flag from the stored bytes (the memory store keeps no flag column).
+        Ok(self
+            .beefs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(txid, beef)| !pot_beef_has_proof(txid, beef))
+            .take(limit as usize)
+            .map(|(txid, beef)| (txid.clone(), beef.clone()))
+            .collect())
+    }
+
+    async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
+        // Fail-closed: overwrite ONLY when the new beef actually proves txid
+        // (its own BUMP is present ⇒ self-contained). BYPASS the longer-wins
+        // guard — a bumped BEEF wins even when shorter.
+        if !pot_beef_has_proof(txid, new_beef) {
+            return Ok(());
+        }
+        self.beefs
+            .lock()
+            .unwrap()
+            .insert(txid.to_string(), new_beef.to_vec());
+        Ok(())
     }
 }
 
@@ -529,6 +604,109 @@ mod tests {
         }))
         .unwrap();
         assert!(!r.spent_confirmed);
+    }
+
+    // ── compact_pot_beef (#192/#193 FIX 5) ───────────────────────────────
+
+    /// Two distinct valid mainnet raw txs, used to build real BEEF fixtures.
+    const RAW_A: &str = "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000";
+    const RAW_B: &str = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2803dc7e0e0499170e6a0003cf341b017e0000152f476f72696c6c61506f6f6c2e696f20f09fa68d2f0000000003000000000000000032006a0547504f4f4c08dc7e0e0000000000200158a2360a03939451e72c3a9302f5d48712bf54a5b2edf8f3c69aed35a668e312236000000000001976a914068a58835bb93b152c901ffb18f6578824f9d5b788ac6eb66612000000001976a91402fd5a91155231d5799e2d22c490d1664cde62cb88ac00000000";
+
+    /// A PROOFLESS BEEF carrying `raw` (+ optional filler ancestor to make it
+    /// longer than a trimmed proven BEEF). Returns `(beef_bytes, subject_txid)`.
+    fn proofless_beef_with_filler(raw: &str, filler: Option<&str>) -> (Vec<u8>, String) {
+        use bsv_rs::transaction::{Beef, Transaction};
+        let tx = Transaction::from_hex(raw).unwrap();
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        if let Some(f) = filler {
+            beef.merge_transaction(Transaction::from_hex(f).unwrap());
+        }
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    /// A PROVEN (single-leaf bump), trimmed BEEF for `raw`. Returns
+    /// `(beef_bytes, subject_txid)`. `pot_beef_has_proof(txid, beef)` is `true`.
+    fn proven_beef(raw: &str) -> (Vec<u8>, String) {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf, Transaction};
+        let mut tx = Transaction::from_hex(raw).unwrap();
+        let txid = tx.id();
+        let bump = MerklePath::new(800_000, vec![vec![MerklePathLeaf::new_txid(0, txid.clone())]])
+            .expect("valid single-leaf merkle path");
+        tx.merkle_path = Some(bump);
+        (tx.to_beef(true).unwrap(), txid)
+    }
+
+    #[tokio::test]
+    async fn compact_pot_beef_shorter_proven_overwrites_longer_proofless() {
+        // Model real compaction: a proofless-with-ancestry BEEF is stored, then
+        // the trimmed PROVEN BEEF (which is SHORTER) must overwrite it —
+        // bypassing the longer-wins guard that a plain store_beef enforces.
+        let store = MemoryPotStorage::new();
+        let (proofless_long, txid) = proofless_beef_with_filler(RAW_A, Some(RAW_B));
+        let (proven_short, txid2) = proven_beef(RAW_A);
+        assert_eq!(txid, txid2, "same subject tx");
+        assert!(!pot_beef_has_proof(&txid, &proofless_long), "fixture is proofless");
+        assert!(pot_beef_has_proof(&txid, &proven_short), "fixture is proven");
+        assert!(
+            proven_short.len() < proofless_long.len(),
+            "the proven+trimmed BEEF must be shorter to exercise the bypass"
+        );
+
+        store.store_beef(&txid, &proofless_long).await.unwrap();
+
+        // A plain store_beef of the shorter proven is REJECTED (longer-wins).
+        store.store_beef(&txid, &proven_short).await.unwrap();
+        assert_eq!(
+            store.get_beef(&txid).await.unwrap().as_deref(),
+            Some(proofless_long.as_slice()),
+            "longer-wins blocks a plain shorter write"
+        );
+
+        // compact_pot_beef BYPASSES longer-wins → the shorter proven overwrites.
+        store.compact_pot_beef(&txid, &proven_short).await.unwrap();
+        assert_eq!(
+            store.get_beef(&txid).await.unwrap().as_deref(),
+            Some(proven_short.as_slice()),
+            "compact_pot_beef overwrites with the shorter proven BEEF"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_pot_beef_proofless_is_a_noop() {
+        // Fail-closed: compacting with a BEEF that does NOT prove txid must not
+        // touch the stored row (never trims on an unproven BEEF).
+        let store = MemoryPotStorage::new();
+        let (proofless_long, txid) = proofless_beef_with_filler(RAW_A, Some(RAW_B));
+        store.store_beef(&txid, &proofless_long).await.unwrap();
+
+        let (proofless_other, _) = proofless_beef_with_filler(RAW_A, None);
+        assert!(!pot_beef_has_proof(&txid, &proofless_other));
+        store.compact_pot_beef(&txid, &proofless_other).await.unwrap();
+        assert_eq!(
+            store.get_beef(&txid).await.unwrap().as_deref(),
+            Some(proofless_long.as_slice()),
+            "a proofless compact is a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_pot_beefs_for_proof_check_returns_only_proofless() {
+        // The candidate query must surface ONLY proofless rows — a proven row
+        // must not be re-fetched.
+        let store = MemoryPotStorage::new();
+        let (proofless, proofless_txid) = proofless_beef_with_filler(RAW_A, None);
+        let (proven, proven_txid) = proven_beef(RAW_B);
+        assert_ne!(proofless_txid, proven_txid);
+
+        store.store_beef(&proofless_txid, &proofless).await.unwrap();
+        store.store_beef(&proven_txid, &proven).await.unwrap();
+        assert_eq!(store.beef_count(), 2);
+
+        let cands = store.find_pot_beefs_for_proof_check(10).await.unwrap();
+        assert_eq!(cands.len(), 1, "only the proofless row is a candidate");
+        assert_eq!(cands[0].0, proofless_txid);
     }
 
     #[test]

@@ -29,8 +29,8 @@ impl PotpartyTopicManager {
     }
 
     /// Validate a single output as a LOW potparty marker: true IFF its
-    /// locking script is a well-formed `LOW/potparty/v1` marker (exact tag
-    /// + exact push lengths + identity != opponentIdentity). Everything
+    /// locking script is a well-formed `LOW/potparty/v1` marker (exact tag +
+    /// exact push lengths + identity != opponentIdentity). Everything
     /// else (P2PKH change, foreign OP_RETURNs, malformed tags) is simply
     /// not admitted.
     pub fn validate_potparty_output(output: &bsv_rs::transaction::TransactionOutput) -> bool {
