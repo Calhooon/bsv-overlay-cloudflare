@@ -39,6 +39,14 @@
 //!   (`pot_records`) + spender bytes (`pot_beefs`) + the chain tip, in one
 //!   request / one D1 query. A missing/invalid identity is an empty result,
 //!   never an error.
+//! - `GET /leaderboard?limit=200` — the server-side leaderboard join + rank
+//!   (bsv-low #38): the recent `result_markers_v2` markers JOINed to their
+//!   `pot_records` anchor (CHUNKED, the same table `/utxo-status` reads) +
+//!   `proof_markers` pointers, aggregated + ranked with the client's exact
+//!   `aggregateBoard` / `lowestHands` rules — the ONE call that replaces the
+//!   client's ~110-round-trip N+1. The server counts on (both sigs +
+//!   anchored) and returns the sigs so the client re-verifies (see
+//!   `logic`'s trust note); a D1 fault is a 5xx, never a fabricated board.
 //! - `GET /beef/:txid` — the admitted BEEF bytes from `transactions`.
 //! - `GET /tip` — present chain height via the CHAINTRACKS service binding.
 //! - `GET /health` — liveness.
@@ -85,6 +93,7 @@ fn router() -> Router<'static, ()> {
         .get_async("/utxo-status", routes::utxo_status)
         .get_async("/pots-view", routes::pots_view)
         .get_async("/recovery-view", routes::recovery_view)
+        .get_async("/leaderboard", routes::leaderboard)
         .get_async("/beef/:txid", routes::beef)
         .get_async("/tip", routes::tip)
         .get("/health", routes::health)

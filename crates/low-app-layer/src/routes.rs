@@ -24,10 +24,12 @@ use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
 
 use crate::logic::{
-    assemble_pots_view, assemble_recovery_view, assemble_statuses, batch_where_sql, beef_body,
-    chunk_outpoints, decode_beef_hex, health_body, parse_outpoints, parse_present_height,
-    pots_view_body, pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body,
-    utxo_status_body, valid_identity, valid_txid, Outpoint, PotRecordRow, PotsViewRow, RecoveryRow,
+    aggregate_leaderboard, assemble_pots_view, assemble_recovery_view, assemble_statuses,
+    batch_where_sql, beef_body, chunk_outpoints, clamp_leaderboard_limit, decode_beef_hex,
+    health_body, leaderboard_body, leaderboard_pot_outpoints, parse_outpoints,
+    parse_present_height, pots_view_body, pots_view_join_sql, recovery_view_body,
+    recovery_view_sql, tip_body, utxo_status_body, valid_identity, valid_txid, Outpoint,
+    PotRecordRow, PotsViewRow, RecoveryRow, ResultMarkerRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -456,6 +458,159 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Respon
     let entries = assemble_recovery_view(rows);
     let tip = chaintracks_present_height(&ctx, "recovery-view").await.ok();
     json_response(recovery_view_body(&entries, tip), 200)
+}
+
+/// `result_markers_v2` row as D1 returns it. `potTxid`/`settleTxid`/
+/// `winnerSigHex` are nullable in the (superseded) original schema, so they
+/// arrive `Option` — a row missing any of them is a malformed marker that
+/// cannot be anchored or counted, dropped in [`ResultRowD1::into_marker`].
+/// `createdAt` is nullable (mirrors the client's `createdAt: number | null`).
+#[derive(Deserialize)]
+struct ResultRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    loser: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: Option<String>,
+    #[serde(rename = "settleTxid")]
+    settle_txid: Option<String>,
+    #[serde(rename = "winnerSigHex")]
+    winner_sig_hex: Option<String>,
+    #[serde(rename = "loserSigHex")]
+    loser_sig_hex: Option<String>,
+    #[serde(rename = "cardsHex")]
+    cards_hex: Option<String>,
+    txid: String,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+}
+
+impl ResultRowD1 {
+    /// Host row, or `None` when a required byte field is NULL (a malformed
+    /// marker that could never anchor or count — never fabricated).
+    fn into_marker(self) -> Option<ResultMarkerRow> {
+        Some(ResultMarkerRow {
+            game_id: self.game_id,
+            winner: self.winner,
+            loser: self.loser,
+            pot_txid: self.pot_txid?,
+            settle_txid: self.settle_txid?,
+            winner_sig_hex: self.winner_sig_hex?,
+            loser_sig_hex: self.loser_sig_hex,
+            cards_hex: self.cards_hex,
+            txid: self.txid,
+            created_at: self.created_at.map(|v| v as i64),
+        })
+    }
+}
+
+/// `proof_markers` pointer row — only the (gameId, winner) key and the marker
+/// txid; the ~10-15 KB transcript `bundle` is never read here (the CLIENT
+/// fetches + verifies it — this surface only points at where it lives).
+#[derive(Deserialize)]
+struct ProofPointerRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    txid: String,
+}
+
+/// `GET /leaderboard?limit=200` — the server-side leaderboard join + rank
+/// (bsv-low #38), collapsing the client's ~110-round-trip N+1 (`result.ts
+/// gatherBoard`: 1 `ls_result` + up to 50 `ls_proof` + ~57 `/beef` + a
+/// `/utxo-status` batch, ranked client-side) into ONE call.
+///
+/// Reads the recent `result_markers_v2` markers, JOINs each against the
+/// `pot_records` spend-status (the SAME table `/utxo-status` reads — CHUNKED at
+/// [`crate::logic::D1_CHUNK_OUTPOINTS`] so a large result set never trips D1's
+/// 100-bound-param cap), joins `proof_markers` for the `proofTxid` pointer, and
+/// aggregates + ranks with the client's exact `aggregateBoard` / `lowestHands`
+/// rules. See the `logic` module note for the trust decision: the server
+/// COUNTS on (both sigs present + anchored) and RETURNS the sigs + anchor so
+/// the client re-verifies and can falsify — it never asserts an ECDSA verify it
+/// did not perform.
+///
+/// FAIL-SAFE: a `pot_records` (or marker) D1 fault is the SAME 5xx the client
+/// already handles — NEVER a fabricated empty/all-zero board. The `proof_markers`
+/// join is best-effort: a fault there only drops the `proofTxid` hint (null),
+/// never a count and never a 5xx.
+pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let limit_raw = url
+        .query_pairs()
+        .find(|(k, _)| k == "limit")
+        .and_then(|(_, v)| v.parse::<u32>().ok());
+    let limit = clamp_leaderboard_limit(limit_raw);
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[leaderboard] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        },
+    };
+
+    // 1) Recent result markers, newest first (mirrors ls_result recentResults).
+    let markers_sql = "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+         loserSigHex, cardsHex, txid, createdAt FROM result_markers_v2 \
+         ORDER BY createdAt DESC, rowid DESC LIMIT ?";
+    let stmt = db
+        .prepare(markers_sql)
+        .bind(&[JsValue::from_f64(limit as f64)])?;
+    let markers: Vec<ResultMarkerRow> = match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+        Ok(rows) => rows.into_iter().filter_map(ResultRowD1::into_marker).collect(),
+        Err(e) => {
+            console_warn!("[leaderboard] result_markers_v2 query failed: {e}");
+            return json_error("database query failed", 503);
+        },
+    };
+
+    // 2) Pot spend-status join (potTxid:0), CHUNKED at D1_CHUNK_OUTPOINTS —
+    // same discipline as /utxo-status. FAIL-SAFE: a chunk's D1 error is the
+    // SAME 503 the client handles and serves no body (never a fabricated
+    // all-unknown board that would silently zero every win).
+    let outpoints = leaderboard_pot_outpoints(&markers);
+    let mut pot_rows: Vec<PotRecordRow> = Vec::with_capacity(outpoints.len());
+    for chunk in chunk_outpoints(&outpoints) {
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        for op in chunk {
+            binds.push(JsValue::from_str(&op.db_txid()));
+            binds.push(JsValue::from_f64(f64::from(op.vout)));
+        }
+        let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&binds)?;
+        match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
+            Ok(chunk_rows) => pot_rows.extend(chunk_rows.into_iter().map(PotRowD1::into_row)),
+            Err(e) => {
+                console_warn!("[leaderboard] pot_records batch query failed: {e}");
+                return json_error("database query failed", 503);
+            },
+        }
+    }
+    let statuses = assemble_statuses(&outpoints, &pot_rows);
+
+    // 3) proof_markers pointers (gameId, winner) → newest marker txid.
+    // BEST-EFFORT: a fault here only omits the proofTxid hint, never a 5xx.
+    // A generous LIMIT bounds the scan; ORDER BY createdAt DESC + or_insert
+    // keeps the newest pointer per (gameId, winner).
+    let mut proof_map: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let proof_sql = "SELECT gameId, winner, txid FROM proof_markers \
+         ORDER BY createdAt DESC, rowid DESC LIMIT 2000";
+    match db.prepare(proof_sql).all().await.and_then(|r| r.results::<ProofPointerRowD1>()) {
+        Ok(rows) => {
+            for pr in rows {
+                proof_map
+                    .entry((pr.game_id.to_ascii_lowercase(), pr.winner.to_ascii_lowercase()))
+                    .or_insert(pr.txid);
+            }
+        },
+        Err(e) => console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}"),
+    }
+
+    let lb = aggregate_leaderboard(&markers, &statuses, &proof_map, limit);
+    let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
+    json_response(leaderboard_body(&lb, computed_at, markers.len()), 200)
 }
 
 /// `GET /health` — liveness only (no DB touch).

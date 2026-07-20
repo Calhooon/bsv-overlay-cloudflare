@@ -540,6 +540,462 @@ pub fn health_body() -> String {
     json!({ "ok": true, "service": "low-app-layer" }).to_string()
 }
 
+// ── /leaderboard — the server-side join + rank (bsv-low #38) ───────────────
+//
+// The zanaadu model completed for the leaderboard: the app-layer serves the
+// aggregation the client's `result.ts gatherBoard` used to assemble itself.
+// TODAY the client does 1 `ls_result` lookup + up to 50 `ls_proof` lookups +
+// ~57 `/beef` fetches + a `/utxo-status` batch, then verifies + ranks
+// client-side (~110 round trips). The app-layer already holds the result
+// markers (`result_markers_v2`), the pot spend-status (`pot_records`, the same
+// table `/utxo-status` reads) and the proof pointers (`proof_markers`) — so it
+// JOINs + ranks server-side and answers the whole board in ONE request.
+//
+// TRUST DECISION (documented, deliberate — the record surface must never
+// lie): the overlay ADMITS result markers by BYTE FORMAT ONLY and NEVER
+// verifies signatures; a marker's ECDSA sigs are BRC-42 `'anyone'`-keyed
+// (protocolID [1,'low result'], keyID = gameId), whose exact ProtoWallet
+// verify round-trip lives in the client (`result.ts verifyResultRow`).
+// Reproducing that key-derivation + verify in-worker is impractical and would
+// risk a SUBTLY-WRONG re-implementation on a money-adjacent surface. So this
+// endpoint COUNTS a win on the presence of BOTH signature pushes
+// (`winnerSigHex` AND `loserSigHex`) plus an on-chain ANCHOR (the pot spent by
+// the named settle txid, from `pot_records`) — the SAME anchor `/utxo-status`
+// reports — and RETURNS both sig hexes + the anchor flag in `evidence` so the
+// CLIENT re-verifies the sigs (and re-checks the covenant + anchor) and can
+// FALSIFY any win the server counted but did not cryptographically verify.
+// The backend organizes; the client verifies. It never asserts a verification
+// it did not perform, and every counted win is reconstructible from the
+// returned evidence. A singly-signed (unconfirmed) or un-anchored marker is
+// STILL returned in evidence (with `anchored`) but does NOT count.
+//
+// The counting + dedup + ranking rules MIRROR the client's
+// `aggregateBoard` / `lowestHands` EXACTLY (a divergence is a bug):
+//  - drop un-anchored markers before grouping;
+//  - per gameId: a single distinct CONFIRMED (both-sig) winner counts +1;
+//    two conflicting confirmed winners (collusion garbage) count for NOBODY;
+//    with no confirmed claim, a single distinct winner counts +1 UNCONFIRMED
+//    (which never adds to `wins`); conflicting unconfirmed → nobody;
+//  - `wins` = the confirmed count; `proven` = wins > 0 (the identity has a
+//    doubly-signed, anchored win — the contract's stated proven rule);
+//  - `hands` = the lowest-score confirmed + anchored v2 (cards-carrying)
+//    hands, one per single-winner game, score ascending then earliest first.
+
+/// Default `?limit` for `/leaderboard` (contract default). Bounds how many
+/// recent result markers are scanned — mirrors the client's `recentResults`.
+pub const LEADERBOARD_DEFAULT_LIMIT: usize = 200;
+/// Hard cap on `?limit` — the same clamp the overlay's `ls_result` lookup
+/// service applies (1..=500).
+pub const LEADERBOARD_MAX_LIMIT: usize = 500;
+/// The pot lock lives at vout 0 (the funding tx's covenant output) — the
+/// client anchors on `potTxid:0` (`result.ts gatherBoard`). We join the same.
+pub const LEADERBOARD_POT_VOUT: u32 = 0;
+
+/// Clamp a raw `?limit` to `1..=LEADERBOARD_MAX_LIMIT`; absent ⇒ the default.
+pub fn clamp_leaderboard_limit(raw: Option<u32>) -> usize {
+    match raw {
+        Some(n) => (n as usize).clamp(1, LEADERBOARD_MAX_LIMIT),
+        None => LEADERBOARD_DEFAULT_LIMIT,
+    }
+}
+
+/// One `result_markers_v2` row, host-typed — every byte field carried verbatim
+/// (the overlay never verifies; the client does). `loser_sig_hex`/`cards_hex`
+/// are `None` for an unconfirmed / v1 marker. `created_at` is `None` only for a
+/// malformed NULL-`createdAt` row (mirrors the client's nullable `createdAt`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultMarkerRow {
+    pub game_id: String,
+    pub winner: String,
+    pub loser: String,
+    pub pot_txid: String,
+    pub settle_txid: String,
+    pub winner_sig_hex: String,
+    pub loser_sig_hex: Option<String>,
+    pub cards_hex: Option<String>,
+    /// The marker OP_RETURN txid (half its outpoint) — carried for reference.
+    pub txid: String,
+    pub created_at: Option<i64>,
+}
+
+/// The distinct pot outpoints (`potTxid:0`) to spent-status-join, in
+/// first-seen marker order (many markers can share a pot — one funding tx,
+/// one settle). The route chunks these at [`D1_CHUNK_OUTPOINTS`] exactly like
+/// `/utxo-status`, so a large result set never trips D1's 100-bound-param cap.
+pub fn leaderboard_pot_outpoints(markers: &[ResultMarkerRow]) -> Vec<Outpoint> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in markers {
+        if seen.insert(m.pot_txid.to_ascii_lowercase()) {
+            out.push(Outpoint {
+                txid: m.pot_txid.clone(),
+                vout: LEADERBOARD_POT_VOUT,
+            });
+        }
+    }
+    out
+}
+
+/// Parse a `cardsHex` push (10 lowercase hex chars → 5 card ordinals): five
+/// DISTINCT indices 0..=51 (mirrors the client's `cardsFromHex` / the overlay
+/// parser's `parse_cards`). `None` on any malformation — such a marker never
+/// enters the hands board (fail-safe: an unverifiable hand never counts).
+pub fn leaderboard_cards_from_hex(cards_hex: &str) -> Option<[u8; 5]> {
+    if cards_hex.len() != 10 {
+        return None;
+    }
+    let bytes = hex::decode(cards_hex).ok()?;
+    if bytes.len() != 5 {
+        return None;
+    }
+    let mut arr = [0u8; 5];
+    let mut seen = 0u64;
+    for (i, &c) in bytes.iter().enumerate() {
+        if c > 51 || seen & (1u64 << c) != 0 {
+            return None;
+        }
+        seen |= 1u64 << c;
+        arr[i] = c;
+    }
+    Some(arr)
+}
+
+/// The LOW hand score — SUM of card values (Ace=1, 2..10 face value,
+/// J/Q/K=10; rank = ordinal % 13 with 0='2'…12='A'). Lowest wins. Byte-for-
+/// byte the client's `handScore` (`result.ts`).
+pub fn hand_score(cards: &[u8; 5]) -> u32 {
+    cards
+        .iter()
+        .map(|&c| {
+            let r = u32::from(c % 13);
+            if r == 12 {
+                1
+            } else if r >= 9 {
+                10
+            } else {
+                r + 2
+            }
+        })
+        .sum()
+}
+
+/// One `board[i].evidence[j]` entry — a marker naming this identity as winner,
+/// carried verbatim (sigs + anchor) so the client re-verifies WITHOUT
+/// re-fetching. `anchored` = the pot spent by the named settle txid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderboardEvidence {
+    pub game_id: String,
+    pub winner: String,
+    pub loser: String,
+    pub pot_txid: String,
+    pub settle_txid: String,
+    pub winner_sig_hex: String,
+    pub loser_sig_hex: Option<String>,
+    pub anchored: bool,
+    /// The `proof_markers` (ls_proof) marker txid for (gameId, winner), when
+    /// one is indexed — a POINTER the client fetches + transcript-verifies,
+    /// NOT a server assertion the bundle is valid. `None` when absent.
+    pub proof_txid: Option<String>,
+}
+
+/// One `board[i]` row — an identity's wins + its evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderboardBoardRow {
+    pub identity: String,
+    /// Confirmed (doubly-signed) + anchored wins, deduped per game.
+    pub wins: u32,
+    /// True iff `wins > 0` (the identity has a doubly-signed, anchored win).
+    pub proven: bool,
+    pub evidence: Vec<LeaderboardEvidence>,
+}
+
+/// One `hands[i]` row — a lowest-winning-hand entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderboardHandRow {
+    pub game_id: String,
+    pub score: u32,
+    pub cards_hex: String,
+    pub winner: String,
+    /// Always `true` for a hand row (only anchored + confirmed hands qualify).
+    pub anchored: bool,
+}
+
+/// The assembled leaderboard, pre-JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leaderboard {
+    pub board: Vec<LeaderboardBoardRow>,
+    pub hands: Vec<LeaderboardHandRow>,
+}
+
+/// True iff the marker is anchored: its `potTxid:0` is recorded spent by the
+/// named `settleTxid` in `pot_records` — the SAME anchor `/utxo-status`
+/// reports. An unknown/unspent/differently-spent pot is NOT anchored
+/// (fail-safe: this surface never asserts a win the chain doesn't back).
+fn marker_anchored(
+    m: &ResultMarkerRow,
+    status_by_pot: &std::collections::HashMap<String, &OutpointStatus>,
+) -> bool {
+    match status_by_pot.get(&m.pot_txid.to_ascii_lowercase()) {
+        Some(st) => {
+            st.spent == Some(true)
+                && st
+                    .spending_txid
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&m.settle_txid))
+        }
+        None => false,
+    }
+}
+
+/// Aggregate + rank the leaderboard server-side, mirroring the client's
+/// `aggregateBoard` / `lowestHands` (see the module note for the exact rules
+/// and the trust decision). `statuses` come from the chunked `pot_records`
+/// join (vout 0); `proof_by_game_winner` maps (gameId_lc, winner_lc) → the
+/// newest `proof_markers` txid (empty when the join was unavailable — a
+/// fail-safe that only drops the `proofTxid` hint, never a count).
+pub fn aggregate_leaderboard(
+    markers: &[ResultMarkerRow],
+    statuses: &[OutpointStatus],
+    proof_by_game_winner: &std::collections::HashMap<(String, String), String>,
+    hands_limit: usize,
+) -> Leaderboard {
+    use std::collections::{HashMap, HashSet};
+
+    // Pot spend-status keyed by lowercase txid (we only join vout 0).
+    let mut status_by_pot: HashMap<String, &OutpointStatus> = HashMap::new();
+    for s in statuses {
+        if s.vout == LEADERBOARD_POT_VOUT {
+            status_by_pot
+                .entry(s.txid.to_ascii_lowercase())
+                .or_insert(s);
+        }
+    }
+    // Anchor each marker once.
+    let anchored: Vec<bool> = markers
+        .iter()
+        .map(|m| marker_anchored(m, &status_by_pot))
+        .collect();
+    // A marker is CONFIRMED (backend sense) when BOTH sig pushes are present.
+    let confirmed = |i: usize| markers[i].loser_sig_hex.is_some();
+
+    // ── wins: per-game dedup over ANCHORED markers (client aggregateBoard) ──
+    let mut by_game: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, m) in markers.iter().enumerate() {
+        if anchored[i] {
+            by_game
+                .entry(m.game_id.to_ascii_lowercase())
+                .or_default()
+                .push(i);
+        }
+    }
+    // identity_lc → (confirmed_wins, unconfirmed_wins).
+    let mut tally: HashMap<String, (u32, u32)> = HashMap::new();
+    for idxs in by_game.values() {
+        let confirmed_winners: HashSet<String> = idxs
+            .iter()
+            .filter(|&&i| confirmed(i))
+            .map(|&i| markers[i].winner.to_ascii_lowercase())
+            .collect();
+        if confirmed_winners.len() == 1 {
+            let w = confirmed_winners.into_iter().next().unwrap();
+            tally.entry(w).or_default().0 += 1;
+            continue;
+        }
+        if confirmed_winners.len() > 1 {
+            continue; // conflicting confirmed claims → count nobody
+        }
+        // No confirmed claim: a single distinct winner counts UNCONFIRMED.
+        let unconfirmed_winners: HashSet<String> = idxs
+            .iter()
+            .map(|&i| markers[i].winner.to_ascii_lowercase())
+            .collect();
+        if unconfirmed_winners.len() == 1 {
+            let w = unconfirmed_winners.into_iter().next().unwrap();
+            tally.entry(w).or_default().1 += 1;
+        }
+        // conflicting unconfirmed → count nobody.
+    }
+
+    // Evidence: every marker (anchored or not) naming this identity as winner.
+    let mut ev_by_identity: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, m) in markers.iter().enumerate() {
+        ev_by_identity
+            .entry(m.winner.to_ascii_lowercase())
+            .or_default()
+            .push(i);
+    }
+
+    let mut rows: Vec<(LeaderboardBoardRow, u32)> = tally
+        .iter()
+        .map(|(id, &(conf, unconf))| {
+            let mut ev_idx = ev_by_identity.get(id).cloned().unwrap_or_default();
+            // Anchored+confirmed first, then anchored, then the rest; newest
+            // (highest createdAt) first within a tier — a display-friendly
+            // drill-down order, not a ranking rule.
+            let rank = |i: usize| match (anchored[i], confirmed(i)) {
+                (true, true) => 0,
+                (true, false) => 1,
+                _ => 2,
+            };
+            ev_idx.sort_by(|&a, &b| {
+                rank(a)
+                    .cmp(&rank(b))
+                    .then(markers[b].created_at.cmp(&markers[a].created_at))
+            });
+            let evidence = ev_idx
+                .iter()
+                .map(|&i| {
+                    let m = &markers[i];
+                    let g = m.game_id.to_ascii_lowercase();
+                    let w = m.winner.to_ascii_lowercase();
+                    let proof_txid = proof_by_game_winner.get(&(g.clone(), w.clone())).cloned();
+                    LeaderboardEvidence {
+                        game_id: g,
+                        winner: w,
+                        loser: m.loser.to_ascii_lowercase(),
+                        pot_txid: m.pot_txid.to_ascii_lowercase(),
+                        settle_txid: m.settle_txid.to_ascii_lowercase(),
+                        winner_sig_hex: m.winner_sig_hex.to_ascii_lowercase(),
+                        loser_sig_hex: m.loser_sig_hex.as_ref().map(|s| s.to_ascii_lowercase()),
+                        anchored: anchored[i],
+                        proof_txid,
+                    }
+                })
+                .collect();
+            (
+                LeaderboardBoardRow {
+                    identity: id.clone(),
+                    wins: conf,
+                    proven: conf > 0,
+                    evidence,
+                },
+                unconf,
+            )
+        })
+        .collect();
+    // Client rank: confirmed desc, then unconfirmed desc, then identity asc
+    // (lowercase hex — byte order == localeCompare).
+    rows.sort_by(|(a, au), (b, bu)| {
+        b.wins
+            .cmp(&a.wins)
+            .then(bu.cmp(au))
+            .then_with(|| a.identity.cmp(&b.identity))
+    });
+    let board = rows.into_iter().map(|(r, _)| r).collect();
+
+    // ── hands: lowest-score confirmed + anchored v2 hands (lowestHands) ─────
+    let mut hand_by_game: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, m) in markers.iter().enumerate() {
+        if !anchored[i] || !confirmed(i) {
+            continue;
+        }
+        let Some(ch) = &m.cards_hex else { continue };
+        if leaderboard_cards_from_hex(ch).is_none() {
+            continue;
+        }
+        hand_by_game
+            .entry(m.game_id.to_ascii_lowercase())
+            .or_default()
+            .push(i);
+    }
+    // (row, created_at) so the score-tie break is the earliest claim.
+    let mut hands: Vec<(LeaderboardHandRow, Option<i64>)> = Vec::new();
+    for idxs in hand_by_game.values() {
+        let winners: HashSet<String> = idxs
+            .iter()
+            .map(|&i| markers[i].winner.to_ascii_lowercase())
+            .collect();
+        if winners.len() != 1 {
+            continue; // conflicting confirmed → count nobody (same as wins)
+        }
+        // idxs is in ascending marker order; markers are newest-first, so the
+        // first index is the newest claim for the game (the client's claims[0]).
+        let i = *idxs.iter().min().unwrap();
+        let m = &markers[i];
+        let cards = leaderboard_cards_from_hex(m.cards_hex.as_ref().unwrap()).unwrap();
+        hands.push((
+            LeaderboardHandRow {
+                game_id: m.game_id.to_ascii_lowercase(),
+                score: hand_score(&cards),
+                cards_hex: m.cards_hex.as_ref().unwrap().to_ascii_lowercase(),
+                winner: m.winner.to_ascii_lowercase(),
+                anchored: true,
+            },
+            m.created_at,
+        ));
+    }
+    // Score ascending; tie → earliest createdAt (None sorts LAST, == the
+    // client's `?? Infinity`).
+    hands.sort_by(|(a, ac), (b, bc)| {
+        a.score.cmp(&b.score).then_with(|| {
+            let ak = ac.unwrap_or(i64::MAX);
+            let bk = bc.unwrap_or(i64::MAX);
+            ak.cmp(&bk)
+        })
+    });
+    let hands = hands
+        .into_iter()
+        .take(hands_limit)
+        .map(|(h, _)| h)
+        .collect();
+
+    Leaderboard { board, hands }
+}
+
+/// Assemble the `/leaderboard` wire body (the endpoint CONTRACT):
+/// `{"board":[…],"hands":[…],"computedAt":<unix>,"resultCount":<int>}`.
+pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize) -> String {
+    let board: Vec<serde_json::Value> = lb
+        .board
+        .iter()
+        .map(|r| {
+            let evidence: Vec<serde_json::Value> = r
+                .evidence
+                .iter()
+                .map(|e| {
+                    json!({
+                        "gameId": e.game_id,
+                        "winner": e.winner,
+                        "loser": e.loser,
+                        "potTxid": e.pot_txid,
+                        "settleTxid": e.settle_txid,
+                        "winnerSigHex": e.winner_sig_hex,
+                        "loserSigHex": e.loser_sig_hex,
+                        "anchored": e.anchored,
+                        "proofTxid": e.proof_txid,
+                    })
+                })
+                .collect();
+            json!({
+                "identity": r.identity,
+                "wins": r.wins,
+                "proven": r.proven,
+                "evidence": evidence,
+            })
+        })
+        .collect();
+    let hands: Vec<serde_json::Value> = lb
+        .hands
+        .iter()
+        .map(|h| {
+            json!({
+                "gameId": h.game_id,
+                "score": h.score,
+                "cardsHex": h.cards_hex,
+                "winner": h.winner,
+                "anchored": h.anchored,
+            })
+        })
+        .collect();
+    json!({
+        "board": board,
+        "hands": hands,
+        "computedAt": computed_at,
+        "resultCount": result_count,
+    })
+    .to_string()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1224,5 +1680,390 @@ mod tests {
             serde_json::from_str(&recovery_view_body(&[], None)).unwrap();
         assert!(v3["tip"].is_null());
         assert_eq!(v3["entries"].as_array().unwrap().len(), 0);
+    }
+
+    // ── /leaderboard aggregation (bsv-low #38) ─────────────────────────────
+
+    use std::collections::HashMap;
+
+    /// 64-hex txid / gameId from a byte.
+    fn tx(b: u8) -> String {
+        format!("{b:02x}").repeat(32)
+    }
+    /// 66-hex compressed identity pubkey from a byte (02 prefix + 64 hex).
+    fn ident(b: u8) -> String {
+        format!("02{}", format!("{b:02x}").repeat(32))
+    }
+
+    /// A result marker. `confirmed` ⇒ a loserSig push is present (backend's
+    /// "confirmed"); `cards` is a 10-hex v2 cards push or None (v1). The
+    /// marker txid is derived from game+winner+seq so distinct markers for the
+    /// same (game, winner) are distinct outpoints (the censorship-fix shape).
+    #[allow(clippy::too_many_arguments)]
+    fn mk(
+        game: u8,
+        winner: &str,
+        loser: &str,
+        pot: u8,
+        settle: u8,
+        confirmed: bool,
+        cards: Option<&str>,
+        created: i64,
+        seq: u8,
+    ) -> ResultMarkerRow {
+        ResultMarkerRow {
+            game_id: tx(game),
+            winner: winner.to_string(),
+            loser: loser.to_string(),
+            pot_txid: tx(pot),
+            settle_txid: tx(settle),
+            winner_sig_hex: "3045abababab".to_string(),
+            loser_sig_hex: confirmed.then(|| "3044cdcdcd".to_string()),
+            cards_hex: cards.map(str::to_string),
+            txid: format!("{game:02x}{seq:02x}").repeat(16),
+            created_at: Some(created),
+        }
+    }
+
+    /// Build `pot_records`-derived statuses through the REAL producer path
+    /// (`leaderboard_pot_outpoints` → PotRecordRow → `assemble_statuses`). Each
+    /// entry of `spent_by` (pot txid byte → settle txid byte) marks that pot
+    /// spent by that settle txid; pots absent from the map have NO row (unknown
+    /// ⇒ un-anchored).
+    fn statuses_for(markers: &[ResultMarkerRow], spent_by: &HashMap<u8, u8>) -> Vec<OutpointStatus> {
+        let ops = leaderboard_pot_outpoints(markers);
+        let mut rows: Vec<PotRecordRow> = Vec::new();
+        for op in &ops {
+            for (pot, settle) in spent_by {
+                if op.db_txid() == tx(*pot) {
+                    rows.push(PotRecordRow {
+                        txid: op.txid.clone(),
+                        vout: 0,
+                        spent: true,
+                        spending_txid: Some(tx(*settle)),
+                        spent_confirmed: true,
+                    });
+                }
+            }
+        }
+        assemble_statuses(&ops, &rows)
+    }
+
+    fn no_proofs() -> HashMap<(String, String), String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn hand_score_matches_client() {
+        // Ace=1, 2..10 face, J/Q/K=10 (rank = ordinal % 13; 0='2'…12='A').
+        // cards 0,1,2,3,4 → 2+3+4+5+6 = 20.
+        assert_eq!(hand_score(&[0, 1, 2, 3, 4]), 20);
+        // cards 0,1,2,3,12(A) → 2+3+4+5+1 = 15.
+        assert_eq!(hand_score(&[0, 1, 2, 3, 12]), 15);
+        // 8='10'(10), 9='J'(10), 10='Q'(10), 11='K'(10), 12='A'(1) → 41.
+        assert_eq!(hand_score(&[8, 9, 10, 11, 12]), 41);
+        // cardsHex parse: 10 hex, five distinct 0..=51.
+        assert_eq!(leaderboard_cards_from_hex("000102030c"), Some([0, 1, 2, 3, 12]));
+        assert_eq!(leaderboard_cards_from_hex("0001020303"), None); // dup
+        assert_eq!(leaderboard_cards_from_hex("0001020334"), None); // 0x34=52 > 51
+        assert_eq!(leaderboard_cards_from_hex("0102030405060708"), None); // wrong len
+    }
+
+    #[test]
+    fn counts_a_confirmed_anchored_win() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb.board.len(), 1);
+        assert_eq!(lb.board[0].identity, a);
+        assert_eq!(lb.board[0].wins, 1);
+        assert!(lb.board[0].proven);
+        assert_eq!(lb.board[0].evidence.len(), 1);
+        let ev = &lb.board[0].evidence[0];
+        assert!(ev.anchored);
+        assert_eq!(ev.winner, a);
+        assert_eq!(ev.loser, b);
+        assert!(ev.loser_sig_hex.is_some());
+    }
+
+    #[test]
+    fn singly_signed_marker_does_not_count() {
+        // A winnerSig-only (unconfirmed) anchored marker: the identity appears
+        // (unconfirmed win) but wins == 0 and proven == false.
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, false, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb.board.len(), 1);
+        assert_eq!(lb.board[0].wins, 0, "a singly-signed marker never adds a win");
+        assert!(!lb.board[0].proven);
+        // The marker is STILL surfaced in evidence (anchored, loserSig null).
+        assert_eq!(lb.board[0].evidence.len(), 1);
+        assert!(lb.board[0].evidence[0].anchored);
+        assert_eq!(lb.board[0].evidence[0].loser_sig_hex, None);
+    }
+
+    #[test]
+    fn unanchored_marker_does_not_count() {
+        // The RED-verified rule: a fully doubly-signed marker whose pot is NOT
+        // spent-by-settle contributes NO win and NO board row.
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
+        // Pot 1 has NO pot_records row at all → unknown → un-anchored.
+        let statuses = statuses_for(&markers, &HashMap::new());
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert!(
+            lb.board.is_empty(),
+            "an un-anchored win must not appear on the board"
+        );
+        assert!(lb.hands.is_empty());
+
+        // Also un-anchored: pot IS spent, but by a DIFFERENT txid than settle.
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 9u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert!(
+            lb.board.is_empty(),
+            "spent-by-a-different-txid is not anchored to this settle"
+        );
+    }
+
+    #[test]
+    fn dedups_a_game_claimed_twice() {
+        // Two distinct markers (different outpoints) for the SAME game + winner
+        // count as ONE win (per-game dedup, mirroring aggregateBoard).
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![
+            mk(1, &a, &b, 1, 2, true, None, 100, 0),
+            mk(1, &a, &b, 1, 2, true, None, 101, 1),
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb.board.len(), 1);
+        assert_eq!(lb.board[0].wins, 1, "a game claimed twice counts once");
+        // Both markers still surface in evidence.
+        assert_eq!(lb.board[0].evidence.len(), 2);
+    }
+
+    #[test]
+    fn conflicting_confirmed_counts_nobody() {
+        // Two confirmed anchored markers for the same game name DIFFERENT
+        // winners (collusion garbage) → neither counts, no board row.
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![
+            mk(1, &a, &b, 1, 2, true, None, 100, 0),
+            mk(1, &b, &a, 1, 2, true, None, 101, 1),
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert!(
+            lb.board.is_empty(),
+            "conflicting confirmed claims count for nobody"
+        );
+        assert!(lb.hands.is_empty());
+    }
+
+    #[test]
+    fn board_ranks_by_wins_desc_then_identity() {
+        // A: 2 confirmed wins; B: 1; C: 1. Ordered A, then B/C by identity asc.
+        let a = ident(0xaa);
+        let b = ident(0x0b);
+        let c = ident(0x0c);
+        let z = ident(0xff); // shared loser
+        let markers = vec![
+            mk(1, &a, &z, 1, 2, true, None, 100, 0),
+            mk(2, &a, &z, 3, 4, true, None, 101, 0),
+            mk(3, &b, &z, 5, 6, true, None, 102, 0),
+            mk(4, &c, &z, 7, 8, true, None, 103, 0),
+        ];
+        let statuses = statuses_for(
+            &markers,
+            &HashMap::from([(1u8, 2u8), (3, 4), (5, 6), (7, 8)]),
+        );
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb.board.len(), 3);
+        assert_eq!(lb.board[0].identity, a);
+        assert_eq!(lb.board[0].wins, 2);
+        // b (0x0b…) sorts before c (0x0c…) at equal wins.
+        assert_eq!(lb.board[1].identity, b);
+        assert_eq!(lb.board[2].identity, c);
+    }
+
+    #[test]
+    fn lowest_hands_ordering() {
+        // Two confirmed anchored v2 hands: game 1 scores 15, game 2 scores 20.
+        // Lowest (15) first.
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![
+            mk(2, &a, &b, 3, 4, true, Some("0001020304"), 200, 0), // score 20
+            mk(1, &a, &b, 1, 2, true, Some("000102030c"), 100, 0), // score 15
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8), (3, 4)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb.hands.len(), 2);
+        assert_eq!(lb.hands[0].score, 15);
+        assert_eq!(lb.hands[0].game_id, tx(1));
+        assert!(lb.hands[0].anchored);
+        assert_eq!(lb.hands[1].score, 20);
+
+        // A v1 (no-cards) or an un-anchored hand never appears.
+        let markers2 = vec![
+            mk(1, &a, &b, 1, 2, true, None, 100, 0), // no cards
+            mk(2, &a, &b, 3, 4, true, Some("0001020304"), 200, 0), // un-anchored below
+        ];
+        let statuses2 = statuses_for(&markers2, &HashMap::from([(1u8, 2u8)])); // pot 3 unspent
+        let lb2 = aggregate_leaderboard(&markers2, &statuses2, &no_proofs(), 200);
+        assert!(lb2.hands.is_empty(), "no-cards + un-anchored ⇒ no hands");
+    }
+
+    #[test]
+    fn score_tie_breaks_on_earliest_created_at() {
+        // Same score, different games — earlier createdAt ranks first.
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![
+            mk(2, &a, &b, 3, 4, true, Some("0001020304"), 500, 0), // score 20, later
+            mk(1, &a, &b, 1, 2, true, Some("0001020304"), 100, 0), // score 20, earlier
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8), (3, 4)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb.hands.len(), 2);
+        assert_eq!(lb.hands[0].game_id, tx(1), "earlier claim wins the score tie");
+        assert_eq!(lb.hands[1].game_id, tx(2));
+    }
+
+    #[test]
+    fn proof_pointer_is_carried_but_never_gates_a_count() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let proofs =
+            HashMap::from([((tx(1), a.clone()), "proof-txid".to_string())]);
+        let lb = aggregate_leaderboard(&markers, &statuses, &proofs, 200);
+        assert_eq!(lb.board[0].evidence[0].proof_txid.as_deref(), Some("proof-txid"));
+        // Absent proof → null, count unchanged.
+        let lb2 = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(lb2.board[0].evidence[0].proof_txid, None);
+        assert_eq!(lb2.board[0].wins, 1);
+    }
+
+    #[test]
+    fn chunked_spent_status_join_over_45_pots() {
+        // >45 distinct pots exceed a single D1 statement's 100-bound-param cap;
+        // the route chunks. Drive the REAL producer path here: build 50 markers
+        // (distinct game+pot each), chunk the outpoints, build each chunk's
+        // pot_records rows separately, merge, and assemble — the anchoring must
+        // resolve identically across the chunk boundary.
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let mut markers = Vec::new();
+        // Anchor every EVEN-indexed pot; leave the odd ones un-anchored.
+        let mut spent_by: HashMap<u8, u8> = HashMap::new();
+        for i in 0u8..50 {
+            // Distinct game/pot/settle bytes per marker (0..50 all distinct).
+            let game = i;
+            let pot = 100 + i; // 100..150, distinct from settle range
+            let settle = 200u16.wrapping_add(u16::from(i)) as u8; // just a distinct byte
+            markers.push(mk(game, &a, &b, pot, settle, true, None, i64::from(i), 0));
+            if i % 2 == 0 {
+                spent_by.insert(pot, settle);
+            }
+        }
+        // Sanity: 50 distinct outpoints ⇒ 2 chunks (45 + 5), crossing the cap.
+        let ops = leaderboard_pot_outpoints(&markers);
+        assert_eq!(ops.len(), 50);
+        let chunks: Vec<&[Outpoint]> = chunk_outpoints(&ops).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!((chunks[0].len(), chunks[1].len()), (45, 5));
+
+        // Build pot rows PER CHUNK (as the route does) then merge + assemble.
+        let mut pot_rows: Vec<PotRecordRow> = Vec::new();
+        for chunk in &chunks {
+            for op in *chunk {
+                for (pot, settle) in &spent_by {
+                    if op.db_txid() == tx(*pot) {
+                        pot_rows.push(PotRecordRow {
+                            txid: op.txid.clone(),
+                            vout: 0,
+                            spent: true,
+                            spending_txid: Some(tx(*settle)),
+                            spent_confirmed: true,
+                        });
+                    }
+                }
+            }
+        }
+        let statuses = assemble_statuses(&ops, &pot_rows);
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+
+        // 25 even pots anchored ⇒ 25 confirmed wins for identity a.
+        assert_eq!(lb.board.len(), 1);
+        assert_eq!(lb.board[0].identity, a);
+        assert_eq!(lb.board[0].wins, 25, "only the 25 anchored pots count");
+        // A pot from the SECOND chunk (index 46, even ⇒ anchored) must count —
+        // proves the merge crosses the chunk boundary. Its evidence entry is
+        // anchored; an odd (un-anchored) one is not.
+        let anchored_games: std::collections::HashSet<String> = lb.board[0]
+            .evidence
+            .iter()
+            .filter(|e| e.anchored)
+            .map(|e| e.game_id.clone())
+            .collect();
+        assert!(anchored_games.contains(&tx(46)), "2nd-chunk even pot anchored");
+        assert!(!anchored_games.contains(&tx(47)), "odd pot un-anchored");
+    }
+
+    #[test]
+    fn leaderboard_body_shape() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, true, Some("000102030c"), 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let proofs = HashMap::from([((tx(1), a.clone()), "px".to_string())]);
+        let lb = aggregate_leaderboard(&markers, &statuses, &proofs, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+        assert_eq!(v["computedAt"], 1_700_000_000_i64);
+        assert_eq!(v["resultCount"], 1);
+        let board = v["board"].as_array().unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0]["identity"], a);
+        assert_eq!(board[0]["wins"], 1);
+        assert_eq!(board[0]["proven"], true);
+        let ev = board[0]["evidence"].as_array().unwrap();
+        assert_eq!(ev[0]["gameId"], tx(1));
+        assert_eq!(ev[0]["winner"], a);
+        assert_eq!(ev[0]["loser"], b);
+        assert_eq!(ev[0]["potTxid"], tx(1));
+        assert_eq!(ev[0]["settleTxid"], tx(2));
+        assert!(ev[0]["winnerSigHex"].is_string());
+        assert!(ev[0]["loserSigHex"].is_string());
+        assert_eq!(ev[0]["anchored"], true);
+        assert_eq!(ev[0]["proofTxid"], "px");
+        let hands = v["hands"].as_array().unwrap();
+        assert_eq!(hands.len(), 1);
+        assert_eq!(hands[0]["gameId"], tx(1));
+        assert_eq!(hands[0]["score"], 15);
+        assert_eq!(hands[0]["cardsHex"], "000102030c");
+        assert_eq!(hands[0]["winner"], a);
+        assert_eq!(hands[0]["anchored"], true);
+    }
+
+    #[test]
+    fn clamp_limit_defaults_and_bounds() {
+        assert_eq!(clamp_leaderboard_limit(None), LEADERBOARD_DEFAULT_LIMIT);
+        assert_eq!(clamp_leaderboard_limit(Some(50)), 50);
+        assert_eq!(clamp_leaderboard_limit(Some(0)), 1);
+        assert_eq!(
+            clamp_leaderboard_limit(Some(99_999)),
+            LEADERBOARD_MAX_LIMIT
+        );
     }
 }
