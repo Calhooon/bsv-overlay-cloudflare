@@ -125,11 +125,17 @@ impl ChainProofFetcher {
         }
 
         // 2. Bitails TSC (secondary — tx mined outside Arcade).
-        if let Some(bump_hex) = self.bitails_tsc_bump(txid).await {
-            if verify_bump(tracker, &bump_hex, txid).await {
-                return Some(bump_hex);
+        match self.bitails_tsc_bump(txid).await {
+            Some(bump_hex) => {
+                if verify_bump(tracker, &bump_hex, txid).await {
+                    return Some(bump_hex);
+                }
+                worker::console_log!("[proof] bitails bump for {txid} FAILED chaintracks verify");
             }
-            worker::console_log!("[proof] bitails bump for {txid} FAILED chaintracks verify");
+            None => worker::console_log!(
+                "[proof] bitails returned NO bump for {txid} (tracker_present={})",
+                tracker.is_some()
+            ),
         }
 
         // 3. WoC TSC (BREAK-GLASS, last resort — WoC 429s on the free tier).
@@ -203,7 +209,16 @@ impl ChainProofFetcher {
             return None;
         }
         let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-        let h = v.get("blockHeight").and_then(|h| h.as_u64())?;
+        // Bitails returns ALL-LOWERCASE `blockheight` (verified live:
+        // {"txid":…,"blockhash":…,"blockheight":913691,…}). Reading only the
+        // camelCase `blockHeight` made this return None for EVERY tx, which
+        // short-circuited `bitails_tsc_bump` before it ever fetched the proof —
+        // silently starving both the pot-beef proof pass and the #186 spend
+        // chaser (both sat at 0 completions). Accept both spellings.
+        let h = v
+            .get("blockheight")
+            .or_else(|| v.get("blockHeight"))
+            .and_then(|h| h.as_u64())?;
         if h == 0 {
             return None;
         }
@@ -582,7 +597,8 @@ fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> O
 
 /// Tally of one pot-spend confirmation pass (logged by the cron / returned by
 /// the admin route).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+// NOTE: not `Copy` — `sample` is a Vec (observability only).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SpendConfirmSummary {
     /// Spent-but-unconfirmed pot rows scanned this tick.
     pub scanned: usize,
@@ -599,6 +615,12 @@ pub struct SpendConfirmSummary {
     /// is likewise not separately observable); such candidates are counted
     /// under `still_unconfirmed`. Kept for shape parity + future use.
     pub fetch_failed: usize,
+    /// OBSERVABILITY ONLY (bounded to 5): the spending txids actually sampled
+    /// this tick. Lets an operator check the candidates against a block explorer
+    /// to tell "the chaser is broken" from "this backlog is genuinely
+    /// unconfirmable" (e.g. a 0-conf spend that was later superseded and never
+    /// mined, so no proof will ever exist). Never used for control flow.
+    pub sample: Vec<String>,
 }
 
 /// Confirm 0-conf pot spends in the LOW `pot_records` landing-proof store
@@ -638,6 +660,9 @@ pub async fn complete_spend_confirmations(
         let Some(spending_txid) = rec.spending_txid.as_deref() else {
             continue;
         };
+        if summary.sample.len() < 5 {
+            summary.sample.push(spending_txid.to_string());
+        }
 
         // PROOF-ONLY fetch + chaintracks-verify: the fetcher returns a bump
         // ONLY once its root is verified against our PoW-anchored header source;

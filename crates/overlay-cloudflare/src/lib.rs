@@ -1170,6 +1170,10 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "spends_confirmed": ss.confirmed,
         "spends_scanned": ss.scanned,
         "spends_still_unconfirmed": ss.still_unconfirmed,
+        // Observability only (≤5): which spending txids were sampled, so an
+        // operator can check them on a block explorer and distinguish a broken
+        // chaser from a genuinely unconfirmable backlog.
+        "spends_sample": ss.sample,
         "proofless_over_24h": flagged,
     }))
 }
