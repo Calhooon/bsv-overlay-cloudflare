@@ -1367,6 +1367,23 @@ impl PotStorage for D1PotStorage {
         Ok(row.map(PotRow::into_record))
     }
 
+    async fn find_spent_unconfirmed(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // Spent-but-unconfirmed pot rows (#186), RANDOM-sampled so a
+        // never-mineable head cannot starve the tail — the same anti-starvation
+        // shape as find_pot_beefs_for_proof_check. `limit` is a u64 (not user
+        // input), interpolated to match that sibling's idiom. The
+        // (spent, spentConfirmed) composite index backs the scan.
+        let sql = format!(
+            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
+             WHERE spent = 1 AND spentConfirmed = 0 ORDER BY RANDOM() LIMIT {limit}"
+        );
+        let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
     async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
         // Probe the existing row's length first; write only when absent or
         // strictly longer ([`beef_write_allowed`] — never clobber a good row

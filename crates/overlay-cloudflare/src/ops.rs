@@ -8,7 +8,8 @@
 //!   completion pass. `last_tick_ms` is the wall-clock of the last live pass;
 //!   `tick_count` a monotonic pass count.
 //! - `ops_counters` — persistent monotonic counters (`proofs_completed_total`,
-//!   `fetch_failed_total`, `pot_beefs_compacted_total`), bumped every tick.
+//!   `fetch_failed_total`, `pot_beefs_compacted_total`, `spends_confirmed_total`),
+//!   bumped every tick.
 //! - `proofless_watch` — a first-seen ledger for proofless txids; a tx still
 //!   proofless after 24h is flagged (the signal that a proof genuinely is not
 //!   landing, vs. merely not-yet-mined).
@@ -29,6 +30,9 @@ use crate::d1::Query;
 pub const COUNTER_PROOFS_COMPLETED: &str = "proofs_completed_total";
 pub const COUNTER_FETCH_FAILED: &str = "fetch_failed_total";
 pub const COUNTER_POT_BEEFS_COMPACTED: &str = "pot_beefs_compacted_total";
+/// Pot spends UPGRADED to `spentConfirmed = 1` by the spend-confirmation
+/// chaser (#186). Name-keyed → additive, no schema change.
+pub const COUNTER_SPENDS_CONFIRMED: &str = "spends_confirmed_total";
 
 /// Default staleness budget for `/health/invariants?strict=1`: 6 hours. The
 /// completion cron runs every 15 min (`wrangler.toml crons`), so 6h ≈ 24 dead
@@ -74,6 +78,7 @@ pub async fn record_completion_tick(
     proofs_completed: u64,
     fetch_failed: u64,
     pot_beefs_compacted: u64,
+    spends_confirmed: u64,
 ) {
     let ts = now_ms();
 
@@ -94,6 +99,7 @@ pub async fn record_completion_tick(
         (COUNTER_PROOFS_COMPLETED, proofs_completed),
         (COUNTER_FETCH_FAILED, fetch_failed),
         (COUNTER_POT_BEEFS_COMPACTED, pot_beefs_compacted),
+        (COUNTER_SPENDS_CONFIRMED, spends_confirmed),
     ] {
         let q = Query::new(
             "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
@@ -178,6 +184,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_PROOFS_COMPLETED: 0,
         COUNTER_FETCH_FAILED: 0,
         COUNTER_POT_BEEFS_COMPACTED: 0,
+        COUNTER_SPENDS_CONFIRMED: 0,
     });
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);

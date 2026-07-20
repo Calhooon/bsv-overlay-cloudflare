@@ -577,6 +577,95 @@ fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> O
 }
 
 // ============================================================================
+// pot_records spend-confirmation chaser (#186)
+// ============================================================================
+
+/// Tally of one pot-spend confirmation pass (logged by the cron / returned by
+/// the admin route).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpendConfirmSummary {
+    /// Spent-but-unconfirmed pot rows scanned this tick.
+    pub scanned: usize,
+    /// Rows UPGRADED to `spentConfirmed = 1` this tick (the spending tx's bump
+    /// verified against chaintracks).
+    pub confirmed: usize,
+    /// Rows whose spending tx is not yet verifiably mined — left unconfirmed,
+    /// retried next tick (fail-closed).
+    pub still_unconfirmed: usize,
+    /// Rows skipped because the per-tick fetch budget was exhausted — retried
+    /// next tick. NOTE: [`AncestorFetcher::verified_proof_for`] folds
+    /// budget-exhausted and unmined into a single `None`, so this counter is
+    /// structurally 0 here (matching [`PotProofSummary::fetch_failed`], which
+    /// is likewise not separately observable); such candidates are counted
+    /// under `still_unconfirmed`. Kept for shape parity + future use.
+    pub fetch_failed: usize,
+}
+
+/// Confirm 0-conf pot spends in the LOW `pot_records` landing-proof store
+/// (#186).
+///
+/// LOW settles submit 0-conf (no merkle bump at submit time), so `mark_spent`
+/// records `spent = 1, spentConfirmed = 0` and nothing ever upgrades it — the
+/// overlay's SPV-confirmed wallet-credit tier goes unrealized. This pass, run
+/// in the SAME completion tick as the BEEF proof passes, chases each such row:
+/// fetch + chaintracks-verify the SPENDING tx's bump
+/// ([`AncestorFetcher::verified_proof_for`] — the raw-free, budget-bounded
+/// path), and on a verified `Some` latch `spentConfirmed = 1` via
+/// [`PotStorage::mark_spent`] with `confirmed = true` (an UPGRADE that never
+/// downgrades a confirmed row).
+///
+/// FAIL-CLOSED: a spend the fetcher can't verify against chaintracks is left
+/// unconfirmed (retried next tick), NEVER latched on a courier's word. Bounded
+/// by `limit`.
+pub async fn complete_spend_confirmations(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn AncestorFetcher,
+    limit: u64,
+) -> SpendConfirmSummary {
+    let mut summary = SpendConfirmSummary::default();
+
+    let candidates = match pot_storage.find_spent_unconfirmed(limit).await {
+        Ok(c) => c,
+        Err(e) => {
+            worker::console_log!("[spend-confirm] candidate scan failed: {e}");
+            return summary;
+        }
+    };
+    summary.scanned = candidates.len();
+
+    for rec in candidates {
+        // A spent row always carries a spending txid; skip defensively if not.
+        let Some(spending_txid) = rec.spending_txid.as_deref() else {
+            continue;
+        };
+
+        // PROOF-ONLY fetch + chaintracks-verify: the fetcher returns a bump
+        // ONLY once its root is verified against our PoW-anchored header source;
+        // unmined / unverifiable / budget-exhausted → `None` (retry), never a
+        // positive.
+        match fetcher.verified_proof_for(spending_txid).await {
+            Some(_bump) => {
+                // UPGRADE: latch spentConfirmed = 1. mark_spent(confirmed=true)
+                // always writes and never downgrades a confirmed row.
+                if let Err(e) = pot_storage
+                    .mark_spent(&rec.txid, rec.output_index, spending_txid, true)
+                    .await
+                {
+                    worker::console_log!("[spend-confirm] {} mark_spent failed: {e}", rec.txid);
+                } else {
+                    summary.confirmed += 1;
+                }
+            }
+            None => {
+                summary.still_unconfirmed += 1;
+            }
+        }
+    }
+
+    summary
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -703,5 +792,130 @@ mod tests {
         let bump_hex = single_tx_bump(TXID, HEIGHT).to_hex();
         let tracker = MockChainTracker::new(HEIGHT + 6); // no roots added
         assert!(!verify_bump(Some(&tracker), &bump_hex, TXID).await);
+    }
+
+    // ── 5. spend-confirmation chaser pass (#186) ─────────────────────────────
+
+    use overlay_discovery::pot::storage::{MemoryPotStorage, PotRecord, PotStorage};
+
+    /// A fetcher whose `verified_proof_for` returns a (dummy) verified bump ONLY
+    /// for the txids in `minable` — models the chaintracks-verified vs unmined
+    /// outcome without hitting the network (the concrete ChainProofFetcher is
+    /// network-only). `fetch_ancestor` is never called by the pass.
+    struct MockProofFetcher {
+        minable: std::collections::HashSet<String>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for MockProofFetcher {
+        async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+            Err(GASPError::NodeNotFound(format!("mock: no ancestor for {txid}")))
+        }
+        async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+            self.minable.contains(txid).then(|| "beefbump".to_string())
+        }
+    }
+
+    fn spent_unconfirmed(txid: &str, spender: &str) -> PotRecord {
+        PotRecord {
+            txid: txid.into(),
+            output_index: 0,
+            spent: true,
+            spending_txid: Some(spender.into()),
+            spent_confirmed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn spend_confirmation_upgrades_when_spend_is_mined() {
+        let store = MemoryPotStorage::new();
+        // Admit then record a 0-conf spend (spent, unconfirmed).
+        store
+            .store_record(&PotRecord {
+                txid: "potA".into(),
+                output_index: 0,
+                spent: false,
+                spending_txid: None,
+                spent_confirmed: false,
+            })
+            .await
+            .unwrap();
+        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+
+        let fetcher = MockProofFetcher {
+            minable: ["settleA".to_string()].into_iter().collect(),
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        assert_eq!(s.scanned, 1);
+        assert_eq!(s.confirmed, 1);
+        assert_eq!(s.still_unconfirmed, 0);
+
+        // The row is now SPV-confirmed and drops out of the candidate set.
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed, "a verified spend latches spentConfirmed");
+        assert_eq!(r.spending_txid.as_deref(), Some("settleA"));
+        assert!(store.find_spent_unconfirmed(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spend_confirmation_leaves_unmined_untouched() {
+        let store = MemoryPotStorage::new();
+        store
+            .store_record(&PotRecord {
+                txid: "potA".into(),
+                output_index: 0,
+                spent: false,
+                spending_txid: None,
+                spent_confirmed: false,
+            })
+            .await
+            .unwrap();
+        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+
+        // The spending tx is NOT verifiably mined → fail-closed, no upgrade.
+        let fetcher = MockProofFetcher {
+            minable: std::collections::HashSet::new(),
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        assert_eq!(s.scanned, 1);
+        assert_eq!(s.confirmed, 0);
+        assert_eq!(s.still_unconfirmed, 1);
+
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(!r.spent_confirmed, "an unverified spend is never latched");
+        assert_eq!(
+            store.find_spent_unconfirmed(10).await.unwrap().len(),
+            1,
+            "the row stays a candidate for the next tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn spend_confirmation_no_candidates_is_a_noop() {
+        let store = MemoryPotStorage::new();
+        let fetcher = MockProofFetcher {
+            minable: std::collections::HashSet::new(),
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        assert_eq!(s, SpendConfirmSummary::default());
+    }
+
+    #[tokio::test]
+    async fn spend_confirmation_only_upgrades_the_mined_row() {
+        let store = MemoryPotStorage::new();
+        for (txid, spender) in [("potA", "settleA"), ("potB", "settleB")] {
+            store.store_record(&spent_unconfirmed(txid, spender)).await.unwrap();
+        }
+        // Only settleA is mined.
+        let fetcher = MockProofFetcher {
+            minable: ["settleA".to_string()].into_iter().collect(),
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        assert_eq!(s.scanned, 2);
+        assert_eq!(s.confirmed, 1);
+        assert_eq!(s.still_unconfirmed, 1);
+
+        assert!(store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed);
+        assert!(!store.get_spent_status("potB", 0).await.unwrap().unwrap().spent_confirmed);
     }
 }
