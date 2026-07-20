@@ -9,6 +9,48 @@ use serde_json::json;
 /// (bounds the per-request D1 work; a client with more splits the call).
 pub const MAX_OUTPOINTS: usize = 64;
 
+/// Cloudflare D1 caps a single prepared statement at 100 bound parameters.
+pub const D1_MAX_BOUND_PARAMS: usize = 100;
+
+/// The batch WHERE binds 2 params per outpoint (`txid` + `outputIndex`).
+pub const BINDS_PER_OUTPOINT: usize = 2;
+
+/// The largest number of outpoints one D1 statement may carry.
+///
+/// Derived from the D1 cap: `floor(100 / 2) = 50` outpoints × 2 binds = 100
+/// bound params, exactly at the ceiling — so a *single* query of >50 outpoints
+/// is the mainnet 503 bug (51 × 2 = 102 > 100). We chunk at **45**, below the
+/// 50 hard boundary, to keep margin: a future column added to the batch WHERE,
+/// or any stray extra bind in the statement, must not silently reintroduce the
+/// cap. A request of up to [`MAX_OUTPOINTS`] is served by `ceil(n / 45)`
+/// internal D1 queries — each ≤ 45 outpoints ⇒ ≤ 90 binds ⇒ always under 100.
+/// The public request contract (input, output shape, [`MAX_OUTPOINTS`] cap)
+/// is unchanged; only the internal D1 execution is chunked, so the server can
+/// never 503 on a legitimately-sized request regardless of client chunk size.
+pub const D1_CHUNK_OUTPOINTS: usize = 45;
+
+// Compile-time proof the chunk size can never exceed the D1 param cap. If
+// someone bumps D1_CHUNK_OUTPOINTS (or BINDS_PER_OUTPOINT) past the ceiling,
+// the crate stops building — the invariant is enforced, not merely commented.
+const _: () = assert!(D1_CHUNK_OUTPOINTS * BINDS_PER_OUTPOINT <= D1_MAX_BOUND_PARAMS);
+
+/// Split a requested outpoint batch into D1-safe sub-batches of at most
+/// [`D1_CHUNK_OUTPOINTS`], preserving input order. The route handlers run ONE
+/// D1 query per returned chunk and merge the rows into the single response
+/// (`assemble_statuses` / `assemble_pots_view` re-key rows onto the requested
+/// outpoints, so cross-chunk row order is irrelevant).
+///
+/// FAIL-SAFE granularity (money-truth, unchanged): if ANY chunk's D1 query
+/// errors, the handler surfaces the SAME 503 the caller already handles and
+/// serves NO body — a failed chunk is "unknown for those rows", never a
+/// fabricated all-unknown/empty result a caller could misread as authoritative
+/// (the same batch-failure discipline the client uses). Only after every chunk
+/// succeeds are the merged rows assembled, so an absent outpoint is reported
+/// unknown/not-spent per the existing contract, never invented.
+pub fn chunk_outpoints(outpoints: &[Outpoint]) -> std::slice::Chunks<'_, Outpoint> {
+    outpoints.chunks(D1_CHUNK_OUTPOINTS)
+}
+
 /// A txid is exactly 32 bytes → 64 hex chars (either case accepted; DB
 /// lookups lowercase separately).
 pub fn valid_txid(s: &str) -> bool {
@@ -592,6 +634,91 @@ mod tests {
         assert_eq!(ops[0].vout, u32::MAX);
         // …u32::MAX + 1 does not.
         assert!(parse_outpoints(&format!("{}.4294967296", txid_a())).is_err());
+    }
+
+    // ── D1-safe chunking (the 100-bound-param cap fix) ─────────────────
+
+    /// Build `n` distinct outpoints (unique vouts) to feed the chunker.
+    fn n_outpoints(n: usize) -> Vec<Outpoint> {
+        (0..n)
+            .map(|i| Outpoint {
+                txid: txid_a(),
+                vout: i as u32,
+            })
+            .collect()
+    }
+
+    // (The chunk size vs the D1 100-param cap is enforced at COMPILE TIME by
+    // the `const _: () = assert!(…)` next to D1_CHUNK_OUTPOINTS — a runtime
+    // test of those constants would be redundant. The per-N test below proves
+    // the derived bound holds for every produced chunk.)
+
+    /// Every chunk is non-empty, ≤ the D1-safe bound, order-preserving, and the
+    /// chunks concatenate back to the exact input — for every N up to the cap.
+    #[test]
+    fn chunk_outpoints_never_exceeds_the_bound_for_any_n() {
+        for n in 1..=MAX_OUTPOINTS {
+            let ops = n_outpoints(n);
+            let chunks: Vec<&[Outpoint]> = chunk_outpoints(&ops).collect();
+            // Count = ceil(n / chunk).
+            let expected = n.div_ceil(D1_CHUNK_OUTPOINTS);
+            assert_eq!(chunks.len(), expected, "n={n}");
+            // Every chunk ≤ the D1-safe bound (⇒ ≤ 100 binds), none empty.
+            for c in &chunks {
+                assert!(!c.is_empty(), "n={n}: empty chunk");
+                assert!(c.len() <= D1_CHUNK_OUTPOINTS, "n={n}: chunk too big");
+                assert!(
+                    c.len() * BINDS_PER_OUTPOINT <= D1_MAX_BOUND_PARAMS,
+                    "n={n}: chunk would exceed D1 param cap"
+                );
+            }
+            // Sizes sum to n, and order is preserved (flatten == input).
+            let flat: Vec<&Outpoint> = chunks.iter().flat_map(|c| c.iter()).collect();
+            assert_eq!(flat.len(), n, "n={n}");
+            assert!(flat.iter().zip(ops.iter()).all(|(a, b)| *a == b), "n={n}");
+        }
+    }
+
+    #[test]
+    fn chunk_single_outpoint_is_one_batch() {
+        let ops = n_outpoints(1);
+        let chunks: Vec<&[Outpoint]> = chunk_outpoints(&ops).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
+    #[test]
+    fn chunk_at_and_around_the_boundary() {
+        // Exactly the chunk size → one batch.
+        let exact = n_outpoints(D1_CHUNK_OUTPOINTS);
+        let exact_chunks: Vec<&[Outpoint]> = chunk_outpoints(&exact).collect();
+        assert_eq!(exact_chunks.len(), 1);
+        assert_eq!(exact_chunks[0].len(), D1_CHUNK_OUTPOINTS);
+        // One over → two batches: full + remainder of 1.
+        let over_ops = n_outpoints(D1_CHUNK_OUTPOINTS + 1);
+        let over: Vec<&[Outpoint]> = chunk_outpoints(&over_ops).collect();
+        assert_eq!(over.len(), 2);
+        assert_eq!(over[0].len(), D1_CHUNK_OUTPOINTS);
+        assert_eq!(over[1].len(), 1);
+        // The old single-query 503 boundary (51 outpoints) now splits cleanly
+        // — the first chunk (45) is well under the 100-param cap.
+        let fifty_one_ops = n_outpoints(51);
+        let fifty_one: Vec<&[Outpoint]> = chunk_outpoints(&fifty_one_ops).collect();
+        assert_eq!(fifty_one.len(), 2);
+        assert_eq!(fifty_one[0].len(), 45);
+        assert_eq!(fifty_one[1].len(), 6);
+    }
+
+    #[test]
+    fn chunk_at_max_outpoints_splits_correctly() {
+        // A full-cap request (64) → ceil(64/45) = 2 chunks (45 + 19), each
+        // under the D1 param cap — the whole cap is servable without a 503.
+        let ops = n_outpoints(MAX_OUTPOINTS);
+        let chunks: Vec<&[Outpoint]> = chunk_outpoints(&ops).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 45);
+        assert_eq!(chunks[1].len(), 19);
+        assert_eq!(chunks[0].len() + chunks[1].len(), MAX_OUTPOINTS);
     }
 
     // ── response assembly ──────────────────────────────────────────────

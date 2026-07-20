@@ -8,8 +8,16 @@
 //! NO CACHING (owner call, 2026-07-14): the Cache API misbehaves on
 //! workers.dev (intermittent CF 1042s observed live) and the scaling win is
 //! the QUERY COLLAPSE, not the cache — `/utxo-status` answers a whole batch
-//! of outpoints with ONE D1 query (`batch_where_sql`), so a home-mount
-//! gather is one request → one query. Every response is `no-store`.
+//! of outpoints with a batched D1 query (`batch_where_sql`), so a home-mount
+//! gather is one request → few queries. Every response is `no-store`.
+//!
+//! D1 100-PARAM CAP: the batch WHERE binds 2 params per outpoint and D1 caps a
+//! statement at 100 bound params, so a single query of >50 outpoints 503s (the
+//! mainnet Leaderboard bug: a 57-pot batch → HTTP 503 → swallowed → empty
+//! board). The handlers chunk internally at [`logic::D1_CHUNK_OUTPOINTS`] and
+//! merge — the public contract (input, output shape, MAX_OUTPOINTS cap) is
+//! unchanged; the server never 503s on a legitimately-sized request regardless
+//! of client chunk size. A chunk's D1 error still surfaces as the same 503.
 
 use serde::Deserialize;
 use worker::wasm_bindgen::JsValue;
@@ -17,9 +25,9 @@ use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Resu
 
 use crate::logic::{
     assemble_pots_view, assemble_recovery_view, assemble_statuses, batch_where_sql, beef_body,
-    decode_beef_hex, health_body, parse_outpoints, parse_present_height, pots_view_body,
-    pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body, utxo_status_body,
-    valid_identity, valid_txid, Outpoint, PotRecordRow, PotsViewRow, RecoveryRow,
+    chunk_outpoints, decode_beef_hex, health_body, parse_outpoints, parse_present_height,
+    pots_view_body, pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body,
+    utxo_status_body, valid_identity, valid_txid, Outpoint, PotRecordRow, PotsViewRow, RecoveryRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -106,20 +114,31 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<()>) -> Result<Response
         },
     };
 
-    // ONE query for the whole batch: WHERE (txid=? AND outputIndex=?) OR …
-    let mut binds: Vec<JsValue> = Vec::with_capacity(outpoints.len() * 2);
-    for op in &outpoints {
-        binds.push(JsValue::from_str(&op.db_txid()));
-        binds.push(JsValue::from_f64(f64::from(op.vout)));
+    // One D1 query PER CHUNK (≤ D1_CHUNK_OUTPOINTS outpoints ⇒ ≤ 90 binds),
+    // merged into one response. A single un-chunked query of >50 outpoints
+    // exceeds D1's 100 bound-param cap and 503s (the mainnet Leaderboard bug);
+    // chunking keeps every statement under the cap for any request up to
+    // MAX_OUTPOINTS. Chunks run sequentially (simple, correct — no race).
+    // FAIL-SAFE: any chunk's D1 error returns the SAME 503 the caller already
+    // handles and serves no body — a failed chunk is unknown-for-those-rows,
+    // never a fabricated all-unknown result. Rows merge across chunks;
+    // assemble_statuses re-keys them onto the requested outpoints (order-free).
+    let mut rows: Vec<PotRecordRow> = Vec::with_capacity(outpoints.len());
+    for chunk in chunk_outpoints(&outpoints) {
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        for op in chunk {
+            binds.push(JsValue::from_str(&op.db_txid()));
+            binds.push(JsValue::from_f64(f64::from(op.vout)));
+        }
+        let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&binds)?;
+        match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
+            Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotRowD1::into_row)),
+            Err(e) => {
+                console_warn!("[utxo-status] pot_records batch query failed: {e}");
+                return json_error("database query failed", 503);
+            },
+        }
     }
-    let stmt = db.prepare(batch_where_sql(outpoints.len())).bind(&binds)?;
-    let rows: Vec<PotRecordRow> = match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
-        Ok(rows) => rows.into_iter().map(PotRowD1::into_row).collect(),
-        Err(e) => {
-            console_warn!("[utxo-status] pot_records batch query failed: {e}");
-            return json_error("database query failed", 503);
-        },
-    };
 
     let entries = assemble_statuses(&outpoints, &rows);
     json_response(utxo_status_body(&entries), 200)
@@ -314,20 +333,27 @@ pub async fn pots_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         },
     };
 
-    // ONE joined query for the whole batch (records + spender BEEFs).
-    let mut binds: Vec<JsValue> = Vec::with_capacity(outpoints.len() * 2);
-    for op in &outpoints {
-        binds.push(JsValue::from_str(&op.db_txid()));
-        binds.push(JsValue::from_f64(f64::from(op.vout)));
+    // One joined query PER CHUNK (records + spender BEEFs), merged into one
+    // response — same D1 100-bound-param discipline as /utxo-status (the join
+    // still binds 2 params per outpoint, so a >50-outpoint single query 503s).
+    // FAIL-SAFE: any chunk's D1 error returns the SAME 503 and no body — a
+    // failed chunk is unknown-for-those-rows, never a fabricated partial view.
+    let mut rows: Vec<PotsViewRow> = Vec::with_capacity(outpoints.len());
+    for chunk in chunk_outpoints(&outpoints) {
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        for op in chunk {
+            binds.push(JsValue::from_str(&op.db_txid()));
+            binds.push(JsValue::from_f64(f64::from(op.vout)));
+        }
+        let stmt = db.prepare(pots_view_join_sql(chunk.len())).bind(&binds)?;
+        match stmt.all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
+            Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotsViewRowD1::into_row)),
+            Err(e) => {
+                console_warn!("[pots-view] pot_records join query failed: {e}");
+                return json_error("database query failed", 503);
+            },
+        }
     }
-    let stmt = db.prepare(pots_view_join_sql(outpoints.len())).bind(&binds)?;
-    let rows: Vec<PotsViewRow> = match stmt.all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
-        Ok(rows) => rows.into_iter().map(PotsViewRowD1::into_row).collect(),
-        Err(e) => {
-            console_warn!("[pots-view] pot_records join query failed: {e}");
-            return json_error("database query failed", 503);
-        },
-    };
 
     let entries = assemble_pots_view(&outpoints, &rows);
     let tip = chaintracks_present_height(&ctx, "pots-view").await.ok();
