@@ -16,6 +16,40 @@ use worker::{Context, Env, Request, Response};
 // Error → HTTP status mapping
 // =============================================================================
 
+/// Work bound for a broadcast-gated submit (#211/#209). Under subject-only
+/// submission the ACTUAL WORK is broadcasting the subject EF; a single LOW tx
+/// EF is a few KB even one level deep, so 256 KB is generous headroom and a
+/// body larger than this is not a LOW tx. (The OLD bound counted unproven txs
+/// and tripped on a player's accumulated unconfirmed ancestry — exactly the
+/// wrong thing to count once we submit the subject alone.)
+const MAX_SUBJECT_EF_BYTES: usize = 256 * 1024;
+/// Total-batch work bound. Subject-only submission means attempts 1–2 send just
+/// the subject, but the async-REJECTED fallback (attempt 3) re-submits the FULL
+/// ancestry batch (`concat_efs`) to ARC. Without a bound on THAT, a malicious
+/// client could pass the subject cap yet force a multi-MB ARC POST + ~40 s of
+/// worker poll per request (the abuse the old `>8`-count cap blocked). 2 MiB is
+/// generous for any legitimate LOW hand's whole ancestry, but caps the attacker.
+const MAX_BATCH_EF_BYTES: usize = 2 * 1024 * 1024;
+
+/// PURE (#211): the offending byte size when EITHER work bound is exceeded, else
+/// `None`. Bounds (a) the SUBJECT EF we broadcast first, and (b) the TOTAL batch
+/// bytes the fallback may re-submit — NOT the ancestry COUNT, which subject-only
+/// submission no longer makes the relevant quantity. A missing subject (already
+/// mined / not in batch) is 0 bytes → never over the subject cap. Evaluated
+/// BEFORE any ARC POST so an oversized batch never reaches the network.
+fn subject_ef_over_cap(efs: &[crate::ef::EfTx], subject_txid: &str) -> Option<usize> {
+    let subject_ef_bytes = efs
+        .iter()
+        .find(|e| e.txid == subject_txid)
+        .map(|e| e.ef.len())
+        .unwrap_or(0);
+    let total_ef_bytes: usize = efs.iter().map(|e| e.ef.len()).sum();
+    if total_ef_bytes > MAX_BATCH_EF_BYTES {
+        return Some(total_ef_bytes);
+    }
+    (subject_ef_bytes > MAX_SUBJECT_EF_BYTES).then_some(subject_ef_bytes)
+}
+
 fn engine_error_status(e: &EngineError) -> u16 {
     match e {
         EngineError::UnsupportedTopic(_) => 400,
@@ -74,6 +108,21 @@ fn json_error(message: &str, status: u16) -> worker::Result<Response> {
         },
         status,
     )
+}
+
+/// A retryable error (#211) — `{status,message,retryable:true}` + a
+/// `Retry-After` header so the client knows to fall back for this submit only.
+fn json_error_retryable(message: &str, status: u16) -> worker::Result<Response> {
+    let mut resp = json_response(
+        &RetryableErrorBody {
+            status: "error",
+            message,
+            retryable: true,
+        },
+        status,
+    )?;
+    let _ = resp.headers_mut().set("Retry-After", "1");
+    Ok(resp)
 }
 
 fn text_response(body: &str, content_type: &str) -> worker::Result<Response> {
@@ -144,6 +193,16 @@ fn read_varint_prefix(data: &[u8]) -> Option<(usize, usize)> {
 struct ErrorBody<'a> {
     status: &'a str,
     message: &'a str,
+}
+
+/// Error body carrying a `retryable` hint (#211). A `429` cap rejection is
+/// transient: the client should fall back for THIS submit but keep using the
+/// overlay, rather than treating a flat `400` as "the overlay is broken".
+#[derive(Serialize)]
+struct RetryableErrorBody<'a> {
+    status: &'a str,
+    message: &'a str,
+    retryable: bool,
 }
 
 #[derive(Serialize)]
@@ -452,6 +511,13 @@ pub async fn submit(
     // transport failure on both broadcasters returns 502 (the caller falls
     // back to its own direct broadcast + historical submit). An all-proven
     // BEEF (already mined) skips the broadcast and admits directly.
+    // #195 Server-Timing segments (ms). `arcade-broadcast` is the gated
+    // network broadcast, `engine-submit` the D1 write-through, `fanout` the
+    // (backgrounded) SHIP fan-out's synchronous scheduling cost. Emitted as a
+    // `Server-Timing` response header so a latency claim is measurable per
+    // slice instead of from client wall-clock (which cannot separate overlay
+    // work from Arcade variance — the retracted #195 measurement).
+    let mut arcade_broadcast_ms = 0f64;
     if mode_header.as_deref() == Some("broadcast-gated") {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
@@ -468,15 +534,27 @@ pub async fn submit(
                 return json_error(&format!("broadcast-gated: {e}"), 400);
             }
         };
-        // Abuse bound: a LOW money BEEF carries ≤4 unproven txs (hop A + hop B +
-        // JOIN + spend); 8 is generous headroom, and a bigger batch is not a LOW
-        // client.
-        if efs.len() > 8 {
+        // Work bound (#211/#209). The OLD cap counted unproven txs (`> 8`) and
+        // was hit ROUTINELY: a real player's funding coin accumulates deep
+        // unconfirmed ancestry, so a LOW BEEF can carry far more than 8 unproven
+        // ancestors even though only ONE tx (the subject) is being broadcast.
+        // Under subject-only submission (`broadcast_efs_gated`) that ancestry no
+        // longer counts — we bound the ACTUAL WORK instead: the byte size of the
+        // SUBJECT EF we broadcast. A body that large is not a LOW tx.
+        //
+        // A cap hit is RETRYABLE (429 + hint), not a flat 400 — a 400 makes the
+        // client permanently abandon the overlay for this submit; a 429 lets it
+        // fall back for THIS submit without giving up on the overlay wholesale.
+        if let Some(over_bytes) = subject_ef_over_cap(&efs, &subject_txid) {
             worker::console_log!(
-                "POST /submit(broadcast-gated) -> 400 ({} unproven txs > 8)",
-                efs.len()
+                "POST /submit(broadcast-gated) -> 429 (EF work bound: {over_bytes} B > subject {MAX_SUBJECT_EF_BYTES} B / batch {MAX_BATCH_EF_BYTES} B)"
             );
-            return json_error("broadcast-gated: too many unproven txs (max 8)", 400);
+            return json_error_retryable(
+                &format!(
+                    "broadcast-gated: EF too large ({over_bytes} B; subject cap {MAX_SUBJECT_EF_BYTES} B, batch cap {MAX_BATCH_EF_BYTES} B) — retry via fallback"
+                ),
+                429,
+            );
         }
         // Ancestors are submitted in the same batch but do NOT gate admission —
         // only the SUBJECT reaching SEEN_ON_NETWORK does (they were broadcast
@@ -486,7 +564,10 @@ pub async fn submit(
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
-        match arcade.broadcast_efs_gated(&efs, &subject_txid).await {
+        let arcade_started = js_sys::Date::now();
+        let arcade_outcome = arcade.broadcast_efs_gated(&efs, &subject_txid).await;
+        arcade_broadcast_ms = js_sys::Date::now() - arcade_started;
+        match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
                 worker::console_log!(
                     "broadcast-gated(arcade): network accepted {subject_txid} ({accepted}, {} EF leg(s)) — admitting",
@@ -512,6 +593,7 @@ pub async fn submit(
     // ── Synchronous write-through: full submit (Phase 1+2+3) ──
     // Admitted outputs are written to D1 before the response is sent,
     // so subsequent /lookup queries on this instance see them immediately.
+    let engine_started = js_sys::Date::now();
     let steak = match engine.submit(&tagged_beef, mode).await {
         Ok(s) => s,
         Err(e) => {
@@ -520,6 +602,7 @@ pub async fn submit(
             return json_error(&e.to_string(), status);
         }
     };
+    let engine_submit_ms = js_sys::Date::now() - engine_started;
 
     // Diagnostic logging: show admitted output counts per topic
     let total_admitted: usize = steak.values().map(|a| a.outputs_to_admit.len()).sum();
@@ -637,14 +720,30 @@ pub async fn submit(
     // response, so the runtime keeps the isolate alive for it after we
     // answer. `tagged_beef` is MOVED (not cloned) — the diagnostics above are
     // its last synchronous reader — so backgrounding costs no extra BEEF copy.
+    let fanout_started = js_sys::Date::now();
     if total_admitted > 0 {
         let owned_host = hosting_url.map(str::to_string);
         ctx.wait_until(async move {
             crate::mainnet_fanout::fan_out(&tagged_beef, owned_host.as_deref()).await;
         });
     }
+    // Only the SCHEDULING cost (near-zero) — the fan-out itself runs after the
+    // response via wait_until. Segmenting it proves it is off the critical path.
+    let fanout_ms = js_sys::Date::now() - fanout_started;
 
-    json_ok(&steak)
+    // #195: `Server-Timing` makes each slice measurable at the client without
+    // conflating overlay work with Arcade variance.
+    let server_timing = format!(
+        "arcade-broadcast;dur={arcade_broadcast_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
+    );
+    let mut resp = json_ok(&steak)?;
+    {
+        let h = resp.headers_mut();
+        let _ = h.set("Server-Timing", &server_timing);
+        // Browsers gate response-header reads behind Access-Control-Expose-Headers.
+        let _ = h.set("Access-Control-Expose-Headers", "Server-Timing");
+    }
+    Ok(resp)
 }
 
 /// POST /lookup — JSON { service, query } → LookupAnswer JSON or aggregated binary.
@@ -1964,5 +2063,88 @@ mod tests {
         assert_eq!(html_escape("a>b"), "a&gt;b");
         assert_eq!(html_escape("a\"b"), "a&quot;b");
         assert_eq!(html_escape("safe"), "safe");
+    }
+
+    // ── #211/#209: work-bound cap (replaces the old `efs.len() > 8`) ─────────
+
+    use crate::ef::EfTx;
+
+    #[test]
+    fn work_bound_cap_ignores_ancestry_depth_bounds_the_subject() {
+        // #209: a deep unconfirmed ancestry (many small unproven ancestors)
+        // used to trip the old COUNT cap (`> 8`) even though only the SUBJECT is
+        // broadcast. The byte bound looks ONLY at the subject we submit, so a
+        // 20-ancestor batch with a normal-sized subject passes.
+        let mut efs: Vec<EfTx> = (0..20)
+            .map(|i| EfTx { txid: format!("anc{i}"), ef: vec![0u8; 1024] })
+            .collect();
+        efs.push(EfTx { txid: "subj".into(), ef: vec![0u8; 4096] });
+        assert_eq!(
+            subject_ef_over_cap(&efs, "subj"),
+            None,
+            "20 ancestors + a 4KB subject must NOT trip the bound"
+        );
+    }
+
+    #[test]
+    fn work_bound_cap_trips_only_on_an_oversized_subject() {
+        let efs = vec![EfTx {
+            txid: "subj".into(),
+            ef: vec![0u8; MAX_SUBJECT_EF_BYTES + 1],
+        }];
+        assert_eq!(
+            subject_ef_over_cap(&efs, "subj"),
+            Some(MAX_SUBJECT_EF_BYTES + 1),
+            "a subject one byte over the bound is capped"
+        );
+        // Exactly at the bound is allowed.
+        let at = vec![EfTx { txid: "subj".into(), ef: vec![0u8; MAX_SUBJECT_EF_BYTES] }];
+        assert_eq!(subject_ef_over_cap(&at, "subj"), None);
+    }
+
+    #[test]
+    fn work_bound_cap_absent_subject_is_never_over() {
+        // Subject already mined / not present → 0 bytes → never capped.
+        let efs = vec![EfTx { txid: "other".into(), ef: vec![0u8; 8] }];
+        assert_eq!(subject_ef_over_cap(&efs, "subj"), None);
+    }
+
+    #[test]
+    fn work_bound_cap_bounds_the_total_batch_the_fallback_resubmits() {
+        // Adversarial review (2026-07-20): a NORMAL-sized subject that passes the
+        // subject cap, but a huge ancestry batch. Attempts 1–2 send only the
+        // subject; the async-REJECTED fallback (attempt 3) re-submits the WHOLE
+        // batch (`concat_efs`) to ARC. The subject cap alone would let an
+        // attacker force a multi-MB ARC POST + ~40 s of worker poll per request
+        // (a double-spend subject: 202 then async REJECTED → the fallback fires).
+        // The total-batch bound catches it BEFORE any ARC submit.
+        let mut efs = vec![EfTx { txid: "subj".into(), ef: vec![0u8; 4096] }]; // subject fine
+        efs.push(EfTx { txid: "fat-ancestor".into(), ef: vec![0u8; MAX_BATCH_EF_BYTES] });
+        let total = 4096 + MAX_BATCH_EF_BYTES;
+        assert_eq!(
+            subject_ef_over_cap(&efs, "subj"),
+            Some(total),
+            "an oversized TOTAL batch must be capped even when the subject is small"
+        );
+        // A total exactly at the bound is allowed — small subject + ancestry
+        // that sums (with the subject) to exactly the batch cap.
+        let at = vec![
+            EfTx { txid: "subj".into(), ef: vec![0u8; 4096] },
+            EfTx { txid: "anc".into(), ef: vec![0u8; MAX_BATCH_EF_BYTES - 4096] },
+        ];
+        assert_eq!(subject_ef_over_cap(&at, "subj"), None, "total exactly at the batch bound is allowed");
+    }
+
+    #[test]
+    fn retryable_cap_error_body_carries_the_retryable_hint() {
+        // #211: a cap rejection must be retryable (429 + `retryable:true`), not
+        // a flat 400 that makes the client abandon the overlay for this submit.
+        let json = serde_json::to_string(&RetryableErrorBody {
+            status: "error",
+            message: "subject EF too large — retry via fallback",
+            retryable: true,
+        })
+        .unwrap();
+        assert!(json.contains("\"retryable\":true"), "{json}");
     }
 }

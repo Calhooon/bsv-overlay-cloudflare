@@ -515,6 +515,147 @@ struct ArcadeStatusResponse {
     txid: String,
     #[serde(default)]
     tx_status: String,
+    /// The node's human-readable status detail. #209: previously DISCARDED —
+    /// now captured so a definitive rejection threads a structured reason a
+    /// fallback can key on (rather than a bare `Arcade REJECTED <txid>`).
+    ///
+    /// STALE-`extraInfo` TRAP (#213) — DO NOT gate on this field. After an
+    /// orphan recovers via an explicit resubmit, `GET /tx` returns a HEALTHY
+    /// `txStatus` (e.g. `SEEN_MULTIPLE_NODES`) ALONGSIDE the OLD failure
+    /// `extraInfo` (`PROCESSING (4): … failed to validate transaction`). Every
+    /// gate/classification here reads ONLY `tx_status` ([`classify_arcade_status`]),
+    /// so it is correct today; any future rule that consulted `extra_info` to
+    /// refuse/concede would mis-gate a recovered, healthy transaction. This
+    /// field is for REASON TEXT ONLY.
+    #[serde(default)]
+    extra_info: String,
+}
+
+/// Arcade's SYNCHRONOUS per-tx validation-failure body (#213). Arcade
+/// validates script + fee synchronously (EF inlines each input's source
+/// script and satoshis, so only UTXO *existence* is deferred), and a
+/// definitive verdict lands as `HTTP 400`:
+///
+/// ```json
+/// {"error":"transaction failed validation",
+///  "reason":"TX_INVALID (31): … -> UNKNOWN (0): insufficient-fee"}
+/// ```
+///
+/// We key on the STRUCTURED `error` field value (never a substring of prose —
+/// this repo has been bitten twice by free-text matching on a money path,
+/// #210/#212). The `reason` is version-brittle node wording, captured for the
+/// human-readable message only, never matched on.
+#[derive(Debug, serde::Deserialize)]
+struct ArcadeSubmitError {
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// The exact value of Arcade's `error` field for a definitive per-tx
+/// validation failure. A whole-FIELD equality (not a prose substring).
+const ARCADE_VALIDATION_FAILED_ERROR: &str = "transaction failed validation";
+
+/// Classified outcome of ONE Arcade EF submit POST (`POST /tx` | `POST /txs`).
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitOutcome {
+    /// 2xx accept-for-processing — carries the response body for status parse.
+    Processing(String),
+    /// A SYNCHRONOUS, DEFINITIVE per-tx rejection (#213): `HTTP 400` carrying
+    /// the structured `{"error":"transaction failed validation", …}` body.
+    /// Script/fee already failed — a resubmit cannot change it; admit nothing.
+    SyncRejected(String),
+    /// TRANSPORT trouble — 5xx, auth (401/403), gateway misroute (404/405),
+    /// rate-limit (429), timeouts, an unrecognised 400. The caller falls back.
+    Transport(String),
+}
+
+/// One gate step's outcome (submit + SEEN-gate of a single body).
+#[derive(Debug, PartialEq, Eq)]
+enum GateStep {
+    /// Subject reached `SEEN_ON_NETWORK` (or better) — admit may proceed.
+    Accepted,
+    /// Synchronous definitive per-tx rejection ([`SubmitOutcome::SyncRejected`]).
+    SyncRejected(String),
+    /// The 202-then-async-`REJECTED` shape (#211): submit was ACCEPTED for
+    /// processing (2xx) but the subject never became SEEN and went to a fatal
+    /// status. This is AMBIGUOUS — a missing parent and a genuine double-spend
+    /// are character-identical here — so the caller RESUBMITS (waiting is
+    /// proven useless) rather than concluding "missing parent".
+    AsyncRejected(String),
+}
+
+/// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
+fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
+    if (200..300).contains(&status) {
+        return SubmitOutcome::Processing(body.to_string());
+    }
+    // #213: a SYNCHRONOUS HTTP 400 carrying the structured validation-failure
+    // body is a DEFINITIVE per-tx verdict — NOT transport. The old code comment
+    // ("an HTTP failure is never a per-tx verdict") was empirically false: a
+    // definitive refusal must return 422/admit-nothing, never fall through to a
+    // re-broadcast of a tx the network already refused.
+    if status == 400 {
+        if let Ok(err) = serde_json::from_str::<ArcadeSubmitError>(body) {
+            if err.error == ARCADE_VALIDATION_FAILED_ERROR {
+                let reason = if err.reason.is_empty() {
+                    err.error
+                } else {
+                    format!("{}: {}", err.error, err.reason)
+                };
+                return SubmitOutcome::SyncRejected(reason);
+            }
+        }
+    }
+    // Everything else non-2xx is transport trouble → fall back. A bare 400 that
+    // is NOT the structured validation-failure shape fails SAFE this way (we
+    // never fabricate a definitive rejection from an unrecognised body).
+    SubmitOutcome::Transport(format!("Arcade submit HTTP {status}: {body}"))
+}
+
+/// One rung of the subject-only resubmit ladder (#211): given a gate step,
+/// either RETURN a terminal outcome or RETRY (advance to the next resubmit).
+/// PURE — this is the real producer of the ladder's control flow, so the
+/// "resubmit fires on async REJECTED, but NOT on a synchronous rejection"
+/// behaviour is unit-tested without the worker runtime.
+#[derive(Debug, PartialEq, Eq)]
+enum Ladder {
+    /// Terminal — return this outcome now.
+    Return(ArcOutcome),
+    /// The 202-then-async-REJECTED shape — advance to the next resubmit.
+    Retry,
+}
+
+fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
+    match step {
+        GateStep::Accepted => Ladder::Return(ArcOutcome::Accepted(subject_txid.to_string())),
+        // A SYNCHRONOUS validation failure (bad script / low fee) is definitive
+        // — a resubmit cannot change it. Admit nothing; do NOT retry.
+        GateStep::SyncRejected(r) => Ladder::Return(ArcOutcome::Rejected(r)),
+        // Network did not accept — ambiguous (missing parent vs double-spend);
+        // an explicit resubmit is the only recovery. Retry.
+        GateStep::AsyncRejected(_) => Ladder::Retry,
+    }
+}
+
+/// Concatenate an EF batch (dependency order) into a single `POST /txs` body.
+fn concat_efs(efs: &[EfTx]) -> Vec<u8> {
+    let mut concat = Vec::with_capacity(efs.iter().map(|e| e.ef.len()).sum());
+    for e in efs {
+        concat.extend_from_slice(&e.ef);
+    }
+    concat
+}
+
+/// Human-readable fatal reason for a status response, folding in the captured
+/// `extra_info` when present (#209). Never used to GATE — reason text only.
+fn arcade_fatal_reason(txid: &str, status: &str, extra_info: &str) -> String {
+    if extra_info.is_empty() {
+        format!("Arcade {status} {txid}")
+    } else {
+        format!("Arcade {status} {txid} ({extra_info})")
+    }
 }
 
 /// Arcade V2 broadcaster (async EF, SEEN-gated, callback-registering).
@@ -588,6 +729,19 @@ impl ArcadeBroadcaster {
     ///
     /// An empty `efs` (every tx already mined) is `Ok(Accepted(subject))` — a
     /// no-op success, mirroring the engine's skip-broadcast-when-mined path.
+    ///
+    /// SUBJECT-ONLY + ADAPTIVE RESUBMIT (#209/#211). Mainnet-proven: Arcade
+    /// resolves unconfirmed parents from the live network, so submitting the
+    /// SUBJECT ALONE succeeds even 8+ unconfirmed ancestors deep — we no longer
+    /// push the whole ancestry batch on the money path. If the subject is
+    /// submitted (202) but never becomes SEEN and goes to a fatal status, that
+    /// shape is AMBIGUOUS (a missing parent is character-identical to a genuine
+    /// double-spend) and Arcade does NOT self-heal orphans — so we EXPLICITLY
+    /// resubmit (subject again, then the full ancestry batch); waiting is proven
+    /// useless. A resubmit of a real double-spend is safe: it fails identically,
+    /// costing one round-trip on an already-terminal case. Because of that
+    /// ambiguity we NEVER report "missing parent" — the reason stays
+    /// "network did not accept; retried".
     pub async fn broadcast_efs_gated(
         &self,
         efs: &[EfTx],
@@ -598,21 +752,79 @@ impl ArcadeBroadcaster {
             return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
         }
 
-        let (endpoint, body): (String, Vec<u8>) = if efs.len() == 1 {
-            (self.tx_endpoint(), efs[0].ef.clone())
-        } else {
-            let mut concat = Vec::with_capacity(efs.iter().map(|e| e.ef.len()).sum());
-            for e in efs {
-                concat.extend_from_slice(&e.ef);
-            }
-            (self.txs_endpoint(), concat)
-        };
+        // The subject's own EF is what we broadcast first (subject-only).
+        let subject_ef = efs
+            .iter()
+            .find(|e| e.txid == subject_txid)
+            .ok_or_else(|| format!("subject {subject_txid} not present in EF batch"))?;
 
-        let submit_body = self.post_ef(&endpoint, subject_txid, &body).await?;
+        // ── Attempt 1: SUBJECT ONLY. Arcade sources unconfirmed parents itself.
+        worker::console_log!(
+            "[arcade] submitting subject-only {subject_txid} → gating on {ARCADE_GATE_STATUS}"
+        );
+        let step = self
+            .submit_once_and_gate(&self.tx_endpoint(), &subject_ef.ef, subject_txid, 1)
+            .await?;
+        if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
+            return Ok(outcome);
+        }
+
+        // ── Attempt 2: RESUBMIT the subject alone (waiting is proven useless;
+        // Arcade needs an explicit resubmit to re-attempt orphan resolution).
+        worker::console_log!("[arcade] {subject_txid} not accepted — resubmitting subject-only");
+        let step = self
+            .submit_once_and_gate(&self.tx_endpoint(), &subject_ef.ef, subject_txid, 1)
+            .await?;
+        if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
+            return Ok(outcome);
+        }
+
+        // ── Attempt 3: FULL ANCESTRY BATCH — feed any parent Arcade could not
+        // source from the live network. Only meaningful when ancestors exist;
+        // with just the subject this repeats attempt 2, so we skip it.
+        if efs.len() > 1 {
+            let concat = concat_efs(efs);
+            worker::console_log!(
+                "[arcade] {subject_txid} still not accepted — resubmitting full batch ({} legs)",
+                efs.len()
+            );
+            let step = self
+                .submit_once_and_gate(&self.txs_endpoint(), &concat, subject_txid, efs.len())
+                .await?;
+            if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
+                return Ok(outcome);
+            }
+        }
+
+        // Exhausted the resubmit ladder — the network genuinely did not accept
+        // the subject. Ambiguous with a double-spend, so DO NOT say "missing
+        // parent"; admit nothing.
+        Ok(ArcOutcome::Rejected(format!(
+            "network did not accept {subject_txid}; retried"
+        )))
+    }
+
+    /// Submit one EF body and SEEN-gate the subject: submit → (echoed-status
+    /// short-circuit) → poll. Returns a [`GateStep`]; `Err` is transport
+    /// trouble the caller falls back on. `batch_len == 1` enables the
+    /// echoed-status short-circuit (a single-tx submit body carries the current
+    /// txStatus; a resubmit of a known tx can come back already SEEN/MINED).
+    async fn submit_once_and_gate(
+        &self,
+        endpoint: &str,
+        body: &[u8],
+        subject_txid: &str,
+        batch_len: usize,
+    ) -> Result<GateStep, String> {
+        let submit_body = match self.submit_ef(endpoint, subject_txid, body).await {
+            SubmitOutcome::Processing(b) => b,
+            SubmitOutcome::SyncRejected(r) => return Ok(GateStep::SyncRejected(r)),
+            SubmitOutcome::Transport(e) => return Err(e),
+        };
 
         // A single submit echoes the current status; a resubmit of a known tx
         // can come back already SEEN/MINED, satisfying the gate without a poll.
-        if efs.len() == 1 {
+        if batch_len == 1 {
             if let Ok(parsed) = serde_json::from_str::<ArcadeStatusResponse>(&submit_body) {
                 if !parsed.txid.is_empty() && parsed.txid != subject_txid {
                     // Never gate/admit under a mismatched identity.
@@ -627,12 +839,13 @@ impl ArcadeBroadcaster {
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
                             parsed.tx_status
                         );
-                        return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+                        return Ok(GateStep::Accepted);
                     }
                     GateVerdict::Fatal => {
-                        return Ok(ArcOutcome::Rejected(format!(
-                            "Arcade {} {subject_txid}",
-                            parsed.tx_status
+                        return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
+                            subject_txid,
+                            &parsed.tx_status,
+                            &parsed.extra_info,
                         )));
                     }
                     GateVerdict::Pending => {}
@@ -640,18 +853,34 @@ impl ArcadeBroadcaster {
             }
         }
 
-        worker::console_log!(
-            "[arcade] submitted {} EF leg(s) → gating {subject_txid} on {ARCADE_GATE_STATUS}",
-            efs.len()
-        );
-        self.poll_for_status(subject_txid).await
+        match self.poll_for_status(subject_txid).await? {
+            ArcOutcome::Accepted(_) => Ok(GateStep::Accepted),
+            ArcOutcome::Rejected(r) => Ok(GateStep::AsyncRejected(r)),
+        }
     }
 
-    /// POST the EF body to `endpoint`, registering the callback headers.
-    /// Returns the response body on 2xx; any non-2xx is TRANSPORT trouble
-    /// (`Err`) — Arcade returns 202 for a valid-script submit and reports
-    /// REJECTED asynchronously, so an HTTP failure is never a per-tx verdict.
-    async fn post_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> Result<String, String> {
+    /// POST the EF body to `endpoint` (callback headers set) and CLASSIFY the
+    /// response (#213): a synchronous HTTP 400 validation-failure is a
+    /// definitive per-tx rejection ([`SubmitOutcome::SyncRejected`]), NOT
+    /// transport. Genuine transport failures (5xx, auth, misroute, 429,
+    /// timeouts, connection errors) stay [`SubmitOutcome::Transport`].
+    async fn submit_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> SubmitOutcome {
+        match self.post_ef_raw(endpoint, token, body).await {
+            Ok((status, text)) => classify_submit_response(status, &text),
+            Err(transport) => SubmitOutcome::Transport(transport),
+        }
+    }
+
+    /// POST the EF body to `endpoint`, registering the callback headers, and
+    /// return `(http_status, body)`. `Err` only for a genuine fetch/transport
+    /// failure (connection refused, DNS, etc.) — the HTTP status is handed back
+    /// verbatim for the caller to classify.
+    async fn post_ef_raw(
+        &self,
+        endpoint: &str,
+        token: &str,
+        body: &[u8],
+    ) -> Result<(u16, String), String> {
         use worker::js_sys::Uint8Array;
 
         let headers = worker::Headers::new();
@@ -679,6 +908,15 @@ impl ArcadeBroadcaster {
 
         let status = response.status_code();
         let text = response.text().await.unwrap_or_default();
+        Ok((status, text))
+    }
+
+    /// Best-effort EF submit for the engine's generic-broadcast slot (non-money
+    /// `CurrentTx`). 2xx accept-for-processing → the body; anything else → `Err`
+    /// (the engine treats it as non-fatal). The money path uses
+    /// [`submit_once_and_gate`](Self::submit_once_and_gate).
+    async fn post_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> Result<String, String> {
+        let (status, text) = self.post_ef_raw(endpoint, token, body).await?;
         if !(200..300).contains(&status) {
             return Err(format!("Arcade submit HTTP {status}: {text}"));
         }
@@ -691,14 +929,23 @@ impl ArcadeBroadcaster {
     async fn poll_for_status(&self, txid: &str) -> Result<ArcOutcome, String> {
         let mut waited = 0u64;
         loop {
-            if let Some(status) = self.tx_status(txid).await {
-                match classify_arcade_status(&status, ARCADE_GATE_STATUS) {
+            if let Some(resp) = self.tx_status(txid).await {
+                // GATE on `tx_status` ONLY — never `extra_info` (stale-extraInfo
+                // trap, #213: a recovered orphan returns a healthy status with
+                // the OLD failure extraInfo still attached).
+                match classify_arcade_status(&resp.tx_status, ARCADE_GATE_STATUS) {
                     GateVerdict::Reached => {
-                        worker::console_log!("[arcade] {txid} reached {status}");
+                        worker::console_log!("[arcade] {txid} reached {}", resp.tx_status);
                         return Ok(ArcOutcome::Accepted(txid.to_string()));
                     }
                     GateVerdict::Fatal => {
-                        return Ok(ArcOutcome::Rejected(format!("Arcade {status} {txid}")));
+                        // #209: fold the captured extra_info into the reason text
+                        // (reason ONLY — the gate above already decided on status).
+                        return Ok(ArcOutcome::Rejected(arcade_fatal_reason(
+                            txid,
+                            &resp.tx_status,
+                            &resp.extra_info,
+                        )));
                     }
                     GateVerdict::Pending => {}
                 }
@@ -714,8 +961,10 @@ impl ArcadeBroadcaster {
         }
     }
 
-    /// `GET /tx/{txid}` → `Some(txStatus)` if Arcade knows the txid, else `None`.
-    async fn tx_status(&self, txid: &str) -> Option<String> {
+    /// `GET /tx/{txid}` → the parsed status response if Arcade knows the txid
+    /// (non-empty `txStatus`), else `None`. Carries `extra_info` for reason
+    /// text — see the [`ArcadeStatusResponse`] stale-extraInfo trap note.
+    async fn tx_status(&self, txid: &str) -> Option<ArcadeStatusResponse> {
         let url = self.status_endpoint(txid);
         let mut init = worker::RequestInit::new();
         init.with_method(worker::Method::Get);
@@ -729,7 +978,7 @@ impl ArcadeBroadcaster {
         if parsed.tx_status.is_empty() {
             None
         } else {
-            Some(parsed.tx_status)
+            Some(parsed)
         }
     }
 }
@@ -755,6 +1004,117 @@ impl ArcBroadcaster for ArcadeBroadcaster {
 #[allow(clippy::unwrap_used, clippy::panic, reason = "test code")]
 mod tests {
     use super::*;
+
+    // ── #213: SYNCHRONOUS submit classification ─────────────────────────────
+    //
+    // These feed `classify_submit_response` the EXACT bodies Arcade returned on
+    // mainnet (issue #213, real proof txids). routes.rs maps `SyncRejected` →
+    // HTTP 422 (admit nothing) and `Transport` → HTTP 502 (fall back).
+
+    /// The real HTTP 400 bodies Arcade returns SYNCHRONOUSLY for a definitive
+    /// per-tx verdict (script + fee validate synchronously because EF inlines
+    /// each input's source). Proof txids in #213.
+    const ARCADE_SYNC_400_LOW_FEE: &str = r#"{"error":"transaction failed validation","reason":"TX_INVALID (31): GoBDK fail to ValidateTransaction -> TX_POLICY (39): transaction fee is too low -> UNKNOWN (0): insufficient-fee"}"#;
+    const ARCADE_SYNC_400_BAD_SIG: &str = r#"{"error":"transaction failed validation","reason":"TX_INVALID (31): GoBDK fail to ValidateTransaction -> UNKNOWN (0): Script failed an OP_EQUALVERIFY operation"}"#;
+
+    #[test]
+    fn submit_sync_400_validation_failure_is_a_definitive_rejection() {
+        // #213: the load-bearing fix — a synchronous 400 with the structured
+        // {"error":"transaction failed validation",…} body is a DEFINITIVE
+        // per-tx verdict (→ 422), never transport (→ 502 → the client
+        // re-broadcasts a tx the network already refused).
+        for body in [ARCADE_SYNC_400_LOW_FEE, ARCADE_SYNC_400_BAD_SIG] {
+            match classify_submit_response(400, body) {
+                SubmitOutcome::SyncRejected(reason) => {
+                    // The structured `reason` is threaded through for the caller.
+                    assert!(reason.contains("transaction failed validation"), "{reason}");
+                }
+                other => panic!("sync 400 must be SyncRejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn submit_transport_failures_stay_transport_never_a_rejection() {
+        // 5xx, auth (401/403), gateway misroute (404/405), rate-limit (429) and
+        // an UNRECOGNISED 400 all fail SAFE to Transport — the caller falls back
+        // (502) and we NEVER fabricate a definitive rejection from a body that
+        // isn't the structured validation-failure shape.
+        for (status, body) in [
+            (500u16, "upstream boom"),
+            (502, "bad gateway"),
+            (503, "unavailable"),
+            (401, "unauthorized"),
+            (403, "forbidden"),
+            (404, "not found"),
+            (429, "slow down"),
+            // A 400 that is NOT the {error:"transaction failed validation"} shape.
+            (400, r#"{"error":"bad request","message":"missing header"}"#),
+            (400, "plain text bad request"),
+        ] {
+            assert!(
+                matches!(classify_submit_response(status, body), SubmitOutcome::Transport(_)),
+                "HTTP {status} must be Transport"
+            );
+        }
+    }
+
+    #[test]
+    fn submit_2xx_is_processing_for_the_gate() {
+        let body = r#"{"txid":"ab","txStatus":"RECEIVED"}"#;
+        assert!(matches!(
+            classify_submit_response(202, body),
+            SubmitOutcome::Processing(_)
+        ));
+    }
+
+    // ── #211: the resubmit ladder (control flow, real producer) ─────────────
+
+    #[test]
+    fn ladder_retries_on_async_reject_but_not_on_sync_reject() {
+        // The async-REJECTED shape (202 then never-SEEN → fatal status) is the
+        // ONLY step that fires a resubmit; a synchronous validation failure is
+        // definitive and terminates immediately.
+        assert_eq!(
+            ladder_step(GateStep::AsyncRejected("Arcade REJECTED ab".into()), "ab"),
+            Ladder::Retry,
+            "async REJECTED must resubmit"
+        );
+        assert_eq!(
+            ladder_step(GateStep::SyncRejected("insufficient-fee".into()), "ab"),
+            Ladder::Return(ArcOutcome::Rejected("insufficient-fee".into())),
+            "sync rejection must NOT resubmit (definitive)"
+        );
+        assert_eq!(
+            ladder_step(GateStep::Accepted, "ab"),
+            Ladder::Return(ArcOutcome::Accepted("ab".into())),
+        );
+    }
+
+    #[test]
+    fn concat_efs_is_dependency_order_concatenation() {
+        // Subject-only vs full-batch bodies: attempt 1 submits ONE tx (the
+        // subject's EF); the fallback batch is the concatenation of all legs.
+        let efs = vec![
+            EfTx { txid: "parent".into(), ef: vec![1, 2, 3] },
+            EfTx { txid: "subject".into(), ef: vec![4, 5] },
+        ];
+        let subject_only = &efs.iter().find(|e| e.txid == "subject").unwrap().ef;
+        assert_eq!(subject_only.len(), 2, "subject-only body is the subject EF");
+        let batch = concat_efs(&efs);
+        assert_eq!(batch, vec![1, 2, 3, 4, 5], "batch concatenates in order");
+        assert_eq!(batch.len(), 5);
+    }
+
+    #[test]
+    fn arcade_fatal_reason_folds_in_extra_info_when_present() {
+        // #209: the captured extraInfo is threaded into the reason text.
+        assert_eq!(arcade_fatal_reason("ab", "REJECTED", ""), "Arcade REJECTED ab");
+        assert_eq!(
+            arcade_fatal_reason("ab", "REJECTED", "PROCESSING (4): failed to validate"),
+            "Arcade REJECTED ab (PROCESSING (4): failed to validate)"
+        );
+    }
 
     #[test]
     fn verdict_accepts_2xx_ok_status() {
