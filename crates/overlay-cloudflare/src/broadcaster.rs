@@ -103,17 +103,192 @@ pub enum ArcOutcome {
     Rejected(String),
 }
 
+/// A hex run this long is a txid / script / BEEF blob, i.e. RANDOM DATA — not
+/// status text. `already_known` is applied to non-2xx ARC bodies that ECHO the
+/// subject txid, and a txid is 64 chars of uniformly random hex, so an
+/// all-DIGIT needle like the `257` node code occurs in it by chance (measured
+/// on bsv-low's own ledger: 6 of 158 real txids contain "257" — 3.8%, ~1 in
+/// 26). See bsv-low #212.
+const MIN_HEX_RUN: usize = 8;
+
+/// Is `b` a regex `\w` byte (`[A-Za-z0-9_]`)? — mirrors JS `\b` semantics.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Replace every run of ≥[`MIN_HEX_RUN`] hex chars with a SPACE (never "", so
+/// the strip can't splice two fragments into a keyword). None of the alpha
+/// needles below can survive inside hex anyway — `k`, `l`, `m`, `n`, `o`, `r`,
+/// `s`, `w`, `y` are not hex digits — so this only removes random data.
+fn strip_long_hex_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    for c in s.chars() {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+            continue;
+        }
+        if run.len() >= MIN_HEX_RUN {
+            out.push(' ');
+        } else {
+            out.push_str(&run);
+        }
+        run.clear();
+        out.push(c);
+    }
+    if run.len() >= MIN_HEX_RUN {
+        out.push(' ');
+    } else {
+        out.push_str(&run);
+    }
+    out
+}
+
+/// Words that DECLARE a status code, i.e. the only tokens that may introduce a
+/// bare `257`. Kept as SHORT as the true-positive corpus allows — every extra
+/// marker is another way to say "already known" to a number in prose.
+///
+/// Dropped deliberately: `arc`/`rpc`/`status` (nothing needs them) and
+/// `reject`/`rejected` — the latter are live false-positive surface, because
+/// `routes.rs` wraps every refusal as `network rejected: {reason}` and one
+/// reason is `{txStatus} {extraInfo}` = `REJECTED {extraInfo}`, so an extraInfo
+/// merely BEGINNING with a number would put a bare `257` right after
+/// "rejected". Mirrors the client's `CODE_257_MARKED` alternation exactly.
+const CODE_MARKERS: &[&str] = &["returned", "error", "code"];
+
+/// `needle` present as a whole word (JS `\b<needle>\b`). Inside a txid the
+/// digits sit between hex word-chars, so a bounded match cannot fire.
+fn contains_word(hay: &str, needle: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let n = needle.len();
+    let mut from = 0usize;
+    while let Some(i) = hay[from..].find(needle) {
+        let at = from + i;
+        let before_ok = at == 0 || !is_word_byte(bytes[at - 1]);
+        let end = at + n;
+        let after_ok = end >= bytes.len() || !is_word_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        // `needle` is ASCII, so `at + 1` is always a char boundary.
+        from = at + 1;
+    }
+    false
+}
+
+/// Is `257` present as the already-known STATUS CODE (as opposed to an
+/// incidental NUMBER in prose)? — the #212 residual. Exact mirror of the
+/// client's `code257` in `bsv-low` `app/src/lib/broadcast.ts`.
+///
+/// 257 is the node's `txn-already-known` reject code and the only needle with
+/// no alpha content — which is precisely why it is dangerous: it is also an
+/// ordinary number a rejection body can quote. All three of these are REAL,
+/// plausible ARC rejection shapes that a bare `\b257\b` called "already known":
+///   {"detail":"Fee too low","extraInfo":"minimum expected fee is 257 sat, …"}
+///   {"detail":"Unlocking scripts not valid","extraInfo":"script evaluated false at op 257"}
+///   nLockTime 257 not satisfied
+///
+/// WHICH WAY TO FAIL — the two errors are NOT symmetric, so this is biased on
+/// purpose. A FALSE POSITIVE turns a definitive network rejection into
+/// `ArcOutcome::Accepted`, admitting the tx and letting the client stamp
+/// `broadcast_ok` (its 0-conf credit authority) — money-visible and silent,
+/// the #212 bug itself. A FALSE NEGATIVE makes a redundant re-broadcast look
+/// like a failure: the caller retries an idempotent step, costing a retry and
+/// nothing else. Where the evidence is ambiguous, take the false NEGATIVE.
+///
+/// A code appears in exactly three dresses; nothing else counts:
+///  1. WHOLE FIELD — 257 is the entire value, no other word content;
+///  2. QUOTED VALUE — `"257"` / `'257'`, the JSON dress of (1);
+///  3. MARKER-ADJACENT — a [`CODE_MARKERS`] word immediately precedes it with
+///     only 1–4 non-word chars between (`code 257`, `(code 257)`,
+///     `arc error 257`, `node returned 257`).
+///
+/// In the prose counter-examples the preceding word is `is` / `op` /
+/// `nlocktime` — never a marker, never quoted, never the whole field.
+fn code_257(t: &str) -> bool {
+    let bytes = t.as_bytes();
+    // 1. WHOLE FIELD: JS `/^\W*257\W*$/` — trimming non-word chars off both
+    //    ends leaves exactly "257".
+    if t.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) == "257" {
+        return true;
+    }
+    // 2. QUOTED VALUE: JS `/["']257["']/`.
+    if t.contains("\"257\"") || t.contains("'257'") {
+        return true;
+    }
+    // 3. MARKER-ADJACENT: JS
+    //    `/(^|[^0-9a-z_])(?:returned|error|code)[^0-9a-z_]{1,4}257([^0-9a-z_]|$)/`.
+    let mut from = 0usize;
+    while let Some(i) = t[from..].find("257") {
+        let at = from + i;
+        from = at + 1; // "257" is ASCII, so at+1 is always a char boundary.
+        // Word boundaries around the digits (a longer number is not the code).
+        if at > 0 && is_word_byte(bytes[at - 1]) {
+            continue;
+        }
+        let end = at + 3;
+        if end < bytes.len() && is_word_byte(bytes[end]) {
+            continue;
+        }
+        // Walk back over 1..=4 non-word separator bytes (the regex quantifier).
+        let mut j = at;
+        let mut seps = 0usize;
+        while j > 0 && seps < 4 && !is_word_byte(bytes[j - 1]) {
+            j -= 1;
+            seps += 1;
+        }
+        if seps == 0 {
+            continue;
+        }
+        // Byte comparison, never `&t[..j]`: `j` can land mid-UTF-8 (a
+        // continuation byte is non-word), and slicing there would PANIC.
+        for marker in CODE_MARKERS {
+            let m = marker.as_bytes();
+            if j >= m.len() && &bytes[j - m.len()..j] == m {
+                let start = j - m.len();
+                if start == 0 || !is_word_byte(bytes[start - 1]) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// "The network already has this exact tx" — a redundant re-broadcast is
 /// SUCCESS, whatever HTTP dress it arrives in (mirrors the bsv-low client's
 /// `alreadyKnown`, incl. the literal 257 txn-already-known node code).
 /// NEGATED forms are stripped first: "unknown"/"unseen" are failures.
+///
+/// bsv-low #212, belt AND braces on a money path — a false positive here turns
+/// a DEFINITIVE network rejection into `ArcOutcome::Accepted`, which admits the
+/// tx and lets the client stamp `broadcast_ok` (its 0-conf credit authority):
+///  1. long hex runs are stripped first, so an echoed txid cannot supply a
+///     needle;
+///  2. the numeric node code must appear as a CODE and not as a number in prose
+///     ([`code_257`]) — and each of its three dresses is word-bounded, so it
+///     could not fire from inside a txid even if step 1 were bypassed.
+///
+/// The alpha needles stay unbounded on purpose — bounding would MISS the real
+/// `ARC_ALREADY_KNOWN` / `already_known` dress (`_` is a word char). `mined` is
+/// the ONE exception: it is WORD-BOUNDED here to match the client's
+/// `\bmined\b`. Unbounded (as this was) `MINED_IN_STALE_BLOCK` read as
+/// "already known", so a non-2xx stale-block body returned `Accepted` instead
+/// of the transient `Err` finding 6 requires — and any body containing
+/// `undetermined` / `examined` was accepted outright. That was a real
+/// TS/Rust divergence AND a false positive in the money-visible direction.
+///
+/// This function is a character-for-character mirror of the bsv-low client's
+/// `alreadyKnown` (`app/src/lib/broadcast.ts`); the two test suites share one
+/// corpus and both must agree on every case in it.
 fn already_known(s: &str) -> bool {
-    let t = s.to_lowercase().replace("unknown", "").replace("unseen", "");
+    let stripped = strip_long_hex_runs(&s.to_lowercase());
+    let t = stripped.replace("unknown", " ").replace("unseen", " ");
     t.contains("already")
         || t.contains("known")
-        || t.contains("257")
-        || t.contains("mined")
+        || contains_word(&t, "mined")
         || t.contains("seen")
+        || code_257(&t)
 }
 
 /// PURE: classify one ARC HTTP response into accept / reject / transport
@@ -646,6 +821,303 @@ mod tests {
         assert!(matches!(arc_verdict(200, dressed).unwrap(), ArcOutcome::Accepted(_)));
         // NEGATED forms are failures, not already-known.
         assert!(arc_verdict(500, "unknown transaction").is_err());
+    }
+
+    // ── bsv-low #212: a rejection body echoing the txid is NOT already-known ──
+
+    /// REAL txids from bsv-low's `docs/DECISION-LOG-spite-relay-2026-07.md`
+    /// that happen to contain the digits "257" — the collisions that made the
+    /// old substring test a ~1-in-26 lottery on every rejected money broadcast.
+    const REAL_LEDGER_TXIDS_CONTAINING_257: &[&str] = &[
+        "2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256",
+        "66cf740bef1e10b549e652cf049ee0257fe2830c733c3aa09d554df73ed6ecab",
+        "03925754b46492ca4e9d9072e399d73f0c66479d314ef83a3a5723a3424047b0",
+    ];
+
+    #[test]
+    fn already_known_never_fires_on_a_real_txid_that_contains_257() {
+        for txid in REAL_LEDGER_TXIDS_CONTAINING_257 {
+            assert_eq!(txid.len(), 64);
+            assert!(txid.contains("257"), "{txid} must exercise the hazard");
+            assert!(!already_known(txid), "bare txid {txid}");
+            // The REAL producer shapes this function is fed:
+            // `broadcaster.rs` Arcade fatal reason …
+            for status in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED"] {
+                assert!(!already_known(&format!("Arcade {status} {txid}")), "{txid}");
+            }
+            // … and `routes.rs::json_error("network rejected: {reason}", 422)`,
+            // the body the bsv-low client reads back as `gated.detail`.
+            let body = format!(
+                r#"{{"status":"error","message":"network rejected: Arcade REJECTED {txid}"}}"#
+            );
+            assert!(!already_known(&body), "{body}");
+        }
+    }
+
+    #[test]
+    fn verdict_460_class_body_echoing_a_257_txid_stays_rejected() {
+        // The load-bearing one: ARC's own 461/465 bodies ECHO the txid, and
+        // `arc_verdict` runs `already_known(body)` BEFORE the 460–479 verdict
+        // class. A false positive there returns `Accepted` — admitting a tx
+        // the network definitively refused.
+        for txid in REAL_LEDGER_TXIDS_CONTAINING_257 {
+            for status in [460u16, 461, 465, 473] {
+                let body = format!(
+                    r#"{{"detail":"Transaction is not valid","status":{status},"title":"Unlocking scripts not valid","txid":"{txid}"}}"#
+                );
+                match arc_verdict(status, &body).unwrap() {
+                    ArcOutcome::Rejected(_) => {}
+                    other => panic!("HTTP {status} {txid} must stay Rejected, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verdict_2xx_error_dress_with_a_257_txid_stays_rejected() {
+        for txid in REAL_LEDGER_TXIDS_CONTAINING_257 {
+            let body = format!(
+                r#"{{"txid":"{txid}","txStatus":"REJECTED","extraInfo":"fee too low for {txid}"}}"#
+            );
+            match arc_verdict(200, &body).unwrap() {
+                ArcOutcome::Rejected(_) => {}
+                other => panic!("{txid} must stay Rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn already_known_property_no_random_txid_ever_matches() {
+        // Deterministic LCG (Numerical Recipes), HIGH bits only — an LCG mod
+        // 2^32 has near-degenerate low bits, and `% 16` yields a vacuous corpus
+        // with ZERO "257" collisions. Seeded, never random: a property cell
+        // that can flake is a bug.
+        let mut s: u32 = 0x0212_c0de;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            s
+        };
+        let hex = b"0123456789abcdef";
+        let mut collisions = 0usize;
+        for _ in 0..2000 {
+            let txid: String = (0..64)
+                .map(|_| hex[(next() >> 28) as usize] as char)
+                .collect();
+            if txid.contains("257") {
+                collisions += 1;
+            }
+            let body = format!(
+                r#"{{"status":"error","message":"network rejected: Arcade REJECTED {txid}"}}"#
+            );
+            assert!(!already_known(&body), "{txid}");
+            assert!(
+                matches!(
+                    arc_verdict(
+                        461,
+                        &format!(r#"{{"detail":"invalid","status":461,"txid":"{txid}"}}"#)
+                    )
+                    .unwrap(),
+                    ArcOutcome::Rejected(_)
+                ),
+                "{txid}"
+            );
+        }
+        // Guard the guard: the corpus must actually exercise the hazard.
+        assert!(collisions > 5, "vacuous corpus: only {collisions} '257' hits");
+    }
+
+    #[test]
+    fn already_known_true_positives_survive_the_hardening() {
+        // The fix must NOT disable the feature — a redundant re-broadcast is
+        // genuinely success.
+        for s in [
+            "txn-already-known (code 257)",
+            "257: txn-already-known",
+            // The bare node code, with no alpha needle to carry it — this is
+            // what `contains_word("257")` alone must still catch.
+            "node returned 257",
+            "reject code 257.",
+            "already in block chain",
+            "transaction already mined",
+            "ARC_ALREADY_KNOWN",
+            "already_known",
+            "SEEN_ON_NETWORK",
+            // With the txid alongside it — the words survive the hex strip.
+            r#"{"txid":"2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256","txStatus":"REJECTED","extraInfo":"transaction already mined"}"#,
+        ] {
+            assert!(already_known(s), "true positive lost: {s}");
+        }
+        // …and the 2xx already-known dress still classifies as Accepted.
+        let dressed = r#"{"txid":"2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256","txStatus":"REJECTED","extraInfo":"txn-already-known (code 257)"}"#;
+        assert!(matches!(
+            arc_verdict(200, dressed).unwrap(),
+            ArcOutcome::Accepted(_)
+        ));
+    }
+
+    // ── #212 RESIDUAL: `257` as a NUMBER in prose vs `257` as a STATUS CODE ──
+    //
+    // The hex strip closed the txid channel, but a bare `\b257\b` still fired
+    // on any standalone decimal 257 — and a rejection body quoting a fee floor,
+    // a script op index or an nLockTime height is entirely plausible. Same
+    // money-bug class: a false positive turns a definitive rejection into
+    // `Accepted`, admitting the tx and letting the client stamp `broadcast_ok`.
+    //
+    // THIS CORPUS IS SHARED, verbatim, with the client mirror
+    // (`bsv-low` `app/src/lib/broadcast.alreadyKnown.test.ts`, `CODE_257_TRUE`
+    // / `CODE_257_PROSE_FALSE`). The two implementations must agree on every
+    // entry — that equivalence is the whole point of the shared list.
+
+    const CODE_257_TRUE: &[&str] = &[
+        "txn-already-known",
+        "257: txn-already-known",
+        "arc error 257",
+        "code 257",
+        "(code 257)",
+        "257", // bare — the whole field
+        r#"{"txStatus":"REJECTED","extraInfo":"257"}"#,
+        "already in block chain",
+        "transaction already mined",
+        "ARC_ALREADY_KNOWN",
+        "already_known",
+        "SEEN_ON_NETWORK",
+        "node returned 257",
+        "reject code 257.",
+        "error: 257",
+        r#""code": 257"#,
+    ];
+
+    /// Plausible REJECTION prose that quotes 257 as an ordinary number. Every
+    /// one of these returned TRUE under the old `contains_word("257")`.
+    const CODE_257_PROSE_FALSE: &[&str] = &[
+        "minimum expected fee is 257 sat, got 200",
+        "script evaluated false at op 257",
+        "nLockTime 257 not satisfied",
+        // Why `reject`/`rejected` are NOT code markers: `routes.rs` wraps every
+        // refusal as `network rejected: {reason}` and `arc_verdict`'s 2xx
+        // reason is `REJECTED {extraInfo}`, so an extraInfo merely BEGINNING
+        // with a number would otherwise sit right after the word "rejected".
+        "257 sat minimum fee required",
+        // Longer numbers merely containing 257 are not the code either.
+        "expected 2570 sat",
+        "nLockTime 1257 not satisfied",
+        "block height 257000 reached",
+        "fee rate 0.257 sat/byte",
+        // The marker must be a WHOLE word with 1–4 non-word chars of
+        // separation: `codes` is not `code`, `code257` has no separator, and
+        // >4 chars of separation falls off the quantifier. All three land on
+        // the RECOVERABLE side (a retry) — the direction this rule is biased
+        // toward.
+        "codes 257",
+        "code257",
+        "error:    257",
+    ];
+
+    /// ARC's RFC7807-ish non-2xx error body (461 unlock-invalid / 465 fee
+    /// floor) — the real producer shape, `txid` field and all.
+    fn arc_error_body(status: u16, title: &str, extra_info: &str, txid: &str) -> String {
+        format!(
+            r#"{{"detail":"Transaction is not valid","status":{status},"title":"{title}","txid":"{txid}","extraInfo":"{extra_info}"}}"#
+        )
+    }
+
+    /// `routes.rs::json_error(&format!("network rejected: {reason}"), 422)`.
+    fn overlay_422(reason: &str) -> String {
+        format!(r#"{{"status":"error","message":"network rejected: {reason}"}}"#)
+    }
+
+    #[test]
+    fn code_257_true_dresses_still_read_as_already_known() {
+        for s in CODE_257_TRUE {
+            assert!(already_known(s), "code dress lost: {s}");
+        }
+    }
+
+    #[test]
+    fn code_257_as_prose_is_never_already_known() {
+        let txid = REAL_LEDGER_TXIDS_CONTAINING_257[0];
+        for prose in CODE_257_PROSE_FALSE {
+            // 1. bare — what `arc_verdict` passes on the 2xx-error path.
+            assert!(!already_known(prose), "bare: {prose}");
+            // 2. ARC's own non-2xx error body, echoing the txid, and
+            // 3. the overlay 422 wrapper the client reads as `gated.detail`.
+            for body in [
+                arc_error_body(461, "Unlocking scripts not valid", prose, txid),
+                arc_error_body(465, "Fee too low", prose, txid),
+            ] {
+                assert!(!already_known(&body), "arc body: {body}");
+                let wrapped = overlay_422(&format!("ARC HTTP 465: {body}"));
+                assert!(!already_known(&wrapped), "wrapped: {wrapped}");
+                // …and the verdict itself must stay a definitive rejection.
+                match arc_verdict(465, &body).unwrap() {
+                    ArcOutcome::Rejected(_) => {}
+                    other => panic!("{body} must stay Rejected, got {other:?}"),
+                }
+            }
+            // 4. the 2xx-error dress: `{txStatus} {extraInfo}`.
+            let two_xx = format!(
+                r#"{{"txid":"{txid}","txStatus":"REJECTED","extraInfo":"{prose}"}}"#
+            );
+            match arc_verdict(200, &two_xx).unwrap() {
+                ArcOutcome::Rejected(_) => {}
+                other => panic!("2xx {prose} must stay Rejected, got {other:?}"),
+            }
+            assert!(
+                !already_known(&overlay_422(&format!("REJECTED {prose}"))),
+                "overlay 2xx reason: {prose}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_257_genuine_verdict_survives_every_wrapper() {
+        let known = "txn-already-known (code 257)";
+        let txid = REAL_LEDGER_TXIDS_CONTAINING_257[1];
+        let body = arc_error_body(465, "Fee too low", known, txid);
+        assert!(already_known(&body));
+        assert!(already_known(&overlay_422(&format!("ARC HTTP 465: {body}"))));
+        assert!(already_known(&overlay_422(&format!("REJECTED {known}"))));
+        match arc_verdict(465, &body).unwrap() {
+            ArcOutcome::Accepted(_) => {}
+            other => panic!("genuine already-known must be Accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mined_is_word_bounded_closing_the_ts_rust_divergence() {
+        // Rust matched `mined` UNBOUNDED while the client matched `\bmined\b`,
+        // so these disagreed. Unbounded is ALSO a false positive in the
+        // money-visible direction: a non-2xx body containing
+        // `MINED_IN_STALE_BLOCK` returned `Accepted` instead of the transient
+        // `Err` finding 6 requires, and any body saying `undetermined` /
+        // `examined` was accepted outright.
+        for s in [
+            "MINED_IN_STALE_BLOCK",
+            "status undetermined",
+            "script examined and rejected",
+            r#"{"txStatus":"MINED_IN_STALE_BLOCK","extraInfo":""}"#,
+        ] {
+            assert!(!already_known(s), "substring 'mined' read as known: {s}");
+        }
+        for s in ["MINED", "transaction already mined", "tx was mined in block"] {
+            assert!(already_known(s), "real mined dress lost: {s}");
+        }
+        // The classification consequence: a non-2xx stale-block body is
+        // TRANSPORT trouble, never an acceptance.
+        assert!(arc_verdict(503, "MINED_IN_STALE_BLOCK, retry").is_err());
+    }
+
+    #[test]
+    fn already_known_negation_still_holds_with_a_txid_present() {
+        for s in [
+            "unknown transaction",
+            "UNKNOWN",
+            "tx unseen by the network",
+            "unknown transaction 66cf740bef1e10b549e652cf049ee0257fe2830c733c3aa09d554df73ed6ecab",
+            r#"{"status":"error","message":"network rejected: ARC HTTP 404: unknown tx 03925754b46492ca4e9d9072e399d73f0c66479d314ef83a3a5723a3424047b0"}"#,
+        ] {
+            assert!(!already_known(s), "negated form read as known: {s}");
+        }
     }
 
     #[test]

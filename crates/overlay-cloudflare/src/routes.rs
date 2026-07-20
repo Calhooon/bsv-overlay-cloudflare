@@ -10,7 +10,7 @@ use overlay_engine::health_checker::JanitorConfig;
 use overlay_engine::types::{GASPInitialRequest, LookupAnswer, LookupQuestion, TaggedBEEF};
 use serde::Deserialize;
 use serde::Serialize;
-use worker::{Env, Request, Response};
+use worker::{Context, Env, Request, Response};
 
 // =============================================================================
 // Error → HTTP status mapping
@@ -345,15 +345,19 @@ pub async fn get_doc_for_lookup_service(
 /// whose SHIP adverts haven't been indexed in our local storage yet
 /// (fresh deploy, sync lag, or migration windows at BSVA).
 ///
-/// The fan-out is best-effort and currently runs inline — peer POST tail
-/// latency adds seconds to the synchronous HTTP response, which is
-/// acceptable for today's write volume. If this becomes a bottleneck,
-/// switch to `ctx.wait_until(...)` to move it background after the
-/// response is sent.
+/// The fan-out is best-effort and runs in the BACKGROUND via
+/// `ctx.wait_until(...)` — it is handed to the runtime *after* the response
+/// has been produced, so its tracker-discovery + peer-POST tail latency is
+/// off the client's wall clock (measured mainnet 2026-07-20: the inline
+/// fan-out cost a LOW pot JOIN submit 6.7–8.9 s, ~25% of a ~39 s hand).
+/// Nothing the client learns is decided by it: errors were already swallowed
+/// inside the module and it never touched the status code or body.
 ///
-/// Synchronous write-through: runs full `engine.submit()` (Phase 1+2+3)
-/// so that admitted outputs are immediately available for `/lookup` queries.
-/// GASP cross-instance sync remains async via the scheduled task.
+/// Everything the response *does* depend on stays synchronous: the
+/// broadcast-gated Arcade broadcast + SEEN_ON_NETWORK gate, and the full
+/// `engine.submit()` (Phase 1+2+3) write-through so that admitted outputs are
+/// immediately available for `/lookup` queries. GASP cross-instance sync
+/// remains async via the scheduled task.
 pub async fn submit(
     engine: &Engine,
     mut req: Request,
@@ -361,6 +365,8 @@ pub async fn submit(
     // Arcade V2 endpoint override for the broadcast-gated mode (None → default
     // endpoint). Arcade is keyless, so broadcast-gated is always available.
     arcade_url: Option<String>,
+    // Worker context — used only to background the mainnet SHIP fan-out.
+    ctx: &Context,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -624,8 +630,18 @@ pub async fn submit(
     // one output locally, matching the TS SHIPBroadcaster pattern (don't
     // broadcast a tx nobody wants). Errors are swallowed inside the module —
     // primary admission has already succeeded.
+    //
+    // BACKGROUNDED (`ctx.wait_until`): the fan-out serially hits 4 SLAP
+    // trackers per topic and then POSTs every discovered peer, which cost the
+    // caller seconds on the synchronous path. It contributes nothing to the
+    // response, so the runtime keeps the isolate alive for it after we
+    // answer. `tagged_beef` is MOVED (not cloned) — the diagnostics above are
+    // its last synchronous reader — so backgrounding costs no extra BEEF copy.
     if total_admitted > 0 {
-        crate::mainnet_fanout::fan_out(&tagged_beef, hosting_url).await;
+        let owned_host = hosting_url.map(str::to_string);
+        ctx.wait_until(async move {
+            crate::mainnet_fanout::fan_out(&tagged_beef, owned_host.as_deref()).await;
+        });
     }
 
     json_ok(&steak)

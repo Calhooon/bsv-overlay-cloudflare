@@ -106,7 +106,7 @@ fn non_gasp_peers() -> Vec<peer_crawler::PeerConfig> {
 }
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
+async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
     // Install a panic hook so Rust panics surface in wrangler tail as
     // proper stack traces instead of the Worker silently returning early
     // (the default wasm behaviour). `set_once` makes re-calls across
@@ -213,7 +213,10 @@ async fn main(req: Request, env: Env, _ctx: Context) -> worker::Result<Response>
             // overrides the default endpoint; the callback is derived from
             // HOSTING_URL inside the route.
             let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
-            submit(&engine, req, hosting_url.as_deref(), arcade_url).await
+            // `ctx` is threaded in so the best-effort mainnet SHIP fan-out
+            // runs via `wait_until` AFTER the response instead of inline
+            // (it was costing the caller seconds on every submit).
+            submit(&engine, req, hosting_url.as_deref(), arcade_url, &ctx).await
         }
         (Method::Post, "/lookup") => lookup(&engine, req).await,
         (Method::Post, "/arc-ingest") => {
