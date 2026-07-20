@@ -1006,6 +1006,33 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         pot_summary.stitch_failed,
     );
 
+    // 3. LOW `pot_records` spend-confirmation chaser (#186). Own fetcher + budget
+    //    cell (not shared with the pot-beef pass). Upgrades a 0-conf pot spend to
+    //    spentConfirmed = 1 ONLY once the SPENDING tx's bump verifies against
+    //    chaintracks — fail-closed, never downgrades.
+    let mut spend_fetcher =
+        crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(&env))
+            .with_budget(20);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        spend_fetcher = spend_fetcher.with_arcade_url(u);
+    }
+    let spend_summary =
+        crate::proof_fetcher::complete_spend_confirmations(pot_storage.as_ref(), &spend_fetcher, 20)
+            .await;
+    worker::console_log!(
+        "Scheduled: spend-confirmation (pot_records) — scanned={} confirmed={} \
+         still_unconfirmed={} fetch_failed={}",
+        spend_summary.scanned,
+        spend_summary.confirmed,
+        spend_summary.still_unconfirmed,
+        spend_summary.fetch_failed,
+    );
+
     // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
     // the persistent counters, and refresh the proofless first-seen ledger so a
     // dead pass / a proof-not-landing surfaces via GET /health/invariants
@@ -1013,17 +1040,20 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let proofs_completed = tx_completed + pot_summary.completed as u64;
     let fetch_failed = tx_fetch_failed + pot_summary.fetch_failed as u64;
     let pot_beefs_compacted = pot_summary.completed as u64;
+    let spends_confirmed = spend_summary.confirmed as u64;
     crate::ops::record_completion_tick(
         &ops_db,
         proofs_completed,
         fetch_failed,
         pot_beefs_compacted,
+        spends_confirmed,
     )
     .await;
     let flagged = crate::ops::refresh_proofless_watch(&ops_db).await;
     worker::console_log!(
         "Scheduled: ops — proofs_completed+={proofs_completed} fetch_failed+={fetch_failed} \
-         pot_beefs_compacted+={pot_beefs_compacted} proofless_over_24h={flagged}"
+         pot_beefs_compacted+={pot_beefs_compacted} spends_confirmed+={spends_confirmed} \
+         proofless_over_24h={flagged}"
     );
 
     // Run janitor health checks
@@ -1100,11 +1130,35 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     }
     let ps = crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &pot_fetcher, 20)
         .await;
-    // 3. observability heartbeat + counters (same as the cron would stamp).
+    // 3. pot_records spend-confirmation chaser (#186) — own fetcher + budget.
+    let mut spend_fetcher =
+        crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(env))
+            .with_budget(20);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        spend_fetcher = spend_fetcher.with_arcade_url(u);
+    }
+    let ss = crate::proof_fetcher::complete_spend_confirmations(
+        pot_storage.as_ref(),
+        &spend_fetcher,
+        20,
+    )
+    .await;
+    // 4. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;
-    crate::ops::record_completion_tick(&ops_db, proofs_completed, fetch_failed, ps.completed as u64)
-        .await;
+    crate::ops::record_completion_tick(
+        &ops_db,
+        proofs_completed,
+        fetch_failed,
+        ps.completed as u64,
+        ss.confirmed as u64,
+    )
+    .await;
     let flagged = crate::ops::refresh_proofless_watch(&ops_db).await;
     Response::from_json(&serde_json::json!({
         "status": "ok",
@@ -1113,6 +1167,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "pot_scanned": ps.scanned,
         "pot_still_unconfirmed": ps.still_unconfirmed,
         "fetch_failed": fetch_failed,
+        "spends_confirmed": ss.confirmed,
+        "spends_scanned": ss.scanned,
+        "spends_still_unconfirmed": ss.still_unconfirmed,
         "proofless_over_24h": flagged,
     }))
 }

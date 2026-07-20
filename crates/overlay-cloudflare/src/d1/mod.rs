@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 60;
+pub const OVERLAY_MIGRATION_COUNT: usize = 61;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -678,6 +678,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         txid TEXT PRIMARY KEY,
         first_seen_ms INTEGER NOT NULL
     )",
+    // Spend-confirmation chaser (#186): the candidate scan is
+    // `WHERE spent = 1 AND spentConfirmed = 0 ORDER BY RANDOM()`. A composite
+    // index so the scan doesn't table-scan pot_records as the landing-proof
+    // table grows. Additive, IF NOT EXISTS.
+    "CREATE INDEX IF NOT EXISTS idx_pot_spent_unconfirmed ON pot_records(spent, spentConfirmed)",
 ];
 
 // =============================================================================
@@ -878,6 +883,7 @@ mod tests {
             "idx_reveal_game",
             "idx_reveal_game_seat",
             "idx_pot_spending",
+            "idx_pot_spent_unconfirmed",
             "idx_result_markers_winner",
             "idx_result_markers_createdAt",
             "idx_result_markers_v2_winner",

@@ -132,6 +132,31 @@ pub trait PotStorage {
         output_index: u32,
     ) -> Result<Option<PotRecord>, PotStorageError>;
 
+    /// Spent-but-UNCONFIRMED pot records — the spend-confirmation chaser's
+    /// candidate set (#186).
+    ///
+    /// LOW settles submit 0-conf (no merkle bump at submit time), so the spend
+    /// is recorded `spent = true, spentConfirmed = false` and NOTHING upgrades
+    /// it (the cron does ad-sync/GASP only). This surfaces those rows so a
+    /// bounded completion pass can fetch+chaintracks-verify the SPENDING tx's
+    /// bump and latch `spentConfirmed` via [`mark_spent`](Self::mark_spent) with
+    /// `confirmed = true`.
+    ///
+    /// Backends that enumerate answer with
+    /// `WHERE spent = 1 AND spentConfirmed = 0 ORDER BY RANDOM() LIMIT n`
+    /// (RANDOM defeats head-of-queue starvation — the same shape as
+    /// [`find_pot_beefs_for_proof_check`](Self::find_pot_beefs_for_proof_check)).
+    /// Every returned row carries a `spending_txid` (a spent row always has
+    /// one). Backends that can't enumerate return an empty `Vec` via this
+    /// default → the chaser is a no-op.
+    async fn find_spent_unconfirmed(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
     /// Durably store `beef` under `txid` (the stored tx's OWN txid — the
     /// funding txid for a funding beef, the SETTLE txid for a settle beef).
     ///
@@ -316,6 +341,24 @@ impl PotStorage for MemoryPotStorage {
             .filter(|(txid, beef)| !pot_beef_has_proof(txid, beef))
             .take(limit as usize)
             .map(|(txid, beef)| (txid.clone(), beef.clone()))
+            .collect())
+    }
+
+    async fn find_spent_unconfirmed(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // Spent rows still awaiting SPV confirmation. The D1 store carries the
+        // anti-starvation `ORDER BY RANDOM()`; the memory store need not
+        // randomize (tests are deterministic).
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.spent && !r.spent_confirmed)
+            .take(limit as usize)
+            .cloned()
             .collect())
     }
 
@@ -707,6 +750,85 @@ mod tests {
         let cands = store.find_pot_beefs_for_proof_check(10).await.unwrap();
         assert_eq!(cands.len(), 1, "only the proofless row is a candidate");
         assert_eq!(cands[0].0, proofless_txid);
+    }
+
+    // ── find_spent_unconfirmed / spend-confirmation chaser (#186) ─────────
+
+    #[tokio::test]
+    async fn find_spent_unconfirmed_surfaces_only_spent_unconfirmed() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.store_record(&pot_record("potB", 0)).await.unwrap();
+        store.store_record(&pot_record("potC", 0)).await.unwrap();
+
+        // potA: spent, unconfirmed → a candidate.
+        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        // potB: spent, confirmed → NOT a candidate.
+        store.mark_spent("potB", 0, "settleB", true).await.unwrap();
+        // potC: never spent → NOT a candidate.
+
+        let cands = store.find_spent_unconfirmed(10).await.unwrap();
+        assert_eq!(cands.len(), 1, "only the spent-unconfirmed row is a candidate");
+        assert_eq!(cands[0].txid, "potA");
+        assert_eq!(
+            cands[0].spending_txid.as_deref(),
+            Some("settleA"),
+            "a candidate always carries its spending txid"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_spent_unconfirmed_empty_when_none() {
+        let store = MemoryPotStorage::new();
+        assert!(store.find_spent_unconfirmed(10).await.unwrap().is_empty());
+        // An unspent admitted row is still not a candidate.
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        assert!(store.find_spent_unconfirmed(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spend_confirmation_upgrade_and_never_downgrade() {
+        // Frames the mark_spent invariant through the candidate query: the
+        // chaser's confirmed upgrade removes the row from the candidate set and
+        // a later unconfirmed claim can never downgrade it.
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+
+        // 0-conf spend recorded → appears as a candidate.
+        store.mark_spent("potA", 0, "settle", false).await.unwrap();
+        assert_eq!(store.find_spent_unconfirmed(10).await.unwrap().len(), 1);
+
+        // The chaser's upgrade (a chaintracks-verified spend).
+        store.mark_spent("potA", 0, "settle", true).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed, "confirmed spend latches the flag");
+        assert!(
+            store.find_spent_unconfirmed(10).await.unwrap().is_empty(),
+            "a confirmed row is no longer a candidate"
+        );
+
+        // A later unconfirmed (forged) claim must NOT downgrade the row back
+        // into the candidate set.
+        store.mark_spent("potA", 0, "forged", false).await.unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed, "confirmed flag survives");
+        assert_eq!(r.spending_txid.as_deref(), Some("settle"), "pointer unchanged");
+        assert!(
+            store.find_spent_unconfirmed(10).await.unwrap().is_empty(),
+            "an unconfirmed claim never re-surfaces a confirmed row"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_spent_unconfirmed_respects_limit() {
+        let store = MemoryPotStorage::new();
+        for i in 0..5u32 {
+            let txid = format!("pot{i}");
+            store.store_record(&pot_record(&txid, 0)).await.unwrap();
+            store.mark_spent(&txid, 0, "settle", false).await.unwrap();
+        }
+        assert_eq!(store.find_spent_unconfirmed(2).await.unwrap().len(), 2);
+        assert_eq!(store.find_spent_unconfirmed(10).await.unwrap().len(), 5);
     }
 
     #[test]
