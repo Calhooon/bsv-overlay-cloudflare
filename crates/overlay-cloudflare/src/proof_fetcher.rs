@@ -365,6 +365,16 @@ pub(crate) async fn verify_bump(
 /// only when `txStatus` is MINED/IMMUTABLE **and** a non-empty `merklePath`
 /// (a BRC-74 BUMP hex) is carried. Anything else (SEEN, no merklePath, parse
 /// failure) → `None` (treated as unmined by the ladder).
+///
+/// #214 — **Arcade REJECTED is never authoritative uncorroborated**: its stale
+/// validator view has reported REJECTED for txs already MINED (sticky ≥28 min,
+/// still REJECTED at 3 confs). Load-bearing consequences here:
+/// 1. a REJECTED status maps to `None` = "no proof from THIS courier", never a
+///    terminal verdict — the ladder falls through to Bitails/WoC, which is the
+///    ONLY way a false-REJECTED tx's proof completes, because
+/// 2. Arcade's MINED callback (/arc-ingest) will never fire for a txid its
+///    view holds at REJECTED. Do not add any rule that skips/abandons proof
+///    completion on an Arcade REJECTED status.
 fn parse_arcade_merklepath(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let status = v.get("txStatus").and_then(|s| s.as_str()).unwrap_or("");

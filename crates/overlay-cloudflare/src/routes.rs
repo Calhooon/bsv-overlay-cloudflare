@@ -424,6 +424,9 @@ pub async fn submit(
     // Arcade V2 endpoint override for the broadcast-gated mode (None → default
     // endpoint). Arcade is keyless, so broadcast-gated is always available.
     arcade_url: Option<String>,
+    // TAAL key for the #214 corroborating broadcaster (exhausted-ladder second
+    // opinion). None still corroborates — TAAL keyless, then GorillaPool.
+    taal_api_key: Option<String>,
     // Worker context — used only to background the mainnet SHIP fan-out.
     ctx: &Context,
 ) -> worker::Result<Response> {
@@ -518,6 +521,7 @@ pub async fn submit(
     // slice instead of from client wall-clock (which cannot separate overlay
     // work from Arcade variance — the retracted #195 measurement).
     let mut arcade_broadcast_ms = 0f64;
+    let mut corroborate_ms = 0f64;
     if mode_header.as_deref() == Some("broadcast-gated") {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
@@ -560,13 +564,25 @@ pub async fn submit(
         // only the SUBJECT reaching SEEN_ON_NETWORK does (they were broadcast
         // long ago by construction; Arcade dedupes their re-submit).
         let mut arcade =
-            crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
+            crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
+                // #214: Arcade's async REJECTED is never authoritative
+                // uncorroborated — an exhausted ladder gets a second
+                // broadcaster's word (TAAL → GorillaPool) before any 422.
+                .with_corroborator_key(taal_api_key.clone());
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
         let arcade_started = js_sys::Date::now();
         let arcade_outcome = arcade.broadcast_efs_gated(&efs, &subject_txid).await;
-        arcade_broadcast_ms = js_sys::Date::now() - arcade_started;
+        // #195: keep segments DISJOINT and attributable — the corroborate leg
+        // runs inside the gated broadcast's wall-clock, so it is carved out of
+        // `arcade-broadcast` and reported as its own `corroborate` segment
+        // (also on the 422/502 early returns, where attribution matters most).
+        corroborate_ms = arcade.corroborate_ms();
+        arcade_broadcast_ms = (js_sys::Date::now() - arcade_started - corroborate_ms).max(0.0);
+        let gated_timing = format!(
+            "arcade-broadcast;dur={arcade_broadcast_ms:.1}, corroborate;dur={corroborate_ms:.1}"
+        );
         match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
                 worker::console_log!(
@@ -575,17 +591,22 @@ pub async fn submit(
                 );
             }
             Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
-                // DEFINITIVE refusal of the SUBJECT → admit NOTHING.
+                // DEFINITIVE refusal of the SUBJECT → admit NOTHING. (#214:
+                // this arm is now reachable only via a SYNCHRONOUS validation
+                // failure or a corroborated async rejection — never on
+                // Arcade's uncorroborated word.)
                 worker::console_log!(
                     "POST /submit(broadcast-gated) -> 422 (network rejected {subject_txid}: {reason})"
                 );
-                return json_error(&format!("network rejected: {reason}"), 422);
+                let resp = json_error(&format!("network rejected: {reason}"), 422)?;
+                return Ok(with_server_timing(resp, &gated_timing));
             }
             Err(transport) => {
                 worker::console_log!(
                     "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
                 );
-                return json_error(&format!("broadcast failed: {transport}"), 502);
+                let resp = json_error(&format!("broadcast failed: {transport}"), 502)?;
+                return Ok(with_server_timing(resp, &gated_timing));
             }
         }
     }
@@ -732,18 +753,25 @@ pub async fn submit(
     let fanout_ms = js_sys::Date::now() - fanout_started;
 
     // #195: `Server-Timing` makes each slice measurable at the client without
-    // conflating overlay work with Arcade variance.
+    // conflating overlay work with Arcade variance. `corroborate` (#214) is
+    // carved out of `arcade-broadcast` so the second-broadcaster leg is
+    // attributable on its own.
     let server_timing = format!(
-        "arcade-broadcast;dur={arcade_broadcast_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
+        "arcade-broadcast;dur={arcade_broadcast_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
     );
-    let mut resp = json_ok(&steak)?;
-    {
-        let h = resp.headers_mut();
-        let _ = h.set("Server-Timing", &server_timing);
-        // Browsers gate response-header reads behind Access-Control-Expose-Headers.
-        let _ = h.set("Access-Control-Expose-Headers", "Server-Timing");
-    }
-    Ok(resp)
+    Ok(with_server_timing(json_ok(&steak)?, &server_timing))
+}
+
+/// #195: attach a `Server-Timing` header (+ its CORS expose) to a response.
+/// Used on the submit success path AND the broadcast-gated 422/502 early
+/// returns — a refusal's latency must be attributable too (#214 debugging is
+/// exactly the failure-path case).
+fn with_server_timing(mut resp: Response, timing: &str) -> Response {
+    let h = resp.headers_mut();
+    let _ = h.set("Server-Timing", timing);
+    // Browsers gate response-header reads behind Access-Control-Expose-Headers.
+    let _ = h.set("Access-Control-Expose-Headers", "Server-Timing");
+    resp
 }
 
 /// POST /lookup — JSON { service, query } → LookupAnswer JSON or aggregated binary.

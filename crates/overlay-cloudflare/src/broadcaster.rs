@@ -345,8 +345,15 @@ pub fn arc_verdict(status: u16, body: &str) -> Result<ArcOutcome, String> {
 }
 
 /// One raw `{ "rawTx": <hex> }` POST to an ARC-compatible `/v1/tx`, returning
-/// the classified verdict. `api_key: None` posts keyless (GorillaPool).
-async fn post_arc_tx(base_url: &str, api_key: Option<&str>, tx_hex: &str) -> Result<ArcOutcome, String> {
+/// `(http_status, body)`. `Err` is transport-only (fetch/DNS/connect failure);
+/// the HTTP verdict is the CALLER's to classify ([`arc_verdict`] for the
+/// primary gate, [`corroborator_verdict`] for the #214 corroboration leg).
+/// `api_key: None` posts keyless (GorillaPool).
+async fn post_arc_raw(
+    base_url: &str,
+    api_key: Option<&str>,
+    tx_hex: &str,
+) -> Result<(u16, String), String> {
     let url = format!("{}/v1/tx", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "rawTx": tx_hex }).to_string();
 
@@ -371,6 +378,13 @@ async fn post_arc_tx(base_url: &str, api_key: Option<&str>, tx_hex: &str) -> Res
         .text()
         .await
         .unwrap_or_else(|_| String::from("<no body>"));
+    Ok((status, text))
+}
+
+/// One raw `{ "rawTx": <hex> }` POST to an ARC-compatible `/v1/tx`, returning
+/// the classified verdict. `api_key: None` posts keyless (GorillaPool).
+async fn post_arc_tx(base_url: &str, api_key: Option<&str>, tx_hex: &str) -> Result<ArcOutcome, String> {
+    let (status, text) = post_arc_raw(base_url, api_key, tx_hex).await?;
     arc_verdict(status, &text)
 }
 
@@ -393,6 +407,158 @@ pub async fn broadcast_tx_hex_gated(
     worker::console_log!("broadcast-gated: TAAL transport trouble ({taal_err}); trying GorillaPool");
     match post_arc_tx(GORILLAPOOL_ARC_URL, None, tx_hex).await {
         Ok(outcome) => Ok(outcome),
+        Err(gp_err) => Err(format!("taal: {taal_err}; gorillapool: {gp_err}")),
+    }
+}
+
+// ============================================================================
+// #214 corroboration — Arcade's REJECTED is never authoritative uncorroborated
+// ============================================================================
+//
+// Mainnet ground truth (bsv-low #214, 2026-07-20/21): Arcade-v2-us-1's
+// validator view went STALE. It async-REJECTED (`PROCESSING (4)`) txs that
+// TAAL accepted as SEEN within seconds and that MINED in block 958776; the
+// REJECTED verdict was STICKY (persisted ≥28 min, across 3 blocks, `GET /tx`
+// still REJECTED for a 3-conf tx) and CASCADED ("parent rejected") to every
+// descendant, while its /health reported healthy throughout. No timing / wait /
+// co-delivery strategy can outlast that (the full-batch rung already
+// co-delivers and failed every attempt), so before the exhausted ladder is
+// allowed to become a DEFINITIVE 422 refusal, a SECOND independent broadcaster
+// (TAAL → GorillaPool) must corroborate the rejection. The #192/#193 invariant
+// is untouched: admission still requires a REAL network accept — just not
+// specifically Arcade's word for it.
+
+/// PURE (#214): STRICT accept semantics for the corroborating broadcaster.
+///
+/// This deliberately does NOT reuse [`arc_verdict`]'s accept arm: `arc_verdict`
+/// treats ANY parseable 2xx with a non-error `txStatus` (including `RECEIVED`,
+/// `STORED`, or an empty string) as `Accepted`, which is fine for a primary
+/// gate that ALSO polls, but a corroborator's word overrides another
+/// broadcaster's explicit REJECTED — a 200-shaped ack without a real
+/// network-accept marker must NOT do that. The bar is the SAME one the primary
+/// Arcade gate uses: `txStatus` rank ≥ [`ARCADE_GATE_STATUS`]
+/// (`SEEN_ON_NETWORK`; ARC and Arcade share the status vocabulary), or an
+/// already-known dress (the network provably HAS the tx).
+///
+/// Three-way contract (mirrors [`arc_verdict`]'s):
+/// - `Ok(Accepted)` — a REAL network accept: `txStatus` ≥ SEEN_ON_NETWORK
+///   (SEEN/SEEN_MULTIPLE/MINED/IMMUTABLE) or already-known in any dress;
+/// - `Ok(Rejected)` — a definitive per-tx refusal: 2xx error `txStatus`
+///   (REJECTED/DOUBLE_SPEND_ATTEMPTED/INVALID/MALFORMED) or HTTP 460–479;
+/// - `Err` — transport trouble OR an INCONCLUSIVE answer (sub-SEEN status,
+///   unparseable body, ORPHAN view). Inconclusive is grouped with transport on
+///   purpose: it neither confirms nor refutes Arcade's rejection, and the
+///   fail direction must be an honest 502 ("unavailable"), never a false 422
+///   ("refused") — the client's direct-ARC fallback keeps money moving.
+///
+/// ORPHAN is classified INCONCLUSIVE here (unlike [`arc_verdict`], which
+/// rejects it): "I cannot see the parent" is exactly the stale-view failure
+/// mode this corroboration exists to catch, not a script/fee refusal of the
+/// subject — an orphan answer must never CONFIRM another provider's REJECTED.
+pub fn corroborator_verdict(status: u16, body: &str) -> Result<ArcOutcome, String> {
+    if (200..300).contains(&status) {
+        let arc_resp: ArcResponse = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("corroborator: unparseable 2xx body: {e} — {body}")),
+        };
+        let upper_status = arc_resp.tx_status.to_uppercase();
+        let is_orphan = arc_resp.extra_info.to_uppercase().contains("ORPHAN")
+            || upper_status.contains("ORPHAN");
+        if is_orphan {
+            return Err(format!(
+                "corroborator: orphan view (inconclusive): {} {}",
+                arc_resp.tx_status, arc_resp.extra_info
+            ));
+        }
+        let error_statuses = ["DOUBLE_SPEND_ATTEMPTED", "REJECTED", "INVALID", "MALFORMED"];
+        if error_statuses.iter().any(|s| upper_status == *s) {
+            // A redundant re-broadcast dressed as an error is SUCCESS.
+            if already_known(&arc_resp.extra_info) {
+                return Ok(ArcOutcome::Accepted(arc_resp.txid));
+            }
+            return Ok(ArcOutcome::Rejected(
+                format!("{} {}", arc_resp.tx_status, arc_resp.extra_info)
+                    .trim()
+                    .to_string(),
+            ));
+        }
+        // THE accept gate: the corroborator's own network-accept marker, the
+        // same bar as the primary Arcade gate. MINED_IN_STALE_BLOCK, RECEIVED,
+        // STORED, ACCEPTED_BY_NETWORK, empty and unknown statuses all rank
+        // below it → inconclusive.
+        if arcade_status_rank(&upper_status) >= arcade_status_rank(ARCADE_GATE_STATUS) {
+            return Ok(ArcOutcome::Accepted(arc_resp.txid));
+        }
+        return Err(format!(
+            "corroborator: 2xx without a network-accept marker (txStatus {:?}) — inconclusive",
+            arc_resp.tx_status
+        ));
+    }
+    // Non-2xx: an already-known/mined body = the network HAS the tx = accept.
+    if already_known(body) {
+        let txid = serde_json::from_str::<ArcResponse>(body)
+            .map(|r| r.txid)
+            .unwrap_or_default();
+        return Ok(ArcOutcome::Accepted(txid));
+    }
+    if (460..480).contains(&status) {
+        return Ok(ArcOutcome::Rejected(format!("ARC HTTP {status}: {body}")));
+    }
+    Err(format!("corroborator: ARC HTTP {status}: {body}"))
+}
+
+/// PURE (#214): fold the corroborator's word into an EXHAUSTED Arcade ladder.
+/// Only ever reached via [`GateStep::AsyncRejected`] (a synchronous validation
+/// failure returns from [`ladder_step`] long before exhaustion — see the
+/// SyncRejected note there).
+///
+/// - Corroborator ACCEPTED → `Ok(Accepted(subject))` — the #192/#193 invariant
+///   holds: the tx IS network-accepted, on a second broadcaster's real accept
+///   marker. Arcade's stale REJECTED does not get to refuse it. We return OUR
+///   subject txid, never the corroborator's echoed one (identity discipline —
+///   same rule as `submit_once_and_gate`'s txid-mismatch guard).
+/// - Corroborator REJECTED → `Ok(Rejected)` — two independent broadcasters
+///   refused it; the 422 is genuinely definitive.
+/// - Corroborator transport/inconclusive → `Err` → 502. Better an honest
+///   "unavailable" (the client's direct-ARC fallback keeps money moving) than
+///   a false "refused" (which the client treats as terminal, by design).
+fn corroborated_exhaustion(
+    corroborator: Result<ArcOutcome, String>,
+    subject_txid: &str,
+) -> Result<ArcOutcome, String> {
+    match corroborator {
+        Ok(ArcOutcome::Accepted(_)) => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        Ok(ArcOutcome::Rejected(r)) => Ok(ArcOutcome::Rejected(format!(
+            "network did not accept {subject_txid}; retried; corroborated by second broadcaster: {r}"
+        ))),
+        Err(t) => Err(format!(
+            "Arcade did not accept {subject_txid} and the corroborating broadcaster was inconclusive — not admitting, not refusing: {t}"
+        )),
+    }
+}
+
+/// Corroborate one tx hex (the subject's EF — ARC accepts Extended Format in
+/// `rawTx`) against TAAL, falling back to GorillaPool when TAAL is transport-
+/// unreachable or inconclusive. A definitive verdict (accept OR reject) from
+/// either host short-circuits. This is a REAL broadcast attempt, not a status
+/// read — deliberately: the corroborator proves network acceptance by the same
+/// means the client's direct-ARC fallback would, and a re-broadcast of an
+/// already-accepted tx is idempotent (already-known = accept).
+async fn corroborate_tx_hex(
+    taal_api_key: Option<&str>,
+    tx_hex: &str,
+) -> Result<ArcOutcome, String> {
+    let taal_err = match post_arc_raw(WorkerArcBroadcaster::ARC_URL, taal_api_key, tx_hex).await {
+        Ok((status, body)) => match corroborator_verdict(status, &body) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    worker::console_log!("corroborate: TAAL inconclusive ({taal_err}); trying GorillaPool");
+    match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
+        Ok((status, body)) => corroborator_verdict(status, &body)
+            .map_err(|gp_err| format!("taal: {taal_err}; gorillapool: {gp_err}")),
         Err(gp_err) => Err(format!("taal: {taal_err}; gorillapool: {gp_err}")),
     }
 }
@@ -438,6 +604,19 @@ pub const ARCADE_DEFAULT_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech"
 const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 
 /// Arcade statuses that are hard rejects — never wait these out, never admit.
+///
+/// #214 — **Arcade REJECTED is never authoritative uncorroborated.** On
+/// 2026-07-20/21 Arcade-v2-us-1's stale validator view reported REJECTED for
+/// txs that TAAL accepted in seconds and that MINED in block 958776; the
+/// verdict was sticky (≥28 min, still REJECTED for a 3-conf tx) and cascaded
+/// ("parent rejected") to descendants. These statuses therefore terminate a
+/// GATE STEP (stop waiting), but an exhausted ladder must pass through the
+/// second-broadcaster corroboration in `broadcast_efs_gated` before it may
+/// become a definitive `Rejected`/422. Note also: Arcade's MINED callback
+/// (/arc-ingest) will never fire for a txid its view holds at REJECTED — proof
+/// completion for such txs rides the Bitails/WoC couriers (`proof_fetcher.rs`
+/// ladder, which treats a non-MINED Arcade answer as merely "no proof here",
+/// never as terminal).
 const ARCADE_FATAL_STATUSES: &[&str] = &["REJECTED", "DOUBLE_SPEND_ATTEMPTED"];
 
 /// Give up waiting for propagation after this long — the tx was submitted but
@@ -632,9 +811,22 @@ fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
         GateStep::Accepted => Ladder::Return(ArcOutcome::Accepted(subject_txid.to_string())),
         // A SYNCHRONOUS validation failure (bad script / low fee) is definitive
         // — a resubmit cannot change it. Admit nothing; do NOT retry.
+        //
+        // #214: sync stays UNCORROBORATED on purpose. The corroboration leg
+        // exists because Arcade's ASYNC verdict depends on its (provably
+        // stale-able) network/UTXO view; the synchronous 400 is computed from
+        // the EF body alone — script and fee, with every input's source script
+        // and satoshis inlined — so it is provider-independent: any honest
+        // validator returns the same answer. The #214 repro confirms the sync
+        // path was NOT implicated: every false rejection that night was the
+        // 202-then-async-REJECTED shape (`PROCESSING (4)`), never the
+        // structured sync-400 body. Returning here (never `Retry`) is also
+        // what keeps the corroborator out of the sync path by construction —
+        // corroboration lives strictly past the exhausted ladder.
         GateStep::SyncRejected(r) => Ladder::Return(ArcOutcome::Rejected(r)),
-        // Network did not accept — ambiguous (missing parent vs double-spend);
-        // an explicit resubmit is the only recovery. Retry.
+        // Network did not accept — ambiguous (missing parent vs double-spend
+        // vs a stale Arcade validator view, #214); an explicit resubmit is the
+        // only recovery. Retry.
         GateStep::AsyncRejected(_) => Ladder::Retry,
     }
 }
@@ -670,6 +862,15 @@ pub struct ArcadeBroadcaster {
     /// `X-CallbackUrl` for the MINED webhook (our `/arc-ingest`). `None` → no
     /// callback registered (SEEN is still gated by polling).
     callback_url: Option<String>,
+    /// TAAL key for the #214 corroborating broadcaster. `None` still
+    /// corroborates: TAAL is tried keyless (its 401 is transport) and
+    /// GorillaPool is keyless by design.
+    corroborator_taal_key: Option<String>,
+    /// Wall-clock spent in the #214 corroboration leg(s), for the `corroborate`
+    /// Server-Timing segment (#195 — the new leg must be attributable, not
+    /// smeared into `arcade-broadcast`). `Cell`: the worker isolate is
+    /// single-threaded and every async path here is `?Send`.
+    corroborate_ms: std::cell::Cell<f64>,
 }
 
 impl ArcadeBroadcaster {
@@ -684,6 +885,8 @@ impl ArcadeBroadcaster {
         Self {
             base_url,
             callback_url: None,
+            corroborator_taal_key: None,
+            corroborate_ms: std::cell::Cell::new(0.0),
         }
     }
 
@@ -696,6 +899,35 @@ impl ArcadeBroadcaster {
             self.callback_url = Some(url);
         }
         self
+    }
+
+    /// Provide the TAAL key for the #214 corroborating broadcaster (optional —
+    /// corroboration runs keyless without it; see `corroborator_taal_key`).
+    #[must_use]
+    pub fn with_corroborator_key(mut self, key: Option<String>) -> Self {
+        self.corroborator_taal_key = key.filter(|k| !k.trim().is_empty());
+        self
+    }
+
+    /// Milliseconds spent in the corroboration leg(s) of the last
+    /// `broadcast_efs_gated` call (0 when no corroboration ran). For the
+    /// `corroborate` Server-Timing segment (#195).
+    pub fn corroborate_ms(&self) -> f64 {
+        self.corroborate_ms.get()
+    }
+
+    /// Run the #214 corroborating broadcast for the subject's EF hex,
+    /// accounting its wall-clock into [`Self::corroborate_ms`].
+    async fn corroborate_subject(&self, subject_ef: &EfTx) -> Result<ArcOutcome, String> {
+        let started = worker::js_sys::Date::now();
+        let res = corroborate_tx_hex(
+            self.corroborator_taal_key.as_deref(),
+            &hex::encode(&subject_ef.ef),
+        )
+        .await;
+        self.corroborate_ms
+            .set(self.corroborate_ms.get() + (worker::js_sys::Date::now() - started));
+        res
     }
 
     fn tx_endpoint(&self) -> String {
@@ -742,6 +974,15 @@ impl ArcadeBroadcaster {
     /// costing one round-trip on an already-terminal case. Because of that
     /// ambiguity we NEVER report "missing parent" — the reason stays
     /// "network did not accept; retried".
+    ///
+    /// #214: Arcade's async REJECTED is additionally NOT trusted on its own —
+    /// its validator view has gone provably stale (REJECTED for txs that MINED)
+    /// — so before an exhausted ladder becomes a definitive `Rejected` (→ 422,
+    /// which the client treats as terminal by design), a SECOND broadcaster
+    /// (TAAL → GorillaPool, [`corroborate_tx_hex`]) must corroborate. Its real
+    /// network accept admits; its rejection confirms the 422; anything else is
+    /// an honest `Err`/502. A synchronous validation failure (SyncRejected)
+    /// stays uncorroborated — see [`ladder_step`].
     pub async fn broadcast_efs_gated(
         &self,
         efs: &[EfTx],
@@ -779,29 +1020,69 @@ impl ArcadeBroadcaster {
             return Ok(outcome);
         }
 
-        // ── Attempt 3: FULL ANCESTRY BATCH — feed any parent Arcade could not
-        // source from the live network. Only meaningful when ancestors exist;
-        // with just the subject this repeats attempt 2, so we skip it.
-        if efs.len() > 1 {
-            let concat = concat_efs(efs);
-            worker::console_log!(
-                "[arcade] {subject_txid} still not accepted — resubmitting full batch ({} legs)",
-                efs.len()
-            );
-            let step = self
-                .submit_once_and_gate(&self.txs_endpoint(), &concat, subject_txid, efs.len())
-                .await?;
-            if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
+        // ── CORROBORATE — deliberately BEFORE the full-batch rung (#214).
+        //
+        // Ordering decision (the rung-3 poisoning question): under a stale
+        // Arcade validator view, re-submitting ANCESTORS in the batch rung can
+        // WORSEN state — a previously-SEEN ancestor gets re-validated against
+        // the same stale view, its stored status can flip to REJECTED, and
+        // Arcade's "parent rejected" cascade then condemns every descendant
+        // (observed on 2026-07-20/21: sticky REJECTED for txs MINED in
+        // 958776). So before feeding Arcade any ancestors, ask a SECOND
+        // broadcaster about the SUBJECT:
+        //  - corroborator ACCEPTS → return Accepted now — the batch rung is
+        //    skipped entirely, so a stale Arcade never gets an ancestor
+        //    resubmit to poison;
+        //  - corroborator REJECTS → two independent broadcasters refused the
+        //    subject — definitively Rejected, and the batch rung is pointless;
+        //  - corroborator transport/inconclusive → the batch rung is still the
+        //    right move: a GENUINE missing-parent orphan (the shape #211 built
+        //    this rung for) is only fixable by feeding Arcade the ancestry.
+        //    The poisoning residual survives ONLY in this arm (both
+        //    broadcasters unable to confirm), which is exactly when we have no
+        //    better information anyway — and the final corroboration below
+        //    still stands between any fallout and a definitive 422.
+        let corroborated = self.corroborate_subject(subject_ef).await;
+        match corroborated_exhaustion(corroborated, subject_txid) {
+            Ok(outcome) => {
+                worker::console_log!(
+                    "[arcade] {subject_txid} corroborated pre-batch → {outcome:?}"
+                );
                 return Ok(outcome);
             }
+            Err(inconclusive) if efs.len() > 1 => {
+                worker::console_log!(
+                    "[arcade] corroborator inconclusive for {subject_txid} ({inconclusive}) — trying full ancestry batch"
+                );
+            }
+            // No ancestors to feed — the ladder is exhausted and the
+            // corroborator could not decide. Honest 502, never a false 422.
+            Err(inconclusive) => return Err(inconclusive),
         }
 
-        // Exhausted the resubmit ladder — the network genuinely did not accept
-        // the subject. Ambiguous with a double-spend, so DO NOT say "missing
-        // parent"; admit nothing.
-        Ok(ArcOutcome::Rejected(format!(
-            "network did not accept {subject_txid}; retried"
-        )))
+        // ── Attempt 3: FULL ANCESTRY BATCH — feed any parent Arcade could not
+        // source from the live network (only reached when the corroborator
+        // could not decide; see the ordering note above).
+        let concat = concat_efs(efs);
+        worker::console_log!(
+            "[arcade] {subject_txid} still not accepted — resubmitting full batch ({} legs)",
+            efs.len()
+        );
+        let step = self
+            .submit_once_and_gate(&self.txs_endpoint(), &concat, subject_txid, efs.len())
+            .await?;
+        if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
+            return Ok(outcome);
+        }
+
+        // Exhausted the resubmit ladder. Tonight's #214 outage proved Arcade's
+        // async REJECTED alone is NOT trustworthy here, so the exhausted
+        // verdict is whatever the corroborating broadcaster says (second
+        // attempt — the pre-batch one was transport/inconclusive, and both
+        // transports can be transient): Accepted admits (real network accept),
+        // Rejected → 422 (two broadcasters agree), inconclusive → Err → 502.
+        let corroborated = self.corroborate_subject(subject_ef).await;
+        corroborated_exhaustion(corroborated, subject_txid)
     }
 
     /// Submit one EF body and SEEN-gate the subject: submit → (echoed-status
@@ -1089,6 +1370,165 @@ mod tests {
             ladder_step(GateStep::Accepted, "ab"),
             Ladder::Return(ArcOutcome::Accepted("ab".into())),
         );
+    }
+
+    // ── #214: exhausted-ladder corroboration (pure control-flow producers) ──
+    //
+    // Ground truth: Arcade-v2-us-1's stale validator view async-REJECTED txs
+    // that TAAL SEENed in seconds and that MINED in block 958776 — sticky,
+    // cascading, /health green throughout. The exhausted ladder therefore may
+    // not become a definitive 422 on Arcade's word alone; these tests pin the
+    // corroboration semantics through the REAL pure producers
+    // (`corroborator_verdict` classifies the corroborator's actual
+    // (status, body) wire answer; `corroborated_exhaustion` folds it into the
+    // exhausted verdict that `broadcast_efs_gated` returns and routes.rs maps
+    // to 200/422/502).
+
+    /// The corroborator's REAL accept shape: TAAL answers `/v1/tx` 200 with a
+    /// SEEN_ON_NETWORK txStatus.
+    const CORR_SEEN_BODY: &str = r#"{"txid":"ab","txStatus":"SEEN_ON_NETWORK","extraInfo":""}"#;
+
+    #[test]
+    fn corroborator_accept_requires_a_real_network_accept_marker() {
+        // Genuine accepts: SEEN_ON_NETWORK or better.
+        for status in ["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES", "MINED", "IMMUTABLE"] {
+            let body = format!(r#"{{"txid":"ab","txStatus":"{status}","extraInfo":""}}"#);
+            assert_eq!(
+                corroborator_verdict(200, &body).unwrap(),
+                ArcOutcome::Accepted("ab".into()),
+                "{status} is a real network accept"
+            );
+        }
+        // A 200-SHAPED ACK WITHOUT THE ACCEPT MARKER IS NOT AN ACCEPT — the
+        // load-bearing #214 requirement. Sub-SEEN statuses, an empty status
+        // object and MINED_IN_STALE_BLOCK are all INCONCLUSIVE (Err), because
+        // the corroborator's word here overrides another broadcaster's
+        // explicit REJECTED and must therefore be a real accept, never an ack.
+        for body in [
+            r#"{"txid":"ab","txStatus":"RECEIVED"}"#.to_string(),
+            r#"{"txid":"ab","txStatus":"STORED"}"#.to_string(),
+            r#"{"txid":"ab","txStatus":"ANNOUNCED_TO_NETWORK"}"#.to_string(),
+            r#"{"txid":"ab","txStatus":"ACCEPTED_BY_NETWORK"}"#.to_string(),
+            r#"{"txid":"ab","txStatus":"MINED_IN_STALE_BLOCK"}"#.to_string(),
+            r#"{"txid":"ab","txStatus":""}"#.to_string(),
+            "{}".to_string(),
+        ] {
+            assert!(
+                corroborator_verdict(200, &body).is_err(),
+                "200 without an accept marker must be inconclusive: {body}"
+            );
+        }
+        // Unparseable 2xx junk is inconclusive too, never an accept.
+        assert!(corroborator_verdict(200, "<html>gateway junk</html>").is_err());
+    }
+
+    #[test]
+    fn corroborator_definitive_rejections_and_transport_classify_apart() {
+        // Definitive: 2xx error txStatus and the 460–479 verdict class.
+        for s in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED", "INVALID", "MALFORMED"] {
+            let body = format!(r#"{{"txid":"ab","txStatus":"{s}","extraInfo":"fee too low"}}"#);
+            assert!(
+                matches!(corroborator_verdict(200, &body).unwrap(), ArcOutcome::Rejected(_)),
+                "{s} must corroborate the rejection"
+            );
+        }
+        for status in [460u16, 461, 465, 473] {
+            assert!(matches!(
+                corroborator_verdict(status, "invalid").unwrap(),
+                ArcOutcome::Rejected(_)
+            ));
+        }
+        // Transport stays transport (Err) — 5xx, auth, misroute, rate-limit.
+        for status in [400u16, 401, 403, 404, 429, 500, 502, 503] {
+            assert!(corroborator_verdict(status, "trouble").is_err(), "HTTP {status}");
+        }
+        // Already-known in any dress = the network HAS the tx = accept.
+        assert!(matches!(
+            corroborator_verdict(422, "txn-already-known (code 257)").unwrap(),
+            ArcOutcome::Accepted(_)
+        ));
+        let dressed =
+            r#"{"txid":"ab","txStatus":"REJECTED","extraInfo":"transaction already mined"}"#;
+        assert!(matches!(
+            corroborator_verdict(200, dressed).unwrap(),
+            ArcOutcome::Accepted(_)
+        ));
+        // ORPHAN is INCONCLUSIVE for a corroborator (unlike arc_verdict): "I
+        // can't see the parent" is the stale-view failure mode itself and must
+        // never CONFIRM another provider's REJECTED.
+        let orphan = r#"{"txid":"ab","txStatus":"SEEN_IN_ORPHAN_MEMPOOL","extraInfo":""}"#;
+        assert!(corroborator_verdict(200, orphan).is_err());
+    }
+
+    #[test]
+    fn exhausted_ladder_with_corroborator_accept_admits() {
+        // exhausted + corroborator-accepts ⇒ Accepted. The #192/#193 invariant
+        // holds — admission rides the corroborator's REAL network accept — and
+        // the returned txid is OUR subject, never the corroborator's echo.
+        let subject = "2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256";
+        let corroborator = corroborator_verdict(200, CORR_SEEN_BODY);
+        assert_eq!(
+            corroborated_exhaustion(corroborator, subject).unwrap(),
+            ArcOutcome::Accepted(subject.to_string()),
+            "a second broadcaster's real accept must override Arcade's stale REJECTED"
+        );
+    }
+
+    #[test]
+    fn exhausted_ladder_with_corroborator_reject_stays_rejected() {
+        // exhausted + corroborator-rejects ⇒ Rejected (→ 422): two independent
+        // broadcasters refused the subject.
+        let body = r#"{"txid":"ab","txStatus":"REJECTED","extraInfo":"fee too low"}"#;
+        let corroborator = corroborator_verdict(200, body);
+        match corroborated_exhaustion(corroborator, "ab").unwrap() {
+            ArcOutcome::Rejected(reason) => {
+                assert!(reason.contains("network did not accept ab"), "{reason}");
+                assert!(reason.contains("corroborated"), "{reason}");
+            }
+            other => panic!("must stay Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exhausted_ladder_with_corroborator_transport_is_err_never_a_false_422() {
+        // exhausted + corroborator-transport/inconclusive ⇒ Err (→ 502): the
+        // client's direct-ARC fallback keeps money moving — better an honest
+        // "unavailable" than a false "refused" (which the client treats as
+        // terminal, by design).
+        for corroborator in [
+            Err("taal: fetch failed; gorillapool: fetch failed".to_string()),
+            corroborator_verdict(503, "unavailable"),
+            // A 200-shaped ack without the accept marker lands here too.
+            corroborator_verdict(200, r#"{"txid":"ab","txStatus":"RECEIVED"}"#),
+        ] {
+            assert!(
+                corroborated_exhaustion(corroborator, "ab").is_err(),
+                "inconclusive corroboration must be Err/502, never Rejected/422"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_400_is_definitive_and_never_reaches_the_corroborator() {
+        // #214 item 2: the synchronous structured 400 is provider-independent
+        // (script/fee computed from the EF body alone — no network/UTXO view
+        // involved, so a stale validator view cannot produce it; every falsy
+        // in the #214 repro was the ASYNC 202-then-REJECTED shape). It stays
+        // an immediate definitive 422 with NO corroborator call — proven via
+        // the real control-flow producers: `classify_submit_response` yields
+        // SyncRejected, and `ladder_step(SyncRejected)` RETURNS (never
+        // `Retry`), so `broadcast_efs_gated` exits before the corroboration
+        // legs, which live strictly past the exhausted ladder.
+        let step = match classify_submit_response(400, ARCADE_SYNC_400_LOW_FEE) {
+            SubmitOutcome::SyncRejected(r) => GateStep::SyncRejected(r),
+            other => panic!("sync 400 must classify SyncRejected, got {other:?}"),
+        };
+        match ladder_step(step, "ab") {
+            Ladder::Return(ArcOutcome::Rejected(reason)) => {
+                assert!(reason.contains("transaction failed validation"), "{reason}");
+            }
+            other => panic!("sync rejection must Return(Rejected) — never Retry (which is the only path to corroboration) — got {other:?}"),
+        }
     }
 
     #[test]

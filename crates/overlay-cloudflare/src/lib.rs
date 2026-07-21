@@ -213,10 +213,15 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
             // overrides the default endpoint; the callback is derived from
             // HOSTING_URL inside the route.
             let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
+            // #214: the TAAL key powers the corroborating broadcaster for an
+            // exhausted gated ladder (Arcade async-REJECTED is never
+            // authoritative uncorroborated). Absent key → keyless TAAL then
+            // GorillaPool; corroboration always runs.
+            let taal_api_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
             // `ctx` is threaded in so the best-effort mainnet SHIP fan-out
             // runs via `wait_until` AFTER the response instead of inline
             // (it was costing the caller seconds on every submit).
-            submit(&engine, req, hosting_url.as_deref(), arcade_url, &ctx).await
+            submit(&engine, req, hosting_url.as_deref(), arcade_url, taal_api_key, &ctx).await
         }
         (Method::Post, "/lookup") => lookup(&engine, req).await,
         (Method::Post, "/arc-ingest") => {
