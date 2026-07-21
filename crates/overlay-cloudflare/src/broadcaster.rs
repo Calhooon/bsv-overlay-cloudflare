@@ -563,6 +563,72 @@ async fn corroborate_tx_hex(
     }
 }
 
+/// PURE (#216): corroborate a subject WITH its ancestry. Feed each ANCESTOR ef
+/// to the corroborating broadcaster FIRST to prime its mempool, THEN corroborate
+/// the SUBJECT — the subject's verdict is the ONLY thing that decides
+/// accept/reject (identical strict semantics to [`corroborate_tx_hex`]).
+///
+/// WHY: during an Arcade validator outage (#214), a pre-signed refund that
+/// spends a still-0-conf pot could not be corroborated — the corroborator
+/// (TAAL/GorillaPool) only ever received the SUBJECT alone, so with a
+/// partial/stale UTXO view it saw a "missing parent" → inconclusive → 502, and
+/// the refund was un-broadcastable until Arcade recovered (bsv-low #216, the
+/// stuck refund `1d65d2fe…` on 2026-07-21). Submitting the parent(s) first lets
+/// a degraded broadcaster ingest the parent chain into its own mempool and
+/// validate the child standalone — the corroboration analogue of the #209
+/// recast-parent-then-child doctrine (btc-relay-rs `RecastParentThenChild`,
+/// dHouse `provenAncestryBeef`).
+///
+/// The `submit_one` closure is the transport (TAAL→GorillaPool for the real
+/// path; a mock in tests) — this function is the PURE control flow, so the
+/// ordering ("parents primed before the subject decides") and the strict
+/// "only-the-subject-verdict-decides" semantics are unit-tested natively without
+/// the worker runtime.
+///
+/// - Parents are submitted in ANCESTRY ORDER (the caller's EF batch is already
+///   parents-before-children, subject last — [`beef_to_ef_batch`]); the subject
+///   is SKIPPED in the parent loop and submitted last.
+/// - Per-parent verdicts are IGNORED (a parent already-known / SEEN / even a
+///   transport blip is fine — the submit only primes the mempool). A parent
+///   submit NEVER causes an Accept, and a parent submit FAILURE never flips the
+///   subject's verdict.
+async fn corroborate_batch_with<F, Fut>(
+    efs: &[EfTx],
+    subject_txid: &str,
+    mut submit_one: F,
+) -> Result<ArcOutcome, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<ArcOutcome, String>>,
+{
+    let subject_ef = efs
+        .iter()
+        .find(|e| e.txid == subject_txid)
+        .ok_or_else(|| format!("subject {subject_txid} not present in EF batch"))?;
+
+    // Prime the corroborator's mempool with each ANCESTOR first — best-effort,
+    // verdicts discarded (they only prime). Ancestry order is preserved; the
+    // subject is skipped here and decided last.
+    for ef in efs {
+        if ef.txid == subject_txid {
+            continue;
+        }
+        let _ = submit_one(hex::encode(&ef.ef)).await;
+    }
+
+    // ONLY the subject's verdict decides accept/reject — a primed parent can
+    // never admit on its own (the #192/#193 invariant: admission still requires
+    // a REAL network-accept marker on the SUBJECT).
+    submit_one(hex::encode(&subject_ef.ef)).await
+}
+
+/// PURE (#216): does the FINAL/exhaustion corroboration carry ancestry? Only
+/// when there IS ancestry beyond the subject leg — a single-leg batch has no
+/// parent to prime, so it stays subject-only ([`corroborate_tx_hex`]).
+fn exhaustion_corroborates_with_ancestry(efs_len: usize) -> bool {
+    efs_len > 1
+}
+
 #[async_trait(?Send)]
 impl ArcBroadcaster for WorkerArcBroadcaster {
     async fn broadcast(&self, raw_tx_hex: &str) -> Result<String, String> {
@@ -930,6 +996,38 @@ impl ArcadeBroadcaster {
         res
     }
 
+    /// Run the #216 corroborating broadcast WITH ancestry: prime the
+    /// corroborator with each ancestor EF first, then corroborate the subject
+    /// ([`corroborate_batch_with`]), accounting wall-clock into
+    /// [`Self::corroborate_ms`].
+    ///
+    /// POISONING NOTE: feeding ancestors to the CORROBORATOR (TAAL →
+    /// GorillaPool) is safe — TAAL/GorillaPool are NOT the stale-view
+    /// broadcaster in the #214/#216 scenario (Arcade is), and the parents here
+    /// (the pot / the JOIN funding the pot) are valid, already-broadcast funded
+    /// txs. This is DELIBERATELY not a resubmit to ARCADE: re-feeding ancestors
+    /// to a stale Arcade validator is the #214 poisoning risk (a previously-SEEN
+    /// ancestor can flip to REJECTED and cascade "parent rejected"), which is
+    /// exactly why the pre-batch corroboration and the Arcade batch rung stay
+    /// subject-first. Here the target is a HEALTHY second broadcaster whose
+    /// mempool we WANT to hold the parent so it can validate the child.
+    async fn corroborate_batch(
+        &self,
+        efs: &[EfTx],
+        subject_txid: &str,
+    ) -> Result<ArcOutcome, String> {
+        let started = worker::js_sys::Date::now();
+        let key = self.corroborator_taal_key.clone();
+        let res = corroborate_batch_with(efs, subject_txid, |tx_hex| {
+            let key = key.clone();
+            async move { corroborate_tx_hex(key.as_deref(), &tx_hex).await }
+        })
+        .await;
+        self.corroborate_ms
+            .set(self.corroborate_ms.get() + (worker::js_sys::Date::now() - started));
+        res
+    }
+
     fn tx_endpoint(&self) -> String {
         format!("{}/tx", self.base_url)
     }
@@ -1081,7 +1179,22 @@ impl ArcadeBroadcaster {
         // attempt — the pre-batch one was transport/inconclusive, and both
         // transports can be transient): Accepted admits (real network accept),
         // Rejected → 422 (two broadcasters agree), inconclusive → Err → 502.
-        let corroborated = self.corroborate_subject(subject_ef).await;
+        //
+        // #216: when there IS ancestry (efs.len() > 1), corroborate WITH it —
+        // prime the corroborator's mempool with the parent chain FIRST so a
+        // degraded broadcaster with a partial UTXO view can validate a subject
+        // that spends a still-0-conf parent (the stuck-refund scenario). With a
+        // single leg there is no parent to feed, so it stays subject-only. The
+        // #214 semantics are UNCHANGED: only the subject's real network-accept
+        // marker admits; a corroborator Rejected is the definitive 422; anything
+        // else is an honest Err/502. Priming ancestors is safe — the
+        // corroborator (TAAL/GorillaPool) is the HEALTHY broadcaster here, not
+        // the stale Arcade view (see `corroborate_batch`'s poisoning note).
+        let corroborated = if exhaustion_corroborates_with_ancestry(efs.len()) {
+            self.corroborate_batch(efs, subject_txid).await
+        } else {
+            self.corroborate_subject(subject_ef).await
+        };
         corroborated_exhaustion(corroborated, subject_txid)
     }
 
@@ -1529,6 +1642,247 @@ mod tests {
             }
             other => panic!("sync rejection must Return(Rejected) — never Retry (which is the only path to corroboration) — got {other:?}"),
         }
+    }
+
+    // ── #216: corroborate WITH ancestry (pure batch control flow) ───────────
+    //
+    // Ground truth: during the #214 Arcade outage a pre-signed refund spending a
+    // still-0-conf pot could not be corroborated — the corroborator only ever
+    // received the SUBJECT alone, saw a "missing parent" and returned
+    // inconclusive → 502. `corroborate_batch_with` primes the corroborator's
+    // mempool with the ANCESTORS first, then lets ONLY the subject's verdict
+    // decide. These tests drive the REAL pure producer with a mocked transport
+    // (the same `submit_one` closure shape the worker path injects
+    // `corroborate_tx_hex` into), so ordering + the strict "subject decides"
+    // semantics are proven natively.
+
+    /// A parent + subject EF batch (ancestry order, subject last). Subject EF
+    /// bytes `[4,5]` (hex "0405"); parent `[1,2,3]` (hex "010203").
+    fn parent_and_subject() -> (Vec<EfTx>, String) {
+        (
+            vec![
+                EfTx { txid: "parent".into(), ef: vec![1, 2, 3] },
+                EfTx { txid: "subject".into(), ef: vec![4, 5] },
+            ],
+            "subject".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn batch_accepts_subject_only_after_parent_primed() {
+        // (a) The corroborator SEENs the subject ONLY once the parent has been
+        // primed into its mempool (subject-alone stays inconclusive). Priming
+        // the parent first flips it to Accepted — the whole point of #216.
+        //
+        // RED-VERIFY: neuter the parent-submit loop in `corroborate_batch_with`
+        // (backup copy) → parent_seen stays false → the subject-alone answer is
+        // RECEIVED → inconclusive Err → this `unwrap` panics → the test fails.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        let parent_seen = std::cell::Cell::new(false);
+        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let is_subject = tx_hex == subject_hex;
+            if !is_subject {
+                parent_seen.set(true);
+            }
+            let seen = parent_seen.get();
+            async move {
+                if is_subject {
+                    // With the parent primed the corroborator can validate the
+                    // child (SEEN); without it, it can only see RECEIVED.
+                    let status = if seen { "SEEN_ON_NETWORK" } else { "RECEIVED" };
+                    corroborator_verdict(
+                        200,
+                        &format!(r#"{{"txid":"subject","txStatus":"{status}"}}"#),
+                    )
+                } else {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
+                    )
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            out.unwrap(),
+            ArcOutcome::Accepted("subject".into()),
+            "parent primed before the subject → the corroborator admits the subject"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_subject_rejection_is_rejected_regardless_of_parents() {
+        // (b) The subject's verdict is the ONLY arbiter: a corroborator that
+        // rejects the subject ⇒ Rejected, no matter how the parents fared.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let is_subject = tx_hex == subject_hex;
+            async move {
+                if is_subject {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"subject","txStatus":"REJECTED","extraInfo":"fee too low"}"#,
+                    )
+                } else {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
+                    )
+                }
+            }
+        })
+        .await;
+        assert!(matches!(out.unwrap(), ArcOutcome::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn batch_subject_transport_failure_is_err() {
+        // (c) Transport trouble on the subject ⇒ Err (→ 502), even with a
+        // healthy parent prime.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let is_subject = tx_hex == subject_hex;
+            async move {
+                if is_subject {
+                    Err::<ArcOutcome, String>(
+                        "taal: fetch failed; gorillapool: fetch failed".into(),
+                    )
+                } else {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
+                    )
+                }
+            }
+        })
+        .await;
+        assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_subject_200_without_seen_marker_is_never_accepted() {
+        // (d) THE #192/#193 guard on the batch path: a 200-shaped ack WITHOUT a
+        // real network-accept marker must be inconclusive (Err), NEVER Accept —
+        // a primed parent can never manufacture an accept out of a sub-SEEN
+        // subject answer.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        for status in ["RECEIVED", "STORED", "ACCEPTED_BY_NETWORK", ""] {
+            let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+                let is_subject = tx_hex == subject_hex;
+                let status = status.to_string();
+                async move {
+                    if is_subject {
+                        corroborator_verdict(
+                            200,
+                            &format!(r#"{{"txid":"subject","txStatus":"{status}"}}"#),
+                        )
+                    } else {
+                        corroborator_verdict(
+                            200,
+                            r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
+                        )
+                    }
+                }
+            })
+            .await;
+            assert!(
+                out.is_err(),
+                "200 txStatus {status:?} without SEEN must be inconclusive, never Accept"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_parent_submit_failures_do_not_flip_the_subject_verdict() {
+        // (e) A parent submit that hard-fails (transport boom) is IGNORED — it
+        // only primes the mempool. The subject's real SEEN still admits.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let is_subject = tx_hex == subject_hex;
+            async move {
+                if is_subject {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#,
+                    )
+                } else {
+                    Err::<ArcOutcome, String>("parent transport boom".into())
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            out.unwrap(),
+            ArcOutcome::Accepted("subject".into()),
+            "a failed parent prime must not flip the subject's accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_submits_parents_in_ancestry_order_then_subject_last_exactly_once() {
+        // Ordering discipline: parents are primed in ancestry order and the
+        // subject is submitted EXACTLY ONCE, LAST (never in the parent loop).
+        let efs = vec![
+            EfTx { txid: "g".into(), ef: vec![0xaa] }, // grandparent
+            EfTx { txid: "p".into(), ef: vec![0xbb] }, // parent
+            EfTx { txid: "subject".into(), ef: vec![0xcc] }, // subject last
+        ];
+        let order = std::cell::RefCell::new(Vec::<String>::new());
+        let out = corroborate_batch_with(&efs, "subject", |tx_hex| {
+            order.borrow_mut().push(tx_hex.clone());
+            let is_subject = tx_hex == hex::encode([0xccu8]);
+            async move {
+                if is_subject {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#,
+                    )
+                } else {
+                    corroborator_verdict(200, r#"{"txid":"p","txStatus":"SEEN_ON_NETWORK"}"#)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        assert_eq!(
+            *order.borrow(),
+            vec![
+                hex::encode([0xaau8]),
+                hex::encode([0xbbu8]),
+                hex::encode([0xccu8]),
+            ],
+            "parents primed in ancestry order; subject submitted once, last"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_missing_subject_in_efs_is_an_error() {
+        let efs = vec![EfTx { txid: "parent".into(), ef: vec![1, 2, 3] }];
+        let out = corroborate_batch_with(&efs, "subject", |_tx_hex| async {
+            corroborator_verdict(200, r#"{"txStatus":"SEEN_ON_NETWORK"}"#)
+        })
+        .await;
+        assert!(out.is_err(), "a batch without the subject leg is an error");
+    }
+
+    #[test]
+    fn exhaustion_routes_batch_only_when_ancestry_present() {
+        // efs.len()==1 stays subject-only; efs.len()>1 routes through the
+        // ancestry-carrying `corroborate_batch`.
+        assert!(
+            !exhaustion_corroborates_with_ancestry(1),
+            "single leg → subject-only corroboration"
+        );
+        assert!(
+            exhaustion_corroborates_with_ancestry(2),
+            "ancestry present → batch corroboration"
+        );
+        assert!(exhaustion_corroborates_with_ancestry(9));
     }
 
     #[test]
