@@ -1019,6 +1019,174 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<()>) -> Result<Response>
     json_response(utxo_status_body(&entries), 200)
 }
 
+// ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
+
+/// One cached `/tx-any` answer.
+type TxAnyCached = crate::txany::TxAnyAnswer;
+
+thread_local! {
+    /// In-isolate `/tx-any` cache (txid → (expiry ms, answer)) — the same
+    /// pattern (and rationale) as `SPENT_ANY_CACHE` above.
+    static TX_ANY_CACHE: std::cell::RefCell<std::collections::HashMap<String, (f64, TxAnyCached)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Bitails tx-route health memo: `Some(true)` once the known-mined anchor
+    /// served (SUCCESS memoized only — a probe fault re-probes next time).
+    /// Ported from the client's `bitailsRouteHealthy` route-rot guard.
+    static BITAILS_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The INDEX leg: raw hex + BUMP height from the stored BEEF (`pot_beefs`
+/// first, `transactions` second — the `/beef` order). `(None, None)` = index
+/// miss OR D1 fault (fault logged; the break-glass leg still answers — a
+/// read surface must not dead-end on a D1 blip, and the external answer is
+/// still truthful).
+async fn tx_any_index_leg(
+    ctx: &RouteContext<()>,
+    txid_lc: &str,
+) -> (Option<String>, Option<u64>) {
+    let Ok(db) = ctx.env.d1("OVERLAY_DB") else {
+        console_warn!("[tx-any] OVERLAY_DB binding unavailable — break-glass leg only");
+        return (None, None);
+    };
+    for (table, sql) in [
+        ("pot_beefs", "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?"),
+        ("transactions", "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?"),
+    ] {
+        let Ok(stmt) = db.prepare(sql).bind(&[JsValue::from_str(txid_lc)]) else {
+            continue;
+        };
+        let row: Option<BeefRow> = match stmt.first(None).await {
+            Ok(row) => row,
+            Err(e) => {
+                console_warn!("[tx-any] {table} query failed: {e}");
+                continue;
+            },
+        };
+        if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
+            if let Some(raw_hex) = crate::logic::extract_raw_tx_hex(&bytes, txid_lc) {
+                let height = crate::results::beef_block_height(&bytes, txid_lc);
+                return (Some(raw_hex), height);
+            }
+        }
+    }
+    (None, None)
+}
+
+/// The BREAK-GLASS external leg: WoC presence/confirmations + hash-verified
+/// raw (WoC hex, Bitails binary fallback); absence corroborated by a Bitails
+/// 404 behind a healthy route. See `txany.rs` for the full bar.
+async fn tx_any_external_leg(
+    txid_lc: &str,
+) -> (crate::txany::TxObservation, crate::txany::AbsenceCorroboration) {
+    use crate::txany::{AbsenceCorroboration, TxObservation};
+
+    let woc = match provider_get(&format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
+        Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => {
+                let confirmed = crate::txany::parse_woc_confirmations(&v);
+                // Positive presence requires the raw in hand, hash-verified
+                // (WoC hex first, Bitails binary fallback).
+                let raw = match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
+                    Some((200, body)) => std::str::from_utf8(&body)
+                        .ok()
+                        .and_then(|h| hex::decode(h.trim()).ok()),
+                    _ => None,
+                };
+                let raw = match raw {
+                    Some(r) => Some(r),
+                    None => match provider_get(&format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
+                        Some((200, body)) if !body.is_empty() => Some(body),
+                        _ => None,
+                    },
+                };
+                let raw_hex = raw.and_then(|r| crate::txany::verify_raw_bytes(&r, txid_lc));
+                TxObservation::Present { confirmed, raw_hex }
+            },
+            Err(_) => TxObservation::Fault,
+        },
+        Some((404, _)) => TxObservation::Absent,
+        _ => TxObservation::Fault,
+    };
+
+    let mut absence = AbsenceCorroboration::Unknown;
+    if woc == TxObservation::Absent {
+        // Corroborate: Bitails must ALSO definitively 404 the txid…
+        let bitails_404 = matches!(
+            provider_get(&format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await,
+            Some((404, _))
+        );
+        if bitails_404 {
+            // …and its tx route must prove healthy against the known-mined
+            // anchor (route-rot would otherwise fake absence for every txid).
+            if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
+                if let Some((200, body)) =
+                    provider_get(&format!("{BITAILS_BASE}/download/tx/{}", crate::txany::KNOWN_MINED_TXID)).await
+                {
+                    if !body.is_empty() {
+                        BITAILS_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+                    }
+                }
+            }
+            if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) == Some(true) {
+                absence = AbsenceCorroboration::CorroboratedAbsent;
+            }
+        }
+    }
+    (woc, absence)
+}
+
+/// `GET /tx-any/:txid` — presence / confirmation / hash-verified raw for an
+/// arbitrary txid, INDEX-FIRST (the overlay is the system of record for every
+/// tx LOW broadcast; external indexers are break-glass for legacy/foreign
+/// txids only — owner doctrine, bsv-low #229). ~15 s in-isolate cache.
+/// Unknown is the honest answer for every fault (`present: null`).
+pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(txid) = ctx.param("txid").cloned() else {
+        return json_error("missing txid", 400);
+    };
+    if !valid_txid(&txid) {
+        return json_error("invalid txid (expect 64 hex chars)", 400);
+    }
+    let key = txid.to_ascii_lowercase();
+
+    let now = worker::Date::now().as_millis() as f64;
+    let cached = TX_ANY_CACHE.with(|c| {
+        c.borrow()
+            .get(&key)
+            .filter(|(expiry, _)| *expiry > now)
+            .map(|(_, a)| a.clone())
+    });
+    let answer = match cached {
+        Some(a) => a,
+        None => {
+            let (index_raw, index_height) = tx_any_index_leg(&ctx, &key).await;
+            // Fully index-native when the BUMP proves the mine — zero
+            // external reads. Otherwise consult the break-glass leg (for an
+            // admitted-but-unproven tx it can only ADD a confirmation; for an
+            // index miss it is the whole answer).
+            let answer = if index_raw.is_some() && index_height.is_some() {
+                crate::txany::decide_tx_any(
+                    index_raw,
+                    index_height,
+                    None,
+                    crate::txany::AbsenceCorroboration::Unknown,
+                )
+            } else {
+                let (external, absence) = tx_any_external_leg(&key).await;
+                crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence)
+            };
+            TX_ANY_CACHE.with(|c| {
+                let mut map = c.borrow_mut();
+                map.retain(|_, (expiry, _)| *expiry > now);
+                map.insert(key.clone(), (now + crate::txany::TX_ANY_CACHE_TTL_MS, answer.clone()));
+            });
+            answer
+        },
+    };
+
+    json_response(crate::txany::tx_any_body(&key, &answer), 200)
+}
+
 /// `GET /health` — liveness only (no DB touch).
 pub fn health(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
     json_response(health_body(), 200)

@@ -73,6 +73,7 @@ pub mod cors;
 pub mod logic;
 pub mod results;
 mod routes;
+pub mod txany;
 
 use worker::{event, Context, Env, Request, Response, Result, Router};
 
@@ -108,6 +109,7 @@ fn router() -> Router<'static, ()> {
         .get_async("/leaderboard", routes::leaderboard)
         .get_async("/results", routes::results)
         .get_async("/spent-any", routes::spent_any)
+        .get_async("/tx-any/:txid", routes::tx_any)
         .get_async("/beef/:txid", routes::beef)
         .get_async("/tip", routes::tip)
         .get("/health", routes::health)
