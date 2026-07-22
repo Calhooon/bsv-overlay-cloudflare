@@ -796,11 +796,55 @@ struct ArcadeSubmitError {
     error: String,
     #[serde(default)]
     reason: String,
+    /// #228 (arcade#260, LIVE 2026-07-22): the ADDITIVE ARC status code some
+    /// 400 bodies now carry. It is a STRUCTURED verdict field (never prose):
+    ///  - `476` — the tx is NON-FINAL (nLockTime/sequence not yet satisfiable
+    ///    against the node's chain view). Arcade persists NOTHING server-side
+    ///    for it, so it is RETRYABLE by definition — classing it definitive
+    ///    would manufacture the exact false-verdict bug class #213 fixed,
+    ///    inverted.
+    ///  - `466` / `467` — terminal per-tx verdicts (same definitive class as
+    ///    the structured validation-failure body).
+    ///  - ABSENT — a pre-#260 responder; classification falls through to the
+    ///    `error`-field equality below, byte-for-byte unchanged (tolerance).
+    #[serde(default)]
+    status: Option<u16>,
 }
 
 /// The exact value of Arcade's `error` field for a definitive per-tx
 /// validation failure. A whole-FIELD equality (not a prose substring).
 const ARCADE_VALIDATION_FAILED_ERROR: &str = "transaction failed validation";
+
+/// #228 (arcade#260): additive `status` code for a NON-FINAL submit — nothing
+/// persisted server-side; retryable after locktime/chain-view catch-up.
+const ARCADE_STATUS_NON_FINAL: u16 = 476;
+/// #228 (arcade#260): additive `status` codes that are TERMINAL per-tx verdicts.
+const ARCADE_STATUS_TERMINAL: [u16; 2] = [466, 467];
+
+/// #228 (arcade#260): the stable cascade-rejection label. Arcade condemns a
+/// descendant of a rejected ancestor with
+/// `parent rejected (ancestor <txid>): retryable` — the prefix is a committed
+/// stable API (arcade#260 kept it deliberately), and the `: retryable` hint
+/// says a resubmit CAN succeed once the ancestor recovers. Unlike the
+/// script/fee validation failure (provider-independent, computed from the EF
+/// body alone), a cascade verdict depends on Arcade's — provably stale-able
+/// (#214) — view of the ANCESTOR, so it must never terminate the ladder.
+///
+/// Matching bias: both halves of the committed label must be present. A false
+/// positive here converts a terminal Return into a Retry, which lands at the
+/// exhausted-ladder corroboration (#214) — the fail-safe direction (never a
+/// fabricated success, never a false 422). A false negative keeps today's
+/// behaviour. So `contains` on the stable label is safe on this money path.
+const ARCADE_CASCADE_PREFIX: &str = "parent rejected (ancestor ";
+const ARCADE_CASCADE_RETRYABLE_HINT: &str = "): retryable";
+
+/// True iff `reason` carries Arcade's #260 cascade-rejection retryable label
+/// (see [`ARCADE_CASCADE_PREFIX`]). Wrappers (`arcade_fatal_reason`, the
+/// `error: reason` join) put text around the label, so this is containment of
+/// BOTH committed halves, not a whole-field equality.
+fn cascade_retryable(reason: &str) -> bool {
+    reason.contains(ARCADE_CASCADE_PREFIX) && reason.contains(ARCADE_CASCADE_RETRYABLE_HINT)
+}
 
 /// Classified outcome of ONE Arcade EF submit POST (`POST /tx` | `POST /txs`).
 #[derive(Debug, PartialEq, Eq)]
@@ -843,12 +887,34 @@ fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
     // re-broadcast of a tx the network already refused.
     if status == 400 {
         if let Ok(err) = serde_json::from_str::<ArcadeSubmitError>(body) {
+            let reason = if err.reason.is_empty() {
+                err.error.clone()
+            } else {
+                format!("{}: {}", err.error, err.reason)
+            };
+            // #228 (arcade#260): the ADDITIVE structured `status` field is
+            // consulted FIRST — when present it is the verdict.
+            match err.status {
+                // 476 NON-FINAL: nothing persisted server-side; retryable
+                // after locktime/chain-view catch-up. Classing this definitive
+                // would be a manufactured false verdict (the #213 class,
+                // inverted) — it is TRANSPORT (429-style: the caller falls
+                // back / retries; routes.rs never turns it into a 422).
+                Some(ARCADE_STATUS_NON_FINAL) => {
+                    return SubmitOutcome::Transport(format!(
+                        "Arcade non-final (status 476, retryable — nothing persisted): {reason}"
+                    ));
+                }
+                // 466/467: terminal per-tx verdicts — same definitive class
+                // as the structured validation-failure body.
+                Some(s) if ARCADE_STATUS_TERMINAL.contains(&s) => {
+                    return SubmitOutcome::SyncRejected(format!("(status {s}) {reason}"));
+                }
+                // Absent (pre-#260 responder) or an unrecognised code: fall
+                // through to the pre-#260 classification, unchanged.
+                _ => {}
+            }
             if err.error == ARCADE_VALIDATION_FAILED_ERROR {
-                let reason = if err.reason.is_empty() {
-                    err.error
-                } else {
-                    format!("{}: {}", err.error, err.reason)
-                };
                 return SubmitOutcome::SyncRejected(reason);
             }
         }
@@ -878,17 +944,27 @@ fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
         // A SYNCHRONOUS validation failure (bad script / low fee) is definitive
         // — a resubmit cannot change it. Admit nothing; do NOT retry.
         //
-        // #214: sync stays UNCORROBORATED on purpose. The corroboration leg
-        // exists because Arcade's ASYNC verdict depends on its (provably
-        // stale-able) network/UTXO view; the synchronous 400 is computed from
-        // the EF body alone — script and fee, with every input's source script
-        // and satoshis inlined — so it is provider-independent: any honest
-        // validator returns the same answer. The #214 repro confirms the sync
-        // path was NOT implicated: every false rejection that night was the
-        // 202-then-async-REJECTED shape (`PROCESSING (4)`), never the
-        // structured sync-400 body. Returning here (never `Retry`) is also
-        // what keeps the corroborator out of the sync path by construction —
-        // corroboration lives strictly past the exhausted ladder.
+        // #228 (arcade#260): a cascade rejection carrying the stable
+        // `parent rejected (ancestor <txid>): retryable` label RETRIES, even
+        // in synchronous dress. The #214 provider-independence rationale
+        // below does NOT cover it: a cascade verdict is computed from
+        // Arcade's (provably stale-able) view of the ANCESTOR, not from the
+        // EF body alone — so it belongs with the ambiguous/retryable class,
+        // and its exhausted ladder still ends at the #214 corroborator, never
+        // at an uncorroborated 422.
+        GateStep::SyncRejected(r) if cascade_retryable(&r) => Ladder::Retry,
+        // #214: (non-cascade) sync stays UNCORROBORATED on purpose. The
+        // corroboration leg exists because Arcade's ASYNC verdict depends on
+        // its (provably stale-able) network/UTXO view; the synchronous 400 is
+        // computed from the EF body alone — script and fee, with every
+        // input's source script and satoshis inlined — so it is
+        // provider-independent: any honest validator returns the same answer.
+        // The #214 repro confirms the sync path was NOT implicated: every
+        // false rejection that night was the 202-then-async-REJECTED shape
+        // (`PROCESSING (4)`), never the structured sync-400 body. Returning
+        // here (never `Retry`) is also what keeps the corroborator out of the
+        // sync path by construction — corroboration lives strictly past the
+        // exhausted ladder.
         GateStep::SyncRejected(r) => Ladder::Return(ArcOutcome::Rejected(r)),
         // Network did not accept — ambiguous (missing parent vs double-spend
         // vs a stale Arcade validator view, #214); an explicit resubmit is the
@@ -1459,6 +1535,150 @@ mod tests {
         assert!(matches!(
             classify_submit_response(202, body),
             SubmitOutcome::Processing(_)
+        ));
+    }
+
+    // ── #228 (arcade#260): the ADDITIVE `status` field in the 400 body ──────
+    //
+    // Arcade v0.10.1-alpha.1 (LIVE 2026-07-22) adds a structured `status` code
+    // to the synchronous 400 JSON. 476 = NON-FINAL (nothing persisted
+    // server-side → retryable); 466/467 = terminal; ABSENT = a pre-#260
+    // responder, classified byte-for-byte as before. All through the real
+    // producer, `classify_submit_response`.
+
+    /// The post-#260 NON-FINAL 400: additive `status: 476` + retryable hint.
+    const ARCADE_400_STATUS_476_NON_FINAL: &str = r#"{"error":"transaction failed validation","reason":"TX_INVALID (31): GoBDK fail to ValidateTransaction -> UNKNOWN (0): non-final transaction: retryable","status":476}"#;
+
+    #[test]
+    fn post260_status_476_non_final_is_retryable_transport_never_a_rejection() {
+        // The load-bearing #228 fix: a 476 non-final 400 persists NOTHING
+        // server-side and is retryable — classing it SyncRejected would
+        // manufacture a definitive 422 for a tx that simply isn't final YET
+        // (the #213 false-verdict class, inverted). It must be Transport (the
+        // caller falls back / retries), even though the body ALSO carries the
+        // pre-#260 `error: "transaction failed validation"` value.
+        match classify_submit_response(400, ARCADE_400_STATUS_476_NON_FINAL) {
+            SubmitOutcome::Transport(reason) => {
+                assert!(reason.contains("476"), "{reason}");
+                assert!(reason.contains("retryable"), "{reason}");
+            }
+            other => panic!("status 476 must be Transport (retryable), got {other:?}"),
+        }
+        // Same verdict when the error field is absent — the structured status
+        // code alone decides.
+        let bare = r#"{"reason":"non-final transaction","status":476}"#;
+        assert!(matches!(
+            classify_submit_response(400, bare),
+            SubmitOutcome::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn post260_status_466_467_are_terminal_and_do_not_retry() {
+        for code in [466u16, 467] {
+            let body = format!(
+                r#"{{"error":"transaction failed validation","reason":"TX_INVALID (31): terminal verdict","status":{code}}}"#
+            );
+            let step = match classify_submit_response(400, &body) {
+                SubmitOutcome::SyncRejected(r) => {
+                    assert!(r.contains(&format!("status {code}")), "{r}");
+                    GateStep::SyncRejected(r)
+                }
+                other => panic!("status {code} must be SyncRejected, got {other:?}"),
+            };
+            // Terminal all the way through the real ladder producer: Return,
+            // never Retry.
+            assert!(
+                matches!(ladder_step(step, "ab"), Ladder::Return(ArcOutcome::Rejected(_))),
+                "status {code} must terminate the ladder"
+            );
+        }
+    }
+
+    #[test]
+    fn post260_absent_or_unrecognised_status_keeps_pre260_classification() {
+        // ABSENT `status` (a pre-#260 responder): the original #213 bodies
+        // classify exactly as before — SyncRejected on the whole-field error
+        // equality. (Tolerance requirement of #228.)
+        for body in [ARCADE_SYNC_400_LOW_FEE, ARCADE_SYNC_400_BAD_SIG] {
+            assert!(matches!(
+                classify_submit_response(400, body),
+                SubmitOutcome::SyncRejected(_)
+            ));
+        }
+        // An UNRECOGNISED status code falls through to the same pre-#260 path:
+        // with the validation-failure error → SyncRejected …
+        let unrecognised = r#"{"error":"transaction failed validation","reason":"fee too low","status":465}"#;
+        assert!(matches!(
+            classify_submit_response(400, unrecognised),
+            SubmitOutcome::SyncRejected(_)
+        ));
+        // … and without it → Transport (never a fabricated rejection).
+        let unrecognised_other = r#"{"error":"bad request","reason":"","status":465}"#;
+        assert!(matches!(
+            classify_submit_response(400, unrecognised_other),
+            SubmitOutcome::Transport(_)
+        ));
+    }
+
+    // ── #228 (arcade#260): cascade `parent rejected … : retryable` label ────
+
+    /// The post-#260 cascade label around a REAL ledger txid (stable prefix,
+    /// explicit retryable hint).
+    const CASCADE_ANCESTOR: &str =
+        "2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256";
+
+    #[test]
+    fn post260_cascade_retryable_sync_rejection_retries_the_ladder() {
+        // A cascade rejection in SYNCHRONOUS dress: classified SyncRejected by
+        // the real classifier, but the ladder must RETRY it — the verdict
+        // depends on Arcade's (stale-able, #214) view of the ANCESTOR, not on
+        // the EF body, so it is not the provider-independent terminal class.
+        let body = format!(
+            r#"{{"error":"transaction failed validation","reason":"parent rejected (ancestor {CASCADE_ANCESTOR}): retryable"}}"#
+        );
+        let step = match classify_submit_response(400, &body) {
+            SubmitOutcome::SyncRejected(r) => GateStep::SyncRejected(r),
+            other => panic!("cascade sync 400 must classify SyncRejected, got {other:?}"),
+        };
+        assert_eq!(
+            ladder_step(step, "ab"),
+            Ladder::Retry,
+            "a cascade-retryable sync rejection must resubmit, not 422"
+        );
+    }
+
+    #[test]
+    fn post260_cascade_retryable_async_rejection_still_retries() {
+        // The same label in ASYNC dress (poll → fatal status, extra_info
+        // carries the cascade) — already a Retry today; pinned so the #228
+        // adoption can never regress it.
+        let reason = arcade_fatal_reason(
+            "ab",
+            "REJECTED",
+            &format!("parent rejected (ancestor {CASCADE_ANCESTOR}): retryable"),
+        );
+        assert_eq!(
+            ladder_step(GateStep::AsyncRejected(reason), "ab"),
+            Ladder::Retry
+        );
+    }
+
+    #[test]
+    fn post260_cascade_without_the_retryable_hint_stays_terminal() {
+        // Only the COMMITTED label (both halves) retries. A cascade-looking
+        // reason WITHOUT the `: retryable` hint keeps today's terminal
+        // behaviour — we never invent a retry from half a label.
+        let body = format!(
+            r#"{{"error":"transaction failed validation","reason":"parent rejected (ancestor {CASCADE_ANCESTOR}): double spend"}}"#
+        );
+        let step = match classify_submit_response(400, &body) {
+            SubmitOutcome::SyncRejected(r) => GateStep::SyncRejected(r),
+            other => panic!("must classify SyncRejected, got {other:?}"),
+        };
+        assert!(matches!(
+            ladder_step(step, "ab"),
+            Ladder::Return(ArcOutcome::Rejected(_))
         ));
     }
 
