@@ -55,6 +55,33 @@ pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech"
 /// never starves the queue.
 pub const DEFAULT_FETCH_BUDGET: u32 = 40;
 
+/// Push-primary BACKSTOP age gate (bsv-low #228 / arcade#259): the poll
+/// passes only touch rows OLDER than this — younger rows are expected to get
+/// their proof via the Arcade MINED webhook (`/arc-ingest`), the PRIMARY
+/// proof source.
+///
+/// ## why 30 minutes
+///
+/// The webhook's demonstrated push latency is ~150 ms post-MINED (#259 live
+/// evidence, 2026-07-22), which is negligible — the governing timescale for
+/// "the push has had its chance" is the BLOCK interval: BSV blocks are
+/// Poisson with a 10-minute mean. N = 30 min = 3× the mean interval, so:
+/// - P(tx still unmined at age N) = e⁻³ ≈ 5% → ≥95% of healthy txs mine AND
+///   receive their pushed proof before ever becoming poll-eligible (polling
+///   them earlier is pure wasted budget: unmined ⇒ no proof exists yet;
+///   mined ⇒ the push already latched it and the candidate query skips it);
+/// - as a safety multiple over the push latency itself it is ~12,000×, so a
+///   merely-slow webhook can never lose its window to the poller;
+/// - a LOST webhook (Arcade outage, dropped callback) is still recovered by
+///   the backstop within N + one completion tick (~15 min) ≈ 45 min — the
+///   same order as the pre-#228 all-polling latency for a typical mine.
+///
+/// The poll path is NEVER removed: an old-enough proofless row is always
+/// polled, so total webhook loss degrades to today's behaviour (polling),
+/// never to nothing — the fail-safe direction. Rows with unknown age
+/// (pre-migration NULL stamps) are always eligible, same direction.
+pub const PUSH_BACKSTOP_MIN_AGE_SECS: u64 = 30 * 60;
+
 /// `AncestorFetcher` backed by the Arcade→Bitails→WoC courier ladder (WoC is
 /// break-glass/last-resort) with a mandatory chaintracks re-verify before ANY
 /// bump is returned.
@@ -523,12 +550,16 @@ pub async fn complete_pot_beef_proofs(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &ChainProofFetcher,
     limit: u64,
+    min_age_secs: u64,
 ) -> PotProofSummary {
     use overlay_engine::gasp::AncestorFetcher;
 
     let mut summary = PotProofSummary::default();
 
-    let candidates = match pot_storage.find_pot_beefs_for_proof_check(limit).await {
+    let candidates = match pot_storage
+        .find_pot_beefs_for_proof_check(limit, min_age_secs)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             worker::console_log!("[pot-proof] candidate scan failed: {e}");
@@ -653,10 +684,11 @@ pub async fn complete_spend_confirmations(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn AncestorFetcher,
     limit: u64,
+    min_age_secs: u64,
 ) -> SpendConfirmSummary {
     let mut summary = SpendConfirmSummary::default();
 
-    let candidates = match pot_storage.find_spent_unconfirmed(limit).await {
+    let candidates = match pot_storage.find_spent_unconfirmed(limit, min_age_secs).await {
         Ok(c) => c,
         Err(e) => {
             worker::console_log!("[spend-confirm] candidate scan failed: {e}");
@@ -695,6 +727,123 @@ pub async fn complete_spend_confirmations(
                 summary.still_unconfirmed += 1;
             }
         }
+    }
+
+    summary
+}
+
+// ============================================================================
+// /arc-ingest push consumer (bsv-low #228 — push is the PRIMARY proof source)
+// ============================================================================
+
+/// What one pushed proof landed in the LOW pot stores.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PushedPotSummary {
+    /// The `pot_beefs` row for this txid was stitched + compacted (it drops
+    /// out of the pot-beef poll pass's candidate set).
+    pub pot_beef_compacted: bool,
+    /// `pot_records` rows upgraded to `spentConfirmed = 1` because this txid
+    /// is their recorded spender (they drop out of the #186 spend chaser).
+    pub spends_confirmed: usize,
+}
+
+impl PushedPotSummary {
+    /// Whether the push landed in ANY pot store.
+    pub fn landed_anything(&self) -> bool {
+        self.pot_beef_compacted || self.spends_confirmed > 0
+    }
+}
+
+/// wasm-safe log for the push consumer: `worker::console_log!` panics off-wasm
+/// ("function not implemented on non-wasm32 targets"), and unlike the poll
+/// passes this path IS exercised by native unit tests.
+fn push_log(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("{}", msg);
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{msg}");
+}
+
+/// Fold an `/arc-ingest`-pushed, ALREADY-chaintracks-VERIFIED bump for `txid`
+/// into the LOW pot stores, so the poll passes skip the tx entirely:
+///
+/// 1. `pot_beefs`: if a stored BEEF for `txid` exists and is still proofless,
+///    stitch the bump, trim, and [`PotStorage::compact_pot_beef`] (which
+///    re-checks the proof, fail-closed) — same shape as one
+///    [`complete_pot_beef_proofs`] candidate, minus the courier fetch.
+/// 2. `pot_records`: every outpoint whose recorded spender is `txid` and is
+///    still unconfirmed is upgraded via `mark_spent(confirmed = true)` — the
+///    spending tx verifiably mined, which is exactly the #186 chaser's latch
+///    condition.
+///
+/// SECURITY PRECONDITION: the caller MUST have verified `bump_hex` against
+/// chaintracks for `txid` first (`/arc-ingest` refuses unverifiable proofs
+/// with 422 before ever reaching here). This function still fails closed on
+/// its own account: a bump that doesn't stitch/prove writes nothing, and
+/// `compact_pot_beef` re-checks the proof at the storage layer.
+///
+/// Best-effort per store: a failure in one store is logged and does not block
+/// the other (the poll backstop still covers whatever didn't land).
+pub async fn apply_pushed_proof_to_pot_stores(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    txid: &str,
+    bump_hex: &str,
+) -> PushedPotSummary {
+    use overlay_discovery::pot::storage::pot_beef_has_proof;
+
+    let mut summary = PushedPotSummary::default();
+
+    // Defense-in-depth: the route has already chaintracks-verified this bump,
+    // but a structurally malformed one (unparseable, or not containing this
+    // txid's leaf) must latch NOTHING here either — fail-closed, the poll
+    // backstop keeps covering the rows.
+    let structurally_ok = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
+        .ok()
+        .and_then(|mp| mp.compute_root(Some(txid)).ok())
+        .is_some();
+    if !structurally_ok {
+        push_log(&format!("[arc-ingest] {txid} pushed bump is malformed — nothing latched"));
+        return summary;
+    }
+
+    // 1. pot_beefs stitch + compact.
+    match pot_storage.get_beef(txid).await {
+        Ok(Some(stored_beef)) if !pot_beef_has_proof(txid, &stored_beef) => {
+            match stitch_and_trim_pot_beef(txid, &stored_beef, bump_hex) {
+                Some(compacted) => match pot_storage.compact_pot_beef(txid, &compacted).await {
+                    Ok(()) => summary.pot_beef_compacted = true,
+                    Err(e) => {
+                        push_log(&format!("[arc-ingest] {txid} pot-beef compact failed: {e}"));
+                    }
+                },
+                None => {
+                    // Fail-closed: an unstitchable pushed bump writes nothing;
+                    // the poll backstop retries this row later.
+                    push_log(&format!("[arc-ingest] {txid} pot-beef stitch failed (backstop will retry)"));
+                }
+            }
+        }
+        Ok(_) => {} // no pot beef, or already proven — nothing to do
+        Err(e) => push_log(&format!("[arc-ingest] {txid} pot-beef read failed: {e}")),
+    }
+
+    // 2. pot_records spend-confirmation latch (this txid as the spender).
+    match pot_storage.find_unconfirmed_by_spending_txid(txid).await {
+        Ok(records) => {
+            for rec in records {
+                match pot_storage
+                    .mark_spent(&rec.txid, rec.output_index, txid, true)
+                    .await
+                {
+                    Ok(()) => summary.spends_confirmed += 1,
+                    Err(e) => push_log(&format!(
+                        "[arc-ingest] {}:{} spend-confirm latch failed: {e}",
+                        rec.txid, rec.output_index
+                    )),
+                }
+            }
+        }
+        Err(e) => push_log(&format!("[arc-ingest] {txid} spender lookup failed: {e}")),
     }
 
     summary
@@ -880,7 +1029,7 @@ mod tests {
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
         };
-        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.scanned, 1);
         assert_eq!(s.confirmed, 1);
         assert_eq!(s.still_unconfirmed, 0);
@@ -889,7 +1038,7 @@ mod tests {
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed, "a verified spend latches spentConfirmed");
         assert_eq!(r.spending_txid.as_deref(), Some("settleA"));
-        assert!(store.find_spent_unconfirmed(10).await.unwrap().is_empty());
+        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -911,7 +1060,7 @@ mod tests {
         let fetcher = MockProofFetcher {
             minable: std::collections::HashSet::new(),
         };
-        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.scanned, 1);
         assert_eq!(s.confirmed, 0);
         assert_eq!(s.still_unconfirmed, 1);
@@ -919,7 +1068,7 @@ mod tests {
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(!r.spent_confirmed, "an unverified spend is never latched");
         assert_eq!(
-            store.find_spent_unconfirmed(10).await.unwrap().len(),
+            store.find_spent_unconfirmed(10, 0).await.unwrap().len(),
             1,
             "the row stays a candidate for the next tick"
         );
@@ -931,7 +1080,7 @@ mod tests {
         let fetcher = MockProofFetcher {
             minable: std::collections::HashSet::new(),
         };
-        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s, SpendConfirmSummary::default());
     }
 
@@ -945,12 +1094,178 @@ mod tests {
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
         };
-        let s = complete_spend_confirmations(&store, &fetcher, 20).await;
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.scanned, 2);
         assert_eq!(s.confirmed, 1);
         assert_eq!(s.still_unconfirmed, 1);
 
         assert!(store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed);
         assert!(!store.get_spent_status("potB", 0).await.unwrap().unwrap().spent_confirmed);
+    }
+
+    // ── 6. push-primary /arc-ingest consumer + poll backstop (#228) ──────────
+
+    /// Two distinct valid mainnet raw txs (same fixtures as the pot storage
+    /// tests) — used to build REAL BEEFs for the stitch/compact path.
+    const RAW_A: &str = "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000";
+
+    /// A proofless single-tx BEEF for RAW_A + its txid.
+    fn proofless_pot_beef() -> (Vec<u8>, String) {
+        use bsv_rs::transaction::{Beef, Transaction};
+        let tx = Transaction::from_hex(RAW_A).unwrap();
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    /// 64-hex settle txids (a bump subject must be a real txid shape).
+    const SETTLE_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SETTLE_B: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[tokio::test]
+    async fn pushed_proof_confirms_spends_and_the_chaser_skips_them() {
+        // pushed-proof-then-chaser-skips: /arc-ingest receives (and verifies)
+        // the settle's bump → apply_pushed_proof_to_pot_stores latches every
+        // pot outpoint that settle spent → the #186 poll chaser finds ZERO
+        // candidates and never asks a courier — through the real producers
+        // (mark_spent → find_unconfirmed_by_spending_txid → mark_spent
+        // confirmed → find_spent_unconfirmed → complete_spend_confirmations).
+        let store = MemoryPotStorage::new();
+        for pot in ["potA", "potB"] {
+            store.store_record(&spent_unconfirmed(pot, SETTLE_A)).await.unwrap();
+        }
+        // A third pot spent by a DIFFERENT settle stays untouched.
+        store.store_record(&spent_unconfirmed("potC", SETTLE_B)).await.unwrap();
+
+        let bump_hex = single_tx_bump(SETTLE_A, HEIGHT).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, SETTLE_A, &bump_hex).await;
+        assert_eq!(s.spends_confirmed, 2, "both outpoints the settle spent are latched");
+
+        for pot in ["potA", "potB"] {
+            assert!(store.get_spent_status(pot, 0).await.unwrap().unwrap().spent_confirmed);
+        }
+        assert!(!store.get_spent_status("potC", 0).await.unwrap().unwrap().spent_confirmed);
+
+        // The chaser (min_age 0 = widest possible candidate set) now sees only
+        // potC — and with an unminable fetcher it upgrades nothing.
+        let fetcher = MockProofFetcher {
+            minable: std::collections::HashSet::new(),
+        };
+        let chase = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(chase.scanned, 1, "pushed-latched rows are skipped entirely");
+        assert_eq!(chase.sample, vec![SETTLE_B.to_string()]);
+        assert_eq!(chase.confirmed, 0);
+    }
+
+    #[tokio::test]
+    async fn pushed_proof_compacts_pot_beef_and_the_poll_pass_skips_it() {
+        // Same skip property for the pot_beefs pass: a pushed proof stitches +
+        // compacts the stored BEEF, so find_pot_beefs_for_proof_check returns
+        // nothing and the poll pass never runs the courier ladder for it.
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = proofless_pot_beef();
+        store.store_beef(&txid, &beef).await.unwrap();
+        assert_eq!(
+            store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().len(),
+            1,
+            "proofless row is a candidate before the push"
+        );
+
+        let bump_hex = single_tx_bump(&txid, HEIGHT).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, &txid, &bump_hex).await;
+        assert!(s.pot_beef_compacted, "the pushed bump compacts the stored BEEF");
+
+        // The stored BEEF now proves its own tx…
+        let stored = store.get_beef(&txid).await.unwrap().unwrap();
+        assert!(overlay_discovery::pot::storage::pot_beef_has_proof(&txid, &stored));
+        // …and the poll pass has nothing left to do.
+        assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+        let pass_fetcher = ChainProofFetcher::new(None).with_budget(0);
+        let pass = complete_pot_beef_proofs(&store, &pass_fetcher, 20, 0).await;
+        assert_eq!(pass.scanned, 0, "a pushed-compacted BEEF is never re-polled");
+    }
+
+    #[tokio::test]
+    async fn pushed_malformed_bump_writes_nothing_fail_closed() {
+        // Malformed-merklePath fail-closed at the apply layer: an unstitchable
+        // bump must leave the stored BEEF byte-identical and the spend rows
+        // unlatched — the poll backstop retains the row. (At the route, a
+        // malformed/forged merklePath is already refused 422 by verify_bump
+        // before apply is ever reached; this pins the second, independent
+        // layer.)
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = proofless_pot_beef();
+        store.store_beef(&txid, &beef).await.unwrap();
+        store.store_record(&spent_unconfirmed("potA", &txid)).await.unwrap();
+
+        let s = apply_pushed_proof_to_pot_stores(&store, &txid, "deadbeef").await;
+        assert_eq!(s, PushedPotSummary::default(), "a malformed bump latches NOTHING");
+        // The stored BEEF is byte-identical, the spend row unlatched, and both
+        // remain poll-backstop candidates.
+        assert_eq!(store.get_beef(&txid).await.unwrap().unwrap(), beef);
+        assert!(!store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed);
+        assert_eq!(
+            store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().len(),
+            1,
+            "the proofless row remains a backstop candidate"
+        );
+        assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
+
+        // A well-formed bump for a DIFFERENT txid is equally refused (its
+        // root cannot be computed for OUR txid's leaf).
+        let foreign = single_tx_bump(TXID, HEIGHT).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, &txid, &foreign).await;
+        assert_eq!(s, PushedPotSummary::default(), "a foreign bump latches NOTHING");
+    }
+
+    #[tokio::test]
+    async fn spend_chaser_backstop_age_gate_young_waits_old_polls() {
+        // no-push-then-backstop-polls + webhook-outage degradation at the pot
+        // level: a fresh 0-conf spend is NOT polled while inside the backstop
+        // window (its push is still expected); once the window passes with no
+        // push, the SAME pass polls and confirms it exactly as pre-#228.
+        let store = MemoryPotStorage::new();
+        store.store_record(&spent_unconfirmed("potA", "settleA")).await.unwrap();
+        // Re-record the spend at clock time so spentAt is stamped by the real
+        // producer (mark_spent).
+        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+
+        let fetcher = MockProofFetcher {
+            minable: ["settleA".to_string()].into_iter().collect(),
+        };
+        let min_age = PUSH_BACKSTOP_MIN_AGE_SECS;
+
+        // Young: skipped entirely (not even scanned).
+        let s = complete_spend_confirmations(&store, &fetcher, 20, min_age).await;
+        assert_eq!(s.scanned, 0, "a young spend waits for its push");
+        assert!(!store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed);
+
+        // The webhook never delivers; the row ages past the gate → the
+        // backstop polls and confirms (degradation to polling, not nothing).
+        store.advance_clock(min_age);
+        let s = complete_spend_confirmations(&store, &fetcher, 20, min_age).await;
+        assert_eq!(s.scanned, 1);
+        assert_eq!(s.confirmed, 1, "the backstop completes what the push missed");
+        assert!(store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn pot_beef_pass_backstop_age_gate_young_waits_old_polls() {
+        // The same young-waits/old-polls property for the pot_beefs pass,
+        // through its real candidate producer (store_beef stamps createdAt).
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = proofless_pot_beef();
+        store.store_beef(&txid, &beef).await.unwrap();
+
+        let min_age = PUSH_BACKSTOP_MIN_AGE_SECS;
+        assert!(
+            store.find_pot_beefs_for_proof_check(10, min_age).await.unwrap().is_empty(),
+            "a young pot BEEF waits for its push"
+        );
+        store.advance_clock(min_age);
+        let cands = store.find_pot_beefs_for_proof_check(10, min_age).await.unwrap();
+        assert_eq!(cands.len(), 1, "past the window the backstop takes over");
+        assert_eq!(cands[0].0, txid);
     }
 }

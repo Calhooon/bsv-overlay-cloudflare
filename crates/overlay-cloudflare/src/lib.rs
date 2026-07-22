@@ -235,8 +235,21 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
             } else {
                 // The callback merklePath is re-verified against chaintracks
                 // before stitch (#192/#193) — a callback is a courier too.
+                // #228: this push is the PRIMARY proof source — a verified
+                // proof also lands in the LOW pot stores (pot_beefs compact +
+                // pot_records spend-confirm latch) so the poll backstop skips
+                // the tx entirely; non-MINED status callbacks
+                // (X-FullStatusUpdates) are acknowledged and counted, never a
+                // parse error.
                 let tracker = lookup_service_chain_tracker(&env);
-                arc_ingest(&engine, req, tracker.as_deref()).await
+                arc_ingest(
+                    &engine,
+                    req,
+                    tracker.as_deref(),
+                    pot_storage.as_ref(),
+                    Some(&ops_db),
+                )
+                .await
             }
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
@@ -966,8 +979,16 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     //
     // 1. Engine `transactions` store — uses the ancestor fetcher set in
     //    build_engine_with_storage. A no-op if no fetcher/tracker is configured.
+    //
+    //    #228: the poll passes are the BACKSTOP — /arc-ingest push is the
+    //    primary proof source — so each pass only touches rows older than
+    //    PUSH_BACKSTOP_MIN_AGE_SECS (see its doc for the 30-min rationale).
     let engine_budget = u64::from(crate::proof_fetcher::DEFAULT_FETCH_BUDGET);
-    let (tx_completed, tx_fetch_failed) = match engine.complete_missing_proofs(engine_budget).await {
+    let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
+    let (tx_completed, tx_fetch_failed) = match engine
+        .complete_missing_proofs(engine_budget, backstop_age)
+        .await
+    {
         Ok(s) => {
             worker::console_log!(
                 "Scheduled: proof-completion (transactions) — scanned={} proofless={} completed={} \
@@ -1002,8 +1023,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     {
         pot_fetcher = pot_fetcher.with_arcade_url(u);
     }
-    let pot_summary =
-        crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &pot_fetcher, 20).await;
+    let pot_summary = crate::proof_fetcher::complete_pot_beef_proofs(
+        pot_storage.as_ref(),
+        &pot_fetcher,
+        20,
+        backstop_age,
+    )
+    .await;
     worker::console_log!(
         "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} still_unconfirmed={} \
          fetch_failed={} stitch_failed={}",
@@ -1029,9 +1055,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     {
         spend_fetcher = spend_fetcher.with_arcade_url(u);
     }
-    let spend_summary =
-        crate::proof_fetcher::complete_spend_confirmations(pot_storage.as_ref(), &spend_fetcher, 20)
-            .await;
+    let spend_summary = crate::proof_fetcher::complete_spend_confirmations(
+        pot_storage.as_ref(),
+        &spend_fetcher,
+        20,
+        backstop_age,
+    )
+    .await;
     worker::console_log!(
         "Scheduled: spend-confirmation (pot_records) — scanned={} confirmed={} \
          still_unconfirmed={} fetch_failed={}",
@@ -1116,15 +1146,19 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         Ok(e) => e,
         Err(e) => return Response::error(format!("complete-proofs: engine: {e}"), 500),
     };
-    // 1. transactions store (engine + ancestor fetcher).
+    // 1. transactions store (engine + ancestor fetcher). #228: backstop-gated —
+    //    /arc-ingest push is the primary source; only rows older than
+    //    PUSH_BACKSTOP_MIN_AGE_SECS are polled.
     let budget = u64::from(crate::proof_fetcher::DEFAULT_FETCH_BUDGET);
-    let (tx_completed, tx_fetch_failed) = match engine.complete_missing_proofs(budget).await {
-        Ok(s) => (s.completed as u64, s.fetch_failed as u64),
-        Err(e) => {
-            worker::console_log!("complete-proofs: transactions error: {e}");
-            (0, 0)
-        }
-    };
+    let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
+    let (tx_completed, tx_fetch_failed) =
+        match engine.complete_missing_proofs(budget, backstop_age).await {
+            Ok(s) => (s.completed as u64, s.fetch_failed as u64),
+            Err(e) => {
+                worker::console_log!("complete-proofs: transactions error: {e}");
+                (0, 0)
+            }
+        };
     // 2. pot_beefs recovery store (own fetcher + budget).
     let pot_tracker = lookup_service_chain_tracker(env);
     let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
@@ -1136,8 +1170,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     {
         pot_fetcher = pot_fetcher.with_arcade_url(u);
     }
-    let ps = crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &pot_fetcher, 20)
-        .await;
+    let ps = crate::proof_fetcher::complete_pot_beef_proofs(
+        pot_storage.as_ref(),
+        &pot_fetcher,
+        20,
+        backstop_age,
+    )
+    .await;
     // 3. pot_records spend-confirmation chaser (#186) — own fetcher + budget.
     let mut spend_fetcher =
         crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(env))
@@ -1154,6 +1193,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         pot_storage.as_ref(),
         &spend_fetcher,
         20,
+        backstop_age,
     )
     .await;
     // 4. observability heartbeat + counters (same as the cron would stamp).

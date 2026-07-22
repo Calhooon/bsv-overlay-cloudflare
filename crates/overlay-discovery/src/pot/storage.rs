@@ -149,11 +149,38 @@ pub trait PotStorage {
     /// Every returned row carries a `spending_txid` (a spent row always has
     /// one). Backends that can't enumerate return an empty `Vec` via this
     /// default → the chaser is a no-op.
+    ///
+    /// `min_age_secs` is the PUSH-PRIMARY BACKSTOP gate (bsv-low #228 /
+    /// arcade#259): rows whose spend was recorded less than `min_age_secs`
+    /// ago are EXCLUDED — the spending tx's proof is expected via the Arcade
+    /// MINED webhook (`/arc-ingest`, which latches `spentConfirmed` directly).
+    /// `0` disables the gate; a row whose spend-record time is UNKNOWN
+    /// (pre-migration `NULL`) MUST be treated as old/eligible — the fail-safe
+    /// direction is to poll MORE, never to starve a row of its backstop. The
+    /// D1 backend anchors the age on a `spentAt` stamp written by
+    /// [`mark_spent`](Self::mark_spent).
     async fn find_spent_unconfirmed(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let _ = limit;
+        let _ = (limit, min_age_secs);
+        Ok(Vec::new())
+    }
+
+    /// Spent-but-UNCONFIRMED pot records whose recorded spender is
+    /// `spending_txid` — the PUSH consumer's lookup (bsv-low #228): when
+    /// `/arc-ingest` receives (and chaintracks-verifies) the merkle proof for
+    /// a settle/refund/sweep tx, it confirms every pot outpoint that spend
+    /// covers via [`mark_spent`](Self::mark_spent)`(confirmed = true)`, so the
+    /// #186 poll chaser skips them entirely. Backends that can't enumerate
+    /// return an empty `Vec` via this default → the push pass is a no-op and
+    /// the poll backstop still covers the row.
+    async fn find_unconfirmed_by_spending_txid(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = spending_txid;
         Ok(Vec::new())
     }
 
@@ -179,11 +206,18 @@ pub trait PotStorage {
     /// head-of-queue starvation — a never-mineable head must not starve the
     /// tail). Backends that can't enumerate (or have nothing to complete) may
     /// return an empty `Vec` via this default → proof completion is a no-op.
+    ///
+    /// `min_age_secs` is the PUSH-PRIMARY BACKSTOP gate (bsv-low #228 /
+    /// arcade#259): rows stored less than `min_age_secs` ago are EXCLUDED —
+    /// their proof is expected via `/arc-ingest` (which stitches + compacts
+    /// the pot BEEF directly). `0` disables the gate; unknown-age rows MUST
+    /// stay eligible (fail-safe). The D1 backend anchors on `createdAt`.
     async fn find_pot_beefs_for_proof_check(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
-        let _ = limit;
+        let _ = (limit, min_age_secs);
         Ok(Vec::new())
     }
 
@@ -232,6 +266,15 @@ pub enum PotStorageError {
 pub struct MemoryPotStorage {
     records: std::sync::Mutex<Vec<PotRecord>>,
     beefs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// Deterministic logical clock (seconds) for the push-primary backstop
+    /// age gates (#228) — models the D1 backend's `unixepoch()`. Tests
+    /// advance it via [`Self::advance_clock`]; no wall clock is ever read.
+    clock_secs: std::sync::Mutex<u64>,
+    /// First-store stamp (clock secs) per beef txid — models `pot_beefs.createdAt`.
+    beef_created_at: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Spend-record stamp (clock secs) per `(txid, vout)` — models
+    /// `pot_records.spentAt` (written by `mark_spent`).
+    spent_at: std::sync::Mutex<std::collections::HashMap<(String, u32), u64>>,
 }
 
 impl MemoryPotStorage {
@@ -245,6 +288,28 @@ impl MemoryPotStorage {
 
     pub fn beef_count(&self) -> usize {
         self.beefs.lock().unwrap().len()
+    }
+
+    /// Advance the deterministic logical clock by `secs` (test hook for the
+    /// #228 push-primary backstop age gates).
+    pub fn advance_clock(&self, secs: u64) {
+        *self.clock_secs.lock().unwrap() += secs;
+    }
+
+    fn now(&self) -> u64 {
+        *self.clock_secs.lock().unwrap()
+    }
+
+    /// Whether a stamp clears the age gate: unknown (None) is OLD/eligible
+    /// (fail-safe); otherwise `clock - stamp >= min_age_secs`.
+    fn gate_open(&self, stamp: Option<u64>, min_age_secs: u64) -> bool {
+        if min_age_secs == 0 {
+            return true;
+        }
+        match stamp {
+            None => true,
+            Some(s) => self.now().saturating_sub(s) >= min_age_secs,
+        }
     }
 }
 
@@ -269,24 +334,38 @@ impl PotStorage for MemoryPotStorage {
         spending_txid: &str,
         confirmed: bool,
     ) -> Result<(), PotStorageError> {
+        let now = self.now();
         let mut records = self.records.lock().unwrap();
         // UPDATE-only: touch an existing row; absent outpoint is a no-op.
         for r in records.iter_mut() {
             if r.txid == txid && r.output_index == output_index {
-                if confirmed {
+                let wrote = if confirmed {
                     // Chain truth: always write, latch spent_confirmed
                     // (last-confirmed-wins).
                     r.spent = true;
                     r.spending_txid = Some(spending_txid.to_string());
                     r.spent_confirmed = true;
+                    true
                 } else if !r.spent_confirmed {
                     // Unconfirmed claim: only allowed while no confirmed
                     // pointer exists (last-writer among unconfirmed);
                     // spent_confirmed is never touched here.
                     r.spent = true;
                     r.spending_txid = Some(spending_txid.to_string());
+                    true
+                } else {
+                    // Unconfirmed claim vs confirmed pointer → REFUSED.
+                    false
+                };
+                // Stamp the spend-record time on every accepted write (#228
+                // backstop age anchor): a NEW spend pointer resets the clock
+                // so its own push gets its chance before the poll backstop.
+                if wrote {
+                    self.spent_at
+                        .lock()
+                        .unwrap()
+                        .insert((txid.to_string(), output_index), now);
                 }
-                // else: unconfirmed claim vs confirmed pointer → REFUSED.
             }
         }
         Ok(())
@@ -311,6 +390,7 @@ impl PotStorage for MemoryPotStorage {
         if beef.is_empty() {
             return Ok(());
         }
+        let now = self.now();
         let mut beefs = self.beefs.lock().unwrap();
         // Longer-wins: write only when absent or strictly longer (a good row
         // is never clobbered by a shorter one).
@@ -318,6 +398,13 @@ impl PotStorage for MemoryPotStorage {
             Some(existing) if existing.len() >= beef.len() => {}
             _ => {
                 beefs.insert(txid.to_string(), beef.to_vec());
+                // First-store stamp only (#228 age anchor): a longer-beef
+                // rewrite keeps the original age real.
+                self.beef_created_at
+                    .lock()
+                    .unwrap()
+                    .entry(txid.to_string())
+                    .or_insert(now);
             }
         }
         Ok(())
@@ -330,34 +417,77 @@ impl PotStorage for MemoryPotStorage {
     async fn find_pot_beefs_for_proof_check(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
         // Model the D1 `WHERE has_proof = 0` candidate set by re-deriving the
         // flag from the stored bytes (the memory store keeps no flag column).
-        Ok(self
+        // The #228 backstop age gate excludes rows younger than min_age_secs
+        // (their proof is expected via /arc-ingest); unknown age = eligible.
+        let candidates: Vec<(String, Vec<u8>)> = self
             .beefs
             .lock()
             .unwrap()
             .iter()
             .filter(|(txid, beef)| !pot_beef_has_proof(txid, beef))
-            .take(limit as usize)
             .map(|(txid, beef)| (txid.clone(), beef.clone()))
+            .collect();
+        Ok(candidates
+            .into_iter()
+            .filter(|(txid, _)| {
+                let stamp = self.beef_created_at.lock().unwrap().get(txid).copied();
+                self.gate_open(stamp, min_age_secs)
+            })
+            .take(limit as usize)
             .collect())
     }
 
     async fn find_spent_unconfirmed(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<PotRecord>, PotStorageError> {
         // Spent rows still awaiting SPV confirmation. The D1 store carries the
         // anti-starvation `ORDER BY RANDOM()`; the memory store need not
-        // randomize (tests are deterministic).
-        Ok(self
+        // randomize (tests are deterministic). The #228 backstop age gate
+        // excludes rows whose spend was recorded less than min_age_secs ago
+        // (the spending tx's push is still expected); unknown age = eligible.
+        let candidates: Vec<PotRecord> = self
             .records
             .lock()
             .unwrap()
             .iter()
             .filter(|r| r.spent && !r.spent_confirmed)
+            .cloned()
+            .collect();
+        Ok(candidates
+            .into_iter()
+            .filter(|r| {
+                let stamp = self
+                    .spent_at
+                    .lock()
+                    .unwrap()
+                    .get(&(r.txid.clone(), r.output_index))
+                    .copied();
+                self.gate_open(stamp, min_age_secs)
+            })
             .take(limit as usize)
+            .collect())
+    }
+
+    async fn find_unconfirmed_by_spending_txid(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.spent
+                    && !r.spent_confirmed
+                    && r.spending_txid.as_deref() == Some(spending_txid)
+            })
             .cloned()
             .collect())
     }
@@ -747,7 +877,7 @@ mod tests {
         store.store_beef(&proven_txid, &proven).await.unwrap();
         assert_eq!(store.beef_count(), 2);
 
-        let cands = store.find_pot_beefs_for_proof_check(10).await.unwrap();
+        let cands = store.find_pot_beefs_for_proof_check(10, 0).await.unwrap();
         assert_eq!(cands.len(), 1, "only the proofless row is a candidate");
         assert_eq!(cands[0].0, proofless_txid);
     }
@@ -767,7 +897,7 @@ mod tests {
         store.mark_spent("potB", 0, "settleB", true).await.unwrap();
         // potC: never spent → NOT a candidate.
 
-        let cands = store.find_spent_unconfirmed(10).await.unwrap();
+        let cands = store.find_spent_unconfirmed(10, 0).await.unwrap();
         assert_eq!(cands.len(), 1, "only the spent-unconfirmed row is a candidate");
         assert_eq!(cands[0].txid, "potA");
         assert_eq!(
@@ -780,10 +910,10 @@ mod tests {
     #[tokio::test]
     async fn find_spent_unconfirmed_empty_when_none() {
         let store = MemoryPotStorage::new();
-        assert!(store.find_spent_unconfirmed(10).await.unwrap().is_empty());
+        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
         // An unspent admitted row is still not a candidate.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        assert!(store.find_spent_unconfirmed(10).await.unwrap().is_empty());
+        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -796,14 +926,14 @@ mod tests {
 
         // 0-conf spend recorded → appears as a candidate.
         store.mark_spent("potA", 0, "settle", false).await.unwrap();
-        assert_eq!(store.find_spent_unconfirmed(10).await.unwrap().len(), 1);
+        assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
 
         // The chaser's upgrade (a chaintracks-verified spend).
         store.mark_spent("potA", 0, "settle", true).await.unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed, "confirmed spend latches the flag");
         assert!(
-            store.find_spent_unconfirmed(10).await.unwrap().is_empty(),
+            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
             "a confirmed row is no longer a candidate"
         );
 
@@ -814,7 +944,7 @@ mod tests {
         assert!(r.spent_confirmed, "confirmed flag survives");
         assert_eq!(r.spending_txid.as_deref(), Some("settle"), "pointer unchanged");
         assert!(
-            store.find_spent_unconfirmed(10).await.unwrap().is_empty(),
+            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
             "an unconfirmed claim never re-surfaces a confirmed row"
         );
     }
@@ -827,8 +957,82 @@ mod tests {
             store.store_record(&pot_record(&txid, 0)).await.unwrap();
             store.mark_spent(&txid, 0, "settle", false).await.unwrap();
         }
-        assert_eq!(store.find_spent_unconfirmed(2).await.unwrap().len(), 2);
-        assert_eq!(store.find_spent_unconfirmed(10).await.unwrap().len(), 5);
+        assert_eq!(store.find_spent_unconfirmed(2, 0).await.unwrap().len(), 2);
+        assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 5);
+    }
+
+    // ── #228: push-consumer lookup + backstop age gates ──────────────────
+
+    #[tokio::test]
+    async fn find_unconfirmed_by_spending_txid_returns_only_that_spenders_rows() {
+        let store = MemoryPotStorage::new();
+        for (pot, spender) in [("potA", "settleX"), ("potB", "settleX"), ("potC", "settleY")] {
+            store.store_record(&pot_record(pot, 0)).await.unwrap();
+            store.mark_spent(pot, 0, spender, false).await.unwrap();
+        }
+        // A CONFIRMED settleX row is not a candidate (nothing left to latch).
+        store.store_record(&pot_record("potD", 0)).await.unwrap();
+        store.mark_spent("potD", 0, "settleX", true).await.unwrap();
+        // An unspent row never appears.
+        store.store_record(&pot_record("potE", 0)).await.unwrap();
+
+        let rows = store.find_unconfirmed_by_spending_txid("settleX").await.unwrap();
+        let mut pots: Vec<&str> = rows.iter().map(|r| r.txid.as_str()).collect();
+        pots.sort_unstable();
+        assert_eq!(pots, vec!["potA", "potB"]);
+        assert!(store
+            .find_unconfirmed_by_spending_txid("settleZ")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn spend_age_gate_anchors_on_the_spend_not_the_admission() {
+        // A pot admitted LONG ago but spent JUST now must still wait out the
+        // backstop window — the age anchor is the spend record (its push is
+        // what gets first chance), never the pot admission time.
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.advance_clock(100_000); // pot ages far past any gate
+        store.mark_spent("potA", 0, "settle", false).await.unwrap();
+
+        assert!(
+            store.find_spent_unconfirmed(10, 1800).await.unwrap().is_empty(),
+            "a fresh spend on an old pot still waits for its push"
+        );
+        store.advance_clock(1800);
+        assert_eq!(store.find_spent_unconfirmed(10, 1800).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spend_age_gate_resets_when_a_new_spender_overwrites() {
+        // Last-writer-wins among unconfirmed claims: the NEW pointer's push
+        // deserves its own window, so an accepted overwrite resets the age.
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "claim1", false).await.unwrap();
+        store.advance_clock(1800); // claim1 is now old enough
+        assert_eq!(store.find_spent_unconfirmed(10, 1800).await.unwrap().len(), 1);
+
+        store.mark_spent("potA", 0, "claim2", false).await.unwrap();
+        assert!(
+            store.find_spent_unconfirmed(10, 1800).await.unwrap().is_empty(),
+            "the new pointer restarts the backstop window"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_min_age_disables_both_gates() {
+        // min_age_secs = 0 is the pre-#228 behaviour: everything eligible
+        // immediately (also the escape hatch if the gate must be turned off).
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store.mark_spent("potA", 0, "settle", false).await.unwrap();
+        store.store_beef("beefTx", &[1, 2, 3]).await.unwrap();
+
+        assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
+        assert_eq!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().len(), 1);
     }
 
     #[test]
