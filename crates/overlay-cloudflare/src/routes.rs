@@ -950,69 +950,189 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// POST /arc-ingest — MINED merkle-proof callback (Arcade V2 push, #192/#193;
-/// TAAL ARC parity too). The Arcade broadcaster registers `X-CallbackToken`
-/// = the SUBJECT txid at broadcast, so the callback echoes it: we bearer-auth
-/// by requiring `X-CallbackToken` to match the body's `txid` (constant-time).
+/// A classified `/arc-ingest` callback body (#228). PURE — unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArcIngestBody {
+    /// A merklePath-bearing (MINED) callback — the proof push.
+    Proof {
+        txid: String,
+        merkle_path: String,
+        block_height: Option<u32>,
+    },
+    /// A non-MINED lifecycle callback (`X-FullStatusUpdates: true` — e.g.
+    /// SEEN_ON_NETWORK) — carries NO merklePath. Acknowledged and ignored
+    /// (2xx, counted), never a parse error.
+    StatusOnly { txid: String, tx_status: String },
+}
+
+/// Parse + classify an `/arc-ingest` body (#228). A missing/empty/whitespace
+/// `merklePath` is a STATUS callback (accept-and-ignore); a present
+/// `merklePath` is a proof push whose verification stays byte-identical to
+/// the pre-#228 fail-closed path. `txid` is always required — a body without
+/// one is malformed (400), same as before.
+pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, String> {
+    #[derive(Deserialize)]
+    struct Body {
+        txid: String,
+        #[serde(rename = "merklePath", default)]
+        merkle_path: Option<String>,
+        #[serde(rename = "blockHeight")]
+        block_height: Option<u32>,
+        #[serde(rename = "txStatus", default)]
+        tx_status: Option<String>,
+    }
+
+    let body: Body = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    match body.merkle_path {
+        Some(mp) if !mp.trim().is_empty() => Ok(ArcIngestBody::Proof {
+            txid: body.txid,
+            merkle_path: mp,
+            block_height: body.block_height,
+        }),
+        _ => Ok(ArcIngestBody::StatusOnly {
+            txid: body.txid,
+            tx_status: body.tx_status.unwrap_or_default(),
+        }),
+    }
+}
+
+/// POST /arc-ingest — Arcade V2 push callback (#192/#193, #259/#228; TAAL ARC
+/// parity too). The Arcade broadcaster registers `X-CallbackToken` = the
+/// SUBJECT txid at broadcast, so the callback echoes it: we bearer-auth by
+/// requiring `X-CallbackToken` to match the body's `txid` (constant-time).
+///
+/// **#228: this is the PRIMARY proof source** — arcade#259 delivers the MINED
+/// merklePath ~150 ms post-mine. A verified push lands in EVERY consumer:
+/// the engine `transactions` stitch (which latches `has_proof`), the LOW
+/// `pot_beefs` compact, and the `pot_records` spend-confirmation latch — so
+/// the poll passes (now backstop-gated, `PUSH_BACKSTOP_MIN_AGE_SECS`) skip
+/// the tx entirely. Non-MINED lifecycle callbacks (`X-FullStatusUpdates`)
+/// carry no merklePath and are acknowledged-and-ignored (200, counted),
+/// never a parse error.
 ///
 /// A callback is a COURIER — we NEVER trust a merklePath we didn't fold.
 /// Before stitching, the callback's merklePath is re-verified against
-/// chaintracks (same discipline as the cron fetcher). An unverifiable proof is
-/// refused (422) and nothing is stitched; the cron pull remains the backstop.
+/// chaintracks (same discipline as the cron fetcher) — BYTE-IDENTICAL to the
+/// pre-#228 check. An unverifiable proof is refused (422) and nothing is
+/// stitched; the poll backstop remains.
 pub async fn arc_ingest(
     engine: &Engine,
     mut req: Request,
     tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    ops_db: Option<&worker::D1Database>,
 ) -> worker::Result<Response> {
-    #[derive(Deserialize)]
-    struct Body {
-        txid: String,
-        #[serde(rename = "merklePath")]
-        merkle_path: String,
-        #[serde(rename = "blockHeight")]
-        block_height: Option<u32>,
-    }
-
     // Read the bearer token BEFORE consuming the body.
     let callback_token = req.headers().get("x-callbacktoken").ok().flatten();
 
-    let body: Body = match req.json().await {
+    let raw = match req.text().await {
+        Ok(t) => t,
+        Err(e) => return json_error(&format!("Invalid arc-ingest body: {e}"), 400),
+    };
+    let body = match classify_arc_ingest_body(&raw) {
         Ok(b) => b,
         Err(e) => return json_error(&format!("Invalid arc-ingest body: {e}"), 400),
+    };
+    let txid = match &body {
+        ArcIngestBody::Proof { txid, .. } | ArcIngestBody::StatusOnly { txid, .. } => txid.clone(),
     };
 
     // Bearer-auth: the token must be present and equal the subject txid the
     // broadcaster registered (constant-time). A missing/mismatched token means
-    // this isn't a callback we scheduled → 401.
+    // this isn't a callback we scheduled → 401. Applies to STATUS callbacks
+    // too — unauthenticated noise is refused before it is ever acknowledged.
     match callback_token {
-        Some(tok) if constant_time_eq(tok.as_bytes(), body.txid.as_bytes()) => {}
+        Some(tok) if constant_time_eq(tok.as_bytes(), txid.as_bytes()) => {}
         _ => {
             worker::console_log!("POST /arc-ingest -> 401 (bad X-CallbackToken)");
             return json_error("Unauthorized arc-ingest callback", 401);
         }
     }
 
-    worker::console_log!("POST /arc-ingest txid={}", body.txid);
+    let (merkle_path, block_height) = match body {
+        // #228 fix: a non-MINED lifecycle callback is NORMAL webhook traffic
+        // (we register X-FullStatusUpdates:true), not an error. Acknowledge
+        // (2xx), count, ignore — no proof means nothing to verify or stitch.
+        ArcIngestBody::StatusOnly { tx_status, .. } => {
+            worker::console_log!(
+                "POST /arc-ingest txid={txid} status-only ({}) -> 200 (acknowledged, no merklePath)",
+                if tx_status.is_empty() { "?" } else { &tx_status }
+            );
+            if let Some(db) = ops_db {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_STATUS_IGNORED, 1)
+                    .await;
+            }
+            return json_ok(&SuccessBody {
+                status: "success",
+                message: "Status update acknowledged (no merklePath)",
+            });
+        }
+        ArcIngestBody::Proof {
+            merkle_path,
+            block_height,
+            ..
+        } => (merkle_path, block_height),
+    };
+
+    worker::console_log!("POST /arc-ingest txid={txid}");
 
     // Verify the callback's merklePath against chaintracks BEFORE stitching —
     // a courier's proof is only a fact once its root matches our PoW-anchored
     // headers. Fail-closed: no tracker / unverifiable → refuse, do not stitch.
-    if !crate::proof_fetcher::verify_bump(tracker, &body.merkle_path, &body.txid).await {
+    if !crate::proof_fetcher::verify_bump(tracker, &merkle_path, &txid).await {
         worker::console_log!("POST /arc-ingest -> 422 (merklePath failed chaintracks verify)");
         return json_error("Callback merklePath failed chaintracks verification", 422);
     }
 
-    match engine
-        .handle_new_merkle_proof(&body.txid, &body.merkle_path, body.block_height)
-        .await
-    {
+    // The VERIFIED push fans out to every consumer (#228):
+    // 1. engine `transactions` stitch — `update_transaction_beef` latches
+    //    `has_proof`, dropping the tx from the poll backstop's candidates.
+    let engine_res = engine
+        .handle_new_merkle_proof(&txid, &merkle_path, block_height)
+        .await;
+    // 2. LOW pot stores — pot_beefs compact + pot_records spend latch. A
+    //    settle/refund/sweep admits no outputs, so the ENGINE knows nothing
+    //    about it (engine_res errors) while the pot stores are exactly where
+    //    its proof belongs.
+    let pot = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(
+        pot_storage,
+        &txid,
+        &merkle_path,
+    )
+    .await;
+
+    match engine_res {
         Ok(()) => {
-            worker::console_log!("POST /arc-ingest -> 200");
+            worker::console_log!(
+                "POST /arc-ingest -> 200 (engine stitched; pot_beef_compacted={} spends_confirmed={})",
+                pot.pot_beef_compacted,
+                pot.spends_confirmed
+            );
+            if let Some(db) = ops_db {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_PUSHED, 1).await;
+            }
             json_ok(&SuccessBody {
                 status: "success",
                 message: "Transaction status updated",
             })
         }
+        // The engine doesn't know the txid but a pot store consumed the proof
+        // (the settle/refund/sweep case) — that is a SUCCESSFUL push.
+        Err(_) if pot.landed_anything() => {
+            worker::console_log!(
+                "POST /arc-ingest -> 200 (pot stores only; pot_beef_compacted={} spends_confirmed={})",
+                pot.pot_beef_compacted,
+                pot.spends_confirmed
+            );
+            if let Some(db) = ops_db {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_PUSHED, 1).await;
+            }
+            json_ok(&SuccessBody {
+                status: "success",
+                message: "Transaction status updated",
+            })
+        }
+        // Nobody knows this txid — keep the pre-#228 error surface.
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /arc-ingest -> {}", status);
@@ -2174,5 +2294,67 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"retryable\":true"), "{json}");
+    }
+
+    // ── #228: /arc-ingest body classification (push-primary) ─────────────────
+
+    const CB_TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn arc_ingest_non_mined_status_callback_is_status_only_never_a_parse_error() {
+        // X-FullStatusUpdates lifecycle callbacks carry NO merklePath — they
+        // must classify StatusOnly (→ 200 acknowledged + counted), never fall
+        // into the malformed-body 400 path.
+        for body in [
+            format!(r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK"}}"#),
+            format!(r#"{{"txid":"{CB_TXID}","txStatus":"ANNOUNCED_TO_NETWORK","blockHeight":0}}"#),
+            // merklePath explicitly null or empty is the same status shape.
+            format!(r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK","merklePath":null}}"#),
+            format!(r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK","merklePath":""}}"#),
+            format!(r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK","merklePath":"  "}}"#),
+        ] {
+            match classify_arc_ingest_body(&body).unwrap() {
+                ArcIngestBody::StatusOnly { txid, tx_status } => {
+                    assert_eq!(txid, CB_TXID);
+                    assert!(!tx_status.is_empty(), "{body}");
+                }
+                other => panic!("status callback must be StatusOnly, got {other:?} for {body}"),
+            }
+        }
+    }
+
+    #[test]
+    fn arc_ingest_merklepath_bearing_body_is_a_proof_push() {
+        let body = format!(
+            r#"{{"txid":"{CB_TXID}","merklePath":"beef00","blockHeight":850000,"txStatus":"MINED"}}"#
+        );
+        match classify_arc_ingest_body(&body).unwrap() {
+            ArcIngestBody::Proof { txid, merkle_path, block_height } => {
+                assert_eq!(txid, CB_TXID);
+                assert_eq!(merkle_path, "beef00");
+                assert_eq!(block_height, Some(850_000));
+            }
+            other => panic!("merklePath body must be Proof, got {other:?}"),
+        }
+        // A garbage merklePath still classifies Proof — the route's
+        // chaintracks verify_bump (fail-closed, byte-identical to pre-#228)
+        // is what refuses it with 422. Classification never "fixes" a proof.
+        let garbage = format!(r#"{{"txid":"{CB_TXID}","merklePath":"zz-not-hex"}}"#);
+        assert!(matches!(
+            classify_arc_ingest_body(&garbage).unwrap(),
+            ArcIngestBody::Proof { .. }
+        ));
+    }
+
+    #[test]
+    fn arc_ingest_malformed_bodies_still_400() {
+        // Missing txid, non-JSON, empty — the pre-#228 400 surface is kept
+        // byte-for-byte (the parity corpus pins 400 on both sides).
+        for body in [r#"{"bogus":"payload"}"#, "not valid json at all", ""] {
+            assert!(
+                classify_arc_ingest_body(body).is_err(),
+                "must stay malformed: {body:?}"
+            );
+        }
     }
 }

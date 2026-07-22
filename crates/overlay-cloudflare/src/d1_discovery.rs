@@ -1295,12 +1295,18 @@ fn pot_err(e: String) -> PotStorageError {
 /// - unconfirmed: the `AND spentConfirmed = 0` guard makes an unconfirmed
 ///   claim a no-op against a confirmed pointer, while preserving
 ///   last-writer-wins among unconfirmed claims; `spentConfirmed` untouched.
+///
+/// Both branches stamp `spentAt = unixepoch()` (#228 backstop age anchor):
+/// every ACCEPTED spend write resets the age, so the poll chaser's gate
+/// measures from the CURRENT spend pointer (its push gets its chance first).
+/// A refused unconfirmed-vs-confirmed write touches nothing (WHERE misses).
 fn mark_spent_sql(confirmed: bool) -> &'static str {
     if confirmed {
-        "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1 \
+        "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
+             spentAt = unixepoch() \
          WHERE txid = ? AND outputIndex = ?"
     } else {
-        "UPDATE pot_records SET spent = 1, spendingTxid = ? \
+        "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch() \
          WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
     }
 }
@@ -1370,17 +1376,43 @@ impl PotStorage for D1PotStorage {
     async fn find_spent_unconfirmed(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<PotRecord>, PotStorageError> {
         // Spent-but-unconfirmed pot rows (#186), RANDOM-sampled so a
         // never-mineable head cannot starve the tail — the same anti-starvation
-        // shape as find_pot_beefs_for_proof_check. `limit` is a u64 (not user
-        // input), interpolated to match that sibling's idiom. The
-        // (spent, spentConfirmed) composite index backs the scan.
+        // shape as find_pot_beefs_for_proof_check. `limit`/`min_age_secs` are
+        // u64s (not user input), interpolated to match that sibling's idiom.
+        // The (spent, spentConfirmed) composite index backs the scan.
+        //
+        // Push-primary backstop age gate (#228), anchored on spentAt (the
+        // CURRENT spend pointer's record time): a young spend's proof is
+        // expected via /arc-ingest. NULL spentAt (pre-migration) = eligible.
         let sql = format!(
             "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
-             WHERE spent = 1 AND spentConfirmed = 0 ORDER BY RANDOM() LIMIT {limit}"
+             WHERE spent = 1 AND spentConfirmed = 0 \
+               AND (spentAt IS NULL OR spentAt <= unixepoch() - {min_age_secs}) \
+             ORDER BY RANDOM() LIMIT {limit}"
         );
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_unconfirmed_by_spending_txid(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // The PUSH consumer's lookup (#228): every pot outpoint whose recorded
+        // spender is this txid and whose spend is still unconfirmed — the rows
+        // /arc-ingest upgrades (mark_spent confirmed) once the spending tx's
+        // pushed bump chaintracks-verifies. Backed by idx_pot_spending.
+        let rows: Vec<PotRow> = Query::new(
+            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
+             WHERE spendingTxid = ? AND spent = 1 AND spentConfirmed = 0",
+        )
+        .bind(spending_txid)
+        .fetch_all(&self.db)
+        .await
+        .map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
     }
 
@@ -1405,12 +1437,16 @@ impl PotStorage for D1PotStorage {
         // BUMP for its own txid, so the completion cron enumerates only
         // proofless rows.
         let has_proof = i64::from(pot_beef_has_proof(txid, beef));
+        // createdAt is preserve-or-stamp (#228 backstop age anchor): a
+        // longer-beef rewrite keeps the original first-store time so the
+        // push-primary backstop's age gate measures real age.
         Query::new(
             "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof) \
-             VALUES (?, ?, ?, ?)",
+             VALUES (?, ?, COALESCE((SELECT createdAt FROM pot_beefs WHERE txid = ?), ?), ?)",
         )
         .bind(txid)
         .bind(beef)
+        .bind(txid)
         .bind(current_unix_seconds_i64())
         .bind(has_proof)
         .execute(&self.db)
@@ -1431,14 +1467,20 @@ impl PotStorage for D1PotStorage {
     async fn find_pot_beefs_for_proof_check(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
         // ONLY proofless rows (#192/#193), RANDOM-sampled so a never-mineable
         // head cannot starve the tail (zanaadu prod incident). Reaches the whole
         // historical backlog (rows written before the has_proof column default
         // to 0). Bytes are read back as hex (the pot_beefs idiom).
+        //
+        // Push-primary backstop age gate (#228): young rows wait for their
+        // /arc-ingest push; NULL createdAt (pre-migration) = eligible.
         let sql = format!(
             "SELECT txid, hex(beef) AS beef FROM pot_beefs \
-             WHERE has_proof = 0 ORDER BY RANDOM() LIMIT {limit}"
+             WHERE has_proof = 0 \
+               AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
+             ORDER BY RANDOM() LIMIT {limit}"
         );
         let rows: Vec<PotBeefProofRow> =
             Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
@@ -2207,8 +2249,9 @@ mod tests {
         // The guard: an unconfirmed claim only lands while no confirmed
         // pointer exists (spentConfirmed = 0)…
         assert!(sql.contains("WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"));
-        // …and the SET clause never touches the flag.
-        assert!(sql.contains("SET spent = 1, spendingTxid = ? WHERE"));
+        // …and the SET clause never touches the flag (it DOES stamp spentAt —
+        // the #228 backstop age anchor — on every accepted write).
+        assert!(sql.contains("SET spent = 1, spendingTxid = ?, spentAt = unixepoch() WHERE"));
         assert!(!sql.contains("spentConfirmed = 1"));
         assert!(sql.starts_with("UPDATE pot_records"));
         assert!(!sql.to_uppercase().contains("DELETE"));

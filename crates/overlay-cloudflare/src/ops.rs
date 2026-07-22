@@ -33,6 +33,14 @@ pub const COUNTER_POT_BEEFS_COMPACTED: &str = "pot_beefs_compacted_total";
 /// Pot spends UPGRADED to `spentConfirmed = 1` by the spend-confirmation
 /// chaser (#186). Name-keyed → additive, no schema change.
 pub const COUNTER_SPENDS_CONFIRMED: &str = "spends_confirmed_total";
+/// Verified merkle proofs that arrived via the `/arc-ingest` PUSH (#228 — the
+/// primary proof source). Compare against `proofs_completed_total` (the poll
+/// backstop) to see the push/poll split. Name-keyed → additive.
+pub const COUNTER_ARC_INGEST_PUSHED: &str = "arc_ingest_pushed_total";
+/// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
+/// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
+/// operation, not an error — it proves the webhook stream is alive.
+pub const COUNTER_ARC_INGEST_STATUS_IGNORED: &str = "arc_ingest_status_ignored_total";
 
 /// Default staleness budget for `/health/invariants?strict=1`: 6 hours. The
 /// completion cron runs every 15 min (`wrangler.toml crons`), so 6h ≈ 24 dead
@@ -101,15 +109,25 @@ pub async fn record_completion_tick(
         (COUNTER_POT_BEEFS_COMPACTED, pot_beefs_compacted),
         (COUNTER_SPENDS_CONFIRMED, spends_confirmed),
     ] {
-        let q = Query::new(
-            "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
-             ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value",
-        )
-        .bind(name)
-        .bind(delta);
-        if let Err(e) = q.execute(db).await {
-            worker::console_log!("[ops] counter {name} bump failed: {e}");
-        }
+        bump_counter(db, name, delta).await;
+    }
+}
+
+/// Bump one persistent monotonic counter by `delta` (additive upsert).
+/// Best-effort — logs and swallows any D1 error (observability must never
+/// break the request that carries it).
+pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
+    if delta == 0 {
+        return;
+    }
+    let q = Query::new(
+        "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
+         ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value",
+    )
+    .bind(name)
+    .bind(delta);
+    if let Err(e) = q.execute(db).await {
+        worker::console_log!("[ops] counter {name} bump failed: {e}");
     }
 }
 
@@ -185,6 +203,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_FETCH_FAILED: 0,
         COUNTER_POT_BEEFS_COMPACTED: 0,
         COUNTER_SPENDS_CONFIRMED: 0,
+        COUNTER_ARC_INGEST_PUSHED: 0,
+        COUNTER_ARC_INGEST_STATUS_IGNORED: 0,
     });
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);

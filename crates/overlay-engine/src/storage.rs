@@ -192,11 +192,23 @@ pub trait Storage {
     ///
     /// `limit` bounds the returned page (and therefore the per-tick WoC fetch /
     /// CPU budget).
+    ///
+    /// `min_age_secs` is the PUSH-PRIMARY BACKSTOP gate (bsv-low #228 /
+    /// arcade#259): rows stored less than `min_age_secs` ago are EXCLUDED —
+    /// their proof is expected to arrive via the Arcade MINED webhook
+    /// (`/arc-ingest`) at push speed, so polling them is wasted budget. Rules:
+    /// - `0` disables the gate (poll everything — today's behaviour).
+    /// - a row whose age is UNKNOWN (pre-migration `NULL` timestamp) MUST be
+    ///   treated as OLD, i.e. eligible — the fail-safe direction is to poll
+    ///   MORE, never to starve a row of its backstop.
+    /// The reference D1 backend answers with
+    /// `AND (created_at IS NULL OR created_at <= unixepoch() - min_age_secs)`.
     async fn find_transactions_for_proof_check(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<TransactionBeef>, StorageError> {
-        let _ = limit;
+        let _ = (limit, min_age_secs);
         Ok(Vec::new())
     }
 
@@ -214,6 +226,127 @@ pub trait Storage {
 
     /// Get the last interaction score for a host+topic pair. Returns 0 if not found.
     async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError>;
+}
+
+// ============================================================================
+// Rc delegation
+// ============================================================================
+
+/// Delegating impl so an `Rc<T: Storage>` is itself a `Storage` — lets a
+/// caller keep a shared handle to the concrete backend (e.g. a test advancing
+/// [`memory::MemoryStorage::advance_clock`]) while the engine owns a
+/// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
+#[async_trait(?Send)]
+impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
+    async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+        (**self).insert_output(output).await
+    }
+    async fn delete_output(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+    ) -> Result<(), StorageError> {
+        (**self).delete_output(txid, output_index, topic).await
+    }
+    async fn mark_utxo_as_spent(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+    ) -> Result<(), StorageError> {
+        (**self).mark_utxo_as_spent(txid, output_index, topic).await
+    }
+    async fn update_consumed_by(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        consumed_by: &[Outpoint],
+    ) -> Result<(), StorageError> {
+        (**self)
+            .update_consumed_by(txid, output_index, topic, consumed_by)
+            .await
+    }
+    async fn update_transaction_beef(&self, txid: &str, beef: &[u8]) -> Result<(), StorageError> {
+        (**self).update_transaction_beef(txid, beef).await
+    }
+    async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
+        (**self).mark_transaction_proven(txid).await
+    }
+    async fn update_output_block_height(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        block_height: u32,
+    ) -> Result<(), StorageError> {
+        (**self)
+            .update_output_block_height(txid, output_index, topic, block_height)
+            .await
+    }
+    async fn insert_applied_transaction(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<(), StorageError> {
+        (**self).insert_applied_transaction(tx).await
+    }
+    async fn does_applied_transaction_exist(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<bool, StorageError> {
+        (**self).does_applied_transaction_exist(tx).await
+    }
+    async fn find_output(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: Option<&str>,
+        spent: Option<bool>,
+        include_beef: bool,
+    ) -> Result<Option<Output>, StorageError> {
+        (**self)
+            .find_output(txid, output_index, topic, spent, include_beef)
+            .await
+    }
+    async fn find_outputs_for_transaction(
+        &self,
+        txid: &str,
+        include_beef: bool,
+    ) -> Result<Vec<Output>, StorageError> {
+        (**self).find_outputs_for_transaction(txid, include_beef).await
+    }
+    async fn find_utxos_for_topic(
+        &self,
+        topic: &str,
+        since: Option<f64>,
+        limit: Option<u64>,
+        include_beef: bool,
+    ) -> Result<Vec<Output>, StorageError> {
+        (**self)
+            .find_utxos_for_topic(topic, since, limit, include_beef)
+            .await
+    }
+    async fn find_transactions_for_proof_check(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<Vec<TransactionBeef>, StorageError> {
+        (**self)
+            .find_transactions_for_proof_check(limit, min_age_secs)
+            .await
+    }
+    async fn update_last_interaction(
+        &self,
+        host: &str,
+        topic: &str,
+        since: u64,
+    ) -> Result<(), StorageError> {
+        (**self).update_last_interaction(host, topic, since).await
+    }
+    async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError> {
+        (**self).get_last_interaction(host, topic).await
+    }
 }
 
 // ============================================================================
@@ -270,11 +403,51 @@ pub mod memory {
         applied: Mutex<HashMap<(String, String), bool>>,
         /// GASP sync state keyed by (host, topic)
         sync_state: Mutex<HashMap<(String, String), u64>>,
+        /// Deterministic logical clock (seconds) for the push-primary backstop
+        /// age gate — models the D1 backend's `unixepoch()`. Tests advance it
+        /// with [`MemoryStorage::advance_clock`]; no wall clock is ever read
+        /// (wasm-safe, deterministic).
+        clock_secs: Mutex<u64>,
+        /// First-store stamp (clock seconds) per txid — models the D1
+        /// `transactions.created_at` column. A txid ABSENT here has UNKNOWN
+        /// age and is treated as OLD (eligible) — the fail-safe direction.
+        created_at: Mutex<HashMap<String, u64>>,
     }
 
     impl MemoryStorage {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Advance the deterministic logical clock by `secs` (test hook for
+        /// the push-primary backstop age gate — see
+        /// [`Storage::find_transactions_for_proof_check`]).
+        pub fn advance_clock(&self, secs: u64) {
+            *self.clock_secs.lock().unwrap() += secs;
+        }
+
+        /// Stamp `txid`'s first-store time at the current clock if absent
+        /// (models `COALESCE(existing, unixepoch())` in the D1 backend).
+        fn stamp_created(&self, txid: &str) {
+            let now = *self.clock_secs.lock().unwrap();
+            self.created_at
+                .lock()
+                .unwrap()
+                .entry(txid.to_string())
+                .or_insert(now);
+        }
+
+        /// Whether `txid` clears the backstop age gate: unknown age is OLD
+        /// (eligible, fail-safe); otherwise `clock - created >= min_age_secs`.
+        fn age_gate_open(&self, txid: &str, min_age_secs: u64) -> bool {
+            if min_age_secs == 0 {
+                return true;
+            }
+            let now = *self.clock_secs.lock().unwrap();
+            match self.created_at.lock().unwrap().get(txid) {
+                None => true, // unknown age → treated old → eligible
+                Some(created) => now.saturating_sub(*created) >= min_age_secs,
+            }
         }
 
         /// Count total outputs (for testing assertions).
@@ -323,6 +496,7 @@ pub mod memory {
                     .unwrap()
                     .entry(output.txid.clone())
                     .or_insert_with(|| beef.clone());
+                self.stamp_created(&output.txid);
             }
 
             Ok(())
@@ -395,6 +569,9 @@ pub mod memory {
                 .lock()
                 .unwrap()
                 .insert(txid.to_string(), beef.to_vec());
+            // Preserve-or-stamp: a rewrite keeps the ORIGINAL first-store
+            // time (models the D1 COALESCE), so the backstop age stays real.
+            self.stamp_created(txid);
             Ok(())
         }
 
@@ -556,6 +733,7 @@ pub mod memory {
         async fn find_transactions_for_proof_check(
             &self,
             limit: u64,
+            min_age_secs: u64,
         ) -> Result<Vec<TransactionBeef>, StorageError> {
             // Models the real D1 `WHERE has_proof = 0 LIMIT {limit}` query
             // (overlay migration 0010): the candidate set is driven by the
@@ -565,18 +743,27 @@ pub mod memory {
             // every existing row to 0) is therefore STILL returned here — it
             // only drops out once `mark_transaction_proven` flips the flag.
             // This reproduces the window-clog the engine must clear.
-            let transactions = self.transactions.lock().unwrap();
-            let proven = self.proven.lock().unwrap();
-            let results = transactions
-                .iter()
-                .filter(|(txid, _)| !proven.contains(*txid))
+            //
+            // The push-primary backstop age gate (#228) excludes rows younger
+            // than `min_age_secs` (their proof is expected via /arc-ingest);
+            // unknown-age rows stay eligible (fail-safe — trait doc).
+            let candidates: Vec<TransactionBeef> = {
+                let transactions = self.transactions.lock().unwrap();
+                let proven = self.proven.lock().unwrap();
+                transactions
+                    .iter()
+                    .filter(|(txid, _)| !proven.contains(*txid))
+                    .map(|(txid, beef)| TransactionBeef {
+                        txid: txid.clone(),
+                        beef: beef.clone(),
+                    })
+                    .collect()
+            };
+            Ok(candidates
+                .into_iter()
+                .filter(|c| self.age_gate_open(&c.txid, min_age_secs))
                 .take(limit as usize)
-                .map(|(txid, beef)| TransactionBeef {
-                    txid: txid.clone(),
-                    beef: beef.clone(),
-                })
-                .collect();
-            Ok(results)
+                .collect())
         }
 
         async fn update_last_interaction(

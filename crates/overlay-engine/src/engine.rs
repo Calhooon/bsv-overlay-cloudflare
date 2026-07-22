@@ -1304,9 +1304,20 @@ impl Engine {
     /// **No-op when no [`AncestorFetcher`] is configured** — production-safe
     /// default (the same opt-in switch as GASP ancestor hydration). Bounded by
     /// `limit` (a per-tick budget, like the platform fetcher's own budget).
+    ///
+    /// `min_age_secs` is the PUSH-PRIMARY BACKSTOP gate (bsv-low #228 /
+    /// arcade#259): since the Arcade MINED webhook (`/arc-ingest`) pushes a
+    /// verified proof ~150 ms after a tx mines, this poll pass is a BACKSTOP,
+    /// not the primary source — rows stored less than `min_age_secs` ago are
+    /// skipped entirely (their push is still expected). Pass `0` to disable
+    /// the gate (poll everything — the pre-#228 behaviour, and the degradation
+    /// mode if pushes stop: an old-enough row is ALWAYS polled, so webhook
+    /// loss degrades to polling, never to nothing). Unknown-age rows are
+    /// always eligible (fail-safe — see the storage-trait doc).
     pub async fn complete_missing_proofs(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<ProofCompletionSummary, EngineError> {
         let mut summary = ProofCompletionSummary::default();
 
@@ -1318,7 +1329,7 @@ impl Engine {
 
         let candidates = self
             .storage
-            .find_transactions_for_proof_check(limit)
+            .find_transactions_for_proof_check(limit, min_age_secs)
             .await
             .map_err(|e| EngineError::StorageError(e.to_string()))?;
         summary.scanned = candidates.len();
@@ -4114,7 +4125,7 @@ mod tests {
     async fn complete_missing_proofs_noop_without_fetcher() {
         // No ancestor fetcher configured → pure no-op (production default).
         let (engine, _txid) = engine_with_proofless_output(None).await;
-        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        let summary = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary, ProofCompletionSummary::default());
     }
 
@@ -4128,7 +4139,7 @@ mod tests {
         });
         let (engine, txid) = engine_with_proofless_output(Some(fetcher.clone())).await;
 
-        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        let summary = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary.scanned, 1);
         assert_eq!(summary.proofless, 1);
         assert_eq!(summary.completed, 1, "the proofless BEEF should be completed");
@@ -4151,7 +4162,7 @@ mod tests {
 
         // A second pass is a no-op: the tx is now proven, so it is not counted
         // proofless and the fetcher is not asked again.
-        let summary2 = engine.complete_missing_proofs(50).await.unwrap();
+        let summary2 = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary2.proofless, 0);
         assert_eq!(summary2.completed, 0);
         assert_eq!(fetcher.calls.get(), 1, "no re-fetch once proven");
@@ -4166,11 +4177,114 @@ mod tests {
             calls: Cell::new(0),
         });
         let (engine, _txid) = engine_with_proofless_output(Some(fetcher.clone())).await;
-        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        let summary = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary.proofless, 1);
         assert_eq!(summary.completed, 0);
         assert_eq!(summary.still_unconfirmed, 1);
         assert_eq!(fetcher.calls.get(), 1);
+    }
+
+    /// Build an engine like [`engine_with_proofless_output`] but keep a shared
+    /// handle to the `MemoryStorage` (via the `Rc<T: Storage>` delegation) so
+    /// the test can advance its deterministic clock — the push-primary
+    /// backstop age-gate tests (#228) need to age rows without sleeping.
+    async fn engine_with_proofless_output_shared(
+        fetcher: Option<std::rc::Rc<StubFetcher>>,
+    ) -> (Engine, String, std::rc::Rc<MemoryStorage>) {
+        let (beef, txid) = proofless_beef();
+        let storage = std::rc::Rc::new(MemoryStorage::new());
+        storage
+            .insert_output(&Output {
+                txid: txid.clone(),
+                output_index: 0,
+                output_script: vec![0x76],
+                satoshis: 1_000_000_000,
+                topic: "Hello".to_string(),
+                spent: false,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: Some(beef),
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+
+        let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
+        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        let mut engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(storage.clone()),
+            None,
+            EngineConfig::default(),
+        );
+        if let Some(f) = fetcher {
+            engine.set_ancestor_fetcher(f);
+        }
+        (engine, txid, storage)
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_age_gate_young_rows_wait_for_the_push() {
+        // Push-primary backstop (#228): a FRESHLY stored proofless tx must NOT
+        // be polled — its proof is expected via /arc-ingest at push speed. The
+        // gated pass scans nothing and never asks the fetcher.
+        let proof_hex = {
+            let (_beef, txid) = proofless_beef();
+            single_leaf_bump_hex(&txid, 850_000)
+        };
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: Some(proof_hex),
+            calls: Cell::new(0),
+        });
+        let (engine, _txid, storage) =
+            engine_with_proofless_output_shared(Some(fetcher.clone())).await;
+
+        let summary = engine.complete_missing_proofs(50, 1800).await.unwrap();
+        assert_eq!(summary.scanned, 0, "a young row is skipped entirely");
+        assert_eq!(fetcher.calls.get(), 0, "no courier fetch for a young row");
+
+        // WEBHOOK-OUTAGE DEGRADATION: no push ever arrives. Once the row is
+        // older than the gate, the SAME backstop pass polls and completes it
+        // exactly as the pre-#228 behaviour — degradation is to polling,
+        // never to nothing.
+        storage.advance_clock(1800);
+        let summary = engine.complete_missing_proofs(50, 1800).await.unwrap();
+        assert_eq!(summary.scanned, 1, "an old-enough row is always polled");
+        assert_eq!(summary.completed, 1, "the backstop completes the proof");
+        assert_eq!(fetcher.calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_missing_proofs_skips_tx_whose_proof_was_pushed() {
+        // Pushed-proof-then-chaser-skips (#228): a proof arriving via the real
+        // /arc-ingest producer path (`handle_new_merkle_proof` → the
+        // `update_transaction_beef` stitch, which latches `has_proof`) drops
+        // the tx out of the poll candidate set entirely — even after the age
+        // gate opens, the chaser never asks the fetcher about it.
+        let fetcher = std::rc::Rc::new(StubFetcher {
+            proof: None,
+            calls: Cell::new(0),
+        });
+        let (engine, txid, storage) =
+            engine_with_proofless_output_shared(Some(fetcher.clone())).await;
+
+        // The push lands (arc-ingest calls exactly this after its own
+        // chaintracks verify).
+        let proof_hex = single_leaf_bump_hex(&txid, 850_000);
+        engine
+            .handle_new_merkle_proof(&txid, &proof_hex, Some(850_000))
+            .await
+            .unwrap();
+
+        // Age the row well past the backstop gate: still skipped — the pushed
+        // proof, not the age, is what removes it from the chaser's world.
+        storage.advance_clock(1_000_000);
+        let summary = engine.complete_missing_proofs(50, 1800).await.unwrap();
+        assert_eq!(summary.scanned, 0, "a pushed-proof tx is never re-polled");
+        assert_eq!(summary.completed, 0);
+        assert_eq!(fetcher.calls.get(), 0, "the chaser must skip it entirely");
     }
 
     #[tokio::test]
@@ -4223,7 +4337,7 @@ mod tests {
         );
         engine.set_ancestor_fetcher(fetcher.clone());
 
-        let summary = engine.complete_missing_proofs(1).await.unwrap();
+        let summary = engine.complete_missing_proofs(1, 0).await.unwrap();
         assert_eq!(summary.scanned, 1, "limit 1 → only one row scanned");
     }
 
@@ -4303,7 +4417,7 @@ mod tests {
 
         // First pass over a window covering both proven rows: each is detected
         // already-proven and marked. Nothing proofless, nothing fetched.
-        let summary = engine.complete_missing_proofs(50).await.unwrap();
+        let summary = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary.scanned, proven_ids.len());
         assert_eq!(summary.proofless, 0);
         assert_eq!(summary.completed, 0);
@@ -4316,7 +4430,7 @@ mod tests {
 
         // Window has advanced: the NEXT candidate query no longer returns the
         // marked rows, so the pass scans nothing.
-        let summary2 = engine.complete_missing_proofs(50).await.unwrap();
+        let summary2 = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary2.scanned, 0, "marked rows dropped out of the window");
         assert_eq!(summary2.already_proven, 0);
     }
@@ -4399,7 +4513,7 @@ mod tests {
         // 2 rows total a couple of ticks suffice; cap iterations defensively.
         let mut completed_total = 0;
         for _ in 0..5 {
-            let s = engine.complete_missing_proofs(1).await.unwrap();
+            let s = engine.complete_missing_proofs(1, 0).await.unwrap();
             completed_total += s.completed;
             if completed_total > 0 {
                 break;

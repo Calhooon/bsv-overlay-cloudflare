@@ -243,7 +243,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 61;
+pub const OVERLAY_MIGRATION_COUNT: usize = 63;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -683,6 +683,23 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // index so the scan doesn't table-scan pot_records as the landing-proof
     // table grows. Additive, IF NOT EXISTS.
     "CREATE INDEX IF NOT EXISTS idx_pot_spent_unconfirmed ON pot_records(spent, spentConfirmed)",
+    // ── Push-primary backstop age anchors (bsv-low #228 / arcade#259) ─────
+    // /arc-ingest is now the PRIMARY proof source (Arcade pushes a verified
+    // merklePath ~150 ms post-MINED); the poll passes are a BACKSTOP that
+    // only touches rows old enough that their push evidently isn't coming.
+    //
+    // transactions.created_at: first-store time (unix seconds), written
+    // preserve-or-now on every BEEF write (`COALESCE(existing, unixepoch())`).
+    // NULLABLE on purpose: pre-migration rows stay NULL and the candidate
+    // query treats NULL as OLD (eligible) — the fail-safe direction (poll
+    // more, never starve a row of its backstop). Additive ALTER — the runner
+    // ignores the re-run "duplicate column" error.
+    "ALTER TABLE transactions ADD COLUMN created_at INTEGER",
+    // pot_records.spentAt: when the CURRENT spend pointer was recorded (unix
+    // seconds), written by every accepted `mark_spent`. Anchors the #186
+    // spend-chaser's age gate on the SPEND, not the pot admission (a pot can
+    // be spent long after admission). NULL (pre-migration) = OLD/eligible.
+    "ALTER TABLE pot_records ADD COLUMN spentAt INTEGER",
 ];
 
 // =============================================================================
@@ -802,6 +819,28 @@ mod tests {
             sql.trim_start().starts_with("ALTER TABLE pot_records")
                 && sql.contains("spentConfirmed INTEGER NOT NULL DEFAULT 0")
         }));
+    }
+
+    #[test]
+    fn push_backstop_age_anchor_migrations_present() {
+        // #228 push-primary backstop: the two additive age-anchor columns
+        // exist and are NULLABLE (no NOT NULL / DEFAULT) — a pre-migration
+        // NULL must remain observable so the candidate queries can treat
+        // unknown age as OLD/eligible (fail-safe).
+        for (table, column) in [("transactions", "created_at"), ("pot_records", "spentAt")] {
+            let m = OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| {
+                    sql.trim_start()
+                        .starts_with(&format!("ALTER TABLE {table}"))
+                        && sql.contains(&format!("ADD COLUMN {column} INTEGER"))
+                })
+                .unwrap_or_else(|| panic!("missing {table}.{column} migration"));
+            assert!(
+                !m.to_uppercase().contains("NOT NULL"),
+                "{table}.{column} must stay nullable (NULL = unknown age = eligible)"
+            );
+        }
     }
 
     #[test]

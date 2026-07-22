@@ -207,11 +207,16 @@ impl Storage for D1Storage {
                 // ChainProofFetcher → chaintracks verify → `mark_transaction_proven`,
                 // or a genuine bump re-verified before it flips the flag) is the
                 // SOLE thing that ever latches `has_proof = 1`.
+                // created_at is preserve-or-stamp (#228 backstop age anchor):
+                // a REPLACE keeps the original first-store time so the
+                // push-primary backstop's age gate measures real age.
                 Query::new(
-                    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?, ?, 0)",
+                    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at) \
+                     VALUES (?, ?, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?), unixepoch()))",
                 )
                 .bind(&*output.txid)
                 .bind(beef.as_slice())
+                .bind(&*output.txid)
                 .execute(&self.db)
                 .await
                 .map_err(d1_err)?;
@@ -305,14 +310,20 @@ impl Storage for D1Storage {
         // which is the untrusted ADMIT path and always writes has_proof = 0.
         let has_proof = i64::from(Self::beef_has_proof(txid, beef));
 
-        // INSERT OR REPLACE — txid is PRIMARY KEY, so this upserts
-        Query::new("INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?, ?, ?)")
-            .bind(txid)
-            .bind(beef)
-            .bind(has_proof)
-            .execute(&self.db)
-            .await
-            .map_err(d1_err)
+        // INSERT OR REPLACE — txid is PRIMARY KEY, so this upserts.
+        // created_at is preserve-or-stamp (#228): the stitch keeps the row's
+        // original first-store time (age stays real for the backstop gate).
+        Query::new(
+            "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at) \
+             VALUES (?, ?, ?, COALESCE((SELECT created_at FROM transactions WHERE txid = ?), unixepoch()))",
+        )
+        .bind(txid)
+        .bind(beef)
+        .bind(has_proof)
+        .bind(txid)
+        .execute(&self.db)
+        .await
+        .map_err(d1_err)
     }
 
     async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
@@ -494,6 +505,7 @@ impl Storage for D1Storage {
     async fn find_transactions_for_proof_check(
         &self,
         limit: u64,
+        min_age_secs: u64,
     ) -> Result<Vec<TransactionBeef>, StorageError> {
         // Return ONLY proofless rows (#192/#193). The has_proof flag is written
         // on every BEEF write, so this is a direct, cheap, indexed scan that
@@ -507,9 +519,16 @@ impl Storage for D1Storage {
         // order lets never-mineable rows at the head starve the tail forever
         // (zanaadu prod incident). Random sampling guarantees every proofless
         // row is eventually visited regardless of backlog shape.
+        //
+        // Push-primary backstop age gate (#228): rows younger than
+        // min_age_secs are excluded — their proof is expected via /arc-ingest.
+        // NULL created_at (pre-migration) is treated as OLD/eligible
+        // (fail-safe: poll more, never starve a row of its backstop).
         let sql = format!(
             "SELECT txid, hex(beef) as beef FROM transactions \
-             WHERE has_proof = 0 ORDER BY RANDOM() LIMIT {limit}"
+             WHERE has_proof = 0 \
+               AND (created_at IS NULL OR created_at <= unixepoch() - {min_age_secs}) \
+             ORDER BY RANDOM() LIMIT {limit}"
         );
         let rows: Vec<TxBeefRow> = Query::new(sql).fetch_all(&self.db).await.map_err(d1_err)?;
 

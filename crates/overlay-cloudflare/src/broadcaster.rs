@@ -803,8 +803,19 @@ struct ArcadeSubmitError {
     ///    for it, so it is RETRYABLE by definition — classing it definitive
     ///    would manufacture the exact false-verdict bug class #213 fixed,
     ///    inverted.
-    ///  - `466` / `467` — terminal per-tx verdicts (same definitive class as
-    ///    the structured validation-failure body).
+    ///  - `466` — CONFLICT, a VIEW verdict. Verified against arcade's actual
+    ///    code table (`errors/errors.go`: `StatusConflict = 466`;
+    ///    `services/propagation/propagator.go classifyFailureLine`:
+    ///    `TX_CONFLICTING (36) → 466`): a double-spend verdict computed from
+    ///    the PEER'S mempool/UTXO view during propagation — exactly the
+    ///    provably stale-able view class #214 says must never terminate
+    ///    uncorroborated. It re-enters the ladder like an async rejection;
+    ///    its exhausted ladder ends at the #214 corroborator, never at an
+    ///    uncorroborated 422.
+    ///  - `467` — TERMINAL. `StatusGeneric = 467` wraps `TX_INVALID (31)`
+    ///    (script/fee/policy), computed from the tx bytes themselves —
+    ///    provider-independent, the same definitive class as the structured
+    ///    validation-failure body.
     ///  - ABSENT — a pre-#260 responder; classification falls through to the
     ///    `error`-field equality below, byte-for-byte unchanged (tolerance).
     #[serde(default)]
@@ -818,8 +829,16 @@ const ARCADE_VALIDATION_FAILED_ERROR: &str = "transaction failed validation";
 /// #228 (arcade#260): additive `status` code for a NON-FINAL submit — nothing
 /// persisted server-side; retryable after locktime/chain-view catch-up.
 const ARCADE_STATUS_NON_FINAL: u16 = 476;
-/// #228 (arcade#260): additive `status` codes that are TERMINAL per-tx verdicts.
-const ARCADE_STATUS_TERMINAL: [u16; 2] = [466, 467];
+/// #228 (arcade#260): additive `status` code for a CONFLICT verdict — arcade's
+/// `StatusConflict` (`TX_CONFLICTING` from the propagation peer's mempool/UTXO
+/// view). A VIEW verdict, not a bytes verdict: per #214 it must never terminate
+/// the ladder uncorroborated (see `ArcadeSubmitError::status`).
+const ARCADE_STATUS_CONFLICT: u16 = 466;
+/// #228 (arcade#260): additive `status` codes that are TERMINAL per-tx
+/// verdicts. 466 is deliberately NOT here — arcade's own table says it is a
+/// conflict from the peer's stale-able view (the #214/#213 false-verdict
+/// class), so it re-enters the ladder and corroborates on exhaustion.
+const ARCADE_STATUS_TERMINAL: [u16; 1] = [467];
 
 /// #228 (arcade#260): the stable cascade-rejection label. Arcade condemns a
 /// descendant of a rejected ancestor with
@@ -855,6 +874,12 @@ enum SubmitOutcome {
     /// the structured `{"error":"transaction failed validation", …}` body.
     /// Script/fee already failed — a resubmit cannot change it; admit nothing.
     SyncRejected(String),
+    /// A rejection computed from the provider's OWN (provably stale-able,
+    /// #214) mempool/UTXO VIEW — today the arcade#260 `status: 466` conflict
+    /// verdict (`TX_CONFLICTING` seen by a propagation peer). NOT terminal:
+    /// it re-enters the resubmit ladder exactly like an async rejection, and
+    /// its exhausted ladder must pass the #214 corroborator before any 422.
+    ViewRejected(String),
     /// TRANSPORT trouble — 5xx, auth (401/403), gateway misroute (404/405),
     /// rate-limit (429), timeouts, an unrecognised 400. The caller falls back.
     Transport(String),
@@ -905,8 +930,19 @@ fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
                         "Arcade non-final (status 476, retryable — nothing persisted): {reason}"
                     ));
                 }
-                // 466/467: terminal per-tx verdicts — same definitive class
-                // as the structured validation-failure body.
+                // 466 CONFLICT: a verdict from the peer's stale-able
+                // mempool/UTXO view (arcade `StatusConflict` ←
+                // `TX_CONFLICTING`), the #214/#213 class — never terminal
+                // uncorroborated. Re-enters the ladder; exhaustion ends at
+                // the corroborator.
+                Some(ARCADE_STATUS_CONFLICT) => {
+                    return SubmitOutcome::ViewRejected(format!(
+                        "(status 466 conflict — provider-view verdict, corroborate) {reason}"
+                    ));
+                }
+                // 467: terminal per-tx verdict (TX_INVALID — script/fee/policy
+                // computed from the tx bytes) — same definitive class as the
+                // structured validation-failure body.
                 Some(s) if ARCADE_STATUS_TERMINAL.contains(&s) => {
                     return SubmitOutcome::SyncRejected(format!("(status {s}) {reason}"));
                 }
@@ -936,6 +972,35 @@ enum Ladder {
     Return(ArcOutcome),
     /// The 202-then-async-REJECTED shape — advance to the next resubmit.
     Retry,
+}
+
+/// How one classified submit outcome enters the gate (PURE — the real
+/// producer between [`classify_submit_response`] and [`ladder_step`], so the
+/// "466 conflict retries the ladder / 467 terminates it" behaviour is
+/// unit-tested end-to-end without the worker runtime).
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitEntry {
+    /// 2xx accepted-for-processing — proceed to the SEEN gate with this body.
+    Proceed(String),
+    /// A gate step decided synchronously by the submit response itself:
+    /// - `SyncRejected` → terminal via [`ladder_step`] (unless cascade);
+    /// - a [`SubmitOutcome::ViewRejected`] (466 conflict) maps to
+    ///   `AsyncRejected` — the ambiguous/retryable class whose exhausted
+    ///   ladder ends at the #214 corroborator, never an uncorroborated 422.
+    Step(GateStep),
+    /// Transport trouble — the caller falls back (fail-closed).
+    Transport(String),
+}
+
+fn submit_entry(outcome: SubmitOutcome) -> SubmitEntry {
+    match outcome {
+        SubmitOutcome::Processing(body) => SubmitEntry::Proceed(body),
+        SubmitOutcome::SyncRejected(r) => SubmitEntry::Step(GateStep::SyncRejected(r)),
+        // #228/#214: a provider-VIEW verdict (466 conflict) joins the async
+        // class — retry the ladder, corroborate on exhaustion.
+        SubmitOutcome::ViewRejected(r) => SubmitEntry::Step(GateStep::AsyncRejected(r)),
+        SubmitOutcome::Transport(e) => SubmitEntry::Transport(e),
+    }
 }
 
 fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
@@ -1286,10 +1351,10 @@ impl ArcadeBroadcaster {
         subject_txid: &str,
         batch_len: usize,
     ) -> Result<GateStep, String> {
-        let submit_body = match self.submit_ef(endpoint, subject_txid, body).await {
-            SubmitOutcome::Processing(b) => b,
-            SubmitOutcome::SyncRejected(r) => return Ok(GateStep::SyncRejected(r)),
-            SubmitOutcome::Transport(e) => return Err(e),
+        let submit_body = match submit_entry(self.submit_ef(endpoint, subject_txid, body).await) {
+            SubmitEntry::Proceed(b) => b,
+            SubmitEntry::Step(step) => return Ok(step),
+            SubmitEntry::Transport(e) => return Err(e),
         };
 
         // A single submit echoes the current status; a resubmit of a known tx
@@ -1574,25 +1639,62 @@ mod tests {
     }
 
     #[test]
-    fn post260_status_466_467_are_terminal_and_do_not_retry() {
-        for code in [466u16, 467] {
-            let body = format!(
-                r#"{{"error":"transaction failed validation","reason":"TX_INVALID (31): terminal verdict","status":{code}}}"#
-            );
-            let step = match classify_submit_response(400, &body) {
-                SubmitOutcome::SyncRejected(r) => {
-                    assert!(r.contains(&format!("status {code}")), "{r}");
-                    GateStep::SyncRejected(r)
-                }
-                other => panic!("status {code} must be SyncRejected, got {other:?}"),
-            };
-            // Terminal all the way through the real ladder producer: Return,
-            // never Retry.
-            assert!(
-                matches!(ladder_step(step, "ab"), Ladder::Return(ArcOutcome::Rejected(_))),
-                "status {code} must terminate the ladder"
-            );
-        }
+    fn post260_status_467_is_terminal_and_does_not_retry() {
+        // 467 = arcade StatusGeneric ← TX_INVALID (31): script/fee/policy,
+        // computed from the tx bytes — provider-independent, definitive.
+        let body = r#"{"error":"transaction failed validation","reason":"TX_INVALID (31): terminal verdict","status":467}"#;
+        let step = match classify_submit_response(400, body) {
+            SubmitOutcome::SyncRejected(r) => {
+                assert!(r.contains("status 467"), "{r}");
+                r
+            }
+            other => panic!("status 467 must be SyncRejected, got {other:?}"),
+        };
+        // Terminal all the way through the real producers: submit_entry keeps
+        // it a SyncRejected step and ladder_step Returns, never Retries.
+        let entry = submit_entry(SubmitOutcome::SyncRejected(step));
+        let SubmitEntry::Step(gate_step) = entry else {
+            panic!("467 must enter the gate as a step, got {entry:?}");
+        };
+        assert!(
+            matches!(
+                ladder_step(gate_step, "ab"),
+                Ladder::Return(ArcOutcome::Rejected(_))
+            ),
+            "status 467 must terminate the ladder"
+        );
+    }
+
+    #[test]
+    fn post260_status_466_conflict_retries_and_corroborates_never_terminal() {
+        // 466 = arcade StatusConflict ← TX_CONFLICTING (36): a double-spend
+        // verdict from the propagation PEER'S mempool/UTXO view — the provably
+        // stale-able #214/#213 class. Verified against arcade's own table
+        // (errors/errors.go + propagator.go classifyFailureLine). Classing it
+        // terminal would manufacture an uncorroborated false 422 for a tx a
+        // stale view merely BELIEVES conflicted. Through the real producers:
+        // classify → ViewRejected → submit_entry → AsyncRejected → ladder
+        // Retry (whose exhaustion path is the #214 corroborator).
+        let body = r#"{"error":"transaction failed validation","reason":"TX_CONFLICTING (36): double spend detected","status":466}"#;
+        let outcome = classify_submit_response(400, body);
+        let SubmitOutcome::ViewRejected(reason) = outcome else {
+            panic!("status 466 must be ViewRejected (view verdict), got {outcome:?}");
+        };
+        assert!(reason.contains("466"), "{reason}");
+
+        let entry = submit_entry(SubmitOutcome::ViewRejected(reason));
+        let SubmitEntry::Step(step) = entry else {
+            panic!("466 must enter the gate as a step, got {entry:?}");
+        };
+        assert!(
+            matches!(step, GateStep::AsyncRejected(_)),
+            "466 must join the async/ambiguous class, got {step:?}"
+        );
+        assert_eq!(
+            ladder_step(step, "ab"),
+            Ladder::Retry,
+            "a 466 conflict must resubmit (and corroborate on exhaustion), never 422 outright"
+        );
     }
 
     #[test]
