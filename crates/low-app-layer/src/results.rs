@@ -74,6 +74,24 @@
 //!   `tm_result` claim for the game agrees on one winner among the two
 //!   parties AND names the chain-classified settle — claim-corroborated
 //!   chain truth, never a bare claim (`outcomeSource` says which).
+//!
+//! ## Claim signatures are VERIFIED server-side before they corroborate
+//!
+//! `tm_result` admits markers by BYTE FORMAT only — anyone can publish a
+//! marker naming any winner/loser/settle. So before a claim participates in
+//! won/lost attribution its signatures are re-verified HERE, with the exact
+//! recipe the client's `result.ts::verifyResultRow` uses: BRC-42/43
+//! 'anyone'-key verification (`ProtoWallet::anyone()`, protocol
+//! `[1, 'low result']`, keyID = gameId) — the winner's sig under the WINNER
+//! identity over the canonical result challenge, the loser's countersig
+//! under the LOSER identity over the same bytes. A claim whose winner sig
+//! does not verify contributes NOTHING (as if never published); a
+//! present-but-unverifiable countersig degrades to "no countersig" (the
+//! client's `unconfirmed` demotion). The outcome tiers stay honest:
+//! `won` needs the winner's VERIFIED sig; `lost` needs the loser's (the
+//! caller's own) VERIFIED countersig — so a fabricated marker naming the
+//! real settle txid can never flip the reported winner when the honest side
+//! never published (adversarial-review finding, 2026-07-22).
 
 use serde_json::json;
 
@@ -542,16 +560,152 @@ pub struct ResultsRow {
     pub spender_beef_hex: Option<String>,
 }
 
-/// A game's `tm_result` claims relevant to won/lost attribution: every
-/// distinct claimed winner over markers naming `settle_txid` as the settle.
-/// (Claims are BYTE-FORMAT admitted and NOT signature-verified server-side —
-/// the same trust posture as `/leaderboard`; that is why a claim can only
-/// CORROBORATE a chain-classified winner spend, never create one, and why
-/// conflicting claims yield `unresolved`.)
+/// A game's SIGNATURE-VERIFIED `tm_result` claims relevant to won/lost
+/// attribution. Only markers whose WINNER signature verified under the
+/// claimed winner's identity make it in at all (`verified_claim`); claims
+/// remain corroboration-only — a claim can never create a result the chain
+/// did not classify, and conflicting claims yield `unresolved`.
 #[derive(Debug, Clone, Default)]
 pub struct GameClaims {
-    /// Lowercased distinct (winner identity, settle txid, both_sigs) tuples.
-    pub claims: Vec<(String, String, bool)>,
+    pub claims: Vec<ClaimFact>,
+}
+
+/// One verified claim fact (all fields lowercased). Existence of a
+/// `ClaimFact` MEANS the winner's signature verified over the canonical
+/// challenge; `loser_sig_verified` reports the countersig independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimFact {
+    /// Claimed winner identity — its signature VERIFIED.
+    pub winner: String,
+    /// Claimed loser identity (whose countersig, if any, is judged below).
+    pub loser: String,
+    /// The settle txid the claim names (the chain-verdict binding).
+    pub settle_txid: String,
+    /// True iff a loser countersig was present AND verified under `loser`.
+    pub loser_sig_verified: bool,
+}
+
+// ── server-side claim signature verification ────────────────────────────────
+//
+// The exact recipe of the client's `result.ts` — same protocol, same keyID,
+// same challenge bytes, same 'anyone' verifier. BRC-42 derivation is
+// byte-identical across the Rust and TS SDKs (cross-vectored in bsv-rs;
+// production-proven by the LOW lobby tokens, which the TS app signs and
+// `overlay-discovery`'s Rust topic manager verifies with this same
+// `ProtoWallet::anyone()` pattern).
+
+/// The BRC-43 protocol result claims are signed under —
+/// `result.ts::RESULT_PROTOCOL` = `[1, 'low result']`.
+fn result_protocol() -> bsv_rs::wallet::Protocol {
+    bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low result")
+}
+
+/// Canonicalize a v2 cards push: 10 hex chars → five DISTINCT ordinals
+/// 0..=51, sorted ascending, re-encoded lowercase — `result.ts::cardsToHex ∘
+/// cardsFromHex`. `None` = malformed (an unverifiable claim: the sigs bind
+/// the canonical cards, so we must be able to reconstruct them).
+fn canonical_cards_hex(cards_hex: &str) -> Option<String> {
+    let mut cards = hex::decode(cards_hex).ok()?;
+    if cards.len() != 5 || cards.iter().any(|&c| c > 51) {
+        return None;
+    }
+    cards.sort_unstable();
+    if cards.windows(2).any(|w| w[0] == w[1]) {
+        return None;
+    }
+    Some(hex::encode(cards))
+}
+
+/// The canonical signed challenge — byte-identical to
+/// `result.ts::resultChallenge` (all fields lowercased; v2 binds the
+/// canonical sorted cards). Inputs must already be lowercase.
+fn result_challenge_bytes(
+    game_id_lc: &str,
+    winner_lc: &str,
+    loser_lc: &str,
+    pot_lc: &str,
+    settle_lc: &str,
+    cards_hex: Option<&str>,
+) -> Option<Vec<u8>> {
+    let base = format!(
+        "gid={game_id_lc}\nwinner={winner_lc}\nloser={loser_lc}\npot={pot_lc}\nsettle={settle_lc}"
+    );
+    let s = match cards_hex {
+        Some(ch) => {
+            let cards = canonical_cards_hex(ch)?;
+            format!("LOW-result\nv2\n{base}\ncards={cards}")
+        }
+        None => format!("LOW-result\nv1\n{base}"),
+    };
+    Some(s.into_bytes())
+}
+
+/// Verify one DER signature under `signer_identity_hex` over `challenge`
+/// with the public 'anyone' verifier — the mirror of the client's
+/// `anyoneVerifier.verifySignature({counterparty: signer, forSelf: false})`.
+/// Any malformed key/sig/derivation failure is simply `false` (fail-safe:
+/// an unverifiable signature never corroborates).
+fn anyone_sig_verifies(
+    signer_identity_hex: &str,
+    key_id: &str,
+    challenge: &[u8],
+    sig_hex: &str,
+) -> bool {
+    let Ok(signer) = bsv_rs::primitives::ec::PublicKey::from_hex(signer_identity_hex) else {
+        return false;
+    };
+    let Ok(sig) = hex::decode(sig_hex) else {
+        return false;
+    };
+    bsv_rs::wallet::ProtoWallet::anyone()
+        .verify_signature(bsv_rs::wallet::VerifySignatureArgs {
+            data: Some(challenge.to_vec()),
+            hash_to_directly_verify: None,
+            signature: sig,
+            protocol_id: result_protocol(),
+            key_id: key_id.to_string(),
+            counterparty: Some(bsv_rs::wallet::Counterparty::Other(signer)),
+            for_self: Some(false),
+        })
+        .map(|r| r.valid)
+        .unwrap_or(false)
+}
+
+/// Verify one raw `result_markers_v2` row into a [`ClaimFact`], or `None`
+/// when it must contribute nothing: self-paired, malformed cards, or a
+/// winner signature that does not verify under the claimed winner identity.
+/// A present-but-unverifiable LOSER countersig does not kill the claim — it
+/// degrades to `loser_sig_verified: false` (the client's `unconfirmed`
+/// demotion in `verifyResultRow`): the winner's own claim still stands,
+/// only the confirmation tier is garbage.
+pub fn verified_claim(m: &ResultMarkerRow) -> Option<ClaimFact> {
+    let winner_lc = m.winner.to_ascii_lowercase();
+    let loser_lc = m.loser.to_ascii_lowercase();
+    if winner_lc == loser_lc {
+        return None; // self-paired claims are invalid (client parity)
+    }
+    let game_lc = m.game_id.to_ascii_lowercase();
+    let challenge = result_challenge_bytes(
+        &game_lc,
+        &winner_lc,
+        &loser_lc,
+        &m.pot_txid.to_ascii_lowercase(),
+        &m.settle_txid.to_ascii_lowercase(),
+        m.cards_hex.as_deref(),
+    )?;
+    if !anyone_sig_verifies(&winner_lc, &game_lc, &challenge, &m.winner_sig_hex) {
+        return None; // fabricated/garbled claim — as if never published
+    }
+    let loser_sig_verified = m
+        .loser_sig_hex
+        .as_deref()
+        .is_some_and(|s| anyone_sig_verifies(&loser_lc, &game_lc, &challenge, s));
+    Some(ClaimFact {
+        winner: winner_lc,
+        loser: loser_lc,
+        settle_txid: m.settle_txid.to_ascii_lowercase(),
+        loser_sig_verified,
+    })
 }
 
 /// One `/results` response entry, pre-JSON.
@@ -600,15 +754,24 @@ impl Outcome {
     }
 }
 
-/// Map a chain verdict (+ claims) to the identity's outcome.
+/// Map a chain verdict (+ VERIFIED claims) to the identity's outcome.
 ///
 /// - `tie` / `refund` are seat-symmetric → pure chain truth.
-/// - a winner verdict upgrades to won/lost ONLY when every on-record claim
-///   that names the classified settle txid agrees on ONE winner and that
-///   winner is one of the two parties (the caller or its opponent). No
-///   claims, conflicting claims, or a claimed winner outside the pair →
+/// - a winner verdict upgrades ONLY when every verified on-record claim that
+///   names the classified settle txid agrees on ONE winner and that winner
+///   is one of the two parties (the caller or its opponent). No claims,
+///   conflicting claims, or a claimed winner outside the pair →
 ///   `unresolved` (the chain alone cannot name the seat's identity — module
 ///   note).
+/// - the tiers are key-honest (every `ClaimFact` already carries a VERIFIED
+///   winner sig — `claims_by_game` drops the rest):
+///   * `won` — the unanimous verified winner is the caller. Nobody can put
+///     the caller here without the caller's own key.
+///   * `lost` — the unanimous verified winner is the opponent AND some claim
+///     naming this settle carries the CALLER's verified countersig
+///     (`loser == identity`, `loser_sig_verified`). The caller attested the
+///     loss itself; an opponent-only (or third-party-countersigned) claim
+///     never shows the caller a loss.
 pub fn derive_outcome(
     verdict: Option<PotVerdict>,
     identity_lc: &str,
@@ -623,18 +786,28 @@ pub fn derive_outcome(
             let (Some(settle), Some(gc)) = (settle_txid_lc, claims) else {
                 return (Outcome::Unresolved, None);
             };
-            // Distinct claimed winners naming THIS settle, both sigs present.
-            let mut winners: Vec<&str> = gc
+            // The verified claims naming THIS settle.
+            let relevant: Vec<&ClaimFact> = gc
                 .claims
                 .iter()
-                .filter(|(_, s, both)| *both && s.eq_ignore_ascii_case(settle))
-                .map(|(w, _, _)| w.as_str())
+                .filter(|c| c.settle_txid.eq_ignore_ascii_case(settle))
                 .collect();
+            let mut winners: Vec<&str> = relevant.iter().map(|c| c.winner.as_str()).collect();
             winners.sort_unstable();
             winners.dedup();
             match winners.as_slice() {
                 [w] if w.eq_ignore_ascii_case(identity_lc) => (Outcome::Won, Some("chain+claim")),
-                [w] if w.eq_ignore_ascii_case(opponent_lc) => (Outcome::Lost, Some("chain+claim")),
+                [w] if w.eq_ignore_ascii_case(opponent_lc) => {
+                    // Lost needs the caller's OWN verified countersig.
+                    if relevant
+                        .iter()
+                        .any(|c| c.loser.eq_ignore_ascii_case(identity_lc) && c.loser_sig_verified)
+                    {
+                        (Outcome::Lost, Some("chain+claim"))
+                    } else {
+                        (Outcome::Unresolved, None)
+                    }
+                }
                 _ => (Outcome::Unresolved, None),
             }
         }
@@ -716,18 +889,19 @@ pub fn assemble_results(
     out
 }
 
-/// Build the claims-by-game map from raw `result_markers_v2` rows.
+/// Build the claims-by-game map from raw `result_markers_v2` rows — each
+/// marker goes through `verified_claim` (real ECDSA over the reconstructed
+/// challenge) and an unverifiable one is DROPPED here, so nothing downstream
+/// ever sees a claim whose winner signature did not verify.
 pub fn claims_by_game(markers: &[ResultMarkerRow]) -> std::collections::HashMap<String, GameClaims> {
     let mut map: std::collections::HashMap<String, GameClaims> = std::collections::HashMap::new();
     for m in markers {
-        map.entry(m.game_id.to_ascii_lowercase())
-            .or_default()
-            .claims
-            .push((
-                m.winner.to_ascii_lowercase(),
-                m.settle_txid.to_ascii_lowercase(),
-                m.loser_sig_hex.is_some(),
-            ));
+        if let Some(fact) = verified_claim(m) {
+            map.entry(m.game_id.to_ascii_lowercase())
+                .or_default()
+                .claims
+                .push(fact);
+        }
     }
     map
 }
@@ -944,11 +1118,21 @@ mod tests {
 
     // ── outcome derivation ─────────────────────────────────────────────
 
-    fn claims_of(entries: &[(&str, &str, bool)]) -> GameClaims {
+    /// Post-verification claim facts (winner, loser, settle, loser_verified)
+    /// — the shape `claims_by_game` emits AFTER real signature verification.
+    /// The adversarial tests further below go through the REAL producer
+    /// (`claims_by_game` over signed markers); these tuples unit-test the
+    /// outcome table itself.
+    fn claims_of(entries: &[(&str, &str, &str, bool)]) -> GameClaims {
         GameClaims {
             claims: entries
                 .iter()
-                .map(|(w, s, both)| (w.to_string(), s.to_string(), *both))
+                .map(|(w, l, s, lv)| ClaimFact {
+                    winner: w.to_string(),
+                    loser: l.to_string(),
+                    settle_txid: s.to_string(),
+                    loser_sig_verified: *lv,
+                })
                 .collect(),
         }
     }
@@ -975,45 +1159,58 @@ mod tests {
         let (o, src) = derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), None);
         assert_eq!((o, src), (Outcome::Unresolved, None));
 
-        // A unanimous both-sig claim naming ME for THIS settle → won.
-        let gc = claims_of(&[(&me, &settle, true)]);
+        // A unanimous countersigned claim naming ME for THIS settle → won.
+        let gc = claims_of(&[(&me, &opp, &settle, true)]);
         let (o, src) =
             derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
         assert_eq!((o, src), (Outcome::Won, Some("chain+claim")));
 
-        // The same claim from the OPPONENT's perspective → lost.
+        // The same claim from the OPPONENT's perspective → lost (its OWN
+        // countersig verified).
         let (o, src) =
             derive_outcome(Some(PotVerdict::WinnerA), &opp, &me, Some(&settle), Some(&gc));
         assert_eq!((o, src), (Outcome::Lost, Some("chain+claim")));
 
         // Conflicting claims (both parties claim the same settle) → nobody.
-        let gc = claims_of(&[(&me, &settle, true), (&opp, &settle, true)]);
+        let gc = claims_of(&[(&me, &opp, &settle, true), (&opp, &me, &settle, true)]);
         let (o, _) =
             derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
         assert_eq!(o, Outcome::Unresolved);
 
-        // A single-sig (unconfirmed) claim never upgrades.
-        let gc = claims_of(&[(&me, &settle, false)]);
-        let (o, _) =
+        // A winner-sig-only claim (no verified countersig): the WINNER's tier
+        // is earned (its own verified key), but the LOSER is NEVER shown a
+        // loss it did not countersign.
+        let gc = claims_of(&[(&me, &opp, &settle, false)]);
+        let (o, src) =
             derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
+        assert_eq!((o, src), (Outcome::Won, Some("chain+claim")));
+        let (o, src) =
+            derive_outcome(Some(PotVerdict::WinnerA), &opp, &me, Some(&settle), Some(&gc));
+        assert_eq!((o, src), (Outcome::Unresolved, None));
+
+        // A countersig by a THIRD PARTY (claim's loser is not the caller)
+        // never shows the caller a loss.
+        let gc = claims_of(&[(&me, &ident(0xcc), &settle, true)]);
+        let (o, _) =
+            derive_outcome(Some(PotVerdict::WinnerA), &opp, &me, Some(&settle), Some(&gc));
         assert_eq!(o, Outcome::Unresolved);
 
         // A claim naming a DIFFERENT settle never corroborates this one.
-        let gc = claims_of(&[(&me, &tx(0x33), true)]);
+        let gc = claims_of(&[(&me, &opp, &tx(0x33), true)]);
         let (o, _) =
             derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
         assert_eq!(o, Outcome::Unresolved);
 
         // A claimed winner OUTSIDE the two parties → unresolved (a foreign
         // marker can't award this pot to anyone).
-        let gc = claims_of(&[(&ident(0xcc), &settle, true)]);
+        let gc = claims_of(&[(&ident(0xcc), &ident(0xdd), &settle, true)]);
         let (o, _) =
             derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
         assert_eq!(o, Outcome::Unresolved);
 
         // No verdict at all → unresolved even with a pretty claim (a claim
         // alone NEVER makes a server-derived result — the owner directive).
-        let gc = claims_of(&[(&me, &settle, true)]);
+        let gc = claims_of(&[(&me, &opp, &settle, true)]);
         let (o, _) = derive_outcome(None, &me, &opp, Some(&settle), Some(&gc));
         assert_eq!(o, Outcome::Unresolved);
     }
@@ -1141,25 +1338,267 @@ mod tests {
         assert_eq!(r["settleTxid"], tx(0x03));
     }
 
-    #[test]
-    fn claims_map_carries_settle_binding_and_sig_presence() {
-        let m = ResultMarkerRow {
-            game_id: tx(0x01).to_ascii_uppercase(), // case-normalized
-            winner: ident(0xaa),
-            loser: ident(0xbb),
-            pot_txid: tx(0x02),
-            settle_txid: tx(0x03),
-            winner_sig_hex: "3045ab".into(),
-            loser_sig_hex: None,
-            cards_hex: None,
+    // ── server-side claim signature verification (adversarial) ─────────
+    //
+    // Real ECDSA round-trips through the REAL producer path
+    // (`claims_by_game` → `derive_outcome`) — never a mocked verify, never
+    // hand-fed post-verification facts (repo doctrine). The signing recipe
+    // is the client's exactly: `createSignature` for counterparty 'anyone'
+    // under `[1,'low result']` with keyID = gameId.
+
+    use bsv_rs::primitives::ec::PrivateKey;
+    use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet};
+
+    /// Deterministic test wallet (same test-key crypto the workspace's
+    /// topic-manager tests use — a pinned root private key).
+    fn wallet_of(seed: u8) -> ProtoWallet {
+        let key = PrivateKey::from_hex(&format!("{seed:064x}")).unwrap();
+        ProtoWallet::new(Some(key))
+    }
+
+    fn identity_of(w: &ProtoWallet) -> String {
+        w.identity_key_hex().to_ascii_lowercase()
+    }
+
+    /// Sign the canonical result challenge as the client does (counterparty
+    /// 'anyone', keyID = gameId), returning DER hex.
+    fn sign_result(w: &ProtoWallet, game_id: &str, challenge: &[u8]) -> String {
+        let sig = w
+            .create_signature(CreateSignatureArgs {
+                data: Some(challenge.to_vec()),
+                hash_to_directly_sign: None,
+                protocol_id: result_protocol(),
+                key_id: game_id.to_string(),
+                counterparty: Some(Counterparty::Anyone),
+            })
+            .unwrap();
+        hex::encode(sig.signature)
+    }
+
+    /// A marker row over the standard test claim shape; sigs supplied by the
+    /// caller (real, forged, or absent).
+    #[allow(clippy::too_many_arguments)]
+    fn marker(
+        game: &str,
+        winner: &str,
+        loser: &str,
+        pot: &str,
+        settle: &str,
+        cards_hex: Option<&str>,
+        winner_sig_hex: String,
+        loser_sig_hex: Option<String>,
+    ) -> ResultMarkerRow {
+        ResultMarkerRow {
+            game_id: game.to_string(),
+            winner: winner.to_string(),
+            loser: loser.to_string(),
+            pot_txid: pot.to_string(),
+            settle_txid: settle.to_string(),
+            winner_sig_hex,
+            loser_sig_hex,
+            cards_hex: cards_hex.map(str::to_string),
             txid: tx(0x04),
             created_at: Some(1),
-        };
-        let map = claims_by_game(&[m]);
-        let gc = map.get(&tx(0x01)).unwrap();
+        }
+    }
+
+    /// A plausibly-shaped but FABRICATED DER sig (valid hex, garbage bytes).
+    fn garbage_sig() -> String {
+        format!("3045{}", "ab".repeat(69))
+    }
+
+    #[test]
+    fn fabricated_sig_claim_contributes_nothing_and_never_flips_the_winner() {
+        // THE finding scenario: the loser fabricates a marker naming the REAL
+        // settle txid and themselves as winner, with garbage sig bytes — and
+        // pads a garbage "countersig" so the old `loser_sig_hex.is_some()`
+        // check would have counted it as both-signed. The honest side never
+        // published. Server-side verification must drop the whole claim.
+        let honest = wallet_of(0x11);
+        let liar = wallet_of(0x22);
+        let (h, l) = (identity_of(&honest), identity_of(&liar));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+
+        let fabricated = marker(
+            &game, &l, &h, &pot, &settle, None,
+            garbage_sig(),
+            Some(garbage_sig()),
+        );
+        let map = claims_by_game(&[fabricated]);
+        assert!(
+            !map.contains_key(&game),
+            "a claim with an unverifiable winner sig must contribute NOTHING"
+        );
+        // Outcome: unresolved for BOTH parties — the honest player is never
+        // shown a fabricated loss, the liar never a fabricated win.
+        for (me, opp) in [(&h, &l), (&l, &h)] {
+            let (o, src) =
+                derive_outcome(Some(PotVerdict::WinnerA), me, opp, Some(&settle), map.get(&game));
+            assert_eq!((o, src), (Outcome::Unresolved, None));
+        }
+    }
+
+    #[test]
+    fn real_signed_claim_upgrades_and_forged_countersig_never_shows_a_loss() {
+        let winner_w = wallet_of(0x11);
+        let loser_w = wallet_of(0x22);
+        let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+        let challenge = result_challenge_bytes(&game, &w, &l, &pot, &settle, None).unwrap();
+        let w_sig = sign_result(&winner_w, &game, &challenge);
+        let l_sig = sign_result(&loser_w, &game, &challenge);
+
+        // Fully countersigned: winner → won, loser → lost (both verified).
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, None, w_sig.clone(), Some(l_sig),
+        )]);
+        let gc = map.get(&game).unwrap();
         assert_eq!(gc.claims.len(), 1);
-        assert_eq!(gc.claims[0].1, tx(0x03));
-        assert!(!gc.claims[0].2, "single-sig marker is not both-signed");
+        assert!(gc.claims[0].loser_sig_verified);
+        let (o, src) = derive_outcome(Some(PotVerdict::WinnerA), &w, &l, Some(&settle), Some(gc));
+        assert_eq!((o, src), (Outcome::Won, Some("chain+claim")));
+        let (o, src) = derive_outcome(Some(PotVerdict::WinnerA), &l, &w, Some(&settle), Some(gc));
+        assert_eq!((o, src), (Outcome::Lost, Some("chain+claim")));
+
+        // FORGED countersig (garbage bytes next to a REAL winner sig): the
+        // claim survives at winner-sig tier (client's `unconfirmed` demotion)
+        // — winner still won, but the loser is NEVER shown a loss it did not
+        // itself countersign. (The old presence-only check called this
+        // both-signed and reported `lost`.)
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, None, w_sig.clone(), Some(garbage_sig()),
+        )]);
+        let gc = map.get(&game).unwrap();
+        assert!(!gc.claims[0].loser_sig_verified);
+        let (o, _) = derive_outcome(Some(PotVerdict::WinnerA), &w, &l, Some(&settle), Some(gc));
+        assert_eq!(o, Outcome::Won);
+        let (o, src) = derive_outcome(Some(PotVerdict::WinnerA), &l, &w, Some(&settle), Some(gc));
+        assert_eq!((o, src), (Outcome::Unresolved, None));
+
+        // A countersig by the WRONG key (the winner signing "the loser's"
+        // countersig) never verifies under the loser identity either.
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, None, w_sig, Some(sign_result(&winner_w, &game, &challenge)),
+        )]);
+        assert!(!map.get(&game).unwrap().claims[0].loser_sig_verified);
+    }
+
+    #[test]
+    fn disagreeing_verified_claims_stay_unresolved() {
+        // Both parties publish REAL self-signed claims for the same settle —
+        // unanimity fails, nobody gets an outcome (verdict-only honesty).
+        let a = wallet_of(0x11);
+        let b = wallet_of(0x22);
+        let (ia, ib) = (identity_of(&a), identity_of(&b));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+        let ch_a = result_challenge_bytes(&game, &ia, &ib, &pot, &settle, None).unwrap();
+        let ch_b = result_challenge_bytes(&game, &ib, &ia, &pot, &settle, None).unwrap();
+        let map = claims_by_game(&[
+            marker(&game, &ia, &ib, &pot, &settle, None, sign_result(&a, &game, &ch_a), None),
+            marker(&game, &ib, &ia, &pot, &settle, None, sign_result(&b, &game, &ch_b), None),
+        ]);
+        let gc = map.get(&game).unwrap();
+        assert_eq!(gc.claims.len(), 2, "both real claims verify");
+        for (me, opp) in [(&ia, &ib), (&ib, &ia)] {
+            let (o, src) =
+                derive_outcome(Some(PotVerdict::WinnerA), me, opp, Some(&settle), Some(gc));
+            assert_eq!((o, src), (Outcome::Unresolved, None));
+        }
+    }
+
+    #[test]
+    fn sig_over_a_different_challenge_never_corroborates() {
+        // A REAL signature, but the marker's fields disagree with what was
+        // signed (here: a different settle txid) — the reconstructed
+        // challenge differs, the sig fails, the claim contributes nothing.
+        let winner_w = wallet_of(0x11);
+        let loser_w = wallet_of(0x22);
+        let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
+        let (game, pot) = (tx(0x01), tx(0x02));
+        let signed_settle = tx(0x03);
+        let named_settle = tx(0x33);
+        let challenge =
+            result_challenge_bytes(&game, &w, &l, &pot, &signed_settle, None).unwrap();
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &named_settle, None,
+            sign_result(&winner_w, &game, &challenge),
+            None,
+        )]);
+        assert!(!map.contains_key(&game));
+    }
+
+    #[test]
+    fn v2_cards_are_bound_by_the_signatures() {
+        // v2: the sigs bind the canonical cards. A marker whose cardsHex was
+        // tampered (or garbled) after signing must contribute nothing; the
+        // untampered claim verifies (including a non-canonical but
+        // set-identical cards encoding — client parity: both sides
+        // canonicalize before challenge reconstruction).
+        let winner_w = wallet_of(0x11);
+        let loser_w = wallet_of(0x22);
+        let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+        let cards = "0001020304"; // ordinals 0..4, canonical
+        let challenge =
+            result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cards)).unwrap();
+        let w_sig = sign_result(&winner_w, &game, &challenge);
+
+        // Untampered → verifies.
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, Some(cards), w_sig.clone(), None,
+        )]);
+        assert_eq!(map.get(&game).unwrap().claims.len(), 1);
+
+        // Unsorted-but-identical set → same canonical challenge → verifies.
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, Some("0403020100"), w_sig.clone(), None,
+        )]);
+        assert_eq!(map.get(&game).unwrap().claims.len(), 1);
+
+        // Tampered hand → dropped.
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, Some("0001020305"), w_sig.clone(), None,
+        )]);
+        assert!(!map.contains_key(&game));
+
+        // Malformed cards (duplicate ordinal) → unverifiable → dropped.
+        let map = claims_by_game(&[marker(
+            &game, &w, &l, &pot, &settle, Some("0000010203"), w_sig, None,
+        )]);
+        assert!(!map.contains_key(&game));
+    }
+
+    #[test]
+    fn self_paired_and_case_variant_markers_are_handled() {
+        // winner === loser is invalid regardless of signatures (client
+        // parity), and an upper-cased marker row still verifies (all
+        // challenge fields are lowercased before reconstruction).
+        let winner_w = wallet_of(0x11);
+        let loser_w = wallet_of(0x22);
+        let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+        let ch_self = result_challenge_bytes(&game, &w, &w, &pot, &settle, None).unwrap();
+        let map = claims_by_game(&[marker(
+            &game, &w, &w, &pot, &settle, None,
+            sign_result(&winner_w, &game, &ch_self),
+            None,
+        )]);
+        assert!(!map.contains_key(&game), "self-paired claim never counts");
+
+        let challenge = result_challenge_bytes(&game, &w, &l, &pot, &settle, None).unwrap();
+        let map = claims_by_game(&[marker(
+            &game.to_ascii_uppercase(),
+            &w.to_ascii_uppercase(),
+            &l.to_ascii_uppercase(),
+            &pot.to_ascii_uppercase(),
+            &settle.to_ascii_uppercase(),
+            None,
+            sign_result(&winner_w, &game, &challenge),
+            None,
+        )]);
+        let gc = map.get(&game).unwrap();
+        assert_eq!(gc.claims.len(), 1);
+        assert_eq!(gc.claims[0].settle_txid, settle);
     }
 
     // ── param-push / script-number hygiene ─────────────────────────────
