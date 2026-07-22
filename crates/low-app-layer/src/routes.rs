@@ -24,9 +24,9 @@ use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
 
 use crate::logic::{
-    aggregate_leaderboard, assemble_pots_view, assemble_recovery_view, assemble_statuses,
-    batch_where_sql, beef_body, chunk_outpoints, clamp_leaderboard_limit, decode_beef_hex,
-    health_body, leaderboard_body, leaderboard_pot_outpoints, parse_outpoints,
+    aggregate_leaderboard_with_verdicts, assemble_pots_view, assemble_recovery_view,
+    assemble_statuses, batch_where_sql, beef_body, chunk_outpoints, clamp_leaderboard_limit,
+    decode_beef_hex, health_body, leaderboard_body, leaderboard_pot_outpoints, parse_outpoints,
     parse_present_height, pots_view_body, pots_view_join_sql, recovery_view_body,
     recovery_view_sql, tip_body, utxo_status_body, valid_identity, valid_txid, Outpoint,
     PotRecordRow, PotsViewRow, RecoveryRow, ResultMarkerRow,
@@ -608,9 +608,415 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         Err(e) => console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}"),
     }
 
-    let lb = aggregate_leaderboard(&markers, &statuses, &proof_map, limit);
+    // 4) Server-derived CHAIN classification of the spent pots (bsv-low #227)
+    // — an ADDITIVE truth source folded in alongside the client claims.
+    // BEST-EFFORT + BOUNDED: at most LEADERBOARD_CLASSIFY_CAP pots (newest
+    // marker order), pot_beefs fetched in ≤45-bind chunks (the D1 param-cap
+    // discipline); any fault only omits classifications (counting falls back
+    // to the pre-#227 claim rules) — never a 5xx, never a fabricated verdict.
+    let verdicts = classify_spent_pots(&db, &statuses).await;
+
+    let lb = aggregate_leaderboard_with_verdicts(&markers, &statuses, &proof_map, limit, &verdicts);
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
     json_response(leaderboard_body(&lb, computed_at, markers.len()), 200)
+}
+
+/// Hard bound on pots classified per `/leaderboard` request (each pot costs
+/// two BLOB reads + two BEEF parses; the default 200-marker board is well
+/// under it in distinct pots).
+const LEADERBOARD_CLASSIFY_CAP: usize = 64;
+
+/// `pot_beefs` row for the classification fold: txid + `hex(beef)`.
+#[derive(Deserialize)]
+struct PotBeefRowD1 {
+    txid: String,
+    beef: Option<String>,
+}
+
+/// Classify the recorded spends of the SPENT pots in `statuses` (vout 0 —
+/// the leaderboard anchor) from their stored `pot_beefs` bytes. Returns a
+/// lowercase-pot-txid → verdict map; every fault or ambiguity simply omits
+/// that pot (see `results.rs` for the conservatism contract).
+async fn classify_spent_pots(
+    db: &worker::D1Database,
+    statuses: &[crate::logic::OutpointStatus],
+) -> std::collections::HashMap<String, crate::results::PotVerdict> {
+    let mut verdicts = std::collections::HashMap::new();
+
+    // The spent pots with a recorded spender, capped, deduped, newest first.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in statuses {
+        if s.spent == Some(true) {
+            if let Some(spender) = &s.spending_txid {
+                let pot = s.txid.to_ascii_lowercase();
+                if seen.insert(pot.clone()) {
+                    pairs.push((pot, spender.to_ascii_lowercase()));
+                    if pairs.len() >= LEADERBOARD_CLASSIFY_CAP {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return verdicts;
+    }
+
+    // One IN-query per ≤45-key chunk over the DISTINCT txids (funding +
+    // spender interleaved) — the same bound-param discipline as /utxo-status.
+    let mut keys: Vec<String> = Vec::with_capacity(pairs.len() * 2);
+    for (pot, spender) in &pairs {
+        keys.push(pot.clone());
+        keys.push(spender.clone());
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let mut beefs: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for chunk in keys.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
+        let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
+        let stmt = match db.prepare(sql).bind(&binds) {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[leaderboard] pot_beefs bind failed (classification omitted): {e}");
+                return verdicts;
+            },
+        };
+        match stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
+            Ok(rows) => {
+                for r in rows {
+                    if let Some(bytes) = r.beef.and_then(|h| decode_beef_hex(&h)) {
+                        beefs.insert(r.txid.to_ascii_lowercase(), bytes);
+                    }
+                }
+            },
+            Err(e) => {
+                console_warn!("[leaderboard] pot_beefs query failed (classification partial): {e}");
+                // Keep whatever chunks already loaded — a missing BEEF only
+                // leaves its pot unclassified.
+            },
+        }
+    }
+
+    for (pot, spender) in &pairs {
+        let (Some(fb), Some(sb)) = (beefs.get(pot), beefs.get(spender)) else {
+            continue;
+        };
+        let funding_raw = crate::logic::extract_raw_tx_hex(fb, pot).and_then(|h| hex::decode(h).ok());
+        let spender_raw =
+            crate::logic::extract_raw_tx_hex(sb, spender).and_then(|h| hex::decode(h).ok());
+        let (Some(fraw), Some(sraw)) = (funding_raw, spender_raw) else {
+            continue;
+        };
+        if let Some(v) = crate::results::classify_pot_spend(&crate::results::PotSpendFacts {
+            pot_txid: pot,
+            pot_vout: crate::logic::LEADERBOARD_POT_VOUT,
+            funding_raw: &fraw,
+            spender_txid: spender,
+            spender_raw: &sraw,
+            marker_recovery_height: None, // no potparty join here — bare pots stay unclassified
+        }) {
+            verdicts.insert(pot.clone(), v);
+        }
+    }
+    verdicts
+}
+
+// ── /results — server-derived settle results (bsv-low #227) ─────────────────
+
+/// `/results` joined row as D1 returns it (the `results_sql` shape): the
+/// caller's potparty facts + spend pointer + BOTH stored BEEFs as hex.
+#[derive(Deserialize)]
+struct ResultsRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    spent: Option<f64>,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: Option<f64>,
+    #[serde(rename = "fundingBeef")]
+    funding_beef: Option<String>,
+    #[serde(rename = "spenderBeef")]
+    spender_beef: Option<String>,
+}
+
+impl ResultsRowD1 {
+    fn into_row(self) -> crate::results::ResultsRow {
+        crate::results::ResultsRow {
+            game_id: self.game_id,
+            pot_txid: self.pot_txid,
+            pot_vout: self.pot_vout as u32,
+            recovery_height: self.recovery_height as u32,
+            opponent_identity: self.opponent_identity,
+            spent: self.spent.map(|v| v != 0.0),
+            spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
+            funding_beef_hex: self.funding_beef,
+            spender_beef_hex: self.spender_beef,
+        }
+    }
+}
+
+/// `GET /results?identity=<66-hex>` — server-derived settle results (bsv-low
+/// #227): the chain-truth classification of every indexed pot spend the
+/// identity is party to, matched against the four covenant-mandated exit
+/// templates derived from the pot's OWN committed lock params. The result
+/// never depends on the winner's client publishing a claim: `tie`/`refund`
+/// outcomes are pure chain truth; a winner-template classification is
+/// exposed verbatim (`verdict`) and upgrades to a per-identity won/lost only
+/// when unanimous on-record claims corroborate it (`outcomeSource` says
+/// which). Full trust model + conservatism rules: `results.rs` module docs.
+///
+/// Fail-safe shape mirrors `/recovery-view`: a missing/invalid identity is
+/// an EMPTY 200 result; a D1 fault on the primary query is a 503; a claims
+/// (result_markers_v2) fault only degrades won/lost attribution to
+/// `unresolved` — never a 5xx, never a guessed outcome. Bounded per the
+/// over-50-outpoint 503 lesson: newest [`crate::results::RESULTS_MAX_ROWS`]
+/// marker rows, claims queried in chunks of at most
+/// [`crate::logic::D1_CHUNK_OUTPOINTS`] binds.
+pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let identity = url
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let identity_lc = identity.to_ascii_lowercase();
+
+    if !crate::logic::valid_identity(&identity_lc) {
+        return json_response(crate::results::results_body(&identity_lc, &[]), 200);
+    }
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[results] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        },
+    };
+
+    let stmt = db
+        .prepare(crate::results::results_sql())
+        .bind(&[JsValue::from_str(&identity_lc)])?;
+    let rows: Vec<crate::results::ResultsRow> =
+        match stmt.all().await.and_then(|r| r.results::<ResultsRowD1>()) {
+            Ok(rows) => rows.into_iter().map(ResultsRowD1::into_row).collect(),
+            Err(e) => {
+                console_warn!("[results] potparty join query failed: {e}");
+                return json_error("database query failed", 503);
+            },
+        };
+
+    // Claims (won/lost attribution) — BEST-EFFORT: a fault here only leaves
+    // winner-verdict games `unresolved`, never a 5xx (the chain-truth
+    // tie/refund outcomes and the verdict field still serve).
+    let mut game_ids: Vec<String> = rows.iter().map(|r| r.game_id.to_ascii_lowercase()).collect();
+    game_ids.sort_unstable();
+    game_ids.dedup();
+    let mut claim_markers: Vec<ResultMarkerRow> = Vec::new();
+    for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|g| JsValue::from_str(g)).collect();
+        let stmt = db
+            .prepare(crate::results::claims_sql(chunk.len()))
+            .bind(&binds)?;
+        match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+            Ok(rows) => claim_markers.extend(rows.into_iter().filter_map(ResultRowD1::into_marker)),
+            Err(e) => {
+                console_warn!("[results] result_markers_v2 query failed (claims omitted): {e}");
+            },
+        }
+    }
+    let claims = crate::results::claims_by_game(&claim_markers);
+
+    let entries = crate::results::assemble_results(&identity_lc, rows, &claims);
+    json_response(crate::results::results_body(&identity_lc, &entries), 200)
+}
+
+// ── /spent-any — server-side legacy outpoint reads (bsv-low #227 addendum) ──
+
+/// One cached `/spent-any` row: the decision fields, without the echo key.
+#[derive(Clone)]
+struct SpentAnyCached {
+    known: bool,
+    spent: Option<bool>,
+    spending_txid: Option<String>,
+    spent_confirmed: Option<bool>,
+}
+
+thread_local! {
+    /// In-isolate `/spent-any` cache (outpoint key → (expiry ms, row)).
+    /// Deliberately NOT the Cache API (owner call, 2026-07-14: it misbehaves
+    /// on workers.dev) — a plain in-memory map with a short TTL bounds
+    /// upstream pressure exactly as well for this surface. Isolate recycling
+    /// simply empties it (harmless).
+    static SPENT_ANY_CACHE: std::cell::RefCell<std::collections::HashMap<String, (f64, SpentAnyCached)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Fetch a URL, returning `(status, body_bytes)`. Faults map to `None`.
+async fn provider_get(url: &str) -> Option<(u16, Vec<u8>)> {
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    let request = worker::Request::new_with_init(url, &init).ok()?;
+    let mut response = worker::Fetch::Request(request).send().await.ok()?;
+    let status = response.status_code();
+    let body = response.bytes().await.unwrap_or_default();
+    Some((status, body))
+}
+
+const WOC_BASE: &str = "https://api.whatsonchain.com/v1/bsv/main";
+const BITAILS_BASE: &str = "https://api.bitails.io";
+
+/// Resolve ONE outpoint against the upstream providers, per the
+/// proof-source-order doctrine (see `results.rs`'s `/spent-any` section):
+/// positive = WoC pointer + raw hash/input verification (raw from WoC, then
+/// Bitails); negative = requires clean Bitails corroboration; any fault =
+/// honest unknown.
+async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
+    use crate::results::{
+        parse_bitails_unspent, parse_woc_spent_body, spender_raw_verifies, SpentObservation,
+        UnspentCorroboration,
+    };
+
+    let woc = match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
+        Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => parse_woc_spent_body(&v),
+            Err(_) => SpentObservation::Fault,
+        },
+        Some((s, _)) if (400..500).contains(&s) => SpentObservation::NotSpent,
+        _ => SpentObservation::Fault,
+    };
+
+    let mut spender_raw_ok = false;
+    let mut bitails = UnspentCorroboration::Unknown;
+    match &woc {
+        SpentObservation::Spent { txid: spender, .. } => {
+            // Raw verification: WoC hex first, Bitails binary fallback. A
+            // positive is served ONLY when the raw hashes to the reported
+            // spender AND spends the requested outpoint.
+            let raw = match provider_get(&format!("{WOC_BASE}/tx/{spender}/hex")).await {
+                Some((200, body)) => std::str::from_utf8(&body)
+                    .ok()
+                    .and_then(|h| hex::decode(h.trim()).ok()),
+                _ => None,
+            };
+            let raw = match raw {
+                Some(r) => Some(r),
+                None => match provider_get(&format!("{BITAILS_BASE}/download/tx/{spender}")).await {
+                    Some((200, body)) if !body.is_empty() => Some(body),
+                    _ => None,
+                },
+            };
+            if let Some(raw) = raw {
+                spender_raw_ok = spender_raw_verifies(&raw, spender, txid_lc, vout);
+            }
+        }
+        SpentObservation::NotSpent => {
+            // Negative corroboration (never WoC-only). Bitails' outpoint
+            // endpoint 500s at the time of writing — parse_bitails_unspent is
+            // strict, so that fault surfaces as known:false (fail-safe).
+            bitails = match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}/output/{vout}/spent"))
+                .await
+            {
+                Some((status, body)) => {
+                    let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                    parse_bitails_unspent(status, v.as_ref())
+                }
+                None => UnspentCorroboration::Unknown,
+            };
+        }
+        SpentObservation::Fault => {}
+    }
+
+    let st = crate::results::decide_spent_any(&woc, spender_raw_ok, bitails);
+    SpentAnyCached {
+        known: st.known,
+        spent: st.spent,
+        spending_txid: st.spending_txid,
+        spent_confirmed: st.spent_confirmed,
+    }
+}
+
+/// `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
+/// outpoints (legacy escrows the overlay never indexed), answered by
+/// SERVER-SIDE provider reads so the browser stops calling WhatsOnChain
+/// directly (bsv-low #227 addendum). Same row shape as `/utxo-status`;
+/// capped at [`crate::results::SPENT_ANY_MAX_OUTPOINTS`]; ~15 s in-isolate
+/// cache. `known:false` is the honest answer for every provider fault or
+/// un-corroborated negative — this surface never asserts what it cannot
+/// verify (positives are raw-hash + input-match verified).
+pub async fn spent_any(req: Request, _ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let Some(param) = url
+        .query_pairs()
+        .find(|(k, _)| k == "outpoints")
+        .map(|(_, v)| v.into_owned())
+    else {
+        return json_error("missing outpoints query parameter", 400);
+    };
+    let outpoints = match parse_outpoints(&param) {
+        Ok(ops) => ops,
+        Err(msg) => return json_error(&msg, 400),
+    };
+    if outpoints.len() > crate::results::SPENT_ANY_MAX_OUTPOINTS {
+        return json_error(
+            &format!(
+                "too many outpoints: {} (max {})",
+                outpoints.len(),
+                crate::results::SPENT_ANY_MAX_OUTPOINTS
+            ),
+            400,
+        );
+    }
+
+    let now = worker::Date::now().as_millis() as f64;
+    let mut entries: Vec<crate::logic::OutpointStatus> = Vec::with_capacity(outpoints.len());
+    for op in &outpoints {
+        let key = format!("{}.{}", op.db_txid(), op.vout);
+        let cached = SPENT_ANY_CACHE.with(|c| {
+            c.borrow()
+                .get(&key)
+                .filter(|(expiry, _)| *expiry > now)
+                .map(|(_, row)| row.clone())
+        });
+        let row = match cached {
+            Some(row) => row,
+            None => {
+                let row = spent_any_resolve(&op.db_txid(), op.vout).await;
+                SPENT_ANY_CACHE.with(|c| {
+                    let mut map = c.borrow_mut();
+                    // Prune expired entries so the map stays bounded.
+                    map.retain(|_, (expiry, _)| *expiry > now);
+                    map.insert(
+                        key,
+                        (now + crate::results::SPENT_ANY_CACHE_TTL_MS, row.clone()),
+                    );
+                });
+                row
+            }
+        };
+        entries.push(crate::logic::OutpointStatus {
+            txid: op.txid.clone(),
+            vout: op.vout,
+            known: row.known,
+            spent: row.spent,
+            spending_txid: row.spending_txid,
+            spent_confirmed: row.spent_confirmed,
+        });
+    }
+
+    json_response(utxo_status_body(&entries), 200)
 }
 
 /// `GET /health` — liveness only (no DB touch).

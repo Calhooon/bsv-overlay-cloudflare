@@ -47,6 +47,17 @@
 //!   client's ~110-round-trip N+1. The server counts on (both sigs +
 //!   anchored) and returns the sigs so the client re-verifies (see
 //!   `logic`'s trust note); a D1 fault is a 5xx, never a fabricated board.
+//! - `GET /results?identity=<66-hex>` — SERVER-DERIVED settle results
+//!   (bsv-low #227): for every pot the identity is a party to, the chain-truth
+//!   classification of the pot's spend against the four covenant-mandated
+//!   templates (winner-A / winner-B / tie / height-gated refund) derived from
+//!   the pot's OWN committed lock params — no client claim required. See the
+//!   `results` module for the trust model + conservatism rules.
+//! - `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
+//!   (legacy, never-indexed) outpoints via SERVER-SIDE upstream reads (WoC
+//!   primary with raw hash-verification; a NEGATIVE needs Bitails
+//!   corroboration; provider faults are an honest `known:false`). Short
+//!   in-isolate cache; same row shape as `/utxo-status`.
 //! - `GET /beef/:txid` — the admitted BEEF bytes from `transactions`.
 //! - `GET /tip` — present chain height via the CHAINTRACKS service binding.
 //! - `GET /health` — liveness.
@@ -60,6 +71,7 @@
 pub mod compaction;
 pub mod cors;
 pub mod logic;
+pub mod results;
 mod routes;
 
 use worker::{event, Context, Env, Request, Response, Result, Router};
@@ -94,6 +106,8 @@ fn router() -> Router<'static, ()> {
         .get_async("/pots-view", routes::pots_view)
         .get_async("/recovery-view", routes::recovery_view)
         .get_async("/leaderboard", routes::leaderboard)
+        .get_async("/results", routes::results)
+        .get_async("/spent-any", routes::spent_any)
         .get_async("/beef/:txid", routes::beef)
         .get_async("/tip", routes::tip)
         .get("/health", routes::health)

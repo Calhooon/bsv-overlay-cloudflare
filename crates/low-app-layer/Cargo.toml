@@ -25,5 +25,9 @@ hex.workspace = true
 # BEEF parsing for /pots-view's spenderRawHex extraction (the same crate the
 # sibling overlay worker uses; `overlay` feature only — no net/tokio on wasm32).
 bsv-rs.workspace = true
+# The `Poc5TemplatePot` covenant recognizer + param-region accessor (the SAME
+# frozen template bytes `tm_pot` admits with) — used by the settle classifier
+# (bsv-low #227) to recover a pot's COMMITTED params from its funding lock.
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"

@@ -696,6 +696,13 @@ pub struct LeaderboardEvidence {
     /// one is indexed — a POINTER the client fetches + transcript-verifies,
     /// NOT a server assertion the bundle is valid. `None` when absent.
     pub proof_txid: Option<String>,
+    /// The server-derived CHAIN classification of this pot's recorded spend
+    /// (bsv-low #227): which mandated covenant template the settle paid.
+    /// `None` = not classified (legacy bare pot, missing bytes, or ambiguous
+    /// — the classifier never guesses). See `results.rs` for the trust model:
+    /// a covenant spend is co-signed by construction and can only pay a
+    /// mandated shape, so this is chain truth, not a claim.
+    pub server_verdict: Option<crate::results::PotVerdict>,
 }
 
 /// One `board[i]` row — an identity's wins + its evidence.
@@ -759,6 +766,39 @@ pub fn aggregate_leaderboard(
     proof_by_game_winner: &std::collections::HashMap<(String, String), String>,
     hands_limit: usize,
 ) -> Leaderboard {
+    aggregate_leaderboard_with_verdicts(
+        markers,
+        statuses,
+        proof_by_game_winner,
+        hands_limit,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// [`aggregate_leaderboard`] plus the server-derived CHAIN classifications
+/// (bsv-low #227): `verdict_by_pot` maps a lowercase pot txid to the
+/// classified template its recorded spend paid (see `results.rs`).
+///
+/// The fold is ADDITIVE truth, applied conservatively:
+/// - a marker whose anchored settle is chain-classified as a **refund** or a
+///   **tie** is EXCLUDED from win/hand counting — the chain says nobody won
+///   that pot, so a claim naming it as a win is contradicted (the server's
+///   presence-only sig check could otherwise be gamed by a fabricated marker
+///   pointing at a real refund txid);
+/// - a winner-template classification (or no classification at all) leaves
+///   counting EXACTLY as before — backward compatible; without a seat →
+///   identity mapping the chain alone can never ADD a win to an identity
+///   (see `results.rs` module docs), so client claims keep working for
+///   legacy/pre-covenant games;
+/// - every marker still appears in `evidence` (with `serverVerdict`) so the
+///   client can re-verify and falsify.
+pub fn aggregate_leaderboard_with_verdicts(
+    markers: &[ResultMarkerRow],
+    statuses: &[OutpointStatus],
+    proof_by_game_winner: &std::collections::HashMap<(String, String), String>,
+    hands_limit: usize,
+    verdict_by_pot: &std::collections::HashMap<String, crate::results::PotVerdict>,
+) -> Leaderboard {
     use std::collections::{HashMap, HashSet};
 
     // Pot spend-status keyed by lowercase txid (we only join vout 0).
@@ -777,11 +817,22 @@ pub fn aggregate_leaderboard(
         .collect();
     // A marker is CONFIRMED (backend sense) when BOTH sig pushes are present.
     let confirmed = |i: usize| markers[i].loser_sig_hex.is_some();
+    // The chain classification of marker i's pot spend, when one exists.
+    let verdict_of = |i: usize| verdict_by_pot.get(&markers[i].pot_txid.to_ascii_lowercase()).copied();
+    // Chain-contradicted: the settle this marker claims as a WIN is
+    // classified as a tie or refund — nobody won that pot. Such a marker
+    // never counts (wins OR hands); it stays in evidence with its verdict.
+    let chain_contradicted = |i: usize| {
+        matches!(
+            verdict_of(i),
+            Some(crate::results::PotVerdict::Tie) | Some(crate::results::PotVerdict::Refund)
+        )
+    };
 
     // ── wins: per-game dedup over ANCHORED markers (client aggregateBoard) ──
     let mut by_game: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, m) in markers.iter().enumerate() {
-        if anchored[i] {
+        if anchored[i] && !chain_contradicted(i) {
             by_game
                 .entry(m.game_id.to_ascii_lowercase())
                 .or_default()
@@ -859,6 +910,7 @@ pub fn aggregate_leaderboard(
                         loser_sig_hex: m.loser_sig_hex.as_ref().map(|s| s.to_ascii_lowercase()),
                         anchored: anchored[i],
                         proof_txid,
+                        server_verdict: verdict_of(i),
                     }
                 })
                 .collect();
@@ -886,7 +938,7 @@ pub fn aggregate_leaderboard(
     // ── hands: lowest-score confirmed + anchored v2 hands (lowestHands) ─────
     let mut hand_by_game: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, m) in markers.iter().enumerate() {
-        if !anchored[i] || !confirmed(i) {
+        if !anchored[i] || !confirmed(i) || chain_contradicted(i) {
             continue;
         }
         let Some(ch) = &m.cards_hex else { continue };
@@ -963,6 +1015,7 @@ pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize)
                         "loserSigHex": e.loser_sig_hex,
                         "anchored": e.anchored,
                         "proofTxid": e.proof_txid,
+                        "serverVerdict": e.server_verdict.map(crate::results::PotVerdict::as_str),
                     })
                 })
                 .collect();
@@ -1952,6 +2005,74 @@ mod tests {
         let lb2 = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
         assert_eq!(lb2.board[0].evidence[0].proof_txid, None);
         assert_eq!(lb2.board[0].wins, 1);
+    }
+
+    // ── the #227 chain-classification fold ─────────────────────────────
+
+    /// A claim whose anchored settle is chain-classified as a REFUND or TIE
+    /// never counts (wins OR hands) — the chain says nobody won that pot —
+    /// while a winner classification (or no classification) leaves counting
+    /// exactly as before. The evidence row carries the verdict either way.
+    #[test]
+    fn chain_refund_or_tie_classification_defeats_a_claimed_win() {
+        use crate::results::PotVerdict;
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        // A doubly-signed, ANCHORED v2 marker — counts 1 win + 1 hand today.
+        let markers = vec![mk(1, &a, &b, 1, 2, true, Some("000102030c"), 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+
+        // No classification → unchanged counting (backward compatible).
+        let lb = aggregate_leaderboard_with_verdicts(
+            &markers, &statuses, &no_proofs(), 200, &HashMap::new(),
+        );
+        assert_eq!(lb.board[0].wins, 1);
+        assert_eq!(lb.hands.len(), 1);
+        assert_eq!(lb.board[0].evidence[0].server_verdict, None);
+
+        // Winner classification → still counts, verdict carried.
+        let verdicts = HashMap::from([(tx(1), PotVerdict::WinnerA)]);
+        let lb = aggregate_leaderboard_with_verdicts(
+            &markers, &statuses, &no_proofs(), 200, &verdicts,
+        );
+        assert_eq!(lb.board[0].wins, 1);
+        assert_eq!(lb.board[0].evidence[0].server_verdict, Some(PotVerdict::WinnerA));
+
+        // REFUND classification → the claimed win is chain-contradicted:
+        // no wins, no hands, but the evidence (with verdict) survives for
+        // the client to falsify.
+        let verdicts = HashMap::from([(tx(1), PotVerdict::Refund)]);
+        let lb = aggregate_leaderboard_with_verdicts(
+            &markers, &statuses, &no_proofs(), 200, &verdicts,
+        );
+        assert!(lb.board.is_empty(), "a refund is never a win");
+        assert!(lb.hands.is_empty());
+
+        // TIE classification → same exclusion.
+        let verdicts = HashMap::from([(tx(1), PotVerdict::Tie)]);
+        let lb = aggregate_leaderboard_with_verdicts(
+            &markers, &statuses, &no_proofs(), 200, &verdicts,
+        );
+        assert!(lb.board.is_empty(), "a tie is never a win");
+        assert!(lb.hands.is_empty());
+    }
+
+    /// The wire body carries `serverVerdict` per evidence row (null when
+    /// unclassified) so clients can re-verify the chain classification.
+    #[test]
+    fn leaderboard_body_carries_server_verdict() {
+        use crate::results::PotVerdict;
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let verdicts = HashMap::from([(tx(1), PotVerdict::WinnerA)]);
+        let lb = aggregate_leaderboard_with_verdicts(
+            &markers, &statuses, &no_proofs(), 200, &verdicts,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+        assert_eq!(v["board"][0]["evidence"][0]["serverVerdict"], "winner-a");
     }
 
     #[test]

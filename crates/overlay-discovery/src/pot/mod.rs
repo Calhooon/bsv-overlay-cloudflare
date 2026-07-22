@@ -154,6 +154,24 @@ pub fn is_pot_covenant_script(s: &[u8]) -> bool {
     s.len() >= head.len() + tail.len() && s.starts_with(head) && s.ends_with(tail)
 }
 
+/// The variable PARAM REGION of a `Poc5TemplatePot` covenant locking script:
+/// the bytes between the fixed HEAD and the fixed contract-code TAIL — i.e.
+/// the 10 per-game constructor pushes `<pubA><pubB><pubTower><payPkhA>
+/// <payPkhB><rakePkh><stakeA><stakeB><feeSats><recoveryHeight>`, exactly as
+/// the client's builder emitted them (data pushes for the keys/hashes,
+/// minimal script-number pushes for the amounts/height).
+///
+/// `None` when `s` is not a covenant lock ([`is_pot_covenant_script`] false).
+/// Callers (e.g. `low-app-layer`'s settle classifier, bsv-low #227) walk the
+/// returned slice as pushdata to recover the COMMITTED params — chain truth,
+/// since these bytes ARE the lock the pot was funded under.
+pub fn pot_covenant_param_region(s: &[u8]) -> Option<&[u8]> {
+    if !is_pot_covenant_script(s) {
+        return None;
+    }
+    Some(&s[head_bytes().len()..s.len() - tail_bytes().len()])
+}
+
 /// True iff `s` is a standard P2PKH locking script — the LOW hop lock shape
 /// (`tm_lowfund`): `OP_DUP OP_HASH160 <20-byte pkh> OP_EQUALVERIFY
 /// OP_CHECKSIG`, exactly 25 bytes.
