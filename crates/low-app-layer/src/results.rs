@@ -583,6 +583,12 @@ pub struct ClaimFact {
     pub settle_txid: String,
     /// True iff a loser countersig was present AND verified under `loser`.
     pub loser_sig_verified: bool,
+    /// The WINNER's revealed 5 cards, CANONICAL 10-hex (sorted ascending
+    /// ordinals) — `None` for a v1 (no-cards) claim. These bytes are BOUND by
+    /// the (already-verified) winner signature (the v2 challenge commits the
+    /// canonical cards), so a present value is the winner's true showdown hand.
+    /// Only the winner's hand is ever revealed on-chain; the loser's is not.
+    pub cards_hex: Option<String>,
 }
 
 // ── server-side claim signature verification ────────────────────────────────
@@ -700,11 +706,18 @@ pub fn verified_claim(m: &ResultMarkerRow) -> Option<ClaimFact> {
         .loser_sig_hex
         .as_deref()
         .is_some_and(|s| anyone_sig_verifies(&loser_lc, &game_lc, &challenge, s));
+    // The cards are re-canonicalized from the SAME field the challenge bound
+    // (present ⇒ it verified as part of the winner sig above), so a Some value
+    // is trustworthy. A malformed field can't reach here (the challenge would
+    // have failed to reconstruct → early `None`), but re-canonicalize
+    // defensively so downstream always sees canonical 10-hex or nothing.
+    let cards_hex = m.cards_hex.as_deref().and_then(canonical_cards_hex);
     Some(ClaimFact {
         winner: winner_lc,
         loser: loser_lc,
         settle_txid: m.settle_txid.to_ascii_lowercase(),
         loser_sig_verified,
+        cards_hex,
     })
 }
 
@@ -730,6 +743,11 @@ pub struct ResultEntry {
     pub outcome_source: Option<&'static str>,
     /// The settle's mined block height per its BEEF BUMP, when proven.
     pub at_height: Option<u64>,
+    /// The provable showdown hand (bsv-low #245): the WINNER's five cards +
+    /// low-sum, or `None` when no hand is provable (refund, unrevealed settle,
+    /// unresolved winner). Only the winner's hand is on-chain — the loser's is
+    /// never fabricated. See [`resolve_winner_hand`].
+    pub winner_hand: Option<WinnerHand>,
 }
 
 /// The per-identity outcome enum (wire strings match bsv-low #227's spec).
@@ -815,6 +833,104 @@ pub fn derive_outcome(
     }
 }
 
+// ── hand-score exposure (bsv-low #245) ──────────────────────────────────────
+//
+// Your Games wants the SHOWDOWN, not just win/lose: the winner's five cards +
+// its low-sum, honestly attributed. The only cards on-chain are the WINNER's
+// (a coop/enforced settle never reveals the loser's hand), carried in a
+// `tm_result` marker as `cardsHex` and BOUND by the winner's signature. So the
+// exposed hand rides on the SAME verified, unanimous claim that already drives
+// `won`/`lost` — never a bare/forged marker, never a fabricated loser hand.
+
+/// The provable showdown hand for a `/results` row: the WINNER's five cards +
+/// its low-sum, plus whose hand it is. The loser's hand is NEVER on-chain for a
+/// settle, so it is never present here (see [`ResultEntry::winner_hand`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinnerHand {
+    /// Whose five cards these are (the winning identity; for a tie, the seat
+    /// whose equal-sum hand was revealed — `is_tie` flags it).
+    pub identity: String,
+    /// The five cards, CANONICAL 10-hex (sorted ascending ordinals).
+    pub cards_hex: String,
+    /// The LOW low-sum of `cards_hex` (`logic::hand_score` — Ace=1, 2..9 pip,
+    /// T/J/Q/K=10). For a tie this is BOTH players' equal sum.
+    pub score: u32,
+    /// True when the chain verdict was a TIE (both sums equal by definition);
+    /// the exposed hand is one provable side, `identity` its owner.
+    pub is_tie: bool,
+}
+
+/// Parse + score a claim's `cards_hex` into a [`WinnerHand`], or `None` if the
+/// cards are malformed (fail-safe: never expose an unparseable hand).
+fn winner_hand_from(identity: &str, cards_hex: &str, is_tie: bool) -> Option<WinnerHand> {
+    let arr = crate::logic::leaderboard_cards_from_hex(cards_hex)?;
+    let canon = canonical_cards_hex(cards_hex)?;
+    Some(WinnerHand {
+        identity: identity.to_ascii_lowercase(),
+        cards_hex: canon,
+        score: crate::logic::hand_score(&arr),
+        is_tie,
+    })
+}
+
+/// Resolve the provable showdown hand for a row from the chain verdict + the
+/// VERIFIED claims naming the classified settle. Viewer-INDEPENDENT (a per-game
+/// fact both parties see identically). `None` unless a hand is genuinely
+/// provable — a refund, an unrevealed (v1) settle, an unresolved/conflicting
+/// winner, or a claim winner outside the two parties all yield `None` (never a
+/// guess, never a fabricated loser hand).
+///
+/// - `winner-a`/`winner-b`: needs the SAME unanimous verified winner
+///   `derive_outcome` requires (one winner among the two parties, naming this
+///   settle) AND a claim by that winner carrying cards → the winner's hand.
+/// - `tie`: any verified claim by a party naming this settle that carries cards
+///   → that (equal-sum) hand, `is_tie = true`. Both sums are equal by the tie
+///   verdict; only the one revealed side is exposed (the other isn't on-chain).
+/// - `refund` / `None`: no showdown → `None`.
+pub fn resolve_winner_hand(
+    verdict: Option<PotVerdict>,
+    identity_lc: &str,
+    opponent_lc: &str,
+    settle_txid_lc: Option<&str>,
+    claims: Option<&GameClaims>,
+) -> Option<WinnerHand> {
+    let settle = settle_txid_lc?;
+    let gc = claims?;
+    let is_party = |id: &str| {
+        id.eq_ignore_ascii_case(identity_lc) || id.eq_ignore_ascii_case(opponent_lc)
+    };
+    let relevant: Vec<&ClaimFact> = gc
+        .claims
+        .iter()
+        .filter(|c| c.settle_txid.eq_ignore_ascii_case(settle))
+        .collect();
+    match verdict {
+        Some(PotVerdict::WinnerA) | Some(PotVerdict::WinnerB) => {
+            let mut winners: Vec<&str> = relevant.iter().map(|c| c.winner.as_str()).collect();
+            winners.sort_unstable();
+            winners.dedup();
+            let [w] = winners.as_slice() else {
+                return None; // no claim, or conflicting winners → unresolved
+            };
+            if !is_party(w) {
+                return None; // a foreign claim never attributes this pot's hand
+            }
+            let cards = relevant
+                .iter()
+                .filter(|c| c.winner.eq_ignore_ascii_case(w))
+                .find_map(|c| c.cards_hex.as_deref())?;
+            winner_hand_from(w, cards, false)
+        }
+        Some(PotVerdict::Tie) => {
+            let c = relevant
+                .iter()
+                .find(|c| is_party(&c.winner) && c.cards_hex.is_some())?;
+            winner_hand_from(&c.winner, c.cards_hex.as_deref()?, true)
+        }
+        Some(PotVerdict::Refund) | None => None,
+    }
+}
+
 /// Assemble the `/results` entries: dedupe rows to one per pot outpoint
 /// (newest first, as the SQL orders), classify each spent pot, and derive
 /// the caller's outcome. Missing bytes anywhere degrade THAT entry to
@@ -864,12 +980,20 @@ pub fn assemble_results(
         }
         let game_lc = r.game_id.to_ascii_lowercase();
         let opponent_lc = r.opponent_identity.to_ascii_lowercase();
+        let game_claims = claims_by_game.get(&game_lc);
         let (outcome, outcome_source) = derive_outcome(
             verdict,
             identity_lc,
             &opponent_lc,
             settle_lc.as_deref(),
-            claims_by_game.get(&game_lc),
+            game_claims,
+        );
+        let winner_hand = resolve_winner_hand(
+            verdict,
+            identity_lc,
+            &opponent_lc,
+            settle_lc.as_deref(),
+            game_claims,
         );
         out.push(ResultEntry {
             game_id: game_lc,
@@ -884,6 +1008,7 @@ pub fn assemble_results(
             outcome,
             outcome_source,
             at_height,
+            winner_hand,
         });
     }
     out
@@ -909,8 +1034,12 @@ pub fn claims_by_game(markers: &[ResultMarkerRow]) -> std::collections::HashMap<
 /// Assemble the `/results` wire body:
 /// `{"identity","results":[{gameId,potTxid,potVout,recoveryHeight,
 /// opponentIdentity,settleTxid,spent,spentConfirmed,verdict,outcome,
-/// outcomeSource,at}]}`. `at` is `{"height": <n|null>}` (block height when
-/// the settle's BEEF carries a verified BUMP; time is not tracked).
+/// outcomeSource,at,hand}]}`. `at` is `{"height": <n|null>}` (block height
+/// when the settle's BEEF carries a verified BUMP; time is not tracked).
+/// `hand` (bsv-low #245) is the provable showdown —
+/// `{winnerIdentity,winnerCardsHex,winnerScore,isTie,loserCardsOnChain,note}`
+/// — or `null` when no hand is provable (refund / unrevealed / unresolved).
+/// Only the winner's five cards are on-chain; the loser's is never fabricated.
 pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
@@ -928,6 +1057,25 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
                 "outcome": e.outcome.as_str(),
                 "outcomeSource": e.outcome_source,
                 "at": { "height": e.at_height },
+                // The showdown (#245): the winner's five cards + low-sum, or
+                // null when no hand is provable. `loserCardsOnChain` is always
+                // false — the loser's hand is never revealed for a settle, and
+                // is never fabricated here. `note` explains the caveat for the
+                // client's honest "—" rendering.
+                "hand": e.winner_hand.as_ref().map(|h| json!({
+                    "winnerIdentity": h.identity,
+                    "winnerCardsHex": h.cards_hex,
+                    "winnerScore": h.score,
+                    "isTie": h.is_tie,
+                    "loserCardsOnChain": false,
+                    "note": if h.is_tie {
+                        "tie — both sums are equal; only the revealed side's five \
+                         cards are on-chain (the other player's hand is not)"
+                    } else {
+                        "only the winner's five cards are revealed on-chain; the \
+                         loser's hand is not (do not fabricate it)"
+                    },
+                })),
             })
         })
         .collect();
@@ -1132,6 +1280,7 @@ mod tests {
                     loser: l.to_string(),
                     settle_txid: s.to_string(),
                     loser_sig_verified: *lv,
+                    cards_hex: None,
                 })
                 .collect(),
         }
@@ -1325,6 +1474,7 @@ mod tests {
             outcome: Outcome::Refund,
             outcome_source: Some("chain"),
             at_height: Some(958_900),
+            winner_hand: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
         assert_eq!(v["identity"], me);
@@ -1336,6 +1486,43 @@ mod tests {
         assert_eq!(r["outcomeSource"], "chain");
         assert_eq!(r["at"]["height"], 958_900);
         assert_eq!(r["settleTxid"], tx(0x03));
+        // A refund has no showdown → `hand` is JSON null (never fabricated).
+        assert!(r["hand"].is_null());
+    }
+
+    /// A winner ResultEntry carrying a showdown hand serializes the full
+    /// `hand` object (winner-only cards + score + the loser caveat).
+    #[test]
+    fn results_body_carries_the_winner_hand() {
+        let me = ident(0xaa);
+        let e = ResultEntry {
+            game_id: tx(0x01),
+            pot_txid: tx(0x02),
+            pot_vout: 0,
+            recovery_height: 958_846,
+            opponent_identity: ident(0xbb),
+            settle_txid: Some(tx(0x03)),
+            spent: Some(true),
+            spent_confirmed: Some(true),
+            verdict: Some(PotVerdict::WinnerA),
+            outcome: Outcome::Won,
+            outcome_source: Some("chain+claim"),
+            at_height: Some(958_900),
+            winner_hand: Some(WinnerHand {
+                identity: me.clone(),
+                cards_hex: "000102030c".to_string(), // A-2-3-4-5 wheel = 15
+                score: 15,
+                is_tie: false,
+            }),
+        };
+        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let h = &v["results"][0]["hand"];
+        assert_eq!(h["winnerIdentity"], me);
+        assert_eq!(h["winnerCardsHex"], "000102030c");
+        assert_eq!(h["winnerScore"], 15);
+        assert_eq!(h["isTie"], false);
+        assert_eq!(h["loserCardsOnChain"], false);
+        assert!(h["note"].as_str().unwrap().contains("winner"));
     }
 
     // ── server-side claim signature verification (adversarial) ─────────
@@ -1599,6 +1786,113 @@ mod tests {
         let gc = map.get(&game).unwrap();
         assert_eq!(gc.claims.len(), 1);
         assert_eq!(gc.claims[0].settle_txid, settle);
+    }
+
+    // ── hand-score exposure (bsv-low #245) ─────────────────────────────
+
+    #[test]
+    fn hand_score_matches_frozen_oracle_vectors() {
+        // (cardsHex, expected low-sum) — cross-checked against
+        // oracle/eval5_lowsum.py, spanning aces (Ace=1) and face cards
+        // (T/J/Q/K=10). Ordinal = 13*suit + rank, rank 0='2'..8='T', 9='J',
+        // 10='Q', 11='K', 12='A' (low-core `card_from_ordinal`).
+        let vectors = [
+            ("0c19263300", 6),  // A A A A 2  (min_quad_ace)
+            ("000102030c", 15), // A 2 3 4 5  (ace_low_wheel)
+            ("0001020304", 20), // 2 3 4 5 6  (run_two_to_six)
+            ("0c08090a0b", 41), // A T J Q K  (ace_and_faces)
+            ("09160a170b", 50), // J J Q Q K  (all_face_cards)
+            ("0b1825320a", 50), // K K K K Q  (max_quad_king)
+        ];
+        for (hexs, want) in vectors {
+            let cards = crate::logic::leaderboard_cards_from_hex(hexs)
+                .unwrap_or_else(|| panic!("vector {hexs} must parse"));
+            assert_eq!(crate::logic::hand_score(&cards), want, "sum for {hexs}");
+            // The exposure helper agrees end-to-end (parse → score → canonical).
+            let h = winner_hand_from("02aa", hexs, false).unwrap();
+            assert_eq!(h.score, want);
+        }
+    }
+
+    #[test]
+    fn resolve_winner_hand_exposes_winner_only_and_is_viewer_independent() {
+        // Real signed v2 claim through the REAL producer (`claims_by_game`):
+        // a winner verdict + the unanimous verified winner claim surfaces the
+        // WINNER's five cards + low-sum — identically for either viewer.
+        let winner_w = wallet_of(0x11);
+        let loser_w = wallet_of(0x22);
+        let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+        let cards = "000102030c"; // A-2-3-4-5 wheel = 15
+        let ch = result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cards)).unwrap();
+        let map =
+            claims_by_game(&[marker(&game, &w, &l, &pot, &settle, Some(cards),
+                sign_result(&winner_w, &game, &ch), None)]);
+        let gc = map.get(&game);
+
+        let hand =
+            resolve_winner_hand(Some(PotVerdict::WinnerA), &w, &l, Some(&settle), gc).unwrap();
+        assert_eq!(hand.identity, w);
+        assert_eq!(hand.cards_hex, "000102030c");
+        assert_eq!(hand.score, 15);
+        assert!(!hand.is_tie);
+        // The loser sees the SAME winner hand (a per-game chain+claim fact).
+        let from_loser =
+            resolve_winner_hand(Some(PotVerdict::WinnerA), &l, &w, Some(&settle), gc).unwrap();
+        assert_eq!(from_loser, hand);
+
+        // A refund / no verdict never exposes a hand (no showdown).
+        assert!(resolve_winner_hand(Some(PotVerdict::Refund), &w, &l, Some(&settle), gc).is_none());
+        assert!(resolve_winner_hand(None, &w, &l, Some(&settle), gc).is_none());
+    }
+
+    #[test]
+    fn resolve_winner_hand_null_when_cards_absent_or_winner_unresolved() {
+        let winner_w = wallet_of(0x11);
+        let loser_w = wallet_of(0x22);
+        let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+
+        // A v1 (no-cards) claim: the winner resolves, but no hand is on-chain
+        // → None (never a fabricated hand).
+        let ch = result_challenge_bytes(&game, &w, &l, &pot, &settle, None).unwrap();
+        let map = claims_by_game(&[marker(&game, &w, &l, &pot, &settle, None,
+            sign_result(&winner_w, &game, &ch), None)]);
+        assert!(resolve_winner_hand(Some(PotVerdict::WinnerA), &w, &l, Some(&settle),
+            map.get(&game)).is_none());
+
+        // Both parties publish REAL claims-with-cards for the same settle:
+        // winner unanimity fails → no attributable hand.
+        let cw = "000102030c";
+        let cl = "0001020304";
+        let chw = result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cw)).unwrap();
+        let chl = result_challenge_bytes(&game, &l, &w, &pot, &settle, Some(cl)).unwrap();
+        let map = claims_by_game(&[
+            marker(&game, &w, &l, &pot, &settle, Some(cw), sign_result(&winner_w, &game, &chw), None),
+            marker(&game, &l, &w, &pot, &settle, Some(cl), sign_result(&loser_w, &game, &chl), None),
+        ]);
+        assert!(resolve_winner_hand(Some(PotVerdict::WinnerA), &w, &l, Some(&settle),
+            map.get(&game)).is_none());
+    }
+
+    #[test]
+    fn resolve_winner_hand_tie_exposes_one_provable_equal_sum_side() {
+        // A TIE verdict is seat-symmetric; only ONE hand is ever on-chain, so
+        // we expose that provable (equal-sum) side, flagged `is_tie`.
+        let a_w = wallet_of(0x11);
+        let b_w = wallet_of(0x22);
+        let (a, b) = (identity_of(&a_w), identity_of(&b_w));
+        let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
+        let cards = "000102030c"; // 15
+        let ch = result_challenge_bytes(&game, &a, &b, &pot, &settle, Some(cards)).unwrap();
+        let map = claims_by_game(&[marker(&game, &a, &b, &pot, &settle, Some(cards),
+            sign_result(&a_w, &game, &ch), None)]);
+        let hand =
+            resolve_winner_hand(Some(PotVerdict::Tie), &a, &b, Some(&settle), map.get(&game))
+                .unwrap();
+        assert!(hand.is_tie);
+        assert_eq!(hand.score, 15);
+        assert_eq!(hand.identity, a);
     }
 
     // ── param-push / script-number hygiene ─────────────────────────────
