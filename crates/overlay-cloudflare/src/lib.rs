@@ -74,7 +74,7 @@ use worker::{event, Context, Env, Method, Request, Response};
 
 use crate::broadcaster::{ArcadeBroadcaster, WorkerBroadcaster};
 use crate::chain_tracker::WorkerChainTracker;
-use crate::d1::{run_migrations, OVERLAY_MIGRATIONS};
+use crate::d1::ensure_overlay_migrations;
 use crate::d1_discovery::{
     D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1LowStorage, D1PotStorage,
     D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage, D1RevealStorage,
@@ -133,8 +133,9 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
     // Ban storage — shares the OVERLAY_DB binding via a dedicated table
     let ban_storage = Rc::new(crate::ban_storage::D1BanStorage::new(db.clone()));
 
-    // Run migrations (idempotent — CREATE IF NOT EXISTS)
-    run_migrations(&db, OVERLAY_MIGRATIONS)
+    // Apply migrations once per isolate (idempotent — CREATE IF NOT EXISTS;
+    // unguarded per-request execution was 63 D1 round-trips/request, #255)
+    ensure_overlay_migrations(&db)
         .await
         .map_err(|e| worker::Error::from(format!("Migration failed: {e}")))?;
 
@@ -337,7 +338,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         env.d1("OVERLAY_DB")
             .map_err(|e| format!("D1 binding error: {e}"))?,
     );
-    run_migrations(&db, OVERLAY_MIGRATIONS)
+    ensure_overlay_migrations(&db)
         .await
         .map_err(|e| format!("Migration failed: {e}"))?;
     let ship_storage: Rc<dyn SHIPStorage> = Rc::new(D1SHIPStorage::new(db.clone()));
@@ -861,7 +862,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         }
     };
 
-    if let Err(e) = run_migrations(&db, OVERLAY_MIGRATIONS).await {
+    if let Err(e) = ensure_overlay_migrations(&db).await {
         worker::console_log!("Scheduled: Migration error: {}", e);
         return;
     }
@@ -1137,7 +1138,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         Ok(d) => Rc::new(d),
         Err(e) => return Response::error(format!("complete-proofs: D1 binding: {e}"), 500),
     };
-    if let Err(e) = run_migrations(&db, OVERLAY_MIGRATIONS).await {
+    if let Err(e) = ensure_overlay_migrations(&db).await {
         return Response::error(format!("complete-proofs: migrations: {e}"), 500);
     }
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));

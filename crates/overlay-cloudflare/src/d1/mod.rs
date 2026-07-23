@@ -242,6 +242,32 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
         && err.to_ascii_lowercase().contains("duplicate column")
 }
 
+/// Set once THIS isolate has applied [`OVERLAY_MIGRATIONS`] successfully.
+///
+/// Workers isolates are single-threaded, but the atomic keeps the guard sound
+/// under any future threading model. A fresh isolate starts `false`, so every
+/// cold start still applies the (idempotent) migrations.
+static OVERLAY_MIGRATIONS_APPLIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Apply [`OVERLAY_MIGRATIONS`] at most once per isolate lifetime.
+///
+/// The 63-statement migration list is 63 sequential D1 round-trips; running it
+/// unguarded on EVERY request taxed every route ~2.5-3s under elevated D1 RTT
+/// (bsv-low #255). The flag is set ONLY after a fully successful pass, so a
+/// failed attempt propagates its error and the next request retries from the
+/// top (`run_migrations` is idempotent by construction). Two requests racing on
+/// a fresh isolate at worst both run the idempotent list — never a skip.
+pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if OVERLAY_MIGRATIONS_APPLIED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    run_migrations(db, OVERLAY_MIGRATIONS).await?;
+    OVERLAY_MIGRATIONS_APPLIED.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// Number of overlay migration statements.
 pub const OVERLAY_MIGRATION_COUNT: usize = 63;
 
