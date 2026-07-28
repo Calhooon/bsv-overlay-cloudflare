@@ -691,6 +691,21 @@ pub struct LeaderboardEvidence {
     pub settle_txid: String,
     pub winner_sig_hex: String,
     pub loser_sig_hex: Option<String>,
+    /// The winner's five revealed cards, canonical 10-hex — the v2 claim byte
+    /// the SIGNATURES bind (bsv-low #276). Carried verbatim from the marker;
+    /// `None` for a v1 claim, which is a real distinction the client relies on
+    /// (`row.cardsHex != null` is what makes it reconstruct a v2 challenge).
+    ///
+    /// WHY IT MUST SHIP: the client re-verifies every evidence row itself
+    /// (`verifyResultRow`) by rebuilding the signed challenge. Without this
+    /// field a v2 claim reconstructs as v1, the winner-sig check FAILS,
+    /// `tier = invalid`, and `gatherBoardFast` DROPS the row — the identity
+    /// renders as a zero-win ghost with an empty drill-down. That was
+    /// invisible while every counted row was CONFIRMED and re-fetched, and it
+    /// bites exactly the row #276 exists to make count: an UNCONFIRMED
+    /// (loser-quit, tower-adjudicated) win, which is served from this
+    /// evidence alone.
+    pub cards_hex: Option<String>,
     pub anchored: bool,
     /// The `proof_markers` (ls_proof) marker txid for (gameId, winner), when
     /// one is indexed — a POINTER the client fetches + transcript-verifies,
@@ -908,6 +923,7 @@ pub fn aggregate_leaderboard_with_verdicts(
                         settle_txid: m.settle_txid.to_ascii_lowercase(),
                         winner_sig_hex: m.winner_sig_hex.to_ascii_lowercase(),
                         loser_sig_hex: m.loser_sig_hex.as_ref().map(|s| s.to_ascii_lowercase()),
+                        cards_hex: m.cards_hex.as_ref().map(|s| s.to_ascii_lowercase()),
                         anchored: anchored[i],
                         proof_txid,
                         server_verdict: verdict_of(i),
@@ -1013,6 +1029,11 @@ pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize)
                         "settleTxid": e.settle_txid,
                         "winnerSigHex": e.winner_sig_hex,
                         "loserSigHex": e.loser_sig_hex,
+                        // bsv-low #276: the v2 cards the sigs bind. ALWAYS
+                        // emitted (null for a v1 claim) — the client treats an
+                        // ABSENT field as v1, so omitting it on a v2 row is a
+                        // silent downgrade to `tier = invalid`.
+                        "cardsHex": e.cards_hex,
                         "anchored": e.anchored,
                         "proofTxid": e.proof_txid,
                         "serverVerdict": e.server_verdict.map(crate::results::PotVerdict::as_str),
@@ -2168,6 +2189,7 @@ mod tests {
         assert!(ev[0]["loserSigHex"].is_string());
         assert_eq!(ev[0]["anchored"], true);
         assert_eq!(ev[0]["proofTxid"], "px");
+        assert_eq!(ev[0]["cardsHex"], "000102030c");
         let hands = v["hands"].as_array().unwrap();
         assert_eq!(hands.len(), 1);
         assert_eq!(hands[0]["gameId"], tx(1));
@@ -2175,6 +2197,57 @@ mod tests {
         assert_eq!(hands[0]["cardsHex"], "000102030c");
         assert_eq!(hands[0]["winner"], a);
         assert_eq!(hands[0]["anchored"], true);
+    }
+
+    /// bsv-low #276 — an UNCONFIRMED (loser-quit / tower-adjudicated) v2 claim
+    /// MUST carry `cardsHex` in its evidence.
+    ///
+    /// This is the row a tower-enforced winner gets: the loser is gone, so no
+    /// countersignature exists and the client can never "upgrade" it by
+    /// re-fetching a confirmed twin — this evidence IS the row. The client
+    /// re-verifies it by rebuilding the exact challenge the winner signed, and
+    /// it treats an ABSENT `cardsHex` as a v1 claim; a v2 claim missing the
+    /// field therefore fails its own winner-sig check, is scored `invalid`,
+    /// and is DROPPED, rendering an honest winner as a zero-win ghost with an
+    /// empty drill-down. `null` (a genuine v1 claim) must stay distinguishable
+    /// from absent, so the field is always emitted.
+    #[test]
+    fn unconfirmed_v2_evidence_carries_cards_hex() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        // confirmed=false ⇒ no loserSigHex: exactly the tower-enforced shape.
+        let markers = vec![mk(1, &a, &b, 1, 2, false, Some("000102030c"), 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        assert_eq!(
+            lb.board[0].evidence[0].cards_hex.as_deref(),
+            Some("000102030c"),
+            "the v2 cards the winner's signature binds must survive aggregation"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+        let ev = &v["board"][0]["evidence"][0];
+        assert_eq!(
+            ev["loserSigHex"],
+            serde_json::Value::Null,
+            "unconfirmed row"
+        );
+        assert_eq!(ev["anchored"], true);
+        assert_eq!(ev["cardsHex"], "000102030c");
+        // The win still tallies as UNCONFIRMED (wins counts confirmed only) —
+        // this test pins the EVIDENCE contract, not the ranking rule.
+        assert_eq!(lb.board[0].wins, 0);
+
+        // A genuine v1 claim emits an explicit null — never an absent key
+        // (absent and null must stay distinguishable on the wire).
+        let markers = vec![mk(1, &a, &b, 1, 2, false, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+        let ev = v["board"][0]["evidence"][0].as_object().unwrap();
+        assert!(ev.contains_key("cardsHex"), "the key is always present");
+        assert_eq!(ev["cardsHex"], serde_json::Value::Null);
     }
 
     #[test]
