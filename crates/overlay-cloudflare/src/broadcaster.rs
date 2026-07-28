@@ -537,6 +537,51 @@ fn corroborated_exhaustion(
     }
 }
 
+/// PURE (#267): fold the corroborator's word into an Arcade ACCEPT claim for
+/// a subject with UNPROVEN ancestry. The bsv-low #267 incident: a degraded
+/// Arcade holding a JOIN only in its ORPHAN pool (parents 0-conf, absent from
+/// its node) echoed a gate-satisfying txStatus and the overlay admitted a tx
+/// the public network never received — because an ACCEPT was never
+/// corroborated (#214 corroborates only rejections). So for an
+/// unproven-parent subject, Arcade's accept claim is a CLAIM, not an admit:
+///
+/// - Corroborator ACCEPTED → `Ok(Accepted(subject))` — a second broadcaster's
+///   REAL network-accept marker confirms the claim (the #192/#193 invariant
+///   now holds against a degraded-accept Arcade too). Our subject txid, never
+///   the corroborator's echo (same identity discipline as
+///   `submit_once_and_gate`).
+/// - Corroborator REJECTED → `Err` → 502, deliberately NOT a 422: the two
+///   providers CONFLICT (Arcade says accepted, the corroborator says
+///   refused), so neither single-provider verdict is the network's — #214's
+///   own doctrine. Fail CLOSED on admission (refuse to admit) but keep the
+///   refusal honest ("unavailable", retryable), never terminal.
+/// - Corroborator transport/inconclusive → `Err` → 502. A degraded
+///   corroborator must NEVER fall back to trusting Arcade alone — that is
+///   the incident. The client's direct-ARC fallback keeps money moving.
+///
+/// AVAILABILITY, stated honestly: the corroborator hosts (TAAL → GorillaPool)
+/// are the SAME hosts the client's direct-ARC fallback uses. An
+/// unproven-parent overlay admission is therefore available only when BOTH
+/// Arcade AND (TAAL ∪ GorillaPool) answer — min(Arcade, TAAL∪GP), a strict
+/// availability reduction versus pre-#267. That is the correct fail-closed
+/// trade, not a free one: in the window where TAAL∪GP are down, the client's
+/// own fallback is down too, and the only thing an uncorroborated admit
+/// could have bought is the #267 incident.
+fn corroborated_accept_claim(
+    corroborator: Result<ArcOutcome, String>,
+    subject_txid: &str,
+) -> Result<ArcOutcome, String> {
+    match corroborator {
+        Ok(ArcOutcome::Accepted(_)) => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        Ok(ArcOutcome::Rejected(r)) => Err(format!(
+            "Arcade claims {subject_txid} accepted but the corroborating broadcaster rejected it ({r}) — conflicting single-provider verdicts; not admitting, not refusing"
+        )),
+        Err(t) => Err(format!(
+            "Arcade claims {subject_txid} accepted but the corroborating broadcaster could not confirm it — not admitting an unproven-parent subject on one provider's word (#267): {t}"
+        )),
+    }
+}
+
 /// Corroborate one tx hex (the subject's EF — ARC accepts Extended Format in
 /// `rawTx`) against TAAL, falling back to GorillaPool when TAAL is transport-
 /// unreachable or inconclusive. A definitive verdict (accept OR reject) from
@@ -601,6 +646,17 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<ArcOutcome, String>>,
 {
+    // #267 hardening: WORK BOUND, checked before any submit. Over the cap
+    // the whole corroboration is INCONCLUSIVE (Err → 502, the client's
+    // fallback — the same fail direction as the routes.rs 429 byte bound),
+    // never a truncated prime-loop whose partial corroboration could admit.
+    if efs.len() > MAX_CORROBORATION_LEGS {
+        return Err(format!(
+            "corroboration leg cap: {} EF legs > {MAX_CORROBORATION_LEGS} — inconclusive, refusing to corroborate (and therefore to admit)",
+            efs.len()
+        ));
+    }
+
     let subject_ef = efs
         .iter()
         .find(|e| e.txid == subject_txid)
@@ -622,10 +678,28 @@ where
     submit_one(hex::encode(&subject_ef.ef)).await
 }
 
-/// PURE (#216): does the FINAL/exhaustion corroboration carry ancestry? Only
-/// when there IS ancestry beyond the subject leg — a single-leg batch has no
-/// parent to prime, so it stays subject-only ([`corroborate_tx_hex`]).
-fn exhaustion_corroborates_with_ancestry(efs_len: usize) -> bool {
+/// #267 hardening (review finding, DoS): bound the corroboration work.
+/// [`corroborate_batch_with`] primes each ancestor with its own SERIAL POST;
+/// the only pre-existing bound is routes.rs's BYTE cap (2 MB batch), which at
+/// ~100 B minimal txs still admits a batch of ~20k legs — and the #267 orphan
+/// shortcut makes that max-work path attacker-reachable (a fabricated-parent
+/// subject is free to construct and lands on the ancestry rungs by design).
+/// Real LOW ancestry runs ~8 unproven legs deep (#211 observed subjects 8+
+/// ancestors deep); 32 gives 4× headroom while bounding the worst case to
+/// ~32 serial corroborator POSTs (~10 s). Over the cap → inconclusive
+/// Err/502 with ZERO submits, never a partial corroboration that could admit.
+const MAX_CORROBORATION_LEGS: usize = 32;
+
+/// PURE (#216/#267): does this EF batch carry UNPROVEN ancestry — legs beyond
+/// the subject itself? The one signal, used two ways:
+/// - #216: the exhaustion corroboration primes ancestors first
+///   ([`corroborate_batch_with`]) only when there IS an ancestor to prime; a
+///   single-leg batch stays subject-only ([`corroborate_tx_hex`]).
+/// - #267: an Arcade ACCEPT claim is corroborated before it may admit only
+///   for unproven-parent subjects ([`corroborated_accept_claim`]); a
+///   proven-parent (single-EF) subject keeps the uncorroborated fast path —
+///   see the risk-class note in `gate_accept_claim`.
+fn has_unproven_ancestry(efs_len: usize) -> bool {
     efs_len > 1
 }
 
@@ -717,11 +791,30 @@ enum GateVerdict {
     Reached,
     /// A fatal status (REJECTED / DOUBLE_SPEND_ATTEMPTED) → never admit.
     Fatal,
+    /// An ORPHAN view (`SEEN_IN_ORPHAN_MEMPOOL`, #267): Arcade holds the tx
+    /// but cannot see its parents. NOT Pending (waiting cannot resolve it —
+    /// Arcade orphan-and-forgets, it never re-evaluates when the parents
+    /// arrive), NOT Reached (an orphan-pool residence is not a network
+    /// accept — the bsv-low #267 incident admitted a JOIN the public network
+    /// never held on exactly this view), NOT Fatal (the tx bytes are fine;
+    /// the parents are merely missing from Arcade's view). The orphan answer
+    /// means "missing parents", so the caller answers it with parents: route
+    /// to the ancestry rungs (full-batch resubmit + ancestry-primed
+    /// corroboration) instead of the Pending→timeout→502 spiral.
+    Orphan,
     /// A non-terminal status below the target → keep waiting.
     Pending,
 }
 
 fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
+    // #267: the orphan check comes FIRST — the same orphan-before-anything
+    // ordering `arc_verdict`/`corroborator_verdict` use (and whose absence in
+    // the TS mirror is the client half of #267). `SEEN_IN_ORPHAN_MEMPOOL`
+    // contains "SEEN": any rule that consulted the text before the orphan
+    // check could mistake an orphan-pool view for a network accept.
+    if status.to_ascii_uppercase().contains("ORPHAN") {
+        return GateVerdict::Orphan;
+    }
     if ARCADE_FATAL_STATUSES.contains(&status) {
         return GateVerdict::Fatal;
     }
@@ -898,6 +991,14 @@ enum GateStep {
     /// are character-identical here — so the caller RESUBMITS (waiting is
     /// proven useless) rather than concluding "missing parent".
     AsyncRejected(String),
+    /// #267: Arcade holds the subject only as an ORPHAN
+    /// (`SEEN_IN_ORPHAN_MEMPOOL` on the echo/poll) — it cannot see the
+    /// parents. Unlike `AsyncRejected` this is NOT ambiguous: the answer IS
+    /// "missing parents", so a subject-only resubmit is pointless — the
+    /// caller jumps straight to the ancestry rungs (full-batch resubmit +
+    /// ancestry-primed corroboration). Never admits, never definitively
+    /// rejects, on the orphan view alone.
+    Orphan(String),
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
@@ -972,6 +1073,11 @@ enum Ladder {
     Return(ArcOutcome),
     /// The 202-then-async-REJECTED shape — advance to the next resubmit.
     Retry,
+    /// #267: an ORPHAN view — skip the remaining subject-only rungs (a
+    /// subject resubmit cannot supply the missing parents) and jump straight
+    /// to the ancestry rungs: the full-batch resubmit, then the
+    /// ancestry-primed exhaustion corroboration.
+    Ancestry,
 }
 
 /// How one classified submit outcome enters the gate (PURE — the real
@@ -1035,7 +1141,255 @@ fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
         // vs a stale Arcade validator view, #214); an explicit resubmit is the
         // only recovery. Retry.
         GateStep::AsyncRejected(_) => Ladder::Retry,
+        // #267: an orphan view is NOT ambiguous — the answer is "missing
+        // parents", so answer it with parents (the ancestry rungs). Never a
+        // Return: an orphan view alone may neither admit nor reject.
+        GateStep::Orphan(_) => Ladder::Ancestry,
     }
+}
+
+/// Which rung of the gated ladder a submit serves ([`broadcast_efs_gated_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitRung {
+    /// `POST /tx` of the subject's EF alone (attempts 1 and 2).
+    SubjectOnly,
+    /// `POST /txs` of the full ancestry batch (attempt 3).
+    FullBatch,
+}
+
+/// Which corroborating broadcast the ladder requests: the #214 subject-only
+/// leg or the #216 ancestry-primed batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorroborationKind {
+    SubjectOnly,
+    WithAncestry,
+}
+
+/// Gate-flow logging that is safe on the native host: the wiring tests drive
+/// [`broadcast_efs_gated_with`] natively, where a `worker::console_log!` call
+/// would abort (js-sys imported functions cannot be called off-wasm — the
+/// same constraint `sleep_ms` documents).
+fn gate_log(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("{msg}");
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = msg;
+}
+
+/// #267: gate a would-be-terminal ladder outcome before it may leave the
+/// gated broadcast. Rejections pass through untouched (the SyncRejected 422
+/// semantics are #213's, unchanged). An ACCEPT claim:
+///
+/// - UNPROVEN ancestry (`efs_len > 1` — the #216 signal): Arcade's word
+///   alone must NOT admit. This is the incident class: Arcade can hold the
+///   subject only as an ORPHAN (parents 0-conf, absent from its node) or in
+///   an otherwise-degraded view and still echo a gate-satisfying txStatus,
+///   vouching for a tx the public network never received. Run the #216
+///   ancestry-first corroboration (`corroborate(WithAncestry)` → the
+///   [`corroborate_batch_with`] flow: ancestors primed to the corroborator
+///   first, subject last, the subject's verdict ALONE decides) and admit
+///   only on the corroborator's genuine accept ([`corroborated_accept_claim`]
+///   — anything else fails CLOSED to Err/502, never back to trusting
+///   Arcade). The wall-clock lands in the `corroborate` Server-Timing
+///   segment via `ArcadeBroadcaster::corroborate_ms`.
+/// - Single-EF fast path (`efs_len == 1`) — HONEST residual, do not
+///   overstate it: one leg means every parent arrived with a merkle-path
+///   bump ATTACHED in the submitted BEEF (`beef_to_ef_batch` skips a leg on
+///   `has_proof()` PRESENCE — the bump is NOT SPV-validated at this layer,
+///   `HistoricalTxNoSpv`), i.e. "parents are mined" here is a
+///   SUBMITTER-ASSERTED signal, not a verified fact. A degraded-Arcade
+///   false-SEEN therefore still admits on this arm, and a submitter can
+///   reach it deliberately by attaching bumps. Accepted as a latency
+///   trade-off for the common genuinely-proven-parent submit; the residual
+///   is tracked as bsv-low#268 (validate the bumps / corroborate here too)
+///   — do NOT treat this arm as sound against an adversarial submitter.
+async fn gate_accept_claim_with<C, CFut>(
+    outcome: ArcOutcome,
+    efs_len: usize,
+    subject_txid: &str,
+    corroborate: &mut C,
+) -> Result<ArcOutcome, String>
+where
+    C: FnMut(CorroborationKind) -> CFut,
+    CFut: std::future::Future<Output = Result<ArcOutcome, String>>,
+{
+    match outcome {
+        ArcOutcome::Rejected(_) => Ok(outcome),
+        ArcOutcome::Accepted(_) if !has_unproven_ancestry(efs_len) => Ok(outcome),
+        ArcOutcome::Accepted(_) => {
+            gate_log(&format!(
+                "[arcade] {subject_txid} accept claim with {} unproven ancestor(s) — corroborating before admit (#267)",
+                efs_len - 1
+            ));
+            let corroborated = corroborate(CorroborationKind::WithAncestry).await;
+            corroborated_accept_claim(corroborated, subject_txid)
+        }
+    }
+}
+
+/// PURE (#267 review hardening): the gated-broadcast LADDER control flow,
+/// generic over the submit/poll transport (`submit_gate`) and the
+/// corroborating broadcaster (`corroborate`) — the same injectable-closure
+/// pattern as [`corroborate_batch_with`], so the ENFORCEMENT WIRING is
+/// unit-tested natively, not just the leaf classifiers: "an Arcade-echoed
+/// SEEN with unproven ancestry cannot return Accepted without a corroborator
+/// accept" and "an orphan answer skips the subject-only rungs" are pinned at
+/// THIS level (reverting a `gate_accept_claim_with` callsite to
+/// `return Ok(outcome)` fails the wiring tests, not just a leaf test).
+///
+/// `submit_gate(rung)` performs one submit+SEEN-gate of the subject alone or
+/// of the full ancestry batch; `corroborate(kind)` runs the #214
+/// subject-only or #216 ancestry-primed corroborating broadcast; `efs_len`
+/// is the EF leg count ([`has_unproven_ancestry`]). The real transports are
+/// injected by [`ArcadeBroadcaster::broadcast_efs_gated`].
+async fn broadcast_efs_gated_with<S, SFut, C, CFut>(
+    efs_len: usize,
+    subject_txid: &str,
+    mut submit_gate: S,
+    mut corroborate: C,
+) -> Result<ArcOutcome, String>
+where
+    S: FnMut(SubmitRung) -> SFut,
+    SFut: std::future::Future<Output = Result<GateStep, String>>,
+    C: FnMut(CorroborationKind) -> CFut,
+    CFut: std::future::Future<Output = Result<ArcOutcome, String>>,
+{
+    // #267: set when an ORPHAN view routes us straight to the ancestry
+    // rungs (attempt 3 + the ancestry-primed exhaustion corroboration) —
+    // the remaining subject-only rungs cannot supply the missing parents.
+    let mut orphan_shortcut = false;
+
+    // ── Attempt 1: SUBJECT ONLY. Arcade sources unconfirmed parents itself.
+    gate_log(&format!(
+        "[arcade] submitting subject-only {subject_txid} → gating on {ARCADE_GATE_STATUS}"
+    ));
+    let step = submit_gate(SubmitRung::SubjectOnly).await?;
+    match ladder_step(step, subject_txid) {
+        Ladder::Return(outcome) => {
+            return gate_accept_claim_with(outcome, efs_len, subject_txid, &mut corroborate).await;
+        }
+        Ladder::Ancestry => {
+            gate_log(&format!(
+                "[arcade] {subject_txid} held as ORPHAN — routing to ancestry rungs (#267)"
+            ));
+            orphan_shortcut = true;
+        }
+        Ladder::Retry => {}
+    }
+
+    // ── Attempt 2: RESUBMIT the subject alone (waiting is proven useless;
+    // Arcade needs an explicit resubmit to re-attempt orphan resolution).
+    // Skipped on the orphan shortcut — a subject-only resubmit cannot
+    // supply the missing parents.
+    if !orphan_shortcut {
+        gate_log(&format!(
+            "[arcade] {subject_txid} not accepted — resubmitting subject-only"
+        ));
+        let step = submit_gate(SubmitRung::SubjectOnly).await?;
+        match ladder_step(step, subject_txid) {
+            Ladder::Return(outcome) => {
+                return gate_accept_claim_with(outcome, efs_len, subject_txid, &mut corroborate)
+                    .await;
+            }
+            Ladder::Ancestry => {
+                gate_log(&format!(
+                    "[arcade] {subject_txid} held as ORPHAN — routing to ancestry rungs (#267)"
+                ));
+                orphan_shortcut = true;
+            }
+            Ladder::Retry => {}
+        }
+    }
+
+    // ── CORROBORATE — deliberately BEFORE the full-batch rung (#214).
+    //
+    // Ordering decision (the rung-3 poisoning question): under a stale
+    // Arcade validator view, re-submitting ANCESTORS in the batch rung can
+    // WORSEN state — a previously-SEEN ancestor gets re-validated against
+    // the same stale view, its stored status can flip to REJECTED, and
+    // Arcade's "parent rejected" cascade then condemns every descendant
+    // (observed on 2026-07-20/21: sticky REJECTED for txs MINED in
+    // 958776). So before feeding Arcade any ancestors, ask a SECOND
+    // broadcaster about the SUBJECT:
+    //  - corroborator ACCEPTS → return Accepted now — the batch rung is
+    //    skipped entirely, so a stale Arcade never gets an ancestor
+    //    resubmit to poison;
+    //  - corroborator REJECTS → two independent broadcasters refused the
+    //    subject — definitively Rejected, and the batch rung is pointless;
+    //  - corroborator transport/inconclusive → the batch rung is still the
+    //    right move: a GENUINE missing-parent orphan (the shape #211 built
+    //    this rung for) is only fixable by feeding Arcade the ancestry.
+    //    The poisoning residual survives ONLY in this arm (both
+    //    broadcasters unable to confirm), which is exactly when we have no
+    //    better information anyway — and the final corroboration below
+    //    still stands between any fallout and a definitive 422.
+    //
+    // #267: skipped on the orphan shortcut — the orphan answer already
+    // says "missing parents", and a subject-only corroboration would see
+    // the same missing parent (the #216 lesson); go straight to the
+    // ancestry rungs, whose exhaustion corroboration is ancestry-primed.
+    if !orphan_shortcut {
+        let corroborated = corroborate(CorroborationKind::SubjectOnly).await;
+        match corroborated_exhaustion(corroborated, subject_txid) {
+            Ok(outcome) => {
+                gate_log(&format!(
+                    "[arcade] {subject_txid} corroborated pre-batch → {outcome:?}"
+                ));
+                return Ok(outcome);
+            }
+            Err(inconclusive) if has_unproven_ancestry(efs_len) => {
+                gate_log(&format!(
+                    "[arcade] corroborator inconclusive for {subject_txid} ({inconclusive}) — trying full ancestry batch"
+                ));
+            }
+            // No ancestors to feed — the ladder is exhausted and the
+            // corroborator could not decide. Honest 502, never a false 422.
+            Err(inconclusive) => return Err(inconclusive),
+        }
+    }
+
+    // ── Attempt 3: FULL ANCESTRY BATCH — feed any parent Arcade could not
+    // source from the live network (reached when the corroborator could
+    // not decide — see the ordering note above — or directly on the #267
+    // orphan shortcut, whose answer IS "missing parents").
+    gate_log(&format!(
+        "[arcade] {subject_txid} still not accepted — resubmitting full batch ({efs_len} legs)"
+    ));
+    let step = submit_gate(SubmitRung::FullBatch).await?;
+    match ladder_step(step, subject_txid) {
+        Ladder::Return(outcome) => {
+            return gate_accept_claim_with(outcome, efs_len, subject_txid, &mut corroborate).await;
+        }
+        // Retry (async-rejected) and Ancestry (still orphan) both fall
+        // through to the exhaustion corroboration — the ladder has no
+        // rungs left, and for a still-orphan view the ancestry-primed
+        // corroborator below is exactly the remaining move.
+        Ladder::Retry | Ladder::Ancestry => {}
+    }
+
+    // Exhausted the resubmit ladder. Tonight's #214 outage proved Arcade's
+    // async REJECTED alone is NOT trustworthy here, so the exhausted
+    // verdict is whatever the corroborating broadcaster says (second
+    // attempt — the pre-batch one was transport/inconclusive, and both
+    // transports can be transient): Accepted admits (real network accept),
+    // Rejected → 422 (two broadcasters agree), inconclusive → Err → 502.
+    //
+    // #216: when there IS ancestry (efs_len > 1), corroborate WITH it —
+    // prime the corroborator's mempool with the parent chain FIRST so a
+    // degraded broadcaster with a partial UTXO view can validate a subject
+    // that spends a still-0-conf parent (the stuck-refund scenario). With a
+    // single leg there is no parent to feed, so it stays subject-only. The
+    // #214 semantics are UNCHANGED: only the subject's real network-accept
+    // marker admits; a corroborator Rejected is the definitive 422; anything
+    // else is an honest Err/502. Priming ancestors is safe — the
+    // corroborator (TAAL/GorillaPool) is the HEALTHY broadcaster here, not
+    // the stale Arcade view (see `corroborate_batch`'s poisoning note).
+    let corroborated = if has_unproven_ancestry(efs_len) {
+        corroborate(CorroborationKind::WithAncestry).await
+    } else {
+        corroborate(CorroborationKind::SubjectOnly).await
+    };
+    corroborated_exhaustion(corroborated, subject_txid)
 }
 
 /// Concatenate an EF batch (dependency order) into a single `POST /txs` body.
@@ -1116,9 +1470,12 @@ impl ArcadeBroadcaster {
         self
     }
 
-    /// Milliseconds spent in the corroboration leg(s) of the last
-    /// `broadcast_efs_gated` call (0 when no corroboration ran). For the
-    /// `corroborate` Server-Timing segment (#195).
+    /// Milliseconds ACCUMULATED across every corroboration leg this
+    /// broadcaster instance has run (each `corroborate_subject` /
+    /// `corroborate_batch` call ADDS its wall-clock; nothing resets it — 0
+    /// only if no corroboration ever ran). routes.rs constructs a fresh
+    /// `ArcadeBroadcaster` per /submit request, so read there this is the
+    /// request's total `corroborate` Server-Timing segment (#195).
     pub fn corroborate_ms(&self) -> f64 {
         self.corroborate_ms.get()
     }
@@ -1222,6 +1579,20 @@ impl ArcadeBroadcaster {
     /// network accept admits; its rejection confirms the 422; anything else is
     /// an honest `Err`/502. A synchronous validation failure (SyncRejected)
     /// stays uncorroborated — see [`ladder_step`].
+    ///
+    /// #267: Arcade's ACCEPT is not trusted on its own either, when the
+    /// subject has UNPROVEN ancestry — every accept-shaped exit passes
+    /// [`gate_accept_claim_with`] (corroborate-on-accept; a single-EF subject
+    /// keeps the fast path — see that function's honest-residual note and
+    /// bsv-low#268). And an ORPHAN view (`SEEN_IN_ORPHAN_MEMPOOL`)
+    /// short-circuits the subject-only rungs straight to the ancestry rungs —
+    /// the orphan answer means "missing parents", so it is answered with
+    /// parents, never with a Pending→timeout→502 and never with an admit.
+    ///
+    /// This is a thin transport-injection wrapper: the ladder control flow
+    /// lives in [`broadcast_efs_gated_with`] (natively wiring-tested); this
+    /// method supplies the real Arcade submit/poll and TAAL→GorillaPool
+    /// corroboration transports.
     pub async fn broadcast_efs_gated(
         &self,
         efs: &[EfTx],
@@ -1238,105 +1609,42 @@ impl ArcadeBroadcaster {
             .find(|e| e.txid == subject_txid)
             .ok_or_else(|| format!("subject {subject_txid} not present in EF batch"))?;
 
-        // ── Attempt 1: SUBJECT ONLY. Arcade sources unconfirmed parents itself.
-        worker::console_log!(
-            "[arcade] submitting subject-only {subject_txid} → gating on {ARCADE_GATE_STATUS}"
-        );
-        let step = self
-            .submit_once_and_gate(&self.tx_endpoint(), &subject_ef.ef, subject_txid, 1)
-            .await?;
-        if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
-            return Ok(outcome);
-        }
-
-        // ── Attempt 2: RESUBMIT the subject alone (waiting is proven useless;
-        // Arcade needs an explicit resubmit to re-attempt orphan resolution).
-        worker::console_log!("[arcade] {subject_txid} not accepted — resubmitting subject-only");
-        let step = self
-            .submit_once_and_gate(&self.tx_endpoint(), &subject_ef.ef, subject_txid, 1)
-            .await?;
-        if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
-            return Ok(outcome);
-        }
-
-        // ── CORROBORATE — deliberately BEFORE the full-batch rung (#214).
-        //
-        // Ordering decision (the rung-3 poisoning question): under a stale
-        // Arcade validator view, re-submitting ANCESTORS in the batch rung can
-        // WORSEN state — a previously-SEEN ancestor gets re-validated against
-        // the same stale view, its stored status can flip to REJECTED, and
-        // Arcade's "parent rejected" cascade then condemns every descendant
-        // (observed on 2026-07-20/21: sticky REJECTED for txs MINED in
-        // 958776). So before feeding Arcade any ancestors, ask a SECOND
-        // broadcaster about the SUBJECT:
-        //  - corroborator ACCEPTS → return Accepted now — the batch rung is
-        //    skipped entirely, so a stale Arcade never gets an ancestor
-        //    resubmit to poison;
-        //  - corroborator REJECTS → two independent broadcasters refused the
-        //    subject — definitively Rejected, and the batch rung is pointless;
-        //  - corroborator transport/inconclusive → the batch rung is still the
-        //    right move: a GENUINE missing-parent orphan (the shape #211 built
-        //    this rung for) is only fixable by feeding Arcade the ancestry.
-        //    The poisoning residual survives ONLY in this arm (both
-        //    broadcasters unable to confirm), which is exactly when we have no
-        //    better information anyway — and the final corroboration below
-        //    still stands between any fallout and a definitive 422.
-        let corroborated = self.corroborate_subject(subject_ef).await;
-        match corroborated_exhaustion(corroborated, subject_txid) {
-            Ok(outcome) => {
-                worker::console_log!(
-                    "[arcade] {subject_txid} corroborated pre-batch → {outcome:?}"
-                );
-                return Ok(outcome);
-            }
-            Err(inconclusive) if efs.len() > 1 => {
-                worker::console_log!(
-                    "[arcade] corroborator inconclusive for {subject_txid} ({inconclusive}) — trying full ancestry batch"
-                );
-            }
-            // No ancestors to feed — the ladder is exhausted and the
-            // corroborator could not decide. Honest 502, never a false 422.
-            Err(inconclusive) => return Err(inconclusive),
-        }
-
-        // ── Attempt 3: FULL ANCESTRY BATCH — feed any parent Arcade could not
-        // source from the live network (only reached when the corroborator
-        // could not decide; see the ordering note above).
-        let concat = concat_efs(efs);
-        worker::console_log!(
-            "[arcade] {subject_txid} still not accepted — resubmitting full batch ({} legs)",
-            efs.len()
-        );
-        let step = self
-            .submit_once_and_gate(&self.txs_endpoint(), &concat, subject_txid, efs.len())
-            .await?;
-        if let Ladder::Return(outcome) = ladder_step(step, subject_txid) {
-            return Ok(outcome);
-        }
-
-        // Exhausted the resubmit ladder. Tonight's #214 outage proved Arcade's
-        // async REJECTED alone is NOT trustworthy here, so the exhausted
-        // verdict is whatever the corroborating broadcaster says (second
-        // attempt — the pre-batch one was transport/inconclusive, and both
-        // transports can be transient): Accepted admits (real network accept),
-        // Rejected → 422 (two broadcasters agree), inconclusive → Err → 502.
-        //
-        // #216: when there IS ancestry (efs.len() > 1), corroborate WITH it —
-        // prime the corroborator's mempool with the parent chain FIRST so a
-        // degraded broadcaster with a partial UTXO view can validate a subject
-        // that spends a still-0-conf parent (the stuck-refund scenario). With a
-        // single leg there is no parent to feed, so it stays subject-only. The
-        // #214 semantics are UNCHANGED: only the subject's real network-accept
-        // marker admits; a corroborator Rejected is the definitive 422; anything
-        // else is an honest Err/502. Priming ancestors is safe — the
-        // corroborator (TAAL/GorillaPool) is the HEALTHY broadcaster here, not
-        // the stale Arcade view (see `corroborate_batch`'s poisoning note).
-        let corroborated = if exhaustion_corroborates_with_ancestry(efs.len()) {
-            self.corroborate_batch(efs, subject_txid).await
-        } else {
-            self.corroborate_subject(subject_ef).await
-        };
-        corroborated_exhaustion(corroborated, subject_txid)
+        broadcast_efs_gated_with(
+            efs.len(),
+            subject_txid,
+            |rung| async move {
+                match rung {
+                    SubmitRung::SubjectOnly => {
+                        self.submit_once_and_gate(
+                            &self.tx_endpoint(),
+                            &subject_ef.ef,
+                            subject_txid,
+                            1,
+                        )
+                        .await
+                    }
+                    SubmitRung::FullBatch => {
+                        let concat = concat_efs(efs);
+                        self.submit_once_and_gate(
+                            &self.txs_endpoint(),
+                            &concat,
+                            subject_txid,
+                            efs.len(),
+                        )
+                        .await
+                    }
+                }
+            },
+            |kind| async move {
+                match kind {
+                    CorroborationKind::SubjectOnly => self.corroborate_subject(subject_ef).await,
+                    CorroborationKind::WithAncestry => {
+                        self.corroborate_batch(efs, subject_txid).await
+                    }
+                }
+            },
+        )
+        .await
     }
 
     /// Submit one EF body and SEEN-gate the subject: submit → (echoed-status
@@ -1383,15 +1691,21 @@ impl ArcadeBroadcaster {
                             &parsed.extra_info,
                         )));
                     }
+                    // #267: an echoed ORPHAN view stops the gate here — no
+                    // poll (waiting cannot conjure the missing parents).
+                    GateVerdict::Orphan => {
+                        return Ok(GateStep::Orphan(arcade_fatal_reason(
+                            subject_txid,
+                            &parsed.tx_status,
+                            &parsed.extra_info,
+                        )));
+                    }
                     GateVerdict::Pending => {}
                 }
             }
         }
 
-        match self.poll_for_status(subject_txid).await? {
-            ArcOutcome::Accepted(_) => Ok(GateStep::Accepted),
-            ArcOutcome::Rejected(r) => Ok(GateStep::AsyncRejected(r)),
-        }
+        self.poll_for_status(subject_txid).await
     }
 
     /// POST the EF body to `endpoint` (callback headers set) and CLASSIFY the
@@ -1459,9 +1773,10 @@ impl ArcadeBroadcaster {
     }
 
     /// Poll `GET /tx/{txid}` until the subject reaches the gate (or better),
-    /// hits a fatal status, or the deadline elapses. Timeout → `Err` (never
-    /// admit a tx that never became SEEN).
-    async fn poll_for_status(&self, txid: &str) -> Result<ArcOutcome, String> {
+    /// hits a fatal status, surfaces an ORPHAN view (#267 — routed to the
+    /// ancestry rungs, not waited out), or the deadline elapses. Timeout →
+    /// `Err` (never admit a tx that never became SEEN).
+    async fn poll_for_status(&self, txid: &str) -> Result<GateStep, String> {
         let mut waited = 0u64;
         loop {
             if let Some(resp) = self.tx_status(txid).await {
@@ -1471,12 +1786,23 @@ impl ArcadeBroadcaster {
                 match classify_arcade_status(&resp.tx_status, ARCADE_GATE_STATUS) {
                     GateVerdict::Reached => {
                         worker::console_log!("[arcade] {txid} reached {}", resp.tx_status);
-                        return Ok(ArcOutcome::Accepted(txid.to_string()));
+                        return Ok(GateStep::Accepted);
                     }
                     GateVerdict::Fatal => {
                         // #209: fold the captured extra_info into the reason text
                         // (reason ONLY — the gate above already decided on status).
-                        return Ok(ArcOutcome::Rejected(arcade_fatal_reason(
+                        return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
+                            txid,
+                            &resp.tx_status,
+                            &resp.extra_info,
+                        )));
+                    }
+                    // #267: an ORPHAN view ends the poll immediately —
+                    // `SEEN_IN_ORPHAN_MEMPOOL` used to rank 0 → Pending →
+                    // 20s timeout → 502, when the answer ("missing parents")
+                    // was already in hand. Route to the ancestry rungs.
+                    GateVerdict::Orphan => {
+                        return Ok(GateStep::Orphan(arcade_fatal_reason(
                             txid,
                             &resp.tx_status,
                             &resp.extra_info,
@@ -2193,18 +2519,411 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_routes_batch_only_when_ancestry_present() {
-        // efs.len()==1 stays subject-only; efs.len()>1 routes through the
-        // ancestry-carrying `corroborate_batch`.
+    fn unproven_ancestry_signal_gates_batch_corroboration_and_accept_claims() {
+        // The ONE signal, two consumers (#216/#267): efs.len()==1 (proven
+        // ancestry) keeps subject-only corroboration AND the uncorroborated
+        // accept fast path; efs.len()>1 routes the exhaustion corroboration
+        // through the ancestry-carrying `corroborate_batch` AND forces the
+        // #267 corroborate-on-accept gate.
         assert!(
-            !exhaustion_corroborates_with_ancestry(1),
-            "single leg → subject-only corroboration"
+            !has_unproven_ancestry(1),
+            "single leg → subject-only corroboration, accept fast path"
         );
         assert!(
-            exhaustion_corroborates_with_ancestry(2),
-            "ancestry present → batch corroboration"
+            has_unproven_ancestry(2),
+            "ancestry present → batch corroboration, corroborate-on-accept"
         );
-        assert!(exhaustion_corroborates_with_ancestry(9));
+        assert!(has_unproven_ancestry(9));
+    }
+
+    // ── #267 hardening: the corroboration leg cap (work bound) ──────────────
+
+    /// `count` parent legs + the subject leg, through the real batch producer.
+    fn capped_batch(count: usize) -> (Vec<EfTx>, String) {
+        let mut efs: Vec<EfTx> = (0..count)
+            .map(|i| EfTx {
+                txid: format!("p{i}"),
+                ef: vec![(i % 250) as u8, (i / 250) as u8],
+            })
+            .collect();
+        efs.push(EfTx {
+            txid: "subject".into(),
+            ef: vec![0xff, 0xff, 0xff],
+        });
+        (efs, "subject".to_string())
+    }
+
+    #[tokio::test]
+    async fn batch_over_the_leg_cap_is_inconclusive_with_zero_submits() {
+        // One leg over the cap → inconclusive Err (→ 502, client fallback)
+        // BEFORE any submit: a truncated/partial corroboration must never
+        // exist, let alone admit. The routes.rs byte bound alone admits ~20k
+        // minimal legs — this is the serial-POST work bound.
+        let (efs, subject) = capped_batch(MAX_CORROBORATION_LEGS); // +subject ⇒ cap+1 legs
+        assert_eq!(efs.len(), MAX_CORROBORATION_LEGS + 1);
+        let submits = std::cell::Cell::new(0usize);
+        let out = corroborate_batch_with(&efs, &subject, |_tx_hex| {
+            submits.set(submits.get() + 1);
+            async { corroborator_verdict(200, r#"{"txid":"x","txStatus":"SEEN_ON_NETWORK"}"#) }
+        })
+        .await;
+        let err = out.expect_err("over-cap batch must be inconclusive, never corroborated");
+        assert!(err.contains("leg cap"), "{err}");
+        assert_eq!(
+            submits.get(),
+            0,
+            "zero submits over the cap — no partial corroboration"
+        );
+        // …and the #267 accept-claim fold on that Err refuses the admit.
+        assert!(corroborated_accept_claim(Err(err), &subject).is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_at_the_leg_cap_still_corroborates_and_subject_decides() {
+        // Exactly at the cap the corroboration runs in full and the subject's
+        // verdict decides, as ever.
+        let (efs, subject) = capped_batch(MAX_CORROBORATION_LEGS - 1); // +subject ⇒ cap legs
+        assert_eq!(efs.len(), MAX_CORROBORATION_LEGS);
+        let subject_hex = hex::encode([0xffu8, 0xff, 0xff]);
+        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let is_subject = tx_hex == subject_hex;
+            async move {
+                if is_subject {
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
+                } else {
+                    corroborator_verdict(200, r#"{"txid":"p","txStatus":"SEEN_ON_NETWORK"}"#)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+    }
+
+    // ── #267: corroborate-on-accept — Arcade's ACCEPT is never authoritative
+    //    for an unproven-parent subject ─────────────────────────────────────
+    //
+    // Ground truth (bsv-low #267, 2026-07-27/28): a degraded Arcade held a
+    // JOIN only in its ORPHAN pool (parents 0-conf, absent from its node) yet
+    // echoed a gate-satisfying txStatus; the overlay admitted, the hand
+    // played out, and BOTH the JOIN and the settle were WoC/Bitails-404
+    // twenty minutes later (Server-Timing showed corroborate=0.0 — #214
+    // corroborates only REJECTIONS). These tests pin the corroborate-on-accept
+    // fold through the REAL pure producers: `corroborator_verdict` classifies
+    // the corroborator's wire answer, `corroborate_batch_with` runs the #216
+    // ancestry-first control flow, and `corroborated_accept_claim` folds the
+    // result into the accept claim that `gate_accept_claim` returns.
+
+    #[test]
+    fn accept_claim_with_corroborator_accept_admits_with_our_subject_txid() {
+        // A second broadcaster's REAL network accept confirms Arcade's claim
+        // → admit, under OUR subject txid (never the corroborator's echo).
+        let subject = "2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256";
+        let corroborator = corroborator_verdict(200, CORR_SEEN_BODY);
+        assert_eq!(
+            corroborated_accept_claim(corroborator, subject).unwrap(),
+            ArcOutcome::Accepted(subject.to_string())
+        );
+    }
+
+    #[test]
+    fn accept_claim_with_corroborator_inconclusive_fails_closed_never_trusting_arcade() {
+        // THE #267 fix: when the corroborator cannot confirm, the admit is
+        // REFUSED (Err → 502) — never a fall-back to trusting Arcade's word
+        // alone (which IS the incident). Every inconclusive dress: transport
+        // failure on both hosts, a 200-shaped sub-SEEN ack, and the
+        // incident's own shape — the corroborator too holding only an ORPHAN
+        // view.
+        for corroborator in [
+            Err("taal: fetch failed; gorillapool: fetch failed".to_string()),
+            corroborator_verdict(503, "unavailable"),
+            corroborator_verdict(200, r#"{"txid":"ab","txStatus":"RECEIVED"}"#),
+            corroborator_verdict(
+                200,
+                r#"{"txid":"ab","txStatus":"SEEN_IN_ORPHAN_MEMPOOL","extraInfo":""}"#,
+            ),
+        ] {
+            let out = corroborated_accept_claim(corroborator, "ab");
+            let err = out.expect_err("inconclusive corroboration must refuse the admit");
+            assert!(err.contains("not admitting"), "{err}");
+        }
+    }
+
+    #[test]
+    fn accept_claim_with_corroborator_reject_refuses_admission_without_a_false_422() {
+        // Arcade says accepted, the corroborator says refused: CONFLICTING
+        // single-provider verdicts. Fail closed on admission (never admit on
+        // Arcade's word) but never mint a definitive 422 from one provider's
+        // rejection either (#214's own doctrine) — Err → an honest,
+        // retryable 502.
+        let body = r#"{"txid":"ab","txStatus":"REJECTED","extraInfo":"fee too low"}"#;
+        let corroborator = corroborator_verdict(200, body);
+        let out = corroborated_accept_claim(corroborator, "ab");
+        let err = out.expect_err("a conflicting reject must be Err/502, never Ok");
+        assert!(err.contains("conflicting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn accept_claim_primed_parent_can_never_manufacture_a_subject_accept() {
+        // The #211/#212-class invariant, extended through the NEW accept-claim
+        // path end-to-end (real producers: corroborate_batch_with →
+        // corroborated_accept_claim): a parent primed as SEEN plus a subject
+        // that never gets past a sub-SEEN ack must NOT admit — the subject's
+        // verdict alone decides, and an ack is not a verdict.
+        //
+        // RED-VERIFY: neuter `corroborated_accept_claim`'s Err arm (backup
+        // copy) to return Ok(Accepted) — "trust Arcade when the corroborator
+        // can't confirm" — and this test fails.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        for status in ["RECEIVED", "STORED", "ACCEPTED_BY_NETWORK", ""] {
+            let corroborated = corroborate_batch_with(&efs, &subject, |tx_hex| {
+                let is_subject = tx_hex == subject_hex;
+                let status = status.to_string();
+                async move {
+                    if is_subject {
+                        corroborator_verdict(
+                            200,
+                            &format!(r#"{{"txid":"subject","txStatus":"{status}"}}"#),
+                        )
+                    } else {
+                        corroborator_verdict(
+                            200,
+                            r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
+                        )
+                    }
+                }
+            })
+            .await;
+            assert!(
+                corroborated_accept_claim(corroborated, &subject).is_err(),
+                "primed parent + sub-SEEN subject ({status:?}) must never admit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incident_267_orphan_vouching_arcade_cannot_admit_uncorroborated() {
+        // The incident, replayed through the real producers: Arcade claims the
+        // subject accepted, but the corroborator — even AFTER the parents are
+        // primed — holds it only as an orphan. The accept claim must be
+        // refused (Err → 502), never admitted.
+        let (efs, subject) = parent_and_subject();
+        let subject_hex = hex::encode([4u8, 5]);
+        let corroborated = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let is_subject = tx_hex == subject_hex;
+            async move {
+                if is_subject {
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"subject","txStatus":"SEEN_IN_ORPHAN_MEMPOOL","extraInfo":""}"#,
+                    )
+                } else {
+                    corroborator_verdict(200, r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#)
+                }
+            }
+        })
+        .await;
+        assert!(
+            corroborated_accept_claim(corroborated, &subject).is_err(),
+            "an orphan-view corroboration must never confirm Arcade's accept claim"
+        );
+    }
+
+    // ── #267 hardening: the ENFORCEMENT WIRING itself ───────────────────────
+    //
+    // The leaf tests above prove the classifiers and the fold; these prove
+    // the LADDER actually routes through them — `broadcast_efs_gated_with` is
+    // the REAL control flow the worker path runs (the method injects only
+    // transports), so reverting a `gate_accept_claim_with` callsite to
+    // `return Ok(outcome)`, or un-wiring the orphan shortcut, fails HERE even
+    // while every leaf test stays green.
+
+    #[tokio::test]
+    async fn wiring_arcade_accept_with_unproven_ancestry_never_admits_uncorroborated() {
+        // Arcade echoes SEEN on the very first rung; the subject has an
+        // unproven parent. Without a genuine corroborator accept the flow
+        // must NOT return Accepted — and the corroboration it runs must be
+        // the ancestry-primed batch.
+        let kinds = std::cell::RefCell::new(Vec::new());
+        let out = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |_rung| async { Ok(GateStep::Accepted) },
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                async { Err::<ArcOutcome, String>("corroborator unavailable".into()) }
+            },
+        )
+        .await;
+        assert!(
+            out.is_err(),
+            "Arcade's word alone must never admit an unproven-parent subject"
+        );
+        assert_eq!(
+            *kinds.borrow(),
+            vec![CorroborationKind::WithAncestry],
+            "the accept claim must be corroborated WITH ancestry"
+        );
+
+        // …and WITH a genuine corroborator accept it admits — under OUR
+        // subject txid, never the corroborator's echo.
+        let out = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |_rung| async { Ok(GateStep::Accepted) },
+            |_kind| async { Ok(ArcOutcome::Accepted("corroborator-echo".into())) },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+    }
+
+    #[tokio::test]
+    async fn wiring_single_leg_accept_keeps_the_fast_path_with_zero_corroboration() {
+        // Proven-parent (single-EF) subject: the accept fast path adds no
+        // corroborator call at all (the honest residual is documented on
+        // `gate_accept_claim_with` and tracked as bsv-low#268).
+        let corr_calls = std::cell::Cell::new(0usize);
+        let out = broadcast_efs_gated_with(
+            1,
+            "subject",
+            |_rung| async { Ok(GateStep::Accepted) },
+            |_kind| {
+                corr_calls.set(corr_calls.get() + 1);
+                async { Err::<ArcOutcome, String>("must not be called".into()) }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        assert_eq!(
+            corr_calls.get(),
+            0,
+            "single-leg fast path must not corroborate"
+        );
+    }
+
+    #[tokio::test]
+    async fn wiring_orphan_poll_answer_routes_to_the_ancestry_rungs() {
+        // Every Arcade answer is the ORPHAN view. The flow must skip the
+        // subject-only resubmit AND the subject-only pre-batch corroborate,
+        // go straight to the FULL BATCH, and (still orphan) end at the
+        // ancestry-primed exhaustion corroboration — whose genuine accept
+        // then admits.
+        let rungs = std::cell::RefCell::new(Vec::new());
+        let kinds = std::cell::RefCell::new(Vec::new());
+        let out = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |rung| {
+                rungs.borrow_mut().push(rung);
+                let step = GateStep::Orphan("Arcade SEEN_IN_ORPHAN_MEMPOOL subject".into());
+                async move { Ok(step) }
+            },
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                async { Ok(ArcOutcome::Accepted("subject".into())) }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        assert_eq!(
+            *rungs.borrow(),
+            vec![SubmitRung::SubjectOnly, SubmitRung::FullBatch],
+            "orphan must skip the subject-only resubmit (attempt 2)"
+        );
+        assert_eq!(
+            *kinds.borrow(),
+            vec![CorroborationKind::WithAncestry],
+            "orphan must skip the subject-only pre-batch corroborate"
+        );
+    }
+
+    #[tokio::test]
+    async fn wiring_async_reject_ladder_sequence_is_preserved() {
+        // The pre-#267 ladder, untouched: subject-only → subject-only →
+        // subject-only pre-batch corroborate (inconclusive) → full batch →
+        // ancestry-primed exhaustion corroborate decides (#211/#214/#216).
+        let rungs = std::cell::RefCell::new(Vec::new());
+        let kinds = std::cell::RefCell::new(Vec::new());
+        let out = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |rung| {
+                rungs.borrow_mut().push(rung);
+                let step = GateStep::AsyncRejected("Arcade REJECTED subject".into());
+                async move { Ok(step) }
+            },
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                let res = match kind {
+                    CorroborationKind::SubjectOnly => {
+                        Err("corroborator: missing parent — inconclusive".into())
+                    }
+                    CorroborationKind::WithAncestry => Ok(ArcOutcome::Accepted("subject".into())),
+                };
+                async move { res }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        assert_eq!(
+            *rungs.borrow(),
+            vec![
+                SubmitRung::SubjectOnly,
+                SubmitRung::SubjectOnly,
+                SubmitRung::FullBatch,
+            ]
+        );
+        assert_eq!(
+            *kinds.borrow(),
+            vec![
+                CorroborationKind::SubjectOnly,
+                CorroborationKind::WithAncestry,
+            ]
+        );
+    }
+
+    // ── #267: SEEN_IN_ORPHAN_MEMPOOL short-circuits to the ancestry rungs ───
+
+    #[test]
+    fn orphan_status_classifies_orphan_never_reached_fatal_or_pending() {
+        // Before #267 SEEN_IN_ORPHAN_MEMPOOL ranked 0 → Pending → 20s
+        // timeout → 502, when the answer ("missing parents") was already in
+        // hand. It must classify Orphan — and NEVER Reached, even though the
+        // status text contains "SEEN" (the orphan check runs first).
+        assert_eq!(
+            classify_arcade_status("SEEN_IN_ORPHAN_MEMPOOL", ARCADE_GATE_STATUS),
+            GateVerdict::Orphan
+        );
+        // The rank stays 0: an orphan view can never satisfy the SEEN gate
+        // through the rank comparison either (belt and braces).
+        assert_eq!(arcade_status_rank("SEEN_IN_ORPHAN_MEMPOOL"), 0);
+        // Healthy and fatal classifications are untouched.
+        assert_eq!(
+            classify_arcade_status("SEEN_ON_NETWORK", ARCADE_GATE_STATUS),
+            GateVerdict::Reached
+        );
+        assert_eq!(
+            classify_arcade_status("REJECTED", ARCADE_GATE_STATUS),
+            GateVerdict::Fatal
+        );
+        assert_eq!(
+            classify_arcade_status("RECEIVED", ARCADE_GATE_STATUS),
+            GateVerdict::Pending
+        );
+    }
+
+    #[test]
+    fn ladder_routes_orphan_to_the_ancestry_rungs_never_terminal() {
+        // An orphan view alone may neither admit nor definitively reject —
+        // it routes to the ancestry rungs (full-batch resubmit + the
+        // ancestry-primed exhaustion corroboration).
+        assert_eq!(
+            ladder_step(
+                GateStep::Orphan("Arcade SEEN_IN_ORPHAN_MEMPOOL ab".into()),
+                "ab"
+            ),
+            Ladder::Ancestry
+        );
     }
 
     #[test]
