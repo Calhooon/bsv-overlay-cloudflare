@@ -104,11 +104,16 @@ pub const POTPARTY_U32_LEN: usize = 4;
 /// RFC6979 is DETERMINISTIC and both potparty challenges are FIXED per
 /// (game, pot, identity), so a signature that happens to fall below the
 /// floor would re-produce IDENTICALLY forever and permanently wedge that
-/// marker (the 2026-07-28 gate's F5). ~2·2⁻¹⁶ of signatures have a 67-byte
-/// DER (one leading-zero byte in r or s); accepting 67 shrinks the
-/// permanent-wedge probability to the ≤66-byte tail (~2⁻²⁴ per marker —
-/// documented residual). Bounds are the SAME for v1 and v2 and mirrored in
-/// the client parser (`potParty.ts`).
+/// marker (the 2026-07-28 gate's F5).
+///
+/// MEASURED DER-length distribution over 4M samples (corrected in the
+/// second gate — an earlier revision of this note overstated the effect by
+/// ~500×): 72B 25%, 71B 49.8%, 70B 25%, 69B 1.9e-3, 68B 1.27e-5, 67B not
+/// observed (~2⁻²⁵), ≤66B ~2⁻³³. The OLD 68-byte floor already accepted the
+/// 68-byte case, so the wedge this change closes is the 67-byte one
+/// (~3e-8 per marker) and the remaining residual is the ≤66-byte tail
+/// (~2⁻³³). Bounds are the SAME for v1 and v2 and mirrored in the client
+/// parser (`potParty.ts`).
 pub const POTPARTY_SIG_MIN_LEN: usize = 67;
 /// Maximum sig push length (bytes) — a DER ECDSA signature.
 pub const POTPARTY_SIG_MAX_LEN: usize = 74;

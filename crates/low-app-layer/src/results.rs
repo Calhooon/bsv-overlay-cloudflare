@@ -1487,46 +1487,67 @@ pub fn results_sql() -> String {
 /// Hard bound on `/results` marker rows per request (BLOB-weight bound).
 pub const RESULTS_MAX_ROWS: usize = 100;
 
-/// Per-pot cap on v2 seat-marker rows considered by the `/leaderboard`
-/// attribution join. Honest traffic is TWO rows per pot (one per seat),
-/// published at funding — the EARLIEST possible markers for the pot (its
-/// txid does not exist to be named before funding). The cap only needs to
-/// keep dust-cost junk from crowding them out of the fetch window.
-pub const SEAT_MARKERS_PER_POT: usize = 40;
+/// Cap on v2 seat-marker rows fetched per COMMITTED KEY SLOT (per
+/// `(potTxid, seatSettlePubkey)` partition) for the `/leaderboard`
+/// attribution join. Honest traffic is exactly ONE row per slot (each seat
+/// publishes its own marker under its own committed key); the headroom
+/// absorbs benign duplicates (the sweep's content-idempotent republish).
+pub const SEAT_MARKERS_PER_KEY: usize = 8;
 
-/// The `/leaderboard` seat-marker query for a chunk of `n` pot txids
-/// (F2, 2026-07-28 gate): per-pot windowed with a DETERMINISTIC order.
+/// Pots per `seat_markers_sql` chunk. THREE binds per pot (potTxid, pubA,
+/// pubB) — 30 × 3 = 90, under D1's 100-bound-param cap.
+pub const SEAT_MARKERS_CHUNK_POTS: usize = 30;
+
+const _: () = assert!(SEAT_MARKERS_CHUNK_POTS * 3 <= crate::logic::D1_MAX_BOUND_PARAMS);
+
+/// The `/leaderboard` seat-marker query for a chunk of `n` pots, each bound
+/// as the triple `(potTxid, pubA, pubB)` — the pot's OWN committed settle
+/// keys, read from its funding lock by the caller (F2, 2026-07-28 gate;
+/// corrected 2026-07-28 second gate).
 ///
-/// Admission is byte-format-only and a v2-shaped row costs dust, so a hot
-/// pot can accumulate junk rows without bound; an unordered `LIMIT` would
-/// let SQLite's arbitrary row order decide whether the HONEST markers are
-/// even fetched (silent attribution loss ⇒ a `chainProven` win quietly
-/// degrades to the claim rules). `ROW_NUMBER() OVER (PARTITION BY potTxid
-/// ORDER BY createdAt ASC, rowid ASC)` keeps the OLDEST
-/// [`SEAT_MARKERS_PER_POT`] rows per pot — oldest-first because the honest
-/// markers are published at funding, before any junk can name the pot's
-/// txid, so an attacker would have to land that many admitted rows BEFORE
-/// both honest seats to evict them. NOTE: a
-/// `seatSettlePubkey IN (pubA, pubB)` SQL filter would only stop LAZY spam
-/// — the committed pubkeys are public in the funding lock, so a motivated
-/// spammer just copies them; the real bar stays the signature verification
-/// in [`attribute_seats`].
+/// THE REAL INVARIANT (an earlier revision's premise was FALSE): this query
+/// must NOT rely on row ORDER to find the honest markers. The #252
+/// opportunistic backfill (`potPartyRepublish.ts`) publishes v2 markers for
+/// pots whose txid has been PUBLIC FOR WEEKS, so an attacker CAN land junk
+/// rows with an EARLIER `createdAt` than an honest marker — and rows are
+/// never deleted, so an `ORDER BY createdAt ASC` window keeps that junk
+/// forever (measured: 45 junk rows + 2 honest ⇒ 40 junk, 0 honest fetched).
+///
+/// What actually holds regardless of junk volume or timing:
+/// - a row can only enter the result set if its `seatSettlePubkey` is one of
+///   the two keys THIS pot's covenant lock committed (bound per pot, from
+///   the hash-verified funding bytes) — every other key is filtered out in
+///   SQL, so junk under an arbitrary key is free to exist and irrelevant;
+/// - the window partitions by `(potTxid, seatSettlePubkey)`, so each
+///   committed key gets its OWN slot: junk piled on seat B's key can never
+///   starve seat A's marker, and vice versa;
+/// - [`attribute_seats`] then requires BOTH signatures (seat + identity) on
+///   whatever comes back, so a fetched junk row attributes nothing.
+///
+/// Residual (documented, not defended in SQL): the committed pubkeys are
+/// public, so a determined spammer can copy the honest seat's OWN key and
+/// crowd that one slot's window. That costs a dust tx per row, is bounded
+/// to failing to CREDIT one pot's attribution (never a wrong attribution —
+/// the signature bars are unconditional), and leaves the countersigned
+/// claim path untouched. Distinguishing junk from honest inside SQL is
+/// impossible (verification needs ECDSA); the honest fix if it is ever
+/// observed is admission-side rate limiting, not a bigger window.
 pub fn seat_markers_sql(n: usize) -> String {
     debug_assert!(n >= 1);
-    let placeholders = vec!["?"; n].join(",");
+    let per_pot = vec!["(potTxid = ? AND seatSettlePubkey IN (?, ?))"; n].join(" OR ");
     format!(
         "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                 recoveryHeight, seatSettlePubkey, seatSigHex, sigHex \
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                       recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
-                      ROW_NUMBER() OVER (PARTITION BY potTxid \
+                      ROW_NUMBER() OVER (PARTITION BY potTxid, seatSettlePubkey \
                                          ORDER BY createdAt ASC, rowid ASC) AS rn \
                FROM potparty_records \
                WHERE seatSettlePubkey IS NOT NULL AND potVout = {vout} \
-                 AND potTxid IN ({placeholders})) \
+                 AND ({per_pot})) \
          WHERE rn <= {cap}",
         vout = crate::logic::LEADERBOARD_POT_VOUT,
-        cap = SEAT_MARKERS_PER_POT,
+        cap = SEAT_MARKERS_PER_KEY,
     )
 }
 
@@ -2412,36 +2433,179 @@ mod tests {
         assert_eq!(entries[0].outcome_source, Some("chain+seatkey"));
     }
 
-    /// F2 (2026-07-28 gate): the seat-marker fetch must be PER-POT windowed
-    /// with a DETERMINISTIC order — an unordered global LIMIT let junk rows
-    /// crowd the honest (oldest, funding-time) markers out of the window and
-    /// silently erase an attribution. Pin the load-bearing SQL clauses.
+    /// F2 (2026-07-28 gate): the seat-marker fetch must be bounded WITHOUT
+    /// relying on row order — filtered to the pot's COMMITTED keys and
+    /// windowed PER KEY SLOT. Pin the load-bearing SQL clauses + the bind
+    /// arity the caller depends on.
     #[test]
-    fn f2_seat_markers_sql_is_per_pot_windowed_and_deterministic() {
+    fn f2_seat_markers_sql_filters_committed_keys_and_windows_per_slot() {
         let sql = seat_markers_sql(3);
-        assert_eq!(sql.matches('?').count(), 3, "one bind per pot txid");
-        assert!(
-            sql.contains("ROW_NUMBER() OVER (PARTITION BY potTxid"),
-            "per-pot window — one hot pot must never starve another: {sql}"
+        assert_eq!(
+            sql.matches('?').count(),
+            9,
+            "three binds per pot: txid, pubA, pubB"
+        );
+        assert_eq!(
+            sql.matches("(potTxid = ? AND seatSettlePubkey IN (?, ?))")
+                .count(),
+            3,
+            "each pot binds its OWN committed keys: {sql}"
         );
         assert!(
-            sql.contains("ORDER BY createdAt ASC, rowid ASC"),
-            "DETERMINISTIC oldest-first order (honest markers publish at funding, \
-             before junk can name the pot txid): {sql}"
+            sql.contains("ROW_NUMBER() OVER (PARTITION BY potTxid, seatSettlePubkey"),
+            "PER-KEY-SLOT window — junk on one seat's key can never starve the \
+             other seat's marker: {sql}"
         );
         assert!(
-            sql.contains(&format!("rn <= {SEAT_MARKERS_PER_POT}")),
-            "bounded per pot: {sql}"
+            sql.contains(&format!("rn <= {SEAT_MARKERS_PER_KEY}")),
+            "bounded per key slot: {sql}"
         );
         assert!(sql.contains("seatSettlePubkey IS NOT NULL"));
         assert!(
             sql.contains("sigHex"),
             "the F1 identity sig must be fetched"
         );
-        // No unordered global LIMIT — the window IS the bound.
+        // No unordered global LIMIT — the per-slot window IS the bound.
         assert!(
             !sql.to_ascii_uppercase().contains("LIMIT"),
             "no raw LIMIT: {sql}"
+        );
+        // (The chunk size × 3 binds/pot ≤ D1's param cap is proven at COMPILE
+        // time by the `const _: () = assert!(…)` beside the constant.)
+    }
+
+    /// Execute the SHIPPED `seat_markers_sql`'s semantics over a row set:
+    /// the WHERE key filter, the window's PARTITION BY, and the `rn <= cap`
+    /// bound are all read OUT OF THE GENERATED SQL, so reverting the query
+    /// to an order-dependent shape changes this simulation too (which is
+    /// what makes the scenario test below RED-verifiable rather than a
+    /// hard-coded restatement of the fix).
+    /// `rows` are `(marker, createdAt)` in insertion (rowid) order.
+    fn simulate_seat_fetch(
+        sql: &str,
+        committed: (&str, &str),
+        rows: &[(SeatMarkerRow, i64)],
+    ) -> Vec<SeatMarkerRow> {
+        let key_filtered = sql.contains("seatSettlePubkey IN (?, ?)");
+        let per_key_window = sql.contains("PARTITION BY potTxid, seatSettlePubkey");
+        let cap: usize = sql
+            .split("rn <= ")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX);
+        // WHERE: committed-key filter (when the SQL has one).
+        let mut kept: Vec<(usize, &(SeatMarkerRow, i64))> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, _))| {
+                !key_filtered
+                    || m.seat_settle_pubkey.eq_ignore_ascii_case(committed.0)
+                    || m.seat_settle_pubkey.eq_ignore_ascii_case(committed.1)
+            })
+            .collect();
+        // ORDER BY createdAt ASC, rowid ASC.
+        kept.sort_by(|(ia, (_, ca)), (ib, (_, cb))| ca.cmp(cb).then(ia.cmp(ib)));
+        // ROW_NUMBER() partition + `rn <= cap`.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for (_, (m, _)) in kept {
+            let part = if per_key_window {
+                format!("{}|{}", m.pot_txid, m.seat_settle_pubkey)
+            } else {
+                m.pot_txid.clone()
+            };
+            let n = seen.entry(part).or_insert(0);
+            *n += 1;
+            if *n <= cap {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
+
+    /// FIX 1 (2026-07-28 second gate): the reviewer's REAL-SQLite scenario.
+    ///
+    /// The earlier revision argued honest markers are always the OLDEST rows
+    /// for a pot ("its txid does not exist to be named before funding") — but
+    /// this PR's own #252 opportunistic BACKFILL republishes v2 markers for
+    /// pots whose txid has been public for WEEKS, so junk can carry an
+    /// EARLIER `createdAt` than the honest markers. With the order-dependent
+    /// window, 45 junk rows + 2 honest ⇒ 40 junk / 0 honest fetched and the
+    /// chainProven win is silently never credited (rows are never deleted, so
+    /// it stays broken forever).
+    ///
+    /// With the shipped query the honest markers survive REGARDLESS of junk
+    /// volume or timing: junk under a non-committed key is filtered out in
+    /// SQL, and each committed key owns its own window slot.
+    #[test]
+    fn fix1_backfilled_honest_markers_survive_older_junk() {
+        let (ka, pa) = real_key(41);
+        let (kb, pb) = real_key(42);
+        let wa = wallet_of(0x51);
+        let wb = wallet_of(0x52);
+        let ida = identity_of(&wa);
+        let idb = identity_of(&wb);
+        let gid = tx(0x01);
+        let pot = tx(0x22);
+        let p = params_with_keys(&pa, &pb);
+
+        // 45 junk rows, all with createdAt EARLIER than the honest markers
+        // (the backfill window), each a byte-valid v2 shape under its own
+        // throwaway key + identity — exactly what dust-cost spam looks like.
+        let mut rows: Vec<(SeatMarkerRow, i64)> = Vec::new();
+        for i in 0..45u8 {
+            let (kj, pj) = real_key(100 + i);
+            let wj = wallet_of(0x80 + i);
+            let idj = identity_of(&wj);
+            let junk = real_seat_marker(&kj, &pj, &wj, &idj, &ida, &gid, &pot, 0);
+            rows.push((junk, 1_000 + i as i64)); // early createdAt
+        }
+        // The two HONEST markers, published by the backfill weeks later.
+        let ma = real_seat_marker(&ka, &pa, &wa, &ida, &idb, &gid, &pot, 0);
+        let mb = real_seat_marker(&kb, &pb, &wb, &idb, &ida, &gid, &pot, 0);
+        rows.push((ma, 9_000));
+        rows.push((mb, 9_001));
+
+        let fetched = simulate_seat_fetch(&seat_markers_sql(1), (&pa, &pb), &rows);
+        // The MONEY assertion first: attribution must credit both seats —
+        // under the pre-fix order-dependent window this yields None/None
+        // (45 older junk rows fill the pot's single window).
+        let attr = attribute_seats(&p, &pot, 0, &fetched);
+        assert_eq!(
+            attr.identity_a.as_deref(),
+            Some(ida.as_str()),
+            "the backfilled honest seat-A marker must still be attributed \
+             ({} rows fetched)",
+            fetched.len()
+        );
+        assert_eq!(
+            fetched.len(),
+            2,
+            "only the two committed-key rows survive the SQL filter"
+        );
+        assert_eq!(attr.identity_b.as_deref(), Some(idb.as_str()));
+        assert_eq!(attr.winner_for(PotVerdict::WinnerA), Some(ida.as_str()));
+
+        // Even junk that COPIES a committed key cannot starve the OTHER seat
+        // (per-key-slot windowing) — pile SEAT_MARKERS_PER_KEY×3 copies of
+        // seat A's key, all older; seat B's marker still comes back.
+        let mut rows2 = rows.clone();
+        for i in 0..(SEAT_MARKERS_PER_KEY as u8 * 3) {
+            let wj = wallet_of(0xa0 + i);
+            let idj = identity_of(&wj);
+            // Note: a copied key with a foreign identity cannot produce a
+            // valid seatSig — this is junk by construction, as on-chain.
+            let mut junk = real_seat_marker(&ka, &pa, &wj, &idj, &ida, &gid, &pot, 0);
+            junk.identity = idj;
+            rows2.push((junk, 500 + i as i64));
+        }
+        let fetched2 = simulate_seat_fetch(&seat_markers_sql(1), (&pa, &pb), &rows2);
+        let attr2 = attribute_seats(&p, &pot, 0, &fetched2);
+        assert_eq!(
+            attr2.identity_b.as_deref(),
+            Some(idb.as_str()),
+            "junk crowding seat A's key slot must not starve seat B"
         );
     }
 

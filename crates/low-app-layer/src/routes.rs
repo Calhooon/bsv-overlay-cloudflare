@@ -795,13 +795,21 @@ async fn seat_attributions(
     pots.sort_unstable();
     let mut markers_by_pot: std::collections::HashMap<String, Vec<crate::results::SeatMarkerRow>> =
         std::collections::HashMap::new();
-    for chunk in pots.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        // F2 (2026-07-28 gate): per-pot windowed + DETERMINISTIC order — see
-        // `seat_markers_sql` for why an unordered global LIMIT was an
-        // erasure-DoS (junk rows crowding the honest markers out of the
-        // fetch window).
+    for chunk in pots.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+        // F2 (2026-07-28 gate): the fetch is filtered to each pot's OWN
+        // COMMITTED settle keys and windowed PER KEY SLOT — order is not
+        // load-bearing, because the #252 backfill publishes honest markers
+        // long after a pot's txid became public (see `seat_markers_sql`).
         let sql = crate::results::seat_markers_sql(chunk.len());
-        let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
+        // Three binds per pot: (potTxid, pubA, pubB) — the keys come from
+        // the pot's hash-verified funding lock, never from a stored claim.
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 3);
+        for pot in chunk {
+            let p = &params_by_pot[*pot];
+            binds.push(JsValue::from_str(pot));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+        }
         let stmt = match db.prepare(sql).bind(&binds) {
             Ok(s) => s,
             Err(e) => {
