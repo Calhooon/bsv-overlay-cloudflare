@@ -20,9 +20,9 @@
 //! `created_at` is assigned by the STORAGE layer at insert (D1 stamps the
 //! unix time, the memory impl an insertion counter) — the value on the
 //! record passed to `store_record` is ignored. The window ordering rides on
-//! it: `list_for_identity` is newest-POT-first over at most one row per pot,
-//! `list_for_pot` is OLDEST-first — both dust-DoS bounds, see the trait
-//! methods and bsv-low #281.
+//! it: `list_for_identity` is newest-POT-first over at most two rows per pot
+//! (the oldest v1 and the oldest v2 marker), `list_for_pot` is OLDEST-first —
+//! both dust-DoS bounds, see the trait methods and bsv-low #281.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -85,9 +85,13 @@ pub struct PotpartyRecord {
 #[serde(tag = "type")]
 pub enum PotpartyQuery {
     /// "Which pots is this identity a party to?" — the recovery question.
-    /// At most one row per pot, newest pot first (bsv-low #281).
+    /// `limit` counts POTS; up to two rows per pot (v1 + v2), newest pot
+    /// first (bsv-low #281).
     #[serde(rename = "partyFor")]
-    PartyFor { identity: String, limit: Option<u32> },
+    PartyFor {
+        identity: String,
+        limit: Option<u32>,
+    },
     /// "Who are the two parties to this pot outpoint?" — returns every
     /// marker naming the pot (each seat publishes its own). Oldest first
     /// (bsv-low #281).
@@ -112,8 +116,9 @@ pub trait PotpartyStorage {
     /// ignored).
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError>;
 
-    /// Up to `limit` records whose `identity` is `identity` — **at most ONE
-    /// per pot** (`pot_txid`), newest pot first.
+    /// Records whose `identity` is `identity`, for up to `limit` POTS —
+    /// newest pot first, **at most TWO rows per pot outpoint**: the oldest
+    /// v1 marker and the oldest v2 (seat-binding) marker.
     ///
     /// The per-pot collapse is a DUST-DoS BOUND, not an optimisation
     /// (bsv-low #281): admission is byte-format-only, so anyone can file
@@ -121,12 +126,21 @@ pub trait PotpartyStorage {
     /// newest-first row window let `limit` junk rows push a victim's real
     /// pots — the pots it may be owed money from — out of the answer
     /// entirely. `limit` therefore counts POTS, which is also exactly what
-    /// this query is asking for: an identity has one genuine marker per pot.
-    /// The representative row for a pot is the OLDEST marker naming it (the
-    /// honest seat publishes at funding, before an attacker can know the pot
-    /// txid). A backend that can see the pot index SHOULD additionally sort
-    /// rows naming a pot it has never heard of last — the D1 implementation
-    /// does; the in-memory one has no pot table and cannot.
+    /// this query is asking for. The representative row of each group is the
+    /// OLDEST marker in it (the honest seat publishes at funding, before an
+    /// attacker can know the pot txid).
+    ///
+    /// BOTH groups must be returned. Returning only the v1 row leaves a
+    /// client unable to latch `v2Indexed`, so it republishes a PAID marker
+    /// forever; returning only the v2 row can erase the pot outright, because
+    /// `lookupPotParty` verifies v2 signatures client-side and DROPS a row
+    /// that fails, falling back on the v1 sibling for discovery.
+    ///
+    /// A backend that can see the pot index SHOULD additionally sort rows
+    /// naming a pot it has never heard of behind the rest, while still
+    /// serving them (a strict filter would erase a pot whose admission is
+    /// merely in flight) — the D1 implementation does; the in-memory one has
+    /// no pot table and cannot.
     async fn list_for_identity(
         &self,
         identity: &str,
@@ -205,22 +219,43 @@ impl PotpartyStorage for MemoryPotpartyStorage {
         limit: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
         let records = self.records.lock().unwrap();
-        // Per-pot collapse (bsv-low #281) — mirrors D1's
-        // `ROW_NUMBER() OVER (PARTITION BY potTxid ORDER BY createdAt ASC) = 1`:
-        // walk in INSERTION order (oldest first) so the first marker seen for
-        // a pot is the one that represents it.
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Per-pot-OUTPOINT collapse, ONE ROW PER (pot, v1/v2) GROUP —
+        // mirrors D1's `ROW_NUMBER() OVER (PARTITION BY potTxid, potVout,
+        // has-seat-key ORDER BY createdAt ASC) = 1`. Walking in INSERTION
+        // order (oldest first) makes the first marker seen for a group the
+        // one that represents it.
+        //
+        // Both groups matter (bsv-low #281 F2): the v2 row is the ONLY thing
+        // that lets a client latch `v2Indexed` (else it republishes a paid
+        // OP_RETURN forever), and the v1 row is what `lookupPotParty` falls
+        // back on for discovery when a v2 row fails its client-side verify.
+        let mut seen: std::collections::HashSet<(&str, u32, bool)> =
+            std::collections::HashSet::new();
         let mut kept: Vec<&PotpartyRecord> = Vec::new();
         for r in records.iter().filter(|r| r.identity == identity) {
-            if seen.insert(r.pot_txid.as_str()) {
+            let is_v2 = r.seat_settle_pubkey.is_some();
+            if seen.insert((r.pot_txid.as_str(), r.pot_vout, is_v2)) {
                 kept.push(r);
             }
         }
-        // Newest pot first. `created_at` is a unique insertion counter here,
-        // so the order is total — deterministic, like the D1 window's
-        // `rowid` tiebreak.
+        // `limit` counts POTS, so take that many distinct pot outpoints
+        // (newest first) and keep every kept row belonging to them. The
+        // in-memory backend has no pot table, so it cannot apply the D1
+        // window's pot-EXISTENCE tier — documented on the trait.
         kept.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-        Ok(kept.into_iter().take(limit).cloned().collect())
+        let mut pots: Vec<(&str, u32)> = Vec::new();
+        for r in &kept {
+            let key = (r.pot_txid.as_str(), r.pot_vout);
+            if !pots.contains(&key) {
+                pots.push(key);
+            }
+        }
+        pots.truncate(limit);
+        Ok(kept
+            .into_iter()
+            .filter(|r| pots.contains(&(r.pot_txid.as_str(), r.pot_vout)))
+            .cloned()
+            .collect())
     }
 
     async fn list_for_pot(
@@ -322,10 +357,7 @@ mod tests {
         other.pot_vout = 1;
         store.store_record(&other).await.unwrap();
 
-        let rows = store
-            .list_for_pot(&"22".repeat(32), 0, 100)
-            .await
-            .unwrap();
+        let rows = store.list_for_pot(&"22".repeat(32), 0, 100).await.unwrap();
         assert_eq!(rows.len(), 2, "both parties to vout 0");
         // OLDEST first (bsv-low #281) — later dust naming this pot can never
         // push the honest seat markers out of the window.

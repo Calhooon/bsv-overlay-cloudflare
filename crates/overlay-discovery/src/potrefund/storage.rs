@@ -21,7 +21,7 @@
 //! `created_at` is assigned by the STORAGE layer at insert (D1 stamps the
 //! unix time, the memory impl an insertion counter) — the value on the
 //! record passed to `store_record` is ignored. The window ordering rides on
-//! it: `list_for_identity` is newest-POT-first over at most one row per pot,
+//! it: `list_for_identity` is newest-POT-first over one row per pot outpoint,
 //! `list_for_pot` is OLDEST-first — both dust-DoS bounds, see the trait
 //! methods and bsv-low #281.
 
@@ -100,8 +100,9 @@ pub trait PotrefundStorage {
     /// ignored).
     async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError>;
 
-    /// Up to `limit` records whose `identity` is `identity` — **at most ONE
-    /// per pot** (`pot_txid`), newest pot first.
+    /// Records whose `identity` is `identity`, for up to `limit` POTS —
+    /// newest pot first, **at most ONE row per pot OUTPOINT** (its oldest
+    /// backup marker).
     ///
     /// The per-pot collapse is a DUST-DoS BOUND (bsv-low #281): admission is
     /// byte-format-only, so anyone can file markers naming any identity for a
@@ -110,8 +111,9 @@ pub trait PotrefundStorage {
     /// therefore counts POTS. The representative row for a pot is the OLDEST
     /// marker naming it (the honest seat publishes at funding). A backend that
     /// can see the pot index SHOULD additionally sort rows naming a pot it has
-    /// never heard of last — the D1 implementation does; the in-memory one has
-    /// no pot table and cannot.
+    /// never heard of behind the rest, while still serving them (a strict
+    /// filter would erase a pot whose admission is merely in flight) — the D1
+    /// implementation does; the in-memory one has no pot table and cannot.
     async fn list_for_identity(
         &self,
         identity: &str,
@@ -189,14 +191,14 @@ impl PotrefundStorage for MemoryPotrefundStorage {
         limit: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
         let records = self.records.lock().unwrap();
-        // Per-pot collapse (bsv-low #281) — mirrors D1's
-        // `ROW_NUMBER() OVER (PARTITION BY potTxid ORDER BY createdAt ASC) = 1`:
+        // Per-pot-OUTPOINT collapse (bsv-low #281) — mirrors D1's
+        // `ROW_NUMBER() OVER (PARTITION BY potTxid, potVout ORDER BY createdAt ASC) = 1`:
         // walk in INSERTION order (oldest first) so the first marker seen for
         // a pot is the one that represents it.
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(&str, u32)> = std::collections::HashSet::new();
         let mut kept: Vec<&PotrefundRecord> = Vec::new();
         for r in records.iter().filter(|r| r.identity == identity) {
-            if seen.insert(r.pot_txid.as_str()) {
+            if seen.insert((r.pot_txid.as_str(), r.pot_vout)) {
                 kept.push(r);
             }
         }

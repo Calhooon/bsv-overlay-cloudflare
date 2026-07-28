@@ -18,15 +18,20 @@ optional — default 100, clamped to 1..=500.
 
 ## Answer
 
-A freeform JSON array, one entry per returned marker. Ordering + windowing
-(bsv-low #281 — admission is byte-format-only, so anyone can file a marker
-naming any identity for a dust `OP_RETURN`; a flat newest-first row window
-was displaceable):
+A freeform JSON array. Ordering + windowing (bsv-low #281 — admission is
+byte-format-only, so anyone can file a marker naming any identity for a dust
+`OP_RETURN`; a flat newest-first row window was displaceable):
 
-- `partyFor` returns **at most one row per `potTxid`** (the OLDEST marker
-  naming that pot), so `limit` counts POTS, not rows, and rows naming a pot
-  the overlay has never indexed sort LAST — they can never displace a real
-  one. Within that: newest pot first.
+- `partyFor` counts POTS, newest pot first, and returns **at most two rows per
+  pot outpoint** — the oldest v1 marker and the oldest v2 (seat-binding)
+  marker. Both are needed: without the v2 row a client can never latch
+  `v2Indexed` and republishes a paid marker forever; without the v1 row a pot
+  whose only v2 row fails the client's signature check disappears from
+  recovery entirely.
+- Rows naming a pot the overlay has never indexed are sorted behind the rest
+  (so they cannot displace a real pot) but are still served, with a small
+  reserved quota promoted so a pot whose admission is merely in flight stays
+  visible.
 - `byPot` returns markers **oldest first** — the honest seats publish at
   funding, so later dust can never crowd them out of the window.
 

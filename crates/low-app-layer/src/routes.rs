@@ -803,10 +803,16 @@ async fn seat_attributions(
         let sql = crate::results::seat_markers_sql(chunk.len());
         // Three binds per pot: (potTxid, pubA, pubB) — the keys come from
         // the pot's hash-verified funding lock, never from a stored claim.
-        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 3);
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
         for pot in chunk {
             let p = &params_by_pot[*pot];
             binds.push(JsValue::from_str(pot));
+            // #281: potVout is a BIND now (it was hardcoded) so `/results`
+            // can share this query; the board is vout-0 by definition.
+            binds.push(JsValue::from_f64(f64::from(
+                crate::logic::LEADERBOARD_POT_VOUT,
+            )));
             binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
             binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
         }
@@ -998,8 +1004,96 @@ pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }
     let claims = crate::results::claims_by_game(&claim_markers);
 
-    let entries = crate::results::assemble_results(&identity_lc, rows, &claims);
+    // #281 F1 — the SEAT PROOF comes from its OWN query, bound to each pot's
+    // COMMITTED settle keys (read from the hash-verified funding lock), NOT
+    // from the `results_sql` page. That page is now one row per pot, and no
+    // ordering rule over it is safe: #252's backfill publishes honest v2
+    // markers long after a pot txid became public, so a forged row can always
+    // be OLDER. Binding the keys removes ordering from the argument entirely
+    // — a forged key cannot enter the result set. BEST-EFFORT: a fault here
+    // only leaves seat attribution absent (claims still decide), never a 5xx.
+    let seat_markers = results_seat_markers(&db, &rows).await;
+
+    let entries = crate::results::assemble_results(&identity_lc, rows, &claims, &seat_markers);
     json_response(crate::results::results_body(&identity_lc, &entries), 200)
+}
+
+/// #230/#281 — the caller's v2 seat markers for the pots on this `/results`
+/// page, fetched with [`crate::results::seat_markers_sql`]: each pot bound as
+/// `(potTxid, potVout, pubA, pubB)` from its OWN committed lock, windowed per
+/// `(pot, committed key)` slot. A row under any other key is filtered out IN
+/// SQL, so junk is free to exist and irrelevant; `attribute_seats` then
+/// requires BOTH signatures on whatever comes back.
+///
+/// BEST-EFFORT by construction: every fault path returns what it has, so a
+/// D1 error degrades attribution to "absent" (claims still decide the
+/// outcome) and never a 5xx.
+async fn results_seat_markers(
+    db: &worker::D1Database,
+    rows: &[crate::results::ResultsRow],
+) -> std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> {
+    let mut out: std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> =
+        std::collections::HashMap::new();
+    let params_by_pot = crate::results::covenant_params_by_pot(rows);
+    if params_by_pot.is_empty() {
+        return out;
+    }
+    let mut pots: Vec<(&(String, u32), &crate::results::CovenantParams)> =
+        params_by_pot.iter().collect();
+    // Deterministic chunking — the answer must not depend on HashMap order.
+    pots.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for chunk in pots.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+        let sql = crate::results::seat_markers_sql(chunk.len());
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
+        for ((pot_txid, pot_vout), p) in chunk {
+            binds.push(JsValue::from_str(pot_txid));
+            binds.push(JsValue::from_f64(f64::from(*pot_vout)));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+        }
+        let stmt = match db.prepare(sql).bind(&binds) {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[results] seat-marker bind failed (attribution omitted): {e}");
+                return out;
+            }
+        };
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<SeatMarkerRowD1>())
+        {
+            Ok(fetched) => {
+                for r in fetched {
+                    let (Some(pk), Some(seat_sig), Some(id_sig)) =
+                        (r.seat_settle_pubkey, r.seat_sig_hex, r.sig_hex)
+                    else {
+                        continue;
+                    };
+                    out.entry((r.pot_txid.to_ascii_lowercase(), r.pot_vout as u32))
+                        .or_default()
+                        .push(crate::results::SeatMarkerRow {
+                            identity: r.identity.to_ascii_lowercase(),
+                            opponent_identity: r.opponent_identity.to_ascii_lowercase(),
+                            game_id: r.game_id.to_ascii_lowercase(),
+                            pot_txid: r.pot_txid.to_ascii_lowercase(),
+                            pot_vout: r.pot_vout as u32,
+                            recovery_height: r.recovery_height as u32,
+                            seat_settle_pubkey: pk.to_ascii_lowercase(),
+                            seat_sig_hex: seat_sig.to_ascii_lowercase(),
+                            identity_sig_hex: id_sig.to_ascii_lowercase(),
+                        });
+                }
+            }
+            Err(e) => {
+                // A racing pre-migration schema (no seatSettlePubkey column
+                // yet) or any D1 fault: attribution is simply omitted.
+                console_warn!("[results] seat-marker query failed (attribution partial): {e}");
+            }
+        }
+    }
+    out
 }
 
 // ── /spent-any — server-side legacy outpoint reads (bsv-low #227 addendum) ──

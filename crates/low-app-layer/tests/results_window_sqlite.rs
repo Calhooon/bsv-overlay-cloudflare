@@ -19,7 +19,10 @@
 //! beside the fix.
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
-use low_app_layer::results::{results_sql, RESULTS_MAX_ROWS};
+use low_app_layer::results::{
+    covenant_params_by_pot, results_sql, seat_markers_sql, RESULTS_UNKNOWN_POT_QUOTA,
+    SEAT_MARKERS_BINDS_PER_POT,
+};
 use rusqlite::{params, Connection};
 
 /// `results_sql()` as it shipped BEFORE #281 — kept only so these tests can
@@ -192,25 +195,31 @@ fn results_window_survives_the_dust_attack() {
     let honest_pot = seed_dust_attack(&conn, &victim);
 
     let got = query_pot_txids(&conn, &results_sql(), &victim);
-    assert_eq!(got.len(), RESULTS_MAX_ROWS, "the window is still full…");
     assert_eq!(
         got.iter().filter(|t| **t == honest_pot).count(),
         1,
         "…and the victim's real pot is present exactly ONCE — the 1 honest \
          plus {DUST_REPLAYS} replayed marker rows naming it collapse to one slot"
     );
-    assert_eq!(
-        got[0], honest_pot,
-        "and it ranks FIRST: the existence tier sinks every row naming a pot \
-         the index has never seen below every row naming a real one"
+    // The promoted ghosts are NEWER than the honest pot, so they legitimately
+    // sort ahead of it inside the main tier — but they are capped at the
+    // reserved quota, so the honest pot can never be pushed off the page.
+    assert!(
+        got.iter().position(|t| *t == honest_pot).unwrap() <= RESULTS_UNKNOWN_POT_QUOTA,
+        "the real pot sits within one quota of the top, whatever the flood"
     );
     // Ghost-pot rows are NOT erased — a pot whose `tm_pot` admission simply
-    // has not landed yet (or a legacy pre-pot-index escrow) must still be
-    // reachable. They only fill the slots real pots left over.
-    assert_eq!(
-        got[1..].iter().filter(|t| t.starts_with("0000")).count(),
-        99,
-        "ghosts occupy leftovers only"
+    // has not landed yet (or a legacy pre-pot-index escrow) must stay
+    // reachable, so they fill the slots real pots leave over. What is bounded
+    // is how many may be PROMOTED ahead of a real pot.
+    let at = got.iter().position(|t| *t == honest_pot).unwrap();
+    assert!(
+        at <= RESULTS_UNKNOWN_POT_QUOTA,
+        "the real pot sits within one quota of the top (was: absent), got {at}"
+    );
+    assert!(
+        got[..at].iter().all(|t| t.starts_with("0000")),
+        "only promoted ghosts precede the real pot"
     );
 }
 
@@ -403,92 +412,317 @@ fn results_window_is_plan_independent_and_deterministic() {
     let ghosts: std::collections::HashSet<String> = (0..40u32)
         .map(|i| format!("{:064x}", 0x0000_9000_u64 + u64::from(i)))
         .collect();
-    let first_ghost = baseline
+    // Exactly RESULTS_UNKNOWN_POT_QUOTA unindexed pots are PROMOTED into the
+    // main tier; the rest are demoted behind every indexed pot but still
+    // served (never erased).
+    let promoted = baseline
         .iter()
-        .position(|(t, _)| ghosts.contains(t))
-        .expect("unindexed pots are still returned");
-    assert_eq!(first_ghost, 40, "all 40 real pots rank ahead of all ghosts");
-}
-
-/// #230 INTERACTION — a seat that published v1 at funding and v2 on republish
-/// must not lose its SEAT PROOF to the per-pot collapse. The v2 row is the one
-/// carrying `seatSettlePubkey`/`seatSigHex`/`sigHex`, and `assemble_results`
-/// builds its seat-marker map from the rows this query returns; collapsing to
-/// the OLDEST row unconditionally would have dropped a genuine proof and
-/// reopened the #276 injustice through the back door.
-#[test]
-fn a_v2_seat_proof_outranks_the_callers_older_v1_row() {
-    let conn = production_schema_db();
-    let victim = format!("02{}", "a1".repeat(32));
-    let pot = h64(0xaa);
-    let settle = format!("02{}", "5e".repeat(32));
-    insert_pot(&conn, &pot, 1_000, true);
-    // v1 at funding…
-    file_marker(&conn, &victim, &pot, "txV1", 1_001);
-    // …v2 on republish, later.
-    file_v2_marker(&conn, &victim, &pot, "txV2", &settle, 4_000);
-
-    let sql = results_sql();
-    let mut stmt = conn.prepare(&sql).unwrap();
-    let rows: Vec<(String, Option<String>)> = stmt
-        .query_map(params![victim], |r| {
-            Ok((
-                r.get::<_, String>("potTxid")?,
-                r.get::<_, Option<String>>("seatSettlePubkey")?,
-            ))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(rows.len(), 1, "one row per pot");
-    assert_eq!(rows[0].0, pot);
+        .take_while(|(t, _)| ghosts.contains(t))
+        .count();
     assert_eq!(
-        rows[0].1.as_deref(),
-        Some(settle.as_str()),
-        "the v2 seat proof survives the collapse"
+        promoted, RESULTS_UNKNOWN_POT_QUOTA,
+        "the promotion is bounded"
+    );
+    assert_eq!(
+        baseline.iter().filter(|(t, _)| ghosts.contains(t)).count(),
+        40,
+        "…and the demoted remainder is still served, never erased"
     );
 }
 
-/// …and the v2 preference is not itself a front-run: an attacker's LATER v2
-/// marker cannot displace the caller's own EARLIER v2 marker. Within the v2
-/// tier the order is still oldest-first, and the honest seat publishes before
-/// anyone else can know the pot txid.
+// ════════════════════════════════════════════════════════════════════════
+// F1 (2026-07-28 re-gate, HIGH) — the SEAT PROOF must not ride on the
+// per-pot window.
+//
+// `/results` has no supplementary seat fetch of its own: `assemble_results`
+// built its seat-marker map from the `results_sql` rows. Collapsing that page
+// to one row per pot therefore dropped the cost of erasing a tower-enforced
+// win from ~110 dust markers to ONE — and NO ordering rule fixes it, because
+// #252's backfill publishes honest v2 markers for pots whose txid has been
+// public for weeks, so a forged row can always be OLDER.
+//
+// The fix is `seat_markers_sql`, bound to each pot's COMMITTED KEYS: a forged
+// key cannot enter the result set at all. These tests execute that query for
+// real, against the same fixture that breaks every ordering heuristic.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Fetch seat markers exactly as `routes::results_seat_markers` does — the
+/// shipped `seat_markers_sql`, bound `(potTxid, potVout, pubA, pubB)`.
+fn seat_marker_keys(
+    conn: &Connection,
+    pot: &str,
+    vout: u32,
+    pub_a: &str,
+    pub_b: &str,
+) -> Vec<String> {
+    let sql = seat_markers_sql(1);
+    assert_eq!(
+        sql.matches('?').count(),
+        SEAT_MARKERS_BINDS_PER_POT,
+        "one pot ⇒ (potTxid, potVout, pubA, pubB)"
+    );
+    let mut stmt = conn.prepare(&sql).unwrap();
+    stmt.query_map(params![pot, vout, pub_a, pub_b], |r| {
+        r.get::<_, String>("seatSettlePubkey")
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+/// THE FIX: a forged v2 marker under a key the pot's lock does NOT commit is
+/// filtered out IN SQL — however early it was stamped, however many there
+/// are. The honest marker cannot be front-run out of the fetch.
 #[test]
-fn a_later_forged_v2_marker_cannot_displace_the_honest_v2_row() {
+fn a_forged_key_cannot_enter_the_seat_marker_fetch() {
     let conn = production_schema_db();
     let victim = format!("02{}", "a1".repeat(32));
     let pot = h64(0xaa);
-    let honest_settle = format!("02{}", "5e".repeat(32));
-    let forged_settle = format!("03{}", "f0".repeat(32));
+    let pub_a = format!("02{}", "5e".repeat(32)); // committed in the lock
+    let pub_b = format!("03{}", "6f".repeat(32)); // committed in the lock
+    let forged = format!("03{}", "f0".repeat(32)); // NOT committed
     insert_pot(&conn, &pot, 1_000, true);
-    file_v2_marker(&conn, &victim, &pot, "txHONESTV2", &honest_settle, 1_001);
+
+    // 50 forged v2 markers, ALL stamped EARLIER than the honest one — the
+    // exact shape that beats `createdAt ASC` inside a per-pot window.
     for i in 0..50u32 {
         file_v2_marker(
             &conn,
             &victim,
             &pot,
             &format!("txFORGED{i:03}"),
-            &forged_settle,
-            5_000 + i64::from(i),
+            &forged,
+            100 + i64::from(i),
         );
     }
+    // The honest v2 marker: latest of all, published by the #252 backfill.
+    file_v2_marker(&conn, &victim, &pot, "txHONESTV2", &pub_a, 9_000);
+
+    let got = seat_marker_keys(&conn, &pot, 0, &pub_a, &pub_b);
+    assert_eq!(
+        got,
+        vec![pub_a.clone()],
+        "only the marker under a COMMITTED key enters the result set — the 50 \
+         EARLIER forgeries are filtered out in SQL, so ordering never enters \
+         the argument at all"
+    );
+}
+
+/// …and junk piled on ONE committed key cannot starve the OTHER seat's slot
+/// (the `PARTITION BY potTxid, potVout, seatSettlePubkey` half).
+#[test]
+fn junk_on_one_committed_key_cannot_starve_the_other_seat() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    let pub_a = format!("02{}", "5e".repeat(32));
+    let pub_b = format!("03{}", "6f".repeat(32));
+    insert_pot(&conn, &pot, 1_000, true);
+    // A spammer copies seat A's PUBLIC committed key and floods it.
+    for i in 0..60u32 {
+        file_v2_marker(
+            &conn,
+            &victim,
+            &pot,
+            &format!("txSPAM{i:03}"),
+            &pub_a,
+            100 + i64::from(i),
+        );
+    }
+    // Seat B's own marker, latest of all.
+    file_v2_marker(&conn, &victim, &pot, "txSEATB", &pub_b, 9_000);
+
+    let got = seat_marker_keys(&conn, &pot, 0, &pub_a, &pub_b);
+    assert!(
+        got.contains(&pub_b),
+        "seat B's slot is its own — flooding seat A's key cannot evict it"
+    );
+    assert!(
+        got.iter().filter(|k| **k == pub_a).count() <= 8,
+        "seat A's own slot stays bounded (rn <= SEAT_MARKERS_PER_KEY)"
+    );
+}
+
+/// The seat query is bound to the OUTPOINT, not just the txid: a marker for
+/// vout 1 never attributes vout 0.
+#[test]
+fn the_seat_fetch_is_bound_to_the_pot_outpoint() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let txid = h64(0xaa);
+    let pub_a = format!("02{}", "5e".repeat(32));
+    let pub_b = format!("03{}", "6f".repeat(32));
+    insert_pot(&conn, &txid, 1_000, true);
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, 1, 958846, '3045id', ?5, '3045seat', 'txVOUT1', 0, 1001)",
+        params![victim, h64(0xbb), h64(0x11), txid, pub_a],
+    )
+    .unwrap();
+    assert!(
+        seat_marker_keys(&conn, &txid, 0, &pub_a, &pub_b).is_empty(),
+        "a vout-1 marker must not attribute vout 0"
+    );
+    assert_eq!(seat_marker_keys(&conn, &txid, 1, &pub_a, &pub_b).len(), 1);
+}
+
+/// `covenant_params_by_pot` is what feeds the committed keys to that query;
+/// with no funding bytes there is nothing to bind, so `/results` asks nothing
+/// and attributes nothing — never a guess.
+#[test]
+fn no_funding_bytes_means_no_seat_query() {
+    let rows = vec![low_app_layer::results::ResultsRow {
+        identity: format!("02{}", "a1".repeat(32)),
+        game_id: h64(0x11),
+        pot_txid: h64(0xaa),
+        pot_vout: 0,
+        recovery_height: 958_846,
+        opponent_identity: h64(0xbb),
+        spent: None,
+        spending_txid: None,
+        spent_confirmed: None,
+        funding_beef_hex: None,
+        spender_beef_hex: None,
+        seat_settle_pubkey: None,
+        seat_sig_hex: None,
+        marker_sig_hex: None,
+    }];
+    assert!(covenant_params_by_pot(&rows).is_empty());
+}
+
+// ── F3 — the existence tier must not become a filter ────────────────────
+
+/// 100 indexed pots plus ONE newest pot whose `tm_pot` admission is still in
+/// flight: a strict tier dropped the fresh pot entirely (it ranked FIRST
+/// pre-fix). The reserved quota is what keeps it visible.
+#[test]
+fn a_fresh_unindexed_pot_is_not_filtered_out_by_the_limit() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    for i in 0..100u32 {
+        let pot = format!("{:064x}", 0x0000_1000_u64 + u64::from(i));
+        insert_pot(&conn, &pot, 1_000 + i64::from(i), true);
+        file_marker(
+            &conn,
+            &victim,
+            &pot,
+            &format!("txM{i:03}"),
+            1_000 + i64::from(i),
+        );
+    }
+    let fresh = h64(0xfa);
+    file_marker(&conn, &victim, &fresh, "txFRESH", 9_999);
+
+    let got = query_pot_txids(&conn, &results_sql(), &victim);
+    assert!(
+        got.contains(&fresh),
+        "a real-but-unindexed pot must not be filtered out by the window"
+    );
+}
+
+// ── F4 — ordering tests that fail when their guarantee is removed ───────
+
+/// The PARTITION's `createdAt ASC, rowid ASC` is under test, so the honest
+/// (oldest) marker is stored PHYSICALLY LAST. A non-discriminating partition
+/// order returns a junk row instead — this cannot pass on incidental order.
+#[test]
+fn the_oldest_marker_represents_a_pot_even_when_stored_last() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    let honest_game = h64(0x11);
+    insert_pot(&conn, &pot, 1_000, true);
+    for i in 0..20u32 {
+        conn.execute(
+            "INSERT OR IGNORE INTO potparty_records \
+             (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+              sigHex, txid, outputIndex, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, 0, 958846, '3045ab', ?5, 0, ?6)",
+            params![
+                victim,
+                h64(0xbb),
+                format!("{:064x}", 0xbad_0000_u64 + u64::from(i)), // a DIFFERENT gameId
+                pot,
+                format!("txJUNK{i:03}"),
+                5_000 + i64::from(i)
+            ],
+        )
+        .unwrap();
+    }
+    // Oldest by createdAt, newest by rowid — the contradiction that makes
+    // this test meaningful.
+    file_marker(&conn, &victim, &pot, "txHONEST", 1_001);
 
     let sql = results_sql();
     let mut stmt = conn.prepare(&sql).unwrap();
-    // `results_sql` does not expose the marker txid, so the committed settle
-    // key is the discriminator — it is exactly what `my_seat` matches against
-    // the pot lock, so it is also the field that matters.
-    let rows: Vec<Option<String>> = stmt
-        .query_map(params![victim], |r| {
-            r.get::<_, Option<String>>("seatSettlePubkey")
-        })
+    let rows: Vec<String> = stmt
+        .query_map(params![victim], |r| r.get::<_, String>("gameId"))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows.len(), 1, "51 rows, one pot ⇒ one slot");
     assert_eq!(
-        rows[0].as_deref(),
-        Some(honest_settle.as_str()),
-        "the HONEST seat proof represents the pot, not the 50 later forgeries"
+        rows,
+        vec![honest_game],
+        "the OLDEST marker represents the pot — its gameId is what the \
+         claims lookup keys on"
+    );
+}
+
+/// The OUTER ordering is under test: pots are stored OLDEST-POT-FIRST, and
+/// the marker stamps run OPPOSITE to the pot stamps, so the promised
+/// newest-POT-first answer contradicts insertion order, rowid order, AND
+/// marker recency.
+#[test]
+fn the_outer_order_is_pot_recency_not_storage_order() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let mut expect: Vec<String> = Vec::new();
+    for i in 0..12u32 {
+        let pot = format!("{:064x}", 0x0000_3000_u64 + u64::from(i));
+        insert_pot(&conn, &pot, 1_000 + i64::from(i), true);
+        file_marker(
+            &conn,
+            &victim,
+            &pot,
+            &format!("txM{i:03}"),
+            9_000 - i64::from(i),
+        );
+        expect.push(pot);
+    }
+    expect.reverse(); // newest POT first
+    let got = query_pot_txids(&conn, &results_sql(), &victim);
+    assert_eq!(got, expect, "exact newest-pot-first sequence");
+}
+
+// ── F6 — the outpoint is the key ────────────────────────────────────────
+
+#[test]
+fn two_pots_sharing_a_funding_txid_are_not_collapsed() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let txid = h64(0xaa);
+    insert_pot(&conn, &txid, 1_000, true);
+    conn.execute(
+        "INSERT OR IGNORE INTO pot_records \
+         (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) \
+         VALUES (?1, 1, 0, NULL, 0, 1001)",
+        params![txid],
+    )
+    .unwrap();
+    file_marker(&conn, &victim, &txid, "txV0", 1_002);
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, 1, 958846, '3045ab', 'txV1', 0, 1003)",
+        params![victim, h64(0xbb), h64(0x11), txid],
+    )
+    .unwrap();
+    assert_eq!(
+        query_pot_txids(&conn, &results_sql(), &victim).len(),
+        2,
+        "distinct outpoints are distinct pots"
     );
 }

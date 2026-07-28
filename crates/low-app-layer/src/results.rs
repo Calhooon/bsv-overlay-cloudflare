@@ -1263,32 +1263,92 @@ pub fn resolve_winner_hand(
     }
 }
 
+/// Every pot outpoint in `rows` whose funding BEEF hash-verifies, mapped to
+/// its COMMITTED covenant params (`pubA`/`pubB` — the settle keys the lock
+/// itself names). This is what lets `/results` fetch seat markers the way
+/// `/leaderboard` does: bound to the pot's own keys, so a forged key cannot
+/// enter the result set at all (bsv-low #281 F1, the same insight that fixed
+/// #230's F1). A pot with no/unparseable funding bytes is simply absent — no
+/// seat query, no attribution, never a guess.
+pub fn covenant_params_by_pot(
+    rows: &[ResultsRow],
+) -> std::collections::HashMap<(String, u32), CovenantParams> {
+    let mut out = std::collections::HashMap::new();
+    for r in rows {
+        let key = (r.pot_txid.to_ascii_lowercase(), r.pot_vout);
+        if out.contains_key(&key) {
+            continue;
+        }
+        let Some(fb_hex) = &r.funding_beef_hex else {
+            continue;
+        };
+        let Some(fb) = crate::logic::decode_beef_hex(fb_hex) else {
+            continue;
+        };
+        let Some(fraw) =
+            crate::logic::extract_raw_tx_hex(&fb, &key.0).and_then(|h| hex::decode(h).ok())
+        else {
+            continue;
+        };
+        // Hash-verified funding bytes only — never a stored claim.
+        if let Some(p) = parse_raw_tx_verified(&fraw, &key.0)
+            .and_then(|f| spender_pot_prevout(&f, r.pot_vout))
+            .and_then(|(_, lock)| extract_covenant_params(&lock))
+        {
+            out.insert(key, p);
+        }
+    }
+    out
+}
+
 /// Assemble the `/results` entries: dedupe rows to one per pot outpoint
 /// (newest first, as the SQL orders), classify each spent pot, and derive
 /// the caller's outcome. Missing bytes anywhere degrade THAT entry to
 /// `unresolved` — never an error, never a guess.
+///
+/// `seat_markers_by_pot` is the KEY-BOUND seat-marker fetch
+/// ([`seat_markers_sql`], keyed by pot outpoint) that `routes::results`
+/// performs as a SECOND query.
+///
+/// # Why the seat proof is no longer taken from `rows` (bsv-low #281 F1)
+///
+/// It used to be: `assemble_results` gathered seat markers from ALL rows
+/// before dedup, and `results_sql` returned every marker the caller had. Once
+/// #281 collapsed that window to one row per pot, `rows` stopped being a
+/// sound seat-marker source — and NO ordering rule can fix it, because
+/// #252's opportunistic backfill publishes honest v2 markers for pots whose
+/// txid has been public for weeks, so an attacker can always land a forged
+/// row with an EARLIER `createdAt`. Preferring the "v2-looking" row would
+/// therefore have dropped the cost of erasing a tower-enforced win from ~110
+/// dust markers to ONE. The fix is not a better sort: it is to fetch seat
+/// markers under the pot's OWN COMMITTED KEYS, where a forged key cannot
+/// enter the result set at all.
+///
+/// Rows still contribute their own marker when they carry one — that is
+/// strictly additive (every marker is re-verified against the committed lock
+/// by [`attribute_seats`]) and keeps a seat proof available if the second
+/// query faults.
 pub fn assemble_results(
     identity_lc: &str,
     rows: Vec<ResultsRow>,
     claims_by_game: &std::collections::HashMap<String, GameClaims>,
+    seat_markers_by_pot: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
 ) -> Vec<ResultEntry> {
-    // #230: gather the caller's v2 seat markers per (game, pot) key BEFORE
-    // dedup — the same pot can have a v1 row AND a v2 row (both published),
-    // and whichever the dedup keeps, the seat proof must not be lost.
-    let mut seat_markers: std::collections::HashMap<(String, String, u32), Vec<SeatMarkerRow>> =
-        std::collections::HashMap::new();
+    // Keyed by pot OUTPOINT, never by gameId: `attribute_seats` re-checks the
+    // outpoint and the committed key on every marker, so a marker naming a
+    // different game is harmless — whereas keying on the row's gameId would
+    // let a forged row's gameId hide the genuine proof.
+    let mut seat_markers: std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>> =
+        seat_markers_by_pot.clone();
     for r in &rows {
         if let (Some(pk), Some(seat_sig), Some(id_sig)) =
             (&r.seat_settle_pubkey, &r.seat_sig_hex, &r.marker_sig_hex)
         {
-            let key = (
-                r.game_id.to_ascii_lowercase(),
-                r.pot_txid.to_ascii_lowercase(),
-                r.pot_vout,
-            );
-            // F8: the marker's identity comes from the ROW, not from the
-            // query parameter — a future SQL change can't silently decouple.
-            seat_markers.entry(key).or_default().push(SeatMarkerRow {
+            let key = (r.pot_txid.to_ascii_lowercase(), r.pot_vout);
+            // F8 (#230): the marker's identity comes from the ROW, not from
+            // the query parameter — a future SQL change can't silently
+            // decouple them.
+            let m = SeatMarkerRow {
                 identity: r.identity.to_ascii_lowercase(),
                 opponent_identity: r.opponent_identity.to_ascii_lowercase(),
                 game_id: r.game_id.to_ascii_lowercase(),
@@ -1298,7 +1358,11 @@ pub fn assemble_results(
                 seat_settle_pubkey: pk.to_ascii_lowercase(),
                 seat_sig_hex: seat_sig.to_ascii_lowercase(),
                 identity_sig_hex: id_sig.to_ascii_lowercase(),
-            });
+            };
+            let slot = seat_markers.entry(key).or_default();
+            if !slot.contains(&m) {
+                slot.push(m);
+            }
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -1349,7 +1413,10 @@ pub fn assemble_results(
                                     &pot_txid_lc,
                                     r.pot_vout,
                                     identity_lc,
-                                    seat_markers.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+                                    seat_markers
+                                        .get(&(pot_txid_lc.clone(), r.pot_vout))
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
                                 )
                             });
                     }
@@ -1465,10 +1532,9 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
 /// The `/results` potparty join SQL: the caller's marker rows JOINed to the
 /// pot spend status plus BOTH stored BEEFs (funding keyed by potTxid,
 /// spender keyed by spendingTxid). Bounded at [`RESULTS_MAX_ROWS`] (the D1
-/// work + BLOB transfer bound — the >50-outpoint 503 lesson; a heavier
-/// history paginates in a future rev).
+/// work + BLOB transfer bound — the >50-outpoint 503 lesson).
 ///
-/// # The window is dust-DoS-resistant (bsv-low #281)
+/// # The window is dust-DoS-bounded (bsv-low #281)
 ///
 /// SHAPE THIS REPLACES: `WHERE pp.identity = ? ORDER BY pp.createdAt DESC,
 /// pp.rowid DESC LIMIT 100`. `tm_potparty` admission is BYTE-FORMAT-ONLY (the
@@ -1477,71 +1543,122 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
 /// victim's REAL pot — including a chain-proven tower-enforced WIN — entirely
 /// off `/results`. Proven against real SQLite: 120 attacker rows ⇒ 100
 /// returned, the victim's pot present ZERO times. The cheapest variant needs
-/// no forgery at all: re-broadcast the victim's OWN on-chain marker bytes (a
-/// different tx ⇒ a different outpoint ⇒ a different row). Erasure of a win is
-/// exactly the harm the #276 owner ruling names.
+/// no forgery: re-broadcast the victim's OWN on-chain marker bytes (a
+/// different tx ⇒ a different outpoint ⇒ a different row).
 ///
 /// Two structural bounds, both deterministic:
 ///
-///  1. **Per-pot collapse** — `ROW_NUMBER() OVER (PARTITION BY pp.potTxid …)
-///     = 1`. The window now counts POTS, not rows: one pot can never consume
-///     more than one slot, so the replay variant is dead outright. The
-///     representative row is the OLDEST marker for the pot (`createdAt ASC,
-///     rowid ASC`) — the honest seat publishes at funding time, before an
-///     attacker can even know the pot txid (the same ordering rationale as the
-///     #230 F2 leaderboard seat window) — except that a **v2 marker outranks a
-///     v1 one** (`seatSettlePubkey IS NULL` sorts last). That exception is
-///     load-bearing for #230: a seat may publish v1 at funding and v2 on
-///     republish, and the v2 row is the one carrying the SEAT PROOF
-///     (`seatSettlePubkey` / `seatSigHex` / `sigHex`) that `my_seat` verifies.
-///     Collapsing to the oldest row unconditionally would have silently
-///     dropped a genuine seat proof — reopening the #276 injustice through the
-///     back door. The v2 row carries every v1 discovery field too, so nothing
-///     is lost by preferring it. Downstream `assemble_results` already
-///     collapsed duplicate pots, so the entry count is unchanged.
-///  2. **Existence tier** — a row whose named pot outpoint is absent from
-///     `pot_records` sorts AFTER every row whose pot exists. Markers naming
-///     INVENTED pots (free: no funding, no chain footprint beyond the marker
-///     itself) can therefore never displace a real one; they only fill slots
-///     the real pots left over. Deliberately a TIER, not a hard `INNER JOIN`
-///     filter: a LEGACY pre-pot-index escrow (see `/spent-any`) or a pot whose
-///     `tm_pot` admission has not landed yet is still returned — never erase a
-///     pot the caller may be owed money from.
+///  1. **Per-POT-OUTPOINT collapse** — `ROW_NUMBER() OVER (PARTITION BY
+///     pp.potTxid, pp.potVout …) = 1`. The window counts POTS, not rows, so
+///     one pot can never consume it and the replay variant dies outright. The
+///     representative is the OLDEST marker for the pot (`createdAt ASC,
+///     rowid ASC`): an honest seat publishes at funding, and oldest-first is
+///     the only order an attacker cannot win by simply publishing later.
+///     Partitioning on the full OUTPOINT (not just the txid) matches every
+///     other key in the system — two genuine pots sharing a funding txid are
+///     not reachable in LOW today, but collapsing them would be silent
+///     erasure if they ever were.
+///  2. **Existence tier with a RESERVED QUOTA** — a row whose pot outpoint is
+///     absent from `pot_records` normally sorts after every row whose pot
+///     exists, so markers naming INVENTED pots (free, unlimited, each its own
+///     partition — the collapse alone does NOT stop them) cannot displace a
+///     real one. But a strict tier silently becomes a FILTER once `LIMIT`
+///     binds: with 100 indexed pots, a genuinely fresh pot whose `tm_pot`
+///     admission is still in flight (or a legacy pre-pot-index escrow — see
+///     `/spent-any`) fell off the answer entirely. So the newest
+///     [`RESULTS_UNKNOWN_POT_QUOTA`] unknown pots are PROMOTED into the main
+///     tier and compete on recency; the rest stay demoted. Ghost rows are
+///     therefore bounded to a small reserved slice instead of the whole page,
+///     and a real-but-unindexed pot is not erased.
 ///
-/// Within a tier: newest POT first (`pot_records.createdAt`, the pot's own
-/// admission stamp — an attacker cannot backdate or advance it by filing
-/// markers), falling back to the marker stamp when the pot is unknown, then
-/// the marker `rowid` as a total-order tiebreak. EVERY level carries an
-/// explicit `ORDER BY`, so the answer is a deterministic function of the table
-/// contents (SQLite is free to reorder anything left unordered).
+/// Ordering within a tier is by the POT's own admission stamp
+/// (`pot_records.createdAt` — an attacker cannot backdate or advance it by
+/// filing markers), falling back to the marker stamp when the pot is unknown,
+/// then the marker `rowid` as a total-order tiebreak. EVERY level carries an
+/// explicit `ORDER BY`.
 ///
-/// EFFECTIVE CAP: [`RESULTS_MAX_ROWS`] DISTINCT POTS per request (still ≤100
-/// rows, so the BLOB-weight bound is unchanged). A player with 100 real pots
+/// HONESTY NOTE on the OUTERMOST `ORDER BY` (after the `pot_beefs` join): it
+/// is insurance, and it is the one ordering guarantee here with no
+/// behavioural test. SQLite cannot reorder a `LEFT JOIN`'s left side, so
+/// deleting it does not change the answer under any plan we can force — it is
+/// pinned by the structural test only. Every OTHER ordering rule in this
+/// query has a test that goes RED when it is removed (see
+/// `tests/results_window_sqlite.rs`).
+///
+/// The `pot_beefs` joins run on the OUTER select — AFTER the window and the
+/// `LIMIT` have pruned to at most [`RESULTS_MAX_ROWS`] rows. Inside the
+/// subquery they would have been evaluated for every matching marker row, so
+/// each dust replay naming the victim's real pot would have dragged the real
+/// funding BEEF along with it (the >50-outpoint 503 lesson: never let an
+/// attacker multiply BLOB work).
+///
+/// # This query no longer carries the seat proof
+///
+/// It selects `seatSettlePubkey` / `seatSigHex` / `sigHex` for continuity,
+/// but `/results` NO LONGER derives the caller's seat from these rows: one
+/// row per pot cannot serve both duties, and any ordering rule that picked
+/// the "v2-looking" row was front-runnable (a forged v2 with an earlier
+/// `createdAt` would have owned the slot and dropped the genuine proof —
+/// making a tower-enforced win erasable for ONE dust marker instead of ~110).
+/// The seat proof comes from [`seat_markers_sql`] instead, bound to the pot's
+/// OWN COMMITTED KEYS, where a forged key cannot enter the result set at all.
+/// See `routes::results`.
+///
+/// EFFECTIVE CAP: [`RESULTS_MAX_ROWS`] DISTINCT POTS per request (one row
+/// each, so the BLOB-weight bound is unchanged). A player with 100 real pots
 /// still sees all 100.
 ///
-/// RESIDUALS (documented, not closed here):
+/// # Residual — stated plainly, because the improvement is modest
 ///
-///  - An attacker willing to spend one ADMITTED marker per slot can still
-///    fill the window by naming 100 DISTINCT pots that really exist and were
-///    admitted more recently than the victim's. Closing that requires the
-///    marker's IDENTITY SIGNATURE to be verified before the row COUNTS —
-///    #230 verifies it before the row ATTRIBUTES (`verify_identity_binding`),
-///    which is what protects the verdict; the overlay itself stays
-///    byte-format-only by doctrine (the READER verifies).
-///  - For a caller who published ONLY a v1 marker, a forged v2 marker naming
-///    that caller outranks it (the tier above) and becomes the pot's display
-///    row, so `gameId` / `opponentIdentity` / `recoveryHeight` could be
-///    attacker-chosen. The pot still appears, its CHAIN facts still come from
-///    `pot_records`, and the seat verdict is unaffected — `my_seat` refuses
-///    the forged marker at F1. This is strictly no worse than the pre-#281
-///    behaviour, where the forged row was returned alongside and refused the
-///    same way; it is display corruption, never a wrong outcome.
+/// This does NOT make the window expensive to fill. An attacker who copies
+/// 100 REAL, recently-admitted pot txids out of the very index being queried
+/// — they are public — and files one marker per pot naming the victim
+/// achieves total erasure at the SAME ~100-dust cost as before. The honest
+/// net gain is narrower than "an admitted marker per slot": it is
+/// **from "any 110 junk rows" to "110 junk rows naming real, recent pot
+/// txids"**, plus the outright death of the zero-forgery replay variant and
+/// of free invented-pot flooding. Closing the rest requires the marker's
+/// IDENTITY SIGNATURE to be verified before the row COUNTS; the overlay
+/// verifies nothing by doctrine (the READER verifies), and #230 verifies
+/// before the row ATTRIBUTES, which is what keeps the VERDICT correct even
+/// when the display window is stuffed.
+///
+/// Second residual (the re-gate's F1b): the representative row supplies the
+/// DISPLAY fields — `gameId`, `opponentIdentity`, `recoveryHeight`. For a pot
+/// backfilled long after its txid became public (#252), an attacker CAN file
+/// a marker with an earlier `createdAt` and own those fields. What that costs
+/// is the CLAIMS fallback for that pot (the claims lookup keys on `gameId`);
+/// it costs nothing on the paths that decide money, because the pot outpoint,
+/// the chain verdict and the SEAT PROOF all come from elsewhere — the
+/// `pot_records` join and the committed-key-bound [`seat_markers_sql`] fetch.
+/// Pre-#281 the `(gameId, potTxid, potVout)` dedupe kept both rows and the
+/// honest one survived to the claims lookup, so this IS a real (if narrow)
+/// regression on the fallback path, traded for the window bound.
 pub fn results_sql() -> String {
     format!(
-        "SELECT identity, gameId, potTxid, potVout, recoveryHeight, opponentIdentity, \
-                seatSettlePubkey, seatSigHex, sigHex, \
-                spent, spendingTxid, spentConfirmed, fundingBeef, spenderBeef \
-         FROM (SELECT pp.identity AS identity, pp.gameId AS gameId, \
+        // L4 — BEEF join, on the ≤{rows} survivors only (never inside the
+        // window, where each dust replay would drag the real BLOBs along).
+        "SELECT w.identity AS identity, w.gameId AS gameId, w.potTxid AS potTxid, \
+                w.potVout AS potVout, w.recoveryHeight AS recoveryHeight, \
+                w.opponentIdentity AS opponentIdentity, \
+                w.seatSettlePubkey AS seatSettlePubkey, w.seatSigHex AS seatSigHex, \
+                w.sigHex AS sigHex, \
+                w.spent AS spent, w.spendingTxid AS spendingTxid, \
+                w.spentConfirmed AS spentConfirmed, \
+                hex(fb.beef) AS fundingBeef, hex(sb.beef) AS spenderBeef \
+         FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
+                  opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
+                  spent, spendingTxid, spentConfirmed, \
+                  markerCreatedAt, markerRowid, potCreatedAt, \
+                  CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
+           FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
+                    opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
+                    spent, spendingTxid, spentConfirmed, \
+                    markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                    ROW_NUMBER() OVER (PARTITION BY unknownPot \
+                                       ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                                markerCreatedAt DESC, markerRowid DESC) AS potRank \
+             FROM (SELECT pp.identity AS identity, pp.gameId AS gameId, \
                       pp.potTxid AS potTxid, pp.potVout AS potVout, \
                       pp.recoveryHeight AS recoveryHeight, \
                       pp.opponentIdentity AS opponentIdentity, \
@@ -1549,34 +1666,47 @@ pub fn results_sql() -> String {
                       pp.seatSigHex AS seatSigHex, pp.sigHex AS sigHex, \
                       r.spent AS spent, r.spendingTxid AS spendingTxid, \
                       r.spentConfirmed AS spentConfirmed, \
-                      hex(fb.beef) AS fundingBeef, \
-                      hex(sb.beef) AS spenderBeef, \
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
-                      ROW_NUMBER() OVER (PARTITION BY pp.potTxid \
-                                         ORDER BY CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END ASC, \
-                                                  CASE WHEN pp.seatSettlePubkey IS NULL \
-                                                       THEN 1 ELSE 0 END ASC, \
-                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
+                      ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
+                                         ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
                FROM potparty_records pp \
-               LEFT JOIN pot_records r ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-               LEFT JOIN pot_beefs fb ON fb.txid = lower(pp.potTxid) \
-               LEFT JOIN pot_beefs sb ON sb.txid = lower(r.spendingTxid) \
+               LEFT JOIN pot_records r \
+                      ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ?) \
-         WHERE rn = 1 \
-         ORDER BY unknownPot ASC, \
-                  COALESCE(potCreatedAt, markerCreatedAt) DESC, \
-                  markerCreatedAt DESC, markerRowid DESC \
-         LIMIT {RESULTS_MAX_ROWS}"
+             WHERE rn = 1) \
+           ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                    markerCreatedAt DESC, markerRowid DESC \
+           LIMIT {rows}) w \
+         LEFT JOIN pot_beefs fb ON fb.txid = lower(w.potTxid) \
+         LEFT JOIN pot_beefs sb ON sb.txid = lower(w.spendingTxid) \
+         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+                  w.markerCreatedAt DESC, w.markerRowid DESC",
+        quota = RESULTS_UNKNOWN_POT_QUOTA,
+        rows = RESULTS_MAX_ROWS,
     )
 }
 
 /// Hard bound on `/results` per request. Since bsv-low #281 the window is
-/// per-POT (`results_sql`'s `PARTITION BY potTxid`), so this is a cap on
-/// DISTINCT POTS — and, one row per pot, still the same ≤100-row BLOB-weight
-/// bound it always was.
+/// per-POT-OUTPOINT (`results_sql`'s `PARTITION BY potTxid, potVout`), so
+/// this is a cap on DISTINCT POTS — and, one row per pot, still the same
+/// ≤100-row BLOB-weight bound it always was.
 pub const RESULTS_MAX_ROWS: usize = 100;
+
+/// How many of the newest pots ABSENT from `pot_records` are promoted into
+/// the main `/results` tier instead of being demoted behind every indexed
+/// pot (bsv-low #281 F3).
+///
+/// A strict existence tier silently becomes a FILTER the moment `LIMIT`
+/// binds: 100 indexed pots plus one genuinely fresh pot whose `tm_pot`
+/// admission is still in flight returned the 100 and dropped the fresh one —
+/// exactly the pot a recovering client most needs. Reserving a slice keeps
+/// that pot visible while still bounding how much of the page free,
+/// invented-pot rows can ever occupy.
+pub const RESULTS_UNKNOWN_POT_QUOTA: usize = 10;
+
+const _: () = assert!(RESULTS_UNKNOWN_POT_QUOTA < RESULTS_MAX_ROWS);
 
 /// Cap on v2 seat-marker rows fetched per COMMITTED KEY SLOT (per
 /// `(potTxid, seatSettlePubkey)` partition) for the `/leaderboard`
@@ -1585,11 +1715,22 @@ pub const RESULTS_MAX_ROWS: usize = 100;
 /// absorbs benign duplicates (the sweep's content-idempotent republish).
 pub const SEAT_MARKERS_PER_KEY: usize = 8;
 
-/// Pots per `seat_markers_sql` chunk. THREE binds per pot (potTxid, pubA,
-/// pubB) — 30 × 3 = 90, under D1's 100-bound-param cap.
-pub const SEAT_MARKERS_CHUNK_POTS: usize = 30;
+/// Pots per `seat_markers_sql` chunk. FOUR binds per pot (potTxid, potVout,
+/// pubA, pubB) — 24 × 4 = 96, under D1's 100-bound-param cap.
+///
+/// `potVout` became a BIND (it was a hardcoded `LEADERBOARD_POT_VOUT`) when
+/// `/results` started using this query too (bsv-low #281 F1): `/results` is
+/// not vout-0-only, and a seat proof must be bound to the OUTPOINT being
+/// attributed. `/leaderboard` passes `LEADERBOARD_POT_VOUT`, so its behaviour
+/// is unchanged.
+pub const SEAT_MARKERS_CHUNK_POTS: usize = 24;
 
-const _: () = assert!(SEAT_MARKERS_CHUNK_POTS * 3 <= crate::logic::D1_MAX_BOUND_PARAMS);
+/// Binds per pot in [`seat_markers_sql`]: `(potTxid, potVout, pubA, pubB)`.
+pub const SEAT_MARKERS_BINDS_PER_POT: usize = 4;
+
+const _: () = assert!(
+    SEAT_MARKERS_CHUNK_POTS * SEAT_MARKERS_BINDS_PER_POT <= crate::logic::D1_MAX_BOUND_PARAMS
+);
 
 /// The `/leaderboard` seat-marker query for a chunk of `n` pots, each bound
 /// as the triple `(potTxid, pubA, pubB)` — the pot's OWN committed settle
@@ -1625,19 +1766,19 @@ const _: () = assert!(SEAT_MARKERS_CHUNK_POTS * 3 <= crate::logic::D1_MAX_BOUND_
 /// observed is admission-side rate limiting, not a bigger window.
 pub fn seat_markers_sql(n: usize) -> String {
     debug_assert!(n >= 1);
-    let per_pot = vec!["(potTxid = ? AND seatSettlePubkey IN (?, ?))"; n].join(" OR ");
+    let per_pot =
+        vec!["(potTxid = ? AND potVout = ? AND seatSettlePubkey IN (?, ?))"; n].join(" OR ");
     format!(
         "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                 recoveryHeight, seatSettlePubkey, seatSigHex, sigHex \
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                       recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
-                      ROW_NUMBER() OVER (PARTITION BY potTxid, seatSettlePubkey \
+                      ROW_NUMBER() OVER (PARTITION BY potTxid, potVout, seatSettlePubkey \
                                          ORDER BY createdAt ASC, rowid ASC) AS rn \
                FROM potparty_records \
-               WHERE seatSettlePubkey IS NOT NULL AND potVout = {vout} \
-                 AND ({per_pot})) \
-         WHERE rn <= {cap}",
-        vout = crate::logic::LEADERBOARD_POT_VOUT,
+               WHERE seatSettlePubkey IS NOT NULL AND ({per_pot})) \
+         WHERE rn <= {cap} \
+         ORDER BY potTxid ASC, potVout ASC, seatSettlePubkey ASC, rn ASC",
         cap = SEAT_MARKERS_PER_KEY,
     )
 }
@@ -2502,7 +2643,12 @@ mod tests {
 
         // NO claims at all — the loser is gone (the #276 shape).
         let rows = vec![row_of(&honest), row_of(&forged)];
-        let entries = assemble_results(&winner, rows, &std::collections::HashMap::new());
+        let entries = assemble_results(
+            &winner,
+            rows,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].verdict, Some(PotVerdict::WinnerA));
         assert_eq!(
@@ -2519,6 +2665,7 @@ mod tests {
             &loser,
             vec![row_of(&loser_marker)],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(entries[0].outcome, Outcome::Lost);
         assert_eq!(entries[0].outcome_source, Some("chain+seatkey"));
@@ -2533,17 +2680,18 @@ mod tests {
         let sql = seat_markers_sql(3);
         assert_eq!(
             sql.matches('?').count(),
-            9,
-            "three binds per pot: txid, pubA, pubB"
+            3 * SEAT_MARKERS_BINDS_PER_POT,
+            "four binds per pot: txid, vout, pubA, pubB (#281 made vout a bind \
+             so `/results`, which is not vout-0-only, shares this query)"
         );
         assert_eq!(
-            sql.matches("(potTxid = ? AND seatSettlePubkey IN (?, ?))")
+            sql.matches("(potTxid = ? AND potVout = ? AND seatSettlePubkey IN (?, ?))")
                 .count(),
             3,
-            "each pot binds its OWN committed keys: {sql}"
+            "each pot binds its OWN committed keys, at its OWN outpoint: {sql}"
         );
         assert!(
-            sql.contains("ROW_NUMBER() OVER (PARTITION BY potTxid, seatSettlePubkey"),
+            sql.contains("ROW_NUMBER() OVER (PARTITION BY potTxid, potVout, seatSettlePubkey"),
             "PER-KEY-SLOT window — junk on one seat's key can never starve the \
              other seat's marker: {sql}"
         );
@@ -2578,7 +2726,7 @@ mod tests {
         rows: &[(SeatMarkerRow, i64)],
     ) -> Vec<SeatMarkerRow> {
         let key_filtered = sql.contains("seatSettlePubkey IN (?, ?)");
-        let per_key_window = sql.contains("PARTITION BY potTxid, seatSettlePubkey");
+        let per_key_window = sql.contains("PARTITION BY potTxid, potVout, seatSettlePubkey");
         let cap: usize = sql
             .split("rn <= ")
             .nth(1)
@@ -2778,7 +2926,12 @@ mod tests {
             marker_sig_hex: None,
         };
         let rows = vec![row.clone(), row.clone(), unspent];
-        let entries = assemble_results(&me, rows, &std::collections::HashMap::new());
+        let entries = assemble_results(
+            &me,
+            rows,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(entries.len(), 2, "duplicate pot rows dedupe");
         // Unknown lock shape → verdict None, outcome unresolved — never a
         // guess, and the pointer facts still serve.
@@ -3268,26 +3421,39 @@ mod tests {
         let sql = results_sql();
         assert_eq!(sql.matches('?').count(), 1);
         assert!(sql.contains(&format!("LIMIT {RESULTS_MAX_ROWS}")));
-        assert!(sql.contains("LEFT JOIN pot_beefs fb ON fb.txid = lower(pp.potTxid)"));
-        assert!(sql.contains("LEFT JOIN pot_beefs sb ON sb.txid = lower(r.spendingTxid)"));
+        // #281 F7: the BEEF joins run on the OUTER select, against the ≤100
+        // survivors — never inside the window, where every dust replay naming
+        // the victim's real pot would have dragged the real BLOBs along.
+        assert!(sql.contains("LEFT JOIN pot_beefs fb ON fb.txid = lower(w.potTxid)"));
+        assert!(sql.contains("LEFT JOIN pot_beefs sb ON sb.txid = lower(w.spendingTxid)"));
         // #281 structural guards. These are a BACKSTOP only — the behaviour
         // they stand for is proven by EXECUTING this SQL against real SQLite
         // over the production schema in `tests/results_window_sqlite.rs`
-        // (the 2026-07-28 gate rejected string-pinning as sufficient).
+        // (the gate rejected string-pinning as sufficient).
         assert!(
-            sql.contains("ROW_NUMBER() OVER (PARTITION BY pp.potTxid"),
-            "the window must count POTS, not rows — one pot can never consume it"
+            sql.contains("ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout"),
+            "the window counts POT OUTPOINTS, not rows"
         );
         assert!(
-            sql.contains("CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot"),
-            "rows naming a pot absent from pot_records must sort last"
+            sql.contains("CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot")
+                && sql.contains(&format!("potRank <= {RESULTS_UNKNOWN_POT_QUOTA}")),
+            "existence tier with a RESERVED QUOTA — a strict tier becomes a \
+             filter once LIMIT binds (F3)"
         );
         // An explicit ORDER BY at EVERY level (the gate flagged unordered
-        // windows): one inside the partition, one on the outer select.
+        // windows): the per-pot window, the pot ranking, the page, and the
+        // post-join projection.
         assert_eq!(
             sql.matches("ORDER BY").count(),
-            2,
-            "deterministic at both levels"
+            4,
+            "deterministic at every level"
+        );
+        // The seat proof does NOT ride on this query any more (F1) — it has
+        // its own committed-key-bound fetch.
+        assert!(
+            !sql.contains("seatSettlePubkey IS NULL"),
+            "no ordering heuristic may decide which marker represents a pot — \
+             a forged v2 could always be stamped earlier"
         );
         // Claims chunks bind one param per gameId.
         assert_eq!(claims_sql(3).matches('?').count(), 3);
