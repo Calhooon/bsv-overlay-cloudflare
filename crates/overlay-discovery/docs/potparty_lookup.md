@@ -18,7 +18,17 @@ optional — default 100, clamped to 1..=500.
 
 ## Answer
 
-A freeform JSON array, newest first, one entry per stored marker:
+A freeform JSON array, one entry per returned marker. Ordering + windowing
+(bsv-low #281 — admission is byte-format-only, so anyone can file a marker
+naming any identity for a dust `OP_RETURN`; a flat newest-first row window
+was displaceable):
+
+- `partyFor` returns **at most one row per `potTxid`** (the OLDEST marker
+  naming that pot), so `limit` counts POTS, not rows, and rows naming a pot
+  the overlay has never indexed sort LAST — they can never displace a real
+  one. Within that: newest pot first.
+- `byPot` returns markers **oldest first** — the honest seats publish at
+  funding, so later dust can never crowd them out of the window.
 
 ```json
 [{"identity": "<hex>", "opponentIdentity": "<hex>", "gameId": "<hex>",

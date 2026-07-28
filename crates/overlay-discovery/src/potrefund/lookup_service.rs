@@ -378,9 +378,10 @@ mod tests {
         let arr = by_pot(&svc, &hex::encode(golden_pot_txid()), 0).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2, "both parties' backups for the pot");
-        // Newest first.
-        assert_eq!(arr[0]["txid"], "txB");
-        assert_eq!(arr[1]["txid"], "txA");
+        // OLDEST first (bsv-low #281) — the honest backups are published at
+        // funding, so later dust naming the pot can never bury them.
+        assert_eq!(arr[0]["txid"], "txA");
+        assert_eq!(arr[1]["txid"], "txB");
 
         // A different vout matches nobody.
         let arr = by_pot(&svc, &hex::encode(golden_pot_txid()), 9).await;
@@ -430,7 +431,7 @@ mod tests {
     // ── Ordering + limit ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn newest_first_and_limit() {
+    async fn oldest_first_and_limit() {
         let (svc, _storage) = make_service_with_storage();
         for i in 1u8..=5 {
             svc.output_admitted_by_topic(&admit(
@@ -442,10 +443,10 @@ mod tests {
             .unwrap();
         }
         let arr = by_pot(&svc, &hex::encode(golden_pot_txid()), 0).await;
-        // limit default returns all 5, newest first.
+        // limit default returns all 5, OLDEST first (bsv-low #281).
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 5);
-        assert_eq!(arr[0]["txid"], "tx5", "newest first");
+        assert_eq!(arr[0]["txid"], "tx1", "oldest first");
 
         // limit clamps.
         assert_eq!(clamp_limit(None), DEFAULT_LIMIT);

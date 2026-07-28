@@ -19,8 +19,10 @@
 //!
 //! `created_at` is assigned by the STORAGE layer at insert (D1 stamps the
 //! unix time, the memory impl an insertion counter) — the value on the
-//! record passed to `store_record` is ignored. Recency ordering
-//! (`list_for_identity` / `list_for_pot`, newest first) rides on it.
+//! record passed to `store_record` is ignored. The window ordering rides on
+//! it: `list_for_identity` is newest-POT-first over at most one row per pot,
+//! `list_for_pot` is OLDEST-first — both dust-DoS bounds, see the trait
+//! methods and bsv-low #281.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -73,11 +75,12 @@ pub struct PotpartyRecord {
 #[serde(tag = "type")]
 pub enum PotpartyQuery {
     /// "Which pots is this identity a party to?" — the recovery question.
-    /// Newest first.
+    /// At most one row per pot, newest pot first (bsv-low #281).
     #[serde(rename = "partyFor")]
     PartyFor { identity: String, limit: Option<u32> },
     /// "Who are the two parties to this pot outpoint?" — returns every
-    /// marker naming the pot (each seat publishes its own). Newest first.
+    /// marker naming the pot (each seat publishes its own). Oldest first
+    /// (bsv-low #281).
     #[serde(rename = "byPot")]
     ByPot {
         #[serde(rename = "potTxid")]
@@ -99,7 +102,21 @@ pub trait PotpartyStorage {
     /// ignored).
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError>;
 
-    /// Up to `limit` records whose `identity` is `identity`, newest first.
+    /// Up to `limit` records whose `identity` is `identity` — **at most ONE
+    /// per pot** (`pot_txid`), newest pot first.
+    ///
+    /// The per-pot collapse is a DUST-DoS BOUND, not an optimisation
+    /// (bsv-low #281): admission is byte-format-only, so anyone can file
+    /// markers naming any identity for a dust `OP_RETURN`, and a flat
+    /// newest-first row window let `limit` junk rows push a victim's real
+    /// pots — the pots it may be owed money from — out of the answer
+    /// entirely. `limit` therefore counts POTS, which is also exactly what
+    /// this query is asking for: an identity has one genuine marker per pot.
+    /// The representative row for a pot is the OLDEST marker naming it (the
+    /// honest seat publishes at funding, before an attacker can know the pot
+    /// txid). A backend that can see the pot index SHOULD additionally sort
+    /// rows naming a pot it has never heard of last — the D1 implementation
+    /// does; the in-memory one has no pot table and cannot.
     async fn list_for_identity(
         &self,
         identity: &str,
@@ -107,7 +124,14 @@ pub trait PotpartyStorage {
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError>;
 
     /// Up to `limit` records naming the pot outpoint `(pot_txid, pot_vout)`,
-    /// newest first — the two parties (one marker each).
+    /// **oldest first** — the two parties (one marker each).
+    ///
+    /// Oldest-first is likewise a DoS bound (bsv-low #281): the pot outpoint
+    /// is public from the moment funding lands, so under newest-first `limit`
+    /// dust markers naming the pot buried BOTH honest seat markers. The
+    /// honest markers are published AT funding, so oldest-first puts them
+    /// permanently at the head of the window — an attacker cannot spam its
+    /// way in front of them after the fact.
     async fn list_for_pot(
         &self,
         pot_txid: &str,
@@ -170,16 +194,23 @@ impl PotpartyStorage for MemoryPotpartyStorage {
         identity: &str,
         limit: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
-        Ok(self
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .rev() // newest first (insertion order = recency order)
-            .filter(|r| r.identity == identity)
-            .take(limit)
-            .cloned()
-            .collect())
+        let records = self.records.lock().unwrap();
+        // Per-pot collapse (bsv-low #281) — mirrors D1's
+        // `ROW_NUMBER() OVER (PARTITION BY potTxid ORDER BY createdAt ASC) = 1`:
+        // walk in INSERTION order (oldest first) so the first marker seen for
+        // a pot is the one that represents it.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut kept: Vec<&PotpartyRecord> = Vec::new();
+        for r in records.iter().filter(|r| r.identity == identity) {
+            if seen.insert(r.pot_txid.as_str()) {
+                kept.push(r);
+            }
+        }
+        // Newest pot first. `created_at` is a unique insertion counter here,
+        // so the order is total — deterministic, like the D1 window's
+        // `rowid` tiebreak.
+        kept.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        Ok(kept.into_iter().take(limit).cloned().collect())
     }
 
     async fn list_for_pot(
@@ -192,8 +223,7 @@ impl PotpartyStorage for MemoryPotpartyStorage {
             .records
             .lock()
             .unwrap()
-            .iter()
-            .rev()
+            .iter() // OLDEST first (bsv-low #281) — insertion order
             .filter(|r| r.pot_txid == pot_txid && r.pot_vout == pot_vout)
             .take(limit)
             .cloned()
@@ -285,23 +315,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "both parties to vout 0");
-        assert_eq!(rows[0].txid, "txB", "newest first");
-        assert_eq!(rows[1].txid, "txA");
+        // OLDEST first (bsv-low #281) — later dust naming this pot can never
+        // push the honest seat markers out of the window.
+        assert_eq!(rows[0].txid, "txA", "oldest first");
+        assert_eq!(rows[1].txid, "txB");
     }
 
     #[tokio::test]
-    async fn lists_are_newest_first_and_respect_limit() {
+    async fn list_for_identity_is_newest_pot_first_and_respects_limit() {
         let store = MemoryPotpartyStorage::new();
+        // FIVE DISTINCT POTS — since bsv-low #281 the window counts pots, so
+        // a fixture that reused one pot txid would (correctly) collapse to a
+        // single row and prove nothing about the limit.
         for i in 0..5u8 {
-            store
-                .store_record(&record("02aa", "03bb", &format!("tx{i}")))
-                .await
-                .unwrap();
+            let mut r = record("02aa", "03bb", &format!("tx{i}"));
+            r.pot_txid = format!("{i:02x}").repeat(32);
+            store.store_record(&r).await.unwrap();
         }
         let rows = store.list_for_identity("02aa", 3).await.unwrap();
         assert_eq!(rows.len(), 3, "limit respected");
-        assert_eq!(rows[0].txid, "tx4", "newest first");
+        assert_eq!(rows[0].txid, "tx4", "newest pot first");
         assert!(rows[0].created_at > rows[1].created_at);
+    }
+
+    /// bsv-low #281 — the per-pot collapse, at the trait's own level: many
+    /// markers naming ONE pot occupy ONE slot, so they cannot crowd a
+    /// victim's other pots out of the recovery window.
+    #[tokio::test]
+    async fn many_markers_for_one_pot_consume_one_slot() {
+        let store = MemoryPotpartyStorage::new();
+        // The victim's honest marker for its real pot, published FIRST.
+        let mut honest = record("02aa", "03bb", "txHONEST");
+        honest.pot_txid = "aa".repeat(32);
+        store.store_record(&honest).await.unwrap();
+        // 120 replays of a marker naming ANOTHER pot, all naming the victim.
+        for i in 0..120u32 {
+            let mut junk = record("02aa", "03cc", &format!("txJUNK{i}"));
+            junk.pot_txid = "bb".repeat(32);
+            store.store_record(&junk).await.unwrap();
+        }
+        let rows = store.list_for_identity("02aa", 100).await.unwrap();
+        assert_eq!(rows.len(), 2, "121 rows, 2 pots ⇒ 2 slots");
+        assert!(
+            rows.iter().any(|r| r.txid == "txHONEST"),
+            "the honest pot survives the flood"
+        );
     }
 
     #[tokio::test]

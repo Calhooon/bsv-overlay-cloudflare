@@ -421,9 +421,10 @@ mod tests {
         let arr = by_pot(&svc, &"22".repeat(32), 0).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2, "both parties to the pot");
-        // Newest first.
-        assert_eq!(arr[0]["txid"], "txB");
-        assert_eq!(arr[1]["txid"], "txA");
+        // OLDEST first (bsv-low #281) — the honest seats publish at funding,
+        // so later dust naming the pot can never displace them.
+        assert_eq!(arr[0]["txid"], "txA");
+        assert_eq!(arr[1]["txid"], "txB");
 
         // A different vout matches nobody.
         let arr = by_pot(&svc, &"22".repeat(32), 9).await;
@@ -433,13 +434,15 @@ mod tests {
     // ── Ordering + limit ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn newest_first_and_limit() {
+    async fn newest_pot_first_and_limit() {
         let (svc, _storage) = make_service_with_storage();
+        // FIVE DISTINCT POTS — since bsv-low #281 `partyFor`'s window counts
+        // POTS, so markers must name different pots to occupy different slots.
         for i in 1u8..=5 {
             svc.output_admitted_by_topic(&admit(
                 &format!("tx{i}"),
                 0,
-                golden_marker(&[i; 32], &golden_pot_txid(), 0),
+                golden_marker(&[i; 32], &[0xd0 + i; 32], 0),
             ))
             .await
             .unwrap();
@@ -447,7 +450,7 @@ mod tests {
         let arr = party_for(&svc, &golden_identity_hex(), Some(3)).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 3, "limit respected");
-        assert_eq!(arr[0]["txid"], "tx5", "newest first");
+        assert_eq!(arr[0]["txid"], "tx5", "newest pot first");
 
         // limit clamps.
         assert_eq!(clamp_limit(None), DEFAULT_LIMIT);
