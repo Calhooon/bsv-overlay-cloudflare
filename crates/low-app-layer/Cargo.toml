@@ -31,3 +31,11 @@ bsv-rs.workspace = true
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+# Real SQLite (bundled) + the overlay's PRODUCTION migration list, so the
+# `/results` read-window test EXECUTES the shipped `results_sql()` against the
+# real schema rather than pinning its text (bsv-low #281). Test-only: neither
+# is linked into the wasm32 Worker build.
+rusqlite = { version = "0.32", features = ["bundled"] }
+bsv-overlay-cloudflare = { version = "0.1", path = "../overlay-cloudflare" }

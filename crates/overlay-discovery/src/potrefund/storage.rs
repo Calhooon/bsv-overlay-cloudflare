@@ -20,8 +20,10 @@
 //!
 //! `created_at` is assigned by the STORAGE layer at insert (D1 stamps the
 //! unix time, the memory impl an insertion counter) — the value on the
-//! record passed to `store_record` is ignored. Recency ordering
-//! (`list_for_identity` / `list_for_pot`, newest first) rides on it.
+//! record passed to `store_record` is ignored. The window ordering rides on
+//! it: `list_for_identity` is newest-POT-first over one row per pot outpoint,
+//! `list_for_pot` is OLDEST-first — both dust-DoS bounds, see the trait
+//! methods and bsv-low #281.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -72,7 +74,7 @@ pub struct PotrefundRecord {
 pub enum PotrefundQuery {
     /// "Give me the pre-signed refund backup(s) for this pot outpoint." —
     /// the recovery question. Returns every marker naming the pot (each seat
-    /// may publish its own). Newest first.
+    /// may publish its own). Oldest first (bsv-low #281).
     #[serde(rename = "byPot")]
     ByPot {
         #[serde(rename = "potTxid")]
@@ -82,7 +84,7 @@ pub enum PotrefundQuery {
         limit: Option<u32>,
     },
     /// "Which pots have I published a refund backup for?" — completeness.
-    /// Newest first.
+    /// At most one row per pot, newest pot first (bsv-low #281).
     #[serde(rename = "partyFor")]
     PartyFor { identity: String, limit: Option<u32> },
 }
@@ -98,7 +100,23 @@ pub trait PotrefundStorage {
     /// ignored).
     async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError>;
 
-    /// Up to `limit` records whose `identity` is `identity`, newest first.
+    /// Records whose `identity` is `identity`, for up to `limit` POTS —
+    /// newest pot first, a BOUNDED SUPERSET of backup markers per pot
+    /// OUTPOINT (never one — see `PotpartyStorage::list_for_identity` for why
+    /// verification must precede collapse).
+    ///
+    /// The per-pot collapse is a DUST-DoS BOUND (bsv-low #281): admission is
+    /// byte-format-only, so anyone can file markers naming any identity for a
+    /// dust `OP_RETURN`, and a flat newest-first row window let `limit` junk
+    /// rows push a victim's real refund backups out of the answer. `limit`
+    /// therefore counts POTS. Rows are NOT collapsed to one per pot: an
+    /// attacker can file a marker stamped earlier than yours, so picking one
+    /// would hand the consumer a forgery and bury the pre-signed refund that
+    /// brings the ante home. A backend that
+    /// can see the pot index SHOULD additionally sort rows naming a pot it has
+    /// never heard of behind the rest, while still serving them (a strict
+    /// filter would erase a pot whose admission is merely in flight) — the D1
+    /// implementation does; the in-memory one has no pot table and cannot.
     async fn list_for_identity(
         &self,
         identity: &str,
@@ -106,7 +124,13 @@ pub trait PotrefundStorage {
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError>;
 
     /// Up to `limit` records naming the pot outpoint `(pot_txid, pot_vout)`,
-    /// newest first — the pre-signed refund backup(s).
+    /// **oldest first** — the pre-signed refund backup(s).
+    ///
+    /// Oldest-first is likewise a DoS bound (bsv-low #281): the pot outpoint
+    /// is public from the moment funding lands, so under newest-first `limit`
+    /// dust markers naming the pot buried the only backup that can bring the
+    /// money home. The honest backups are published AT funding, so
+    /// oldest-first puts them permanently at the head of the window.
     async fn list_for_pot(
         &self,
         pot_txid: &str,
@@ -169,16 +193,22 @@ impl PotrefundStorage for MemoryPotrefundStorage {
         identity: &str,
         limit: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
-        Ok(self
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .rev() // newest first (insertion order = recency order)
-            .filter(|r| r.identity == identity)
-            .take(limit)
-            .cloned()
-            .collect())
+        let records = self.records.lock().unwrap();
+        // Per-pot-OUTPOINT collapse (bsv-low #281) — mirrors D1's
+        // `ROW_NUMBER() OVER (PARTITION BY potTxid, potVout ORDER BY createdAt ASC) = 1`:
+        // walk in INSERTION order (oldest first) so the first marker seen for
+        // a pot is the one that represents it.
+        let mut seen: std::collections::HashSet<(&str, u32)> = std::collections::HashSet::new();
+        let mut kept: Vec<&PotrefundRecord> = Vec::new();
+        for r in records.iter().filter(|r| r.identity == identity) {
+            if seen.insert((r.pot_txid.as_str(), r.pot_vout)) {
+                kept.push(r);
+            }
+        }
+        // Newest pot first; `created_at` is a unique insertion counter here,
+        // so the order is total — deterministic.
+        kept.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        Ok(kept.into_iter().take(limit).cloned().collect())
     }
 
     async fn list_for_pot(
@@ -191,8 +221,7 @@ impl PotrefundStorage for MemoryPotrefundStorage {
             .records
             .lock()
             .unwrap()
-            .iter()
-            .rev()
+            .iter() // OLDEST first (bsv-low #281) — insertion order
             .filter(|r| r.pot_txid == pot_txid && r.pot_vout == pot_vout)
             .take(limit)
             .cloned()
@@ -262,23 +291,47 @@ mod tests {
 
         let rows = store.list_for_pot(&"22".repeat(32), 0, 100).await.unwrap();
         assert_eq!(rows.len(), 2, "both parties' backups for vout 0");
-        assert_eq!(rows[0].txid, "txB", "newest first");
-        assert_eq!(rows[1].txid, "txA");
+        // OLDEST first (bsv-low #281) — later dust naming this pot can never
+        // bury the pre-signed refund that brings the money home.
+        assert_eq!(rows[0].txid, "txA", "oldest first");
+        assert_eq!(rows[1].txid, "txB");
     }
 
     #[tokio::test]
-    async fn lists_are_newest_first_and_respect_limit() {
+    async fn list_for_identity_is_newest_pot_first_and_respects_limit() {
         let store = MemoryPotrefundStorage::new();
+        // FIVE DISTINCT POTS — since bsv-low #281 the window counts pots.
         for i in 0..5u8 {
-            store
-                .store_record(&record("02aa", 0, &format!("tx{i}")))
-                .await
-                .unwrap();
+            let mut r = record("02aa", 0, &format!("tx{i}"));
+            r.pot_txid = format!("{i:02x}").repeat(32);
+            store.store_record(&r).await.unwrap();
         }
         let rows = store.list_for_identity("02aa", 3).await.unwrap();
         assert_eq!(rows.len(), 3, "limit respected");
-        assert_eq!(rows[0].txid, "tx4", "newest first");
+        assert_eq!(rows[0].txid, "tx4", "newest pot first");
         assert!(rows[0].created_at > rows[1].created_at);
+    }
+
+    /// bsv-low #281 — the per-pot collapse at the trait level: a flood of
+    /// markers naming ONE pot occupies ONE slot, so it cannot crowd the
+    /// victim's other refund backups out of the recovery window.
+    #[tokio::test]
+    async fn many_markers_for_one_pot_consume_one_slot() {
+        let store = MemoryPotrefundStorage::new();
+        let mut honest = record("02aa", 0, "txHONEST");
+        honest.pot_txid = "aa".repeat(32);
+        store.store_record(&honest).await.unwrap();
+        for i in 0..120u32 {
+            let mut junk = record("02aa", 0, &format!("txJUNK{i}"));
+            junk.pot_txid = "bb".repeat(32);
+            store.store_record(&junk).await.unwrap();
+        }
+        let rows = store.list_for_identity("02aa", 100).await.unwrap();
+        assert_eq!(rows.len(), 2, "121 rows, 2 pots ⇒ 2 slots");
+        assert!(
+            rows.iter().any(|r| r.txid == "txHONEST"),
+            "the honest backup survives the flood"
+        );
     }
 
     #[tokio::test]

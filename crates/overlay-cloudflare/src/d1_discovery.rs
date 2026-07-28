@@ -1823,6 +1823,389 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
      recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt \
      FROM potparty_records";
 
+/// `ls_potparty partyFor` — the identity-scoped RECOVERY-DISCOVERY window
+/// ("which pots am I a party to?", i.e. which pots may owe me money).
+///
+/// # Why this is not `WHERE identity = ? ORDER BY createdAt DESC LIMIT ?`
+///
+/// (bsv-low #281.) `tm_potparty` admission is BYTE-FORMAT-ONLY by doctrine —
+/// the overlay is an INDEX, not an authority, and never verifies the marker's
+/// `sig`. ANYONE can therefore file a marker naming ANY identity for one dust
+/// `OP_RETURN`, and under a flat newest-first window `limit` junk rows pushed
+/// the victim's REAL pots out of the answer. Because this is the surface a
+/// seed-only client uses to FIND the pots it must drive a refund/settle exit
+/// on, that displacement is a MONEY path. The cheapest variant needs no
+/// forgery at all: re-broadcast the victim's OWN on-chain marker bytes — a
+/// different tx is a different outpoint, hence a different row.
+///
+/// # A SUPERSET per pot, never one row — the client depends on it
+///
+/// `limit` counts POTS, and each pot yields up to
+/// [`PARTYFOR_ROWS_PER_GROUP`] rows in EACH of two groups, partitioned by
+/// `(potTxid, potVout, has-seat-key)`. Collapsing to one row per pot — or one
+/// per group — is WRONG here, in three ways that each cost the honest player
+/// money (the third is the architectural one, below):
+///
+///  - **Dropping the v2 columns is a permanent fee leak.** `decideV2Step`
+///    (`potPartyPending.ts`) only returns `'done'` when an indexed row for
+///    (gameId, potTxid, identity) carries `seatSettlePubkey`. Omit the
+///    column — or return only the pot's v1 row — and `v2Indexed` NEVER
+///    latches, so `workV2Half` publishes a real `createAction` `OP_RETURN`
+///    on EVERY sweep, forever: the honest player pays sats indefinitely and
+///    manufactures precisely the dust rows this window exists to bound.
+///  - **Returning only the v2 row can erase the pot entirely.**
+///    `lookupPotParty` (`overlay.ts`) VERIFIES both v2 signatures client-side
+///    and DROPS a row that fails — relying, in its own words, on "the pot's
+///    v1 sibling row" for discovery. Hand it only a forged v2 row and the pot
+///    vanishes from `creditSweep`'s recovery list. The v1 sibling must
+///    always be there.
+///
+/// # ARCHITECTURE — verification before collapse
+///
+/// (2026-07-28 owner steer; the principle this whole family of bugs comes
+/// from, stated here because it generalises.)
+///
+/// **A layer that cannot verify signatures must never choose which row is
+/// real.** SQL cannot verify a signature. So any ordering heuristic it uses to
+/// pick "the honest row" — newest, oldest, v2-preferred — is guessable and
+/// FORGEABLE by an attacker who controls `createdAt` and can file rows for
+/// dust. There is no sort order that fixes this. An earlier revision of this
+/// window returned `rn = 1` per group and defended it with "the honest seat
+/// publishes at funding, before an attacker can know the pot txid". **That
+/// claim was FALSE and has been removed**: `potPartyPending.ts` completes the
+/// publish on a LATER visit and backfills HISTORICAL pots, so an attacker has
+/// had the pot txid for weeks and can always land an EARLIER `createdAt`. One
+/// forged marker then evicted the honest row server-side, `lookupPotParty`
+/// dropped it client-side for failing its signature check, and the pot
+/// vanished from recovery — strictly worse than doing nothing.
+///
+/// So this window no longer decides anything. It returns a BOUNDED SUPERSET —
+/// up to [`PARTYFOR_ROWS_PER_GROUP`] rows per `(potTxid, potVout, group)` —
+/// and the CONSUMER collapses AFTER verifying. `lookupPotParty` already
+/// verifies both v2 signatures and discards failures; handed a superset it now
+/// has the honest row left to keep. The contract is: **the server guarantees
+/// the answer CONTAINS the honest row; the client decides which row is real.**
+///
+/// Where the caller already holds VERIFIED key material, the right answer is
+/// stronger still — BIND it instead of ordering, so a forged row cannot enter
+/// the result set at all. `low-app-layer`'s `seat_markers_sql` does exactly
+/// that with each pot's COMMITTED settle keys. `partyFor` cannot: it IS the
+/// discovery query, so its caller does not yet know which pots — let alone
+/// which keys — to bind. Superset-plus-verify is the fallback for that case
+/// only.
+///
+/// # The bounds, all deterministic
+///
+///  1. **Per-POT-OUTPOINT windowing** (within each of the v1 / v2 groups) —
+///     `limit` counts POTS, not rows, so one pot can never consume the window
+///     however many markers name it, and the zero-forgery replay variant dies
+///     outright. Partitioning on the full OUTPOINT (not just the txid) matches
+///     every other key in the system. Within a group the OLDEST rows are kept
+///     — not because oldest is trustworthy (it is not, see above) but because
+///     it is the only order an attacker cannot improve on by publishing MORE
+///     later; it bounds cost without pretending to pick truth.
+///  2. **Existence tier with a RESERVED QUOTA** — a row whose pot outpoint is
+///     absent from `pot_records` normally sorts behind every row whose pot
+///     exists, so markers naming INVENTED pots (free, unlimited, each its own
+///     partition) cannot displace a real one. A STRICT tier, though, silently
+///     becomes a FILTER once `limit` binds — a genuinely fresh pot whose
+///     `tm_pot` admission is still in flight would fall off the page, which
+///     is exactly the pot a recovering client most needs. So the newest
+///     `quota` unknown pots are PROMOTED into the main tier and compete on
+///     recency; the rest stay demoted but are still served.
+///  3. Ordering is by the POT's own admission stamp (`pot_records.createdAt`
+///     — an attacker cannot backdate or advance it by filing markers), then
+///     the marker stamp, then `rowid` as a total order. EVERY level carries
+///     an explicit `ORDER BY`.
+///
+/// BINDS (numbered): `?1` identity, `?2` limit (POTS), `?3` quota
+/// (unknown-pot promotion slots), `?4` row cap. Rows are bounded by
+/// `limit × 2 groups × PARTYFOR_ROWS_PER_GROUP`, and the cap is a BELT — the
+/// filters already guarantee it, so it can never cut a pot in half.
+///
+/// # Residual — stated plainly, because the improvement is modest
+///
+/// This does NOT make the window expensive to fill. An attacker who copies
+/// `limit` REAL, recently-admitted pot txids out of the very index being
+/// queried — they are public — and files one marker per pot naming the victim
+/// still displaces the victim's pots at the same ~`limit`-dust cost as before.
+/// The honest net gain is **from "any N junk rows" to "N junk rows naming
+/// real, recent pot txids"**, plus the outright death of the zero-forgery
+/// replay variant and of free invented-pot flooding. And eviction WITHIN a
+/// pot now costs [`PARTYFOR_ROWS_PER_GROUP`] markers per group instead of one
+/// — a MITIGATION, not a closure: file one more than that and the honest row
+/// is evicted again. See [`PARTYFOR_ROWS_PER_GROUP`] for the measured size,
+/// and for the only two things that would actually close it (binding verified
+/// key material, which discovery has none of; or making admission cost
+/// something, which is an owner decision about the byte-format-only
+/// doctrine).
+pub fn potparty_list_for_identity_sql() -> String {
+    // NUMBERED parameters (?1 identity, ?2 limit, ?3 quota, ?4 row_cap): the
+    // quota appears twice and the identity sits in the INNERMOST subquery, so
+    // anonymous `?` would bind in a textual order nobody could keep straight.
+    format!(
+        "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+            recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+            txid, outputIndex, createdAt \
+     FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+                  recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+                  txid, outputIndex, createdAt, isV2, markerRowid, \
+                  potCreatedAt, potFirstMarkerAt, tier, \
+                  DENSE_RANK() OVER (ORDER BY tier ASC, \
+                                              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+                                              potTxid ASC, potVout ASC) AS finalRank \
+           FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+                        recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+                        txid, outputIndex, createdAt, isV2, markerRowid, \
+                        potCreatedAt, potFirstMarkerAt, \
+                        CASE WHEN unknownPot = 0 OR potRank <= ?3 THEN 0 ELSE 1 END AS tier \
+                 FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+                              recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+                              txid, outputIndex, createdAt, isV2, markerRowid, \
+                              potCreatedAt, potFirstMarkerAt, unknownPot, \
+                              DENSE_RANK() OVER (PARTITION BY unknownPot \
+                                                 ORDER BY COALESCE(potCreatedAt, \
+                                                                   potFirstMarkerAt) DESC, \
+                                                          potTxid ASC, potVout ASC) AS potRank \
+                       FROM (SELECT pp.identity AS identity, \
+                                    pp.opponentIdentity AS opponentIdentity, \
+                                    pp.gameId AS gameId, pp.potTxid AS potTxid, \
+                                    pp.potVout AS potVout, \
+                                    pp.recoveryHeight AS recoveryHeight, \
+                                    pp.sigHex AS sigHex, \
+                                    pp.seatSettlePubkey AS seatSettlePubkey, \
+                                    pp.seatSigHex AS seatSigHex, \
+                                    pp.txid AS txid, pp.outputIndex AS outputIndex, \
+                                    pp.createdAt AS createdAt, pp.rowid AS markerRowid, \
+                                    r.createdAt AS potCreatedAt, \
+                                    MIN(pp.createdAt) OVER (PARTITION BY pp.potTxid, \
+                                                                         pp.potVout) \
+                                        AS potFirstMarkerAt, \
+                                    CASE WHEN pp.seatSettlePubkey IS NULL \
+                                         THEN 0 ELSE 1 END AS isV2, \
+                                    CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                                    ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout, \
+                                                                    CASE WHEN \
+                                                                      pp.seatSettlePubkey IS NULL \
+                                                                      THEN 0 ELSE 1 END \
+                                                       ORDER BY pp.createdAt ASC, \
+                                                                pp.rowid ASC) AS rn \
+                             FROM potparty_records pp \
+                             LEFT JOIN pot_records r \
+                                    ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
+                             WHERE pp.identity = ?1) \
+                       WHERE rn <= {per_group}))) \
+     WHERE finalRank <= ?2 \
+     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+              potTxid ASC, potVout ASC, isV2 DESC, markerRowid ASC \
+     LIMIT ?4",
+        per_group = PARTYFOR_ROWS_PER_GROUP,
+    )
+}
+
+/// `ls_potrefund partyFor` — the identity-scoped pre-signed-refund-backup
+/// window. Same bounds as [`potparty_list_for_identity_sql`] (per-POT-OUTPOINT
+/// collapse, existence tier with a reserved quota, a fully explicit ORDER BY
+/// at every level, `limit` counting POTS) — read that doc for the dust-DoS
+/// they close and the residual they do not. Two differences:
+///
+///  - there is no v2/seat-binding split here, so each pot yields exactly ONE
+///    row (its oldest backup marker) and the row cap equals the pot cap; and
+///  - the stakes are the highest of the family: these rows carry
+///    `refundRawHex`, the pre-signed refund a seed-only client re-broadcasts
+///    to bring its ante home when the tower's dead-man switch never fired.
+///    Displacing them off the window is displacing the money.
+///
+/// BINDS, in order: `identity`, `limit` (POTS), `quota` (unknown-pot slots),
+/// `row_cap`.
+pub fn potrefund_list_for_identity_sql() -> String {
+    // NUMBERED parameters — see `potparty_list_for_identity_sql`.
+    format!(
+        "SELECT identity, gameId, potTxid, potVout, refundRawHex, \
+            sigHex, txid, outputIndex, createdAt \
+     FROM (SELECT identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
+                  txid, outputIndex, createdAt, markerRowid, \
+                  potCreatedAt, potFirstMarkerAt, tier, \
+                  DENSE_RANK() OVER (ORDER BY tier ASC, \
+                                              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+                                              potTxid ASC, potVout ASC) AS finalRank \
+           FROM (SELECT identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
+                        txid, outputIndex, createdAt, markerRowid, \
+                        potCreatedAt, potFirstMarkerAt, \
+                        CASE WHEN unknownPot = 0 OR potRank <= ?3 THEN 0 ELSE 1 END AS tier \
+                 FROM (SELECT identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
+                              txid, outputIndex, createdAt, markerRowid, \
+                              potCreatedAt, potFirstMarkerAt, unknownPot, \
+                              DENSE_RANK() OVER (PARTITION BY unknownPot \
+                                                 ORDER BY COALESCE(potCreatedAt, \
+                                                                   potFirstMarkerAt) DESC, \
+                                                          potTxid ASC, potVout ASC) AS potRank \
+                       FROM (SELECT pr.identity AS identity, pr.gameId AS gameId, \
+                                    pr.potTxid AS potTxid, pr.potVout AS potVout, \
+                                    pr.refundRawHex AS refundRawHex, pr.sigHex AS sigHex, \
+                                    pr.txid AS txid, pr.outputIndex AS outputIndex, \
+                                    pr.createdAt AS createdAt, pr.rowid AS markerRowid, \
+                                    r.createdAt AS potCreatedAt, \
+                                    MIN(pr.createdAt) OVER (PARTITION BY pr.potTxid, \
+                                                                         pr.potVout) \
+                                        AS potFirstMarkerAt, \
+                                    CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                                    ROW_NUMBER() OVER (PARTITION BY pr.potTxid, pr.potVout \
+                                                       ORDER BY pr.createdAt ASC, \
+                                                                pr.rowid ASC) AS rn \
+                             FROM potrefund_records pr \
+                             LEFT JOIN pot_records r \
+                                    ON r.txid = pr.potTxid AND r.outputIndex = pr.potVout \
+                             WHERE pr.identity = ?1) \
+                       WHERE rn <= {per_group}))) \
+     WHERE finalRank <= ?2 \
+     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+              potTxid ASC, potVout ASC, markerRowid ASC \
+     LIMIT ?4",
+        per_group = PARTYFOR_ROWS_PER_GROUP,
+    )
+}
+
+/// `ls_potparty byPot` / `ls_potrefund byPot` — the POT-scoped windows, in
+/// OLDEST-first order (bsv-low #281).
+///
+/// The pot outpoint is public from the moment funding lands, so under a
+/// NEWEST-first window `limit` dust markers naming the pot buried BOTH honest
+/// seat markers — and for `ls_potrefund` that is the only backup that can
+/// bring the money home (`lookupPotRefund` unions every row's `refundRawHex`,
+/// so ordering is not otherwise load-bearing). The honest markers are
+/// published AT funding, so oldest-first puts them permanently at the head of
+/// the window: an attacker would have to land `limit` admitted rows BEFORE
+/// the seats themselves, and cannot spam its way in front afterwards.
+/// `rowid ASC` breaks same-second ties into a total order.
+///
+/// Built from the caller's own SELECT list so the tests execute the SHIPPED
+/// string rather than a transcription of it.
+pub fn list_for_pot_sql(select: &str) -> String {
+    format!(
+        "{select} WHERE potTxid = ? AND potVout = ? \
+         ORDER BY createdAt ASC, rowid ASC LIMIT ?"
+    )
+}
+
+/// How many of the newest pots ABSENT from `pot_records` are promoted into
+/// the main tier instead of being demoted behind every indexed pot
+/// (bsv-low #281 F3): a STRICT existence tier silently becomes a FILTER once
+/// `limit` binds, dropping exactly the fresh pot a recovering client most
+/// needs. One tenth of the page, at least one slot.
+pub fn unknown_pot_quota(limit: usize) -> usize {
+    (limit / 10).max(1)
+}
+
+/// Rows kept per `(potTxid, potVout, marker group)` by the identity-scoped
+/// windows — the SUPERSET size (bsv-low #281, 2026-07-28 owner steer).
+///
+/// # Why this is not 1
+///
+/// **Verification must happen BEFORE collapse. A layer that cannot verify
+/// signatures must never choose which row is real.** SQL cannot verify a
+/// signature, so ANY ordering heuristic it uses to pick "the honest row" —
+/// newest, oldest, v2-preferred — is guessable and forgeable by an attacker
+/// who controls `createdAt` and can file rows for dust. There is no sort order
+/// that fixes this; a per-group window of 1 is exactly wrong, because ONE
+/// forged marker is then the whole attack.
+///
+/// The window's job is to BOUND COST, not to decide truth. The layer that CAN
+/// verify already does: `lookupPotParty` (`overlay.ts`) checks both v2
+/// signatures and DROPS a row that fails — given a superset it now has the
+/// honest row left to keep. That is the CONTRACT this constant exists to
+/// honour: the server hands the consumer a set that CONTAINS the honest row.
+///
+/// # This is a MITIGATION, not a closure — do not read it as airtight
+///
+/// An attacker who files `PARTYFOR_ROWS_PER_GROUP + 1` rows stamped earlier
+/// than the honest one evicts it again. This raises the cost of erasing a pot
+/// from ONE dust marker to four; it does NOT eliminate the erasure, and the
+/// previous docblock's mistake — asserting a defence that did not hold — is
+/// not to be repeated here. Two things would actually CLOSE it:
+///
+///  1. **Binding to verified key material.** Where the caller already holds a
+///     verified key, bind it and a forged row cannot enter the result set at
+///     all — no ordering, no window, no residual. That is why `/results`'
+///     seat fetch (`low-app-layer`'s `seat_markers_sql`, bound to each pot's
+///     COMMITTED settle keys from the hash-verified funding lock) is genuinely
+///     closed and this query is not: `partyFor` IS the discovery query, so its
+///     caller does not yet know which pots — let alone which keys — to bind.
+///     There is nothing to bind here, which is exactly why it falls back to
+///     superset-plus-verify.
+///  2. **Making admission cost something** — rate limiting, or requiring a
+///     verifiable signature before a marker is admitted. That cuts against
+///     this overlay's byte-format-only doctrine (the INDEX is not an
+///     authority; the READER verifies), so it is an OWNER decision about the
+///     doctrine, not something to smuggle in behind a window size.
+///
+/// # Why 4 — chosen DEFENSIVELY
+///
+/// N is the number of forged rows an attacker must land ahead of yours to
+/// evict it, per pot per group. It is picked for that threshold, NOT to dodge
+/// a per-candidate cost:
+///
+///  - **N = 1 is the bug.** One forged marker, one dust transaction, and the
+///    pot is erased. That is the attack the gate demonstrated.
+///  - **N must clear honest traffic.** An honest client publishes one marker
+///    per group and republishes (content-idempotent, new outpoint) whenever an
+///    index read failed. N = 4 leaves three slots of headroom above a single
+///    honest marker, so an honest client's own republishes can never crowd it
+///    out either.
+///  - **Beyond that the return is LINEAR and the attacker's cost is small in
+///    absolute terms** — 4 dust transactions or 8, a determined attacker
+///    targeting one pot pays either. That is precisely why this is a
+///    mitigation and not a closure (above), and why the honest answer is to
+///    name the real closures rather than keep buying linear increments.
+///
+/// SECONDARY CHECK — wire weight, measured against real SQLite over the
+/// production schema with realistic field sizes (71-byte DER sigs, 258-byte
+/// refund raws), serialising the record shape `ls_potparty` actually returns,
+/// at the client's default `limit` of 100 pots with EVERY group filled:
+///
+/// | N | potparty rows | potparty bytes | potrefund rows | potrefund bytes |
+/// |---|---------------|----------------|----------------|-----------------|
+/// | 1 |           200 |       137 KiB  |            100 |         96 KiB  |
+/// | 2 |           400 |       274 KiB  |            200 |        192 KiB  |
+/// | **4** |       800 |   **548 KiB**  |            400 |    **384 KiB**  |
+/// | 8 |          1600 |     1097 KiB   |            800 |        768 KiB  |
+///
+/// N = 8 puts the worst case at 1.07 MiB — at the practical response boundary,
+/// reachable only under exactly the flood this defends against, so it would
+/// trade erasure for a 503: the same denial by another name. Since the
+/// defensive return from 4 to 8 is linear while the wire cost hits a cliff, 4
+/// is the better point on that curve. Typical honest traffic is 1–2 rows per
+/// group (~200 rows / ~140 KiB); the worst case is what an attacker must PAY
+/// 800 dust transactions to produce. Pinned by
+/// `worst_case_window_response_stays_in_budget`.
+///
+/// NOT A FACTOR, deliberately: per-candidate BLOB and classification cost.
+/// NEITHER identity window joins `pot_beefs` — no covenant lock is re-parsed
+/// here, so nothing about this constant scales that work. (`/results` and
+/// `/leaderboard` DO re-`hex()` and re-decode both BEEFs per pot on every
+/// read, recomputing an immutable answer — that is bsv-low #284, a separate
+/// defect being moved to admission time, and it is why those surfaces keep
+/// their BEEF joins on the OUTER select: run BLOB work on survivors, not
+/// candidates. Once #284 lands, per-candidate cost drops out of this decision
+/// entirely and N should be RE-EVALUATED UPWARD if the defensive case wants
+/// it — re-measure the wire weight, which is the only bound that remains.)
+pub const PARTYFOR_ROWS_PER_GROUP: usize = 4;
+
+/// Row cap for an identity-scoped window: `limit` pots (the `finalRank`
+/// filter), `groups` marker groups per pot, [`PARTYFOR_ROWS_PER_GROUP`] rows
+/// per group. `groups` is 2 for potparty (a v1 and a v2 group) and 1 for
+/// potrefund.
+///
+/// It is a BELT, never a truncation: the window's own filters already bound
+/// the result to exactly this many rows, so the `LIMIT` can never cut a pot in
+/// half (which would hand the client a pot's v1 rows without its v2 rows and
+/// re-open the republish-forever fee leak).
+pub fn identity_window_row_cap(limit: usize, groups: usize) -> usize {
+    limit
+        .saturating_mul(groups)
+        .saturating_mul(PARTYFOR_ROWS_PER_GROUP)
+}
+
 #[async_trait(?Send)]
 impl PotpartyStorage for D1PotpartyStorage {
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
@@ -1859,15 +2242,17 @@ impl PotpartyStorage for D1PotpartyStorage {
         identity: &str,
         limit: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
-        let rows: Vec<PotpartyRow> = Query::new(format!(
-            "{POTPARTY_SELECT} WHERE identity = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
-        ))
-        .bind(identity)
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(potparty_err)?;
+        // Per-pot + existence-tiered window — see
+        // `potparty_list_for_identity_sql` for the dust-DoS this shape closes
+        // (bsv-low #281).
+        let rows: Vec<PotpartyRow> = Query::new(potparty_list_for_identity_sql())
+            .bind(identity)
+            .bind(limit as u32)
+            .bind(unknown_pot_quota(limit) as u32)
+            .bind(identity_window_row_cap(limit, 2) as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(potparty_err)?;
         Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
     }
 
@@ -1877,16 +2262,14 @@ impl PotpartyStorage for D1PotpartyStorage {
         pot_vout: u32,
         limit: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
-        let rows: Vec<PotpartyRow> = Query::new(format!(
-            "{POTPARTY_SELECT} WHERE potTxid = ? AND potVout = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
-        ))
-        .bind(pot_txid)
-        .bind(pot_vout)
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(potparty_err)?;
+        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281).
+        let rows: Vec<PotpartyRow> = Query::new(list_for_pot_sql(POTPARTY_SELECT))
+            .bind(pot_txid)
+            .bind(pot_vout)
+            .bind(limit as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(potparty_err)?;
         Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
     }
 }
@@ -1997,15 +2380,18 @@ impl PotrefundStorage for D1PotrefundStorage {
         identity: &str,
         limit: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
-        let rows: Vec<PotrefundRow> = Query::new(format!(
-            "{POTREFUND_SELECT} WHERE identity = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
-        ))
-        .bind(identity)
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(potrefund_err)?;
+        // Per-pot + existence-tiered window — the IDENTICAL dust-DoS shape
+        // `potparty_list_for_identity_sql` documents (bsv-low #281), and if
+        // anything the sharper money path: these rows carry the PRE-SIGNED
+        // REFUND a seed-only client re-broadcasts when the tower never fired.
+        let rows: Vec<PotrefundRow> = Query::new(potrefund_list_for_identity_sql())
+            .bind(identity)
+            .bind(limit as u32)
+            .bind(unknown_pot_quota(limit) as u32)
+            .bind(identity_window_row_cap(limit, 1) as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(potrefund_err)?;
         Ok(rows.into_iter().map(PotrefundRow::into_record).collect())
     }
 
@@ -2015,16 +2401,14 @@ impl PotrefundStorage for D1PotrefundStorage {
         pot_vout: u32,
         limit: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
-        let rows: Vec<PotrefundRow> = Query::new(format!(
-            "{POTREFUND_SELECT} WHERE potTxid = ? AND potVout = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
-        ))
-        .bind(pot_txid)
-        .bind(pot_vout)
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(potrefund_err)?;
+        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281).
+        let rows: Vec<PotrefundRow> = Query::new(list_for_pot_sql(POTREFUND_SELECT))
+            .bind(pot_txid)
+            .bind(pot_vout)
+            .bind(limit as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(potrefund_err)?;
         Ok(rows.into_iter().map(PotrefundRow::into_record).collect())
     }
 }
@@ -2308,5 +2692,1009 @@ mod tests {
         // consumes.
         let row = BeefLenRow { len: 1234.0 };
         assert_eq!(row.len as usize, 1234);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // bsv-low #281 — identity-scoped read windows are dust-DoS-bounded
+    //
+    // These tests EXECUTE the exact shipped SQL against REAL SQLite
+    // (`rusqlite`, bundled) over the PRODUCTION schema (`d1::OVERLAY_MIGRATIONS`
+    // verbatim — no hand-written CREATE TABLE that could drift). Pinning the
+    // SQL text is not enough: the #230 gate called that out as the weakness in
+    // its own F2 test. Each suite also runs the LEGACY query it replaced, so
+    // the defect stays demonstrated in-repo.
+    //
+    // F4 (2026-07-28 re-gate) — every ordering test below is built so that
+    // PHYSICAL row order (rowid / insertion) CONTRADICTS the order the query
+    // promises, and asserts the exact expected sequence. A test whose green
+    // could come from SQLite's incidental row order proves nothing; removing
+    // the guarantee it names must turn it red.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// The `ls_potparty partyFor` query as it shipped BEFORE #281.
+    const LEGACY_POTPARTY_PARTY_FOR_SQL: &str = "SELECT identity, opponentIdentity, gameId, \
+         potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt \
+         FROM potparty_records WHERE identity = ? \
+         ORDER BY createdAt DESC, rowid DESC LIMIT ?";
+
+    /// The `ls_potrefund partyFor` query as it shipped BEFORE #281.
+    const LEGACY_POTREFUND_PARTY_FOR_SQL: &str = "SELECT identity, gameId, potTxid, potVout, \
+         refundRawHex, sigHex, txid, outputIndex, createdAt \
+         FROM potrefund_records WHERE identity = ? \
+         ORDER BY createdAt DESC, rowid DESC LIMIT ?";
+
+    /// A fresh in-memory SQLite carrying the REAL production schema.
+    ///
+    /// `OVERLAY_MIGRATIONS` is applied statement-by-statement exactly as
+    /// `d1::run_migrations` does, tolerating ONLY the error class the
+    /// production runner tolerates (a re-run additive `ALTER TABLE` on an
+    /// existing column). Anything else fails loudly — a silently-skipped
+    /// migration would be schema drift this proof could not see.
+    fn production_schema_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        conn
+    }
+
+    fn h64(seed: u8) -> String {
+        format!("{seed:02x}").repeat(32)
+    }
+
+    fn victim_id() -> String {
+        format!("02{}", "a1".repeat(32))
+    }
+
+    fn insert_pot(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        created_at: i64,
+        spent: bool,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO pot_records \
+             (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                txid,
+                vout,
+                i32::from(spent),
+                if spent { Some(h64(0xfe)) } else { None },
+                i32::from(spent),
+                created_at
+            ],
+        )
+        .expect("insert pot_records");
+    }
+
+    /// File a potparty marker. `settle_pubkey = Some` ⇒ a v2 (seat-binding)
+    /// marker. The production write is `INSERT OR IGNORE` on the marker
+    /// OUTPOINT, so every distinct `(txid, outputIndex)` lands — which is
+    /// exactly why anyone can file unlimited rows naming anyone.
+    fn insert_potparty(
+        conn: &rusqlite::Connection,
+        identity: &str,
+        pot_txid: &str,
+        pot_vout: u32,
+        marker_txid: &str,
+        created_at: i64,
+        settle_pubkey: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO potparty_records \
+             (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+              sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '3045id', ?7, ?8, ?9, 0, ?10)",
+            rusqlite::params![
+                identity,
+                h64(0xbb),
+                h64(0x11),
+                pot_txid,
+                pot_vout,
+                850_000,
+                settle_pubkey,
+                settle_pubkey.map(|_| "3045seat"),
+                marker_txid,
+                created_at
+            ],
+        )
+        .expect("insert potparty_records");
+    }
+
+    fn insert_potrefund(
+        conn: &rusqlite::Connection,
+        identity: &str,
+        pot_txid: &str,
+        pot_vout: u32,
+        marker_txid: &str,
+        created_at: i64,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO potrefund_records \
+             (identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
+              txid, outputIndex, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, '0100de', '3045ab', ?5, 0, ?6)",
+            rusqlite::params![
+                identity,
+                h64(0x11),
+                pot_txid,
+                pot_vout,
+                marker_txid,
+                created_at
+            ],
+        )
+        .expect("insert potrefund_records");
+    }
+
+    /// Run one of the SHIPPED identity windows with its real bind list —
+    /// `(identity, limit, quota, row_cap)` — and project one column.
+    fn window_col(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        identity: &str,
+        limit: usize,
+        col: &str,
+    ) -> Vec<String> {
+        window_col_groups(conn, sql, identity, limit, 2, col)
+    }
+
+    fn window_col_groups(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        identity: &str,
+        limit: usize,
+        groups: usize,
+        col: &str,
+    ) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        stmt.query_map(
+            rusqlite::params![
+                identity,
+                limit as u32,
+                unknown_pot_quota(limit) as u32,
+                identity_window_row_cap(limit, groups) as u32
+            ],
+            |r| r.get::<_, String>(col),
+        )
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+    }
+
+    /// The legacy 2-bind `(identity, limit)` shape.
+    fn legacy_col(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        identity: &str,
+        limit: usize,
+        col: &str,
+    ) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        stmt.query_map(rusqlite::params![identity, limit as u32], |r| {
+            r.get::<_, String>(col)
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+    }
+
+    /// Distinct pot txids in the order the window returned them (the window
+    /// is a per-pot SUPERSET now, so several rows can share a pot).
+    fn distinct_pots(rows: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in rows {
+            if !out.contains(r) {
+                out.push(r.clone());
+            }
+        }
+        out
+    }
+
+    /// Attacker rows naming invented pots — enough to fill the page alone.
+    const DUST_GHOSTS: u32 = 120;
+    /// Attacker rows replaying the victim's own marker for its real pot.
+    const DUST_REPLAYS: u32 = 60;
+
+    /// The victim's ONE real (funded, admitted, SPENT) pot plus the two cheap
+    /// attacker variants, every attacker row stamped NEWER than the honest
+    /// marker — recency being the only thing the legacy window ordered on.
+    fn seed_dust_attack(conn: &rusqlite::Connection, victim: &str, potparty: bool) -> String {
+        let honest_pot = h64(0xaa);
+        insert_pot(conn, &honest_pot, 0, 1_000, true);
+        let insert: &dyn Fn(&str, &str, &str, i64) = if potparty {
+            &|id, pot, mtx, at| insert_potparty(conn, id, pot, 0, mtx, at, None)
+        } else {
+            &|id, pot, mtx, at| insert_potrefund(conn, id, pot, 0, mtx, at)
+        };
+        insert(victim, &honest_pot, "txHONEST", 1_001);
+        for i in 0..DUST_REPLAYS {
+            insert(
+                victim,
+                &honest_pot,
+                &format!("txREPLAY{i:03}"),
+                2_000 + i as i64,
+            );
+        }
+        for i in 0..DUST_GHOSTS {
+            insert(
+                victim,
+                &format!("{:064x}", 0xdead_0000u64 + i as u64),
+                &format!("txGHOST{i:03}"),
+                3_000 + i as i64,
+            );
+        }
+        honest_pot
+    }
+
+    /// RED — the defect, executed.
+    #[test]
+    fn potparty_legacy_window_is_dust_displaceable_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let honest_pot = seed_dust_attack(&conn, &victim, true);
+        let got = legacy_col(
+            &conn,
+            LEGACY_POTPARTY_PARTY_FOR_SQL,
+            &victim,
+            100,
+            "potTxid",
+        );
+        assert_eq!(got.len(), 100, "the legacy window returns a full page…");
+        assert_eq!(
+            got.iter().filter(|t| **t == honest_pot).count(),
+            0,
+            "…and the victim's REAL pot appears ZERO times — total erasure of \
+             the row that leads a recovering client to its money"
+        );
+    }
+
+    /// GREEN — the shipped window over the same table state.
+    #[test]
+    fn potparty_window_survives_the_dust_attack_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let honest_pot = seed_dust_attack(&conn, &victim, true);
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
+        assert!(
+            got.contains(&honest_pot),
+            "the real pot is back — the 1 + DUST_REPLAYS marker rows naming it \
+             consume ONE pot slot, not DUST_REPLAYS of them"
+        );
+        // The PROMOTED ghosts are newer than the honest pot, so inside the
+        // main tier they legitimately sort ahead of it — but promotion is
+        // capped at the reserved quota, so the real pot can never be pushed
+        // more than one quota down, let alone off the page. Pre-fix it was
+        // absent entirely.
+        let at = got.iter().position(|t| *t == honest_pot).unwrap();
+        assert!(
+            at <= unknown_pot_quota(100),
+            "the real pot sits within one quota of the top (was: absent), got {at}"
+        );
+        // Every remaining ghost is DEMOTED behind it — never erased (a pot
+        // whose tm_pot admission is still in flight must stay reachable), but
+        // never able to displace a real one either.
+        assert!(
+            got[..at].iter().all(|t| t.starts_with("0000")),
+            "only promoted ghosts precede the real pot"
+        );
+    }
+
+    #[test]
+    fn potrefund_legacy_window_is_dust_displaceable_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let honest_pot = seed_dust_attack(&conn, &victim, false);
+        let got = legacy_col(
+            &conn,
+            LEGACY_POTREFUND_PARTY_FOR_SQL,
+            &victim,
+            100,
+            "potTxid",
+        );
+        assert_eq!(got.len(), 100);
+        assert_eq!(
+            got.iter().filter(|t| **t == honest_pot).count(),
+            0,
+            "the pre-signed refund backup for the victim's real pot is erased"
+        );
+    }
+
+    #[test]
+    fn potrefund_window_survives_the_dust_attack_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let honest_pot = seed_dust_attack(&conn, &victim, false);
+        let got = window_col_groups(
+            &conn,
+            &potrefund_list_for_identity_sql(),
+            &victim,
+            100,
+            1,
+            "potTxid",
+        );
+        let pots = distinct_pots(&got);
+        let at = pots.iter().position(|t| *t == honest_pot).unwrap();
+        assert!(
+            at <= unknown_pot_quota(100),
+            "the refund backup is back, within one quota of the top (was: absent)"
+        );
+    }
+
+    /// F2 (re-gate, HIGH — honest-player MONEY LEAK). `decideV2Step`
+    /// (`potPartyPending.ts`) only returns `'done'` when an indexed row for
+    /// (gameId, potTxid, identity) carries `seatSettlePubkey`. If this window
+    /// omits the column — or returns only the pot's v1 row — `v2Indexed`
+    /// never latches and `workV2Half` publishes a REAL, PAID `createAction`
+    /// OP_RETURN on every sweep forever, manufacturing the very dust this
+    /// window exists to bound.
+    #[test]
+    fn partyfor_returns_the_v2_seat_columns_and_the_v1_sibling() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xaa);
+        let settle = format!("02{}", "5e".repeat(32));
+        insert_pot(&conn, &pot, 0, 1_000, false);
+        // v1 at funding, v2 on the #252 republish — the real-world shape.
+        insert_potparty(&conn, &victim, &pot, 0, "txV1", 1_001, None);
+        insert_potparty(&conn, &victim, &pot, 0, "txV2", 4_000, Some(&settle));
+
+        let sql = potparty_list_for_identity_sql();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params![victim, 100u32, 10u32, 220u32], |r| {
+                Ok((
+                    r.get::<_, String>("txid")?,
+                    r.get::<_, Option<String>>("seatSettlePubkey")?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "one pot yields BOTH its v1 and its v2 row");
+        // The v2 row must be present WITH its key — else the client pays an
+        // OP_RETURN fee every sweep, forever.
+        assert!(
+            rows.iter()
+                .any(|(tx, pk)| tx == "txV2" && pk.as_deref() == Some(settle.as_str())),
+            "the v2 seat columns must survive the window (the fee-leak bug)"
+        );
+        // The v1 sibling must ALSO be present: `lookupPotParty` verifies v2
+        // signatures client-side and DROPS a row that fails, relying on the
+        // v1 sibling for discovery. Return only a (forged) v2 and the pot
+        // vanishes from the recovery list entirely.
+        assert!(
+            rows.iter().any(|(tx, pk)| tx == "txV1" && pk.is_none()),
+            "the v1 sibling must survive as the discovery fallback"
+        );
+    }
+
+    /// …and a forged v2 marker cannot take the v1 sibling's slot with it: the
+    /// two groups are partitioned separately, so junk in the v2 group is
+    /// bounded to the v2 group.
+    #[test]
+    fn a_forged_v2_marker_cannot_carry_away_the_v1_discovery_row() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xaa);
+        insert_pot(&conn, &pot, 0, 1_000, false);
+        insert_potparty(&conn, &victim, &pot, 0, "txV1", 1_001, None);
+        for i in 0..40u32 {
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txFORGED{i:03}"),
+                500 + i as i64, // EARLIER than the honest v1 — front-running
+                Some(&format!("03{:064x}", i)),
+            );
+        }
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "txid",
+        );
+        assert!(
+            got.len() <= 2 * PARTYFOR_ROWS_PER_GROUP,
+            "one pot ⇒ at most 2 groups × N rows, however much junk: {}",
+            got.len()
+        );
+        assert!(
+            got.contains(&"txV1".to_string()),
+            "the honest v1 discovery row survives 40 front-running forgeries"
+        );
+    }
+
+    /// F3 (re-gate, MEDIUM) — a strict existence tier silently becomes a
+    /// FILTER once the limit binds. 100 indexed pots plus ONE newest pot whose
+    /// `tm_pot` admission is still in flight: pre-fix the fresh pot ranked
+    /// first, post-tier it fell off the page entirely. The reserved quota is
+    /// what keeps it visible.
+    #[test]
+    fn a_fresh_unindexed_pot_is_not_filtered_out_by_the_limit() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+            );
+        }
+        // The pot the client most needs: funded seconds ago, not yet admitted.
+        let fresh = h64(0xfa);
+        insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", 9_999, None);
+
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
+        assert!(
+            got.contains(&fresh),
+            "a real-but-unindexed pot must not be filtered out by the window"
+        );
+    }
+
+    /// The legitimate use case: `limit` counts POTS, so a player with 100 real
+    /// pots sees all 100 — even with every one of them dust-replayed.
+    #[test]
+    fn a_player_with_100_real_pots_still_sees_all_100_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+            );
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txD{i:03}"),
+                9_000 + i as i64,
+                None,
+            );
+        }
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
+        let unique: std::collections::HashSet<&String> = got.iter().collect();
+        assert_eq!(unique.len(), 100, "all 100 real pots returned");
+        assert!(
+            got.len() <= 100 * 2 * PARTYFOR_ROWS_PER_GROUP,
+            "and the superset stays inside the row cap"
+        );
+    }
+
+    /// F4 — the PARTITION's `createdAt ASC, rowid ASC` is the thing under
+    /// test, so the honest (oldest) marker is inserted PHYSICALLY LAST. Any
+    /// non-discriminating partition order (or a newest-first one) returns a
+    /// junk row instead, so this test cannot pass on SQLite's incidental
+    /// order.
+    #[test]
+    fn the_oldest_marker_represents_a_pot_even_when_stored_last() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xaa);
+        insert_pot(&conn, &pot, 0, 1_000, true);
+        for i in 0..20u32 {
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txJUNK{i:03}"),
+                5_000 + i as i64,
+                None,
+            );
+        }
+        // Oldest by createdAt, newest by rowid — the contradiction that makes
+        // this test meaningful.
+        insert_potparty(&conn, &victim, &pot, 0, "txHONEST", 1_001, None);
+
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "txid",
+        );
+        assert_eq!(
+            got.len(),
+            PARTYFOR_ROWS_PER_GROUP,
+            "the group window keeps exactly N candidates"
+        );
+        assert!(
+            got.contains(&"txHONEST".to_string()),
+            "the OLDEST rows are the candidates, so the honest marker is among \
+             them however many NEWER junk rows exist: {got:?}"
+        );
+        assert!(
+            !got.contains(&"txJUNK019".to_string()),
+            "and the newest junk is outside the window"
+        );
+    }
+
+    /// F4 — the OUTER ordering is the thing under test: pots are inserted
+    /// OLDEST-POT-FIRST, so the promised newest-pot-first answer is the exact
+    /// REVERSE of both insertion and rowid order.
+    #[test]
+    fn the_outer_order_is_pot_recency_not_storage_order() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let mut expect: Vec<String> = Vec::new();
+        for i in 0..12u32 {
+            let pot = format!("{:064x}", 0x0000_3000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            // Marker stamps run OPPOSITE to pot stamps, so a query that
+            // ordered on the marker instead of the pot also fails here.
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                9_000 - i as i64,
+                None,
+            );
+            expect.push(pot);
+        }
+        expect.reverse(); // newest POT first
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
+        assert_eq!(got, expect, "exact newest-pot-first sequence");
+    }
+
+    /// F4 — plan independence ON TOP of the exact-sequence tests above: the
+    /// answer is a function of the STORED ROWS, never of the query PLAN.
+    #[test]
+    fn window_is_plan_independent_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..40u32 {
+            let pot = format!("{:064x}", 0x0000_2000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 5_000 + i as i64, i % 2 == 0);
+            insert_potparty(&conn, &victim, &pot, 0, &format!("txB{i:03}"), 7_000, None);
+            insert_potparty(&conn, &victim, &pot, 0, &format!("txA{i:03}"), 7_000, None);
+            insert_potparty(
+                &conn,
+                &victim,
+                &format!("{:064x}", 0x0000_9000u64 + i as u64),
+                0,
+                &format!("txG{i:03}"),
+                7_000 + i as i64,
+                None,
+            );
+        }
+        let snap = |c: &rusqlite::Connection| {
+            window_col(c, &potparty_list_for_identity_sql(), &victim, 100, "txid")
+        };
+        let baseline = snap(&conn);
+        assert_eq!(baseline, snap(&conn), "repeat runs agree");
+        conn.execute_batch("ANALYZE").unwrap();
+        assert_eq!(baseline, snap(&conn), "stable across ANALYZE");
+        conn.execute_batch(
+            "CREATE INDEX ix1 ON potparty_records(identity, createdAt DESC); \
+             CREATE INDEX ix2 ON potparty_records(potTxid, createdAt ASC); \
+             CREATE INDEX ix3 ON pot_records(createdAt); \
+             ANALYZE",
+        )
+        .unwrap();
+        assert_eq!(
+            baseline,
+            snap(&conn),
+            "stable across a forced plan change — the explicit ORDER BY at \
+             every level decides the answer, not SQLite"
+        );
+        // `txA*`/`txB*` share a createdAt, so only the rowid tiebreak orders
+        // them — and the SUPERSET keeps BOTH, deterministically, every time.
+        // The window bounds cost; it never picks which one is real.
+        assert_eq!(
+            baseline.iter().filter(|t| t.starts_with("txB")).count(),
+            40,
+            "every stored candidate is returned as a candidate"
+        );
+        assert_eq!(baseline.iter().filter(|t| t.starts_with("txA")).count(), 40);
+    }
+
+    /// `byPot` is OLDEST-first: the honest seat markers publish at funding, so
+    /// a later flood naming the pot cannot bury them. Built so the honest rows
+    /// are stored LAST — incidental order would fail this.
+    #[test]
+    fn by_pot_window_keeps_the_honest_markers_under_flood_real_sqlite() {
+        let conn = production_schema_db();
+        let pot = h64(0xaa);
+        insert_pot(&conn, &pot, 0, 1_000, false);
+        for i in 0..500u32 {
+            insert_potrefund(
+                &conn,
+                &format!("02{:064x}", i),
+                &pot,
+                0,
+                &format!("txFLOOD{i:03}"),
+                5_000 + i as i64,
+            );
+        }
+        // Stored last, stamped first.
+        insert_potrefund(&conn, &victim_id(), &pot, 0, "txSEATA", 1_001);
+        insert_potrefund(
+            &conn,
+            &format!("03{}", "b2".repeat(32)),
+            &pot,
+            0,
+            "txSEATB",
+            1_002,
+        );
+
+        let sql = list_for_pot_sql(POTREFUND_SELECT);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let got: Vec<String> = stmt
+            .query_map(rusqlite::params![pot, 0u32, 100u32], |r| {
+                r.get::<_, String>("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(got.len(), 100, "window full");
+        assert_eq!(got[0], "txSEATA", "honest seat markers head the window");
+        assert_eq!(got[1], "txSEATB");
+
+        // RED half: the legacy NEWEST-first order buried both of them.
+        let legacy = format!(
+            "{POTREFUND_SELECT} WHERE potTxid = ? AND potVout = ? \
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&legacy).unwrap();
+        let old: Vec<String> = stmt
+            .query_map(rusqlite::params![pot, 0u32, 100u32], |r| {
+                r.get::<_, String>("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !old.contains(&"txSEATA".to_string()) && !old.contains(&"txSEATB".to_string()),
+            "the legacy byPot window dropped BOTH honest refund backups"
+        );
+    }
+
+    /// F6 — every other key in the system is the OUTPOINT. Two genuine pots
+    /// sharing a funding txid are not reachable in LOW today; partitioning on
+    /// the txid alone would silently erase one if they ever were.
+    #[test]
+    fn two_pots_sharing_a_funding_txid_are_not_collapsed() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let txid = h64(0xaa);
+        insert_pot(&conn, &txid, 0, 1_000, true);
+        insert_pot(&conn, &txid, 1, 1_001, true);
+        insert_potparty(&conn, &victim, &txid, 0, "txV0", 1_002, None);
+        insert_potparty(&conn, &victim, &txid, 1, "txV1", 1_003, None);
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "txid",
+        );
+        assert_eq!(got.len(), 2, "distinct outpoints are distinct pots");
+    }
+
+    /// Structural BACKSTOP for both identity windows. The behaviour these
+    /// strings stand for is proven by EXECUTING them above; this only catches
+    /// a future edit that quietly drops a clause.
+    #[test]
+    fn identity_windows_are_partitioned_tiered_and_ordered() {
+        for (name, sql) in [
+            ("potparty", potparty_list_for_identity_sql()),
+            ("potrefund", potrefund_list_for_identity_sql()),
+        ] {
+            assert!(
+                sql.contains("ROW_NUMBER() OVER (PARTITION BY"),
+                "{name}: the window must count POTS, not rows"
+            );
+            assert!(
+                sql.contains("potTxid, pp.potVout") || sql.contains("potTxid, pr.potVout"),
+                "{name}: partition on the pot OUTPOINT, not the txid alone"
+            );
+            assert!(
+                sql.contains("AS unknownPot") && sql.contains("potRank <= ?"),
+                "{name}: existence tier with a reserved quota"
+            );
+            // Ordered at every level: the per-pot window, the pot ranking,
+            // and the final projection — nothing left to SQLite's discretion.
+            assert_eq!(
+                sql.matches("ORDER BY").count(),
+                4,
+                "{name}: ordered throughout"
+            );
+            // NUMBERED binds ?1..?4 = identity, limit, quota, row_cap.
+            for n in 1..=4 {
+                assert!(sql.contains(&format!("?{n}")), "{name}: bind ?{n} is used");
+            }
+            assert!(!sql.contains("?5"), "{name}: exactly four binds");
+        }
+        // The potparty window must carry the v2 seat columns (the F2 fee leak).
+        let pp = potparty_list_for_identity_sql();
+        assert!(
+            pp.matches("seatSettlePubkey").count() >= 4 && pp.contains("seatSigHex"),
+            "potparty: the v2 seat columns must reach the OUTER select"
+        );
+    }
+
+    // ── FIX B (2026-07-28 owner steer) — SUPERSET, not `rn = 1` ──────────
+    //
+    // PRINCIPLE: verification happens BEFORE collapse. SQL cannot verify a
+    // signature, so it must not choose which row is real; it returns a bounded
+    // superset and `lookupPotParty` — which DOES verify, and DROPS a failing
+    // row — collapses. Under `rn = 1` a single forged marker stamped earlier
+    // than the victim's own won the slot server-side, was discarded
+    // client-side, and the pot VANISHED from recovery: strictly worse than
+    // main, which returned [honest, forged] and kept the honest one.
+
+    /// The gate's exact scenario: ONE forged marker, older than the honest
+    /// one, in each group.
+    #[test]
+    fn one_forged_marker_cannot_erase_the_pot_from_partyfor() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xaa);
+        insert_pot(&conn, &pot, 0, 1_000, false);
+        // The attacker HAS the pot txid — it has been public for weeks (the
+        // #252 backfill publishes honest markers long after funding), so it
+        // files EARLIER than the honest seat, in BOTH groups.
+        insert_potparty(&conn, &victim, &pot, 0, "txFORGEDV1", 100, None);
+        insert_potparty(
+            &conn,
+            &victim,
+            &pot,
+            0,
+            "txFORGEDV2",
+            101,
+            Some(&format!("03{}", "f0".repeat(32))),
+        );
+        insert_potparty(&conn, &victim, &pot, 0, "txHONESTV1", 5_000, None);
+        insert_potparty(
+            &conn,
+            &victim,
+            &pot,
+            0,
+            "txHONESTV2",
+            5_001,
+            Some(&format!("02{}", "5e".repeat(32))),
+        );
+
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "txid",
+        );
+        assert!(
+            got.contains(&"txHONESTV1".to_string()),
+            "the honest v1 row must SURVIVE alongside the forged one — the \
+             client drops the forgery and keeps this: {got:?}"
+        );
+        assert!(
+            got.contains(&"txHONESTV2".to_string()),
+            "and the honest v2 row too (the seat proof / v2Indexed latch): {got:?}"
+        );
+    }
+
+    /// The eviction bar, at N-2 / N-1 / N forged rows per group. The window
+    /// keeps the OLDEST `PARTYFOR_ROWS_PER_GROUP`, so the honest row survives
+    /// while FEWER than that many forgeries precede it — and is evicted at
+    /// exactly N, which is the documented residual, pinned so it cannot drift
+    /// silently.
+    #[test]
+    fn the_eviction_bar_is_exactly_partyfor_rows_per_group() {
+        let n = PARTYFOR_ROWS_PER_GROUP;
+        for forged in [n - 2, n - 1, n] {
+            let conn = production_schema_db();
+            let victim = victim_id();
+            let pot = h64(0xaa);
+            insert_pot(&conn, &pot, 0, 1_000, false);
+            for i in 0..forged {
+                insert_potparty(
+                    &conn,
+                    &victim,
+                    &pot,
+                    0,
+                    &format!("txFORGED{i:03}"),
+                    100 + i as i64,
+                    None,
+                );
+            }
+            insert_potparty(&conn, &victim, &pot, 0, "txHONEST", 5_000, None);
+            let got = window_col(
+                &conn,
+                &potparty_list_for_identity_sql(),
+                &victim,
+                100,
+                "txid",
+            );
+            let survived = got.contains(&"txHONEST".to_string());
+            if forged < n {
+                assert!(
+                    survived,
+                    "{forged} forged (< {n}) must NOT evict the honest row"
+                );
+            } else {
+                assert!(
+                    !survived,
+                    "{forged} forged (= {n}) evicts it — a COST BAR, not a proof"
+                );
+            }
+        }
+    }
+
+    /// The same superset guarantee on the refund index, where the row carries
+    /// `refundRawHex` — the pre-signed refund that brings the ante home.
+    #[test]
+    fn one_forged_marker_cannot_erase_a_refund_backup() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xaa);
+        insert_pot(&conn, &pot, 0, 1_000, false);
+        insert_potrefund(&conn, &victim, &pot, 0, "txFORGED", 100);
+        insert_potrefund(&conn, &victim, &pot, 0, "txHONEST", 5_000);
+        let got = window_col_groups(
+            &conn,
+            &potrefund_list_for_identity_sql(),
+            &victim,
+            100,
+            1,
+            "txid",
+        );
+        assert!(
+            got.contains(&"txHONEST".to_string()),
+            "the honest refund backup must survive a forged older row: {got:?}"
+        );
+    }
+
+    /// MEASURED BUDGET (owner steer): pin the worst-case response weight so a
+    /// future bump to `PARTYFOR_ROWS_PER_GROUP` trips a test, not production.
+    #[test]
+    fn worst_case_window_response_stays_in_budget() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        // 100 pots (the client's default limit), EVERY group filled — the
+        // state an attacker must pay 800 dust transactions to produce.
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            for k in 0..PARTYFOR_ROWS_PER_GROUP {
+                insert_potparty(
+                    &conn,
+                    &victim,
+                    &pot,
+                    0,
+                    &format!("a{i:03}{k}"),
+                    100 + k as i64,
+                    None,
+                );
+                insert_potparty(
+                    &conn,
+                    &victim,
+                    &pot,
+                    0,
+                    &format!("b{i:03}{k}"),
+                    200 + k as i64,
+                    Some(&format!("02{}", "5e".repeat(32))),
+                );
+            }
+        }
+        let sql = potparty_list_for_identity_sql();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<PotpartyRecord> = stmt
+            .query_map(
+                rusqlite::params![
+                    victim,
+                    100u32,
+                    unknown_pot_quota(100) as u32,
+                    identity_window_row_cap(100, 2) as u32
+                ],
+                |r| {
+                    Ok(PotpartyRecord {
+                        identity: r.get("identity")?,
+                        opponent_identity: r.get("opponentIdentity")?,
+                        game_id: r.get("gameId")?,
+                        pot_txid: r.get("potTxid")?,
+                        pot_vout: r.get::<_, i64>("potVout")? as u32,
+                        recovery_height: r.get::<_, i64>("recoveryHeight")? as u32,
+                        sig_hex: r.get::<_, Option<String>>("sigHex")?.unwrap_or_default(),
+                        seat_settle_pubkey: r.get("seatSettlePubkey")?,
+                        seat_sig_hex: r.get("seatSigHex")?,
+                        txid: r.get("txid")?,
+                        output_index: r.get::<_, i64>("outputIndex")? as u32,
+                        created_at: r.get::<_, i64>("createdAt")?,
+                    })
+                },
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            100 * 2 * PARTYFOR_ROWS_PER_GROUP,
+            "the row cap is exact, so the LIMIT never cuts a pot in half"
+        );
+        let bytes = serde_json::to_string(&rows).unwrap().len();
+        // 640 KiB: the measured 548 KiB at N=4 plus headroom. N=8 measured
+        // 1.07 MiB and would fail here — which is the point.
+        assert!(
+            bytes < 640 * 1024,
+            "worst-case ls_potparty response {bytes} bytes exceeds the budget \
+             — re-measure before raising PARTYFOR_ROWS_PER_GROUP"
+        );
+    }
+
+    /// Quota/row-cap arithmetic — the values the storage layer binds.
+    #[test]
+    fn window_bind_helpers_are_sane() {
+        assert_eq!(unknown_pot_quota(100), 10);
+        assert_eq!(unknown_pot_quota(500), 50);
+        assert_eq!(
+            unknown_pot_quota(1),
+            1,
+            "never zero — a fresh pot always fits"
+        );
+        assert_eq!(unknown_pot_quota(0), 1);
+        // limit pots × groups × PARTYFOR_ROWS_PER_GROUP.
+        assert_eq!(
+            identity_window_row_cap(100, 2),
+            100 * 2 * PARTYFOR_ROWS_PER_GROUP
+        );
+        assert_eq!(
+            identity_window_row_cap(100, 1),
+            100 * PARTYFOR_ROWS_PER_GROUP
+        );
+        assert!(
+            identity_window_row_cap(usize::MAX, 2) > 0,
+            "saturating, never a panic"
+        );
     }
 }
