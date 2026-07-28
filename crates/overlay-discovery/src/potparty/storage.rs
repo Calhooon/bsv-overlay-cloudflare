@@ -117,8 +117,8 @@ pub trait PotpartyStorage {
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError>;
 
     /// Records whose `identity` is `identity`, for up to `limit` POTS —
-    /// newest pot first, **at most TWO rows per pot outpoint**: the oldest
-    /// v1 marker and the oldest v2 (seat-binding) marker.
+    /// newest pot first, a BOUNDED SUPERSET per pot outpoint: several v1
+    /// markers AND several v2 (seat-binding) markers.
     ///
     /// The per-pot collapse is a DUST-DoS BOUND, not an optimisation
     /// (bsv-low #281): admission is byte-format-only, so anyone can file
@@ -126,9 +126,17 @@ pub trait PotpartyStorage {
     /// newest-first row window let `limit` junk rows push a victim's real
     /// pots — the pots it may be owed money from — out of the answer
     /// entirely. `limit` therefore counts POTS, which is also exactly what
-    /// this query is asking for. The representative row of each group is the
-    /// OLDEST marker in it (the honest seat publishes at funding, before an
-    /// attacker can know the pot txid).
+    /// this query is asking for.
+    ///
+    /// It does NOT collapse each group to one row. **Verification must happen
+    /// BEFORE collapse: a layer that cannot verify signatures must never
+    /// choose which row is real.** Admission is byte-format-only, so an
+    /// attacker can file a marker with an EARLIER `created_at` than yours —
+    /// the publish completes on a later visit and backfills historical pots,
+    /// so the pot txid has been public for a long time. Collapsing to the
+    /// oldest row therefore handed the consumer a forgery, which it then
+    /// dropped for failing its signature check, erasing the pot. The window
+    /// bounds COST; the verifying consumer decides truth.
     ///
     /// BOTH groups must be returned. Returning only the v1 row leaves a
     /// client unable to latch `v2Indexed`, so it republishes a PAID marker

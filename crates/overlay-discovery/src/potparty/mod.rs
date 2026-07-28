@@ -59,11 +59,12 @@
 //! "who are the two parties to this pot outpoint?". `limit` is optional
 //! (default 100, clamped to 1..=500). The answer is a freeform JSON array,
 //! one entry per returned marker. `partyFor` counts POTS (newest first) and
-//! returns at most TWO rows per pot OUTPOINT — the oldest v1 marker and the
-//! oldest v2 (seat-binding) marker, both of which the client needs; rows
-//! naming a pot the overlay has never indexed sort behind the rest but are
-//! still served. `byPot` returns markers OLDEST first. All of these are
-//! dust-DoS bounds — see `storage::PotpartyStorage` and bsv-low #281.
+//! returns a BOUNDED SUPERSET per pot OUTPOINT — several v1 markers and
+//! several v2 (seat-binding) markers, both of which the client needs — because
+//! this layer cannot verify signatures and so must not choose which row is
+//! real; the verifying CLIENT collapses. Rows naming a pot the overlay has
+//! never indexed sort behind the rest but are still served. `byPot` returns
+//! markers OLDEST first. See `storage::PotpartyStorage` and bsv-low #281.
 //!
 //! ```json
 //! [{"identity": "<hex>", "opponentIdentity": "<hex>", "gameId": "<hex>",

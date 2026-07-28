@@ -726,3 +726,106 @@ fn two_pots_sharing_a_funding_txid_are_not_collapsed() {
         "distinct outpoints are distinct pots"
     );
 }
+
+/// FIX A (iv) — `rn <= SEAT_MARKERS_PER_KEY` enforced BEHAVIOURALLY, not by
+/// string match. A spammer that copies seat A's PUBLIC committed key and
+/// files rows OLDER than the genuine one must not evict it while it files
+/// fewer than the cap; with `rn <= 1` the genuine marker is gone at ONE junk
+/// row, and the win it proves becomes `unresolved`.
+#[test]
+fn the_per_key_slot_cap_keeps_the_genuine_marker_behind_older_junk() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    let pub_a = format!("02{}", "5e".repeat(32));
+    let pub_b = format!("03{}", "6f".repeat(32));
+    insert_pot(&conn, &pot, 1_000, true);
+    // Two junk rows under seat A's own (public) committed key, both OLDER…
+    file_v2_marker(&conn, &victim, &pot, "txJUNK0", &pub_a, 100);
+    file_v2_marker(&conn, &victim, &pot, "txJUNK1", &pub_a, 101);
+    // …and the genuine marker, published later by the #252 backfill.
+    file_v2_marker(&conn, &victim, &pot, "txGENUINE", &pub_a, 9_000);
+
+    let sql = seat_markers_sql(1);
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let got: Vec<String> = stmt
+        .query_map(params![pot, 0u32, pub_a, pub_b], |r| {
+            r.get::<_, String>("identity")
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    // All three rows come back as CANDIDATES — the app-layer then verifies
+    // both signatures and only the genuine one attributes. With a cap of 1
+    // only `txJUNK0` would return and the proof would be lost.
+    assert_eq!(
+        got.len(),
+        3,
+        "the per-key slot returns a superset; verification decides, not the cap"
+    );
+}
+
+/// FIX A (iv) — `PARTITION BY potTxid, potVout, seatSettlePubkey` enforced
+/// behaviourally. Without `potVout` the two outpoints of one funding txid
+/// SHARE a single slot window, so junk piled on vout 0 evicts the genuine
+/// marker of vout 1 (one of the two silent bugs on main that this branch
+/// fixes).
+#[test]
+fn the_seat_slot_window_is_per_outpoint_not_per_txid() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let txid = h64(0xaa);
+    let pub_a = format!("02{}", "5e".repeat(32));
+    let pub_b = format!("03{}", "6f".repeat(32));
+    insert_pot(&conn, &txid, 1_000, true);
+    // Fill vout 0's slot for pubA with junk, all OLDER than the genuine row.
+    for i in 0..8u32 {
+        file_v2_marker(
+            &conn,
+            &victim,
+            &txid,
+            &format!("txJUNK{i}"),
+            &pub_a,
+            100 + i64::from(i),
+        );
+    }
+    // The genuine marker lives at vout 1 under the SAME committed key.
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, 1, 958846, '3045id', ?5, '3045seat', 'txVOUT1', 0, 9000)",
+        params![victim, h64(0xbb), h64(0x11), txid, pub_a],
+    )
+    .unwrap();
+
+    // BIND BOTH OUTPOINTS IN ONE CHUNK — the production path: two pots of the
+    // same funding txid on one `/results` page land in the same
+    // `seat_markers_sql` call, so the subquery sees BOTH vouts' rows and only
+    // `potVout` in the PARTITION keeps their slot windows apart. (Binding a
+    // single outpoint would filter the other vout out before the window and
+    // prove nothing.)
+    let sql = seat_markers_sql(2);
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let got: Vec<String> = stmt
+        .query_map(
+            params![txid, 0u32, pub_a, pub_b, txid, 1u32, pub_a, pub_b],
+            // `seat_markers_sql` exposes no marker txid; the outpoint +
+            // committed key are what `attribute_seats` matches on anyway.
+            |r| {
+                Ok(format!(
+                    "{}:{}",
+                    r.get::<_, i64>("potVout")?,
+                    r.get::<_, String>("seatSettlePubkey")?
+                ))
+            },
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        got.contains(&format!("1:{pub_a}")),
+        "vout 1 has its OWN slot window — 8 junk rows at vout 0 cannot evict \
+         the genuine marker of a DIFFERENT outpoint sharing the txid: {got:?}"
+    );
+}

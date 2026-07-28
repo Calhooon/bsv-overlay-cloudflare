@@ -1038,25 +1038,27 @@ async fn results_seat_markers(
     if params_by_pot.is_empty() {
         return out;
     }
-    let mut pots: Vec<(&(String, u32), &crate::results::CovenantParams)> =
-        params_by_pot.iter().collect();
-    // Deterministic chunking — the answer must not depend on HashMap order.
-    pots.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for chunk in pots.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+    // Chunking + bind construction live in `results::seat_marker_chunks` so
+    // they are testable without a Worker (the re-gate's finding #3: this whole
+    // delivery path could be deleted with no test failing).
+    for chunk in crate::results::seat_marker_chunks(&params_by_pot) {
         let sql = crate::results::seat_markers_sql(chunk.len());
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
-        for ((pot_txid, pot_vout), p) in chunk {
-            binds.push(JsValue::from_str(pot_txid));
-            binds.push(JsValue::from_f64(f64::from(*pot_vout)));
-            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
-            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+        for b in &chunk {
+            binds.push(JsValue::from_str(&b.pot_txid));
+            binds.push(JsValue::from_f64(f64::from(b.pot_vout)));
+            binds.push(JsValue::from_str(&b.pub_a_hex));
+            binds.push(JsValue::from_str(&b.pub_b_hex));
         }
         let stmt = match db.prepare(sql).bind(&binds) {
             Ok(s) => s,
             Err(e) => {
-                console_warn!("[results] seat-marker bind failed (attribution omitted): {e}");
-                return out;
+                // CONTINUE, never return: one chunk failing to bind must not
+                // abandon the seat proofs of every REMAINING chunk (re-gate
+                // finding #6).
+                console_warn!("[results] seat-marker bind failed (chunk omitted): {e}");
+                continue;
             }
         };
         match stmt

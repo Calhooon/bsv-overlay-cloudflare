@@ -20,18 +20,26 @@ optional — default 100, clamped to 1..=500.
 
 ## Answer
 
-A freeform JSON array. Ordering + windowing (bsv-low #281 — admission is
-byte-format-only, so anyone can file a marker naming any identity for a dust
-`OP_RETURN`; a flat newest-first row window was displaceable):
+A freeform JSON array. Ordering + windowing (bsv-low #281):
 
-- `partyFor` counts POTS, newest pot first, and returns **one row per pot
-  outpoint** — the oldest backup marker naming it.
-- Rows naming a pot the overlay has never indexed are sorted behind the rest
-  (so they cannot displace a real pot) but are still served, with a small
-  reserved quota promoted so a pot whose admission is merely in flight stays
-  visible.
-- `byPot` returns markers **oldest first** — the honest seats publish at
-  funding, so later dust can never crowd them out of the window.
+**PRINCIPLE — verification before collapse.** Marker admission is
+byte-format-only: anyone can file a marker naming any identity for a dust
+`OP_RETURN`, and this layer never verifies signatures. A layer that cannot
+verify must not choose which row is real, so this query does NOT pick a
+"representative" marker per pot. It returns a BOUNDED SUPERSET and the CLIENT
+— which does verify, and drops a row whose signatures fail — decides. The
+contract is: **the answer CONTAINS the honest row; the caller picks it.**
+
+- `partyFor` counts POTS (newest pot first) and returns up to 4 marker rows
+  per pot outpoint — a superset, so a forged backup cannot hide yours.
+- MITIGATION, NOT CLOSURE: an attacker who files more than 4 markers stamped
+  earlier than yours in a group still evicts it. This raises erasure from ONE
+  dust marker to four; it does not eliminate it. Do not read the window as a
+  proof of anything.
+- Rows naming a pot the overlay has never indexed sort behind the rest (so
+  they cannot displace a real pot) but are still served, with a small reserved
+  quota promoted so a pot whose admission is merely in flight stays visible.
+- `byPot` returns markers oldest first.
 
 ```json
 [{"identity": "<hex>", "gameId": "<hex>", "potTxid": "<hex>",

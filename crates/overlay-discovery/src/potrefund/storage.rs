@@ -101,15 +101,18 @@ pub trait PotrefundStorage {
     async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError>;
 
     /// Records whose `identity` is `identity`, for up to `limit` POTS —
-    /// newest pot first, **at most ONE row per pot OUTPOINT** (its oldest
-    /// backup marker).
+    /// newest pot first, a BOUNDED SUPERSET of backup markers per pot
+    /// OUTPOINT (never one — see `PotpartyStorage::list_for_identity` for why
+    /// verification must precede collapse).
     ///
     /// The per-pot collapse is a DUST-DoS BOUND (bsv-low #281): admission is
     /// byte-format-only, so anyone can file markers naming any identity for a
     /// dust `OP_RETURN`, and a flat newest-first row window let `limit` junk
     /// rows push a victim's real refund backups out of the answer. `limit`
-    /// therefore counts POTS. The representative row for a pot is the OLDEST
-    /// marker naming it (the honest seat publishes at funding). A backend that
+    /// therefore counts POTS. Rows are NOT collapsed to one per pot: an
+    /// attacker can file a marker stamped earlier than yours, so picking one
+    /// would hand the consumer a forgery and bury the pre-signed refund that
+    /// brings the ante home. A backend that
     /// can see the pot index SHOULD additionally sort rows naming a pot it has
     /// never heard of behind the rest, while still serving them (a strict
     /// filter would erase a pot whose admission is merely in flight) — the D1

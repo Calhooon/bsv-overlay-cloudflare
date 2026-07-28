@@ -1783,6 +1783,53 @@ pub fn seat_markers_sql(n: usize) -> String {
     )
 }
 
+/// One pot's slice of a [`seat_markers_sql`] chunk: the OUTPOINT plus the two
+/// COMMITTED settle keys read from that pot's own funding lock. Exists so the
+/// chunking + bind construction is testable WITHOUT a Worker — `routes.rs` has
+/// no test harness, and the 2026-07-28 re-gate showed the whole delivery of
+/// the committed-key fetch could be deleted silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatMarkerBind {
+    pub pot_txid: String,
+    pub pot_vout: u32,
+    /// `pubA` from the covenant params, lowercase hex.
+    pub pub_a_hex: String,
+    /// `pubB` from the covenant params, lowercase hex.
+    pub pub_b_hex: String,
+}
+
+/// The EXACT chunk list `routes::results_seat_markers` issues one
+/// [`seat_markers_sql`] query per — deterministically ordered (the answer must
+/// never depend on `HashMap` iteration order) and sized so every chunk stays
+/// under D1's bound-parameter ceiling.
+///
+/// INVARIANTS the tests enforce behaviourally (not by reading this text):
+///  - every pot in `params_by_pot` appears in EXACTLY ONE chunk — no pot is
+///    silently dropped at a chunk boundary, which is how a whole page of seat
+///    proofs could go missing without a single test failing;
+///  - `chunk.len() * SEAT_MARKERS_BINDS_PER_POT <= D1_MAX_BOUND_PARAMS`, so a
+///    chunk can never exceed what D1 will bind;
+///  - the order is a pure function of the pot outpoints.
+pub fn seat_marker_chunks(
+    params_by_pot: &std::collections::HashMap<(String, u32), CovenantParams>,
+) -> Vec<Vec<SeatMarkerBind>> {
+    let mut pots: Vec<(&(String, u32), &CovenantParams)> = params_by_pot.iter().collect();
+    pots.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    pots.chunks(SEAT_MARKERS_CHUNK_POTS)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|((pot_txid, pot_vout), p)| SeatMarkerBind {
+                    pot_txid: pot_txid.clone(),
+                    pot_vout: *pot_vout,
+                    pub_a_hex: hex::encode(p.pub_a),
+                    pub_b_hex: hex::encode(p.pub_b),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The claims query for a chunk of gameIds (1 bind each — chunk at
 /// [`crate::logic::D1_CHUNK_OUTPOINTS`] to stay far under D1's 100-param cap).
 pub fn claims_sql(n: usize) -> String {
@@ -2669,6 +2716,199 @@ mod tests {
         );
         assert_eq!(entries[0].outcome, Outcome::Lost);
         assert_eq!(entries[0].outcome_source, Some("chain+seatkey"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // FIX A (2026-07-28 re-gate finding #3) — the HEADLINE mechanism.
+    //
+    // The re-gate ran 20 one-at-a-time source mutations and found the ENTIRE
+    // delivery of the committed-key seat fetch into the assembler could be
+    // deleted with the whole suite still green: `routes.rs` has no test
+    // harness, so keying the seat map by gameId, discarding the injected map,
+    // or dropping a chunk all passed silently. That is exactly the blind spot
+    // #230 had. These tests close it.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// (i) + (ii): the genuine seat proof arrives ONLY through the injected
+    /// `seat_markers_by_pot` map, and the ROW that represents the pot carries
+    /// a DIFFERENT gameId (an attacker front-ran the display row of a
+    /// backfilled pot — the residual `results_sql` documents).
+    ///
+    /// RED for BOTH mutations the gate found:
+    ///  - keying the seat map by gameId (insert or lookup): the row's gameId
+    ///    no longer matches the marker's, the lookup misses, and the win
+    ///    degrades to `unresolved` — the #276 injustice;
+    ///  - discarding the injected map: there is no other source, same result.
+    #[test]
+    fn the_injected_seat_map_is_keyed_by_outpoint_and_actually_reaches_the_assembler() {
+        let (ka, pa) = real_key(41);
+        let (_kb, pb) = real_key(42);
+        let w_winner = wallet_of(0x51);
+        let w_loser = wallet_of(0x52);
+        let winner = identity_of(&w_winner);
+        let loser = identity_of(&w_loser);
+        let gid = tx(0x01);
+        let params = params_with_keys(&pa, &pb);
+
+        let lock = covenant_lock(&params);
+        let f_raw = raw_tx(&"11".repeat(32), 0, 0xffff_ffff, &[(1000, lock)], 0);
+        let f_id = bsv_rs::transaction::Transaction::from_binary(&f_raw)
+            .unwrap()
+            .id();
+        let outs = vec![
+            (10u64, p2pkh_lock(&params.rake_pkh)),
+            (980u64, p2pkh_lock(&params.pay_pkh_a)),
+        ];
+        let s_raw = raw_tx(&f_id, 0, 0xffff_ffff, &outs, 0);
+        let s_id = bsv_rs::transaction::Transaction::from_binary(&s_raw)
+            .unwrap()
+            .id();
+
+        // The winner's GENUINE v2 marker, over its real gameId.
+        let honest = real_seat_marker(&ka, &pa, &w_winner, &winner, &loser, &gid, &f_id, 0);
+
+        // The row that survived the per-pot window names a DIFFERENT gameId —
+        // and carries NO seat columns, so `rows` cannot supply the proof.
+        let other_game = tx(0x99);
+        let row = ResultsRow {
+            identity: winner.clone(),
+            game_id: other_game.clone(),
+            pot_txid: f_id.clone(),
+            pot_vout: 0,
+            recovery_height: 900_000,
+            opponent_identity: loser.clone(),
+            spent: Some(true),
+            spending_txid: Some(s_id.clone()),
+            spent_confirmed: Some(true),
+            funding_beef_hex: Some(beef_hex_of(&f_raw)),
+            spender_beef_hex: Some(beef_hex_of(&s_raw)),
+            seat_settle_pubkey: None,
+            seat_sig_hex: None,
+            marker_sig_hex: None,
+        };
+
+        // The fetch delivers the proof keyed by POT OUTPOINT.
+        let mut injected: std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>> =
+            std::collections::HashMap::new();
+        injected.insert((f_id.to_ascii_lowercase(), 0), vec![honest]);
+
+        let entries = assemble_results(
+            &winner,
+            vec![row],
+            &std::collections::HashMap::new(), // zero claims — the #276 shape
+            &injected,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verdict, Some(PotVerdict::WinnerA));
+        assert_eq!(
+            entries[0].outcome,
+            Outcome::Won,
+            "the seat proof must reach the assembler through the injected map, \
+             keyed by the POT OUTPOINT — not by the row's (forgeable) gameId"
+        );
+        assert_eq!(entries[0].outcome_source, Some("chain+seatkey"));
+    }
+
+    /// (iii) chunk-boundary coverage: EVERY pot must land in exactly one
+    /// chunk, and no chunk may exceed D1's bind ceiling. RED for "drop the
+    /// final chunk" and for any change to `SEAT_MARKERS_CHUNK_POTS`.
+    #[test]
+    fn seat_marker_chunks_cover_every_pot_at_the_boundaries() {
+        let c = SEAT_MARKERS_CHUNK_POTS;
+        for n in [1, c - 1, c, c + 1, 2 * c - 1, 2 * c, 2 * c + 1] {
+            let mut params_by_pot = std::collections::HashMap::new();
+            for i in 0..n {
+                params_by_pot.insert(
+                    (format!("{:064x}", i), (i % 3) as u32),
+                    params_with_keys(&real_key(41).1, &real_key(42).1),
+                );
+            }
+            let chunks = seat_marker_chunks(&params_by_pot);
+            // No pot dropped, none duplicated.
+            let mut seen: Vec<(String, u32)> = chunks
+                .iter()
+                .flatten()
+                .map(|b| (b.pot_txid.clone(), b.pot_vout))
+                .collect();
+            let total = seen.len();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(total, n, "n={n}: every pot queried exactly once");
+            assert_eq!(seen.len(), n, "n={n}: no duplicates");
+            let mut want: Vec<(String, u32)> = params_by_pot.keys().cloned().collect();
+            want.sort();
+            assert_eq!(seen, want, "n={n}: the queried set IS the pot set");
+            // Chunk count is a function of the chunk size — pins it in BOTH
+            // directions (a smaller chunk size costs subrequests, a larger one
+            // blows D1's bind cap).
+            assert_eq!(chunks.len(), n.div_ceil(c), "n={n}: chunk count");
+            for chunk in &chunks {
+                assert!(!chunk.is_empty(), "n={n}: no empty chunk");
+                assert!(
+                    chunk.len() * SEAT_MARKERS_BINDS_PER_POT <= crate::logic::D1_MAX_BOUND_PARAMS,
+                    "n={n}: a chunk must never exceed D1's bind ceiling"
+                );
+                // The SQL built for this chunk binds exactly what we supply.
+                assert_eq!(
+                    seat_markers_sql(chunk.len()).matches('?').count(),
+                    chunk.len() * SEAT_MARKERS_BINDS_PER_POT,
+                    "n={n}: bind arity matches the chunk"
+                );
+            }
+        }
+    }
+
+    /// The chunk SIZE itself. Changing it is a PERFORMANCE change, not a
+    /// correctness one — every pot is still queried, just in more or fewer D1
+    /// round-trips — so it is pinned by VALUE with its rationale rather than
+    /// by a contrived behavioural test. Stated honestly because the re-gate
+    /// listed `24 -> 23` among the mutations nothing caught: it is benign,
+    /// and the invariants that are NOT benign are asserted alongside.
+    #[test]
+    fn seat_marker_chunk_size_is_pinned_with_its_rationale() {
+        // NEVER exceed D1's bind ceiling — a COMPILE-time failure, so the
+        // build breaks before a test can even run.
+        const _: () = assert!(
+            SEAT_MARKERS_CHUNK_POTS * SEAT_MARKERS_BINDS_PER_POT
+                <= crate::logic::D1_MAX_BOUND_PARAMS
+        );
+        // 24 x 4 = 96, leaving a spare slot under the 100-parameter cap.
+        assert_eq!(
+            SEAT_MARKERS_CHUNK_POTS, 24,
+            "deliberate value: raising it past 25 breaks binding outright; \
+             lowering it multiplies D1 round-trips per /results request (the \
+             >50-outpoint 503 lesson)"
+        );
+        // A full page must stay within a handful of subrequests.
+        let mut m = std::collections::HashMap::new();
+        for i in 0..RESULTS_MAX_ROWS {
+            m.insert(
+                (format!("{i:064x}"), 0u32),
+                params_with_keys(&real_key(41).1, &real_key(42).1),
+            );
+        }
+        assert!(
+            seat_marker_chunks(&m).len() <= 5,
+            "a full /results page costs at most 5 seat-marker round-trips"
+        );
+    }
+
+    /// Chunking is a pure function of the pot outpoints — never of `HashMap`
+    /// iteration order.
+    #[test]
+    fn seat_marker_chunks_are_deterministic() {
+        let build = || {
+            let mut m = std::collections::HashMap::new();
+            for i in 0..(SEAT_MARKERS_CHUNK_POTS * 2 + 5) {
+                m.insert(
+                    (format!("{:064x}", i * 7919 % 1000), (i % 2) as u32),
+                    params_with_keys(&real_key(41).1, &real_key(42).1),
+                );
+            }
+            seat_marker_chunks(&m)
+        };
+        assert_eq!(build(), build());
+        assert_eq!(build(), build(), "stable across rebuilds");
     }
 
     /// F2 (2026-07-28 gate): the seat-marker fetch must be bounded WITHOUT
