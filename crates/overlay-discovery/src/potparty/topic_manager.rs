@@ -1,9 +1,11 @@
 //! POTPARTY Topic Manager — validates LOW pot-participation markers.
 //!
-//! See [`super`] for the full on-wire format. One record version is
+//! See [`super`] for the full on-wire format. Two record versions are
 //! admitted: the `LOW/potparty/v1` `OP_RETURN` data carrier (8 pushes: tag
 //! / identity / opponentIdentity / gameId / potTxid / potVout /
-//! recoveryHeight / sig).
+//! recoveryHeight / sig) and the `LOW/potparty/v2` SEAT-BINDING carrier
+//! (bsv-low #230; 10 pushes: v1 + seatSettlePubkey + seatSig before the
+//! identity sig). v1 stays frozen — clients publish BOTH.
 //!
 //! Like `tm_result` / `tm_collected`, there is NO server-side signature
 //! verification: the marker is admitted by BYTE FORMAT ONLY (plus the
@@ -29,10 +31,10 @@ impl PotpartyTopicManager {
     }
 
     /// Validate a single output as a LOW potparty marker: true IFF its
-    /// locking script is a well-formed `LOW/potparty/v1` marker (exact tag +
-    /// exact push lengths + identity != opponentIdentity). Everything
-    /// else (P2PKH change, foreign OP_RETURNs, malformed tags) is simply
-    /// not admitted.
+    /// locking script is a well-formed `LOW/potparty/v1` OR `/v2` marker
+    /// (exact tag + exact push lengths + identity != opponentIdentity).
+    /// Everything else (P2PKH change, foreign OP_RETURNs, malformed tags)
+    /// is simply not admitted.
     pub fn validate_potparty_output(output: &bsv_rs::transaction::TransactionOutput) -> bool {
         is_potparty_marker_script(&output.locking_script.to_binary())
     }
@@ -132,6 +134,38 @@ pub(crate) mod tests {
     fn valid_marker_admitted() {
         let out = make_potparty_output(&[0x42u8; 32]);
         assert!(PotpartyTopicManager::validate_potparty_output(&out));
+    }
+
+    #[test]
+    fn valid_v2_marker_admitted() {
+        use super::super::tests::golden_marker_v2;
+        let script = golden_marker_v2(&golden_game_id(), &golden_pot_txid(), 0);
+        let out = TransactionOutput {
+            satoshis: Some(0),
+            locking_script: LockingScript::from_binary(&script).unwrap(),
+            change: false,
+        };
+        assert!(PotpartyTopicManager::validate_potparty_output(&out));
+    }
+
+    #[test]
+    fn v2_tag_with_v1_shape_not_admitted() {
+        // A v2 tag with only v1's 8 pushes is malformed — never admitted.
+        let mut s = vec![0x00, 0x6au8];
+        s.extend(push_data(super::super::POTPARTY_TAG_V2));
+        s.extend(push_data(&golden_identity()));
+        s.extend(push_data(&golden_opponent()));
+        s.extend(push_data(&golden_game_id()));
+        s.extend(push_data(&golden_pot_txid()));
+        s.extend(push_data(&golden_vout().to_le_bytes()));
+        s.extend(push_data(&golden_recovery_height().to_le_bytes()));
+        s.extend(push_data(&golden_sig()));
+        let out = TransactionOutput {
+            satoshis: Some(0),
+            locking_script: LockingScript::from_binary(&s).unwrap(),
+            change: false,
+        };
+        assert!(!PotpartyTopicManager::validate_potparty_output(&out));
     }
 
     // ── Not-a-marker (skip) ───────────────────────────────────────────────

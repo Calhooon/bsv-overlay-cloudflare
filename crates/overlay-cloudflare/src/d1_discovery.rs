@@ -1759,6 +1759,12 @@ struct PotpartyRow {
     recovery_height: f64,
     #[serde(rename = "sigHex")]
     sig_hex: Option<String>,
+    /// v2 (#230) seat-binding fields — NULL for v1 rows (and for rows
+    /// admitted before the additive migration).
+    #[serde(rename = "seatSettlePubkey", default)]
+    seat_settle_pubkey: Option<String>,
+    #[serde(rename = "seatSigHex", default)]
+    seat_sig_hex: Option<String>,
     txid: String,
     #[serde(rename = "outputIndex")]
     output_index: f64,
@@ -1778,6 +1784,8 @@ impl PotpartyRow {
             // The column is nullable in the schema but the admit path always
             // writes it; an impossible NULL reads back as "".
             sig_hex: self.sig_hex.unwrap_or_default(),
+            seat_settle_pubkey: self.seat_settle_pubkey,
+            seat_sig_hex: self.seat_sig_hex,
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
@@ -1812,7 +1820,8 @@ fn potparty_err(e: String) -> PotpartyStorageError {
 }
 
 const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
-     recoveryHeight, sigHex, txid, outputIndex, createdAt FROM potparty_records";
+     recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt \
+     FROM potparty_records";
 
 #[async_trait(?Send)]
 impl PotpartyStorage for D1PotpartyStorage {
@@ -1824,8 +1833,9 @@ impl PotpartyStorage for D1PotpartyStorage {
         Query::new(
             "INSERT OR IGNORE INTO potparty_records \
              (identity, opponentIdentity, gameId, potTxid, potVout, \
-              recoveryHeight, sigHex, txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+              txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.identity.as_str())
         .bind(record.opponent_identity.as_str())
@@ -1834,6 +1844,8 @@ impl PotpartyStorage for D1PotpartyStorage {
         .bind(record.pot_vout)
         .bind(record.recovery_height)
         .bind(record.sig_hex.as_str())
+        .bind(record.seat_settle_pubkey.as_deref())
+        .bind(record.seat_sig_hex.as_deref())
         .bind(record.txid.as_str())
         .bind(record.output_index)
         .bind(current_unix_seconds_i64())

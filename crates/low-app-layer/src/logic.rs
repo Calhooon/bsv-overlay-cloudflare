@@ -572,14 +572,21 @@ pub fn health_body() -> String {
 // The counting + dedup + ranking rules MIRROR the client's
 // `aggregateBoard` / `lowestHands` EXACTLY (a divergence is a bug):
 //  - drop un-anchored markers before grouping;
-//  - per gameId: a single distinct CONFIRMED (both-sig) winner counts +1;
+//  - (#230) drop chain-CONTRADICTED markers (settle classified tie/refund,
+//    or the pot's winner chain-attributed to a DIFFERENT identity);
+//  - per gameId, FIRST (#230): a chain-attributed winner whose own anchored
+//    marker names it counts +1 (`chainProven` tier — countersigned or not;
+//    the #276 tower-enforced winner). Otherwise the claim rules:
+//  - a single distinct CONFIRMED (both-sig) winner counts +1;
 //    two conflicting confirmed winners (collusion garbage) count for NOBODY;
 //    with no confirmed claim, a single distinct winner counts +1 UNCONFIRMED
 //    (which never adds to `wins`); conflicting unconfirmed → nobody;
-//  - `wins` = the confirmed count; `proven` = wins > 0 (the identity has a
-//    doubly-signed, anchored win — the contract's stated proven rule);
+//  - `wins` = countersigned + chain-attributed counted games; `proven` =
+//    ≥1 countersigned win (unchanged meaning); `chainProven` = ≥1
+//    chain-attributed win (the honest new tier — see the row docs);
 //  - `hands` = the lowest-score confirmed + anchored v2 (cards-carrying)
-//    hands, one per single-winner game, score ascending then earliest first.
+//    hands, one per single-winner game, score ascending then earliest first
+//    (deliberately still countersigned-only — an accepted residual).
 
 /// Default `?limit` for `/leaderboard` (contract default). Bounds how many
 /// recent result markers are scanned — mirrors the client's `recentResults`.
@@ -718,16 +725,35 @@ pub struct LeaderboardEvidence {
     /// a covenant spend is co-signed by construction and can only pay a
     /// mandated shape, so this is chain truth, not a claim.
     pub server_verdict: Option<crate::results::PotVerdict>,
+    /// #230: the identity the server ATTRIBUTED as this pot's winner via a
+    /// verified `LOW/potparty/v2` seat-binding marker joined to the chain
+    /// verdict (the winning seat's committed settle key, proven held by this
+    /// identity). `None` when unattributed. The client can falsify it:
+    /// `ls_potparty byPot` serves the v2 marker, `/beef` the committed lock,
+    /// and `serverVerdict` names the winning template.
+    pub chain_attributed_winner: Option<String>,
 }
 
 /// One `board[i]` row — an identity's wins + its evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderboardBoardRow {
     pub identity: String,
-    /// Confirmed (doubly-signed) + anchored wins, deduped per game.
+    /// Counted wins, deduped per game: countersigned (doubly-signed +
+    /// anchored) wins PLUS #230 chain-attributed wins (anchored winner
+    /// verdict + verified seat-binding marker naming this identity).
     pub wins: u32,
-    /// True iff `wins > 0` (the identity has a doubly-signed, anchored win).
+    /// True iff the identity has ≥1 COUNTERSIGNED (doubly-signed, anchored)
+    /// win — the original contract's proven rule, deliberately NOT widened
+    /// (#230): a countersignature is the loser's own attestation, a distinct
+    /// trust fact worth surfacing separately.
     pub proven: bool,
+    /// True iff the identity has ≥1 CHAIN-ATTRIBUTED win (#230): the pot's
+    /// covenant verdict named a winning seat and a verified v2 seat-binding
+    /// marker proved this identity held that seat's committed settle key.
+    /// The honest new tier for a tower-enforced win whose loser never
+    /// countersigned — chain truth, not a claim, but a different fact than
+    /// `proven` (hence a separate flag rather than overloading it).
+    pub chain_proven: bool,
     pub evidence: Vec<LeaderboardEvidence>,
 }
 
@@ -790,9 +816,30 @@ pub fn aggregate_leaderboard(
     )
 }
 
+/// [`aggregate_leaderboard_with_verdicts`] without seat attributions (#230)
+/// — the pre-#230 behaviour, kept for callers/tests without the join.
+pub fn aggregate_leaderboard_with_verdicts(
+    markers: &[ResultMarkerRow],
+    statuses: &[OutpointStatus],
+    proof_by_game_winner: &std::collections::HashMap<(String, String), String>,
+    hands_limit: usize,
+    verdict_by_pot: &std::collections::HashMap<String, crate::results::PotVerdict>,
+) -> Leaderboard {
+    aggregate_leaderboard_attributed(
+        markers,
+        statuses,
+        proof_by_game_winner,
+        hands_limit,
+        verdict_by_pot,
+        &std::collections::HashMap::new(),
+    )
+}
+
 /// [`aggregate_leaderboard`] plus the server-derived CHAIN classifications
-/// (bsv-low #227): `verdict_by_pot` maps a lowercase pot txid to the
-/// classified template its recorded spend paid (see `results.rs`).
+/// (bsv-low #227) and the #230 SEAT ATTRIBUTIONS: `verdict_by_pot` maps a
+/// lowercase pot txid to the classified template its recorded spend paid
+/// (see `results.rs`); `attr_by_pot` maps a lowercase pot txid to the
+/// verified `LOW/potparty/v2` seat → identity attribution for that pot.
 ///
 /// The fold is ADDITIVE truth, applied conservatively:
 /// - a marker whose anchored settle is chain-classified as a **refund** or a
@@ -800,19 +847,26 @@ pub fn aggregate_leaderboard(
 ///   that pot, so a claim naming it as a win is contradicted (the server's
 ///   presence-only sig check could otherwise be gamed by a fabricated marker
 ///   pointing at a real refund txid);
-/// - a winner-template classification (or no classification at all) leaves
-///   counting EXACTLY as before — backward compatible; without a seat →
-///   identity mapping the chain alone can never ADD a win to an identity
-///   (see `results.rs` module docs), so client claims keep working for
-///   legacy/pre-covenant games;
-/// - every marker still appears in `evidence` (with `serverVerdict`) so the
-///   client can re-verify and falsify.
-pub fn aggregate_leaderboard_with_verdicts(
+/// - (#230) when a winner verdict's winning-seat settle key is PROVEN held
+///   by an identity (verified v2 marker), that identity is the pot's
+///   CHAIN-ATTRIBUTED winner: an anchored marker by that identity counts a
+///   WIN even without a countersignature (`chainProven` tier — the #276
+///   tower-enforced winner), and an anchored claim naming a DIFFERENT
+///   winner is chain-contradicted and counts for nobody. The attribution
+///   alone never mints a board row — a win still requires (and is
+///   reconstructible from) the winner's own anchored marker in `evidence`;
+/// - a winner-template classification WITHOUT an attribution (or no
+///   classification at all) leaves counting EXACTLY as before — backward
+///   compatible; client claims keep working for legacy/pre-covenant games;
+/// - every marker still appears in `evidence` (with `serverVerdict` +
+///   `chainAttributedWinner`) so the client can re-verify and falsify.
+pub fn aggregate_leaderboard_attributed(
     markers: &[ResultMarkerRow],
     statuses: &[OutpointStatus],
     proof_by_game_winner: &std::collections::HashMap<(String, String), String>,
     hands_limit: usize,
     verdict_by_pot: &std::collections::HashMap<String, crate::results::PotVerdict>,
+    attr_by_pot: &std::collections::HashMap<String, crate::results::SeatAttribution>,
 ) -> Leaderboard {
     use std::collections::{HashMap, HashSet};
 
@@ -834,14 +888,30 @@ pub fn aggregate_leaderboard_with_verdicts(
     let confirmed = |i: usize| markers[i].loser_sig_hex.is_some();
     // The chain classification of marker i's pot spend, when one exists.
     let verdict_of = |i: usize| verdict_by_pot.get(&markers[i].pot_txid.to_ascii_lowercase()).copied();
+    // #230: the CHAIN-ATTRIBUTED winner of marker i's pot — the identity
+    // that provably held the winning seat's committed settle key, when the
+    // verdict names a winning seat and a verified v2 marker attributes it.
+    let attributed_winner_of = |i: usize| -> Option<String> {
+        let pot = markers[i].pot_txid.to_ascii_lowercase();
+        let v = verdict_by_pot.get(&pot).copied()?;
+        attr_by_pot
+            .get(&pot)
+            .and_then(|a| a.winner_for(v))
+            .map(str::to_string)
+    };
     // Chain-contradicted: the settle this marker claims as a WIN is
-    // classified as a tie or refund — nobody won that pot. Such a marker
-    // never counts (wins OR hands); it stays in evidence with its verdict.
+    // classified as a tie or refund — nobody won that pot; OR (#230) the
+    // pot's winner is chain-attributed to a DIFFERENT identity than the
+    // marker claims. Such a marker never counts (wins OR hands); it stays
+    // in evidence with its verdict + attribution.
     let chain_contradicted = |i: usize| {
-        matches!(
+        if matches!(
             verdict_of(i),
             Some(crate::results::PotVerdict::Tie) | Some(crate::results::PotVerdict::Refund)
-        )
+        ) {
+            return true;
+        }
+        matches!(attributed_winner_of(i), Some(w) if !w.eq_ignore_ascii_case(&markers[i].winner))
     };
 
     // ── wins: per-game dedup over ANCHORED markers (client aggregateBoard) ──
@@ -854,9 +924,50 @@ pub fn aggregate_leaderboard_with_verdicts(
                 .push(i);
         }
     }
-    // identity_lc → (confirmed_wins, unconfirmed_wins).
-    let mut tally: HashMap<String, (u32, u32)> = HashMap::new();
+    // identity_lc → per-tier tallies (a game counts into `wins` at most once).
+    #[derive(Default)]
+    struct Tally {
+        /// Counted wins (countersigned OR chain-attributed), per-game deduped.
+        wins: u32,
+        /// Unconfirmed single-winner games (never added to `wins`).
+        unconf: u32,
+        /// Games whose counted win carries the loser's countersignature.
+        countersigned: u32,
+        /// Games whose counted win is #230 chain-attributed.
+        chain: u32,
+    }
+    let mut tally: HashMap<String, Tally> = HashMap::new();
     for idxs in by_game.values() {
+        // ── #230 first: a CHAIN-ATTRIBUTED winner that also claimed the pot
+        // (its own anchored marker names it — chain_contradicted already
+        // dropped every claim the attribution disagrees with) counts a WIN
+        // outright, countersigned or not. This is the #276 tower-enforced
+        // winner: verdict winner-X + proven holder of seat X's committed key.
+        let chain_winners: HashSet<String> = idxs
+            .iter()
+            .filter(|&&i| {
+                matches!(attributed_winner_of(i),
+                    Some(w) if w.eq_ignore_ascii_case(&markers[i].winner))
+            })
+            .map(|&i| markers[i].winner.to_ascii_lowercase())
+            .collect();
+        if chain_winners.len() == 1 {
+            let w = chain_winners.into_iter().next().unwrap();
+            let countersigned = idxs
+                .iter()
+                .any(|&i| confirmed(i) && markers[i].winner.eq_ignore_ascii_case(&w));
+            let e = tally.entry(w).or_default();
+            e.wins += 1;
+            e.chain += 1;
+            if countersigned {
+                e.countersigned += 1;
+            }
+            continue;
+        }
+        // (>1 chain winner is only reachable with garbage markers over
+        //  DIFFERENT pots inside one gameId — fall through to the
+        //  conservative claim rules rather than guess.)
+
         let confirmed_winners: HashSet<String> = idxs
             .iter()
             .filter(|&&i| confirmed(i))
@@ -864,7 +975,9 @@ pub fn aggregate_leaderboard_with_verdicts(
             .collect();
         if confirmed_winners.len() == 1 {
             let w = confirmed_winners.into_iter().next().unwrap();
-            tally.entry(w).or_default().0 += 1;
+            let e = tally.entry(w).or_default();
+            e.wins += 1;
+            e.countersigned += 1;
             continue;
         }
         if confirmed_winners.len() > 1 {
@@ -877,7 +990,7 @@ pub fn aggregate_leaderboard_with_verdicts(
             .collect();
         if unconfirmed_winners.len() == 1 {
             let w = unconfirmed_winners.into_iter().next().unwrap();
-            tally.entry(w).or_default().1 += 1;
+            tally.entry(w).or_default().unconf += 1;
         }
         // conflicting unconfirmed → count nobody.
     }
@@ -893,7 +1006,7 @@ pub fn aggregate_leaderboard_with_verdicts(
 
     let mut rows: Vec<(LeaderboardBoardRow, u32)> = tally
         .iter()
-        .map(|(id, &(conf, unconf))| {
+        .map(|(id, t)| {
             let mut ev_idx = ev_by_identity.get(id).cloned().unwrap_or_default();
             // Anchored+confirmed first, then anchored, then the rest; newest
             // (highest createdAt) first within a tier — a display-friendly
@@ -927,17 +1040,19 @@ pub fn aggregate_leaderboard_with_verdicts(
                         anchored: anchored[i],
                         proof_txid,
                         server_verdict: verdict_of(i),
+                        chain_attributed_winner: attributed_winner_of(i),
                     }
                 })
                 .collect();
             (
                 LeaderboardBoardRow {
                     identity: id.clone(),
-                    wins: conf,
-                    proven: conf > 0,
+                    wins: t.wins,
+                    proven: t.countersigned > 0,
+                    chain_proven: t.chain > 0,
                     evidence,
                 },
-                unconf,
+                t.unconf,
             )
         })
         .collect();
@@ -1037,6 +1152,11 @@ pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize)
                         "anchored": e.anchored,
                         "proofTxid": e.proof_txid,
                         "serverVerdict": e.server_verdict.map(crate::results::PotVerdict::as_str),
+                        // bsv-low #230: the identity attributed as this pot's
+                        // winner via the verified seat-binding marker + chain
+                        // verdict (null when unattributed) — the falsifiable
+                        // fact behind the row's `chainProven` tier.
+                        "chainAttributedWinner": e.chain_attributed_winner,
                     })
                 })
                 .collect();
@@ -1044,6 +1164,11 @@ pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize)
                 "identity": r.identity,
                 "wins": r.wins,
                 "proven": r.proven,
+                // bsv-low #230: ≥1 counted win is CHAIN-ATTRIBUTED (covenant
+                // verdict + seat-binding proof, no countersignature). A
+                // deliberate separate tier — `proven` keeps meaning "the
+                // loser countersigned".
+                "chainProven": r.chain_proven,
                 "evidence": evidence,
             })
         })
@@ -2248,6 +2373,192 @@ mod tests {
         let ev = v["board"][0]["evidence"][0].as_object().unwrap();
         assert!(ev.contains_key("cardsHex"), "the key is always present");
         assert_eq!(ev["cardsHex"], serde_json::Value::Null);
+    }
+
+    // ── #230 chain-attributed wins (the potparty-v2 seat-binding tier) ──────
+
+    /// attr map: pot-txid byte → (identity_a, identity_b).
+    fn attrs_of(
+        entries: &[(u8, Option<&str>, Option<&str>)],
+    ) -> HashMap<String, crate::results::SeatAttribution> {
+        entries
+            .iter()
+            .map(|(pot, a, b)| {
+                (
+                    tx(*pot),
+                    crate::results::SeatAttribution {
+                        identity_a: a.map(str::to_string),
+                        identity_b: b.map(str::to_string),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn verdicts_of(
+        entries: &[(u8, crate::results::PotVerdict)],
+    ) -> HashMap<String, crate::results::PotVerdict> {
+        entries.iter().map(|(pot, v)| (tx(*pot), *v)).collect()
+    }
+
+    /// THE #276 case: a tower-enforced winner's UNCONFIRMED claim (the loser
+    /// is gone — no countersignature exists and never will) COUNTS as a win
+    /// once the chain verdict + verified seat-binding marker attribute the
+    /// winning seat to the claimed winner. Tier honesty: `proven` stays
+    /// false (no countersig), `chainProven` reports the new fact.
+    #[test]
+    fn unconfirmed_enforced_win_counts_when_chain_attributed() {
+        let w = ident(0xaa);
+        let l = ident(0xbb);
+        let markers = vec![mk(1, &w, &l, 1, 2, false, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let verdicts = verdicts_of(&[(1, crate::results::PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(1, Some(&w), Some(&l))]);
+
+        // WITHOUT the attribution: today's behaviour — an unconfirmed row,
+        // wins = 0 (the exact #276 injustice).
+        let lb =
+            aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
+        assert_eq!(lb.board[0].wins, 0);
+        assert!(!lb.board[0].proven);
+        assert!(!lb.board[0].chain_proven);
+
+        // WITH it: the win counts, on the honest new tier.
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        assert_eq!(lb.board[0].identity, w);
+        assert_eq!(
+            lb.board[0].wins, 1,
+            "a chain-attributed enforced win COUNTS"
+        );
+        assert!(
+            !lb.board[0].proven,
+            "no countersignature ⇒ proven stays false"
+        );
+        assert!(
+            lb.board[0].chain_proven,
+            "the chainProven tier reports the chain fact"
+        );
+        // The wire body carries both tier flags + the falsifiable attribution.
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+        assert_eq!(v["board"][0]["wins"], 1);
+        assert_eq!(v["board"][0]["proven"], false);
+        assert_eq!(v["board"][0]["chainProven"], true);
+        assert_eq!(v["board"][0]["evidence"][0]["chainAttributedWinner"], w);
+
+        // A countersigned + attributed win carries BOTH tiers (counted once).
+        let markers = vec![mk(1, &w, &l, 1, 2, true, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        assert_eq!(lb.board[0].wins, 1);
+        assert!(lb.board[0].proven);
+        assert!(lb.board[0].chain_proven);
+    }
+
+    /// Adversarial (risk register B1/B5): a fabricated claim naming a THIEF
+    /// as winner of a chain-attributed pot is CONTRADICTED and counts for
+    /// nobody — even countersigned by an accomplice — while the honest
+    /// attributed winner's own claim still counts. And an attribution with
+    /// NO claim by the attributed winner mints NOTHING (every counted win
+    /// stays reconstructible from evidence).
+    #[test]
+    fn chain_attribution_beats_fabricated_and_never_mints_rowless_wins() {
+        let honest = ident(0xaa);
+        let loser = ident(0xbb);
+        let thief = ident(0xcc);
+        let verdicts = verdicts_of(&[(1, crate::results::PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(1, Some(&honest), Some(&loser))]);
+
+        // Thief's countersigned fabrication vs the honest unconfirmed claim:
+        // pre-#230 the conflicting-set rules would let the CONFIRMED thief
+        // claim win the game. With attribution the thief is contradicted.
+        let markers = vec![
+            mk(1, &thief, &loser, 1, 2, true, None, 200, 0),
+            mk(1, &honest, &loser, 1, 2, false, None, 100, 1),
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        let row_of = |id: &str| lb.board.iter().find(|r| r.identity == id);
+        assert!(
+            row_of(&thief).is_none(),
+            "the contradicted thief counts NOTHING"
+        );
+        let h = row_of(&honest).expect("the attributed winner counts");
+        assert_eq!(h.wins, 1);
+        assert!(h.chain_proven);
+        assert!(!h.proven);
+
+        // Attribution alone, with NO claim by the attributed winner: nobody
+        // counts (a win must stay reconstructible from an anchored marker in
+        // evidence), and the thief's contradicted claim stays excluded.
+        let markers = vec![mk(1, &thief, &loser, 1, 2, true, None, 200, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        assert!(
+            lb.board.is_empty(),
+            "no self-claim ⇒ no row, and the thief is contradicted"
+        );
+
+        // An UN-anchored claim never counts even when attributed (the anchor
+        // rule is untouched).
+        let markers = vec![mk(1, &honest, &loser, 1, 2, false, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::new()); // pot unknown
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        assert!(lb.board.is_empty());
+
+        // Attribution for a NONEXISTENT/unclassified pot contributes nothing:
+        // verdictless pots fall through to the claim rules verbatim.
+        let markers = vec![mk(3, &honest, &loser, 3, 4, false, None, 100, 0)];
+        let statuses = statuses_for(&markers, &HashMap::from([(3u8, 4u8)]));
+        let attrs_wrong = attrs_of(&[(9, Some(&honest), Some(&loser))]);
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &HashMap::new(),
+            &attrs_wrong,
+        );
+        assert_eq!(
+            lb.board[0].wins, 0,
+            "unconfirmed stays unconfirmed without a verdict"
+        );
+        assert!(!lb.board[0].chain_proven);
     }
 
     #[test]

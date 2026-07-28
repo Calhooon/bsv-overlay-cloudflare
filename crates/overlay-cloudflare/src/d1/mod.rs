@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 63;
+pub const OVERLAY_MIGRATION_COUNT: usize = 65;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -726,6 +726,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // spend-chaser's age gate on the SPEND, not the pot admission (a pot can
     // be spent long after admission). NULL (pre-migration) = OLD/eligible.
     "ALTER TABLE pot_records ADD COLUMN spentAt INTEGER",
+    // potparty v2 SEAT-BINDING fields (bsv-low #230): the seat's committed
+    // settle pubkey + the settle key's signature over the seat-binding
+    // preimage, carried VERBATIM (admission stays byte-format-only; the
+    // app-layer reader verifies). NULLABLE on purpose: v1 rows stay NULL and
+    // keep today's behaviour. Additive ALTERs — the runner ignores the
+    // re-run "duplicate column" error (`migration_error_is_benign`).
+    "ALTER TABLE potparty_records ADD COLUMN seatSettlePubkey TEXT",
+    "ALTER TABLE potparty_records ADD COLUMN seatSigHex TEXT",
 ];
 
 // =============================================================================
