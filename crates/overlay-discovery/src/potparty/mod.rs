@@ -38,7 +38,7 @@
 //! | 4 | potTxid          | 32 bytes                                     |
 //! | 5 | potVout          | 4 bytes little-endian (u32)                  |
 //! | 6 | recoveryHeight   | 4 bytes little-endian (u32)                  |
-//! | 7 | sig              | DER ECDSA, 68..=74 bytes (preserved, never   |
+//! | 7 | sig              | DER ECDSA, 67..=74 bytes (preserved, never   |
 //! |   |                  | verified by the overlay)                     |
 //!
 //! The parser validates the shape strictly (exact tag + exact push count +
@@ -100,8 +100,16 @@ pub const POTPARTY_GAME_ID_LEN: usize = 32;
 pub const POTPARTY_TXID_LEN: usize = 32;
 /// potVout / recoveryHeight push length (bytes) — a little-endian u32.
 pub const POTPARTY_U32_LEN: usize = 4;
-/// Minimum sig push length (bytes) — a DER ECDSA signature.
-pub const POTPARTY_SIG_MIN_LEN: usize = 68;
+/// Minimum sig push length (bytes) — a DER ECDSA signature. 67 (not 68):
+/// RFC6979 is DETERMINISTIC and both potparty challenges are FIXED per
+/// (game, pot, identity), so a signature that happens to fall below the
+/// floor would re-produce IDENTICALLY forever and permanently wedge that
+/// marker (the 2026-07-28 gate's F5). ~2·2⁻¹⁶ of signatures have a 67-byte
+/// DER (one leading-zero byte in r or s); accepting 67 shrinks the
+/// permanent-wedge probability to the ≤66-byte tail (~2⁻²⁴ per marker —
+/// documented residual). Bounds are the SAME for v1 and v2 and mirrored in
+/// the client parser (`potParty.ts`).
+pub const POTPARTY_SIG_MIN_LEN: usize = 67;
 /// Maximum sig push length (bytes) — a DER ECDSA signature.
 pub const POTPARTY_SIG_MAX_LEN: usize = 74;
 
@@ -127,13 +135,13 @@ pub struct PotpartyMarker {
     pub pot_vout: u32,
     /// The pre-signed refund's recovery height (u32, little-endian on wire).
     pub recovery_height: u32,
-    /// The seat's DER ECDSA signature push (68..=74 bytes) — carried back
+    /// The seat's DER ECDSA signature push (67..=74 bytes) — carried back
     /// verbatim; the overlay NEVER verifies it.
     pub sig: Vec<u8>,
     /// v2 only (bsv-low #230): the seat's SETTLE pubkey (exactly 33 bytes)
     /// — the key the covenant lock commits for this seat. `None` for v1.
     pub seat_settle_pubkey: Option<Vec<u8>>,
-    /// v2 only: the DER ECDSA signature BY the settle key (68..=74 bytes)
+    /// v2 only: the DER ECDSA signature BY the settle key (67..=74 bytes)
     /// over the seat-binding preimage — carried back verbatim, never
     /// verified here (the app-layer reader verifies). `None` for v1.
     pub seat_sig: Option<Vec<u8>>,
@@ -206,9 +214,9 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
 /// followed by EXACTLY the version's push count with its exact shape —
 /// v1 (tag == [`POTPARTY_TAG`], 8 pushes): identity 33 bytes,
 /// opponentIdentity 33 bytes, gameId 32 bytes, potTxid 32 bytes, potVout 4
-/// bytes, recoveryHeight 4 bytes, sig 68..=74 bytes; v2 (tag ==
+/// bytes, recoveryHeight 4 bytes, sig 67..=74 bytes; v2 (tag ==
 /// [`POTPARTY_TAG_V2`], 10 pushes, bsv-low #230): the same with
-/// `seatSettlePubkey` (33 bytes) + `seatSig` (68..=74 bytes) inserted
+/// `seatSettlePubkey` (33 bytes) + `seatSig` (67..=74 bytes) inserted
 /// between recoveryHeight and sig — AND, in both versions, identity !=
 /// opponentIdentity (a pot is between two distinct seats). Everything else
 /// — a bare `OP_RETURN`, a different tag, a wrong length, extra/missing
@@ -573,7 +581,7 @@ pub(crate) mod tests {
 
     #[test]
     fn valid_v2_marker_round_trips() {
-        for sig_len in [68usize, 70, 71, 72, 74] {
+        for sig_len in [67usize, 68, 70, 71, 72, 74] {
             let script = marker_script_v2(
                 &golden_identity(),
                 &golden_opponent(),
@@ -644,7 +652,7 @@ pub(crate) mod tests {
             assert!(parse_potparty_marker(&s).is_none(), "settle pk len {len}");
         }
         // seatSig length out of the DER range.
-        for len in [0usize, 67, 75] {
+        for len in [0usize, 66, 75] {
             let s = marker_script_v2(
                 &golden_identity(),
                 &golden_opponent(),
@@ -680,7 +688,7 @@ pub(crate) mod tests {
     #[test]
     fn valid_marker_round_trips() {
         // Build → parse → every field back, over the full sig-length range.
-        for sig_len in [68usize, 70, 71, 72, 74] {
+        for sig_len in [67usize, 68, 70, 71, 72, 74] {
             let script = marker_script(
                 &golden_identity(),
                 &golden_opponent(),
@@ -871,7 +879,7 @@ pub(crate) mod tests {
 
     #[test]
     fn sig_length_out_of_range_rejected() {
-        for len in [0usize, 1, 67, 75, 100] {
+        for len in [0usize, 1, 66, 75, 100] {
             let script = marker_script(
                 &golden_identity(),
                 &golden_opponent(),

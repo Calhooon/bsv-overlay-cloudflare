@@ -758,16 +758,23 @@ async fn classify_spent_pots(
 #[derive(Deserialize)]
 struct SeatMarkerRowD1 {
     identity: String,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
     #[serde(rename = "potTxid")]
     pot_txid: String,
     #[serde(rename = "potVout")]
     pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
     #[serde(rename = "seatSettlePubkey")]
     seat_settle_pubkey: Option<String>,
     #[serde(rename = "seatSigHex")]
     seat_sig_hex: Option<String>,
+    /// The marker's IDENTITY signature — required by the F1 binding check.
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
 }
 
 /// #230: build the pot → [`crate::results::SeatAttribution`] map for the
@@ -789,14 +796,11 @@ async fn seat_attributions(
     let mut markers_by_pot: std::collections::HashMap<String, Vec<crate::results::SeatMarkerRow>> =
         std::collections::HashMap::new();
     for chunk in pots.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!(
-            "SELECT identity, gameId, potTxid, potVout, seatSettlePubkey, seatSigHex \
-             FROM potparty_records \
-             WHERE seatSettlePubkey IS NOT NULL AND potVout = {} \
-               AND potTxid IN ({placeholders}) LIMIT 1000",
-            crate::logic::LEADERBOARD_POT_VOUT
-        );
+        // F2 (2026-07-28 gate): per-pot windowed + DETERMINISTIC order — see
+        // `seat_markers_sql` for why an unordered global LIMIT was an
+        // erasure-DoS (junk rows crowding the honest markers out of the
+        // fetch window).
+        let sql = crate::results::seat_markers_sql(chunk.len());
         let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
         let stmt = match db.prepare(sql).bind(&binds) {
             Ok(s) => s,
@@ -812,7 +816,9 @@ async fn seat_attributions(
         {
             Ok(rows) => {
                 for r in rows {
-                    let (Some(pk), Some(sig)) = (r.seat_settle_pubkey, r.seat_sig_hex) else {
+                    let (Some(pk), Some(seat_sig), Some(id_sig)) =
+                        (r.seat_settle_pubkey, r.seat_sig_hex, r.sig_hex)
+                    else {
                         continue;
                     };
                     markers_by_pot
@@ -820,11 +826,14 @@ async fn seat_attributions(
                         .or_default()
                         .push(crate::results::SeatMarkerRow {
                             identity: r.identity.to_ascii_lowercase(),
+                            opponent_identity: r.opponent_identity.to_ascii_lowercase(),
                             game_id: r.game_id.to_ascii_lowercase(),
                             pot_txid: r.pot_txid.to_ascii_lowercase(),
                             pot_vout: r.pot_vout as u32,
+                            recovery_height: r.recovery_height as u32,
                             seat_settle_pubkey: pk.to_ascii_lowercase(),
-                            seat_sig_hex: sig.to_ascii_lowercase(),
+                            seat_sig_hex: seat_sig.to_ascii_lowercase(),
+                            identity_sig_hex: id_sig.to_ascii_lowercase(),
                         });
                 }
             }
@@ -858,6 +867,7 @@ async fn seat_attributions(
 /// caller's potparty facts + spend pointer + BOTH stored BEEFs as hex.
 #[derive(Deserialize)]
 struct ResultsRowD1 {
+    identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
     #[serde(rename = "potTxid")]
@@ -883,11 +893,15 @@ struct ResultsRowD1 {
     seat_settle_pubkey: Option<String>,
     #[serde(rename = "seatSigHex", default)]
     seat_sig_hex: Option<String>,
+    /// The marker's IDENTITY signature (F1 binding check).
+    #[serde(rename = "sigHex", default)]
+    sig_hex: Option<String>,
 }
 
 impl ResultsRowD1 {
     fn into_row(self) -> crate::results::ResultsRow {
         crate::results::ResultsRow {
+            identity: self.identity,
             game_id: self.game_id,
             pot_txid: self.pot_txid,
             pot_vout: self.pot_vout as u32,
@@ -900,6 +914,7 @@ impl ResultsRowD1 {
             spender_beef_hex: self.spender_beef,
             seat_settle_pubkey: self.seat_settle_pubkey,
             seat_sig_hex: self.seat_sig_hex,
+            marker_sig_hex: self.sig_hex,
         }
     }
 }

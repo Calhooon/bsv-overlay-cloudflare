@@ -564,20 +564,34 @@ pub fn beef_block_height(beef_bytes: &[u8], txid: &str) -> Option<u64> {
 pub const POTPARTY_SEATSIG_DOMAIN: &[u8] = b"LOW/potparty/v2/seatsig|";
 
 /// One raw v2 potparty marker row (from `potparty_records`), NOT yet
-/// verified — [`verify_seat_marker`] decides whether it attributes anything.
+/// verified — [`verify_seat_marker`] + [`verify_identity_binding`] (both
+/// enforced by [`attribute_seats`]) decide whether it attributes anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatMarkerRow {
     /// The publishing identity (66-hex compressed pubkey).
     pub identity: String,
+    /// The opponent identity named by the marker (66-hex) — part of the
+    /// identity-signature challenge.
+    pub opponent_identity: String,
     /// The marker's gameId (64-hex).
     pub game_id: String,
     /// The pot outpoint the marker names.
     pub pot_txid: String,
     pub pot_vout: u32,
+    /// The marker's recoveryHeight — part of the identity-sig challenge.
+    pub recovery_height: u32,
     /// The claimed settle pubkey (66-hex) — matched against the lock.
     pub seat_settle_pubkey: String,
     /// The settle key's DER signature over the seat-binding preimage.
     pub seat_sig_hex: String,
+    /// The IDENTITY's DER signature over the v2 marker challenge
+    /// (`[1,'low potparty']`, keyID = gameId, counterparty 'anyone') — the
+    /// proof that `identity` itself published this marker. WITHOUT verifying
+    /// it, a hostile counterparty could mint a marker naming the VICTIM's
+    /// identity over its OWN settle key (its wallet happily seat-signs a
+    /// preimage embedding any identity), landing the victim in BOTH slots
+    /// and erasing the victim's `my_seat` — the 2026-07-28 gate's F1.
+    pub identity_sig_hex: String,
 }
 
 /// The EXACT cross-repo seatSig preimage (bsv-low #230; the client's
@@ -637,6 +651,62 @@ pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
     pubkey.verify(&hash, &sig)
 }
 
+/// The BRC-43 protocol potparty markers sign their IDENTITY challenge under
+/// — `potParty.ts::POTPARTY_PROTOCOL` = `[1, 'low potparty']`.
+fn potparty_protocol() -> bsv_rs::wallet::Protocol {
+    bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty")
+}
+
+/// The EXACT v2 IDENTITY-signature challenge — byte-identical to the
+/// client's `potPartyV2Challenge`: the v2 tag + every field (incl.
+/// `seatSettlePubkey`), all raw bytes, u32s little-endian. `None` when any
+/// hex field is malformed (an unbuildable challenge can never verify).
+pub fn potparty_v2_challenge(m: &SeatMarkerRow) -> Option<Vec<u8>> {
+    let identity = hex::decode(m.identity.to_ascii_lowercase()).ok()?;
+    let opponent = hex::decode(m.opponent_identity.to_ascii_lowercase()).ok()?;
+    let game_id = hex::decode(m.game_id.to_ascii_lowercase()).ok()?;
+    let pot_txid = hex::decode(m.pot_txid.to_ascii_lowercase()).ok()?;
+    let settle_pk = hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()).ok()?;
+    if identity.len() != 33
+        || opponent.len() != 33
+        || game_id.len() != 32
+        || pot_txid.len() != 32
+        || settle_pk.len() != 33
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(15 + 33 + 33 + 32 + 32 + 4 + 4 + 33);
+    out.extend_from_slice(b"LOW/potparty/v2");
+    out.extend_from_slice(&identity);
+    out.extend_from_slice(&opponent);
+    out.extend_from_slice(&game_id);
+    out.extend_from_slice(&pot_txid);
+    out.extend_from_slice(&m.pot_vout.to_le_bytes());
+    out.extend_from_slice(&m.recovery_height.to_le_bytes());
+    out.extend_from_slice(&settle_pk);
+    Some(out)
+}
+
+/// Verify the marker's IDENTITY signature: the claimed `identity` really
+/// published this marker (BRC-42/43 'anyone' verification, protocol
+/// `[1,'low potparty']`, keyID = gameId — the exact recipe of the client's
+/// `verifyPotPartyV2Marker`). This is the F1 bar: `seatSig` alone proves
+/// "SOME settle key signed this identity into the preimage" — which the
+/// OPPONENT's wallet will happily do with its own key — so a marker may
+/// attribute a slot only when the named identity's own signature is on it.
+pub fn verify_identity_binding(m: &SeatMarkerRow) -> bool {
+    let Some(challenge) = potparty_v2_challenge(m) else {
+        return false;
+    };
+    anyone_sig_verifies(
+        &m.identity.to_ascii_lowercase(),
+        &m.game_id.to_ascii_lowercase(),
+        &challenge,
+        &m.identity_sig_hex,
+        potparty_protocol(),
+    )
+}
+
 /// Which identity (if provably any) holds each committed settle-key slot of
 /// one pot. `None` = unattributed (no verified marker for the slot, or a
 /// conflict — never a guess).
@@ -666,12 +736,18 @@ impl SeatAttribution {
 /// - a marker whose `seatSettlePubkey` is NOT `pubA`/`pubB` is REFUSED (the
 ///   lock is the authority; a foreign key attributes nothing);
 /// - a marker whose `seatSig` does not verify is REFUSED;
+/// - a marker whose IDENTITY signature does not verify is REFUSED (F1: the
+///   opponent can mint a valid seatSig over the VICTIM's identity with its
+///   own settle key — only the victim can mint the identity sig, so a
+///   hostile marker can never occupy a slot with someone else's identity,
+///   and in particular can never erase `my_seat` via the both-slots case);
 /// - a marker naming a different (gameId-irrelevant) pot outpoint than the
 ///   one being attributed is REFUSED (the preimage binds the outpoint);
 /// - each key matches only its OWN slot, so both seats claiming "seat A" is
 ///   impossible by construction — and CONFLICTING identities for one slot
 ///   (two verified markers, different identities, same key — only the key
-///   holder can mint them, i.e. self-sabotage) poison that slot to `None`;
+///   holder can mint BOTH sig pairs, i.e. self-sabotage) poison that slot
+///   to `None`;
 /// - a degenerate lock with `pubA == pubB` attributes NOTHING (one key
 ///   cannot distinguish the seats);
 /// - duplicate identical markers (the outpoint-replay case) are idempotent.
@@ -703,7 +779,10 @@ pub fn attribute_seats(
             continue; // key not committed in this pot's lock — refused
         };
         if !verify_seat_marker(m) {
-            continue; // signature does not verify — refused
+            continue; // seat signature does not verify — refused
+        }
+        if !verify_identity_binding(m) {
+            continue; // identity signature does not verify — refused (F1)
         }
         let id = m.identity.to_ascii_lowercase();
         match slot {
@@ -781,6 +860,9 @@ pub fn derive_outcome_with_seat(
 /// BEEFs. The route dedupes marker rows to one entry per pot outpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultsRow {
+    /// The potparty row's OWN identity column (F8: carried explicitly so the
+    /// seat path can never silently decouple from the SQL's WHERE filter).
+    pub identity: String,
     pub game_id: String,
     pub pot_txid: String,
     pub pot_vout: u32,
@@ -798,6 +880,9 @@ pub struct ResultsRow {
     /// attribute anything.
     pub seat_settle_pubkey: Option<String>,
     pub seat_sig_hex: Option<String>,
+    /// The marker's IDENTITY signature push (`sigHex`) — required by the F1
+    /// identity-binding verification before a v2 row may attribute a seat.
+    pub marker_sig_hex: Option<String>,
 }
 
 /// A game's SIGNATURE-VERIFIED `tm_result` claims relevant to won/lost
@@ -896,6 +981,7 @@ fn anyone_sig_verifies(
     key_id: &str,
     challenge: &[u8],
     sig_hex: &str,
+    protocol: bsv_rs::wallet::Protocol,
 ) -> bool {
     let Ok(signer) = bsv_rs::primitives::ec::PublicKey::from_hex(signer_identity_hex) else {
         return false;
@@ -908,7 +994,7 @@ fn anyone_sig_verifies(
             data: Some(challenge.to_vec()),
             hash_to_directly_verify: None,
             signature: sig,
-            protocol_id: result_protocol(),
+            protocol_id: protocol,
             key_id: key_id.to_string(),
             counterparty: Some(bsv_rs::wallet::Counterparty::Other(signer)),
             for_self: Some(false),
@@ -939,13 +1025,18 @@ pub fn verified_claim(m: &ResultMarkerRow) -> Option<ClaimFact> {
         &m.settle_txid.to_ascii_lowercase(),
         m.cards_hex.as_deref(),
     )?;
-    if !anyone_sig_verifies(&winner_lc, &game_lc, &challenge, &m.winner_sig_hex) {
+    if !anyone_sig_verifies(
+        &winner_lc,
+        &game_lc,
+        &challenge,
+        &m.winner_sig_hex,
+        result_protocol(),
+    ) {
         return None; // fabricated/garbled claim — as if never published
     }
-    let loser_sig_verified = m
-        .loser_sig_hex
-        .as_deref()
-        .is_some_and(|s| anyone_sig_verifies(&loser_lc, &game_lc, &challenge, s));
+    let loser_sig_verified = m.loser_sig_hex.as_deref().is_some_and(|s| {
+        anyone_sig_verifies(&loser_lc, &game_lc, &challenge, s, result_protocol())
+    });
     // The cards are re-canonicalized from the SAME field the challenge bound
     // (present ⇒ it verified as part of the winner sig above), so a Some value
     // is trustworthy. A malformed field can't reach here (the challenge would
@@ -1187,19 +1278,26 @@ pub fn assemble_results(
     let mut seat_markers: std::collections::HashMap<(String, String, u32), Vec<SeatMarkerRow>> =
         std::collections::HashMap::new();
     for r in &rows {
-        if let (Some(pk), Some(sig)) = (&r.seat_settle_pubkey, &r.seat_sig_hex) {
+        if let (Some(pk), Some(seat_sig), Some(id_sig)) =
+            (&r.seat_settle_pubkey, &r.seat_sig_hex, &r.marker_sig_hex)
+        {
             let key = (
                 r.game_id.to_ascii_lowercase(),
                 r.pot_txid.to_ascii_lowercase(),
                 r.pot_vout,
             );
+            // F8: the marker's identity comes from the ROW, not from the
+            // query parameter — a future SQL change can't silently decouple.
             seat_markers.entry(key).or_default().push(SeatMarkerRow {
-                identity: identity_lc.to_string(),
+                identity: r.identity.to_ascii_lowercase(),
+                opponent_identity: r.opponent_identity.to_ascii_lowercase(),
                 game_id: r.game_id.to_ascii_lowercase(),
                 pot_txid: r.pot_txid.to_ascii_lowercase(),
                 pot_vout: r.pot_vout,
+                recovery_height: r.recovery_height,
                 seat_settle_pubkey: pk.to_ascii_lowercase(),
-                seat_sig_hex: sig.to_ascii_lowercase(),
+                seat_sig_hex: seat_sig.to_ascii_lowercase(),
+                identity_sig_hex: id_sig.to_ascii_lowercase(),
             });
         }
     }
@@ -1371,9 +1469,9 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
 /// lesson; a heavier history paginates in a future rev).
 pub fn results_sql() -> String {
     format!(
-        "SELECT pp.gameId, pp.potTxid, pp.potVout, pp.recoveryHeight, \
+        "SELECT pp.identity, pp.gameId, pp.potTxid, pp.potVout, pp.recoveryHeight, \
                 pp.opponentIdentity, \
-                pp.seatSettlePubkey, pp.seatSigHex, \
+                pp.seatSettlePubkey, pp.seatSigHex, pp.sigHex, \
                 r.spent, r.spendingTxid, r.spentConfirmed, \
                 hex(fb.beef) AS fundingBeef, \
                 hex(sb.beef) AS spenderBeef \
@@ -1388,6 +1486,49 @@ pub fn results_sql() -> String {
 
 /// Hard bound on `/results` marker rows per request (BLOB-weight bound).
 pub const RESULTS_MAX_ROWS: usize = 100;
+
+/// Per-pot cap on v2 seat-marker rows considered by the `/leaderboard`
+/// attribution join. Honest traffic is TWO rows per pot (one per seat),
+/// published at funding — the EARLIEST possible markers for the pot (its
+/// txid does not exist to be named before funding). The cap only needs to
+/// keep dust-cost junk from crowding them out of the fetch window.
+pub const SEAT_MARKERS_PER_POT: usize = 40;
+
+/// The `/leaderboard` seat-marker query for a chunk of `n` pot txids
+/// (F2, 2026-07-28 gate): per-pot windowed with a DETERMINISTIC order.
+///
+/// Admission is byte-format-only and a v2-shaped row costs dust, so a hot
+/// pot can accumulate junk rows without bound; an unordered `LIMIT` would
+/// let SQLite's arbitrary row order decide whether the HONEST markers are
+/// even fetched (silent attribution loss ⇒ a `chainProven` win quietly
+/// degrades to the claim rules). `ROW_NUMBER() OVER (PARTITION BY potTxid
+/// ORDER BY createdAt ASC, rowid ASC)` keeps the OLDEST
+/// [`SEAT_MARKERS_PER_POT`] rows per pot — oldest-first because the honest
+/// markers are published at funding, before any junk can name the pot's
+/// txid, so an attacker would have to land that many admitted rows BEFORE
+/// both honest seats to evict them. NOTE: a
+/// `seatSettlePubkey IN (pubA, pubB)` SQL filter would only stop LAZY spam
+/// — the committed pubkeys are public in the funding lock, so a motivated
+/// spammer just copies them; the real bar stays the signature verification
+/// in [`attribute_seats`].
+pub fn seat_markers_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(",");
+    format!(
+        "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+                recoveryHeight, seatSettlePubkey, seatSigHex, sigHex \
+         FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+                      recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
+                      ROW_NUMBER() OVER (PARTITION BY potTxid \
+                                         ORDER BY createdAt ASC, rowid ASC) AS rn \
+               FROM potparty_records \
+               WHERE seatSettlePubkey IS NOT NULL AND potVout = {vout} \
+                 AND potTxid IN ({placeholders})) \
+         WHERE rn <= {cap}",
+        vout = crate::logic::LEADERBOARD_POT_VOUT,
+        cap = SEAT_MARKERS_PER_POT,
+    )
+}
 
 /// The claims query for a chunk of gameIds (1 bind each — chunk at
 /// [`crate::logic::D1_CHUNK_OUTPOINTS`] to stay far under D1's 100-param cap).
@@ -1647,10 +1788,11 @@ mod tests {
         assert_eq!(o, Outcome::Unresolved);
     }
 
-    // ── #230 seat attribution (REAL secp256k1 keys + signatures — the
-    //    risk-register B1/B5 bars; never a mocked verify) ─────────────────
+    // ── #230 seat attribution (REAL secp256k1 keys + REAL BRC-42 identity
+    //    signatures — the risk-register B1/B5 bars + the 2026-07-28 gate's
+    //    F1; never a mocked verify) ────────────────────────────────────────
 
-    /// A real keypair: (privkey, 66-hex compressed pubkey).
+    /// A real settle keypair: (privkey, 66-hex compressed pubkey).
     fn real_key(seed: u8) -> (bsv_rs::primitives::ec::PrivateKey, String) {
         let k = bsv_rs::primitives::ec::PrivateKey::from_bytes(&{
             let mut b = [0u8; 32];
@@ -1662,27 +1804,53 @@ mod tests {
         (k, pk.to_ascii_lowercase())
     }
 
-    /// A REAL seat marker: `seat_sig` is a genuine ECDSA signature by
-    /// `settle_key` over sha256 of the exact cross-repo preimage.
+    /// Sign the v2 IDENTITY challenge exactly as the client does
+    /// (`[1,'low potparty']`, keyID = gameId, counterparty 'anyone').
+    fn sign_potparty_identity(w: &ProtoWallet, game_id: &str, challenge: &[u8]) -> String {
+        let sig = w
+            .create_signature(CreateSignatureArgs {
+                data: Some(challenge.to_vec()),
+                hash_to_directly_sign: None,
+                protocol_id: potparty_protocol(),
+                key_id: game_id.to_string(),
+                counterparty: Some(Counterparty::Anyone),
+            })
+            .unwrap();
+        hex::encode(sig.signature)
+    }
+
+    /// A FULLY REAL v2 seat marker: `seat_sig` is a genuine ECDSA signature
+    /// by `settle_key` over sha256 of the exact cross-repo preimage, and the
+    /// identity signature is a genuine BRC-42 'anyone' signature by
+    /// `identity_wallet` over the exact v2 challenge.
+    #[allow(clippy::too_many_arguments)]
     fn real_seat_marker(
         settle_key: &bsv_rs::primitives::ec::PrivateKey,
         settle_pub_hex: &str,
+        identity_wallet: &ProtoWallet,
         identity_hex: &str,
+        opponent_hex: &str,
         game_id: &str,
         pot_txid: &str,
         pot_vout: u32,
     ) -> SeatMarkerRow {
         let preimage = seatsig_preimage(game_id, pot_txid, pot_vout, identity_hex).unwrap();
         let hash = bsv_rs::primitives::hash::sha256(&preimage);
-        let sig = settle_key.sign(&hash).unwrap();
-        SeatMarkerRow {
+        let seat_sig = settle_key.sign(&hash).unwrap();
+        let mut m = SeatMarkerRow {
             identity: identity_hex.to_string(),
+            opponent_identity: opponent_hex.to_string(),
             game_id: game_id.to_string(),
             pot_txid: pot_txid.to_string(),
             pot_vout,
+            recovery_height: 900_000,
             seat_settle_pubkey: settle_pub_hex.to_string(),
-            seat_sig_hex: hex::encode(sig.to_der()),
-        }
+            seat_sig_hex: hex::encode(seat_sig.to_der()),
+            identity_sig_hex: String::new(),
+        };
+        let challenge = potparty_v2_challenge(&m).unwrap();
+        m.identity_sig_hex = sign_potparty_identity(identity_wallet, game_id, &challenge);
+        m
     }
 
     /// CovenantParams committing the two settle pubkeys (rest arbitrary).
@@ -1709,15 +1877,21 @@ mod tests {
     fn seat_attribution_real_roundtrip_and_slot_exactness() {
         let (ka, pa) = real_key(41); // seat A settle key (committed as pubA)
         let (kb, pb) = real_key(42); // seat B settle key
-        let ida = ident(0xaa); // seat A's identity
-        let idb = ident(0xbb);
+        let wa = wallet_of(0x51); // seat A identity wallet
+        let wb = wallet_of(0x52);
+        let ida = identity_of(&wa);
+        let idb = identity_of(&wb);
         let gid = tx(0x01);
         let pot = tx(0x22);
         let p = params_with_keys(&pa, &pb);
 
-        let ma = real_seat_marker(&ka, &pa, &ida, &gid, &pot, 0);
-        let mb = real_seat_marker(&kb, &pb, &idb, &gid, &pot, 0);
+        let ma = real_seat_marker(&ka, &pa, &wa, &ida, &idb, &gid, &pot, 0);
+        let mb = real_seat_marker(&kb, &pb, &wb, &idb, &ida, &gid, &pot, 0);
         assert!(verify_seat_marker(&ma), "a genuine seat sig verifies");
+        assert!(
+            verify_identity_binding(&ma),
+            "a genuine identity sig verifies"
+        );
         let attr = attribute_seats(&p, &pot, 0, &[ma.clone(), mb.clone()]);
         assert_eq!(attr.identity_a.as_deref(), Some(ida.as_str()));
         assert_eq!(attr.identity_b.as_deref(), Some(idb.as_str()));
@@ -1731,8 +1905,8 @@ mod tests {
         // bytes put it in slot B. And B CANNOT occupy slot A: a marker
         // pairing pubA with B's identity needs a signature by A's key over
         // B's identity, which only A can mint. Simulate the best theft
-        // available (copy A's marker, swap the identity): the sig no longer
-        // verifies and the marker is refused.
+        // available (copy A's marker, swap the identity): the seat sig no
+        // longer verifies and the marker is refused.
         let stolen = SeatMarkerRow {
             identity: idb.clone(),
             ..ma.clone()
@@ -1754,25 +1928,98 @@ mod tests {
         assert_eq!(my_seat(&p, &pot, 0, &idb, &[ma]), None);
     }
 
+    /// F1 (2026-07-28 gate, HIGH): a spiteful LOSER mints a byte-valid v2
+    /// marker naming the WINNER's identity over its OWN committed settle key
+    /// — its wallet happily seat-signs the preimage embedding the winner's
+    /// identity, so the seatSig is GENUINE. Without the identity-binding
+    /// check this landed the winner in BOTH slots, `my_seat` returned None,
+    /// and the enforced win fell back to `unresolved` — the exact injustice
+    /// #230 ships to fix, re-opened by dust. The forged marker must be
+    /// REFUSED (the loser cannot mint the WINNER's identity signature) and
+    /// the winner's attribution must survive untouched.
+    #[test]
+    fn f1_loser_forged_identity_marker_cannot_erase_the_winner() {
+        let (ka, pa) = real_key(41); // winner (seat A)
+        let (kb, pb) = real_key(42); // loser (seat B)
+        let w_winner = wallet_of(0x51);
+        let w_loser = wallet_of(0x52);
+        let winner = identity_of(&w_winner);
+        let loser = identity_of(&w_loser);
+        let gid = tx(0x01);
+        let pot = tx(0x22);
+        let p = params_with_keys(&pa, &pb);
+
+        // The winner's own honest marker.
+        let honest = real_seat_marker(&ka, &pa, &w_winner, &winner, &loser, &gid, &pot, 0);
+
+        // The forgery: identity = WINNER, key = the LOSER's committed pubB,
+        // seatSig GENUINELY made by the loser's settle key over the preimage
+        // binding the winner's identity. The best identity sig the loser can
+        // attach is one by its OWN identity wallet (or garbage) — it cannot
+        // sign as the winner.
+        let mut forged = SeatMarkerRow {
+            identity: winner.clone(),
+            opponent_identity: loser.clone(),
+            game_id: gid.clone(),
+            pot_txid: pot.clone(),
+            pot_vout: 0,
+            recovery_height: 900_000,
+            seat_settle_pubkey: pb.clone(),
+            seat_sig_hex: {
+                let preimage = seatsig_preimage(&gid, &pot, 0, &winner).unwrap();
+                let hash = bsv_rs::primitives::hash::sha256(&preimage);
+                hex::encode(kb.sign(&hash).unwrap().to_der())
+            },
+            identity_sig_hex: String::new(),
+        };
+        let challenge = potparty_v2_challenge(&forged).unwrap();
+        forged.identity_sig_hex = sign_potparty_identity(&w_loser, &gid, &challenge);
+
+        // The seatSig alone DOES verify (that is the whole attack)…
+        assert!(verify_seat_marker(&forged), "the forged seatSig is genuine");
+        // …but the identity binding refuses it: the sig is not the WINNER's.
+        assert!(!verify_identity_binding(&forged));
+
+        // Attribution: slot B stays clean of the forgery; the winner's slot
+        // A survives; my_seat still answers A — the /results outcome stays
+        // the correct chain+seatkey WIN.
+        let markers = vec![honest.clone(), forged];
+        let attr = attribute_seats(&p, &pot, 0, &markers);
+        assert_eq!(attr.identity_a.as_deref(), Some(winner.as_str()));
+        assert_eq!(attr.identity_b, None, "the forgery occupies nothing");
+        assert_eq!(my_seat(&p, &pot, 0, &winner, &markers), Some(SeatLetter::A));
+        let (o, src) = derive_outcome_with_seat(
+            Some(PotVerdict::WinnerA),
+            my_seat(&p, &pot, 0, &winner, &markers),
+            &winner,
+            &loser,
+            Some(&tx(0x33)),
+            None,
+        );
+        assert_eq!((o, src), (Outcome::Won, Some("chain+seatkey")));
+    }
+
     #[test]
     fn seat_attribution_refusals_are_exhaustive() {
         let (ka, pa) = real_key(41);
         let (_kb, pb) = real_key(42);
         let (kf, pf) = real_key(43); // a FOREIGN key, not in the lock
-        let ida = ident(0xaa);
+        let wa = wallet_of(0x51);
+        let ida = identity_of(&wa);
+        let opp = ident(0xbb);
         let gid = tx(0x01);
         let pot = tx(0x22);
         let p = params_with_keys(&pa, &pb);
 
         // (B1) a marker whose settle pubkey is NOT in the pot's lock is
-        // refused at read — even with a perfectly valid signature.
-        let foreign = real_seat_marker(&kf, &pf, &ida, &gid, &pot, 0);
+        // refused at read — even with perfectly valid signatures.
+        let foreign = real_seat_marker(&kf, &pf, &wa, &ida, &opp, &gid, &pot, 0);
         assert!(verify_seat_marker(&foreign), "the sig itself is fine…");
         let attr = attribute_seats(&p, &pot, 0, &[foreign]);
         assert_eq!(attr, SeatAttribution::default(), "…but the lock refuses it");
 
         // A marker whose seatSig does not verify is refused (tampered sig).
-        let mut bad = real_seat_marker(&ka, &pa, &ida, &gid, &pot, 0);
+        let mut bad = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &pot, 0);
         let mut sig = hex::decode(&bad.seat_sig_hex).unwrap();
         let last = sig.len() - 1;
         sig[last] ^= 0x01;
@@ -1783,16 +2030,38 @@ mod tests {
             SeatAttribution::default()
         );
 
+        // A marker whose IDENTITY sig does not verify is refused (F1) —
+        // genuine seatSig, garbage identity sig.
+        let mut no_id = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &pot, 0);
+        no_id.identity_sig_hex = "30".repeat(35);
+        assert!(verify_seat_marker(&no_id));
+        assert!(!verify_identity_binding(&no_id));
+        assert_eq!(
+            attribute_seats(&p, &pot, 0, &[no_id]),
+            SeatAttribution::default()
+        );
+
+        // …and the identity sig binds EVERY challenge field: a re-targeted
+        // recoveryHeight (not covered by the seatSig preimage) also refuses.
+        let mut retarget = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &pot, 0);
+        retarget.recovery_height += 1;
+        assert!(verify_seat_marker(&retarget)); // seat preimage unaffected
+        assert!(!verify_identity_binding(&retarget)); // challenge tampered
+        assert_eq!(
+            attribute_seats(&p, &pot, 0, &[retarget]),
+            SeatAttribution::default()
+        );
+
         // A marker for a DIFFERENT pot outpoint contributes nothing to this
         // one (and a marker for a NONEXISTENT pot simply never joins — there
         // is no params/verdict for it to attribute).
-        let other_pot = real_seat_marker(&ka, &pa, &ida, &gid, &tx(0x33), 0);
+        let other_pot = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &tx(0x33), 0);
         assert!(verify_seat_marker(&other_pot));
         assert_eq!(
             attribute_seats(&p, &pot, 0, std::slice::from_ref(&other_pot)),
             SeatAttribution::default()
         );
-        let wrong_vout = real_seat_marker(&ka, &pa, &ida, &gid, &pot, 1);
+        let wrong_vout = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &pot, 1);
         assert_eq!(
             attribute_seats(&p, &pot, 0, &[wrong_vout]),
             SeatAttribution::default()
@@ -1805,18 +2074,21 @@ mod tests {
         assert!(seatsig_preimage("nothex", &pot, 0, &ida).is_none());
         assert!(seatsig_preimage(&gid, &pot, 0, "02aabb").is_none()); // short identity
 
-        // CONFLICTING identities for one slot (two verified markers by the
-        // SAME key naming different identities — only the key holder can
-        // mint both, i.e. self-sabotage): the slot poisons to None.
-        let m1 = real_seat_marker(&ka, &pa, &ida, &gid, &pot, 0);
-        let m2 = real_seat_marker(&ka, &pa, &ident(0xcc), &gid, &pot, 0);
-        assert!(verify_seat_marker(&m2));
+        // CONFLICTING identities for one slot (two fully-verified markers by
+        // the SAME key naming different identities — only the key holder can
+        // mint both seatSigs, and each identity signs its own marker, i.e.
+        // coordinated self-sabotage): the slot poisons to None.
+        let wc = wallet_of(0x53);
+        let idc = identity_of(&wc);
+        let m1 = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &pot, 0);
+        let m2 = real_seat_marker(&ka, &pa, &wc, &idc, &opp, &gid, &pot, 0);
+        assert!(verify_seat_marker(&m2) && verify_identity_binding(&m2));
         let attr = attribute_seats(&p, &pot, 0, &[m1, m2]);
         assert_eq!(attr.identity_a, None, "conflicting slot poisons");
 
         // A degenerate lock (pubA == pubB) attributes NOTHING.
         let p_degen = params_with_keys(&pa, &pa);
-        let m = real_seat_marker(&ka, &pa, &ida, &gid, &pot, 0);
+        let m = real_seat_marker(&ka, &pa, &wa, &ida, &opp, &gid, &pot, 0);
         assert_eq!(
             attribute_seats(&p_degen, &pot, 0, &[m]),
             SeatAttribution::default()
@@ -1826,8 +2098,10 @@ mod tests {
     /// The CROSS-REPO crypto round-trip: the client's FROZEN golden v2 marker
     /// (real `@bsv/sdk` ProtoWallet output, pinned in `potParty.test.ts` and
     /// in `overlay-discovery`'s parser tests) must verify under THIS crate's
-    /// server-side ECDSA — proving the preimage layout AND the single-sha256
-    /// hash convention match the wallet byte-for-byte.
+    /// server-side crypto — BOTH signatures: the seatSig (plain ECDSA, single
+    /// sha256) AND the identity signature (BRC-42 'anyone' derivation over
+    /// the v2 challenge) — proving the preimage/challenge layouts and hash
+    /// conventions match the wallet byte-for-byte.
     #[test]
     fn golden_client_v2_marker_verifies_server_side() {
         const GOLDEN_V2_HEX: &str = "006a0f4c4f572f706f7470617274792f7632210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee520cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd04010000000428a00e002103d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee4630440220106a632f58753f6b9ebaf20d105874d3aed43c28dab90e8b6a8a51dbd610e1e402204c7837248995842ec551eb3c8510b5862f87bf0c54368534fd3d7c1e3b9a50fd473045022100d3ea901d46fa588cb2f20e0bb0a3c7e23f6320138efee69f9e506a8e79abbaa102207cfccbd475e5d9e789091acdfa7d81503b950ebf51da6a1ac9fec44c84553773";
@@ -1836,20 +2110,32 @@ mod tests {
             .expect("the golden v2 marker parses");
         let row = SeatMarkerRow {
             identity: hex::encode(&m.identity),
+            opponent_identity: hex::encode(&m.opponent),
             game_id: hex::encode(m.game_id),
             pot_txid: hex::encode(m.pot_txid),
             pot_vout: m.pot_vout,
+            recovery_height: m.recovery_height,
             seat_settle_pubkey: hex::encode(m.seat_settle_pubkey.as_ref().unwrap()),
             seat_sig_hex: hex::encode(m.seat_sig.as_ref().unwrap()),
+            identity_sig_hex: hex::encode(&m.sig),
         };
         assert!(
             verify_seat_marker(&row),
             "the client's REAL wallet-derived seat signature must verify server-side"
         );
-        // Tamper the identity → refused (the preimage binds it).
-        let mut swapped = row;
+        assert!(
+            verify_identity_binding(&row),
+            "the client's REAL identity signature must verify over the reconstructed v2 challenge"
+        );
+        // Tamper the identity → BOTH bindings refuse.
+        let mut swapped = row.clone();
         swapped.identity = hex::encode(&m.opponent);
         assert!(!verify_seat_marker(&swapped));
+        assert!(!verify_identity_binding(&swapped));
+        // Tamper a challenge-only field → the identity binding refuses.
+        let mut rh = row;
+        rh.recovery_height += 1;
+        assert!(!verify_identity_binding(&rh));
     }
 
     #[test]
@@ -1938,6 +2224,227 @@ mod tests {
         hex::encode(beef.to_binary()).to_ascii_uppercase()
     }
 
+    /// Minimal Bitcoin data push (the covenant param region uses direct
+    /// pushes only — `read_param_pushes`).
+    fn param_push(blob: &[u8]) -> Vec<u8> {
+        let mut v = vec![blob.len() as u8];
+        v.extend_from_slice(blob);
+        v
+    }
+
+    /// Minimal script-number push for a non-negative u64 (LE, sign-guarded)
+    /// — mirrors the client builder's `push_minimal_int`.
+    fn param_push_num(n: u64) -> Vec<u8> {
+        if n == 0 {
+            return vec![0x00];
+        }
+        if n <= 16 {
+            return vec![0x50 + n as u8];
+        }
+        let mut b = Vec::new();
+        let mut v = n;
+        while v > 0 {
+            b.push((v & 0xff) as u8);
+            v >>= 8;
+        }
+        if b.last().unwrap() & 0x80 != 0 {
+            b.push(0x00);
+        }
+        param_push(&b)
+    }
+
+    /// A REAL `Poc5TemplatePot` covenant lock: the frozen template's fixed
+    /// HEAD + the 10 param pushes + the fixed TAIL (the exact bytes
+    /// `is_pot_covenant_script` recognizes and the classifier reads).
+    fn covenant_lock(p: &CovenantParams) -> Vec<u8> {
+        let t = overlay_discovery::pot::POC5_TEMPLATE_HEX;
+        let head = hex::decode(&t[..t.find('<').unwrap()]).unwrap();
+        let tail = hex::decode(&t[t.rfind('>').unwrap() + 1..]).unwrap();
+        let mut s = head;
+        s.extend(param_push(&p.pub_a));
+        s.extend(param_push(&p.pub_b));
+        s.extend(param_push(&p.pub_tower));
+        s.extend(param_push(&p.pay_pkh_a));
+        s.extend(param_push(&p.pay_pkh_b));
+        s.extend(param_push(&p.rake_pkh));
+        s.extend(param_push_num(p.stake_a));
+        s.extend(param_push_num(p.stake_b));
+        s.extend(param_push_num(p.fee_sats));
+        s.extend(param_push_num(p.recovery_height));
+        s.extend(tail);
+        s
+    }
+
+    /// Serialize a bare raw tx: one input, the given outputs, a locktime.
+    fn raw_tx(
+        prev_txid_hex: &str,
+        prev_vout: u32,
+        sequence: u32,
+        outs: &[(u64, Vec<u8>)],
+        lock_time: u32,
+    ) -> Vec<u8> {
+        fn varint(v: &mut Vec<u8>, n: usize) {
+            if n < 0xfd {
+                v.push(n as u8);
+            } else {
+                v.push(0xfd);
+                v.push((n & 0xff) as u8);
+                v.push(((n >> 8) & 0xff) as u8);
+            }
+        }
+        let mut v = Vec::new();
+        v.extend_from_slice(&1u32.to_le_bytes());
+        varint(&mut v, 1);
+        let mut prev = hex::decode(prev_txid_hex).unwrap();
+        prev.reverse();
+        v.extend_from_slice(&prev);
+        v.extend_from_slice(&prev_vout.to_le_bytes());
+        varint(&mut v, 0);
+        v.extend_from_slice(&sequence.to_le_bytes());
+        varint(&mut v, outs.len());
+        for (sats, script) in outs {
+            v.extend_from_slice(&sats.to_le_bytes());
+            varint(&mut v, script.len());
+            v.extend_from_slice(script);
+        }
+        v.extend_from_slice(&lock_time.to_le_bytes());
+        v
+    }
+
+    /// F1 END-TO-END through the REAL `/results` producer path
+    /// (`assemble_results` over a genuine covenant lock): the winner's own
+    /// v2 marker row plus the loser's FORGED identity=WINNER row (genuine
+    /// seatSig by the loser's committed key, loser-signed identity sig) —
+    /// the winner's `/results` STILL answers the correct `chain+seatkey`
+    /// win. Before the F1 fix this exact input erased the win to
+    /// `unresolved` via the both-slots collision.
+    #[test]
+    fn f1_results_end_to_end_forged_row_cannot_erase_the_chain_seatkey_win() {
+        let (ka, pa) = real_key(41);
+        let (kb, pb) = real_key(42);
+        let w_winner = wallet_of(0x51);
+        let w_loser = wallet_of(0x52);
+        let winner = identity_of(&w_winner);
+        let loser = identity_of(&w_loser);
+        let gid = tx(0x01);
+        let params = params_with_keys(&pa, &pb);
+
+        // A REAL covenant pot: funding vout 0 = the template lock over the
+        // committed params, value = stakeA + stakeB.
+        let lock = covenant_lock(&params);
+        let f_raw = raw_tx(&"11".repeat(32), 0, 0xffff_ffff, &[(1000, lock)], 0);
+        let f_id = bsv_rs::transaction::Transaction::from_binary(&f_raw)
+            .unwrap()
+            .id();
+        // The winner-A template spend: rake 10 → rakePkh, 980 → payPkhA.
+        let outs = vec![
+            (10u64, p2pkh_lock(&params.rake_pkh)),
+            (980u64, p2pkh_lock(&params.pay_pkh_a)),
+        ];
+        let s_raw = raw_tx(&f_id, 0, 0xffff_ffff, &outs, 0);
+        let s_id = bsv_rs::transaction::Transaction::from_binary(&s_raw)
+            .unwrap()
+            .id();
+
+        // The winner's HONEST v2 marker fields.
+        let honest = real_seat_marker(&ka, &pa, &w_winner, &winner, &loser, &gid, &f_id, 0);
+        // The loser's FORGED row: identity = WINNER, its own pubB + genuine
+        // seatSig over the winner-bound preimage, loser-signed identity sig.
+        let mut forged = SeatMarkerRow {
+            identity: winner.clone(),
+            opponent_identity: loser.clone(),
+            game_id: gid.clone(),
+            pot_txid: f_id.clone(),
+            pot_vout: 0,
+            recovery_height: 900_000,
+            seat_settle_pubkey: pb.clone(),
+            seat_sig_hex: {
+                let pre = seatsig_preimage(&gid, &f_id, 0, &winner).unwrap();
+                hex::encode(
+                    kb.sign(&bsv_rs::primitives::hash::sha256(&pre))
+                        .unwrap()
+                        .to_der(),
+                )
+            },
+            identity_sig_hex: String::new(),
+        };
+        forged.identity_sig_hex =
+            sign_potparty_identity(&w_loser, &gid, &potparty_v2_challenge(&forged).unwrap());
+
+        let row_of = |m: &SeatMarkerRow| ResultsRow {
+            identity: m.identity.clone(),
+            game_id: gid.clone(),
+            pot_txid: f_id.clone(),
+            pot_vout: 0,
+            recovery_height: m.recovery_height,
+            opponent_identity: m.opponent_identity.clone(),
+            spent: Some(true),
+            spending_txid: Some(s_id.clone()),
+            spent_confirmed: Some(true),
+            funding_beef_hex: Some(beef_hex_of(&f_raw)),
+            spender_beef_hex: Some(beef_hex_of(&s_raw)),
+            seat_settle_pubkey: Some(m.seat_settle_pubkey.clone()),
+            seat_sig_hex: Some(m.seat_sig_hex.clone()),
+            marker_sig_hex: Some(m.identity_sig_hex.clone()),
+        };
+
+        // NO claims at all — the loser is gone (the #276 shape).
+        let rows = vec![row_of(&honest), row_of(&forged)];
+        let entries = assemble_results(&winner, rows, &std::collections::HashMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verdict, Some(PotVerdict::WinnerA));
+        assert_eq!(
+            entries[0].outcome,
+            Outcome::Won,
+            "the forged row must not erase the win"
+        );
+        assert_eq!(entries[0].outcome_source, Some("chain+seatkey"));
+
+        // And from the LOSER's side its own seat proof honestly shows the
+        // loss (its marker, its key, the chain's verdict).
+        let loser_marker = real_seat_marker(&kb, &pb, &w_loser, &loser, &winner, &gid, &f_id, 0);
+        let entries = assemble_results(
+            &loser,
+            vec![row_of(&loser_marker)],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(entries[0].outcome, Outcome::Lost);
+        assert_eq!(entries[0].outcome_source, Some("chain+seatkey"));
+    }
+
+    /// F2 (2026-07-28 gate): the seat-marker fetch must be PER-POT windowed
+    /// with a DETERMINISTIC order — an unordered global LIMIT let junk rows
+    /// crowd the honest (oldest, funding-time) markers out of the window and
+    /// silently erase an attribution. Pin the load-bearing SQL clauses.
+    #[test]
+    fn f2_seat_markers_sql_is_per_pot_windowed_and_deterministic() {
+        let sql = seat_markers_sql(3);
+        assert_eq!(sql.matches('?').count(), 3, "one bind per pot txid");
+        assert!(
+            sql.contains("ROW_NUMBER() OVER (PARTITION BY potTxid"),
+            "per-pot window — one hot pot must never starve another: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY createdAt ASC, rowid ASC"),
+            "DETERMINISTIC oldest-first order (honest markers publish at funding, \
+             before junk can name the pot txid): {sql}"
+        );
+        assert!(
+            sql.contains(&format!("rn <= {SEAT_MARKERS_PER_POT}")),
+            "bounded per pot: {sql}"
+        );
+        assert!(sql.contains("seatSettlePubkey IS NOT NULL"));
+        assert!(
+            sql.contains("sigHex"),
+            "the F1 identity sig must be fetched"
+        );
+        // No unordered global LIMIT — the window IS the bound.
+        assert!(
+            !sql.to_ascii_uppercase().contains("LIMIT"),
+            "no raw LIMIT: {sql}"
+        );
+    }
+
     /// A tiny synthetic pot: bare-era lock is NOT used here — we build a
     /// spend-shape that stays UNRESOLVED (unknown lock), which is all the
     /// assembly plumbing needs (classification itself is pinned against the
@@ -1982,6 +2489,7 @@ mod tests {
         let opp = ident(0xbb);
         let (f_raw, f_id, s_raw, s_id) = fake_funding_and_spender();
         let row = ResultsRow {
+            identity: me.clone(),
             game_id: tx(0x01),
             pot_txid: f_id.clone(),
             pot_vout: 0,
@@ -1994,10 +2502,12 @@ mod tests {
             spender_beef_hex: Some(beef_hex_of(&s_raw)),
             seat_settle_pubkey: None,
             seat_sig_hex: None,
+            marker_sig_hex: None,
         };
         // A duplicate marker row (garbage coexists by outpoint keying) and an
         // unspent pot with no bytes at all.
         let unspent = ResultsRow {
+            identity: me.clone(),
             game_id: tx(0x02),
             pot_txid: tx(0x44),
             pot_vout: 0,
@@ -2010,6 +2520,7 @@ mod tests {
             spender_beef_hex: None,
             seat_settle_pubkey: None,
             seat_sig_hex: None,
+            marker_sig_hex: None,
         };
         let rows = vec![row.clone(), row.clone(), unspent];
         let entries = assemble_results(&me, rows, &std::collections::HashMap::new());
