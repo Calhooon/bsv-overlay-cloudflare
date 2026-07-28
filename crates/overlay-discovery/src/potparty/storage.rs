@@ -58,6 +58,16 @@ pub struct PotpartyRecord {
     /// verified CLIENT-side only (the overlay never verifies it).
     #[serde(rename = "sigHex")]
     pub sig_hex: String,
+    /// v2 only (bsv-low #230): the seat's SETTLE pubkey (33 bytes, lowercase
+    /// hex) — the key the covenant lock commits for this seat. `None` for a
+    /// v1 marker (NULL column).
+    #[serde(rename = "seatSettlePubkey", default)]
+    pub seat_settle_pubkey: Option<String>,
+    /// v2 only: the settle key's DER signature over the seat-binding
+    /// preimage (lowercase hex) — carried verbatim, verified by READERS
+    /// (the app-layer / clients), never here. `None` for v1.
+    #[serde(rename = "seatSigHex", default)]
+    pub seat_sig_hex: Option<String>,
     /// The txid carrying the marker OP_RETURN — half of the primary key.
     pub txid: String,
     /// The marker output's index within `txid` — the other half of the
@@ -248,6 +258,8 @@ mod tests {
             pot_vout: 0,
             recovery_height: 850_000,
             sig_hex: "3045ab".into(),
+            seat_settle_pubkey: None,
+            seat_sig_hex: None,
             txid: txid.into(),
             output_index: 0,
             created_at: 0, // ignored — storage assigns

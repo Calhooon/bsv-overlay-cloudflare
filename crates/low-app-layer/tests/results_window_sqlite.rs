@@ -91,6 +91,34 @@ fn file_marker(conn: &Connection, identity: &str, pot_txid: &str, marker_txid: &
     .expect("insert potparty_records");
 }
 
+/// File a `LOW/potparty/v2` marker — the #230 shape, carrying the SEAT PROOF
+/// (`seatSettlePubkey` / `seatSigHex` / `sigHex`) that `my_seat` verifies.
+fn file_v2_marker(
+    conn: &Connection,
+    identity: &str,
+    pot_txid: &str,
+    marker_txid: &str,
+    settle_pubkey: &str,
+    at: i64,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, 0, 958846, '3045id', ?5, '3045seat', ?6, 0, ?7)",
+        params![
+            identity,
+            h64(0xbb),
+            h64(0x11),
+            pot_txid,
+            settle_pubkey,
+            marker_txid,
+            at
+        ],
+    )
+    .expect("insert v2 potparty_records");
+}
+
 fn query_pot_txids(conn: &Connection, sql: &str, identity: &str) -> Vec<String> {
     let mut stmt = conn.prepare(sql).expect("prepare");
     stmt.query_map(params![identity], |r| r.get::<_, String>("potTxid"))
@@ -380,4 +408,87 @@ fn results_window_is_plan_independent_and_deterministic() {
         .position(|(t, _)| ghosts.contains(t))
         .expect("unindexed pots are still returned");
     assert_eq!(first_ghost, 40, "all 40 real pots rank ahead of all ghosts");
+}
+
+/// #230 INTERACTION — a seat that published v1 at funding and v2 on republish
+/// must not lose its SEAT PROOF to the per-pot collapse. The v2 row is the one
+/// carrying `seatSettlePubkey`/`seatSigHex`/`sigHex`, and `assemble_results`
+/// builds its seat-marker map from the rows this query returns; collapsing to
+/// the OLDEST row unconditionally would have dropped a genuine proof and
+/// reopened the #276 injustice through the back door.
+#[test]
+fn a_v2_seat_proof_outranks_the_callers_older_v1_row() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    let settle = format!("02{}", "5e".repeat(32));
+    insert_pot(&conn, &pot, 1_000, true);
+    // v1 at funding…
+    file_marker(&conn, &victim, &pot, "txV1", 1_001);
+    // …v2 on republish, later.
+    file_v2_marker(&conn, &victim, &pot, "txV2", &settle, 4_000);
+
+    let sql = results_sql();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map(params![victim], |r| {
+            Ok((
+                r.get::<_, String>("potTxid")?,
+                r.get::<_, Option<String>>("seatSettlePubkey")?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one row per pot");
+    assert_eq!(rows[0].0, pot);
+    assert_eq!(
+        rows[0].1.as_deref(),
+        Some(settle.as_str()),
+        "the v2 seat proof survives the collapse"
+    );
+}
+
+/// …and the v2 preference is not itself a front-run: an attacker's LATER v2
+/// marker cannot displace the caller's own EARLIER v2 marker. Within the v2
+/// tier the order is still oldest-first, and the honest seat publishes before
+/// anyone else can know the pot txid.
+#[test]
+fn a_later_forged_v2_marker_cannot_displace_the_honest_v2_row() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    let honest_settle = format!("02{}", "5e".repeat(32));
+    let forged_settle = format!("03{}", "f0".repeat(32));
+    insert_pot(&conn, &pot, 1_000, true);
+    file_v2_marker(&conn, &victim, &pot, "txHONESTV2", &honest_settle, 1_001);
+    for i in 0..50u32 {
+        file_v2_marker(
+            &conn,
+            &victim,
+            &pot,
+            &format!("txFORGED{i:03}"),
+            &forged_settle,
+            5_000 + i64::from(i),
+        );
+    }
+
+    let sql = results_sql();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    // `results_sql` does not expose the marker txid, so the committed settle
+    // key is the discriminator — it is exactly what `my_seat` matches against
+    // the pot lock, so it is also the field that matters.
+    let rows: Vec<Option<String>> = stmt
+        .query_map(params![victim], |r| {
+            r.get::<_, Option<String>>("seatSettlePubkey")
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "51 rows, one pot ⇒ one slot");
+    assert_eq!(
+        rows[0].as_deref(),
+        Some(honest_settle.as_str()),
+        "the HONEST seat proof represents the pot, not the 50 later forgeries"
+    );
 }

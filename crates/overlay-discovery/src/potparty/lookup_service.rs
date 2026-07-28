@@ -98,6 +98,9 @@ impl LookupService for PotpartyLookupService {
             pot_vout: marker.pot_vout,
             recovery_height: marker.recovery_height,
             sig_hex: hex::encode(&marker.sig),
+            // v2 (#230) seat-binding fields — None for a v1 marker.
+            seat_settle_pubkey: marker.seat_settle_pubkey.as_ref().map(hex::encode),
+            seat_sig_hex: marker.seat_sig.as_ref().map(hex::encode),
             txid: txid.to_string(),
             output_index,
             created_at: 0, // assigned by the storage layer at insert
@@ -175,6 +178,11 @@ impl LookupService for PotpartyLookupService {
                     "potVout": r.pot_vout,
                     "recoveryHeight": r.recovery_height,
                     "sigHex": r.sig_hex,
+                    // v2 (#230): ALWAYS emitted, null for a v1 row — absent
+                    // and null must stay distinguishable on the wire (the
+                    // cardsHex lesson, bsv-low #276).
+                    "seatSettlePubkey": r.seat_settle_pubkey,
+                    "seatSigHex": r.seat_sig_hex,
                     "txid": r.txid,
                     "outputIndex": r.output_index,
                     "createdAt": r.created_at,
@@ -342,6 +350,59 @@ mod tests {
         assert_eq!(e["sigHex"], hex::encode(golden_sig()));
         assert_eq!(e["txid"], "markerTx1");
         assert!(e["createdAt"].is_i64());
+        // A v1 row carries EXPLICIT nulls for the v2 fields (present, null —
+        // never absent; the wire distinguishes them).
+        let obj = e.as_object().unwrap();
+        assert!(obj.contains_key("seatSettlePubkey"));
+        assert_eq!(e["seatSettlePubkey"], serde_json::Value::Null);
+        assert!(obj.contains_key("seatSigHex"));
+        assert_eq!(e["seatSigHex"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn v2_marker_admitted_and_answer_carries_seat_binding() {
+        use super::super::tests::{golden_marker_v2, golden_settle_pubkey};
+        let (svc, storage) = make_service_with_storage();
+        let script = golden_marker_v2(&golden_game_id(), &golden_pot_txid(), 3);
+        svc.output_admitted_by_topic(&admit("markerTxV2", 0, script))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 1);
+
+        let arr = party_for(&svc, &golden_identity_hex(), None).await;
+        let e = &arr[0];
+        assert_eq!(e["identity"], golden_identity_hex());
+        assert_eq!(e["gameId"], "11".repeat(32));
+        assert_eq!(e["potTxid"], "22".repeat(32));
+        // The seat-binding fields ride back VERBATIM (never verified here —
+        // the app-layer reader verifies).
+        assert_eq!(e["seatSettlePubkey"], hex::encode(golden_settle_pubkey()));
+        assert_eq!(e["seatSigHex"], hex::encode(golden_sig()));
+
+        // byPot surfaces them too.
+        let arr = by_pot(&svc, &"22".repeat(32), 3).await;
+        assert_eq!(
+            arr[0]["seatSettlePubkey"],
+            hex::encode(golden_settle_pubkey())
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_replay_of_same_outpoint_is_idempotent() {
+        use super::super::tests::golden_marker_v2;
+        let (svc, storage) = make_service_with_storage();
+        let script = golden_marker_v2(&golden_game_id(), &golden_pot_txid(), 0);
+        // The SAME output submitted twice (risk register B5: a replayed v2
+        // marker must be a no-op — outpoint-keyed dedup).
+        svc.output_admitted_by_topic(&admit("txSAME", 0, script.clone()))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit("txSAME", 0, script))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 1);
+        let arr = party_for(&svc, &golden_identity_hex(), None).await;
+        assert_eq!(arr.as_array().unwrap().len(), 1);
     }
 
     // ── partyFor filters by identity only (not the opponent's marker) ─────

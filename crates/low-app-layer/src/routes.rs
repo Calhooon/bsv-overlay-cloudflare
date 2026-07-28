@@ -24,12 +24,11 @@ use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
 
 use crate::logic::{
-    aggregate_leaderboard_with_verdicts, assemble_pots_view, assemble_recovery_view,
-    assemble_statuses, batch_where_sql, beef_body, chunk_outpoints, clamp_leaderboard_limit,
-    decode_beef_hex, health_body, leaderboard_body, leaderboard_pot_outpoints, parse_outpoints,
-    parse_present_height, pots_view_body, pots_view_join_sql, recovery_view_body,
-    recovery_view_sql, tip_body, utxo_status_body, valid_identity, valid_txid, Outpoint,
-    PotRecordRow, PotsViewRow, RecoveryRow, ResultMarkerRow,
+    assemble_pots_view, assemble_recovery_view, assemble_statuses, batch_where_sql, beef_body,
+    chunk_outpoints, clamp_leaderboard_limit, decode_beef_hex, health_body, leaderboard_body,
+    leaderboard_pot_outpoints, parse_outpoints, parse_present_height, pots_view_body,
+    pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body, utxo_status_body,
+    valid_identity, valid_txid, Outpoint, PotRecordRow, PotsViewRow, RecoveryRow, ResultMarkerRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -614,9 +613,22 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     // marker order), pot_beefs fetched in ≤45-bind chunks (the D1 param-cap
     // discipline); any fault only omits classifications (counting falls back
     // to the pre-#227 claim rules) — never a 5xx, never a fabricated verdict.
-    let verdicts = classify_spent_pots(&db, &statuses).await;
+    let (verdicts, params_by_pot) = classify_spent_pots(&db, &statuses).await;
 
-    let lb = aggregate_leaderboard_with_verdicts(&markers, &statuses, &proof_map, limit, &verdicts);
+    // 5) #230 seat attribution: the classified pots' verified potparty-v2
+    // seat-binding markers, joined to each pot's committed lock keys.
+    // BEST-EFFORT: any fault yields an empty map (counting falls back to
+    // the claim rules) — never a 5xx, never a guessed attribution.
+    let attributions = seat_attributions(&db, &params_by_pot).await;
+
+    let lb = crate::logic::aggregate_leaderboard_attributed(
+        &markers,
+        &statuses,
+        &proof_map,
+        limit,
+        &verdicts,
+        &attributions,
+    );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
     json_response(leaderboard_body(&lb, computed_at, markers.len()), 200)
 }
@@ -635,13 +647,19 @@ struct PotBeefRowD1 {
 
 /// Classify the recorded spends of the SPENT pots in `statuses` (vout 0 —
 /// the leaderboard anchor) from their stored `pot_beefs` bytes. Returns a
-/// lowercase-pot-txid → verdict map; every fault or ambiguity simply omits
-/// that pot (see `results.rs` for the conservatism contract).
+/// lowercase-pot-txid → verdict map PLUS each classified pot's committed
+/// covenant params (the #230 attribution needs its lock keys); every fault
+/// or ambiguity simply omits that pot (see `results.rs` for the
+/// conservatism contract).
 async fn classify_spent_pots(
     db: &worker::D1Database,
     statuses: &[crate::logic::OutpointStatus],
-) -> std::collections::HashMap<String, crate::results::PotVerdict> {
+) -> (
+    std::collections::HashMap<String, crate::results::PotVerdict>,
+    std::collections::HashMap<String, crate::results::CovenantParams>,
+) {
     let mut verdicts = std::collections::HashMap::new();
+    let mut params_by_pot = std::collections::HashMap::new();
 
     // The spent pots with a recorded spender, capped, deduped, newest first.
     let mut pairs: Vec<(String, String)> = Vec::new();
@@ -660,7 +678,7 @@ async fn classify_spent_pots(
         }
     }
     if pairs.is_empty() {
-        return verdicts;
+        return (verdicts, params_by_pot);
     }
 
     // One IN-query per ≤45-key chunk over the DISTINCT txids (funding +
@@ -681,7 +699,7 @@ async fn classify_spent_pots(
             Ok(s) => s,
             Err(e) => {
                 console_warn!("[leaderboard] pot_beefs bind failed (classification omitted): {e}");
-                return verdicts;
+                return (verdicts, params_by_pot);
             },
         };
         match stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
@@ -719,9 +737,136 @@ async fn classify_spent_pots(
             marker_recovery_height: None, // no potparty join here — bare pots stay unclassified
         }) {
             verdicts.insert(pot.clone(), v);
+            // #230: keep the classified pot's COMMITTED lock params (from
+            // the hash-verified funding bytes) for the seat attribution.
+            if let Some(params) = crate::results::parse_raw_tx_verified(&fraw, pot)
+                .and_then(|f| {
+                    f.outputs
+                        .get(crate::logic::LEADERBOARD_POT_VOUT as usize)
+                        .map(|(_, lock)| lock.clone())
+                })
+                .and_then(|lock| crate::results::extract_covenant_params(&lock))
+            {
+                params_by_pot.insert(pot.clone(), params);
+            }
         }
     }
-    verdicts
+    (verdicts, params_by_pot)
+}
+
+/// `potparty_records` v2 row for the #230 attribution join.
+#[derive(Deserialize)]
+struct SeatMarkerRowD1 {
+    identity: String,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "seatSettlePubkey")]
+    seat_settle_pubkey: Option<String>,
+    #[serde(rename = "seatSigHex")]
+    seat_sig_hex: Option<String>,
+    /// The marker's IDENTITY signature — required by the F1 binding check.
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+}
+
+/// #230: build the pot → [`crate::results::SeatAttribution`] map for the
+/// CLASSIFIED pots — fetch their `LOW/potparty/v2` marker rows (chunked, D1
+/// param-cap discipline), VERIFY each seat signature (real secp256k1, in
+/// `attribute_seats`) against the pot's committed lock keys, and fold.
+/// BEST-EFFORT: any fault yields an empty/partial map — counting falls back
+/// to the claim rules, never a guess, never a 5xx.
+async fn seat_attributions(
+    db: &worker::D1Database,
+    params_by_pot: &std::collections::HashMap<String, crate::results::CovenantParams>,
+) -> std::collections::HashMap<String, crate::results::SeatAttribution> {
+    let mut out = std::collections::HashMap::new();
+    if params_by_pot.is_empty() {
+        return out;
+    }
+    let mut pots: Vec<&String> = params_by_pot.keys().collect();
+    pots.sort_unstable();
+    let mut markers_by_pot: std::collections::HashMap<String, Vec<crate::results::SeatMarkerRow>> =
+        std::collections::HashMap::new();
+    for chunk in pots.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+        // F2 (2026-07-28 gate): the fetch is filtered to each pot's OWN
+        // COMMITTED settle keys and windowed PER KEY SLOT — order is not
+        // load-bearing, because the #252 backfill publishes honest markers
+        // long after a pot's txid became public (see `seat_markers_sql`).
+        let sql = crate::results::seat_markers_sql(chunk.len());
+        // Three binds per pot: (potTxid, pubA, pubB) — the keys come from
+        // the pot's hash-verified funding lock, never from a stored claim.
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 3);
+        for pot in chunk {
+            let p = &params_by_pot[*pot];
+            binds.push(JsValue::from_str(pot));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+        }
+        let stmt = match db.prepare(sql).bind(&binds) {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[leaderboard] potparty v2 bind failed (attribution omitted): {e}");
+                return out;
+            }
+        };
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<SeatMarkerRowD1>())
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let (Some(pk), Some(seat_sig), Some(id_sig)) =
+                        (r.seat_settle_pubkey, r.seat_sig_hex, r.sig_hex)
+                    else {
+                        continue;
+                    };
+                    markers_by_pot
+                        .entry(r.pot_txid.to_ascii_lowercase())
+                        .or_default()
+                        .push(crate::results::SeatMarkerRow {
+                            identity: r.identity.to_ascii_lowercase(),
+                            opponent_identity: r.opponent_identity.to_ascii_lowercase(),
+                            game_id: r.game_id.to_ascii_lowercase(),
+                            pot_txid: r.pot_txid.to_ascii_lowercase(),
+                            pot_vout: r.pot_vout as u32,
+                            recovery_height: r.recovery_height as u32,
+                            seat_settle_pubkey: pk.to_ascii_lowercase(),
+                            seat_sig_hex: seat_sig.to_ascii_lowercase(),
+                            identity_sig_hex: id_sig.to_ascii_lowercase(),
+                        });
+                }
+            }
+            Err(e) => {
+                // A racing pre-migration schema (no seatSettlePubkey column
+                // yet) or any D1 fault: attribution is simply omitted.
+                console_warn!("[leaderboard] potparty v2 query failed (attribution partial): {e}");
+            }
+        }
+    }
+    for (pot, params) in params_by_pot {
+        let Some(markers) = markers_by_pot.get(pot) else {
+            continue;
+        };
+        let attr = crate::results::attribute_seats(
+            params,
+            pot,
+            crate::logic::LEADERBOARD_POT_VOUT,
+            markers,
+        );
+        if attr != crate::results::SeatAttribution::default() {
+            out.insert(pot.clone(), attr);
+        }
+    }
+    out
 }
 
 // ── /results — server-derived settle results (bsv-low #227) ─────────────────
@@ -730,6 +875,7 @@ async fn classify_spent_pots(
 /// caller's potparty facts + spend pointer + BOTH stored BEEFs as hex.
 #[derive(Deserialize)]
 struct ResultsRowD1 {
+    identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
     #[serde(rename = "potTxid")]
@@ -749,11 +895,21 @@ struct ResultsRowD1 {
     funding_beef: Option<String>,
     #[serde(rename = "spenderBeef")]
     spender_beef: Option<String>,
+    /// #230 v2 seat-binding fields — NULL for v1 rows; `default` tolerates a
+    /// read racing the overlay's additive migration.
+    #[serde(rename = "seatSettlePubkey", default)]
+    seat_settle_pubkey: Option<String>,
+    #[serde(rename = "seatSigHex", default)]
+    seat_sig_hex: Option<String>,
+    /// The marker's IDENTITY signature (F1 binding check).
+    #[serde(rename = "sigHex", default)]
+    sig_hex: Option<String>,
 }
 
 impl ResultsRowD1 {
     fn into_row(self) -> crate::results::ResultsRow {
         crate::results::ResultsRow {
+            identity: self.identity,
             game_id: self.game_id,
             pot_txid: self.pot_txid,
             pot_vout: self.pot_vout as u32,
@@ -764,6 +920,9 @@ impl ResultsRowD1 {
             spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
             funding_beef_hex: self.funding_beef,
             spender_beef_hex: self.spender_beef,
+            seat_settle_pubkey: self.seat_settle_pubkey,
+            seat_sig_hex: self.seat_sig_hex,
+            marker_sig_hex: self.sig_hex,
         }
     }
 }
