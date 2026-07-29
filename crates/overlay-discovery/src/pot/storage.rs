@@ -246,6 +246,26 @@ pub trait PotStorage {
         output_index: u32,
     ) -> Result<Option<PotRecord>, PotStorageError>;
 
+    /// Batched [`get_spent_status`](Self::get_spent_status) (bsv-low #289):
+    /// answers a whole outpoint set at once. The result is ALIGNED
+    /// index-for-index with the input — `None` for an outpoint we never
+    /// admitted — so the caller's per-entry fail-safe semantics
+    /// (`known: false`, never "unspent") are unchanged. This default loops
+    /// the single-row method; the D1 backend overrides it with one
+    /// `IN (VALUES …)` query per chunk instead of one round trip per
+    /// outpoint (`ls_pot` is the money landing-proof path, polled by every
+    /// crediting client).
+    async fn get_spent_statuses(
+        &self,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Option<PotRecord>>, PotStorageError> {
+        let mut out = Vec::with_capacity(outpoints.len());
+        for (txid, output_index) in outpoints {
+            out.push(self.get_spent_status(txid, *output_index).await?);
+        }
+        Ok(out)
+    }
+
     /// Spent-but-UNCONFIRMED pot records — the spend-confirmation chaser's
     /// candidate set (#186).
     ///

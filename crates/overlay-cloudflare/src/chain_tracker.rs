@@ -39,6 +39,46 @@ pub struct WorkerChainTracker {
     /// `base_url` still supplies the request URL (only its PATH is used by the
     /// bound service; the host is resolved via the binding).
     service: Option<worker::Fetcher>,
+    /// Per-isolate `(fetched_at_ms, height)` memo for `current_height`
+    /// (bsv-low #289): `ls_low`'s expiry filter resolves the tip on EVERY
+    /// lobby poll, which was an uncached network subrequest each time. A tip
+    /// is stale-tolerant by construction (blocks are ~10 min apart; the
+    /// expiry filter fails open on error anyway), so a [`TIP_CACHE_TTL_MS`]
+    /// memo is behaviourally invisible while removing the per-poll fetch.
+    /// SUCCESS-ONLY: an error is never cached. `is_valid_root_for_height`
+    /// (the SPV verify path) is deliberately untouched.
+    tip_cache: std::rc::Rc<std::cell::Cell<Option<(f64, u32)>>>,
+}
+
+/// How long a fetched chain tip is served from memory (30 s ≪ the ~10 min
+/// block cadence — worst case the expiry filter runs against a 30 s-old tip,
+/// strictly better than its fail-open no-filter degradation).
+const TIP_CACHE_TTL_MS: f64 = 30_000.0;
+
+/// Wall-clock ms. `worker::Date` inside the Workers runtime; std time in
+/// native unit tests (worker::Date requires a JS host).
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        worker::Date::now().as_millis() as f64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    }
+}
+
+/// Pure cache-read: `Some(height)` iff a cached entry exists and is younger
+/// than `ttl_ms`. Factored out for direct unit testing.
+fn tip_cache_read(cached: Option<(f64, u32)>, now_ms: f64, ttl_ms: f64) -> Option<u32> {
+    cached.and_then(|(at, height)| {
+        // A clock that moved backwards (now < at) reads as fresh — harmless
+        // for a 30 s tip memo, and impossible within one isolate anyway.
+        (now_ms - at < ttl_ms).then_some(height)
+    })
 }
 
 // SAFETY: wasm32 is single-threaded. There are no other threads to send to.
@@ -53,6 +93,7 @@ impl WorkerChainTracker {
         Self {
             base_url,
             service: None,
+            tip_cache: std::rc::Rc::new(std::cell::Cell::new(None)),
         }
     }
 
@@ -63,6 +104,7 @@ impl WorkerChainTracker {
         Self {
             base_url,
             service: Some(service),
+            tip_cache: std::rc::Rc::new(std::cell::Cell::new(None)),
         }
     }
 }
@@ -267,8 +309,17 @@ impl ChainTracker for WorkerChainTracker {
     {
         let base_url = self.base_url.clone();
         let service = self.service.clone();
+        let tip_cache = self.tip_cache.clone();
         Box::pin(UnsafeSendFuture(async move {
-            fetch_current_height(base_url, service).await
+            // Serve a fresh-enough memoized tip without a network subrequest
+            // (bsv-low #289 — the per-lobby-poll /getPresentHeight).
+            if let Some(height) = tip_cache_read(tip_cache.get(), now_ms(), TIP_CACHE_TTL_MS) {
+                return Ok(height);
+            }
+            let height = fetch_current_height(base_url, service).await?;
+            // Success-only write: an error result is never memoized.
+            tip_cache.set(Some((now_ms(), height)));
+            Ok(height)
         }))
     }
 }
@@ -298,5 +349,31 @@ mod root_frame_tests {
         // The security fix: a success+null body is UNVERIFIABLE → false, never
         // a fail-open true that would confirm an arbitrary root.
         assert_eq!(root_matches_frame(None, "anything"), Ok(false));
+    }
+}
+
+#[cfg(test)]
+mod tip_cache_tests {
+    use super::{tip_cache_read, TIP_CACHE_TTL_MS};
+
+    #[test]
+    fn empty_cache_misses() {
+        assert_eq!(tip_cache_read(None, 1_000.0, TIP_CACHE_TTL_MS), None);
+    }
+
+    #[test]
+    fn fresh_entry_hits_stale_entry_misses() {
+        let cached = Some((100_000.0, 900_123));
+        // Just inside the TTL — hit.
+        assert_eq!(
+            tip_cache_read(cached, 100_000.0 + TIP_CACHE_TTL_MS - 1.0, TIP_CACHE_TTL_MS),
+            Some(900_123)
+        );
+        // Exactly at the TTL — miss (strict `<`), so a wedged clock can
+        // never serve one entry forever on the boundary.
+        assert_eq!(
+            tip_cache_read(cached, 100_000.0 + TIP_CACHE_TTL_MS, TIP_CACHE_TTL_MS),
+            None
+        );
     }
 }

@@ -822,8 +822,8 @@ pub async fn lookup(engine: &Engine, mut req: Request) -> worker::Result<Respons
         .and_then(|v| v.parse::<u32>().ok())
         .map(overlay_engine::engine::HistorySelector::Depth);
 
-    match engine.lookup(&question, history_selector).await {
-        Ok(answer) => {
+    match engine.lookup_with_txids(&question, history_selector).await {
+        Ok((answer, txids)) => {
             if !aggregation {
                 let count = match &answer {
                     LookupAnswer::OutputList { outputs } => outputs.len(),
@@ -837,7 +837,7 @@ pub async fn lookup(engine: &Engine, mut req: Request) -> worker::Result<Respons
             match answer {
                 LookupAnswer::OutputList { outputs } => {
                     worker::console_log!("POST /lookup -> 200 (binary, {} outputs)", outputs.len());
-                    match serialize_aggregated_lookup(&outputs) {
+                    match serialize_aggregated_lookup(&outputs, &txids) {
                         Ok(bytes) => binary_response(bytes),
                         Err(msg) => {
                             worker::console_log!(
@@ -865,14 +865,21 @@ pub async fn lookup(engine: &Engine, mut req: Request) -> worker::Result<Respons
 
 /// Serialize an OutputList into the aggregated binary lookup format.
 ///
-/// For each output, parses the BEEF to extract the txid (32 raw bytes),
-/// then writes the output metadata followed by merged BEEF data.
+/// For each output, writes the txid (32 raw bytes) and output metadata,
+/// followed by merged BEEF data.
+///
+/// `txids` is the engine-supplied txid per output (aligned index-for-index —
+/// it is the storage primary key the row was hydrated by), so the txid is
+/// written directly instead of re-derived via a full BEEF parse plus a
+/// double-SHA256 per output (bsv-low #289). A missing/malformed entry falls
+/// back to the old parse-and-hash path — defense, not an expected route.
 ///
 /// Individual BEEFs from each OutputListItem are merged into a single BEEF
 /// using `Beef::merge_beef()`, matching the TS `beef.mergeTransaction()`
 /// behavior (issue #17).
 fn serialize_aggregated_lookup(
     outputs: &[overlay_engine::types::OutputListItem],
+    txids: &[String],
 ) -> Result<Vec<u8>, String> {
     use bsv_rs::transaction::Beef;
 
@@ -884,24 +891,28 @@ fn serialize_aggregated_lookup(
     // Merged BEEF accumulator — start with the first output's BEEF and merge the rest.
     let mut merged_beef: Option<Beef> = None;
 
-    for output in outputs {
-        // Parse BEEF to get the transaction and its txid
-        let tx = bsv_rs::transaction::Transaction::from_beef(&output.beef, None)
-            .map_err(|e| format!("Failed to parse BEEF: {e}"))?;
-
-        // tx.id() returns hex string of reversed hash (standard txid format).
-        // We need the raw 32 bytes in the same byte order as TS `tx.id()` which
-        // returns a 32-byte array (little-endian txid, i.e. reversed double-SHA256).
-        let txid_hex = tx.id();
-        let txid_bytes =
-            hex::decode(&txid_hex).map_err(|e| format!("Failed to decode txid hex: {e}"))?;
-
-        if txid_bytes.len() != 32 {
-            return Err(format!(
-                "Unexpected txid length: {} (expected 32)",
-                txid_bytes.len()
-            ));
-        }
+    for (i, output) in outputs.iter().enumerate() {
+        // The engine handed us this row's txid (its storage primary key);
+        // hex-decode it directly. tx.id() returns the same standard txid hex,
+        // so the bytes written are identical to the old parse-and-hash path.
+        let txid_bytes = match txids.get(i).and_then(|t| hex::decode(t).ok()) {
+            Some(bytes) if bytes.len() == 32 => bytes,
+            _ => {
+                // Fallback: parse the BEEF and hash — the pre-#289 path.
+                let tx = bsv_rs::transaction::Transaction::from_beef(&output.beef, None)
+                    .map_err(|e| format!("Failed to parse BEEF: {e}"))?;
+                let txid_hex = tx.id();
+                let bytes = hex::decode(&txid_hex)
+                    .map_err(|e| format!("Failed to decode txid hex: {e}"))?;
+                if bytes.len() != 32 {
+                    return Err(format!(
+                        "Unexpected txid length: {} (expected 32)",
+                        bytes.len()
+                    ));
+                }
+                bytes
+            }
+        };
 
         // Write 32-byte txid
         buf.extend_from_slice(&txid_bytes);

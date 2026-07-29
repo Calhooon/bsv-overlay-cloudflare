@@ -41,6 +41,11 @@ use tracing::debug;
 use super::is_pot_covenant_script;
 use super::storage::{PotQuery, PotRecord, PotStorage};
 
+/// Hard cap on outpoints per `spentStatus` query (bsv-low #291). Requests
+/// over the cap are refused with an explicit `InvalidQuery` — this is the
+/// money landing-proof path, so the answer is never silently truncated.
+pub const MAX_SPENT_STATUS_OUTPOINTS: usize = 100;
+
 /// POT Lookup Service — indexes pot spends and answers spent-status queries.
 pub struct PotLookupService {
     storage: Rc<dyn PotStorage>,
@@ -397,18 +402,36 @@ impl LookupService for PotLookupService {
 
         let PotQuery::SpentStatus { outpoints } = query;
 
+        // Bound the request array (bsv-low #291): this is a MONEY answer, so
+        // an over-cap request is an EXPLICIT InvalidQuery — never a silent
+        // truncation that could hide a landing proof from a crediting
+        // client. Legitimate clients ask about a handful of pots per call.
+        if outpoints.len() > MAX_SPENT_STATUS_OUTPOINTS {
+            return Err(LookupServiceError::InvalidQuery(format!(
+                "at most {MAX_SPENT_STATUS_OUTPOINTS} outpoints per query \
+                 (got {}) — split the request",
+                outpoints.len()
+            )));
+        }
+
+        // txids are canonical lowercase hex on-chain; normalize the query
+        // so an uppercase-hex client still matches the stored record.
+        let keys: Vec<(String, u32)> = outpoints
+            .iter()
+            .map(|op| (op.txid.to_ascii_lowercase(), op.vout))
+            .collect();
+
+        // ONE batched storage call for the whole set (bsv-low #289) —
+        // results aligned index-for-index with the request.
+        let records = self
+            .storage
+            .get_spent_statuses(&keys)
+            .await
+            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+
         // Build an input-ordered array: one entry per requested outpoint.
         let mut entries = Vec::with_capacity(outpoints.len());
-        for op in &outpoints {
-            // txids are canonical lowercase hex on-chain; normalize the query
-            // so an uppercase-hex client still matches the stored record.
-            let key = op.txid.to_ascii_lowercase();
-            let record: Option<PotRecord> = self
-                .storage
-                .get_spent_status(&key, op.vout)
-                .await
-                .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
-
+        for (op, record) in outpoints.iter().zip(records) {
             // Fail-safe: an outpoint we never admitted is `known:false` with
             // null spent/spendingTxid/spentConfirmed — never assert
             // "unspent" for an output we never saw.
@@ -1431,5 +1454,33 @@ mod tests {
         let svc = make_service();
         let arr = spent_status(&svc, serde_json::json!([])).await;
         assert!(arr.as_array().unwrap().is_empty());
+    }
+
+    /// #291: an over-cap request is an EXPLICIT error, never a silent
+    /// truncation — this is the money landing-proof path, so a dropped
+    /// entry must be impossible (a client would read an absent entry as
+    /// "unknown" and could stall a credit forever).
+    #[tokio::test]
+    async fn over_cap_outpoints_is_an_explicit_invalid_query() {
+        let svc = make_service();
+        let at_cap: Vec<_> = (0..MAX_SPENT_STATUS_OUTPOINTS)
+            .map(|i| serde_json::json!({"txid": format!("{i:064x}"), "vout": 0}))
+            .collect();
+        // Exactly at the cap: fine (every entry answered).
+        let arr = spent_status(&svc, serde_json::json!(at_cap)).await;
+        assert_eq!(arr.as_array().unwrap().len(), MAX_SPENT_STATUS_OUTPOINTS);
+
+        // One over: refused loudly.
+        let mut over = at_cap;
+        over.push(serde_json::json!({"txid": "ff".repeat(32), "vout": 0}));
+        let q = LookupQuestion::new(
+            "ls_pot",
+            serde_json::json!({"type": "spentStatus", "outpoints": over}),
+        );
+        let err = svc.lookup(&q).await.unwrap_err();
+        assert!(
+            matches!(err, LookupServiceError::InvalidQuery(_)),
+            "expected InvalidQuery, got {err:?}"
+        );
     }
 }
