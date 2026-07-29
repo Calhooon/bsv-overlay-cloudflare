@@ -63,7 +63,7 @@ impl MockTopicManager {
 impl TopicManager for MockTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        _beef: &[u8],
+        _tx: &bsv_rs::transaction::Transaction,
         _prev: &[u8],
         _ocv: Option<&[u8]>,
         _mode: SubmitMode,
@@ -867,7 +867,7 @@ impl RetainingTopicManager {
 impl TopicManager for RetainingTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        _beef: &[u8],
+        _tx: &bsv_rs::transaction::Transaction,
         previous_coins: &[u8],
         _ocv: Option<&[u8]>,
         _mode: SubmitMode,

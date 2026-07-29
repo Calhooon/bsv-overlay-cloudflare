@@ -61,7 +61,7 @@ impl TrackingTopicManager {
 impl TopicManager for TrackingTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        _beef: &[u8],
+        _tx: &bsv_rs::transaction::Transaction,
         previous_coins: &[u8],
         _ocv: Option<&[u8]>,
         _mode: SubmitMode,

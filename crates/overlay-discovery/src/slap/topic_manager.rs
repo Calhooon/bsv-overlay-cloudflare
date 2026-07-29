@@ -38,19 +38,12 @@ impl Default for SLAPTopicManager {
 impl TopicManager for SLAPTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        beef: &[u8],
+        tx: &Transaction,
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
-
-        let tx = match Transaction::from_beef(beef, None) {
-            Ok(tx) => tx,
-            Err(e) => {
-                return Err(TopicManagerError::InvalidBeef(e.to_string()));
-            }
-        };
 
         for (i, output) in tx.outputs.iter().enumerate() {
             match Self::validate_slap_output(output) {

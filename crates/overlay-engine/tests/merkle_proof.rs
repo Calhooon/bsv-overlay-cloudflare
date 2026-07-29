@@ -36,7 +36,7 @@ struct AdmitAllTM;
 impl TopicManager for AdmitAllTM {
     async fn identify_admissible_outputs(
         &self,
-        _: &[u8],
+        _: &bsv_rs::transaction::Transaction,
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,

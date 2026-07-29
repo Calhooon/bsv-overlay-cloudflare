@@ -652,7 +652,10 @@ impl Engine {
             let manager = &self.managers[topic];
             match manager
                 .identify_admissible_outputs(
-                    &tagged_beef.beef,
+                    // The ONE engine parse of the submitted BEEF, shared by
+                    // every topic on this submit (bsv-low #289 — managers
+                    // used to re-parse the same bytes independently).
+                    &tx,
                     &previous_coins
                         .iter()
                         .flat_map(|i| i.to_le_bytes())
@@ -2161,7 +2164,7 @@ mod tests {
     impl TopicManagerTrait for MockTopicManager {
         async fn identify_admissible_outputs(
             &self,
-            _beef: &[u8],
+            _tx: &Transaction,
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
