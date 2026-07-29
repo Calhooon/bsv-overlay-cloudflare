@@ -680,6 +680,17 @@ pub struct SpendConfirmSummary {
 /// FAIL-CLOSED: a spend the fetcher can't verify against chaintracks is left
 /// unconfirmed (retried next tick), NEVER latched on a courier's word. Bounded
 /// by `limit`.
+///
+/// NOTE (2026-07-28 gate, MEDIUM-2 sibling — deliberately NOT CAS-guarded
+/// here): unlike the #284 backfill's verdict write, this pass's confirmed
+/// write is justified by a FRESH SPV verification of exactly the spender it
+/// writes — `verified_proof_for(rec.spending_txid)` proved THAT txid mined,
+/// which is chain truth, so last-confirmed-wins re-asserting it over a
+/// racing UNCONFIRMED displacement is correct, not stale. The residual is
+/// the narrow window where a DIFFERENT spender was CONFIRMED in-flight (two
+/// verified-mined spenders of one outpoint can only coexist across a reorg);
+/// that pre-existing base-branch class is left for a follow-up issue rather
+/// than folded into #284.
 pub async fn complete_spend_confirmations(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn AncestorFetcher,
@@ -922,18 +933,25 @@ pub async fn backfill_decoded_params(
         let Some(verdict) = classify_covenant(&params, &spender, pot_input_sequence) else {
             continue; // non-template spend — honestly unresolved
         };
-        // Store under the row's OWN confirmed flag: the confirmed-guard
-        // semantics hold (if a confirmed pointer landed since our read, an
-        // unconfirmed write here is refused; a confirmed re-write with the
-        // same pointer is idempotent). No height (this pass verified none).
+        // GUARDED CAS write (gate MEDIUM-2, 2026-07-28): the candidate read
+        // and this write are separated by several awaits, so the pointer may
+        // have MOVED (e.g. a reorg-confirmed S2 landed). A plain mark_spent
+        // echoing the stale read (`row.spent_confirmed` + the read-time
+        // spender) would — on the confirmed always-write branch — reset the
+        // row back to the stale S1, and nothing would re-chase it (the #186
+        // chaser only surfaces spentConfirmed = 0 rows).
+        // `mark_verdict_for_spender` writes verdict + verdictTxid ONLY while
+        // the row's CURRENT pointer still equals the spender this verdict
+        // was computed for, and touches nothing else (not the pointer, not
+        // spentConfirmed, not the #228 spentAt anchor, not spentHeight) —
+        // a moved pointer makes it a no-op and the read-path fallback (or a
+        // later tick, if this row re-enters via its spender) covers it.
         if let Err(e) = pot_storage
-            .mark_spent(
+            .mark_verdict_for_spender(
                 &row.txid,
                 row.output_index,
                 spending_txid,
-                row.spent_confirmed,
-                Some(verdict.as_str()),
-                None,
+                verdict.as_str(),
             )
             .await
         {

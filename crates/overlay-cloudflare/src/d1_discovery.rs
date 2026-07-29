@@ -1350,13 +1350,22 @@ fn pot_err(e: String) -> PotStorageError {
 ///
 /// - confirmed: always writes and latches `spentConfirmed = 1`
 ///   (last-confirmed-wins). ONLY this branch touches `spentHeight` (a fact
-///   of the verified BUMP): `spentHeight = COALESCE(?, spentHeight)` — a
-///   `Some(h)` bind overwrites (a re-confirmed/reorged pointer carries its
-///   own height), a NULL bind keeps the stored value.
+///   of the verified BUMP), and the height RIDES THE POINTER exactly like
+///   the verdict does (gate finding LOW-1, 2026-07-28):
+///   `spentHeight = CASE WHEN spendingTxid = ?new THEN COALESCE(?h,
+///   spentHeight) ELSE ?h END` — a re-confirm of the SAME pointer keeps the
+///   stored height when the caller has none (COALESCE), but a write that
+///   CHANGES the pointer RESETS the height to the incoming value (including
+///   NULL: an unparseable-bump S2 must never inherit S1's height and serve
+///   it as its own `at.height`). Column refs in SET expressions are the
+///   PRE-update values, so `spendingTxid` here is the stored pointer.
 /// - unconfirmed: the `AND spentConfirmed = 0` guard makes an unconfirmed
 ///   claim a no-op against a confirmed pointer, while preserving
-///   last-writer-wins among unconfirmed claims; `spentConfirmed` (and
-///   `spentHeight`) untouched.
+///   last-writer-wins among unconfirmed claims; `spentConfirmed` untouched,
+///   and `spentHeight` untouched too — safe, because a height is only ever
+///   written by a confirmed write, which latches the flag, after which no
+///   unconfirmed write can be accepted (so an accepted unconfirmed write
+///   always meets `spentHeight IS NULL`).
 ///
 /// # #284 verdict atomicity (`with_verdict`)
 ///
@@ -1370,8 +1379,8 @@ fn pot_err(e: String) -> PotStorageError {
 /// a pointer change under `false` deliberately leaves a stale verdict
 /// behind, neutralized by the reader's `verdictTxid == spendingTxid` check.
 ///
-/// Bind order: `spendingTxid, [verdict, verdictTxid,] [spentHeight,] txid,
-/// outputIndex`.
+/// Bind order: `spendingTxid, [verdict, verdictTxid,] [confirmed only:
+/// spendingTxid, spentHeight, spentHeight,] txid, outputIndex`.
 ///
 /// Both branches stamp `spentAt = unixepoch()` (#228 backstop age anchor):
 /// every ACCEPTED spend write resets the age, so the poll chaser's gate
@@ -1382,12 +1391,15 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
         (true, true) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
                  spentAt = unixepoch(), verdict = ?, verdictTxid = ?, \
-                 spentHeight = COALESCE(?, spentHeight) \
+                 spentHeight = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spentHeight) ELSE ? END \
              WHERE txid = ? AND outputIndex = ?"
         }
         (true, false) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
-                 spentAt = unixepoch(), spentHeight = COALESCE(?, spentHeight) \
+                 spentAt = unixepoch(), \
+                 spentHeight = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spentHeight) ELSE ? END \
              WHERE txid = ? AND outputIndex = ?"
         }
         (false, true) => {
@@ -1402,13 +1414,38 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     }
 }
 
+/// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
+/// GUARDED COMPARE-AND-SET that attaches a verdict to the pointer it was
+/// computed for — and touches NOTHING else. `WHERE … AND spendingTxid = ?`
+/// makes a stale candidate-read harmless: if the pointer moved (a
+/// reorg-confirmed S2 landing between the backfill's read and write), the
+/// WHERE misses and the write is a NO-OP — the backfill can never displace a
+/// newer pointer, never flip `spentConfirmed`, never reset the #228
+/// `spentAt` age anchor, and never attach a verdict to a spender it was not
+/// computed from (verdictTxid is bound to the same guarded pointer).
+///
+/// Bind order: `verdict, spendingTxid (verdictTxid), txid, outputIndex,
+/// spendingTxid (guard)`.
+pub fn verdict_cas_sql() -> &'static str {
+    "UPDATE pot_records SET verdict = ?, verdictTxid = ? \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
+}
+
 /// The #284 `store_record` upsert: insert-if-absent for the SPEND fields,
-/// COALESCE backfill for the DECODED columns. The conflict update touches
+/// STORED-WINS fill for the DECODED columns. The conflict update touches
 /// ONLY decoded columns — never `spent` / `spendingTxid` / `spentConfirmed`
 /// / `spentAt` / `verdict` / `verdictTxid` / `spentHeight` / `createdAt`
-/// (re-admission must never regress spend state), and COALESCE means a
-/// replay lacking data never nulls a stored value; `paramsDecoded` only
-/// latches 0 → 1.
+/// (re-admission must never regress spend state).
+///
+/// STORED-WINS argument order (gate finding MEDIUM-1, 2026-07-28):
+/// `X = COALESCE(X, excluded.X)` — an incoming value only ever FILLS an
+/// absent stored one; it can never overwrite. The first ship had the
+/// arguments reversed (incoming-wins), which let a later store with a
+/// DIFFERENT value — including an empty string, which is not NULL —
+/// silently replace an already-decoded param. Stored-wins matches the trait
+/// doc, `MemoryPotStorage`, and least privilege: a decoded param is a pure
+/// function of the admitted lock bytes, so the first decode is as good as
+/// any and nothing may rewrite it. `paramsDecoded` only latches 0 → 1.
 pub fn store_record_sql() -> &'static str {
     "INSERT INTO pot_records \
          (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt, \
@@ -1416,18 +1453,18 @@ pub fn store_record_sql() -> &'static str {
           stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded) \
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
      ON CONFLICT(txid, outputIndex) DO UPDATE SET \
-         lockKind = COALESCE(excluded.lockKind, lockKind), \
-         pubA = COALESCE(excluded.pubA, pubA), \
-         pubB = COALESCE(excluded.pubB, pubB), \
-         pubTower = COALESCE(excluded.pubTower, pubTower), \
-         payPkhA = COALESCE(excluded.payPkhA, payPkhA), \
-         payPkhB = COALESCE(excluded.payPkhB, payPkhB), \
-         rakePkh = COALESCE(excluded.rakePkh, rakePkh), \
-         stakeA = COALESCE(excluded.stakeA, stakeA), \
-         stakeB = COALESCE(excluded.stakeB, stakeB), \
-         feeSats = COALESCE(excluded.feeSats, feeSats), \
-         recoveryHeight = COALESCE(excluded.recoveryHeight, recoveryHeight), \
-         potSats = COALESCE(excluded.potSats, potSats), \
+         lockKind = COALESCE(lockKind, excluded.lockKind), \
+         pubA = COALESCE(pubA, excluded.pubA), \
+         pubB = COALESCE(pubB, excluded.pubB), \
+         pubTower = COALESCE(pubTower, excluded.pubTower), \
+         payPkhA = COALESCE(payPkhA, excluded.payPkhA), \
+         payPkhB = COALESCE(payPkhB, excluded.payPkhB), \
+         rakePkh = COALESCE(rakePkh, excluded.rakePkh), \
+         stakeA = COALESCE(stakeA, excluded.stakeA), \
+         stakeB = COALESCE(stakeB, excluded.stakeB), \
+         feeSats = COALESCE(feeSats, excluded.feeSats), \
+         recoveryHeight = COALESCE(recoveryHeight, excluded.recoveryHeight), \
+         potSats = COALESCE(potSats, excluded.potSats), \
          paramsDecoded = CASE WHEN excluded.paramsDecoded = 1 THEN 1 ELSE paramsDecoded END"
 }
 
@@ -1483,17 +1520,42 @@ impl PotStorage for D1PotStorage {
         //
         // #284: a Some(verdict) rides the SAME statement as the pointer
         // (verdictTxid bound to the spending txid — atomic); None leaves
-        // verdict/verdictTxid entirely out of the SET. spentHeight is
-        // COALESCE-bound on the confirmed branch only (see mark_spent_sql).
+        // verdict/verdictTxid entirely out of the SET. spentHeight (the
+        // confirmed branch only) RIDES THE POINTER: same-pointer re-confirm
+        // keeps-or-updates (COALESCE), a pointer change resets it to the
+        // incoming value (gate LOW-1) — see mark_spent_sql for the CASE.
         let mut q = Query::new(mark_spent_sql(confirmed, verdict.is_some())).bind(spending_txid);
         if let Some(v) = verdict {
             q = q.bind(v).bind(spending_txid);
         }
         if confirmed {
-            q = q.bind(spent_height);
+            // CASE binds: the same-pointer probe, the COALESCE height, the
+            // ELSE (pointer-changed) height.
+            q = q.bind(spending_txid).bind(spent_height).bind(spent_height);
         }
         q.bind(txid)
             .bind(output_index)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
+    }
+
+    async fn mark_verdict_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        verdict: &str,
+    ) -> Result<(), PotStorageError> {
+        // The backfill's CAS verdict write (gate MEDIUM-2): verdict +
+        // verdictTxid only, guarded on the pointer it was computed for. A
+        // moved pointer ⇒ WHERE misses ⇒ no-op (see `verdict_cas_sql`).
+        Query::new(verdict_cas_sql())
+            .bind(verdict)
+            .bind(spending_txid)
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
             .execute(&self.db)
             .await
             .map_err(pot_err)
@@ -2795,9 +2857,13 @@ mod tests {
             assert!(sql.starts_with("UPDATE pot_records"));
             assert!(sql.contains("WHERE txid = ? AND outputIndex = ?"));
             assert!(!sql.to_uppercase().contains("DELETE"));
-            // #284: spentHeight rides ONLY the confirmed branch, COALESCE'd
-            // so a NULL bind keeps the stored value.
-            assert!(sql.contains("spentHeight = COALESCE(?, spentHeight)"));
+            // #284 + gate LOW-1: spentHeight rides ONLY the confirmed branch
+            // AND rides the pointer — same-pointer keeps-or-updates
+            // (COALESCE), a pointer change resets to the incoming value.
+            assert!(sql.contains(
+                "spentHeight = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spentHeight) ELSE ? END"
+            ));
         }
     }
 
@@ -2922,8 +2988,8 @@ mod tests {
     }
 
     /// Execute the shipped `mark_spent_sql(...)` with the D1 impl's exact
-    /// bind order (spendingTxid, [verdict, verdictTxid,] [spentHeight,]
-    /// txid, outputIndex).
+    /// bind order (spendingTxid, [verdict, verdictTxid,] [confirmed only:
+    /// spendingTxid, spentHeight, spentHeight,] txid, outputIndex).
     fn exec_mark_spent(
         conn: &rusqlite::Connection,
         txid: &str,
@@ -2937,11 +3003,27 @@ mod tests {
         match (confirmed, verdict) {
             (true, Some(v)) => conn.execute(
                 sql,
-                rusqlite::params![spending_txid, v, spending_txid, spent_height, txid, vout],
+                rusqlite::params![
+                    spending_txid,
+                    v,
+                    spending_txid,
+                    spending_txid,
+                    spent_height,
+                    spent_height,
+                    txid,
+                    vout
+                ],
             ),
             (true, None) => conn.execute(
                 sql,
-                rusqlite::params![spending_txid, spent_height, txid, vout],
+                rusqlite::params![
+                    spending_txid,
+                    spending_txid,
+                    spent_height,
+                    spent_height,
+                    txid,
+                    vout
+                ],
             ),
             (false, Some(v)) => conn.execute(
                 sql,
@@ -2952,6 +3034,22 @@ mod tests {
             }
         }
         .expect("mark_spent_sql executes");
+    }
+
+    /// Execute the shipped `verdict_cas_sql()` (the backfill's guarded
+    /// verdict write) with the D1 impl's exact bind order.
+    fn exec_verdict_cas(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        spending_txid: &str,
+        verdict: &str,
+    ) {
+        conn.execute(
+            verdict_cas_sql(),
+            rusqlite::params![verdict, spending_txid, txid, vout, spending_txid],
+        )
+        .expect("verdict_cas_sql executes");
     }
 
     #[test]
@@ -3027,9 +3125,123 @@ mod tests {
         assert_eq!(r.verdict.as_deref(), Some("tie"), "None leaves the verdict");
         assert_eq!(r.verdict_txid.as_deref(), Some("settleTx"));
         assert_eq!(r.spent_height, Some(801_234));
-        // A later confirm with a NULL height keeps the stored one (COALESCE).
+        // A later confirm with a NULL height keeps the stored one (COALESCE
+        // — SAME pointer, so the height survives).
         exec_mark_spent(&conn, "potA", 0, "settleTx", true, None, None);
         assert_eq!(read_pot_row(&conn, "potA", 0).spent_height, Some(801_234));
+    }
+
+    // ── 2026-07-28 gate findings, executed against the production schema ──
+
+    /// MEDIUM-1: the upsert is STORED-WINS. An incoming Some over a
+    /// DIFFERENT stored Some must NOT overwrite (the probe that caught the
+    /// reversed COALESCE: incoming stakeA=999 overwrote stored 1000), and an
+    /// incoming EMPTY STRING — which is not NULL, so COALESCE alone never
+    /// filters it — must not overwrite a stored key either.
+    #[test]
+    fn sql_upsert_is_stored_wins_never_incoming_wins() {
+        let conn = production_schema_db();
+        let good_key = "02".repeat(33);
+        exec_store(
+            &conn,
+            "potA",
+            0,
+            1_000,
+            Some("covenant"),
+            Some(&good_key),
+            Some(1000),
+            Some(2000),
+            1,
+        );
+
+        // The overwrite attempts: a different stake, an empty-string key.
+        exec_store(&conn, "potA", 0, 2_000, Some("covenant"), Some(""), Some(999), Some(4), 1);
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.stake_a, Some(1000), "stored 1000 survives incoming 999");
+        assert_eq!(
+            r.pub_a.as_deref(),
+            Some(good_key.as_str()),
+            "incoming '' (not NULL!) never displaces a stored key"
+        );
+        assert_eq!(r.pot_sats, Some(2000));
+
+        // …and the fill direction still works: a stored NULL takes the
+        // incoming value (the whole point of the backfill upsert).
+        exec_store(&conn, "potB", 0, 1_000, None, None, None, None, 0);
+        exec_store(
+            &conn,
+            "potB",
+            0,
+            2_000,
+            Some("covenant"),
+            Some(&good_key),
+            Some(1000),
+            Some(2000),
+            1,
+        );
+        let r = read_pot_row(&conn, "potB", 0);
+        assert_eq!(r.stake_a, Some(1000));
+        assert_eq!(r.pub_a.as_deref(), Some(good_key.as_str()));
+        assert_eq!(r.params_decoded, 1);
+    }
+
+    /// MEDIUM-2: the backfill's verdict write is a guarded CAS — if the
+    /// spend pointer MOVED between the backfill's candidate read and its
+    /// write (a reorg-confirmed S2 landing in the window), the write bound
+    /// to the stale S1 is a NO-OP: S2's pointer, confirmed flag, height and
+    /// spentAt all survive untouched, and no verdict is attached to a
+    /// spender it was not computed from.
+    #[test]
+    fn sql_backfill_verdict_cas_is_a_noop_when_the_pointer_moved() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        // The backfill "reads" the row while it points at S1 (unconfirmed).
+        exec_mark_spent(&conn, "potA", 0, "settleS1", false, None, None);
+        // …then, before its write lands, a reorg-CONFIRMED S2 displaces S1.
+        exec_mark_spent(&conn, "potA", 0, "settleS2", true, None, Some(802_000));
+        let before = read_pot_row(&conn, "potA", 0);
+
+        // The backfill's write, still bound to the stale S1 → NO-OP.
+        exec_verdict_cas(&conn, "potA", 0, "settleS1", "winner-a");
+        let after = read_pot_row(&conn, "potA", 0);
+        assert_eq!(after, before, "a stale CAS write changes NOTHING");
+        assert_eq!(after.spending_txid.as_deref(), Some("settleS2"));
+        assert_eq!(after.verdict, None);
+        assert_eq!(after.spent_confirmed, 1);
+        assert_eq!(after.spent_height, Some(802_000));
+
+        // The CURRENT-pointer write DOES land (the non-race case) and
+        // touches only the verdict pair.
+        exec_verdict_cas(&conn, "potA", 0, "settleS2", "winner-b");
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.verdict.as_deref(), Some("winner-b"));
+        assert_eq!(r.verdict_txid.as_deref(), Some("settleS2"));
+        assert_eq!(r.spent_height, Some(802_000), "nothing else touched");
+    }
+
+    /// LOW-1 (the exact gate probe): confirmed S1 with height 800000, then a
+    /// confirmed S2 whose bump yielded NO height (bind NULL) — S2 must NOT
+    /// inherit S1's height (`at.height` would have served S1's height as
+    /// S2's). The height rides the pointer: a pointer change RESETS it.
+    #[test]
+    fn sql_spent_height_rides_the_pointer_never_inherited_across_spenders() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(&conn, "potA", 0, "settleS1", true, None, Some(800_000));
+        assert_eq!(read_pot_row(&conn, "potA", 0).spent_height, Some(800_000));
+
+        // Reorg-confirmed S2, bump unparseable → height bind NULL.
+        exec_mark_spent(&conn, "potA", 0, "settleS2", true, None, None);
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS2"));
+        assert_eq!(
+            r.spent_height, None,
+            "S2 never inherits S1's height — reset on pointer change"
+        );
+
+        // A pointer change WITH a height carries its own.
+        exec_mark_spent(&conn, "potA", 0, "settleS3", true, None, Some(803_000));
+        assert_eq!(read_pot_row(&conn, "potA", 0).spent_height, Some(803_000));
     }
 
     #[test]

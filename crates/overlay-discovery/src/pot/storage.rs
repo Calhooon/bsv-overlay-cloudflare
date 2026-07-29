@@ -218,9 +218,17 @@ pub trait PotStorage {
     ///   verdict); if the pointer changes under `None`, the stale verdict
     ///   deliberately remains and is neutralized by the reader's
     ///   `verdict_txid == spending_txid` equality check.
-    /// - `spent_height = Some(h)` is honored ONLY on the `confirmed = true`
-    ///   branch (a height is a fact of the verified BUMP); `None` keeps the
-    ///   stored value (COALESCE). The unconfirmed branch never touches it.
+    /// - `spent_height` is honored ONLY on the `confirmed = true` branch (a
+    ///   height is a fact of the verified BUMP), and it RIDES THE POINTER
+    ///   exactly like the verdict does (gate finding LOW-1, 2026-07-28):
+    ///   when the write keeps the SAME `spending_txid`, `None` keeps the
+    ///   stored value (COALESCE); when the write CHANGES the pointer, the
+    ///   height is RESET to the incoming value — including `None`, so a
+    ///   reorg-confirmed S2 whose bump yielded no height can never inherit
+    ///   S1's height and serve it as its own `at.height`. The unconfirmed
+    ///   branch never touches it (an accepted unconfirmed write always meets
+    ///   a NULL height — heights only ride confirmed writes, which latch the
+    ///   flag that then refuses unconfirmed writers).
     async fn mark_spent(
         &self,
         txid: &str,
@@ -290,6 +298,28 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
+    /// Attach a #284 verdict to a row via GUARDED COMPARE-AND-SET (gate
+    /// finding MEDIUM-2, 2026-07-28): sets `verdict` + `verdict_txid =
+    /// spending_txid` ONLY when the row's CURRENT spend pointer still equals
+    /// `spending_txid` — and touches NOTHING else (never the pointer, never
+    /// `spent_confirmed`, never the #228 `spent_at` age anchor, never
+    /// `spent_height`). This is the backfill's write: its candidate read and
+    /// its write are separated by awaits, so a reorg-confirmed S2 landing in
+    /// the window must make the write a NO-OP, never get displaced back to
+    /// the stale S1 the verdict was computed for. Backends that can't
+    /// enumerate may keep this default no-op — the read-path fallback still
+    /// classifies.
+    async fn mark_verdict_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        verdict: &str,
+    ) -> Result<(), PotStorageError> {
+        let _ = (txid, output_index, spending_txid, verdict);
+        Ok(())
+    }
+
     /// Rows whose #284 decode has never been attempted (`params_decoded =
     /// false`) — the lazy-backfill candidate set
     /// (`proof_fetcher::backfill_decoded_params`). Backends that enumerate
@@ -312,6 +342,17 @@ pub trait PotStorage {
     /// happens only when no row exists or the new beef is strictly LONGER
     /// than the stored one; an empty `beef` is rejected (no-op). A good row
     /// is therefore never replaced by a shorter/empty one.
+    ///
+    /// KNOWN RESIDUAL SURFACE (gate finding LOW-2, 2026-07-28; pre-existing,
+    /// documented not defended): "longer" is a byte-length proxy, not a
+    /// usefulness proof — a submitted BEEF that is LONGER yet carries less
+    /// usable data (e.g. duplicate/`TxidOnly`-encoded entries padding the
+    /// length while the subject's raw bytes are absent) can displace a
+    /// raw-carrying row. The failure direction is fail-safe only: every
+    /// consumer hash-verifies/extracts before deriving anything, so a
+    /// degraded stored BEEF makes reads degrade to unresolved/`retry` (the
+    /// proof-completion and #284 backfill passes retry forever) — it can
+    /// ERASE serving ability, never FABRICATE a fact.
     async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError>;
 
     /// The stored BEEF for `txid`, or `None` if we never stored one.
@@ -491,13 +532,21 @@ impl PotStorage for MemoryPotStorage {
                 let wrote = if confirmed {
                     // Chain truth: always write, latch spent_confirmed
                     // (last-confirmed-wins). The height rides ONLY the
-                    // confirmed branch (it is a fact of the verified BUMP);
-                    // None keeps the stored value (COALESCE).
+                    // confirmed branch (a fact of the verified BUMP) AND
+                    // rides the POINTER (gate LOW-1): same pointer ⇒
+                    // keep-or-update (None keeps); pointer change ⇒ RESET to
+                    // the incoming value (a new spender never inherits the
+                    // old spender's height).
+                    let same_pointer = r.spending_txid.as_deref() == Some(spending_txid);
                     r.spent = true;
                     r.spending_txid = Some(spending_txid.to_string());
                     r.spent_confirmed = true;
-                    if let Some(h) = spent_height {
-                        r.spent_height = Some(h);
+                    if same_pointer {
+                        if let Some(h) = spent_height {
+                            r.spent_height = Some(h);
+                        }
+                    } else {
+                        r.spent_height = spent_height;
                     }
                     true
                 } else if !r.spent_confirmed {
@@ -528,6 +577,29 @@ impl PotStorage for MemoryPotStorage {
                         .unwrap()
                         .insert((txid.to_string(), output_index), now);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_verdict_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        verdict: &str,
+    ) -> Result<(), PotStorageError> {
+        // Guarded CAS (gate MEDIUM-2): verdict + verdict_txid only, and only
+        // while the row's CURRENT pointer still equals the one the verdict
+        // was computed for. A moved pointer ⇒ no-op. Nothing else touched.
+        let mut records = self.records.lock().unwrap();
+        for r in records.iter_mut() {
+            if r.txid == txid
+                && r.output_index == output_index
+                && r.spending_txid.as_deref() == Some(spending_txid)
+            {
+                r.verdict = Some(verdict.to_string());
+                r.verdict_txid = Some(spending_txid.to_string());
             }
         }
         Ok(())
@@ -1344,6 +1416,74 @@ mod tests {
             Some("settle1"),
             "…and observably stale: verdict_txid ≠ spending_txid"
         );
+    }
+
+    #[tokio::test]
+    async fn verdict_cas_is_a_noop_when_the_pointer_moved() {
+        // 2026-07-28 gate MEDIUM-2 (memory mirror of the executed-SQL test):
+        // the backfill's guarded verdict write bound to a stale pointer must
+        // change NOTHING once a newer (reorg-confirmed) spender landed.
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleS1", false, None, None)
+            .await
+            .unwrap();
+        store
+            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000))
+            .await
+            .unwrap();
+        let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+
+        store
+            .mark_verdict_for_spender("potA", 0, "settleS1", "winner-a")
+            .await
+            .unwrap();
+        let after = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(after, before, "a stale CAS write changes NOTHING");
+        assert_eq!(after.verdict, None);
+
+        // The current-pointer write lands, touching only the verdict pair.
+        store
+            .mark_verdict_for_spender("potA", 0, "settleS2", "winner-b")
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.verdict.as_deref(), Some("winner-b"));
+        assert_eq!(r.verdict_txid.as_deref(), Some("settleS2"));
+        assert_eq!(r.spent_height, Some(802_000), "nothing else touched");
+        assert!(r.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn spent_height_rides_the_pointer_never_inherited() {
+        // 2026-07-28 gate LOW-1 (memory mirror): a confirmed S2 with NO
+        // height must not inherit S1's — the height resets on a pointer
+        // change, exactly like the verdict binding.
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleS1", true, None, Some(800_000))
+            .await
+            .unwrap();
+        store
+            .mark_spent("potA", 0, "settleS2", true, None, None)
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS2"));
+        assert_eq!(r.spent_height, None, "S2 never inherits S1's height");
+        // Same-pointer re-confirm with None still KEEPS a height.
+        store
+            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000))
+            .await
+            .unwrap();
+        store
+            .mark_spent("potA", 0, "settleS2", true, None, None)
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spent_height, Some(802_000));
     }
 
     #[tokio::test]
