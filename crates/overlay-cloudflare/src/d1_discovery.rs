@@ -2497,12 +2497,21 @@ pub fn potrefund_list_for_identity_sql() -> String {
 /// the seats themselves, and cannot spam its way in front afterwards.
 /// `rowid ASC` breaks same-second ties into a total order.
 ///
+/// `OFFSET` (bsv-low #291 gate finding M2): the byPot window is now
+/// PAGEABLE — each response stays payload-bounded (rows carry up to
+/// ~200 KB of `refundRawHex` TEXT), yet no admitted row is unreachable: a
+/// client that suspects burial pages `offset += limit` past junk to the
+/// honest markers. The `(createdAt ASC, rowid ASC)` total order makes
+/// offset pages stable — new markers only ever APPEND at the tail, so a
+/// concurrent insert can never shift rows across an already-fetched page
+/// boundary.
+///
 /// Built from the caller's own SELECT list so the tests execute the SHIPPED
 /// string rather than a transcription of it.
 pub fn list_for_pot_sql(select: &str) -> String {
     format!(
         "{select} WHERE potTxid = ? AND potVout = ? \
-         ORDER BY createdAt ASC, rowid ASC LIMIT ?"
+         ORDER BY createdAt ASC, rowid ASC LIMIT ? OFFSET ?"
     )
 }
 
@@ -2680,11 +2689,15 @@ impl PotpartyStorage for D1PotpartyStorage {
         pot_vout: u32,
         limit: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
-        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281).
+        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281). The shared
+        // SQL is offset-pageable since gate M2; the potparty wire has no
+        // offset (its rows are small — no payload-bound cap forcing one),
+        // so this binds page 0.
         let rows: Vec<PotpartyRow> = Query::new(list_for_pot_sql(POTPARTY_SELECT))
             .bind(pot_txid)
             .bind(pot_vout)
             .bind(limit as u32)
+            .bind(0u32)
             .fetch_all(&self.db)
             .await
             .map_err(potparty_err)?;
@@ -2818,12 +2831,15 @@ impl PotrefundStorage for D1PotrefundStorage {
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
-        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281).
+        // OLDEST FIRST, offset-pageable — see `list_for_pot_sql`
+        // (bsv-low #281 / #291 gate M2).
         let rows: Vec<PotrefundRow> = Query::new(list_for_pot_sql(POTREFUND_SELECT))
             .bind(pot_txid)
             .bind(pot_vout)
             .bind(limit as u32)
+            .bind(offset as u32)
             .fetch_all(&self.db)
             .await
             .map_err(potrefund_err)?;
@@ -4456,7 +4472,7 @@ mod tests {
         let sql = list_for_pot_sql(POTREFUND_SELECT);
         let mut stmt = conn.prepare(&sql).unwrap();
         let got: Vec<String> = stmt
-            .query_map(rusqlite::params![pot, 0u32, 100u32], |r| {
+            .query_map(rusqlite::params![pot, 0u32, 100u32, 0u32], |r| {
                 r.get::<_, String>("txid")
             })
             .unwrap()
@@ -4483,6 +4499,62 @@ mod tests {
             !old.contains(&"txSEATA".to_string()) && !old.contains(&"txSEATB".to_string()),
             "the legacy byPot window dropped BOTH honest refund backups"
         );
+    }
+
+    /// bsv-low #291 gate finding M2: the byPot window is offset-PAGEABLE —
+    /// a row buried behind more than MAX_LIMIT older rows (the pre-funding
+    /// front-run) is still REACHABLE, pages are disjoint and cover the set,
+    /// and each response stays LIMIT-bounded. Executes the SHIPPED SQL.
+    #[test]
+    fn by_pot_offset_pages_reach_every_row_real_sqlite() {
+        let conn = production_schema_db();
+        let pot = h64(0xbb);
+        // 130 junk rows admitted BEFORE funding (older stamps)…
+        for i in 0..130u32 {
+            insert_potrefund(
+                &conn,
+                &format!("02{:064x}", i),
+                &pot,
+                0,
+                &format!("txJUNK{i:03}"),
+                100 + i as i64,
+            );
+        }
+        // …then the honest backup, landed at funding — beyond ANY single
+        // page at MAX_LIMIT 100.
+        insert_potrefund(&conn, &victim_id(), &pot, 0, "txHONEST", 10_000);
+
+        let sql = list_for_pot_sql(POTREFUND_SELECT);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut page = |limit: u32, offset: u32| -> Vec<String> {
+            stmt.query_map(rusqlite::params![pot, 0u32, limit, offset], |r| {
+                r.get::<_, String>("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        let p1 = page(100, 0);
+        let p2 = page(100, 100);
+        assert_eq!(p1.len(), 100, "page 1 LIMIT-bounded");
+        assert_eq!(p2.len(), 31, "page 2 = the remaining 30 junk + the honest row");
+        assert!(
+            !p1.contains(&"txHONEST".to_string()),
+            "sanity: the buried row is NOT on page 1 (it needs paging)"
+        );
+        assert_eq!(
+            p2.last().unwrap(),
+            "txHONEST",
+            "the row behind >MAX_LIMIT junk is REACHABLE via offset — the \
+             cap bounds a response, never the reachable set"
+        );
+        // Disjoint + covering: pages partition the oldest-first total order.
+        let mut all: Vec<String> = p1.iter().chain(p2.iter()).cloned().collect();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(all.len(), n, "pages are disjoint (stable total order)");
+        assert_eq!(n, 131, "pages cover every admitted row");
     }
 
     /// F6 — every other key in the system is the OUTPOINT. Two genuine pots

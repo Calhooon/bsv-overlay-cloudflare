@@ -82,6 +82,14 @@ pub enum PotrefundQuery {
         #[serde(rename = "potVout")]
         pot_vout: u32,
         limit: Option<u32>,
+        /// Page start (rows to skip in the oldest-first total order),
+        /// default 0 (bsv-low #291 gate finding M2): each response is
+        /// payload-bounded by `limit`, but no admitted row is unreachable
+        /// — a client pages `offset += limit` past junk. Oldest-first with
+        /// a `rowid` tiebreak makes pages stable: new markers only append
+        /// at the tail.
+        #[serde(default)]
+        offset: Option<u32>,
     },
     /// "Which pots have I published a refund backup for?" — completeness.
     /// At most one row per pot, newest pot first (bsv-low #281).
@@ -124,18 +132,24 @@ pub trait PotrefundStorage {
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError>;
 
     /// Up to `limit` records naming the pot outpoint `(pot_txid, pot_vout)`,
-    /// **oldest first** — the pre-signed refund backup(s).
+    /// **oldest first**, starting `offset` rows into that total order — the
+    /// pre-signed refund backup(s).
     ///
     /// Oldest-first is likewise a DoS bound (bsv-low #281): the pot outpoint
     /// is public from the moment funding lands, so under newest-first `limit`
     /// dust markers naming the pot buried the only backup that can bring the
     /// money home. The honest backups are published AT funding, so
     /// oldest-first puts them permanently at the head of the window.
+    /// `offset` (bsv-low #291 gate M2) makes every admitted row REACHABLE
+    /// while each response stays payload-bounded: a client pages
+    /// `offset += limit` past pre-funding junk instead of the cap silently
+    /// amputating the tail.
     async fn list_for_pot(
         &self,
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError>;
 }
 
@@ -216,6 +230,7 @@ impl PotrefundStorage for MemoryPotrefundStorage {
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
         Ok(self
             .records
@@ -223,6 +238,7 @@ impl PotrefundStorage for MemoryPotrefundStorage {
             .unwrap()
             .iter() // OLDEST first (bsv-low #281) — insertion order
             .filter(|r| r.pot_txid == pot_txid && r.pot_vout == pot_vout)
+            .skip(offset) // page start (gate M2) — mirrors D1's OFFSET
             .take(limit)
             .cloned()
             .collect())
@@ -289,12 +305,17 @@ mod tests {
         // A different pot vout is NOT matched.
         store.store_record(&record("02aa", 1, "txC")).await.unwrap();
 
-        let rows = store.list_for_pot(&"22".repeat(32), 0, 100).await.unwrap();
+        let rows = store.list_for_pot(&"22".repeat(32), 0, 100, 0).await.unwrap();
         assert_eq!(rows.len(), 2, "both parties' backups for vout 0");
         // OLDEST first (bsv-low #281) — later dust naming this pot can never
         // bury the pre-signed refund that brings the money home.
         assert_eq!(rows[0].txid, "txA", "oldest first");
         assert_eq!(rows[1].txid, "txB");
+
+        // Offset paging (gate M2): page 2 of size 1 starts at the second row.
+        let page2 = store.list_for_pot(&"22".repeat(32), 0, 1, 1).await.unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].txid, "txB", "offset skips the head of the order");
     }
 
     #[tokio::test]
@@ -368,13 +389,34 @@ mod tests {
                 pot_txid,
                 pot_vout,
                 limit,
+                offset,
             } => {
                 assert_eq!(pot_txid.len(), 64);
                 assert_eq!(pot_vout, 3);
                 assert_eq!(limit, Some(50));
+                // Gate M2: `offset` absent on the wire defaults to the head
+                // of the window — pre-paging queries parse unchanged.
+                assert_eq!(offset, None);
             }
             other => panic!("expected ByPot, got {other:?}"),
         }
+
+        // Gate M2: the paging cursor parses.
+        let q: PotrefundQuery = serde_json::from_value(serde_json::json!({
+            "type": "byPot",
+            "potTxid": "22".repeat(32),
+            "potVout": 3,
+            "limit": 50,
+            "offset": 100
+        }))
+        .unwrap();
+        assert!(matches!(
+            q,
+            PotrefundQuery::ByPot {
+                offset: Some(100),
+                ..
+            }
+        ));
 
         // limit optional; partyFor shape.
         let q: PotrefundQuery = serde_json::from_value(serde_json::json!({
