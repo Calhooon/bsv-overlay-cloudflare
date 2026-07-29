@@ -2846,7 +2846,13 @@ struct ProofRow {
     winner: String,
     #[serde(rename = "sigHex")]
     sig_hex: Option<String>,
-    /// hex(bundle) — decoded in `into_record`.
+    /// Admission-time base64 of the bundle (bsv-low #289). NULL on rows
+    /// admitted before the `bundleB64` column existed.
+    #[serde(rename = "bundleB64")]
+    bundle_b64: Option<String>,
+    /// hex(bundle) — decoded in `into_record`. The SHIPPED select only
+    /// hauls the blob when `bundleB64` is NULL (the pre-#289 fallback);
+    /// otherwise this arrives as `''`.
     bundle: String,
     txid: String,
     #[serde(rename = "outputIndex")]
@@ -2863,16 +2869,31 @@ impl ProofRow {
             // The column is nullable in the schema but the admit path
             // always writes it; an impossible NULL reads back as "".
             sig_hex: self.sig_hex.unwrap_or_default(),
-            // hex(bundle) → bytes. The column is NOT NULL and written
-            // from parse-validated bytes; undecodable hex is impossible,
-            // but fail toward an empty bundle (which no client verify
-            // ever accepts) rather than a panic.
+            // hex(bundle) → bytes. Empty when bundleB64 answered instead
+            // (the select skips hauling the blob then). Undecodable hex is
+            // impossible (written from parse-validated bytes), but fail
+            // toward an empty bundle (which no client verify ever accepts)
+            // rather than a panic.
             bundle: hex::decode(&self.bundle).unwrap_or_default(),
+            bundle_b64: self.bundle_b64,
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
         }
     }
+}
+
+/// `ls_proof proofsFor` (bsv-low #289): prefer the admission-time
+/// `bundleB64` TEXT; haul `hex(bundle)` ONLY for pre-#289 rows where it is
+/// NULL — never both. Factored out so the real-SQLite test executes the
+/// SHIPPED string against the production schema and proves the two paths
+/// answer byte-identically.
+pub fn proof_list_for_game_winner_sql() -> &'static str {
+    "SELECT gameId, winner, sigHex, bundleB64, \
+            CASE WHEN bundleB64 IS NULL THEN hex(bundle) ELSE '' END AS bundle, \
+            txid, outputIndex, createdAt \
+     FROM proof_markers WHERE gameId = ? AND winner = ? \
+     ORDER BY createdAt DESC, rowid DESC LIMIT ?"
 }
 
 /// Cloudflare D1 implementation of the ProofStorage trait
@@ -2911,13 +2932,16 @@ impl ProofStorage for D1ProofStorage {
         // overwrite, never delete.
         Query::new(
             "INSERT OR IGNORE INTO proof_markers \
-             (gameId, winner, sigHex, bundle, txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.game_id.as_str())
         .bind(record.winner.as_str())
         .bind(record.sig_hex.as_str())
         .bind(record.bundle.clone()) // BLOB bind, like pot_beefs
+        // bsv-low #289: the admission-time base64 (the admit path always
+        // sets it; a defensive None binds NULL → the read-time fallback).
+        .bind(record.bundle_b64.as_deref())
         .bind(record.txid.as_str())
         .bind(record.output_index)
         .bind(current_unix_seconds_i64())
@@ -2932,11 +2956,7 @@ impl ProofStorage for D1ProofStorage {
         winner: &str,
         limit: usize,
     ) -> Result<Vec<ProofRecord>, ProofStorageError> {
-        let rows: Vec<ProofRow> = Query::new(
-            "SELECT gameId, winner, sigHex, hex(bundle) AS bundle, txid, outputIndex, createdAt \
-             FROM proof_markers WHERE gameId = ? AND winner = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?",
-        )
+        let rows: Vec<ProofRow> = Query::new(proof_list_for_game_winner_sql())
         .bind(game_id)
         .bind(winner)
         .bind(limit as u32)
@@ -2957,12 +2977,13 @@ mod tests {
 
     #[test]
     fn proof_row_conversion_decodes_bundle_hex() {
-        // hex(bundle) round-trips to the raw bytes; numeric columns come
-        // back as f64 from D1.
+        // Pre-#289 row shape: bundleB64 NULL, hex(bundle) hauled and
+        // decoded; numeric columns come back as f64 from D1.
         let row = ProofRow {
             game_id: "11".repeat(32),
             winner: "02aa".into(),
             sig_hex: Some("3045ab".into()),
+            bundle_b64: None,
             bundle: hex::encode(b"{\"v\":1}").to_uppercase(), // SQLite hex() is uppercase
             txid: "tx1".into(),
             output_index: 2.0,
@@ -2970,6 +2991,7 @@ mod tests {
         };
         let r = row.into_record();
         assert_eq!(r.bundle, b"{\"v\":1}");
+        assert_eq!(r.bundle_b64, None, "legacy row: service falls back to encoding");
         assert_eq!(r.output_index, 2);
         assert_eq!(r.created_at, 1_234);
         assert_eq!(r.sig_hex, "3045ab");
@@ -3570,6 +3592,67 @@ mod tests {
             "exactly the requested present outpoints — no txid-only matches, \
              no phantom rows"
         );
+    }
+
+    /// #289: the shipped `ls_proof` select answers the SAME `bundleBase64`
+    /// for a new row (admission-time `bundleB64`) and a pre-#289 legacy row
+    /// (NULL `bundleB64` → hex(bundle) fallback) — byte-identical wire
+    /// either way — and never hauls the blob when the b64 column answers.
+    #[test]
+    fn proof_list_sql_b64_and_legacy_rows_answer_identically_real_sqlite() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let conn = production_schema_db();
+        let bundle: &[u8] = b"{\"v\":1,\"proof\":true}";
+        let game = h64(0x11);
+        // New-path row: bundle BLOB + admission-time bundleB64 (as
+        // D1ProofStorage::store_record now writes).
+        conn.execute(
+            "INSERT INTO proof_markers \
+             (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
+             VALUES (?1, '02aa', 'sig', ?2, ?3, ?4, 0, 2)",
+            rusqlite::params![game, bundle, BASE64.encode(bundle), h64(0x01)],
+        )
+        .unwrap();
+        // Legacy row: same bytes, NO bundleB64 (pre-#289 writer shape).
+        conn.execute(
+            "INSERT INTO proof_markers \
+             (gameId, winner, sigHex, bundle, txid, outputIndex, createdAt) \
+             VALUES (?1, '02aa', 'sig', ?2, ?3, 0, 1)",
+            rusqlite::params![game, bundle, h64(0x02)],
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(proof_list_for_game_winner_sql())
+            .expect("shipped proof select must parse");
+        let rows: Vec<(String, Option<String>, String)> = stmt
+            .query_map(rusqlite::params![game, "02aa", 10u32], |row| {
+                Ok((
+                    row.get::<_, String>(5)?,         // txid
+                    row.get::<_, Option<String>>(3)?, // bundleB64
+                    row.get::<_, String>(4)?,         // bundle (hex or '')
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        // Newest first: the b64 row (createdAt 2), then the legacy row.
+        let (new_txid, new_b64, new_hex) = &rows[0];
+        let (old_txid, old_b64, old_hex) = &rows[1];
+        assert_eq!(new_txid, &h64(0x01));
+        assert_eq!(old_txid, &h64(0x02));
+        assert_eq!(new_hex, "", "b64 answered — the blob is NOT hauled");
+        assert!(old_b64.is_none(), "legacy row has no b64");
+
+        // The wire value each path produces (mirrors the lookup service:
+        // stored b64 preferred, else encode the decoded hex) must be
+        // byte-identical.
+        let wire_new = new_b64.clone().unwrap();
+        let wire_old = BASE64.encode(hex::decode(old_hex).unwrap());
+        assert_eq!(wire_new, wire_old, "both read paths answer the same bundleBase64");
+        assert_eq!(wire_new, BASE64.encode(bundle), "…and it is the admitted bytes");
     }
 
     // ── #290/#291: the low / reveal / collected shipped SQL ──────────────

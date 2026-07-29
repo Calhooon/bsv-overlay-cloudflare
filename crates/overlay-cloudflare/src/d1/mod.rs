@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 88;
+pub const OVERLAY_MIGRATION_COUNT: usize = 89;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -813,6 +813,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // has_proof index for this query; that one stays, additive-only list).
     "CREATE INDEX IF NOT EXISTS idx_transactions_proof_created \
      ON transactions(has_proof, created_at)",
+    // bsv-low #289: base64 of `bundle`, encoded ONCE at admission so the
+    // ls_proof read path stops triple-transcoding the blob (hex() in SQL →
+    // hex::decode → base64 per row, 2× bundle bytes on the D1 wire). A pure
+    // re-presentation of the same admitted bytes (#284 precedent); the BLOB
+    // column stays and NULL here falls back to it at read time. Additive
+    // ALTER — the runner ignores the re-run "duplicate column" error.
+    "ALTER TABLE proof_markers ADD COLUMN bundleB64 TEXT",
 ];
 
 // =============================================================================
@@ -1017,6 +1024,28 @@ mod tests {
         assert!(OVERLAY_MIGRATIONS.iter().any(|sql| sql
             .trim_start()
             .starts_with("CREATE INDEX IF NOT EXISTS idx_pot_params_undecoded")));
+    }
+
+    #[test]
+    fn proof_bundle_b64_migration_present_nullable_and_benign_class() {
+        // bsv-low #289: the admission-time base64 column on proof_markers.
+        // Additive ALTER, NULLABLE (pre-#289 rows fall back to the BLOB at
+        // read time — never erased), benign on re-run.
+        let m = OVERLAY_MIGRATIONS
+            .iter()
+            .find(|sql| {
+                sql.trim_start().starts_with("ALTER TABLE proof_markers")
+                    && sql.contains("ADD COLUMN bundleB64 TEXT")
+            })
+            .expect("missing proof_markers.bundleB64 migration");
+        assert!(
+            !m.to_uppercase().contains("NOT NULL"),
+            "proof_markers.bundleB64 must stay nullable (NULL = pre-#289 row)"
+        );
+        assert!(
+            migration_error_is_benign(m, "duplicate column name: bundleB64"),
+            "bundleB64 re-run must be the benign class"
+        );
     }
 
     #[test]
