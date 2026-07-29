@@ -1065,8 +1065,10 @@ struct LowRow {
 }
 
 impl LowRow {
-    /// `None` on an unknown recordType (can't happen — the writer only ever
-    /// stores the two known discriminators; defensive skip, never a panic).
+    /// `None` on an unknown recordType — possible only under version skew
+    /// (a discriminator written by a NEWER deploy read back after a
+    /// rollback). Callers go through [`low_records_from_rows`], which makes
+    /// the skip LOUD (gate finding L3) — never a silent vanish.
     fn into_record(self) -> Option<LowRecord> {
         Some(LowRecord {
             record_type: LowRecordType::from_str_opt(&self.record_type)?,
@@ -1080,6 +1082,37 @@ impl LowRow {
             expiry_height: self.expiry_height.map(|e| e as u32),
         })
     }
+}
+
+/// Convert `low_records` rows, LOUDLY skipping any with an unknown
+/// `recordType` discriminator (gate finding L3): a silent `filter_map` let
+/// a discriminator added writer-side before reader-side (deploy rollback /
+/// version skew) vanish rows from lobby and rejoin answers with zero
+/// signal. Good rows always survive; each skip is console-warned with its
+/// outpoint so the skew is diagnosable from logs.
+fn low_records_from_rows(rows: Vec<LowRow>) -> Vec<LowRecord> {
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let outpoint = format!("{}:{}", row.txid, row.output_index);
+        let record_type = row.record_type.clone();
+        match row.into_record() {
+            Some(record) => records.push(record),
+            None => {
+                let msg = format!(
+                    "low_records: SKIPPING row {outpoint} with unknown recordType \
+                     '{record_type}' (reader older than writer? deploy skew) — \
+                     the row is preserved in D1, only this answer omits it"
+                );
+                // worker::console_warn! requires the JS host; native (unit
+                // tests) goes to stderr.
+                #[cfg(target_arch = "wasm32")]
+                worker::console_warn!("{msg}");
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("{msg}");
+            }
+        }
+    }
+    records
 }
 
 /// Cloudflare D1 implementation of the LowStorage trait (tm_low / ls_low).
@@ -1165,7 +1198,7 @@ impl LowStorage for D1LowStorage {
             q = q.bind(p);
         }
         let rows: Vec<LowRow> = q.fetch_all(&self.db).await.map_err(low_err)?;
-        Ok(rows.into_iter().filter_map(LowRow::into_record).collect())
+        Ok(low_records_from_rows(rows))
     }
 
     async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<LowRecord>, LowStorageError> {
@@ -1174,7 +1207,7 @@ impl LowStorage for D1LowStorage {
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
-        Ok(rows.into_iter().filter_map(LowRow::into_record).collect())
+        Ok(low_records_from_rows(rows))
     }
 
     async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError> {
@@ -1183,7 +1216,7 @@ impl LowStorage for D1LowStorage {
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
-        Ok(rows.into_iter().filter_map(LowRow::into_record).collect())
+        Ok(low_records_from_rows(rows))
     }
 }
 
@@ -1538,18 +1571,6 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     }
 }
 
-/// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
-/// GUARDED COMPARE-AND-SET that attaches a verdict to the pointer it was
-/// computed for — and touches NOTHING else. `WHERE … AND spendingTxid = ?`
-/// makes a stale candidate-read harmless: if the pointer moved (a
-/// reorg-confirmed S2 landing between the backfill's read and write), the
-/// WHERE misses and the write is a NO-OP — the backfill can never displace a
-/// newer pointer, never flip `spentConfirmed`, never reset the #228
-/// `spentAt` age anchor, and never attach a verdict to a spender it was not
-/// computed from (verdictTxid is bound to the same guarded pointer).
-///
-/// Bind order: `verdict, spendingTxid (verdictTxid), txid, outputIndex,
-/// spendingTxid (guard)`.
 /// SQL for one batched spent-status chunk (bsv-low #289): a single
 /// row-value `IN (VALUES …)` query replacing `n` individual
 /// `get_spent_status` round trips. Factored out so the real-SQLite test
@@ -1562,6 +1583,18 @@ pub fn pot_spent_statuses_sql(n: usize) -> String {
     )
 }
 
+/// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
+/// GUARDED COMPARE-AND-SET that attaches a verdict to the pointer it was
+/// computed for — and touches NOTHING else. `WHERE … AND spendingTxid = ?`
+/// makes a stale candidate-read harmless: if the pointer moved (a
+/// reorg-confirmed S2 landing between the backfill's read and write), the
+/// WHERE misses and the write is a NO-OP — the backfill can never displace a
+/// newer pointer, never flip `spentConfirmed`, never reset the #228
+/// `spentAt` age anchor, and never attach a verdict to a spender it was not
+/// computed from (verdictTxid is bound to the same guarded pointer).
+///
+/// Bind order: `verdict, spendingTxid (verdictTxid), txid, outputIndex,
+/// spendingTxid (guard)`.
 pub fn verdict_cas_sql() -> &'static str {
     "UPDATE pot_records SET verdict = ?, verdictTxid = ? \
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
@@ -3625,6 +3658,35 @@ mod tests {
             vec![(h64(0xaa), 1), (h64(0xbb), 0)],
             "exactly the requested present outpoints — no txid-only matches, \
              no phantom rows"
+        );
+    }
+
+    /// Gate finding L3: an unknown recordType discriminator (version skew —
+    /// written by a newer deploy, read after a rollback) is an EXPLICIT
+    /// logged skip, and it can never take neighboring good rows with it.
+    #[test]
+    fn unknown_low_record_type_skips_loudly_never_the_good_rows() {
+        let row = |record_type: &str, txid: &str| LowRow {
+            record_type: record_type.into(),
+            txid: txid.into(),
+            output_index: 0.0,
+            host_identity: "02aa".into(),
+            game_id: "11".repeat(32),
+            stake_sats: Some(1000.0),
+            rules_hash: None,
+            relay_url: None,
+            expiry_height: None,
+        };
+        let records = low_records_from_rows(vec![
+            row("table", "txGOOD1"),
+            row("fromTheFuture", "txSKEW"), // v-next discriminator
+            row("gameutxo", "txGOOD2"),
+        ]);
+        assert_eq!(
+            records.iter().map(|r| r.txid.as_str()).collect::<Vec<_>>(),
+            vec!["txGOOD1", "txGOOD2"],
+            "the skewed row is skipped (and console-warned with its \
+             outpoint); every convertible row survives in order"
         );
     }
 
