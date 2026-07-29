@@ -1072,6 +1072,25 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         spend_summary.fetch_failed,
     );
 
+    // 4. LOW `pot_records` decoded-params lazy backfill (#284): decode the
+    //    covenant params / lock kind / verdict for pre-migration rows from
+    //    the durable pot_beefs bytes. No courier, no tracker — pure re-reads
+    //    of our own admitted bytes; a row with a missing funding BEEF stays
+    //    a candidate (bounded per tick, RANDOM-sampled).
+    let backfill_summary = crate::proof_fetcher::backfill_decoded_params(
+        pot_storage.as_ref(),
+        crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
+    )
+    .await;
+    worker::console_log!(
+        "Scheduled: params-backfill (pot_records) — scanned={} decoded={} verdicts={} \
+         missing_beef={}",
+        backfill_summary.scanned,
+        backfill_summary.decoded,
+        backfill_summary.verdicts,
+        backfill_summary.missing_beef,
+    );
+
     // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
     // the persistent counters, and refresh the proofless first-seen ledger so a
     // dead pass / a proof-not-landing surfaces via GET /health/invariants
@@ -1197,7 +1216,14 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         backstop_age,
     )
     .await;
-    // 4. observability heartbeat + counters (same as the cron would stamp).
+    // 4. pot_records decoded-params lazy backfill (#284) — no courier/tracker,
+    //    pure re-reads of our own admitted pot_beefs bytes.
+    let bf = crate::proof_fetcher::backfill_decoded_params(
+        pot_storage.as_ref(),
+        crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
+    )
+    .await;
+    // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;
     crate::ops::record_completion_tick(
@@ -1219,6 +1245,11 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "spends_confirmed": ss.confirmed,
         "spends_scanned": ss.scanned,
         "spends_still_unconfirmed": ss.still_unconfirmed,
+        // #284 decoded-params backfill counters.
+        "params_scanned": bf.scanned,
+        "params_decoded": bf.decoded,
+        "params_verdicts": bf.verdicts,
+        "params_missing_beef": bf.missing_beef,
         // Observability only (≤5): which spending txids were sampled, so an
         // operator can check them on a block explorer and distinguish a broken
         // chaser from a genuinely unconfirmable backlog.
