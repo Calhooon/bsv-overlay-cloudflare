@@ -93,10 +93,20 @@
 
 use std::sync::OnceLock;
 
+pub mod covenant;
 pub mod lookup_service;
 pub mod lowfund_topic_manager;
 pub mod storage;
 pub mod topic_manager;
+
+// The covenant param decoder + spend-template classifier (bsv-low #284 —
+// moved down from `low-app-layer/src/results.rs`, which re-exports these so
+// its consumers keep compiling with unchanged call sites).
+pub use covenant::{
+    classify_covenant, covenant_params_from_hex, encode_covenant_param_pushes,
+    extract_covenant_params, is_bare_2of3_lock, p2pkh_lock, CovenantParams, PotVerdict, RawInput,
+    RawTx, LOCKTIME_THRESHOLD, TEMPLATE_RAKE_DIVISOR,
+};
 
 /// The compiled `Poc5TemplatePot` covenant template, copied byte-for-byte
 /// from the canonical source

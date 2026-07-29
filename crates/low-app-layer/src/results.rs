@@ -104,25 +104,23 @@ use serde_json::json;
 
 use crate::logic::ResultMarkerRow;
 
-// ── minimal raw-tx model ────────────────────────────────────────────────────
-
-/// One parsed input of a raw tx: the outpoint it spends + its sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawInput {
-    /// Previous txid, lowercase hex (display order).
-    pub prev_txid: String,
-    pub prev_vout: u32,
-    pub sequence: u32,
-}
-
-/// A parsed raw tx — just the fields classification needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawTx {
-    pub inputs: Vec<RawInput>,
-    /// `(satoshis, locking_script)` in output order.
-    pub outputs: Vec<(u64, Vec<u8>)>,
-    pub lock_time: u32,
-}
+// ── the covenant decoder/classifier now lives in the OVERLAY (bsv-low #284) ─
+//
+// The pure param decoder + spend-template classifier moved down to
+// `overlay-discovery::pot::covenant` so the overlay can decode covenant
+// params ONCE at admission and classify a spend verdict ONCE at
+// spend-detection (both pure functions of hash-bound chain bytes). This
+// re-export keeps every existing consumer — this module, `routes.rs`, the
+// golden-vector tests in `tests/classifier_real_txs.rs` — compiling with
+// UNCHANGED call sites. What did NOT move: `classify_pot_spend` (the
+// hash-verifying orchestration), `classify_bare_refund` (depends on an
+// UNVERIFIED marker hint — app-layer-only), `parse_raw_tx_verified`, and
+// everything touching markers/signatures. The verifying reader stays here.
+pub use overlay_discovery::pot::covenant::{
+    classify_covenant, covenant_params_from_hex, extract_covenant_params, is_bare_2of3_lock,
+    p2pkh_lock, CovenantParams, PotVerdict, RawInput, RawTx, LOCKTIME_THRESHOLD,
+    TEMPLATE_RAKE_DIVISOR,
+};
 
 /// Parse raw tx bytes via `bsv_rs` and require the bytes HASH to
 /// `expected_txid` — a garbled or substituted store row must degrade to
@@ -134,259 +132,7 @@ pub fn parse_raw_tx_verified(raw: &[u8], expected_txid: &str) -> Option<RawTx> {
     if !tx.id().eq_ignore_ascii_case(expected_txid) {
         return None;
     }
-    let mut inputs = Vec::with_capacity(tx.inputs.len());
-    for i in &tx.inputs {
-        inputs.push(RawInput {
-            prev_txid: i.source_txid.clone()?.to_ascii_lowercase(),
-            prev_vout: i.source_output_index,
-            sequence: i.sequence,
-        });
-    }
-    let mut outputs = Vec::with_capacity(tx.outputs.len());
-    for o in &tx.outputs {
-        outputs.push((o.satoshis?, o.locking_script.to_binary()));
-    }
-    Some(RawTx {
-        inputs,
-        outputs,
-        lock_time: tx.lock_time,
-    })
-}
-
-// ── covenant param extraction ───────────────────────────────────────────────
-
-/// The 10 committed params of a `Poc5TemplatePot` lock, as funded on-chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CovenantParams {
-    pub pub_a: [u8; 33],
-    pub pub_b: [u8; 33],
-    pub pub_tower: [u8; 33],
-    pub pay_pkh_a: [u8; 20],
-    pub pay_pkh_b: [u8; 20],
-    pub rake_pkh: [u8; 20],
-    pub stake_a: u64,
-    pub stake_b: u64,
-    pub fee_sats: u64,
-    pub recovery_height: u64,
-}
-
-/// One push read out of the covenant param region: raw data or a minimal
-/// script number (the builder emits `push_data` for keys/hashes and
-/// `push_minimal_int` for amounts/height — `covenant.rs::push_minimal_int`).
-enum ParamPush {
-    Data(Vec<u8>),
-    Num(u64),
-}
-
-/// Walk the param region as the builder wrote it: direct data pushes
-/// (opcode 1..=75) plus the minimal-int encodings OP_0 and OP_1..=OP_16.
-/// Anything else (OP_PUSHDATA*, non-push opcodes, truncation) is `None` —
-/// the frozen template's fills never use them, so their presence means this
-/// is not a well-formed param region. All offset math is checked (wasm32
-/// usize=u32 lesson — see `potparty::read_pushes`).
-fn read_param_pushes(bytes: &[u8]) -> Option<Vec<ParamPush>> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let op = bytes[i];
-        i = i.checked_add(1)?;
-        match op {
-            0x00 => out.push(ParamPush::Num(0)),
-            0x51..=0x60 => out.push(ParamPush::Num(u64::from(op - 0x50))),
-            1..=0x4b => {
-                let end = i.checked_add(op as usize)?;
-                if end > bytes.len() {
-                    return None;
-                }
-                out.push(ParamPush::Data(bytes[i..end].to_vec()));
-                i = end;
-            }
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
-/// Decode a minimal, NON-NEGATIVE Bitcoin script number push (≤ 8 value
-/// bytes; an optional 0x00 sign-guard byte allowed — `push_minimal_int`
-/// appends one when the top bit is set). A sign bit (negative) refuses:
-/// no committed param is ever negative.
-fn script_num_u64(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() || bytes.len() > 9 {
-        return None;
-    }
-    let last = *bytes.last()?;
-    if last & 0x80 != 0 {
-        return None; // negative — never a valid committed param
-    }
-    let mut v: u64 = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        if i >= 8 {
-            // 9th byte is only ever the 0x00 sign guard.
-            if b != 0 {
-                return None;
-            }
-            continue;
-        }
-        v |= u64::from(b) << (8 * i);
-    }
-    Some(v)
-}
-
-/// Extract the COMMITTED params from a covenant funding lock, or `None` when
-/// `lock` is not a `Poc5TemplatePot` script / its param region is malformed.
-/// The recognizer + region split come from `overlay-discovery`'s frozen
-/// template (the SAME bytes `tm_pot` admits with, drift-pinned there).
-pub fn extract_covenant_params(lock: &[u8]) -> Option<CovenantParams> {
-    let region = overlay_discovery::pot::pot_covenant_param_region(lock)?;
-    let pushes = read_param_pushes(region)?;
-    if pushes.len() != 10 {
-        return None;
-    }
-    fn data<const N: usize>(p: &ParamPush) -> Option<[u8; N]> {
-        match p {
-            ParamPush::Data(d) if d.len() == N => {
-                let mut a = [0u8; N];
-                a.copy_from_slice(d);
-                Some(a)
-            }
-            _ => None,
-        }
-    }
-    fn num(p: &ParamPush) -> Option<u64> {
-        match p {
-            ParamPush::Num(n) => Some(*n),
-            ParamPush::Data(d) => script_num_u64(d),
-        }
-    }
-    Some(CovenantParams {
-        pub_a: data(&pushes[0])?,
-        pub_b: data(&pushes[1])?,
-        pub_tower: data(&pushes[2])?,
-        pay_pkh_a: data(&pushes[3])?,
-        pay_pkh_b: data(&pushes[4])?,
-        rake_pkh: data(&pushes[5])?,
-        stake_a: num(&pushes[6])?,
-        stake_b: num(&pushes[7])?,
-        fee_sats: num(&pushes[8])?,
-        recovery_height: num(&pushes[9])?,
-    })
-}
-
-/// The canonical 25-byte P2PKH locking script for a 20-byte hash160.
-fn p2pkh_lock(pkh: &[u8; 20]) -> Vec<u8> {
-    let mut s = Vec::with_capacity(25);
-    s.extend_from_slice(&[0x76, 0xa9, 0x14]);
-    s.extend_from_slice(pkh);
-    s.extend_from_slice(&[0x88, 0xac]);
-    s
-}
-
-/// True iff `s` is a bare 2-of-3 multisig lock (`build_2of3_lock` shape):
-/// `OP_2 <33> <33> <33> OP_3 OP_CHECKMULTISIG` — the pre-covenant pot lock.
-pub fn is_bare_2of3_lock(s: &[u8]) -> bool {
-    s.len() == 105
-        && s[0] == 0x52
-        && s[1] == 33
-        && s[35] == 33
-        && s[69] == 33
-        && s[103] == 0x53
-        && s[104] == 0xae
-}
-
-// ── template derivation (mirrors low-spend tower_settle byte-for-byte) ──────
-
-/// The rake divisor the covenant hardcodes: `rake = floor(pot / 100)` (1%).
-/// MUST stay equal to `tower_settle.rs::TEMPLATE_RAKE_DIVISOR` /
-/// `pot.ts::POT_RAKE_DIVISOR` / `case.rs::POT_RAKE_DIVISOR`.
-pub const TEMPLATE_RAKE_DIVISOR: u64 = 100;
-
-/// nLockTime values ≥ this are unix-time, < this are block heights.
-const LOCKTIME_THRESHOLD: u32 = 500_000_000;
-
-/// One derived output template: `(satoshis, locking_script)` in tx order.
-type OutputSet = Vec<(u64, Vec<u8>)>;
-
-/// Derive the winner-A / winner-B / tie output sets from the committed
-/// params — `tower_settle.rs::template_settle_outputs` verbatim (fee from
-/// pot, absolute rake `floor(pot/100)`, tie odd sat → rake, rake output
-/// first, omitted when 0). `None` when the params could never build a lock
-/// (fee ≥ pot / rake ≥ net — refused at funding time, so on-chain pots never
-/// hit this; conservative anyway).
-fn settle_templates(p: &CovenantParams) -> Option<[OutputSet; 3]> {
-    let pot = p.stake_a.checked_add(p.stake_b)?;
-    if p.fee_sats >= pot {
-        return None;
-    }
-    let net = pot - p.fee_sats;
-    let rake = pot / TEMPLATE_RAKE_DIVISOR;
-    if rake >= net {
-        return None;
-    }
-    let winner = |pkh: &[u8; 20]| -> OutputSet {
-        let mut outs = Vec::with_capacity(2);
-        if rake > 0 {
-            outs.push((rake, p2pkh_lock(&p.rake_pkh)));
-        }
-        outs.push((net - rake, p2pkh_lock(pkh)));
-        outs
-    };
-    // Tie: the odd sat joins the rake so the halves stay equal.
-    let mut tie_rake = rake;
-    if (net - tie_rake.min(net)) % 2 == 1 {
-        tie_rake += 1;
-    }
-    if tie_rake >= net {
-        return None;
-    }
-    let half = (net - tie_rake) / 2;
-    let mut tie = Vec::with_capacity(3);
-    if tie_rake > 0 {
-        tie.push((tie_rake, p2pkh_lock(&p.rake_pkh)));
-    }
-    tie.push((half, p2pkh_lock(&p.pay_pkh_a)));
-    tie.push((half, p2pkh_lock(&p.pay_pkh_b)));
-    Some([winner(&p.pay_pkh_a), winner(&p.pay_pkh_b), tie])
-}
-
-/// Derive the refund output set — `settle.rs::refund_outputs` verbatim over
-/// the committed pay homes: un-raked, seat A absorbs the odd fee sat
-/// (`feeA = fee − fee/2`, `feeB = fee/2`). `None` if a fee share exceeds its
-/// stake (an unbuildable lock).
-fn refund_template(p: &CovenantParams) -> Option<OutputSet> {
-    let fee_b = p.fee_sats / 2;
-    let fee_a = p.fee_sats - fee_b;
-    if fee_a > p.stake_a || fee_b > p.stake_b {
-        return None;
-    }
-    Some(vec![
-        (p.stake_a - fee_a, p2pkh_lock(&p.pay_pkh_a)),
-        (p.stake_b - fee_b, p2pkh_lock(&p.pay_pkh_b)),
-    ])
-}
-
-// ── classification ──────────────────────────────────────────────────────────
-
-/// Which mandated exit a pot spend fired. Seat-lettered, NOT identity-mapped
-/// (see the module note: seat → identity is not derivable server-side).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PotVerdict {
-    WinnerA,
-    WinnerB,
-    Tie,
-    Refund,
-}
-
-impl PotVerdict {
-    /// The wire string for JSON bodies.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PotVerdict::WinnerA => "winner-a",
-            PotVerdict::WinnerB => "winner-b",
-            PotVerdict::Tie => "tie",
-            PotVerdict::Refund => "refund",
-        }
-    }
+    RawTx::from_transaction(&tx)
 }
 
 /// Everything the classifier consumes for one pot spend. All txids lowercase
@@ -440,61 +186,6 @@ pub fn classify_pot_spend(f: &PotSpendFacts) -> Option<PotVerdict> {
 fn spender_pot_prevout(funding: &RawTx, vout: u32) -> Option<(u64, Vec<u8>)> {
     let (sats, lock) = funding.outputs.get(vout as usize)?;
     Some((*sats, lock.clone()))
-}
-
-/// Covenant classification: exact output-set match against the four derived
-/// templates, refund height-gate observed, collisions resolved only when
-/// money-identical.
-fn classify_covenant(p: &CovenantParams, spender: &RawTx, pot_sequence: u32) -> Option<PotVerdict> {
-    // A degenerate pot committing the same pay home for both seats can never
-    // distinguish winner-A from winner-B — no verdict.
-    if p.pay_pkh_a == p.pay_pkh_b {
-        return None;
-    }
-    let [t_a, t_b, t_tie] = settle_templates(p)?;
-    let t_refund = refund_template(p)?;
-
-    let matches_a = spender.outputs == t_a;
-    let matches_b = spender.outputs == t_b;
-    let matches_tie = spender.outputs == t_tie;
-    let matches_refund = spender.outputs == t_refund;
-
-    // The refund's in-script height gate, observed on the wire: nLockTime is
-    // a BLOCK HEIGHT ≥ the committed recoveryHeight and the pot input's
-    // sequence is non-final (a final sequence disables nLockTime entirely).
-    let refund_gate_ok = u64::from(spender.lock_time) >= p.recovery_height
-        && spender.lock_time < LOCKTIME_THRESHOLD
-        && spender.lock_time > 0
-        && pot_sequence != 0xffff_ffff;
-
-    match (matches_a, matches_b, matches_tie, matches_refund) {
-        (true, false, false, false) => Some(PotVerdict::WinnerA),
-        (false, true, false, false) => Some(PotVerdict::WinnerB),
-        (false, false, true, false) => Some(PotVerdict::Tie),
-        (false, false, false, true) => {
-            // Pure refund shape: the covenant enforces the gate in-script, so
-            // an on-chain spend always satisfies it — but classification is
-            // conservative: no observed gate, no refund verdict.
-            if refund_gate_ok {
-                Some(PotVerdict::Refund)
-            } else {
-                None
-            }
-        }
-        (false, false, true, true) => {
-            // The known T_tie == T_refund byte-collision (rakeless
-            // equal-stakes pot — unreachable at prod stakes, pinned in the
-            // covenant's own tests). The output sets are IDENTICAL, so the
-            // money outcome is the same either way; the wire locktime picks
-            // the honest label.
-            if refund_gate_ok {
-                Some(PotVerdict::Refund)
-            } else {
-                Some(PotVerdict::Tie)
-            }
-        }
-        _ => None, // no match, or an impossible multi-match — unresolved
-    }
 }
 
 /// Bare-era (pre-covenant) pots: classify ONLY the pre-signed nLockTime
@@ -3622,37 +3313,11 @@ mod tests {
     }
 
     // ── param-push / script-number hygiene ─────────────────────────────
-
-    #[test]
-    fn script_num_decoding_is_minimal_and_non_negative() {
-        assert_eq!(script_num_u64(&[0x90, 0x01]), Some(400));
-        assert_eq!(script_num_u64(&[0xd0, 0x07]), Some(2000));
-        // Sign-guard byte accepted (top bit of the value byte set).
-        assert_eq!(script_num_u64(&[0x80, 0x00]), Some(128));
-        // Negative refused.
-        assert_eq!(script_num_u64(&[0x90]), None);
-        // Empty / oversized refused.
-        assert_eq!(script_num_u64(&[]), None);
-        assert_eq!(script_num_u64(&[1; 10]), None);
-    }
-
-    #[test]
-    fn bare_lock_recognizer_is_exact() {
-        let mut s = vec![0x52];
-        for seed in [0x02u8, 0x03, 0x04] {
-            s.push(33);
-            s.extend_from_slice(&[seed; 33]);
-        }
-        s.push(0x53);
-        s.push(0xae);
-        assert!(is_bare_2of3_lock(&s));
-        // Any perturbation refuses.
-        assert!(!is_bare_2of3_lock(&s[..104]));
-        let mut t = s.clone();
-        t[0] = 0x51; // OP_1-of-3 is not the pot lock
-        assert!(!is_bare_2of3_lock(&t));
-        assert!(!is_bare_2of3_lock(&[0x76, 0xa9]));
-    }
+    // (The pure-decoder pins — script-number minimality, bare-lock
+    // exactness — MOVED with the decoder to
+    // `overlay-discovery::pot::covenant` (bsv-low #284). The golden-vector
+    // test `tests/classifier_real_txs.rs::real_covenant_lock_params_extract_exactly`
+    // still exercises the extractor through this module's re-export.)
 
     #[test]
     fn results_and_claims_sql_are_bounded() {
