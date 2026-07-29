@@ -118,8 +118,11 @@ struct TopicValidation {
 
 impl Engine {
     /// Page size used by `/requestSyncResponse` when the (public) caller
-    /// omits `limit`. GASP pages by the `since` score cursor, so a bounded
-    /// page is never lossy — the next request resumes where this one ended.
+    /// omits `limit`. A bounded page is not lossy for a conforming
+    /// initiator: ours ([`crate::gasp::GASPSync`]) keeps requesting pages
+    /// for as long as the `since` score cursor advances (gate finding M1 —
+    /// it must NOT require a "full" page to continue, because this clamp
+    /// makes a full-by-the-initiator's-limit page impossible).
     pub const SYNC_RESPONSE_DEFAULT_LIMIT: u64 = 500;
     /// Hard cap on a `/requestSyncResponse` page. Before bsv-low #291 an
     /// absent/huge caller-supplied limit meant an unbounded scan of the
@@ -129,7 +132,9 @@ impl Engine {
     /// Clamp the public `/requestSyncResponse` page size: absent → the
     /// default page; anything larger than the cap → the cap. The result is
     /// ALWAYS `Some`-worthy — a sync response is never unbounded (bsv-low
-    /// #291); the `since` cursor pages through the rest.
+    /// #291). Completeness relies on the INITIATOR paging while its `since`
+    /// cursor advances (see `SYNC_RESPONSE_DEFAULT_LIMIT`'s doc) — the
+    /// responder alone cannot page for it.
     pub fn clamp_sync_limit(requested: Option<u64>) -> u64 {
         requested
             .unwrap_or(Self::SYNC_RESPONSE_DEFAULT_LIMIT)
@@ -1060,8 +1065,11 @@ impl Engine {
     /// [`Engine::SYNC_RESPONSE_MAX_LIMIT`] (and defaulted when absent):
     /// `/requestSyncResponse` is a PUBLIC route, and an absent limit used to
     /// mean an unbounded scan of the outputs table (bsv-low #291). Bounding
-    /// is lossless for sync correctness — GASP pages by the `since` score
-    /// cursor, so a truncated page is simply fetched on the next request.
+    /// is lossless for sync correctness because the initiator
+    /// ([`crate::gasp::GASPSync`]) pages for as long as its `since` score
+    /// cursor advances — a truncated page is fetched by its NEXT request
+    /// within the same run (gate finding M1: pagination must not demand a
+    /// full page, which this clamp can make impossible).
     pub async fn provide_foreign_sync_response(
         &self,
         request: &GASPInitialRequest,

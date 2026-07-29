@@ -298,6 +298,7 @@ impl<'a> GASPSync<'a> {
 
         // Paginated pull from remote
         loop {
+            let cursor_before_page = self.last_interaction;
             let request = GASPInitialRequest {
                 version: GASP_VERSION,
                 since: self.last_interaction,
@@ -342,8 +343,17 @@ impl<'a> GASPSync<'a> {
                 }
             }
 
-            // Continue pagination if we got a full page
-            if limit.is_none() || (page_size as u64) < limit.unwrap_or(u64::MAX) {
+            // Pagination termination (bsv-low #291 gate finding M1): keep
+            // paging on ANY page that advanced the score cursor. The old
+            // rule ("continue only on a full page") silently terminated
+            // after one page against a responder that CLAMPS the requested
+            // limit (Engine::SYNC_RESPONSE_MAX_LIMIT) below ours — a
+            // clamped page is never "full" by our limit, yet more rows
+            // remain. A non-advancing page (empty, or only rows at scores
+            // we already hold — the responder serves `score >= since`, so
+            // the boundary row is re-served) is the true completion signal:
+            // no further request can make progress.
+            if limit.is_none() || self.last_interaction == cursor_before_page {
                 break;
             }
         }
