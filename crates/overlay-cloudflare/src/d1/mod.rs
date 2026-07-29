@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 65;
+pub const OVERLAY_MIGRATION_COUNT: usize = 82;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -734,6 +734,58 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // re-run "duplicate column" error (`migration_error_is_benign`).
     "ALTER TABLE potparty_records ADD COLUMN seatSettlePubkey TEXT",
     "ALTER TABLE potparty_records ADD COLUMN seatSigHex TEXT",
+    // ── #284 decoded pot columns (decode-once at admission) ───────────────
+    // The DECODED covenant params + the spend VERDICT, denormalized onto
+    // pot_records so /results and /leaderboard become pure column reads
+    // instead of re-parsing the pot_beefs BLOBs on every request. Every
+    // value is a RE-PRESENTATION of bytes already admitted (the funding
+    // lock's committed param pushes, the funding output's value, the exact
+    // template-match verdict of the recorded spend) — a pure function of
+    // hash-bound chain bytes, decoded by `overlay_discovery::pot::covenant`.
+    // Admission stays BYTE-FORMAT-ONLY and the overlay still verifies no
+    // signature and chooses no truth: the app-layer remains the verifying
+    // reader (seat/claim signatures, marker hints). All NULLABLE additive
+    // ALTERs (the runner ignores the re-run "duplicate column" error via
+    // `migration_error_is_benign`); pre-#284 rows stay NULL and are decoded
+    // lazily by the backfill pass (`proof_fetcher::backfill_decoded_params`)
+    // or served via the read-path BEEF fallback.
+    //
+    // lockKind: 'covenant' | 'bare' | 'p2pkh'; NULL = not yet decoded (or
+    // decode attempted on an unrecognized shape — paramsDecoded says which).
+    "ALTER TABLE pot_records ADD COLUMN lockKind TEXT",
+    // The committed SETTLE keys (66-hex lowercase compressed pubkeys).
+    "ALTER TABLE pot_records ADD COLUMN pubA TEXT",
+    "ALTER TABLE pot_records ADD COLUMN pubB TEXT",
+    "ALTER TABLE pot_records ADD COLUMN pubTower TEXT",
+    // The committed payout homes + rake home (40-hex lowercase hash160s).
+    "ALTER TABLE pot_records ADD COLUMN payPkhA TEXT",
+    "ALTER TABLE pot_records ADD COLUMN payPkhB TEXT",
+    "ALTER TABLE pot_records ADD COLUMN rakePkh TEXT",
+    // The committed amounts/height (script-number params, as integers).
+    "ALTER TABLE pot_records ADD COLUMN stakeA INTEGER",
+    "ALTER TABLE pot_records ADD COLUMN stakeB INTEGER",
+    "ALTER TABLE pot_records ADD COLUMN feeSats INTEGER",
+    "ALTER TABLE pot_records ADD COLUMN recoveryHeight INTEGER",
+    // The funding output's value, from the admitted BEEF's parsed tx — what
+    // the stake-conservation check compares stakeA+stakeB against.
+    "ALTER TABLE pot_records ADD COLUMN potSats INTEGER",
+    // 0 = decode not yet attempted (a backfill candidate); 1 = attempted and
+    // recorded (lockKind says what the lock turned out to be).
+    "ALTER TABLE pot_records ADD COLUMN paramsDecoded INTEGER NOT NULL DEFAULT 0",
+    // The template-match verdict of the recorded spend
+    // ('winner-a'|'winner-b'|'tie'|'refund'; NULL = unresolved/never
+    // classified). Meaningful ONLY when verdictTxid = spendingTxid — a
+    // later spend-pointer overwrite leaves a stale verdict behind on
+    // purpose (the reader's equality check is the guard; see
+    // `mark_spent_sql`). Bare pots NEVER get a stored verdict: their refund
+    // rule depends on an unverified marker hint (app-layer-only).
+    "ALTER TABLE pot_records ADD COLUMN verdict TEXT",
+    "ALTER TABLE pot_records ADD COLUMN verdictTxid TEXT",
+    // Block height from the SPV-verified BUMP at spend-confirm time; NULL
+    // until proven. Written only alongside a CONFIRMED spend pointer.
+    "ALTER TABLE pot_records ADD COLUMN spentHeight INTEGER",
+    // The backfill candidate scan (`WHERE paramsDecoded = 0`).
+    "CREATE INDEX IF NOT EXISTS idx_pot_params_undecoded ON pot_records(paramsDecoded)",
 ];
 
 // =============================================================================
@@ -888,6 +940,59 @@ mod tests {
     }
 
     #[test]
+    fn decoded_pot_column_migrations_present_nullable_and_benign_class() {
+        // #284: the decoded-param / verdict columns on pot_records. Every
+        // one must be an additive ALTER (the ONLY statement class the
+        // re-run-everything runner treats as benign on a duplicate-column
+        // error) and NULLABLE (pre-#284 rows must stay observably
+        // undecoded), except paramsDecoded which carries NOT NULL DEFAULT 0
+        // (0 = backfill candidate).
+        let nullable = [
+            ("lockKind", "TEXT"),
+            ("pubA", "TEXT"),
+            ("pubB", "TEXT"),
+            ("pubTower", "TEXT"),
+            ("payPkhA", "TEXT"),
+            ("payPkhB", "TEXT"),
+            ("rakePkh", "TEXT"),
+            ("stakeA", "INTEGER"),
+            ("stakeB", "INTEGER"),
+            ("feeSats", "INTEGER"),
+            ("recoveryHeight", "INTEGER"),
+            ("potSats", "INTEGER"),
+            ("verdict", "TEXT"),
+            ("verdictTxid", "TEXT"),
+            ("spentHeight", "INTEGER"),
+        ];
+        for (column, ty) in nullable {
+            let m = OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| {
+                    sql.trim_start().starts_with("ALTER TABLE pot_records")
+                        && sql.contains(&format!("ADD COLUMN {column} {ty}"))
+                })
+                .unwrap_or_else(|| panic!("missing pot_records.{column} migration"));
+            assert!(
+                !m.to_uppercase().contains("NOT NULL"),
+                "pot_records.{column} must stay nullable (NULL = not decoded)"
+            );
+            assert!(
+                migration_error_is_benign(m, &format!("duplicate column name: {column}")),
+                "pot_records.{column} re-run must be the benign class"
+            );
+        }
+        // paramsDecoded is the one defaulted flag column.
+        assert!(OVERLAY_MIGRATIONS.iter().any(|sql| {
+            sql.trim_start().starts_with("ALTER TABLE pot_records")
+                && sql.contains("ADD COLUMN paramsDecoded INTEGER NOT NULL DEFAULT 0")
+        }));
+        // The backfill candidate index is idempotent (IF NOT EXISTS).
+        assert!(OVERLAY_MIGRATIONS.iter().any(|sql| sql
+            .trim_start()
+            .starts_with("CREATE INDEX IF NOT EXISTS idx_pot_params_undecoded")));
+    }
+
+    #[test]
     fn result_markers_carry_migration_is_rerun_safe() {
         // The one non-CREATE/ALTER migration: the result_markers →
         // result_markers_v2 data carry. Pin the two properties that make
@@ -957,6 +1062,7 @@ mod tests {
             "idx_reveal_game_seat",
             "idx_pot_spending",
             "idx_pot_spent_unconfirmed",
+            "idx_pot_params_undecoded",
             "idx_result_markers_winner",
             "idx_result_markers_createdAt",
             "idx_result_markers_v2_winner",

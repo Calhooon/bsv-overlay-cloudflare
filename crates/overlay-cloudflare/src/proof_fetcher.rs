@@ -711,11 +711,27 @@ pub async fn complete_spend_confirmations(
         // unmined / unverifiable / budget-exhausted → `None` (retry), never a
         // positive.
         match fetcher.verified_proof_for(spending_txid).await {
-            Some(_bump) => {
+            Some(bump_hex) => {
                 // UPGRADE: latch spentConfirmed = 1. mark_spent(confirmed=true)
                 // always writes and never downgrades a confirmed row.
+                //
+                // #284: this caller only CONFIRMS an existing pointer and has
+                // no spender raw in hand → verdict = None (the SQL leaves the
+                // stored verdict/verdictTxid UNCHANGED — never nulled). The
+                // spentHeight DOES ride along: the block height is a fact of
+                // the just-verified BUMP.
+                let spent_height = MerklePath::from_hex(&bump_hex)
+                    .ok()
+                    .map(|mp| u64::from(mp.block_height));
                 if let Err(e) = pot_storage
-                    .mark_spent(&rec.txid, rec.output_index, spending_txid, true)
+                    .mark_spent(
+                        &rec.txid,
+                        rec.output_index,
+                        spending_txid,
+                        true,
+                        None,
+                        spent_height,
+                    )
                     .await
                 {
                     worker::console_log!("[spend-confirm] {} mark_spent failed: {e}", rec.txid);
@@ -828,11 +844,17 @@ pub async fn apply_pushed_proof_to_pot_stores(
     }
 
     // 2. pot_records spend-confirmation latch (this txid as the spender).
+    // #284: a confirm-only latch — no spender raw in hand → verdict = None
+    // (the stored verdict/verdictTxid are left UNCHANGED); the spentHeight
+    // rides along from the (route-verified, structurally re-checked) bump.
+    let spent_height = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
+        .ok()
+        .map(|mp| u64::from(mp.block_height));
     match pot_storage.find_unconfirmed_by_spending_txid(txid).await {
         Ok(records) => {
             for rec in records {
                 match pot_storage
-                    .mark_spent(&rec.txid, rec.output_index, txid, true)
+                    .mark_spent(&rec.txid, rec.output_index, txid, true, None, spent_height)
                     .await
                 {
                     Ok(()) => summary.spends_confirmed += 1,
@@ -1007,6 +1029,7 @@ mod tests {
             spent: true,
             spending_txid: Some(spender.into()),
             spent_confirmed: false,
+            ..Default::default()
         }
     }
 
@@ -1021,10 +1044,11 @@ mod tests {
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
+            ..Default::default()
             })
             .await
             .unwrap();
-        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
 
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
@@ -1051,10 +1075,11 @@ mod tests {
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
+            ..Default::default()
             })
             .await
             .unwrap();
-        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
 
         // The spending tx is NOT verifiably mined → fail-closed, no upgrade.
         let fetcher = MockProofFetcher {
@@ -1229,7 +1254,7 @@ mod tests {
         store.store_record(&spent_unconfirmed("potA", "settleA")).await.unwrap();
         // Re-record the spend at clock time so spentAt is stamped by the real
         // producer (mark_spent).
-        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
 
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),

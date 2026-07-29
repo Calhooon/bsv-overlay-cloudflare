@@ -1188,8 +1188,11 @@ impl RevealStorage for D1RevealStorage {
 // =============================================================================
 
 /// Row for pot-spend record queries. D1 returns numbers as f64 and a
-/// nullable TEXT column as `Option<String>`.
-#[derive(Deserialize)]
+/// nullable TEXT column as `Option<String>`. The #284 decoded columns are
+/// all `serde(default)` so the narrow SELECTs (the spend-chaser scans, which
+/// don't need them) and a read racing the additive migrations both
+/// deserialize.
+#[derive(Deserialize, Default)]
 struct PotRow {
     txid: String,
     #[serde(rename = "outputIndex")]
@@ -1201,6 +1204,38 @@ struct PotRow {
     /// `spentConfirmed` migration.
     #[serde(rename = "spentConfirmed", default)]
     spent_confirmed: f64,
+    #[serde(rename = "lockKind", default)]
+    lock_kind: Option<String>,
+    #[serde(rename = "pubA", default)]
+    pub_a: Option<String>,
+    #[serde(rename = "pubB", default)]
+    pub_b: Option<String>,
+    #[serde(rename = "pubTower", default)]
+    pub_tower: Option<String>,
+    #[serde(rename = "payPkhA", default)]
+    pay_pkh_a: Option<String>,
+    #[serde(rename = "payPkhB", default)]
+    pay_pkh_b: Option<String>,
+    #[serde(rename = "rakePkh", default)]
+    rake_pkh: Option<String>,
+    #[serde(rename = "stakeA", default)]
+    stake_a: Option<f64>,
+    #[serde(rename = "stakeB", default)]
+    stake_b: Option<f64>,
+    #[serde(rename = "feeSats", default)]
+    fee_sats: Option<f64>,
+    #[serde(rename = "recoveryHeight", default)]
+    recovery_height: Option<f64>,
+    #[serde(rename = "potSats", default)]
+    pot_sats: Option<f64>,
+    #[serde(rename = "paramsDecoded", default)]
+    params_decoded: f64,
+    #[serde(rename = "verdict", default)]
+    verdict: Option<String>,
+    #[serde(rename = "verdictTxid", default)]
+    verdict_txid: Option<String>,
+    #[serde(rename = "spentHeight", default)]
+    spent_height: Option<f64>,
 }
 
 impl PotRow {
@@ -1211,9 +1246,32 @@ impl PotRow {
             spent: self.spent != 0.0,
             spending_txid: self.spending_txid,
             spent_confirmed: self.spent_confirmed != 0.0,
+            lock_kind: self.lock_kind,
+            pub_a: self.pub_a,
+            pub_b: self.pub_b,
+            pub_tower: self.pub_tower,
+            pay_pkh_a: self.pay_pkh_a,
+            pay_pkh_b: self.pay_pkh_b,
+            rake_pkh: self.rake_pkh,
+            stake_a: self.stake_a.map(|v| v as u64),
+            stake_b: self.stake_b.map(|v| v as u64),
+            fee_sats: self.fee_sats.map(|v| v as u64),
+            recovery_height: self.recovery_height.map(|v| v as u64),
+            pot_sats: self.pot_sats.map(|v| v as u64),
+            params_decoded: self.params_decoded != 0.0,
+            verdict: self.verdict,
+            verdict_txid: self.verdict_txid,
+            spent_height: self.spent_height.map(|v| v as u64),
         }
     }
 }
+
+/// The full pot_records column list (#284) for reads that need the decoded
+/// fields (`get_spent_status`, the backfill candidate scan).
+const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentConfirmed, \
+     lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
+     stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
+     verdict, verdictTxid, spentHeight";
 
 /// Row for the `pot_beefs` length probe (`length(beef) AS len`). D1 returns
 /// numbers as f64.
@@ -1287,48 +1345,121 @@ fn pot_err(e: String) -> PotStorageError {
 
 /// The `mark_spent` UPDATE, by confirmation (prefer-confirmed /
 /// never-clobber-with-unconfirmed — see the `PotStorage::mark_spent` trait
-/// doc). Both are UPDATE-only (nonexistent outpoint = 0 rows touched) and
-/// never DELETE:
+/// doc). All four variants are UPDATE-only (nonexistent outpoint = 0 rows
+/// touched) and never DELETE:
 ///
 /// - confirmed: always writes and latches `spentConfirmed = 1`
-///   (last-confirmed-wins).
+///   (last-confirmed-wins). ONLY this branch touches `spentHeight` (a fact
+///   of the verified BUMP): `spentHeight = COALESCE(?, spentHeight)` — a
+///   `Some(h)` bind overwrites (a re-confirmed/reorged pointer carries its
+///   own height), a NULL bind keeps the stored value.
 /// - unconfirmed: the `AND spentConfirmed = 0` guard makes an unconfirmed
 ///   claim a no-op against a confirmed pointer, while preserving
-///   last-writer-wins among unconfirmed claims; `spentConfirmed` untouched.
+///   last-writer-wins among unconfirmed claims; `spentConfirmed` (and
+///   `spentHeight`) untouched.
+///
+/// # #284 verdict atomicity (`with_verdict`)
+///
+/// `with_verdict = true` adds `verdict = ?, verdictTxid = ?` to the SAME
+/// statement — verdictTxid is bound to the spending txid, so the verdict can
+/// never point at a different spender than the pointer it rode in with, and
+/// the unconfirmed guard covers it identically (an unconfirmed writer can
+/// never displace a confirmed pointer's verdict). `with_verdict = false`
+/// leaves BOTH columns entirely out of the SET (explicitly UNCHANGED — a
+/// confirm-only caller with no spender raw must not null a stored verdict);
+/// a pointer change under `false` deliberately leaves a stale verdict
+/// behind, neutralized by the reader's `verdictTxid == spendingTxid` check.
+///
+/// Bind order: `spendingTxid, [verdict, verdictTxid,] [spentHeight,] txid,
+/// outputIndex`.
 ///
 /// Both branches stamp `spentAt = unixepoch()` (#228 backstop age anchor):
 /// every ACCEPTED spend write resets the age, so the poll chaser's gate
 /// measures from the CURRENT spend pointer (its push gets its chance first).
 /// A refused unconfirmed-vs-confirmed write touches nothing (WHERE misses).
-fn mark_spent_sql(confirmed: bool) -> &'static str {
-    if confirmed {
-        "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
-             spentAt = unixepoch() \
-         WHERE txid = ? AND outputIndex = ?"
-    } else {
-        "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch() \
-         WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
+pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
+    match (confirmed, with_verdict) {
+        (true, true) => {
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
+                 spentAt = unixepoch(), verdict = ?, verdictTxid = ?, \
+                 spentHeight = COALESCE(?, spentHeight) \
+             WHERE txid = ? AND outputIndex = ?"
+        }
+        (true, false) => {
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
+                 spentAt = unixepoch(), spentHeight = COALESCE(?, spentHeight) \
+             WHERE txid = ? AND outputIndex = ?"
+        }
+        (false, true) => {
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch(), \
+                 verdict = ?, verdictTxid = ? \
+             WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
+        }
+        (false, false) => {
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch() \
+             WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
+        }
     }
+}
+
+/// The #284 `store_record` upsert: insert-if-absent for the SPEND fields,
+/// COALESCE backfill for the DECODED columns. The conflict update touches
+/// ONLY decoded columns — never `spent` / `spendingTxid` / `spentConfirmed`
+/// / `spentAt` / `verdict` / `verdictTxid` / `spentHeight` / `createdAt`
+/// (re-admission must never regress spend state), and COALESCE means a
+/// replay lacking data never nulls a stored value; `paramsDecoded` only
+/// latches 0 → 1.
+pub fn store_record_sql() -> &'static str {
+    "INSERT INTO pot_records \
+         (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt, \
+          lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
+          stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+     ON CONFLICT(txid, outputIndex) DO UPDATE SET \
+         lockKind = COALESCE(excluded.lockKind, lockKind), \
+         pubA = COALESCE(excluded.pubA, pubA), \
+         pubB = COALESCE(excluded.pubB, pubB), \
+         pubTower = COALESCE(excluded.pubTower, pubTower), \
+         payPkhA = COALESCE(excluded.payPkhA, payPkhA), \
+         payPkhB = COALESCE(excluded.payPkhB, payPkhB), \
+         rakePkh = COALESCE(excluded.rakePkh, rakePkh), \
+         stakeA = COALESCE(excluded.stakeA, stakeA), \
+         stakeB = COALESCE(excluded.stakeB, stakeB), \
+         feeSats = COALESCE(excluded.feeSats, feeSats), \
+         recoveryHeight = COALESCE(excluded.recoveryHeight, recoveryHeight), \
+         potSats = COALESCE(excluded.potSats, potSats), \
+         paramsDecoded = CASE WHEN excluded.paramsDecoded = 1 THEN 1 ELSE paramsDecoded END"
 }
 
 #[async_trait(?Send)]
 impl PotStorage for D1PotStorage {
     async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
-        // INSERT OR IGNORE: insert-if-absent, never clobber a spent row.
-        Query::new(
-            "INSERT OR IGNORE INTO pot_records \
-             (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(record.txid.as_str())
-        .bind(record.output_index)
-        .bind(if record.spent { 1u32 } else { 0u32 })
-        .bind(record.spending_txid.as_deref())
-        .bind(if record.spent_confirmed { 1u32 } else { 0u32 })
-        .bind(current_unix_seconds_i64())
-        .execute(&self.db)
-        .await
-        .map_err(pot_err)
+        // #284 upsert: insert-if-absent for SPEND state, COALESCE backfill
+        // for the decoded columns (see `store_record_sql` for the contract:
+        // the conflict update never touches spend state and never nulls).
+        Query::new(store_record_sql())
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(if record.spent { 1u32 } else { 0u32 })
+            .bind(record.spending_txid.as_deref())
+            .bind(if record.spent_confirmed { 1u32 } else { 0u32 })
+            .bind(current_unix_seconds_i64())
+            .bind(record.lock_kind.as_deref())
+            .bind(record.pub_a.as_deref())
+            .bind(record.pub_b.as_deref())
+            .bind(record.pub_tower.as_deref())
+            .bind(record.pay_pkh_a.as_deref())
+            .bind(record.pay_pkh_b.as_deref())
+            .bind(record.rake_pkh.as_deref())
+            .bind(record.stake_a)
+            .bind(record.stake_b)
+            .bind(record.fee_sats)
+            .bind(record.recovery_height)
+            .bind(record.pot_sats)
+            .bind(if record.params_decoded { 1u32 } else { 0u32 })
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
     }
 
     async fn mark_spent(
@@ -1337,6 +1468,8 @@ impl PotStorage for D1PotStorage {
         output_index: u32,
         spending_txid: &str,
         confirmed: bool,
+        verdict: Option<&str>,
+        spent_height: Option<u64>,
     ) -> Result<(), PotStorageError> {
         // UPDATE-only: records the spender on an existing row (a nonexistent
         // outpoint is a no-op — an output must be admitted before it spends).
@@ -1347,9 +1480,19 @@ impl PotStorage for D1PotStorage {
         // - unconfirmed → write ONLY IF spentConfirmed = 0 (an unconfirmed
         //   claim never clobbers a confirmed pointer; last-writer-wins among
         //   unconfirmed claims is preserved); spentConfirmed untouched.
-        Query::new(mark_spent_sql(confirmed))
-            .bind(spending_txid)
-            .bind(txid)
+        //
+        // #284: a Some(verdict) rides the SAME statement as the pointer
+        // (verdictTxid bound to the spending txid — atomic); None leaves
+        // verdict/verdictTxid entirely out of the SET. spentHeight is
+        // COALESCE-bound on the confirmed branch only (see mark_spent_sql).
+        let mut q = Query::new(mark_spent_sql(confirmed, verdict.is_some())).bind(spending_txid);
+        if let Some(v) = verdict {
+            q = q.bind(v).bind(spending_txid);
+        }
+        if confirmed {
+            q = q.bind(spent_height);
+        }
+        q.bind(txid)
             .bind(output_index)
             .execute(&self.db)
             .await
@@ -1361,16 +1504,28 @@ impl PotStorage for D1PotStorage {
         txid: &str,
         output_index: u32,
     ) -> Result<Option<PotRecord>, PotStorageError> {
-        let row: Option<PotRow> = Query::new(
-            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
-             WHERE txid = ? AND outputIndex = ?",
-        )
+        let row: Option<PotRow> = Query::new(format!(
+            "SELECT {POT_RECORD_COLUMNS} FROM pot_records WHERE txid = ? AND outputIndex = ?"
+        ))
         .bind(txid)
         .bind(output_index)
         .fetch_optional(&self.db)
         .await
         .map_err(pot_err)?;
         Ok(row.map(PotRow::into_record))
+    }
+
+    async fn find_params_undecoded(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
+        // #284 backfill candidates: rows whose decode was never attempted,
+        // RANDOM-sampled (the proof-check anti-starvation idiom — a row with
+        // a permanently missing funding BEEF must not starve the tail).
+        // Backed by idx_pot_params_undecoded.
+        let sql = format!(
+            "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+             WHERE paramsDecoded = 0 ORDER BY RANDOM() LIMIT {limit}"
+        );
+        let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
     }
 
     async fn find_spent_unconfirmed(
@@ -2587,6 +2742,7 @@ mod tests {
             spent: 0.0,
             spending_txid: None,
             spent_confirmed: 0.0,
+            ..Default::default()
         };
         let r = row.into_record();
         assert_eq!(r.txid, "pot1");
@@ -2605,6 +2761,7 @@ mod tests {
             spent: 1.0,
             spending_txid: Some("settleTx".into()),
             spent_confirmed: 1.0,
+            ..Default::default()
         };
         let r = row.into_record();
         assert_eq!(r.output_index, 2);
@@ -2628,29 +2785,251 @@ mod tests {
 
     #[test]
     fn mark_spent_sql_confirmed_always_writes_and_latches_flag() {
-        let sql = mark_spent_sql(true);
-        // Chain truth: sets the pointer AND the flag…
-        assert!(sql.contains("SET spent = 1, spendingTxid = ?, spentConfirmed = 1"));
-        // …with no confirmation guard (last-confirmed-wins), UPDATE-only,
-        // never DELETE.
-        assert!(!sql.contains("spentConfirmed = 0"));
-        assert!(sql.starts_with("UPDATE pot_records"));
-        assert!(sql.contains("WHERE txid = ? AND outputIndex = ?"));
-        assert!(!sql.to_uppercase().contains("DELETE"));
+        for with_verdict in [false, true] {
+            let sql = mark_spent_sql(true, with_verdict);
+            // Chain truth: sets the pointer AND the flag…
+            assert!(sql.contains("SET spent = 1, spendingTxid = ?, spentConfirmed = 1"));
+            // …with no confirmation guard (last-confirmed-wins), UPDATE-only,
+            // never DELETE.
+            assert!(!sql.contains("spentConfirmed = 0"));
+            assert!(sql.starts_with("UPDATE pot_records"));
+            assert!(sql.contains("WHERE txid = ? AND outputIndex = ?"));
+            assert!(!sql.to_uppercase().contains("DELETE"));
+            // #284: spentHeight rides ONLY the confirmed branch, COALESCE'd
+            // so a NULL bind keeps the stored value.
+            assert!(sql.contains("spentHeight = COALESCE(?, spentHeight)"));
+        }
     }
 
     #[test]
     fn mark_spent_sql_unconfirmed_guarded_and_never_touches_flag() {
-        let sql = mark_spent_sql(false);
-        // The guard: an unconfirmed claim only lands while no confirmed
-        // pointer exists (spentConfirmed = 0)…
-        assert!(sql.contains("WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"));
-        // …and the SET clause never touches the flag (it DOES stamp spentAt —
-        // the #228 backstop age anchor — on every accepted write).
-        assert!(sql.contains("SET spent = 1, spendingTxid = ?, spentAt = unixepoch() WHERE"));
-        assert!(!sql.contains("spentConfirmed = 1"));
-        assert!(sql.starts_with("UPDATE pot_records"));
-        assert!(!sql.to_uppercase().contains("DELETE"));
+        for with_verdict in [false, true] {
+            let sql = mark_spent_sql(false, with_verdict);
+            // The guard: an unconfirmed claim only lands while no confirmed
+            // pointer exists (spentConfirmed = 0)…
+            assert!(sql.contains("WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"));
+            // …and the SET clause never touches the flag (it DOES stamp
+            // spentAt — the #228 backstop age anchor — on every accepted
+            // write) nor spentHeight (a fact of a verified BUMP only).
+            assert!(sql.contains("SET spent = 1, spendingTxid = ?, spentAt = unixepoch()"));
+            assert!(!sql.contains("spentConfirmed = 1"));
+            assert!(!sql.contains("spentHeight"));
+            assert!(sql.starts_with("UPDATE pot_records"));
+            assert!(!sql.to_uppercase().contains("DELETE"));
+        }
+    }
+
+    #[test]
+    fn mark_spent_sql_verdict_is_atomic_with_the_pointer_or_absent() {
+        // #284: with_verdict adds BOTH columns to the same statement (the
+        // verdict can never point at a different spender than the pointer it
+        // rode in with)…
+        for confirmed in [false, true] {
+            let sql = mark_spent_sql(confirmed, true);
+            assert!(sql.contains("verdict = ?, verdictTxid = ?"));
+        }
+        // …and WITHOUT a verdict the SET must not mention either column at
+        // all (explicitly UNCHANGED — a confirm-only caller must never null
+        // a stored verdict).
+        for confirmed in [false, true] {
+            let sql = mark_spent_sql(confirmed, false);
+            assert!(!sql.contains("verdict"));
+            assert!(!sql.contains("verdictTxid"));
+        }
+    }
+
+    // ── #284 store/mark SQL EXECUTED against the production schema ────────
+    // String pins are a backstop only (the #230 gate lesson); the contract —
+    // re-admission never regresses spend state, verdict atomic with the
+    // pointer, unconfirmed can never displace a confirmed verdict — is
+    // proven by RUNNING the exact shipped SQL under real SQLite over the
+    // exact shipped migrations.
+
+    /// One pot_records row snapshot for the #284 SQL tests.
+    #[derive(Debug, PartialEq)]
+    struct SqlPotRow {
+        spent: i64,
+        spending_txid: Option<String>,
+        spent_confirmed: i64,
+        lock_kind: Option<String>,
+        pub_a: Option<String>,
+        stake_a: Option<i64>,
+        pot_sats: Option<i64>,
+        params_decoded: i64,
+        verdict: Option<String>,
+        verdict_txid: Option<String>,
+        spent_height: Option<i64>,
+        created_at: Option<i64>,
+    }
+
+    fn read_pot_row(conn: &rusqlite::Connection, txid: &str, vout: u32) -> SqlPotRow {
+        conn.query_row(
+            "SELECT spent, spendingTxid, spentConfirmed, lockKind, pubA, stakeA, potSats, \
+                    paramsDecoded, verdict, verdictTxid, spentHeight, createdAt \
+             FROM pot_records WHERE txid = ?1 AND outputIndex = ?2",
+            rusqlite::params![txid, vout],
+            |r| {
+                Ok(SqlPotRow {
+                    spent: r.get(0)?,
+                    spending_txid: r.get(1)?,
+                    spent_confirmed: r.get(2)?,
+                    lock_kind: r.get(3)?,
+                    pub_a: r.get(4)?,
+                    stake_a: r.get(5)?,
+                    pot_sats: r.get(6)?,
+                    params_decoded: r.get(7)?,
+                    verdict: r.get(8)?,
+                    verdict_txid: r.get(9)?,
+                    spent_height: r.get(10)?,
+                    created_at: r.get(11)?,
+                })
+            },
+        )
+        .expect("pot row present")
+    }
+
+    /// Execute the shipped `store_record_sql()` with the given decoded
+    /// column values (spend fields as a fresh admission: unspent).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_store(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        created_at: i64,
+        lock_kind: Option<&str>,
+        pub_a: Option<&str>,
+        stake_a: Option<i64>,
+        pot_sats: Option<i64>,
+        params_decoded: i64,
+    ) {
+        conn.execute(
+            store_record_sql(),
+            rusqlite::params![
+                txid, vout, 0i64, Option::<String>::None, 0i64, created_at, lock_kind, pub_a,
+                pub_a, pub_a, // pubB / pubTower ride the same fixture value
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                stake_a,
+                stake_a, // stakeB
+                Option::<i64>::None,
+                Option::<i64>::None,
+                pot_sats,
+                params_decoded
+            ],
+        )
+        .expect("store_record_sql executes");
+    }
+
+    /// Execute the shipped `mark_spent_sql(...)` with the D1 impl's exact
+    /// bind order (spendingTxid, [verdict, verdictTxid,] [spentHeight,]
+    /// txid, outputIndex).
+    fn exec_mark_spent(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        spending_txid: &str,
+        confirmed: bool,
+        verdict: Option<&str>,
+        spent_height: Option<i64>,
+    ) {
+        let sql = mark_spent_sql(confirmed, verdict.is_some());
+        match (confirmed, verdict) {
+            (true, Some(v)) => conn.execute(
+                sql,
+                rusqlite::params![spending_txid, v, spending_txid, spent_height, txid, vout],
+            ),
+            (true, None) => conn.execute(
+                sql,
+                rusqlite::params![spending_txid, spent_height, txid, vout],
+            ),
+            (false, Some(v)) => conn.execute(
+                sql,
+                rusqlite::params![spending_txid, v, spending_txid, txid, vout],
+            ),
+            (false, None) => {
+                conn.execute(sql, rusqlite::params![spending_txid, txid, vout])
+            }
+        }
+        .expect("mark_spent_sql executes");
+    }
+
+    #[test]
+    fn sql_re_admission_backfills_decoded_columns_but_never_regresses_spend_state() {
+        let conn = production_schema_db();
+        // Pre-#284 admission (no decoded values), then a CONFIRMED spend
+        // with a verdict + height.
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(&conn, "potA", 0, "settleTx", true, Some("winner-a"), Some(800_000));
+        let before = read_pot_row(&conn, "potA", 0);
+        assert_eq!(before.spent, 1);
+        assert_eq!(before.verdict.as_deref(), Some("winner-a"));
+
+        // Re-admission / backfill upsert with decoded columns (a LATER
+        // createdAt bind, which must NOT overwrite the original stamp).
+        exec_store(
+            &conn,
+            "potA",
+            0,
+            9_999,
+            Some("covenant"),
+            Some(&"02".repeat(33)),
+            Some(2000),
+            Some(4000),
+            1,
+        );
+        let after = read_pot_row(&conn, "potA", 0);
+        // Spend state + createdAt byte-identical…
+        assert_eq!(after.spent, before.spent);
+        assert_eq!(after.spending_txid, before.spending_txid);
+        assert_eq!(after.spent_confirmed, before.spent_confirmed);
+        assert_eq!(after.verdict, before.verdict);
+        assert_eq!(after.verdict_txid, before.verdict_txid);
+        assert_eq!(after.spent_height, before.spent_height);
+        assert_eq!(after.created_at, Some(1_000), "createdAt never re-stamped");
+        // …decoded columns filled + latched.
+        assert_eq!(after.lock_kind.as_deref(), Some("covenant"));
+        assert_eq!(after.stake_a, Some(2000));
+        assert_eq!(after.pot_sats, Some(4000));
+        assert_eq!(after.params_decoded, 1);
+
+        // A NULL-bearing replay never nulls, never un-latches.
+        exec_store(&conn, "potA", 0, 8_888, None, None, None, None, 0);
+        assert_eq!(read_pot_row(&conn, "potA", 0), after);
+    }
+
+    #[test]
+    fn sql_unconfirmed_writer_cannot_displace_a_confirmed_verdict() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(&conn, "potA", 0, "realSettle", true, Some("winner-a"), Some(800_000));
+
+        // The attacker's unconfirmed claim — with its own forged verdict.
+        exec_mark_spent(&conn, "potA", 0, "forgedSpend", false, Some("winner-b"), None);
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spending_txid.as_deref(), Some("realSettle"));
+        assert_eq!(r.verdict.as_deref(), Some("winner-a"));
+        assert_eq!(r.verdict_txid.as_deref(), Some("realSettle"));
+        assert_eq!(r.spent_height, Some(800_000));
+        assert_eq!(r.spent_confirmed, 1);
+    }
+
+    #[test]
+    fn sql_confirm_only_write_keeps_the_stored_verdict_and_stamps_height() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        // 0-conf spend with a verdict (the lookup-service shape)…
+        exec_mark_spent(&conn, "potA", 0, "settleTx", false, Some("tie"), None);
+        // …then the chaser's confirm-only latch (no spender raw in hand).
+        exec_mark_spent(&conn, "potA", 0, "settleTx", true, None, Some(801_234));
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spent_confirmed, 1);
+        assert_eq!(r.verdict.as_deref(), Some("tie"), "None leaves the verdict");
+        assert_eq!(r.verdict_txid.as_deref(), Some("settleTx"));
+        assert_eq!(r.spent_height, Some(801_234));
+        // A later confirm with a NULL height keeps the stored one (COALESCE).
+        exec_mark_spent(&conn, "potA", 0, "settleTx", true, None, None);
+        assert_eq!(read_pot_row(&conn, "potA", 0).spent_height, Some(801_234));
     }
 
     #[test]

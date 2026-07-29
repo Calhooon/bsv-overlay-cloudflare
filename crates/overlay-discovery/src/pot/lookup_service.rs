@@ -75,33 +75,41 @@ impl PotLookupService {
         self
     }
 
-    /// Derive the `confirmed` hint for a spend: `true` ONLY when a tracker
-    /// is configured AND the spending BEEF carries a bump containing
-    /// `spending_txid` AND the bump's root computes AND the tracker answers
-    /// `Ok(true)` for it at the bump's height. EVERY other outcome (no
-    /// tracker, no bump, compute error, tracker error/false) → `false` —
-    /// FAIL-SAFE: a verification hiccup degrades to "unconfirmed hint",
-    /// never an error that blocks the spend record.
+    /// Derive the `confirmed` hint for a spend, as the VERIFIED BLOCK HEIGHT:
+    /// `Some(height)` ONLY when a tracker is configured AND the spending BEEF
+    /// carries a bump containing `spending_txid` AND the bump's root computes
+    /// AND the tracker answers `Ok(true)` for it at the bump's height. EVERY
+    /// other outcome (no tracker, no bump, compute error, tracker
+    /// error/false) → `None` — FAIL-SAFE: a verification hiccup degrades to
+    /// "unconfirmed hint", never an error that blocks the spend record. The
+    /// height is what `mark_spent` persists as `spentHeight` (#284): a fact
+    /// of the SPV-verified BUMP, never a courier's word.
     ///
     /// NOTE: `Transaction::from_beef` never populates the returned tx's
     /// `merkle_path` (bsv-rs keeps the bump as a `bump_index` into
     /// `Beef.bumps`), so we re-parse the BEEF and look the bump up directly.
-    async fn spend_confirmed(&self, spending_atomic_beef: &[u8], spending_txid: &str) -> bool {
-        let Some(tracker) = &self.chain_tracker else {
-            return false;
-        };
+    async fn spend_confirmed_height(
+        &self,
+        spending_atomic_beef: &[u8],
+        spending_txid: &str,
+    ) -> Option<u64> {
+        let tracker = self.chain_tracker.as_ref()?;
         let beef = match Beef::from_binary(spending_atomic_beef) {
             Ok(b) => b,
             Err(e) => {
                 debug!("POT: spending beef re-parse for SPV failed — unconfirmed: {e}");
-                return false;
+                return None;
             }
         };
         let Some(bump) = beef.find_bump(spending_txid) else {
             // No merkle path for the SPENDING tx itself (0-conf spend).
-            return false;
+            return None;
         };
-        bump_verifies(tracker.as_ref(), bump, spending_txid).await
+        if bump_verifies(tracker.as_ref(), bump, spending_txid).await {
+            Some(u64::from(bump.block_height))
+        } else {
+            None
+        }
     }
 }
 
@@ -178,13 +186,15 @@ impl LookupService for PotLookupService {
         // The topic manager already recognized the shape; re-check defensively
         // per topic (the TM should never admit a mismatched output here):
         // tm_pot admits the pot covenant, tm_lowfund the hop P2PKH.
-        let shape_ok = tx.outputs.get(output_index as usize).is_some_and(|o| {
-            let s = o.locking_script.to_binary();
-            match topic.as_str() {
-                "tm_pot" => is_pot_covenant_script(&s),
-                _ => crate::pot::is_p2pkh_script(&s), // tm_lowfund (gated above)
-            }
-        });
+        let Some(output) = tx.outputs.get(output_index as usize) else {
+            debug!("POT: admitted output index out of range — skipped");
+            return Ok(());
+        };
+        let lock_bytes = output.locking_script.to_binary();
+        let shape_ok = match topic.as_str() {
+            "tm_pot" => is_pot_covenant_script(&lock_bytes),
+            _ => crate::pot::is_p2pkh_script(&lock_bytes), // tm_lowfund (gated above)
+        };
         if !shape_ok {
             debug!("POT: admitted output does not match its topic's script shape — skipped");
             return Ok(());
@@ -194,13 +204,52 @@ impl LookupService for PotLookupService {
         // no txid field).
         let txid = tx.id();
 
-        let record = PotRecord {
+        // #284: decode ONCE at admission. Everything stored is a pure
+        // re-presentation of the admitted bytes: the lock's committed param
+        // pushes and the funding output's value. Admission itself stays
+        // byte-format-only — a failed extraction on a recognizer-matched
+        // script (should be impossible: the recognizer pinned the frozen
+        // HEAD/TAIL) is logged and stored as `lockKind='covenant'` with NULL
+        // params, and NEVER refuses the admission.
+        let mut record = PotRecord {
             txid: txid.clone(),
             output_index,
             spent: false,
             spending_txid: None,
             spent_confirmed: false,
+            pot_sats: output.satoshis,
+            params_decoded: true,
+            ..Default::default()
         };
+        match topic.as_str() {
+            "tm_pot" => {
+                record.lock_kind = Some("covenant".into());
+                match crate::pot::extract_covenant_params(&lock_bytes) {
+                    Some(p) => {
+                        record.pub_a = Some(hex::encode(p.pub_a));
+                        record.pub_b = Some(hex::encode(p.pub_b));
+                        record.pub_tower = Some(hex::encode(p.pub_tower));
+                        record.pay_pkh_a = Some(hex::encode(p.pay_pkh_a));
+                        record.pay_pkh_b = Some(hex::encode(p.pay_pkh_b));
+                        record.rake_pkh = Some(hex::encode(p.rake_pkh));
+                        record.stake_a = Some(p.stake_a);
+                        record.stake_b = Some(p.stake_b);
+                        record.fee_sats = Some(p.fee_sats);
+                        record.recovery_height = Some(p.recovery_height);
+                    }
+                    None => {
+                        debug!(
+                            "POT: recognizer-matched covenant lock failed param extraction \
+                             (admitted with NULL params): {txid}:{output_index}"
+                        );
+                    }
+                }
+            }
+            _ => {
+                // tm_lowfund: a plain P2PKH hop — no committed params exist.
+                record.lock_kind = Some("p2pkh".into());
+            }
+        }
 
         self.storage
             .store_record(&record)
@@ -251,18 +300,66 @@ impl LookupService for PotLookupService {
         };
         let spending_txid = spending_tx.id();
 
-        // Derive the CONFIRMED hint (SPV against the pinned tracker); any
-        // hiccup degrades fail-safe to `false` — never blocks the record.
-        // This is what makes the public /submit surface safe: an arbitrary
-        // unconfirmed claim can never clobber a confirmed pointer
-        // (`PotStorage::mark_spent` semantics).
-        let confirmed = self
-            .spend_confirmed(spending_atomic_beef, &spending_txid)
+        // Derive the CONFIRMED hint (SPV against the pinned tracker), as the
+        // verified block height; any hiccup degrades fail-safe to `None` —
+        // never blocks the record. This is what makes the public /submit
+        // surface safe: an arbitrary unconfirmed claim can never clobber a
+        // confirmed pointer (`PotStorage::mark_spent` semantics).
+        let spent_height = self
+            .spend_confirmed_height(spending_atomic_beef, &spending_txid)
             .await;
+        let confirmed = spent_height.is_some();
 
-        // PERSIST the spender — never delete. This is the landing proof.
+        // #284: classify the spend verdict ONCE, from the DECODED covenant
+        // params stored at admission — a pure template-match of the spending
+        // tx's outputs (chain bytes) against the four covenant-mandated
+        // exits. Bare pots NEVER get a stored verdict (their refund rule
+        // depends on an unverified marker hint — app-layer-only); a row
+        // without decoded params (pre-#284 admission) gets `None` and is
+        // covered by the backfill pass / the read-path fallback. The
+        // stake-conservation check mirrors the app-layer's
+        // `classify_pot_spend`: the covenant asserts `ctx.utxo.value ==
+        // stakeA + stakeB` in-script, so a funding value that disagrees is
+        // not the pot the params describe → no verdict.
+        let verdict = match self.storage.get_spent_status(txid, output_index).await {
+            Ok(Some(record)) => record
+                .decoded_covenant_params()
+                .and_then(|params| {
+                    let pot_sats = record.pot_sats?;
+                    if params.stake_a.checked_add(params.stake_b)? != pot_sats {
+                        return None; // conservation failed — never classify
+                    }
+                    // The spend notification names the spent outpoint; find
+                    // the spending tx's OWN input for it (its sequence feeds
+                    // the refund height-gate check).
+                    let pot_input_sequence = spending_tx.inputs.iter().find_map(|i| {
+                        (i.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(txid))
+                            && i.source_output_index == output_index)
+                            .then_some(i.sequence)
+                    })?;
+                    let spender = crate::pot::RawTx::from_transaction(&spending_tx)?;
+                    crate::pot::classify_covenant(&params, &spender, pot_input_sequence)
+                })
+                .map(|v| v.as_str()),
+            Ok(None) => None, // never admitted — mark_spent is a no-op anyway
+            Err(e) => {
+                debug!("POT: record read for verdict classification failed — no verdict: {e}");
+                None
+            }
+        };
+
+        // PERSIST the spender — never delete. This is the landing proof. The
+        // verdict (+ verified height) rides the SAME write, atomic with the
+        // pointer.
         self.storage
-            .mark_spent(txid, output_index, &spending_txid, confirmed)
+            .mark_spent(
+                txid,
+                output_index,
+                &spending_txid,
+                confirmed,
+                verdict,
+                spent_height,
+            )
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
@@ -1062,6 +1159,244 @@ mod tests {
         let arr = spent_status(&svc, serde_json::json!([{"txid": pot_txid, "vout": 0}])).await;
         assert_eq!(arr[0]["spent"], true);
         assert_eq!(arr[0]["spendingTxid"], settle.id());
+    }
+
+    // ── #284: decode-once at admission + classify-once at spend ──────────
+
+    use crate::pot::covenant::{encode_covenant_param_pushes, p2pkh_lock, CovenantParams};
+    use crate::pot::topic_manager::tests::covenant_script;
+
+    /// Committed params whose stakes sum to `make_covenant_output`'s 2500
+    /// funded satoshis (conservation holds): pot 2500, fee 100 → net 2400,
+    /// rake floor(2500/100)=25 → winner payout 2375.
+    fn real_params() -> CovenantParams {
+        CovenantParams {
+            pub_a: [0x02; 33],
+            pub_b: [0x03; 33],
+            pub_tower: [0x04; 33],
+            pay_pkh_a: [0xAA; 20],
+            pay_pkh_b: [0xBB; 20],
+            rake_pkh: [0xCC; 20],
+            stake_a: 1250,
+            stake_b: 1250,
+            fee_sats: 100,
+            recovery_height: 900_000,
+        }
+    }
+
+    /// A funding tx whose vout 0 is the covenant over REAL param pushes.
+    fn real_funding_tx(salt: u8, p: &CovenantParams) -> Tx {
+        let mut tx = Tx::new();
+        tx.add_input(TransactionInput::new(hex::encode([salt; 32]), 0))
+            .unwrap();
+        tx.add_output(TransactionOutput {
+            satoshis: Some(2500),
+            locking_script: LockingScript::from_binary(&covenant_script(
+                &encode_covenant_param_pushes(p),
+            ))
+            .unwrap(),
+            change: false,
+        })
+        .unwrap();
+        tx
+    }
+
+    /// A spender paying an explicit output set (a template match candidate).
+    fn spender_paying(pot_txid: &str, vout: u32, outs: &[(u64, Vec<u8>)]) -> Tx {
+        let mut tx = Tx::new();
+        tx.add_input(TransactionInput::new(pot_txid.to_string(), vout))
+            .unwrap();
+        for (sats, script) in outs {
+            tx.add_output(TransactionOutput {
+                satoshis: Some(*sats),
+                locking_script: LockingScript::from_binary(script).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        }
+        tx
+    }
+
+    #[tokio::test]
+    async fn admission_decodes_the_committed_params_into_the_record() {
+        let (svc, storage) = make_service_with_storage();
+        let p = real_params();
+        let funding = real_funding_tx(1, &p);
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+
+        let r = storage.get_spent_status(&funding.id(), 0).await.unwrap().unwrap();
+        assert!(r.params_decoded);
+        assert_eq!(r.lock_kind.as_deref(), Some("covenant"));
+        assert_eq!(r.pub_a.as_deref(), Some(hex::encode(p.pub_a).as_str()));
+        assert_eq!(r.pub_b.as_deref(), Some(hex::encode(p.pub_b).as_str()));
+        assert_eq!(r.pay_pkh_a.as_deref(), Some(hex::encode(p.pay_pkh_a).as_str()));
+        assert_eq!(r.rake_pkh.as_deref(), Some(hex::encode(p.rake_pkh).as_str()));
+        assert_eq!(r.stake_a, Some(1250));
+        assert_eq!(r.stake_b, Some(1250));
+        assert_eq!(r.fee_sats, Some(100));
+        assert_eq!(r.recovery_height, Some(900_000));
+        assert_eq!(r.pot_sats, Some(2500), "funding output value captured");
+        // The round-trip: the stored columns rebuild the exact params.
+        assert_eq!(r.decoded_covenant_params(), Some(p));
+        // No spend yet → no verdict.
+        assert_eq!(r.verdict, None);
+    }
+
+    #[tokio::test]
+    async fn recognizer_matched_but_unextractable_params_still_admit() {
+        // The existing dummy fixture's 45×0xAB middle is NOT a valid push
+        // sequence — extraction fails. The admission must still land
+        // (lockKind covenant, params NULL, paramsDecoded latched) — decode
+        // failure NEVER refuses an admission.
+        let (svc, storage) = make_service_with_storage();
+        let funding = funding_tx(1);
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        let r = storage.get_spent_status(&funding.id(), 0).await.unwrap().unwrap();
+        assert!(r.params_decoded, "decode was ATTEMPTED and recorded");
+        assert_eq!(r.lock_kind.as_deref(), Some("covenant"));
+        assert_eq!(r.pub_a, None);
+        assert_eq!(r.decoded_covenant_params(), None);
+    }
+
+    #[tokio::test]
+    async fn spend_classifies_the_winner_template_and_stores_the_verdict() {
+        let (svc, storage) = make_service_with_storage();
+        let p = real_params();
+        let funding = real_funding_tx(1, &p);
+        let pot_txid = funding.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+
+        // The exact winner-A template: [25 → rakePkh, 2375 → payPkhA].
+        let settle = spender_paying(
+            &pot_txid,
+            0,
+            &[(25, p2pkh_lock(&p.rake_pkh)), (2375, p2pkh_lock(&p.pay_pkh_a))],
+        );
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&settle)))
+            .await
+            .unwrap();
+
+        let r = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert_eq!(r.spending_txid.as_deref(), Some(settle.id().as_str()));
+        assert_eq!(r.verdict.as_deref(), Some("winner-a"));
+        assert_eq!(
+            r.verdict_txid.as_deref(),
+            Some(settle.id().as_str()),
+            "the verdict is bound to the spender it was computed from"
+        );
+        // Unconfirmed spend (no tracker) → no spentHeight.
+        assert_eq!(r.spent_height, None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_spend_stores_the_bump_height_alongside_the_verdict() {
+        let storage = Rc::new(MemoryPotStorage::new());
+        let p = real_params();
+        let funding = real_funding_tx(1, &p);
+        let pot_txid = funding.id();
+        let mut settle = spender_paying(
+            &pot_txid,
+            0,
+            &[(25, p2pkh_lock(&p.rake_pkh)), (2375, p2pkh_lock(&p.pay_pkh_a))],
+        );
+        let settle_txid = settle.id();
+        settle.merkle_path = Some(single_tx_bump(&settle_txid, 800_000));
+
+        let svc = PotLookupService::new(storage.clone())
+            .with_chain_tracker(tracker_accepting(&settle_txid, 800_000));
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&settle)))
+            .await
+            .unwrap();
+
+        let r = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed);
+        assert_eq!(r.spent_height, Some(800_000), "the SPV-verified BUMP height");
+        assert_eq!(r.verdict.as_deref(), Some("winner-a"));
+    }
+
+    #[tokio::test]
+    async fn non_template_spend_and_conservation_mismatch_store_no_verdict() {
+        // A spend paying a NON-template shape → spent recorded, verdict NULL.
+        let (svc, storage) = make_service_with_storage();
+        let p = real_params();
+        let funding = real_funding_tx(1, &p);
+        let pot_txid = funding.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        let redirect = spender_paying(&pot_txid, 0, &[(2400, p2pkh_lock(&[0xEE; 20]))]);
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&redirect)))
+            .await
+            .unwrap();
+        let r = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert_eq!(r.verdict, None, "a non-template spend never classifies");
+
+        // Conservation mismatch: committed stakes (500+500) ≠ the funded
+        // 2500 sats — even an exact template match must refuse (the params
+        // do not describe THIS pot's money).
+        let (svc2, storage2) = make_service_with_storage();
+        let bad = CovenantParams {
+            stake_a: 500,
+            stake_b: 500,
+            ..real_params()
+        };
+        let funding2 = real_funding_tx(2, &bad);
+        let pot2 = funding2.id();
+        svc2.output_admitted_by_topic(&admit(beef_of(&funding2), 0))
+            .await
+            .unwrap();
+        // The template derived from the (lying) params: pot 1000, fee 100 →
+        // net 900, rake 10 → winner 890.
+        let settle2 = spender_paying(
+            &pot2,
+            0,
+            &[(10, p2pkh_lock(&bad.rake_pkh)), (890, p2pkh_lock(&bad.pay_pkh_a))],
+        );
+        svc2.output_spent(&spent(&pot2, 0, beef_of(&settle2)))
+            .await
+            .unwrap();
+        let r2 = storage2.get_spent_status(&pot2, 0).await.unwrap().unwrap();
+        assert!(r2.spent, "the landing proof still lands");
+        assert_eq!(r2.verdict, None, "stake conservation failed → no verdict");
+    }
+
+    #[tokio::test]
+    async fn lowfund_rows_are_p2pkh_kind_and_never_get_a_verdict() {
+        let (svc, storage) = make_service_with_storage();
+        let mut hop = Tx::new();
+        hop.add_input(TransactionInput::new("22".repeat(32), 0)).unwrap();
+        hop.add_output(p2pkh_output()).unwrap();
+        let hop_txid = hop.id();
+        svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&hop), 0)))
+            .await
+            .unwrap();
+        let r = storage.get_spent_status(&hop_txid, 0).await.unwrap().unwrap();
+        assert_eq!(r.lock_kind.as_deref(), Some("p2pkh"));
+        assert!(r.params_decoded);
+        assert_eq!(r.pub_a, None, "a hop has no committed params");
+        assert_eq!(r.pot_sats, Some(546));
+
+        // The JOIN spends it — spent recorded, but NEVER a verdict.
+        let join = settle_tx(&hop_txid, 0);
+        let mut payload = spent(&hop_txid, 0, beef_of(&join));
+        if let OutputSpent::WholeTx { ref mut topic, .. } = payload {
+            *topic = "tm_lowfund".into();
+        }
+        svc.output_spent(&payload).await.unwrap();
+        let r = storage.get_spent_status(&hop_txid, 0).await.unwrap().unwrap();
+        assert!(r.spent);
+        assert_eq!(r.verdict, None, "p2pkh rows never carry a verdict");
     }
 
     // ── Query validation ─────────────────────────────────────────────────
