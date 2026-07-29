@@ -672,3 +672,140 @@ mod tests {
         assert_eq!(classify_covenant(&p, &ungated, 0xffff_ffff), None);
     }
 }
+
+/// #288 (bsv-low) — this crate's template derivation asserted against the
+/// FROZEN cross-language money-template vectors, vendored at
+/// `crates/overlay-discovery/vectors/money-templates-v1.json` (generated from
+/// the bsv-low Rust SSOT `tower_settle.rs::template_settle_outputs` /
+/// `template_refund_outputs` by `low-conformance/tests/money_template_vectors.rs`).
+/// A failure here is cross-repo money-template drift — fix the derivation or
+/// re-vendor a deliberately regenerated vector file (adversarial gate), never
+/// loosen the assertion.
+#[cfg(test)]
+mod money_vector_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const LOCAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/vectors/money-templates-v1.json"
+    );
+    /// The canonical file in the bsv-low checkout (sibling repo on the dev
+    /// machine). The byte-compare guard runs whenever it is present.
+    const CANONICAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../bsv-low/crates/low-conformance/vectors/money-templates-v1.json"
+    );
+
+    fn vectors() -> Value {
+        serde_json::from_str(&std::fs::read_to_string(LOCAL).expect("read vendored vectors"))
+            .expect("parse money-templates-v1.json")
+    }
+
+    fn pkh20(v: &Value) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&hex::decode(v.as_str().expect("pkh")).expect("pkh hex"));
+        out
+    }
+
+    fn pub33(v: &Value) -> [u8; 33] {
+        let mut out = [0u8; 33];
+        out.copy_from_slice(&hex::decode(v.as_str().expect("pub")).expect("pub hex"));
+        out
+    }
+
+    /// `None` = the exit is refused; `Some` = the exact ordered output set.
+    fn expected(case: &Value, exit: &str) -> Option<OutputSet> {
+        case[exit].as_array().map(|outs| {
+            outs.iter()
+                .map(|o| {
+                    (
+                        o[0].as_u64().expect("satoshis"),
+                        hex::decode(o[1].as_str().expect("scriptHex")).expect("script hex"),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Vendored copy == the canonical bsv-low file, byte-for-byte (guard
+    /// against the two repos drifting apart on a regeneration). Skips quietly
+    /// when the sibling checkout is absent (e.g. a standalone clone) — the
+    /// derivation assertions below still run against the vendored bytes.
+    #[test]
+    fn vendored_vectors_match_canonical() {
+        let Ok(canonical) = std::fs::read(CANONICAL) else {
+            eprintln!("note: {CANONICAL} not present — byte-compare guard skipped");
+            return;
+        };
+        let local = std::fs::read(LOCAL).expect("read vendored vectors");
+        assert_eq!(
+            local, canonical,
+            "vendored money-template vectors drifted from the canonical bsv-low file — re-vendor the regenerated file (a money-template change; adversarial gate)"
+        );
+    }
+
+    #[test]
+    fn templates_match_frozen_vectors() {
+        let v = vectors();
+        assert_eq!(
+            v["constants"]["rakeDivisor"].as_u64().unwrap(),
+            TEMPLATE_RAKE_DIVISOR
+        );
+        assert_eq!(
+            v["constants"]["locktimeThreshold"].as_u64().unwrap(),
+            u64::from(LOCKTIME_THRESHOLD)
+        );
+        let fx = &v["fixtures"];
+        let mut asserted = 0usize;
+        for case in v["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let p = CovenantParams {
+                pub_a: pub33(&fx["pubA"]),
+                pub_b: pub33(&fx["pubB"]),
+                pub_tower: pub33(&fx["pubTower"]),
+                pay_pkh_a: pkh20(&case["payPkhA"]),
+                pay_pkh_b: pkh20(&case["payPkhB"]),
+                rake_pkh: pkh20(&case["rakePkh"]),
+                stake_a: case["stakeA"].as_u64().unwrap(),
+                stake_b: case["stakeB"].as_u64().unwrap(),
+                fee_sats: case["feeSats"].as_u64().unwrap(),
+                recovery_height: case["recoveryHeight"].as_u64().unwrap(),
+            };
+            let got = settle_templates(&p);
+            match (
+                expected(case, "winnerA"),
+                expected(case, "winnerB"),
+                expected(case, "tie"),
+            ) {
+                // Classifier semantics: all-or-nothing — this site derives NO
+                // templates when ANY settle exit is unbuildable; the tie is
+                // the weakest exit (winner refused implies tie refused), so
+                // "tie == null" is exactly the refusal condition.
+                (_, _, None) => assert!(
+                    got.is_none(),
+                    "{name}: SSOT refuses the tie but settle_templates derived {got:?}"
+                ),
+                (Some(a), Some(b), Some(tie)) => {
+                    let [t_a, t_b, t_tie] = got.unwrap_or_else(|| panic!("{name}: refused"));
+                    assert_eq!(t_a, a, "{name}/winnerA drifted");
+                    assert_eq!(t_b, b, "{name}/winnerB drifted");
+                    assert_eq!(t_tie, tie, "{name}/tie drifted");
+                }
+                other => panic!("{name}: vectors carry a winner without a tie: {other:?}"),
+            }
+            // The refund pin: this site implements the WEAK boundary (refuses
+            // only fee_share > stake; the SSOT refuses at >=). At the
+            // divergence point the vectors carry the pinned weak expectation
+            // (`refundWeakBoundary`); everywhere else it must equal the SSOT.
+            let want_refund = if case.get("refundWeakBoundary").is_some() {
+                expected(case, "refundWeakBoundary")
+            } else {
+                expected(case, "refund")
+            };
+            assert_eq!(refund_template(&p), want_refund, "{name}/refund drifted");
+            asserted += 4;
+        }
+        assert!(asserted >= 24 * 4, "vector file unexpectedly small");
+    }
+}

@@ -1,0 +1,1237 @@
+{
+  "_readme": [
+    "#288 FROZEN MONEY-TEMPLATE VECTORS — the cross-language contract for the four mandated pot exits (winner-A / winner-B / tie / refund).",
+    "GENERATED from the Rust SSOT (crates/low-spend/src/tower_settle.rs template_settle_outputs + template_refund_outputs — the code that builds the real covenant txs) by crates/low-conformance/tests/money_template_vectors.rs.",
+    "A DIFF IN THIS FILE IS A MONEY-TEMPLATE CHANGE and requires the adversarial money-code review gate before shipping.",
+    "Regenerate deliberately: LOW_REGEN_MONEY_VECTORS=1 cargo test -p low-conformance --test money_template_vectors  — then copy to ~/bsv/bsv-overlay-cloudflare/crates/overlay-discovery/vectors/ and re-run every asserting suite.",
+    "Asserted by: (1) this pin (SSOT byte-compare); (2) low-watchtower cosign.rs mandated_outputs; (3) app/src/lib/moneyTemplates.vectors.test.ts (pot.ts settleOutputs + chainAttribution.ts settleTemplates/refundTemplate); (4) overlay-discovery pot/covenant.rs (vendored copy + byte-compare guard in that repo).",
+    "Encoding: each exit is null (the SSOT REFUSES the parameterization at lock-build time) or an ordered list of [satoshis, lockingScriptHex]. potSats = stakeA + stakeB. lockBuildable mirrors build_template_bound_lock (templates derivable AND recoveryHeight < locktimeThreshold).",
+    "refundWeakBoundary (present only when it differs from refund): what the two CLASSIFIER sites (chainAttribution.ts refundTemplate, overlay covenant.rs refund_template) derive — they refuse only when fee_share > stake, the SSOT refuses at fee_share >= stake. Pinned so the divergence cannot silently widen; the SSOT field is the law for tx builders.",
+    "Classifier sites derive settle templates all-or-nothing: they return NO templates when ANY settle exit is unbuildable — equivalently, exactly when this file's tie is null (tie is the weakest settle exit: winner refused implies tie refused)."
+  ],
+  "cases": [
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "baseline-live-shape-even-tie",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          325,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          325,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          320,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 351,
+      "lockBuildable": true,
+      "name": "tie-odd-net-rake-takes-odd-sat",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          324,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          325,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          319,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          319,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          639,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          639,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "odd-rake-tie-odd-net",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1100,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          375,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          375,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 550,
+      "stakeB": 550,
+      "tie": [
+        [
+          12,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          369,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          369,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          739,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          739,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 10,
+      "lockBuildable": true,
+      "name": "rakeless-tiny-pot-tie-collides-refund",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 80,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          35,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          35,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 40,
+      "stakeB": 40,
+      "tie": [
+        [
+          35,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          35,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          70,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          70,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 9,
+      "lockBuildable": true,
+      "name": "rakeless-tie-takes-odd-sat",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 90,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          40,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          41,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 45,
+      "stakeB": 45,
+      "tie": [
+        [
+          1,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          40,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          40,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          81,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          81,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 9,
+      "lockBuildable": true,
+      "name": "pot-99-last-rakeless",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 99,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          44,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          46,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 49,
+      "stakeB": 50,
+      "tie": [
+        [
+          45,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          45,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          90,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          90,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 10,
+      "lockBuildable": true,
+      "name": "pot-100-first-raked",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 100,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          45,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          45,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 50,
+      "stakeB": 50,
+      "tie": [
+        [
+          2,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          44,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          44,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          1,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          89,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          1,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          89,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "unequal-stakes",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          125,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          525,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 300,
+      "stakeB": 700,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          320,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 351,
+      "lockBuildable": true,
+      "name": "unequal-stakes-odd-fee-seat-a-absorbs",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          124,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          525,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 300,
+      "stakeB": 700,
+      "tie": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          319,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          319,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          639,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          639,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 0,
+      "lockBuildable": true,
+      "name": "fee-zero",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          500,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          500,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          495,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          495,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          990,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          990,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 1,
+      "lockBuildable": true,
+      "name": "fee-one-tie-odd",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          499,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          500,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          494,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          494,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          989,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          989,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 1000,
+      "lockBuildable": false,
+      "name": "fee-eq-pot-all-refused",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": null,
+      "refundWeakBoundary": [
+        [
+          0,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          0,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": null,
+      "winnerA": null,
+      "winnerB": null
+    },
+    {
+      "feeSats": 999,
+      "lockBuildable": false,
+      "name": "fee-pot-minus-one",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": null,
+      "refundWeakBoundary": [
+        [
+          0,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          1,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": null,
+      "winnerA": null,
+      "winnerB": null
+    },
+    {
+      "feeSats": 400,
+      "lockBuildable": false,
+      "name": "fee-share-eq-stake-divergence",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1100,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": null,
+      "refundWeakBoundary": [
+        [
+          0,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          700,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 200,
+      "stakeB": 900,
+      "tie": [
+        [
+          12,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          344,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          344,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          689,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          689,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 400,
+      "lockBuildable": true,
+      "name": "fee-share-eq-stake-minus-one",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1101,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          1,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          700,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 201,
+      "stakeB": 900,
+      "tie": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          345,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          345,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          690,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          11,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          690,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 9900,
+      "lockBuildable": false,
+      "name": "rake-eq-net-settle-refused-refund-ok",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 10000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          50,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          50,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 5000,
+      "stakeB": 5000,
+      "tie": null,
+      "winnerA": null,
+      "winnerB": null
+    },
+    {
+      "feeSats": 9899,
+      "lockBuildable": false,
+      "name": "winner-one-sat-tie-refused",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 10000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          50,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          51,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 5000,
+      "stakeB": 5000,
+      "tie": null,
+      "winnerA": [
+        [
+          100,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          1,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          100,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          1,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "sub-floor-tiny-net",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 500,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          75,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          75,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 250,
+      "stakeB": 250,
+      "tie": [
+        [
+          6,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          72,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          72,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          5,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          145,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          5,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          145,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "economics-worked-example-scale",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 200000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          99825,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          99825,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 100000,
+      "stakeB": 100000,
+      "tie": [
+        [
+          2000,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          98825,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          98825,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          2000,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          197650,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          2000,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          197650,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 500,
+      "lockBuildable": true,
+      "name": "big-pot-two-tenths-bsv",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 20000000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          9999750,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          9999750,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 10000000,
+      "stakeB": 10000000,
+      "tie": [
+        [
+          200000,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          9899750,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          9899750,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          200000,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          19799500,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          200000,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          19799500,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "recovery-height-threshold-minus-one",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 499999999,
+      "refund": [
+        [
+          325,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          325,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          320,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": false,
+      "name": "recovery-height-at-threshold-unbuildable",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 500000000,
+      "refund": [
+        [
+          325,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          325,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          320,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "recovery-height-zero",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 0,
+      "refund": [
+        [
+          325,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          325,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          320,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+        ]
+      ]
+    },
+    {
+      "feeSats": 350,
+      "lockBuildable": true,
+      "name": "degenerate-same-pay-home",
+      "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payPkhB": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "potSats": 1000,
+      "rakePkh": "cccccccccccccccccccccccccccccccccccccccc",
+      "recoveryHeight": 910000,
+      "refund": [
+        [
+          325,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          325,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "stakeA": 500,
+      "stakeB": 500,
+      "tie": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ],
+        [
+          320,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerA": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ],
+      "winnerB": [
+        [
+          10,
+          "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+        ],
+        [
+          640,
+          "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        ]
+      ]
+    }
+  ],
+  "constants": {
+    "feeDivisor": 10,
+    "locktimeThreshold": 500000000,
+    "rakeDivisor": 100
+  },
+  "fixtures": {
+    "defaultPayPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "defaultPayPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "pubA": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "pubB": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "pubTower": "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1",
+    "rakePkh": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "version": 1
+}
