@@ -15,7 +15,10 @@ use overlay_discovery::collected::storage::{
 use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
-use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
+use overlay_discovery::low::storage::{
+    LowRecord, LowRecordType, LowStorage, LowStorageError, LOW_BY_KEY_RESULT_CAP,
+    OPEN_TABLES_RESULT_CAP,
+};
 use overlay_discovery::pot::storage::{
     pot_beef_has_proof, PotRecord, PotStorage, PotStorageError,
 };
@@ -27,7 +30,9 @@ use overlay_discovery::potrefund::storage::{
 };
 use overlay_discovery::proof::storage::{ProofRecord, ProofStorage, ProofStorageError};
 use overlay_discovery::result::storage::{ResultRecord, ResultStorage, ResultStorageError};
-use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
+use overlay_discovery::reveal::storage::{
+    RevealRecord, RevealStorage, RevealStorageError, REVEAL_RESULT_CAP,
+};
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
 };
@@ -985,6 +990,53 @@ impl UHRPStorage for D1UHRPStorage {
 // D1LowStorage
 // =============================================================================
 
+/// The full `low_records` column set (#290 — the decoded index IS the
+/// answer, so the queries read it back instead of just the outpoint refs).
+const LOW_RECORD_COLUMNS: &str =
+    "recordType, txid, outputIndex, hostIdentity, gameId, stakeSats, rulesHash, \
+     relayUrl, expiryHeight";
+
+/// Row for full low_records queries. D1 returns numbers as f64 and nullable
+/// columns as `Option`.
+#[derive(Deserialize)]
+struct LowRow {
+    #[serde(rename = "recordType")]
+    record_type: String,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "hostIdentity")]
+    host_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "stakeSats")]
+    stake_sats: Option<f64>,
+    #[serde(rename = "rulesHash")]
+    rules_hash: Option<String>,
+    #[serde(rename = "relayUrl")]
+    relay_url: Option<String>,
+    #[serde(rename = "expiryHeight")]
+    expiry_height: Option<f64>,
+}
+
+impl LowRow {
+    /// `None` on an unknown recordType (can't happen — the writer only ever
+    /// stores the two known discriminators; defensive skip, never a panic).
+    fn into_record(self) -> Option<LowRecord> {
+        Some(LowRecord {
+            record_type: LowRecordType::from_str_opt(&self.record_type)?,
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            host_identity: self.host_identity,
+            game_id: self.game_id,
+            stake_sats: self.stake_sats.map(|s| s as u64),
+            rules_hash: self.rules_hash,
+            relay_url: self.relay_url,
+            expiry_height: self.expiry_height.map(|e| e as u32),
+        })
+    }
+}
+
 /// Cloudflare D1 implementation of the LowStorage trait (tm_low / ls_low).
 ///
 /// Schema: `low_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by
@@ -1040,7 +1092,7 @@ impl LowStorage for D1LowStorage {
         stake_min: Option<u64>,
         stake_max: Option<u64>,
         tip_height: Option<u32>,
-    ) -> Result<Vec<UTXOReference>, LowStorageError> {
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
         let mut wb = WhereBuilder::new().eq("recordType", "table");
         if let Some(min) = stake_min {
             wb = wb.gte("stakeSats", min as i64);
@@ -1060,47 +1112,70 @@ impl LowStorage for D1LowStorage {
         }
         let (where_clause, params) = wb.build();
 
+        // Full index rows (#290) + newest-first bound (#291) — the lobby is
+        // a display surface; the cap keeps the newest tables.
         let sql = format!(
-            "SELECT txid, outputIndex FROM low_records{where_clause} ORDER BY createdAt DESC"
+            "SELECT {LOW_RECORD_COLUMNS} FROM low_records{where_clause} \
+             ORDER BY createdAt DESC LIMIT {OPEN_TABLES_RESULT_CAP}"
         );
         let mut q = Query::new(sql);
         for p in params {
             q = q.bind(p);
         }
-        let rows: Vec<UTXORow> = q.fetch_all(&self.db).await.map_err(low_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        let rows: Vec<LowRow> = q.fetch_all(&self.db).await.map_err(low_err)?;
+        Ok(rows.into_iter().filter_map(LowRow::into_record).collect())
     }
 
-    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<UTXOReference>, LowStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM low_records WHERE gameId = ? ORDER BY createdAt DESC",
-        )
+    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+        let rows: Vec<LowRow> = Query::new(format!(
+            "SELECT {LOW_RECORD_COLUMNS} FROM low_records WHERE gameId = ? \
+             ORDER BY createdAt DESC LIMIT {LOW_BY_KEY_RESULT_CAP}"
+        ))
         .bind(game_id)
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(rows.into_iter().filter_map(LowRow::into_record).collect())
     }
 
-    async fn find_by_host(
-        &self,
-        identity_key: &str,
-    ) -> Result<Vec<UTXOReference>, LowStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM low_records WHERE hostIdentity = ? \
-             ORDER BY createdAt DESC",
-        )
+    async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+        let rows: Vec<LowRow> = Query::new(format!(
+            "SELECT {LOW_RECORD_COLUMNS} FROM low_records WHERE hostIdentity = ? \
+             ORDER BY createdAt DESC LIMIT {LOW_BY_KEY_RESULT_CAP}"
+        ))
         .bind(identity_key)
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(rows.into_iter().filter_map(LowRow::into_record).collect())
     }
 }
 
 // =============================================================================
 // D1RevealStorage
 // =============================================================================
+
+/// Row for full reveal_records queries. D1 returns numbers as f64.
+#[derive(Deserialize)]
+struct RevealRow {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    seat: f64,
+}
+
+impl RevealRow {
+    fn into_record(self) -> RevealRecord {
+        RevealRecord {
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            game_id: self.game_id,
+            seat: self.seat as u8,
+        }
+    }
+}
 
 /// Cloudflare D1 implementation of the RevealStorage trait (tm_reveal /
 /// ls_reveal).
@@ -1154,32 +1229,33 @@ impl RevealStorage for D1RevealStorage {
         &self,
         game_id: &str,
         seat: u8,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM reveal_records \
-             WHERE gameId = ? AND seat = ? ORDER BY createdAt DESC",
-        )
+    ) -> Result<Vec<RevealRecord>, RevealStorageError> {
+        let rows: Vec<RevealRow> = Query::new(format!(
+            "SELECT txid, outputIndex, gameId, seat FROM reveal_records \
+             WHERE gameId = ? AND seat = ? ORDER BY createdAt DESC \
+             LIMIT {REVEAL_RESULT_CAP}"
+        ))
         .bind(game_id)
         .bind(seat as u32)
         .fetch_all(&self.db)
         .await
         .map_err(reveal_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(rows.into_iter().map(RevealRow::into_record).collect())
     }
 
     async fn find_by_game_id(
         &self,
         game_id: &str,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM reveal_records WHERE gameId = ? \
-             ORDER BY createdAt DESC",
-        )
+    ) -> Result<Vec<RevealRecord>, RevealStorageError> {
+        let rows: Vec<RevealRow> = Query::new(format!(
+            "SELECT txid, outputIndex, gameId, seat FROM reveal_records WHERE gameId = ? \
+             ORDER BY createdAt DESC LIMIT {REVEAL_RESULT_CAP}"
+        ))
         .bind(game_id)
         .fetch_all(&self.db)
         .await
         .map_err(reveal_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(rows.into_iter().map(RevealRow::into_record).collect())
     }
 }
 
@@ -1426,6 +1502,18 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
 ///
 /// Bind order: `verdict, spendingTxid (verdictTxid), txid, outputIndex,
 /// spendingTxid (guard)`.
+/// SQL for one batched spent-status chunk (bsv-low #289): a single
+/// row-value `IN (VALUES …)` query replacing `n` individual
+/// `get_spent_status` round trips. Factored out so the real-SQLite test
+/// proves the syntax against the production schema.
+pub fn pot_spent_statuses_sql(n: usize) -> String {
+    let placeholders = vec!["(?, ?)"; n].join(", ");
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE (txid, outputIndex) IN (VALUES {placeholders})"
+    )
+}
+
 pub fn verdict_cas_sql() -> &'static str {
     "UPDATE pot_records SET verdict = ?, verdictTxid = ? \
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
@@ -1575,6 +1663,41 @@ impl PotStorage for D1PotStorage {
         .await
         .map_err(pot_err)?;
         Ok(row.map(PotRow::into_record))
+    }
+
+    /// Batched spent-status (bsv-low #289): one row-value `IN (VALUES …)`
+    /// query per 40-outpoint chunk instead of one D1 round trip per
+    /// outpoint. Alignment contract (input order, `None` where absent) is
+    /// preserved via an outpoint-keyed map.
+    async fn get_spent_statuses(
+        &self,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Option<PotRecord>>, PotStorageError> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        // D1 caps bound parameters (100); 2 per outpoint → chunks of 40.
+        const CHUNK: usize = 40;
+        let mut by_outpoint: std::collections::HashMap<(String, u32), PotRecord> =
+            std::collections::HashMap::new();
+        for chunk in outpoints.chunks(CHUNK) {
+            let sql = pot_spent_statuses_sql(chunk.len());
+            let mut q = Query::new(sql);
+            for (txid, output_index) in chunk {
+                q = q.bind(txid.as_str()).bind(*output_index);
+            }
+            let rows: Vec<PotRow> = q.fetch_all(&self.db).await.map_err(pot_err)?;
+            for row in rows {
+                let record = row.into_record();
+                by_outpoint.insert((record.txid.clone(), record.output_index), record);
+            }
+        }
+        Ok(outpoints
+            .iter()
+            .map(|(txid, output_index)| {
+                by_outpoint.get(&(txid.clone(), *output_index)).cloned()
+            })
+            .collect())
     }
 
     async fn find_params_undecoded(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
@@ -1813,6 +1936,45 @@ impl CollectedStorage for D1CollectedStorage {
         .await
         .map_err(collected_err)?;
         Ok(row.map(CollectedRow::into_record))
+    }
+
+    /// Batched pair lookup (bsv-low #289): one `gameId IN (…)` query per
+    /// chunk instead of a D1 round trip per requested game. Alignment
+    /// contract (input order, `None` where no marker exists) preserved via
+    /// a gameId-keyed map — (identity, gameId) is the primary key, so at
+    /// most one row exists per requested gameId.
+    async fn get_records(
+        &self,
+        identity: &str,
+        game_ids: &[String],
+    ) -> Result<Vec<Option<CollectedRecord>>, CollectedStorageError> {
+        if game_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // D1 caps bound parameters (100); 1 per gameId + the identity.
+        const CHUNK: usize = 90;
+        let mut by_game: std::collections::HashMap<String, CollectedRecord> =
+            std::collections::HashMap::new();
+        for chunk in game_ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT identity, gameId, txid, sigHex FROM collected_markers \
+                 WHERE identity = ? AND gameId IN ({placeholders})"
+            );
+            let mut q = Query::new(sql).bind(identity);
+            for game_id in chunk {
+                q = q.bind(game_id.as_str());
+            }
+            let rows: Vec<CollectedRow> = q.fetch_all(&self.db).await.map_err(collected_err)?;
+            for row in rows {
+                let record = row.into_record();
+                by_game.insert(record.game_id.clone(), record);
+            }
+        }
+        Ok(game_ids
+            .iter()
+            .map(|game_id| by_game.get(game_id).cloned())
+            .collect())
     }
 }
 
@@ -3337,6 +3499,38 @@ mod tests {
 
     fn h64(seed: u8) -> String {
         format!("{seed:02x}").repeat(32)
+    }
+
+    /// #289: the batched spent-status SQL must execute on the production
+    /// schema (row-value `IN (VALUES …)` is newer SQLite surface) and select
+    /// per-OUTPOINT — a txid match with a different vout must NOT be
+    /// returned.
+    #[test]
+    fn pot_batch_sql_selects_exact_outpoints_real_sqlite() {
+        let conn = production_schema_db();
+        insert_pot(&conn, &h64(0xaa), 0, 1, false);
+        insert_pot(&conn, &h64(0xaa), 1, 2, true);
+        insert_pot(&conn, &h64(0xbb), 0, 3, false);
+
+        let sql = pot_spent_statuses_sql(3);
+        let mut stmt = conn.prepare(&sql).expect("batch SQL must parse on real SQLite");
+        // Ask for (aa,1), (bb,0) and an absent (cc,0).
+        let rows: Vec<(String, u32)> = stmt
+            .query_map(
+                rusqlite::params![h64(0xaa), 1u32, h64(0xbb), 0u32, h64(0xcc), 0u32],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut sorted = rows;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![(h64(0xaa), 1), (h64(0xbb), 0)],
+            "exactly the requested present outpoints — no txid-only matches, \
+             no phantom rows"
+        );
     }
 
     fn victim_id() -> String {

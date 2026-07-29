@@ -29,9 +29,21 @@ use super::parse_potrefund_marker;
 use super::storage::{PotrefundQuery, PotrefundRecord, PotrefundStorage};
 
 /// Default number of records returned when a query omits `limit`.
-const DEFAULT_LIMIT: usize = 100;
-/// Hard cap on the number of records a single query can return.
-const MAX_LIMIT: usize = 500;
+///
+/// Sized to the PAYLOAD, not the row count (bsv-low #291): a potrefund row
+/// carries `refundRawHex` (format-capped at 100,000 raw bytes → up to
+/// ~200 KB of hex TEXT per row), so the old default of 100 allowed a
+/// ~20 MB response (and MAX 500 ⇒ ~100 MB) — compare `ls_proof`, capped at
+/// 3 for a 64 KiB payload. 16 covers every honest need with headroom: a
+/// `byPot` query has at most 2 genuine backups (one per seat), and the
+/// windowed `partyFor` SQL (#281) reserves per-pot quotas inside whatever
+/// limit it is handed. Honest rows are not displaced by a flood at this
+/// size — the by-pot window orders `createdAt ASC`, so markers published at
+/// game time precede any later spam (the dust-attack suite proves it).
+const DEFAULT_LIMIT: usize = 16;
+/// Hard cap on the number of records a single query can return. A client
+/// that genuinely needs more than 100 rows pages explicitly.
+const MAX_LIMIT: usize = 100;
 
 /// POTREFUND Lookup Service — indexes markers and answers `byPot` /
 /// `partyFor`.

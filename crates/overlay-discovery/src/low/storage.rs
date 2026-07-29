@@ -6,7 +6,6 @@
 //! `ship::storage`.
 
 use async_trait::async_trait;
-use overlay_engine::types::UTXOReference;
 use serde::{Deserialize, Serialize};
 
 /// Record type discriminator for `low_records` rows.
@@ -73,6 +72,14 @@ pub struct LowRecord {
 
 /// `ls_low` query shapes — tagged JSON, e.g.
 /// `{"type":"findOpenTables","stakeMin":100,"stakeMax":5000}`.
+///
+/// Every variant carries an optional `decoded` flag (bsv-low #290, default
+/// `false`): `false` keeps the legacy `OutputList` answer (`{beef,
+/// outputIndex}` per row — byte-identical to the pre-#290 wire); `true`
+/// returns the DECODED index columns as a `Freeform` array (the shaped
+/// answer the index already holds), the same idiom as the other six LOW
+/// services. Raw bytes stay available via the app-layer `/beef/:txid` for
+/// independent verification (the slim-mirror pattern).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LowQuery {
@@ -83,20 +90,38 @@ pub enum LowQuery {
         stake_min: Option<u64>,
         #[serde(rename = "stakeMax", default, skip_serializing_if = "Option::is_none")]
         stake_max: Option<u64>,
+        #[serde(default)]
+        decoded: bool,
     },
     /// All records (TABLE_OPEN + GAME_UTXO) for one game.
     #[serde(rename = "byGameId")]
     ByGameId {
         #[serde(rename = "gameId")]
         game_id: String,
+        #[serde(default)]
+        decoded: bool,
     },
     /// All records published by one host identity key.
     #[serde(rename = "byHost")]
     ByHost {
         #[serde(rename = "identityKey")]
         identity_key: String,
+        #[serde(default)]
+        decoded: bool,
     },
 }
+
+/// Newest-first cap on `find_open_tables` results (bsv-low #291). The lobby
+/// is a DISPLAY surface, not a money answer: a table beyond the newest 200
+/// is invisible until older ones close/expire — an acceptable, documented
+/// bound (an unjoined table risks no funds), versus the previous unbounded
+/// scan feeding the per-row BEEF hydration.
+pub const OPEN_TABLES_RESULT_CAP: usize = 200;
+
+/// Cap on `find_by_game_id` / `find_by_host` results (bsv-low #291). A game
+/// legitimately has ~2 live rows (its TABLE_OPEN + current GAME_UTXO
+/// pointer) and a host a handful — 50 is an order of magnitude of headroom.
+pub const LOW_BY_KEY_RESULT_CAP: usize = 50;
 
 /// Backend-agnostic storage for LOW lobby records.
 #[async_trait(?Send)]
@@ -107,7 +132,10 @@ pub trait LowStorage {
     /// Delete a record by UTXO reference (spend or eviction).
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), LowStorageError>;
 
-    /// Unspent TABLE_OPEN records, optionally filtered by stake range.
+    /// Unspent TABLE_OPEN records, optionally filtered by stake range —
+    /// FULL index rows (bsv-low #290: the decoded columns are the shaped
+    /// answer; the caller chooses whether to return them or just the refs),
+    /// newest-first, capped at [`OPEN_TABLES_RESULT_CAP`].
     ///
     /// `tip_height` enforces expiry at QUERY TIME: when `Some(tip)`, a row is
     /// returned only if its `expiryHeight > tip` (strictly greater, mirroring
@@ -121,14 +149,15 @@ pub trait LowStorage {
         stake_min: Option<u64>,
         stake_max: Option<u64>,
         tip_height: Option<u32>,
-    ) -> Result<Vec<UTXOReference>, LowStorageError>;
+    ) -> Result<Vec<LowRecord>, LowStorageError>;
 
-    /// All records for a game ID (lowercase hex).
-    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<UTXOReference>, LowStorageError>;
+    /// All records for a game ID (lowercase hex), capped at
+    /// [`LOW_BY_KEY_RESULT_CAP`].
+    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<LowRecord>, LowStorageError>;
 
-    /// All records for a host identity key (lowercase hex).
-    async fn find_by_host(&self, identity_key: &str)
-        -> Result<Vec<UTXOReference>, LowStorageError>;
+    /// All records for a host identity key (lowercase hex), capped at
+    /// [`LOW_BY_KEY_RESULT_CAP`].
+    async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError>;
 }
 
 /// LOW storage errors.
@@ -183,8 +212,8 @@ impl LowStorage for MemoryLowStorage {
         stake_min: Option<u64>,
         stake_max: Option<u64>,
         tip_height: Option<u32>,
-    ) -> Result<Vec<UTXOReference>, LowStorageError> {
-        Ok(self
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        let records: Vec<LowRecord> = self
             .records
             .lock()
             .unwrap()
@@ -203,43 +232,45 @@ impl LowStorage for MemoryLowStorage {
             .filter(|r| {
                 tip_height.is_none_or(|tip| r.expiry_height.is_some_and(|e| e > tip))
             })
-            .map(|r| UTXOReference {
-                txid: r.txid.clone(),
-                output_index: r.output_index,
-            })
-            .collect())
+            .cloned()
+            .collect();
+        // Cap keeps the NEWEST rows (this store is insertion-ordered, so the
+        // newest are the tail) — mirrors D1's `ORDER BY createdAt DESC LIMIT`.
+        Ok(keep_newest(records, OPEN_TABLES_RESULT_CAP))
     }
 
-    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<UTXOReference>, LowStorageError> {
-        Ok(self
+    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+        let records: Vec<LowRecord> = self
             .records
             .lock()
             .unwrap()
             .iter()
             .filter(|r| r.game_id == game_id)
-            .map(|r| UTXOReference {
-                txid: r.txid.clone(),
-                output_index: r.output_index,
-            })
-            .collect())
+            .cloned()
+            .collect();
+        Ok(keep_newest(records, LOW_BY_KEY_RESULT_CAP))
     }
 
-    async fn find_by_host(
-        &self,
-        identity_key: &str,
-    ) -> Result<Vec<UTXOReference>, LowStorageError> {
-        Ok(self
+    async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+        let records: Vec<LowRecord> = self
             .records
             .lock()
             .unwrap()
             .iter()
             .filter(|r| r.host_identity == identity_key)
-            .map(|r| UTXOReference {
-                txid: r.txid.clone(),
-                output_index: r.output_index,
-            })
-            .collect())
+            .cloned()
+            .collect();
+        Ok(keep_newest(records, LOW_BY_KEY_RESULT_CAP))
     }
+}
+
+/// Truncate to the newest `cap` rows of an insertion-ordered vec (the tail),
+/// preserving relative order.
+fn keep_newest<T>(mut rows: Vec<T>, cap: usize) -> Vec<T> {
+    if rows.len() > cap {
+        rows.drain(..rows.len() - cap);
+    }
+    rows
 }
 
 // ============================================================================
@@ -449,9 +480,13 @@ mod tests {
             LowQuery::FindOpenTables {
                 stake_min,
                 stake_max,
+                decoded,
             } => {
                 assert_eq!(stake_min, Some(100));
                 assert_eq!(stake_max, Some(5000));
+                // #290: `decoded` absent on the wire defaults to false — the
+                // legacy answer shape stays byte-identical.
+                assert!(!decoded);
             }
             _ => panic!("wrong variant"),
         }
@@ -463,9 +498,17 @@ mod tests {
             q,
             LowQuery::FindOpenTables {
                 stake_min: None,
-                stake_max: None
+                stake_max: None,
+                decoded: false,
             }
         ));
+
+        // #290: opting into the decoded answer parses.
+        let q: LowQuery = serde_json::from_value(serde_json::json!({
+            "type": "findOpenTables", "decoded": true
+        }))
+        .unwrap();
+        assert!(matches!(q, LowQuery::FindOpenTables { decoded: true, .. }));
 
         let q: LowQuery = serde_json::from_value(serde_json::json!({
             "type": "byGameId", "gameId": "ab".repeat(32)

@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 82;
+pub const OVERLAY_MIGRATION_COUNT: usize = 88;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -786,6 +786,33 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE pot_records ADD COLUMN spentHeight INTEGER",
     // The backfill candidate scan (`WHERE paramsDecoded = 0`).
     "CREATE INDEX IF NOT EXISTS idx_pot_params_undecoded ON pot_records(paramsDecoded)",
+    // ── #291 hot-sort indexes (all additive CREATE INDEX IF NOT EXISTS) ───
+    // Lobby (`ls_low findOpenTables`, every poll): `WHERE recordType = ?
+    // [stake/expiry residuals] ORDER BY createdAt DESC LIMIT n` — the
+    // composite serves the filter AND the sort in one backward index scan
+    // (createdAt was previously unindexed → filesort per poll).
+    "CREATE INDEX IF NOT EXISTS idx_low_type_created ON low_records(recordType, createdAt)",
+    // potrefund hot queries both `ORDER BY createdAt DESC, rowid DESC`
+    // (there was NO createdAt index at all on this table).
+    "CREATE INDEX IF NOT EXISTS idx_potrefund_createdAt ON potrefund_records(createdAt)",
+    // /leaderboard + /results: `WHERE winner = ? ORDER BY createdAt DESC` —
+    // the two existing single-column indexes forced pick-one-then-sort.
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_winner_created \
+     ON result_markers_v2(winner, createdAt)",
+    // potparty partyFor window: `WHERE identity = ? ORDER BY createdAt DESC`.
+    "CREATE INDEX IF NOT EXISTS idx_potparty_identity_created \
+     ON potparty_records(identity, createdAt)",
+    // find_utxos_for_topic (GASP sync + admission): `WHERE topic = ? AND
+    // spent = ? ORDER BY score` — the sole outputs index (txid, outputIndex,
+    // topic) has no topic-leftmost prefix, so this was a full scan+filesort.
+    "CREATE INDEX IF NOT EXISTS idx_outputs_topic_spent_score \
+     ON outputs(topic, spent, score)",
+    // Proof-completion candidate scan (#228 backstop age gate):
+    // `WHERE has_proof = 0 AND (created_at IS NULL OR created_at <= ?)` —
+    // the composite covers both predicates (supersedes the single-column
+    // has_proof index for this query; that one stays, additive-only list).
+    "CREATE INDEX IF NOT EXISTS idx_transactions_proof_created \
+     ON transactions(has_proof, created_at)",
 ];
 
 // =============================================================================
@@ -1073,6 +1100,13 @@ mod tests {
             "idx_potparty_createdAt",
             "idx_potrefund_pot",
             "idx_potrefund_identity",
+            // #291 hot-sort indexes
+            "idx_low_type_created",
+            "idx_potrefund_createdAt",
+            "idx_result_markers_v2_winner_created",
+            "idx_potparty_identity_created",
+            "idx_outputs_topic_spent_score",
+            "idx_transactions_proof_created",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

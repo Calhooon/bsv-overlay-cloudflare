@@ -185,10 +185,11 @@ impl LookupService for LowLookupService {
         let query: LowQuery = serde_json::from_value(question.query.clone())
             .map_err(|e| LookupServiceError::InvalidQuery(e.to_string()))?;
 
-        let result = match query {
+        let (records, decoded) = match query {
             LowQuery::FindOpenTables {
                 stake_min,
                 stake_max,
+                decoded,
             } => {
                 if let (Some(min), Some(max)) = (stake_min, stake_max) {
                     if min > max {
@@ -200,23 +201,56 @@ impl LookupService for LowLookupService {
                 // Enforce table expiry at query time against the live chain
                 // tip (bsv-low #148). `None` => fail-open (no expiry filter).
                 let tip = self.resolve_tip().await;
-                self.storage
-                    .find_open_tables(stake_min, stake_max, tip)
-                    .await
+                (
+                    self.storage
+                        .find_open_tables(stake_min, stake_max, tip)
+                        .await,
+                    decoded,
+                )
             }
-            LowQuery::ByGameId { game_id } => {
+            LowQuery::ByGameId { game_id, decoded } => {
                 let game_id = normalize_hex(&game_id, 32, "gameId")?;
-                self.storage.find_by_game_id(&game_id).await
+                (self.storage.find_by_game_id(&game_id).await, decoded)
             }
-            LowQuery::ByHost { identity_key } => {
+            LowQuery::ByHost {
+                identity_key,
+                decoded,
+            } => {
                 let identity_key = normalize_hex(&identity_key, 33, "identityKey")?;
-                self.storage.find_by_host(&identity_key).await
+                (self.storage.find_by_host(&identity_key).await, decoded)
             }
         };
 
-        result
-            .map(LookupResult::OutputList)
-            .map_err(|e| LookupServiceError::StorageError(e.to_string()))
+        let records = records.map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+
+        if decoded {
+            // bsv-low #290: return the DECODED index columns the query
+            // already read — the shaped answer — instead of making every
+            // client re-run a PushDrop decode over raw BEEF. Same Freeform
+            // idiom as the other six LOW services; raw bytes stay available
+            // via the app-layer `/beef/:txid` for independent verification.
+            let entries: Vec<serde_json::Value> = records
+                .iter()
+                .map(|r| {
+                    serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+            return Ok(LookupResult::Answer(LookupAnswer::Freeform {
+                result: serde_json::Value::Array(entries),
+            }));
+        }
+
+        // Legacy wire (decoded absent/false): the outpoint refs, hydrated to
+        // `{beef, outputIndex}` by the engine — byte-identical to pre-#290.
+        Ok(LookupResult::OutputList(
+            records
+                .into_iter()
+                .map(|r| UTXOReference {
+                    txid: r.txid,
+                    output_index: r.output_index,
+                })
+                .collect(),
+        ))
     }
 
     async fn get_documentation(&self) -> String {
@@ -488,6 +522,59 @@ mod tests {
         let results = svc.lookup(&q).await.unwrap().into_outputs().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].txid, "tx1");
+    }
+
+    // ── #290: decoded Freeform answer ────────────────────────────────────
+
+    #[tokio::test]
+    async fn decoded_query_returns_freeform_index_rows() {
+        let (svc, _storage) = make_service_with_storage();
+        let signer = PrivateKey::random();
+        svc.output_admitted_by_topic(&admit("tx1", 3, table_open_script(&signer, 2500)))
+            .await
+            .unwrap();
+
+        let q = LookupQuestion::new(
+            "ls_low",
+            serde_json::json!({"type": "findOpenTables", "decoded": true}),
+        );
+        let LookupResult::Answer(LookupAnswer::Freeform { result }) = svc.lookup(&q).await.unwrap()
+        else {
+            panic!("decoded:true must return the Freeform shaped answer");
+        };
+        let rows = result.as_array().expect("array of rows");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["recordType"], "table");
+        assert_eq!(row["txid"], "tx1");
+        assert_eq!(row["outputIndex"], 3);
+        assert_eq!(row["stakeSats"], 2500);
+        assert_eq!(row["relayUrl"], "https://relay.example.com");
+        assert_eq!(row["expiryHeight"], 900000);
+        assert!(row["hostIdentity"].is_string(), "decoded host identity");
+        assert!(row["gameId"].is_string(), "decoded gameId");
+        assert!(row["rulesHash"].is_string(), "decoded rulesHash");
+    }
+
+    #[tokio::test]
+    async fn decoded_false_or_absent_keeps_the_legacy_output_list() {
+        let (svc, _storage) = make_service_with_storage();
+        let signer = PrivateKey::random();
+        svc.output_admitted_by_topic(&admit("tx1", 0, table_open_script(&signer, 1000)))
+            .await
+            .unwrap();
+
+        for query in [
+            serde_json::json!({"type": "findOpenTables"}),
+            serde_json::json!({"type": "findOpenTables", "decoded": false}),
+        ] {
+            let q = LookupQuestion::new("ls_low", query);
+            let results = svc.lookup(&q).await.unwrap().into_outputs().expect(
+                "legacy queries must still yield the OutputList wire (byte-identical pre-#290)",
+            );
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].txid, "tx1");
+        }
     }
 
     #[tokio::test]

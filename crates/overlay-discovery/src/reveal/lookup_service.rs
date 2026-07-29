@@ -123,21 +123,48 @@ impl LookupService for RevealLookupService {
         let query: RevealQuery = serde_json::from_value(question.query.clone())
             .map_err(|e| LookupServiceError::InvalidQuery(e.to_string()))?;
 
-        let result = match query {
-            RevealQuery::ByGameSeat { game_id, seat } => {
+        let (records, decoded) = match query {
+            RevealQuery::ByGameSeat {
+                game_id,
+                seat,
+                decoded,
+            } => {
                 let game_id = normalize_game_id(&game_id)?;
                 let seat = normalize_seat(seat)?;
-                self.storage.find_by_game_seat(&game_id, seat).await
+                (self.storage.find_by_game_seat(&game_id, seat).await, decoded)
             }
-            RevealQuery::ByGameId { game_id } => {
+            RevealQuery::ByGameId { game_id, decoded } => {
                 let game_id = normalize_game_id(&game_id)?;
-                self.storage.find_by_game_id(&game_id).await
+                (self.storage.find_by_game_id(&game_id).await, decoded)
             }
         };
 
-        result
-            .map(LookupResult::OutputList)
-            .map_err(|e| LookupServiceError::StorageError(e.to_string()))
+        let records = records.map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+
+        if decoded {
+            // bsv-low #290: the shaped index answer (txid/outputIndex/
+            // gameId/seat) — no per-row BEEF hydration, no client-side
+            // re-decode. The reveal OPENING still lives in the artifact
+            // bytes (app-layer `/beef/:txid`).
+            let entries: Vec<serde_json::Value> = records
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+                .collect();
+            return Ok(LookupResult::Answer(LookupAnswer::Freeform {
+                result: serde_json::Value::Array(entries),
+            }));
+        }
+
+        // Legacy wire (decoded absent/false) — byte-identical to pre-#290.
+        Ok(LookupResult::OutputList(
+            records
+                .into_iter()
+                .map(|r| UTXOReference {
+                    txid: r.txid,
+                    output_index: r.output_index,
+                })
+                .collect(),
+        ))
     }
 
     async fn get_documentation(&self) -> String {
@@ -237,6 +264,51 @@ mod tests {
         let meta = svc.get_metadata().await;
         assert_eq!(meta.name, "REVEAL Lookup Service");
         assert!(!svc.get_documentation().await.is_empty());
+    }
+
+    // ── #290: decoded Freeform answer ────────────────────────────────────
+
+    #[tokio::test]
+    async fn decoded_query_returns_freeform_index_rows() {
+        let (svc, _storage) = make_service_with_storage();
+        svc.output_admitted_by_topic(&admit("tx9", 1, reveal_script(&[0x11u8; 32], 1)))
+            .await
+            .unwrap();
+
+        let q = LookupQuestion::new(
+            "ls_reveal",
+            serde_json::json!({
+                "type": "byGameSeat", "gameId": "11".repeat(32), "seat": 1, "decoded": true
+            }),
+        );
+        let LookupResult::Answer(LookupAnswer::Freeform { result }) = svc.lookup(&q).await.unwrap()
+        else {
+            panic!("decoded:true must return the Freeform shaped answer");
+        };
+        let rows = result.as_array().expect("array of rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["txid"], "tx9");
+        assert_eq!(rows[0]["outputIndex"], 1);
+        assert_eq!(rows[0]["gameId"], "11".repeat(32));
+        assert_eq!(rows[0]["seat"], 1);
+    }
+
+    #[tokio::test]
+    async fn decoded_absent_keeps_the_legacy_output_list() {
+        let (svc, _storage) = make_service_with_storage();
+        svc.output_admitted_by_topic(&admit("tx9", 0, reveal_script(&[0x11u8; 32], 0)))
+            .await
+            .unwrap();
+
+        let q = LookupQuestion::new(
+            "ls_reveal",
+            serde_json::json!({"type": "byGameId", "gameId": "11".repeat(32)}),
+        );
+        let results = svc.lookup(&q).await.unwrap().into_outputs().expect(
+            "legacy queries must still yield the OutputList wire (byte-identical pre-#290)",
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].txid, "tx9");
     }
 
     // ── Admission + lookup (golden mainnet reveal) ───────────────────────
