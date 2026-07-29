@@ -680,6 +680,17 @@ pub struct SpendConfirmSummary {
 /// FAIL-CLOSED: a spend the fetcher can't verify against chaintracks is left
 /// unconfirmed (retried next tick), NEVER latched on a courier's word. Bounded
 /// by `limit`.
+///
+/// NOTE (2026-07-28 gate, MEDIUM-2 sibling — deliberately NOT CAS-guarded
+/// here): unlike the #284 backfill's verdict write, this pass's confirmed
+/// write is justified by a FRESH SPV verification of exactly the spender it
+/// writes — `verified_proof_for(rec.spending_txid)` proved THAT txid mined,
+/// which is chain truth, so last-confirmed-wins re-asserting it over a
+/// racing UNCONFIRMED displacement is correct, not stale. The residual is
+/// the narrow window where a DIFFERENT spender was CONFIRMED in-flight (two
+/// verified-mined spenders of one outpoint can only coexist across a reorg);
+/// that pre-existing base-branch class is left for a follow-up issue rather
+/// than folded into #284.
 pub async fn complete_spend_confirmations(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn AncestorFetcher,
@@ -711,11 +722,27 @@ pub async fn complete_spend_confirmations(
         // unmined / unverifiable / budget-exhausted → `None` (retry), never a
         // positive.
         match fetcher.verified_proof_for(spending_txid).await {
-            Some(_bump) => {
+            Some(bump_hex) => {
                 // UPGRADE: latch spentConfirmed = 1. mark_spent(confirmed=true)
                 // always writes and never downgrades a confirmed row.
+                //
+                // #284: this caller only CONFIRMS an existing pointer and has
+                // no spender raw in hand → verdict = None (the SQL leaves the
+                // stored verdict/verdictTxid UNCHANGED — never nulled). The
+                // spentHeight DOES ride along: the block height is a fact of
+                // the just-verified BUMP.
+                let spent_height = MerklePath::from_hex(&bump_hex)
+                    .ok()
+                    .map(|mp| u64::from(mp.block_height));
                 if let Err(e) = pot_storage
-                    .mark_spent(&rec.txid, rec.output_index, spending_txid, true)
+                    .mark_spent(
+                        &rec.txid,
+                        rec.output_index,
+                        spending_txid,
+                        true,
+                        None,
+                        spent_height,
+                    )
                     .await
                 {
                     worker::console_log!("[spend-confirm] {} mark_spent failed: {e}", rec.txid);
@@ -726,6 +753,211 @@ pub async fn complete_spend_confirmations(
             None => {
                 summary.still_unconfirmed += 1;
             }
+        }
+    }
+
+    summary
+}
+
+// ============================================================================
+// pot_records decoded-params lazy backfill (bsv-low #284)
+// ============================================================================
+
+/// Per-tick candidate bound for [`backfill_decoded_params`] (~16 rows; each
+/// costs one `pot_beefs` read + a parse, plus a second pair for a spent
+/// covenant row's verdict).
+pub const PARAMS_BACKFILL_LIMIT: u64 = 16;
+
+/// Tally of one decoded-params backfill pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ParamsBackfillSummary {
+    /// Undecoded rows scanned this tick.
+    pub scanned: usize,
+    /// Rows whose decode was recorded (`paramsDecoded` latched) this tick —
+    /// covenant, bare, p2pkh, or unrecognized.
+    pub decoded: usize,
+    /// Verdicts computed + stored for already-spent covenant rows.
+    pub verdicts: usize,
+    /// Rows skipped because their funding BEEF is missing/unparseable —
+    /// they STAY candidates (retried forever, bounded per tick).
+    pub missing_beef: usize,
+}
+
+/// Lazily decode the #284 columns for pre-migration `pot_records` rows
+/// (`paramsDecoded = 0`), from the DURABLE `pot_beefs` store — modeled on
+/// [`complete_spend_confirmations`] (bounded, RANDOM-sampled candidates,
+/// fail-safe skips) but needing NO courier: everything decoded is already in
+/// our own admitted bytes.
+///
+/// Per candidate row:
+/// 1. read the funding BEEF (`get_beef`); missing → leave `paramsDecoded = 0`
+///    (a permanent candidate, retried next tick — RANDOM order stops it
+///    starving the tail);
+/// 2. parse the tx out of the BEEF **hash-bound** (`Transaction::from_beef`
+///    selects by the row's own txid over parse-computed ids — a garbled
+///    stored row cannot masquerade as the funding tx) and take the lock at
+///    the row's `outputIndex`;
+/// 3. classify the lock shape: covenant (params extracted; an extraction
+///    failure still records `lockKind='covenant'` with NULL params), bare
+///    2-of-3, plain P2PKH, or unrecognized (`lockKind` NULL) — in EVERY
+///    case `paramsDecoded` latches 1 (decode attempted + recorded), written
+///    through [`PotStorage::store_record`]'s decoded-column upsert (which
+///    never touches spend state);
+/// 4. if the row is SPENT, its spender's BEEF is stored, and the lock
+///    decoded to a covenant: compute the verdict for the CURRENT
+///    `spendingTxid` (input match + stake conservation + template match)
+///    and store it via `mark_spent` under the row's own confirmed flag —
+///    which respects the confirmed-guard semantics (a racing confirmed
+///    writer can never be displaced by this pass).
+///
+/// Bare rows NEVER get a verdict (their refund rule needs an unverified
+/// marker hint — app-layer-only, money-neutral).
+pub async fn backfill_decoded_params(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    limit: u64,
+) -> ParamsBackfillSummary {
+    use overlay_discovery::pot::storage::PotRecord;
+    use overlay_discovery::pot::{
+        classify_covenant, extract_covenant_params, is_bare_2of3_lock, is_p2pkh_script, RawTx,
+    };
+
+    let mut summary = ParamsBackfillSummary::default();
+    let candidates = match pot_storage.find_params_undecoded(limit).await {
+        Ok(c) => c,
+        Err(e) => {
+            push_log(&format!("[params-backfill] candidate scan failed: {e}"));
+            return summary;
+        }
+    };
+    summary.scanned = candidates.len();
+
+    for row in candidates {
+        // 1. The funding BEEF — the only byte source this pass trusts.
+        let beef = match pot_storage.get_beef(&row.txid).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                summary.missing_beef += 1;
+                continue; // stays a candidate — retried next tick
+            }
+            Err(e) => {
+                push_log(&format!("[params-backfill] {} beef read failed: {e}", row.txid));
+                summary.missing_beef += 1;
+                continue;
+            }
+        };
+        // 2. Hash-bound parse: select the subject by the row's own txid
+        //    (BEEF txids are computed from the raw bytes at parse time).
+        let Ok(tx) = Transaction::from_beef(&beef, Some(&row.txid)) else {
+            push_log(&format!(
+                "[params-backfill] {} stored beef unparseable — left a candidate",
+                row.txid
+            ));
+            summary.missing_beef += 1;
+            continue;
+        };
+        let output = tx.outputs.get(row.output_index as usize);
+
+        // 3. Decode the lock shape into an upsert record.
+        let mut decoded = PotRecord {
+            txid: row.txid.clone(),
+            output_index: row.output_index,
+            pot_sats: output.and_then(|o| o.satoshis),
+            params_decoded: true,
+            ..Default::default()
+        };
+        let mut covenant_params = None;
+        if let Some(o) = output {
+            let lock = o.locking_script.to_binary();
+            if let Some(p) = extract_covenant_params(&lock) {
+                decoded.lock_kind = Some("covenant".into());
+                decoded.pub_a = Some(hex::encode(p.pub_a));
+                decoded.pub_b = Some(hex::encode(p.pub_b));
+                decoded.pub_tower = Some(hex::encode(p.pub_tower));
+                decoded.pay_pkh_a = Some(hex::encode(p.pay_pkh_a));
+                decoded.pay_pkh_b = Some(hex::encode(p.pay_pkh_b));
+                decoded.rake_pkh = Some(hex::encode(p.rake_pkh));
+                decoded.stake_a = Some(p.stake_a);
+                decoded.stake_b = Some(p.stake_b);
+                decoded.fee_sats = Some(p.fee_sats);
+                decoded.recovery_height = Some(p.recovery_height);
+                covenant_params = Some(p);
+            } else if overlay_discovery::pot::is_pot_covenant_script(&lock) {
+                // Recognizer-matched but unextractable params ("impossible"
+                // — mirrors the admission path): covenant kind, NULL params.
+                decoded.lock_kind = Some("covenant".into());
+            } else if is_bare_2of3_lock(&lock) {
+                decoded.lock_kind = Some("bare".into());
+            } else if is_p2pkh_script(&lock) {
+                decoded.lock_kind = Some("p2pkh".into());
+            }
+            // else: unrecognized shape — lockKind stays NULL, decode
+            // attempted (paramsDecoded = 1).
+        }
+        if let Err(e) = pot_storage.store_record(&decoded).await {
+            push_log(&format!("[params-backfill] {} decoded upsert failed: {e}", row.txid));
+            continue;
+        }
+        summary.decoded += 1;
+
+        // 4. Verdict backfill for an already-spent covenant row whose
+        //    spender BEEF we hold.
+        let (Some(params), Some(pot_sats), true, Some(spending_txid)) = (
+            covenant_params,
+            decoded.pot_sats,
+            row.spent,
+            row.spending_txid.as_deref(),
+        ) else {
+            continue;
+        };
+        if params.stake_a.checked_add(params.stake_b) != Some(pot_sats) {
+            continue; // conservation failed — never classify
+        }
+        let Ok(Some(spender_beef)) = pot_storage.get_beef(spending_txid).await else {
+            continue; // no spender bytes — the read-path fallback covers it
+        };
+        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+            continue;
+        };
+        let Some(pot_input_sequence) = spending_tx.inputs.iter().find_map(|i| {
+            (i.source_txid
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(&row.txid))
+                && i.source_output_index == row.output_index)
+                .then_some(i.sequence)
+        }) else {
+            continue; // the recorded spender does not spend this outpoint
+        };
+        let Some(spender) = RawTx::from_transaction(&spending_tx) else {
+            continue;
+        };
+        let Some(verdict) = classify_covenant(&params, &spender, pot_input_sequence) else {
+            continue; // non-template spend — honestly unresolved
+        };
+        // GUARDED CAS write (gate MEDIUM-2, 2026-07-28): the candidate read
+        // and this write are separated by several awaits, so the pointer may
+        // have MOVED (e.g. a reorg-confirmed S2 landed). A plain mark_spent
+        // echoing the stale read (`row.spent_confirmed` + the read-time
+        // spender) would — on the confirmed always-write branch — reset the
+        // row back to the stale S1, and nothing would re-chase it (the #186
+        // chaser only surfaces spentConfirmed = 0 rows).
+        // `mark_verdict_for_spender` writes verdict + verdictTxid ONLY while
+        // the row's CURRENT pointer still equals the spender this verdict
+        // was computed for, and touches nothing else (not the pointer, not
+        // spentConfirmed, not the #228 spentAt anchor, not spentHeight) —
+        // a moved pointer makes it a no-op and the read-path fallback (or a
+        // later tick, if this row re-enters via its spender) covers it.
+        if let Err(e) = pot_storage
+            .mark_verdict_for_spender(
+                &row.txid,
+                row.output_index,
+                spending_txid,
+                verdict.as_str(),
+            )
+            .await
+        {
+            push_log(&format!("[params-backfill] {} verdict write failed: {e}", row.txid));
+        } else {
+            summary.verdicts += 1;
         }
     }
 
@@ -828,11 +1060,17 @@ pub async fn apply_pushed_proof_to_pot_stores(
     }
 
     // 2. pot_records spend-confirmation latch (this txid as the spender).
+    // #284: a confirm-only latch — no spender raw in hand → verdict = None
+    // (the stored verdict/verdictTxid are left UNCHANGED); the spentHeight
+    // rides along from the (route-verified, structurally re-checked) bump.
+    let spent_height = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
+        .ok()
+        .map(|mp| u64::from(mp.block_height));
     match pot_storage.find_unconfirmed_by_spending_txid(txid).await {
         Ok(records) => {
             for rec in records {
                 match pot_storage
-                    .mark_spent(&rec.txid, rec.output_index, txid, true)
+                    .mark_spent(&rec.txid, rec.output_index, txid, true, None, spent_height)
                     .await
                 {
                     Ok(()) => summary.spends_confirmed += 1,
@@ -1007,6 +1245,7 @@ mod tests {
             spent: true,
             spending_txid: Some(spender.into()),
             spent_confirmed: false,
+            ..Default::default()
         }
     }
 
@@ -1021,10 +1260,11 @@ mod tests {
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
+            ..Default::default()
             })
             .await
             .unwrap();
-        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
 
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
@@ -1051,10 +1291,11 @@ mod tests {
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
+            ..Default::default()
             })
             .await
             .unwrap();
-        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
 
         // The spending tx is NOT verifiably mined → fail-closed, no upgrade.
         let fetcher = MockProofFetcher {
@@ -1122,6 +1363,214 @@ mod tests {
     /// 64-hex settle txids (a bump subject must be a real txid shape).
     const SETTLE_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SETTLE_B: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    // ── #284 decoded-params lazy backfill ────────────────────────────────
+
+    use overlay_discovery::pot::{
+        encode_covenant_param_pushes, CovenantParams, POC5_TEMPLATE_HEX,
+    };
+
+    fn backfill_params() -> CovenantParams {
+        CovenantParams {
+            pub_a: [0x02; 33],
+            pub_b: [0x03; 33],
+            pub_tower: [0x04; 33],
+            pay_pkh_a: [0xAA; 20],
+            pay_pkh_b: [0xBB; 20],
+            rake_pkh: [0xCC; 20],
+            stake_a: 1250,
+            stake_b: 1250,
+            fee_sats: 100,
+            recovery_height: 900_000,
+        }
+    }
+
+    /// A byte-faithful covenant lock: frozen HEAD ‖ encoded params ‖ TAIL.
+    fn covenant_lock(p: &CovenantParams) -> Vec<u8> {
+        let t = POC5_TEMPLATE_HEX;
+        let mut s = hex::decode(&t[..t.find('<').unwrap()]).unwrap();
+        s.extend(encode_covenant_param_pushes(p));
+        s.extend(hex::decode(&t[t.rfind('>').unwrap() + 1..]).unwrap());
+        s
+    }
+
+    fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(pkh);
+        s.extend_from_slice(&[0x88, 0xac]);
+        s
+    }
+
+    /// A tx paying the given `(sats, lock)` outputs from a salt-derived
+    /// dummy input; returns `(beef_bytes, txid)`.
+    fn tx_beef(salt: u8, outs: &[(u64, Vec<u8>)]) -> (Vec<u8>, String) {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Beef, TransactionInput, TransactionOutput};
+        let mut tx = Transaction::new();
+        tx.add_input(TransactionInput::new(hex::encode([salt; 32]), 0)).unwrap();
+        for (sats, lock) in outs {
+            tx.add_output(TransactionOutput {
+                satoshis: Some(*sats),
+                locking_script: LockingScript::from_binary(lock).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        }
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    /// A spender of `pot_txid:0` paying `outs`; returns `(beef, txid)`.
+    fn spender_beef(pot_txid: &str, outs: &[(u64, Vec<u8>)]) -> (Vec<u8>, String) {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Beef, TransactionInput, TransactionOutput};
+        let mut tx = Transaction::new();
+        tx.add_input(TransactionInput::new(pot_txid.to_string(), 0)).unwrap();
+        for (sats, lock) in outs {
+            tx.add_output(TransactionOutput {
+                satoshis: Some(*sats),
+                locking_script: LockingScript::from_binary(lock).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        }
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    /// An undecoded (pre-#284) pot_records row for `(txid, 0)`.
+    fn undecoded_row(txid: &str) -> PotRecord {
+        PotRecord {
+            txid: txid.into(),
+            output_index: 0,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_decodes_covenant_bare_p2pkh_and_unknown_shapes() {
+        let store = MemoryPotStorage::new();
+        let p = backfill_params();
+        // Covenant pot (funded value == stakeA+stakeB).
+        let (cov_beef, cov_txid) = tx_beef(1, &[(2500, covenant_lock(&p))]);
+        // Bare 2-of-3 pot.
+        let mut bare = vec![0x52];
+        for seed in [0x02u8, 0x03, 0x04] {
+            bare.push(33);
+            bare.extend_from_slice(&[seed; 33]);
+        }
+        bare.push(0x53);
+        bare.push(0xae);
+        let (bare_beef, bare_txid) = tx_beef(2, &[(4000, bare)]);
+        // A plain hop P2PKH.
+        let (hop_beef, hop_txid) = tx_beef(3, &[(546, p2pkh_script(&[0xDD; 20]))]);
+        // An unrecognized lock shape.
+        let (odd_beef, odd_txid) = tx_beef(4, &[(1000, vec![0x6a, 0x01, 0xff])]);
+
+        for (txid, beef) in [
+            (&cov_txid, &cov_beef),
+            (&bare_txid, &bare_beef),
+            (&hop_txid, &hop_beef),
+            (&odd_txid, &odd_beef),
+        ] {
+            store.store_record(&undecoded_row(txid)).await.unwrap();
+            store.store_beef(txid, beef).await.unwrap();
+        }
+
+        let s = backfill_decoded_params(&store, 20).await;
+        assert_eq!(s.scanned, 4);
+        assert_eq!(s.decoded, 4);
+        assert_eq!(s.missing_beef, 0);
+
+        let cov = store.get_spent_status(&cov_txid, 0).await.unwrap().unwrap();
+        assert_eq!(cov.lock_kind.as_deref(), Some("covenant"));
+        assert_eq!(cov.decoded_covenant_params(), Some(p));
+        assert_eq!(cov.pot_sats, Some(2500));
+        let bare = store.get_spent_status(&bare_txid, 0).await.unwrap().unwrap();
+        assert_eq!(bare.lock_kind.as_deref(), Some("bare"));
+        assert!(bare.params_decoded);
+        let hop = store.get_spent_status(&hop_txid, 0).await.unwrap().unwrap();
+        assert_eq!(hop.lock_kind.as_deref(), Some("p2pkh"));
+        let odd = store.get_spent_status(&odd_txid, 0).await.unwrap().unwrap();
+        assert_eq!(odd.lock_kind, None, "unrecognized shape stays kind-less…");
+        assert!(odd.params_decoded, "…but the decode attempt is recorded");
+
+        // TERMINATION: every row decoded — the next tick scans nothing.
+        let s2 = backfill_decoded_params(&store, 20).await;
+        assert_eq!(s2.scanned, 0, "decoded rows are never rescanned");
+    }
+
+    #[tokio::test]
+    async fn backfill_missing_beef_stays_a_candidate() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&undecoded_row("potNoBeef")).await.unwrap();
+        let s = backfill_decoded_params(&store, 20).await;
+        assert_eq!((s.scanned, s.decoded, s.missing_beef), (1, 0, 1));
+        // Still a candidate next tick (retry forever, bounded per tick).
+        let s2 = backfill_decoded_params(&store, 20).await;
+        assert_eq!(s2.scanned, 1, "a missing-BEEF row is retried");
+        let r = store.get_spent_status("potNoBeef", 0).await.unwrap().unwrap();
+        assert!(!r.params_decoded);
+    }
+
+    #[tokio::test]
+    async fn backfill_computes_the_verdict_for_a_spent_covenant_row() {
+        let store = MemoryPotStorage::new();
+        let p = backfill_params();
+        let (cov_beef, cov_txid) = tx_beef(1, &[(2500, covenant_lock(&p))]);
+        // The exact winner-B template: pot 2500, fee 100 → net 2400, rake 25.
+        let (settle_bytes, settle_txid) = spender_beef(
+            &cov_txid,
+            &[(25, p2pkh_script(&p.rake_pkh)), (2375, p2pkh_script(&p.pay_pkh_b))],
+        );
+
+        // A pre-#284 row that is already SPENT (unconfirmed pointer), with
+        // both BEEFs durably stored.
+        store.store_record(&undecoded_row(&cov_txid)).await.unwrap();
+        store
+            .mark_spent(&cov_txid, 0, &settle_txid, false, None, None)
+            .await
+            .unwrap();
+        store.store_beef(&cov_txid, &cov_beef).await.unwrap();
+        store.store_beef(&settle_txid, &settle_bytes).await.unwrap();
+
+        let s = backfill_decoded_params(&store, 20).await;
+        assert_eq!((s.scanned, s.decoded, s.verdicts), (1, 1, 1));
+        let r = store.get_spent_status(&cov_txid, 0).await.unwrap().unwrap();
+        assert_eq!(r.verdict.as_deref(), Some("winner-b"));
+        assert_eq!(r.verdict_txid.as_deref(), Some(settle_txid.as_str()));
+        assert_eq!(r.spent_height, None, "this pass verifies no height");
+
+        // A spent BARE row never gets a verdict from the backfill.
+        let mut bare = vec![0x52];
+        for seed in [0x02u8, 0x03, 0x04] {
+            bare.push(33);
+            bare.extend_from_slice(&[seed; 33]);
+        }
+        bare.push(0x53);
+        bare.push(0xae);
+        let (bare_beef, bare_txid) = tx_beef(2, &[(4000, bare)]);
+        let (bspend, bspend_txid) = spender_beef(
+            &bare_txid,
+            &[(1800, p2pkh_script(&[0xAA; 20])), (1800, p2pkh_script(&[0xBB; 20]))],
+        );
+        store.store_record(&undecoded_row(&bare_txid)).await.unwrap();
+        store
+            .mark_spent(&bare_txid, 0, &bspend_txid, false, None, None)
+            .await
+            .unwrap();
+        store.store_beef(&bare_txid, &bare_beef).await.unwrap();
+        store.store_beef(&bspend_txid, &bspend).await.unwrap();
+        let s = backfill_decoded_params(&store, 20).await;
+        assert_eq!(s.verdicts, 0, "bare pots NEVER get a stored verdict");
+        let r = store.get_spent_status(&bare_txid, 0).await.unwrap().unwrap();
+        assert_eq!(r.lock_kind.as_deref(), Some("bare"));
+        assert_eq!(r.verdict, None);
+    }
 
     #[tokio::test]
     async fn pushed_proof_confirms_spends_and_the_chaser_skips_them() {
@@ -1229,7 +1678,7 @@ mod tests {
         store.store_record(&spent_unconfirmed("potA", "settleA")).await.unwrap();
         // Re-record the spend at clock time so spentAt is stamped by the real
         // producer (mark_spent).
-        store.mark_spent("potA", 0, "settleA", false).await.unwrap();
+        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
 
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),

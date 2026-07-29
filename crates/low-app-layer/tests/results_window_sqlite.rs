@@ -20,8 +20,8 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::results::{
-    covenant_params_by_pot, results_sql, seat_markers_sql, RESULTS_UNKNOWN_POT_QUOTA,
-    SEAT_MARKERS_BINDS_PER_POT,
+    assemble_results, covenant_params_by_pot, results_sql, seat_markers_sql, PotVerdict,
+    ResultsRow, RESULTS_UNKNOWN_POT_QUOTA, SEAT_MARKERS_BINDS_PER_POT,
 };
 use rusqlite::{params, Connection};
 
@@ -256,6 +256,12 @@ fn a_player_with_100_real_pots_still_sees_all_100() {
 
 /// The joined facts still arrive: `/results` is only useful if the pot's
 /// spend status and BOTH stored BEEFs survive the rewrite.
+///
+/// #284: the BEEF joins are now CONDITION-GATED — this row is a LEGACY one
+/// (no decoded columns: `pubA IS NULL` opens the funding gate, `verdict IS
+/// NULL` opens the spender gate), so BOTH BLOBs must still come back exactly
+/// as pre-#284. The decoded-row halves of the gate (no BLOBs fetched /
+/// stale-verdict re-open) are proven in the #284 section below.
 #[test]
 fn the_joined_chain_facts_still_come_back() {
     let conn = production_schema_db();
@@ -588,8 +594,323 @@ fn no_funding_bytes_means_no_seat_query() {
         seat_settle_pubkey: None,
         seat_sig_hex: None,
         marker_sig_hex: None,
+        ..Default::default()
     }];
     assert!(covenant_params_by_pot(&rows).is_empty());
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// #284 — decoded pot columns: pure column reads, fallback-preserving
+// ════════════════════════════════════════════════════════════════════════
+
+/// Real mainnet fixtures (shared with `classifier_real_txs.rs`): the
+/// tower-enforced covenant settle 91309122… over the funded pot c571d433…
+/// (ground truth: winner-a; committed stakes 2000+2000, fee 400,
+/// recoveryHeight 956656).
+const ENFORCED_SETTLE_TXID: &str =
+    "91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6";
+const ENFORCED_SETTLE_HEX: &str = include_str!(
+    "fixtures/91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6.hex"
+);
+const ENFORCED_FUNDING_TXID: &str =
+    "c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563";
+const ENFORCED_FUNDING_HEX: &str = include_str!(
+    "fixtures/c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563.hex"
+);
+
+/// Wrap a real raw-tx fixture in a minimal (unproven) BEEF — the bytes
+/// `pot_beefs` would durably hold.
+fn beef_bytes_of(raw_hex: &str) -> Vec<u8> {
+    let tx = bsv_rs::transaction::Transaction::from_hex(raw_hex.trim()).unwrap();
+    let mut beef = bsv_rs::transaction::Beef::new();
+    beef.merge_transaction(tx);
+    beef.to_binary()
+}
+
+fn insert_beef(conn: &Connection, txid: &str, beef: &[u8]) {
+    conn.execute(
+        "INSERT INTO pot_beefs (txid, beef, createdAt) VALUES (?1, ?2, 1)",
+        params![txid, beef],
+    )
+    .unwrap();
+}
+
+/// The REAL committed params of the c571d433 pot, hex-encoded exactly as
+/// admission stores them (extracted through the shipped decoder).
+fn enforced_pot_columns() -> low_app_layer::results::CovenantParams {
+    let raw = hex::decode(ENFORCED_FUNDING_HEX.trim()).unwrap();
+    let ftx =
+        low_app_layer::results::parse_raw_tx_verified(&raw, ENFORCED_FUNDING_TXID).unwrap();
+    low_app_layer::results::extract_covenant_params(&ftx.outputs[0].1).unwrap()
+}
+
+/// Insert a pot_records row WITH decoded columns (+ optional verdict).
+#[allow(clippy::too_many_arguments)]
+fn insert_decoded_pot(
+    conn: &Connection,
+    txid: &str,
+    spending_txid: Option<&str>,
+    p: &low_app_layer::results::CovenantParams,
+    pot_sats: i64,
+    verdict: Option<&str>,
+    verdict_txid: Option<&str>,
+    spent_height: Option<i64>,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO pot_records \
+         (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt, \
+          lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
+          stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
+          verdict, verdictTxid, spentHeight) \
+         VALUES (?1, 0, ?2, ?3, ?4, 1000, 'covenant', ?5, ?6, ?7, ?8, ?9, ?10, \
+                 ?11, ?12, ?13, ?14, ?15, 1, ?16, ?17, ?18)",
+        params![
+            txid,
+            i32::from(spending_txid.is_some()),
+            spending_txid,
+            i32::from(spent_height.is_some()),
+            hex::encode(p.pub_a),
+            hex::encode(p.pub_b),
+            hex::encode(p.pub_tower),
+            hex::encode(p.pay_pkh_a),
+            hex::encode(p.pay_pkh_b),
+            hex::encode(p.rake_pkh),
+            p.stake_a as i64,
+            p.stake_b as i64,
+            p.fee_sats as i64,
+            p.recovery_height as i64,
+            pot_sats,
+            verdict,
+            verdict_txid,
+            spent_height
+        ],
+    )
+    .expect("insert decoded pot_records");
+}
+
+/// One joined `/results` row read exactly as `routes::ResultsRowD1` does
+/// (converted to the pure `ResultsRow` the assembler consumes).
+fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
+    let sql = results_sql();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    stmt.query_map(params![identity], |r| {
+        Ok(ResultsRow {
+            identity: r.get("identity")?,
+            game_id: r.get("gameId")?,
+            pot_txid: r.get("potTxid")?,
+            pot_vout: r.get::<_, i64>("potVout")? as u32,
+            recovery_height: r.get::<_, i64>("recoveryHeight")? as u32,
+            opponent_identity: r.get("opponentIdentity")?,
+            spent: r.get::<_, Option<i64>>("spent")?.map(|v| v != 0),
+            spending_txid: r.get("spendingTxid")?,
+            spent_confirmed: r.get::<_, Option<i64>>("spentConfirmed")?.map(|v| v != 0),
+            funding_beef_hex: r.get("fundingBeef")?,
+            spender_beef_hex: r.get("spenderBeef")?,
+            seat_settle_pubkey: r.get("seatSettlePubkey")?,
+            seat_sig_hex: r.get("seatSigHex")?,
+            marker_sig_hex: r.get("sigHex")?,
+            lock_kind: r.get("lockKind")?,
+            pub_a: r.get("pubA")?,
+            pub_b: r.get("pubB")?,
+            pub_tower: r.get("pubTower")?,
+            pay_pkh_a: r.get("payPkhA")?,
+            pay_pkh_b: r.get("payPkhB")?,
+            rake_pkh: r.get("rakePkh")?,
+            stake_a: r.get::<_, Option<i64>>("stakeA")?.map(|v| v as u64),
+            stake_b: r.get::<_, Option<i64>>("stakeB")?.map(|v| v as u64),
+            fee_sats: r.get::<_, Option<i64>>("feeSats")?.map(|v| v as u64),
+            cov_recovery_height: r
+                .get::<_, Option<i64>>("covRecoveryHeight")?
+                .map(|v| v as u64),
+            pot_sats: r.get::<_, Option<i64>>("potSats")?.map(|v| v as u64),
+            verdict: r.get("verdict")?,
+            verdict_txid: r.get("verdictTxid")?,
+            spent_height: r.get::<_, Option<i64>>("spentHeight")?.map(|v| v as u64),
+        })
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+
+/// The gated joins surface "no BLOB fetched" the same way a missing
+/// `pot_beefs` row always has: `hex(NULL)` is the EMPTY STRING in SQLite
+/// (never SQL NULL) — shape-identical to pre-#284, and `decode_beef_hex("")`
+/// already refuses it downstream.
+fn no_blob(v: &Option<String>) -> bool {
+    v.as_deref().is_none_or(str::is_empty)
+}
+
+/// (1) A decoded-columns row round-trips through `results_sql` and yields
+/// the verdict + params WITHOUT any pot_beefs row being read — even when
+/// BLOB rows EXIST, the gated joins must not fetch them.
+#[test]
+fn a_decoded_row_serves_verdict_and_params_with_no_blob_fetch() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        Some("winner-a"),
+        Some(ENFORCED_SETTLE_TXID),
+        Some(800_000),
+    );
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    // BLOB rows EXIST — the gate must leave them untouched.
+    insert_beef(&conn, ENFORCED_FUNDING_TXID, &beef_bytes_of(ENFORCED_FUNDING_HEX));
+    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+
+    let rows = query_results_rows(&conn, &victim);
+    assert_eq!(rows.len(), 1);
+    assert!(no_blob(&rows[0].funding_beef_hex), "no funding BLOB fetched");
+    assert!(no_blob(&rows[0].spender_beef_hex), "no spender BLOB fetched");
+    assert_eq!(rows[0].verdict.as_deref(), Some("winner-a"));
+
+    // The full assembler answers from columns alone.
+    let entries = assemble_results(
+        &victim,
+        rows.clone(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(entries[0].verdict, Some(PotVerdict::WinnerA));
+    assert_eq!(entries[0].at_height, Some(800_000));
+
+    // …and the committed keys feed the seat query with no funding bytes
+    // (the complement of `no_funding_bytes_means_no_seat_query`).
+    let by_pot = covenant_params_by_pot(&rows);
+    assert_eq!(
+        by_pot.get(&(ENFORCED_FUNDING_TXID.to_string(), 0)),
+        Some(&p),
+        "decoded columns bind the seat-marker fetch without a BLOB"
+    );
+}
+
+/// (2) A LEGACY row (columns NULL) still classifies via the BEEF fallback —
+/// the pre-#284 path, byte-for-byte.
+#[test]
+fn a_legacy_row_still_classifies_via_the_beef_fallback() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    // A pre-#284 pot row: spent pointer, NO decoded columns.
+    conn.execute(
+        "INSERT OR IGNORE INTO pot_records \
+         (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) \
+         VALUES (?1, 0, 1, ?2, 1, 1000)",
+        params![ENFORCED_FUNDING_TXID, ENFORCED_SETTLE_TXID],
+    )
+    .unwrap();
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(&conn, ENFORCED_FUNDING_TXID, &beef_bytes_of(ENFORCED_FUNDING_HEX));
+    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+
+    let rows = query_results_rows(&conn, &victim);
+    assert_eq!(rows.len(), 1);
+    assert!(!no_blob(&rows[0].funding_beef_hex), "legacy row fetches the BLOBs");
+    assert!(!no_blob(&rows[0].spender_beef_hex));
+    assert_eq!(rows[0].lock_kind, None);
+
+    let entries = assemble_results(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        entries[0].verdict,
+        Some(PotVerdict::WinnerA),
+        "the real tower-enforced settle classifies through the fallback"
+    );
+}
+
+/// (3) A STALE stored verdict (`verdictTxid <> spendingTxid`) is NOT
+/// trusted: the SQL re-opens the spender BLOB and the assembler
+/// re-classifies from the column params + hash-verified spender bytes —
+/// correcting the stale label instead of serving it.
+#[test]
+fn a_stale_verdict_is_not_trusted_and_falls_back() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+    // The stored verdict says winner-b, but it was computed for a DIFFERENT
+    // (displaced) spender.
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        Some("winner-b"),
+        Some(&h64(0xd0)), // stale: not the current spendingTxid
+        None,
+    );
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+
+    let rows = query_results_rows(&conn, &victim);
+    assert_eq!(rows.len(), 1);
+    assert!(no_blob(&rows[0].funding_beef_hex), "params are columns — no funding BLOB");
+    assert!(
+        !no_blob(&rows[0].spender_beef_hex),
+        "a stale verdict re-opens the spender BLOB"
+    );
+
+    let entries = assemble_results(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        entries[0].verdict,
+        Some(PotVerdict::WinnerA),
+        "the stale winner-b label is ignored; the spend re-classifies to the \
+         real winner-a from column params + hash-verified spender bytes"
+    );
+}
+
+/// A fresh verdict with a MISSING proven height keeps the spender BLOB
+/// available as the at.height fallback (the un-confirmed-spend case).
+#[test]
+fn a_fresh_verdict_without_height_still_fetches_the_spender_blob() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        Some("winner-a"),
+        Some(ENFORCED_SETTLE_TXID),
+        None, // spentHeight NULL — unconfirmed spend
+    );
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+
+    let rows = query_results_rows(&conn, &victim);
+    assert!(no_blob(&rows[0].funding_beef_hex));
+    assert!(
+        !no_blob(&rows[0].spender_beef_hex),
+        "spentHeight NULL keeps the spender BEEF for the at.height fallback"
+    );
+    let entries = assemble_results(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(entries[0].verdict, Some(PotVerdict::WinnerA), "column verdict trusted");
+    assert_eq!(
+        entries[0].at_height, None,
+        "a proofless spender BEEF honestly yields no height — never a guess"
+    );
 }
 
 // ── F3 — the existence tier must not become a filter ────────────────────
