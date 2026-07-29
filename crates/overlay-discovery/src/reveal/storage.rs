@@ -156,11 +156,11 @@ impl RevealStorage for MemoryRevealStorage {
             .filter(|r| r.game_id == game_id && r.seat == seat)
             .cloned()
             .collect();
-        // Cap keeps the NEWEST rows (this store is insertion-ordered, so the
-        // newest are the tail) — mirrors D1's `ORDER BY createdAt DESC LIMIT`.
-        if records.len() > REVEAL_RESULT_CAP {
-            records.drain(..records.len() - REVEAL_RESULT_CAP);
-        }
+        // NEWEST-first, capped — the same rows in the same DIRECTION as
+        // D1's `ORDER BY createdAt DESC LIMIT` (gate L2: a memory backend
+        // answering in the opposite order would mask ordering bugs).
+        records.reverse();
+        records.truncate(REVEAL_RESULT_CAP);
         Ok(records)
     }
 
@@ -176,10 +176,9 @@ impl RevealStorage for MemoryRevealStorage {
             .filter(|r| r.game_id == game_id)
             .cloned()
             .collect();
-        // Cap keeps the NEWEST rows — see find_by_game_seat.
-        if records.len() > REVEAL_RESULT_CAP {
-            records.drain(..records.len() - REVEAL_RESULT_CAP);
-        }
+        // NEWEST-first, capped — see find_by_game_seat (gate L2).
+        records.reverse();
+        records.truncate(REVEAL_RESULT_CAP);
         Ok(records)
     }
 }

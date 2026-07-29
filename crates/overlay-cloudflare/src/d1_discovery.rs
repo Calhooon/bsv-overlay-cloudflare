@@ -17,7 +17,7 @@ use overlay_discovery::dm_delegation::storage::{
 };
 use overlay_discovery::low::storage::{
     LowRecord, LowRecordType, LowStorage, LowStorageError, LOW_BY_KEY_RESULT_CAP,
-    OPEN_TABLES_RESULT_CAP,
+    OPEN_TABLES_PER_HOST_CAP, OPEN_TABLES_RESULT_CAP,
 };
 use overlay_discovery::pot::storage::{
     pot_beef_has_proof, PotRecord, PotStorage, PotStorageError,
@@ -997,13 +997,31 @@ const LOW_RECORD_COLUMNS: &str =
      relayUrl, expiryHeight";
 
 /// `ls_low findOpenTables` — full index rows (#290), newest-first, capped at
-/// [`OPEN_TABLES_RESULT_CAP`] (#291). `where_clause` is the WhereBuilder
-/// output (leading " WHERE …" or empty). Factored out so the real-SQLite
-/// tests below execute the SHIPPED string, not a transcription.
+/// [`OPEN_TABLES_RESULT_CAP`] (#291), with a PER-HOST quota of
+/// [`OPEN_TABLES_PER_HOST_CAP`] (#291 gate finding M3, the #281 partitioned-
+/// window pattern): a flat newest-first cap let ONE identity's
+/// [`OPEN_TABLES_RESULT_CAP`] byte-format-admitted junk rows blank every
+/// honest table from the lobby before the client's verify-and-drop filter
+/// ever saw them. With the partition, a single host occupies at most
+/// [`OPEN_TABLES_PER_HOST_CAP`] window slots — blanking the lobby now takes
+/// `CAP / PER_HOST` distinct identities' worth of admitted on-chain rows.
+/// Residual (accepted, display-only): identities are free keypairs, so a
+/// determined multi-identity flood can still displace; no money path reads
+/// the lobby (rejoin is keyed byGameId/byHost, money discovery is
+/// server-primary).
+///
+/// `where_clause` is the WhereBuilder output (leading " WHERE …" or empty).
+/// Factored out so the real-SQLite tests below execute the SHIPPED string,
+/// not a transcription.
 pub fn low_open_tables_sql(where_clause: &str) -> String {
     format!(
-        "SELECT {LOW_RECORD_COLUMNS} FROM low_records{where_clause} \
-         ORDER BY createdAt DESC LIMIT {OPEN_TABLES_RESULT_CAP}"
+        "SELECT {LOW_RECORD_COLUMNS} \
+         FROM (SELECT {LOW_RECORD_COLUMNS}, createdAt, rowid AS mrowid, \
+                      ROW_NUMBER() OVER (PARTITION BY hostIdentity \
+                                         ORDER BY createdAt DESC, rowid DESC) AS hostRank \
+               FROM low_records{where_clause}) \
+         WHERE hostRank <= {OPEN_TABLES_PER_HOST_CAP} \
+         ORDER BY createdAt DESC, mrowid DESC LIMIT {OPEN_TABLES_RESULT_CAP}"
     )
 }
 
@@ -3676,14 +3694,23 @@ mod tests {
     /// Insert a `low_records` row with an explicit TEXT `createdAt`
     /// (this table's `createdAt` is `datetime('now')` TEXT — the odd one
     /// out; every other LOW marker table stamps INTEGER unix seconds).
-    fn insert_low(conn: &rusqlite::Connection, txid: &str, created_at: &str) {
+    fn insert_low_for_host(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        host: &str,
+        created_at: &str,
+    ) {
         conn.execute(
             "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, \
              gameId, stakeSats, rulesHash, relayUrl, expiryHeight, createdAt) \
              VALUES ('table', ?1, 0, ?2, ?3, 1000, 'rh', 'https://r', 900000, ?4)",
-            rusqlite::params![txid, victim_id(), h64(0x11), created_at],
+            rusqlite::params![txid, host, h64(0x11), created_at],
         )
         .unwrap();
+    }
+
+    fn insert_low(conn: &rusqlite::Connection, txid: &str, created_at: &str) {
+        insert_low_for_host(conn, txid, &victim_id(), created_at);
     }
 
     /// #290/#291: the shipped lobby SQL executes on the production schema,
@@ -3717,13 +3744,16 @@ mod tests {
         );
         assert_eq!(rows[0].1, 1000, "full index row: stakeSats decoded column present");
 
-        // LIMIT proof: cap + 1 rows in ⇒ cap rows out, and the row displaced
-        // is the OLDEST (the cap keeps the newest — the #291 contract).
+        // LIMIT proof: cap + 1 rows (each from a DISTINCT host, so the M3
+        // per-host quota is not the binding constraint) ⇒ cap rows out, and
+        // the row displaced is the OLDEST (the cap keeps the newest — the
+        // #291 contract).
         let conn = production_schema_db();
         for i in 0..=OPEN_TABLES_RESULT_CAP {
-            insert_low(
+            insert_low_for_host(
                 &conn,
                 &format!("{i:064x}"),
+                &format!("02{i:064x}"),
                 &format!("2026-07-29 13:{:02}:{:02}", (i / 60) % 60, i % 60),
             );
         }
@@ -3740,6 +3770,56 @@ mod tests {
             "the displaced row is the OLDEST, never a newer one"
         );
         assert!(txids.contains(&format!("{:064x}", OPEN_TABLES_RESULT_CAP)));
+    }
+
+    /// #291 gate finding M3 (the #281 partitioned-window pattern): ONE
+    /// identity flooding the lobby with newest-stamped junk occupies at most
+    /// OPEN_TABLES_PER_HOST_CAP window slots — every other host's honest
+    /// table SURVIVES in the answer. Pre-partition, a single host's 200
+    /// newest rows blanked the whole lobby. Executes the SHIPPED SQL.
+    #[test]
+    fn lobby_single_host_flood_cannot_blank_other_hosts_real_sqlite() {
+        let conn = production_schema_db();
+        // Honest tables from two hosts, stamped EARLY.
+        insert_low_for_host(&conn, &h64(0x01), &victim_id(), "2026-07-29 10:00:00");
+        insert_low_for_host(
+            &conn,
+            &h64(0x02),
+            &format!("03{}", "b2".repeat(32)),
+            "2026-07-29 10:00:01",
+        );
+        // One attacker identity floods OPEN_TABLES_RESULT_CAP newer rows.
+        let attacker = format!("02{}", "ff".repeat(32));
+        for i in 0..OPEN_TABLES_RESULT_CAP {
+            insert_low_for_host(
+                &conn,
+                &format!("{i:060x}dead"),
+                &attacker,
+                &format!("2026-07-29 12:{:02}:{:02}", (i / 60) % 60, i % 60),
+            );
+        }
+
+        let sql = low_open_tables_sql(" WHERE recordType = ?");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params!["table"], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        let attacker_rows = rows.iter().filter(|(_, h)| *h == attacker).count();
+        assert_eq!(
+            attacker_rows, OPEN_TABLES_PER_HOST_CAP,
+            "the flooding identity holds exactly its quota, never the window"
+        );
+        let txids: Vec<&String> = rows.iter().map(|(t, _)| t).collect();
+        assert!(
+            txids.contains(&&h64(0x01)) && txids.contains(&&h64(0x02)),
+            "both honest hosts' tables SURVIVE the single-identity flood \
+             (pre-M3 the flat newest-first cap blanked them)"
+        );
     }
 
     /// #290/#291: byGameId / byHost — shipped SQL parses, selects per-key,
