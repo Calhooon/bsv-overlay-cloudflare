@@ -188,6 +188,37 @@ fn spender_pot_prevout(funding: &RawTx, vout: u32) -> Option<(u64, Vec<u8>)> {
     Some((*sats, lock.clone()))
 }
 
+/// #284 read-time fallback for a row whose DECODED params are present but
+/// whose stored verdict is stale/absent: classify the spend from the column
+/// params + the hash-verified spender BEEF — no funding BLOB required. The
+/// same bars as [`classify_pot_spend`], resourced:
+/// - the spender raw must HASH to the recorded `spending_txid` and actually
+///   spend the pot outpoint (input match — its sequence feeds the refund
+///   height gate);
+/// - stake conservation against the stored funding value (`stakeA + stakeB
+///   == potSats` — the covenant's own in-script assertion); a missing
+///   `potSats` refuses (never classify without the conservation anchor).
+fn classify_from_columns(
+    params: &CovenantParams,
+    pot_sats: Option<u64>,
+    pot_txid_lc: &str,
+    pot_vout: u32,
+    settle_lc: &str,
+    spender_beef_hex: &str,
+) -> Option<PotVerdict> {
+    if params.stake_a.checked_add(params.stake_b)? != pot_sats? {
+        return None; // conservation failed — the params do not describe this pot
+    }
+    let sb = crate::logic::decode_beef_hex(spender_beef_hex)?;
+    let sraw = crate::logic::extract_raw_tx_hex(&sb, settle_lc).and_then(|h| hex::decode(h).ok())?;
+    let spender = parse_raw_tx_verified(&sraw, settle_lc)?;
+    let pot_input = spender
+        .inputs
+        .iter()
+        .find(|i| i.prev_txid.eq_ignore_ascii_case(pot_txid_lc) && i.prev_vout == pot_vout)?;
+    classify_covenant(params, &spender, pot_input.sequence)
+}
+
 /// Bare-era (pre-covenant) pots: classify ONLY the pre-signed nLockTime
 /// refund (see module note — winner/tie shapes prove nothing on a bare
 /// 2-of-3). Requires the potparty marker's recoveryHeight to EQUAL the wire
@@ -549,7 +580,7 @@ pub fn derive_outcome_with_seat(
 /// One pot the identity is a party to, ready for classification: the
 /// `potparty_records` facts joined to the spend pointer and both stored
 /// BEEFs. The route dedupes marker rows to one entry per pot outpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResultsRow {
     /// The potparty row's OWN identity column (F8: carried explicitly so the
     /// seat path can never silently decouple from the SQL's WHERE filter).
@@ -562,9 +593,12 @@ pub struct ResultsRow {
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
     pub spent_confirmed: Option<bool>,
-    /// `hex(pot_beefs.beef)` for the FUNDING tx (keyed by potTxid).
+    /// `hex(pot_beefs.beef)` for the FUNDING tx (keyed by potTxid). #284:
+    /// FALLBACK-ONLY — NULL when the row carries decoded params (the SQL
+    /// gates the join on `pubA IS NULL`).
     pub funding_beef_hex: Option<String>,
-    /// `hex(pot_beefs.beef)` for the recorded spender.
+    /// `hex(pot_beefs.beef)` for the recorded spender. #284: FALLBACK-ONLY —
+    /// NULL when the stored verdict is fresh AND the proven height present.
     pub spender_beef_hex: Option<String>,
     /// #230 v2 seat-binding fields from the caller's own potparty row —
     /// `None` for a v1 row. UNVERIFIED here; `my_seat` verifies before they
@@ -574,6 +608,56 @@ pub struct ResultsRow {
     /// The marker's IDENTITY signature push (`sigHex`) — required by the F1
     /// identity-binding verification before a v2 row may attribute a seat.
     pub marker_sig_hex: Option<String>,
+    /// #284 decoded pot_records columns — the DECODE-ONCE re-presentation of
+    /// the admitted funding lock (see the overlay's `pot_records` migration
+    /// notes). All `None` for a legacy un-backfilled row, in which case the
+    /// BEEF fallback path below behaves exactly as pre-#284.
+    pub lock_kind: Option<String>,
+    pub pub_a: Option<String>,
+    pub pub_b: Option<String>,
+    pub pub_tower: Option<String>,
+    pub pay_pkh_a: Option<String>,
+    pub pay_pkh_b: Option<String>,
+    pub rake_pkh: Option<String>,
+    pub stake_a: Option<u64>,
+    pub stake_b: Option<u64>,
+    pub fee_sats: Option<u64>,
+    /// The COMMITTED covenant recoveryHeight (pot_records.recoveryHeight,
+    /// aliased covRecoveryHeight — distinct from the marker's own
+    /// `recovery_height` field above).
+    pub cov_recovery_height: Option<u64>,
+    pub pot_sats: Option<u64>,
+    /// The stored spend verdict — trusted ONLY when `verdict_txid` equals
+    /// the row's `spending_txid` (a stale pointer-overwrite leftover is
+    /// ignored and the BEEF fallback classifies instead).
+    pub verdict: Option<String>,
+    pub verdict_txid: Option<String>,
+    /// Block height of the SPV-verified spend confirm (at.height source).
+    pub spent_height: Option<u64>,
+}
+
+impl ResultsRow {
+    /// The committed [`CovenantParams`] from the row's decoded columns —
+    /// strict reconstruction (`covenant_params_from_hex` validates hex +
+    /// lengths); any malformed/absent field is `None` and the caller falls
+    /// back to the BEEF parse. Never a panic, never a trust-shortcut.
+    fn column_covenant_params(&self) -> Option<CovenantParams> {
+        if self.lock_kind.as_deref() != Some("covenant") {
+            return None;
+        }
+        covenant_params_from_hex(
+            self.pub_a.as_deref()?,
+            self.pub_b.as_deref()?,
+            self.pub_tower.as_deref()?,
+            self.pay_pkh_a.as_deref()?,
+            self.pay_pkh_b.as_deref()?,
+            self.rake_pkh.as_deref()?,
+            self.stake_a?,
+            self.stake_b?,
+            self.fee_sats?,
+            self.cov_recovery_height?,
+        )
+    }
 }
 
 /// A game's SIGNATURE-VERIFIED `tm_result` claims relevant to won/lost
@@ -970,6 +1054,17 @@ pub fn covenant_params_by_pot(
         if out.contains_key(&key) {
             continue;
         }
+        // #284: the decoded columns first — a strict reconstruction of the
+        // params the OVERLAY decoded from the admitted funding lock at
+        // admission/backfill time (`column_covenant_params` refuses any
+        // malformed stored hex). When they answer, no funding BLOB was even
+        // fetched (the SQL gates the join on `pubA IS NULL`).
+        if let Some(p) = r.column_covenant_params() {
+            out.insert(key, p);
+            continue;
+        }
+        // Fallback (legacy un-backfilled rows): the hash-verified funding
+        // bytes, exactly as pre-#284.
         let Some(fb_hex) = &r.funding_beef_hex else {
             continue;
         };
@@ -1068,51 +1163,108 @@ pub fn assemble_results(
             continue; // duplicate marker rows (garbage coexists by design)
         }
         let settle_lc = r.spending_txid.as_ref().map(|s| s.to_ascii_lowercase());
+        let pot_txid_lc = r.pot_txid.to_ascii_lowercase();
+        // #284: the row's decoded covenant params (strictly reconstructed —
+        // malformed stored hex yields None and the BEEF fallback applies).
+        let column_params = r.column_covenant_params();
         let mut verdict = None;
         let mut at_height = None;
         let mut seat = None;
-        if let (Some(true), Some(settle), Some(fb_hex), Some(sb_hex)) =
-            (r.spent, settle_lc.as_deref(), &r.funding_beef_hex, &r.spender_beef_hex)
-        {
-            if let (Some(fb), Some(sb)) =
-                (crate::logic::decode_beef_hex(fb_hex), crate::logic::decode_beef_hex(sb_hex))
-            {
-                let pot_txid_lc = r.pot_txid.to_ascii_lowercase();
-                let funding_raw = crate::logic::extract_raw_tx_hex(&fb, &pot_txid_lc)
-                    .and_then(|h| hex::decode(h).ok());
-                let spender_raw = crate::logic::extract_raw_tx_hex(&sb, settle)
-                    .and_then(|h| hex::decode(h).ok());
-                if let (Some(fraw), Some(sraw)) = (funding_raw, spender_raw) {
-                    verdict = classify_pot_spend(&PotSpendFacts {
-                        pot_txid: &pot_txid_lc,
-                        pot_vout: r.pot_vout,
-                        funding_raw: &fraw,
-                        spender_txid: settle,
-                        spender_raw: &sraw,
-                        marker_recovery_height: Some(r.recovery_height),
-                    });
-                    // #230: the caller's PROVEN seat, from its v2 marker(s)
-                    // verified against the pot's OWN committed lock (the
-                    // hash-verified funding bytes — never a store claim).
-                    if verdict.is_some() {
-                        seat = parse_raw_tx_verified(&fraw, &pot_txid_lc)
-                            .and_then(|f| spender_pot_prevout(&f, r.pot_vout))
-                            .and_then(|(_, lock)| extract_covenant_params(&lock))
-                            .and_then(|p| {
-                                my_seat(
-                                    &p,
-                                    &pot_txid_lc,
-                                    r.pot_vout,
-                                    identity_lc,
-                                    seat_markers
-                                        .get(&(pot_txid_lc.clone(), r.pot_vout))
-                                        .map(Vec::as_slice)
-                                        .unwrap_or(&[]),
-                                )
+        if let (Some(true), Some(settle)) = (r.spent, settle_lc.as_deref()) {
+            // 1. The STORED verdict — trusted only when it was computed from
+            //    THIS spend pointer (`verdictTxid == spendingTxid`; the
+            //    overlay enforced the stake-conservation check at write
+            //    time). Bare pots never have one (overlay rule), so the
+            //    marker-hint refund rule below still covers them.
+            if let (Some(v), Some(vt)) = (r.verdict.as_deref(), r.verdict_txid.as_deref()) {
+                if vt.eq_ignore_ascii_case(settle) {
+                    verdict = PotVerdict::from_wire(v);
+                }
+            }
+            // 2. Decoded params + spender BEEF (stored verdict stale/absent
+            //    but the params columns answer): classify per-request from
+            //    the hash-verified spender bytes against the column params —
+            //    no funding BLOB needed (the SQL didn't even fetch it).
+            if verdict.is_none() {
+                if let (Some(p), Some(sb_hex)) = (&column_params, &r.spender_beef_hex) {
+                    verdict = classify_from_columns(
+                        p,
+                        r.pot_sats,
+                        &pot_txid_lc,
+                        r.pot_vout,
+                        settle,
+                        sb_hex,
+                    );
+                }
+            }
+            // 3. Full legacy fallback (un-backfilled rows — no decoded
+            //    columns): both BEEFs, exactly the pre-#284 path, including
+            //    the bare-pot marker-hint refund rule.
+            if verdict.is_none() && column_params.is_none() {
+                if let (Some(fb_hex), Some(sb_hex)) = (&r.funding_beef_hex, &r.spender_beef_hex) {
+                    if let (Some(fb), Some(sb)) = (
+                        crate::logic::decode_beef_hex(fb_hex),
+                        crate::logic::decode_beef_hex(sb_hex),
+                    ) {
+                        let funding_raw = crate::logic::extract_raw_tx_hex(&fb, &pot_txid_lc)
+                            .and_then(|h| hex::decode(h).ok());
+                        let spender_raw = crate::logic::extract_raw_tx_hex(&sb, settle)
+                            .and_then(|h| hex::decode(h).ok());
+                        if let (Some(fraw), Some(sraw)) = (funding_raw, spender_raw) {
+                            verdict = classify_pot_spend(&PotSpendFacts {
+                                pot_txid: &pot_txid_lc,
+                                pot_vout: r.pot_vout,
+                                funding_raw: &fraw,
+                                spender_txid: settle,
+                                spender_raw: &sraw,
+                                marker_recovery_height: Some(r.recovery_height),
                             });
+                        }
                     }
                 }
-                at_height = beef_block_height(&sb, settle);
+            }
+            // at.height: the SPV-proven spentHeight column when present,
+            // else the spender BEEF's own BUMP (proofless BEEFs honestly
+            // yield None — never a guess).
+            at_height = r.spent_height;
+            if at_height.is_none() {
+                if let Some(sb) = r
+                    .spender_beef_hex
+                    .as_deref()
+                    .and_then(crate::logic::decode_beef_hex)
+                {
+                    at_height = beef_block_height(&sb, settle);
+                }
+            }
+            // #230: the caller's PROVEN seat, from its v2 marker(s) verified
+            // against the pot's OWN committed lock — the decoded columns
+            // (the overlay's admission-time decode of those same bytes)
+            // first, else the hash-verified funding bytes.
+            if verdict.is_some() {
+                let params = column_params.clone().or_else(|| {
+                    r.funding_beef_hex
+                        .as_deref()
+                        .and_then(crate::logic::decode_beef_hex)
+                        .and_then(|fb| {
+                            crate::logic::extract_raw_tx_hex(&fb, &pot_txid_lc)
+                                .and_then(|h| hex::decode(h).ok())
+                        })
+                        .and_then(|fraw| parse_raw_tx_verified(&fraw, &pot_txid_lc))
+                        .and_then(|f| spender_pot_prevout(&f, r.pot_vout))
+                        .and_then(|(_, lock)| extract_covenant_params(&lock))
+                });
+                seat = params.and_then(|p| {
+                    my_seat(
+                        &p,
+                        &pot_txid_lc,
+                        r.pot_vout,
+                        identity_lc,
+                        seat_markers
+                            .get(&(pot_txid_lc.clone(), r.pot_vout))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                    )
+                });
             }
         }
         let game_lc = r.game_id.to_ascii_lowercase();
@@ -1326,9 +1478,28 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
 /// honest one survived to the claims lookup, so this IS a real (if narrow)
 /// regression on the fallback path, traded for the window bound.
 pub fn results_sql() -> String {
+    // The #284 decoded pot_records columns, threaded verbatim through every
+    // window level (pot_records.recoveryHeight is aliased covRecoveryHeight
+    // — the potparty marker owns the bare `recoveryHeight` name).
+    const DECODED: &str = "lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
+         stakeA, stakeB, feeSats, covRecoveryHeight, potSats, \
+         verdict, verdictTxid, spentHeight";
     format!(
         // L4 — BEEF join, on the ≤{rows} survivors only (never inside the
         // window, where each dust replay would drag the real BLOBs along).
+        //
+        // #284 FALLBACK-ONLY BLOBs: the joins are CONDITION-GATED so a row
+        // whose decoded columns already answer the question transfers NO
+        // BLOB at all —
+        //  - fundingBeef only when the decoded params are absent
+        //    (`w.pubA IS NULL`): covers legacy un-backfilled rows AND bare
+        //    pots (whose per-request marker-hint classification stays);
+        //  - spenderBeef only when there IS a spender AND the stored verdict
+        //    cannot be trusted for it (NULL verdict / NULL-or-different
+        //    verdictTxid — explicit NULL handling, since `verdictTxid <>
+        //    spendingTxid` is NULL-opaque) OR the proven height is missing
+        //    (the spender BEEF is the at.height fallback for spends whose
+        //    confirm hasn't landed).
         "SELECT w.identity AS identity, w.gameId AS gameId, w.potTxid AS potTxid, \
                 w.potVout AS potVout, w.recoveryHeight AS recoveryHeight, \
                 w.opponentIdentity AS opponentIdentity, \
@@ -1336,15 +1507,21 @@ pub fn results_sql() -> String {
                 w.sigHex AS sigHex, \
                 w.spent AS spent, w.spendingTxid AS spendingTxid, \
                 w.spentConfirmed AS spentConfirmed, \
+                w.lockKind AS lockKind, w.pubA AS pubA, w.pubB AS pubB, \
+                w.pubTower AS pubTower, w.payPkhA AS payPkhA, w.payPkhB AS payPkhB, \
+                w.rakePkh AS rakePkh, w.stakeA AS stakeA, w.stakeB AS stakeB, \
+                w.feeSats AS feeSats, w.covRecoveryHeight AS covRecoveryHeight, \
+                w.potSats AS potSats, w.verdict AS verdict, \
+                w.verdictTxid AS verdictTxid, w.spentHeight AS spentHeight, \
                 hex(fb.beef) AS fundingBeef, hex(sb.beef) AS spenderBeef \
          FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                   opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
-                  spent, spendingTxid, spentConfirmed, \
+                  spent, spendingTxid, spentConfirmed, {DECODED}, \
                   markerCreatedAt, markerRowid, potCreatedAt, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                     opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
-                    spent, spendingTxid, spentConfirmed, \
+                    spent, spendingTxid, spentConfirmed, {DECODED}, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
                                        ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
@@ -1357,6 +1534,14 @@ pub fn results_sql() -> String {
                       pp.seatSigHex AS seatSigHex, pp.sigHex AS sigHex, \
                       r.spent AS spent, r.spendingTxid AS spendingTxid, \
                       r.spentConfirmed AS spentConfirmed, \
+                      r.lockKind AS lockKind, r.pubA AS pubA, r.pubB AS pubB, \
+                      r.pubTower AS pubTower, r.payPkhA AS payPkhA, \
+                      r.payPkhB AS payPkhB, r.rakePkh AS rakePkh, \
+                      r.stakeA AS stakeA, r.stakeB AS stakeB, \
+                      r.feeSats AS feeSats, \
+                      r.recoveryHeight AS covRecoveryHeight, \
+                      r.potSats AS potSats, r.verdict AS verdict, \
+                      r.verdictTxid AS verdictTxid, r.spentHeight AS spentHeight, \
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
@@ -1370,12 +1555,33 @@ pub fn results_sql() -> String {
            ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
            LIMIT {rows}) w \
-         LEFT JOIN pot_beefs fb ON fb.txid = lower(w.potTxid) \
-         LEFT JOIN pot_beefs sb ON sb.txid = lower(w.spendingTxid) \
+         LEFT JOIN pot_beefs fb ON w.pubA IS NULL AND fb.txid = lower(w.potTxid) \
+         LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
+              AND (w.verdict IS NULL OR w.verdictTxid IS NULL \
+                   OR w.verdictTxid <> w.spendingTxid OR w.spentHeight IS NULL) \
+              AND sb.txid = lower(w.spendingTxid) \
          ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = RESULTS_UNKNOWN_POT_QUOTA,
         rows = RESULTS_MAX_ROWS,
+    )
+}
+
+/// The #284 decoded-column fetch for a chunk of pot outpoints (2 binds each
+/// — chunk at [`crate::logic::D1_CHUNK_OUTPOINTS`] like `batch_where_sql`):
+/// the `/leaderboard` classification partition reads verdict + params as
+/// PURE COLUMNS here, and only rows this query cannot answer fall back to
+/// the legacy BLOB path (which stays capped). `recoveryHeight` is aliased
+/// `covRecoveryHeight` for shape-parity with `results_sql`.
+pub fn decoded_pots_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let clause = vec!["(txid = ? AND outputIndex = ?)"; n].join(" OR ");
+    format!(
+        "SELECT txid, outputIndex, spendingTxid, lockKind, pubA, pubB, pubTower, \
+                payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, \
+                recoveryHeight AS covRecoveryHeight, potSats, \
+                verdict, verdictTxid, spentHeight \
+         FROM pot_records WHERE {clause}"
     )
 }
 
@@ -2377,6 +2583,7 @@ mod tests {
             seat_settle_pubkey: Some(m.seat_settle_pubkey.clone()),
             seat_sig_hex: Some(m.seat_sig_hex.clone()),
             marker_sig_hex: Some(m.identity_sig_hex.clone()),
+            ..Default::default()
         };
 
         // NO claims at all — the loser is gone (the #276 shape).
@@ -2476,6 +2683,7 @@ mod tests {
             seat_settle_pubkey: None,
             seat_sig_hex: None,
             marker_sig_hex: None,
+            ..Default::default()
         };
 
         // The fetch delivers the proof keyed by POT OUTPOINT.
@@ -2837,6 +3045,7 @@ mod tests {
             seat_settle_pubkey: None,
             seat_sig_hex: None,
             marker_sig_hex: None,
+            ..Default::default()
         };
         // A duplicate marker row (garbage coexists by outpoint keying) and an
         // unspent pot with no bytes at all.
@@ -2855,6 +3064,7 @@ mod tests {
             seat_settle_pubkey: None,
             seat_sig_hex: None,
             marker_sig_hex: None,
+            ..Default::default()
         };
         let rows = vec![row.clone(), row.clone(), unspent];
         let entries = assemble_results(
@@ -3329,8 +3539,21 @@ mod tests {
         // #281 F7: the BEEF joins run on the OUTER select, against the ≤100
         // survivors — never inside the window, where every dust replay naming
         // the victim's real pot would have dragged the real BLOBs along.
-        assert!(sql.contains("LEFT JOIN pot_beefs fb ON fb.txid = lower(w.potTxid)"));
-        assert!(sql.contains("LEFT JOIN pot_beefs sb ON sb.txid = lower(w.spendingTxid)"));
+        // #284: both joins are additionally CONDITION-GATED to fallback-only
+        // — the funding BLOB only when the decoded params are absent, the
+        // spender BLOB only when the stored verdict is stale/absent for the
+        // current pointer or the proven height is missing (with EXPLICIT
+        // NULL handling: `verdictTxid <> spendingTxid` alone is NULL-opaque).
+        assert!(sql.contains("LEFT JOIN pot_beefs fb ON w.pubA IS NULL AND fb.txid = lower(w.potTxid)"));
+        assert!(sql.contains("LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL"));
+        assert!(sql.contains(
+            "(w.verdict IS NULL OR w.verdictTxid IS NULL OR w.verdictTxid <> w.spendingTxid \
+             OR w.spentHeight IS NULL)"
+        ));
+        assert!(sql.contains("AND sb.txid = lower(w.spendingTxid)"));
+        // The behaviour these strings stand for is EXECUTED in
+        // tests/results_window_sqlite.rs (decoded rows fetch no BLOB; legacy
+        // rows still fetch both; a stale verdict re-opens the spender BLOB).
         // #281 structural guards. These are a BACKSTOP only — the behaviour
         // they stand for is proven by EXECUTING this SQL against real SQLite
         // over the production schema in `tests/results_window_sqlite.rs`

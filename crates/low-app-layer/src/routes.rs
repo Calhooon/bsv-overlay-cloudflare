@@ -633,9 +633,12 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     json_response(leaderboard_body(&lb, computed_at, markers.len()), 200)
 }
 
-/// Hard bound on pots classified per `/leaderboard` request (each pot costs
-/// two BLOB reads + two BEEF parses; the default 200-marker board is well
-/// under it in distinct pots).
+/// Hard bound on pots classified per `/leaderboard` request via the LEGACY
+/// BLOB fallback (each such pot costs two BLOB reads + two BEEF parses).
+/// #284: this cap now bounds ONLY the fallback partition — a pot whose
+/// decoded columns answer (verdict + params as pure column reads) costs no
+/// BLOB and is NOT capped. Once the backfill completes, the fallback
+/// partition — and with it this cap's effect — dies entirely.
 const LEADERBOARD_CLASSIFY_CAP: usize = 64;
 
 /// `pot_beefs` row for the classification fold: txid + `hex(beef)`.
@@ -645,11 +648,78 @@ struct PotBeefRowD1 {
     beef: Option<String>,
 }
 
+/// `pot_records` decoded-column row for the #284 classification partition
+/// (`decoded_pots_sql`). All optional/`default` — a legacy row is NULLs.
+#[derive(Deserialize)]
+struct DecodedPotRowD1 {
+    txid: String,
+    #[serde(rename = "spendingTxid", default)]
+    spending_txid: Option<String>,
+    #[serde(rename = "lockKind", default)]
+    lock_kind: Option<String>,
+    #[serde(rename = "pubA", default)]
+    pub_a: Option<String>,
+    #[serde(rename = "pubB", default)]
+    pub_b: Option<String>,
+    #[serde(rename = "pubTower", default)]
+    pub_tower: Option<String>,
+    #[serde(rename = "payPkhA", default)]
+    pay_pkh_a: Option<String>,
+    #[serde(rename = "payPkhB", default)]
+    pay_pkh_b: Option<String>,
+    #[serde(rename = "rakePkh", default)]
+    rake_pkh: Option<String>,
+    #[serde(rename = "stakeA", default)]
+    stake_a: Option<f64>,
+    #[serde(rename = "stakeB", default)]
+    stake_b: Option<f64>,
+    #[serde(rename = "feeSats", default)]
+    fee_sats: Option<f64>,
+    #[serde(rename = "covRecoveryHeight", default)]
+    cov_recovery_height: Option<f64>,
+    #[serde(rename = "verdict", default)]
+    verdict: Option<String>,
+    #[serde(rename = "verdictTxid", default)]
+    verdict_txid: Option<String>,
+}
+
+impl DecodedPotRowD1 {
+    /// Strict column reconstruction of the committed params (length/hex
+    /// validated) — `None` falls back to the BLOB path, never a shortcut.
+    fn covenant_params(&self) -> Option<crate::results::CovenantParams> {
+        if self.lock_kind.as_deref() != Some("covenant") {
+            return None;
+        }
+        crate::results::covenant_params_from_hex(
+            self.pub_a.as_deref()?,
+            self.pub_b.as_deref()?,
+            self.pub_tower.as_deref()?,
+            self.pay_pkh_a.as_deref()?,
+            self.pay_pkh_b.as_deref()?,
+            self.rake_pkh.as_deref()?,
+            self.stake_a? as u64,
+            self.stake_b? as u64,
+            self.fee_sats? as u64,
+            self.cov_recovery_height? as u64,
+        )
+    }
+}
+
 /// Classify the recorded spends of the SPENT pots in `statuses` (vout 0 —
-/// the leaderboard anchor) from their stored `pot_beefs` bytes. Returns a
-/// lowercase-pot-txid → verdict map PLUS each classified pot's committed
-/// covenant params (the #230 attribution needs its lock keys); every fault
-/// or ambiguity simply omits that pot (see `results.rs` for the
+/// the leaderboard anchor). #284 two-tier sourcing:
+///
+/// 1. **Column partition (uncapped, no BLOBs):** pots whose `pot_records`
+///    row carries a FRESH stored verdict (`verdictTxid` equal to the spender
+///    being attributed — write-time classified, conservation enforced by the
+///    overlay) plus strict column params. A pure column read.
+/// 2. **Legacy fallback (capped at [`LEADERBOARD_CLASSIFY_CAP`]):** the
+///    pre-#284 path — stored `pot_beefs` bytes, hash-verified, classified
+///    per request. Covers un-backfilled rows and stale verdicts; dies
+///    entirely once the backfill completes.
+///
+/// Returns a lowercase-pot-txid → verdict map PLUS each classified pot's
+/// committed covenant params (the #230 attribution needs its lock keys);
+/// every fault or ambiguity simply omits that pot (see `results.rs` for the
 /// conservatism contract).
 async fn classify_spent_pots(
     db: &worker::D1Database,
@@ -661,22 +731,87 @@ async fn classify_spent_pots(
     let mut verdicts = std::collections::HashMap::new();
     let mut params_by_pot = std::collections::HashMap::new();
 
-    // The spent pots with a recorded spender, capped, deduped, newest first.
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    // ALL spent pots with a recorded spender, deduped, newest first (the
+    // fallback cap is applied AFTER the column partition below).
+    let mut all_pairs: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for s in statuses {
         if s.spent == Some(true) {
             if let Some(spender) = &s.spending_txid {
                 let pot = s.txid.to_ascii_lowercase();
                 if seen.insert(pot.clone()) {
-                    pairs.push((pot, spender.to_ascii_lowercase()));
-                    if pairs.len() >= LEADERBOARD_CLASSIFY_CAP {
-                        break;
-                    }
+                    all_pairs.push((pot, spender.to_ascii_lowercase()));
                 }
             }
         }
     }
+    if all_pairs.is_empty() {
+        return (verdicts, params_by_pot);
+    }
+
+    // ── Tier 1: the decoded-column partition (no BLOB fetch, NO CAP) ──────
+    // BEST-EFFORT: any fault leaves rows unresolved here and the fallback
+    // (still capped) picks them up — never a 5xx, never a guessed verdict.
+    let mut column_resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for chunk in all_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let sql = crate::results::decoded_pots_sql(chunk.len());
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        for (pot, _) in chunk {
+            binds.push(JsValue::from_str(pot));
+            binds.push(JsValue::from_f64(f64::from(crate::logic::LEADERBOARD_POT_VOUT)));
+        }
+        let stmt = match db.prepare(sql).bind(&binds) {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[leaderboard] decoded-pots bind failed (column tier skipped): {e}");
+                break;
+            }
+        };
+        match stmt.all().await.and_then(|r| r.results::<DecodedPotRowD1>()) {
+            Ok(rows) => {
+                let by_txid: std::collections::HashMap<String, DecodedPotRowD1> = rows
+                    .into_iter()
+                    .map(|r| (r.txid.to_ascii_lowercase(), r))
+                    .collect();
+                for (pot, spender) in chunk {
+                    let Some(row) = by_txid.get(pot) else { continue };
+                    // The stored verdict counts ONLY for the spender being
+                    // attributed (freshness: verdictTxid == the pointer this
+                    // board read; a stale/differing one falls back).
+                    let fresh = row
+                        .verdict_txid
+                        .as_deref()
+                        .is_some_and(|vt| vt.eq_ignore_ascii_case(spender))
+                        && row
+                            .spending_txid
+                            .as_deref()
+                            .is_some_and(|st| st.eq_ignore_ascii_case(spender));
+                    if !fresh {
+                        continue;
+                    }
+                    let (Some(v), Some(params)) = (
+                        row.verdict.as_deref().and_then(crate::results::PotVerdict::from_wire),
+                        row.covenant_params(),
+                    ) else {
+                        continue;
+                    };
+                    verdicts.insert(pot.clone(), v);
+                    params_by_pot.insert(pot.clone(), params);
+                    column_resolved.insert(pot.clone());
+                }
+            }
+            Err(e) => {
+                console_warn!("[leaderboard] decoded-pots query failed (column tier partial): {e}");
+            }
+        }
+    }
+
+    // ── Tier 2: the legacy BLOB fallback, capped ──────────────────────────
+    let pairs: Vec<(String, String)> = all_pairs
+        .into_iter()
+        .filter(|(pot, _)| !column_resolved.contains(pot))
+        .take(LEADERBOARD_CLASSIFY_CAP)
+        .collect();
     if pairs.is_empty() {
         return (verdicts, params_by_pot);
     }
@@ -801,8 +936,10 @@ async fn seat_attributions(
         // load-bearing, because the #252 backfill publishes honest markers
         // long after a pot's txid became public (see `seat_markers_sql`).
         let sql = crate::results::seat_markers_sql(chunk.len());
-        // Three binds per pot: (potTxid, pubA, pubB) — the keys come from
-        // the pot's hash-verified funding lock, never from a stored claim.
+        // Four binds per pot: (potTxid, potVout, pubA, pubB) — the keys come
+        // from the pot's committed funding lock (decoded columns, or the
+        // hash-verified funding bytes on the legacy fallback), never from a
+        // stored potparty claim.
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
         for pot in chunk {
@@ -910,6 +1047,38 @@ struct ResultsRowD1 {
     /// The marker's IDENTITY signature (F1 binding check).
     #[serde(rename = "sigHex", default)]
     sig_hex: Option<String>,
+    /// #284 decoded pot_records columns — NULL for legacy un-backfilled
+    /// rows; `default` tolerates a read racing the additive migrations.
+    #[serde(rename = "lockKind", default)]
+    lock_kind: Option<String>,
+    #[serde(rename = "pubA", default)]
+    pub_a: Option<String>,
+    #[serde(rename = "pubB", default)]
+    pub_b: Option<String>,
+    #[serde(rename = "pubTower", default)]
+    pub_tower: Option<String>,
+    #[serde(rename = "payPkhA", default)]
+    pay_pkh_a: Option<String>,
+    #[serde(rename = "payPkhB", default)]
+    pay_pkh_b: Option<String>,
+    #[serde(rename = "rakePkh", default)]
+    rake_pkh: Option<String>,
+    #[serde(rename = "stakeA", default)]
+    stake_a: Option<f64>,
+    #[serde(rename = "stakeB", default)]
+    stake_b: Option<f64>,
+    #[serde(rename = "feeSats", default)]
+    fee_sats: Option<f64>,
+    #[serde(rename = "covRecoveryHeight", default)]
+    cov_recovery_height: Option<f64>,
+    #[serde(rename = "potSats", default)]
+    pot_sats: Option<f64>,
+    #[serde(rename = "verdict", default)]
+    verdict: Option<String>,
+    #[serde(rename = "verdictTxid", default)]
+    verdict_txid: Option<String>,
+    #[serde(rename = "spentHeight", default)]
+    spent_height: Option<f64>,
 }
 
 impl ResultsRowD1 {
@@ -929,6 +1098,21 @@ impl ResultsRowD1 {
             seat_settle_pubkey: self.seat_settle_pubkey,
             seat_sig_hex: self.seat_sig_hex,
             marker_sig_hex: self.sig_hex,
+            lock_kind: self.lock_kind,
+            pub_a: self.pub_a,
+            pub_b: self.pub_b,
+            pub_tower: self.pub_tower,
+            pay_pkh_a: self.pay_pkh_a,
+            pay_pkh_b: self.pay_pkh_b,
+            rake_pkh: self.rake_pkh,
+            stake_a: self.stake_a.map(|v| v as u64),
+            stake_b: self.stake_b.map(|v| v as u64),
+            fee_sats: self.fee_sats.map(|v| v as u64),
+            cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
+            pot_sats: self.pot_sats.map(|v| v as u64),
+            verdict: self.verdict,
+            verdict_txid: self.verdict_txid,
+            spent_height: self.spent_height.map(|v| v as u64),
         }
     }
 }
