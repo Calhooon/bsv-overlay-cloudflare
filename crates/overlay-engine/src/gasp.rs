@@ -343,17 +343,29 @@ impl<'a> GASPSync<'a> {
                 }
             }
 
-            // Pagination termination (bsv-low #291 gate finding M1): keep
-            // paging on ANY page that advanced the score cursor. The old
-            // rule ("continue only on a full page") silently terminated
-            // after one page against a responder that CLAMPS the requested
-            // limit (Engine::SYNC_RESPONSE_MAX_LIMIT) below ours — a
-            // clamped page is never "full" by our limit, yet more rows
-            // remain. A non-advancing page (empty, or only rows at scores
-            // we already hold — the responder serves `score >= since`, so
-            // the boundary row is re-served) is the true completion signal:
-            // no further request can make progress.
-            if limit.is_none() || self.last_interaction == cursor_before_page {
+            // Pagination termination (bsv-low #291 gate findings M1/LOW-A):
+            // keep paging on ANY page that advanced the score cursor —
+            // with or without a requested limit. The old rule ("continue
+            // only on a full page"; `None` never paged at all) silently
+            // terminated after one page against a responder that CLAMPS
+            // the page size (Engine::clamp_sync_limit clamps BOTH an
+            // over-large and an ABSENT limit) — a clamped page is never
+            // "full" by our limit, yet more rows remain. A non-advancing
+            // page (empty, or only rows at scores we already hold — the
+            // responder serves `score >= since`, so the boundary row is
+            // re-served) is the true completion signal: no further request
+            // can make progress.
+            //
+            // Known residual (gate LOW-B, documented not fixed): the
+            // cursor is the bare GASP `since` score, so a tie group of
+            // IDENTICAL scores at least as large as the responder's page
+            // would end the run with that group's tail unreached (break on
+            // non-advance — a silent gap, never a spin). A compound
+            // (score, rowid) cursor would need a wire change to `since`,
+            // which is out of bounds; unconstructible in practice — see
+            // the responder-side note at
+            // `D1Storage::find_utxos_for_topic`.
+            if self.last_interaction == cursor_before_page {
                 break;
             }
         }

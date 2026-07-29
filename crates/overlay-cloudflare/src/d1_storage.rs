@@ -498,6 +498,23 @@ impl Storage for D1Storage {
         Ok(rows.into_iter().map(OutputRow::into_output).collect())
     }
 
+    /// Known residual (bsv-low #291 gate finding LOW-B — documented, not
+    /// fixed): this is the `/requestSyncResponse` responder read, ordered
+    /// by `score ASC` with the initiator's cursor being the bare GASP
+    /// `since` score. A tie group of IDENTICAL scores at least as large as
+    /// the clamped page size would re-serve the same page on every request
+    /// — the initiator then terminates on cursor non-advance with the
+    /// group's tail unreached (a silent gap, never a spin; see the
+    /// termination rule in `gasp.rs`). The durable fix is a compound
+    /// `(score, rowid)` cursor, but `since` is a single u64 on the GASP
+    /// wire — changing it is out of bounds. Unconstructible in practice:
+    /// scores are responder-local millisecond timestamps stamped one
+    /// admission round-trip (HTTP submit + D1 write) at a time, so ~1,000
+    /// rows sharing one millisecond cannot occur. Deliberately NO rowid
+    /// tiebreak in the ORDER BY: under a hypothetical over-page tie group,
+    /// SQLite's unspecified within-tie order lets successive runs serve
+    /// varying subsets (probabilistic coverage), whereas a deterministic
+    /// tiebreak would pin the exact same page forever.
     async fn find_utxos_for_topic(
         &self,
         topic: &str,
