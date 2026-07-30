@@ -430,6 +430,17 @@ pub trait PotStorage {
         let _ = txid;
         Ok(())
     }
+
+    /// Whether `txid`'s stored BEEF carries a VERIFIED proof latch
+    /// (bsv-low#304) — i.e. one of the verifying writers latched it. NEVER
+    /// derived from byte structure. Default: `false` (backends without the
+    /// latch treat every row as unverified — the fail direction that only
+    /// ever causes a redundant VERIFYING re-write, never a trust
+    /// strengthening).
+    async fn pot_beef_proof_verified(&self, txid: &str) -> Result<bool, PotStorageError> {
+        let _ = txid;
+        Ok(false)
+    }
 }
 
 /// Whether `beef` carries a merkle proof for `txid`'s OWN tx (not an
@@ -811,6 +822,10 @@ impl PotStorage for MemoryPotStorage {
     async fn mark_pot_beef_proven(&self, txid: &str) -> Result<(), PotStorageError> {
         self.verified.lock().unwrap().insert(txid.to_string());
         Ok(())
+    }
+
+    async fn pot_beef_proof_verified(&self, txid: &str) -> Result<bool, PotStorageError> {
+        Ok(self.verified.lock().unwrap().contains(txid))
     }
 }
 

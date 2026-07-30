@@ -1989,6 +1989,15 @@ impl PotStorage for D1PotStorage {
             .await
             .map_err(pot_err)
     }
+
+    async fn pot_beef_proof_verified(&self, txid: &str) -> Result<bool, PotStorageError> {
+        let row: Option<BeefLenRow> = Query::new(POT_BEEF_PROBE_SQL)
+            .bind(txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(row.is_some_and(|r| r.proof_verified.unwrap_or(0.0) != 0.0))
+    }
 }
 
 // =============================================================================

@@ -55,6 +55,7 @@ pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech"
 /// never starves the queue.
 pub const DEFAULT_FETCH_BUDGET: u32 = 40;
 
+
 /// Push-primary BACKSTOP age gate (bsv-low #228 / arcade#259): the poll
 /// passes only touch rows OLDER than this — younger rows are expected to get
 /// their proof via the Arcade MINED webhook (`/arc-ingest`), the PRIMARY
@@ -552,12 +553,10 @@ pub struct PotProofSummary {
 /// (retried next tick), never written proofless. Bounded by `limit`.
 pub async fn complete_pot_beef_proofs(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
-    fetcher: &ChainProofFetcher,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
     limit: u64,
     min_age_secs: u64,
 ) -> PotProofSummary {
-    use overlay_engine::gasp::AncestorFetcher;
-
     let mut summary = PotProofSummary::default();
 
     let candidates = match pot_storage
@@ -566,7 +565,7 @@ pub async fn complete_pot_beef_proofs(
     {
         Ok(c) => c,
         Err(e) => {
-            worker::console_log!("[pot-proof] candidate scan failed: {e}");
+            push_log(&format!("[pot-proof] candidate scan failed: {e}"));
             return summary;
         }
     };
@@ -593,16 +592,16 @@ pub async fn complete_pot_beef_proofs(
         if let Some(bump_hex) = stored_bump {
             if fetcher.verify_proof(&txid, &bump_hex).await {
                 if let Err(e) = pot_storage.mark_pot_beef_proven(&txid).await {
-                    worker::console_log!("[pot-proof] {txid} verified-latch write failed: {e}");
+                    push_log(&format!("[pot-proof] {txid} verified-latch write failed: {e}"));
                     summary.stitch_failed += 1;
                 } else {
                     summary.already_proven += 1;
                 }
                 continue;
             }
-            worker::console_log!(
+            push_log(&format!(
                 "[pot-proof] {txid} stored structural bump FAILED chaintracks re-verify — not trusting it, refetching (bsv-low#304)"
-            );
+            ));
         }
 
         // PROOF-ONLY fetch + chaintracks-verify (#192/#193 FIX 2): the raw is
@@ -620,14 +619,14 @@ pub async fn complete_pot_beef_proofs(
                 // compact_pot_beef re-checks the proof (fail-closed) and
                 // bypasses the longer-wins guard.
                 if let Err(e) = pot_storage.compact_pot_beef(&txid, &compacted).await {
-                    worker::console_log!("[pot-proof] {txid} compact write failed: {e}");
+                    push_log(&format!("[pot-proof] {txid} compact write failed: {e}"));
                     summary.stitch_failed += 1;
                 } else {
                     summary.completed += 1;
                 }
             }
             None => {
-                worker::console_log!("[pot-proof] {txid} stitch/trim failed (retry)");
+                push_log(&format!("[pot-proof] {txid} stitch/trim failed (retry)"));
                 summary.stitch_failed += 1;
             }
         }
@@ -1312,9 +1311,11 @@ impl PushedPotSummary {
     }
 }
 
-/// wasm-safe log for the push consumer: `worker::console_log!` panics off-wasm
-/// ("function not implemented on non-wasm32 targets"), and unlike the poll
-/// passes this path IS exercised by native unit tests.
+/// wasm-safe log: `worker::console_log!` panics off-wasm ("function not
+/// implemented on non-wasm32 targets"). Used by every path native unit tests
+/// exercise — the push consumer, the params backfill, and (since the
+/// bsv-low#304 gate round) the pot-beef poll pass incl. its
+/// stored-bump-failed-reverify branch.
 fn push_log(msg: &str) {
     #[cfg(target_arch = "wasm32")]
     worker::console_log!("{}", msg);
@@ -1325,10 +1326,13 @@ fn push_log(msg: &str) {
 /// Fold an `/arc-ingest`-pushed, ALREADY-chaintracks-VERIFIED bump for `txid`
 /// into the LOW pot stores, so the poll passes skip the tx entirely:
 ///
-/// 1. `pot_beefs`: if a stored BEEF for `txid` exists and is still proofless,
-///    stitch the bump, trim, and [`PotStorage::compact_pot_beef`] (which
-///    re-checks the proof, fail-closed) — same shape as one
-///    [`complete_pot_beef_proofs`] candidate, minus the courier fetch.
+/// 1. `pot_beefs`: if a stored BEEF for `txid` exists and is not yet
+///    VERIFIED-proven (the `proof_verified` latch, bsv-low#304 — NOT byte
+///    structure: a structurally-bumped admit row carries an untrusted bump
+///    this free verified push should REPLACE and latch), stitch the bump,
+///    trim, and [`PotStorage::compact_pot_beef`] (which re-checks the
+///    proof, fail-closed) — same shape as one [`complete_pot_beef_proofs`]
+///    candidate, minus the courier fetch.
 /// 2. `pot_records`: every outpoint whose recorded spender is `txid` and is
 ///    still unconfirmed is upgraded via `mark_spent(confirmed = true)` — the
 ///    spending tx verifiably mined, which is exactly the #186 chaser's latch
@@ -1347,8 +1351,6 @@ pub async fn apply_pushed_proof_to_pot_stores(
     txid: &str,
     bump_hex: &str,
 ) -> PushedPotSummary {
-    use overlay_discovery::pot::storage::pot_beef_has_proof;
-
     let mut summary = PushedPotSummary::default();
 
     // Defense-in-depth: the route has already chaintracks-verified this bump,
@@ -1364,9 +1366,18 @@ pub async fn apply_pushed_proof_to_pot_stores(
         return summary;
     }
 
-    // 1. pot_beefs stitch + compact.
+    // 1. pot_beefs stitch + compact. Gate on the VERIFIED latch, not byte
+    // structure (bsv-low#304 gate LOW-2): a structurally-bumped row whose
+    // latch is still 0 carries an UNTRUSTED admit-path bump — this push's
+    // route-verified bump replaces it and latches for free (no courier, no
+    // poll-pass wait). A latch-read fault degrades to "unverified" — worst
+    // case a redundant VERIFYING write, never a trust strengthening.
+    let already_verified = pot_storage
+        .pot_beef_proof_verified(txid)
+        .await
+        .unwrap_or(false);
     match pot_storage.get_beef(txid).await {
-        Ok(Some(stored_beef)) if !pot_beef_has_proof(txid, &stored_beef) => {
+        Ok(Some(stored_beef)) if !already_verified => {
             match stitch_and_trim_pot_beef(txid, &stored_beef, bump_hex) {
                 Some(compacted) => match pot_storage.compact_pot_beef(txid, &compacted).await {
                     Ok(()) => summary.pot_beef_compacted = true,
@@ -1381,7 +1392,7 @@ pub async fn apply_pushed_proof_to_pot_stores(
                 }
             }
         }
-        Ok(_) => {} // no pot beef, or already proven — nothing to do
+        Ok(_) => {} // no pot beef, or already VERIFIED-proven — nothing to do
         Err(e) => push_log(&format!("[arc-ingest] {txid} pot-beef read failed: {e}")),
     }
 
@@ -1765,6 +1776,140 @@ mod tests {
         (beef.to_binary(), txid)
     }
 
+    /// A STRUCTURALLY-bumped pot BEEF exactly as an ungated admit leaves it
+    /// (bytes carry a bump nobody verified). `lock_time_salt` varies the
+    /// txid so tests can seed many distinct rows from one raw fixture.
+    fn structurally_bumped_pot_beef(bump_height: u32, lock_time_salt: u32) -> (Vec<u8>, String) {
+        use bsv_rs::transaction::Transaction;
+        // Salt the lock_time in the RAW BYTES (its trailing 4 LE bytes) and
+        // parse fresh: `Transaction` caches raw bytes + hash at parse time,
+        // so a post-parse field mutation would keep the stale txid.
+        let mut raw = hex::decode(RAW_A).unwrap();
+        let n = raw.len();
+        raw[n - 4..].copy_from_slice(&lock_time_salt.to_le_bytes());
+        let mut tx = Transaction::from_binary(&raw).unwrap();
+        let txid = tx.id();
+        tx.merkle_path = Some(single_tx_bump(&txid, bump_height));
+        (tx.to_beef(true).unwrap(), txid)
+    }
+
+    /// The subject's own bump height inside a stored BEEF (None = proofless).
+    fn stored_bump_height(beef: &[u8], txid: &str) -> Option<u32> {
+        let b = bsv_rs::transaction::Beef::from_binary(beef).ok()?;
+        let idx = b.find_txid(txid)?.bump_index()?;
+        Some(b.bumps.get(idx)?.block_height)
+    }
+
+    /// bsv-low#304 fast-path test fetcher: configurable stored-bump verdict
+    /// + refetch table, with call counters so tests can assert "no courier
+    /// fetch happened" through the REAL pass (never hand-fed candidates).
+    struct ReverifyFetcher {
+        verify_ok: bool,
+        refetch: std::collections::HashMap<String, String>,
+        verify_calls: std::cell::Cell<usize>,
+        fetch_calls: std::cell::Cell<usize>,
+    }
+
+    impl ReverifyFetcher {
+        fn new(verify_ok: bool) -> Self {
+            Self {
+                verify_ok,
+                refetch: std::collections::HashMap::new(),
+                verify_calls: std::cell::Cell::new(0),
+                fetch_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for ReverifyFetcher {
+        async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+            Err(GASPError::NodeNotFound(format!("mock: no ancestor for {txid}")))
+        }
+        async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+            self.fetch_calls.set(self.fetch_calls.get() + 1);
+            self.refetch.get(txid).cloned()
+        }
+        async fn verify_proof(&self, _txid: &str, _bump_hex: &str) -> bool {
+            self.verify_calls.set(self.verify_calls.get() + 1);
+            self.verify_ok
+        }
+    }
+
+    // ── bsv-low#304: stored-bump re-verify fast path (poll pass) ─────────
+
+    #[tokio::test]
+    async fn stored_bump_reverify_fast_path_latches_without_fetch_or_rewrite() {
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 0);
+        store.store_beef(&txid, &beef).await.unwrap();
+
+        let fetcher = ReverifyFetcher::new(true);
+        let pass = complete_pot_beef_proofs(&store, &fetcher, 20, 0).await;
+        assert_eq!(pass.already_proven, 1, "verified stored bump latches");
+        assert_eq!(pass.completed, 0);
+        assert_eq!(pass.still_unconfirmed, 0);
+        assert_eq!(fetcher.verify_calls.get(), 1);
+        assert_eq!(fetcher.fetch_calls.get(), 0, "the fast path never touches the courier");
+
+        // Latched (out of the candidate set), bytes untouched.
+        assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+        assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
+        assert_eq!(store.get_beef(&txid).await.unwrap().unwrap(), beef, "no byte rewrite");
+    }
+
+    #[tokio::test]
+    async fn stored_bump_failing_reverify_is_not_latched_and_falls_to_refetch() {
+        // bsv-low#304 gate LOW-3: the fail branch runs NATIVELY (its log is
+        // push_log — a console_log here aborts off-wasm) and behaves
+        // fail-closed: chaintracks says no → NOT latched, the courier
+        // refetch path is taken, and with nothing refetchable the row stays
+        // an honest candidate.
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 0);
+        store.store_beef(&txid, &beef).await.unwrap();
+
+        let fetcher = ReverifyFetcher::new(false);
+        let pass = complete_pot_beef_proofs(&store, &fetcher, 20, 0).await;
+        assert_eq!(pass.already_proven, 0, "a FAILED re-verify must not latch");
+        assert_eq!(pass.still_unconfirmed, 1);
+        assert_eq!(fetcher.verify_calls.get(), 1);
+        assert_eq!(fetcher.fetch_calls.get(), 1, "falls through to the refetch path");
+        assert!(
+            !store.pot_beef_proof_verified(&txid).await.unwrap(),
+            "fake bump stays unverified"
+        );
+        assert_eq!(
+            store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().len(),
+            1,
+            "still a candidate — retried next tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reverify_with_a_refetched_proof_replaces_the_fake_bump() {
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 0);
+        store.store_beef(&txid, &beef).await.unwrap();
+
+        let mut fetcher = ReverifyFetcher::new(false);
+        fetcher
+            .refetch
+            .insert(txid.clone(), single_tx_bump(&txid, HEIGHT + 1).to_hex());
+        let pass = complete_pot_beef_proofs(&store, &fetcher, 20, 0).await;
+        assert_eq!(pass.completed, 1, "the verified refetched proof stitches in");
+        assert_eq!(pass.already_proven, 0);
+
+        let stored = store.get_beef(&txid).await.unwrap().unwrap();
+        assert_eq!(
+            stored_bump_height(&stored, &txid),
+            Some(HEIGHT + 1),
+            "the fake bump was REPLACED by the chaintracks-verified one"
+        );
+        assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
+        assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+    }
+
     /// 64-hex settle txids (a bump subject must be a real txid shape).
     const SETTLE_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SETTLE_B: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -2038,6 +2183,39 @@ mod tests {
         let pass_fetcher = ChainProofFetcher::new(None).with_budget(0);
         let pass = complete_pot_beef_proofs(&store, &pass_fetcher, 20, 0).await;
         assert_eq!(pass.scanned, 0, "a pushed-compacted BEEF is never re-polled");
+    }
+
+    #[tokio::test]
+    async fn pushed_proof_latches_a_structurally_bumped_unverified_row() {
+        // bsv-low#304 gate LOW-2: the push consumer gates on the VERIFIED
+        // latch, not byte structure. A fake-bumped row admitted via the
+        // REAL admit path (store_beef) used to be skipped as "already
+        // proven" — the free route-verified push now REPLACES the untrusted
+        // bump and latches, with zero courier/poll-pass involvement.
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 0);
+        store.store_beef(&txid, &beef).await.unwrap();
+        assert!(!store.pot_beef_proof_verified(&txid).await.unwrap());
+
+        let pushed = single_tx_bump(&txid, HEIGHT + 2).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, &txid, &pushed).await;
+        assert!(
+            s.pot_beef_compacted,
+            "a structurally-bumped UNVERIFIED row must accept the verified push"
+        );
+        assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
+        assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+        let stored = store.get_beef(&txid).await.unwrap().unwrap();
+        assert_eq!(
+            stored_bump_height(&stored, &txid),
+            Some(HEIGHT + 2),
+            "the untrusted admit bump was replaced by the pushed verified one"
+        );
+
+        // Idempotence: a second push against the now-VERIFIED row is a
+        // no-op (verified rows are authoritative — nothing to strengthen).
+        let again = apply_pushed_proof_to_pot_stores(&store, &txid, &pushed).await;
+        assert!(!again.pot_beef_compacted, "an already-verified row is left alone");
     }
 
     #[tokio::test]
