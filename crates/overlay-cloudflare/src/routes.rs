@@ -513,7 +513,10 @@ pub async fn submit(
     // nothing — the index can never contain a tx the network refused. A
     // transport failure on both broadcasters returns 502 (the caller falls
     // back to its own direct broadcast + historical submit). An all-proven
-    // BEEF (already mined) skips the broadcast and admits directly.
+    // BEEF ("already mined" — a SUBMITTER-ASSERTED bump, never validated
+    // here) no longer admits ungated (bsv-low#268): the claim is
+    // corroborated against a real provider via the subject's raw, and an
+    // unconfirmable claim refuses admission (502, retryable).
     // #195 Server-Timing segments (ms). `arcade-broadcast` is the gated
     // network broadcast, `engine-submit` the D1 write-through, `fanout` the
     // (backgrounded) SHIP fan-out's synchronous scheduling cost. Emitted as a
@@ -521,6 +524,7 @@ pub async fn submit(
     // slice instead of from client wall-clock (which cannot separate overlay
     // work from Arcade variance — the retracted #195 measurement).
     let mut arcade_broadcast_ms = 0f64;
+    let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
     if mode_header.as_deref() == Some("broadcast-gated") {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
@@ -572,16 +576,31 @@ pub async fn submit(
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
+        // #268: when every leg claims a bump (efs empty) the subject's RAW is
+        // the mined-claim corroboration body — extracted here (the route holds
+        // the BEEF; the broadcaster does not).
+        let mined_subject_raw = if efs.is_empty() {
+            crate::ef::proven_subject_raw(&tagged_beef.beef)
+        } else {
+            None
+        };
         let arcade_started = js_sys::Date::now();
-        let arcade_outcome = arcade.broadcast_efs_gated(&efs, &subject_txid).await;
+        let arcade_outcome = arcade
+            .broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref())
+            .await;
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of
         // `arcade-broadcast` and reported as its own `corroborate` segment
         // (also on the 422/502 early returns, where attribution matters most).
+        // #272: `arcade-poll` (the SEEN-gate wait) is carved out too, so the
+        // remaining `arcade-broadcast` is submit-POST wall-clock — the
+        // 15–16 s JOIN-submit budget becomes attributable per slice.
         corroborate_ms = arcade.corroborate_ms();
-        arcade_broadcast_ms = (js_sys::Date::now() - arcade_started - corroborate_ms).max(0.0);
+        arcade_poll_ms = arcade.poll_wait_ms();
+        arcade_broadcast_ms =
+            (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms).max(0.0);
         let gated_timing = format!(
-            "arcade-broadcast;dur={arcade_broadcast_ms:.1}, corroborate;dur={corroborate_ms:.1}"
+            "arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}"
         );
         match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
@@ -757,7 +776,7 @@ pub async fn submit(
     // carved out of `arcade-broadcast` so the second-broadcaster leg is
     // attributable on its own.
     let server_timing = format!(
-        "arcade-broadcast;dur={arcade_broadcast_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
+        "arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
     );
     Ok(with_server_timing(json_ok(&steak)?, &server_timing))
 }

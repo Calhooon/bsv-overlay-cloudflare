@@ -114,6 +114,27 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
     Ok((efs, subject_txid))
 }
 
+/// The SUBJECT's raw bytes when it CLAIMS to be already mined (bsv-low#268).
+///
+/// [`beef_to_ef_batch`] returns an EMPTY `efs` when every tx in the BEEF —
+/// including the subject — carries a bump. That bump is submitter-asserted
+/// and NOT validated at this layer, so the broadcast gate must corroborate
+/// the "already mined" claim against a real provider instead of admitting
+/// on it; the corroboration body is the subject's RAW (a genuinely mined
+/// tx's parents are on-chain, so raw suffices and any honest provider
+/// answers "already known/mined").
+///
+/// `None` when the BEEF does not parse, is empty, or the subject is a
+/// txid-only entry with no tx data — the caller then refuses admission
+/// (fail-closed: an unverifiable claim never admits).
+pub fn proven_subject_raw(beef_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut beef = Beef::from_binary(beef_bytes).ok()?;
+    beef.sort_txs();
+    let subject = beef.txs.last()?;
+    let tx = subject.tx()?;
+    Some(tx.to_binary())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -190,6 +211,23 @@ mod tests {
     #[test]
     fn ef_batch_rejects_garbage_beef() {
         assert!(matches!(beef_to_ef_batch(&[0xde, 0xad]), Err(EfError::Parse(_))));
+    }
+
+    #[test]
+    fn proven_subject_raw_extracts_the_subject_bytes_for_the_mined_claim() {
+        // bsv-low#268: an all-proven BEEF (efs empty) needs the SUBJECT's raw
+        // for the mined-claim corroboration. The parent fixture BEEF alone is
+        // exactly that shape — its subject (the parent tx) carries a bump, so
+        // the EF batch is empty and the raw must come from here.
+        let beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
+        let (efs, subject_txid) = beef_to_ef_batch(&beef).unwrap();
+        assert!(efs.is_empty(), "all-proven BEEF yields no EF legs");
+        let raw = proven_subject_raw(&beef).expect("subject raw must extract");
+        let tx = Transaction::from_binary(&raw).unwrap();
+        assert_eq!(tx.id(), subject_txid, "raw is content-addressed to the subject");
+        // Garbage → None (the caller refuses admission, fail-closed).
+        assert!(proven_subject_raw(&[0xde, 0xad]).is_none());
+        assert!(proven_subject_raw(&[]).is_none());
     }
 
     #[test]
