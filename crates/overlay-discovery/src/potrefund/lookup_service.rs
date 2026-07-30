@@ -29,9 +29,26 @@ use super::parse_potrefund_marker;
 use super::storage::{PotrefundQuery, PotrefundRecord, PotrefundStorage};
 
 /// Default number of records returned when a query omits `limit`.
-const DEFAULT_LIMIT: usize = 100;
-/// Hard cap on the number of records a single query can return.
-const MAX_LIMIT: usize = 500;
+///
+/// Sized to the PAYLOAD, not the row count (bsv-low #291): a potrefund row
+/// carries `refundRawHex` (format-capped at 100,000 raw bytes → up to
+/// ~200 KB of hex TEXT per row), so the old default of 100 allowed a
+/// ~20 MB response (and MAX 500 ⇒ ~100 MB) — compare `ls_proof`, capped at
+/// 3 for a 64 KiB payload. 16 covers every honest need with headroom: a
+/// `byPot` query has at most 2 genuine backups (one per seat), and the
+/// windowed `partyFor` SQL (#281) reserves per-pot quotas inside whatever
+/// limit it is handed. Honest rows are not displaced by a flood at this
+/// size — the by-pot window orders `createdAt ASC`, so markers published at
+/// game time precede any later spam (the dust-attack suite proves it), and
+/// rows landed BEFORE funding (the pre-funding front-run) are reachable by
+/// paging `offset += limit` (gate M2) — the cap bounds a RESPONSE, never
+/// the reachable set.
+const DEFAULT_LIMIT: usize = 16;
+/// Hard cap on the number of records a single query can return. A client
+/// that genuinely needs more than 100 rows pages explicitly via the
+/// `byPot.offset` cursor (`partyFor` windows by POT with per-pot quotas
+/// instead).
+const MAX_LIMIT: usize = 100;
 
 /// POTREFUND Lookup Service — indexes markers and answers `byPot` /
 /// `partyFor`.
@@ -146,10 +163,20 @@ impl LookupService for PotrefundLookupService {
                 pot_txid,
                 pot_vout,
                 limit,
+                offset,
             } => {
                 let pot_txid = normalize_txid(&pot_txid)?;
                 self.storage
-                    .list_for_pot(&pot_txid, pot_vout, clamp_limit(limit))
+                    .list_for_pot(
+                        &pot_txid,
+                        pot_vout,
+                        clamp_limit(limit),
+                        // Page start (gate M2): absent → the head of the
+                        // oldest-first order. Unclamped — a huge offset is
+                        // just an empty page, never a scan (the window is
+                        // still LIMIT-bounded).
+                        offset.unwrap_or(0) as usize,
+                    )
                     .await
                     .map_err(|e| LookupServiceError::StorageError(e.to_string()))?
             }

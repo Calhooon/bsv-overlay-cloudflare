@@ -15,7 +15,10 @@ use overlay_discovery::collected::storage::{
 use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
-use overlay_discovery::low::storage::{LowRecord, LowStorage, LowStorageError};
+use overlay_discovery::low::storage::{
+    LowRecord, LowRecordType, LowStorage, LowStorageError, LOW_BY_KEY_RESULT_CAP,
+    OPEN_TABLES_PER_HOST_CAP, OPEN_TABLES_RESULT_CAP,
+};
 use overlay_discovery::pot::storage::{
     pot_beef_has_proof, PotRecord, PotStorage, PotStorageError,
 };
@@ -27,7 +30,9 @@ use overlay_discovery::potrefund::storage::{
 };
 use overlay_discovery::proof::storage::{ProofRecord, ProofStorage, ProofStorageError};
 use overlay_discovery::result::storage::{ResultRecord, ResultStorage, ResultStorageError};
-use overlay_discovery::reveal::storage::{RevealRecord, RevealStorage, RevealStorageError};
+use overlay_discovery::reveal::storage::{
+    RevealRecord, RevealStorage, RevealStorageError, REVEAL_RESULT_CAP,
+};
 use overlay_discovery::ship::storage::{
     SHIPDiscoveryRecord, SHIPQuery, SHIPStorage, SHIPStorageError, SortOrder,
 };
@@ -985,6 +990,131 @@ impl UHRPStorage for D1UHRPStorage {
 // D1LowStorage
 // =============================================================================
 
+/// The full `low_records` column set (#290 — the decoded index IS the
+/// answer, so the queries read it back instead of just the outpoint refs).
+const LOW_RECORD_COLUMNS: &str =
+    "recordType, txid, outputIndex, hostIdentity, gameId, stakeSats, rulesHash, \
+     relayUrl, expiryHeight";
+
+/// `ls_low findOpenTables` — full index rows (#290), newest-first, capped at
+/// [`OPEN_TABLES_RESULT_CAP`] (#291), with a PER-HOST quota of
+/// [`OPEN_TABLES_PER_HOST_CAP`] (#291 gate finding M3, the #281 partitioned-
+/// window pattern): a flat newest-first cap let ONE identity's
+/// [`OPEN_TABLES_RESULT_CAP`] byte-format-admitted junk rows blank every
+/// honest table from the lobby before the client's verify-and-drop filter
+/// ever saw them. With the partition, a single host occupies at most
+/// [`OPEN_TABLES_PER_HOST_CAP`] window slots — blanking the lobby now takes
+/// `CAP / PER_HOST` distinct identities' worth of admitted on-chain rows.
+/// Residual (accepted, display-only): identities are free keypairs, so a
+/// determined multi-identity flood can still displace; no money path reads
+/// the lobby (rejoin is keyed byGameId/byHost, money discovery is
+/// server-primary).
+///
+/// `where_clause` is the WhereBuilder output (leading " WHERE …" or empty).
+/// Factored out so the real-SQLite tests below execute the SHIPPED string,
+/// not a transcription.
+pub fn low_open_tables_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT {LOW_RECORD_COLUMNS} \
+         FROM (SELECT {LOW_RECORD_COLUMNS}, createdAt, rowid AS mrowid, \
+                      ROW_NUMBER() OVER (PARTITION BY hostIdentity \
+                                         ORDER BY createdAt DESC, rowid DESC) AS hostRank \
+               FROM low_records{where_clause}) \
+         WHERE hostRank <= {OPEN_TABLES_PER_HOST_CAP} \
+         ORDER BY createdAt DESC, mrowid DESC LIMIT {OPEN_TABLES_RESULT_CAP}"
+    )
+}
+
+/// `ls_low byGameId` — full index rows, newest-first, capped (#290/#291).
+pub fn low_by_game_id_sql() -> String {
+    format!(
+        "SELECT {LOW_RECORD_COLUMNS} FROM low_records WHERE gameId = ? \
+         ORDER BY createdAt DESC LIMIT {LOW_BY_KEY_RESULT_CAP}"
+    )
+}
+
+/// `ls_low byHost` — full index rows, newest-first, capped (#290/#291).
+pub fn low_by_host_sql() -> String {
+    format!(
+        "SELECT {LOW_RECORD_COLUMNS} FROM low_records WHERE hostIdentity = ? \
+         ORDER BY createdAt DESC LIMIT {LOW_BY_KEY_RESULT_CAP}"
+    )
+}
+
+/// Row for full low_records queries. D1 returns numbers as f64 and nullable
+/// columns as `Option`.
+#[derive(Deserialize)]
+struct LowRow {
+    #[serde(rename = "recordType")]
+    record_type: String,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "hostIdentity")]
+    host_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "stakeSats")]
+    stake_sats: Option<f64>,
+    #[serde(rename = "rulesHash")]
+    rules_hash: Option<String>,
+    #[serde(rename = "relayUrl")]
+    relay_url: Option<String>,
+    #[serde(rename = "expiryHeight")]
+    expiry_height: Option<f64>,
+}
+
+impl LowRow {
+    /// `None` on an unknown recordType — possible only under version skew
+    /// (a discriminator written by a NEWER deploy read back after a
+    /// rollback). Callers go through [`low_records_from_rows`], which makes
+    /// the skip LOUD (gate finding L3) — never a silent vanish.
+    fn into_record(self) -> Option<LowRecord> {
+        Some(LowRecord {
+            record_type: LowRecordType::from_str_opt(&self.record_type)?,
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            host_identity: self.host_identity,
+            game_id: self.game_id,
+            stake_sats: self.stake_sats.map(|s| s as u64),
+            rules_hash: self.rules_hash,
+            relay_url: self.relay_url,
+            expiry_height: self.expiry_height.map(|e| e as u32),
+        })
+    }
+}
+
+/// Convert `low_records` rows, LOUDLY skipping any with an unknown
+/// `recordType` discriminator (gate finding L3): a silent `filter_map` let
+/// a discriminator added writer-side before reader-side (deploy rollback /
+/// version skew) vanish rows from lobby and rejoin answers with zero
+/// signal. Good rows always survive; each skip is console-warned with its
+/// outpoint so the skew is diagnosable from logs.
+fn low_records_from_rows(rows: Vec<LowRow>) -> Vec<LowRecord> {
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let outpoint = format!("{}:{}", row.txid, row.output_index);
+        let record_type = row.record_type.clone();
+        match row.into_record() {
+            Some(record) => records.push(record),
+            None => {
+                let msg = format!(
+                    "low_records: SKIPPING row {outpoint} with unknown recordType \
+                     '{record_type}' (reader older than writer? deploy skew) — \
+                     the row is preserved in D1, only this answer omits it"
+                );
+                // worker::console_warn! requires the JS host; native (unit
+                // tests) goes to stderr.
+                #[cfg(target_arch = "wasm32")]
+                worker::console_warn!("{msg}");
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("{msg}");
+            }
+        }
+    }
+    records
+}
+
 /// Cloudflare D1 implementation of the LowStorage trait (tm_low / ls_low).
 ///
 /// Schema: `low_records` in `d1::OVERLAY_MIGRATIONS`. Keyed by
@@ -1040,7 +1170,7 @@ impl LowStorage for D1LowStorage {
         stake_min: Option<u64>,
         stake_max: Option<u64>,
         tip_height: Option<u32>,
-    ) -> Result<Vec<UTXOReference>, LowStorageError> {
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
         let mut wb = WhereBuilder::new().eq("recordType", "table");
         if let Some(min) = stake_min {
             wb = wb.gte("stakeSats", min as i64);
@@ -1060,47 +1190,80 @@ impl LowStorage for D1LowStorage {
         }
         let (where_clause, params) = wb.build();
 
-        let sql = format!(
-            "SELECT txid, outputIndex FROM low_records{where_clause} ORDER BY createdAt DESC"
-        );
+        // Full index rows (#290) + newest-first bound (#291) — the lobby is
+        // a display surface; the cap keeps the newest tables.
+        let sql = low_open_tables_sql(&where_clause);
         let mut q = Query::new(sql);
         for p in params {
             q = q.bind(p);
         }
-        let rows: Vec<UTXORow> = q.fetch_all(&self.db).await.map_err(low_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        let rows: Vec<LowRow> = q.fetch_all(&self.db).await.map_err(low_err)?;
+        Ok(low_records_from_rows(rows))
     }
 
-    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<UTXOReference>, LowStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM low_records WHERE gameId = ? ORDER BY createdAt DESC",
-        )
+    async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+        let rows: Vec<LowRow> = Query::new(low_by_game_id_sql())
         .bind(game_id)
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(low_records_from_rows(rows))
     }
 
-    async fn find_by_host(
-        &self,
-        identity_key: &str,
-    ) -> Result<Vec<UTXOReference>, LowStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM low_records WHERE hostIdentity = ? \
-             ORDER BY createdAt DESC",
-        )
+    async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+        let rows: Vec<LowRow> = Query::new(low_by_host_sql())
         .bind(identity_key)
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(low_records_from_rows(rows))
     }
 }
 
 // =============================================================================
 // D1RevealStorage
 // =============================================================================
+
+/// `ls_reveal byGameSeat` — full index rows (#290), newest-first, capped at
+/// [`REVEAL_RESULT_CAP`] (#291). Factored out so the real-SQLite tests
+/// execute the SHIPPED string.
+pub fn reveal_by_game_seat_sql() -> String {
+    format!(
+        "SELECT txid, outputIndex, gameId, seat FROM reveal_records \
+         WHERE gameId = ? AND seat = ? ORDER BY createdAt DESC \
+         LIMIT {REVEAL_RESULT_CAP}"
+    )
+}
+
+/// `ls_reveal byGameId` — full index rows, newest-first, capped (#290/#291).
+pub fn reveal_by_game_id_sql() -> String {
+    format!(
+        "SELECT txid, outputIndex, gameId, seat FROM reveal_records WHERE gameId = ? \
+         ORDER BY createdAt DESC LIMIT {REVEAL_RESULT_CAP}"
+    )
+}
+
+/// Row for full reveal_records queries. D1 returns numbers as f64.
+#[derive(Deserialize)]
+struct RevealRow {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    seat: f64,
+}
+
+impl RevealRow {
+    fn into_record(self) -> RevealRecord {
+        RevealRecord {
+            txid: self.txid,
+            output_index: self.output_index as u32,
+            game_id: self.game_id,
+            seat: self.seat as u8,
+        }
+    }
+}
 
 /// Cloudflare D1 implementation of the RevealStorage trait (tm_reveal /
 /// ls_reveal).
@@ -1154,32 +1317,26 @@ impl RevealStorage for D1RevealStorage {
         &self,
         game_id: &str,
         seat: u8,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM reveal_records \
-             WHERE gameId = ? AND seat = ? ORDER BY createdAt DESC",
-        )
+    ) -> Result<Vec<RevealRecord>, RevealStorageError> {
+        let rows: Vec<RevealRow> = Query::new(reveal_by_game_seat_sql())
         .bind(game_id)
         .bind(seat as u32)
         .fetch_all(&self.db)
         .await
         .map_err(reveal_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(rows.into_iter().map(RevealRow::into_record).collect())
     }
 
     async fn find_by_game_id(
         &self,
         game_id: &str,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
-        let rows: Vec<UTXORow> = Query::new(
-            "SELECT txid, outputIndex FROM reveal_records WHERE gameId = ? \
-             ORDER BY createdAt DESC",
-        )
+    ) -> Result<Vec<RevealRecord>, RevealStorageError> {
+        let rows: Vec<RevealRow> = Query::new(reveal_by_game_id_sql())
         .bind(game_id)
         .fetch_all(&self.db)
         .await
         .map_err(reveal_err)?;
-        Ok(rows.into_iter().map(UTXORow::into_ref).collect())
+        Ok(rows.into_iter().map(RevealRow::into_record).collect())
     }
 }
 
@@ -1414,6 +1571,18 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     }
 }
 
+/// SQL for one batched spent-status chunk (bsv-low #289): a single
+/// row-value `IN (VALUES …)` query replacing `n` individual
+/// `get_spent_status` round trips. Factored out so the real-SQLite test
+/// proves the syntax against the production schema.
+pub fn pot_spent_statuses_sql(n: usize) -> String {
+    let placeholders = vec!["(?, ?)"; n].join(", ");
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE (txid, outputIndex) IN (VALUES {placeholders})"
+    )
+}
+
 /// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
 /// GUARDED COMPARE-AND-SET that attaches a verdict to the pointer it was
 /// computed for — and touches NOTHING else. `WHERE … AND spendingTxid = ?`
@@ -1575,6 +1744,41 @@ impl PotStorage for D1PotStorage {
         .await
         .map_err(pot_err)?;
         Ok(row.map(PotRow::into_record))
+    }
+
+    /// Batched spent-status (bsv-low #289): one row-value `IN (VALUES …)`
+    /// query per 40-outpoint chunk instead of one D1 round trip per
+    /// outpoint. Alignment contract (input order, `None` where absent) is
+    /// preserved via an outpoint-keyed map.
+    async fn get_spent_statuses(
+        &self,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Option<PotRecord>>, PotStorageError> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        // D1 caps bound parameters (100); 2 per outpoint → chunks of 40.
+        const CHUNK: usize = 40;
+        let mut by_outpoint: std::collections::HashMap<(String, u32), PotRecord> =
+            std::collections::HashMap::new();
+        for chunk in outpoints.chunks(CHUNK) {
+            let sql = pot_spent_statuses_sql(chunk.len());
+            let mut q = Query::new(sql);
+            for (txid, output_index) in chunk {
+                q = q.bind(txid.as_str()).bind(*output_index);
+            }
+            let rows: Vec<PotRow> = q.fetch_all(&self.db).await.map_err(pot_err)?;
+            for row in rows {
+                let record = row.into_record();
+                by_outpoint.insert((record.txid.clone(), record.output_index), record);
+            }
+        }
+        Ok(outpoints
+            .iter()
+            .map(|(txid, output_index)| {
+                by_outpoint.get(&(txid.clone(), *output_index)).cloned()
+            })
+            .collect())
     }
 
     async fn find_params_undecoded(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
@@ -1756,6 +1960,19 @@ impl CollectedRow {
     }
 }
 
+/// SQL for one batched collected-marker chunk (bsv-low #289): one
+/// `identity = ? AND gameId IN (…)` query replacing `n` individual
+/// `get_record` round trips. Factored out so the real-SQLite test proves
+/// the SHIPPED string selects per-(identity, gameId) — never a same-gameId
+/// row belonging to a DIFFERENT identity.
+pub fn collected_records_batch_sql(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT identity, gameId, txid, sigHex FROM collected_markers \
+         WHERE identity = ? AND gameId IN ({placeholders})"
+    )
+}
+
 /// Cloudflare D1 implementation of the CollectedStorage trait
 /// (tm_collected / ls_collected, bsv-low #161).
 ///
@@ -1813,6 +2030,41 @@ impl CollectedStorage for D1CollectedStorage {
         .await
         .map_err(collected_err)?;
         Ok(row.map(CollectedRow::into_record))
+    }
+
+    /// Batched pair lookup (bsv-low #289): one `gameId IN (…)` query per
+    /// chunk instead of a D1 round trip per requested game. Alignment
+    /// contract (input order, `None` where no marker exists) preserved via
+    /// a gameId-keyed map — (identity, gameId) is the primary key, so at
+    /// most one row exists per requested gameId.
+    async fn get_records(
+        &self,
+        identity: &str,
+        game_ids: &[String],
+    ) -> Result<Vec<Option<CollectedRecord>>, CollectedStorageError> {
+        if game_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // D1 caps bound parameters (100); 1 per gameId + the identity.
+        const CHUNK: usize = 90;
+        let mut by_game: std::collections::HashMap<String, CollectedRecord> =
+            std::collections::HashMap::new();
+        for chunk in game_ids.chunks(CHUNK) {
+            let sql = collected_records_batch_sql(chunk.len());
+            let mut q = Query::new(sql).bind(identity);
+            for game_id in chunk {
+                q = q.bind(game_id.as_str());
+            }
+            let rows: Vec<CollectedRow> = q.fetch_all(&self.db).await.map_err(collected_err)?;
+            for row in rows {
+                let record = row.into_record();
+                by_game.insert(record.game_id.clone(), record);
+            }
+        }
+        Ok(game_ids
+            .iter()
+            .map(|game_id| by_game.get(game_id).cloned())
+            .collect())
     }
 }
 
@@ -2296,12 +2548,21 @@ pub fn potrefund_list_for_identity_sql() -> String {
 /// the seats themselves, and cannot spam its way in front afterwards.
 /// `rowid ASC` breaks same-second ties into a total order.
 ///
+/// `OFFSET` (bsv-low #291 gate finding M2): the byPot window is now
+/// PAGEABLE — each response stays payload-bounded (rows carry up to
+/// ~200 KB of `refundRawHex` TEXT), yet no admitted row is unreachable: a
+/// client that suspects burial pages `offset += limit` past junk to the
+/// honest markers. The `(createdAt ASC, rowid ASC)` total order makes
+/// offset pages stable — new markers only ever APPEND at the tail, so a
+/// concurrent insert can never shift rows across an already-fetched page
+/// boundary.
+///
 /// Built from the caller's own SELECT list so the tests execute the SHIPPED
 /// string rather than a transcription of it.
 pub fn list_for_pot_sql(select: &str) -> String {
     format!(
         "{select} WHERE potTxid = ? AND potVout = ? \
-         ORDER BY createdAt ASC, rowid ASC LIMIT ?"
+         ORDER BY createdAt ASC, rowid ASC LIMIT ? OFFSET ?"
     )
 }
 
@@ -2479,11 +2740,15 @@ impl PotpartyStorage for D1PotpartyStorage {
         pot_vout: u32,
         limit: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
-        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281).
+        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281). The shared
+        // SQL is offset-pageable since gate M2; the potparty wire has no
+        // offset (its rows are small — no payload-bound cap forcing one),
+        // so this binds page 0.
         let rows: Vec<PotpartyRow> = Query::new(list_for_pot_sql(POTPARTY_SELECT))
             .bind(pot_txid)
             .bind(pot_vout)
             .bind(limit as u32)
+            .bind(0u32)
             .fetch_all(&self.db)
             .await
             .map_err(potparty_err)?;
@@ -2617,12 +2882,15 @@ impl PotrefundStorage for D1PotrefundStorage {
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
-        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281).
+        // OLDEST FIRST, offset-pageable — see `list_for_pot_sql`
+        // (bsv-low #281 / #291 gate M2).
         let rows: Vec<PotrefundRow> = Query::new(list_for_pot_sql(POTREFUND_SELECT))
             .bind(pot_txid)
             .bind(pot_vout)
             .bind(limit as u32)
+            .bind(offset as u32)
             .fetch_all(&self.db)
             .await
             .map_err(potrefund_err)?;
@@ -2645,7 +2913,13 @@ struct ProofRow {
     winner: String,
     #[serde(rename = "sigHex")]
     sig_hex: Option<String>,
-    /// hex(bundle) — decoded in `into_record`.
+    /// Admission-time base64 of the bundle (bsv-low #289). NULL on rows
+    /// admitted before the `bundleB64` column existed.
+    #[serde(rename = "bundleB64")]
+    bundle_b64: Option<String>,
+    /// hex(bundle) — decoded in `into_record`. The SHIPPED select only
+    /// hauls the blob when `bundleB64` is NULL (the pre-#289 fallback);
+    /// otherwise this arrives as `''`.
     bundle: String,
     txid: String,
     #[serde(rename = "outputIndex")]
@@ -2662,16 +2936,31 @@ impl ProofRow {
             // The column is nullable in the schema but the admit path
             // always writes it; an impossible NULL reads back as "".
             sig_hex: self.sig_hex.unwrap_or_default(),
-            // hex(bundle) → bytes. The column is NOT NULL and written
-            // from parse-validated bytes; undecodable hex is impossible,
-            // but fail toward an empty bundle (which no client verify
-            // ever accepts) rather than a panic.
+            // hex(bundle) → bytes. Empty when bundleB64 answered instead
+            // (the select skips hauling the blob then). Undecodable hex is
+            // impossible (written from parse-validated bytes), but fail
+            // toward an empty bundle (which no client verify ever accepts)
+            // rather than a panic.
             bundle: hex::decode(&self.bundle).unwrap_or_default(),
+            bundle_b64: self.bundle_b64,
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
         }
     }
+}
+
+/// `ls_proof proofsFor` (bsv-low #289): prefer the admission-time
+/// `bundleB64` TEXT; haul `hex(bundle)` ONLY for pre-#289 rows where it is
+/// NULL — never both. Factored out so the real-SQLite test executes the
+/// SHIPPED string against the production schema and proves the two paths
+/// answer byte-identically.
+pub fn proof_list_for_game_winner_sql() -> &'static str {
+    "SELECT gameId, winner, sigHex, bundleB64, \
+            CASE WHEN bundleB64 IS NULL THEN hex(bundle) ELSE '' END AS bundle, \
+            txid, outputIndex, createdAt \
+     FROM proof_markers WHERE gameId = ? AND winner = ? \
+     ORDER BY createdAt DESC, rowid DESC LIMIT ?"
 }
 
 /// Cloudflare D1 implementation of the ProofStorage trait
@@ -2710,13 +2999,16 @@ impl ProofStorage for D1ProofStorage {
         // overwrite, never delete.
         Query::new(
             "INSERT OR IGNORE INTO proof_markers \
-             (gameId, winner, sigHex, bundle, txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.game_id.as_str())
         .bind(record.winner.as_str())
         .bind(record.sig_hex.as_str())
         .bind(record.bundle.clone()) // BLOB bind, like pot_beefs
+        // bsv-low #289: the admission-time base64 (the admit path always
+        // sets it; a defensive None binds NULL → the read-time fallback).
+        .bind(record.bundle_b64.as_deref())
         .bind(record.txid.as_str())
         .bind(record.output_index)
         .bind(current_unix_seconds_i64())
@@ -2731,11 +3023,7 @@ impl ProofStorage for D1ProofStorage {
         winner: &str,
         limit: usize,
     ) -> Result<Vec<ProofRecord>, ProofStorageError> {
-        let rows: Vec<ProofRow> = Query::new(
-            "SELECT gameId, winner, sigHex, hex(bundle) AS bundle, txid, outputIndex, createdAt \
-             FROM proof_markers WHERE gameId = ? AND winner = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?",
-        )
+        let rows: Vec<ProofRow> = Query::new(proof_list_for_game_winner_sql())
         .bind(game_id)
         .bind(winner)
         .bind(limit as u32)
@@ -2756,12 +3044,13 @@ mod tests {
 
     #[test]
     fn proof_row_conversion_decodes_bundle_hex() {
-        // hex(bundle) round-trips to the raw bytes; numeric columns come
-        // back as f64 from D1.
+        // Pre-#289 row shape: bundleB64 NULL, hex(bundle) hauled and
+        // decoded; numeric columns come back as f64 from D1.
         let row = ProofRow {
             game_id: "11".repeat(32),
             winner: "02aa".into(),
             sig_hex: Some("3045ab".into()),
+            bundle_b64: None,
             bundle: hex::encode(b"{\"v\":1}").to_uppercase(), // SQLite hex() is uppercase
             txid: "tx1".into(),
             output_index: 2.0,
@@ -2769,6 +3058,7 @@ mod tests {
         };
         let r = row.into_record();
         assert_eq!(r.bundle, b"{\"v\":1}");
+        assert_eq!(r.bundle_b64, None, "legacy row: service falls back to encoding");
         assert_eq!(r.output_index, 2);
         assert_eq!(r.created_at, 1_234);
         assert_eq!(r.sig_hex, "3045ab");
@@ -3337,6 +3627,368 @@ mod tests {
 
     fn h64(seed: u8) -> String {
         format!("{seed:02x}").repeat(32)
+    }
+
+    /// #289: the batched spent-status SQL must execute on the production
+    /// schema (row-value `IN (VALUES …)` is newer SQLite surface) and select
+    /// per-OUTPOINT — a txid match with a different vout must NOT be
+    /// returned.
+    #[test]
+    fn pot_batch_sql_selects_exact_outpoints_real_sqlite() {
+        let conn = production_schema_db();
+        insert_pot(&conn, &h64(0xaa), 0, 1, false);
+        insert_pot(&conn, &h64(0xaa), 1, 2, true);
+        insert_pot(&conn, &h64(0xbb), 0, 3, false);
+
+        let sql = pot_spent_statuses_sql(3);
+        let mut stmt = conn.prepare(&sql).expect("batch SQL must parse on real SQLite");
+        // Ask for (aa,1), (bb,0) and an absent (cc,0).
+        let rows: Vec<(String, u32)> = stmt
+            .query_map(
+                rusqlite::params![h64(0xaa), 1u32, h64(0xbb), 0u32, h64(0xcc), 0u32],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut sorted = rows;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![(h64(0xaa), 1), (h64(0xbb), 0)],
+            "exactly the requested present outpoints — no txid-only matches, \
+             no phantom rows"
+        );
+    }
+
+    /// Gate finding L3: an unknown recordType discriminator (version skew —
+    /// written by a newer deploy, read after a rollback) is an EXPLICIT
+    /// logged skip, and it can never take neighboring good rows with it.
+    #[test]
+    fn unknown_low_record_type_skips_loudly_never_the_good_rows() {
+        let row = |record_type: &str, txid: &str| LowRow {
+            record_type: record_type.into(),
+            txid: txid.into(),
+            output_index: 0.0,
+            host_identity: "02aa".into(),
+            game_id: "11".repeat(32),
+            stake_sats: Some(1000.0),
+            rules_hash: None,
+            relay_url: None,
+            expiry_height: None,
+        };
+        let records = low_records_from_rows(vec![
+            row("table", "txGOOD1"),
+            row("fromTheFuture", "txSKEW"), // v-next discriminator
+            row("gameutxo", "txGOOD2"),
+        ]);
+        assert_eq!(
+            records.iter().map(|r| r.txid.as_str()).collect::<Vec<_>>(),
+            vec!["txGOOD1", "txGOOD2"],
+            "the skewed row is skipped (and console-warned with its \
+             outpoint); every convertible row survives in order"
+        );
+    }
+
+    /// #289: the shipped `ls_proof` select answers the SAME `bundleBase64`
+    /// for a new row (admission-time `bundleB64`) and a pre-#289 legacy row
+    /// (NULL `bundleB64` → hex(bundle) fallback) — byte-identical wire
+    /// either way — and never hauls the blob when the b64 column answers.
+    #[test]
+    fn proof_list_sql_b64_and_legacy_rows_answer_identically_real_sqlite() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let conn = production_schema_db();
+        let bundle: &[u8] = b"{\"v\":1,\"proof\":true}";
+        let game = h64(0x11);
+        // New-path row: bundle BLOB + admission-time bundleB64 (as
+        // D1ProofStorage::store_record now writes).
+        conn.execute(
+            "INSERT INTO proof_markers \
+             (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
+             VALUES (?1, '02aa', 'sig', ?2, ?3, ?4, 0, 2)",
+            rusqlite::params![game, bundle, BASE64.encode(bundle), h64(0x01)],
+        )
+        .unwrap();
+        // Legacy row: same bytes, NO bundleB64 (pre-#289 writer shape).
+        conn.execute(
+            "INSERT INTO proof_markers \
+             (gameId, winner, sigHex, bundle, txid, outputIndex, createdAt) \
+             VALUES (?1, '02aa', 'sig', ?2, ?3, 0, 1)",
+            rusqlite::params![game, bundle, h64(0x02)],
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(proof_list_for_game_winner_sql())
+            .expect("shipped proof select must parse");
+        let rows: Vec<(String, Option<String>, String)> = stmt
+            .query_map(rusqlite::params![game, "02aa", 10u32], |row| {
+                Ok((
+                    row.get::<_, String>(5)?,         // txid
+                    row.get::<_, Option<String>>(3)?, // bundleB64
+                    row.get::<_, String>(4)?,         // bundle (hex or '')
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        // Newest first: the b64 row (createdAt 2), then the legacy row.
+        let (new_txid, new_b64, new_hex) = &rows[0];
+        let (old_txid, old_b64, old_hex) = &rows[1];
+        assert_eq!(new_txid, &h64(0x01));
+        assert_eq!(old_txid, &h64(0x02));
+        assert_eq!(new_hex, "", "b64 answered — the blob is NOT hauled");
+        assert!(old_b64.is_none(), "legacy row has no b64");
+
+        // The wire value each path produces (mirrors the lookup service:
+        // stored b64 preferred, else encode the decoded hex) must be
+        // byte-identical.
+        let wire_new = new_b64.clone().unwrap();
+        let wire_old = BASE64.encode(hex::decode(old_hex).unwrap());
+        assert_eq!(wire_new, wire_old, "both read paths answer the same bundleBase64");
+        assert_eq!(wire_new, BASE64.encode(bundle), "…and it is the admitted bytes");
+    }
+
+    // ── #290/#291: the low / reveal / collected shipped SQL ──────────────
+
+    /// Insert a `low_records` row with an explicit TEXT `createdAt`
+    /// (this table's `createdAt` is `datetime('now')` TEXT — the odd one
+    /// out; every other LOW marker table stamps INTEGER unix seconds).
+    fn insert_low_for_host(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        host: &str,
+        created_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, \
+             gameId, stakeSats, rulesHash, relayUrl, expiryHeight, createdAt) \
+             VALUES ('table', ?1, 0, ?2, ?3, 1000, 'rh', 'https://r', 900000, ?4)",
+            rusqlite::params![txid, host, h64(0x11), created_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_low(conn: &rusqlite::Connection, txid: &str, created_at: &str) {
+        insert_low_for_host(conn, txid, &victim_id(), created_at);
+    }
+
+    /// #290/#291: the shipped lobby SQL executes on the production schema,
+    /// returns FULL index rows newest-first, and is LIMIT-bounded. Physical
+    /// insertion order CONTRADICTS createdAt order (F4 discipline) so a
+    /// green cannot come from incidental row order.
+    #[test]
+    fn low_open_tables_sql_newest_first_and_capped_real_sqlite() {
+        let conn = production_schema_db();
+        // Newest inserted FIRST (physical order opposes the promised order).
+        insert_low(&conn, &h64(0x03), "2026-07-29 12:00:03");
+        insert_low(&conn, &h64(0x01), "2026-07-29 12:00:01");
+        insert_low(&conn, &h64(0x02), "2026-07-29 12:00:02");
+
+        // The full lobby where-shape (type + stake range + expiry filter).
+        let sql = low_open_tables_sql(
+            " WHERE recordType = ? AND stakeSats >= ? AND stakeSats <= ? AND expiryHeight > ?",
+        );
+        let mut stmt = conn.prepare(&sql).expect("shipped lobby SQL must parse");
+        let rows: Vec<(String, u64)> = stmt
+            .query_map(rusqlite::params!["table", 100u64, 5000u64, 800000u32], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, u64>(5)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+            vec![h64(0x03), h64(0x02), h64(0x01)],
+            "newest-first by createdAt, not physical order"
+        );
+        assert_eq!(rows[0].1, 1000, "full index row: stakeSats decoded column present");
+
+        // LIMIT proof: cap + 1 rows (each from a DISTINCT host, so the M3
+        // per-host quota is not the binding constraint) ⇒ cap rows out, and
+        // the row displaced is the OLDEST (the cap keeps the newest — the
+        // #291 contract).
+        let conn = production_schema_db();
+        for i in 0..=OPEN_TABLES_RESULT_CAP {
+            insert_low_for_host(
+                &conn,
+                &format!("{i:064x}"),
+                &format!("02{i:064x}"),
+                &format!("2026-07-29 13:{:02}:{:02}", (i / 60) % 60, i % 60),
+            );
+        }
+        let sql = low_open_tables_sql(" WHERE recordType = ?");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let txids: Vec<String> = stmt
+            .query_map(rusqlite::params!["table"], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(txids.len(), OPEN_TABLES_RESULT_CAP, "bounded at the cap");
+        assert!(
+            !txids.contains(&format!("{:064x}", 0)),
+            "the displaced row is the OLDEST, never a newer one"
+        );
+        assert!(txids.contains(&format!("{:064x}", OPEN_TABLES_RESULT_CAP)));
+    }
+
+    /// #291 gate finding M3 (the #281 partitioned-window pattern): ONE
+    /// identity flooding the lobby with newest-stamped junk occupies at most
+    /// OPEN_TABLES_PER_HOST_CAP window slots — every other host's honest
+    /// table SURVIVES in the answer. Pre-partition, a single host's 200
+    /// newest rows blanked the whole lobby. Executes the SHIPPED SQL.
+    #[test]
+    fn lobby_single_host_flood_cannot_blank_other_hosts_real_sqlite() {
+        let conn = production_schema_db();
+        // Honest tables from two hosts, stamped EARLY.
+        insert_low_for_host(&conn, &h64(0x01), &victim_id(), "2026-07-29 10:00:00");
+        insert_low_for_host(
+            &conn,
+            &h64(0x02),
+            &format!("03{}", "b2".repeat(32)),
+            "2026-07-29 10:00:01",
+        );
+        // One attacker identity floods OPEN_TABLES_RESULT_CAP newer rows.
+        let attacker = format!("02{}", "ff".repeat(32));
+        for i in 0..OPEN_TABLES_RESULT_CAP {
+            insert_low_for_host(
+                &conn,
+                &format!("{i:060x}dead"),
+                &attacker,
+                &format!("2026-07-29 12:{:02}:{:02}", (i / 60) % 60, i % 60),
+            );
+        }
+
+        let sql = low_open_tables_sql(" WHERE recordType = ?");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params!["table"], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        let attacker_rows = rows.iter().filter(|(_, h)| *h == attacker).count();
+        assert_eq!(
+            attacker_rows, OPEN_TABLES_PER_HOST_CAP,
+            "the flooding identity holds exactly its quota, never the window"
+        );
+        let txids: Vec<&String> = rows.iter().map(|(t, _)| t).collect();
+        assert!(
+            txids.contains(&&h64(0x01)) && txids.contains(&&h64(0x02)),
+            "both honest hosts' tables SURVIVE the single-identity flood \
+             (pre-M3 the flat newest-first cap blanked them)"
+        );
+    }
+
+    /// #290/#291: byGameId / byHost — shipped SQL parses, selects per-key,
+    /// LIMIT present.
+    #[test]
+    fn low_by_key_sql_selects_per_key_real_sqlite() {
+        let conn = production_schema_db();
+        insert_low(&conn, &h64(0x01), "2026-07-29 12:00:01");
+        // A row for a DIFFERENT game + host.
+        conn.execute(
+            "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, \
+             gameId, createdAt) VALUES ('game', ?1, 0, ?2, ?3, '2026-07-29 12:00:02')",
+            rusqlite::params![h64(0x02), format!("03{}", "b2".repeat(32)), h64(0x22)],
+        )
+        .unwrap();
+
+        for (sql, key) in [
+            (low_by_game_id_sql(), h64(0x11)),
+            (low_by_host_sql(), victim_id()),
+        ] {
+            assert!(sql.contains("LIMIT"), "by-key query must be bounded: {sql}");
+            let mut stmt = conn.prepare(&sql).expect("shipped by-key SQL must parse");
+            let txids: Vec<String> = stmt
+                .query_map(rusqlite::params![key], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(txids, vec![h64(0x01)], "exactly the requested key's rows");
+        }
+    }
+
+    /// #290/#291: the shipped reveal SQL parses on the production schema,
+    /// selects per-(gameId, seat), and is LIMIT-bounded.
+    #[test]
+    fn reveal_sql_selects_per_key_and_is_bounded_real_sqlite() {
+        let conn = production_schema_db();
+        for (txid_seed, game_seed, seat) in
+            [(0x01u8, 0x11u8, 0u8), (0x02, 0x11, 1), (0x03, 0x22, 0)]
+        {
+            conn.execute(
+                "INSERT INTO reveal_records (txid, outputIndex, gameId, seat) \
+                 VALUES (?1, 0, ?2, ?3)",
+                rusqlite::params![h64(txid_seed), h64(game_seed), seat],
+            )
+            .unwrap();
+        }
+
+        for sql in [reveal_by_game_seat_sql(), reveal_by_game_id_sql()] {
+            assert!(sql.contains("LIMIT"), "reveal query must be bounded: {sql}");
+        }
+
+        let mut stmt = conn.prepare(&reveal_by_game_seat_sql()).unwrap();
+        let txids: Vec<String> = stmt
+            .query_map(rusqlite::params![h64(0x11), 1u8], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(txids, vec![h64(0x02)], "per-(gameId, seat) exact");
+
+        let mut stmt = conn.prepare(&reveal_by_game_id_sql()).unwrap();
+        let mut txids: Vec<String> = stmt
+            .query_map(rusqlite::params![h64(0x11)], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        txids.sort();
+        assert_eq!(txids, vec![h64(0x01), h64(0x02)], "both seats of the game, no leak");
+    }
+
+    /// #289: the batched collected-marker SQL selects per-(identity, gameId)
+    /// — a same-gameId row belonging to a DIFFERENT identity must never
+    /// answer for the requested identity (an absent marker reads as
+    /// "not collected"; a leaked one would hide a Collect card).
+    #[test]
+    fn collected_batch_sql_scopes_to_identity_real_sqlite() {
+        let conn = production_schema_db();
+        let me = victim_id();
+        let other = format!("03{}", "c3".repeat(32));
+        conn.execute(
+            "INSERT INTO collected_markers (identity, gameId, txid, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 'sig-a', 1)",
+            rusqlite::params![me, h64(0x11), h64(0x01)],
+        )
+        .unwrap();
+        // Same gameId, DIFFERENT identity — must not leak into my answer.
+        conn.execute(
+            "INSERT INTO collected_markers (identity, gameId, txid, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 'sig-b', 2)",
+            rusqlite::params![other, h64(0x22), h64(0x02)],
+        )
+        .unwrap();
+
+        let sql = collected_records_batch_sql(2);
+        let mut stmt = conn.prepare(&sql).expect("shipped batch SQL must parse");
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![me, h64(0x11), h64(0x22)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(me.clone(), h64(0x11))],
+            "only MY marker answers — the other identity's gameId 0x22 row \
+             never leaks in as a phantom 'collected'"
+        );
     }
 
     fn victim_id() -> String {
@@ -3962,7 +4614,7 @@ mod tests {
         let sql = list_for_pot_sql(POTREFUND_SELECT);
         let mut stmt = conn.prepare(&sql).unwrap();
         let got: Vec<String> = stmt
-            .query_map(rusqlite::params![pot, 0u32, 100u32], |r| {
+            .query_map(rusqlite::params![pot, 0u32, 100u32, 0u32], |r| {
                 r.get::<_, String>("txid")
             })
             .unwrap()
@@ -3989,6 +4641,62 @@ mod tests {
             !old.contains(&"txSEATA".to_string()) && !old.contains(&"txSEATB".to_string()),
             "the legacy byPot window dropped BOTH honest refund backups"
         );
+    }
+
+    /// bsv-low #291 gate finding M2: the byPot window is offset-PAGEABLE —
+    /// a row buried behind more than MAX_LIMIT older rows (the pre-funding
+    /// front-run) is still REACHABLE, pages are disjoint and cover the set,
+    /// and each response stays LIMIT-bounded. Executes the SHIPPED SQL.
+    #[test]
+    fn by_pot_offset_pages_reach_every_row_real_sqlite() {
+        let conn = production_schema_db();
+        let pot = h64(0xbb);
+        // 130 junk rows admitted BEFORE funding (older stamps)…
+        for i in 0..130u32 {
+            insert_potrefund(
+                &conn,
+                &format!("02{:064x}", i),
+                &pot,
+                0,
+                &format!("txJUNK{i:03}"),
+                100 + i as i64,
+            );
+        }
+        // …then the honest backup, landed at funding — beyond ANY single
+        // page at MAX_LIMIT 100.
+        insert_potrefund(&conn, &victim_id(), &pot, 0, "txHONEST", 10_000);
+
+        let sql = list_for_pot_sql(POTREFUND_SELECT);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut page = |limit: u32, offset: u32| -> Vec<String> {
+            stmt.query_map(rusqlite::params![pot, 0u32, limit, offset], |r| {
+                r.get::<_, String>("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        let p1 = page(100, 0);
+        let p2 = page(100, 100);
+        assert_eq!(p1.len(), 100, "page 1 LIMIT-bounded");
+        assert_eq!(p2.len(), 31, "page 2 = the remaining 30 junk + the honest row");
+        assert!(
+            !p1.contains(&"txHONEST".to_string()),
+            "sanity: the buried row is NOT on page 1 (it needs paging)"
+        );
+        assert_eq!(
+            p2.last().unwrap(),
+            "txHONEST",
+            "the row behind >MAX_LIMIT junk is REACHABLE via offset — the \
+             cap bounds a response, never the reachable set"
+        );
+        // Disjoint + covering: pages partition the oldest-first total order.
+        let mut all: Vec<String> = p1.iter().chain(p2.iter()).cloned().collect();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(all.len(), n, "pages are disjoint (stable total order)");
+        assert_eq!(n, 131, "pages cover every admitted row");
     }
 
     /// F6 — every other key in the system is the OUTPOINT. Two genuine pots

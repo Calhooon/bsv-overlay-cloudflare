@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 82;
+pub const OVERLAY_MIGRATION_COUNT: usize = 89;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -786,6 +786,40 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE pot_records ADD COLUMN spentHeight INTEGER",
     // The backfill candidate scan (`WHERE paramsDecoded = 0`).
     "CREATE INDEX IF NOT EXISTS idx_pot_params_undecoded ON pot_records(paramsDecoded)",
+    // ── #291 hot-sort indexes (all additive CREATE INDEX IF NOT EXISTS) ───
+    // Lobby (`ls_low findOpenTables`, every poll): `WHERE recordType = ?
+    // [stake/expiry residuals] ORDER BY createdAt DESC LIMIT n` — the
+    // composite serves the filter AND the sort in one backward index scan
+    // (createdAt was previously unindexed → filesort per poll).
+    "CREATE INDEX IF NOT EXISTS idx_low_type_created ON low_records(recordType, createdAt)",
+    // potrefund hot queries both `ORDER BY createdAt DESC, rowid DESC`
+    // (there was NO createdAt index at all on this table).
+    "CREATE INDEX IF NOT EXISTS idx_potrefund_createdAt ON potrefund_records(createdAt)",
+    // /leaderboard + /results: `WHERE winner = ? ORDER BY createdAt DESC` —
+    // the two existing single-column indexes forced pick-one-then-sort.
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_winner_created \
+     ON result_markers_v2(winner, createdAt)",
+    // potparty partyFor window: `WHERE identity = ? ORDER BY createdAt DESC`.
+    "CREATE INDEX IF NOT EXISTS idx_potparty_identity_created \
+     ON potparty_records(identity, createdAt)",
+    // find_utxos_for_topic (GASP sync + admission): `WHERE topic = ? AND
+    // spent = ? ORDER BY score` — the sole outputs index (txid, outputIndex,
+    // topic) has no topic-leftmost prefix, so this was a full scan+filesort.
+    "CREATE INDEX IF NOT EXISTS idx_outputs_topic_spent_score \
+     ON outputs(topic, spent, score)",
+    // Proof-completion candidate scan (#228 backstop age gate):
+    // `WHERE has_proof = 0 AND (created_at IS NULL OR created_at <= ?)` —
+    // the composite covers both predicates (supersedes the single-column
+    // has_proof index for this query; that one stays, additive-only list).
+    "CREATE INDEX IF NOT EXISTS idx_transactions_proof_created \
+     ON transactions(has_proof, created_at)",
+    // bsv-low #289: base64 of `bundle`, encoded ONCE at admission so the
+    // ls_proof read path stops triple-transcoding the blob (hex() in SQL →
+    // hex::decode → base64 per row, 2× bundle bytes on the D1 wire). A pure
+    // re-presentation of the same admitted bytes (#284 precedent); the BLOB
+    // column stays and NULL here falls back to it at read time. Additive
+    // ALTER — the runner ignores the re-run "duplicate column" error.
+    "ALTER TABLE proof_markers ADD COLUMN bundleB64 TEXT",
 ];
 
 // =============================================================================
@@ -993,6 +1027,28 @@ mod tests {
     }
 
     #[test]
+    fn proof_bundle_b64_migration_present_nullable_and_benign_class() {
+        // bsv-low #289: the admission-time base64 column on proof_markers.
+        // Additive ALTER, NULLABLE (pre-#289 rows fall back to the BLOB at
+        // read time — never erased), benign on re-run.
+        let m = OVERLAY_MIGRATIONS
+            .iter()
+            .find(|sql| {
+                sql.trim_start().starts_with("ALTER TABLE proof_markers")
+                    && sql.contains("ADD COLUMN bundleB64 TEXT")
+            })
+            .expect("missing proof_markers.bundleB64 migration");
+        assert!(
+            !m.to_uppercase().contains("NOT NULL"),
+            "proof_markers.bundleB64 must stay nullable (NULL = pre-#289 row)"
+        );
+        assert!(
+            migration_error_is_benign(m, "duplicate column name: bundleB64"),
+            "bundleB64 re-run must be the benign class"
+        );
+    }
+
+    #[test]
     fn result_markers_carry_migration_is_rerun_safe() {
         // The one non-CREATE/ALTER migration: the result_markers →
         // result_markers_v2 data carry. Pin the two properties that make
@@ -1073,6 +1129,13 @@ mod tests {
             "idx_potparty_createdAt",
             "idx_potrefund_pot",
             "idx_potrefund_identity",
+            // #291 hot-sort indexes
+            "idx_low_type_created",
+            "idx_potrefund_createdAt",
+            "idx_result_markers_v2_winner_created",
+            "idx_potparty_identity_created",
+            "idx_outputs_topic_spent_score",
+            "idx_transactions_proof_created",
         ] {
             assert!(joined.contains(index), "Missing index: {index}");
         }

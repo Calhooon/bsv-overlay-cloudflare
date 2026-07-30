@@ -1073,3 +1073,182 @@ async fn ts_gasp_unidirectional_no_outgoing() {
     // returns immediately without calling submit_node. The test passes if sync completes
     // without pushing local UTXOs.
 }
+
+// ============================================================================
+// bsv-low #291 gate finding M1: a responder that CLAMPS the requested page
+// size (Engine::SYNC_RESPONSE_MAX_LIMIT) must not truncate a sync run.
+// The initiator pages while its score cursor advances — never "only on a
+// full page", which a clamping responder makes impossible.
+// ============================================================================
+
+#[tokio::test]
+async fn clamped_responder_pages_to_completion_in_one_run() {
+    use bsv_overlay_engine::engine::Engine;
+    use bsv_overlay_engine::gasp::DEFAULT_GASP_SYNC_LIMIT;
+
+    /// A remote that behaves exactly like our own responder: serves
+    /// `score >= since` in ascending score order, truncated to the REAL
+    /// production clamp (`Engine::clamp_sync_limit`), tracking request
+    /// count.
+    struct ClampingRemote {
+        utxos: Vec<GASPOutput>, // ascending score
+        requests: std::rc::Rc<Mutex<u32>>,
+    }
+
+    #[async_trait(?Send)]
+    impl GASPRemote for ClampingRemote {
+        async fn get_initial_response(
+            &self,
+            request: &GASPInitialRequest,
+        ) -> Result<GASPInitialResponse, GASPError> {
+            *self.requests.lock().unwrap() += 1;
+            let page: Vec<GASPOutput> = self
+                .utxos
+                .iter()
+                .filter(|u| u.score as u64 >= request.since)
+                .take(Engine::clamp_sync_limit(request.limit) as usize)
+                .cloned()
+                .collect();
+            Ok(GASPInitialResponse {
+                utxo_list: page,
+                since: request.since,
+            })
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &GASPInitialResponse,
+        ) -> Result<GASPInitialReply, GASPError> {
+            Ok(GASPInitialReply {
+                utxo_list: Vec::new(),
+            })
+        }
+        async fn request_node(
+            &self,
+            graph_id: &str,
+            txid: &str,
+            output_index: u32,
+            _metadata: bool,
+        ) -> Result<GASPNode, GASPError> {
+            Ok(GASPNode {
+                graph_id: graph_id.to_string(),
+                raw_tx: format!("remote_rawtx_{txid}"),
+                output_index,
+                proof: None,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            })
+        }
+        async fn submit_node(&self, _: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+            Ok(None)
+        }
+    }
+
+    // 2,500 rows: more than TWO clamped pages (max clamp 1,000), so a
+    // single-page OR a two-page truncation both fail this probe.
+    const N: u64 = 2_500;
+    let utxos: Vec<GASPOutput> = (1..=N).map(|i| utxo(&format!("tx{i}"), 0, i as f64)).collect();
+    let requests = std::rc::Rc::new(Mutex::new(0u32));
+    let remote = ClampingRemote {
+        utxos,
+        requests: requests.clone(),
+    };
+    let local = TrackingGASPStorage::new(vec![]);
+
+    let mut gasp = GASPSync::new(Box::new(local), Box::new(remote), 0, "[TEST]", true);
+    // The production initiator limit — far above the responder clamp.
+    gasp.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await.unwrap();
+
+    assert_eq!(
+        gasp.last_interaction, N,
+        "ONE sync run must reach the newest row through a clamping responder \
+         (the pre-fix initiator stopped after the first clamped page and \
+         falsely logged completion)"
+    );
+    let made = *requests.lock().unwrap();
+    assert!(
+        made >= 3,
+        "must have paged (≥3 requests for 2,500 rows at clamp 1,000); got {made}"
+    );
+    assert!(
+        made <= 10,
+        "termination must not degrade into request spinning; got {made}"
+    );
+}
+
+/// Gate LOW-A: the `sync(None)` path (no requested limit — the responder
+/// serves its DEFAULT page) pages to completion on cursor-advance exactly
+/// like the limited path. Pre-fix, `None` broke unconditionally after one
+/// page — the M1 shape on the default-page path.
+#[tokio::test]
+async fn clamped_responder_pages_to_completion_without_a_requested_limit() {
+    use bsv_overlay_engine::engine::Engine;
+
+    struct ClampingRemote {
+        utxos: Vec<GASPOutput>,
+    }
+
+    #[async_trait(?Send)]
+    impl GASPRemote for ClampingRemote {
+        async fn get_initial_response(
+            &self,
+            request: &GASPInitialRequest,
+        ) -> Result<GASPInitialResponse, GASPError> {
+            // clamp_sync_limit(None) = the responder's DEFAULT page (500).
+            let page: Vec<GASPOutput> = self
+                .utxos
+                .iter()
+                .filter(|u| u.score as u64 >= request.since)
+                .take(Engine::clamp_sync_limit(request.limit) as usize)
+                .cloned()
+                .collect();
+            Ok(GASPInitialResponse {
+                utxo_list: page,
+                since: request.since,
+            })
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &GASPInitialResponse,
+        ) -> Result<GASPInitialReply, GASPError> {
+            Ok(GASPInitialReply {
+                utxo_list: Vec::new(),
+            })
+        }
+        async fn request_node(
+            &self,
+            graph_id: &str,
+            txid: &str,
+            output_index: u32,
+            _metadata: bool,
+        ) -> Result<GASPNode, GASPError> {
+            Ok(GASPNode {
+                graph_id: graph_id.to_string(),
+                raw_tx: format!("remote_rawtx_{txid}"),
+                output_index,
+                proof: None,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            })
+        }
+        async fn submit_node(&self, _: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+            Ok(None)
+        }
+    }
+
+    // 1,200 rows: more than TWO default pages (500), so single-page AND
+    // two-page truncation both fail this probe.
+    const N: u64 = 1_200;
+    let utxos: Vec<GASPOutput> = (1..=N).map(|i| utxo(&format!("tx{i}"), 0, i as f64)).collect();
+    let local = TrackingGASPStorage::new(vec![]);
+
+    let mut gasp = GASPSync::new(Box::new(local), Box::new(ClampingRemote { utxos }), 0, "[TEST]", true);
+    gasp.sync(None).await.unwrap();
+
+    assert_eq!(
+        gasp.last_interaction, N,
+        "sync(None) must page to the newest row through a default-page \
+         responder (pre-LOW-A it broke unconditionally after one page)"
+    );
+}

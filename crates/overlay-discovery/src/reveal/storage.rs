@@ -8,7 +8,6 @@
 //! a PERMANENT fact, so rows are never deleted on spend/eviction.
 
 use async_trait::async_trait;
-use overlay_engine::types::UTXOReference;
 use serde::{Deserialize, Serialize};
 
 /// A break-glass reveal record as stored in the index.
@@ -30,6 +29,13 @@ pub struct RevealRecord {
 
 /// `ls_reveal` query shapes — tagged JSON, e.g.
 /// `{"type":"byGameSeat","gameId":"<hex>","seat":0}`.
+///
+/// Every variant carries an optional `decoded` flag (bsv-low #290, default
+/// `false`): `false` keeps the legacy `OutputList` answer (byte-identical
+/// wire); `true` returns the index columns (`txid`/`outputIndex`/`gameId`/
+/// `seat`) as a `Freeform` array. The reveal OPENING (positions + scalars)
+/// still requires the artifact bytes — fetch via the app-layer
+/// `/beef/:txid` when needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RevealQuery {
@@ -40,14 +46,26 @@ pub enum RevealQuery {
         #[serde(rename = "gameId")]
         game_id: String,
         seat: u8,
+        #[serde(default)]
+        decoded: bool,
     },
     /// All reveal records for one game (both seats).
     #[serde(rename = "byGameId")]
     ByGameId {
         #[serde(rename = "gameId")]
         game_id: String,
+        #[serde(default)]
+        decoded: bool,
     },
 }
+
+/// Cap on reveal query results (bsv-low #291). SAFE against the money bar
+/// by construction: the reveal index is FOUND-only in the scan precedence —
+/// an index hit short-circuits, but an index miss (including a truncation
+/// that hid the genuine reveal behind admitted garbage) NEVER concludes
+/// `Absent`; the chain-truthful WoC+Bitails union is the sole Absent
+/// authority. A game legitimately has ≤2 reveals, so 500 is pure headroom.
+pub const REVEAL_RESULT_CAP: usize = 500;
 
 /// Backend-agnostic storage for reveal records.
 #[async_trait(?Send)]
@@ -62,18 +80,20 @@ pub trait RevealStorage {
     /// operator use only.
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), RevealStorageError>;
 
-    /// All reveal records for a game ID (lowercase hex) AND seat.
+    /// All reveal records for a game ID (lowercase hex) AND seat, capped at
+    /// [`REVEAL_RESULT_CAP`].
     async fn find_by_game_seat(
         &self,
         game_id: &str,
         seat: u8,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError>;
+    ) -> Result<Vec<RevealRecord>, RevealStorageError>;
 
-    /// All reveal records for a game ID (lowercase hex), any seat.
+    /// All reveal records for a game ID (lowercase hex), any seat, capped
+    /// at [`REVEAL_RESULT_CAP`].
     async fn find_by_game_id(
         &self,
         game_id: &str,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError>;
+    ) -> Result<Vec<RevealRecord>, RevealStorageError>;
 }
 
 /// REVEAL storage errors.
@@ -127,35 +147,39 @@ impl RevealStorage for MemoryRevealStorage {
         &self,
         game_id: &str,
         seat: u8,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
-        Ok(self
+    ) -> Result<Vec<RevealRecord>, RevealStorageError> {
+        let mut records: Vec<RevealRecord> = self
             .records
             .lock()
             .unwrap()
             .iter()
             .filter(|r| r.game_id == game_id && r.seat == seat)
-            .map(|r| UTXOReference {
-                txid: r.txid.clone(),
-                output_index: r.output_index,
-            })
-            .collect())
+            .cloned()
+            .collect();
+        // NEWEST-first, capped — the same rows in the same DIRECTION as
+        // D1's `ORDER BY createdAt DESC LIMIT` (gate L2: a memory backend
+        // answering in the opposite order would mask ordering bugs).
+        records.reverse();
+        records.truncate(REVEAL_RESULT_CAP);
+        Ok(records)
     }
 
     async fn find_by_game_id(
         &self,
         game_id: &str,
-    ) -> Result<Vec<UTXOReference>, RevealStorageError> {
-        Ok(self
+    ) -> Result<Vec<RevealRecord>, RevealStorageError> {
+        let mut records: Vec<RevealRecord> = self
             .records
             .lock()
             .unwrap()
             .iter()
             .filter(|r| r.game_id == game_id)
-            .map(|r| UTXOReference {
-                txid: r.txid.clone(),
-                output_index: r.output_index,
-            })
-            .collect())
+            .cloned()
+            .collect();
+        // NEWEST-first, capped — see find_by_game_seat (gate L2).
+        records.reverse();
+        records.truncate(REVEAL_RESULT_CAP);
+        Ok(records)
     }
 }
 

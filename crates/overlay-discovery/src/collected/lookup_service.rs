@@ -29,6 +29,11 @@ use tracing::debug;
 use super::parse_collected_marker;
 use super::storage::{CollectedQuery, CollectedRecord, CollectedStorage};
 
+/// Hard cap on gameIds per `collectedFor` query (bsv-low #291). Requests
+/// over the cap are refused with an explicit `InvalidQuery` — never a silent
+/// truncation (an absent entry reads as "not collected").
+pub const MAX_COLLECTED_GAME_IDS: usize = 100;
+
 /// COLLECTED Lookup Service — indexes markers and answers `collectedFor`.
 pub struct CollectedLookupService {
     storage: Rc<dyn CollectedStorage>,
@@ -132,16 +137,34 @@ impl LookupService for CollectedLookupService {
         let CollectedQuery::CollectedFor { identity, game_ids } = query;
         let identity = normalize_identity(&identity)?;
 
+        // Bound the request array (bsv-low #291): an over-cap request is an
+        // EXPLICIT InvalidQuery — never a silent truncation (an absent entry
+        // reads as "not collected", which could double-surface a Collect
+        // card). The client batches ≤ a couple dozen gameIds per pass.
+        if game_ids.len() > MAX_COLLECTED_GAME_IDS {
+            return Err(LookupServiceError::InvalidQuery(format!(
+                "at most {MAX_COLLECTED_GAME_IDS} gameIds per query (got {}) \
+                 — split the request",
+                game_ids.len()
+            )));
+        }
+
+        let keys = game_ids
+            .iter()
+            .map(|g| normalize_game_id(g))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // ONE batched storage call for the whole set (bsv-low #289) —
+        // results aligned index-for-index with the request.
+        let records = self
+            .storage
+            .get_records(&identity, &keys)
+            .await
+            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+
         // Build an input-ordered array: one entry per requested gameId.
         let mut entries = Vec::with_capacity(game_ids.len());
-        for game_id in &game_ids {
-            let key = normalize_game_id(game_id)?;
-            let record = self
-                .storage
-                .get_record(&identity, &key)
-                .await
-                .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
-
+        for (key, record) in keys.iter().zip(records) {
             // Fail-safe: a pair with no stored marker is present:false with
             // null txid/sigHex — an absent marker never hides a Collect card.
             let (present, txid, sig_hex) = match record {
@@ -273,6 +296,34 @@ mod tests {
         let meta = svc.get_metadata().await;
         assert_eq!(meta.name, "COLLECTED Lookup Service");
         assert!(!svc.get_documentation().await.is_empty());
+    }
+
+    /// #291: an over-cap request is an EXPLICIT error, never a silent
+    /// truncation (an absent entry reads as "not collected" and could
+    /// double-surface a Collect card).
+    #[tokio::test]
+    async fn over_cap_game_ids_is_an_explicit_invalid_query() {
+        let svc = make_service();
+        let identity = golden_identity_hex();
+        let at_cap: Vec<_> = (0..MAX_COLLECTED_GAME_IDS)
+            .map(|i| serde_json::json!(format!("{i:064x}")))
+            .collect();
+        // Exactly at the cap: fine (every entry answered, absent ⇒ present:false).
+        let arr = collected_for(&svc, &identity, serde_json::json!(at_cap)).await;
+        assert_eq!(arr.as_array().unwrap().len(), MAX_COLLECTED_GAME_IDS);
+
+        // One over: refused loudly.
+        let mut over = at_cap;
+        over.push(serde_json::json!("ff".repeat(32)));
+        let q = LookupQuestion::new(
+            "ls_collected",
+            serde_json::json!({"type": "collectedFor", "identity": identity, "gameIds": over}),
+        );
+        let err = svc.lookup(&q).await.unwrap_err();
+        assert!(
+            matches!(err, LookupServiceError::InvalidQuery(_)),
+            "expected InvalidQuery, got {err:?}"
+        );
     }
 
     // ── Admission + lookup (the golden vector end-to-end) ────────────────

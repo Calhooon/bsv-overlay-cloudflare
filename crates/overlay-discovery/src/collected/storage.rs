@@ -70,6 +70,24 @@ pub trait CollectedStorage {
         identity: &str,
         game_id: &str,
     ) -> Result<Option<CollectedRecord>, CollectedStorageError>;
+
+    /// Batched [`get_record`](Self::get_record) for one identity over many
+    /// gameIds (bsv-low #289): the result is ALIGNED index-for-index with
+    /// `game_ids` (`None` where no marker exists), so the caller's
+    /// fail-safe `present: false` semantics are unchanged. This default
+    /// loops the single-pair method; the D1 backend overrides it with one
+    /// `gameId IN (…)` query per chunk instead of a round trip per game.
+    async fn get_records(
+        &self,
+        identity: &str,
+        game_ids: &[String],
+    ) -> Result<Vec<Option<CollectedRecord>>, CollectedStorageError> {
+        let mut out = Vec::with_capacity(game_ids.len());
+        for game_id in game_ids {
+            out.push(self.get_record(identity, game_id).await?);
+        }
+        Ok(out)
+    }
 }
 
 /// COLLECTED storage errors.

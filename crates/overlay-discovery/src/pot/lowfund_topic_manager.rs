@@ -38,19 +38,12 @@ impl Default for LowFundTopicManager {
 impl TopicManager for LowFundTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        beef: &[u8],
+        tx: &Transaction,
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
-
-        let tx = match Transaction::from_beef(beef, None) {
-            Ok(tx) => tx,
-            Err(e) => {
-                return Err(TopicManagerError::InvalidBeef(e.to_string()));
-            }
-        };
 
         for (i, output) in tx.outputs.iter().enumerate() {
             if is_p2pkh_script(&output.locking_script.to_binary()) {
@@ -137,7 +130,9 @@ mod tests {
             p2pkh_script(0x22),
         ]);
         let got = mgr
-            .identify_admissible_outputs(&beef, &[], None, SubmitMode::CurrentTx)
+            .identify_admissible_outputs(
+                &Tx::from_beef(&beef, None).expect("engine-side parse"),
+                &[], None, SubmitMode::CurrentTx)
             .await
             .unwrap();
         assert_eq!(got.outputs_to_admit, vec![0, 3]);
@@ -148,20 +143,14 @@ mod tests {
         let mgr = LowFundTopicManager::new();
         let beef = beef_with_outputs(vec![covenant_script(&dummy_params())]);
         let got = mgr
-            .identify_admissible_outputs(&beef, &[], None, SubmitMode::CurrentTx)
+            .identify_admissible_outputs(
+                &Tx::from_beef(&beef, None).expect("engine-side parse"),
+                &[], None, SubmitMode::CurrentTx)
             .await
             .unwrap();
         assert!(got.outputs_to_admit.is_empty());
     }
 
-    #[tokio::test]
-    async fn garbage_beef_is_a_typed_error() {
-        let mgr = LowFundTopicManager::new();
-        let got = mgr
-            .identify_admissible_outputs(&[0x00, 0x01], &[], None, SubmitMode::CurrentTx)
-            .await;
-        assert!(matches!(got, Err(TopicManagerError::InvalidBeef(_))));
-    }
 
     #[test]
     fn p2pkh_recognizer_is_exact() {

@@ -42,7 +42,7 @@ struct FailingTopicManager;
 impl TopicManager for FailingTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        _: &[u8],
+        _: &bsv_rs::transaction::Transaction,
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
@@ -111,7 +111,7 @@ struct OkTopicManager;
 impl TopicManager for OkTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        _: &[u8],
+        _: &bsv_rs::transaction::Transaction,
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,

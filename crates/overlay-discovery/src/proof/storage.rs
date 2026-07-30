@@ -45,9 +45,19 @@ pub struct ProofRecord {
     #[serde(rename = "sigHex")]
     pub sig_hex: String,
     /// The canonical JSON proof bundle BYTES, verbatim (1..=65536).
-    /// Stored as a D1 BLOB (the `pot_beefs` idiom); base64-encoded only
-    /// at the lookup answer edge.
+    /// Stored as a D1 BLOB (the `pot_beefs` idiom). May be EMPTY when
+    /// `bundle_b64` is populated on a read path (the D1 read skips
+    /// hauling the blob when the base64 column already answers).
     pub bundle: Vec<u8>,
+    /// Base64 of `bundle`, encoded ONCE at admission (bsv-low #289) and
+    /// stored alongside the BLOB, so reads skip the hex()→bytes→base64
+    /// triple transcoding (and the 2× hex on the D1 wire). `None` on
+    /// rows admitted before the column existed — the lookup service
+    /// falls back to encoding `bundle`. NEVER new trust: a pure
+    /// re-presentation of the same admitted bytes, the #284
+    /// decoded-column precedent (raw BLOB stays, never erased).
+    #[serde(rename = "bundleB64", default)]
+    pub bundle_b64: Option<String>,
     /// The txid carrying the marker OP_RETURN — half of the primary key.
     pub txid: String,
     /// The marker output's index within `txid` — the other half of the
@@ -187,6 +197,7 @@ mod tests {
             winner: winner.into(),
             sig_hex: "3045ab".into(),
             bundle: bundle.to_vec(),
+            bundle_b64: None,
             txid: txid.into(),
             output_index: 0,
             created_at: 0, // ignored — storage assigns

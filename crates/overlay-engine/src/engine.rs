@@ -117,6 +117,30 @@ struct TopicValidation {
 }
 
 impl Engine {
+    /// Page size used by `/requestSyncResponse` when the (public) caller
+    /// omits `limit`. A bounded page is not lossy for a conforming
+    /// initiator: ours ([`crate::gasp::GASPSync`]) keeps requesting pages
+    /// for as long as the `since` score cursor advances (gate finding M1 —
+    /// it must NOT require a "full" page to continue, because this clamp
+    /// makes a full-by-the-initiator's-limit page impossible).
+    pub const SYNC_RESPONSE_DEFAULT_LIMIT: u64 = 500;
+    /// Hard cap on a `/requestSyncResponse` page. Before bsv-low #291 an
+    /// absent/huge caller-supplied limit meant an unbounded scan of the
+    /// outputs table on a public route.
+    pub const SYNC_RESPONSE_MAX_LIMIT: u64 = 1000;
+
+    /// Clamp the public `/requestSyncResponse` page size: absent → the
+    /// default page; anything larger than the cap → the cap. The result is
+    /// ALWAYS `Some`-worthy — a sync response is never unbounded (bsv-low
+    /// #291). Completeness relies on the INITIATOR paging while its `since`
+    /// cursor advances (see `SYNC_RESPONSE_DEFAULT_LIMIT`'s doc) — the
+    /// responder alone cannot page for it.
+    pub fn clamp_sync_limit(requested: Option<u64>) -> u64 {
+        requested
+            .unwrap_or(Self::SYNC_RESPONSE_DEFAULT_LIMIT)
+            .min(Self::SYNC_RESPONSE_MAX_LIMIT)
+    }
+
     /// Create a new Overlay Services Engine.
     pub fn new(
         managers: HashMap<String, Box<dyn TopicManager>>,
@@ -633,7 +657,10 @@ impl Engine {
             let manager = &self.managers[topic];
             match manager
                 .identify_admissible_outputs(
-                    &tagged_beef.beef,
+                    // The ONE engine parse of the submitted BEEF, shared by
+                    // every topic on this submit (bsv-low #289 — managers
+                    // used to re-parse the same bytes independently).
+                    &tx,
                     &previous_coins
                         .iter()
                         .flat_map(|i| i.to_le_bytes())
@@ -786,6 +813,22 @@ impl Engine {
         question: &LookupQuestion,
         history_selector: Option<HistorySelector>,
     ) -> Result<LookupAnswer, EngineError> {
+        Ok(self.lookup_with_txids(question, history_selector).await?.0)
+    }
+
+    /// Same as [`Engine::lookup`], additionally returning each hydrated
+    /// output's txid, aligned index-for-index with the `OutputList` items
+    /// (empty for pre-formed `Answer`s).
+    ///
+    /// The txid IS the storage primary key the row was just fetched by —
+    /// handing it to the caller lets the aggregated wire serializer write it
+    /// directly instead of re-deriving it with a full BEEF parse plus a
+    /// double-SHA256 per output (bsv-low #289).
+    pub async fn lookup_with_txids(
+        &self,
+        question: &LookupQuestion,
+        history_selector: Option<HistorySelector>,
+    ) -> Result<(LookupAnswer, Vec<String>), EngineError> {
         let service = self
             .lookup_services
             .get(&question.service)
@@ -806,49 +849,61 @@ impl Engine {
         //   LS is presumed to have embedded whatever ancestry it wants.
         let refs = match result {
             LookupResult::OutputList(refs) => refs,
-            LookupResult::Answer(answer) => return Ok(answer),
+            LookupResult::Answer(answer) => return Ok((answer, Vec::new())),
         };
 
-        // Hydrate each result with BEEF from storage
-        let mut outputs = Vec::new();
-        for reference in &refs {
-            if let Ok(Some(output)) = self
-                .storage
-                .find_output(&reference.txid, reference.output_index, None, None, true)
-                .await
-            {
-                // If history selector provided, hydrate ancestor chain
-                let final_output = if history_selector.is_some() {
-                    match self
-                        .get_utxo_history(&output, history_selector.clone())
-                        .await
-                    {
-                        Ok(Some(hydrated)) => hydrated,
-                        _ => output,
-                    }
-                } else {
-                    output
-                };
+        // ONE batched hydration query for the whole result set instead of a
+        // D1 round-trip per row (the #289 N+1). Order is preserved: the
+        // batch contract returns outputs in input-outpoint order, skipping
+        // outpoints with no stored row. A storage error is a REAL error now
+        // (it used to be swallowed per-row into a silently-empty list — the
+        // "vanishing table" failure mode): an uncertain read must never
+        // masquerade as a confidently-empty lobby.
+        let outpoints: Vec<Outpoint> = refs
+            .iter()
+            .map(|r| Outpoint::new(&r.txid, r.output_index))
+            .collect();
+        let found = self
+            .storage
+            .find_outputs_by_outpoints(&outpoints, true)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
 
-                // Skip an output whose BEEF is missing OR empty: a lookup item
-                // without decodable BEEF is useless to the client (it can only
-                // drop it), and returning an empty-BEEF row is what made a fresh
-                // LOW table show up in a query yet be undecodable/invisible to
-                // opponents (the "vanishing table" — 2026-07-11). Only ever
-                // return fully-hydrated, decodable outputs.
-                if let Some(beef) = final_output.beef {
-                    if !beef.is_empty() {
-                        outputs.push(OutputListItem {
-                            beef,
-                            output_index: final_output.output_index,
-                            context: None,
-                        });
-                    }
+        let mut outputs = Vec::new();
+        let mut txids = Vec::new();
+        for output in found {
+            // If history selector provided, hydrate ancestor chain
+            let final_output = if history_selector.is_some() {
+                match self
+                    .get_utxo_history(&output, history_selector.clone())
+                    .await
+                {
+                    Ok(Some(hydrated)) => hydrated,
+                    _ => output,
+                }
+            } else {
+                output
+            };
+
+            // Skip an output whose BEEF is missing OR empty: a lookup item
+            // without decodable BEEF is useless to the client (it can only
+            // drop it), and returning an empty-BEEF row is what made a fresh
+            // LOW table show up in a query yet be undecodable/invisible to
+            // opponents (the "vanishing table" — 2026-07-11). Only ever
+            // return fully-hydrated, decodable outputs.
+            if let Some(beef) = final_output.beef {
+                if !beef.is_empty() {
+                    txids.push(final_output.txid.clone());
+                    outputs.push(OutputListItem {
+                        beef,
+                        output_index: final_output.output_index,
+                        context: None,
+                    });
                 }
             }
         }
 
-        Ok(LookupAnswer::OutputList { outputs })
+        Ok((LookupAnswer::OutputList { outputs }, txids))
     }
 
     // ========================================================================
@@ -1005,14 +1060,25 @@ impl Engine {
     /// Respond to a GASP initial sync request.
     ///
     /// Returns UTXOs for the given topic since the requested score.
+    ///
+    /// The caller-supplied `limit` is CLAMPED to
+    /// [`Engine::SYNC_RESPONSE_MAX_LIMIT`] (and defaulted when absent):
+    /// `/requestSyncResponse` is a PUBLIC route, and an absent limit used to
+    /// mean an unbounded scan of the outputs table (bsv-low #291). Bounding
+    /// is lossless for sync correctness because the initiator
+    /// ([`crate::gasp::GASPSync`]) pages for as long as its `since` score
+    /// cursor advances — a truncated page is fetched by its NEXT request
+    /// within the same run (gate finding M1: pagination must not demand a
+    /// full page, which this clamp can make impossible).
     pub async fn provide_foreign_sync_response(
         &self,
         request: &GASPInitialRequest,
         topic: &str,
     ) -> Result<GASPInitialResponse, EngineError> {
+        let limit = Self::clamp_sync_limit(request.limit);
         let outputs = self
             .storage
-            .find_utxos_for_topic(topic, Some(request.since as f64), request.limit, false)
+            .find_utxos_for_topic(topic, Some(request.since as f64), Some(limit), false)
             .await
             .map_err(|e| EngineError::StorageError(e.to_string()))?;
 
@@ -2106,7 +2172,7 @@ mod tests {
     impl TopicManagerTrait for MockTopicManager {
         async fn identify_admissible_outputs(
             &self,
-            _beef: &[u8],
+            _tx: &Transaction,
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
@@ -2330,6 +2396,43 @@ mod tests {
             }
             _ => panic!("Expected OutputList"),
         }
+    }
+
+    /// #289: `lookup_with_txids` returns the storage txid per hydrated
+    /// output, aligned with the OutputList — the aggregated serializer
+    /// writes it instead of re-hashing the BEEF.
+    #[tokio::test]
+    async fn test_lookup_with_txids_aligns_txids_with_outputs() {
+        let engine = make_engine(vec![0]);
+        let beef = test_tagged_beef(vec!["tm_test"]);
+        engine.submit(&beef, SubmitMode::CurrentTx).await.unwrap();
+
+        let question = LookupQuestion::new("ls_test", serde_json::json!({}));
+        let (answer, txids) = engine.lookup_with_txids(&question, None).await.unwrap();
+        match answer {
+            LookupAnswer::OutputList { outputs } => {
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(txids.len(), outputs.len(), "one txid per output");
+                assert_eq!(txids[0], TEST_TXID, "the storage primary key, verbatim");
+            }
+            _ => panic!("Expected OutputList"),
+        }
+    }
+
+    /// #291: the public sync-response page size is always bounded.
+    #[test]
+    fn sync_limit_clamp() {
+        assert_eq!(
+            Engine::clamp_sync_limit(None),
+            Engine::SYNC_RESPONSE_DEFAULT_LIMIT,
+            "absent limit gets the default page, never unbounded"
+        );
+        assert_eq!(Engine::clamp_sync_limit(Some(7)), 7);
+        assert_eq!(
+            Engine::clamp_sync_limit(Some(u64::MAX)),
+            Engine::SYNC_RESPONSE_MAX_LIMIT,
+            "a huge caller-supplied limit is capped"
+        );
     }
 
     #[tokio::test]

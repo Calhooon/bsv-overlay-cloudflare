@@ -48,19 +48,12 @@ impl Default for CollectedTopicManager {
 impl TopicManager for CollectedTopicManager {
     async fn identify_admissible_outputs(
         &self,
-        beef: &[u8],
+        tx: &Transaction,
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
-
-        let tx = match Transaction::from_beef(beef, None) {
-            Ok(tx) => tx,
-            Err(e) => {
-                return Err(TopicManagerError::InvalidBeef(e.to_string()));
-            }
-        };
 
         for (i, output) in tx.outputs.iter().enumerate() {
             if Self::validate_collected_output(output) {
@@ -230,21 +223,15 @@ pub(crate) mod tests {
 
         let mgr = CollectedTopicManager::new();
         let instructions = mgr
-            .identify_admissible_outputs(&beef, &[], None, SubmitMode::HistoricalTxNoSpv)
+            .identify_admissible_outputs(
+                &Tx::from_beef(&beef, None).expect("engine-side parse"),
+                &[], None, SubmitMode::HistoricalTxNoSpv)
             .await
             .unwrap();
         // Only the marker (index 1) is admitted.
         assert_eq!(instructions.outputs_to_admit, vec![1]);
     }
 
-    #[tokio::test]
-    async fn invalid_beef_is_an_error() {
-        let mgr = CollectedTopicManager::new();
-        assert!(mgr
-            .identify_admissible_outputs(&[0xde, 0xad], &[], None, SubmitMode::HistoricalTxNoSpv)
-            .await
-            .is_err());
-    }
 
     #[tokio::test]
     async fn topic_manager_trait_works() {

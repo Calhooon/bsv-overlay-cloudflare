@@ -135,6 +135,16 @@ impl D1Storage {
         }
     }
 
+    /// SQL for one batched-outpoint chunk (bsv-low #289): a single row-value
+    /// `IN (VALUES …)` query replacing `n` individual `find_output` round
+    /// trips. `n` must be ≥ 1. Factored out so the real-SQLite test below can
+    /// prove the syntax against the production schema.
+    fn outputs_batch_sql(include_beef: bool, n: usize) -> String {
+        let base = Self::select_outputs(include_beef);
+        let placeholders = vec!["(?, ?)"; n].join(", ");
+        format!("{base} WHERE (o.txid, o.outputIndex) IN (VALUES {placeholders})")
+    }
+
     /// Parse a serialized BEEF and report whether it carries a merkle proof for
     /// `txid` (the tx's OWN proof, not an ancestor's). Used to keep the
     /// `transactions.has_proof` flag accurate on every BEEF write so the
@@ -424,6 +434,53 @@ impl Storage for D1Storage {
         Ok(row.map(OutputRow::into_output))
     }
 
+    /// Batched outpoint hydration (bsv-low #289): the engine's `/lookup`
+    /// used to call `find_output` once per result row — one D1 round trip
+    /// (plus a JOINed BEEF transfer) per lobby row. This override answers the
+    /// whole set in `ceil(n / 40)` queries.
+    ///
+    /// Contract preserved from the default impl: results come back in INPUT
+    /// order, outpoints with no stored row are skipped, and (matching
+    /// `find_output`'s `LIMIT 1`) at most one row is returned per outpoint
+    /// even when the same outpoint is admitted under several topics.
+    async fn find_outputs_by_outpoints(
+        &self,
+        outpoints: &[Outpoint],
+        include_beef: bool,
+    ) -> Result<Vec<Output>, StorageError> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // D1 caps bound parameters per statement (100); two binds per
+        // outpoint → chunks of 40 stay well clear of the limit.
+        const CHUNK: usize = 40;
+
+        let mut by_outpoint: std::collections::HashMap<(String, u32), Output> =
+            std::collections::HashMap::new();
+        for chunk in outpoints.chunks(CHUNK) {
+            let sql = Self::outputs_batch_sql(include_beef, chunk.len());
+            let mut query = Query::new(sql);
+            for op in chunk {
+                query = query.bind(&*op.txid).bind(op.output_index);
+            }
+            let rows: Vec<OutputRow> = query.fetch_all(&self.db).await.map_err(d1_err)?;
+            for row in rows {
+                let output = row.into_output();
+                // First row per outpoint wins — same arbitrary-topic pick as
+                // find_output's LIMIT 1.
+                by_outpoint
+                    .entry((output.txid.clone(), output.output_index))
+                    .or_insert(output);
+            }
+        }
+
+        Ok(outpoints
+            .iter()
+            .filter_map(|op| by_outpoint.get(&(op.txid.clone(), op.output_index)).cloned())
+            .collect())
+    }
+
     async fn find_outputs_for_transaction(
         &self,
         txid: &str,
@@ -441,6 +498,23 @@ impl Storage for D1Storage {
         Ok(rows.into_iter().map(OutputRow::into_output).collect())
     }
 
+    /// Known residual (bsv-low #291 gate finding LOW-B — documented, not
+    /// fixed): this is the `/requestSyncResponse` responder read, ordered
+    /// by `score ASC` with the initiator's cursor being the bare GASP
+    /// `since` score. A tie group of IDENTICAL scores at least as large as
+    /// the clamped page size would re-serve the same page on every request
+    /// — the initiator then terminates on cursor non-advance with the
+    /// group's tail unreached (a silent gap, never a spin; see the
+    /// termination rule in `gasp.rs`). The durable fix is a compound
+    /// `(score, rowid)` cursor, but `since` is a single u64 on the GASP
+    /// wire — changing it is out of bounds. Unconstructible in practice:
+    /// scores are responder-local millisecond timestamps stamped one
+    /// admission round-trip (HTTP submit + D1 write) at a time, so ~1,000
+    /// rows sharing one millisecond cannot occur. Deliberately NO rowid
+    /// tiebreak in the ORDER BY: under a hypothetical over-page tie group,
+    /// SQLite's unspecified within-tie order lets successive runs serve
+    /// varying subsets (probabilistic coverage), whereas a deterministic
+    /// tiebreak would pin the exact same page forever.
     async fn find_utxos_for_topic(
         &self,
         topic: &str,
@@ -640,6 +714,59 @@ mod tests {
         let sql = D1Storage::select_outputs(true);
         assert!(sql.contains("LEFT JOIN transactions t"));
         assert!(sql.contains("hex(t.beef) as beef"));
+    }
+
+    /// The batched-outpoint SQL (#289) must actually execute on the
+    /// production schema — row-value `IN (VALUES …)` is newer SQLite surface
+    /// area, so prove it against a real database built from
+    /// `OVERLAY_MIGRATIONS`, and prove the row selection is per-OUTPOINT
+    /// (txid alone must not match a different vout).
+    #[test]
+    fn outputs_batch_sql_selects_exact_outpoints_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+
+        for (txid, vout) in [("aa", 0), ("aa", 1), ("bb", 0), ("cc", 7)] {
+            conn.execute(
+                "INSERT INTO outputs (txid, outputIndex, topic, spent) VALUES (?1, ?2, 'tm_t', 0)",
+                rusqlite::params![txid, vout],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO transactions (txid, beef) VALUES (?1, x'beef')",
+                rusqlite::params![txid],
+            )
+            .unwrap();
+        }
+
+        // Ask for (aa,1), (cc,7) and one absent outpoint (bb,9).
+        let sql = D1Storage::outputs_batch_sql(true, 3);
+        let mut stmt = conn.prepare(&sql).expect("batch SQL must parse on real SQLite");
+        let rows: Vec<(String, u32)> = stmt
+            .query_map(
+                rusqlite::params!["aa", 1u32, "cc", 7u32, "bb", 9u32],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        let mut sorted = rows.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![("aa".into(), 1), ("cc".into(), 7)],
+            "exactly the requested present outpoints — never txid-only matches \
+             (aa,0 / bb,0) nor phantom rows for absent outpoints"
+        );
     }
 
     #[test]

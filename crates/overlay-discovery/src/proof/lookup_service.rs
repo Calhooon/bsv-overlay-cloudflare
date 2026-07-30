@@ -37,7 +37,11 @@ use super::parse_proof_marker;
 use super::storage::{ProofQuery, ProofRecord, ProofStorage};
 
 /// Default number of records returned when a query omits `limit`.
-/// Deliberately small — each row carries a ~10–15 KB bundle.
+/// Deliberately small — each row carries a ~10–15 KB bundle, so this is
+/// a CLIENT-payload bound. Revisited for bsv-low #289 (the triple
+/// transcoding it was suspected of masking is fixed — base64 is now
+/// encoded once at admission): the client wire cost per row is
+/// unchanged, so the bound stands as a genuine data bound.
 const DEFAULT_LIMIT: usize = 3;
 /// Hard cap on the number of records a single query can return.
 const MAX_LIMIT: usize = 10;
@@ -102,6 +106,10 @@ impl LookupService for ProofLookupService {
             game_id: hex::encode(marker.game_id),
             winner: hex::encode(&marker.winner),
             sig_hex: hex::encode(&marker.sig),
+            // Base64 computed ONCE here at admission (bsv-low #289) so no
+            // read ever re-transcodes the blob; a pure re-presentation of
+            // the same bytes stored verbatim below — never new trust.
+            bundle_b64: Some(BASE64.encode(&marker.bundle)),
             // The bundle BYTES verbatim — content never validated here.
             bundle: marker.bundle,
             txid: txid.to_string(),
@@ -161,9 +169,11 @@ impl LookupService for ProofLookupService {
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
-        // Carry the stored bytes back VERBATIM — the bundle base64-encoded
-        // at this edge only (it is raw JSON bytes in storage). No derived
-        // "verified" flag: the overlay is an index, not an authority.
+        // Carry the stored bytes back VERBATIM. Since bsv-low #289 the
+        // base64 is encoded once at ADMISSION and stored (`bundle_b64`);
+        // rows admitted before that column fall back to encoding the blob
+        // here — same string either way. No derived "verified" flag: the
+        // overlay is an index, not an authority.
         let entries: Vec<serde_json::Value> = records
             .into_iter()
             .map(|r| {
@@ -171,7 +181,9 @@ impl LookupService for ProofLookupService {
                     "gameId": r.game_id,
                     "winner": r.winner,
                     "sigHex": r.sig_hex,
-                    "bundleBase64": BASE64.encode(&r.bundle),
+                    "bundleBase64": r
+                        .bundle_b64
+                        .unwrap_or_else(|| BASE64.encode(&r.bundle)),
                     "txid": r.txid,
                     "outputIndex": r.output_index,
                     "createdAt": r.created_at,
@@ -325,6 +337,37 @@ mod tests {
         assert_eq!(e["txid"], "markerTx1");
         assert_eq!(e["outputIndex"], 0);
         assert!(e["createdAt"].is_i64());
+    }
+
+    /// #289: a row stored BEFORE the admission-time base64 existed
+    /// (`bundle_b64: None` — the pre-#289 D1 shape) still answers the
+    /// identical `bundleBase64` via the encode fallback. Never erased,
+    /// never a different wire.
+    #[tokio::test]
+    async fn legacy_record_without_b64_still_answers_bundle_base64() {
+        let (svc, storage) = make_service_with_storage();
+        let game_id = "22".repeat(32);
+        let winner = golden_winner_hex();
+        storage
+            .store_record(&ProofRecord {
+                game_id: game_id.clone(),
+                winner: winner.clone(),
+                sig_hex: "3045ab".into(),
+                bundle: b"{\"v\":1,\"legacy\":true}".to_vec(),
+                bundle_b64: None, // pre-#289 row
+                txid: "legacyTx".into(),
+                output_index: 0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let arr = proofs_for(&svc, &game_id, &winner, None).await;
+        assert_eq!(
+            arr[0]["bundleBase64"],
+            BASE64.encode(b"{\"v\":1,\"legacy\":true}"),
+            "fallback encodes the stored blob — same wire as the b64 path"
+        );
     }
 
     #[tokio::test]

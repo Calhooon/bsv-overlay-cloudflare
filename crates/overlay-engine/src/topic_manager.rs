@@ -7,6 +7,7 @@
 //! Ported from `~/bsv/overlay-services/src/TopicManager.ts`.
 
 use async_trait::async_trait;
+use bsv_rs::transaction::Transaction;
 
 use crate::types::{AdmittanceInstructions, Outpoint, ServiceMetadata, SubmitMode};
 
@@ -17,11 +18,17 @@ use crate::types::{AdmittanceInstructions, Outpoint, ServiceMetadata, SubmitMode
 /// token transfers.
 #[async_trait(?Send)]
 pub trait TopicManager {
-    /// Examine a transaction (in BEEF format) and return instructions indicating
-    /// which outputs should be admitted into this topic.
+    /// Examine a transaction and return instructions indicating which
+    /// outputs should be admitted into this topic.
     ///
     /// # Arguments
-    /// - `beef` — The transaction in BEEF format (includes ancestor proofs).
+    /// - `tx` — The submitted transaction, parsed ONCE by the engine from
+    ///   the BEEF (`Transaction::from_beef(beef, None)`) and shared across
+    ///   every topic manager on the submit. Before bsv-low #289 each manager
+    ///   re-parsed the same bytes independently (T+1 parses per `/submit`).
+    ///   Admission stays byte-format-only: managers still validate the
+    ///   OUTPUT SCRIPTS themselves; only the redundant container parse
+    ///   moved.
     /// - `previous_coins` — BEEF data for previously-admitted outputs that this
     ///   transaction spends (inputs from the same topic). May be empty if no
     ///   inputs come from this topic.
@@ -36,7 +43,7 @@ pub trait TopicManager {
     /// - `coins_to_retain`: indices of previous coins to keep (not garbage-collect)
     async fn identify_admissible_outputs(
         &self,
-        beef: &[u8],
+        tx: &Transaction,
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
@@ -102,7 +109,7 @@ mod tests {
     impl TopicManager for AdmitAllManager {
         async fn identify_admissible_outputs(
             &self,
-            _beef: &[u8],
+            _tx: &Transaction,
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
@@ -134,7 +141,7 @@ mod tests {
     impl TopicManager for RejectAllManager {
         async fn identify_admissible_outputs(
             &self,
-            _beef: &[u8],
+            _tx: &Transaction,
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
@@ -158,7 +165,7 @@ mod tests {
     async fn test_admit_all_manager() {
         let mgr = AdmitAllManager;
         let result = mgr
-            .identify_admissible_outputs(&[], &[], None, SubmitMode::CurrentTx)
+            .identify_admissible_outputs(&Transaction::new(), &[], None, SubmitMode::CurrentTx)
             .await
             .unwrap();
         assert_eq!(result.outputs_to_admit, vec![0, 1, 2]);
@@ -169,7 +176,7 @@ mod tests {
     async fn test_reject_all_manager() {
         let mgr = RejectAllManager;
         let result = mgr
-            .identify_admissible_outputs(&[], &[], None, SubmitMode::CurrentTx)
+            .identify_admissible_outputs(&Transaction::new(), &[], None, SubmitMode::CurrentTx)
             .await
             .unwrap();
         assert!(result.outputs_to_admit.is_empty());
@@ -199,7 +206,7 @@ mod tests {
         // Verify the trait can be used as dyn TopicManager (required for Engine)
         let mgr: Box<dyn TopicManager> = Box::new(AdmitAllManager);
         let result = mgr
-            .identify_admissible_outputs(&[], &[], None, SubmitMode::HistoricalTx)
+            .identify_admissible_outputs(&Transaction::new(), &[], None, SubmitMode::HistoricalTx)
             .await
             .unwrap();
         assert_eq!(result.outputs_to_admit.len(), 3);
