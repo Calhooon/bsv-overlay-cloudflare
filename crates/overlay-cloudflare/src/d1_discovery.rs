@@ -1464,6 +1464,20 @@ pub(crate) const POT_BEEF_VERIFIED_WRITE_SQL: &str =
 pub(crate) const POT_BEEF_MARK_PROVEN_SQL: &str =
     "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1 WHERE txid = ?";
 
+/// Chunk size for the batched verified-latch flip (bsv-low#304 gate M-4) —
+/// one D1 statement per up-to-100 latched rows instead of one per row,
+/// comfortably under SQLite's bind-parameter ceiling.
+pub(crate) const POT_BEEF_MARK_PROVEN_CHUNK: usize = 100;
+
+/// SHIPPED batched verified-latch flip for `n` txids
+/// ([`D1PotStorage::mark_pot_beefs_proven`]) — the `IN (?, …)` form of
+/// [`POT_BEEF_MARK_PROVEN_SQL`], identical semantics per row.
+pub(crate) fn pot_beef_mark_proven_batch_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!("UPDATE pot_beefs SET proof_verified = 1, has_proof = 1 WHERE txid IN ({placeholders})")
+}
+
 /// SHIPPED completion-pass candidate scan (bsv-low#304: gated on the
 /// VERIFIED latch, not the structural flag).
 pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
@@ -1988,6 +2002,21 @@ impl PotStorage for D1PotStorage {
             .execute(&self.db)
             .await
             .map_err(pot_err)
+    }
+
+    async fn mark_pot_beefs_proven(&self, txids: &[String]) -> Result<(), PotStorageError> {
+        // One statement per POT_BEEF_MARK_PROVEN_CHUNK rows (bsv-low#304
+        // gate M-4) — the per-row round trip was the fast path's dominant
+        // subrequest cost. A failed chunk propagates; its rows simply stay
+        // candidates for the next tick (fail-safe).
+        for chunk in txids.chunks(POT_BEEF_MARK_PROVEN_CHUNK) {
+            let mut q = Query::new(pot_beef_mark_proven_batch_sql(chunk.len()));
+            for txid in chunk {
+                q = q.bind(txid.as_str());
+            }
+            q.execute(&self.db).await.map_err(pot_err)?;
+        }
+        Ok(())
     }
 
     async fn pot_beef_proof_verified(&self, txid: &str) -> Result<bool, PotStorageError> {
@@ -3357,6 +3386,23 @@ mod tests {
             .unwrap();
         assert_eq!(len, 3, "the verifying write replaced the bytes");
         assert_eq!(verified, 1);
+
+        // gate M-4: the BATCHED latch flip — one statement latches many rows
+        // (identical per-row semantics to POT_BEEF_MARK_PROVEN_SQL).
+        for t in ["b1", "b2", "b3"] {
+            conn.execute(
+                POT_BEEF_ADMIT_WRITE_SQL,
+                rusqlite::params![t, vec![0xbeu8, 0xef], t, 100i64, 1i64],
+            )
+            .unwrap();
+        }
+        assert_eq!(candidates(0), vec!["b1".to_string(), "b2".into(), "b3".into()]);
+        conn.execute(
+            &pot_beef_mark_proven_batch_sql(3),
+            rusqlite::params!["b1", "b2", "b3"],
+        )
+        .unwrap();
+        assert!(candidates(0).is_empty(), "one batched statement latched all three");
     }
 
     #[test]

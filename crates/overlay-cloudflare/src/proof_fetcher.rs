@@ -56,34 +56,45 @@ pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech"
 pub const DEFAULT_FETCH_BUDGET: u32 = 40;
 
 /// Candidate page for ONE pot-beef proof-completion pass (bsv-low#304 gate
-/// M-2). The page must be big enough that the post-#304 re-verify BACKLOG
-/// (every pre-existing mined pot row re-entered the candidate set when
-/// candidacy moved to the verified latch) drains in HOURS, not weeks —
-/// while the backlog lasts, /tx-any's index leg defers those rows to the
-/// external WoC-first leg, which must never become a warm path (the 429
-/// doctrine).
+/// M-2, re-derived per gate M-4). The page must be big enough that the
+/// post-#304 re-verify BACKLOG (every pre-existing mined pot row re-entered
+/// the candidate set when candidacy moved to the verified latch) drains in
+/// HOURS, not weeks — while the backlog lasts, /tx-any's index leg defers
+/// those rows to the external WoC-first leg, which must never become a warm
+/// path (the 429 doctrine).
 ///
 /// DRAIN MATH: the fast path costs ONE chaintracks service-binding read per
-/// structurally-bumped candidate — no courier fetch, no byte rewrite. At
-/// 128 rows/tick × 96 ticks/day, a ~3,000-row backlog clears in ~24 ticks
-/// ≈ 6 h (vs the old 20/tick: ≥150 ticks ≈ 1.6 days FLOOR, stretched to
-/// 1-2 weeks by RANDOM sampling against still-unmined rows sharing the
-/// pool). SUBREQUEST BUDGET: worst case the pass adds ≤128 chaintracks
-/// reads + ≤DEFAULT_FETCH_BUDGET(40) courier fetches ≈ 170 subrequests —
-/// inside the ~255/tick envelope observed live (#257 forensics) and far
-/// under the paid 1,000 cap, with the tick's other steps (GASP 240 s
-/// bounded, crawl, janitor, #273 backstop ≤48 probes) sharing the rest.
-/// One-shot post-deploy drains can go faster via /admin/reverifyPotBeefs.
-pub const POT_PROOF_PASS_LIMIT: u64 = 128;
+/// structurally-bumped candidate — no courier fetch, no byte rewrite, and
+/// (M-4) the verified-latch writes are BATCHED (`mark_pot_beefs_proven`,
+/// one D1 statement per 100 rows, not one per row). At 100 rows/tick × 96
+/// ticks/day, a ~3,000-row backlog clears in ~30 ticks ≈ 7.5 h (vs the old
+/// 20/tick: ≥150 ticks ≈ 1.6 days FLOOR, stretched to 1-2 weeks by RANDOM
+/// sampling against still-unmined rows sharing the pool).
+///
+/// OP BUDGET (reads + writes + overhead, the conservative counting — gate
+/// M-4 corrected the earlier ≈170 claim which omitted writes/migrations):
+/// warm-isolate worst case ≈ 1 candidate scan + ≤100 chaintracks reads +
+/// ≤1 batched latch write + ≤DEFAULT_FETCH_BUDGET(40) budgeted courier
+/// candidates (each a fetch + verify) + ≤40 compact writes ≈ 182 ops; a
+/// COLD isolate adds the one-time 92-statement migration pass ≈ 274. Both
+/// sit under the paid 1,000-subrequest cap with the tick's other steps
+/// (GASP 240 s bounded, crawl, janitor, #273 backstop ≤48 probes) sharing
+/// the rest; unbatched, the same page would have cost ~100 extra writes.
+/// One-shot post-deploy drains go faster via /admin/reverifyPotBeefs.
+pub const POT_PROOF_PASS_LIMIT: u64 = 100;
 
 /// Default / max candidate page for the operator-driven one-shot backlog
 /// drain (`POST /admin/reverifyPotBeefs`). Its fetcher runs with budget 0
-/// (chaintracks-only — never a courier fetch), so the page is bounded by
-/// the invocation's subrequest cap alone: 500 default leaves ample slack,
-/// 900 caps below the paid 1,000-subrequest wall.
-pub const ADMIN_REVERIFY_DEFAULT_LIMIT: u64 = 500;
+/// (chaintracks-only — never a courier fetch), so per gate M-4's
+/// reads+writes+migration accounting: default 250 ≈ 1 scan + ≤250
+/// chaintracks reads + ≤3 batched latch writes ≈ 254 ops warm (+92
+/// migration statements on a cold isolate ≈ 346); cap 450 ≈ 456 warm /
+/// ≈ 548 cold — both comfortably under the paid 1,000-subrequest wall
+/// (the earlier 500/900 figures sat ~2× over it under this conservative
+/// counting and were lowered).
+pub const ADMIN_REVERIFY_DEFAULT_LIMIT: u64 = 250;
 /// Hard cap for `/admin/reverifyPotBeefs?limit=` (see above).
-pub const ADMIN_REVERIFY_MAX_LIMIT: u64 = 900;
+pub const ADMIN_REVERIFY_MAX_LIMIT: u64 = 450;
 
 /// Push-primary BACKSTOP age gate (bsv-low #228 / arcade#259): the poll
 /// passes only touch rows OLDER than this — younger rows are expected to get
@@ -631,6 +642,12 @@ pub async fn complete_pot_beef_proofs(
     };
     summary.scanned = candidates.len();
 
+    // bsv-low#304 gate M-4: fast-path latches are COLLECTED and written in
+    // one batched statement per chunk after the loop — one D1 write per row
+    // was the wide page's dominant op cost (the subrequest math at
+    // POT_PROOF_PASS_LIMIT counts on this).
+    let mut latched: Vec<String> = Vec::new();
+
     for (txid, stored_beef) in candidates {
         // bsv-low#304 fast path (mirrors the engine's transactions pass): a
         // candidate whose STORED bytes already carry a bump for its own txid
@@ -651,12 +668,7 @@ pub async fn complete_pot_beef_proofs(
             });
         if let Some(bump_hex) = stored_bump {
             if fetcher.verify_proof(&txid, &bump_hex).await {
-                if let Err(e) = pot_storage.mark_pot_beef_proven(&txid).await {
-                    push_log(&format!("[pot-proof] {txid} verified-latch write failed: {e}"));
-                    summary.stitch_failed += 1;
-                } else {
-                    summary.already_proven += 1;
-                }
+                latched.push(txid);
                 continue;
             }
             push_log(&format!(
@@ -688,6 +700,23 @@ pub async fn complete_pot_beef_proofs(
             None => {
                 push_log(&format!("[pot-proof] {txid} stitch/trim failed (retry)"));
                 summary.stitch_failed += 1;
+            }
+        }
+    }
+
+    // The batched verified-latch write (chunked at the backend). A failure
+    // latches NOTHING from the failed chunk-set — those rows simply remain
+    // candidates and re-verify next tick (fail-safe; counted so the tick is
+    // not silently short).
+    if !latched.is_empty() {
+        match pot_storage.mark_pot_beefs_proven(&latched).await {
+            Ok(()) => summary.already_proven = latched.len(),
+            Err(e) => {
+                push_log(&format!(
+                    "[pot-proof] batched verified-latch write failed for {} row(s) (retry next tick): {e}",
+                    latched.len()
+                ));
+                summary.stitch_failed += latched.len();
             }
         }
     }

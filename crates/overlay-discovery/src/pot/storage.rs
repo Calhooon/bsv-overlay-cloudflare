@@ -431,6 +431,21 @@ pub trait PotStorage {
         Ok(())
     }
 
+    /// Batch form of [`Self::mark_pot_beef_proven`] (bsv-low#304 gate M-4):
+    /// latch MANY re-verified rows in as few backend round trips as the
+    /// backend can manage — the completion pass's fast path latches up to a
+    /// whole candidate page per tick, and one write per row was the page's
+    /// dominant op cost. Same trust contract as the single form: the caller
+    /// chaintracks-verified EVERY listed txid's stored bump. All-or-nothing
+    /// is NOT required — a failed chunk simply leaves those rows candidates
+    /// (retried next tick). Default: loop the single form.
+    async fn mark_pot_beefs_proven(&self, txids: &[String]) -> Result<(), PotStorageError> {
+        for txid in txids {
+            self.mark_pot_beef_proven(txid).await?;
+        }
+        Ok(())
+    }
+
     /// Whether `txid`'s stored BEEF carries a VERIFIED proof latch
     /// (bsv-low#304) — i.e. one of the verifying writers latched it. NEVER
     /// derived from byte structure. Default: `false` (backends without the
