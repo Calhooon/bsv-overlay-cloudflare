@@ -726,6 +726,9 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             verdict: r.get("verdict")?,
             verdict_txid: r.get("verdictTxid")?,
             spent_height: r.get::<_, Option<i64>>("spentHeight")?.map(|v| v as u64),
+            spender_proof_verified: r
+                .get::<_, Option<i64>>("spenderProofVerified")?
+                .map(|v| v != 0),
         })
     })
     .unwrap()
@@ -911,6 +914,85 @@ fn a_fresh_verdict_without_height_still_fetches_the_spender_blob() {
         entries[0].at_height, None,
         "a proofless spender BEEF honestly yields no height — never a guess"
     );
+}
+
+/// bsv-low#304: the spender-BEEF at.height fallback trusts ONLY the
+/// VERIFIED proof latch. A spender row whose stored bytes STRUCTURALLY
+/// carry a bump (admit-path bytes — possibly attacker-fabricated via the
+/// ungated historical/GASP/peer-crawl modes) with `proof_verified = 0`
+/// yields NO height (the pre-#304 behavior — the RED half — served the
+/// bump's attacker-chosen height); once the overlay's verifying writer
+/// latches `proof_verified = 1`, the exact same bytes serve their height.
+/// Executes the shipped `results_sql()` on the production schema.
+#[test]
+fn spender_beef_height_is_gated_on_the_verified_latch() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        Some("winner-a"),
+        Some(ENFORCED_SETTLE_TXID),
+        None, // spentHeight NULL — the BEEF fallback is the only height source
+    );
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+
+    // A structurally-BUMPED spender BEEF stored with the default (0)
+    // verified latch — exactly what an ungated admit of fake-bumped bytes
+    // leaves behind.
+    let bumped = {
+        let mut tx =
+            bsv_rs::transaction::Transaction::from_hex(ENFORCED_SETTLE_HEX.trim()).unwrap();
+        let txid = tx.id();
+        tx.merkle_path = Some(
+            bsv_rs::transaction::MerklePath::new(
+                959_000,
+                vec![vec![bsv_rs::transaction::MerklePathLeaf::new_txid(0, txid)]],
+            )
+            .unwrap(),
+        );
+        tx.to_beef(true).unwrap()
+    };
+    insert_beef(&conn, ENFORCED_SETTLE_TXID, &bumped);
+
+    let rows = query_results_rows(&conn, &victim);
+    assert!(!no_blob(&rows[0].spender_beef_hex), "the fallback BLOB is fetched");
+    assert_eq!(
+        rows[0].spender_proof_verified,
+        Some(false),
+        "the shipped SQL carries the latch"
+    );
+    let entries = assemble_results(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        entries[0].at_height, None,
+        "an UNVERIFIED structural bump must never serve a height (bsv-low#304)"
+    );
+
+    // The overlay's verifying writer latches the row → the same bytes now
+    // serve their (verified) height. Verified answers are never weakened.
+    conn.execute(
+        "UPDATE pot_beefs SET proof_verified = 1 WHERE txid = ?1",
+        params![ENFORCED_SETTLE_TXID],
+    )
+    .unwrap();
+    let rows = query_results_rows(&conn, &victim);
+    assert_eq!(rows[0].spender_proof_verified, Some(true));
+    let entries = assemble_results(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(entries[0].at_height, Some(959_000));
 }
 
 // ── F3 — the existence tier must not become a filter ────────────────────

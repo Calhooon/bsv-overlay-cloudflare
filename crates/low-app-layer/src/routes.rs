@@ -182,17 +182,43 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // definitive not-found (module note above).
     let key = txid.to_ascii_lowercase();
     let mut faulted = false;
-    for (table, sql) in [
-        ("pot_beefs", "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?"),
-        ("transactions", "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?"),
+    for (table, sql, legacy_sql) in [
+        (
+            "pot_beefs",
+            POT_BEEFS_TRUST_SQL,
+            "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?",
+        ),
+        (
+            "transactions",
+            TRANSACTIONS_TRUST_SQL,
+            "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?",
+        ),
     ] {
+        // Trust-flag query first (bsv-low#304); if it faults (e.g. this
+        // worker deployed ahead of the overlay's additive migration), fall
+        // back to the legacy no-flag read and treat the row as UNVERIFIED —
+        // availability is preserved, trust is not strengthened.
         let stmt = db.prepare(sql).bind(&[JsValue::from_str(&key)])?;
-        let row: Option<BeefRow> = match stmt.first(None).await {
-            Ok(row) => row,
+        let (row, proof_verified): (Option<BeefRow>, bool) = match stmt.first::<BeefTrustRow>(None).await {
+            Ok(row) => {
+                let verified = row
+                    .as_ref()
+                    .and_then(|r| r.proof_verified)
+                    .unwrap_or(0.0)
+                    != 0.0;
+                (row.map(|r| BeefRow { beef: r.beef }), verified)
+            }
             Err(e) => {
-                console_warn!("[beef] {table} query failed: {e}");
-                faulted = true;
-                continue;
+                console_warn!("[beef] {table} trust query failed ({e}) — legacy no-flag read");
+                let stmt = db.prepare(legacy_sql).bind(&[JsValue::from_str(&key)])?;
+                match stmt.first::<BeefRow>(None).await {
+                    Ok(row) => (row, false),
+                    Err(e) => {
+                        console_warn!("[beef] {table} query failed: {e}");
+                        faulted = true;
+                        continue;
+                    },
+                }
             },
         };
         if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
@@ -204,7 +230,20 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
             // proofless (or already-minimal) BEEF is returned byte-for-byte
             // unchanged. The subject is the lowercase DB key (BEEF txids are
             // lowercase hex).
-            let compacted = crate::compaction::compact_beef(&key, &bytes);
+            //
+            // bsv-low#304 TRIMMING LICENSE: compaction is licensed ONLY by
+            // the row's VERIFIED proof latch. Trimming decides mined-ness
+            // from IN-BEEF bump presence, and an unverified row's bumps are
+            // submitter bytes (possibly forged) — trimming on them would
+            // drop the very ancestry an honest verifier needs. An
+            // unverified row is served byte-for-byte as stored (weaker,
+            // never wrong); a verified row keeps trimming exactly as
+            // before.
+            let compacted = if proof_verified {
+                crate::compaction::compact_beef(&key, &bytes)
+            } else {
+                bytes
+            };
             return json_response(beef_body(&txid, &compacted), 200);
         }
     }
@@ -1079,6 +1118,11 @@ struct ResultsRowD1 {
     verdict_txid: Option<String>,
     #[serde(rename = "spentHeight", default)]
     spent_height: Option<f64>,
+    /// bsv-low#304: the spender pot_beefs row's VERIFIED proof latch
+    /// (`sb.proof_verified`); `default` tolerates a read racing the
+    /// overlay's additive migration — absent = unverified (fail-safe).
+    #[serde(rename = "spenderProofVerified", default)]
+    spender_proof_verified: Option<f64>,
 }
 
 impl ResultsRowD1 {
@@ -1113,6 +1157,7 @@ impl ResultsRowD1 {
             verdict: self.verdict,
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
+            spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
         }
     }
 }
@@ -1474,11 +1519,43 @@ thread_local! {
     static BITAILS_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// SHIPPED trusted-BEEF reads shared by `/tx-any`'s index leg and `/beef`
+/// (bsv-low#304) — consts so the real-SQLite tests execute the production
+/// strings. Each table's VERIFIED proof latch is aliased `proofVerified`:
+/// `transactions.has_proof` is latched only by the overlay's verifying
+/// writers (`insert_output` forces 0 on every admit;
+/// `mark_transaction_proven` / the verified stitch flip it), and
+/// `pot_beefs.proof_verified` is the #304 verified latch (its `has_proof`
+/// sibling is STRUCTURAL — submitter bytes, zero SPV — and is deliberately
+/// NOT selected here).
+pub(crate) const POT_BEEFS_TRUST_SQL: &str =
+    "SELECT hex(beef) AS beef, proof_verified AS proofVerified FROM pot_beefs WHERE txid = ?";
+pub(crate) const TRANSACTIONS_TRUST_SQL: &str =
+    "SELECT hex(beef) AS beef, has_proof AS proofVerified FROM transactions WHERE txid = ?";
+
+/// A BEEF row + its VERIFIED proof latch. `proofVerified` is
+/// Option-tolerant: NULL/absent (a read racing the overlay's additive
+/// migration) = UNVERIFIED — the height is withheld, never strengthened.
+#[derive(Deserialize)]
+struct BeefTrustRow {
+    beef: Option<String>,
+    #[serde(rename = "proofVerified", default)]
+    proof_verified: Option<f64>,
+}
+
 /// The INDEX leg: raw hex + BUMP height from the stored BEEF (`pot_beefs`
 /// first, `transactions` second — the `/beef` order). `(None, None)` = index
 /// miss OR D1 fault (fault logged; the break-glass leg still answers — a
 /// read surface must not dead-end on a D1 blip, and the external answer is
 /// still truthful).
+///
+/// bsv-low#304: the served height is GATED on the row's VERIFIED proof
+/// latch (`verified_beef_block_height`) — a stored bump WITHOUT the latch
+/// (fake-bumped rows admitted via the ungated historical/GASP/peer-crawl
+/// paths, or an honest backlog row awaiting re-verify) answers like a
+/// bumpless row: raw served, confirmed/height defer to the external leg
+/// (the #247 machinery). Weakens only unverified answers, never verified
+/// ones.
 async fn tx_any_index_leg(
     ctx: &RouteContext<()>,
     txid_lc: &str,
@@ -1488,22 +1565,25 @@ async fn tx_any_index_leg(
         return (None, None);
     };
     for (table, sql) in [
-        ("pot_beefs", "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?"),
-        ("transactions", "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?"),
+        ("pot_beefs", POT_BEEFS_TRUST_SQL),
+        ("transactions", TRANSACTIONS_TRUST_SQL),
     ] {
         let Ok(stmt) = db.prepare(sql).bind(&[JsValue::from_str(txid_lc)]) else {
             continue;
         };
-        let row: Option<BeefRow> = match stmt.first(None).await {
+        let row: Option<BeefTrustRow> = match stmt.first(None).await {
             Ok(row) => row,
             Err(e) => {
                 console_warn!("[tx-any] {table} query failed: {e}");
                 continue;
             },
         };
-        if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
+        let Some(row) = row else { continue };
+        let proof_verified = row.proof_verified.unwrap_or(0.0) != 0.0;
+        if let Some(bytes) = row.beef.and_then(|h| decode_beef_hex(&h)) {
             if let Some(raw_hex) = crate::logic::extract_raw_tx_hex(&bytes, txid_lc) {
-                let height = crate::results::beef_block_height(&bytes, txid_lc);
+                let height =
+                    crate::results::verified_beef_block_height(&bytes, txid_lc, proof_verified);
                 return (Some(raw_hex), height);
             }
         }
@@ -1674,4 +1754,65 @@ pub fn health(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
 /// Catch-all: JSON 404 for any unknown route/method.
 pub fn not_found(req: Request, _ctx: RouteContext<()>) -> Result<Response> {
     json_error(&format!("no such route: {}", req.path()), 404)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bsv-low#304: the SHIPPED trusted-BEEF reads (`/tx-any` index leg +
+    /// `/beef`) on the PRODUCTION schema — both tables' verified latches
+    /// surface under the shared `proofVerified` alias, and the latch is the
+    /// one the verifying writers own: a raw admit-shaped insert leaves it 0
+    /// (the fake-bumped case answers untrusted), the verified flip turns
+    /// it 1. Executes the exact production strings under real SQLite.
+    #[test]
+    fn trusted_beef_reads_surface_the_verified_latch_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        // A fake-bumped pot row as the ungated admit paths leave it:
+        // structural has_proof = 1, verified latch DEFAULT 0.
+        conn.execute(
+            "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof) VALUES ('pot1', x'beef', 1, 1)",
+            [],
+        )
+        .unwrap();
+        // A transactions row as the untrusted admit path writes it
+        // (has_proof forced 0 — d1_storage::insert_output).
+        conn.execute(
+            "INSERT INTO transactions (txid, beef, has_proof) VALUES ('tx1', x'beef', 0)",
+            [],
+        )
+        .unwrap();
+
+        let read = |sql: &str, txid: &str| -> (Option<String>, Option<i64>) {
+            conn.query_row(sql, rusqlite::params![txid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+
+        // Both rows answer UNTRUSTED — the pot row's STRUCTURAL has_proof=1
+        // does not leak through (the #304 hole: the old read had no flag at
+        // all and served the bump height regardless).
+        let (beef, verified) = read(POT_BEEFS_TRUST_SQL, "pot1");
+        assert_eq!(beef.as_deref(), Some("BEEF"));
+        assert_eq!(verified, Some(0), "structural has_proof must NOT read as trust");
+        let (_, verified) = read(TRANSACTIONS_TRUST_SQL, "tx1");
+        assert_eq!(verified, Some(0));
+
+        // The verifying writers latch — the same reads now answer trusted.
+        conn.execute("UPDATE pot_beefs SET proof_verified = 1 WHERE txid = 'pot1'", [])
+            .unwrap();
+        conn.execute("UPDATE transactions SET has_proof = 1 WHERE txid = 'tx1'", [])
+            .unwrap();
+        assert_eq!(read(POT_BEEFS_TRUST_SQL, "pot1").1, Some(1));
+        assert_eq!(read(TRANSACTIONS_TRUST_SQL, "tx1").1, Some(1));
+    }
 }
