@@ -170,13 +170,17 @@ impl ChainProofFetcher {
     /// Run the courier ladder for `txid` and return the FIRST verified BUMP hex,
     /// or `None` if no courier yields a bump that verifies against chaintracks
     /// (unmined, or an unverifiable/forged proof — both fail-closed to `None`).
-    async fn fetch_verified_proof(&self, txid: &str) -> Option<String> {
+    /// The courier ladder. `Err` = a chaintracks READ FAULT while verifying a
+    /// candidate bump (bsv-low#304 gate M-5 — one failing header read will
+    /// fail for every rung, so it propagates immediately as retryable);
+    /// courier fetch failures stay `Ok(None)`-shaped (honest unknown).
+    async fn fetch_verified_proof(&self, txid: &str) -> Result<Option<String>, String> {
         let tracker = self.tracker.as_deref();
 
         // 1. Arcade — our own broadcaster's free BUMP (MINED status merklePath).
         if let Some(bump_hex) = self.arcade_merklepath(txid).await {
-            if verify_bump(tracker, &bump_hex, txid).await {
-                return Some(bump_hex);
+            if verify_bump_detailed(tracker, &bump_hex, txid).await? {
+                return Ok(Some(bump_hex));
             }
             worker::console_log!("[proof] arcade bump for {txid} FAILED chaintracks verify");
         }
@@ -184,8 +188,8 @@ impl ChainProofFetcher {
         // 2. Bitails TSC (secondary — tx mined outside Arcade).
         match self.bitails_tsc_bump(txid).await {
             Some(bump_hex) => {
-                if verify_bump(tracker, &bump_hex, txid).await {
-                    return Some(bump_hex);
+                if verify_bump_detailed(tracker, &bump_hex, txid).await? {
+                    return Ok(Some(bump_hex));
                 }
                 worker::console_log!("[proof] bitails bump for {txid} FAILED chaintracks verify");
             }
@@ -197,13 +201,13 @@ impl ChainProofFetcher {
 
         // 3. WoC TSC (BREAK-GLASS, last resort — WoC 429s on the free tier).
         if let Some(bump_hex) = self.woc_tsc_bump(txid).await {
-            if verify_bump(tracker, &bump_hex, txid).await {
-                return Some(bump_hex);
+            if verify_bump_detailed(tracker, &bump_hex, txid).await? {
+                return Ok(Some(bump_hex));
             }
             worker::console_log!("[proof] woc bump for {txid} FAILED chaintracks verify");
         }
 
-        None
+        Ok(None)
     }
 
     /// Arcade `GET /tx/{txid}` → the BUMP hex when the tx is MINED and a
@@ -356,7 +360,9 @@ impl AncestorFetcher for ChainProofFetcher {
 
         // Proof: courier ladder + chaintracks verify. Unmined / unverifiable at
         // every tier → `None` (retry next tick), NEVER an error.
-        let proof = self.fetch_verified_proof(txid).await;
+        // The ancestor path never needs the fault distinction — a proof-read
+        // fault degrades to "no proof" (the raw alone is still the answer).
+        let proof = self.fetch_verified_proof(txid).await.unwrap_or(None);
         Ok(FetchedAncestor { raw_tx, proof })
     }
 
@@ -367,12 +373,20 @@ impl AncestorFetcher for ChainProofFetcher {
     /// like [`Self::fetch_ancestor`]. Fail-closed: budget-exhausted / unmined /
     /// unverifiable → `None`.
     async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+        self.verified_proof_for_detailed(txid).await.unwrap_or(None)
+    }
+
+    async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
         let remaining = self.budget.get();
         if remaining == 0 {
-            worker::console_log!(
+            // push_log, not console_log (bsv-low#304 gate LOW-3 residual):
+            // native tests exercise the zero-budget path (the admin bulk
+            // re-verify's chaintracks-only property). A budget refusal is a
+            // DELIBERATE local bound, not a read fault → Ok(None).
+            push_log(&format!(
                 "[proof] per-tick budget exhausted (skipping proof for {txid}; retried next tick)"
-            );
-            return None;
+            ));
+            return Ok(None);
         }
         self.budget.set(remaining - 1);
         self.fetch_verified_proof(txid).await
@@ -401,21 +415,38 @@ pub(crate) async fn verify_bump(
     bump_hex: &str,
     txid: &str,
 ) -> bool {
+    verify_bump_detailed(tracker, bump_hex, txid)
+        .await
+        .unwrap_or(false)
+}
+
+/// [`verify_bump`] with the chaintracks READ FAULT kept distinguishable
+/// (bsv-low#304 gate M-5): `Err` = the header-source read itself failed
+/// (transport / a starved subrequest at the tick's wall) — retryable and NOT
+/// a chain verdict; `Ok(false)` = a definitive local/chain "no" (no tracker
+/// configured, malformed bump, root mismatch). Collapsing the two made a
+/// subrequest-wall starvation of the money-relevant spend-confirmation
+/// chaser silent. Same fail-closed net: every non-`Ok(true)` refuses.
+pub(crate) async fn verify_bump_detailed(
+    tracker: Option<&dyn ChainTracker>,
+    bump_hex: &str,
+    txid: &str,
+) -> Result<bool, String> {
     let Some(tracker) = tracker else {
-        return false; // No header source → nothing is a proven fact.
+        return Ok(false); // No header source → nothing is a proven fact.
     };
     let bump = match MerklePath::from_hex(bump_hex) {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
     let root = match bump.compute_root(Some(txid)) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
-    matches!(
-        tracker.is_valid_root_for_height(&root, bump.block_height).await,
-        Ok(true)
-    )
+    tracker
+        .is_valid_root_for_height(&root, bump.block_height)
+        .await
+        .map_err(|e| format!("chaintracks read failed for {txid}@{}: {e}", bump.block_height))
 }
 
 /// Extract a ready BUMP hex from an Arcade `GET /tx/{txid}` status body: present
@@ -664,6 +695,33 @@ pub async fn complete_pot_beef_proofs(
     summary
 }
 
+/// Run the two LOW pot-store maintenance passes in their LOAD-BEARING ORDER
+/// (bsv-low#304 gate M-5): the #186 spend-confirmation chaser FIRST, the
+/// pot-beef proof/bulk-drain pass SECOND.
+///
+/// The chaser is the independent CREDIT ANCHOR — small (≤ ~20 budgeted
+/// candidates) and money-relevant — while the pot-beef pass is a bulk drain
+/// (≤ [`POT_PROOF_PASS_LIMIT`] chaintracks reads). If the drain ran first
+/// and the invocation hit its subrequest wall, the chaser's chaintracks
+/// reads would starve — and a starved read fail-closes shaped like "not
+/// mined yet" (now surfaced via `tracker_faults`, but still a credit
+/// delay). BOTH entry points (the scheduled tick and
+/// `/admin/complete-proofs`) call THIS function, so the order cannot drift
+/// apart. Each pass keeps its own fetcher (own budget cell).
+pub async fn run_pot_maintenance(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    spend_fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    spend_limit: u64,
+    pot_fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    pot_limit: u64,
+    min_age_secs: u64,
+) -> (SpendConfirmSummary, PotProofSummary) {
+    let spend =
+        complete_spend_confirmations(pot_storage, spend_fetcher, spend_limit, min_age_secs).await;
+    let pot = complete_pot_beef_proofs(pot_storage, pot_fetcher, pot_limit, min_age_secs).await;
+    (spend, pot)
+}
+
 /// Stitch a VERIFIED `bump_hex` into a stored pot BEEF for `txid`, trim the now
 /// proven ancestry, and return the compacted BEEF bytes — or `None` on any
 /// parse/serialize failure (fail-closed; the caller retries). The result is
@@ -720,6 +778,12 @@ pub struct SpendConfirmSummary {
     /// is likewise not separately observable); such candidates are counted
     /// under `still_unconfirmed`. Kept for shape parity + future use.
     pub fetch_failed: usize,
+    /// bsv-low#304 gate M-5: proof/header READ FAULTS
+    /// (`verified_proof_for_detailed` → `Err`, e.g. a chaintracks call
+    /// starved at the invocation's subrequest wall) — retried next tick,
+    /// counted SEPARATELY from `still_unconfirmed` so a starved tick is
+    /// visible instead of masquerading as "not mined yet".
+    pub tracker_faults: usize,
     /// OBSERVABILITY ONLY (bounded to 5): the spending txids actually sampled
     /// this tick. Lets an operator check the candidates against a block explorer
     /// to tell "the chaser is broken" from "this backlog is genuinely
@@ -766,7 +830,7 @@ pub async fn complete_spend_confirmations(
     let candidates = match pot_storage.find_spent_unconfirmed(limit, min_age_secs).await {
         Ok(c) => c,
         Err(e) => {
-            worker::console_log!("[spend-confirm] candidate scan failed: {e}");
+            push_log(&format!("[spend-confirm] candidate scan failed: {e}"));
             return summary;
         }
     };
@@ -783,10 +847,20 @@ pub async fn complete_spend_confirmations(
 
         // PROOF-ONLY fetch + chaintracks-verify: the fetcher returns a bump
         // ONLY once its root is verified against our PoW-anchored header source;
-        // unmined / unverifiable / budget-exhausted → `None` (retry), never a
-        // positive.
-        match fetcher.verified_proof_for(spending_txid).await {
-            Some(bump_hex) => {
+        // unmined / unverifiable / budget-exhausted → `Ok(None)` (retry),
+        // never a positive. A READ FAULT (`Err` — chaintracks/transport,
+        // incl. a starved subrequest at the tick's wall) is surfaced +
+        // counted separately (bsv-low#304 gate M-5): this pass is the
+        // independent CREDIT ANCHOR, and a silent starvation here would be
+        // indistinguishable from "chain says not yet".
+        match fetcher.verified_proof_for_detailed(spending_txid).await {
+            Err(e) => {
+                summary.tracker_faults += 1;
+                push_log(&format!(
+                    "[spend-confirm] {spending_txid} proof/header READ FAULT (subrequest wall?) — retrying, NOT a chain verdict: {e}"
+                ));
+            }
+            Ok(Some(bump_hex)) => {
                 // UPGRADE: latch spentConfirmed = 1. mark_spent(confirmed=true)
                 // always writes and never downgrades a confirmed row.
                 //
@@ -809,12 +883,12 @@ pub async fn complete_spend_confirmations(
                     )
                     .await
                 {
-                    worker::console_log!("[spend-confirm] {} mark_spent failed: {e}", rec.txid);
+                    push_log(&format!("[spend-confirm] {} mark_spent failed: {e}", rec.txid));
                 } else {
                     summary.confirmed += 1;
                 }
             }
-            None => {
+            Ok(None) => {
                 summary.still_unconfirmed += 1;
             }
         }
@@ -1937,6 +2011,157 @@ mod tests {
         );
         assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
         assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+    }
+
+    // ── bsv-low#304 gate M-5: order + starvation visibility ──────────────
+
+    /// A fetcher pair model of the invocation's SUBREQUEST WALL: a shared
+    /// allowance every chaintracks-ish op consumes; at 0 further reads
+    /// FAULT (detailed) / fail closed (bool), exactly like a starved tick.
+    struct StarvingFetcher {
+        allowance: std::rc::Rc<std::cell::Cell<u32>>,
+        bump_for: std::collections::HashMap<String, String>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for StarvingFetcher {
+        async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+            Err(GASPError::NodeNotFound(format!("mock: no ancestor for {txid}")))
+        }
+        async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+            self.verified_proof_for_detailed(txid).await.unwrap_or(None)
+        }
+        async fn verified_proof_for_detailed(
+            &self,
+            txid: &str,
+        ) -> Result<Option<String>, String> {
+            if self.allowance.get() == 0 {
+                return Err("chaintracks read starved at the subrequest wall".into());
+            }
+            self.allowance.set(self.allowance.get() - 1);
+            Ok(self.bump_for.get(txid).cloned())
+        }
+        async fn verify_proof(&self, _txid: &str, _bump_hex: &str) -> bool {
+            if self.allowance.get() == 0 {
+                return false; // starved read fail-closes (the silent shape M-5 surfaces)
+            }
+            self.allowance.set(self.allowance.get() - 1);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn credit_anchor_chaser_runs_before_the_bulk_drain() {
+        // bsv-low#304 gate M-5(a): with an op allowance of EXACTLY ONE, the
+        // shipped order must spend it on the #186 spend-confirmation chaser
+        // (the credit anchor) — the pot-beef bulk drain starves instead.
+        // RED-form: swap the order inside run_pot_maintenance and the drain
+        // eats the allowance, the anchor faults, and `confirmed` stays 0.
+        let store = MemoryPotStorage::new();
+        store
+            .store_record(&spent_unconfirmed("potA", SETTLE_A))
+            .await
+            .unwrap();
+        for salt in 0..5u32 {
+            let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, salt);
+            store.store_beef(&txid, &beef).await.unwrap();
+        }
+
+        let allowance = std::rc::Rc::new(std::cell::Cell::new(1u32));
+        let spend_fetcher = StarvingFetcher {
+            allowance: allowance.clone(),
+            bump_for: std::collections::HashMap::from([(
+                SETTLE_A.to_string(),
+                single_tx_bump(SETTLE_A, HEIGHT).to_hex(),
+            )]),
+        };
+        let pot_fetcher = StarvingFetcher {
+            allowance: allowance.clone(),
+            bump_for: std::collections::HashMap::new(),
+        };
+
+        let (spend, pot) = run_pot_maintenance(
+            &store,
+            &spend_fetcher,
+            20,
+            &pot_fetcher,
+            POT_PROOF_PASS_LIMIT,
+            0,
+        )
+        .await;
+
+        assert_eq!(spend.confirmed, 1, "the credit anchor ran FIRST and landed");
+        assert_eq!(spend.tracker_faults, 0);
+        assert!(
+            store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed,
+            "spentConfirmed latched by the anchor"
+        );
+        // The bulk drain hit the wall AFTER the anchor: nothing latched,
+        // every row honestly still a candidate.
+        assert_eq!(pot.already_proven, 0);
+        assert_eq!(pot.still_unconfirmed, 5);
+        assert_eq!(
+            store.find_pot_beefs_for_proof_check(100, 0).await.unwrap().len(),
+            5,
+            "starved drain latches nothing (fail-safe, retried next tick)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_starved_chaser_read_is_a_counted_tracker_fault_not_a_chain_verdict() {
+        // bsv-low#304 gate M-5(b): a chaintracks/proof READ FAULT is counted
+        // under tracker_faults — DISTINGUISHABLE from still_unconfirmed
+        // ("chain says not yet"), so a subrequest-wall starvation is visible.
+        let store = MemoryPotStorage::new();
+        store
+            .store_record(&spent_unconfirmed("potA", SETTLE_A))
+            .await
+            .unwrap();
+        let starved = StarvingFetcher {
+            allowance: std::rc::Rc::new(std::cell::Cell::new(0)),
+            bump_for: std::collections::HashMap::new(),
+        };
+        let s = complete_spend_confirmations(&store, &starved, 20, 0).await;
+        assert_eq!(s.tracker_faults, 1, "the fault is counted separately");
+        assert_eq!(s.still_unconfirmed, 0, "a read fault is NOT 'not mined yet'");
+        assert_eq!(s.confirmed, 0);
+        assert!(
+            !store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed,
+            "nothing latched on a fault (fail-closed)"
+        );
+    }
+
+    // ── bsv-low#304 gate LOW-3 residual: the REAL fetcher at budget 0 ─────
+
+    #[tokio::test]
+    async fn bulk_reverify_is_chaintracks_only_with_the_real_fetcher() {
+        // The admin drain's exact configuration: the PRODUCTION
+        // ChainProofFetcher with budget 0 — the fast path chaintracks-verifies
+        // stored bumps (latching genuine ones), and the courier path REFUSES
+        // at zero budget (push_log, natively safe — the residual swap this
+        // test exists to pin). A MockChainTracker vouches for the bumped
+        // row's root; the proofless row can only go the (refused) courier way.
+        let store = MemoryPotStorage::new();
+        let (bumped, txid_bumped) = structurally_bumped_pot_beef(HEIGHT, 1);
+        store.store_beef(&txid_bumped, &bumped).await.unwrap();
+        let (proofless, txid_proofless) = proofless_pot_beef();
+        assert_ne!(txid_bumped, txid_proofless);
+        store.store_beef(&txid_proofless, &proofless).await.unwrap();
+
+        let mut tracker = MockChainTracker::new(HEIGHT + 6);
+        tracker.add_root(HEIGHT, txid_bumped.clone());
+        let fetcher = ChainProofFetcher::new(Some(std::rc::Rc::new(tracker))).with_budget(0);
+
+        let pass =
+            complete_pot_beef_proofs(&store, &fetcher, ADMIN_REVERIFY_MAX_LIMIT, 0).await;
+        assert_eq!(pass.scanned, 2);
+        assert_eq!(pass.already_proven, 1, "real chaintracks re-verify latches the bumped row");
+        assert_eq!(
+            pass.still_unconfirmed, 1,
+            "the proofless row is REFUSED at zero courier budget — chaintracks-only"
+        );
+        assert!(store.pot_beef_proof_verified(&txid_bumped).await.unwrap());
+        assert!(!store.pot_beef_proof_verified(&txid_proofless).await.unwrap());
     }
 
     // ── bsv-low#304 gate M-2: the backlog drains in one wide pass ────────

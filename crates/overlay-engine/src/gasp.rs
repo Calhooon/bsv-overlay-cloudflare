@@ -249,6 +249,19 @@ pub trait AncestorFetcher {
         self.fetch_ancestor(txid).await.ok().and_then(|a| a.proof)
     }
 
+    /// Like [`Self::verified_proof_for`], but a TRANSPORT/READ FAULT stays
+    /// distinguishable (bsv-low#304 gate M-5): `Err` = the proof source or
+    /// header source READ failed (e.g. a chaintracks call starved at the
+    /// invocation's subrequest wall) — retryable, NOT a chain verdict;
+    /// `Ok(None)` = honestly no verified proof yet. Money-relevant callers
+    /// (the spend-confirmation chaser) surface + count the fault so a
+    /// starved tick is visible instead of masquerading as "not mined yet".
+    /// Default: wrap `verified_proof_for` (which never faults) — existing
+    /// fetchers keep their semantics unchanged.
+    async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
+        Ok(self.verified_proof_for(txid).await)
+    }
+
     /// Verify that `bump_hex` is a chaintracks-valid merkle proof for `txid`.
     ///
     /// Used by proof completion to re-check a STORED structural bump before
