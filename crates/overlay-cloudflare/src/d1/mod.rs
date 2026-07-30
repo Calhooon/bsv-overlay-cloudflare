@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 89;
+pub const OVERLAY_MIGRATION_COUNT: usize = 90;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -820,6 +820,21 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // column stays and NULL here falls back to it at read time. Additive
     // ALTER — the runner ignores the re-run "duplicate column" error.
     "ALTER TABLE proof_markers ADD COLUMN bundleB64 TEXT",
+    // ── bsv-low#302: GASP peer health (dead-peer quarantine) ─────────────
+    // One row per (host, topic) sync pairing the engine has ever attempted.
+    // `consecutive_failures` resets to 0 on any successful sync; a timeout
+    // or error increments it. `last_attempt` (unixepoch secs) ages the
+    // re-probe window — quarantine-SKIPPED ticks do NOT touch the row (a
+    // skip is not an attempt), so the window always re-opens. Rows are
+    // NEVER deleted: quarantine is a skip-with-re-probe, not a removal.
+    "CREATE TABLE IF NOT EXISTS gasp_peer_health (
+        host TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_attempt INTEGER,
+        last_success INTEGER,
+        PRIMARY KEY (host, topic)
+    )",
 ];
 
 // =============================================================================

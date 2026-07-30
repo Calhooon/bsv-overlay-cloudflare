@@ -827,6 +827,21 @@ fn build_engine_with_storage(
     // Enable GASP sync with HTTP-based peer communication
     engine.set_gasp_remote_factory(Box::new(crate::gasp_remote::WorkerGASPRemoteFactory));
 
+    // bsv-low#302: per-peer GASP sync budget. The #257 fix bounds the whole
+    // cron STEP at GASP_SYNC_BUDGET_MS, but ONE dead ephemeral peer (ngrok
+    // tunnel / dead host imported via SHIP ads) could still burn the entire
+    // step budget because the per-peer fetch had no timeout. Each peer now
+    // gets its own slice; a peer exceeding it is dropped loudly, recorded
+    // as a failed sync (feeding the quarantine), and the loop continues —
+    // so one dead peer costs 30 s, not the tick. Applies to the cron AND
+    // /admin/startGASPSync (same engine builder).
+    engine.set_peer_sync_budget(
+        std::rc::Rc::new(|ms| {
+            Box::pin(crate::broadcaster::sleep_ms(ms)) as overlay_engine::engine::SleepFuture
+        }),
+        GASP_PEER_SYNC_BUDGET_MS,
+    );
+
     // Chain-backed proof fetcher (#192/#193): the courier ladder
     // (Arcade→WoC→Bitails) with a MANDATORY chaintracks re-verify before any
     // BUMP is returned. This is the proof source the cron's
@@ -852,25 +867,10 @@ fn build_engine_with_storage(
 /// PURE (bsv-low#257): race `fut` against `deadline`; `None` = the deadline
 /// won and `fut` was DROPPED (its in-flight work cancelled). Injectable
 /// deadline so the control flow is natively unit-tested; the scheduled
-/// handler passes `broadcaster::sleep_ms`.
-async fn race_or_deadline<F, D, T>(fut: F, deadline: D) -> Option<T>
-where
-    F: std::future::Future<Output = T>,
-    D: std::future::Future<Output = ()>,
-{
-    let mut fut = std::pin::pin!(fut);
-    let mut deadline = std::pin::pin!(deadline);
-    std::future::poll_fn(move |cx| {
-        if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Some(v));
-        }
-        if deadline.as_mut().poll(cx).is_ready() {
-            return std::task::Poll::Ready(None);
-        }
-        std::task::Poll::Pending
-    })
-    .await
-}
+/// handler passes `broadcaster::sleep_ms`. Generalized into the engine
+/// crate for bsv-low#302 (the per-peer GASP budget reuses it) — this is
+/// the same function, re-exported to keep every existing call site.
+use overlay_engine::gasp::race_or_deadline;
 
 /// Per-step wall-clock budgets for the `*/15` scheduled tick (bsv-low#257).
 ///
@@ -898,6 +898,12 @@ where
 const GASP_SYNC_BUDGET_MS: u64 = 240_000;
 const PEER_CRAWL_BUDGET_MS: u64 = 120_000;
 const JANITOR_BUDGET_MS: u64 = 180_000;
+
+/// bsv-low#302: wall-clock slice ONE GASP peer's sync may consume. 30 s is
+/// generous for a healthy peer (a page fetch is seconds) while letting the
+/// 240 s step survive several dead peers AND still reach live ones; the
+/// step-level GASP_SYNC_BUDGET_MS stays as the outer belt.
+const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
 
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {

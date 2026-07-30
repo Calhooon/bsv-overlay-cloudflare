@@ -88,6 +88,39 @@ struct SyncStateRow {
     since: f64,
 }
 
+/// Row from `gasp_peer_health` (bsv-low#302): the failure streak plus the
+/// AGE of the last attempt (computed in SQL so the engine needs no clock).
+#[derive(Deserialize)]
+struct PeerHealthRow {
+    consecutive_failures: f64,
+    /// `unixepoch() - last_attempt`; NULL when `last_attempt` is NULL
+    /// (defensive — the upsert always stamps it).
+    #[serde(rename = "secsSince")]
+    secs_since: Option<f64>,
+}
+
+/// The SHIPPED upsert behind `record_peer_sync_outcome` (bsv-low#302) —
+/// a const so the real-SQLite test executes the production string. Binds:
+/// `?1` host, `?2` topic, `?3` success (1/0). Success resets the streak and
+/// stamps `last_success`; failure increments the streak. `last_attempt` is
+/// stamped either way (the re-probe window ages from here). The backend owns
+/// the clock (`unixepoch()`), matching the engine contract.
+pub(crate) const PEER_HEALTH_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
+     (host, topic, consecutive_failures, last_attempt, last_success) \
+     VALUES (?1, ?2, CASE WHEN ?3 THEN 0 ELSE 1 END, unixepoch(), \
+             CASE WHEN ?3 THEN unixepoch() ELSE NULL END) \
+     ON CONFLICT(host, topic) DO UPDATE SET \
+       consecutive_failures = CASE WHEN ?3 THEN 0 ELSE consecutive_failures + 1 END, \
+       last_attempt = unixepoch(), \
+       last_success = CASE WHEN ?3 THEN unixepoch() ELSE last_success END";
+
+/// The SHIPPED health read (bsv-low#302). Age is computed relative in SQL
+/// (`unixepoch() - last_attempt`) so wasm and the rusqlite test agree on
+/// semantics without any host clock in the engine.
+pub(crate) const PEER_HEALTH_SELECT_SQL: &str = "SELECT consecutive_failures, \
+            (unixepoch() - last_attempt) AS secsSince \
+     FROM gasp_peer_health WHERE host = ?1 AND topic = ?2";
+
 /// Row for proof-completion scanning: a stored transaction's txid + its BEEF
 /// read back as hex (`hex(beef) AS beef`, the same idiom as `OutputRow::beef`).
 #[derive(Deserialize)]
@@ -621,6 +654,40 @@ impl Storage for D1Storage {
         Ok(row.map_or(0, |r| r.since as u64))
     }
 
+    async fn record_peer_sync_outcome(
+        &self,
+        host: &str,
+        topic: &str,
+        success: bool,
+    ) -> Result<(), StorageError> {
+        Query::new(PEER_HEALTH_UPSERT_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(success)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn get_peer_sync_health(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<overlay_engine::storage::PeerSyncHealth, StorageError> {
+        let row: Option<PeerHealthRow> = Query::new(PEER_HEALTH_SELECT_SQL)
+            .bind(host)
+            .bind(topic)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(row
+            .map(|r| overlay_engine::storage::PeerSyncHealth {
+                consecutive_failures: r.consecutive_failures.max(0.0) as u64,
+                secs_since_last_attempt: r.secs_since.map(|s| s.max(0.0) as u64),
+            })
+            .unwrap_or_default())
+    }
+
     async fn find_transactions_for_proof_check(
         &self,
         limit: u64,
@@ -725,6 +792,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(all_proofless, 4, "nothing was deleted or proven by aging out");
+    }
+
+    /// bsv-low#302: the SHIPPED peer-health upsert + select on the
+    /// production schema — failure streaks accumulate, one success resets
+    /// to 0, and the select's relative age answers 0-ish for a fresh
+    /// attempt. Executes the exact production strings (a transcribed copy
+    /// could drift out from under the engine's quarantine rule).
+    #[test]
+    fn peer_health_upsert_and_select_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let record = |host: &str, success: bool| {
+            conn.execute(
+                PEER_HEALTH_UPSERT_SQL,
+                rusqlite::params!["https://".to_owned() + host, "tm_test", success],
+            )
+            .unwrap();
+        };
+        let health = |host: &str| -> (i64, Option<i64>) {
+            conn.query_row(
+                PEER_HEALTH_SELECT_SQL,
+                rusqlite::params!["https://".to_owned() + host, "tm_test"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        // Three consecutive failures accumulate.
+        record("dead", false);
+        record("dead", false);
+        record("dead", false);
+        let (fails, age) = health("dead");
+        assert_eq!(fails, 3);
+        assert!(age.is_some_and(|a| (0..5).contains(&a)), "fresh attempt age ≈ 0: {age:?}");
+
+        // One success resets the streak to 0 — full re-admission.
+        record("dead", true);
+        assert_eq!(health("dead").0, 0);
+
+        // …and a later failure starts a NEW streak from 1.
+        record("dead", false);
+        assert_eq!(health("dead").0, 1);
+
+        // Unknown peer: no row — the trait maps that to the pristine
+        // default (never quarantined).
+        let missing: Option<i64> = conn
+            .query_row(
+                PEER_HEALTH_SELECT_SQL,
+                rusqlite::params!["https://never-seen.example.com", "tm_test"],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(missing, None);
     }
 
     #[test]
