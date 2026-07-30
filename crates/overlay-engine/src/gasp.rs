@@ -74,6 +74,21 @@ pub const PEER_QUARANTINE_REPROBE_SECS: u64 = 6 * 3600;
 /// backend without peer-health tracking) is NEVER quarantined, and an old
 /// enough last attempt always re-opens one probe — fail-safe in the
 /// "attempt more, never strand a peer forever" direction.
+///
+/// ACCEPTED RESIDUAL (bsv-low#304 gate M-3, documented — not built): a
+/// peer that ALTERNATES one success into every window of ≤7 failures
+/// resets its streak each time and is never quarantined, burning up to one
+/// per-peer budget slice (30 s) per (host, topic) per tick forever. Why
+/// accepted: (a) the burn is bounded by the per-peer budget times the
+/// configured peer set, all inside the 240 s outer step belt — the #257
+/// unbounded-hang class cannot recur; (b) sustaining it requires the peer
+/// to actually COMPLETE a real sync every few ticks, i.e. behave as a
+/// (slow) live peer — indistinguishable in principle from a genuinely
+/// flaky honest peer, which the rule must never strand; (c) LOW's money
+/// topics do not GASP-sync at all (no `sync_configuration` peers in prod),
+/// so the exposure is cron-budget noise, not a money surface. A
+/// streak-decay or success-ratio rule could narrow it later if a real
+/// abuser appears.
 pub fn peer_sync_quarantined(health: &crate::storage::PeerSyncHealth) -> bool {
     health.consecutive_failures >= PEER_QUARANTINE_THRESHOLD
         && health
