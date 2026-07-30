@@ -582,30 +582,111 @@ fn corroborated_accept_claim(
     }
 }
 
+/// PURE (#268): fold the corroborator's word into a SUBMITTER-ASSERTED
+/// "already mined" claim (`efs` empty — every tx in the BEEF, including the
+/// SUBJECT, carries a bump). The bump is NEVER validated at this layer
+/// (`HistoricalTxNoSpv`), so before #268 this claim admitted with ZERO
+/// network contact: a fake bump on the subject itself made `beef_to_ef_batch`
+/// return no legs and the gate said "already mined — skipping broadcast".
+/// Now the claim must be corroborated against a real provider — the
+/// subject's RAW bytes are re-broadcast (TAAL → GorillaPool): a genuinely
+/// mined tx comes back "already known/mined" (= accept, idempotent); a
+/// still-valid-but-unmined tx gets genuinely network-accepted (which is
+/// exactly the gate's bar); a fabricated claim yields orphan/inconclusive
+/// or a refusal.
+///
+/// - Corroborator ACCEPTED → `Ok(Accepted(subject))` (our subject txid,
+///   never the corroborator's echo — the usual identity discipline).
+/// - Corroborator REJECTED → `Err` → 502, deliberately NOT a 422: one
+///   provider's definitive refusal contradicting the submitter's bump is
+///   still ONE provider's word (#214) — refuse admission, keep it retryable.
+/// - Transport/inconclusive → `Err` → 502. Never admit on the submitter's
+///   unvalidated bump alone — that is the #268 hole itself.
+fn corroborated_mined_claim(
+    corroborator: Result<ArcOutcome, String>,
+    subject_txid: &str,
+) -> Result<ArcOutcome, String> {
+    match corroborator {
+        Ok(ArcOutcome::Accepted(_)) => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        Ok(ArcOutcome::Rejected(r)) => Err(format!(
+            "submitter claims {subject_txid} already mined (bump attached) but the corroborating broadcaster rejected it ({r}) — refusing to admit an unverified mined-claim (#268); not refusing definitively"
+        )),
+        Err(t) => Err(format!(
+            "submitter claims {subject_txid} already mined (bump attached) but the corroborating broadcaster could not confirm it — not admitting on an unvalidated bump (#268): {t}"
+        )),
+    }
+}
+
+/// PURE (bsv-low#268 gate LOW-M): fold the two corroborator hosts' verdicts
+/// under the #214 TWO-PROVIDER bar in BOTH directions. Reached only when
+/// the FIRST host did not accept (an accept short-circuits before this):
+///
+/// - EITHER host's genuine accept → `Accepted` (the network provably has /
+///   took the tx — one real accept marker suffices, as ever);
+/// - BOTH hosts definitively rejected → `Rejected` (a definitive refusal —
+///   which flows to a terminal 422 via `corroborated_exhaustion` — now
+///   requires two independent providers, the same bar #214 demands of a
+///   rejection before it may terminate the ladder; previously ONE host's
+///   460–479/REJECTED settled the corroboration alone);
+/// - anything else (one-sided reject + inconclusive, double inconclusive)
+///   → `Err` — an honest "unavailable" (502, retryable), never a
+///   single-provider refusal.
+fn fold_refuse_bar(
+    first: Result<ArcOutcome, String>,
+    second: Result<ArcOutcome, String>,
+) -> Result<ArcOutcome, String> {
+    match (first, second) {
+        (Ok(ArcOutcome::Accepted(t)), _) | (_, Ok(ArcOutcome::Accepted(t))) => {
+            Ok(ArcOutcome::Accepted(t))
+        }
+        (Ok(ArcOutcome::Rejected(a)), Ok(ArcOutcome::Rejected(b))) => Ok(ArcOutcome::Rejected(
+            format!("both corroborators rejected — taal: {a}; gorillapool: {b}"),
+        )),
+        (Ok(ArcOutcome::Rejected(a)), Err(b)) => Err(format!(
+            "one-provider rejection is not definitive (taal rejected: {a}; gorillapool inconclusive: {b})"
+        )),
+        (Err(a), Ok(ArcOutcome::Rejected(b))) => Err(format!(
+            "one-provider rejection is not definitive (taal inconclusive: {a}; gorillapool rejected: {b})"
+        )),
+        (Err(a), Err(b)) => Err(format!("taal: {a}; gorillapool: {b}")),
+    }
+}
+
 /// Corroborate one tx hex (the subject's EF — ARC accepts Extended Format in
-/// `rawTx`) against TAAL, falling back to GorillaPool when TAAL is transport-
-/// unreachable or inconclusive. A definitive verdict (accept OR reject) from
-/// either host short-circuits. This is a REAL broadcast attempt, not a status
-/// read — deliberately: the corroborator proves network acceptance by the same
-/// means the client's direct-ARC fallback would, and a re-broadcast of an
-/// already-accepted tx is idempotent (already-known = accept).
+/// `rawTx`) against TAAL, then GorillaPool. A genuine ACCEPT from TAAL
+/// short-circuits; every other TAAL answer — INCLUDING a definitive
+/// rejection (bsv-low#268 gate LOW-M) — consults GorillaPool before the
+/// verdict settles, folded under the two-provider refuse bar
+/// ([`fold_refuse_bar`]): a definitive `Rejected` now needs BOTH hosts'
+/// word, exactly as #214 demands before a refusal may become terminal.
+/// This is a REAL broadcast attempt, not a status read — deliberately: the
+/// corroborator proves network acceptance by the same means the client's
+/// direct-ARC fallback would, and a re-broadcast of an already-accepted tx
+/// is idempotent (already-known = accept).
 async fn corroborate_tx_hex(
     taal_api_key: Option<&str>,
     tx_hex: &str,
 ) -> Result<ArcOutcome, String> {
-    let taal_err = match post_arc_raw(WorkerArcBroadcaster::ARC_URL, taal_api_key, tx_hex).await {
-        Ok((status, body)) => match corroborator_verdict(status, &body) {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        },
-        Err(e) => e,
+    let taal = match post_arc_raw(WorkerArcBroadcaster::ARC_URL, taal_api_key, tx_hex).await {
+        Ok((status, body)) => corroborator_verdict(status, &body),
+        Err(e) => Err(e),
     };
-    worker::console_log!("corroborate: TAAL inconclusive ({taal_err}); trying GorillaPool");
-    match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
-        Ok((status, body)) => corroborator_verdict(status, &body)
-            .map_err(|gp_err| format!("taal: {taal_err}; gorillapool: {gp_err}")),
-        Err(gp_err) => Err(format!("taal: {taal_err}; gorillapool: {gp_err}")),
+    if matches!(taal, Ok(ArcOutcome::Accepted(_))) {
+        return taal;
     }
+    worker::console_log!(
+        "corroborate: TAAL did not accept ({}); consulting GorillaPool (two-provider bar)",
+        match &taal {
+            Ok(ArcOutcome::Rejected(r)) => format!("rejected: {r}"),
+            Err(e) => format!("inconclusive: {e}"),
+            Ok(ArcOutcome::Accepted(_)) => unreachable!("accept short-circuits"),
+        }
+    );
+    let gp = match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
+        Ok((status, body)) => corroborator_verdict(status, &body),
+        Err(e) => Err(e),
+    };
+    fold_refuse_bar(taal, gp)
 }
 
 /// PURE (#216): corroborate a subject WITH its ancestry. Feed each ANCESTOR ef
@@ -630,9 +711,20 @@ async fn corroborate_tx_hex(
 /// "only-the-subject-verdict-decides" semantics are unit-tested natively without
 /// the worker runtime.
 ///
-/// - Parents are submitted in ANCESTRY ORDER (the caller's EF batch is already
-///   parents-before-children, subject last — [`beef_to_ef_batch`]); the subject
-///   is SKIPPED in the parent loop and submitted last.
+/// - SUBJECT-FIRST fast path (bsv-low #272): the subject's EF is submitted
+///   FIRST, alone — EF inlines every input's source script + satoshis, so a
+///   HEALTHY corroborator validates it standalone and answers with a real
+///   network-accept in one POST. Only when that first attempt does NOT
+///   accept (inconclusive/transport — the #216 partial-UTXO-view shape — or
+///   a rejection that may be a missing-parent artifact) are the ancestors
+///   primed and the subject retried; the PRIMED attempt's verdict is then
+///   final, which is byte-identical to the pre-#272 always-primed semantics.
+///   This cut the measured JOIN-submit corroboration from N+1 serial POSTs
+///   to 1 on the happy path (the 15–16 s regression that sat ON the tower's
+///   15 s overlay-leg cap).
+/// - Parents are primed in ANCESTRY ORDER (the caller's EF batch is already
+///   parents-before-children, subject last — [`beef_to_ef_batch`]); the
+///   subject is SKIPPED in the parent loop and decided last.
 /// - Per-parent verdicts are IGNORED (a parent already-known / SEEN / even a
 ///   transport blip is fine — the submit only primes the mempool). A parent
 ///   submit NEVER causes an Accept, and a parent submit FAILURE never flips the
@@ -662,7 +754,17 @@ where
         .find(|e| e.txid == subject_txid)
         .ok_or_else(|| format!("subject {subject_txid} not present in EF batch"))?;
 
-    // Prime the corroborator's mempool with each ANCESTOR first — best-effort,
+    // SUBJECT-FIRST (#272): only a genuine ACCEPT short-circuits — the same
+    // strict bar as everywhere ([`corroborator_verdict`]'s SEEN-or-better /
+    // already-known). Anything else (inconclusive, transport, or a rejection
+    // that may be a missing-parent artifact of the corroborator's own view)
+    // falls through to the primed attempt, whose verdict is final.
+    let first = submit_one(hex::encode(&subject_ef.ef)).await;
+    if matches!(first, Ok(ArcOutcome::Accepted(_))) {
+        return first;
+    }
+
+    // Prime the corroborator's mempool with each ANCESTOR — best-effort,
     // verdicts discarded (they only prime). Ancestry order is preserved; the
     // subject is skipped here and decided last.
     for ef in efs {
@@ -672,9 +774,9 @@ where
         let _ = submit_one(hex::encode(&ef.ef)).await;
     }
 
-    // ONLY the subject's verdict decides accept/reject — a primed parent can
-    // never admit on its own (the #192/#193 invariant: admission still requires
-    // a REAL network-accept marker on the SUBJECT).
+    // ONLY the subject's (primed) verdict decides accept/reject — a primed
+    // parent can never admit on its own (the #192/#193 invariant: admission
+    // still requires a REAL network-accept marker on the SUBJECT).
     submit_one(hex::encode(&subject_ef.ef)).await
 }
 
@@ -826,8 +928,9 @@ fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
 
 /// Async sleep via JS `setTimeout` (Cloudflare Workers runtime). Compiles on the
 /// host for unit tests (js-sys is a normal crate); only exercised at runtime on
-/// wasm — the pure classification tests never call it.
-async fn sleep_ms(ms: u64) {
+/// wasm — the pure classification tests never call it. `pub(crate)`: the
+/// scheduled handler's step deadlines (bsv-low#257) race against it.
+pub(crate) async fn sleep_ms(ms: u64) {
     use worker::js_sys;
     use worker::wasm_bindgen::prelude::*;
     use worker::wasm_bindgen::JsCast;
@@ -1158,11 +1261,14 @@ enum SubmitRung {
 }
 
 /// Which corroborating broadcast the ladder requests: the #214 subject-only
-/// leg or the #216 ancestry-primed batch.
+/// leg, the #216 ancestry-primed batch, or the #268 mined-claim probe (the
+/// subject's RAW bytes re-broadcast to a real provider — a genuinely mined
+/// tx answers "already known/mined"; a fake-bumped one cannot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CorroborationKind {
     SubjectOnly,
     WithAncestry,
+    MinedClaim,
 }
 
 /// Gate-flow logging that is safe on the native host: the wiring tests drive
@@ -1192,17 +1298,21 @@ fn gate_log(msg: &str) {
 ///   — anything else fails CLOSED to Err/502, never back to trusting
 ///   Arcade). The wall-clock lands in the `corroborate` Server-Timing
 ///   segment via `ArcadeBroadcaster::corroborate_ms`.
-/// - Single-EF fast path (`efs_len == 1`) — HONEST residual, do not
-///   overstate it: one leg means every parent arrived with a merkle-path
-///   bump ATTACHED in the submitted BEEF (`beef_to_ef_batch` skips a leg on
-///   `has_proof()` PRESENCE — the bump is NOT SPV-validated at this layer,
-///   `HistoricalTxNoSpv`), i.e. "parents are mined" here is a
-///   SUBMITTER-ASSERTED signal, not a verified fact. A degraded-Arcade
-///   false-SEEN therefore still admits on this arm, and a submitter can
-///   reach it deliberately by attaching bumps. Accepted as a latency
-///   trade-off for the common genuinely-proven-parent submit; the residual
-///   is tracked as bsv-low#268 (validate the bumps / corroborate here too)
-///   — do NOT treat this arm as sound against an adversarial submitter.
+/// - Single-EF subject (`efs_len == 1`) — SUBJECT-ONLY corroborate-on-accept
+///   (bsv-low#268, closing the #267 review's residual). One leg means every
+///   parent arrived with a merkle-path bump ATTACHED in the submitted BEEF
+///   (`beef_to_ef_batch` skips a leg on `has_proof()` PRESENCE — the bump is
+///   NOT SPV-validated at this layer, `HistoricalTxNoSpv`), i.e. "parents
+///   are mined" is a SUBMITTER-ASSERTED signal, not a verified fact: a
+///   fabricated parent bump used to make an unproven subject look single-EF
+///   and ride the uncorroborated fast path (needing only a degraded/false-
+///   SEEN Arcade — the proven-to-occur #267 condition). The fast path is
+///   REMOVED: the accept claim is corroborated subject-only (the EF inlines
+///   every input's source script + satoshis, so a healthy second broadcaster
+///   can validate it standalone; ~1 corroborator POST on the happy path).
+///   Fail direction unchanged: anything but the corroborator's genuine
+///   accept refuses admission (Err → 502, the client retries) — never
+///   admit-on-unknown, never a single-provider 422.
 async fn gate_accept_claim_with<C, CFut>(
     outcome: ArcOutcome,
     efs_len: usize,
@@ -1215,13 +1325,17 @@ where
 {
     match outcome {
         ArcOutcome::Rejected(_) => Ok(outcome),
-        ArcOutcome::Accepted(_) if !has_unproven_ancestry(efs_len) => Ok(outcome),
         ArcOutcome::Accepted(_) => {
+            let kind = if has_unproven_ancestry(efs_len) {
+                CorroborationKind::WithAncestry
+            } else {
+                CorroborationKind::SubjectOnly
+            };
             gate_log(&format!(
-                "[arcade] {subject_txid} accept claim with {} unproven ancestor(s) — corroborating before admit (#267)",
-                efs_len - 1
+                "[arcade] {subject_txid} accept claim ({} unproven ancestor(s)) — corroborating before admit (#267/#268, {kind:?})",
+                efs_len.saturating_sub(1)
             ));
-            let corroborated = corroborate(CorroborationKind::WithAncestry).await;
+            let corroborated = corroborate(kind).await;
             corroborated_accept_claim(corroborated, subject_txid)
         }
     }
@@ -1254,6 +1368,21 @@ where
     C: FnMut(CorroborationKind) -> CFut,
     CFut: std::future::Future<Output = Result<ArcOutcome, String>>,
 {
+    // #268: an EMPTY EF batch is the submitter's claim that EVERYTHING —
+    // including the SUBJECT — is already mined (bump attached, NEVER
+    // validated at this layer). It used to admit with ZERO network contact
+    // ("already mined — skipping broadcast"); now the claim must be
+    // corroborated against a real provider, and anything but the
+    // corroborator's genuine accept refuses admission (Err → 502, the
+    // client retries — never admit-on-unknown).
+    if efs_len == 0 {
+        gate_log(&format!(
+            "[arcade] {subject_txid} all-proven BEEF (submitter-asserted mined) — corroborating the claim before admit (#268)"
+        ));
+        let corroborated = corroborate(CorroborationKind::MinedClaim).await;
+        return corroborated_mined_claim(corroborated, subject_txid);
+    }
+
     // #267: set when an ORPHAN view routes us straight to the ancestry
     // rungs (attempt 3 + the ancestry-primed exhaustion corroboration) —
     // the remaining subject-only rungs cannot supply the missing parents.
@@ -1432,6 +1561,11 @@ pub struct ArcadeBroadcaster {
     /// smeared into `arcade-broadcast`). `Cell`: the worker isolate is
     /// single-threaded and every async path here is `?Send`.
     corroborate_ms: std::cell::Cell<f64>,
+    /// Wall-clock spent inside the SEEN-gate poll loop (`poll_for_status`),
+    /// for the `arcade-poll` Server-Timing segment (bsv-low #272 — the
+    /// 15–16 s JOIN-submit budget must be attributable per slice: submit
+    /// POSTs vs poll waits vs corroboration).
+    poll_ms: std::cell::Cell<f64>,
 }
 
 impl ArcadeBroadcaster {
@@ -1448,6 +1582,7 @@ impl ArcadeBroadcaster {
             callback_url: None,
             corroborator_taal_key: None,
             corroborate_ms: std::cell::Cell::new(0.0),
+            poll_ms: std::cell::Cell::new(0.0),
         }
     }
 
@@ -1480,6 +1615,14 @@ impl ArcadeBroadcaster {
         self.corroborate_ms.get()
     }
 
+    /// Milliseconds ACCUMULATED inside the SEEN-gate poll loop across this
+    /// broadcaster instance (bsv-low #272 — read per request in routes.rs
+    /// as the `arcade-poll` Server-Timing segment; the remainder of
+    /// `arcade-broadcast` is then submit-POST wall-clock).
+    pub fn poll_wait_ms(&self) -> f64 {
+        self.poll_ms.get()
+    }
+
     /// Run the #214 corroborating broadcast for the subject's EF hex,
     /// accounting its wall-clock into [`Self::corroborate_ms`].
     async fn corroborate_subject(&self, subject_ef: &EfTx) -> Result<ArcOutcome, String> {
@@ -1487,6 +1630,25 @@ impl ArcadeBroadcaster {
         let res = corroborate_tx_hex(
             self.corroborator_taal_key.as_deref(),
             &hex::encode(&subject_ef.ef),
+        )
+        .await;
+        self.corroborate_ms
+            .set(self.corroborate_ms.get() + (worker::js_sys::Date::now() - started));
+        res
+    }
+
+    /// Run the #268 mined-claim corroborating broadcast: the subject's RAW
+    /// bytes (its EF does not exist — the submitter attached a bump, so
+    /// `beef_to_ef_batch` skipped it) re-broadcast to TAAL → GorillaPool. A
+    /// genuinely mined tx is answered "already known/mined" by any honest
+    /// provider (raw suffices — its parents are on-chain); a fake-bumped
+    /// unmined tx yields orphan/missing-input inconclusive or a refusal.
+    /// Wall-clock accounted into [`Self::corroborate_ms`].
+    async fn corroborate_mined_raw(&self, subject_raw: &[u8]) -> Result<ArcOutcome, String> {
+        let started = worker::js_sys::Date::now();
+        let res = corroborate_tx_hex(
+            self.corroborator_taal_key.as_deref(),
+            &hex::encode(subject_raw),
         )
         .await;
         self.corroborate_ms
@@ -1542,7 +1704,15 @@ impl ArcadeBroadcaster {
         let beef_bytes = hex::decode(beef_hex.trim()).map_err(|e| format!("BEEF hex: {e}"))?;
         let (efs, subject_txid) =
             beef_to_ef_batch(&beef_bytes).map_err(|e| format!("EF conversion: {e}"))?;
-        self.broadcast_efs_gated(&efs, &subject_txid).await
+        // #268: when every leg claims a bump (efs empty), the subject's RAW
+        // is the mined-claim corroboration body.
+        let mined_subject_raw = if efs.is_empty() {
+            crate::ef::proven_subject_raw(&beef_bytes)
+        } else {
+            None
+        };
+        self.broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref())
+            .await
     }
 
     /// Submit `efs` (unproven Extended-Format legs, dependency order) to Arcade
@@ -1555,8 +1725,13 @@ impl ArcadeBroadcaster {
     /// - `Err(transport)` — submit/gate transport trouble or never-SEEN timeout
     ///   (fail-closed: the caller falls back to its own direct broadcast).
     ///
-    /// An empty `efs` (every tx already mined) is `Ok(Accepted(subject))` — a
-    /// no-op success, mirroring the engine's skip-broadcast-when-mined path.
+    /// An empty `efs` (every tx CLAIMS a bump — including the subject) is NO
+    /// LONGER an ungated no-op success (bsv-low#268): the bump is
+    /// submitter-asserted and never validated here, so the "already mined"
+    /// claim is corroborated against a real provider via the subject's RAW
+    /// bytes (`mined_subject_raw`); without the corroborator's genuine
+    /// accept — or without the raw itself — admission is refused (`Err` →
+    /// 502, retryable).
     ///
     /// SUBJECT-ONLY + ADAPTIVE RESUBMIT (#209/#211). Mainnet-proven: Arcade
     /// resolves unconfirmed parents from the live network, so submitting the
@@ -1597,22 +1772,23 @@ impl ArcadeBroadcaster {
         &self,
         efs: &[EfTx],
         subject_txid: &str,
+        mined_subject_raw: Option<&[u8]>,
     ) -> Result<ArcOutcome, String> {
-        if efs.is_empty() {
-            worker::console_log!("[arcade] {subject_txid} already mined — skipping broadcast");
-            return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
-        }
-
         // The subject's own EF is what we broadcast first (subject-only).
-        let subject_ef = efs
-            .iter()
-            .find(|e| e.txid == subject_txid)
-            .ok_or_else(|| format!("subject {subject_txid} not present in EF batch"))?;
+        // `None` ONLY on the #268 mined-claim path (efs empty), where no
+        // submit rung ever runs — the pure control flow corroborates the
+        // claim and returns before touching a rung.
+        let subject_ef = efs.iter().find(|e| e.txid == subject_txid);
+        if !efs.is_empty() && subject_ef.is_none() {
+            return Err(format!("subject {subject_txid} not present in EF batch"));
+        }
 
         broadcast_efs_gated_with(
             efs.len(),
             subject_txid,
             |rung| async move {
+                let subject_ef = subject_ef
+                    .ok_or_else(|| format!("subject {subject_txid} has no EF leg"))?;
                 match rung {
                     SubmitRung::SubjectOnly => {
                         self.submit_once_and_gate(
@@ -1637,10 +1813,22 @@ impl ArcadeBroadcaster {
             },
             |kind| async move {
                 match kind {
-                    CorroborationKind::SubjectOnly => self.corroborate_subject(subject_ef).await,
+                    CorroborationKind::SubjectOnly => {
+                        let subject_ef = subject_ef
+                            .ok_or_else(|| format!("subject {subject_txid} has no EF leg"))?;
+                        self.corroborate_subject(subject_ef).await
+                    }
                     CorroborationKind::WithAncestry => {
                         self.corroborate_batch(efs, subject_txid).await
                     }
+                    // #268: the "already mined" claim probe. No raw in the
+                    // BEEF (txid-only subject) → inconclusive → refuse.
+                    CorroborationKind::MinedClaim => match mined_subject_raw {
+                        Some(raw) => self.corroborate_mined_raw(raw).await,
+                        None => Err(format!(
+                            "all-proven BEEF for {subject_txid} carries no subject raw — cannot corroborate the mined-claim; refusing to admit (#268)"
+                        )),
+                    },
                 }
             },
         )
@@ -1777,6 +1965,12 @@ impl ArcadeBroadcaster {
     /// ancestry rungs, not waited out), or the deadline elapses. Timeout →
     /// `Err` (never admit a tx that never became SEEN).
     async fn poll_for_status(&self, txid: &str) -> Result<GateStep, String> {
+        let started = worker::js_sys::Date::now();
+        // Accumulate this loop's wall-clock into `poll_ms` on EVERY exit —
+        // scopeguard-free: the loop has 3 exits, each stamps before return.
+        let stamp = |cell: &std::cell::Cell<f64>| {
+            cell.set(cell.get() + (worker::js_sys::Date::now() - started));
+        };
         let mut waited = 0u64;
         loop {
             if let Some(resp) = self.tx_status(txid).await {
@@ -1785,12 +1979,17 @@ impl ArcadeBroadcaster {
                 // the OLD failure extraInfo still attached).
                 match classify_arcade_status(&resp.tx_status, ARCADE_GATE_STATUS) {
                     GateVerdict::Reached => {
-                        worker::console_log!("[arcade] {txid} reached {}", resp.tx_status);
+                        worker::console_log!(
+                            "[arcade] {txid} reached {} (polled {waited} ms)",
+                            resp.tx_status
+                        );
+                        stamp(&self.poll_ms);
                         return Ok(GateStep::Accepted);
                     }
                     GateVerdict::Fatal => {
                         // #209: fold the captured extra_info into the reason text
                         // (reason ONLY — the gate above already decided on status).
+                        stamp(&self.poll_ms);
                         return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
                             txid,
                             &resp.tx_status,
@@ -1802,6 +2001,7 @@ impl ArcadeBroadcaster {
                     // 20s timeout → 502, when the answer ("missing parents")
                     // was already in hand. Route to the ancestry rungs.
                     GateVerdict::Orphan => {
+                        stamp(&self.poll_ms);
                         return Ok(GateStep::Orphan(arcade_fatal_reason(
                             txid,
                             &resp.tx_status,
@@ -1812,6 +2012,7 @@ impl ArcadeBroadcaster {
                 }
             }
             if waited >= ARCADE_WAIT_TIMEOUT_MS {
+                stamp(&self.poll_ms);
                 return Err(format!(
                     "Arcade {txid} never reached {ARCADE_GATE_STATUS} within {}s — do not admit",
                     ARCADE_WAIT_TIMEOUT_MS / 1000
@@ -2472,9 +2673,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_submits_parents_in_ancestry_order_then_subject_last_exactly_once() {
-        // Ordering discipline: parents are primed in ancestry order and the
-        // subject is submitted EXACTLY ONCE, LAST (never in the parent loop).
+    async fn batch_subject_first_fast_path_skips_the_primes_on_a_genuine_accept() {
+        // bsv-low#272: a HEALTHY corroborator SEENs the subject standalone
+        // (EF inlines source scripts + sats), so the happy path is ONE POST —
+        // no ancestor primes at all. This is the N+1→1 latency fix.
         let efs = vec![
             EfTx { txid: "g".into(), ef: vec![0xaa] }, // grandparent
             EfTx { txid: "p".into(), ef: vec![0xbb] }, // parent
@@ -2483,12 +2685,45 @@ mod tests {
         let order = std::cell::RefCell::new(Vec::<String>::new());
         let out = corroborate_batch_with(&efs, "subject", |tx_hex| {
             order.borrow_mut().push(tx_hex.clone());
+            async move {
+                corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        assert_eq!(
+            *order.borrow(),
+            vec![hex::encode([0xccu8])],
+            "a genuine accept on the subject-first attempt must skip every prime"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_degraded_path_primes_parents_in_ancestry_order_then_subject_decides() {
+        // The #216 shape: subject-alone is inconclusive (the corroborator's
+        // partial UTXO view can't validate it) → parents are primed in
+        // ANCESTRY ORDER, then the subject is retried LAST and its primed
+        // verdict is final — byte-identical to the pre-#272 semantics.
+        let efs = vec![
+            EfTx { txid: "g".into(), ef: vec![0xaa] }, // grandparent
+            EfTx { txid: "p".into(), ef: vec![0xbb] }, // parent
+            EfTx { txid: "subject".into(), ef: vec![0xcc] }, // subject last
+        ];
+        let order = std::cell::RefCell::new(Vec::<String>::new());
+        let primed = std::cell::Cell::new(false);
+        let out = corroborate_batch_with(&efs, "subject", |tx_hex| {
+            order.borrow_mut().push(tx_hex.clone());
             let is_subject = tx_hex == hex::encode([0xccu8]);
+            if !is_subject {
+                primed.set(true);
+            }
+            let seen = primed.get();
             async move {
                 if is_subject {
+                    let status = if seen { "SEEN_ON_NETWORK" } else { "RECEIVED" };
                     corroborator_verdict(
                         200,
-                        r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#,
+                        &format!(r#"{{"txid":"subject","txStatus":"{status}"}}"#),
                     )
                 } else {
                     corroborator_verdict(200, r#"{"txid":"p","txStatus":"SEEN_ON_NETWORK"}"#)
@@ -2500,11 +2735,12 @@ mod tests {
         assert_eq!(
             *order.borrow(),
             vec![
-                hex::encode([0xaau8]),
+                hex::encode([0xccu8]), // subject-first probe (inconclusive)
+                hex::encode([0xaau8]), // primes, ancestry order
                 hex::encode([0xbbu8]),
-                hex::encode([0xccu8]),
+                hex::encode([0xccu8]), // subject decided last
             ],
-            "parents primed in ancestry order; subject submitted once, last"
+            "degraded path: subject probe, parents primed in ancestry order, subject last"
         );
     }
 
@@ -2520,14 +2756,15 @@ mod tests {
 
     #[test]
     fn unproven_ancestry_signal_gates_batch_corroboration_and_accept_claims() {
-        // The ONE signal, two consumers (#216/#267): efs.len()==1 (proven
-        // ancestry) keeps subject-only corroboration AND the uncorroborated
-        // accept fast path; efs.len()>1 routes the exhaustion corroboration
-        // through the ancestry-carrying `corroborate_batch` AND forces the
-        // #267 corroborate-on-accept gate.
+        // The ONE signal, two consumers (#216/#267/#268): efs.len()==1
+        // (claimed-proven ancestry) keeps corroboration SUBJECT-ONLY — but
+        // since #268 the accept claim is corroborated on this arm too (the
+        // uncorroborated fast path is dead); efs.len()>1 routes the
+        // exhaustion corroboration through the ancestry-carrying
+        // `corroborate_batch` AND the #267 corroborate-on-accept gate.
         assert!(
             !has_unproven_ancestry(1),
-            "single leg → subject-only corroboration, accept fast path"
+            "single leg → subject-only corroboration (still corroborated on accept, #268)"
         );
         assert!(
             has_unproven_ancestry(2),
@@ -2778,27 +3015,158 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiring_single_leg_accept_keeps_the_fast_path_with_zero_corroboration() {
-        // Proven-parent (single-EF) subject: the accept fast path adds no
-        // corroborator call at all (the honest residual is documented on
-        // `gate_accept_claim_with` and tracked as bsv-low#268).
-        let corr_calls = std::cell::Cell::new(0usize);
+    async fn wiring_single_leg_accept_corroborates_subject_only_never_admits_uncorroborated() {
+        // bsv-low#268: the single-EF fast path is DEAD. "Proven parents" is
+        // bump PRESENCE — submitter-asserted, never validated — so a
+        // fabricated parent bump made an unproven subject look single-EF and
+        // ride an uncorroborated admit. Now a single-leg accept claim must
+        // corroborate SUBJECT-ONLY, and without the corroborator's genuine
+        // accept it must NOT admit.
+        //
+        // RED-VERIFY: restore `ArcOutcome::Accepted(_) if
+        // !has_unproven_ancestry(efs_len) => Ok(outcome)` in
+        // `gate_accept_claim_with` (backup copy) and this test fails.
+        let kinds = std::cell::RefCell::new(Vec::new());
         let out = broadcast_efs_gated_with(
             1,
             "subject",
             |_rung| async { Ok(GateStep::Accepted) },
-            |_kind| {
-                corr_calls.set(corr_calls.get() + 1);
-                async { Err::<ArcOutcome, String>("must not be called".into()) }
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                async { Err::<ArcOutcome, String>("corroborator unavailable".into()) }
             },
         )
         .await;
-        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
-        assert_eq!(
-            corr_calls.get(),
-            0,
-            "single-leg fast path must not corroborate"
+        assert!(
+            out.is_err(),
+            "a single-leg accept claim must never admit uncorroborated (#268)"
         );
+        assert_eq!(
+            *kinds.borrow(),
+            vec![CorroborationKind::SubjectOnly],
+            "single-leg accept must corroborate subject-only"
+        );
+
+        // …and WITH a genuine corroborator accept it admits — under OUR
+        // subject txid, never the corroborator's echo.
+        let out = broadcast_efs_gated_with(
+            1,
+            "subject",
+            |_rung| async { Ok(GateStep::Accepted) },
+            |_kind| async { Ok(ArcOutcome::Accepted("corroborator-echo".into())) },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+    }
+
+    #[tokio::test]
+    async fn wiring_empty_efs_mined_claim_never_admits_without_corroboration() {
+        // bsv-low#268, the worse sibling: a fake bump on the SUBJECT itself
+        // made efs empty → "already mined — skipping broadcast" → ADMIT WITH
+        // ZERO NETWORK CONTACT. Now the mined-claim must be corroborated; no
+        // submit rung ever runs, and anything but a genuine corroborator
+        // accept refuses admission (Err → 502, retryable — never a 422 off
+        // one provider's word, never an admit-on-unknown).
+        //
+        // RED-VERIFY: restore the `if efs.is_empty() { return Ok(Accepted) }`
+        // shortcut in `broadcast_efs_gated` (backup copy) — the worker path
+        // then bypasses this control flow and the routes admit ungated.
+        let rungs = std::cell::Cell::new(0usize);
+        let kinds = std::cell::RefCell::new(Vec::new());
+        // Inconclusive corroborator → refuse.
+        let out = broadcast_efs_gated_with(
+            0,
+            "subject",
+            |_rung| {
+                rungs.set(rungs.get() + 1);
+                async { Ok(GateStep::Accepted) }
+            },
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                async { Err::<ArcOutcome, String>("corroborator unavailable".into()) }
+            },
+        )
+        .await;
+        let err = out.expect_err("an unconfirmable mined-claim must refuse admission");
+        assert!(err.contains("not admitting"), "{err}");
+        assert_eq!(rungs.get(), 0, "no submit rung may run for a mined-claim");
+        assert_eq!(*kinds.borrow(), vec![CorroborationKind::MinedClaim]);
+
+        // Corroborator REJECTED → still Err (one provider's word, #214) —
+        // refuse admission without minting a definitive 422.
+        let out = broadcast_efs_gated_with(
+            0,
+            "subject",
+            |_rung| async { Ok(GateStep::Accepted) },
+            |_kind| async { Ok(ArcOutcome::Rejected("orphan / missing inputs".into())) },
+        )
+        .await;
+        assert!(out.is_err(), "a single-provider rejection must be Err/502, never Ok");
+
+        // Genuine corroborator accept (already-known/mined) → admit, under
+        // OUR subject txid.
+        let out = broadcast_efs_gated_with(
+            0,
+            "subject",
+            |_rung| async { Ok(GateStep::Accepted) },
+            |_kind| async { Ok(ArcOutcome::Accepted("echo".into())) },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+    }
+
+    #[test]
+    fn refuse_bar_requires_both_providers_for_a_definitive_rejection() {
+        // bsv-low#268 gate LOW-M: a definitive corroborator Rejected (which
+        // corroborated_exhaustion turns into a terminal 422) now needs BOTH
+        // hosts' word — the #214 two-provider bar in the refuse direction.
+        let rej = |r: &str| Ok(ArcOutcome::Rejected(r.into()));
+        let acc = || Ok(ArcOutcome::Accepted("ab".into()));
+        let inc = |e: &str| Err::<ArcOutcome, String>(e.into());
+
+        // Both rejected → definitive.
+        assert!(matches!(
+            fold_refuse_bar(rej("fee"), rej("fee")),
+            Ok(ArcOutcome::Rejected(_))
+        ));
+        // Either accepted → accepted (a real network-accept always wins).
+        assert!(matches!(
+            fold_refuse_bar(rej("fee"), acc()),
+            Ok(ArcOutcome::Accepted(_))
+        ));
+        assert!(matches!(
+            fold_refuse_bar(inc("down"), acc()),
+            Ok(ArcOutcome::Accepted(_))
+        ));
+        // ONE-SIDED rejection (other host inconclusive) → Err/502, never a
+        // single-provider 422 — in BOTH orders.
+        let e = fold_refuse_bar(rej("fee"), inc("down")).unwrap_err();
+        assert!(e.contains("not definitive"), "{e}");
+        let e = fold_refuse_bar(inc("down"), rej("fee")).unwrap_err();
+        assert!(e.contains("not definitive"), "{e}");
+        // Double inconclusive → Err.
+        assert!(fold_refuse_bar(inc("a"), inc("b")).is_err());
+    }
+
+    #[test]
+    fn mined_claim_fold_semantics() {
+        // The pure #268 fold: accept → Accepted(subject); reject → Err
+        // (refuse, retryable — never a single-provider 422); inconclusive →
+        // Err. An "already mined" body IS the accept dress a genuinely mined
+        // tx produces on re-broadcast.
+        let subject = "2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256";
+        let already = corroborator_verdict(422, "txn-already-known (code 257)");
+        assert_eq!(
+            corroborated_mined_claim(already, subject).unwrap(),
+            ArcOutcome::Accepted(subject.to_string())
+        );
+        let rejected = corroborator_verdict(461, "unlock invalid");
+        let err = corroborated_mined_claim(rejected, subject)
+            .expect_err("one provider's rejection must not admit OR mint a 422");
+        assert!(err.contains("#268"), "{err}");
+        let inconclusive =
+            corroborator_verdict(200, r#"{"txid":"ab","txStatus":"SEEN_IN_ORPHAN_MEMPOOL"}"#);
+        assert!(corroborated_mined_claim(inconclusive, subject).is_err());
     }
 
     #[tokio::test]
@@ -2859,6 +3227,9 @@ mod tests {
                         Err("corroborator: missing parent — inconclusive".into())
                     }
                     CorroborationKind::WithAncestry => Ok(ArcOutcome::Accepted("subject".into())),
+                    CorroborationKind::MinedClaim => {
+                        Err("unreachable: no mined-claim on a 2-leg batch".into())
+                    }
                 };
                 async move { res }
             },

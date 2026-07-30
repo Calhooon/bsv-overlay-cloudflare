@@ -145,6 +145,51 @@ impl D1Storage {
         format!("{base} WHERE (o.txid, o.outputIndex) IN (VALUES {placeholders})")
     }
 
+    /// bsv-low#273 (gate LOW-1) — the rebroadcast backstop's OWN candidate
+    /// window: proofless rows aged INTO candidacy after `min_age_secs`
+    /// (younger rows are healthy 0-conf traffic) and OUT of it after
+    /// `max_age_secs`. Without the ceiling, permanently-dead rows (a
+    /// superseded/conflicting tx that can never land) churn as candidates
+    /// forever and dilute the RANDOM sample the genuinely-rescuable rows
+    /// share. Aged-out rows are NEVER deleted and remain full candidates of
+    /// the proof-completion passes (`find_transactions_for_proof_check`,
+    /// which this deliberately does not touch) — only backstop
+    /// PRESENCE-PROBE/REBROADCAST candidacy expires. NULL `created_at`
+    /// (pre-migration) rows are older than any sane ceiling by construction
+    /// → excluded here (same direction).
+    pub async fn find_rebroadcast_candidates(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+        max_age_secs: u64,
+    ) -> Result<Vec<TransactionBeef>, StorageError> {
+        let sql = Self::rebroadcast_candidates_sql(limit, min_age_secs, max_age_secs);
+        let rows: Vec<TxBeefRow> = Query::new(sql).fetch_all(&self.db).await.map_err(d1_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                r.beef
+                    .and_then(|h| hex::decode(h).ok())
+                    .filter(|b| !b.is_empty())
+                    .map(|beef| TransactionBeef { txid: r.txid, beef })
+            })
+            .collect())
+    }
+
+    /// The shipped SQL behind [`Self::find_rebroadcast_candidates`] —
+    /// factored out so the real-SQLite test executes the SHIPPED string
+    /// against the production schema.
+    fn rebroadcast_candidates_sql(limit: u64, min_age_secs: u64, max_age_secs: u64) -> String {
+        format!(
+            "SELECT txid, hex(beef) as beef FROM transactions \
+             WHERE has_proof = 0 \
+               AND created_at IS NOT NULL \
+               AND created_at <= unixepoch() - {min_age_secs} \
+               AND created_at >= unixepoch() - {max_age_secs} \
+             ORDER BY RANDOM() LIMIT {limit}"
+        )
+    }
+
     /// Parse a serialized BEEF and report whether it carries a merkle proof for
     /// `txid` (the tx's OWN proof, not an ancestor's). Used to keep the
     /// `transactions.has_proof` flag accurate on every BEEF write so the
@@ -626,6 +671,61 @@ impl Storage for D1Storage {
 mod tests {
     use super::*;
     use overlay_engine::types::Outpoint;
+
+    /// bsv-low#273 gate LOW-1: the backstop candidacy bracket, shipped SQL
+    /// on the production schema — young rows (healthy 0-conf), aged-out
+    /// rows (permanently-dead churn), NULL-stamped rows (pre-migration ⇒
+    /// ancient) and proven rows are all excluded; only the in-bracket
+    /// proofless row is a candidate. Aged-out ≠ deleted: the row stays in
+    /// `transactions` and stays a proof-pass candidate.
+    #[test]
+    fn rebroadcast_candidates_bracket_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let now: i64 = conn
+            .query_row("SELECT unixepoch()", [], |r| r.get(0))
+            .unwrap();
+        let insert = |txid: &str, created_at: Option<i64>, has_proof: i64| {
+            conn.execute(
+                "INSERT INTO transactions (txid, beef, has_proof, created_at) \
+                 VALUES (?1, x'beef', ?2, ?3)",
+                rusqlite::params![txid, has_proof, created_at],
+            )
+            .unwrap();
+        };
+        insert("young", Some(now - 60), 0); // < min age — healthy 0-conf
+        insert("inbracket", Some(now - 3600), 0); // the candidate
+        insert("agedout", Some(now - 15 * 24 * 3600), 0); // > max age
+        insert("nullstamp", None, 0); // pre-migration ⇒ ancient
+        insert("proven", Some(now - 3600), 1); // already proven
+
+        let sql = D1Storage::rebroadcast_candidates_sql(16, 30 * 60, 14 * 24 * 3600);
+        let mut stmt = conn.prepare(&sql).expect("shipped SQL must parse");
+        let got: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(got, vec!["inbracket".to_string()]);
+        // …and the aged-out / NULL rows remain proof-pass candidates (the
+        // completion window this bracket deliberately does not touch).
+        let all_proofless: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE has_proof = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all_proofless, 4, "nothing was deleted or proven by aging out");
+    }
 
     #[test]
     fn output_row_conversion_basic() {

@@ -965,6 +965,296 @@ pub async fn backfill_decoded_params(
 }
 
 // ============================================================================
+// admitted-but-network-absent rebroadcast backstop (bsv-low #273, #267 item c)
+// ============================================================================
+
+/// Per-tick candidate bound for [`rebroadcast_absent_admitted`] — the same
+/// figure as the #284 backfill (each candidate costs ≤2 presence GETs and,
+/// only when provably absent, the rebroadcast POSTs).
+pub const REBROADCAST_BACKSTOP_LIMIT: u64 = 16;
+
+/// Minimum age before an admitted proofless row is presence-probed. The
+/// */15 proof passes only ever HELP a tx that mined; an admitted tx the
+/// network never held (the #267 incident class) is invisible to them — but a
+/// healthy 0-conf tx is also proofless for ~1 block interval, so probing
+/// younger rows is wasted budget. 30 min = the [`PUSH_BACKSTOP_MIN_AGE_SECS`]
+/// rationale: ≥95% of healthy txs have mined (and left the proofless set)
+/// by then, so what remains is either slow-mine (probe answers "present",
+/// one GET wasted) or the incident class this backstop exists for.
+pub const REBROADCAST_MIN_AGE_SECS: u64 = PUSH_BACKSTOP_MIN_AGE_SECS;
+
+/// Maximum age for backstop CANDIDACY (bsv-low#273, gate LOW-1): a proofless
+/// admitted row older than this stops being presence-probed/rebroadcast —
+/// permanently-dead rows (superseded/conflicting, can never land) would
+/// otherwise churn in the 16-random sample forever and dilute the
+/// genuinely-rescuable ones. 14 days ≫ any honest rescue window (the #267
+/// incident class was rescued within a day; a healthy tx mines in ~10 min).
+/// NEVER a deletion: aged-out rows stay stored, stay served, and stay
+/// candidates of the ordinary proof-completion passes; the #247
+/// `unconfirmable` verdict is the terminal client-facing signal for the
+/// truly dead.
+pub const REBROADCAST_MAX_CANDIDATE_AGE_SECS: u64 = 14 * 24 * 3600;
+
+/// Per-candidate EF-leg cap for the ancestry-first rebroadcast — mirrors the
+/// corroboration leg cap's rationale (bound serial POST work; real LOW
+/// ancestry runs ~8 unproven legs). Over the cap the candidate is SKIPPED
+/// (counted, retried on a later tick when its ancestry may have compacted),
+/// never partially rebroadcast out of order.
+pub const REBROADCAST_MAX_LEGS: usize = 32;
+
+/// Total broadcast POSTs allowed per tick across ALL candidates — the belt
+/// that keeps a pathological backlog (many absent candidates × deep
+/// ancestry) from eating the invocation's subrequest budget and starving
+/// the passes that ran before it (this pass runs LAST; the belt just keeps
+/// its own worst case bounded too).
+pub const REBROADCAST_POST_BUDGET: usize = 48;
+
+/// The classified network presence of an admitted tx (PURE — unit-tested).
+///
+/// Fail direction: a REBROADCAST is idempotent (the network dedupes /
+/// answers already-known), so the harmful error is a MISSED rescue, not a
+/// redundant one — but doctrine still requires that a NEGATIVE never rest
+/// on one provider's word (#212/#213/#214), so `Absent` (the only verdict
+/// that triggers action) needs BOTH indexers' definitive 404. Anything
+/// uncertain is `Inconclusive` → skip, retried next tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPresence {
+    /// At least one indexer holds the tx (mempool or mined) — healthy;
+    /// proof completion will pick it up when it mines.
+    Present,
+    /// BOTH indexers answered a definitive 404 — the admitted tx is absent
+    /// from the network (the #267 incident class): rebroadcast.
+    Absent,
+    /// Faults / mixed answers — no action this tick.
+    Inconclusive,
+}
+
+/// PURE: fold the two indexer observations (`Some(true)` present,
+/// `Some(false)` definitive 404, `None` fault) into a [`NetworkPresence`].
+pub fn classify_presence(bitails: Option<bool>, woc: Option<bool>) -> NetworkPresence {
+    match (bitails, woc) {
+        (Some(true), _) | (_, Some(true)) => NetworkPresence::Present,
+        (Some(false), Some(false)) => NetworkPresence::Absent,
+        _ => NetworkPresence::Inconclusive,
+    }
+}
+
+/// Tally of one rebroadcast-backstop pass (logged by the cron / returned by
+/// the admin route).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RebroadcastSummary {
+    /// Proofless admitted rows old enough to probe this tick.
+    pub scanned: usize,
+    /// Rows an indexer still holds (healthy — no action).
+    pub present: usize,
+    /// Rows probed inconclusively (provider fault / one-sided 404) — no
+    /// action, retried next tick.
+    pub inconclusive: usize,
+    /// Provably-absent rows whose stored BEEF was rebroadcast ancestry-first
+    /// and whose SUBJECT the network then accepted.
+    pub rebroadcast: usize,
+    /// Absent rows whose rebroadcast did not land (definitive rejection,
+    /// transport on both hosts, unparseable stored BEEF, or the leg cap) —
+    /// logged, retried next tick.
+    pub rebroadcast_failed: usize,
+    /// Candidates skipped because the per-tick POST budget ran out.
+    pub budget_skipped: usize,
+}
+
+/// PURE (bsv-low#273, gate NEW-LOW): the broadcastable legs for one stored
+/// BEEF — `(subject_txid, [(leg_txid, bytes)])`, dependency-ordered,
+/// subject last.
+///
+/// Primary: the EF batch (ancestry-first — ARC validates each EF
+/// standalone). Fallback to the SUBJECT RAW alone when NO EF is
+/// constructible, in EITHER dress:
+/// - EMPTY batch — every tx claims a bump (the #268 mined-claim class);
+/// - CONVERSION ERROR — the subject's inputs cannot be sourced, e.g. a
+///   #268-M1 STRIPPED mined-claim row: the strip drops bump-only parents
+///   (no raws existed to keep), so the stored single-tx BEEF has
+///   unsourceable inputs and `beef_to_ef_batch` errors. Pre-fix that row
+///   hit the Err path and counted `rebroadcast_failed` forever instead of
+///   rescuing.
+///
+/// For both populations the parents are on-chain by (corroborated) claim,
+/// so a raw broadcast is the right rescue; a network that cannot source
+/// the parents simply fails the subject verdict (retried) — never a false
+/// rescue. The subject txid is CONTENT-ADDRESSED from the raw itself.
+///
+/// `None` = nothing broadcastable (unparseable BEEF / txid-only subject) —
+/// the caller counts `rebroadcast_failed` and retries later.
+///
+/// One broadcastable leg: `(leg_txid, bytes)` — EF bytes on the primary
+/// path, the subject raw on the fallback.
+type RebroadcastLeg = (String, Vec<u8>);
+fn rebroadcast_legs(beef: &[u8]) -> Option<(String, Vec<RebroadcastLeg>)> {
+    match crate::ef::beef_to_ef_batch(beef) {
+        Ok((efs, subject_txid)) if !efs.is_empty() => Some((
+            subject_txid,
+            efs.into_iter().map(|e| (e.txid, e.ef)).collect(),
+        )),
+        Ok(_) | Err(_) => {
+            let raw = crate::ef::proven_subject_raw(beef)?;
+            let subject_txid = bsv_rs::transaction::Transaction::from_binary(&raw)
+                .ok()?
+                .id();
+            Some((subject_txid.clone(), vec![(subject_txid, raw)]))
+        }
+    }
+}
+
+/// Bitails `GET /tx/{txid}` presence: `Some(true)` on 2xx, `Some(false)` on
+/// a definitive 404, `None` on anything else (fault — never a verdict).
+async fn bitails_presence(base: &str, txid: &str) -> Option<bool> {
+    let url = format!("{}/tx/{}", base.trim_end_matches('/'), txid);
+    match http_get(&url, None).await {
+        Ok((status, _)) if (200..300).contains(&status) => Some(true),
+        Ok((404, _)) => Some(false),
+        _ => None,
+    }
+}
+
+/// WoC `GET /tx/hash/{txid}` presence — same three-way contract.
+async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<bool> {
+    let url = format!("{}/tx/hash/{}", base.trim_end_matches('/'), txid);
+    let hdr = api_key.map(|k| ("woc-api-key", k));
+    match http_get(&url, hdr).await {
+        Ok((status, _)) if (200..300).contains(&status) => Some(true),
+        Ok((404, _)) => Some(false),
+        _ => None,
+    }
+}
+
+/// The #273 backstop: admitted (broadcast-gated) rows that are STILL
+/// proofless after [`REBROADCAST_MIN_AGE_SECS`] get an external presence
+/// probe (Bitails + WoC — the existing courier hosts); a row BOTH indexers
+/// definitively 404 is the #267 incident class (admitted, network-absent,
+/// invisible to every proof pass) and its stored BEEF is rebroadcast
+/// ANCESTRY-FIRST (each unproven EF leg in dependency order, subject last,
+/// via the TAAL→GorillaPool gated transport). This automates the manual
+/// rescue of 2026-07-28 ~01:39Z.
+///
+/// Bounds: the caller supplies `candidates` from the backstop's OWN
+/// age-bracketed window ([`REBROADCAST_MIN_AGE_SECS`] ..
+/// [`REBROADCAST_MAX_CANDIDATE_AGE_SECS`], RANDOM-sampled —
+/// `D1Storage::find_rebroadcast_candidates`; gate LOW-1: permanently-dead
+/// rows age OUT of candidacy instead of diluting the sample forever, and
+/// are never deleted), [`REBROADCAST_MAX_LEGS`] EF legs per candidate,
+/// [`REBROADCAST_POST_BUDGET`] broadcast POSTs per tick. Runs LAST in the
+/// completion tick with its OWN bounds — it can never starve the proof
+/// passes that precede it.
+///
+/// Fail-safe: probe faults and one-sided 404s act on nothing; a rebroadcast
+/// failure writes nothing and is retried on a later tick; a rebroadcast of
+/// a present tx (should the probes both lie) is idempotent.
+pub async fn rebroadcast_absent_admitted(
+    candidates: Vec<overlay_engine::storage::TransactionBeef>,
+    taal_api_key: Option<&str>,
+    woc_api_key: Option<&str>,
+) -> RebroadcastSummary {
+    let mut summary = RebroadcastSummary {
+        scanned: candidates.len(),
+        ..Default::default()
+    };
+
+    let mut post_budget = REBROADCAST_POST_BUDGET;
+
+    for candidate in candidates {
+        let txid = &candidate.txid;
+
+        // Presence probe: Bitails first (WoC is the free-tier-429 host — it
+        // is only consulted when Bitails did not already prove presence).
+        let bitails = bitails_presence(DEFAULT_BITAILS_BASE, txid).await;
+        if bitails == Some(true) {
+            summary.present += 1;
+            continue;
+        }
+        let woc = woc_presence(DEFAULT_WOC_BASE, woc_api_key, txid).await;
+        match classify_presence(bitails, woc) {
+            NetworkPresence::Present => {
+                summary.present += 1;
+                continue;
+            }
+            NetworkPresence::Inconclusive => {
+                summary.inconclusive += 1;
+                continue;
+            }
+            NetworkPresence::Absent => {}
+        }
+
+        // Provably absent from both indexers: rebroadcast the stored BEEF
+        // ancestry-first ([`rebroadcast_legs`] — falls back to the SUBJECT
+        // RAW when no EF is constructible, e.g. a #268-M1 STRIPPED
+        // mined-claim row).
+        let Some((subject_txid, legs)) = rebroadcast_legs(&candidate.beef) else {
+            push_log(&format!(
+                "[rebroadcast-backstop] {txid} absent but no broadcastable bytes — retry later"
+            ));
+            summary.rebroadcast_failed += 1;
+            continue;
+        };
+        if legs.len() > REBROADCAST_MAX_LEGS {
+            push_log(&format!(
+                "[rebroadcast-backstop] {txid} has {} EF legs > cap {REBROADCAST_MAX_LEGS} — skipped",
+                legs.len()
+            ));
+            summary.rebroadcast_failed += 1;
+            continue;
+        }
+        if post_budget < legs.len() {
+            summary.budget_skipped += 1;
+            continue;
+        }
+        post_budget -= legs.len();
+
+        // Ancestor verdicts are logged but IGNORED (they prime/dedupe); the
+        // SUBJECT's verdict decides the counter. No admission state changes
+        // here — landing is verified by the ordinary proof passes later.
+        let mut subject_outcome: Option<Result<crate::broadcaster::ArcOutcome, String>> = None;
+        for (leg_txid, bytes) in &legs {
+            let out =
+                crate::broadcaster::broadcast_tx_hex_gated(taal_api_key, &hex::encode(bytes))
+                    .await;
+            if leg_txid == &subject_txid {
+                subject_outcome = Some(out);
+            } else if let Err(e) = out {
+                push_log(&format!(
+                    "[rebroadcast-backstop] {txid} ancestor {leg_txid} transport: {e}"
+                ));
+            }
+        }
+        match subject_outcome {
+            Some(Ok(crate::broadcaster::ArcOutcome::Accepted(_))) => {
+                push_log(&format!(
+                    "[rebroadcast-backstop] {txid} RESCUED — absent from both indexers, rebroadcast accepted ({} leg(s))",
+                    legs.len()
+                ));
+                summary.rebroadcast += 1;
+            }
+            Some(Ok(crate::broadcaster::ArcOutcome::Rejected(r))) => {
+                push_log(&format!(
+                    "[rebroadcast-backstop] {txid} rebroadcast REJECTED ({r}) — retry later"
+                ));
+                summary.rebroadcast_failed += 1;
+            }
+            Some(Err(e)) => {
+                push_log(&format!(
+                    "[rebroadcast-backstop] {txid} rebroadcast transport failed ({e}) — retry later"
+                ));
+                summary.rebroadcast_failed += 1;
+            }
+            None => {
+                // Subject leg absent from the batch — beef_to_ef_batch
+                // guarantees it, so this is defensive only.
+                summary.rebroadcast_failed += 1;
+            }
+        }
+    }
+
+    summary
+}
+
+// ============================================================================
 // /arc-ingest push consumer (bsv-low #228 — push is the PRIMARY proof source)
 // ============================================================================
 
@@ -1108,6 +1398,85 @@ mod tests {
             vec![vec![MerklePathLeaf::new_txid(0, txid.into())]],
         )
         .expect("valid single-leaf merkle path")
+    }
+
+    // ── 0. #273 rebroadcast-backstop presence classification ─────────────────
+
+    #[test]
+    fn presence_positive_from_either_indexer_is_present() {
+        // A single indexer holding the tx is enough to STAND DOWN (positive
+        // presence is cheap to trust — the harmful error is a missed rescue,
+        // and proof completion covers a present tx).
+        assert_eq!(classify_presence(Some(true), None), NetworkPresence::Present);
+        assert_eq!(classify_presence(None, Some(true)), NetworkPresence::Present);
+        assert_eq!(classify_presence(Some(true), Some(false)), NetworkPresence::Present);
+        assert_eq!(classify_presence(Some(false), Some(true)), NetworkPresence::Present);
+    }
+
+    #[test]
+    fn presence_absent_requires_both_definitive_404s() {
+        // The ACTION verdict needs BOTH indexers' definitive 404 — a negative
+        // never rests on one provider's word (#212/#213/#214 doctrine).
+        assert_eq!(classify_presence(Some(false), Some(false)), NetworkPresence::Absent);
+        // One-sided 404s and faults are inconclusive → no action, retried.
+        assert_eq!(classify_presence(Some(false), None), NetworkPresence::Inconclusive);
+        assert_eq!(classify_presence(None, Some(false)), NetworkPresence::Inconclusive);
+        assert_eq!(classify_presence(None, None), NetworkPresence::Inconclusive);
+    }
+
+    // ── 0b. #273 rebroadcast legs (gate NEW-LOW: the stripped-row rescue) ────
+
+    /// The all-proven fixture BEEF (subject a7d76588… + its bump — the
+    /// mined-claim shape; shared with ef.rs's suite).
+    const PARENT_BEEF_HEX: &str = include_str!("../tests/fixtures/ef/parent_a7d76588_beef.hex");
+
+    #[test]
+    fn stripped_beef_row_rescues_via_the_subject_raw() {
+        use bsv_rs::transaction::{Beef, Transaction};
+        // A #268-M1 STRIPPED mined-claim row, built by the REAL strip
+        // producer: the bump-only parent does not survive, so the stored
+        // BEEF is a single proofless tx with unsourceable inputs.
+        let beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
+        let subject_txid = {
+            let b = Beef::from_binary(&beef).unwrap();
+            b.txs.last().unwrap().txid()
+        };
+        let stripped = crate::ef::strip_subject_bump(&beef, &subject_txid)
+            .expect("fixture must sanitize");
+        // Premise pinned: NO EF is constructible from the stripped row —
+        // exactly the shape that previously dead-ended in rebroadcast_failed.
+        assert!(
+            crate::ef::beef_to_ef_batch(&stripped).is_err(),
+            "a stripped bump-only-parent BEEF must not EF-convert"
+        );
+
+        // The backstop's real leg producer falls back to the SUBJECT RAW:
+        // one leg, content-addressed to the subject, bytes = the raw tx.
+        let (subj, legs) = rebroadcast_legs(&stripped)
+            .expect("a stripped row must still be broadcastable");
+        assert_eq!(subj, subject_txid);
+        assert_eq!(legs.len(), 1, "subject raw alone");
+        assert_eq!(legs[0].0, subject_txid);
+        let parsed = Transaction::from_binary(&legs[0].1).unwrap();
+        assert_eq!(parsed.id(), subject_txid, "the broadcast bytes ARE the subject raw");
+
+        // The ordinary shapes are untouched: a normal unproven-subject BEEF
+        // still yields its EF legs (subject last) …
+        let unproven = {
+            let b = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+            let raw = b.txs.last().unwrap().tx().unwrap().to_hex();
+            let mut nb = Beef::new();
+            nb.merge_transaction(Transaction::from_hex(&raw).unwrap());
+            nb.to_binary()
+        };
+        let (subj2, legs2) = rebroadcast_legs(&unproven).unwrap();
+        assert_eq!(subj2, subject_txid);
+        assert_eq!(legs2.last().unwrap().0, subject_txid);
+        // … an all-proven (unstripped mined-claim) BEEF falls back to raw …
+        let (subj3, legs3) = rebroadcast_legs(&beef).unwrap();
+        assert_eq!((subj3.as_str(), legs3.len()), (subject_txid.as_str(), 1));
+        // … and garbage is honestly unbroadcastable.
+        assert!(rebroadcast_legs(&[0xde, 0xad]).is_none());
     }
 
     // ── 1. Arcade merklePath extraction ──────────────────────────────────────

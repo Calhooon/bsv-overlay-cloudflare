@@ -114,6 +114,79 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
     Ok((efs, subject_txid))
 }
 
+/// Strip the SUBJECT's (submitter-supplied, NEVER-validated) bump from a
+/// BEEF before storage — bsv-low#268 gate finding M1.
+///
+/// The mined-claim corroboration proves NETWORK ACCEPTANCE (already-known /
+/// SEEN on a second broadcaster), NOT SPV-mined-ness — yet the submitted
+/// BEEF was previously stored VERBATIM, fake bump included. The read side
+/// serves that bump with zero SPV (`low-app-layer` `beef_block_height` →
+/// `/tx-any` answers `present:true confirmed:true height:<attacker-chosen>`
+/// straight from the stored bytes), so an attacker-fabricated bump became a
+/// served "confirmation" forever. Stripping the subject's bump makes the
+/// stored row byte-equivalent to every honestly-submitted UNMINED tx: the
+/// completion pass later attaches a chaintracks-VERIFIED bump (or the row
+/// honestly stays proofless), and the #273 backstop keeps covering it.
+///
+/// Ancestor bumps are PRESERVED (they are source-data context, identical to
+/// every existing submit; no per-ancestor row is stored under them). The
+/// subject's raw + ancestry survive; only its own proof claim is dropped.
+///
+/// `None` = the BEEF could not be safely rebuilt (unparseable, subject
+/// missing/txid-only, or the rebuilt BEEF failed the proofless/raw guard) —
+/// the caller REFUSES admission (fail-closed: never store an unverified
+/// mined-claim verbatim).
+pub fn strip_subject_bump(beef_bytes: &[u8], subject_txid: &str) -> Option<Vec<u8>> {
+    let mut tx = Transaction::from_beef(beef_bytes, Some(subject_txid)).ok()?;
+    if !tx.id().eq_ignore_ascii_case(subject_txid) {
+        return None; // content-addressing belt — never rebuild the wrong tx
+    }
+    tx.merkle_path = None;
+    // allow_partial: a mined-claim BEEF may carry bump-only parents with no
+    // raws — the subject's own raw is what admission stores.
+    let rebuilt = match tx.to_beef(true) {
+        Ok(b) => b,
+        Err(_) => {
+            // Fallback: a minimal single-tx BEEF (parents dropped — they
+            // were claim-context only; the completion pass re-anchors the
+            // subject against chaintracks directly).
+            let mut nb = Beef::new();
+            tx.merkle_path = None;
+            nb.merge_transaction(tx);
+            nb.to_binary()
+        }
+    };
+    // GUARD: the rebuilt BEEF must carry the subject's raw and must NOT
+    // claim a proof for it — otherwise refuse (the caller 502s).
+    let b = Beef::from_binary(&rebuilt).ok()?;
+    let btx = b.find_txid(subject_txid)?;
+    if btx.has_proof() || btx.tx().is_none() {
+        return None;
+    }
+    Some(rebuilt)
+}
+
+/// The SUBJECT's raw bytes when it CLAIMS to be already mined (bsv-low#268).
+///
+/// [`beef_to_ef_batch`] returns an EMPTY `efs` when every tx in the BEEF —
+/// including the subject — carries a bump. That bump is submitter-asserted
+/// and NOT validated at this layer, so the broadcast gate must corroborate
+/// the "already mined" claim against a real provider instead of admitting
+/// on it; the corroboration body is the subject's RAW (a genuinely mined
+/// tx's parents are on-chain, so raw suffices and any honest provider
+/// answers "already known/mined").
+///
+/// `None` when the BEEF does not parse, is empty, or the subject is a
+/// txid-only entry with no tx data — the caller then refuses admission
+/// (fail-closed: an unverifiable claim never admits).
+pub fn proven_subject_raw(beef_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut beef = Beef::from_binary(beef_bytes).ok()?;
+    beef.sort_txs();
+    let subject = beef.txs.last()?;
+    let tx = subject.tx()?;
+    Some(tx.to_binary())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -190,6 +263,70 @@ mod tests {
     #[test]
     fn ef_batch_rejects_garbage_beef() {
         assert!(matches!(beef_to_ef_batch(&[0xde, 0xad]), Err(EfError::Parse(_))));
+    }
+
+    #[test]
+    fn strip_subject_bump_makes_the_stored_row_honestly_proofless() {
+        // #268 gate M1, through the REAL producers: the mined-claim admit
+        // stores `strip_subject_bump`'s output, and the read/storage sides
+        // judge it by `BeefTx::has_proof` (the same predicate
+        // `D1Storage::beef_has_proof` and the /tx-any height read key on).
+        //
+        // RED-VERIFY: neuter `strip_subject_bump` (backup copy) to return
+        // the input verbatim → the stripped BEEF still claims a proof →
+        // both assertions below fail.
+        let beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
+        let (efs, subject_txid) = beef_to_ef_batch(&beef).unwrap();
+        assert!(efs.is_empty(), "fixture is the all-proven (mined-claim) shape");
+        // Before: the subject CLAIMS a proof (the M1 poison, stored verbatim
+        // pre-fix).
+        let before = Beef::from_binary(&beef).unwrap();
+        assert!(before.find_txid(&subject_txid).unwrap().has_proof());
+
+        let stripped = strip_subject_bump(&beef, &subject_txid)
+            .expect("a parseable mined-claim BEEF must sanitize");
+        let after = Beef::from_binary(&stripped).unwrap();
+        let btx = after.find_txid(&subject_txid).expect("subject survives");
+        assert!(
+            !btx.has_proof(),
+            "the submitter's unverified bump must NOT survive into storage"
+        );
+        // The raw survives byte-meaningfully (content-addressed identity).
+        assert_eq!(btx.tx().unwrap().id(), subject_txid);
+
+        // Fail-closed arms: garbage bytes and a wrong subject txid refuse.
+        assert!(strip_subject_bump(&[0xde, 0xad], &subject_txid).is_none());
+        assert!(strip_subject_bump(&beef, &"0".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn strip_subject_bump_is_a_noop_shape_for_a_proofless_subject() {
+        // A subject with NO bump (the efs>=1 shape) round-trips proofless —
+        // stripping never manufactures or destroys anything but the
+        // subject's own proof claim.
+        let beef = build_unmined_beef();
+        let stripped = strip_subject_bump(&beef, SUBJECT_TXID).expect("must rebuild");
+        let after = Beef::from_binary(&stripped).unwrap();
+        let btx = after.find_txid(SUBJECT_TXID).unwrap();
+        assert!(!btx.has_proof());
+        assert_eq!(btx.tx().unwrap().id(), SUBJECT_TXID);
+    }
+
+    #[test]
+    fn proven_subject_raw_extracts_the_subject_bytes_for_the_mined_claim() {
+        // bsv-low#268: an all-proven BEEF (efs empty) needs the SUBJECT's raw
+        // for the mined-claim corroboration. The parent fixture BEEF alone is
+        // exactly that shape — its subject (the parent tx) carries a bump, so
+        // the EF batch is empty and the raw must come from here.
+        let beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
+        let (efs, subject_txid) = beef_to_ef_batch(&beef).unwrap();
+        assert!(efs.is_empty(), "all-proven BEEF yields no EF legs");
+        let raw = proven_subject_raw(&beef).expect("subject raw must extract");
+        let tx = Transaction::from_binary(&raw).unwrap();
+        assert_eq!(tx.id(), subject_txid, "raw is content-addressed to the subject");
+        // Garbage → None (the caller refuses admission, fail-closed).
+        assert!(proven_subject_raw(&[0xde, 0xad]).is_none());
+        assert!(proven_subject_raw(&[]).is_none());
     }
 
     #[test]

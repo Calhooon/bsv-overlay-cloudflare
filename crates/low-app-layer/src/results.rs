@@ -1610,6 +1610,24 @@ const _: () = assert!(RESULTS_UNKNOWN_POT_QUOTA < RESULTS_MAX_ROWS);
 /// attribution join. Honest traffic is exactly ONE row per slot (each seat
 /// publishes its own marker under its own committed key); the headroom
 /// absorbs benign duplicates (the sweep's content-idempotent republish).
+///
+/// # KNOWN residual — eviction at exactly this bar (bsv-low #283c)
+///
+/// The committed settle keys are PUBLIC on-chain, so the `IN (?,?)` key
+/// binding is a PREFILTER, not a barrier: an attacker can file well-formed
+/// markers UNDER the honest seat's own committed key, and exactly
+/// [`SEAT_MARKERS_PER_KEY`] forged rows stamped ahead of the honest one
+/// evict it from the window (threshold executed in the #281 gate: 7 junk →
+/// honest survives, 8 → evicted). Fail-safe — attribution is then OMITTED,
+/// never wrong (the verify pass drops every non-verifying row).
+///
+/// DO NOT half-fix this in SQL: no window size or sort order closes it —
+/// the row that must win is "the one whose `seatSigHex` VERIFIES", which
+/// SQL cannot compute. The real fixes are admission-side (rate-limit /
+/// price marker admission under a given key — an owner decision against
+/// the byte-format-only doctrine) or a verify-on-read pass over a
+/// deliberately wider window when attribution comes back empty. Tracked in
+/// bsv-low#283; widening this constant only moves the executed threshold.
 pub const SEAT_MARKERS_PER_KEY: usize = 8;
 
 /// Pots per `seat_markers_sql` chunk. FOUR binds per pot (potTxid, potVout,

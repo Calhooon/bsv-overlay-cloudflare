@@ -849,6 +849,56 @@ fn build_engine_with_storage(
     engine
 }
 
+/// PURE (bsv-low#257): race `fut` against `deadline`; `None` = the deadline
+/// won and `fut` was DROPPED (its in-flight work cancelled). Injectable
+/// deadline so the control flow is natively unit-tested; the scheduled
+/// handler passes `broadcaster::sleep_ms`.
+async fn race_or_deadline<F, D, T>(fut: F, deadline: D) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+    D: std::future::Future<Output = ()>,
+{
+    let mut fut = std::pin::pin!(fut);
+    let mut deadline = std::pin::pin!(deadline);
+    std::future::poll_fn(move |cx| {
+        if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(v));
+        }
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Per-step wall-clock budgets for the `*/15` scheduled tick (bsv-low#257).
+///
+/// ROOT CAUSE, proven live 2026-07-30: EVERY cron invocation since the
+/// 2026-07-02 deploy died at the platform's 15-minute wall-clock kill
+/// (workersInvocationsAdaptive: exactly one internalError per 15-min
+/// bucket, wallTime ≈ 900,000,000 µs, ≈112.5 GB-s at 128 MB — the
+/// metronomic #257 signature), because `engine.start_gasp_sync()` runs
+/// UNBOUNDED: `/admin/startGASPSync` (the same call on the fetch path)
+/// ran 114 s and 240 s live with zero progress and never returned. The
+/// discovered/bootstrapped peer set includes long-dead ephemeral hosts
+/// (ngrok tunnels imported via SHIP ads), the per-peer sync has no
+/// per-fetch timeout, and errors continue to the NEXT peer — so the step
+/// can exceed the whole 15-minute budget, and every step after it (peer
+/// crawl, proof passes, janitor, ops heartbeat, the #273 backstop) never
+/// ran from cron. Completion has been carried solely by the external
+/// /admin/complete-proofs poke since deploy day.
+///
+/// The fix direction: every network-bound cron step gets a bounded slice
+/// and a LOUD timeout log; a timed-out step is dropped (its work is
+/// idempotent — GASP cursors persist only per completed peer sync, crawl
+/// submits are dupe-checked, janitor evictions retry) and the tick moves
+/// on. Budgets sum to ≤ 9 min of network steps, leaving headroom for the
+/// bounded passes inside the 15-min cap.
+const GASP_SYNC_BUDGET_MS: u64 = 240_000;
+const PEER_CRAWL_BUDGET_MS: u64 = 120_000;
+const JANITOR_BUDGET_MS: u64 = 180_000;
+
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
     worker::console_log!("Scheduled event triggered");
@@ -921,8 +971,20 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     // default), GASP sync is a near-no-op: `start_gasp_sync` iterates
     // configured topics only. That's fine — calling it keeps the wire
     // connected so adding topic peers later Just Works.
-    match engine.start_gasp_sync().await {
-        Ok(r) => {
+    // #257: BOUNDED — an unbounded GASP sync (dead SHIP-discovered peers, no
+    // per-fetch timeout) hung every cron to the 15-min kill since deploy day;
+    // see the budget consts. A timeout drops the sync (cursors persist only
+    // per completed peer — idempotent redo next tick) and the tick moves on.
+    match race_or_deadline(
+        engine.start_gasp_sync(),
+        crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
+    )
+    .await
+    {
+        None => worker::console_log!(
+            "Scheduled: GASP sync EXCEEDED its {GASP_SYNC_BUDGET_MS} ms budget — dropped (bsv-low#257); continuing the tick"
+        ),
+        Some(Ok(r)) => {
             let total_peers: usize = r.topics_synced.values().map(|t| t.peers.len()).sum();
             let total_errors: usize = r.topics_synced.values().map(|t| t.errors.len()).sum();
             worker::console_log!(
@@ -942,7 +1004,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
                 }
             }
         }
-        Err(e) => worker::console_log!("Scheduled: GASP sync error: {}", e),
+        Some(Err(e)) => worker::console_log!("Scheduled: GASP sync error: {}", e),
     }
 
     // Peer crawl: bridge for non-GASP peers (bsvb today). `/lookup` +
@@ -950,27 +1012,40 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     // is_dupe check makes this idempotent — crawling the same peer
     // twice in a row costs compute but admits nothing new.
     let peers = non_gasp_peers();
-    let crawl_result = peer_crawler::crawl_peers(&engine, &peers, "cron").await;
-    let total_attempted: usize = crawl_result.attempted.values().sum();
-    let total_admitted: usize = crawl_result.admitted_by.values().sum();
-    worker::console_log!(
-        "Scheduled: peer-crawl — peers={} attempted={} admitted={} peer_errors={}",
-        peers.len(),
-        total_attempted,
-        total_admitted,
-        crawl_result.peer_errors.len(),
-    );
-    for (k, errs) in &crawl_result.errors {
-        if !errs.is_empty() {
+    // #257: bounded like GASP sync — crawl submits are dupe-checked, so a
+    // dropped crawl re-does nothing next tick.
+    match race_or_deadline(
+        peer_crawler::crawl_peers(&engine, &peers, "cron"),
+        crate::broadcaster::sleep_ms(PEER_CRAWL_BUDGET_MS),
+    )
+    .await
+    {
+        None => worker::console_log!(
+            "Scheduled: peer-crawl EXCEEDED its {PEER_CRAWL_BUDGET_MS} ms budget — dropped (bsv-low#257); continuing the tick"
+        ),
+        Some(crawl_result) => {
+            let total_attempted: usize = crawl_result.attempted.values().sum();
+            let total_admitted: usize = crawl_result.admitted_by.values().sum();
             worker::console_log!(
-                "  Scheduled peer-crawl {k}: {} submit-errors (first: {})",
-                errs.len(),
-                errs.first().map(String::as_str).unwrap_or("")
+                "Scheduled: peer-crawl — peers={} attempted={} admitted={} peer_errors={}",
+                peers.len(),
+                total_attempted,
+                total_admitted,
+                crawl_result.peer_errors.len(),
             );
+            for (k, errs) in &crawl_result.errors {
+                if !errs.is_empty() {
+                    worker::console_log!(
+                        "  Scheduled peer-crawl {k}: {} submit-errors (first: {})",
+                        errs.len(),
+                        errs.first().map(String::as_str).unwrap_or("")
+                    );
+                }
+            }
+            for (k, e) in &crawl_result.peer_errors {
+                worker::console_log!("  Scheduled peer-crawl {k}: lookup failed: {e}");
+            }
         }
-    }
-    for (k, e) in &crawl_result.peer_errors {
-        worker::console_log!("  Scheduled peer-crawl {k}: lookup failed: {e}");
     }
 
     // BEEF proof completion (#192/#193). Two parallel passes, both bounded per
@@ -1091,6 +1166,44 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         backfill_summary.missing_beef,
     );
 
+    // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
+    //    #267 item c). The passes above only help txs the network HOLDS; an
+    //    admitted tx the network never accepted (the #267 incident class)
+    //    never self-heals — this pass presence-probes old proofless rows
+    //    (Bitails + WoC) and rebroadcasts the stored BEEF ancestry-first
+    //    when BOTH indexers definitively 404 it. Runs LAST, own bounds
+    //    (16 candidates / 48 POSTs, 30min–14d candidacy bracket — gate
+    //    LOW-1), so it can never starve proof completion.
+    let tx_storage = D1Storage::new(ops_db.clone());
+    let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let rb_candidates = tx_storage
+        .find_rebroadcast_candidates(
+            crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
+            crate::proof_fetcher::REBROADCAST_MIN_AGE_SECS,
+            crate::proof_fetcher::REBROADCAST_MAX_CANDIDATE_AGE_SECS,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            worker::console_log!("Scheduled: rebroadcast-backstop candidate scan failed: {e}");
+            Vec::new()
+        });
+    let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
+        rb_candidates,
+        taal_key.as_deref(),
+        None,
+    )
+    .await;
+    worker::console_log!(
+        "Scheduled: rebroadcast-backstop (transactions) — scanned={} present={} \
+         inconclusive={} rebroadcast={} failed={} budget_skipped={}",
+        rb.scanned,
+        rb.present,
+        rb.inconclusive,
+        rb.rebroadcast,
+        rb.rebroadcast_failed,
+        rb.budget_skipped,
+    );
+
     // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
     // the persistent counters, and refresh the proofless first-seen ledger so a
     // dead pass / a proof-not-landing surfaces via GET /health/invariants
@@ -1114,20 +1227,30 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
          proofless_over_24h={flagged}"
     );
 
-    // Run janitor health checks
+    // Run janitor health checks. #257: bounded — the janitor serially
+    // health-checks every SHIP/SLAP domain (including dead ephemeral hosts),
+    // so once GASP sync stopped eating the whole budget this step would be
+    // the next unbounded candidate. A dropped janitor just retries evictions
+    // next tick.
     let janitor_config = overlay_engine::health_checker::JanitorConfig::default();
     let checker = WorkerHealthChecker;
     let hosting_url = env.var("HOSTING_URL").ok().map(|v| v.to_string());
-    match janitor::run_janitor(
-        ship_storage.as_ref(),
-        slap_storage.as_ref(),
-        &checker,
-        &janitor_config,
-        hosting_url.as_deref(),
+    match race_or_deadline(
+        janitor::run_janitor(
+            ship_storage.as_ref(),
+            slap_storage.as_ref(),
+            &checker,
+            &janitor_config,
+            hosting_url.as_deref(),
+        ),
+        crate::broadcaster::sleep_ms(JANITOR_BUDGET_MS),
     )
     .await
     {
-        Ok(result) => {
+        None => worker::console_log!(
+            "Scheduled: janitor EXCEEDED its {JANITOR_BUDGET_MS} ms budget — dropped (bsv-low#257); continuing"
+        ),
+        Some(Ok(result)) => {
             worker::console_log!(
                 "Scheduled: Janitor completed — SHIP: {}, SLAP: {}, evicted: {}, healthy: {}, unhealthy: {}",
                 result.ship_records_checked,
@@ -1137,7 +1260,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
                 result.domains_unhealthy,
             );
         }
-        Err(e) => {
+        Some(Err(e)) => {
             worker::console_log!("Scheduled: Janitor error: {}", e);
         }
     }
@@ -1223,6 +1346,28 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
     )
     .await;
+    // 4b. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
+    //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1);
+    //     see the scheduled block's note.
+    let tx_storage = D1Storage::new(db.clone());
+    let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let rb_candidates = tx_storage
+        .find_rebroadcast_candidates(
+            crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
+            crate::proof_fetcher::REBROADCAST_MIN_AGE_SECS,
+            crate::proof_fetcher::REBROADCAST_MAX_CANDIDATE_AGE_SECS,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            worker::console_log!("complete-proofs: rebroadcast candidate scan failed: {e}");
+            Vec::new()
+        });
+    let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
+        rb_candidates,
+        taal_key.as_deref(),
+        None,
+    )
+    .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;
@@ -1250,6 +1395,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "params_decoded": bf.decoded,
         "params_verdicts": bf.verdicts,
         "params_missing_beef": bf.missing_beef,
+        // #273 rebroadcast-backstop counters.
+        "rebroadcast_scanned": rb.scanned,
+        "rebroadcast_present": rb.present,
+        "rebroadcast_inconclusive": rb.inconclusive,
+        "rebroadcast_rescued": rb.rebroadcast,
+        "rebroadcast_failed": rb.rebroadcast_failed,
+        "rebroadcast_budget_skipped": rb.budget_skipped,
         // Observability only (≤5): which spending txids were sampled, so an
         // operator can check them on a block explorer and distinguish a broken
         // chaser from a genuinely unconfirmable backlog.
@@ -1373,5 +1525,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── bsv-low#257: the cron step deadline race ─────────────────────────
+
+    #[tokio::test]
+    async fn race_returns_the_value_when_the_step_finishes_first() {
+        let out = race_or_deadline(async { 42u32 }, std::future::pending::<()>()).await;
+        assert_eq!(out, Some(42));
+    }
+
+    #[tokio::test]
+    async fn race_drops_a_hung_step_when_the_deadline_fires() {
+        // The #257 shape: a step that never completes (the unbounded GASP
+        // sync against a dead peer) must NOT hold the tick — the deadline
+        // wins, the step future is dropped, and the caller continues.
+        let out = race_or_deadline(std::future::pending::<u32>(), async {}).await;
+        assert_eq!(out, None, "a hung step must yield to the deadline");
     }
 }

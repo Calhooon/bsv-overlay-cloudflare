@@ -1600,10 +1600,11 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
         None => {
             let (index_raw, index_height) = tx_any_index_leg(&ctx, &key).await;
             // Fully index-native when the BUMP proves the mine — zero
-            // external reads. Otherwise consult the break-glass leg (for an
-            // admitted-but-unproven tx it can only ADD a confirmation; for an
-            // index miss it is the whole answer).
-            let answer = if index_raw.is_some() && index_height.is_some() {
+            // external reads. Otherwise consult the break-glass leg: for an
+            // admitted-but-unproven tx it now answers the PRESENCE question
+            // too (bsv-low #247 — own-store bytes with no BUMP are not
+            // network truth); for an index miss it is the whole answer.
+            let mut answer = if index_raw.is_some() && index_height.is_some() {
                 crate::txany::decide_tx_any(
                     index_raw,
                     index_height,
@@ -1614,6 +1615,45 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 let (external, absence) = tx_any_external_leg(&key).await;
                 crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence)
             };
+            // #247 provably-unconfirmable probe: ONLY for a corroborated
+            // network-absent tx whose bytes we hold (rare — the zombie
+            // class). If an input is verified spent by a DIFFERENT confirmed
+            // tx, this tx can never land: a terminal skip the client may
+            // consume to stop bounded rebroadcasts. Bounded to the first 3
+            // inputs; every weaker observation proves nothing (stays false).
+            if answer.present == Some(false) {
+                if let Some(inputs) = answer
+                    .raw_hex
+                    .as_deref()
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| bsv_rs::transaction::Transaction::from_binary(&b).ok())
+                    .map(|tx| tx.inputs)
+                {
+                    for input in inputs.iter().take(3) {
+                        let Some(src_txid) = input.source_txid.as_deref() else {
+                            continue;
+                        };
+                        let st =
+                            spent_any_resolve(&src_txid.to_ascii_lowercase(), input.source_output_index)
+                                .await;
+                        if crate::txany::input_proves_unconfirmable(
+                            &key,
+                            st.known,
+                            st.spent,
+                            st.spending_txid.as_deref(),
+                            st.spent_confirmed,
+                        ) {
+                            console_warn!(
+                                "[tx-any] {key} PROVABLY UNCONFIRMABLE — input {}:{} spent by a different confirmed tx",
+                                src_txid,
+                                input.source_output_index
+                            );
+                            answer.unconfirmable = true;
+                            break;
+                        }
+                    }
+                }
+            }
             TX_ANY_CACHE.with(|c| {
                 let mut map = c.borrow_mut();
                 map.retain(|_, (expiry, _)| *expiry > now);
