@@ -23,6 +23,65 @@ pub const GASP_VERSION: u32 = 1;
 pub const DEFAULT_GASP_SYNC_LIMIT: u64 = 10000;
 
 // ============================================================================
+// Per-peer sync budgets + dead-peer quarantine (bsv-low#302)
+// ============================================================================
+
+/// PURE (bsv-low#257/#302): race `fut` against `deadline`; `None` = the
+/// deadline won and `fut` was DROPPED (its in-flight work cancelled).
+/// Injectable deadline so the control flow is natively unit-tested — the
+/// house idiom generalized out of `overlay-cloudflare`'s scheduled handler
+/// (which passes its platform `sleep_ms`) so the ENGINE's per-peer GASP
+/// budget can reuse it.
+pub async fn race_or_deadline<F, D, T>(fut: F, deadline: D) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+    D: std::future::Future<Output = ()>,
+{
+    let mut fut = std::pin::pin!(fut);
+    let mut deadline = std::pin::pin!(deadline);
+    std::future::poll_fn(move |cx| {
+        if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(v));
+        }
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Consecutive all-failure syncs after which a peer is QUARANTINED
+/// (bsv-low#302). At the production `*/15` cron cadence 8 consecutive
+/// failures ≈ 2 hours of unbroken unreachability — comfortably past any
+/// transient blip (deploy, restart, brief network fault, one bad tick),
+/// while still cutting a genuinely dead peer's budget burn off the same
+/// day it dies.
+pub const PEER_QUARANTINE_THRESHOLD: u64 = 8;
+
+/// Re-probe interval for a quarantined peer, seconds (6 h ≈ every 24 cron
+/// ticks). Quarantine is NEVER a deletion: once `secs_since_last_attempt`
+/// reaches this age the peer gets exactly ONE fresh sync attempt — success
+/// resets its failure count to 0 (full re-admission), failure re-arms the
+/// quarantine for another window. A peer that died transiently therefore
+/// re-admits itself automatically on the first re-probe after it recovers.
+pub const PEER_QUARANTINE_REPROBE_SECS: u64 = 6 * 3600;
+
+/// PURE quarantine rule (bsv-low#302): a peer is skipped IFF it has hit
+/// [`PEER_QUARANTINE_THRESHOLD`] consecutive failures AND its last attempt
+/// is younger than [`PEER_QUARANTINE_REPROBE_SECS`]. A peer with no
+/// recorded attempt (`secs_since_last_attempt == None` — pristine, or a
+/// backend without peer-health tracking) is NEVER quarantined, and an old
+/// enough last attempt always re-opens one probe — fail-safe in the
+/// "attempt more, never strand a peer forever" direction.
+pub fn peer_sync_quarantined(health: &crate::storage::PeerSyncHealth) -> bool {
+    health.consecutive_failures >= PEER_QUARANTINE_THRESHOLD
+        && health
+            .secs_since_last_attempt
+            .is_some_and(|secs| secs < PEER_QUARANTINE_REPROBE_SECS)
+}
+
+// ============================================================================
 // GASPStorage trait
 // ============================================================================
 
@@ -664,6 +723,77 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    // ── race_or_deadline (bsv-low#257/#302, generalized here) ──────────
+
+    #[tokio::test]
+    async fn race_or_deadline_future_wins() {
+        let out = race_or_deadline(async { 42u32 }, std::future::pending::<()>()).await;
+        assert_eq!(out, Some(42));
+    }
+
+    #[tokio::test]
+    async fn race_or_deadline_deadline_wins() {
+        let out = race_or_deadline(std::future::pending::<u32>(), async {}).await;
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn race_or_deadline_ready_future_beats_ready_deadline() {
+        // The sync future is polled FIRST — an instantly-ready result wins
+        // even against an already-expired deadline (a completed sync is
+        // never discarded).
+        let out = race_or_deadline(async { 7u32 }, async {}).await;
+        assert_eq!(out, Some(7));
+    }
+
+    // ── peer_sync_quarantined (bsv-low#302 pure rule) ──────────────────
+
+    fn health(fails: u64, age: Option<u64>) -> crate::storage::PeerSyncHealth {
+        crate::storage::PeerSyncHealth {
+            consecutive_failures: fails,
+            secs_since_last_attempt: age,
+        }
+    }
+
+    #[test]
+    fn quarantine_needs_the_full_threshold() {
+        assert!(!peer_sync_quarantined(&health(0, Some(0))));
+        assert!(!peer_sync_quarantined(&health(
+            PEER_QUARANTINE_THRESHOLD - 1,
+            Some(0)
+        )));
+        assert!(peer_sync_quarantined(&health(
+            PEER_QUARANTINE_THRESHOLD,
+            Some(0)
+        )));
+        assert!(peer_sync_quarantined(&health(
+            PEER_QUARANTINE_THRESHOLD + 100,
+            Some(0)
+        )));
+    }
+
+    #[test]
+    fn quarantine_reopens_one_probe_after_the_reprobe_window() {
+        let fails = PEER_QUARANTINE_THRESHOLD;
+        assert!(peer_sync_quarantined(&health(
+            fails,
+            Some(PEER_QUARANTINE_REPROBE_SECS - 1)
+        )));
+        // AT the window boundary the probe re-opens — a quarantined peer is
+        // never stranded forever.
+        assert!(!peer_sync_quarantined(&health(
+            fails,
+            Some(PEER_QUARANTINE_REPROBE_SECS)
+        )));
+    }
+
+    #[test]
+    fn never_attempted_peer_is_never_quarantined() {
+        // `None` age = pristine peer OR a backend without health tracking —
+        // fail-safe: always attempted.
+        assert!(!peer_sync_quarantined(&health(u64::MAX, None)));
+    }
 
     // ── Mock GASPStorage ───────────────────────────────────────────────
 

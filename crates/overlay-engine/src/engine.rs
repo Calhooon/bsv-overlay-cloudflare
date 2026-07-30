@@ -72,8 +72,25 @@ pub struct Engine {
     /// today. A platform crate may set `Some` (one-time-migration only) to let
     /// ingest self-heal missing ancestry by fetching it from chain.
     ancestor_fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>>,
+    /// bsv-low#302: per-peer GASP sync wall-clock budget —
+    /// `(sleep factory, budget ms)`. `None` (default) = unbounded per-peer
+    /// sync, byte-identical to the pre-#302 behavior. When set, each peer's
+    /// `GASPSync::sync` is raced against `sleep(budget_ms)`; a peer that
+    /// exceeds the budget is DROPPED (loud log, failure recorded, cursor NOT
+    /// advanced) and the loop continues with the next peer.
+    peer_sync_budget: Option<(SleepFactory, u64)>,
     config: EngineConfig,
 }
+
+/// Boxed platform sleep future (bsv-low#302). Not `Send` — the engine runs
+/// single-threaded on wasm (Workers) and under `#[tokio::test]` locally.
+pub type SleepFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// Platform sleep factory (bsv-low#302): milliseconds → a future that
+/// resolves after that delay. The Cloudflare crate passes its `sleep_ms`;
+/// tests pass `ready(())` (instant deadline) or `pending()` (no deadline)
+/// to drive the race deterministically.
+pub type SleepFactory = std::rc::Rc<dyn Fn(u64) -> SleepFuture>;
 
 /// Summary of an [`Engine::complete_missing_proofs`] pass.
 ///
@@ -252,6 +269,7 @@ impl Engine {
             chain_tracker,
             gasp_remote_factory: None,
             ancestor_fetcher: None,
+            peer_sync_budget: None,
             config,
         }
     }
@@ -283,6 +301,18 @@ impl Engine {
     /// NOT call this — when unset, GASP ingest behavior is unchanged.
     pub fn set_ancestor_fetcher(&mut self, fetcher: std::rc::Rc<dyn crate::gasp::AncestorFetcher>) {
         self.ancestor_fetcher = Some(fetcher);
+    }
+
+    /// Set the per-peer GASP sync budget (bsv-low#302).
+    ///
+    /// `sleep` is the platform sleep factory (ms → future); `budget_ms` is
+    /// the wall-clock slice ONE peer's sync may consume. A peer exceeding it
+    /// is dropped (loudly logged, recorded as a failed sync, cursor NOT
+    /// advanced — `update_last_interaction` runs only after a COMPLETED
+    /// sync, so a re-scan next tick is idempotent) and the loop moves on.
+    /// Unset (default) = unbounded, the pre-#302 behavior.
+    pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
+        self.peer_sync_budget = Some((sleep, budget_ms));
     }
 
     // ========================================================================
@@ -1828,6 +1858,27 @@ impl Engine {
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
                 for peer_url in &peers {
+                    // bsv-low#302 quarantine gate: a peer at
+                    // PEER_QUARANTINE_THRESHOLD consecutive failures is
+                    // SKIPPED (no attempt recorded — its last-attempt age
+                    // keeps growing) until the re-probe window opens. A
+                    // health-read FAULT treats the peer as healthy: broken
+                    // bookkeeping must never silence a live peer.
+                    let health = self
+                        .storage
+                        .get_peer_sync_health(peer_url, topic)
+                        .await
+                        .unwrap_or_default();
+                    if crate::gasp::peer_sync_quarantined(&health) {
+                        warn!(
+                            "[GASP SYNC] Peer {peer_url} for {topic} QUARANTINED ({} consecutive failed syncs, last attempt {:?}s ago) — skipped until the {}s re-probe window (bsv-low#302)",
+                            health.consecutive_failures,
+                            health.secs_since_last_attempt,
+                            crate::gasp::PEER_QUARANTINE_REPROBE_SECS
+                        );
+                        continue;
+                    }
+
                     info!("[GASP SYNC] Syncing topic {topic} with peer {peer_url}");
 
                     // Get last interaction score for this (peer, topic) pair
@@ -1862,8 +1913,35 @@ impl Engine {
                     )
                     .with_ancestor_fetcher(self.ancestor_fetcher.clone());
 
-                    match sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await {
-                        Ok(()) => {
+                    // bsv-low#302: bound THIS peer's sync to the configured
+                    // budget. `None` from the race = the budget won and the
+                    // sync future was dropped mid-flight — safe, because the
+                    // persisted cursor only ever advances in the completed-Ok
+                    // arm below (idempotent re-scan next tick), and finalized
+                    // graphs are only submitted there too.
+                    let sync_outcome = match &self.peer_sync_budget {
+                        Some((sleep, budget_ms)) => {
+                            crate::gasp::race_or_deadline(
+                                sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)),
+                                sleep(*budget_ms),
+                            )
+                            .await
+                        }
+                        None => Some(sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await),
+                    };
+
+                    let outcome_success = matches!(sync_outcome, Some(Ok(())));
+                    match sync_outcome {
+                        None => {
+                            let budget_ms =
+                                self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
+                            let msg = format!(
+                                "{peer_url}: per-peer sync budget of {budget_ms} ms EXCEEDED — dropped (bsv-low#302)"
+                            );
+                            warn!("[GASP SYNC] {msg}");
+                            errors.push(msg);
+                        }
+                        Some(Ok(())) => {
                             // Submit finalized graphs to the Engine
                             let finalized: Vec<_> = sink
                                 .lock()
@@ -1923,11 +2001,25 @@ impl Engine {
                                 sync.last_interaction
                             );
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             let msg = format!("{peer_url}: {e}");
                             warn!("[GASP SYNC] Sync failed: {msg}");
                             errors.push(msg);
                         }
+                    }
+
+                    // bsv-low#302: record the attempt outcome (success resets
+                    // the consecutive-failure count; timeout/error increments
+                    // it). Best-effort — a bookkeeping fault must never fail
+                    // the sync pass itself.
+                    if let Err(e) = self
+                        .storage
+                        .record_peer_sync_outcome(peer_url, topic, outcome_success)
+                        .await
+                    {
+                        warn!(
+                            "[GASP SYNC] failed to record peer sync outcome for {peer_url}/{topic}: {e}"
+                        );
                     }
                 }
             }
@@ -3843,6 +3935,239 @@ mod tests {
         // them. See `test_start_gasp_sync_with_factory_runs_sync` (#43 gap-guard).
         assert_eq!(last1, 99);
         assert_eq!(last2, 99);
+    }
+
+    // ── Per-peer budget + dead-peer quarantine (bsv-low#302) ──────────
+
+    /// A remote whose initial request HANGS forever — models the dead
+    /// ephemeral peers (ngrok tunnels) whose fetch never returns, the #257
+    /// root cause the per-peer budget exists for.
+    struct HangingRemote;
+
+    #[async_trait(?Send)]
+    impl crate::gasp::GASPRemote for HangingRemote {
+        async fn get_initial_response(
+            &self,
+            _: &crate::types::GASPInitialRequest,
+        ) -> Result<crate::types::GASPInitialResponse, crate::gasp::GASPError> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &crate::types::GASPInitialResponse,
+        ) -> Result<crate::types::GASPInitialReply, crate::gasp::GASPError> {
+            unreachable!()
+        }
+        async fn request_node(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: bool,
+        ) -> Result<crate::types::GASPNode, crate::gasp::GASPError> {
+            unreachable!()
+        }
+        async fn submit_node(
+            &self,
+            _: &crate::types::GASPNode,
+        ) -> Result<Option<crate::types::GASPNodeResponse>, crate::gasp::GASPError> {
+            unreachable!()
+        }
+    }
+
+    /// Factory that HANGS for `hang.example.com` peers and serves the normal
+    /// mock sync remote for everyone else, counting `create_remote` calls
+    /// (a quarantine-skipped peer never reaches the factory).
+    struct SelectiveHangFactory {
+        created: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl crate::gasp::GASPRemoteFactory for SelectiveHangFactory {
+        fn create_remote(&self, peer_url: &str, _topic: &str) -> Box<dyn crate::gasp::GASPRemote> {
+            self.created.borrow_mut().push(peer_url.to_string());
+            if peer_url.contains("hang.example.com") {
+                Box::new(HangingRemote)
+            } else {
+                Box::new(MockSyncRemote {
+                    utxos: vec![crate::types::GASPOutput {
+                        txid: "remote_tx1".to_string(),
+                        output_index: 0,
+                        score: 100.0,
+                    }],
+                })
+            }
+        }
+    }
+
+    /// The deterministic "instant deadline" sleep factory: `race_or_deadline`
+    /// polls the sync future FIRST, so an in-memory sync that never yields
+    /// still completes; only a future that actually returns Pending (the
+    /// hanging remote) loses the race.
+    fn instant_deadline() -> crate::engine::SleepFactory {
+        std::rc::Rc::new(|_ms| Box::pin(std::future::ready(())))
+    }
+
+    fn two_peer_engine(store: std::rc::Rc<MemoryStorage>) -> Engine {
+        let mut sync_config: SyncConfiguration = HashMap::new();
+        sync_config.insert(
+            "tm_test".to_string(),
+            SyncTarget::Peers(vec![
+                "https://hang.example.com".to_string(),
+                "https://good.example.com".to_string(),
+            ]),
+        );
+        Engine::new(
+            HashMap::new(),
+            HashMap::new(),
+            Box::new(store),
+            None,
+            EngineConfig {
+                sync_configuration: sync_config,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn peer_budget_timeout_skips_dead_peer_continues_loop_and_never_advances_cursor() {
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        let created = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut engine = two_peer_engine(store.clone());
+        engine.set_gasp_remote_factory(Box::new(SelectiveHangFactory {
+            created: created.clone(),
+        }));
+        engine.set_peer_sync_budget(instant_deadline(), 1);
+
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic_result = &result.topics_synced["tm_test"];
+
+        // The hanging peer was dropped LOUDLY (an error entry) and the loop
+        // CONTINUED: the good peer was still attempted and completed.
+        assert_eq!(topic_result.errors.len(), 1, "one budget-exceeded error");
+        assert!(topic_result.errors[0].contains("budget"), "{:?}", topic_result.errors);
+        assert_eq!(
+            created.borrow().as_slice(),
+            ["https://hang.example.com", "https://good.example.com"],
+            "both peers attempted this tick"
+        );
+
+        // Cursor semantics (the #257 gate property): a timed-out peer's
+        // cursor NEVER advances; the completed peer's does.
+        let hang_cursor = store
+            .get_last_interaction("https://hang.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert_eq!(hang_cursor, 0, "timeout must not advance the sync cursor");
+        let good_cursor = store
+            .get_last_interaction("https://good.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert!(good_cursor > 0, "completed peer's cursor advances");
+
+        // Health bookkeeping: timeout = failure, completion = success.
+        let hang_health = store
+            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert_eq!(hang_health.consecutive_failures, 1);
+        let good_health = store
+            .get_peer_sync_health("https://good.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert_eq!(good_health.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn peer_quarantined_after_threshold_reprobed_after_window_readmitted_on_success() {
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        let created = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        let mut sync_config: SyncConfiguration = HashMap::new();
+        sync_config.insert(
+            "tm_test".to_string(),
+            SyncTarget::Peers(vec!["https://hang.example.com".to_string()]),
+        );
+        let mut engine = Engine::new(
+            HashMap::new(),
+            HashMap::new(),
+            Box::new(store.clone()),
+            None,
+            EngineConfig {
+                sync_configuration: sync_config,
+                ..Default::default()
+            },
+        );
+        engine.set_gasp_remote_factory(Box::new(SelectiveHangFactory {
+            created: created.clone(),
+        }));
+        engine.set_peer_sync_budget(instant_deadline(), 1);
+
+        // Fail the peer up to (but not past) the quarantine threshold — every
+        // tick attempts it (advance the clock between ticks so the attempts
+        // are distinguishable in age).
+        for i in 0..crate::gasp::PEER_QUARANTINE_THRESHOLD {
+            engine.start_gasp_sync().await.unwrap();
+            store.advance_clock(900);
+            assert_eq!(
+                created.borrow().len() as u64,
+                i + 1,
+                "peer attempted while below the threshold"
+            );
+        }
+        let health = store
+            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert_eq!(
+            health.consecutive_failures,
+            crate::gasp::PEER_QUARANTINE_THRESHOLD
+        );
+
+        // Next tick: QUARANTINED — the factory is never consulted, no error
+        // is emitted, and the attempt count does not grow (a skip is not an
+        // attempt, so the re-probe window keeps aging).
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert!(result.topics_synced["tm_test"].errors.is_empty());
+        assert_eq!(
+            created.borrow().len() as u64,
+            crate::gasp::PEER_QUARANTINE_THRESHOLD,
+            "quarantined peer must be skipped"
+        );
+
+        // Age past the re-probe window: exactly one fresh probe is allowed.
+        store.advance_clock(crate::gasp::PEER_QUARANTINE_REPROBE_SECS);
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            created.borrow().len() as u64,
+            crate::gasp::PEER_QUARANTINE_THRESHOLD + 1,
+            "re-probe attempted after the window"
+        );
+        // The probe failed again → failure count kept growing → re-armed.
+        let health = store
+            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert_eq!(
+            health.consecutive_failures,
+            crate::gasp::PEER_QUARANTINE_THRESHOLD + 1
+        );
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert!(result.topics_synced["tm_test"].errors.is_empty(), "re-quarantined");
+
+        // The peer comes back to life: age to the next re-probe, then answer
+        // like a healthy peer → SUCCESS resets the count to 0 (full
+        // re-admission — quarantine is never a deletion).
+        store.advance_clock(crate::gasp::PEER_QUARANTINE_REPROBE_SECS);
+        // Swap the factory for one that serves the healthy mock for this URL.
+        engine.set_gasp_remote_factory(Box::new(MockGASPRemoteFactory));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert!(result.topics_synced["tm_test"].errors.is_empty());
+        let health = store
+            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .await
+            .unwrap();
+        assert_eq!(health.consecutive_failures, 0, "success fully re-admits");
     }
 
     // ── Mock ARC Broadcaster ─────────────────────────────────────────

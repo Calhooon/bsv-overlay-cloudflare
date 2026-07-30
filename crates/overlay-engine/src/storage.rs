@@ -226,6 +226,55 @@ pub trait Storage {
 
     /// Get the last interaction score for a host+topic pair. Returns 0 if not found.
     async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError>;
+
+    // ========================================================================
+    // GASP peer health (bsv-low#302 — dead-peer quarantine)
+    // ========================================================================
+
+    /// Record the outcome of ONE GASP sync attempt with `host` for `topic`
+    /// (bsv-low#302). `success = true` resets the consecutive-failure count
+    /// to 0 (full re-admission); `false` increments it. The backend stamps
+    /// its own clock for the attempt time — the engine never supplies wall
+    /// time. Quarantine-SKIPPED peers are NOT recorded (a skip is not an
+    /// attempt; the last-attempt age must keep growing so the re-probe
+    /// window opens).
+    ///
+    /// Default: no-op — a backend without durable peer health never
+    /// quarantines anything (fail-safe: every peer keeps being attempted).
+    async fn record_peer_sync_outcome(
+        &self,
+        host: &str,
+        topic: &str,
+        success: bool,
+    ) -> Result<(), StorageError> {
+        let _ = (host, topic, success);
+        Ok(())
+    }
+
+    /// Current sync health of the (host, topic) pairing (bsv-low#302). The
+    /// backend answers with its consecutive-failure count and the AGE of
+    /// the last attempt (relative seconds, so the engine needs no clock of
+    /// its own). Default: pristine — never attempted, never quarantined.
+    async fn get_peer_sync_health(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<PeerSyncHealth, StorageError> {
+        let _ = (host, topic);
+        Ok(PeerSyncHealth::default())
+    }
+}
+
+/// Durable per-(host, topic) GASP sync health (bsv-low#302) — the input to
+/// the pure quarantine rule [`crate::gasp::peer_sync_quarantined`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerSyncHealth {
+    /// Consecutive sync attempts that ALL failed (timeout counts as a
+    /// failure). Reset to 0 by any successful sync.
+    pub consecutive_failures: u64,
+    /// Seconds since the last recorded sync ATTEMPT (success or failure).
+    /// `None` = never attempted / no health tracked — never quarantined.
+    pub secs_since_last_attempt: Option<u64>,
 }
 
 // ============================================================================
@@ -347,6 +396,23 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError> {
         (**self).get_last_interaction(host, topic).await
     }
+    async fn record_peer_sync_outcome(
+        &self,
+        host: &str,
+        topic: &str,
+        success: bool,
+    ) -> Result<(), StorageError> {
+        (**self)
+            .record_peer_sync_outcome(host, topic, success)
+            .await
+    }
+    async fn get_peer_sync_health(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<PeerSyncHealth, StorageError> {
+        (**self).get_peer_sync_health(host, topic).await
+    }
 }
 
 // ============================================================================
@@ -412,6 +478,11 @@ pub mod memory {
         /// `transactions.created_at` column. A txid ABSENT here has UNKNOWN
         /// age and is treated as OLD (eligible) — the fail-safe direction.
         created_at: Mutex<HashMap<String, u64>>,
+        /// GASP peer health keyed by (host, topic) —
+        /// `(consecutive_failures, last_attempt_at_clock_secs)`. Models the
+        /// D1 `gasp_peer_health` table (bsv-low#302); the logical clock
+        /// above stands in for `unixepoch()`.
+        peer_health: Mutex<HashMap<(String, String), (u64, u64)>>,
     }
 
     impl MemoryStorage {
@@ -786,6 +857,40 @@ pub mod memory {
                 .unwrap()
                 .get(&(host.to_string(), topic.to_string()))
                 .unwrap_or(&0))
+        }
+
+        async fn record_peer_sync_outcome(
+            &self,
+            host: &str,
+            topic: &str,
+            success: bool,
+        ) -> Result<(), StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
+            let mut health = self.peer_health.lock().unwrap();
+            let entry = health
+                .entry((host.to_string(), topic.to_string()))
+                .or_insert((0, now));
+            entry.0 = if success { 0 } else { entry.0 + 1 };
+            entry.1 = now;
+            Ok(())
+        }
+
+        async fn get_peer_sync_health(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<PeerSyncHealth, StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
+            Ok(self
+                .peer_health
+                .lock()
+                .unwrap()
+                .get(&(host.to_string(), topic.to_string()))
+                .map(|(fails, attempt_at)| PeerSyncHealth {
+                    consecutive_failures: *fails,
+                    secs_since_last_attempt: Some(now.saturating_sub(*attempt_at)),
+                })
+                .unwrap_or_default())
         }
     }
 }
