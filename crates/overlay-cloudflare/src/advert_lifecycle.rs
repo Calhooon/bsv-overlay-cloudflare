@@ -35,15 +35,24 @@
 //! never came through us; that is the whole problem). The closest honest
 //! alternative on the services this worker already uses (WoC + Bitails,
 //! the #273 rebroadcast-backstop / courier-ladder hosts — no new provider)
-//! is the `/spent-any` doctrine already shipped server-side in this repo
-//! (`low-app-layer::routes::spent_any_resolve`, bsv-low#227): WoC's
-//! `GET /tx/{txid}/{vout}/spent` pointer is accepted ONLY after RAW
-//! VERIFICATION — the spender's raw bytes are fetched (Bitails first, WoC
-//! break-glass, THIS worker's courier order), hash-checked against the
-//! reported txid, and input-matched to the advert outpoint. A pointer that
-//! fails verification is a provider fault → the row stands. One provider's
-//! word alone never destroys a row; a raw-verified spend is chain truth
-//! (the spender's bytes themselves prove the outpoint is consumed).
+//! is the `/spent-any` doctrine shipped server-side in this repo
+//! (`low-app-layer::routes::spent_any_resolve`, bsv-low#227), TIGHTENED
+//! for a destructive consumer: WoC's `GET /tx/{txid}/{vout}/spent` pointer
+//! is accepted ONLY after RAW VERIFICATION, and the raw MUST come from the
+//! NON-POINTER provider (Bitails). A pointer corroborated only by the
+//! pointer provider's own raw proves nothing — a single lying provider
+//! could mint both the pointer AND a crafted hash-bound raw and delete any
+//! row — so that case is classified UNVERIFIABLE and the row stands
+//! (#227's positives may fall back to a WoC raw because they only ANSWER a
+//! query; this pass DELETES, so its bar is two independent providers).
+//!
+//! Honest bar (what a deletion actually rests on): the Bitails-served
+//! bytes hash to the WoC-reported spender AND spend the advert outpoint —
+//! i.e. BYTE-EXISTENCE + INPUT-MATCH corroborated across two independent
+//! providers, NOT SPV chain inclusion (no bump is verified here; that is
+//! the #227 bar too). Proportionate to the stake: a wrongly-standing row
+//! is a stale lobby listing, a wrongly-deleted row is a lost listing —
+//! never money — and every uncertain read leaves the row standing.
 //!
 //! WoC on a background pass: bounded at [`ADVERT_SPEND_CHECK_LIMIT`]
 //! candidates × ≤3 GETs per tick — the same cold-path posture as the #273
@@ -125,8 +134,14 @@ pub enum SpentProbe {
 
 /// PURE: parse a WoC `GET /tx/{txid}/{vout}/spent` response into a
 /// [`SpentProbe`]. Strict: a 200 whose body lacks a well-formed 64-hex
-/// `txid` is a Fault, never a verdict.
+/// `txid` is a Fault, never a verdict. 429 (rate-limited — the free-tier
+/// WoC signature) and every 5xx/transport shape are Faults too (gate L4):
+/// a throttled probe says nothing about the outpoint, and bucketing it as
+/// NotSpent would make the `not_spent` counter lie under rate-limiting.
 pub fn parse_woc_spent_probe(status: u16, body: &str) -> SpentProbe {
+    if status == 429 {
+        return SpentProbe::Fault;
+    }
     if (400..500).contains(&status) {
         return SpentProbe::NotSpent;
     }
@@ -219,9 +234,12 @@ pub struct AdvertSpendSummary {
 /// Tally of one expired-advert reap pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AdvertReapSummary {
-    /// Whether a real tip resolved this pass. `false` ⇒ NOTHING was reaped
-    /// (fail-closed) — surfaced so a permanently-dead tracker is visible in
-    /// logs instead of masquerading as "no expired adverts".
+    /// Whether a real tip RESOLVED this pass (gate L5: this reports the tip
+    /// read honestly, not whether the reaper acted). `false` ⇒ NOTHING was
+    /// reaped (fail-closed) — surfaced so a permanently-dead tracker is
+    /// visible instead of masquerading as "no expired adverts". A resolved
+    /// tip BELOW the margin (a degenerate chain read) reports `true` while
+    /// still reaping nothing (`scanned = reaped = 0`, loudly logged).
     pub tip_resolved: bool,
     /// Expired candidates surfaced this tick.
     pub scanned: usize,
@@ -276,15 +294,27 @@ pub async fn reap_expired_adverts(
     tip: Option<u32>,
     limit: u64,
 ) -> AdvertReapSummary {
-    let mut summary = AdvertReapSummary::default();
+    let mut summary = AdvertReapSummary {
+        // Honest reporting (gate L5): tip_resolved states whether a tip
+        // RESOLVED — not whether the reaper acted. A resolved-but-degenerate
+        // tip (below the margin) reports true while still reaping nothing.
+        tip_resolved: tip.is_some(),
+        ..Default::default()
+    };
 
     let Some(cutoff) = reap_cutoff(tip, ADVERT_REAP_MARGIN_BLOCKS) else {
         // Logged by resolve_tip when the tip itself failed; log the
         // decision here too so a reap-nothing tick is always attributable.
-        push_log("[advert-reap] no resolved tip — reaping NOTHING this tick");
+        if tip.is_some() {
+            push_log(
+                "[advert-reap] resolved tip is BELOW the margin (degenerate chain read) \
+                 — reaping NOTHING this tick",
+            );
+        } else {
+            push_log("[advert-reap] no resolved tip — reaping NOTHING this tick");
+        }
         return summary;
     };
-    summary.tip_resolved = true;
 
     let candidates = match storage.find_tables_expired_at_or_before(cutoff, limit).await {
         Ok(c) => c,
@@ -325,22 +355,55 @@ pub async fn reap_expired_adverts(
     summary
 }
 
-/// Probe ONE advert outpoint's spend status and verify any reported
-/// spender's raw bytes (WoC pointer → raw fetch Bitails-first / WoC
-/// break-glass → hash + input match). Network glue only — every decision
-/// it feeds is pure ([`parse_woc_spent_probe`], [`spender_raw_verifies`],
+/// Injectable HTTP transport for the spend probe (gate L1, the PR #90
+/// producer-path rule): the pass-level tests drive the REAL
+/// probe-response → parse → raw-verify → delete pipeline through a mock
+/// transport; production uses [`WorkerFetchTransport`].
+#[async_trait::async_trait(?Send)]
+pub trait SpendProbeTransport {
+    /// GET `url`, returning `(status, body)`; `Err` = transport fault.
+    async fn get(
+        &self,
+        url: &str,
+        header: Option<(&str, &str)>,
+    ) -> Result<(u16, String), String>;
+}
+
+/// The production transport — `worker::Fetch` via the shared
+/// [`http_get`] helper.
+pub struct WorkerFetchTransport;
+
+#[async_trait::async_trait(?Send)]
+impl SpendProbeTransport for WorkerFetchTransport {
+    async fn get(
+        &self,
+        url: &str,
+        header: Option<(&str, &str)>,
+    ) -> Result<(u16, String), String> {
+        http_get(url, header).await
+    }
+}
+
+/// Probe ONE advert outpoint's spend status and corroborate any reported
+/// spender's raw bytes. Network glue only — every decision it feeds is
+/// pure ([`parse_woc_spent_probe`], [`spender_raw_verifies`],
 /// [`spend_row_action`]).
+///
+/// Gate M2: the corroborating raw comes from BITAILS ONLY — the
+/// NON-pointer provider. Falling back to a WoC raw would let one lying
+/// provider mint both the pointer and a crafted hash-bound raw and delete
+/// any row; if Bitails cannot supply a verifying raw the pointer is
+/// UNVERIFIABLE (`raw_ok = false` → the row stands, counted `unknown`).
 async fn probe_advert_spend(
+    transport: &dyn SpendProbeTransport,
     txid: &str,
     vout: u32,
     woc_api_key: Option<&str>,
 ) -> (SpentProbe, bool) {
     let hdr = woc_api_key.map(|k| ("woc-api-key", k));
-    let probe = match http_get(
-        &format!("{DEFAULT_WOC_BASE}/tx/{txid}/{vout}/spent"),
-        hdr,
-    )
-    .await
+    let probe = match transport
+        .get(&format!("{DEFAULT_WOC_BASE}/tx/{txid}/{vout}/spent"), hdr)
+        .await
     {
         Ok((status, body)) => parse_woc_spent_probe(status, &body),
         Err(_) => SpentProbe::Fault,
@@ -350,22 +413,19 @@ async fn probe_advert_spend(
         return (probe, false);
     };
 
-    // Raw verification — Bitails hex first, WoC hex break-glass (this
-    // worker's courier order: WoC never sits on the warm path).
-    let mut raw_ok = false;
-    for url in [
-        format!("{DEFAULT_BITAILS_BASE}/download/tx/{spending_txid}/hex"),
-        format!("{DEFAULT_WOC_BASE}/tx/{spending_txid}/hex"),
-    ] {
-        if let Ok((status, body)) = http_get(&url, hdr).await {
-            if (200..300).contains(&status)
-                && spender_raw_verifies(&body, spending_txid, txid, vout)
-            {
-                raw_ok = true;
-                break;
-            }
+    // Independent corroboration (gate M2): Bitails raw hex ONLY.
+    let raw_ok = match transport
+        .get(
+            &format!("{DEFAULT_BITAILS_BASE}/download/tx/{spending_txid}/hex"),
+            None,
+        )
+        .await
+    {
+        Ok((status, body)) if (200..300).contains(&status) => {
+            spender_raw_verifies(&body, spending_txid, txid, vout)
         }
-    }
+        _ => false,
+    };
     (probe, raw_ok)
 }
 
@@ -375,13 +435,15 @@ async fn probe_advert_spend(
 /// through `/submit`, so nothing ever fired the hook and the row lingered.
 ///
 /// Per RANDOM-sampled TABLE row (bounded by `limit`): WoC outpoint-spent
-/// probe → on a pointer, fetch + verify the spender's RAW (hash-bound,
-/// input-matched — the module-doc doctrine) → on a VERIFIED spend, the same
+/// probe → on a pointer, fetch the spender's RAW from BITAILS (the
+/// NON-pointer provider, gate M2) and verify it (hash-bound, input-matched
+/// — the module-doc doctrine) → on a corroborated spend, the same
 /// [`LowStorage::delete_record`] the `output_spent` path runs. NotSpent /
 /// fault / unverifiable pointer → the row stands (fail-safe: an uncertain
 /// read never deletes; the RANDOM sample revisits it later).
 pub async fn confirm_advert_spends(
     storage: &dyn LowStorage,
+    transport: &dyn SpendProbeTransport,
     woc_api_key: Option<&str>,
     limit: u64,
 ) -> AdvertSpendSummary {
@@ -397,7 +459,8 @@ pub async fn confirm_advert_spends(
     summary.scanned = candidates.len();
 
     for row in &candidates {
-        let (probe, raw_ok) = probe_advert_spend(&row.txid, row.output_index, woc_api_key).await;
+        let (probe, raw_ok) =
+            probe_advert_spend(transport, &row.txid, row.output_index, woc_api_key).await;
         match spend_row_action(&probe, raw_ok) {
             SpendRowAction::Delete => {
                 let spender = match &probe {
@@ -407,8 +470,9 @@ pub async fn confirm_advert_spends(
                 match storage.delete_record(&row.txid, row.output_index).await {
                     Ok(()) => {
                         push_log(&format!(
-                            "[advert-spend] evicted {}:{} — RAW-VERIFIED spent by {spender} \
-                             (the direct-ARC close class, bsv-low#309)",
+                            "[advert-spend] evicted {}:{} — WoC spent pointer {spender} \
+                             corroborated by the Bitails raw (hash-bound, input-matched; \
+                             the direct-ARC close class, bsv-low#309)",
                             row.txid, row.output_index
                         ));
                         summary.deleted += 1;
@@ -426,8 +490,9 @@ pub async fn confirm_advert_spends(
             SpendRowAction::LeaveUnknown => {
                 if matches!(probe, SpentProbe::Spent { .. }) {
                     push_log(&format!(
-                        "[advert-spend] {}:{} has a WoC spent pointer whose raw did NOT verify \
-                         — left standing (provider fault, never a deletion)",
+                        "[advert-spend] {}:{} has a WoC spent pointer the NON-pointer \
+                         provider (Bitails) did not corroborate — left standing \
+                         (unverifiable, never a deletion)",
                         row.txid, row.output_index
                     ));
                 }
@@ -453,7 +518,8 @@ pub async fn run_advert_lifecycle(
     reap_limit: u64,
 ) -> (AdvertReapSummary, AdvertSpendSummary) {
     let reap = reap_expired_adverts(storage, tip, reap_limit).await;
-    let spend = confirm_advert_spends(storage, woc_api_key, spend_limit).await;
+    let spend =
+        confirm_advert_spends(storage, &WorkerFetchTransport, woc_api_key, spend_limit).await;
     (reap, spend)
 }
 
@@ -465,7 +531,9 @@ pub async fn run_advert_lifecycle(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use overlay_discovery::low::storage::{LowRecord, LowRecordType, MemoryLowStorage};
+    use overlay_discovery::low::storage::{
+        LowRecord, LowRecordType, LowStorageError, MemoryLowStorage,
+    };
 
     // ── the reap predicate ───────────────────────────────────────────────
 
@@ -561,6 +629,27 @@ mod tests {
         );
     }
 
+    /// Gate L5: a RESOLVED-but-degenerate tip (below the margin) still
+    /// reaps nothing, but reports `tip_resolved: true` honestly — the
+    /// summary states what the tip read did, not what the reaper did.
+    #[tokio::test]
+    async fn reap_pass_degenerate_tip_reports_resolved_but_reaps_nothing() {
+        let store = MemoryLowStorage::new();
+        store.store_record(&table("ancient", Some(1))).await.unwrap();
+
+        let s = reap_expired_adverts(&store, Some(3), ADVERT_REAP_LIMIT).await;
+        assert_eq!(
+            s,
+            AdvertReapSummary {
+                tip_resolved: true,
+                scanned: 0,
+                reaped: 0,
+                delete_failed: 0
+            }
+        );
+        assert_eq!(store.record_count(), 1, "the row STANDS on a degenerate tip");
+    }
+
     #[tokio::test]
     async fn reap_pass_is_bounded_per_tick() {
         let store = MemoryLowStorage::new();
@@ -626,6 +715,7 @@ mod tests {
         );
         for (status, body) in [
             (500u16, ""),                          // provider fault
+            (429, ""),                             // rate-limited (gate L4) — never "unspent"
             (200, "not json"),                     // malformed body
             (200, "{\"noTxid\":true}"),            // missing pointer
             (200, "{\"txid\":\"beef\"}"),          // short txid
@@ -659,6 +749,179 @@ mod tests {
         v.push(0x51); // OP_TRUE
         v.extend_from_slice(&0u32.to_le_bytes());
         v
+    }
+
+    // ── pass-level producer path (gate L1, the PR #90 rule): probe
+    //    response → parse → raw-verify → delete_record, through the REAL
+    //    confirm_advert_spends over the REAL memory storage ──────────────
+
+    /// Canned-response transport. Records every URL hit so the M2 bar
+    /// (the pointer provider's raw is NEVER consulted) is provable at the
+    /// producer level. Unrouted URLs answer a transport fault.
+    struct MockTransport {
+        responses: std::collections::HashMap<String, (u16, String)>,
+        hits: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl MockTransport {
+        fn new(routes: Vec<(String, u16, String)>) -> Self {
+            Self {
+                responses: routes
+                    .into_iter()
+                    .map(|(u, s, b)| (u, (s, b)))
+                    .collect(),
+                hits: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl SpendProbeTransport for MockTransport {
+        async fn get(
+            &self,
+            url: &str,
+            _header: Option<(&str, &str)>,
+        ) -> Result<(u16, String), String> {
+            self.hits.borrow_mut().push(url.to_string());
+            self.responses
+                .get(url)
+                .cloned()
+                .ok_or_else(|| "mock transport: unrouted".to_string())
+        }
+    }
+
+    fn woc_spent_url(txid: &str, vout: u32) -> String {
+        format!("{DEFAULT_WOC_BASE}/tx/{txid}/{vout}/spent")
+    }
+    fn bitails_raw_url(txid: &str) -> String {
+        format!("{DEFAULT_BITAILS_BASE}/download/tx/{txid}/hex")
+    }
+    fn spent_body(txid: &str) -> String {
+        format!("{{\"txid\":\"{txid}\",\"status\":\"confirmed\"}}")
+    }
+
+    #[tokio::test]
+    async fn spend_pass_producer_path_deletes_only_the_corroborated_row() {
+        let store = MemoryLowStorage::new();
+        let advert_a = "11".repeat(32); // spent + Bitails-corroborated → deleted
+        let advert_b = "22".repeat(32); // spent pointer, Bitails 404 → stands
+        let advert_c = "33".repeat(32); // WoC 404 → not spent, stands
+        for t in [&advert_a, &advert_b, &advert_c] {
+            store.store_record(&table(t, Some(900_000))).await.unwrap();
+        }
+
+        let raw_a = raw_tx_spending(&advert_a, 0);
+        let spender_a = bsv_rs::transaction::Transaction::from_binary(&raw_a)
+            .unwrap()
+            .id();
+        let raw_b = raw_tx_spending(&advert_b, 0);
+        let spender_b = bsv_rs::transaction::Transaction::from_binary(&raw_b)
+            .unwrap()
+            .id();
+
+        let transport = MockTransport::new(vec![
+            (woc_spent_url(&advert_a, 0), 200, spent_body(&spender_a)),
+            (bitails_raw_url(&spender_a), 200, hex::encode(&raw_a)),
+            // B: a valid pointer, but the NON-pointer provider cannot
+            // corroborate — and WoC itself COULD have (its raw route is
+            // deliberately routable to prove it is never asked).
+            (woc_spent_url(&advert_b, 0), 200, spent_body(&spender_b)),
+            (bitails_raw_url(&spender_b), 404, String::new()),
+            (
+                format!("{DEFAULT_WOC_BASE}/tx/{spender_b}/hex"),
+                200,
+                hex::encode(&raw_b),
+            ),
+            (woc_spent_url(&advert_c, 0), 404, String::new()),
+        ]);
+
+        let s = confirm_advert_spends(&store, &transport, None, 10).await;
+        assert_eq!(
+            (s.scanned, s.deleted, s.not_spent, s.unknown, s.delete_failed),
+            (3, 1, 1, 1, 0)
+        );
+
+        // The storage-level effect: exactly the corroborated row left ls_low.
+        let remaining = store.find_by_game_id(&"11".repeat(32)).await.unwrap();
+        let mut txids: Vec<&str> = remaining.iter().map(|r| r.txid.as_str()).collect();
+        txids.sort_unstable();
+        assert_eq!(
+            txids,
+            vec![advert_b.as_str(), advert_c.as_str()],
+            "only the Bitails-corroborated spend was evicted"
+        );
+
+        // Gate M2 at the producer level: the pointer provider's raw route
+        // was routable and would have verified — and was NEVER consulted.
+        let woc_raw_b = format!("{DEFAULT_WOC_BASE}/tx/{spender_b}/hex");
+        assert!(
+            !transport.hits.borrow().iter().any(|u| u == &woc_raw_b),
+            "the WoC (pointer-provider) raw must never corroborate its own pointer"
+        );
+    }
+
+    /// A storage whose deletes always fail — drives the `delete_failed`
+    /// accounting branch through the real pass.
+    struct FailingDelete(MemoryLowStorage);
+
+    #[async_trait::async_trait(?Send)]
+    impl LowStorage for FailingDelete {
+        async fn store_record(&self, r: &LowRecord) -> Result<(), LowStorageError> {
+            self.0.store_record(r).await
+        }
+        async fn delete_record(&self, _t: &str, _o: u32) -> Result<(), LowStorageError> {
+            Err(LowStorageError::Database("delete refused (test)".into()))
+        }
+        async fn find_open_tables(
+            &self,
+            min: Option<u64>,
+            max: Option<u64>,
+            tip: Option<u32>,
+        ) -> Result<Vec<LowRecord>, LowStorageError> {
+            self.0.find_open_tables(min, max, tip).await
+        }
+        async fn find_by_game_id(&self, g: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+            self.0.find_by_game_id(g).await
+        }
+        async fn find_by_host(&self, h: &str) -> Result<Vec<LowRecord>, LowStorageError> {
+            self.0.find_by_host(h).await
+        }
+        async fn find_tables_for_spend_check(
+            &self,
+            limit: u64,
+        ) -> Result<Vec<LowRecord>, LowStorageError> {
+            self.0.find_tables_for_spend_check(limit).await
+        }
+        async fn find_tables_expired_at_or_before(
+            &self,
+            cutoff: u32,
+            limit: u64,
+        ) -> Result<Vec<LowRecord>, LowStorageError> {
+            self.0.find_tables_expired_at_or_before(cutoff, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn spend_pass_counts_a_failed_delete_and_leaves_the_row() {
+        let store = FailingDelete(MemoryLowStorage::new());
+        let advert = "44".repeat(32);
+        store.store_record(&table(&advert, Some(900_000))).await.unwrap();
+        let raw = raw_tx_spending(&advert, 0);
+        let spender = bsv_rs::transaction::Transaction::from_binary(&raw)
+            .unwrap()
+            .id();
+        let transport = MockTransport::new(vec![
+            (woc_spent_url(&advert, 0), 200, spent_body(&spender)),
+            (bitails_raw_url(&spender), 200, hex::encode(&raw)),
+        ]);
+
+        let s = confirm_advert_spends(&store, &transport, None, 10).await;
+        assert_eq!(
+            (s.scanned, s.deleted, s.delete_failed),
+            (1, 0, 1),
+            "a failed delete is COUNTED, never reported as an eviction"
+        );
+        assert_eq!(store.0.record_count(), 1, "the row survives for a retry");
     }
 
     #[test]
