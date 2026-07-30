@@ -1061,6 +1061,48 @@ pub struct RebroadcastSummary {
     pub budget_skipped: usize,
 }
 
+/// PURE (bsv-low#273, gate NEW-LOW): the broadcastable legs for one stored
+/// BEEF — `(subject_txid, [(leg_txid, bytes)])`, dependency-ordered,
+/// subject last.
+///
+/// Primary: the EF batch (ancestry-first — ARC validates each EF
+/// standalone). Fallback to the SUBJECT RAW alone when NO EF is
+/// constructible, in EITHER dress:
+/// - EMPTY batch — every tx claims a bump (the #268 mined-claim class);
+/// - CONVERSION ERROR — the subject's inputs cannot be sourced, e.g. a
+///   #268-M1 STRIPPED mined-claim row: the strip drops bump-only parents
+///   (no raws existed to keep), so the stored single-tx BEEF has
+///   unsourceable inputs and `beef_to_ef_batch` errors. Pre-fix that row
+///   hit the Err path and counted `rebroadcast_failed` forever instead of
+///   rescuing.
+///
+/// For both populations the parents are on-chain by (corroborated) claim,
+/// so a raw broadcast is the right rescue; a network that cannot source
+/// the parents simply fails the subject verdict (retried) — never a false
+/// rescue. The subject txid is CONTENT-ADDRESSED from the raw itself.
+///
+/// `None` = nothing broadcastable (unparseable BEEF / txid-only subject) —
+/// the caller counts `rebroadcast_failed` and retries later.
+///
+/// One broadcastable leg: `(leg_txid, bytes)` — EF bytes on the primary
+/// path, the subject raw on the fallback.
+type RebroadcastLeg = (String, Vec<u8>);
+fn rebroadcast_legs(beef: &[u8]) -> Option<(String, Vec<RebroadcastLeg>)> {
+    match crate::ef::beef_to_ef_batch(beef) {
+        Ok((efs, subject_txid)) if !efs.is_empty() => Some((
+            subject_txid,
+            efs.into_iter().map(|e| (e.txid, e.ef)).collect(),
+        )),
+        Ok(_) | Err(_) => {
+            let raw = crate::ef::proven_subject_raw(beef)?;
+            let subject_txid = bsv_rs::transaction::Transaction::from_binary(&raw)
+                .ok()?
+                .id();
+            Some((subject_txid.clone(), vec![(subject_txid, raw)]))
+        }
+    }
+}
+
 /// Bitails `GET /tx/{txid}` presence: `Some(true)` on 2xx, `Some(false)` on
 /// a definitive 404, `None` on anything else (fault — never a verdict).
 async fn bitails_presence(base: &str, txid: &str) -> Option<bool> {
@@ -1141,33 +1183,15 @@ pub async fn rebroadcast_absent_admitted(
         }
 
         // Provably absent from both indexers: rebroadcast the stored BEEF
-        // ancestry-first. The EF batch is already dependency-ordered,
-        // subject last.
-        let (efs, subject_txid) = match crate::ef::beef_to_ef_batch(&candidate.beef) {
-            Ok(v) => v,
-            Err(e) => {
-                push_log(&format!(
-                    "[rebroadcast-backstop] {txid} stored BEEF unusable ({e}) — retry later"
-                ));
-                summary.rebroadcast_failed += 1;
-                continue;
-            }
-        };
-        // An absent-yet-all-proven BEEF (fake or stale bump — the #268
-        // class): fall back to the subject raw so the rescue still fires.
-        let legs: Vec<(String, Vec<u8>)> = if efs.is_empty() {
-            match crate::ef::proven_subject_raw(&candidate.beef) {
-                Some(raw) => vec![(subject_txid.clone(), raw)],
-                None => {
-                    push_log(&format!(
-                        "[rebroadcast-backstop] {txid} absent but no broadcastable bytes — retry later"
-                    ));
-                    summary.rebroadcast_failed += 1;
-                    continue;
-                }
-            }
-        } else {
-            efs.into_iter().map(|e| (e.txid, e.ef)).collect()
+        // ancestry-first ([`rebroadcast_legs`] — falls back to the SUBJECT
+        // RAW when no EF is constructible, e.g. a #268-M1 STRIPPED
+        // mined-claim row).
+        let Some((subject_txid, legs)) = rebroadcast_legs(&candidate.beef) else {
+            push_log(&format!(
+                "[rebroadcast-backstop] {txid} absent but no broadcastable bytes — retry later"
+            ));
+            summary.rebroadcast_failed += 1;
+            continue;
         };
         if legs.len() > REBROADCAST_MAX_LEGS {
             push_log(&format!(
@@ -1398,6 +1422,61 @@ mod tests {
         assert_eq!(classify_presence(Some(false), None), NetworkPresence::Inconclusive);
         assert_eq!(classify_presence(None, Some(false)), NetworkPresence::Inconclusive);
         assert_eq!(classify_presence(None, None), NetworkPresence::Inconclusive);
+    }
+
+    // ── 0b. #273 rebroadcast legs (gate NEW-LOW: the stripped-row rescue) ────
+
+    /// The all-proven fixture BEEF (subject a7d76588… + its bump — the
+    /// mined-claim shape; shared with ef.rs's suite).
+    const PARENT_BEEF_HEX: &str = include_str!("../tests/fixtures/ef/parent_a7d76588_beef.hex");
+
+    #[test]
+    fn stripped_beef_row_rescues_via_the_subject_raw() {
+        use bsv_rs::transaction::{Beef, Transaction};
+        // A #268-M1 STRIPPED mined-claim row, built by the REAL strip
+        // producer: the bump-only parent does not survive, so the stored
+        // BEEF is a single proofless tx with unsourceable inputs.
+        let beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
+        let subject_txid = {
+            let b = Beef::from_binary(&beef).unwrap();
+            b.txs.last().unwrap().txid()
+        };
+        let stripped = crate::ef::strip_subject_bump(&beef, &subject_txid)
+            .expect("fixture must sanitize");
+        // Premise pinned: NO EF is constructible from the stripped row —
+        // exactly the shape that previously dead-ended in rebroadcast_failed.
+        assert!(
+            crate::ef::beef_to_ef_batch(&stripped).is_err(),
+            "a stripped bump-only-parent BEEF must not EF-convert"
+        );
+
+        // The backstop's real leg producer falls back to the SUBJECT RAW:
+        // one leg, content-addressed to the subject, bytes = the raw tx.
+        let (subj, legs) = rebroadcast_legs(&stripped)
+            .expect("a stripped row must still be broadcastable");
+        assert_eq!(subj, subject_txid);
+        assert_eq!(legs.len(), 1, "subject raw alone");
+        assert_eq!(legs[0].0, subject_txid);
+        let parsed = Transaction::from_binary(&legs[0].1).unwrap();
+        assert_eq!(parsed.id(), subject_txid, "the broadcast bytes ARE the subject raw");
+
+        // The ordinary shapes are untouched: a normal unproven-subject BEEF
+        // still yields its EF legs (subject last) …
+        let unproven = {
+            let b = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+            let raw = b.txs.last().unwrap().tx().unwrap().to_hex();
+            let mut nb = Beef::new();
+            nb.merge_transaction(Transaction::from_hex(&raw).unwrap());
+            nb.to_binary()
+        };
+        let (subj2, legs2) = rebroadcast_legs(&unproven).unwrap();
+        assert_eq!(subj2, subject_txid);
+        assert_eq!(legs2.last().unwrap().0, subject_txid);
+        // … an all-proven (unstripped mined-claim) BEEF falls back to raw …
+        let (subj3, legs3) = rebroadcast_legs(&beef).unwrap();
+        assert_eq!((subj3.as_str(), legs3.len()), (subject_txid.as_str(), 1));
+        // … and garbage is honestly unbroadcastable.
+        assert!(rebroadcast_legs(&[0xde, 0xad]).is_none());
     }
 
     // ── 1. Arcade merklePath extraction ──────────────────────────────────────
