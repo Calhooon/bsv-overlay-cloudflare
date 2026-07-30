@@ -340,6 +340,42 @@ pub trait PotStorage {
         Ok(())
     }
 
+    /// Latch `spent_confirmed` via GUARDED COMPARE-AND-SET (bsv-low #301,
+    /// the [`mark_verdict_for_spender`](Self::mark_verdict_for_spender)
+    /// sibling): sets `spent = true, spent_confirmed = true` (and
+    /// keeps-or-updates `spent_height` — `None` keeps the stored value,
+    /// the same-pointer COALESCE semantics of
+    /// [`mark_spent`](Self::mark_spent)) ONLY when the row's CURRENT spend
+    /// pointer still equals `spending_txid` — the spender the caller's SPV
+    /// proof was verified FOR. Touches NOTHING else: never the pointer,
+    /// never `verdict`/`verdict_txid`, never the #228 `spent_at` age
+    /// anchor (the confirmed row leaves the chaser's candidate set, so the
+    /// anchor is moot — and a CAS-missed row keeps its true age).
+    ///
+    /// This is the #186 spend-confirmation chaser's write: its candidate
+    /// read and its confirm are separated by awaits (the proof fetch), so
+    /// a reorg-confirmed S2 landing in that window must make the write a
+    /// NO-OP — the pre-#301 unguarded `mark_spent(confirmed = true)` reset
+    /// the pointer back to the stale S1, and nothing ever re-chased it
+    /// (the chaser only surfaces `spent_confirmed = 0` rows).
+    ///
+    /// Returns whether the guard HIT (`true` = confirmed written; `false`
+    /// = the pointer moved under the caller — leave it, count it, let the
+    /// pass's normal candidate selection re-visit). Backends that cannot
+    /// CAS keep this default `Ok(false)`: fail-safe — nothing is ever
+    /// confirmed on their word, the row simply stays a candidate and the
+    /// miss is loud in the caller's counters.
+    async fn mark_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        spent_height: Option<u64>,
+    ) -> Result<bool, PotStorageError> {
+        let _ = (txid, output_index, spending_txid, spent_height);
+        Ok(false)
+    }
+
     /// Rows whose #284 decode has never been attempted (`params_decoded =
     /// false`) — the lazy-backfill candidate set
     /// (`proof_fetcher::backfill_decoded_params`). Backends that enumerate
@@ -671,6 +707,36 @@ impl PotStorage for MemoryPotStorage {
             }
         }
         Ok(())
+    }
+
+    async fn mark_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        spent_height: Option<u64>,
+    ) -> Result<bool, PotStorageError> {
+        // Guarded CAS confirm (#301, the mark_verdict_for_spender sibling):
+        // latch the confirmed flag only while the row's CURRENT pointer
+        // still equals the spender the caller's proof was verified for. A
+        // moved pointer ⇒ Ok(false), nothing touched. Same-pointer height
+        // semantics (None keeps the stored value); spent_at deliberately
+        // untouched (the CAS idiom — a missed row keeps its true age).
+        let mut records = self.records.lock().unwrap();
+        for r in records.iter_mut() {
+            if r.txid == txid
+                && r.output_index == output_index
+                && r.spending_txid.as_deref() == Some(spending_txid)
+            {
+                r.spent = true;
+                r.spent_confirmed = true;
+                if let Some(h) = spent_height {
+                    r.spent_height = Some(h);
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn find_params_undecoded(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
@@ -1589,6 +1655,77 @@ mod tests {
         assert_eq!(r.verdict_txid.as_deref(), Some("settleS2"));
         assert_eq!(r.spent_height, Some(802_000), "nothing else touched");
         assert!(r.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirm_cas_is_a_noop_when_the_pointer_moved() {
+        // bsv-low#301 (memory mirror of the executed-SQL test, the verdict-CAS
+        // sibling): the chaser's confirmed write bound to a stale pointer
+        // must change NOTHING once a newer spender landed in the window —
+        // pre-#301 the unguarded confirm RESET the pointer to the stale S1.
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        // The chaser "reads" the row while it points at S1 (unconfirmed)…
+        store
+            .mark_spent("potA", 0, "settleS1", false, None, None)
+            .await
+            .unwrap();
+        // …then a reorg-CONFIRMED S2 displaces S1 before the write lands.
+        store
+            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000))
+            .await
+            .unwrap();
+        let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+
+        let hit = store
+            .mark_confirmed_for_spender("potA", 0, "settleS1", Some(800_000))
+            .await
+            .unwrap();
+        assert!(!hit, "a moved pointer is a CAS MISS");
+        let after = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(after, before, "a stale CAS confirm changes NOTHING");
+        assert_eq!(after.spending_txid.as_deref(), Some("settleS2"));
+        assert_eq!(after.spent_height, Some(802_000), "S2 never inherits S1's height");
+        assert!(after.spent_confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirm_cas_hit_latches_and_keeps_stored_height_on_none() {
+        // bsv-low#301: the non-race case — the pointer is still the spender
+        // the proof was verified for, so the CAS lands: confirmed latches,
+        // the height writes; a later same-pointer CAS with None KEEPS the
+        // stored height (the mark_spent same-pointer COALESCE semantics).
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleS1", false, None, None)
+            .await
+            .unwrap();
+
+        let hit = store
+            .mark_confirmed_for_spender("potA", 0, "settleS1", Some(800_000))
+            .await
+            .unwrap();
+        assert!(hit);
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS1"), "pointer untouched");
+        assert_eq!(r.spent_height, Some(800_000));
+        assert_eq!(r.verdict, None, "the CAS never touches the verdict pair");
+
+        // Same-pointer re-confirm with no height in hand → stored survives.
+        assert!(store
+            .mark_confirmed_for_spender("potA", 0, "settleS1", None)
+            .await
+            .unwrap());
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spent_height, Some(800_000));
+
+        // An absent outpoint is a miss, never an error / phantom row.
+        assert!(!store
+            .mark_confirmed_for_spender("ghost", 0, "settleS1", None)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

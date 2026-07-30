@@ -1706,6 +1706,33 @@ pub fn verdict_cas_sql() -> &'static str {
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
 }
 
+/// The #301 spend-confirmation CAS (the [`verdict_cas_sql`] sibling): the
+/// #186 chaser's confirmed latch, GUARDED on the spender the SPV proof was
+/// verified FOR. If the pointer moved between the chaser's candidate read
+/// and this write (a reorg-confirmed S2 landing in the await window), the
+/// WHERE misses and the write is a NO-OP — the pre-#301 unguarded
+/// `mark_spent(confirmed)` write RESET the pointer back to the stale S1,
+/// and nothing ever re-chased it (the candidate query only surfaces
+/// `spentConfirmed = 0` rows).
+///
+/// SET is the guard-hit subset of `mark_spent_sql(true, false)`: the
+/// pointer already equals the bound spender, so only `spent`/
+/// `spentConfirmed` latch and `spentHeight` keeps-or-updates
+/// (`COALESCE(?, spentHeight)` — the same-pointer branch of the LOW-1
+/// CASE). `spentAt` is deliberately NOT restamped (the verdict-CAS
+/// touches-nothing-else idiom: a confirmed row leaves the candidate set,
+/// so the #228 age anchor is moot — and a missed row keeps its true age).
+/// `RETURNING txid` makes the hit/miss observable through the ordinary
+/// row-read path (`fetch_optional`): a row back = the guard HIT.
+///
+/// Bind order: `spentHeight, txid, outputIndex, spendingTxid (guard)`.
+pub fn confirm_spend_cas_sql() -> &'static str {
+    "UPDATE pot_records SET spent = 1, spentConfirmed = 1, \
+         spentHeight = COALESCE(?, spentHeight) \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? \
+     RETURNING txid"
+}
+
 /// The #284 `store_record` upsert: insert-if-absent for the SPEND fields,
 /// STORED-WINS fill for the DECODED columns. The conflict update touches
 /// ONLY decoded columns — never `spent` / `spendingTxid` / `spentConfirmed`
@@ -1834,6 +1861,28 @@ impl PotStorage for D1PotStorage {
             .execute(&self.db)
             .await
             .map_err(pot_err)
+    }
+
+    async fn mark_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        spent_height: Option<u64>,
+    ) -> Result<bool, PotStorageError> {
+        // The #301 CAS confirm (see `confirm_spend_cas_sql`): guarded on
+        // the spender the proof was verified for; a moved pointer ⇒ WHERE
+        // misses ⇒ no-op. RETURNING txid turns the hit into a row, so
+        // `fetch_optional` answers the hit/miss the caller counts.
+        let hit: Option<serde_json::Value> = Query::new(confirm_spend_cas_sql())
+            .bind(spent_height)
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(hit.is_some())
     }
 
     async fn get_spent_status(
@@ -3924,6 +3973,94 @@ mod tests {
         assert_eq!(r.verdict.as_deref(), Some("winner-b"));
         assert_eq!(r.verdict_txid.as_deref(), Some("settleS2"));
         assert_eq!(r.spent_height, Some(802_000), "nothing else touched");
+    }
+
+    /// Execute the shipped `confirm_spend_cas_sql()` (the #301 chaser
+    /// confirm) with the D1 impl's exact bind order; returns whether the
+    /// guard HIT (a RETURNING row came back).
+    fn exec_confirm_cas(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        spending_txid: &str,
+        spent_height: Option<i64>,
+    ) -> bool {
+        match conn.query_row(
+            confirm_spend_cas_sql(),
+            rusqlite::params![spent_height, txid, vout, spending_txid],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(_) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => panic!("confirm_spend_cas_sql executes: {e}"),
+        }
+    }
+
+    /// bsv-low#301 (the MEDIUM-2 sibling, executed against the production
+    /// schema): the #186 chaser's confirmed write is a guarded CAS — bound
+    /// to the stale S1 after a reorg-confirmed S2 displaced it, the write
+    /// is a NO-OP (miss) and S2's pointer/flag/height/spentAt all survive;
+    /// bound to the CURRENT pointer it lands (hit), latching the flag and
+    /// height while leaving the pointer, the verdict pair, and the #228
+    /// spentAt age anchor untouched.
+    #[test]
+    fn sql_confirm_cas_is_a_noop_when_the_pointer_moved() {
+        let read_spent_at = |conn: &rusqlite::Connection, txid: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT spentAt FROM pot_records WHERE txid = ?1 AND outputIndex = 0",
+                rusqlite::params![txid],
+                |r| r.get(0),
+            )
+            .expect("row present")
+        };
+
+        let conn = production_schema_db();
+        // The RACE case: the chaser reads S1 (unconfirmed)…
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(&conn, "potA", 0, "settleS1", false, None, None);
+        // …then a reorg-CONFIRMED S2 displaces S1 before the write lands.
+        exec_mark_spent(&conn, "potA", 0, "settleS2", true, None, Some(802_000));
+        let before = read_pot_row(&conn, "potA", 0);
+        let before_at = read_spent_at(&conn, "potA");
+
+        assert!(
+            !exec_confirm_cas(&conn, "potA", 0, "settleS1", Some(800_000)),
+            "a moved pointer is a CAS MISS"
+        );
+        let after = read_pot_row(&conn, "potA", 0);
+        assert_eq!(after, before, "a stale CAS confirm changes NOTHING");
+        assert_eq!(after.spending_txid.as_deref(), Some("settleS2"));
+        assert_eq!(after.spent_confirmed, 1);
+        assert_eq!(after.spent_height, Some(802_000), "S2 never regains S1's height");
+        assert_eq!(read_spent_at(&conn, "potA"), before_at, "spentAt untouched");
+
+        // The HIT case: pointer still the proof's spender. Sentinel the age
+        // anchor first so "not restamped" is provable (the CAS idiom: only
+        // spent/spentConfirmed/spentHeight move).
+        exec_store(&conn, "potB", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(&conn, "potB", 0, "settleS1", false, Some("tie"), None);
+        conn.execute(
+            "UPDATE pot_records SET spentAt = 12345 WHERE txid = 'potB'",
+            [],
+        )
+        .unwrap();
+        assert!(exec_confirm_cas(&conn, "potB", 0, "settleS1", Some(800_000)));
+        let r = read_pot_row(&conn, "potB", 0);
+        assert_eq!(r.spent_confirmed, 1);
+        assert_eq!(r.spent, 1);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS1"), "pointer untouched");
+        assert_eq!(r.spent_height, Some(800_000));
+        assert_eq!(r.verdict.as_deref(), Some("tie"), "verdict pair untouched");
+        assert_eq!(r.verdict_txid.as_deref(), Some("settleS1"));
+        assert_eq!(read_spent_at(&conn, "potB"), Some(12345), "spentAt not restamped");
+
+        // Same-pointer re-confirm with a NULL height keeps the stored one
+        // (COALESCE — the mark_spent same-pointer semantics).
+        assert!(exec_confirm_cas(&conn, "potB", 0, "settleS1", None));
+        assert_eq!(read_pot_row(&conn, "potB", 0).spent_height, Some(800_000));
+
+        // An absent outpoint: miss, never an error / phantom row.
+        assert!(!exec_confirm_cas(&conn, "ghost", 0, "settleS1", None));
     }
 
     /// LOW-1 (the exact gate probe): confirmed S1 with height 800000, then a
