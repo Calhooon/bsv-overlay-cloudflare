@@ -5,6 +5,7 @@
 //!
 //! Pattern from ~/bsv/rust-wallet-infra/src/lib.rs.
 
+pub mod advert_lifecycle;
 pub mod advertiser;
 pub mod ban_storage;
 pub mod broadcaster;
@@ -300,6 +301,12 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 // never a courier fetch). Drive repeatedly post-deploy until
                 // `already_proven` returns 0.
                 "/admin/reverifyPotBeefs" => admin_reverify_pot_beefs(&env, &req).await,
+                // bsv-low#309: run the advert-lifecycle passes (expired-advert
+                // reaper + advert spend-confirm) on demand — the same logic as
+                // the scheduled tick's step 6, from a reliably-firing FETCH
+                // route (cron completion has historically been carried by the
+                // external admin poker). Fail-closed on the tip like the cron.
+                "/admin/advert-lifecycle" => admin_advert_lifecycle(&env, &req).await,
                 "/admin/syncAdvertisements" => admin_sync_advertisements(&engine).await,
                 "/admin/startGASPSync" => admin_start_gasp_sync(&engine).await,
                 "/admin/evictOutpoint" => admin_evict_outpoint(&engine, req).await,
@@ -904,6 +911,13 @@ const GASP_SYNC_BUDGET_MS: u64 = 240_000;
 const PEER_CRAWL_BUDGET_MS: u64 = 120_000;
 const JANITOR_BUDGET_MS: u64 = 180_000;
 
+/// bsv-low#309: wall-clock slice for the advert-lifecycle passes (reap plus
+/// spend-confirm). Internally bounded already (1 tip read, ≤50 D1 deletes,
+/// 16 candidates × ≤3 provider GETs), so 60 s is generous headroom for slow
+/// providers; a timed-out pass is dropped (both passes are idempotent —
+/// candidates are simply revisited next tick) and the tick moves on.
+const ADVERT_LIFECYCLE_BUDGET_MS: u64 = 60_000;
+
 /// bsv-low#302: wall-clock slice ONE GASP peer's sync may consume. 30 s is
 /// generous for a healthy peer (a page fetch is seconds) while letting the
 /// 240 s step survive several dead peers AND still reach live ones; the
@@ -1216,6 +1230,51 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         rb.budget_skipped,
     );
 
+    // 6. LOW advert lifecycle (bsv-low#309): reap expired-but-unspent lobby
+    //    adverts (fail-CLOSED — a null tip reaps NOTHING) + spend-confirm a
+    //    bounded advert-outpoint sample so a close that bypassed /submit
+    //    (the direct-ARC fallback — the #256 orphan generator) still leaves
+    //    ls_low. Raced like the other network-bound steps; both passes are
+    //    idempotent, so a dropped tick just retries. Also poke-able via
+    //    POST /admin/advert-lifecycle (the cron-poker doctrine).
+    let advert_tracker = lookup_service_chain_tracker(&env);
+    match race_or_deadline(
+        async {
+            let tip = crate::advert_lifecycle::resolve_tip(advert_tracker.as_deref()).await;
+            crate::advert_lifecycle::run_advert_lifecycle(
+                low_storage.as_ref(),
+                tip,
+                None,
+                crate::advert_lifecycle::ADVERT_SPEND_CHECK_LIMIT,
+                crate::advert_lifecycle::ADVERT_REAP_LIMIT,
+            )
+            .await
+        },
+        crate::broadcaster::sleep_ms(ADVERT_LIFECYCLE_BUDGET_MS),
+    )
+    .await
+    {
+        None => worker::console_log!(
+            "Scheduled: advert-lifecycle EXCEEDED its {ADVERT_LIFECYCLE_BUDGET_MS} ms budget — dropped; continuing the tick"
+        ),
+        Some((reap, spend)) => {
+            worker::console_log!(
+                "Scheduled: advert-lifecycle (low_records) — tip_resolved={} reap_scanned={} \
+                 reaped={} reap_delete_failed={} spend_scanned={} spend_deleted={} \
+                 not_spent={} unknown={} spend_delete_failed={}",
+                reap.tip_resolved,
+                reap.scanned,
+                reap.reaped,
+                reap.delete_failed,
+                spend.scanned,
+                spend.deleted,
+                spend.not_spent,
+                spend.unknown,
+                spend.delete_failed,
+            );
+        }
+    }
+
     // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
     // the persistent counters, and refresh the proofless first-seen ledger so a
     // dead pass / a proof-not-landing surfaces via GET /health/invariants
@@ -1338,6 +1397,78 @@ async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Re
         "completed": s.completed,
         "still_unconfirmed": s.still_unconfirmed,
         "stitch_failed": s.stitch_failed,
+    }))
+}
+
+/// POST /admin/advert-lifecycle[?spendLimit=N&reapLimit=M] (bsv-low#309) —
+/// run the LOW advert-lifecycle passes ON DEMAND: the expired-advert reaper
+/// (fail-CLOSED — a null tip reaps NOTHING, the #148 lesson) then the
+/// advert-outpoint spend-confirm probe (delete ONLY on a raw-verified
+/// spend; unknown never deletes). Same logic + shared runner as the
+/// scheduled tick (`run_advert_lifecycle` — the order cannot drift apart);
+/// bearer-authed at the dispatch like every admin POST. `spendLimit` /
+/// `reapLimit` widen a post-deploy backlog drain, clamped at the
+/// subrequest-wall caps (math at the consts).
+async fn admin_advert_lifecycle(env: &Env, req: &Request) -> worker::Result<Response> {
+    let query_limit = |name: &str, default: u64, max: u64| {
+        req.url()
+            .ok()
+            .and_then(|u| {
+                u.query_pairs()
+                    .find(|(k, _)| k == name)
+                    .and_then(|(_, v)| v.parse::<u64>().ok())
+            })
+            .unwrap_or(default)
+            .clamp(1, max)
+    };
+    let spend_limit = query_limit(
+        "spendLimit",
+        crate::advert_lifecycle::ADVERT_SPEND_CHECK_LIMIT,
+        crate::advert_lifecycle::ADVERT_SPEND_CHECK_MAX_LIMIT,
+    );
+    let reap_limit = query_limit(
+        "reapLimit",
+        crate::advert_lifecycle::ADVERT_REAP_LIMIT,
+        crate::advert_lifecycle::ADVERT_REAP_MAX_LIMIT,
+    );
+
+    let db = match env.d1("OVERLAY_DB") {
+        Ok(d) => Rc::new(d),
+        Err(e) => return Response::error(format!("advert-lifecycle: D1 binding: {e}"), 500),
+    };
+    if let Err(e) = ensure_overlay_migrations(&db).await {
+        return Response::error(format!("advert-lifecycle: migrations: {e}"), 500);
+    }
+    let low_storage: Rc<dyn LowStorage> = Rc::new(D1LowStorage::new(db));
+
+    // The SAME tip source the ls_low expiry filter uses; unresolved →
+    // the reaper refuses (fail-closed) while the spend probe still runs
+    // (it needs no tip — chain truth is age-independent).
+    let tracker = lookup_service_chain_tracker(env);
+    let tip = crate::advert_lifecycle::resolve_tip(tracker.as_deref()).await;
+    let (reap, spend) = crate::advert_lifecycle::run_advert_lifecycle(
+        low_storage.as_ref(),
+        tip,
+        None,
+        spend_limit,
+        reap_limit,
+    )
+    .await;
+
+    Response::from_json(&serde_json::json!({
+        "status": "ok",
+        "tip": tip,
+        "spend_limit": spend_limit,
+        "reap_limit": reap_limit,
+        "reap_tip_resolved": reap.tip_resolved,
+        "reap_scanned": reap.scanned,
+        "reaped": reap.reaped,
+        "reap_delete_failed": reap.delete_failed,
+        "spend_scanned": spend.scanned,
+        "spend_deleted": spend.deleted,
+        "spend_not_spent": spend.not_spent,
+        "spend_unknown": spend.unknown,
+        "spend_delete_failed": spend.delete_failed,
     }))
 }
 

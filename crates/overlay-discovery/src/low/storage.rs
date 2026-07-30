@@ -170,6 +170,53 @@ pub trait LowStorage {
     /// All records for a host identity key (lowercase hex), capped at
     /// [`LOW_BY_KEY_RESULT_CAP`].
     async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError>;
+
+    /// Bounded candidate scan for the cron's advert spend-confirmation pass
+    /// (bsv-low #309): TABLE rows whose advert outpoint may already be spent
+    /// on-chain.
+    ///
+    /// Deletion normally happens only via `output_spent`, which fires only
+    /// when the closing tx is SUBMITTED to `tm_low` — a close that reached
+    /// the network via the client's direct-ARC fallback never evicts the
+    /// row (the #256 orphan generator). This scan surfaces table rows so a
+    /// bounded external probe can confirm the spend and run the SAME
+    /// deletion `output_spent` runs.
+    ///
+    /// Backends that enumerate answer
+    /// `WHERE recordType = 'table' ORDER BY RANDOM() LIMIT n` (RANDOM
+    /// defeats head-of-queue starvation — the same anti-starvation shape as
+    /// the pot store's `find_spent_unconfirmed`; every row is eventually
+    /// visited across ticks). Backends that can't enumerate keep this
+    /// default (empty `Vec`) → the pass is a no-op.
+    async fn find_tables_for_spend_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
+    /// Bounded candidate scan for the cron's expired-advert reaper
+    /// (bsv-low #309): TABLE rows with a NON-NULL `expiryHeight <=
+    /// cutoff_height`, OLDEST-expiry-first (deterministic — deletion removes
+    /// rows from the set, so a fixed order cannot starve; the backlog drains
+    /// front-to-back), bounded by `limit`.
+    ///
+    /// `cutoff_height` is computed by the CALLER as `tip - margin` from a
+    /// RESOLVED tip — a caller without a real tip must not call this at all
+    /// (the reaper is fail-CLOSED, unlike `find_open_tables`' fail-open
+    /// display filter; bsv-low #148). Rows with a NULL `expiryHeight` are
+    /// NEVER candidates: there is no expiry evidence to delete on (they are
+    /// already invisible to the lobby under a tip, and only a confirmed
+    /// on-chain spend may remove them).
+    async fn find_tables_expired_at_or_before(
+        &self,
+        cutoff_height: u32,
+        limit: u64,
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        let _ = (cutoff_height, limit);
+        Ok(Vec::new())
+    }
 }
 
 /// LOW storage errors.
@@ -290,6 +337,47 @@ impl LowStorage for MemoryLowStorage {
             .cloned()
             .collect();
         Ok(newest_first(records, LOW_BY_KEY_RESULT_CAP))
+    }
+
+    async fn find_tables_for_spend_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        // Insertion order stands in for D1's RANDOM sample — the memory
+        // backend is deterministic on purpose (tests pin the FILTER and the
+        // BOUND; the sampling order is the D1 backend's anti-starvation
+        // concern, exercised by the shipped-SQL tests).
+        let records: Vec<LowRecord> = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.record_type == LowRecordType::Table)
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        Ok(records)
+    }
+
+    async fn find_tables_expired_at_or_before(
+        &self,
+        cutoff_height: u32,
+        limit: u64,
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        // Same predicate the D1 backend ships: table rows with a NON-NULL
+        // expiryHeight <= cutoff, oldest-expiry-first, bounded.
+        let mut records: Vec<LowRecord> = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.record_type == LowRecordType::Table)
+            .filter(|r| r.expiry_height.is_some_and(|e| e <= cutoff_height))
+            .cloned()
+            .collect();
+        records.sort_by_key(|r| r.expiry_height);
+        records.truncate(limit as usize);
+        Ok(records)
     }
 }
 
@@ -611,6 +699,70 @@ mod tests {
         assert!(
             serde_json::from_value::<LowQuery>(serde_json::json!({"type": "nope"})).is_err()
         );
+    }
+
+    // ── bsv-low#309: advert-lifecycle candidate scans ────────────────────
+
+    #[tokio::test]
+    async fn spend_check_scan_surfaces_only_table_rows_bounded() {
+        let store = MemoryLowStorage::new();
+        store.store_record(&table_record("tx1", 1000)).await.unwrap();
+        store.store_record(&table_record("tx2", 1000)).await.unwrap();
+        store
+            .store_record(&gameutxo_record("tx3", &"11".repeat(32)))
+            .await
+            .unwrap();
+
+        let cands = store.find_tables_for_spend_check(10).await.unwrap();
+        assert_eq!(cands.len(), 2, "table rows only — never the gameutxo pointer");
+        assert!(cands.iter().all(|r| r.record_type == LowRecordType::Table));
+
+        let bounded = store.find_tables_for_spend_check(1).await.unwrap();
+        assert_eq!(bounded.len(), 1, "limit bounds the batch");
+    }
+
+    #[tokio::test]
+    async fn expired_scan_is_cutoff_inclusive_and_skips_null_expiry() {
+        let store = MemoryLowStorage::new();
+        store
+            .store_record(&table_record_expiry("at_cutoff", 1000, 900_000))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record_expiry("below_cutoff", 1000, 899_990))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record_expiry("above_cutoff", 1000, 900_001))
+            .await
+            .unwrap();
+        // NULL expiry: no expiry evidence — NEVER a reap candidate.
+        let mut no_expiry = table_record("no_expiry", 1000);
+        no_expiry.expiry_height = None;
+        store.store_record(&no_expiry).await.unwrap();
+        // A gameutxo row even with an (impossible) expiry stays out of scope.
+        store
+            .store_record(&gameutxo_record("ptr", &"11".repeat(32)))
+            .await
+            .unwrap();
+
+        let cands = store
+            .find_tables_expired_at_or_before(900_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            cands.iter().map(|r| r.txid.as_str()).collect::<Vec<_>>(),
+            vec!["below_cutoff", "at_cutoff"],
+            "<= cutoff inclusive, oldest-expiry-first; above-cutoff / NULL / \
+             non-table rows never surface"
+        );
+
+        let bounded = store
+            .find_tables_expired_at_or_before(900_000, 1)
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].txid, "below_cutoff", "the bound keeps the oldest");
     }
 
     #[test]
