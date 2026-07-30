@@ -2,15 +2,18 @@
 //! ARBITRARY txids, honoring the READ HIERARCHY (owner doctrine, bsv-low
 //! #229, 2026-07-22):
 //!
-//!   1. **Index-native leg (system of record).** Every tx LOW ever broadcast
-//!      is admitted to the overlay (network-accept-gated) and its BEEF is
-//!      stored durably (`pot_beefs` / `transactions`). If the stored BEEF
-//!      carries a chaintracks-verified BUMP (stitched by the completion pass /
-//!      arc-ingest merkle push), the tx is PROVEN mined — presence, raw bytes,
-//!      confirmation, and height all answer from the index, zero external
-//!      reads. A stored BEEF without a BUMP still proves presence + raw bytes
-//!      (admission was network-accept-gated); only the confirmation question
-//!      falls through to the external leg.
+//!   1. **Index-native leg (system of record for BYTES, not for network
+//!      presence).** Every tx LOW ever broadcast is admitted to the overlay
+//!      and its BEEF is stored durably (`pot_beefs` / `transactions`). If the
+//!      stored BEEF carries a chaintracks-verified BUMP (stitched by the
+//!      completion pass / arc-ingest merkle push), the tx is PROVEN mined —
+//!      presence, raw bytes, confirmation, and height all answer from the
+//!      index, zero external reads. A stored BEEF WITHOUT a BUMP proves only
+//!      that we HOLD the bytes (bsv-low #247): the broadcast gate has had
+//!      holes (#267/#268) and the sibling admission modes
+//!      (historical-tx / GASP sync / peer crawl) are ungated by design, so
+//!      the PRESENCE question falls through to the external leg alongside
+//!      the confirmation question — the raw is still served either way.
 //!   2. **Break-glass external leg (WoC + Bitails, SERVER-SIDE).** Only for
 //!      txids the index has never seen: legacy pre-overlay-era txs (the
 //!      2026-07-21 incident class) and foreign txs. The trust bars of the
@@ -76,9 +79,19 @@ pub enum AbsenceCorroboration {
 /// The assembled `/tx-any` answer, pre-JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TxAnyAnswer {
-    /// `Some(true)` = provably present (index BEEF, or externally
-    /// hash-verified raw); `Some(false)` = provably absent (corroborated
-    /// double-404); `None` = unknown.
+    /// `Some(true)` = provably NETWORK-present (index BEEF with a verified
+    /// BUMP, or an external indexer's hash-verified positive);
+    /// `Some(false)` = provably absent (corroborated double-404);
+    /// `None` = unknown.
+    ///
+    /// bsv-low #247: own-store bytes WITHOUT a BUMP no longer assert
+    /// presence on their own. Admission is broadcast-gated on the money
+    /// path, but (a) the gate had holes (#267 degraded-Arcade false-SEEN,
+    /// #268 fake-bump efs==0 — both since closed) and (b) the sibling
+    /// admission modes (historical-tx / GASP / peer-crawl) are ungated by
+    /// design — so "we hold the bytes" is NOT "the network saw it", and the
+    /// client treats `present` as network truth (a zombie orphan JOIN served
+    /// present:true kept its bounded rebroadcasts alive forever).
     pub present: Option<bool>,
     /// `Some(true)` = proven/claimed mined (index BUMP, or WoC
     /// confirmations≥1); `Some(false)` = present but not yet confirmed per
@@ -88,10 +101,19 @@ pub struct TxAnyAnswer {
     /// only — the external leg never claims a height).
     pub height: Option<u64>,
     /// The raw tx bytes as lowercase hex — index-extracted or externally
-    /// hash-verified. Never an unverified byte.
+    /// hash-verified. Never an unverified byte. Still served when the
+    /// network verdict is absent/unknown (they are the caller's own admitted
+    /// bytes — e.g. for a rebroadcast).
     pub raw_hex: Option<String>,
     /// Which leg answered: `"index"` / `"index+external"` / `"external"`.
     pub source: Option<&'static str>,
+    /// bsv-low #247: `true` = PROVABLY UNCONFIRMABLE — an input of this tx
+    /// is spent by a DIFFERENT, CONFIRMED tx, so this tx can never land.
+    /// A terminal skip signal the client may consume to stop bounded
+    /// rebroadcasts. Only ever set alongside `present: Some(false)` (the
+    /// route probes inputs only for a corroborated-absent index-held tx);
+    /// `false` means "not proven unconfirmable", never "confirmable".
+    pub unconfirmable: bool,
 }
 
 /// The pure `/tx-any` decision table (unit-tested; the route feeds it real
@@ -105,9 +127,8 @@ pub fn decide_tx_any(
     absence: AbsenceCorroboration,
 ) -> TxAnyAnswer {
     if let Some(raw) = index_raw_hex {
-        // Index-native: admission was network-accept-gated, so a stored BEEF
-        // IS presence. A verified BUMP is the strongest confirmation anchor
-        // there is (chaintracks-verified merkle path) — fully index-native.
+        // Index-native ONLY with a verified BUMP: a chaintracks-verified
+        // merkle path is the strongest network truth there is.
         if let Some(h) = index_height {
             return TxAnyAnswer {
                 present: Some(true),
@@ -115,27 +136,48 @@ pub fn decide_tx_any(
                 height: Some(h),
                 raw_hex: Some(raw),
                 source: Some("index"),
+                unconfirmable: false,
             };
         }
-        // Admitted but no BUMP yet: presence + raw from the index; only the
-        // confirmation question consults the external leg. An external
-        // Absent/Fault must NEVER contradict index presence (the index is the
-        // system of record; a WoC 404 for an admitted tx only means "not
-        // indexed there yet") — it just leaves `confirmed` unknown.
+        // Stored bytes WITHOUT a BUMP (#247): the store proves we HOLD the
+        // bytes, not that the network ever saw them (see the `present` doc
+        // — gate holes + deliberately ungated sibling admission modes), so
+        // the PRESENCE question falls through to the external leg:
+        //  - an external positive corroborates network presence
+        //    (mempool `confirmed:false` or mined `confirmed:true`);
+        //  - a CORROBORATED double-404 is an honest network-absent — the
+        //    raw is still served (the caller's own bytes, rebroadcastable);
+        //  - anything else is the honest unknown (`present: null`), raw
+        //    still served. Fail-safe either way: the client's
+        //    positive-anywhere-outranks-negatives read stays intact.
         return match external {
-            Some(TxObservation::Present { confirmed: true, .. }) => TxAnyAnswer {
+            Some(TxObservation::Present { confirmed, .. }) => TxAnyAnswer {
                 present: Some(true),
-                confirmed: Some(true),
+                confirmed: Some(*confirmed),
                 height: None,
                 raw_hex: Some(raw),
                 source: Some("index+external"),
+                unconfirmable: false,
             },
+            Some(TxObservation::Absent)
+                if absence == AbsenceCorroboration::CorroboratedAbsent =>
+            {
+                TxAnyAnswer {
+                    present: Some(false),
+                    confirmed: None,
+                    height: None,
+                    raw_hex: Some(raw),
+                    source: Some("index+external"),
+                    unconfirmable: false,
+                }
+            }
             _ => TxAnyAnswer {
-                present: Some(true),
+                present: None,
                 confirmed: None,
                 height: None,
                 raw_hex: Some(raw),
                 source: Some("index"),
+                unconfirmable: false,
             },
         };
     }
@@ -151,6 +193,7 @@ pub fn decide_tx_any(
                 height: None,
                 raw_hex: Some(raw.clone()),
                 source: Some("external"),
+                unconfirmable: false,
             },
             None => TxAnyAnswer::default(),
         },
@@ -161,11 +204,32 @@ pub fn decide_tx_any(
                 height: None,
                 raw_hex: None,
                 source: Some("external"),
+                unconfirmable: false,
             },
             AbsenceCorroboration::Unknown => TxAnyAnswer::default(),
         },
         Some(TxObservation::Fault) | None => TxAnyAnswer::default(),
     }
+}
+
+/// PURE (#247): does ONE input's spend observation prove the subject can
+/// never confirm? True iff the input's outpoint is VERIFIED spent by a
+/// DIFFERENT tx that is CONFIRMED — a confirmed conflicting spend is
+/// permanent (absent a reorg), so the subject is provably unconfirmable.
+/// Everything else (unknown, unspent, spent by the subject itself, spent
+/// unconfirmed) proves nothing — fail toward `false` (keep retrying),
+/// never toward a fabricated terminal verdict.
+pub fn input_proves_unconfirmable(
+    subject_txid: &str,
+    known: bool,
+    spent: Option<bool>,
+    spending_txid: Option<&str>,
+    spent_confirmed: Option<bool>,
+) -> bool {
+    known
+        && spent == Some(true)
+        && spent_confirmed == Some(true)
+        && spending_txid.is_some_and(|s| !s.eq_ignore_ascii_case(subject_txid))
 }
 
 /// Parse a WoC `GET /tx/hash/{txid}` 200 body into the confirmation claim:
@@ -189,7 +253,9 @@ pub fn verify_raw_bytes(raw: &[u8], txid: &str) -> Option<String> {
     Some(hex::encode(raw))
 }
 
-/// The `/tx-any` wire body.
+/// The `/tx-any` wire body. `unconfirmable` is additive (#247) — pre-#247
+/// clients ignore it; a client that consumes it gets the terminal-skip
+/// signal for a provably-dead tx.
 pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
     json!({
         "txid": txid,
@@ -198,6 +264,7 @@ pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
         "height": a.height,
         "rawHex": a.raw_hex,
         "source": a.source,
+        "unconfirmable": a.unconfirmable,
     })
     .to_string()
 }
@@ -229,8 +296,9 @@ mod tests {
     }
 
     #[test]
-    fn index_leg_without_bump_keeps_presence_and_only_confirms_via_external_positive() {
-        // External confirmed:true upgrades confirmation.
+    fn index_leg_without_bump_defers_presence_to_the_external_leg() {
+        // bsv-low #247: own-store bytes with no BUMP are not network truth.
+        // An external positive corroborates presence (and confirmation).
         let a = decide_tx_any(
             Some(raw()),
             None,
@@ -243,18 +311,8 @@ mod tests {
         assert_eq!((a.present, a.confirmed), (Some(true), Some(true)));
         assert_eq!(a.source, Some("index+external"));
 
-        // An external ABSENT can never contradict index presence — the index
-        // is the system of record; confirmation just stays unknown.
-        let a = decide_tx_any(
-            Some(raw()),
-            None,
-            Some(&TxObservation::Absent),
-            AbsenceCorroboration::CorroboratedAbsent,
-        );
-        assert_eq!((a.present, a.confirmed), (Some(true), None));
-        assert_eq!(a.source, Some("index"));
-
-        // External present-but-unconfirmed adds nothing over the index.
+        // External present-but-unconfirmed still corroborates PRESENCE
+        // (mempool) — confirmed honestly false.
         let a = decide_tx_any(
             Some(raw()),
             None,
@@ -264,8 +322,64 @@ mod tests {
             }),
             AbsenceCorroboration::Unknown,
         );
-        assert_eq!((a.present, a.confirmed), (Some(true), None));
-        assert_eq!(a.source, Some("index"));
+        assert_eq!((a.present, a.confirmed), (Some(true), Some(false)));
+        assert_eq!(a.source, Some("index+external"));
+
+        // THE #247 fix: a CORROBORATED double-404 for an index-held,
+        // bump-less tx is an honest network-absent (the zombie orphan JOIN
+        // class) — present:false, raw still served (the caller's own bytes).
+        let a = decide_tx_any(
+            Some(raw()),
+            None,
+            Some(&TxObservation::Absent),
+            AbsenceCorroboration::CorroboratedAbsent,
+        );
+        assert_eq!((a.present, a.confirmed), (Some(false), None));
+        assert_eq!(a.raw_hex, Some(raw()));
+        assert_eq!(a.source, Some("index+external"));
+
+        // An UNCORROBORATED 404 / a fault is the honest unknown — never a
+        // negative on one provider's word, and no longer a fabricated
+        // positive from our own store either.
+        for (external, absence) in [
+            (TxObservation::Absent, AbsenceCorroboration::Unknown),
+            (TxObservation::Fault, AbsenceCorroboration::Unknown),
+            (TxObservation::Fault, AbsenceCorroboration::CorroboratedAbsent),
+        ] {
+            let a = decide_tx_any(Some(raw()), None, Some(&external), absence);
+            assert_eq!((a.present, a.confirmed), (None, None), "{external:?}");
+            assert_eq!(a.raw_hex, Some(raw()), "raw is still served");
+            assert_eq!(a.source, Some("index"));
+        }
+    }
+
+    #[test]
+    fn unconfirmable_requires_a_confirmed_conflicting_spender() {
+        // Provably unconfirmable: an input spent by a DIFFERENT confirmed tx.
+        let subject = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        assert!(input_proves_unconfirmable(
+            &subject,
+            true,
+            Some(true),
+            Some(&other),
+            Some(true)
+        ));
+        // Everything weaker proves NOTHING (fail toward retry):
+        // spent by the subject itself (i.e. the subject IS the spender),
+        for (known, spent, spender, conf) in [
+            (true, Some(true), Some(subject.as_str()), Some(true)), // self-spend
+            (true, Some(true), Some(other.as_str()), Some(false)),  // unconfirmed conflict
+            (true, Some(true), Some(other.as_str()), None),         // confirmation unknown
+            (true, Some(false), None, None),                        // unspent
+            (false, Some(true), Some(other.as_str()), Some(true)),  // unverified read
+            (true, None, Some(other.as_str()), Some(true)),         // spend unknown
+        ] {
+            assert!(
+                !input_proves_unconfirmable(&subject, known, spent, spender, conf),
+                "({known},{spent:?},{spender:?},{conf:?}) must not prove unconfirmable"
+            );
+        }
     }
 
     #[test]
@@ -364,6 +478,7 @@ mod tests {
             height: Some(1),
             raw_hex: Some("aa".into()),
             source: Some("index"),
+            unconfirmable: false,
         };
         let v: serde_json::Value = serde_json::from_str(&tx_any_body("ab", &a)).unwrap();
         assert_eq!(v["txid"], "ab");
@@ -372,6 +487,7 @@ mod tests {
         assert_eq!(v["height"], 1);
         assert_eq!(v["rawHex"], "aa");
         assert_eq!(v["source"], "index");
+        assert_eq!(v["unconfirmable"], false);
         let empty: serde_json::Value =
             serde_json::from_str(&tx_any_body("ab", &TxAnyAnswer::default())).unwrap();
         assert!(empty["present"].is_null());
