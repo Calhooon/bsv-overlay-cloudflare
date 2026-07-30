@@ -485,7 +485,9 @@ pub async fn submit(
         (raw_body, None)
     };
 
-    let tagged_beef = TaggedBEEF {
+    // `mut`: the broadcast-gated mined-claim arm strips the subject's
+    // unverified bump before storage (#268 gate M1).
+    let mut tagged_beef = TaggedBEEF {
         beef,
         topics,
         off_chain_values,
@@ -608,6 +610,34 @@ pub async fn submit(
                     "broadcast-gated(arcade): network accepted {subject_txid} ({accepted}, {} EF leg(s)) — admitting",
                     efs.len()
                 );
+                // #268 gate M1: a mined-claim admit (efs empty — the ONLY
+                // gated arm whose SUBJECT carries a submitter-supplied bump)
+                // proved NETWORK ACCEPTANCE, not SPV-mined-ness. STRIP the
+                // unverified bump before storage so the stored row is
+                // byte-equivalent to an honestly-submitted unmined tx (the
+                // completion pass attaches a chaintracks-VERIFIED bump later;
+                // /tx-any never serves an attacker-chosen height). A BEEF
+                // that cannot be sanitized is REFUSED, never stored verbatim.
+                if efs.is_empty() {
+                    match crate::ef::strip_subject_bump(&tagged_beef.beef, &subject_txid) {
+                        Some(stripped) => {
+                            worker::console_log!(
+                                "broadcast-gated: stripped the unverified mined-claim bump from {subject_txid} before storage (#268 M1)"
+                            );
+                            tagged_beef.beef = stripped;
+                        }
+                        None => {
+                            worker::console_log!(
+                                "POST /submit(broadcast-gated) -> 502 (mined-claim BEEF for {subject_txid} could not be sanitized — refusing to store an unverified bump)"
+                            );
+                            let resp = json_error(
+                                "broadcast failed: mined-claim BEEF could not be sanitized — retry via fallback",
+                                502,
+                            )?;
+                            return Ok(with_server_timing(resp, &gated_timing));
+                        }
+                    }
+                }
             }
             Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
                 // DEFINITIVE refusal of the SUBJECT → admit NOTHING. (#214:
