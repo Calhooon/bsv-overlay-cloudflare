@@ -983,6 +983,18 @@ pub const REBROADCAST_BACKSTOP_LIMIT: u64 = 16;
 /// one GET wasted) or the incident class this backstop exists for.
 pub const REBROADCAST_MIN_AGE_SECS: u64 = PUSH_BACKSTOP_MIN_AGE_SECS;
 
+/// Maximum age for backstop CANDIDACY (bsv-low#273, gate LOW-1): a proofless
+/// admitted row older than this stops being presence-probed/rebroadcast —
+/// permanently-dead rows (superseded/conflicting, can never land) would
+/// otherwise churn in the 16-random sample forever and dilute the
+/// genuinely-rescuable ones. 14 days ≫ any honest rescue window (the #267
+/// incident class was rescued within a day; a healthy tx mines in ~10 min).
+/// NEVER a deletion: aged-out rows stay stored, stay served, and stay
+/// candidates of the ordinary proof-completion passes; the #247
+/// `unconfirmable` verdict is the terminal client-facing signal for the
+/// truly dead.
+pub const REBROADCAST_MAX_CANDIDATE_AGE_SECS: u64 = 14 * 24 * 3600;
+
 /// Per-candidate EF-leg cap for the ancestry-first rebroadcast — mirrors the
 /// corroboration leg cap's rationale (bound serial POST work; real LOW
 /// ancestry runs ~8 unproven legs). Over the cap the candidate is SKIPPED
@@ -1080,9 +1092,12 @@ async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<b
 /// via the TAAL→GorillaPool gated transport). This automates the manual
 /// rescue of 2026-07-28 ~01:39Z.
 ///
-/// Bounds: `limit` candidates (RANDOM-sampled by the same candidate query
-/// the proof pass uses, so a stuck head cannot starve the tail),
-/// [`REBROADCAST_MAX_LEGS`] EF legs per candidate,
+/// Bounds: the caller supplies `candidates` from the backstop's OWN
+/// age-bracketed window ([`REBROADCAST_MIN_AGE_SECS`] ..
+/// [`REBROADCAST_MAX_CANDIDATE_AGE_SECS`], RANDOM-sampled —
+/// `D1Storage::find_rebroadcast_candidates`; gate LOW-1: permanently-dead
+/// rows age OUT of candidacy instead of diluting the sample forever, and
+/// are never deleted), [`REBROADCAST_MAX_LEGS`] EF legs per candidate,
 /// [`REBROADCAST_POST_BUDGET`] broadcast POSTs per tick. Runs LAST in the
 /// completion tick with its OWN bounds — it can never starve the proof
 /// passes that precede it.
@@ -1091,24 +1106,14 @@ async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<b
 /// failure writes nothing and is retried on a later tick; a rebroadcast of
 /// a present tx (should the probes both lie) is idempotent.
 pub async fn rebroadcast_absent_admitted(
-    storage: &dyn overlay_engine::storage::Storage,
+    candidates: Vec<overlay_engine::storage::TransactionBeef>,
     taal_api_key: Option<&str>,
     woc_api_key: Option<&str>,
-    limit: u64,
 ) -> RebroadcastSummary {
-    let mut summary = RebroadcastSummary::default();
-
-    let candidates = match storage
-        .find_transactions_for_proof_check(limit, REBROADCAST_MIN_AGE_SECS)
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            push_log(&format!("[rebroadcast-backstop] candidate scan failed: {e}"));
-            return summary;
-        }
+    let mut summary = RebroadcastSummary {
+        scanned: candidates.len(),
+        ..Default::default()
     };
-    summary.scanned = candidates.len();
 
     let mut post_budget = REBROADCAST_POST_BUDGET;
 

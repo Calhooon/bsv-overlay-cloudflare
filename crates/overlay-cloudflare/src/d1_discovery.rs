@@ -3977,7 +3977,7 @@ mod tests {
         let conn = production_schema_db();
         let game = h64(0x11);
         let winner = "02".to_string() + &"a1".repeat(32);
-        let mut insert = |txid: &str, at: i64| {
+        let insert = |txid: &str, at: i64| {
             conn.execute(
                 "INSERT OR IGNORE INTO proof_markers \
                  (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \

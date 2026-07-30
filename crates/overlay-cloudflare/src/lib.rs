@@ -1172,15 +1172,25 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     //    never self-heals — this pass presence-probes old proofless rows
     //    (Bitails + WoC) and rebroadcasts the stored BEEF ancestry-first
     //    when BOTH indexers definitively 404 it. Runs LAST, own bounds
-    //    (16 candidates / 48 POSTs), so it can never starve proof
-    //    completion.
+    //    (16 candidates / 48 POSTs, 30min–14d candidacy bracket — gate
+    //    LOW-1), so it can never starve proof completion.
     let tx_storage = D1Storage::new(ops_db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let rb_candidates = tx_storage
+        .find_rebroadcast_candidates(
+            crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
+            crate::proof_fetcher::REBROADCAST_MIN_AGE_SECS,
+            crate::proof_fetcher::REBROADCAST_MAX_CANDIDATE_AGE_SECS,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            worker::console_log!("Scheduled: rebroadcast-backstop candidate scan failed: {e}");
+            Vec::new()
+        });
     let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
-        &tx_storage,
+        rb_candidates,
         taal_key.as_deref(),
         None,
-        crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
     )
     .await;
     worker::console_log!(
@@ -1337,14 +1347,25 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     )
     .await;
     // 4b. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
-    //     runs last, own bounds; see the scheduled block's note.
+    //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1);
+    //     see the scheduled block's note.
     let tx_storage = D1Storage::new(db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let rb_candidates = tx_storage
+        .find_rebroadcast_candidates(
+            crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
+            crate::proof_fetcher::REBROADCAST_MIN_AGE_SECS,
+            crate::proof_fetcher::REBROADCAST_MAX_CANDIDATE_AGE_SECS,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            worker::console_log!("complete-proofs: rebroadcast candidate scan failed: {e}");
+            Vec::new()
+        });
     let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
-        &tx_storage,
+        rb_candidates,
         taal_key.as_deref(),
         None,
-        crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
     )
     .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
