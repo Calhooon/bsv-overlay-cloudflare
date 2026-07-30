@@ -617,30 +617,76 @@ fn corroborated_mined_claim(
     }
 }
 
+/// PURE (bsv-low#268 gate LOW-M): fold the two corroborator hosts' verdicts
+/// under the #214 TWO-PROVIDER bar in BOTH directions. Reached only when
+/// the FIRST host did not accept (an accept short-circuits before this):
+///
+/// - EITHER host's genuine accept → `Accepted` (the network provably has /
+///   took the tx — one real accept marker suffices, as ever);
+/// - BOTH hosts definitively rejected → `Rejected` (a definitive refusal —
+///   which flows to a terminal 422 via `corroborated_exhaustion` — now
+///   requires two independent providers, the same bar #214 demands of a
+///   rejection before it may terminate the ladder; previously ONE host's
+///   460–479/REJECTED settled the corroboration alone);
+/// - anything else (one-sided reject + inconclusive, double inconclusive)
+///   → `Err` — an honest "unavailable" (502, retryable), never a
+///   single-provider refusal.
+fn fold_refuse_bar(
+    first: Result<ArcOutcome, String>,
+    second: Result<ArcOutcome, String>,
+) -> Result<ArcOutcome, String> {
+    match (first, second) {
+        (Ok(ArcOutcome::Accepted(t)), _) | (_, Ok(ArcOutcome::Accepted(t))) => {
+            Ok(ArcOutcome::Accepted(t))
+        }
+        (Ok(ArcOutcome::Rejected(a)), Ok(ArcOutcome::Rejected(b))) => Ok(ArcOutcome::Rejected(
+            format!("both corroborators rejected — taal: {a}; gorillapool: {b}"),
+        )),
+        (Ok(ArcOutcome::Rejected(a)), Err(b)) => Err(format!(
+            "one-provider rejection is not definitive (taal rejected: {a}; gorillapool inconclusive: {b})"
+        )),
+        (Err(a), Ok(ArcOutcome::Rejected(b))) => Err(format!(
+            "one-provider rejection is not definitive (taal inconclusive: {a}; gorillapool rejected: {b})"
+        )),
+        (Err(a), Err(b)) => Err(format!("taal: {a}; gorillapool: {b}")),
+    }
+}
+
 /// Corroborate one tx hex (the subject's EF — ARC accepts Extended Format in
-/// `rawTx`) against TAAL, falling back to GorillaPool when TAAL is transport-
-/// unreachable or inconclusive. A definitive verdict (accept OR reject) from
-/// either host short-circuits. This is a REAL broadcast attempt, not a status
-/// read — deliberately: the corroborator proves network acceptance by the same
-/// means the client's direct-ARC fallback would, and a re-broadcast of an
-/// already-accepted tx is idempotent (already-known = accept).
+/// `rawTx`) against TAAL, then GorillaPool. A genuine ACCEPT from TAAL
+/// short-circuits; every other TAAL answer — INCLUDING a definitive
+/// rejection (bsv-low#268 gate LOW-M) — consults GorillaPool before the
+/// verdict settles, folded under the two-provider refuse bar
+/// ([`fold_refuse_bar`]): a definitive `Rejected` now needs BOTH hosts'
+/// word, exactly as #214 demands before a refusal may become terminal.
+/// This is a REAL broadcast attempt, not a status read — deliberately: the
+/// corroborator proves network acceptance by the same means the client's
+/// direct-ARC fallback would, and a re-broadcast of an already-accepted tx
+/// is idempotent (already-known = accept).
 async fn corroborate_tx_hex(
     taal_api_key: Option<&str>,
     tx_hex: &str,
 ) -> Result<ArcOutcome, String> {
-    let taal_err = match post_arc_raw(WorkerArcBroadcaster::ARC_URL, taal_api_key, tx_hex).await {
-        Ok((status, body)) => match corroborator_verdict(status, &body) {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        },
-        Err(e) => e,
+    let taal = match post_arc_raw(WorkerArcBroadcaster::ARC_URL, taal_api_key, tx_hex).await {
+        Ok((status, body)) => corroborator_verdict(status, &body),
+        Err(e) => Err(e),
     };
-    worker::console_log!("corroborate: TAAL inconclusive ({taal_err}); trying GorillaPool");
-    match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
-        Ok((status, body)) => corroborator_verdict(status, &body)
-            .map_err(|gp_err| format!("taal: {taal_err}; gorillapool: {gp_err}")),
-        Err(gp_err) => Err(format!("taal: {taal_err}; gorillapool: {gp_err}")),
+    if matches!(taal, Ok(ArcOutcome::Accepted(_))) {
+        return taal;
     }
+    worker::console_log!(
+        "corroborate: TAAL did not accept ({}); consulting GorillaPool (two-provider bar)",
+        match &taal {
+            Ok(ArcOutcome::Rejected(r)) => format!("rejected: {r}"),
+            Err(e) => format!("inconclusive: {e}"),
+            Ok(ArcOutcome::Accepted(_)) => unreachable!("accept short-circuits"),
+        }
+    );
+    let gp = match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
+        Ok((status, body)) => corroborator_verdict(status, &body),
+        Err(e) => Err(e),
+    };
+    fold_refuse_bar(taal, gp)
 }
 
 /// PURE (#216): corroborate a subject WITH its ancestry. Feed each ANCESTOR ef
@@ -3067,6 +3113,39 @@ mod tests {
         )
         .await;
         assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+    }
+
+    #[test]
+    fn refuse_bar_requires_both_providers_for_a_definitive_rejection() {
+        // bsv-low#268 gate LOW-M: a definitive corroborator Rejected (which
+        // corroborated_exhaustion turns into a terminal 422) now needs BOTH
+        // hosts' word — the #214 two-provider bar in the refuse direction.
+        let rej = |r: &str| Ok(ArcOutcome::Rejected(r.into()));
+        let acc = || Ok(ArcOutcome::Accepted("ab".into()));
+        let inc = |e: &str| Err::<ArcOutcome, String>(e.into());
+
+        // Both rejected → definitive.
+        assert!(matches!(
+            fold_refuse_bar(rej("fee"), rej("fee")),
+            Ok(ArcOutcome::Rejected(_))
+        ));
+        // Either accepted → accepted (a real network-accept always wins).
+        assert!(matches!(
+            fold_refuse_bar(rej("fee"), acc()),
+            Ok(ArcOutcome::Accepted(_))
+        ));
+        assert!(matches!(
+            fold_refuse_bar(inc("down"), acc()),
+            Ok(ArcOutcome::Accepted(_))
+        ));
+        // ONE-SIDED rejection (other host inconclusive) → Err/502, never a
+        // single-provider 422 — in BOTH orders.
+        let e = fold_refuse_bar(rej("fee"), inc("down")).unwrap_err();
+        assert!(e.contains("not definitive"), "{e}");
+        let e = fold_refuse_bar(inc("down"), rej("fee")).unwrap_err();
+        assert!(e.contains("not definitive"), "{e}");
+        // Double inconclusive → Err.
+        assert!(fold_refuse_bar(inc("a"), inc("b")).is_err());
     }
 
     #[test]
