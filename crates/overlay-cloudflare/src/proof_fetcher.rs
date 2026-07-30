@@ -1831,7 +1831,7 @@ mod tests {
 
     /// bsv-low#304 fast-path test fetcher: configurable stored-bump verdict
     /// + refetch table, with call counters so tests can assert "no courier
-    /// fetch happened" through the REAL pass (never hand-fed candidates).
+    ///   fetch happened" through the REAL pass (never hand-fed candidates).
     struct ReverifyFetcher {
         verify_ok: bool,
         refetch: std::collections::HashMap<String, String>,
@@ -1942,6 +1942,10 @@ mod tests {
     // ── bsv-low#304 gate M-2: the backlog drains in one wide pass ────────
 
     #[tokio::test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "deliberate drift pin: the drain-math floor on the shipped page const"
+    )]
     async fn one_pass_drains_a_backlog_wider_than_the_old_page() {
         // The shipped cron page must clear a whole seeded backlog in ONE
         // pass — the pre-M-2 page of 20 strands rows 21+ for later ticks,
