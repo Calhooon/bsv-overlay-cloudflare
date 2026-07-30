@@ -55,6 +55,35 @@ pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech"
 /// never starves the queue.
 pub const DEFAULT_FETCH_BUDGET: u32 = 40;
 
+/// Candidate page for ONE pot-beef proof-completion pass (bsv-low#304 gate
+/// M-2). The page must be big enough that the post-#304 re-verify BACKLOG
+/// (every pre-existing mined pot row re-entered the candidate set when
+/// candidacy moved to the verified latch) drains in HOURS, not weeks —
+/// while the backlog lasts, /tx-any's index leg defers those rows to the
+/// external WoC-first leg, which must never become a warm path (the 429
+/// doctrine).
+///
+/// DRAIN MATH: the fast path costs ONE chaintracks service-binding read per
+/// structurally-bumped candidate — no courier fetch, no byte rewrite. At
+/// 128 rows/tick × 96 ticks/day, a ~3,000-row backlog clears in ~24 ticks
+/// ≈ 6 h (vs the old 20/tick: ≥150 ticks ≈ 1.6 days FLOOR, stretched to
+/// 1-2 weeks by RANDOM sampling against still-unmined rows sharing the
+/// pool). SUBREQUEST BUDGET: worst case the pass adds ≤128 chaintracks
+/// reads + ≤DEFAULT_FETCH_BUDGET(40) courier fetches ≈ 170 subrequests —
+/// inside the ~255/tick envelope observed live (#257 forensics) and far
+/// under the paid 1,000 cap, with the tick's other steps (GASP 240 s
+/// bounded, crawl, janitor, #273 backstop ≤48 probes) sharing the rest.
+/// One-shot post-deploy drains can go faster via /admin/reverifyPotBeefs.
+pub const POT_PROOF_PASS_LIMIT: u64 = 128;
+
+/// Default / max candidate page for the operator-driven one-shot backlog
+/// drain (`POST /admin/reverifyPotBeefs`). Its fetcher runs with budget 0
+/// (chaintracks-only — never a courier fetch), so the page is bounded by
+/// the invocation's subrequest cap alone: 500 default leaves ample slack,
+/// 900 caps below the paid 1,000-subrequest wall.
+pub const ADMIN_REVERIFY_DEFAULT_LIMIT: u64 = 500;
+/// Hard cap for `/admin/reverifyPotBeefs?limit=` (see above).
+pub const ADMIN_REVERIFY_MAX_LIMIT: u64 = 900;
 
 /// Push-primary BACKSTOP age gate (bsv-low #228 / arcade#259): the poll
 /// passes only touch rows OLDER than this — younger rows are expected to get
@@ -1908,6 +1937,39 @@ mod tests {
         );
         assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
         assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+    }
+
+    // ── bsv-low#304 gate M-2: the backlog drains in one wide pass ────────
+
+    #[tokio::test]
+    async fn one_pass_drains_a_backlog_wider_than_the_old_page() {
+        // The shipped cron page must clear a whole seeded backlog in ONE
+        // pass — the pre-M-2 page of 20 strands rows 21+ for later ticks,
+        // keeping /tx-any's WoC-first external leg warm (the 429 doctrine).
+        assert!(
+            POT_PROOF_PASS_LIMIT >= 96,
+            "drain math: at {POT_PROOF_PASS_LIMIT}/tick x 96 ticks/day a ~3,000-row \
+             backlog must clear in hours, not weeks — do not shrink this below ~96 \
+             without redoing the bsv-low#304 M-2 math"
+        );
+
+        let store = MemoryPotStorage::new();
+        let mut txids = Vec::new();
+        for salt in 0..25u32 {
+            let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, salt);
+            store.store_beef(&txid, &beef).await.unwrap();
+            txids.push(txid);
+        }
+        assert_eq!(store.find_pot_beefs_for_proof_check(1000, 0).await.unwrap().len(), 25);
+
+        let fetcher = ReverifyFetcher::new(true);
+        let pass = complete_pot_beef_proofs(&store, &fetcher, POT_PROOF_PASS_LIMIT, 0).await;
+        assert_eq!(
+            pass.already_proven, 25,
+            "one shipped-page pass drains the whole seeded backlog"
+        );
+        assert_eq!(fetcher.fetch_calls.get(), 0, "chaintracks-only — zero courier fetches");
+        assert!(store.find_pot_beefs_for_proof_check(1000, 0).await.unwrap().is_empty());
     }
 
     /// 64-hex settle txids (a bump subject must be a real txid shape).

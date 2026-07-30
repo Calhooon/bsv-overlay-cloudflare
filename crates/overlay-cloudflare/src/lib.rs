@@ -295,6 +295,11 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 // cron (e.g. low-monitor) POSTs it every ~15 min. Same logic as the
                 // scheduled block; fail-closed.
                 "/admin/complete-proofs" => admin_complete_proofs(&env).await,
+                // bsv-low#304 M-2: one-shot operator drain of the verified-
+                // latch backlog (chaintracks-only stored-bump re-verify —
+                // never a courier fetch). Drive repeatedly post-deploy until
+                // `already_proven` returns 0.
+                "/admin/reverifyPotBeefs" => admin_reverify_pot_beefs(&env, &req).await,
                 "/admin/syncAdvertisements" => admin_sync_advertisements(&engine).await,
                 "/admin/startGASPSync" => admin_start_gasp_sync(&engine).await,
                 "/admin/evictOutpoint" => admin_evict_outpoint(&engine, req).await,
@@ -1105,10 +1110,14 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     {
         pot_fetcher = pot_fetcher.with_arcade_url(u);
     }
+    // Candidate page = POT_PROOF_PASS_LIMIT (bsv-low#304 M-2): the fast
+    // re-verify path is chaintracks-only, so a wide page drains the
+    // verified-latch backlog in hours (drain math at the const); courier
+    // traffic stays independently bounded by the fetcher's own budget.
     let pot_summary = crate::proof_fetcher::complete_pot_beef_proofs(
         pot_storage.as_ref(),
         &pot_fetcher,
-        20,
+        crate::proof_fetcher::POT_PROOF_PASS_LIMIT,
         backstop_age,
     )
     .await;
@@ -1282,6 +1291,60 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
 /// fail-closed: a BUMP is stitched only once chaintracks-verified; the `has_proof`
 /// latch + serve-time trim trust only verified proofs. An external cron POSTs this
 /// (bearer-authed via ADMIN_TOKEN, gated at the dispatch). Returns the counters.
+/// POST /admin/reverifyPotBeefs[?limit=N] (bsv-low#304 gate M-2) — one-shot
+/// bulk drain of the pot_beefs verified-latch backlog. Runs the SAME
+/// completion pass the cron runs but with a WIDE candidate page and a
+/// ZERO-budget fetcher: every structurally-bumped candidate gets its STORED
+/// bump chaintracks-re-verified (one service-binding read each — never a
+/// courier fetch); genuine → `mark_pot_beef_proven`, fake → honestly left
+/// for the budgeted cron pass to replace. Rows without a structural bump
+/// simply count `still_unconfirmed` (the zero budget refuses the courier
+/// path). Bearer-authed at the dispatch like every admin POST. The operator
+/// drives it repeatedly post-deploy until `already_proven` returns 0 —
+/// `limit` defaults to ADMIN_REVERIFY_DEFAULT_LIMIT, capped at
+/// ADMIN_REVERIFY_MAX_LIMIT (subrequest-wall math at the consts).
+async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Response> {
+    let limit = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "limit")
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        })
+        .unwrap_or(crate::proof_fetcher::ADMIN_REVERIFY_DEFAULT_LIMIT)
+        .clamp(1, crate::proof_fetcher::ADMIN_REVERIFY_MAX_LIMIT);
+
+    let db = match env.d1("OVERLAY_DB") {
+        Ok(d) => Rc::new(d),
+        Err(e) => return Response::error(format!("reverify-pot-beefs: D1 binding: {e}"), 500),
+    };
+    if let Err(e) = ensure_overlay_migrations(&db).await {
+        return Response::error(format!("reverify-pot-beefs: migrations: {e}"), 500);
+    }
+    let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db));
+
+    // Chaintracks-only: budget 0 makes every courier attempt refuse
+    // (fail-closed None → still_unconfirmed), so this route can never turn
+    // into a WoC/Bitails hammer no matter how wide the page is.
+    let fetcher = crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(env))
+        .with_budget(0);
+    // min_age 0: the drain is operator-driven and the fast path only ever
+    // LATCHES verified truth — the #228 push-primary age gate protects
+    // courier polling, which budget 0 already forbids.
+    let s = crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &fetcher, limit, 0)
+        .await;
+    Response::from_json(&serde_json::json!({
+        "status": "ok",
+        "limit": limit,
+        "scanned": s.scanned,
+        "already_proven": s.already_proven,
+        "completed": s.completed,
+        "still_unconfirmed": s.still_unconfirmed,
+        "stitch_failed": s.stitch_failed,
+    }))
+}
+
 async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     let db = match env.d1("OVERLAY_DB") {
         Ok(d) => Rc::new(d),
@@ -1323,7 +1386,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     let ps = crate::proof_fetcher::complete_pot_beef_proofs(
         pot_storage.as_ref(),
         &pot_fetcher,
-        20,
+        crate::proof_fetcher::POT_PROOF_PASS_LIMIT,
         backstop_age,
     )
     .await;
