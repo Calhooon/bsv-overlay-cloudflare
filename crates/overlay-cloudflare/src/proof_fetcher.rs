@@ -1470,11 +1470,19 @@ fn push_log(msg: &str) {
 ///    spending tx verifiably mined, which is exactly the #186 chaser's latch
 ///    condition.
 ///
-/// SECURITY PRECONDITION: the caller MUST have verified `bump_hex` against
-/// chaintracks for `txid` first (`/arc-ingest` refuses unverifiable proofs
-/// with 422 before ever reaching here). This function still fails closed on
-/// its own account: a bump that doesn't stitch/prove writes nothing, and
-/// `compact_pot_beef` re-checks the proof at the storage layer.
+/// SECURITY PRECONDITION / LOAD-BEARING GUARD: the caller MUST have verified
+/// `bump_hex` against chaintracks for `txid` first. This function has NO
+/// chaintracks bar of its own — its ONLY chaintracks guard is the
+/// `verify_bump` → 422 refusal in the `/arc-ingest` route
+/// (`routes.rs::arc_ingest`, "Callback merklePath failed chaintracks
+/// verification") sitting in front of its single production caller. Because
+/// what it writes latches the bsv-low#304 `proof_verified` trust flag
+/// (via `compact_pot_beef`), ADDING A NEW CALLER WITHOUT AN EQUIVALENT
+/// CHAINTRACKS VERIFY WOULD REOPEN THE FAKE-BUMP HOLE #304 CLOSED. The
+/// function still fails closed on its own STRUCTURAL account: a bump that
+/// doesn't parse/stitch/prove writes nothing, and `compact_pot_beef`
+/// re-checks the (structural) proof at the storage layer — but structure is
+/// not chain truth; the route's 422 is the chain bar.
 ///
 /// Best-effort per store: a failure in one store is logged and does not block
 /// the other (the poll backstop still covers whatever didn't land).
