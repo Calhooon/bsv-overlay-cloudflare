@@ -693,3 +693,28 @@ fn beef_block_height_reads_the_bump_or_honestly_none() {
     let bytes = proven.to_beef(true).unwrap();
     assert_eq!(beef_block_height(&bytes, REFUND_TXID), Some(959_000));
 }
+
+#[test]
+fn verified_gate_withholds_a_structural_bump_and_passes_a_verified_one() {
+    use bsv_rs::transaction::{MerklePath, MerklePathLeaf, Transaction};
+    use low_app_layer::results::verified_beef_block_height;
+    // bsv-low#304: a stored bump is STRUCTURE, not truth — the serving gate
+    // answers None unless the row's VERIFIED latch is set, regardless of
+    // what the bytes claim. The RED half (pre-#304): `beef_block_height`
+    // alone served the attacker-chosen 959_000 straight from admit bytes.
+    let mut proven = Transaction::from_binary(&raw(REFUND_HEX)).unwrap();
+    let leaf = MerklePathLeaf::new_txid(0, REFUND_TXID.to_string());
+    proven.merkle_path = Some(MerklePath::new_unchecked(959_000, vec![vec![leaf]]).unwrap());
+    let bytes = proven.to_beef(true).unwrap();
+
+    assert_eq!(
+        verified_beef_block_height(&bytes, REFUND_TXID, false),
+        None,
+        "an unverified row answers like a bumpless row — never a height"
+    );
+    assert_eq!(
+        verified_beef_block_height(&bytes, REFUND_TXID, true),
+        Some(959_000),
+        "a verified row's answer is unchanged"
+    );
+}

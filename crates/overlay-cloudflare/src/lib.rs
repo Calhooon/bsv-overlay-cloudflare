@@ -295,6 +295,11 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 // cron (e.g. low-monitor) POSTs it every ~15 min. Same logic as the
                 // scheduled block; fail-closed.
                 "/admin/complete-proofs" => admin_complete_proofs(&env).await,
+                // bsv-low#304 M-2: one-shot operator drain of the verified-
+                // latch backlog (chaintracks-only stored-bump re-verify —
+                // never a courier fetch). Drive repeatedly post-deploy until
+                // `already_proven` returns 0.
+                "/admin/reverifyPotBeefs" => admin_reverify_pot_beefs(&env, &req).await,
                 "/admin/syncAdvertisements" => admin_sync_advertisements(&engine).await,
                 "/admin/startGASPSync" => admin_start_gasp_sync(&engine).await,
                 "/admin/evictOutpoint" => admin_evict_outpoint(&engine, req).await,
@@ -827,6 +832,21 @@ fn build_engine_with_storage(
     // Enable GASP sync with HTTP-based peer communication
     engine.set_gasp_remote_factory(Box::new(crate::gasp_remote::WorkerGASPRemoteFactory));
 
+    // bsv-low#302: per-peer GASP sync budget. The #257 fix bounds the whole
+    // cron STEP at GASP_SYNC_BUDGET_MS, but ONE dead ephemeral peer (ngrok
+    // tunnel / dead host imported via SHIP ads) could still burn the entire
+    // step budget because the per-peer fetch had no timeout. Each peer now
+    // gets its own slice; a peer exceeding it is dropped loudly, recorded
+    // as a failed sync (feeding the quarantine), and the loop continues —
+    // so one dead peer costs 30 s, not the tick. Applies to the cron AND
+    // /admin/startGASPSync (same engine builder).
+    engine.set_peer_sync_budget(
+        std::rc::Rc::new(|ms| {
+            Box::pin(crate::broadcaster::sleep_ms(ms)) as overlay_engine::engine::SleepFuture
+        }),
+        GASP_PEER_SYNC_BUDGET_MS,
+    );
+
     // Chain-backed proof fetcher (#192/#193): the courier ladder
     // (Arcade→WoC→Bitails) with a MANDATORY chaintracks re-verify before any
     // BUMP is returned. This is the proof source the cron's
@@ -852,25 +872,10 @@ fn build_engine_with_storage(
 /// PURE (bsv-low#257): race `fut` against `deadline`; `None` = the deadline
 /// won and `fut` was DROPPED (its in-flight work cancelled). Injectable
 /// deadline so the control flow is natively unit-tested; the scheduled
-/// handler passes `broadcaster::sleep_ms`.
-async fn race_or_deadline<F, D, T>(fut: F, deadline: D) -> Option<T>
-where
-    F: std::future::Future<Output = T>,
-    D: std::future::Future<Output = ()>,
-{
-    let mut fut = std::pin::pin!(fut);
-    let mut deadline = std::pin::pin!(deadline);
-    std::future::poll_fn(move |cx| {
-        if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Some(v));
-        }
-        if deadline.as_mut().poll(cx).is_ready() {
-            return std::task::Poll::Ready(None);
-        }
-        std::task::Poll::Pending
-    })
-    .await
-}
+/// handler passes `broadcaster::sleep_ms`. Generalized into the engine
+/// crate for bsv-low#302 (the per-peer GASP budget reuses it) — this is
+/// the same function, re-exported to keep every existing call site.
+use overlay_engine::gasp::race_or_deadline;
 
 /// Per-step wall-clock budgets for the `*/15` scheduled tick (bsv-low#257).
 ///
@@ -898,6 +903,12 @@ where
 const GASP_SYNC_BUDGET_MS: u64 = 240_000;
 const PEER_CRAWL_BUDGET_MS: u64 = 120_000;
 const JANITOR_BUDGET_MS: u64 = 180_000;
+
+/// bsv-low#302: wall-clock slice ONE GASP peer's sync may consume. 30 s is
+/// generous for a healthy peer (a page fetch is seconds) while letting the
+/// 240 s step survive several dead peers AND still reach live ones; the
+/// step-level GASP_SYNC_BUDGET_MS stays as the outer belt.
+const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
 
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
@@ -1085,41 +1096,19 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         }
     };
 
-    // 2. LOW `pot_beefs` recovery store — the engine does NOT touch it, so this
-    //    parallel tick fetches → verifies → stitches → trims → compacts (bypass
-    //    longer-wins) each proofless pot BEEF. Its own fetcher (own per-tick
-    //    subrequest budget) so the two passes don't share a budget cell.
-    let pot_tracker = lookup_service_chain_tracker(&env);
-    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        pot_fetcher = pot_fetcher.with_arcade_url(u);
-    }
-    let pot_summary = crate::proof_fetcher::complete_pot_beef_proofs(
-        pot_storage.as_ref(),
-        &pot_fetcher,
-        20,
-        backstop_age,
-    )
-    .await;
-    worker::console_log!(
-        "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} still_unconfirmed={} \
-         fetch_failed={} stitch_failed={}",
-        pot_summary.scanned,
-        pot_summary.completed,
-        pot_summary.still_unconfirmed,
-        pot_summary.fetch_failed,
-        pot_summary.stitch_failed,
-    );
-
-    // 3. LOW `pot_records` spend-confirmation chaser (#186). Own fetcher + budget
-    //    cell (not shared with the pot-beef pass). Upgrades a 0-conf pot spend to
+    // 2+3. LOW pot-store maintenance, ORDER LOAD-BEARING (bsv-low#304 gate
+    //    M-5): the #186 spend-confirmation chaser (the small, money-relevant
+    //    CREDIT ANCHOR) runs BEFORE the pot-beef proof/bulk-drain pass so a
+    //    subrequest-wall starvation can never queue the anchor behind the
+    //    drain. The order is encoded ONCE in `run_pot_maintenance` (shared
+    //    with /admin/complete-proofs). Each pass keeps its own fetcher (own
+    //    budget cell). The chaser upgrades a 0-conf pot spend to
     //    spentConfirmed = 1 ONLY once the SPENDING tx's bump verifies against
-    //    chaintracks — fail-closed, never downgrades.
+    //    chaintracks — fail-closed, never downgrades. The pot-beef pass
+    //    fetches → verifies → stitches → trims → compacts each
+    //    not-yet-verified pot BEEF; its candidate page is
+    //    POT_PROOF_PASS_LIMIT (drain + op math at the const), courier
+    //    traffic independently bounded by its fetcher budget.
     let mut spend_fetcher =
         crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(&env))
             .with_budget(20);
@@ -1131,20 +1120,43 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     {
         spend_fetcher = spend_fetcher.with_arcade_url(u);
     }
-    let spend_summary = crate::proof_fetcher::complete_spend_confirmations(
+    let pot_tracker = lookup_service_chain_tracker(&env);
+    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        pot_fetcher = pot_fetcher.with_arcade_url(u);
+    }
+    let (spend_summary, pot_summary) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,
         20,
+        &pot_fetcher,
+        crate::proof_fetcher::POT_PROOF_PASS_LIMIT,
         backstop_age,
     )
     .await;
     worker::console_log!(
         "Scheduled: spend-confirmation (pot_records) — scanned={} confirmed={} \
-         still_unconfirmed={} fetch_failed={}",
+         still_unconfirmed={} fetch_failed={} tracker_faults={}",
         spend_summary.scanned,
         spend_summary.confirmed,
         spend_summary.still_unconfirmed,
         spend_summary.fetch_failed,
+        spend_summary.tracker_faults,
+    );
+    worker::console_log!(
+        "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} already_proven={} \
+         still_unconfirmed={} fetch_failed={} stitch_failed={}",
+        pot_summary.scanned,
+        pot_summary.completed,
+        pot_summary.already_proven,
+        pot_summary.still_unconfirmed,
+        pot_summary.fetch_failed,
+        pot_summary.stitch_failed,
     );
 
     // 4. LOW `pot_records` decoded-params lazy backfill (#284): decode the
@@ -1275,6 +1287,60 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
 /// fail-closed: a BUMP is stitched only once chaintracks-verified; the `has_proof`
 /// latch + serve-time trim trust only verified proofs. An external cron POSTs this
 /// (bearer-authed via ADMIN_TOKEN, gated at the dispatch). Returns the counters.
+/// POST /admin/reverifyPotBeefs[?limit=N] (bsv-low#304 gate M-2) — one-shot
+/// bulk drain of the pot_beefs verified-latch backlog. Runs the SAME
+/// completion pass the cron runs but with a WIDE candidate page and a
+/// ZERO-budget fetcher: every structurally-bumped candidate gets its STORED
+/// bump chaintracks-re-verified (one service-binding read each — never a
+/// courier fetch); genuine → `mark_pot_beef_proven`, fake → honestly left
+/// for the budgeted cron pass to replace. Rows without a structural bump
+/// simply count `still_unconfirmed` (the zero budget refuses the courier
+/// path). Bearer-authed at the dispatch like every admin POST. The operator
+/// drives it repeatedly post-deploy until `already_proven` returns 0 —
+/// `limit` defaults to ADMIN_REVERIFY_DEFAULT_LIMIT, capped at
+/// ADMIN_REVERIFY_MAX_LIMIT (subrequest-wall math at the consts).
+async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Response> {
+    let limit = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "limit")
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        })
+        .unwrap_or(crate::proof_fetcher::ADMIN_REVERIFY_DEFAULT_LIMIT)
+        .clamp(1, crate::proof_fetcher::ADMIN_REVERIFY_MAX_LIMIT);
+
+    let db = match env.d1("OVERLAY_DB") {
+        Ok(d) => Rc::new(d),
+        Err(e) => return Response::error(format!("reverify-pot-beefs: D1 binding: {e}"), 500),
+    };
+    if let Err(e) = ensure_overlay_migrations(&db).await {
+        return Response::error(format!("reverify-pot-beefs: migrations: {e}"), 500);
+    }
+    let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db));
+
+    // Chaintracks-only: budget 0 makes every courier attempt refuse
+    // (fail-closed None → still_unconfirmed), so this route can never turn
+    // into a WoC/Bitails hammer no matter how wide the page is.
+    let fetcher = crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(env))
+        .with_budget(0);
+    // min_age 0: the drain is operator-driven and the fast path only ever
+    // LATCHES verified truth — the #228 push-primary age gate protects
+    // courier polling, which budget 0 already forbids.
+    let s = crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &fetcher, limit, 0)
+        .await;
+    Response::from_json(&serde_json::json!({
+        "status": "ok",
+        "limit": limit,
+        "scanned": s.scanned,
+        "already_proven": s.already_proven,
+        "completed": s.completed,
+        "still_unconfirmed": s.still_unconfirmed,
+        "stitch_failed": s.stitch_failed,
+    }))
+}
+
 async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     let db = match env.d1("OVERLAY_DB") {
         Ok(d) => Rc::new(d),
@@ -1302,25 +1368,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
                 (0, 0)
             }
         };
-    // 2. pot_beefs recovery store (own fetcher + budget).
-    let pot_tracker = lookup_service_chain_tracker(env);
-    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        pot_fetcher = pot_fetcher.with_arcade_url(u);
-    }
-    let ps = crate::proof_fetcher::complete_pot_beef_proofs(
-        pot_storage.as_ref(),
-        &pot_fetcher,
-        20,
-        backstop_age,
-    )
-    .await;
-    // 3. pot_records spend-confirmation chaser (#186) — own fetcher + budget.
+    // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
+    //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
+    //    order as the scheduled tick). Own fetchers, own budget cells.
     let mut spend_fetcher =
         crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(env))
             .with_budget(20);
@@ -1332,10 +1382,22 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     {
         spend_fetcher = spend_fetcher.with_arcade_url(u);
     }
-    let ss = crate::proof_fetcher::complete_spend_confirmations(
+    let pot_tracker = lookup_service_chain_tracker(env);
+    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        pot_fetcher = pot_fetcher.with_arcade_url(u);
+    }
+    let (ss, ps) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,
         20,
+        &pot_fetcher,
+        crate::proof_fetcher::POT_PROOF_PASS_LIMIT,
         backstop_age,
     )
     .await;
@@ -1385,11 +1447,15 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "tx_completed": tx_completed,
         "pot_completed": ps.completed,
         "pot_scanned": ps.scanned,
+        "pot_already_proven": ps.already_proven,
         "pot_still_unconfirmed": ps.still_unconfirmed,
         "fetch_failed": fetch_failed,
         "spends_confirmed": ss.confirmed,
         "spends_scanned": ss.scanned,
         "spends_still_unconfirmed": ss.still_unconfirmed,
+        // bsv-low#304 gate M-5: proof/header READ faults (subrequest wall /
+        // transport) — distinguishable from "not mined yet".
+        "spends_tracker_faults": ss.tracker_faults,
         // #284 decoded-params backfill counters.
         "params_scanned": bf.scanned,
         "params_decoded": bf.decoded,

@@ -258,14 +258,39 @@ fn is_p2pkh(s: &[u8]) -> bool {
     s.len() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac
 }
 
-/// The mined block height of `txid` per its stored BEEF's BUMP, when the
-/// completion pass has stitched one in. `None` when unproven/unknown — a
-/// missing height is presented as `null`, never guessed.
+/// The mined block height of `txid` per its stored BEEF's BUMP. `None` when
+/// unproven/unknown — a missing height is presented as `null`, never guessed.
+///
+/// TRUST WARNING (bsv-low#304): this is a STRUCTURAL read of the stored
+/// bytes — it does zero SPV. A bump admitted via the ungated overlay paths
+/// (historical-tx / GASP sync / peer crawl) can be attacker-fabricated, so
+/// serving surfaces MUST gate this on the row's VERIFIED latch
+/// (`transactions.has_proof` / `pot_beefs.proof_verified`) — use
+/// [`verified_beef_block_height`].
 pub fn beef_block_height(beef_bytes: &[u8], txid: &str) -> Option<u64> {
     let beef = bsv_rs::transaction::Beef::from_binary(beef_bytes).ok()?;
     let btx = beef.find_txid(&txid.to_ascii_lowercase())?;
     let bump = beef.bumps.get(btx.bump_index()?)?;
     Some(u64::from(bump.block_height))
+}
+
+/// PURE (bsv-low#304): the height a read surface may SERVE from a stored
+/// BEEF — [`beef_block_height`] gated on the row's VERIFIED proof latch.
+/// `proof_verified = false` answers `None` regardless of what the bytes
+/// structurally claim: a fake-bumped row admitted via the ungated paths
+/// answers like a bumpless row (presence/confirmation defer to the external
+/// leg — slower, honest), NEVER an attacker-chosen confirmed/height. The
+/// fail direction only ever WEAKENS an unverified answer; a verified row's
+/// answer is unchanged.
+pub fn verified_beef_block_height(
+    beef_bytes: &[u8],
+    txid: &str,
+    proof_verified: bool,
+) -> Option<u64> {
+    if !proof_verified {
+        return None;
+    }
+    beef_block_height(beef_bytes, txid)
 }
 
 // ── #230 potparty-v2 SEAT ATTRIBUTION (the countersignature-free winner map) ─
@@ -634,6 +659,12 @@ pub struct ResultsRow {
     pub verdict_txid: Option<String>,
     /// Block height of the SPV-verified spend confirm (at.height source).
     pub spent_height: Option<u64>,
+    /// bsv-low#304: the spender `pot_beefs` row's VERIFIED proof latch
+    /// (`sb.proof_verified` — set only by the overlay's chaintracks-
+    /// verifying writers). The spender-BEEF at.height fallback is served
+    /// ONLY when this is `Some(true)`; a structural bump on an unverified
+    /// row is never a height. `None` = no spender row joined.
+    pub spender_proof_verified: Option<bool>,
 }
 
 impl ResultsRow {
@@ -1224,8 +1255,11 @@ pub fn assemble_results(
                 }
             }
             // at.height: the SPV-proven spentHeight column when present,
-            // else the spender BEEF's own BUMP (proofless BEEFs honestly
-            // yield None — never a guess).
+            // else the spender BEEF's own BUMP — served ONLY when the
+            // spender row's VERIFIED latch is set (bsv-low#304: a
+            // structural bump on an unverified row can be attacker-
+            // fabricated; proofless/unverified BEEFs honestly yield None —
+            // never a guess).
             at_height = r.spent_height;
             if at_height.is_none() {
                 if let Some(sb) = r
@@ -1233,7 +1267,11 @@ pub fn assemble_results(
                     .as_deref()
                     .and_then(crate::logic::decode_beef_hex)
                 {
-                    at_height = beef_block_height(&sb, settle);
+                    at_height = verified_beef_block_height(
+                        &sb,
+                        settle,
+                        r.spender_proof_verified == Some(true),
+                    );
                 }
             }
             // #230: the caller's PROVEN seat, from its v2 marker(s) verified
@@ -1500,6 +1538,13 @@ pub fn results_sql() -> String {
         //    spendingTxid` is NULL-opaque) OR the proven height is missing
         //    (the spender BEEF is the at.height fallback for spends whose
         //    confirm hasn't landed).
+        //
+        // bsv-low#304: `sb.proof_verified` rides the spender join — the
+        // at.height fallback is served only when the overlay's verifying
+        // writers latched it. DEPLOY ORDER: the column comes from the
+        // overlay worker's additive migration, so the overlay deploys (and
+        // runs its migrations) BEFORE this worker — the same ordering every
+        // prior additive column here required.
         "SELECT w.identity AS identity, w.gameId AS gameId, w.potTxid AS potTxid, \
                 w.potVout AS potVout, w.recoveryHeight AS recoveryHeight, \
                 w.opponentIdentity AS opponentIdentity, \
@@ -1513,7 +1558,8 @@ pub fn results_sql() -> String {
                 w.feeSats AS feeSats, w.covRecoveryHeight AS covRecoveryHeight, \
                 w.potSats AS potSats, w.verdict AS verdict, \
                 w.verdictTxid AS verdictTxid, w.spentHeight AS spentHeight, \
-                hex(fb.beef) AS fundingBeef, hex(sb.beef) AS spenderBeef \
+                hex(fb.beef) AS fundingBeef, hex(sb.beef) AS spenderBeef, \
+                sb.proof_verified AS spenderProofVerified \
          FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                   opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                   spent, spendingTxid, spentConfirmed, {DECODED}, \

@@ -1430,11 +1430,63 @@ const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentC
      stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
      verdict, verdictTxid, spentHeight";
 
-/// Row for the `pot_beefs` length probe (`length(beef) AS len`). D1 returns
-/// numbers as f64.
+/// Row for the `pot_beefs` length + verified-latch probe
+/// (`length(beef) AS len, proof_verified`). D1 returns numbers as f64;
+/// `proof_verified` is Option-tolerant (defensive for a read racing the
+/// additive bsv-low#304 migration — NULL/absent = 0 = unverified).
 #[derive(Deserialize)]
 struct BeefLenRow {
     len: f64,
+    #[serde(default)]
+    proof_verified: Option<f64>,
+}
+
+/// SHIPPED `pot_beefs` probe for [`D1PotStorage::store_beef`] (bsv-low#304)
+/// — a const so the real-SQLite test executes the production string.
+pub(crate) const POT_BEEF_PROBE_SQL: &str =
+    "SELECT length(beef) AS len, proof_verified FROM pot_beefs WHERE txid = ?";
+
+/// SHIPPED admit-path write: `proof_verified` FORCED to 0 (an admit bump is
+/// never a verified fact — bsv-low#304); `has_proof` records structure;
+/// createdAt is preserve-or-stamp (#228).
+pub(crate) const POT_BEEF_ADMIT_WRITE_SQL: &str =
+    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) \
+     VALUES (?, ?, COALESCE((SELECT createdAt FROM pot_beefs WHERE txid = ?), ?), ?, 0)";
+
+/// SHIPPED verifying write ([`D1PotStorage::compact_pot_beef`]): both
+/// latches set — the caller chaintracks-verified the bump.
+pub(crate) const POT_BEEF_VERIFIED_WRITE_SQL: &str =
+    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) \
+     VALUES (?, ?, ?, 1, 1)";
+
+/// SHIPPED verified-latch flip ([`D1PotStorage::mark_pot_beef_proven`]) —
+/// no byte rewrite, no createdAt touch.
+pub(crate) const POT_BEEF_MARK_PROVEN_SQL: &str =
+    "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1 WHERE txid = ?";
+
+/// Chunk size for the batched verified-latch flip (bsv-low#304 gate M-4) —
+/// one D1 statement per up-to-100 latched rows instead of one per row,
+/// comfortably under SQLite's bind-parameter ceiling.
+pub(crate) const POT_BEEF_MARK_PROVEN_CHUNK: usize = 100;
+
+/// SHIPPED batched verified-latch flip for `n` txids
+/// ([`D1PotStorage::mark_pot_beefs_proven`]) — the `IN (?, …)` form of
+/// [`POT_BEEF_MARK_PROVEN_SQL`], identical semantics per row.
+pub(crate) fn pot_beef_mark_proven_batch_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!("UPDATE pot_beefs SET proof_verified = 1, has_proof = 1 WHERE txid IN ({placeholders})")
+}
+
+/// SHIPPED completion-pass candidate scan (bsv-low#304: gated on the
+/// VERIFIED latch, not the structural flag).
+pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
+    format!(
+        "SELECT txid, hex(beef) AS beef FROM pot_beefs \
+         WHERE proof_verified = 0 \
+           AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
+         ORDER BY RANDOM() LIMIT {limit}"
+    )
 }
 
 /// Row for the `pot_beefs` read-back: the BLOB as hex (`hex(beef) AS beef`) —
@@ -1838,15 +1890,24 @@ impl PotStorage for D1PotStorage {
     }
 
     async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
-        // Probe the existing row's length first; write only when absent or
-        // strictly longer ([`beef_write_allowed`] — never clobber a good row
-        // with a shorter/empty one).
-        let existing: Option<BeefLenRow> =
-            Query::new("SELECT length(beef) AS len FROM pot_beefs WHERE txid = ?")
-                .bind(txid)
-                .fetch_optional(&self.db)
-                .await
-                .map_err(pot_err)?;
+        // Probe the existing row's length + verified latch first; write only
+        // when absent or strictly longer ([`beef_write_allowed`] — never
+        // clobber a good row with a shorter/empty one) AND the existing row
+        // is not VERIFIED-proven (bsv-low#304: an admit-path write is
+        // untrusted submitter bytes; a chaintracks-verified row is
+        // authoritative and only the verifying writers may rewrite it —
+        // "never weaken existing verified answers").
+        let existing: Option<BeefLenRow> = Query::new(POT_BEEF_PROBE_SQL)
+            .bind(txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        if existing
+            .as_ref()
+            .is_some_and(|r| r.proof_verified.unwrap_or(0.0) != 0.0)
+        {
+            return Ok(());
+        }
         if !beef_write_allowed(existing.map(|r| r.len as usize), beef.len()) {
             return Ok(());
         }
@@ -1854,25 +1915,24 @@ impl PotStorage for D1PotStorage {
         // OR REPLACE + BLOB bind — the same idiom as the engine's
         // transactions upsert (`d1_storage.rs::insert_output`): the guard
         // above means we only ever replace with a strictly longer beef.
-        // has_proof (#192/#193) records whether this beef already carries a
-        // BUMP for its own txid, so the completion cron enumerates only
-        // proofless rows.
+        // has_proof (#192/#193) records whether this beef STRUCTURALLY
+        // carries a BUMP for its own txid; proof_verified is FORCED to 0 —
+        // an admit-path bump is never a verified fact (bsv-low#304), so the
+        // row stays a completion-pass candidate until the pass
+        // chaintracks-verifies (or replaces) its proof.
         let has_proof = i64::from(pot_beef_has_proof(txid, beef));
         // createdAt is preserve-or-stamp (#228 backstop age anchor): a
         // longer-beef rewrite keeps the original first-store time so the
         // push-primary backstop's age gate measures real age.
-        Query::new(
-            "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof) \
-             VALUES (?, ?, COALESCE((SELECT createdAt FROM pot_beefs WHERE txid = ?), ?), ?)",
-        )
-        .bind(txid)
-        .bind(beef)
-        .bind(txid)
-        .bind(current_unix_seconds_i64())
-        .bind(has_proof)
-        .execute(&self.db)
-        .await
-        .map_err(pot_err)
+        Query::new(POT_BEEF_ADMIT_WRITE_SQL)
+            .bind(txid)
+            .bind(beef)
+            .bind(txid)
+            .bind(current_unix_seconds_i64())
+            .bind(has_proof)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
     }
 
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
@@ -1890,19 +1950,18 @@ impl PotStorage for D1PotStorage {
         limit: u64,
         min_age_secs: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
-        // ONLY proofless rows (#192/#193), RANDOM-sampled so a never-mineable
-        // head cannot starve the tail (zanaadu prod incident). Reaches the whole
-        // historical backlog (rows written before the has_proof column default
-        // to 0). Bytes are read back as hex (the pot_beefs idiom).
+        // ONLY not-yet-VERIFIED rows (#192/#193, re-based on the verified
+        // latch by bsv-low#304 — a structurally-bumped admit row must stay
+        // a candidate until its proof is chaintracks-verified or replaced),
+        // RANDOM-sampled so a never-mineable head cannot starve the tail
+        // (zanaadu prod incident). Reaches the whole historical backlog
+        // (rows written before the proof_verified column default to 0 and
+        // re-latch via the pass's stored-bump re-verify fast path). Bytes
+        // are read back as hex (the pot_beefs idiom).
         //
         // Push-primary backstop age gate (#228): young rows wait for their
         // /arc-ingest push; NULL createdAt (pre-migration) = eligible.
-        let sql = format!(
-            "SELECT txid, hex(beef) AS beef FROM pot_beefs \
-             WHERE has_proof = 0 \
-               AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
-             ORDER BY RANDOM() LIMIT {limit}"
-        );
+        let sql = pot_beef_candidates_sql(limit, min_age_secs);
         let rows: Vec<PotBeefProofRow> =
             Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows
@@ -1915,21 +1974,58 @@ impl PotStorage for D1PotStorage {
         // Fail-closed: overwrite ONLY when the new beef actually proves txid
         // (its own BUMP present ⇒ self-contained). This BYPASSES the longer-wins
         // `beef_write_allowed` guard — a bumped BEEF is authoritative even when
-        // SHORTER (its proven ancestry has been trimmed away). has_proof is
-        // latched to 1 so the row drops out of the completion candidate set.
+        // SHORTER (its proven ancestry has been trimmed away). This is a
+        // VERIFYING writer (every caller chaintracks-verified the bump before
+        // stitching), so BOTH has_proof and the bsv-low#304 proof_verified
+        // latch are set — the row drops out of the completion candidate set
+        // and its confirmed/height become index-servable.
         if !pot_beef_has_proof(txid, new_beef) {
             return Ok(());
         }
-        Query::new(
-            "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof) \
-             VALUES (?, ?, ?, 1)",
-        )
-        .bind(txid)
-        .bind(new_beef)
-        .bind(current_unix_seconds_i64())
-        .execute(&self.db)
-        .await
-        .map_err(pot_err)
+        Query::new(POT_BEEF_VERIFIED_WRITE_SQL)
+            .bind(txid)
+            .bind(new_beef)
+            .bind(current_unix_seconds_i64())
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
+    }
+
+    async fn mark_pot_beef_proven(&self, txid: &str) -> Result<(), PotStorageError> {
+        // Lightweight verified-latch flip (bsv-low#304) — NO byte rewrite,
+        // first-store age anchor untouched. Called ONLY after the completion
+        // pass chaintracks-re-verified the STORED bump (the honest-backlog
+        // fast path). has_proof is latched alongside (the bytes demonstrably
+        // carry the bump that just verified).
+        Query::new(POT_BEEF_MARK_PROVEN_SQL)
+            .bind(txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
+    }
+
+    async fn mark_pot_beefs_proven(&self, txids: &[String]) -> Result<(), PotStorageError> {
+        // One statement per POT_BEEF_MARK_PROVEN_CHUNK rows (bsv-low#304
+        // gate M-4) — the per-row round trip was the fast path's dominant
+        // subrequest cost. A failed chunk propagates; its rows simply stay
+        // candidates for the next tick (fail-safe).
+        for chunk in txids.chunks(POT_BEEF_MARK_PROVEN_CHUNK) {
+            let mut q = Query::new(pot_beef_mark_proven_batch_sql(chunk.len()));
+            for txid in chunk {
+                q = q.bind(txid.as_str());
+            }
+            q.execute(&self.db).await.map_err(pot_err)?;
+        }
+        Ok(())
+    }
+
+    async fn pot_beef_proof_verified(&self, txid: &str) -> Result<bool, PotStorageError> {
+        let row: Option<BeefLenRow> = Query::new(POT_BEEF_PROBE_SQL)
+            .bind(txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(row.is_some_and(|r| r.proof_verified.unwrap_or(0.0) != 0.0))
     }
 }
 
@@ -3216,6 +3312,99 @@ impl ProofStorage for D1ProofStorage {
 mod tests {
     use super::*;
 
+    /// bsv-low#304: the SHIPPED pot_beefs SQL on the production schema —
+    /// the completion-pass candidate set is gated on the VERIFIED latch
+    /// (`proof_verified`), NOT the structural `has_proof` flag; the admit
+    /// write forces `proof_verified = 0`; only the verifying writes latch
+    /// it. Executes the exact production strings under real SQLite.
+    #[test]
+    fn pot_beef_verified_latch_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let candidates = |min_age: u64| -> Vec<String> {
+            let sql = pot_beef_candidates_sql(16, min_age);
+            let mut stmt = conn.prepare(&sql).expect("shipped candidate SQL must parse");
+            let mut got: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            got.sort();
+            got
+        };
+
+        // ADMIT writes (the store_beef path): a fake-bumped submission is
+        // modeled by has_proof = 1 in the bind — proof_verified is FORCED
+        // to 0 by the SQL itself, so the row STAYS a candidate.
+        conn.execute(
+            POT_BEEF_ADMIT_WRITE_SQL,
+            rusqlite::params!["fakebumped", vec![0xbeu8, 0xef], "fakebumped", 100i64, 1i64],
+        )
+        .unwrap();
+        conn.execute(
+            POT_BEEF_ADMIT_WRITE_SQL,
+            rusqlite::params!["proofless", vec![0xbeu8, 0xef], "proofless", 100i64, 0i64],
+        )
+        .unwrap();
+        assert_eq!(
+            candidates(0),
+            vec!["fakebumped".to_string(), "proofless".to_string()],
+            "a structurally-bumped ADMIT row must stay a completion candidate (the #304 hole: \
+             WHERE has_proof = 0 excluded it forever)"
+        );
+
+        // The verifying compact write latches BOTH flags → drops out.
+        conn.execute(
+            POT_BEEF_VERIFIED_WRITE_SQL,
+            rusqlite::params!["fakebumped", vec![0xbeu8, 0xef, 0x01], 200i64],
+        )
+        .unwrap();
+        assert_eq!(candidates(0), vec!["proofless".to_string()]);
+
+        // The lightweight mark-proven flip latches without a byte rewrite.
+        conn.execute(POT_BEEF_MARK_PROVEN_SQL, rusqlite::params!["proofless"])
+            .unwrap();
+        assert!(candidates(0).is_empty());
+
+        // The probe SQL surfaces the latch the store_beef guard consumes —
+        // a verified row answers proof_verified = 1 (the Rust side then
+        // refuses the admit overwrite: never weaken a verified answer).
+        let (len, verified): (i64, i64) = conn
+            .query_row(
+                POT_BEEF_PROBE_SQL,
+                rusqlite::params!["fakebumped"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(len, 3, "the verifying write replaced the bytes");
+        assert_eq!(verified, 1);
+
+        // gate M-4: the BATCHED latch flip — one statement latches many rows
+        // (identical per-row semantics to POT_BEEF_MARK_PROVEN_SQL).
+        for t in ["b1", "b2", "b3"] {
+            conn.execute(
+                POT_BEEF_ADMIT_WRITE_SQL,
+                rusqlite::params![t, vec![0xbeu8, 0xef], t, 100i64, 1i64],
+            )
+            .unwrap();
+        }
+        assert_eq!(candidates(0), vec!["b1".to_string(), "b2".into(), "b3".into()]);
+        conn.execute(
+            &pot_beef_mark_proven_batch_sql(3),
+            rusqlite::params!["b1", "b2", "b3"],
+        )
+        .unwrap();
+        assert!(candidates(0).is_empty(), "one batched statement latched all three");
+    }
+
     #[test]
     fn proof_row_conversion_decodes_bundle_hex() {
         // Pre-#289 row shape: bundleB64 NULL, hex(bundle) hauled and
@@ -3745,8 +3934,14 @@ mod tests {
     fn pot_beef_len_row_converts() {
         // D1 returns length(beef) as f64 — the usize cast the write gate
         // consumes.
-        let row = BeefLenRow { len: 1234.0 };
+        let row = BeefLenRow {
+            len: 1234.0,
+            proof_verified: None,
+        };
         assert_eq!(row.len as usize, 1234);
+        // NULL/absent proof_verified (a read racing the additive #304
+        // migration) is UNVERIFIED — the admit write stays allowed.
+        assert!(row.proof_verified.unwrap_or(0.0) == 0.0);
     }
 
     // ════════════════════════════════════════════════════════════════════
