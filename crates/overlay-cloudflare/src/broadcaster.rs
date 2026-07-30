@@ -882,8 +882,9 @@ fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
 
 /// Async sleep via JS `setTimeout` (Cloudflare Workers runtime). Compiles on the
 /// host for unit tests (js-sys is a normal crate); only exercised at runtime on
-/// wasm — the pure classification tests never call it.
-async fn sleep_ms(ms: u64) {
+/// wasm — the pure classification tests never call it. `pub(crate)`: the
+/// scheduled handler's step deadlines (bsv-low#257) race against it.
+pub(crate) async fn sleep_ms(ms: u64) {
     use worker::js_sys;
     use worker::wasm_bindgen::prelude::*;
     use worker::wasm_bindgen::JsCast;
