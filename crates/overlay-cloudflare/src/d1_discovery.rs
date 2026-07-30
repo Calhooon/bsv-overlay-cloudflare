@@ -2379,9 +2379,13 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 ///     partition) cannot displace a real one. A STRICT tier, though, silently
 ///     becomes a FILTER once `limit` binds — a genuinely fresh pot whose
 ///     `tm_pot` admission is still in flight would fall off the page, which
-///     is exactly the pot a recovering client most needs. So the newest
-///     `quota` unknown pots are PROMOTED into the main tier and compete on
-///     recency; the rest stay demoted but are still served.
+///     is exactly the pot a recovering client most needs. So up to `quota`
+///     unknown pots are PROMOTED into the main tier — allocated AGE-BOUNDED
+///     and OLDEST-FIRST, never by recency (bsv-low #283a: recency slots were
+///     attacker-jumpable, since a ghost can always be newer but can never
+///     backdate a server stamp) — see [`unknown_pot_quota`] /
+///     [`UNKNOWN_POT_PROMOTION_MAX_AGE_SECS`]; the rest stay demoted but are
+///     still served.
 ///  3. Ordering is by the POT's own admission stamp (`pot_records.createdAt`
 ///     — an attacker cannot backdate or advance it by filing markers), then
 ///     the marker stamp, then `rowid` as a total order. EVERY level carries
@@ -2427,14 +2431,16 @@ pub fn potparty_list_for_identity_sql() -> String {
                         recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                         txid, outputIndex, createdAt, isV2, markerRowid, \
                         potCreatedAt, potFirstMarkerAt, \
-                        CASE WHEN unknownPot = 0 OR potRank <= ?3 THEN 0 ELSE 1 END AS tier \
+                        CASE WHEN unknownPot = 0 \
+                             OR (freshUnknown = 1 AND potRank <= ?3) \
+                             THEN 0 ELSE 1 END AS tier \
                  FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                               recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                               txid, outputIndex, createdAt, isV2, markerRowid, \
                               potCreatedAt, potFirstMarkerAt, unknownPot, \
-                              DENSE_RANK() OVER (PARTITION BY unknownPot \
-                                                 ORDER BY COALESCE(potCreatedAt, \
-                                                                   potFirstMarkerAt) DESC, \
+                              {fresh} AS freshUnknown, \
+                              DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
+                                                 ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
                                                           potTxid ASC, potVout ASC) AS potRank \
                        FROM (SELECT pp.identity AS identity, \
                                     pp.opponentIdentity AS opponentIdentity, \
@@ -2469,6 +2475,7 @@ pub fn potparty_list_for_identity_sql() -> String {
               potTxid ASC, potVout ASC, isV2 DESC, markerRowid ASC \
      LIMIT ?4",
         per_group = PARTYFOR_ROWS_PER_GROUP,
+        fresh = fresh_unknown_expr(),
     )
 }
 
@@ -2501,13 +2508,15 @@ pub fn potrefund_list_for_identity_sql() -> String {
            FROM (SELECT identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
                         txid, outputIndex, createdAt, markerRowid, \
                         potCreatedAt, potFirstMarkerAt, \
-                        CASE WHEN unknownPot = 0 OR potRank <= ?3 THEN 0 ELSE 1 END AS tier \
+                        CASE WHEN unknownPot = 0 \
+                             OR (freshUnknown = 1 AND potRank <= ?3) \
+                             THEN 0 ELSE 1 END AS tier \
                  FROM (SELECT identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
                               txid, outputIndex, createdAt, markerRowid, \
                               potCreatedAt, potFirstMarkerAt, unknownPot, \
-                              DENSE_RANK() OVER (PARTITION BY unknownPot \
-                                                 ORDER BY COALESCE(potCreatedAt, \
-                                                                   potFirstMarkerAt) DESC, \
+                              {fresh} AS freshUnknown, \
+                              DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
+                                                 ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
                                                           potTxid ASC, potVout ASC) AS potRank \
                        FROM (SELECT pr.identity AS identity, pr.gameId AS gameId, \
                                     pr.potTxid AS potTxid, pr.potVout AS potVout, \
@@ -2532,6 +2541,7 @@ pub fn potrefund_list_for_identity_sql() -> String {
               potTxid ASC, potVout ASC, markerRowid ASC \
      LIMIT ?4",
         per_group = PARTYFOR_ROWS_PER_GROUP,
+        fresh = fresh_unknown_expr(),
     )
 }
 
@@ -2566,13 +2576,71 @@ pub fn list_for_pot_sql(select: &str) -> String {
     )
 }
 
-/// How many of the newest pots ABSENT from `pot_records` are promoted into
-/// the main tier instead of being demoted behind every indexed pot
-/// (bsv-low #281 F3): a STRICT existence tier silently becomes a FILTER once
-/// `limit` binds, dropping exactly the fresh pot a recovering client most
-/// needs. One tenth of the page, at least one slot.
+/// How many pots ABSENT from `pot_records` are promoted into the main tier
+/// instead of being demoted behind every indexed pot (bsv-low #281 F3): a
+/// STRICT existence tier silently becomes a FILTER once `limit` binds,
+/// dropping exactly the fresh pot a recovering client most needs. One tenth
+/// of the page, at least one slot.
+///
+/// # Quota ALLOCATION is age-bounded and oldest-first (bsv-low #283a)
+///
+/// The #281 revision allocated the quota slots by MARKER RECENCY — and an
+/// attacker can ALWAYS be newer: 10 ghost markers filed after the victim's
+/// funding demoted the victim's genuinely fresh pot (tm_pot admission still
+/// in flight) out of the promoted set, executed in the #283 gate. Two facts
+/// fix the allocation:
+///
+///  1. `createdAt` is SERVER-STAMPED at admission (`store_record` ignores
+///     the record's value) — an attacker can be arbitrarily NEW but can
+///     never BACKDATE;
+///  2. an honest pot is "unknown" only for the in-flight window between its
+///     marker admit and its `tm_pot` admit (the SAME gated submit family —
+///     seconds to minutes; [`UNKNOWN_POT_PROMOTION_MAX_AGE_SECS`] bounds it
+///     generously). A ghost pot stays unknown FOREVER.
+///
+/// So promotion is restricted to unknown pots whose FIRST marker is younger
+/// than the freshness window (a stale unknown is a ghost with probability
+/// →1 and is only ever demoted-not-dropped), and slots inside the window go
+/// OLDEST-first — the one order an attacker cannot jump by filing MORE
+/// markers after seeing the victim's funding. Residual, stated plainly: an
+/// attacker who keeps ≥quota ghost markers CONTINUOUSLY inside every
+/// freshness window (a rolling dust flood, ~quota markers/hour forever, vs
+/// 10 markers ONCE before this fix) can still pre-date a victim's funding
+/// moment and occupy the slots. That raises cost from O(1) to O(sustained);
+/// the closures remain the #281-documented ones (verified-key binding —
+/// impossible for discovery — or priced admission, an owner decision).
+///
+/// # The guaranteed ~10% ghost share (bsv-low #283b — documented, accepted)
+///
+/// The quota ITSELF hands an invented-pot flood up to `limit/10` promoted
+/// slots for free: 50 ghost markers displace exactly `quota` real pots
+/// (executed in the #281 gate; main displaced 50). This only bites a victim
+/// whose REAL pot count exceeds `limit - quota` (>90 pots at the default
+/// page), is strictly better than the pre-#281 total erasure, and is the
+/// price of never filtering a genuinely fresh pot. Accepted; revisit only
+/// with priced admission.
 pub fn unknown_pot_quota(limit: usize) -> usize {
     (limit / 10).max(1)
+}
+
+/// Freshness window for unknown-pot quota PROMOTION (bsv-low #283a): an
+/// unknown pot only competes for promoted slots while its first marker is
+/// younger than this. An honest pot's unknown phase is the marker-vs-tm_pot
+/// admission race (seconds–minutes; both ride the same submit family), so
+/// one hour is generous headroom for provider outages/retries while
+/// guaranteeing every ghost ages OUT of the promoted set. Stale unknowns
+/// are DEMOTED, never dropped — the pot stays reachable, just behind every
+/// indexed pot.
+pub const UNKNOWN_POT_PROMOTION_MAX_AGE_SECS: u64 = 3600;
+
+/// The shared SQL expression for "this row's pot is a FRESH unknown"
+/// (see [`UNKNOWN_POT_PROMOTION_MAX_AGE_SECS`]). `COALESCE(…, 0)`: a
+/// NULL-stamped (pre-migration) marker reads as ancient → never promoted
+/// (fail direction: demoted-but-served).
+fn fresh_unknown_expr() -> String {
+    format!(
+        "CASE WHEN unknownPot = 1 AND COALESCE(potFirstMarkerAt, 0) >= unixepoch() - {UNKNOWN_POT_PROMOTION_MAX_AGE_SECS} THEN 1 ELSE 0 END"
+    )
 }
 
 /// Rows kept per `(potTxid, potVout, marker group)` by the identity-scoped
@@ -4371,6 +4439,10 @@ mod tests {
     /// what keeps it visible.
     #[test]
     fn a_fresh_unindexed_pot_is_not_filtered_out_by_the_limit() {
+        // #283a: promotion is AGE-BOUNDED (unixepoch()-anchored in the
+        // shipped SQL), so the fresh pot's marker must carry a genuinely
+        // fresh server-style stamp — exactly what the admit path writes.
+        let now = now_secs();
         let conn = production_schema_db();
         let victim = victim_id();
         for i in 0..100u32 {
@@ -4388,7 +4460,7 @@ mod tests {
         }
         // The pot the client most needs: funded seconds ago, not yet admitted.
         let fresh = h64(0xfa);
-        insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", 9_999, None);
+        insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None);
 
         let got = window_col(
             &conn,
@@ -4400,6 +4472,131 @@ mod tests {
         assert!(
             got.contains(&fresh),
             "a real-but-unindexed pot must not be filtered out by the window"
+        );
+    }
+
+    /// Wall clock as the shipped SQL sees it (`unixepoch()`).
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+    }
+
+    // ── #283a — quota slots are AGE-BOUNDED + OLDEST-FIRST, not recency ──
+
+    /// The #283 gate's executed failing case, now GREEN: a victim with 100
+    /// indexed pots and ONE freshly funded pot (tm_pot admission in flight);
+    /// an attacker files 10 ghost markers NEWER than the honest one. Under
+    /// recency allocation the ghosts took every promoted slot and the fresh
+    /// pot went ABSENT — exactly the case the quota was introduced to
+    /// prevent. Oldest-first allocation ranks the honest (earlier) marker
+    /// ahead of every later ghost.
+    #[test]
+    fn fresh_pot_survives_ghost_markers_filed_after_it_real_sqlite() {
+        let now = now_secs();
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+        }
+        let fresh = h64(0xfa);
+        insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 120, None);
+        // Ghosts NEWER than the honest marker — the attacker reacted to the
+        // funding (they cannot backdate a server stamp).
+        for i in 0..(unknown_pot_quota(100) as u32) {
+            insert_potparty(
+                &conn,
+                &victim,
+                &format!("{:064x}", 0xdead_beefu64 + i as u64),
+                0,
+                &format!("txGHOSTN{i:02}"),
+                now - 60 + i as i64,
+                None,
+            );
+        }
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        assert!(
+            got.contains(&fresh),
+            "the fresh honest pot must survive newer ghost markers (#283a): {got:?}"
+        );
+    }
+
+    /// A STALE unknown pot (older than the promotion window) never occupies
+    /// a promoted slot — ghosts age out; the one-time 10-marker flood dies.
+    /// The stale rows are DEMOTED, not dropped (still reachable past the
+    /// indexed pots).
+    #[test]
+    fn stale_unknown_pots_never_occupy_promotion_slots_real_sqlite() {
+        let now = now_secs();
+        let stale = now - (UNKNOWN_POT_PROMOTION_MAX_AGE_SECS as i64) - 100;
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+        }
+        let fresh = h64(0xfa);
+        insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None);
+        // Ghosts OLDER than the honest marker but STALE — pre-#283a these
+        // could never even be beaten oldest-first; the age bound retires them.
+        for i in 0..20u32 {
+            insert_potparty(
+                &conn,
+                &victim,
+                &format!("{:064x}", 0xdead_beefu64 + i as u64),
+                0,
+                &format!("txGHOSTS{i:02}"),
+                stale + i as i64,
+                None,
+            );
+        }
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        assert!(
+            got.contains(&fresh),
+            "stale ghosts must not displace the fresh pot's promoted slot: {got:?}"
+        );
+    }
+
+    /// RESIDUAL, pinned so it cannot drift silently (#283a doc): an attacker
+    /// who keeps ≥quota ghost markers INSIDE the freshness window and OLDER
+    /// than the victim's funding moment (a sustained rolling flood — ~quota
+    /// markers per hour, forever) still occupies the promoted slots. The fix
+    /// raises the cost from 10 markers once to a continuous flood; it does
+    /// not close the window (the closures are verified-key binding — absent
+    /// for discovery — or priced admission, an owner decision).
+    #[test]
+    fn sustained_fresh_older_ghost_flood_still_displaces_residual_real_sqlite() {
+        let now = now_secs();
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+        }
+        let fresh = h64(0xfa);
+        insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None);
+        // Fresh ghosts OLDER than the honest marker (the sustained flood).
+        for i in 0..(unknown_pot_quota(100) as u32) {
+            insert_potparty(
+                &conn,
+                &victim,
+                &format!("{:064x}", 0xdead_beefu64 + i as u64),
+                0,
+                &format!("txGHOSTO{i:02}"),
+                now - 600 + i as i64,
+                None,
+            );
+        }
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        assert!(
+            !got.contains(&fresh),
+            "KNOWN residual: a sustained older-but-fresh ghost flood still displaces — \
+             if this starts PASSING, the allocation changed and the docs must move with it"
         );
     }
 
