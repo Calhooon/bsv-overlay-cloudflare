@@ -1041,6 +1041,36 @@ pub fn low_by_host_sql() -> String {
     )
 }
 
+/// `find_tables_for_spend_check` (bsv-low #309) — bounded RANDOM sample of
+/// TABLE rows for the cron's advert spend-confirmation pass. RANDOM defeats
+/// head-of-queue starvation (the same anti-starvation shape as
+/// `pot_records.find_spent_unconfirmed`): a probe-resistant head cannot
+/// starve the tail, and every row is eventually visited across ticks.
+/// `limit` is interpolated (a code constant, never user input) to match the
+/// sibling idiom. Factored out so the real-SQLite tests execute the SHIPPED
+/// string.
+pub fn low_tables_for_spend_check_sql(limit: u64) -> String {
+    format!(
+        "SELECT {LOW_RECORD_COLUMNS} FROM low_records \
+         WHERE recordType = 'table' ORDER BY RANDOM() LIMIT {limit}"
+    )
+}
+
+/// `find_tables_expired_at_or_before` (bsv-low #309) — TABLE rows with a
+/// NON-NULL `expiryHeight <= ?` (the caller-computed `tip - margin` cutoff),
+/// OLDEST-expiry-first (deterministic: deletion removes rows from the set,
+/// so a fixed order drains the backlog front-to-back without starvation),
+/// bounded. `expiryHeight IS NOT NULL` is belt-and-braces (`NULL <= ?` is
+/// already never true) and documents that a NULL-expiry row is NEVER reaped.
+/// Backed by `idx_low_expiry (recordType, expiryHeight)`.
+pub fn low_tables_expired_sql(limit: u64) -> String {
+    format!(
+        "SELECT {LOW_RECORD_COLUMNS} FROM low_records \
+         WHERE recordType = 'table' AND expiryHeight IS NOT NULL AND expiryHeight <= ? \
+         ORDER BY expiryHeight ASC LIMIT {limit}"
+    )
+}
+
 /// Row for full low_records queries. D1 returns numbers as f64 and nullable
 /// columns as `Option`.
 #[derive(Deserialize)]
@@ -1216,6 +1246,30 @@ impl LowStorage for D1LowStorage {
         .fetch_all(&self.db)
         .await
         .map_err(low_err)?;
+        Ok(low_records_from_rows(rows))
+    }
+
+    async fn find_tables_for_spend_check(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        let rows: Vec<LowRow> = Query::new(low_tables_for_spend_check_sql(limit))
+            .fetch_all(&self.db)
+            .await
+            .map_err(low_err)?;
+        Ok(low_records_from_rows(rows))
+    }
+
+    async fn find_tables_expired_at_or_before(
+        &self,
+        cutoff_height: u32,
+        limit: u64,
+    ) -> Result<Vec<LowRecord>, LowStorageError> {
+        let rows: Vec<LowRow> = Query::new(low_tables_expired_sql(limit))
+            .bind(cutoff_height)
+            .fetch_all(&self.db)
+            .await
+            .map_err(low_err)?;
         Ok(low_records_from_rows(rows))
     }
 }
@@ -4450,6 +4504,86 @@ mod tests {
                 .collect();
             assert_eq!(txids, vec![h64(0x01)], "exactly the requested key's rows");
         }
+    }
+
+    /// bsv-low#309: the shipped advert-lifecycle candidate scans execute on
+    /// the production schema. Spend-check: TABLE rows only, LIMIT-bounded.
+    /// Reap: cutoff-INCLUSIVE (`<=`), NULL-expiry rows never surface,
+    /// oldest-expiry-first, LIMIT-bounded.
+    #[test]
+    fn low_advert_lifecycle_scan_sql_real_sqlite() {
+        let conn = production_schema_db();
+        // Three table rows with distinct expiries + one NULL-expiry table
+        // row + one gameutxo pointer row.
+        for (txid_seed, expiry) in [(0x01u8, 899_990i64), (0x02, 900_000), (0x03, 900_001)] {
+            conn.execute(
+                "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, \
+                 gameId, stakeSats, expiryHeight) VALUES ('table', ?1, 0, ?2, ?3, 1000, ?4)",
+                rusqlite::params![h64(txid_seed), victim_id(), h64(0x11), expiry],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, gameId) \
+             VALUES ('table', ?1, 0, ?2, ?3)",
+            rusqlite::params![h64(0x04), victim_id(), h64(0x11)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, gameId) \
+             VALUES ('gameutxo', ?1, 1, ?2, ?3)",
+            rusqlite::params![h64(0x05), victim_id(), h64(0x11)],
+        )
+        .unwrap();
+
+        // Spend-check scan: every TABLE row (incl. the NULL-expiry one — a
+        // confirmed spend is the ONLY thing that may remove it), never the
+        // gameutxo pointer; LIMIT bounds the batch.
+        let mut stmt = conn
+            .prepare(&low_tables_for_spend_check_sql(10))
+            .expect("shipped spend-check SQL must parse");
+        let mut txids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        txids.sort();
+        assert_eq!(
+            txids,
+            vec![h64(0x01), h64(0x02), h64(0x03), h64(0x04)],
+            "all table rows, never the pointer"
+        );
+        let mut stmt = conn.prepare(&low_tables_for_spend_check_sql(2)).unwrap();
+        assert_eq!(
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .count(),
+            2,
+            "LIMIT bounds the batch"
+        );
+
+        // Reap scan at cutoff 900_000: the <= boundary row and the older row,
+        // OLDEST first; the above-cutoff and NULL-expiry rows never surface.
+        let mut stmt = conn
+            .prepare(&low_tables_expired_sql(10))
+            .expect("shipped reap SQL must parse");
+        let txids: Vec<String> = stmt
+            .query_map(rusqlite::params![900_000i64], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            txids,
+            vec![h64(0x01), h64(0x02)],
+            "cutoff-inclusive, oldest-expiry-first; NULL expiry is NEVER a candidate"
+        );
+        let mut stmt = conn.prepare(&low_tables_expired_sql(1)).unwrap();
+        let txids: Vec<String> = stmt
+            .query_map(rusqlite::params![900_000i64], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(txids, vec![h64(0x01)], "the bound keeps the oldest");
     }
 
     /// #290/#291: the shipped reveal SQL parses on the production schema,

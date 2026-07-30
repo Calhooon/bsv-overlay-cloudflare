@@ -565,8 +565,9 @@ fn tsc_proof_to_merkle_path(
 }
 
 /// Fetch a URL via `worker::Fetch`, returning `(status, body)`. `header` is an
-/// optional single `(name, value)` pair (e.g. the WoC api key).
-async fn http_get(url: &str, header: Option<(&str, &str)>) -> Result<(u16, String), String> {
+/// optional single `(name, value)` pair (e.g. the WoC api key). `pub(crate)`
+/// since bsv-low#309: the advert-lifecycle pass probes the same courier hosts.
+pub(crate) async fn http_get(url: &str, header: Option<(&str, &str)>) -> Result<(u16, String), String> {
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
     init.with_redirect(worker::RequestRedirect::Manual);
@@ -1447,8 +1448,9 @@ impl PushedPotSummary {
 /// implemented on non-wasm32 targets"). Used by every path native unit tests
 /// exercise — the push consumer, the params backfill, and (since the
 /// bsv-low#304 gate round) the pot-beef poll pass incl. its
-/// stored-bump-failed-reverify branch.
-fn push_log(msg: &str) {
+/// stored-bump-failed-reverify branch. `pub(crate)` since bsv-low#309: the
+/// natively-tested advert-lifecycle passes log through it too.
+pub(crate) fn push_log(msg: &str) {
     #[cfg(target_arch = "wasm32")]
     worker::console_log!("{}", msg);
     #[cfg(not(target_arch = "wasm32"))]
