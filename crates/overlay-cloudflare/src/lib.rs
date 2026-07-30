@@ -1091,6 +1091,34 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         backfill_summary.missing_beef,
     );
 
+    // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
+    //    #267 item c). The passes above only help txs the network HOLDS; an
+    //    admitted tx the network never accepted (the #267 incident class)
+    //    never self-heals — this pass presence-probes old proofless rows
+    //    (Bitails + WoC) and rebroadcasts the stored BEEF ancestry-first
+    //    when BOTH indexers definitively 404 it. Runs LAST, own bounds
+    //    (16 candidates / 48 POSTs), so it can never starve proof
+    //    completion.
+    let tx_storage = D1Storage::new(ops_db.clone());
+    let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
+        &tx_storage,
+        taal_key.as_deref(),
+        None,
+        crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
+    )
+    .await;
+    worker::console_log!(
+        "Scheduled: rebroadcast-backstop (transactions) — scanned={} present={} \
+         inconclusive={} rebroadcast={} failed={} budget_skipped={}",
+        rb.scanned,
+        rb.present,
+        rb.inconclusive,
+        rb.rebroadcast,
+        rb.rebroadcast_failed,
+        rb.budget_skipped,
+    );
+
     // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
     // the persistent counters, and refresh the proofless first-seen ledger so a
     // dead pass / a proof-not-landing surfaces via GET /health/invariants
@@ -1223,6 +1251,17 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
     )
     .await;
+    // 4b. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
+    //     runs last, own bounds; see the scheduled block's note.
+    let tx_storage = D1Storage::new(db.clone());
+    let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
+        &tx_storage,
+        taal_key.as_deref(),
+        None,
+        crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
+    )
+    .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;
@@ -1250,6 +1289,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "params_decoded": bf.decoded,
         "params_verdicts": bf.verdicts,
         "params_missing_beef": bf.missing_beef,
+        // #273 rebroadcast-backstop counters.
+        "rebroadcast_scanned": rb.scanned,
+        "rebroadcast_present": rb.present,
+        "rebroadcast_inconclusive": rb.inconclusive,
+        "rebroadcast_rescued": rb.rebroadcast,
+        "rebroadcast_failed": rb.rebroadcast_failed,
+        "rebroadcast_budget_skipped": rb.budget_skipped,
         // Observability only (≤5): which spending txids were sampled, so an
         // operator can check them on a block explorer and distinguish a broken
         // chaser from a genuinely unconfirmable backlog.
