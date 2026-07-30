@@ -521,10 +521,14 @@ async fn http_get(url: &str, header: Option<(&str, &str)>) -> Result<(u16, Strin
 /// Tally of one pot-store proof-completion pass (logged by the cron).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PotProofSummary {
-    /// Proofless pot BEEFs scanned this tick.
+    /// Not-yet-verified pot BEEFs scanned this tick.
     pub scanned: usize,
     /// BEEFs upgraded with a verified BUMP, trimmed, and compacted back.
     pub completed: usize,
+    /// Candidates whose STORED structural bump chaintracks-re-verified —
+    /// latched via `mark_pot_beef_proven`, no fetch, no byte rewrite
+    /// (bsv-low#304: the honest-backlog fast path).
+    pub already_proven: usize,
     /// Candidates still unmined (fetcher returned no verified proof) — retried.
     pub still_unconfirmed: usize,
     /// Candidates the fetcher errored on (budget / transport) — retried.
@@ -569,6 +573,38 @@ pub async fn complete_pot_beef_proofs(
     summary.scanned = candidates.len();
 
     for (txid, stored_beef) in candidates {
+        // bsv-low#304 fast path (mirrors the engine's transactions pass): a
+        // candidate whose STORED bytes already carry a bump for its own txid
+        // gets that bump chaintracks-RE-VERIFIED first. Genuine → latch the
+        // verified flag (no fetch, no byte rewrite — the honest backlog
+        // clears without courier traffic). A bump that FAILS the re-verify
+        // is a fake/stale claim: fall through to the fetch path, which
+        // replaces it with a chaintracks-verified one (or honestly retries).
+        let stored_bump = bsv_rs::transaction::Beef::from_binary(&stored_beef)
+            .ok()
+            .filter(|b| {
+                b.find_txid(&txid)
+                    .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
+            })
+            .and_then(|b| {
+                b.find_bump(&txid)
+                    .map(bsv_rs::transaction::MerklePath::to_hex)
+            });
+        if let Some(bump_hex) = stored_bump {
+            if fetcher.verify_proof(&txid, &bump_hex).await {
+                if let Err(e) = pot_storage.mark_pot_beef_proven(&txid).await {
+                    worker::console_log!("[pot-proof] {txid} verified-latch write failed: {e}");
+                    summary.stitch_failed += 1;
+                } else {
+                    summary.already_proven += 1;
+                }
+                continue;
+            }
+            worker::console_log!(
+                "[pot-proof] {txid} stored structural bump FAILED chaintracks re-verify — not trusting it, refetching (bsv-low#304)"
+            );
+        }
+
         // PROOF-ONLY fetch + chaintracks-verify (#192/#193 FIX 2): the raw is
         // ALREADY in `stored_beef` (which `stitch_and_trim_pot_beef` reuses), so
         // we never re-fetch it. The fetcher returns a bump ONLY once its root is

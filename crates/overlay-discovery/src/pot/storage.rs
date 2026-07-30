@@ -378,13 +378,16 @@ pub trait PotStorage {
     /// The stored BEEF for `txid`, or `None` if we never stored one.
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError>;
 
-    /// Return a bounded page of PROOFLESS stored pot BEEFs (`(txid, beef)`) for
-    /// the proof-completion cron (#192/#193). A row is "proofless" when its
-    /// stored BEEF does NOT yet carry a chaintracks-verified merkle BUMP for its
-    /// OWN txid.
+    /// Return a bounded page of NOT-YET-VERIFIED stored pot BEEFs
+    /// (`(txid, beef)`) for the proof-completion cron (#192/#193). A row is
+    /// a candidate until a chaintracks-VERIFIED merkle BUMP for its OWN
+    /// txid has been latched (bsv-low#304) — a STRUCTURAL bump in the
+    /// stored bytes does NOT settle it: admit-path bytes are submitter-
+    /// supplied with zero SPV, so a fake-bumped row must stay in the
+    /// candidate set until the pass re-verifies (or replaces) its proof.
     ///
-    /// Backends that track a `has_proof` flag answer with
-    /// `WHERE has_proof = 0 ORDER BY RANDOM() LIMIT n` (RANDOM defeats
+    /// Backends that track a verified latch answer with
+    /// `WHERE proof_verified = 0 ORDER BY RANDOM() LIMIT n` (RANDOM defeats
     /// head-of-queue starvation — a never-mineable head must not starve the
     /// tail). Backends that can't enumerate (or have nothing to complete) may
     /// return an empty `Vec` via this default → proof completion is a no-op.
@@ -412,6 +415,19 @@ pub trait PotStorage {
     /// Backends that don't compact may use this no-op default.
     async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
         let _ = (txid, new_beef);
+        Ok(())
+    }
+
+    /// Latch `txid`'s VERIFIED-proof flag WITHOUT rewriting bytes
+    /// (bsv-low#304) — called by the completion pass when the STORED BEEF's
+    /// own bump has just been chaintracks-re-verified (the fast path for
+    /// the honest backlog: no external fetch, no byte rewrite, the
+    /// first-store age anchor stays intact). The caller is the ONLY party
+    /// allowed to have verified; backends must never latch this from
+    /// structure alone. Default: no-op (backends without the latch keep
+    /// their candidate semantics).
+    async fn mark_pot_beef_proven(&self, txid: &str) -> Result<(), PotStorageError> {
+        let _ = txid;
         Ok(())
     }
 }
@@ -457,6 +473,12 @@ pub struct MemoryPotStorage {
     /// Spend-record stamp (clock secs) per `(txid, vout)` — models
     /// `pot_records.spentAt` (written by `mark_spent`).
     spent_at: std::sync::Mutex<std::collections::HashMap<(String, u32), u64>>,
+    /// txids whose VERIFIED-proof latch is set — models the D1
+    /// `pot_beefs.proof_verified` column (bsv-low#304). Latched ONLY by
+    /// `compact_pot_beef` / `mark_pot_beef_proven` (the verifying
+    /// writers); RESET by any admit-path `store_beef` byte write. A
+    /// structural bump in stored bytes never enters this set by itself.
+    verified: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl MemoryPotStorage {
@@ -657,6 +679,13 @@ impl PotStorage for MemoryPotStorage {
             return Ok(());
         }
         let now = self.now();
+        // bsv-low#304: a VERIFIED row is authoritative — an admit-path
+        // write (untrusted, submitter-supplied bytes) must never clobber a
+        // chaintracks-verified proof, even when longer. Only the verifying
+        // writers (`compact_pot_beef`) may rewrite it.
+        if self.verified.lock().unwrap().contains(txid) {
+            return Ok(());
+        }
         let mut beefs = self.beefs.lock().unwrap();
         // Longer-wins: write only when absent or strictly longer (a good row
         // is never clobbered by a shorter one).
@@ -685,18 +714,22 @@ impl PotStorage for MemoryPotStorage {
         limit: u64,
         min_age_secs: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
-        // Model the D1 `WHERE has_proof = 0` candidate set by re-deriving the
-        // flag from the stored bytes (the memory store keeps no flag column).
+        // Model the D1 `WHERE proof_verified = 0` candidate set
+        // (bsv-low#304): a row is a candidate until the VERIFIED latch is
+        // set — a STRUCTURAL bump in the stored bytes does NOT drop it out
+        // (admit-path bytes are untrusted; the pass re-verifies them).
         // The #228 backstop age gate excludes rows younger than min_age_secs
         // (their proof is expected via /arc-ingest); unknown age = eligible.
+        let verified = self.verified.lock().unwrap();
         let candidates: Vec<(String, Vec<u8>)> = self
             .beefs
             .lock()
             .unwrap()
             .iter()
-            .filter(|(txid, beef)| !pot_beef_has_proof(txid, beef))
+            .filter(|(txid, _)| !verified.contains(*txid))
             .map(|(txid, beef)| (txid.clone(), beef.clone()))
             .collect();
+        drop(verified);
         Ok(candidates
             .into_iter()
             .filter(|(txid, _)| {
@@ -761,7 +794,9 @@ impl PotStorage for MemoryPotStorage {
     async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
         // Fail-closed: overwrite ONLY when the new beef actually proves txid
         // (its own BUMP is present ⇒ self-contained). BYPASS the longer-wins
-        // guard — a bumped BEEF wins even when shorter.
+        // guard — a bumped BEEF wins even when shorter. This is a VERIFYING
+        // writer (the caller chaintracks-verified the bump before stitching),
+        // so the verified latch is set (bsv-low#304).
         if !pot_beef_has_proof(txid, new_beef) {
             return Ok(());
         }
@@ -769,6 +804,12 @@ impl PotStorage for MemoryPotStorage {
             .lock()
             .unwrap()
             .insert(txid.to_string(), new_beef.to_vec());
+        self.verified.lock().unwrap().insert(txid.to_string());
+        Ok(())
+    }
+
+    async fn mark_pot_beef_proven(&self, txid: &str) -> Result<(), PotStorageError> {
+        self.verified.lock().unwrap().insert(txid.to_string());
         Ok(())
     }
 }
@@ -1132,21 +1173,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_pot_beefs_for_proof_check_returns_only_proofless() {
-        // The candidate query must surface ONLY proofless rows — a proven row
-        // must not be re-fetched.
+    async fn find_pot_beefs_candidacy_is_the_verified_latch_not_structure() {
+        // bsv-low#304: an ADMIT-path row stays a completion candidate even
+        // when its stored bytes STRUCTURALLY carry a bump — admit bytes are
+        // submitter-supplied with zero SPV (a fake bump must not
+        // self-exempt from re-verification). Only the VERIFYING writers
+        // (`mark_pot_beef_proven` / `compact_pot_beef`) drop a row out.
         let store = MemoryPotStorage::new();
         let (proofless, proofless_txid) = proofless_beef_with_filler(RAW_A, None);
-        let (proven, proven_txid) = proven_beef(RAW_B);
-        assert_ne!(proofless_txid, proven_txid);
+        let (structurally_bumped, bumped_txid) = proven_beef(RAW_B);
+        assert_ne!(proofless_txid, bumped_txid);
+        assert!(pot_beef_has_proof(&bumped_txid, &structurally_bumped));
 
         store.store_beef(&proofless_txid, &proofless).await.unwrap();
-        store.store_beef(&proven_txid, &proven).await.unwrap();
+        store
+            .store_beef(&bumped_txid, &structurally_bumped)
+            .await
+            .unwrap();
         assert_eq!(store.beef_count(), 2);
 
+        // BOTH rows are candidates — structure alone settles nothing.
         let cands = store.find_pot_beefs_for_proof_check(10, 0).await.unwrap();
-        assert_eq!(cands.len(), 1, "only the proofless row is a candidate");
+        assert_eq!(
+            cands.len(),
+            2,
+            "a structurally-bumped admit row must stay a candidate until verified"
+        );
+
+        // The verified latch (set only after a chaintracks re-verify) drops
+        // the row out without touching its bytes.
+        store.mark_pot_beef_proven(&bumped_txid).await.unwrap();
+        let cands = store.find_pot_beefs_for_proof_check(10, 0).await.unwrap();
+        assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].0, proofless_txid);
+
+        // …and the verifying compact write latches too.
+        let (proven_a, txid_a) = proven_beef(RAW_A);
+        assert_eq!(txid_a, proofless_txid);
+        store.compact_pot_beef(&txid_a, &proven_a).await.unwrap();
+        assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admit_write_never_clobbers_a_verified_row() {
+        // bsv-low#304 ("never weaken existing verified answers"): once a
+        // row's proof is chaintracks-verified, an UNTRUSTED admit-path
+        // store_beef — even a strictly LONGER one, which the longer-wins
+        // guard would otherwise accept — must not replace the bytes.
+        let store = MemoryPotStorage::new();
+        let (proven_short, txid) = proven_beef(RAW_A);
+        let (proofless_long, txid2) = proofless_beef_with_filler(RAW_A, Some(RAW_B));
+        assert_eq!(txid, txid2);
+        assert!(proofless_long.len() > proven_short.len());
+
+        store.compact_pot_beef(&txid, &proven_short).await.unwrap();
+        store.store_beef(&txid, &proofless_long).await.unwrap();
+        assert_eq!(
+            store.get_beef(&txid).await.unwrap().as_deref(),
+            Some(proven_short.as_slice()),
+            "an admit write must not replace a verified row's bytes"
+        );
     }
 
     // ── find_spent_unconfirmed / spend-confirmation chaser (#186) ─────────

@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 90;
+pub const OVERLAY_MIGRATION_COUNT: usize = 92;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -663,10 +663,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // both order by createdAt DESC.
     "CREATE INDEX IF NOT EXISTS idx_potrefund_pot ON potrefund_records(potTxid, potVout)",
     "CREATE INDEX IF NOT EXISTS idx_potrefund_identity ON potrefund_records(identity)",
-    // pot_beefs proof-completion flag (#192/#193): 1 once the stored BEEF
-    // carries a chaintracks-verified BUMP for its OWN txid, else 0. Written on
-    // every `store_beef`/`compact_pot_beef`; the pot-store completion cron
-    // enumerates ONLY proofless rows (`WHERE has_proof = 0 ORDER BY RANDOM()`).
+    // pot_beefs proof-completion flag (#192/#193): 1 when the stored BEEF
+    // STRUCTURALLY carries a BUMP for its OWN txid, else 0. Written on
+    // every `store_beef`/`compact_pot_beef`. bsv-low#304: this flag is
+    // derived from submitted bytes with NO SPV, so it is NOT a trust
+    // signal — the completion-pass candidate set and every money-relevant
+    // read moved to the VERIFIED `proof_verified` latch added below; this
+    // column stays as the structural record (additive-only list).
     // A `compact_pot_beef` write BYPASSES the longer-wins guard — a bumped BEEF
     // is authoritative even when SHORTER (trimmed ancestry). Additive ALTER —
     // the runner ignores the re-run "duplicate column" error
@@ -835,6 +838,24 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         last_success INTEGER,
         PRIMARY KEY (host, topic)
     )",
+    // ── bsv-low#304: VERIFIED proof latch for pot_beefs ──────────────────
+    // `has_proof` above is STRUCTURAL — `store_beef` latches it from the
+    // submitted bytes with zero SPV, so a fake-bumped BEEF admitted via the
+    // ungated paths (historical-tx / GASP sync / peer crawl) carried
+    // has_proof = 1 and (a) escaped the completion pass forever and (b) fed
+    // /tx-any's index leg an attacker-chosen confirmed/height. This column
+    // is latched ONLY by the VERIFYING writers (`compact_pot_beef` after a
+    // chaintracks-verified stitch, `mark_pot_beef_proven` after a
+    // chaintracks re-verify of a stored bump); every admit-path write
+    // resets it to 0. Money-relevant reads (the /tx-any confirmed/height
+    // answer, the /beef serve-time trimming license, the completion-pass
+    // candidate set) trust ONLY this latch. Existing rows default to 0 —
+    // the completion pass re-verifies the backlog (stored-bump re-verify
+    // first, so an honest backlog latches without external fetches).
+    "ALTER TABLE pot_beefs ADD COLUMN proof_verified INTEGER NOT NULL DEFAULT 0",
+    // The completion-pass candidate scan (`WHERE proof_verified = 0 …`).
+    "CREATE INDEX IF NOT EXISTS idx_pot_beefs_proof_verified \
+     ON pot_beefs(proof_verified)",
 ];
 
 // =============================================================================

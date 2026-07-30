@@ -1113,10 +1113,11 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     )
     .await;
     worker::console_log!(
-        "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} still_unconfirmed={} \
-         fetch_failed={} stitch_failed={}",
+        "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} already_proven={} \
+         still_unconfirmed={} fetch_failed={} stitch_failed={}",
         pot_summary.scanned,
         pot_summary.completed,
+        pot_summary.already_proven,
         pot_summary.still_unconfirmed,
         pot_summary.fetch_failed,
         pot_summary.stitch_failed,
@@ -1391,6 +1392,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "tx_completed": tx_completed,
         "pot_completed": ps.completed,
         "pot_scanned": ps.scanned,
+        "pot_already_proven": ps.already_proven,
         "pot_still_unconfirmed": ps.still_unconfirmed,
         "fetch_failed": fetch_failed,
         "spends_confirmed": ss.confirmed,
