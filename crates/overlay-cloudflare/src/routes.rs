@@ -1164,9 +1164,11 @@ pub async fn arc_ingest(
     match engine_res {
         Ok(()) => {
             worker::console_log!(
-                "POST /arc-ingest -> 200 (engine stitched; pot_beef_compacted={} spends_confirmed={})",
+                "POST /arc-ingest -> 200 (engine stitched; pot_beef_compacted={} spends_confirmed={} cas_missed={} cas_errors={})",
                 pot.pot_beef_compacted,
-                pot.spends_confirmed
+                pot.spends_confirmed,
+                pot.spends_cas_missed,
+                pot.spends_cas_errors
             );
             if let Some(db) = ops_db {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_PUSHED, 1).await;
@@ -1180,9 +1182,11 @@ pub async fn arc_ingest(
         // (the settle/refund/sweep case) — that is a SUCCESSFUL push.
         Err(_) if pot.landed_anything() => {
             worker::console_log!(
-                "POST /arc-ingest -> 200 (pot stores only; pot_beef_compacted={} spends_confirmed={})",
+                "POST /arc-ingest -> 200 (pot stores only; pot_beef_compacted={} spends_confirmed={} cas_missed={} cas_errors={})",
                 pot.pot_beef_compacted,
-                pot.spends_confirmed
+                pot.spends_confirmed,
+                pot.spends_cas_missed,
+                pot.spends_cas_errors
             );
             if let Some(db) = ops_db {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_PUSHED, 1).await;

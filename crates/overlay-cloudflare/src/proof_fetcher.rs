@@ -814,6 +814,23 @@ pub struct SpendConfirmSummary {
     /// counted SEPARATELY from `still_unconfirmed` so a starved tick is
     /// visible instead of masquerading as "not mined yet".
     pub tracker_faults: usize,
+    /// bsv-low#301: rows whose confirmed CAS write MISSED — the spend
+    /// pointer moved between the candidate read and the write (a racing
+    /// displacement, reorg class included), so the guarded write was a
+    /// NO-OP. Never confirmed on the stale read; the row is either still
+    /// unconfirmed (→ re-surfaced by the next tick's candidate scan) or
+    /// was confirmed by the competing writer (terminal, correct).
+    pub cas_missed: usize,
+    /// bsv-low#301 gate M2: CAS writes that ERRORED (storage/driver fault —
+    /// distinct from a guard miss). Load-bearing observability:
+    /// `confirm_spend_cas_sql` is the codebase's first `RETURNING` through
+    /// the worker-rs D1 driver, so a driver that rejected the statement
+    /// would fail EVERY row — without this counter that failure mode would
+    /// be silent (confirmed=0, cas_missed=0, only per-row logs). A total-
+    /// RETURNING failure now self-announces as `scanned > 0 && confirmed
+    /// == 0 && cas_errors > 0`. Rows are retried next tick (still
+    /// unconfirmed candidates), fail-safe.
+    pub cas_errors: usize,
     /// OBSERVABILITY ONLY (bounded to 5): the spending txids actually sampled
     /// this tick. Lets an operator check the candidates against a block explorer
     /// to tell "the chaser is broken" from "this backlog is genuinely
@@ -839,16 +856,40 @@ pub struct SpendConfirmSummary {
 /// unconfirmed (retried next tick), NEVER latched on a courier's word. Bounded
 /// by `limit`.
 ///
-/// NOTE (2026-07-28 gate, MEDIUM-2 sibling — deliberately NOT CAS-guarded
-/// here): unlike the #284 backfill's verdict write, this pass's confirmed
-/// write is justified by a FRESH SPV verification of exactly the spender it
-/// writes — `verified_proof_for(rec.spending_txid)` proved THAT txid mined,
-/// which is chain truth, so last-confirmed-wins re-asserting it over a
-/// racing UNCONFIRMED displacement is correct, not stale. The residual is
-/// the narrow window where a DIFFERENT spender was CONFIRMED in-flight (two
-/// verified-mined spenders of one outpoint can only coexist across a reorg);
-/// that pre-existing base-branch class is left for a follow-up issue rather
-/// than folded into #284.
+/// # #301: the confirmed write is a GUARDED CAS (the #284 MEDIUM-2 sibling)
+///
+/// The candidate read and the confirmed write are separated by awaits (the
+/// proof fetch), so the write goes through
+/// [`PotStorage::mark_confirmed_for_spender`] — conditional on the row's
+/// spend pointer STILL being the spender the proof was verified FOR
+/// (`WHERE … AND spendingTxid = ?`, the `verdict_cas_sql` idiom). Pre-#301
+/// the unguarded `mark_spent(confirmed = true)` re-wrote the pointer from
+/// the STALE read: a reorg-confirmed S2 landing in the window was RESET
+/// back to S1, and nothing ever re-chased it (this pass's candidate query
+/// only surfaces `spentConfirmed = 0` rows).
+///
+/// A CAS MISS (counted `cas_missed`) leaves the row untouched, and NO
+/// explicit re-chase hook is needed — the normal candidate selection
+/// covers both miss shapes:
+/// - pointer moved to an UNCONFIRMED S2 (an `output_spent` last-writer
+///   displacement): the row still matches `spent = 1 AND spentConfirmed =
+///   0`, so [`PotStorage::find_spent_unconfirmed`] re-surfaces it and the
+///   next tick chases the CURRENT pointer (the displacement restamped
+///   `spentAt`, so the #228 push-first age gate re-applies to S2 —
+///   correct: it is S2's push window now);
+/// - pointer moved to a CONFIRMED S2 (the reorg class): the row left the
+///   candidate set BECAUSE a competing chaintracks-verified confirm
+///   landed — a terminal, correct state with nothing to re-chase.
+///
+/// Accepted residual (deliberate): the pre-#301 behaviour re-asserted a
+/// fresh-SPV-verified S1 over a racing unconfirmed displacement in the
+/// same tick; under the CAS that defers to the NEXT tick, which chases
+/// the CURRENT pointer instead. If the displacing claim never proves, the
+/// row is simply re-chased forever (bounded, RANDOM-sampled) — the
+/// fail-safe direction, and the pointer is last-writer-wins among
+/// unconfirmed claims by design (`mark_spent` trait doc). The reorg-reset
+/// harm this closes (a silently reverted confirmed pointer that nothing
+/// re-visits) outweighs the one-tick confirm delay.
 pub async fn complete_spend_confirmations(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn AncestorFetcher,
@@ -891,31 +932,50 @@ pub async fn complete_spend_confirmations(
                 ));
             }
             Ok(Some(bump_hex)) => {
-                // UPGRADE: latch spentConfirmed = 1. mark_spent(confirmed=true)
-                // always writes and never downgrades a confirmed row.
+                // UPGRADE: latch spentConfirmed = 1 — via the #301 GUARDED
+                // CAS (`mark_confirmed_for_spender`), conditional on the
+                // pointer still being the spender THIS proof was verified
+                // for; a moved pointer ⇒ no-op, counted, left for the next
+                // tick's candidate scan (see the fn doc's case analysis).
                 //
-                // #284: this caller only CONFIRMS an existing pointer and has
-                // no spender raw in hand → verdict = None (the SQL leaves the
-                // stored verdict/verdictTxid UNCHANGED — never nulled). The
-                // spentHeight DOES ride along: the block height is a fact of
-                // the just-verified BUMP.
+                // #284: this caller only CONFIRMS an existing pointer and
+                // has no spender raw in hand → the CAS never touches the
+                // stored verdict/verdictTxid. The spentHeight DOES ride
+                // along: the block height is a fact of the just-verified
+                // BUMP (None keeps the stored value — same-pointer
+                // COALESCE semantics).
                 let spent_height = MerklePath::from_hex(&bump_hex)
                     .ok()
                     .map(|mp| u64::from(mp.block_height));
-                if let Err(e) = pot_storage
-                    .mark_spent(
+                match pot_storage
+                    .mark_confirmed_for_spender(
                         &rec.txid,
                         rec.output_index,
                         spending_txid,
-                        true,
-                        None,
                         spent_height,
                     )
                     .await
                 {
-                    push_log(&format!("[spend-confirm] {} mark_spent failed: {e}", rec.txid));
-                } else {
-                    summary.confirmed += 1;
+                    Ok(true) => summary.confirmed += 1,
+                    Ok(false) => {
+                        summary.cas_missed += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} pointer moved off {spending_txid} between \
+                             read and write (reorg/displacement race, bsv-low#301) — confirmed \
+                             NOTHING; the next pass re-chases the current pointer",
+                            rec.txid, rec.output_index
+                        ));
+                    }
+                    Err(e) => {
+                        // Gate M2: counted, not just logged — a driver that
+                        // rejects the RETURNING statement fails EVERY row,
+                        // and that must self-announce in the summary.
+                        summary.cas_errors += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {} confirm CAS failed: {e}",
+                            rec.txid
+                        ));
+                    }
                 }
             }
             Ok(None) => {
@@ -1435,6 +1495,16 @@ pub struct PushedPotSummary {
     /// `pot_records` rows upgraded to `spentConfirmed = 1` because this txid
     /// is their recorded spender (they drop out of the #186 spend chaser).
     pub spends_confirmed: usize,
+    /// bsv-low#301 gate M1: rows selected by `spendingTxid = <this txid>`
+    /// whose guarded confirm then MISSED — the pointer moved off this txid
+    /// in the row-loop window (the #301 race, narrower window). Nothing
+    /// written; the row re-chases or was competing-confirmed (the
+    /// `complete_spend_confirmations` case analysis applies verbatim).
+    pub spends_cas_missed: usize,
+    /// bsv-low#301 gate M2: CAS confirm writes that ERRORED (storage/driver
+    /// fault) — counted so a total-RETURNING driver failure self-announces
+    /// here too, not only in the poll chaser.
+    pub spends_cas_errors: usize,
 }
 
 impl PushedPotSummary {
@@ -1468,9 +1538,18 @@ pub(crate) fn push_log(msg: &str) {
 ///    proof, fail-closed) — same shape as one [`complete_pot_beef_proofs`]
 ///    candidate, minus the courier fetch.
 /// 2. `pot_records`: every outpoint whose recorded spender is `txid` and is
-///    still unconfirmed is upgraded via `mark_spent(confirmed = true)` — the
-///    spending tx verifiably mined, which is exactly the #186 chaser's latch
-///    condition.
+///    still unconfirmed is upgraded via the #301 GUARDED CAS
+///    ([`PotStorage::mark_confirmed_for_spender`]) — the spending tx
+///    verifiably mined, which is exactly the #186 chaser's latch condition.
+///    The rows were SELECTED by `spendingTxid = txid`, but the selection and
+///    the per-row writes straddle awaits (gate M1 — the same race class the
+///    chaser closed, narrower window): an unguarded confirmed `mark_spent`
+///    would re-write the pointer from the stale selection, silently
+///    resetting a reorg-confirmed S2 that landed mid-loop — invisible to
+///    every re-chase. A CAS miss writes nothing and is counted
+///    (`spends_cas_missed`); the chaser's re-visit case analysis applies
+///    verbatim (still-unconfirmed rows re-surface, competing-confirmed rows
+///    are terminal).
 ///
 /// SECURITY PRECONDITION / LOAD-BEARING GUARD: the caller MUST have verified
 /// `bump_hex` against chaintracks for `txid` first. This function has NO
@@ -1548,15 +1627,30 @@ pub async fn apply_pushed_proof_to_pot_stores(
     match pot_storage.find_unconfirmed_by_spending_txid(txid).await {
         Ok(records) => {
             for rec in records {
+                // #301 gate M1: the guarded CAS — the row was selected BY
+                // spendingTxid = txid, so a hit changes no pointer (and the
+                // old unguarded write's pointer re-write is gone); a miss
+                // means the pointer moved mid-loop → write NOTHING, count.
                 match pot_storage
-                    .mark_spent(&rec.txid, rec.output_index, txid, true, None, spent_height)
+                    .mark_confirmed_for_spender(&rec.txid, rec.output_index, txid, spent_height)
                     .await
                 {
-                    Ok(()) => summary.spends_confirmed += 1,
-                    Err(e) => push_log(&format!(
-                        "[arc-ingest] {}:{} spend-confirm latch failed: {e}",
-                        rec.txid, rec.output_index
-                    )),
+                    Ok(true) => summary.spends_confirmed += 1,
+                    Ok(false) => {
+                        summary.spends_cas_missed += 1;
+                        push_log(&format!(
+                            "[arc-ingest] {}:{} pointer moved off {txid} in the row-loop window \
+                             (bsv-low#301) — confirmed NOTHING; the poll chaser covers the row",
+                            rec.txid, rec.output_index
+                        ));
+                    }
+                    Err(e) => {
+                        summary.spends_cas_errors += 1;
+                        push_log(&format!(
+                            "[arc-ingest] {}:{} spend-confirm CAS failed: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                    }
                 }
             }
         }
@@ -1776,7 +1870,9 @@ mod tests {
 
     // ── 5. spend-confirmation chaser pass (#186) ─────────────────────────────
 
-    use overlay_discovery::pot::storage::{MemoryPotStorage, PotRecord, PotStorage};
+    use overlay_discovery::pot::storage::{
+        MemoryPotStorage, PotRecord, PotStorage, PotStorageError,
+    };
 
     /// A fetcher whose `verified_proof_for` returns a (dummy) verified bump ONLY
     /// for the txids in `minable` — models the chaintracks-verified vs unmined
@@ -1900,6 +1996,99 @@ mod tests {
 
         assert!(store.get_spent_status("potA", 0).await.unwrap().unwrap().spent_confirmed);
         assert!(!store.get_spent_status("potB", 0).await.unwrap().unwrap().spent_confirmed);
+    }
+
+    // ── 5b. #301: the confirmed write is a guarded CAS ───────────────────────
+
+    /// A fetcher that DISPLACES the row's spend pointer inside the proof-
+    /// fetch await window — the exact #301 race shape (the chaser's
+    /// candidate read and its confirmed write straddle this call) — then
+    /// returns a verified proof for the ORIGINALLY-read spender.
+    struct RacingFetcher {
+        store: std::rc::Rc<MemoryPotStorage>,
+        /// (txid, vout, new_spender, confirmed, height) applied on first call.
+        displacement: (String, u32, String, bool, Option<u64>),
+        fired: std::cell::Cell<bool>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for RacingFetcher {
+        async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+            Err(GASPError::NodeNotFound(format!("mock: no ancestor for {txid}")))
+        }
+        async fn verified_proof_for(&self, _txid: &str) -> Option<String> {
+            if !self.fired.replace(true) {
+                let (t, v, s, confirmed, h) = &self.displacement;
+                self.store
+                    .mark_spent(t, *v, s, *confirmed, None, *h)
+                    .await
+                    .unwrap();
+            }
+            Some("beefbump".to_string())
+        }
+    }
+
+    /// #301 producer path, unconfirmed-displacement shape: the pointer moves
+    /// to an UNCONFIRMED S2 while the chaser verifies S1's proof. The CAS
+    /// misses (counted), the row keeps S2 unconfirmed — and the pass's
+    /// NORMAL candidate selection re-surfaces it (no explicit re-chase hook
+    /// needed: `find_spent_unconfirmed` matches it again).
+    #[tokio::test]
+    async fn spend_confirmation_cas_miss_leaves_the_displaced_row_a_candidate() {
+        let store = std::rc::Rc::new(MemoryPotStorage::new());
+        store.store_record(&spent_unconfirmed("potA", "settleS1")).await.unwrap();
+
+        let fetcher = RacingFetcher {
+            store: store.clone(),
+            displacement: ("potA".into(), 0, "settleS2".into(), false, None),
+            fired: std::cell::Cell::new(false),
+        };
+        let s = complete_spend_confirmations(store.as_ref(), &fetcher, 20, 0).await;
+        assert_eq!((s.scanned, s.confirmed, s.cas_missed), (1, 0, 1));
+
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("settleS2"),
+            "the stale S1 write never resets the displaced pointer"
+        );
+        assert!(!r.spent_confirmed, "nothing confirmed on a stale read");
+        assert_eq!(
+            store.find_spent_unconfirmed(10, 0).await.unwrap().len(),
+            1,
+            "the CAS-missed row is RE-VISITED by the normal candidate scan \
+             (spent=1, spentConfirmed=0 still matches) — not stranded"
+        );
+    }
+
+    /// #301 producer path, the REORG shape the issue was filed for: a
+    /// CONFIRMED S2 lands while the chaser verifies S1's proof. Pre-#301
+    /// the unguarded write reset the pointer to S1 and the row — now
+    /// confirmed-with-a-stale-pointer — was invisible to every re-chase.
+    /// Under the CAS: miss (counted), S2's confirmed pointer + height
+    /// survive, and the row is terminal (confirmed by the competing
+    /// verified writer — nothing left to re-chase).
+    #[tokio::test]
+    async fn spend_confirmation_cas_miss_never_resets_a_reorg_confirmed_pointer() {
+        let store = std::rc::Rc::new(MemoryPotStorage::new());
+        store.store_record(&spent_unconfirmed("potA", "settleS1")).await.unwrap();
+
+        let fetcher = RacingFetcher {
+            store: store.clone(),
+            displacement: ("potA".into(), 0, "settleS2".into(), true, Some(802_000)),
+            fired: std::cell::Cell::new(false),
+        };
+        let s = complete_spend_confirmations(store.as_ref(), &fetcher, 20, 0).await;
+        assert_eq!((s.scanned, s.confirmed, s.cas_missed), (1, 0, 1));
+
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS2"));
+        assert!(r.spent_confirmed, "the reorg-confirmed pointer SURVIVES");
+        assert_eq!(r.spent_height, Some(802_000), "S2 keeps its own height");
+        assert!(
+            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
+            "terminal: confirmed by the competing writer, nothing to re-chase"
+        );
     }
 
     // ── 6. push-primary /arc-ingest consumer + poll backstop (#228) ──────────
@@ -2485,6 +2674,208 @@ mod tests {
         assert_eq!(chase.scanned, 1, "pushed-latched rows are skipped entirely");
         assert_eq!(chase.sample, vec![SETTLE_B.to_string()]);
         assert_eq!(chase.confirmed, 0);
+    }
+
+    /// #301 gate M1 producer path (the RacingFetcher pattern for the PUSH
+    /// consumer): a storage whose `find_unconfirmed_by_spending_txid`
+    /// answers the stale selection and THEN displaces one selected row's
+    /// pointer — modelling a reorg-confirmed S2 landing between the push
+    /// consumer's selection and its per-row write.
+    struct DisplacingStore {
+        inner: std::rc::Rc<MemoryPotStorage>,
+        /// (txid, vout, new_spender, confirmed, height) applied AFTER the
+        /// selection is taken (once).
+        displacement: (String, u32, String, bool, Option<u64>),
+        fired: std::cell::Cell<bool>,
+    }
+
+    #[async_trait(?Send)]
+    impl PotStorage for DisplacingStore {
+        async fn store_record(&self, r: &PotRecord) -> Result<(), PotStorageError> {
+            self.inner.store_record(r).await
+        }
+        async fn mark_spent(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            confirmed: bool,
+            verdict: Option<&str>,
+            spent_height: Option<u64>,
+        ) -> Result<(), PotStorageError> {
+            self.inner
+                .mark_spent(txid, output_index, spending_txid, confirmed, verdict, spent_height)
+                .await
+        }
+        async fn get_spent_status(
+            &self,
+            txid: &str,
+            output_index: u32,
+        ) -> Result<Option<PotRecord>, PotStorageError> {
+            self.inner.get_spent_status(txid, output_index).await
+        }
+        async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
+            self.inner.store_beef(txid, beef).await
+        }
+        async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+            self.inner.get_beef(txid).await
+        }
+        async fn mark_confirmed_for_spender(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            spent_height: Option<u64>,
+        ) -> Result<bool, PotStorageError> {
+            self.inner
+                .mark_confirmed_for_spender(txid, output_index, spending_txid, spent_height)
+                .await
+        }
+        async fn find_unconfirmed_by_spending_txid(
+            &self,
+            spending_txid: &str,
+        ) -> Result<Vec<PotRecord>, PotStorageError> {
+            // Take the (soon to be stale) selection FIRST, then displace —
+            // the exact row-loop race window shape.
+            let stale = self.inner.find_unconfirmed_by_spending_txid(spending_txid).await?;
+            if !self.fired.replace(true) {
+                let (t, v, s, confirmed, h) = &self.displacement;
+                self.inner.mark_spent(t, *v, s, *confirmed, None, *h).await?;
+            }
+            Ok(stale)
+        }
+    }
+
+    /// #301 gate M1: the push consumer's per-row confirm is the guarded
+    /// CAS. A reorg-confirmed S2 landing after the `spendingTxid = T`
+    /// selection but before the row's write is NEVER reset to T (pre-fix
+    /// the unguarded `mark_spent(confirmed)` re-wrote the pointer from the
+    /// stale selection); the miss is counted, the untouched sibling row
+    /// still latches.
+    #[tokio::test]
+    async fn pushed_proof_cas_miss_never_resets_a_mid_loop_reorg_pointer() {
+        let inner = std::rc::Rc::new(MemoryPotStorage::new());
+        // Both pots selected by SETTLE_A; potA is displaced mid-loop.
+        inner.store_record(&spent_unconfirmed("potA", SETTLE_A)).await.unwrap();
+        inner.store_record(&spent_unconfirmed("potB", SETTLE_A)).await.unwrap();
+        let store = DisplacingStore {
+            inner: inner.clone(),
+            displacement: ("potA".into(), 0, SETTLE_B.into(), true, Some(802_000)),
+            fired: std::cell::Cell::new(false),
+        };
+
+        let bump_hex = single_tx_bump(SETTLE_A, HEIGHT).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, SETTLE_A, &bump_hex).await;
+        assert_eq!(
+            (s.spends_confirmed, s.spends_cas_missed, s.spends_cas_errors),
+            (1, 1, 0),
+            "the displaced row misses (counted); the intact sibling latches"
+        );
+
+        // The reorg-confirmed S2 pointer + height SURVIVE (pre-#301-M1 the
+        // stale write reset the pointer to SETTLE_A).
+        let a = inner.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(a.spending_txid.as_deref(), Some(SETTLE_B));
+        assert!(a.spent_confirmed);
+        assert_eq!(a.spent_height, Some(802_000), "S2 keeps its own height");
+        // The sibling latched under the pushed spender.
+        let b = inner.get_spent_status("potB", 0).await.unwrap().unwrap();
+        assert_eq!(b.spending_txid.as_deref(), Some(SETTLE_A));
+        assert!(b.spent_confirmed);
+        // Terminal for potA (competing-confirmed), nothing left to chase.
+        assert!(inner.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
+    }
+
+    /// #301 gate M2: a CAS write that ERRORS (the driver-rejects-RETURNING
+    /// failure mode) is COUNTED in both consumers — a total failure
+    /// self-announces as scanned>0 & confirmed=0 & cas_errors>0 instead of
+    /// silently stalling confirmations with clean-looking counters.
+    struct FailingCasStore(std::rc::Rc<MemoryPotStorage>);
+
+    #[async_trait(?Send)]
+    impl PotStorage for FailingCasStore {
+        async fn store_record(&self, r: &PotRecord) -> Result<(), PotStorageError> {
+            self.0.store_record(r).await
+        }
+        async fn mark_spent(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            confirmed: bool,
+            verdict: Option<&str>,
+            spent_height: Option<u64>,
+        ) -> Result<(), PotStorageError> {
+            self.0
+                .mark_spent(txid, output_index, spending_txid, confirmed, verdict, spent_height)
+                .await
+        }
+        async fn get_spent_status(
+            &self,
+            txid: &str,
+            output_index: u32,
+        ) -> Result<Option<PotRecord>, PotStorageError> {
+            self.0.get_spent_status(txid, output_index).await
+        }
+        async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
+            self.0.store_beef(txid, beef).await
+        }
+        async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+            self.0.get_beef(txid).await
+        }
+        async fn mark_confirmed_for_spender(
+            &self,
+            _txid: &str,
+            _output_index: u32,
+            _spending_txid: &str,
+            _spent_height: Option<u64>,
+        ) -> Result<bool, PotStorageError> {
+            Err(PotStorageError::Database("RETURNING rejected (test)".into()))
+        }
+        async fn find_spent_unconfirmed(
+            &self,
+            limit: u64,
+            min_age_secs: u64,
+        ) -> Result<Vec<PotRecord>, PotStorageError> {
+            self.0.find_spent_unconfirmed(limit, min_age_secs).await
+        }
+        async fn find_unconfirmed_by_spending_txid(
+            &self,
+            spending_txid: &str,
+        ) -> Result<Vec<PotRecord>, PotStorageError> {
+            self.0.find_unconfirmed_by_spending_txid(spending_txid).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cas_errors_are_counted_in_both_consumers_never_silent() {
+        let inner = std::rc::Rc::new(MemoryPotStorage::new());
+        inner.store_record(&spent_unconfirmed("potA", SETTLE_A)).await.unwrap();
+        let store = FailingCasStore(inner.clone());
+
+        // Poll chaser: the proof verifies, the CAS errors → counted.
+        let fetcher = MockProofFetcher {
+            minable: [SETTLE_A.to_string()].into_iter().collect(),
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(
+            (s.scanned, s.confirmed, s.cas_missed, s.cas_errors),
+            (1, 0, 0, 1),
+            "the M2 signature: scanned>0, confirmed=0, cas_errors>0"
+        );
+
+        // Push consumer: same signature in its own summary shape.
+        let bump_hex = single_tx_bump(SETTLE_A, HEIGHT).to_hex();
+        let p = apply_pushed_proof_to_pot_stores(&store, SETTLE_A, &bump_hex).await;
+        assert_eq!(
+            (p.spends_confirmed, p.spends_cas_missed, p.spends_cas_errors),
+            (0, 0, 1)
+        );
+
+        // Fail-safe: the row is untouched and still a candidate for retry.
+        let r = inner.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert!(!r.spent_confirmed);
+        assert_eq!(inner.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

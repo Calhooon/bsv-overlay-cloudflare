@@ -1155,12 +1155,14 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     .await;
     worker::console_log!(
         "Scheduled: spend-confirmation (pot_records) — scanned={} confirmed={} \
-         still_unconfirmed={} fetch_failed={} tracker_faults={}",
+         still_unconfirmed={} fetch_failed={} tracker_faults={} cas_missed={} cas_errors={}",
         spend_summary.scanned,
         spend_summary.confirmed,
         spend_summary.still_unconfirmed,
         spend_summary.fetch_failed,
         spend_summary.tracker_faults,
+        spend_summary.cas_missed,
+        spend_summary.cas_errors,
     );
     worker::console_log!(
         "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} already_proven={} \
@@ -1587,6 +1589,14 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         // bsv-low#304 gate M-5: proof/header READ faults (subrequest wall /
         // transport) — distinguishable from "not mined yet".
         "spends_tracker_faults": ss.tracker_faults,
+        // bsv-low#301: confirmed-CAS misses — the pointer moved between the
+        // chaser's read and its write; nothing was confirmed on the stale
+        // read (the row re-chases or was competing-confirmed).
+        "spends_cas_missed": ss.cas_missed,
+        // bsv-low#301 gate M2: CAS write ERRORS (driver/storage fault —
+        // distinct from a guard miss). A total failure of the RETURNING
+        // statement self-announces as scanned>0 & confirmed=0 & this >0.
+        "spends_cas_errors": ss.cas_errors,
         // #284 decoded-params backfill counters.
         "params_scanned": bf.scanned,
         "params_decoded": bf.decoded,
