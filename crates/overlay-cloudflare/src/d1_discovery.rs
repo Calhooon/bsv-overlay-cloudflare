@@ -2145,8 +2145,103 @@ fn result_err(e: String) -> ResultStorageError {
     ResultStorageError::Database(e)
 }
 
-const RESULT_SELECT: &str = "SELECT gameId, winner, loser, potTxid, settleTxid, \
-     winnerSigHex, loserSigHex, cardsHex, txid, outputIndex, createdAt FROM result_markers_v2";
+/// The result-marker columns, threaded through every window level.
+const RESULT_COLS: &str = "gameId, winner, loser, potTxid, settleTxid, \
+     winnerSigHex, loserSigHex, cardsHex, txid, outputIndex, createdAt";
+
+/// `ls_result resultsFor` / `recentResults` — the leaderboard/history read
+/// windows over `result_markers_v2` (bsv-low #282, the #281 class).
+///
+/// `tm_result` admission is BYTE-FORMAT-ONLY, so anyone can file a marker
+/// naming any (gameId, winner, potTxid) for one dust `OP_RETURN`; under the
+/// legacy flat `ORDER BY createdAt DESC LIMIT n` window, `n` junk rows
+/// displaced every honest result — erasing a player's record from the
+/// leaderboard read (and #276 established that a win RECORD is a product
+/// promise). The #281 pattern applies:
+///
+///  - **Per-POT windowing**: `limit` counts POTS (a settled hand ≙ one pot),
+///    and each pot yields up to [`PARTYFOR_ROWS_PER_GROUP`] rows as a
+///    SUPERSET — verification-before-collapse: SQL cannot verify
+///    `winnerSigHex`, so it must never pick "the real row"; the consumer
+///    (the client / low-app-layer verify pass) checks sigs and keeps the
+///    genuine one. Within a pot the OLDEST rows are kept — not because
+///    oldest is honest (an attacker who pre-files during the hand beats it;
+///    a post-hoc flood — the CHEAP variant — does not), but because it is
+///    the one order later spam cannot improve on.
+///  - **Pot-existence tier with the age-bounded oldest-first quota**
+///    (#283a): markers naming invented pots are demoted behind every row
+///    whose pot is indexed in `pot_records`; up to `quota` FRESH unknown
+///    pots are promoted (a genuinely just-settled pot whose admission is
+///    in flight must not be filtered), allocated oldest-first inside the
+///    freshness window.
+///  - **Explicit ORDER BY at every level**; pots newest-first by the pot's
+///    own admission stamp (an attacker cannot move it by filing markers) —
+///    "recent results" stays recent.
+///
+/// BINDS (numbered): winner-scoped — `?1` winner, `?2` limit (POTS), `?3`
+/// quota, `?4` row cap; recent — `?1` limit, `?2` quota, `?3` row cap.
+/// Residual, same as the family: markers naming REAL recent pots still
+/// displace at ~limit dust cost; eviction WITHIN a pot costs
+/// [`PARTYFOR_ROWS_PER_GROUP`] pre-filed rows.
+pub fn result_window_sql(winner_scoped: bool) -> String {
+    let (where_winner, b_limit, b_quota, b_cap) = if winner_scoped {
+        ("WHERE rm.winner = ?1", "?2", "?3", "?4")
+    } else {
+        ("", "?1", "?2", "?3")
+    };
+    format!(
+        "SELECT {cols} \
+     FROM (SELECT {cols}, markerRowid, potCreatedAt, potFirstMarkerAt, tier, \
+                  DENSE_RANK() OVER (ORDER BY tier ASC, \
+                                              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+                                              potTxid ASC) AS finalRank \
+           FROM (SELECT {cols}, markerRowid, potCreatedAt, potFirstMarkerAt, \
+                        CASE WHEN unknownPot = 0 \
+                             OR (freshUnknown = 1 AND potRank <= {b_quota}) \
+                             THEN 0 ELSE 1 END AS tier \
+                 FROM (SELECT {cols}, markerRowid, potCreatedAt, potFirstMarkerAt, \
+                              unknownPot, \
+                              {fresh} AS freshUnknown, \
+                              DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
+                                                 ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
+                                                          potTxid ASC) AS potRank \
+                       FROM (SELECT rm.gameId AS gameId, rm.winner AS winner, \
+                                    rm.loser AS loser, rm.potTxid AS potTxid, \
+                                    rm.settleTxid AS settleTxid, \
+                                    rm.winnerSigHex AS winnerSigHex, \
+                                    rm.loserSigHex AS loserSigHex, \
+                                    rm.cardsHex AS cardsHex, \
+                                    rm.txid AS txid, rm.outputIndex AS outputIndex, \
+                                    rm.createdAt AS createdAt, rm.rowid AS markerRowid, \
+                                    r.potCreatedAt AS potCreatedAt, \
+                                    MIN(rm.createdAt) OVER (PARTITION BY rm.potTxid) \
+                                        AS potFirstMarkerAt, \
+                                    CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                                    ROW_NUMBER() OVER (PARTITION BY rm.potTxid \
+                                                       ORDER BY rm.createdAt ASC, \
+                                                                rm.rowid ASC) AS rn \
+                             FROM result_markers_v2 rm \
+                             LEFT JOIN (SELECT txid, MIN(createdAt) AS potCreatedAt \
+                                        FROM pot_records GROUP BY txid) r \
+                                    ON r.txid = rm.potTxid \
+                             {where_winner}) \
+                       WHERE rn <= {per_group}))) \
+     WHERE finalRank <= {b_limit} \
+     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+              potTxid ASC, markerRowid ASC \
+     LIMIT {b_cap}",
+        cols = RESULT_COLS,
+        per_group = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
+        fresh = fresh_unknown_expr(),
+    )
+}
+
+/// Row cap for a result window: `limit` pots x the per-pot superset. A
+/// BELT, never a truncation (the rn filter already bounds it) — same
+/// contract as `identity_window_row_cap`.
+pub fn result_window_row_cap(limit: usize) -> usize {
+    limit.saturating_mul(overlay_discovery::result::storage::RESULT_ROWS_PER_POT)
+}
 
 #[async_trait(?Send)]
 impl ResultStorage for D1ResultStorage {
@@ -2182,26 +2277,27 @@ impl ResultStorage for D1ResultStorage {
         winner: &str,
         limit: usize,
     ) -> Result<Vec<ResultRecord>, ResultStorageError> {
-        let rows: Vec<ResultRow> = Query::new(format!(
-            "{RESULT_SELECT} WHERE winner = ? \
-             ORDER BY createdAt DESC, rowid DESC LIMIT ?"
-        ))
-        .bind(winner)
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(result_err)?;
+        // Per-pot superset window — see `result_window_sql` (bsv-low #282;
+        // the flat newest-first window was dust-displaceable).
+        let rows: Vec<ResultRow> = Query::new(result_window_sql(true))
+            .bind(winner)
+            .bind(limit as u32)
+            .bind(unknown_pot_quota(limit) as u32)
+            .bind(result_window_row_cap(limit) as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(result_err)?;
         Ok(rows.into_iter().map(ResultRow::into_record).collect())
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<ResultRecord>, ResultStorageError> {
-        let rows: Vec<ResultRow> = Query::new(format!(
-            "{RESULT_SELECT} ORDER BY createdAt DESC, rowid DESC LIMIT ?"
-        ))
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(result_err)?;
+        let rows: Vec<ResultRow> = Query::new(result_window_sql(false))
+            .bind(limit as u32)
+            .bind(unknown_pot_quota(limit) as u32)
+            .bind(result_window_row_cap(limit) as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(result_err)?;
         Ok(rows.into_iter().map(ResultRow::into_record).collect())
     }
 }
@@ -3023,12 +3119,22 @@ impl ProofRow {
 /// NULL — never both. Factored out so the real-SQLite test executes the
 /// SHIPPED string against the production schema and proves the two paths
 /// answer byte-identically.
+///
+/// OLDEST-first (bsv-low #282): `tm_proof` admission is byte-format-only
+/// and the window is tiny (DEFAULT_LIMIT 3), so under newest-first THREE
+/// junk bundles filed after the honest one hid the real proof — the
+/// cheapest attack in the dust-displacement family. The honest bundle is
+/// published at settle; a post-hoc flood can never get in front of it
+/// oldest-first. Residual (stated plainly): an attacker who PRE-files
+/// during the hand — (gameId, winner) are guessable from the two seats —
+/// still buries it; the closure is the client verifying each bundle
+/// (which it does: a junk bundle never validates) plus paging, not order.
 pub fn proof_list_for_game_winner_sql() -> &'static str {
     "SELECT gameId, winner, sigHex, bundleB64, \
             CASE WHEN bundleB64 IS NULL THEN hex(bundle) ELSE '' END AS bundle, \
             txid, outputIndex, createdAt \
      FROM proof_markers WHERE gameId = ? AND winner = ? \
-     ORDER BY createdAt DESC, rowid DESC LIMIT ?"
+     ORDER BY createdAt ASC, rowid ASC LIMIT ?"
 }
 
 /// Cloudflare D1 implementation of the ProofStorage trait
@@ -3729,6 +3835,176 @@ mod tests {
         );
     }
 
+    // ── #282: result_markers_v2 windows + proof oldest-first ─────────────
+
+    fn insert_result(
+        conn: &rusqlite::Connection,
+        winner: &str,
+        pot_txid: &str,
+        marker_txid: &str,
+        created_at: i64,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO result_markers_v2 \
+             (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+              loserSigHex, cardsHex, txid, outputIndex, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, '3045ab', NULL, NULL, ?6, 0, ?7)",
+            rusqlite::params![
+                h64(0x11),
+                winner,
+                "03bb",
+                pot_txid,
+                h64(0x33),
+                marker_txid,
+                created_at
+            ],
+        )
+        .expect("insert result_markers_v2");
+    }
+
+    /// Project one column from the shipped result window.
+    fn result_window_col(
+        conn: &rusqlite::Connection,
+        winner: Option<&str>,
+        limit: usize,
+        col: &str,
+    ) -> Vec<String> {
+        let sql = result_window_sql(winner.is_some());
+        let mut stmt = conn.prepare(&sql).expect("prepare shipped result window");
+        let map = |r: &rusqlite::Row<'_>| r.get::<_, String>(col);
+        let rows = match winner {
+            Some(w) => stmt
+                .query_map(
+                    rusqlite::params![
+                        w,
+                        limit as u32,
+                        unknown_pot_quota(limit) as u32,
+                        result_window_row_cap(limit) as u32
+                    ],
+                    map,
+                )
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>(),
+            None => stmt
+                .query_map(
+                    rusqlite::params![
+                        limit as u32,
+                        unknown_pot_quota(limit) as u32,
+                        result_window_row_cap(limit) as u32
+                    ],
+                    map,
+                )
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>(),
+        };
+        rows.expect("rows")
+    }
+
+    /// RED-class scenario (the #281 family, executed for tm_result): junk
+    /// markers flooding BOTH invented pots and the victim's real pot bury
+    /// the honest result under a flat newest-first window; the shipped
+    /// per-pot window keeps the honest row reachable.
+    #[test]
+    fn result_window_survives_dust_flood_real_sqlite() {
+        let conn = production_schema_db();
+        let winner = "02".to_string() + &"a1".repeat(32);
+        let honest_pot = h64(0xaa);
+        insert_pot(&conn, &honest_pot, 0, 1_000, true);
+        // The honest result at settle…
+        insert_result(&conn, &winner, &honest_pot, "txHONEST", 1_001);
+        // …then a post-hoc flood: replays on the real pot + ghost pots.
+        for i in 0..60u32 {
+            insert_result(&conn, &winner, &honest_pot, &format!("txJUNK{i:03}"), 2_000 + i as i64);
+        }
+        for i in 0..120u32 {
+            insert_result(
+                &conn,
+                &winner,
+                &format!("{:064x}", 0xdead_0000u64 + i as u64),
+                &format!("txGHOST{i:03}"),
+                3_000 + i as i64,
+            );
+        }
+        for (scope, got) in [
+            ("resultsFor", result_window_col(&conn, Some(&winner), 100, "txid")),
+            ("recentResults", result_window_col(&conn, None, 100, "txid")),
+        ] {
+            assert!(
+                got.contains(&"txHONEST".to_string()),
+                "{scope}: the honest result survives the flood (oldest-in-pot \
+                 superset + existence tier): {}",
+                got.len()
+            );
+        }
+        // And the real pot contributes at most the superset, never 61 rows.
+        let per_pot = result_window_col(&conn, Some(&winner), 100, "potTxid")
+            .iter()
+            .filter(|p| **p == honest_pot)
+            .count();
+        assert!(
+            per_pot <= overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
+            "per-pot superset bounded, got {per_pot}"
+        );
+    }
+
+    /// The windows stay windows: `limit` counts POTS newest-first (pot
+    /// admission stamp — unmovable by marker spam), and every real pot's
+    /// result stays reachable at the page size.
+    #[test]
+    fn result_window_limit_counts_pots_newest_first_real_sqlite() {
+        let conn = production_schema_db();
+        let winner = "02".to_string() + &"a1".repeat(32);
+        for i in 0..5u32 {
+            let pot = format!("{:064x}", 0x0000_2000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_result(&conn, &winner, &pot, &format!("txR{i}"), 1_000 + i as i64);
+        }
+        let got = result_window_col(&conn, None, 3, "txid");
+        assert_eq!(
+            got,
+            vec!["txR4", "txR3", "txR2"],
+            "3 newest pots, newest first"
+        );
+        let got = result_window_col(&conn, Some(&winner), 100, "txid");
+        assert_eq!(got.len(), 5, "all real results at the page size");
+    }
+
+    /// #282: `ls_proof` answers OLDEST-first — the honest bundle lands at
+    /// settle, so a post-hoc junk flood (3 rows beat the old DEFAULT_LIMIT 3
+    /// newest-first window) can never get in front of it.
+    #[test]
+    fn proof_window_is_oldest_first_real_sqlite() {
+        let conn = production_schema_db();
+        let game = h64(0x11);
+        let winner = "02".to_string() + &"a1".repeat(32);
+        let mut insert = |txid: &str, at: i64| {
+            conn.execute(
+                "INSERT OR IGNORE INTO proof_markers \
+                 (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
+                 VALUES (?1, ?2, '3045ab', X'7B7D', 'e30=', ?3, 0, ?4)",
+                rusqlite::params![game, winner, txid, at],
+            )
+            .expect("insert proof_markers");
+        };
+        insert("txREAL", 1_000);
+        for i in 0..10u32 {
+            insert(&format!("txJUNK{i:02}"), 2_000 + i as i64);
+        }
+        let mut stmt = conn.prepare(proof_list_for_game_winner_sql()).unwrap();
+        let got: Vec<String> = stmt
+            .query_map(rusqlite::params![game, winner, 3u32], |r| {
+                r.get::<_, String>("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some("txREAL"),
+            "the settle-time bundle heads the window; junk filed later never fronts it"
+        );
+    }
+
     /// Gate finding L3: an unknown recordType discriminator (version skew —
     /// written by a newer deploy, read after a rollback) is an EXPLICIT
     /// logged skip, and it can never take neighboring good rows with it.
@@ -3802,9 +4078,9 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(rows.len(), 2);
-        // Newest first: the b64 row (createdAt 2), then the legacy row.
-        let (new_txid, new_b64, new_hex) = &rows[0];
-        let (old_txid, old_b64, old_hex) = &rows[1];
+        // OLDEST first (#282): the legacy row (createdAt 1), then the b64 row.
+        let (old_txid, old_b64, old_hex) = &rows[0];
+        let (new_txid, new_b64, new_hex) = &rows[1];
         assert_eq!(new_txid, &h64(0x01));
         assert_eq!(old_txid, &h64(0x02));
         assert_eq!(new_hex, "", "b64 answered — the blob is NOT hauled");

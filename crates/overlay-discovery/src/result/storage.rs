@@ -112,16 +112,33 @@ pub trait ResultStorage {
     /// ignored).
     async fn store_record(&self, record: &ResultRecord) -> Result<(), ResultStorageError>;
 
-    /// Up to `limit` records whose winner is `winner`, newest first.
+    /// Records whose winner is `winner` — a PER-POT SUPERSET (bsv-low #282):
+    /// `limit` counts POTS (newest-first by pot recency); each pot yields up
+    /// to [`RESULT_ROWS_PER_POT`] rows, OLDEST-first within the pot.
+    /// Admission is byte-format-only, so a flat newest-first row window was
+    /// dust-displaceable (`limit` junk markers erased every honest result);
+    /// the storage layer cannot verify `winnerSigHex`, so it never picks
+    /// "the real row" — it bounds cost and guarantees the honest row is IN
+    /// the answer (≤ [`RESULT_ROWS_PER_POT`]−1 pre-filed forgeries per pot);
+    /// the CONSUMER verifies sigs and collapses.
     async fn list_for_winner(
         &self,
         winner: &str,
         limit: usize,
     ) -> Result<Vec<ResultRecord>, ResultStorageError>;
 
-    /// Up to `limit` records across all identities, newest first.
+    /// Records across all identities — the same per-pot superset contract
+    /// as [`Self::list_for_winner`] (`limit` counts pots, newest-first).
     async fn list_recent(&self, limit: usize) -> Result<Vec<ResultRecord>, ResultStorageError>;
 }
+
+/// Rows kept per pot by the result read windows (bsv-low #282) — the
+/// SUPERSET size, one group (results have no v1/v2 split). Mirrors — and is
+/// consumed by — the D1 window (`result_window_sql`) so the memory backend
+/// answers like production (the #291 divergence lesson). See
+/// `d1_discovery::PARTYFOR_ROWS_PER_GROUP` for the full
+/// verification-before-collapse rationale and the eviction-bar residual.
+pub const RESULT_ROWS_PER_POT: usize = 4;
 
 /// RESULT storage errors.
 #[derive(Debug, thiserror::Error)]
@@ -180,29 +197,54 @@ impl ResultStorage for MemoryResultStorage {
         winner: &str,
         limit: usize,
     ) -> Result<Vec<ResultRecord>, ResultStorageError> {
-        Ok(self
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .rev() // newest first (insertion order = recency order)
-            .filter(|r| r.winner == winner)
-            .take(limit)
-            .cloned()
-            .collect())
+        let records = self.records.lock().unwrap();
+        Ok(per_pot_window(
+            records.iter().filter(|r| r.winner == winner),
+            limit,
+        ))
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<ResultRecord>, ResultStorageError> {
-        Ok(self
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .rev() // newest first
-            .take(limit)
-            .cloned()
-            .collect())
+        let records = self.records.lock().unwrap();
+        Ok(per_pot_window(records.iter(), limit))
     }
+}
+
+/// The memory mirror of the D1 per-pot window (`result_window_sql`,
+/// bsv-low #282): `limit` counts POTS ordered newest-first by the pot's
+/// first-marker stamp (memory has no `pot_records` admission stamp — no
+/// existence tier here, documented divergence: every pot competes on
+/// recency); within a pot the OLDEST [`RESULT_ROWS_PER_POT`] rows are kept,
+/// oldest-first.
+fn per_pot_window<'a>(
+    rows: impl Iterator<Item = &'a ResultRecord>,
+    limit: usize,
+) -> Vec<ResultRecord> {
+    let mut by_pot: Vec<(String, Vec<&'a ResultRecord>)> = Vec::new();
+    for r in rows {
+        match by_pot.iter_mut().find(|(pot, _)| *pot == r.pot_txid) {
+            Some((_, v)) => v.push(r),
+            None => by_pot.push((r.pot_txid.clone(), vec![r])),
+        }
+    }
+    for (_, v) in &mut by_pot {
+        // Oldest-first within the pot (created_at is storage-assigned and
+        // monotone; ties impossible), capped at the superset size.
+        v.sort_by_key(|r| r.created_at);
+        v.truncate(RESULT_ROWS_PER_POT);
+    }
+    // Pots newest-first by first-marker stamp; pot txid as the total-order
+    // tiebreak (mirrors the D1 window's `potTxid ASC`).
+    by_pot.sort_by(|a, b| {
+        let fa = a.1.first().map_or(i64::MIN, |r| r.created_at);
+        let fb = b.1.first().map_or(i64::MIN, |r| r.created_at);
+        fb.cmp(&fa).then_with(|| a.0.cmp(&b.0))
+    });
+    by_pot
+        .into_iter()
+        .take(limit)
+        .flat_map(|(_, v)| v.into_iter().cloned())
+        .collect()
 }
 
 // ============================================================================
@@ -218,7 +260,10 @@ mod tests {
             game_id: game_id.into(),
             winner: winner.into(),
             loser: loser.into(),
-            pot_txid: "22".repeat(32),
+            // One pot per GAME — the read windows are per-pot (bsv-low
+            // #282), so recency tests over distinct games get distinct pots
+            // while same-game rows share one.
+            pot_txid: game_id.into(),
             settle_txid: "33".repeat(32),
             winner_sig_hex: "3045ab".into(),
             loser_sig_hex: Some("3044cd".into()),
@@ -334,10 +379,42 @@ mod tests {
 
         assert_eq!(store.record_count(), 3);
         let rows = store.list_for_winner("02aa", 100).await.unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].txid, "txGENUINE", "newest first");
-        assert_eq!(rows[0].output_index, 1);
-        assert_eq!(rows[2].txid, "txGARBAGE");
+        assert_eq!(rows.len(), 3, "ALL kept — the front-run censors nothing");
+        // Same pot => oldest-first within the pot (bsv-low #282 superset;
+        // order is not truth — the client's sig verify collapses).
+        assert_eq!(rows[0].txid, "txGARBAGE");
+        assert_eq!(rows[1].txid, "txGENUINE");
+        assert_eq!(rows[1].output_index, 0);
+        assert_eq!(rows[2].txid, "txGENUINE");
+        assert_eq!(rows[2].output_index, 1);
+    }
+
+    #[tokio::test]
+    async fn per_pot_superset_is_capped_and_limit_counts_pots() {
+        // bsv-low #282: a flood of same-pot rows returns at most
+        // RESULT_ROWS_PER_POT (oldest-first), and `limit` counts POTS.
+        let store = MemoryResultStorage::new();
+        for i in 0..10u8 {
+            store
+                .store_record(&record(&"11".repeat(32), "02aa", "03bb", &format!("txA{i}")))
+                .await
+                .unwrap();
+        }
+        store
+            .store_record(&record(&"22".repeat(32), "02aa", "03bb", "txB"))
+            .await
+            .unwrap();
+        let rows = store.list_for_winner("02aa", 100).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            RESULT_ROWS_PER_POT + 1,
+            "pot A capped at the superset size; pot B intact"
+        );
+        // limit = 1 pot => only the NEWEST pot (B, whose first marker is
+        // later) comes back.
+        let rows = store.list_for_winner("02aa", 1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].txid, "txB");
     }
 
     #[tokio::test]

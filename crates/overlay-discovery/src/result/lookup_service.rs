@@ -248,7 +248,8 @@ mod tests {
     use super::super::storage::MemoryResultStorage;
     use super::super::tests::{
         golden_loser, golden_loser_sig, golden_marker, golden_pot_txid, golden_settle_txid,
-        golden_winner, golden_winner_sig, GOLDEN_RESULT_HEX, GOLDEN_RESULT_UNCONFIRMED_HEX,
+        golden_winner, golden_winner_sig, marker_script, GOLDEN_RESULT_HEX,
+        GOLDEN_RESULT_UNCONFIRMED_HEX,
     };
     use super::*;
 
@@ -260,6 +261,21 @@ mod tests {
 
     fn make_service() -> ResultLookupService {
         make_service_with_storage().0
+    }
+
+    /// A golden-shaped marker with a DISTINCT pot txid — the read windows
+    /// are PER-POT now (bsv-low #282), so recency/limit tests give each
+    /// marker its own pot.
+    fn golden_marker_for_pot(game_id: &[u8; 32], pot: &[u8; 32]) -> Vec<u8> {
+        marker_script(
+            game_id,
+            &golden_winner(),
+            &golden_loser(),
+            pot,
+            &golden_settle_txid(),
+            &golden_winner_sig(),
+            &golden_loser_sig(),
+        )
     }
 
     fn admit(txid: &str, output_index: u32, script: Vec<u8>) -> OutputAdmittedByTopic {
@@ -422,12 +438,14 @@ mod tests {
 
     #[tokio::test]
     async fn recent_results_newest_first_respects_limit() {
+        // One pot per marker — `limit` counts POTS (bsv-low #282) and pots
+        // answer newest-first.
         let (svc, _storage) = make_service_with_storage();
         for i in 1u8..=5 {
             svc.output_admitted_by_topic(&admit(
                 &format!("tx{i}"),
                 0,
-                golden_marker(&[i; 32], &golden_loser_sig()),
+                golden_marker_for_pot(&[i; 32], &[0xA0 + i; 32]),
             ))
             .await
             .unwrap();
@@ -454,7 +472,7 @@ mod tests {
             svc.output_admitted_by_topic(&admit(
                 &format!("tx{i}"),
                 0,
-                golden_marker(&[i; 32], &golden_loser_sig()),
+                golden_marker_for_pot(&[i; 32], &[0xA0 + i; 32]),
             ))
             .await
             .unwrap();
@@ -545,11 +563,13 @@ mod tests {
         let arr = results_for(&svc, &golden_winner_hex(), None).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2, "garbage AND genuine rows coexist");
-        assert_eq!(arr[0]["txid"], "txGENUINE", "newest first");
-        assert_eq!(arr[0]["winnerSigHex"], hex::encode(golden_winner_sig()));
-        assert_eq!(arr[0]["loserSigHex"], hex::encode(golden_loser_sig()));
-        assert_eq!(arr[1]["txid"], "txGARBAGE");
-        assert_eq!(arr[1]["winnerSigHex"], hex::encode(vec![0x30u8; 71]));
+        // Same pot => oldest-first within the pot (bsv-low #282 superset —
+        // ORDER is not truth; the client's sig verify separates them).
+        assert_eq!(arr[0]["txid"], "txGARBAGE");
+        assert_eq!(arr[0]["winnerSigHex"], hex::encode(vec![0x30u8; 71]));
+        assert_eq!(arr[1]["txid"], "txGENUINE", "the genuine marker SURVIVES the front-run");
+        assert_eq!(arr[1]["winnerSigHex"], hex::encode(golden_winner_sig()));
+        assert_eq!(arr[1]["loserSigHex"], hex::encode(golden_loser_sig()));
         // Bytes back verbatim for both — the CLIENT's sig verify is what
         // separates them.
     }
@@ -585,12 +605,13 @@ mod tests {
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2);
 
-        // Newest first: the v2 row, cards verbatim as 10 hex chars.
-        assert_eq!(arr[0]["txid"], "txV2");
-        assert_eq!(arr[0]["cardsHex"], "0001020304");
+        // Same golden pot => oldest-first within the pot (bsv-low #282).
         // The v1 row: cardsHex is null (back-compat — never synthesized).
-        assert_eq!(arr[1]["txid"], "txV1");
-        assert!(arr[1]["cardsHex"].is_null(), "v1 row has null cardsHex");
+        assert_eq!(arr[0]["txid"], "txV1");
+        assert!(arr[0]["cardsHex"].is_null(), "v1 row has null cardsHex");
+        // The v2 row: cards verbatim as 10 hex chars.
+        assert_eq!(arr[1]["txid"], "txV2");
+        assert_eq!(arr[1]["cardsHex"], "0001020304");
     }
 
     // ── Admission filters ────────────────────────────────────────────────
