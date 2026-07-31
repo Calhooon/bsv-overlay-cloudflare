@@ -16,7 +16,7 @@ use bsv_overlay_cloudflare::d1_discovery::{mark_spent_sql, store_record_sql};
 use low_app_layer::logic::valid_identity;
 use low_app_layer::refund_view::{
     assemble_refund_view, refund_view_body, refund_view_sql, RefundStatus, RefundViewRow,
-    REFUND_VIEW_MAX_ROWS,
+    REFUND_VIEW_MAX_ROWS, REFUND_VIEW_UNKNOWN_POT_QUOTA,
 };
 use low_app_layer::results::PotVerdict;
 use rusqlite::{params, Connection};
@@ -158,7 +158,7 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<RefundViewRow> {
             verdict: r.get("verdict")?,
             verdict_txid: r.get("verdictTxid")?,
             spent_height: r.get::<_, Option<i64>>("spentHeight")?.map(|v| v as u64),
-            backup_published: r.get::<_, i64>("backupPublished")? != 0,
+            backup_marker_present: r.get::<_, i64>("backupMarkerPresent")? != 0,
         })
     })
     .expect("query")
@@ -191,7 +191,7 @@ fn armed_below_the_gate_and_the_backup_bit_upgrades_the_source() {
     assert_eq!(e.status_source, Some("chain"));
     assert_eq!(e.blocks_to_gate, Some(45));
     assert!(!e.gate_passed);
-    assert!(!e.backup_published);
+    assert!(!e.backup_marker_present);
     assert_eq!(e.recovery_height, Some(GATE as u64));
     assert_eq!(e.spent, Some(false));
 
@@ -200,7 +200,7 @@ fn armed_below_the_gate_and_the_backup_bit_upgrades_the_source() {
     let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_078))[0];
     assert_eq!(e.status, RefundStatus::Armed);
     assert_eq!(e.status_source, Some("chain+marker"));
-    assert!(e.backup_published);
+    assert!(e.backup_marker_present);
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn both_seats_backups_never_multiply_rows_and_bytes_never_leak() {
 
     let rows = query_rows(&conn, &me);
     assert_eq!(rows.len(), 1, "EXISTS probe must not multiply the pot row");
-    assert!(rows[0].backup_published);
+    assert!(rows[0].backup_marker_present);
 
     // Display-only contract: the stored refund bytes NEVER reach the wire.
     let entries = assemble_refund_view(rows, Some(900_078));
@@ -391,6 +391,66 @@ fn dust_replays_collapse_to_one_row_per_pot() {
     assert_eq!(rows.len(), 1, "one pot ⇒ one row, whatever the replay count");
     // The representative is the OLDEST marker (the honest funding-time one).
     assert_eq!(rows[0].marker_recovery_height, GATE as u32);
+}
+
+/// The #281 window rules, exercised BEHAVIORALLY against this route's OWN
+/// SQL (the structural string pin is not enough — `refund_view_sql` can
+/// drift independently of `results_sql`): 60 dust replays of the victim's
+/// real pot + 120 markers naming INVENTED pots, every attacker row NEWER
+/// than the honest marker. The real pot must survive within one quota of
+/// the top; ghost promotion is bounded to the newest
+/// [`REFUND_VIEW_UNKNOWN_POT_QUOTA`] unknown pots; the demoted tier fills
+/// the rest newest-first.
+#[test]
+fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
+    let conn = production_schema_db();
+    let (me, honest_pot) = seed_armed_pot(&conn); // indexed, createdAt 1_000
+    const REPLAYS: i64 = 60;
+    const GHOSTS: u64 = 120;
+    for i in 0..REPLAYS {
+        file_party(&conn, &me, &honest_pot, GATE, &format!("txREPLAY{i:03}"), 2_000 + i);
+    }
+    let ghost_txid = |i: u64| format!("{:064x}", 0xdead_0000_u64 + i);
+    for i in 0..GHOSTS {
+        // Never admitted to pot_records — each a distinct partition, so only
+        // the existence tier + quota bound them.
+        file_party(&conn, &me, &ghost_txid(i), GATE, &format!("txGHOST{i:03}"), 3_000 + i as i64);
+    }
+
+    let rows = query_rows(&conn, &me);
+    assert_eq!(rows.len(), REFUND_VIEW_MAX_ROWS, "page full");
+    let pots: Vec<&String> = rows.iter().map(|r| &r.pot_txid).collect();
+    assert_eq!(
+        pots.iter().filter(|t| ***t == honest_pot).count(),
+        1,
+        "the real pot survives exactly once (replays collapsed)"
+    );
+    // Promotion is bounded: every ghost that sorts ahead of the real pot
+    // sits inside the reserved quota — and here, with every ghost newer,
+    // the quota is EXACTLY consumed: the newest quota-many ghosts.
+    let pos = pots.iter().position(|t| **t == honest_pot).unwrap();
+    assert_eq!(pos, REFUND_VIEW_UNKNOWN_POT_QUOTA, "quota-many promoted ghosts, no more");
+    let promoted: Vec<String> = (0..REFUND_VIEW_UNKNOWN_POT_QUOTA as u64)
+        .map(|k| ghost_txid(GHOSTS - 1 - k))
+        .collect();
+    assert_eq!(
+        pots[..pos].to_vec(),
+        promoted.iter().collect::<Vec<_>>(),
+        "the promoted slice is the NEWEST ghosts, newest first (eviction ordering)"
+    );
+    // The demoted tier fills the remainder newest-first: the row after the
+    // real pot is the newest UN-promoted ghost, and the oldest ghosts fell
+    // off the page entirely.
+    assert_eq!(*pots[pos + 1], ghost_txid(GHOSTS - 1 - REFUND_VIEW_UNKNOWN_POT_QUOTA as u64));
+    let dropped = (GHOSTS as usize + 1) - REFUND_VIEW_MAX_ROWS; // 21 oldest ghosts
+    for i in 0..dropped as u64 {
+        assert!(
+            !pots.iter().any(|t| **t == ghost_txid(i)),
+            "oldest ghost {i} must have fallen off, not a real pot"
+        );
+    }
+    // Ghost rows arrive with the fail-safe unknown shape (spent null).
+    assert!(rows[0].spent.is_none() && rows[0].pot_txid != honest_pot);
 }
 
 #[test]

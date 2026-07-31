@@ -1332,8 +1332,16 @@ async fn results_seat_markers(
 /// `/refund-view` joined row as D1 returns it (the `refund_view_sql` shape):
 /// the caller's potparty facts + the pot's spend/verdict columns + the
 /// `potrefund_records` presence bit. Pot-side fields are `Option` because the
-/// join can MISS; `serde(default)` on the #284 columns tolerates a read that
-/// races the overlay's additive migrations.
+/// join can MISS (NULL columns).
+///
+/// DEPLOY ORDER: the #284 columns come from the OVERLAY worker's additive
+/// migrations, so the overlay deploys (and runs its migrations) BEFORE this
+/// worker — the same ordering `results_sql` requires. `serde(default)` does
+/// NOT buy pre-migration tolerance here: `refund_view_sql` names those
+/// columns explicitly, so against a pre-migration schema the whole query
+/// faults and the route answers 503 for everyone — the honest fail-safe (a
+/// fault is never shaped like an answer). The defaults only cover NULL/
+/// absent VALUES on a migrated schema; no default can manufacture a fact.
 #[derive(Deserialize)]
 struct RefundViewRowD1 {
     #[serde(rename = "gameId")]
@@ -1357,8 +1365,8 @@ struct RefundViewRowD1 {
     verdict_txid: Option<String>,
     #[serde(rename = "spentHeight", default)]
     spent_height: Option<f64>,
-    #[serde(rename = "backupPublished")]
-    backup_published: f64,
+    #[serde(rename = "backupMarkerPresent")]
+    backup_marker_present: f64,
 }
 
 impl RefundViewRowD1 {
@@ -1375,7 +1383,7 @@ impl RefundViewRowD1 {
             verdict: self.verdict,
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
-            backup_published: self.backup_published != 0.0,
+            backup_marker_present: self.backup_marker_present != 0.0,
         }
     }
 }
@@ -1925,5 +1933,68 @@ mod tests {
             .unwrap();
         assert_eq!(read(POT_BEEFS_TRUST_SQL, "pot1").1, Some(1));
         assert_eq!(read(TRANSACTIONS_TRUST_SQL, "tx1").1, Some(1));
+    }
+
+    /// `/refund-view`'s D1-row → host-row mapping, field by field: a
+    /// representative D1-shaped JSON object (every value DISTINCT, so any
+    /// swapped-field bug fails an assertion) deserialized exactly as the
+    /// route does, then `into_row` checked slot by slot.
+    #[test]
+    fn refund_view_d1_row_maps_every_field_to_the_right_slot() {
+        let full: RefundViewRowD1 = serde_json::from_value(serde_json::json!({
+            "gameId": "game-1",
+            "potTxid": "pot-1",
+            "potVout": 2.0,
+            "recoveryHeight": 900_123.0,
+            "covRecoveryHeight": 900_200.0,
+            "spent": 1.0,
+            "spendingTxid": "spender-1",
+            "spentConfirmed": 0.0,
+            "verdict": "refund",
+            "verdictTxid": "verdict-txid-1",
+            "spentHeight": 900_170.0,
+            "backupMarkerPresent": 1.0,
+        }))
+        .expect("deserialize D1-shaped row");
+        let r = full.into_row();
+        assert_eq!(r.game_id, "game-1");
+        assert_eq!(r.pot_txid, "pot-1");
+        assert_eq!(r.pot_vout, 2);
+        assert_eq!(r.marker_recovery_height, 900_123);
+        assert_eq!(r.cov_recovery_height, Some(900_200));
+        assert_eq!(r.spent, Some(true));
+        assert_eq!(r.spending_txid.as_deref(), Some("spender-1"));
+        assert_eq!(r.spent_confirmed, Some(false), "0.0 maps to Some(false), not None");
+        assert_eq!(r.verdict.as_deref(), Some("refund"));
+        assert_eq!(r.verdict_txid.as_deref(), Some("verdict-txid-1"));
+        assert_eq!(r.spent_height, Some(900_170));
+        assert!(r.backup_marker_present);
+
+        // The all-NULL pot side (join miss): every Option arrives None —
+        // never a fabricated false/0 fact — and the presence bit is false.
+        let sparse: RefundViewRowD1 = serde_json::from_value(serde_json::json!({
+            "gameId": "game-2",
+            "potTxid": "pot-2",
+            "potVout": 0.0,
+            "recoveryHeight": 0.0,
+            "covRecoveryHeight": null,
+            "spent": null,
+            "spendingTxid": null,
+            "spentConfirmed": null,
+            "verdict": null,
+            "verdictTxid": null,
+            "spentHeight": null,
+            "backupMarkerPresent": 0.0,
+        }))
+        .expect("deserialize sparse row");
+        let r = sparse.into_row();
+        assert_eq!(r.cov_recovery_height, None);
+        assert_eq!(r.spent, None);
+        assert_eq!(r.spending_txid, None);
+        assert_eq!(r.spent_confirmed, None);
+        assert_eq!(r.verdict, None);
+        assert_eq!(r.verdict_txid, None);
+        assert_eq!(r.spent_height, None);
+        assert!(!r.backup_marker_present);
     }
 }

@@ -5,10 +5,11 @@
 //! refund, its recovery height, and the "did it land" poll are all
 //! client-side state a wiped profile loses. This view is the SERVER half of
 //! stage 2a: for one identity, every pot it is a party to, shaped as a
-//! refund-status answer — how far the height gate is, whether a refund
-//! backup marker was published, and what (if anything) the chain proves
-//! happened to the pot. DISPLAY-ONLY by decision (#252 stage-2 plan §4):
-//! `backupPublished` is PRESENCE only — `refundRawHex` is never served here;
+//! refund-status answer — how far the height gate is, whether a
+//! refund-backup marker row is indexed for the pot, and what (if anything)
+//! the chain proves happened to it. DISPLAY-ONLY by decision (#252 stage-2
+//! plan §4):
+//! `backupMarkerPresent` is PRESENCE only — `refundRawHex` is never served here;
 //! recovery paths keep their existing per-pot `lookupPotRefund`.
 //!
 //! ## Honesty model (mirrors `/results`' `outcome`/`outcomeSource`)
@@ -33,10 +34,16 @@
 //!
 //! `statusSource` is `"chain"` when the status derives purely from
 //! `pot_records` spend/verdict facts; `"chain+marker"` when the
-//! `potrefund_records` PRESENCE contributed to the wording (an armed/
-//! gate-open pot with a published backup — the marker says a re-broadcastable
-//! refund exists, which is what those statuses mean to a user); `null` for
-//! `unknown`.
+//! `potrefund_records` PRESENCE bit factored into the wording; `null` for
+//! `unknown`. The bit is named `backupMarkerPresent` — NOT "a backup
+//! exists" — because `tm_potrefund` admission is BYTE-FORMAT-ONLY: either
+//! seat OR any third party can file a marker row for any pot outpoint for
+//! one dust `OP_RETURN`, and the overlay never parses or verifies the
+//! stored bytes. Presence means exactly "at least one marker row is
+//! indexed for this outpoint", nothing more. The READER verifies
+//! (doctrine): before rendering a real re-broadcastable backup, the client
+//! must fetch the marker via its existing per-pot `lookupPotRefund`,
+//! verify the signature, and parse the raw refund bytes itself.
 //!
 //! Deliberately NOT derived server-side: a `parked`/`unarmed` distinction.
 //! The server cannot see tower arm state or client dormancy — that honesty
@@ -66,6 +73,17 @@
 //! [`REFUND_VIEW_MAX_ROWS`]. The `potrefund_records` presence probe runs on
 //! the ≤100 survivors only (the results_sql BLOB-join discipline — never let
 //! an attacker multiply per-row work), and transfers no bytes (EXISTS).
+//!
+//! Accepted residuals, inherited with the shape (documented in
+//! `results_sql`'s own notes; no defense here): an attacker who copies ~100
+//! REAL, recently-admitted pot txids out of the public index and files one
+//! marker per pot naming the victim can still fill the window; and the
+//! representative (oldest) marker row owns the DISPLAY fields — `gameId`
+//! and the marker height hint — so a forged marker front-run with an
+//! earlier `createdAt` can own them (#281 F1b). Both are display-tier harms
+//! only here: the served recovery height prefers the covenant-COMMITTED
+//! column precisely because of the second residual, and no status is ever
+//! derived from marker fields alone.
 
 use serde_json::json;
 
@@ -88,7 +106,7 @@ const _: () = assert!(REFUND_VIEW_UNKNOWN_POT_QUOTA < REFUND_VIEW_MAX_ROWS);
 /// #281 window over the caller's `potparty_records` rows LEFT-JOINed to
 /// `pot_records` on the pot outpoint, then — OUTSIDE the window, on the
 /// ≤[`REFUND_VIEW_MAX_ROWS`] survivors only — an EXISTS probe of
-/// `potrefund_records` for `backupPublished`. No BLOB is ever touched.
+/// `potrefund_records` for `backupMarkerPresent`. No BLOB is ever touched.
 /// `pot_records.recoveryHeight` is aliased `covRecoveryHeight` (the potparty
 /// marker owns the bare name), mirroring `results_sql`.
 pub fn refund_view_sql() -> String {
@@ -102,7 +120,7 @@ pub fn refund_view_sql() -> String {
                 w.spentHeight AS spentHeight, \
                 EXISTS(SELECT 1 FROM potrefund_records pr \
                        WHERE pr.potTxid = w.potTxid AND pr.potVout = w.potVout) \
-                    AS backupPublished \
+                    AS backupMarkerPresent \
          FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                   spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
                   markerCreatedAt, markerRowid, potCreatedAt, \
@@ -166,9 +184,11 @@ pub struct RefundViewRow {
     /// Block height of the SPV-verified spend confirm (pointer-guarded at
     /// write time — see the overlay's `mark_spent_sql`).
     pub spent_height: Option<u64>,
-    /// `potrefund_records` PRESENCE for the pot outpoint (either seat's
-    /// backup marker counts — a published backup is per-pot, not per-seat).
-    pub backup_published: bool,
+    /// `potrefund_records` PRESENCE for the pot outpoint — an UNVERIFIED,
+    /// byte-format-admitted bit: either seat OR any third party can file a
+    /// marker row, so this is never proof a genuine backup exists (the
+    /// reader verifies — module docs).
+    pub backup_marker_present: bool,
 }
 
 impl RefundViewRow {
@@ -230,20 +250,27 @@ pub fn derive_refund_status(
     spent_confirmed: Option<bool>,
     trusted_verdict: Option<PotVerdict>,
     gate_passed: bool,
-    backup_published: bool,
+    backup_marker_present: bool,
 ) -> (RefundStatus, Option<&'static str>) {
     match spent {
-        // Unspent is a POSITIVE chain fact (a pot_records row saying so).
+        // `spent = 0` is the overlay's NON-OBSERVATION of a spend on an
+        // indexed pot (the admission default), not a UTXO existence check —
+        // the overlay may simply not have seen the spend yet. The error
+        // direction is safe: a missed spend keeps the user pursuing money
+        // that already landed; it never abandons a live claim.
         Some(false) => {
             let status = if gate_passed {
                 RefundStatus::GateOpen
             } else {
                 RefundStatus::Armed
             };
-            // The backup marker's presence contributes to what armed/
-            // gate-open MEAN to the user (a re-broadcastable refund exists),
-            // so its participation is declared.
-            let source = if backup_published {
+            // The marker bit's PARTICIPATION is declared, never trusted:
+            // presence is unverified byte-format admission (either seat or
+            // any third party can file it — module docs), so the source
+            // only says a marker row factored into the wording. The client
+            // must fetch, sig-verify and parse the marker itself before
+            // rendering it as a real re-broadcastable backup.
+            let source = if backup_marker_present {
                 "chain+marker"
             } else {
                 "chain"
@@ -277,7 +304,7 @@ pub struct RefundEntry {
     pub blocks_to_gate: Option<u64>,
     /// `tip >= recoveryHeight` when both known, else `false` (fail-safe).
     pub gate_passed: bool,
-    pub backup_published: bool,
+    pub backup_marker_present: bool,
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
     pub spent_confirmed: Option<bool>,
@@ -305,7 +332,7 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
                 r.spent_confirmed,
                 verdict,
                 gate_passed,
-                r.backup_published,
+                r.backup_marker_present,
             );
             RefundEntry {
                 game_id: r.game_id,
@@ -314,7 +341,7 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
                 recovery_height,
                 blocks_to_gate,
                 gate_passed,
-                backup_published: r.backup_published,
+                backup_marker_present: r.backup_marker_present,
                 spent: r.spent,
                 spending_txid: r.spending_txid,
                 spent_confirmed: r.spent_confirmed,
@@ -329,7 +356,7 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
 
 /// Assemble the `/refund-view` wire body:
 /// `{"identity","tip":<height|null>,"refunds":[{gameId,potTxid,potVout,
-/// recoveryHeight,blocksToGate,gatePassed,backupPublished,spent,
+/// recoveryHeight,blocksToGate,gatePassed,backupMarkerPresent,spent,
 /// spendingTxid,spentConfirmed,verdict,spentHeight,status,statusSource}]}`.
 /// `tip` mirrors `/recovery-view` (`null` on a chaintracks fault — the D1
 /// facts still serve; the gate fields then degrade to `null`/`false`).
@@ -344,7 +371,7 @@ pub fn refund_view_body(identity: &str, tip: Option<u64>, entries: &[RefundEntry
                 "recoveryHeight": e.recovery_height,
                 "blocksToGate": e.blocks_to_gate,
                 "gatePassed": e.gate_passed,
-                "backupPublished": e.backup_published,
+                "backupMarkerPresent": e.backup_marker_present,
                 "spent": e.spent,
                 "spendingTxid": e.spending_txid,
                 "spentConfirmed": e.spent_confirmed,
@@ -379,7 +406,7 @@ mod tests {
             verdict: None,
             verdict_txid: None,
             spent_height: None,
-            backup_published: false,
+            backup_marker_present: false,
         }
     }
 
@@ -551,7 +578,7 @@ mod tests {
         r.verdict = Some("refund".into());
         r.verdict_txid = Some(h64(0xfe));
         r.spent_height = Some(900_170);
-        r.backup_published = true;
+        r.backup_marker_present = true;
         let me = format!("02{}", "a1".repeat(32));
         let entries = assemble_refund_view(vec![r], Some(900_168));
         let v: serde_json::Value =
@@ -565,7 +592,7 @@ mod tests {
         assert_eq!(e["recoveryHeight"], serde_json::json!(900_123));
         assert_eq!(e["blocksToGate"], serde_json::json!(0));
         assert_eq!(e["gatePassed"], serde_json::json!(true));
-        assert_eq!(e["backupPublished"], serde_json::json!(true));
+        assert_eq!(e["backupMarkerPresent"], serde_json::json!(true));
         assert_eq!(e["spent"], serde_json::json!(true));
         assert_eq!(e["spendingTxid"], serde_json::json!(h64(0xfe)));
         assert_eq!(e["spentConfirmed"], serde_json::json!(true));

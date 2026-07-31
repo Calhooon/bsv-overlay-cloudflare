@@ -56,8 +56,9 @@
 //! - `GET /refund-view?identity=<66-hex>` — the per-identity REFUND STATUS
 //!   view (bsv-low #252 stage 2a): every pot the identity is a party to,
 //!   shaped as a refund answer — height-gate math against the tip,
-//!   refund-backup marker PRESENCE (`backupPublished` — never the raw
-//!   bytes), and the chain-truth exit status (`armed`/`gate-open`/`landed`/
+//!   refund-backup marker PRESENCE (`backupMarkerPresent` — an unverified
+//!   byte-format-admitted bit, never the raw bytes; the reader verifies),
+//!   and the chain-truth exit status (`armed`/`gate-open`/`landed`/
 //!   `superseded`/`unknown`) with a `/results`-style `status`/`statusSource`
 //!   honesty pair. See the `refund_view` module docs.
 //! - `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
