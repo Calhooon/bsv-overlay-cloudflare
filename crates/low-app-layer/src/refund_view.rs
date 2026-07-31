@@ -1,0 +1,604 @@
+//! `/refund-view` — the per-identity REFUND STATUS view (bsv-low #252
+//! stage 2a).
+//!
+//! The client's refund pipeline today lives in localStorage: the pre-signed
+//! refund, its recovery height, and the "did it land" poll are all
+//! client-side state a wiped profile loses. This view is the SERVER half of
+//! stage 2a: for one identity, every pot it is a party to, shaped as a
+//! refund-status answer — how far the height gate is, whether a refund
+//! backup marker was published, and what (if anything) the chain proves
+//! happened to the pot. DISPLAY-ONLY by decision (#252 stage-2 plan §4):
+//! `backupPublished` is PRESENCE only — `refundRawHex` is never served here;
+//! recovery paths keep their existing per-pot `lookupPotRefund`.
+//!
+//! ## Honesty model (mirrors `/results`' `outcome`/`outcomeSource`)
+//!
+//! The `status`/`statusSource` pair never asserts what the data doesn't
+//! prove:
+//!
+//! | facts                                                        | status       | source           |
+//! |--------------------------------------------------------------|--------------|------------------|
+//! | pot unspent, tip below the gate                              | `armed`      | chain (+marker)  |
+//! | pot unspent, tip at/past the gate                            | `gate-open`  | chain (+marker)  |
+//! | spend CONFIRMED, trusted decoded verdict = `refund`          | `landed`     | chain            |
+//! | spend CONFIRMED, trusted decoded verdict = settle/tie        | `superseded` | chain            |
+//! | anything incomplete (below)                                  | `unknown`    | null             |
+//!
+//! `unknown` is a first-class value, never a guess: a pot with no
+//! `pot_records` row (spend status genuinely unknown — NEVER asserted
+//! unspent), a spend that is recorded but unconfirmed (displaceable), or a
+//! confirmed spend with no trusted decoded verdict (#284 columns absent, a
+//! stale `verdictTxid` pointer, or an unrecognized stored string) all answer
+//! `unknown`/`null`.
+//!
+//! `statusSource` is `"chain"` when the status derives purely from
+//! `pot_records` spend/verdict facts; `"chain+marker"` when the
+//! `potrefund_records` PRESENCE contributed to the wording (an armed/
+//! gate-open pot with a published backup — the marker says a re-broadcastable
+//! refund exists, which is what those statuses mean to a user); `null` for
+//! `unknown`.
+//!
+//! Deliberately NOT derived server-side: a `parked`/`unarmed` distinction.
+//! The server cannot see tower arm state or client dormancy — that honesty
+//! gap stays client-side (stage 2a client work).
+//!
+//! ## The gate math
+//!
+//! `blocksToGate = max(0, recoveryHeight - tip)` when both are known, else
+//! `null`; `gatePassed = tip >= recoveryHeight` when both known, else
+//! `false` (fail-safe: a gate is never reported open on missing data). The
+//! served `recoveryHeight` prefers the COVENANT-COMMITTED height decoded
+//! from the admitted funding lock (`pot_records.recoveryHeight`, #284 —
+//! chain truth an attacker cannot file) and falls back to the caller's own
+//! `potparty_records` marker height (byte-format-admitted, i.e. a HINT) only
+//! when no decoded value exists (bare/legacy pots). Either source is
+//! range-checked against [`LOCKTIME_THRESHOLD`] — a nonsense height serves
+//! `null`, never a fake countdown.
+//!
+//! ## The window is the `/results` window (bsv-low #281)
+//!
+//! `tm_potparty` admission is byte-format-only, so the same dust-DoS that
+//! erased a victim's real pot from `/results` applies verbatim here — and an
+//! erased refund row is money-visibility harm (the user stops seeing a
+//! recoverable pot). The SQL reuses the exact #281 shape: per-POT-OUTPOINT
+//! collapse (oldest marker is the representative), pot-existence tier with
+//! the newest [`REFUND_VIEW_UNKNOWN_POT_QUOTA`] unknown pots promoted, LIMIT
+//! [`REFUND_VIEW_MAX_ROWS`]. The `potrefund_records` presence probe runs on
+//! the ≤100 survivors only (the results_sql BLOB-join discipline — never let
+//! an attacker multiply per-row work), and transfers no bytes (EXISTS).
+
+use serde_json::json;
+
+use crate::results::{PotVerdict, LOCKTIME_THRESHOLD};
+
+/// Hard bound on `/refund-view` rows per request — same cap + rationale as
+/// [`crate::results::RESULTS_MAX_ROWS`] (a cap on DISTINCT POTS since the
+/// window is per-pot-outpoint).
+pub const REFUND_VIEW_MAX_ROWS: usize = 100;
+
+/// How many of the newest pots ABSENT from `pot_records` are promoted into
+/// the main tier — same reservation + rationale as
+/// [`crate::results::RESULTS_UNKNOWN_POT_QUOTA`] (a fresh pot whose `tm_pot`
+/// admission is in flight is exactly the pot a refund view must not hide).
+pub const REFUND_VIEW_UNKNOWN_POT_QUOTA: usize = 10;
+
+const _: () = assert!(REFUND_VIEW_UNKNOWN_POT_QUOTA < REFUND_VIEW_MAX_ROWS);
+
+/// The single `/refund-view` SQL (ONE bind: the lowercase identity). The
+/// #281 window over the caller's `potparty_records` rows LEFT-JOINed to
+/// `pot_records` on the pot outpoint, then — OUTSIDE the window, on the
+/// ≤[`REFUND_VIEW_MAX_ROWS`] survivors only — an EXISTS probe of
+/// `potrefund_records` for `backupPublished`. No BLOB is ever touched.
+/// `pot_records.recoveryHeight` is aliased `covRecoveryHeight` (the potparty
+/// marker owns the bare name), mirroring `results_sql`.
+pub fn refund_view_sql() -> String {
+    format!(
+        "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
+                w.recoveryHeight AS recoveryHeight, \
+                w.covRecoveryHeight AS covRecoveryHeight, \
+                w.spent AS spent, w.spendingTxid AS spendingTxid, \
+                w.spentConfirmed AS spentConfirmed, \
+                w.verdict AS verdict, w.verdictTxid AS verdictTxid, \
+                w.spentHeight AS spentHeight, \
+                EXISTS(SELECT 1 FROM potrefund_records pr \
+                       WHERE pr.potTxid = w.potTxid AND pr.potVout = w.potVout) \
+                    AS backupPublished \
+         FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                  spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
+                  markerCreatedAt, markerRowid, potCreatedAt, \
+                  CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
+           FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                    spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
+                    markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                    ROW_NUMBER() OVER (PARTITION BY unknownPot \
+                                       ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                                markerCreatedAt DESC, markerRowid DESC) AS potRank \
+             FROM (SELECT pp.gameId AS gameId, pp.potTxid AS potTxid, \
+                      pp.potVout AS potVout, pp.recoveryHeight AS recoveryHeight, \
+                      r.recoveryHeight AS covRecoveryHeight, \
+                      r.spent AS spent, r.spendingTxid AS spendingTxid, \
+                      r.spentConfirmed AS spentConfirmed, \
+                      r.verdict AS verdict, r.verdictTxid AS verdictTxid, \
+                      r.spentHeight AS spentHeight, \
+                      pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
+                      r.createdAt AS potCreatedAt, \
+                      CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                      ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
+                                         ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+               FROM potparty_records pp \
+               LEFT JOIN pot_records r \
+                      ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
+               WHERE pp.identity = ?) \
+             WHERE rn = 1) \
+           ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                    markerCreatedAt DESC, markerRowid DESC \
+           LIMIT {rows}) w \
+         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+                  w.markerCreatedAt DESC, w.markerRowid DESC",
+        quota = REFUND_VIEW_UNKNOWN_POT_QUOTA,
+        rows = REFUND_VIEW_MAX_ROWS,
+    )
+}
+
+/// One `/refund-view` joined row, host-typed (the `refund_view_sql` shape).
+/// The pot-side fields are `Option` because the `pot_records` join can MISS
+/// — a party marker whose pot the overlay never indexed yields NULL columns
+/// (fail-safe: never asserted unspent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefundViewRow {
+    pub game_id: String,
+    pub pot_txid: String,
+    pub pot_vout: u32,
+    /// The caller's OWN potparty marker height — byte-format-admitted, a
+    /// HINT (used only when no covenant-committed height exists).
+    pub marker_recovery_height: u32,
+    /// The COVENANT-COMMITTED recoveryHeight decoded from the admitted
+    /// funding lock (#284) — chain truth; `None` for bare/legacy rows.
+    pub cov_recovery_height: Option<u64>,
+    pub spent: Option<bool>,
+    pub spending_txid: Option<String>,
+    pub spent_confirmed: Option<bool>,
+    /// The stored #284 spend verdict — trusted ONLY via [`trusted_verdict`]
+    /// (`verdict_txid` must equal `spending_txid`; a stale pointer-overwrite
+    /// leftover is ignored).
+    pub verdict: Option<String>,
+    pub verdict_txid: Option<String>,
+    /// Block height of the SPV-verified spend confirm (pointer-guarded at
+    /// write time — see the overlay's `mark_spent_sql`).
+    pub spent_height: Option<u64>,
+    /// `potrefund_records` PRESENCE for the pot outpoint (either seat's
+    /// backup marker counts — a published backup is per-pot, not per-seat).
+    pub backup_published: bool,
+}
+
+impl RefundViewRow {
+    /// The stored verdict, trusted only when it was computed FOR the row's
+    /// current spend pointer (`verdictTxid == spendingTxid` — the #284
+    /// stale-pointer rule `results.rs` applies before believing a stored
+    /// verdict). An unrecognized stored string is `None` (never a guess).
+    pub fn trusted_verdict(&self) -> Option<PotVerdict> {
+        let (v, vt, st) = (
+            self.verdict.as_deref()?,
+            self.verdict_txid.as_deref()?,
+            self.spending_txid.as_deref()?,
+        );
+        if !vt.eq_ignore_ascii_case(st) {
+            return None;
+        }
+        PotVerdict::from_wire(v)
+    }
+
+    /// The recovery height this view SERVES: the covenant-committed value
+    /// when decoded (chain truth), else the caller's own marker value
+    /// (hint), each range-checked — 0 or a timestamp-range value is `None`
+    /// (no fake countdown).
+    pub fn served_recovery_height(&self) -> Option<u64> {
+        let valid = |h: u64| (h > 0 && h < u64::from(LOCKTIME_THRESHOLD)).then_some(h);
+        self.cov_recovery_height
+            .and_then(valid)
+            .or_else(|| valid(u64::from(self.marker_recovery_height)))
+    }
+}
+
+/// The `/refund-view` status enum (wire strings per the #252 stage-2 spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundStatus {
+    Armed,
+    GateOpen,
+    Landed,
+    Superseded,
+    Unknown,
+}
+
+impl RefundStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefundStatus::Armed => "armed",
+            RefundStatus::GateOpen => "gate-open",
+            RefundStatus::Landed => "landed",
+            RefundStatus::Superseded => "superseded",
+            RefundStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// Derive `(status, statusSource)` from the row facts — the honesty table in
+/// the module docs. NEVER guesses: every incomplete-fact combination is
+/// (`Unknown`, `None`).
+pub fn derive_refund_status(
+    spent: Option<bool>,
+    spent_confirmed: Option<bool>,
+    trusted_verdict: Option<PotVerdict>,
+    gate_passed: bool,
+    backup_published: bool,
+) -> (RefundStatus, Option<&'static str>) {
+    match spent {
+        // Unspent is a POSITIVE chain fact (a pot_records row saying so).
+        Some(false) => {
+            let status = if gate_passed {
+                RefundStatus::GateOpen
+            } else {
+                RefundStatus::Armed
+            };
+            // The backup marker's presence contributes to what armed/
+            // gate-open MEAN to the user (a re-broadcastable refund exists),
+            // so its participation is declared.
+            let source = if backup_published {
+                "chain+marker"
+            } else {
+                "chain"
+            };
+            (status, Some(source))
+        }
+        Some(true) => match (spent_confirmed, trusted_verdict) {
+            // Confirmed spend + a verdict decoded FOR that spender: the one
+            // place this view asserts an outcome — pure chain truth.
+            (Some(true), Some(PotVerdict::Refund)) => (RefundStatus::Landed, Some("chain")),
+            (Some(true), Some(_)) => (RefundStatus::Superseded, Some("chain")),
+            // Confirmed but undecoded, or recorded-but-unconfirmed (a
+            // displaceable intent, not a landing): incomplete — never guess.
+            _ => (RefundStatus::Unknown, None),
+        },
+        // No pot_records row: spend status genuinely unknown (never
+        // asserted unspent → never "armed" on absence-of-evidence).
+        None => (RefundStatus::Unknown, None),
+    }
+}
+
+/// One `/refund-view` response entry, pre-JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefundEntry {
+    pub game_id: String,
+    pub pot_txid: String,
+    pub pot_vout: u32,
+    /// The served recovery height (see [`RefundViewRow::served_recovery_height`]).
+    pub recovery_height: Option<u64>,
+    /// `max(0, recoveryHeight - tip)` when both known, else `None`.
+    pub blocks_to_gate: Option<u64>,
+    /// `tip >= recoveryHeight` when both known, else `false` (fail-safe).
+    pub gate_passed: bool,
+    pub backup_published: bool,
+    pub spent: Option<bool>,
+    pub spending_txid: Option<String>,
+    pub spent_confirmed: Option<bool>,
+    /// The TRUSTED decoded verdict (stale/unrecognized served as `None`).
+    pub verdict: Option<PotVerdict>,
+    pub spent_height: Option<u64>,
+    pub status: RefundStatus,
+    pub status_source: Option<&'static str>,
+}
+
+/// Assemble the joined rows + chain tip into response entries. Order is
+/// preserved (the SQL already returns tiered-newest-first). Pure — every
+/// branch is unit-testable without D1.
+pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<RefundEntry> {
+    rows.into_iter()
+        .map(|r| {
+            let recovery_height = r.served_recovery_height();
+            let (blocks_to_gate, gate_passed) = match (recovery_height, tip) {
+                (Some(rh), Some(t)) => (Some(rh.saturating_sub(t)), t >= rh),
+                _ => (None, false),
+            };
+            let verdict = r.trusted_verdict();
+            let (status, status_source) = derive_refund_status(
+                r.spent,
+                r.spent_confirmed,
+                verdict,
+                gate_passed,
+                r.backup_published,
+            );
+            RefundEntry {
+                game_id: r.game_id,
+                pot_txid: r.pot_txid,
+                pot_vout: r.pot_vout,
+                recovery_height,
+                blocks_to_gate,
+                gate_passed,
+                backup_published: r.backup_published,
+                spent: r.spent,
+                spending_txid: r.spending_txid,
+                spent_confirmed: r.spent_confirmed,
+                verdict,
+                spent_height: r.spent_height,
+                status,
+                status_source,
+            }
+        })
+        .collect()
+}
+
+/// Assemble the `/refund-view` wire body:
+/// `{"identity","tip":<height|null>,"refunds":[{gameId,potTxid,potVout,
+/// recoveryHeight,blocksToGate,gatePassed,backupPublished,spent,
+/// spendingTxid,spentConfirmed,verdict,spentHeight,status,statusSource}]}`.
+/// `tip` mirrors `/recovery-view` (`null` on a chaintracks fault — the D1
+/// facts still serve; the gate fields then degrade to `null`/`false`).
+pub fn refund_view_body(identity: &str, tip: Option<u64>, entries: &[RefundEntry]) -> String {
+    let arr: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "gameId": e.game_id,
+                "potTxid": e.pot_txid,
+                "potVout": e.pot_vout,
+                "recoveryHeight": e.recovery_height,
+                "blocksToGate": e.blocks_to_gate,
+                "gatePassed": e.gate_passed,
+                "backupPublished": e.backup_published,
+                "spent": e.spent,
+                "spendingTxid": e.spending_txid,
+                "spentConfirmed": e.spent_confirmed,
+                "verdict": e.verdict.map(PotVerdict::as_str),
+                "spentHeight": e.spent_height,
+                "status": e.status.as_str(),
+                "statusSource": e.status_source,
+            })
+        })
+        .collect();
+    json!({ "identity": identity, "tip": tip, "refunds": arr }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h64(seed: u8) -> String {
+        format!("{seed:02x}").repeat(32)
+    }
+
+    fn base_row() -> RefundViewRow {
+        RefundViewRow {
+            game_id: h64(0x11),
+            pot_txid: h64(0xaa),
+            pot_vout: 0,
+            marker_recovery_height: 900_123,
+            cov_recovery_height: None,
+            spent: Some(false),
+            spending_txid: None,
+            spent_confirmed: Some(false),
+            verdict: None,
+            verdict_txid: None,
+            spent_height: None,
+            backup_published: false,
+        }
+    }
+
+    // ── status derivation table ─────────────────────────────────────────────
+
+    #[test]
+    fn unspent_below_gate_is_armed() {
+        assert_eq!(
+            derive_refund_status(Some(false), Some(false), None, false, false),
+            (RefundStatus::Armed, Some("chain"))
+        );
+        // A published backup upgrades the SOURCE, not the status.
+        assert_eq!(
+            derive_refund_status(Some(false), Some(false), None, false, true),
+            (RefundStatus::Armed, Some("chain+marker"))
+        );
+    }
+
+    #[test]
+    fn unspent_past_gate_is_gate_open() {
+        assert_eq!(
+            derive_refund_status(Some(false), Some(false), None, true, false),
+            (RefundStatus::GateOpen, Some("chain"))
+        );
+        assert_eq!(
+            derive_refund_status(Some(false), Some(false), None, true, true),
+            (RefundStatus::GateOpen, Some("chain+marker"))
+        );
+    }
+
+    #[test]
+    fn confirmed_refund_verdict_is_landed() {
+        assert_eq!(
+            derive_refund_status(Some(true), Some(true), Some(PotVerdict::Refund), true, true),
+            (RefundStatus::Landed, Some("chain"))
+        );
+    }
+
+    #[test]
+    fn confirmed_settle_verdicts_are_superseded() {
+        for v in [PotVerdict::WinnerA, PotVerdict::WinnerB, PotVerdict::Tie] {
+            assert_eq!(
+                derive_refund_status(Some(true), Some(true), Some(v), false, true),
+                (RefundStatus::Superseded, Some("chain"))
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_facts_are_unknown_never_guessed() {
+        // No pot_records row at all.
+        assert_eq!(
+            derive_refund_status(None, None, None, true, true),
+            (RefundStatus::Unknown, None)
+        );
+        // Spent but unconfirmed — a displaceable intent, even with a verdict.
+        assert_eq!(
+            derive_refund_status(Some(true), Some(false), Some(PotVerdict::Refund), true, true),
+            (RefundStatus::Unknown, None)
+        );
+        assert_eq!(
+            derive_refund_status(Some(true), None, None, false, false),
+            (RefundStatus::Unknown, None)
+        );
+        // Confirmed spend, no trusted decoded verdict.
+        assert_eq!(
+            derive_refund_status(Some(true), Some(true), None, false, true),
+            (RefundStatus::Unknown, None)
+        );
+    }
+
+    // ── verdict trust (the #284 stale-pointer rule) ─────────────────────────
+
+    #[test]
+    fn verdict_trusted_only_for_the_current_spend_pointer() {
+        let mut r = base_row();
+        r.spent = Some(true);
+        r.spent_confirmed = Some(true);
+        r.spending_txid = Some(h64(0xfe));
+        r.verdict = Some("refund".into());
+        r.verdict_txid = Some(h64(0xfe));
+        assert_eq!(r.trusted_verdict(), Some(PotVerdict::Refund));
+
+        // Stale pointer: verdict computed for a DIFFERENT spender.
+        r.verdict_txid = Some(h64(0xfd));
+        assert_eq!(r.trusted_verdict(), None);
+
+        // Unrecognized stored string never becomes a verdict.
+        r.verdict_txid = Some(h64(0xfe));
+        r.verdict = Some("garbage".into());
+        assert_eq!(r.trusted_verdict(), None);
+
+        // Missing pieces refuse.
+        r.verdict = Some("refund".into());
+        r.spending_txid = None;
+        assert_eq!(r.trusted_verdict(), None);
+    }
+
+    // ── served recovery height ──────────────────────────────────────────────
+
+    #[test]
+    fn covenant_height_preferred_over_marker_hint() {
+        let mut r = base_row();
+        r.cov_recovery_height = Some(900_200);
+        assert_eq!(r.served_recovery_height(), Some(900_200));
+        r.cov_recovery_height = None;
+        assert_eq!(r.served_recovery_height(), Some(900_123));
+    }
+
+    #[test]
+    fn nonsense_heights_serve_null() {
+        let mut r = base_row();
+        r.marker_recovery_height = 0;
+        assert_eq!(r.served_recovery_height(), None);
+        r.marker_recovery_height = LOCKTIME_THRESHOLD; // timestamp range
+        assert_eq!(r.served_recovery_height(), None);
+        // A junk covenant column falls back to a valid marker height.
+        r.marker_recovery_height = 900_123;
+        r.cov_recovery_height = Some(0);
+        assert_eq!(r.served_recovery_height(), Some(900_123));
+    }
+
+    // ── gate math + assembly ────────────────────────────────────────────────
+
+    #[test]
+    fn blocks_to_gate_math() {
+        let rows = vec![base_row()]; // recoveryHeight 900_123
+        // 45 blocks out.
+        let e = &assemble_refund_view(rows.clone(), Some(900_078))[0];
+        assert_eq!(e.blocks_to_gate, Some(45));
+        assert!(!e.gate_passed);
+        assert_eq!(e.status, RefundStatus::Armed);
+        // Exactly at the gate.
+        let e = &assemble_refund_view(rows.clone(), Some(900_123))[0];
+        assert_eq!(e.blocks_to_gate, Some(0));
+        assert!(e.gate_passed);
+        assert_eq!(e.status, RefundStatus::GateOpen);
+        // Past the gate clamps at 0, never negative.
+        let e = &assemble_refund_view(rows.clone(), Some(900_200))[0];
+        assert_eq!(e.blocks_to_gate, Some(0));
+        assert!(e.gate_passed);
+        // No tip: gate fields degrade, status stays fail-safe armed.
+        let e = &assemble_refund_view(rows, None)[0];
+        assert_eq!(e.blocks_to_gate, None);
+        assert!(!e.gate_passed);
+        assert_eq!(e.status, RefundStatus::Armed);
+    }
+
+    #[test]
+    fn gate_math_null_when_no_height_known() {
+        let mut r = base_row();
+        r.marker_recovery_height = 0;
+        let e = &assemble_refund_view(vec![r], Some(900_500))[0];
+        assert_eq!(e.recovery_height, None);
+        assert_eq!(e.blocks_to_gate, None);
+        assert!(!e.gate_passed);
+        // Spend facts still derive a status (unspent + !gatePassed = armed).
+        assert_eq!(e.status, RefundStatus::Armed);
+    }
+
+    // ── wire body ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn refund_view_body_shape() {
+        let mut r = base_row();
+        r.spent = Some(true);
+        r.spent_confirmed = Some(true);
+        r.spending_txid = Some(h64(0xfe));
+        r.verdict = Some("refund".into());
+        r.verdict_txid = Some(h64(0xfe));
+        r.spent_height = Some(900_170);
+        r.backup_published = true;
+        let me = format!("02{}", "a1".repeat(32));
+        let entries = assemble_refund_view(vec![r], Some(900_168));
+        let v: serde_json::Value =
+            serde_json::from_str(&refund_view_body(&me, Some(900_168), &entries)).unwrap();
+        assert_eq!(v["identity"], serde_json::json!(me));
+        assert_eq!(v["tip"], serde_json::json!(900_168));
+        let e = &v["refunds"][0];
+        assert_eq!(e["gameId"], serde_json::json!(h64(0x11)));
+        assert_eq!(e["potTxid"], serde_json::json!(h64(0xaa)));
+        assert_eq!(e["potVout"], serde_json::json!(0));
+        assert_eq!(e["recoveryHeight"], serde_json::json!(900_123));
+        assert_eq!(e["blocksToGate"], serde_json::json!(0));
+        assert_eq!(e["gatePassed"], serde_json::json!(true));
+        assert_eq!(e["backupPublished"], serde_json::json!(true));
+        assert_eq!(e["spent"], serde_json::json!(true));
+        assert_eq!(e["spendingTxid"], serde_json::json!(h64(0xfe)));
+        assert_eq!(e["spentConfirmed"], serde_json::json!(true));
+        assert_eq!(e["verdict"], serde_json::json!("refund"));
+        assert_eq!(e["spentHeight"], serde_json::json!(900_170));
+        assert_eq!(e["status"], serde_json::json!("landed"));
+        assert_eq!(e["statusSource"], serde_json::json!("chain"));
+        // Display-only: the raw refund bytes are NEVER in this body.
+        assert!(!refund_view_body(&me, None, &entries).contains("refundRawHex"));
+    }
+
+    #[test]
+    fn refund_view_body_empty_and_null_tip() {
+        let v: serde_json::Value =
+            serde_json::from_str(&refund_view_body("nope", None, &[])).unwrap();
+        assert_eq!(v["identity"], serde_json::json!("nope"));
+        assert!(v["tip"].is_null());
+        assert_eq!(v["refunds"], serde_json::json!([]));
+    }
+
+    // ── SQL structure pins ──────────────────────────────────────────────────
+
+    #[test]
+    fn refund_view_sql_shape() {
+        let sql = refund_view_sql();
+        assert_eq!(sql.matches('?').count(), 1, "one identity bind");
+        assert!(sql.contains(&format!("LIMIT {REFUND_VIEW_MAX_ROWS}")));
+        assert!(sql.contains("PARTITION BY pp.potTxid, pp.potVout"));
+        assert!(sql.contains(&format!("potRank <= {REFUND_VIEW_UNKNOWN_POT_QUOTA}")));
+        assert!(sql.contains("EXISTS(SELECT 1 FROM potrefund_records"));
+        // Display-only: the refund bytes column never appears in the query.
+        assert!(!sql.contains("refundRawHex"));
+        // No BLOB is ever transferred.
+        assert!(!sql.contains("hex("));
+    }
+}

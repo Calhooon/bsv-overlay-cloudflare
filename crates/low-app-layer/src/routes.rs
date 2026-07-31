@@ -1327,6 +1327,117 @@ async fn results_seat_markers(
     out
 }
 
+// ── /refund-view — per-identity refund status (bsv-low #252 stage 2a) ───────
+
+/// `/refund-view` joined row as D1 returns it (the `refund_view_sql` shape):
+/// the caller's potparty facts + the pot's spend/verdict columns + the
+/// `potrefund_records` presence bit. Pot-side fields are `Option` because the
+/// join can MISS; `serde(default)` on the #284 columns tolerates a read that
+/// races the overlay's additive migrations.
+#[derive(Deserialize)]
+struct RefundViewRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "covRecoveryHeight", default)]
+    cov_recovery_height: Option<f64>,
+    spent: Option<f64>,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: Option<f64>,
+    #[serde(rename = "verdict", default)]
+    verdict: Option<String>,
+    #[serde(rename = "verdictTxid", default)]
+    verdict_txid: Option<String>,
+    #[serde(rename = "spentHeight", default)]
+    spent_height: Option<f64>,
+    #[serde(rename = "backupPublished")]
+    backup_published: f64,
+}
+
+impl RefundViewRowD1 {
+    fn into_row(self) -> crate::refund_view::RefundViewRow {
+        crate::refund_view::RefundViewRow {
+            game_id: self.game_id,
+            pot_txid: self.pot_txid,
+            pot_vout: self.pot_vout as u32,
+            marker_recovery_height: self.recovery_height as u32,
+            cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
+            spent: self.spent.map(|v| v != 0.0),
+            spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
+            verdict: self.verdict,
+            verdict_txid: self.verdict_txid,
+            spent_height: self.spent_height.map(|v| v as u64),
+            backup_published: self.backup_published != 0.0,
+        }
+    }
+}
+
+/// `GET /refund-view?identity=<66-hex>` — the per-identity REFUND STATUS
+/// view (bsv-low #252 stage 2a): for every pot the identity is a party to,
+/// the height-gate math + refund-backup presence + the chain-truth status of
+/// the pot's exit (`armed`/`gate-open`/`landed`/`superseded`/`unknown`),
+/// with the `/results`-style honesty pair (`status`/`statusSource` — never
+/// asserting what the data doesn't prove). Full derivation table + trust
+/// model: `refund_view.rs` module docs. DISPLAY-ONLY: serves backup PRESENCE
+/// only, never `refundRawHex`.
+///
+/// Fail-safe shape mirrors `/recovery-view`/`/results`: a missing/invalid
+/// identity is an EMPTY 200 result (never an error); a D1 fault is a 503; a
+/// chaintracks fault only degrades `tip` (and thus the gate fields) to
+/// `null` — the D1 facts still serve. ONE bounded D1 query
+/// ([`crate::refund_view::REFUND_VIEW_MAX_ROWS`] pots, one identity bind, no
+/// BLOBs).
+pub async fn refund_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let identity = url
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let identity_lc = identity.to_ascii_lowercase();
+
+    if !crate::logic::valid_identity(&identity_lc) {
+        return json_response(crate::refund_view::refund_view_body(&identity_lc, None, &[]), 200);
+    }
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[refund-view] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        },
+    };
+
+    let stmt = db
+        .prepare(crate::refund_view::refund_view_sql())
+        .bind(&[JsValue::from_str(&identity_lc)])?;
+    let rows: Vec<crate::refund_view::RefundViewRow> =
+        match stmt.all().await.and_then(|r| r.results::<RefundViewRowD1>()) {
+            Ok(rows) => rows.into_iter().map(RefundViewRowD1::into_row).collect(),
+            Err(e) => {
+                console_warn!("[refund-view] potparty join query failed: {e}");
+                return json_error("database query failed", 503);
+            },
+        };
+
+    // The tip AFTER the D1 facts (the gate math needs it; `null` on a fault
+    // — gate fields degrade to null/false, statuses stay fail-safe).
+    let tip = chaintracks_present_height(&ctx, "refund-view").await.ok();
+    let entries = crate::refund_view::assemble_refund_view(rows, tip);
+    json_response(
+        crate::refund_view::refund_view_body(&identity_lc, tip, &entries),
+        200,
+    )
+}
+
 // ── /spent-any — server-side legacy outpoint reads (bsv-low #227 addendum) ──
 
 /// One cached `/spent-any` row: the decision fields, without the echo key.

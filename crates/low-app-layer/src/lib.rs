@@ -53,6 +53,13 @@
 //!   templates (winner-A / winner-B / tie / height-gated refund) derived from
 //!   the pot's OWN committed lock params — no client claim required. See the
 //!   `results` module for the trust model + conservatism rules.
+//! - `GET /refund-view?identity=<66-hex>` — the per-identity REFUND STATUS
+//!   view (bsv-low #252 stage 2a): every pot the identity is a party to,
+//!   shaped as a refund answer — height-gate math against the tip,
+//!   refund-backup marker PRESENCE (`backupPublished` — never the raw
+//!   bytes), and the chain-truth exit status (`armed`/`gate-open`/`landed`/
+//!   `superseded`/`unknown`) with a `/results`-style `status`/`statusSource`
+//!   honesty pair. See the `refund_view` module docs.
 //! - `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
 //!   (legacy, never-indexed) outpoints via SERVER-SIDE upstream reads (WoC
 //!   primary with raw hash-verification; a NEGATIVE needs Bitails
@@ -71,6 +78,7 @@
 pub mod compaction;
 pub mod cors;
 pub mod logic;
+pub mod refund_view;
 pub mod results;
 mod routes;
 pub mod txany;
@@ -108,6 +116,7 @@ fn router() -> Router<'static, ()> {
         .get_async("/recovery-view", routes::recovery_view)
         .get_async("/leaderboard", routes::leaderboard)
         .get_async("/results", routes::results)
+        .get_async("/refund-view", routes::refund_view)
         .get_async("/spent-any", routes::spent_any)
         .get_async("/tx-any/:txid", routes::tx_any)
         .get_async("/beef/:txid", routes::beef)
