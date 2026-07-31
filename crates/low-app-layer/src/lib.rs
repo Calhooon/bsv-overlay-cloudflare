@@ -61,6 +61,25 @@
 //!   and the chain-truth exit status (`armed`/`gate-open`/`landed`/
 //!   `superseded`/`unknown`) with a `/results`-style `status`/`statusSource`
 //!   honesty pair. See the `refund_view` module docs.
+//! - `GET /live-view?identity=<66-hex>` — the per-identity LIVE-HAND view
+//!   (bsv-low #252 stage 2a step 3): every pot the identity is a party to
+//!   with NO confirmed spend (unspent / unconfirmed-spend / never-indexed —
+//!   a confirmed spend belongs to `/refund-view`/`/results`), with the
+//!   `/refund-view` gate math, per-POT marker corroboration (a second
+//!   bounded candidate query — the pot's OWN v2 seat-binding markers,
+//!   verified under a per-request budget, since production files v1 first so
+//!   the window representative is never the v2 row; `markerSource` /
+//!   `opponentIdentitySource` honesty tags) and a
+//!   BOUNDED tower fan-out: corroborated gameIds (quality-selected — known
+//!   pots first, never raw window position) get the watchtower's public
+//!   `GET /case/:gameId` (via the `TOWER` service binding, per-fetch
+//!   timeout plus a pre-buffer byte budget), shaped to a validated
+//!   `{status,epoch,deadlineMs,accused}` subset. Success serves the fetched
+//!   `caseGameId` under the NON-VOUCHING `"tower-by-gameid-unverified"` tag
+//!   (the tower's answer for that gameId — the case↔pot binding is not
+//!   verified); every other state keeps `case: null` under a four-valued
+//!   `caseSource` — UNKNOWN, never "no case". See the `live_view` module
+//!   docs.
 //! - `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
 //!   (legacy, never-indexed) outpoints via SERVER-SIDE upstream reads (WoC
 //!   primary with raw hash-verification; a NEGATIVE needs Bitails
@@ -78,6 +97,7 @@
 
 pub mod compaction;
 pub mod cors;
+pub mod live_view;
 pub mod logic;
 pub mod refund_view;
 pub mod results;
@@ -118,6 +138,7 @@ fn router() -> Router<'static, ()> {
         .get_async("/leaderboard", routes::leaderboard)
         .get_async("/results", routes::results)
         .get_async("/refund-view", routes::refund_view)
+        .get_async("/live-view", routes::live_view)
         .get_async("/spent-any", routes::spent_any)
         .get_async("/tx-any/:txid", routes::tx_any)
         .get_async("/beef/:txid", routes::beef)

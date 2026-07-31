@@ -40,3 +40,13 @@ database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
 [[services]]
 binding = "CHAINTRACKS"
 service = "rust-chaintracks"
+
+# Service binding to the LOW watchtower worker (same account). /live-view
+# uses this for its BOUNDED case fan-out: the tower's PUBLIC no-auth
+# `GET /case/:gameId` view, at most LIVE_VIEW_CASE_FANOUT_CAP (8) fetches
+# per request, each raced against a per-fetch timeout — any fault only
+# degrades that row's `case` to null, never the route. `service` is a
+# worker name, not a secret.
+[[services]]
+binding = "TOWER"
+service = "low-watchtower"

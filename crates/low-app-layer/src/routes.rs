@@ -1446,6 +1446,459 @@ pub async fn refund_view(req: Request, ctx: RouteContext<()>) -> Result<Response
     )
 }
 
+// ── /live-view — per-identity live-hand view (bsv-low #252 stage 2a step 3) ─
+
+/// `/live-view` joined row as D1 returns it (the `live_view_sql` shape): the
+/// caller's potparty facts + the pot's spend columns. Pot-side fields are
+/// `Option` because the join can MISS (NULL columns — an unindexed pot is
+/// INCLUDED as possibly-live). Same deploy-order note as `RefundViewRowD1`:
+/// the SQL names only pre-#284 columns plus `pot_records.recoveryHeight`
+/// (a #284 additive), so against a pre-migration schema the whole query
+/// faults → 503 for everyone (a fault is never shaped like an answer).
+#[derive(Deserialize)]
+struct LiveViewRowD1 {
+    /// The marker row's own identity column (verification takes it from the
+    /// ROW, not the query bind — the #230 F8 discipline). TEXT NOT NULL, but
+    /// tolerated as Option: a NULL simply fails corroboration (fail-safe),
+    /// never faults the page.
+    #[serde(default)]
+    identity: Option<String>,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    /// TEXT NOT NULL in the schema, but tolerated as Option — a NULL must
+    /// degrade to `null` on the wire, never fault the whole page.
+    #[serde(rename = "opponentIdentity", default)]
+    opponent_identity: Option<String>,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "covRecoveryHeight", default)]
+    cov_recovery_height: Option<f64>,
+    /// The marker's identity-signature push — nullable in the schema.
+    #[serde(rename = "sigHex", default)]
+    sig_hex: Option<String>,
+    /// v2 seat-binding columns of the REPRESENTATIVE marker — NULL on a v1
+    /// marker, which is what production files first (so these are usually
+    /// NULL; the pot's real v2 marker arrives through the candidate query).
+    #[serde(rename = "seatSettlePubkey", default)]
+    seat_settle_pubkey: Option<String>,
+    #[serde(rename = "seatSigHex", default)]
+    seat_sig_hex: Option<String>,
+    /// The pot's DECODED committed settle keys (#284) — the free membership
+    /// pre-filter + the keyed candidate query's binds. NULL for join-miss
+    /// and bare/legacy pots.
+    #[serde(rename = "covPubA", default)]
+    cov_pub_a: Option<String>,
+    #[serde(rename = "covPubB", default)]
+    cov_pub_b: Option<String>,
+    spent: Option<f64>,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: Option<f64>,
+}
+
+impl LiveViewRowD1 {
+    fn into_row(self) -> crate::live_view::LiveViewRow {
+        crate::live_view::LiveViewRow {
+            identity: self.identity.unwrap_or_default(),
+            game_id: self.game_id,
+            pot_txid: self.pot_txid,
+            pot_vout: self.pot_vout as u32,
+            opponent_identity: self.opponent_identity,
+            marker_recovery_height: self.recovery_height as u32,
+            cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
+            identity_sig_hex: self.sig_hex,
+            seat_settle_pubkey: self.seat_settle_pubkey,
+            seat_sig_hex: self.seat_sig_hex,
+            cov_pub_a: self.cov_pub_a,
+            cov_pub_b: self.cov_pub_b,
+            spent: self.spent.map(|v| v != 0.0),
+            spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
+        }
+    }
+}
+
+/// Race a future against a soft wall-clock timeout — the tower's own #272
+/// `with_timeout` idiom (`worker::Delay` is a `setTimeout` future). `Some`
+/// if `fut` resolved first, `None` on timeout. Used to BOUND each tower
+/// `/case` fetch so a wedged tower degrades `/live-view` by seconds (cases
+/// null), never stalls it.
+async fn with_timeout<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
+    use futures_util::future::Either;
+    let delay = worker::Delay::from(core::time::Duration::from_millis(ms));
+    futures_util::pin_mut!(fut, delay);
+    match futures_util::future::select(fut, delay).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(((), _)) => None,
+    }
+}
+
+/// Fetch + shape ONE tower case through the `TOWER` service binding
+/// (`GET /case/:gameId` — the tower front door's PUBLIC no-auth view; only
+/// the path matters, the host is resolved by the binding), bounded by
+/// [`crate::live_view::CASE_FETCH_TIMEOUT_MS`]. EVERY fault — transport,
+/// timeout, non-200 (including the tower's 404 "no case"), oversized or
+/// malformed body — is `None` (= `case: null` under a non-success
+/// `caseSource`), never an error the route surfaces: the D1 half must serve
+/// regardless (the `/results` claims-fault posture).
+///
+/// The body is bounded BEFORE it is buffered (MEDIUM-3): a `Content-Length`
+/// already over [`crate::live_view::CASE_BODY_MAX_BYTES`] rejects without
+/// reading a byte, and the read itself streams under a hard byte budget
+/// ([`crate::live_view::push_bounded`]) — 8 concurrent multi-MB bodies from
+/// a wedged/compromised tower can therefore never approach the Worker's
+/// memory limit and take the always-serving D1 half down with them.
+/// `parse_case_body`'s own length check stays as the belt (a body of
+/// exactly the ceiling is still accepted, +1 rejected).
+async fn tower_case_fetch(
+    svc: &worker::Fetcher,
+    game_id: &str,
+) -> Option<crate::live_view::CaseView> {
+    // Belt (LOW-8): this function interpolates `game_id` into a URL, so it
+    // re-asserts the txid shape itself instead of trusting every caller to
+    // have run `fanout_targets` first.
+    if !valid_txid(game_id) {
+        console_warn!("[live-view] tower case fetch refused: malformed gameId");
+        return None;
+    }
+    let url = format!("https://tower/case/{game_id}");
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    let headers = Headers::new();
+    let _ = headers.set("Accept", "application/json");
+    init.with_headers(headers);
+    let fut = async {
+        let mut resp = match svc.fetch(url.as_str(), Some(init)).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                console_warn!("[live-view] tower /case/{game_id} fetch failed: {e}");
+                return None;
+            },
+        };
+        let status = resp.status_code();
+        // MEDIUM-3(a): a declared over-budget body is rejected pre-read.
+        if let Ok(Some(cl)) = resp.headers().get("Content-Length") {
+            if crate::live_view::content_length_over_budget(Some(&cl)) {
+                console_warn!(
+                    "[live-view] tower /case/{game_id} Content-Length {cl} over budget (case omitted)"
+                );
+                return None;
+            }
+        }
+        // MEDIUM-3(b): stream the body under a hard byte budget — never
+        // `text().await` (which buffers the ENTIRE body first). Every
+        // DECISION lives in `live_view::BodyAccumulator` (unit-tested
+        // through `read_case_body`); this loop is only the stream. Aborting
+        // mid-read drops the ReadableStream, so nothing past the ceiling is
+        // ever held in memory.
+        let mut stream = match resp.stream() {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[live-view] tower /case/{game_id} body stream failed: {e}");
+                return None;
+            },
+        };
+        let mut acc = crate::live_view::BodyAccumulator::new(crate::live_view::CASE_BODY_MAX_BYTES);
+        {
+            use futures_util::StreamExt;
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        if !acc.push(&chunk) {
+                            console_warn!(
+                                "[live-view] tower /case/{game_id} body exceeded {} bytes (case omitted)",
+                                crate::live_view::CASE_BODY_MAX_BYTES
+                            );
+                            return None;
+                        }
+                    },
+                    Some(Err(e)) => {
+                        console_warn!("[live-view] tower /case/{game_id} body read failed: {e}");
+                        return None;
+                    },
+                    None => break,
+                }
+            }
+        }
+        acc.finish(status)
+    };
+    match with_timeout(fut, crate::live_view::CASE_FETCH_TIMEOUT_MS).await {
+        Some(shaped) => shaped,
+        None => {
+            console_warn!(
+                "[live-view] tower /case/{game_id} timed out after {}ms (case omitted)",
+                crate::live_view::CASE_FETCH_TIMEOUT_MS
+            );
+            None
+        },
+    }
+}
+
+/// The `/live-view` CANDIDATE fetch (HIGH-A): the caller's v2 seat-binding
+/// markers for the page's pots, so corroboration examines the POT's markers
+/// instead of the window representative — which production guarantees is the
+/// V1 row (v1 is published before v2, `createdAt` is second-granular, and
+/// the representative is the oldest). Two bounded queries, both best-effort:
+///
+/// - pots with DECODED committed keys → [`crate::results::seat_markers_sql`]
+///   verbatim (the proven `/results` query: per-`(pot, key)` slot window,
+///   membership enforced IN SQL, chunked at
+///   [`crate::results::SEAT_MARKERS_CHUNK_POTS`]);
+/// - pots without them (join miss / bare lock) →
+///   [`crate::live_view::keyless_candidates_sql`] (per-outpoint window,
+///   identity-bound), chunked at
+///   [`crate::live_view::LIVE_VIEW_CANDIDATE_CHUNK_POTS`].
+///
+/// BEST-EFFORT by construction (the `/results` posture): a bind or query
+/// fault CONTINUES to the next chunk and returns what it has, so a D1 error
+/// never 5xxs and never empties the row list. It DOES set the returned
+/// `faulted` flag, so the rows are labeled `corroboration-unavailable`
+/// ("we could not look") instead of `marker-unverified` ("nothing verified")
+/// — R2-2: a fault must never be reported as a property of the data.
+/// Chunking + plan construction live in
+/// [`crate::live_view::candidate_plan`] so the whole delivery path is
+/// testable without a Worker.
+async fn live_view_candidates(
+    db: &worker::D1Database,
+    identity_lc: &str,
+    rows: &[crate::live_view::LiveViewRow],
+) -> (
+    std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>>,
+    bool,
+) {
+    let mut out: std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> =
+        std::collections::HashMap::new();
+    let mut faulted = false;
+    let plan = crate::live_view::candidate_plan(rows);
+
+    let collect = |fetched: Vec<SeatMarkerRowD1>,
+                   out: &mut std::collections::HashMap<
+        (String, u32),
+        Vec<crate::results::SeatMarkerRow>,
+    >| {
+        for r in fetched {
+            let (Some(pk), Some(seat_sig), Some(id_sig)) =
+                (r.seat_settle_pubkey, r.seat_sig_hex, r.sig_hex)
+            else {
+                continue; // a v1 row can never corroborate
+            };
+            out.entry((r.pot_txid.to_ascii_lowercase(), r.pot_vout as u32))
+                .or_default()
+                .push(crate::results::SeatMarkerRow {
+                    identity: r.identity.to_ascii_lowercase(),
+                    opponent_identity: r.opponent_identity.to_ascii_lowercase(),
+                    game_id: r.game_id.to_ascii_lowercase(),
+                    pot_txid: r.pot_txid.to_ascii_lowercase(),
+                    pot_vout: r.pot_vout as u32,
+                    recovery_height: r.recovery_height as u32,
+                    seat_settle_pubkey: pk.to_ascii_lowercase(),
+                    seat_sig_hex: seat_sig.to_ascii_lowercase(),
+                    identity_sig_hex: id_sig.to_ascii_lowercase(),
+                });
+        }
+    };
+
+    for chunk in &plan.keyed {
+        let sql = crate::results::seat_markers_sql(chunk.len());
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
+        for b in chunk {
+            binds.push(JsValue::from_str(&b.pot_txid));
+            binds.push(JsValue::from_f64(f64::from(b.pot_vout)));
+            binds.push(JsValue::from_str(&b.pub_a_hex));
+            binds.push(JsValue::from_str(&b.pub_b_hex));
+        }
+        let stmt = match db.prepare(sql).bind(&binds) {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[live-view] keyed candidate bind failed (chunk omitted): {e}");
+                faulted = true;
+                continue;
+            },
+        };
+        match stmt.all().await.and_then(|r| r.results::<SeatMarkerRowD1>()) {
+            Ok(fetched) => collect(fetched, &mut out),
+            Err(e) => {
+                console_warn!("[live-view] keyed candidate query failed (partial): {e}");
+                faulted = true;
+            },
+        }
+    }
+
+    for chunk in &plan.keyless {
+        let sql = crate::live_view::keyless_candidates_sql(chunk.len());
+        let mut binds: Vec<JsValue> = Vec::with_capacity(crate::live_view::keyless_chunk_binds(chunk.len()));
+        binds.push(JsValue::from_str(identity_lc));
+        for (txid, vout) in chunk {
+            binds.push(JsValue::from_str(txid));
+            binds.push(JsValue::from_f64(f64::from(*vout)));
+        }
+        let stmt = match db.prepare(sql).bind(&binds) {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[live-view] keyless candidate bind failed (chunk omitted): {e}");
+                faulted = true;
+                continue;
+            },
+        };
+        match stmt.all().await.and_then(|r| r.results::<SeatMarkerRowD1>()) {
+            Ok(fetched) => collect(fetched, &mut out),
+            Err(e) => {
+                console_warn!("[live-view] keyless candidate query failed (partial): {e}");
+                faulted = true;
+            },
+        }
+    }
+    (out, faulted)
+}
+
+/// `GET /live-view?identity=<66-hex>` — the per-identity LIVE-HAND view
+/// (bsv-low #252 stage 2a step 3): every pot the identity is a party to with
+/// NO confirmed spend (unspent, unconfirmed-spend, or never-indexed — a
+/// confirmed spend is `/refund-view`/`/results`' story), with the
+/// `/refund-view` gate math, per-POT marker CORROBORATION (a SECOND bounded
+/// candidate query — the pot's v2 markers, not the window representative
+/// which production guarantees is the v1 row; `markerSource` /
+/// `opponentIdentitySource`), and a BOUNDED tower-case fan-out: at most
+/// [`crate::live_view::LIVE_VIEW_CASE_FANOUT_CAP`] corroborated gameIds
+/// (quality-selected — known pots first, never raw window position) get the
+/// tower's public `GET /case/:gameId` (shaped + validated subset). Success
+/// is tagged `caseSource: "tower-by-gameid-unverified"` with the fetched
+/// `caseGameId` served alongside — the tower's answer for that gameId, NOT
+/// a verified case↔pot binding; ANY fault/timeout/cap keeps `case: null`
+/// under an honest non-success tag — unknown, never "no case". Full honesty
+/// model: `live_view.rs` module docs.
+///
+/// Fail-safe shape mirrors `/refund-view`: a missing/invalid identity is an
+/// EMPTY 200 result; a D1 fault is a 503 (a fault is NEVER an empty "no
+/// live hands" answer); a chaintracks fault only degrades `tip`/gate
+/// fields; a tower fault only degrades `case`. EVERY exit — including URL
+/// and bind faults — goes through `json_response` (wildcard CORS +
+/// `no-store`; a default worker error response would carry neither). ONE
+/// bounded D1 query ([`crate::live_view::LIVE_VIEW_MAX_ROWS`] pots, one
+/// identity bind, no BLOBs) + at most
+/// [`crate::live_view::LIVE_VIEW_CASE_FANOUT_CAP`] concurrent bounded
+/// subrequests, run CONCURRENTLY with the (also bounded) chaintracks tip
+/// hop — the added latency is `max(tip, cases)`, not `tip + cases`.
+pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    // LOW-7: `?` here would escape the handler and produce a default error
+    // response with neither wildcard CORS nor `no-store`.
+    let url = match req.url() {
+        Ok(u) => u,
+        Err(e) => {
+            console_warn!("[live-view] request URL unavailable: {e}");
+            return json_error("request url unavailable", 503);
+        },
+    };
+    let identity = url
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let identity_lc = identity.to_ascii_lowercase();
+
+    if !crate::logic::valid_identity(&identity_lc) {
+        return json_response(crate::live_view::live_view_body(&identity_lc, None, &[]), 200);
+    }
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[live-view] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        },
+    };
+
+    // LOW-7: same rule for the bind fault — through json_error, never `?`.
+    let stmt = match db
+        .prepare(crate::live_view::live_view_sql())
+        .bind(&[JsValue::from_str(&identity_lc)])
+    {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            console_warn!("[live-view] statement bind failed: {e}");
+            return json_error("database query failed", 503);
+        },
+    };
+    let rows: Vec<crate::live_view::LiveViewRow> =
+        match stmt.all().await.and_then(|r| r.results::<LiveViewRowD1>()) {
+            Ok(rows) => rows.into_iter().map(LiveViewRowD1::into_row).collect(),
+            Err(e) => {
+                console_warn!("[live-view] potparty join query failed: {e}");
+                return json_error("database query failed", 503);
+            },
+        };
+
+    // LOW-6: the tip hop is BOUNDED (same with_timeout idiom as the case
+    // fetches — an untimed await here would let a wedged chaintracks stall
+    // the whole route) and runs CONCURRENTLY with the candidate query +
+    // fan-out. Either fault degrades its own fields only.
+    let tip_fut = async {
+        match with_timeout(
+            chaintracks_present_height(&ctx, "live-view"),
+            crate::live_view::TIP_FETCH_TIMEOUT_MS,
+        )
+        .await
+        {
+            Some(res) => res.ok(), // inner faults already logged + mapped
+            None => {
+                console_warn!(
+                    "[live-view] chaintracks tip timed out after {}ms (tip null)",
+                    crate::live_view::TIP_FETCH_TIMEOUT_MS
+                );
+                None
+            },
+        }
+    };
+    // HIGH-A: corroborate each POT from its OWN v2 candidate markers (the
+    // second bounded query), then choose fan-out targets by QUALITY from the
+    // corroborated pots — known pots first, never raw window position.
+    let cases_fut = async {
+        let (candidates, faulted) = live_view_candidates(&db, &identity_lc, &rows).await;
+        let mut corr = crate::live_view::corroborate_rows(&identity_lc, &rows, &candidates);
+        // R2-2: a candidate-query fault is "we could not look", labeled
+        // distinctly — never reported as a property of the marker data.
+        corr.unavailable = faulted;
+        let targets = crate::live_view::fanout_targets(&rows, &corr.claims);
+        if targets.is_empty() {
+            return (corr, Vec::new(), std::collections::HashMap::new());
+        }
+        match ctx.env.service("TOWER") {
+            Ok(svc) => {
+                let svc_ref = &svc;
+                // `run_fanout` returns the EFFECTIVE list, so apply_cases can
+                // only ever label targets that were really asked (LOW-F).
+                let (effective, fetched) =
+                    crate::live_view::run_fanout(&targets, move |g: String| async move {
+                        tower_case_fetch(svc_ref, &g).await
+                    })
+                    .await;
+                (corr, effective, fetched)
+            },
+            Err(e) => {
+                // The SELECTED targets are then tagged "tower-unavailable"
+                // (empty fetched map): we should have asked and could not —
+                // honest unknown, never "no case".
+                console_warn!("[live-view] TOWER binding unavailable (cases omitted): {e}");
+                (corr, targets, std::collections::HashMap::new())
+            },
+        }
+    };
+    let (tip, (corr, targets, fetched)) = futures_util::future::join(tip_fut, cases_fut).await;
+
+    let mut entries = crate::live_view::assemble_live_view(rows, &corr, tip);
+    // Unconditional — apply_cases stamps EVERY row's provenance tag, even
+    // when nothing was targeted or fetched.
+    crate::live_view::apply_cases(&mut entries, &targets, &fetched);
+
+    json_response(crate::live_view::live_view_body(&identity_lc, tip, &entries), 200)
+}
+
 // ── /spent-any — server-side legacy outpoint reads (bsv-low #227 addendum) ──
 
 /// One cached `/spent-any` row: the decision fields, without the echo key.
@@ -1996,5 +2449,85 @@ mod tests {
         assert_eq!(r.verdict_txid, None);
         assert_eq!(r.spent_height, None);
         assert!(!r.backup_marker_present);
+    }
+
+    /// `/live-view`'s D1-row → host-row mapping, field by field — same
+    /// discipline as the refund-view test above (every value DISTINCT so a
+    /// swapped-field bug fails; the NULL pot side maps to None, never a
+    /// fabricated fact).
+    #[test]
+    fn live_view_d1_row_maps_every_field_to_the_right_slot() {
+        let full: LiveViewRowD1 = serde_json::from_value(serde_json::json!({
+            "identity": "me-1",
+            "gameId": "game-1",
+            "potTxid": "pot-1",
+            "potVout": 2.0,
+            "opponentIdentity": "opp-1",
+            "recoveryHeight": 900_123.0,
+            "covRecoveryHeight": 900_200.0,
+            "sigHex": "idsig-1",
+            "seatSettlePubkey": "settlepk-1",
+            "seatSigHex": "seatsig-1",
+            "covPubA": "covpuba-1",
+            "covPubB": "covpubb-1",
+            "spent": 1.0,
+            "spendingTxid": "spender-1",
+            "spentConfirmed": 0.0,
+        }))
+        .expect("deserialize D1-shaped row");
+        let r = full.into_row();
+        assert_eq!(r.identity, "me-1");
+        assert_eq!(r.game_id, "game-1");
+        assert_eq!(r.pot_txid, "pot-1");
+        assert_eq!(r.pot_vout, 2);
+        assert_eq!(r.opponent_identity.as_deref(), Some("opp-1"));
+        assert_eq!(r.marker_recovery_height, 900_123);
+        assert_eq!(r.cov_recovery_height, Some(900_200));
+        assert_eq!(r.identity_sig_hex.as_deref(), Some("idsig-1"));
+        assert_eq!(r.seat_settle_pubkey.as_deref(), Some("settlepk-1"));
+        assert_eq!(r.seat_sig_hex.as_deref(), Some("seatsig-1"));
+        assert_eq!(r.cov_pub_a.as_deref(), Some("covpuba-1"));
+        assert_eq!(r.cov_pub_b.as_deref(), Some("covpubb-1"));
+        assert_eq!(r.spent, Some(true));
+        assert_eq!(r.spending_txid.as_deref(), Some("spender-1"));
+        assert_eq!(r.spent_confirmed, Some(false), "0.0 maps to Some(false), not None");
+
+        let sparse: LiveViewRowD1 = serde_json::from_value(serde_json::json!({
+            "identity": null,
+            "gameId": "game-2",
+            "potTxid": "pot-2",
+            "potVout": 0.0,
+            "opponentIdentity": null,
+            "recoveryHeight": 0.0,
+            "covRecoveryHeight": null,
+            "sigHex": null,
+            "seatSettlePubkey": null,
+            "seatSigHex": null,
+            "covPubA": null,
+            "covPubB": null,
+            "spent": null,
+            "spendingTxid": null,
+            "spentConfirmed": null,
+        }))
+        .expect("deserialize sparse row");
+        let r = sparse.into_row();
+        assert_eq!(r.identity, "", "NULL identity degrades (fails corroboration), never faults");
+        assert_eq!(r.opponent_identity, None);
+        assert_eq!(r.cov_recovery_height, None);
+        assert_eq!(r.identity_sig_hex, None);
+        assert_eq!(r.seat_settle_pubkey, None);
+        assert_eq!(r.seat_sig_hex, None);
+        assert_eq!(r.cov_pub_a, None);
+        assert_eq!(r.cov_pub_b, None);
+        assert_eq!(r.spent, None);
+        assert_eq!(r.spending_txid, None);
+        assert_eq!(r.spent_confirmed, None);
+        // A v1/sparse marker row contributes NO candidate of its own (the
+        // pot's real v2 marker must come from the candidate query — HIGH-A),
+        // and a keyless row lands in the keyless half of the plan.
+        assert!(r.own_marker().is_none());
+        let plan = crate::live_view::candidate_plan(std::slice::from_ref(&r));
+        assert!(plan.keyed.is_empty());
+        assert_eq!(plan.keyless, vec![vec![(r.pot_txid.to_ascii_lowercase(), 0)]]);
     }
 }

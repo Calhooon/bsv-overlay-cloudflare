@@ -208,16 +208,26 @@ impl RefundViewRow {
         PotVerdict::from_wire(v)
     }
 
-    /// The recovery height this view SERVES: the covenant-committed value
-    /// when decoded (chain truth), else the caller's own marker value
-    /// (hint), each range-checked — 0 or a timestamp-range value is `None`
-    /// (no fake countdown).
+    /// The recovery height this view SERVES — see the free
+    /// [`served_recovery_height`] (shared with `/live-view`).
     pub fn served_recovery_height(&self) -> Option<u64> {
-        let valid = |h: u64| (h > 0 && h < u64::from(LOCKTIME_THRESHOLD)).then_some(h);
-        self.cov_recovery_height
-            .and_then(valid)
-            .or_else(|| valid(u64::from(self.marker_recovery_height)))
+        served_recovery_height(self.cov_recovery_height, self.marker_recovery_height)
     }
+}
+
+/// The recovery height a per-identity view SERVES: the covenant-committed
+/// value when decoded (chain truth), else the caller's own marker value
+/// (hint), each range-checked — 0 or a timestamp-range value is `None` (no
+/// fake countdown). Shared by `/refund-view` and `/live-view` so the two
+/// surfaces can never drift on the sourcing rule.
+pub fn served_recovery_height(
+    cov_recovery_height: Option<u64>,
+    marker_recovery_height: u32,
+) -> Option<u64> {
+    let valid = |h: u64| (h > 0 && h < u64::from(LOCKTIME_THRESHOLD)).then_some(h);
+    cov_recovery_height
+        .and_then(valid)
+        .or_else(|| valid(u64::from(marker_recovery_height)))
 }
 
 /// The `/refund-view` status enum (wire strings per the #252 stage-2 spec).

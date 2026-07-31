@@ -31,6 +31,11 @@ bsv-rs.workspace = true
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"
+# /live-view's bounded tower fan-out: `select` races each service-binding
+# /case fetch against a `worker::Delay` (the tower's #272 with_timeout
+# idiom), `join_all` runs the ≤8 fetches concurrently. std only — no
+# executor, no net; works on wasm32.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Real SQLite (bundled) + the overlay's PRODUCTION migration list, so the
