@@ -384,12 +384,16 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
 fn dust_replays_collapse_to_one_row_per_pot() {
     let conn = production_schema_db();
     let (me, pot) = seed_armed_pot(&conn);
+    // Every replay files a DIFFERENT height so the assertion below can tell
+    // WHICH row won the partition (delta round 2: with identical heights an
+    // ASC→DESC drift in the oldest-representative ORDER BY passed unseen).
     for i in 0..40 {
-        file_party(&conn, &me, &pot, GATE, &format!("txREPLAY{i:03}"), 2_000 + i);
+        file_party(&conn, &me, &pot, GATE + 1_000 + i, &format!("txREPLAY{i:03}"), 2_000 + i);
     }
     let rows = query_rows(&conn, &me);
     assert_eq!(rows.len(), 1, "one pot ⇒ one row, whatever the replay count");
-    // The representative is the OLDEST marker (the honest funding-time one).
+    // The representative is the OLDEST marker (the honest funding-time one) —
+    // the only order an attacker cannot win by simply publishing later.
     assert_eq!(rows[0].marker_recovery_height, GATE as u32);
 }
 
