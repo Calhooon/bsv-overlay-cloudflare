@@ -56,7 +56,10 @@ use std::rc::Rc;
 
 use crate::wallet::client::Wallet;
 use crate::wallet::signer::sign_transaction;
-use crate::wallet::types::{CreateActionOutput, CreateActionRequest, ProcessActionRequest};
+use crate::wallet::types::{
+    AbortActionRequest, AbortActionResult, CreateActionOutput, CreateActionRequest,
+    CreateActionResult, ProcessActionRequest, ProcessActionResult,
+};
 
 /// Wallet-infra endpoint env var. Shared with `crate::wallet::client` so
 /// operators set exactly one variable.
@@ -69,6 +72,59 @@ const AD_TOKEN_VALUE: u64 = 1;
 /// Basket name for our own SHIP/SLAP advertisement UTXOs. Not
 /// user-configurable — `/admin/syncAdvertisements` only knows to look here.
 const AD_BASKET: &str = "overlay advertisements";
+
+/// Native-safe logging shim — mirror of `broadcaster::gate_log`. The #320
+/// rollback tests drive [`CloudflareAdvertiser::create_advertisements_with`]
+/// natively, where a `worker::console_log!` call would abort (js-sys imported
+/// functions cannot be called off-wasm).
+fn ad_log(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("{msg}");
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = msg;
+}
+
+/// The three wallet-infra RPCs the advertisement-issuance flow needs, as a
+/// trait so the #320 defect-2 rollback contract (a post-allocation failure
+/// must `abortAction` the allocated change UTXO) is testable natively: the
+/// tests run the REAL `create_advertisements_with` pipeline — real script
+/// building, real signer, real BEEF assembly — with only the HTTP transport
+/// mocked.
+#[async_trait(?Send)]
+pub(crate) trait AdWalletOps {
+    async fn create_action(
+        &self,
+        req: &CreateActionRequest,
+    ) -> Result<CreateActionResult, &'static str>;
+    async fn process_action(
+        &self,
+        req: &ProcessActionRequest,
+    ) -> Result<ProcessActionResult, &'static str>;
+    async fn abort_action(&self, req: &AbortActionRequest)
+        -> Result<AbortActionResult, &'static str>;
+}
+
+#[async_trait(?Send)]
+impl AdWalletOps for Wallet<'_> {
+    async fn create_action(
+        &self,
+        req: &CreateActionRequest,
+    ) -> Result<CreateActionResult, &'static str> {
+        Wallet::create_action(self, req).await
+    }
+    async fn process_action(
+        &self,
+        req: &ProcessActionRequest,
+    ) -> Result<ProcessActionResult, &'static str> {
+        Wallet::process_action(self, req).await
+    }
+    async fn abort_action(
+        &self,
+        req: &AbortActionRequest,
+    ) -> Result<AbortActionResult, &'static str> {
+        Wallet::abort_action(self, req).await
+    }
+}
 
 /// CF Worker implementation of [`Advertiser`].
 ///
@@ -129,19 +185,47 @@ impl CloudflareAdvertiser {
             .map(|b| format!("{b:02x}"))
             .collect()
     }
-}
 
-#[async_trait(?Send)]
-impl Advertiser for CloudflareAdvertiser {
-    async fn create_advertisements(
+    /// Release the change UTXO a `createAction` allocated for an action that
+    /// can no longer complete (#320 defect 2). Without this, the UTXO stays
+    /// `spent_by=<abandoned_tx>` until wallet-infra's `fail_abandoned` cron
+    /// releases it (>30 min) — observed live as `getBalance` 4607 → 0 after
+    /// one failed sync.
+    ///
+    /// The abort's own outcome must never mask the original failure: both
+    /// are logged, the caller returns the original error either way. An
+    /// `aborted: false` result is fine — it means the action had already
+    /// completed (e.g. a post-`processAction` failure), so there was nothing
+    /// to release.
+    async fn abort_allocated(wallet: &dyn AdWalletOps, reference: &str) {
+        let req = AbortActionRequest {
+            reference: reference.to_string(),
+        };
+        match wallet.abort_action(&req).await {
+            Ok(r) => ad_log(&format!(
+                "advertiser: abort_action ref={reference} aborted={}",
+                r.aborted
+            )),
+            Err(e) => ad_log(&format!(
+                "advertiser: abort_action ref={reference} FAILED {e} — original failure stands"
+            )),
+        }
+    }
+
+    /// The real advertisement-issuance pipeline, with the wallet transport
+    /// injected so the failure/rollback paths are natively testable. The
+    /// [`Advertiser::create_advertisements`] trait method delegates here
+    /// with the production [`Wallet`].
+    async fn create_advertisements_with(
         &self,
         ads: &[AdvertisementData],
+        wallet: &dyn AdWalletOps,
     ) -> Result<TaggedBEEF, AdvertiserError> {
-        worker::console_log!(
+        ad_log(&format!(
             "advertiser.create_advertisements: n={} hosting_url={}",
             ads.len(),
             self.hosting_url
-        );
+        ));
         if ads.is_empty() {
             // Engine's caller already guards this (`if !all_to_create.is_empty()`),
             // but defence-in-depth: a zero-output createAction would be
@@ -194,11 +278,6 @@ impl Advertiser for CloudflareAdvertiser {
             topics_set.insert(topic.to_string());
         }
 
-        // Build a Wallet scoped to this call. Same per-call-client pattern
-        // as bsv-storage-cloudflare's `Wallet::from_env` — the BRC-103
-        // session state is mutated per RPC and can't safely cross calls.
-        let wallet = Wallet::new(self.private_key.clone(), self.wallet_storage_url.clone());
-
         // createAction: unsigned template + selected P2PKH change inputs.
         let create_req = CreateActionRequest {
             outputs,
@@ -207,68 +286,86 @@ impl Advertiser for CloudflareAdvertiser {
             description: "SHIP/SLAP advertisement issuance".to_string(),
             randomize_outputs: false,
         };
-        worker::console_log!(
+        ad_log(&format!(
             "advertiser: createAction outputs={} wallet_url={}",
             create_req.outputs.len(),
             self.wallet_storage_url
-        );
+        ));
         let template = wallet
             .create_action(&create_req)
             .await
             .map_err(|e| AdvertiserError::CreationFailed(format!("createAction: {e}")))?;
-        worker::console_log!(
+        ad_log(&format!(
             "advertiser: createAction OK inputs={} outputs={} ref={}",
             template.inputs.len(),
             template.outputs.len(),
             template.reference
-        );
+        ));
 
-        // Sign P2PKH change inputs locally.
-        let signed = sign_transaction(&template, &self.private_key).map_err(|e| {
-            worker::console_log!("advertiser: sign_transaction FAILED {e:?}");
-            AdvertiserError::CreationFailed(format!("sign: {e:?}"))
-        })?;
-        worker::console_log!(
-            "advertiser: sign_transaction OK txid={} raw_tx_len={}",
-            signed.txid,
-            signed.raw_tx.len()
-        );
+        // From here on a change UTXO is allocated to `template.reference`.
+        // Every failure below MUST release it via `abort_allocated` before
+        // propagating (#320 defect 2) — the `Err` cannot early-return out of
+        // this block without passing through the rollback match below.
+        let pipeline: Result<TaggedBEEF, AdvertiserError> = async {
+            // Sign P2PKH change inputs locally.
+            let signed = sign_transaction(&template, &self.private_key).map_err(|e| {
+                ad_log(&format!("advertiser: sign_transaction FAILED {e:?}"));
+                AdvertiserError::CreationFailed(format!("sign: {e:?}"))
+            })?;
+            ad_log(&format!(
+                "advertiser: sign_transaction OK txid={} raw_tx_len={}",
+                signed.txid,
+                signed.raw_tx.len()
+            ));
 
-        // processAction: record + broadcast via ARC.
-        let process_req = ProcessActionRequest {
-            is_new_tx: true,
-            is_send_with: false,
-            is_no_send: false,
-            is_delayed: false,
-            reference: Some(template.reference.clone()),
-            txid: Some(signed.txid.clone()),
-            raw_tx: Some(signed.raw_tx.clone()),
-            send_with: vec![],
+            // processAction: record + broadcast via ARC.
+            let process_req = ProcessActionRequest {
+                is_new_tx: true,
+                is_send_with: false,
+                is_no_send: false,
+                is_delayed: false,
+                reference: Some(template.reference.clone()),
+                txid: Some(signed.txid.clone()),
+                raw_tx: Some(signed.raw_tx.clone()),
+                send_with: vec![],
+            };
+            wallet.process_action(&process_req).await.map_err(|e| {
+                ad_log(&format!("advertiser: processAction FAILED {e}"));
+                AdvertiserError::CreationFailed(format!("processAction: {e}"))
+            })?;
+            ad_log("advertiser: processAction OK");
+
+            // Wrap the signed tx + its input ancestry in an AtomicBEEF.
+            // `Engine::submit` will run tm_ship/tm_slap over this BEEF.
+            let mut beef = Beef::from_binary(&template.input_beef).map_err(|e| {
+                ad_log(&format!("advertiser: Beef::from_binary FAILED {e}"));
+                AdvertiserError::CreationFailed(format!("Beef::from_binary: {e}"))
+            })?;
+            beef.merge_raw_tx(signed.raw_tx.clone(), None);
+            let atomic_beef = beef.to_binary_atomic(&signed.txid).map_err(|e| {
+                ad_log(&format!("advertiser: to_binary_atomic FAILED {e}"));
+                AdvertiserError::CreationFailed(format!("to_binary_atomic: {e}"))
+            })?;
+            ad_log(&format!(
+                "advertiser: AtomicBEEF built {} bytes topics={:?}",
+                atomic_beef.len(),
+                topics_set
+            ));
+
+            Ok(TaggedBEEF::new(
+                atomic_beef,
+                topics_set.into_iter().collect(),
+            ))
+        }
+        .await;
+
+        let tagged = match pipeline {
+            Ok(t) => t,
+            Err(e) => {
+                Self::abort_allocated(wallet, &template.reference).await;
+                return Err(e);
+            }
         };
-        wallet.process_action(&process_req).await.map_err(|e| {
-            worker::console_log!("advertiser: processAction FAILED {e}");
-            AdvertiserError::CreationFailed(format!("processAction: {e}"))
-        })?;
-        worker::console_log!("advertiser: processAction OK");
-
-        // Wrap the signed tx + its input ancestry in an AtomicBEEF.
-        // `Engine::submit` will run tm_ship/tm_slap over this BEEF.
-        let mut beef = Beef::from_binary(&template.input_beef).map_err(|e| {
-            worker::console_log!("advertiser: Beef::from_binary FAILED {e}");
-            AdvertiserError::CreationFailed(format!("Beef::from_binary: {e}"))
-        })?;
-        beef.merge_raw_tx(signed.raw_tx.clone(), None);
-        let atomic_beef = beef.to_binary_atomic(&signed.txid).map_err(|e| {
-            worker::console_log!("advertiser: to_binary_atomic FAILED {e}");
-            AdvertiserError::CreationFailed(format!("to_binary_atomic: {e}"))
-        })?;
-        worker::console_log!(
-            "advertiser: AtomicBEEF built {} bytes topics={:?}",
-            atomic_beef.len(),
-            topics_set
-        );
-
-        let tagged = TaggedBEEF::new(atomic_beef, topics_set.into_iter().collect());
 
         // God-tier B: fan out our SHIP/SLAP self-advertisements to every
         // mainnet tm_X peer discovered via DEFAULT_SLAP_TRACKERS. Without
@@ -286,6 +383,20 @@ impl Advertiser for CloudflareAdvertiser {
         crate::mainnet_fanout::fan_out(&tagged, Some(&self.hosting_url)).await;
 
         Ok(tagged)
+    }
+}
+
+#[async_trait(?Send)]
+impl Advertiser for CloudflareAdvertiser {
+    async fn create_advertisements(
+        &self,
+        ads: &[AdvertisementData],
+    ) -> Result<TaggedBEEF, AdvertiserError> {
+        // Build a Wallet scoped to this call. Same per-call-client pattern
+        // as bsv-storage-cloudflare's `Wallet::from_env` — the BRC-103
+        // session state is mutated per RPC and can't safely cross calls.
+        let wallet = Wallet::new(self.private_key.clone(), self.wallet_storage_url.clone());
+        self.create_advertisements_with(ads, &wallet).await
     }
 
     async fn find_all_advertisements(
@@ -360,5 +471,237 @@ impl Advertiser for CloudflareAdvertiser {
     fn parse_advertisement(&self, output_script: &[u8]) -> Option<Advertisement> {
         // Reuse the stock parser — field layout is identical.
         self.inner.parse_advertisement(output_script)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// #320 defect 2 — rollback contract tests
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::wallet::types::{UnsignedInput, UnsignedOutput};
+    use overlay_discovery::ship::storage::MemorySHIPStorage;
+    use overlay_discovery::slap::storage::MemorySLAPStorage;
+    use std::cell::RefCell;
+
+    // BIP-32 test-vector keys — same convention as `wallet::signer::tests`.
+    const ADMIN_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const OTHER_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+    const TEST_REF: &str = "test-ref-320";
+
+    fn p2pkh_hex_for_key(key: &PrivateKey) -> String {
+        let hash = key.public_key().hash160();
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(&hash);
+        s.extend_from_slice(&[0x88, 0xac]);
+        s.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn advertiser() -> CloudflareAdvertiser {
+        CloudflareAdvertiser::new(
+            PrivateKey::from_hex(ADMIN_KEY_HEX).unwrap(),
+            "https://ads.example.com".to_string(),
+            "https://wallet.invalid".to_string(),
+            Rc::new(MemorySHIPStorage::new()),
+            Rc::new(MemorySLAPStorage::new()),
+        )
+        .expect("valid hosting url")
+    }
+
+    /// A createAction template whose sole input is a plain P2PKH lock to
+    /// `lock_key` — signable by the admin key iff `lock_key` IS the admin
+    /// key. `input_beef` is caller-chosen so the BEEF-assembly failure path
+    /// is reachable through the real pipeline.
+    fn template_locked_to(lock_key: &PrivateKey, input_beef: Vec<u8>) -> CreateActionResult {
+        let locking_hex = p2pkh_hex_for_key(lock_key);
+        CreateActionResult {
+            input_beef,
+            inputs: vec![UnsignedInput {
+                vin: 0,
+                source_txid: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+                    .to_string(),
+                source_vout: 0,
+                source_satoshis: 5_000,
+                source_locking_script: locking_hex.clone(),
+                source_transaction: None,
+                derivation_prefix: None,
+                derivation_suffix: None,
+                sender_identity_key: None,
+            }],
+            outputs: vec![UnsignedOutput {
+                vout: 0,
+                satoshis: 1,
+                locking_script: locking_hex,
+                derivation_suffix: None,
+            }],
+            version: 1,
+            lock_time: 0,
+            reference: TEST_REF.to_string(),
+            derivation_prefix: String::new(),
+        }
+    }
+
+    /// Mock of the wallet-infra transport ONLY — everything else in the
+    /// pipeline (script building, signing, BEEF assembly) is the real
+    /// production code, per the "test through the real producer path" rule.
+    struct MockWallet {
+        template: CreateActionResult,
+        create_fails: bool,
+        process_fails: bool,
+        abort_fails: bool,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl MockWallet {
+        fn new(template: CreateActionResult) -> Self {
+            Self {
+                template,
+                create_fails: false,
+                process_fails: false,
+                abort_fails: false,
+                calls: RefCell::new(vec![]),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+        fn aborted_refs(&self) -> Vec<String> {
+            self.calls()
+                .iter()
+                .filter_map(|c| c.strip_prefix("abortAction:").map(str::to_string))
+                .collect()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AdWalletOps for MockWallet {
+        async fn create_action(
+            &self,
+            _req: &CreateActionRequest,
+        ) -> Result<CreateActionResult, &'static str> {
+            self.calls.borrow_mut().push("createAction".into());
+            if self.create_fails {
+                return Err("mock createAction refused");
+            }
+            Ok(self.template.clone())
+        }
+        async fn process_action(
+            &self,
+            _req: &ProcessActionRequest,
+        ) -> Result<ProcessActionResult, &'static str> {
+            self.calls.borrow_mut().push("processAction".into());
+            if self.process_fails {
+                return Err("mock processAction refused");
+            }
+            Ok(ProcessActionResult {
+                send_with_results: None,
+                not_delayed_results: None,
+                log: None,
+            })
+        }
+        async fn abort_action(
+            &self,
+            req: &AbortActionRequest,
+        ) -> Result<AbortActionResult, &'static str> {
+            self.calls
+                .borrow_mut()
+                .push(format!("abortAction:{}", req.reference));
+            if self.abort_fails {
+                return Err("mock abortAction refused");
+            }
+            Ok(AbortActionResult { aborted: true })
+        }
+    }
+
+    fn one_ad() -> Vec<AdvertisementData> {
+        vec![AdvertisementData {
+            protocol: Protocol::Ship,
+            topic_or_service_name: "tm_test".to_string(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn sign_failure_aborts_the_allocated_action() {
+        // Input locked to a key we don't hold → the REAL signer fails
+        // WrongKey → the allocated change UTXO must be released.
+        let other = PrivateKey::from_hex(OTHER_KEY_HEX).unwrap();
+        let wallet = MockWallet::new(template_locked_to(&other, vec![]));
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("sign must fail for a foreign lock");
+        assert!(format!("{err}").contains("sign"), "err was: {err}");
+        assert_eq!(
+            wallet.aborted_refs(),
+            vec![TEST_REF.to_string()],
+            "a sign failure must abortAction the allocated reference; calls: {:?}",
+            wallet.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_failure_aborts_the_allocated_action() {
+        let admin = PrivateKey::from_hex(ADMIN_KEY_HEX).unwrap();
+        let mut wallet = MockWallet::new(template_locked_to(&admin, vec![]));
+        wallet.process_fails = true;
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("processAction failure must propagate");
+        assert!(format!("{err}").contains("processAction"), "err was: {err}");
+        assert_eq!(wallet.aborted_refs(), vec![TEST_REF.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn beef_assembly_failure_aborts_the_allocated_action() {
+        // processAction succeeds, then Beef::from_binary chokes on garbage
+        // input_beef. The action is completed server-side by then, so the
+        // abort is a safety no-op (`aborted:false` live) — but the contract
+        // is that EVERY post-allocation failure path releases, so the call
+        // must still be made.
+        let admin = PrivateKey::from_hex(ADMIN_KEY_HEX).unwrap();
+        let wallet = MockWallet::new(template_locked_to(&admin, vec![0xde, 0xad]));
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("garbage input_beef must fail BEEF assembly");
+        assert!(format!("{err}").contains("Beef::from_binary"), "err was: {err}");
+        assert_eq!(wallet.aborted_refs(), vec![TEST_REF.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn abort_failure_never_masks_the_original_error() {
+        let other = PrivateKey::from_hex(OTHER_KEY_HEX).unwrap();
+        let mut wallet = MockWallet::new(template_locked_to(&other, vec![]));
+        wallet.abort_fails = true;
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("original sign failure must survive an abort failure");
+        // The surfaced error is the SIGN failure, not the abort's.
+        assert!(format!("{err}").contains("sign"), "err was: {err}");
+        assert!(
+            wallet.calls().iter().any(|c| c.starts_with("abortAction:")),
+            "abort must still have been attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_action_failure_needs_no_abort() {
+        // Nothing was allocated — an abort here would be noise (and live,
+        // a pointless RPC).
+        let admin = PrivateKey::from_hex(ADMIN_KEY_HEX).unwrap();
+        let mut wallet = MockWallet::new(template_locked_to(&admin, vec![]));
+        wallet.create_fails = true;
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("createAction failure must propagate");
+        assert!(format!("{err}").contains("createAction"), "err was: {err}");
+        assert!(wallet.aborted_refs().is_empty());
     }
 }
