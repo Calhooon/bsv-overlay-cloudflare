@@ -467,7 +467,7 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Respon
 
     // Missing / empty / malformed identity → empty result, not an error.
     if !valid_identity(&identity) {
-        return json_response(recovery_view_body(&[], None), 200);
+        return json_response(recovery_view_body(&[], None, false), 200);
     }
 
     let db = match ctx.env.d1("OVERLAY_DB") {
@@ -491,9 +491,9 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Respon
         }
     };
 
-    let entries = assemble_recovery_view(rows);
+    let (entries, truncated) = assemble_recovery_view(rows);
     let tip = chaintracks_present_height(&ctx, "recovery-view").await.ok();
-    json_response(recovery_view_body(&entries, tip), 200)
+    json_response(recovery_view_body(&entries, tip, truncated), 200)
 }
 
 /// `result_markers_v2` row as D1 returns it. `potTxid`/`settleTxid`/
@@ -787,7 +787,13 @@ async fn classify_spent_pots(
     let mut all_pairs: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for s in statuses {
-        if s.spent == Some(true) {
+        // #323 HIGH-3 — CONFIRMED spends only. The overlay's unconfirmed
+        // write path stamps `verdict`/`verdictTxid` while leaving
+        // `spentConfirmed = 0`, so a PARKED spender would mint a real
+        // `PotVerdict` here — which can both CREATE a chain-attributed win
+        // and ERASE an honest claim via `chain_contradicted`. `spent_confirmed`
+        // was already in the struct; it was simply not read.
+        if s.spent == Some(true) && s.spent_confirmed == Some(true) {
             if let Some(spender) = &s.spending_txid {
                 let pot = s.txid.to_ascii_lowercase();
                 if seen.insert(pot.clone()) {
@@ -2002,8 +2008,12 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             Ok(v) => parse_woc_spent_body(&v),
             Err(_) => SpentObservation::Fault,
         },
-        Some((s, _)) if (400..500).contains(&s) => SpentObservation::NotSpent,
-        _ => SpentObservation::Fault,
+        // #323 HIGH-2 — status mapping is PURE and pinned (see
+        // `results::woc_spent_status_observation`). This used to be
+        // `(400..500) => NotSpent`, which swallowed 429 — this repo's
+        // most-documented outage — as "unspent".
+        Some((s, _)) => crate::results::woc_spent_status_observation(s),
+        None => SpentObservation::Fault,
     };
 
     let mut spender_raw_ok = false;

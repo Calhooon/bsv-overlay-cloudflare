@@ -64,7 +64,22 @@ fn h64(seed: u8) -> String {
     format!("{seed:02x}").repeat(32)
 }
 
+/// Insert a pot row whose spend, when present, is CONFIRMED.
+///
+/// `spentConfirmed` is derived from `spent` here DELIBERATELY and is
+/// documented as such: this helper models a settled pot. It used to be the
+/// same silent inference `insert_decoded_pot` carried (#323) — the danger is
+/// not the derivation, it is an UNDOCUMENTED one that leaves callers
+/// believing they exercised a parked row when they never could. The parked
+/// shape (`spent = 1, spentConfirmed = 0`) is exercised end to end against
+/// the production schema by `a_parked_spend_yields_no_verdict_through_the_real_sql`
+/// via `insert_decoded_pot`'s explicit `confirmed` flag; call
+/// [`insert_pot_with`] directly if a NON-decoded parked row is ever needed.
 fn insert_pot(conn: &Connection, txid: &str, created_at: i64, spent: bool) {
+    insert_pot_with(conn, txid, created_at, spent, spent);
+}
+
+fn insert_pot_with(conn: &Connection, txid: &str, created_at: i64, spent: bool, confirmed: bool) {
     conn.execute(
         "INSERT OR IGNORE INTO pot_records \
          (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) \
@@ -73,7 +88,7 @@ fn insert_pot(conn: &Connection, txid: &str, created_at: i64, spent: bool) {
             txid,
             i32::from(spent),
             if spent { Some(h64(0xfe)) } else { None },
-            i32::from(spent),
+            i32::from(confirmed),
             created_at
         ],
     )
@@ -1287,4 +1302,96 @@ fn the_seat_slot_window_is_per_outpoint_not_per_txid() {
         "vout 1 has its OWN slot window — 8 junk rows at vout 0 cannot evict \
          the genuine marker of a DIFFERENT outpoint sharing the txid: {got:?}"
     );
+}
+
+/// #323 — the parked-spender bar, proven END TO END against the PRODUCTION
+/// schema through the real `results_sql()`, not just the pure assembler.
+///
+/// This is the shape that shipped to production on 7 of 8 refunds: a
+/// non-final refund admitted before it mined, so `pot_records` holds
+/// `spent = 1, spentConfirmed = 0` and the pointer names a tx that never
+/// landed. Before #323 no fixture in this suite could even express it
+/// (`insert_pot`/`insert_decoded_pot` both inferred confirmation), so the
+/// bar was unproven against the real SQL + schema.
+#[test]
+fn a_parked_spend_yields_no_verdict_through_the_real_sql() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+
+    // CONTROL: the identical row, CONFIRMED, classifies — so a green
+    // assertion below cannot be an artefact of the fixture never resolving.
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        None,
+        None,
+        Some(800_000),
+        true,
+    );
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(
+        &conn,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
+    let confirmed = assemble_results(
+        &victim,
+        query_results_rows(&conn, &victim),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(confirmed.len(), 1);
+    assert!(
+        confirmed[0].verdict.is_some(),
+        "CONTROL: a confirmed spend must classify, else this test proves nothing"
+    );
+
+    // THE DEFECT SHAPE: a second pot, same bytes, spend NOT confirmed.
+    let conn2 = production_schema_db();
+    insert_decoded_pot(
+        &conn2,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        None,
+        None,
+        None,
+        false, // parked: recorded, never mined
+    );
+    file_marker(&conn2, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(
+        &conn2,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
+    let rows = query_results_rows(&conn2, &victim);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].spent_confirmed,
+        Some(false),
+        "the production schema really does carry an unconfirmed spend"
+    );
+    let parked = assemble_results(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        parked[0].verdict, None,
+        "a parked spender must never yield a verdict through the real SQL"
+    );
+    assert_eq!(parked[0].at_height, None);
+    // The pointer facts still SERVE — surface the attempt, never consume it.
+    assert_eq!(
+        parked[0].settle_txid.as_deref(),
+        Some(ENFORCED_SETTLE_TXID.to_ascii_lowercase().as_str())
+    );
+    assert_eq!(parked[0].spent_confirmed, Some(false));
 }

@@ -447,35 +447,108 @@ pub fn decode_beef_hex(hex_str: &str) -> Option<Vec<u8>> {
 /// spendingTxid write (pot_beefs keys are lowercase). `rowid DESC` breaks
 /// same-second `createdAt` ties in insertion order (mirrors the overlay's
 /// own `list_for_identity`).
-pub fn recovery_view_sql() -> &'static str {
-    "SELECT pp.gameId, pp.potTxid, pp.potVout, pp.recoveryHeight, \
-            pp.opponentIdentity, \
-            r.spent, r.spendingTxid, r.spentConfirmed, \
+/// # Why this is not a plain `ORDER BY … LIMIT` (#323 HIGH-1)
+///
+/// `potparty_records.identity` is ATTACKER-WRITABLE: the overlay admits
+/// those markers by BYTE FORMAT with no signature check, and the production
+/// write is `INSERT OR IGNORE` on the marker OUTPOINT, so every distinct
+/// `(txid, outputIndex)` lands — anyone can file unlimited rows naming
+/// anyone. A naive `ORDER BY pp.createdAt DESC LIMIT n` is therefore a
+/// FLOOD-TO-EVICT primitive: ~`n` fresh dust markers naming the victim take
+/// every slot, and the victim's real pots vanish from their own recovery
+/// view **while the response still looks complete**. That is strictly worse
+/// than the unbounded read it replaced (which was merely noisy — every
+/// honest row was still present), i.e. a self-healing failure traded for a
+/// permanent one on a money-visible surface.
+///
+/// So this mirrors `results_sql`'s three defences verbatim:
+///
+/// 1. **Dedupe in SQL, keeping the OLDEST marker per pot**
+///    (`PARTITION BY pp.potTxid, pp.potVout ORDER BY pp.createdAt ASC` →
+///    `rn = 1`). Oldest-wins is anti-squat: a later marker cannot displace
+///    the original, and one pot can occupy only one slot however many
+///    markers exist for it.
+/// 2. **Rank by the POT's own admission stamp**
+///    (`COALESCE(potCreatedAt, markerCreatedAt) DESC`). `pot_records.createdAt`
+///    is written by the overlay's own admission, so an attacker cannot
+///    backdate or advance it by filing markers — the ordering an attacker
+///    controls is used only as the fallback for pots with no row yet.
+/// 3. **Reserve a quota for unknown pots** (`tier`): rows with no
+///    `pot_records` row are demoted behind every indexed pot EXCEPT for the
+///    newest [`RECOVERY_VIEW_UNKNOWN_QUOTA`], so ghost rows are bounded to a
+///    small reserved slice instead of the whole page, while a real-but-not-
+///    yet-indexed pot (the one a recovering client most needs) is not erased.
+///
+/// The BEEF join sits OUTSIDE the window, on the survivors only, so a flood
+/// can never drag real BLOBs along with it.
+pub fn recovery_view_sql() -> String {
+    // NOTE: any change here must keep the `w.`-qualified outer ORDER BY —
+    // SQLite does not guarantee ordering survives a join otherwise.
+    //
+    // The window takes MAX_ROWS + 1 so the caller can detect truncation
+    // without a second COUNT query (see `assemble_recovery_view`).
+    format!(
+        "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
+            w.recoveryHeight AS recoveryHeight, \
+            w.opponentIdentity AS opponentIdentity, \
+            w.spent AS spent, w.spendingTxid AS spendingTxid, \
+            w.spentConfirmed AS spentConfirmed, \
             hex(b.beef) AS spenderBeef \
-     FROM potparty_records pp \
-     LEFT JOIN pot_records r ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-     LEFT JOIN pot_beefs b ON b.txid = lower(r.spendingTxid) \
-     WHERE pp.identity = ? \
-     ORDER BY pp.createdAt DESC, pp.rowid DESC \
-     LIMIT 400"
+     FROM (SELECT gameId, potTxid, potVout, recoveryHeight, opponentIdentity, \
+              spent, spendingTxid, spentConfirmed, \
+              markerCreatedAt, markerRowid, potCreatedAt, \
+              CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
+       FROM (SELECT gameId, potTxid, potVout, recoveryHeight, opponentIdentity, \
+                spent, spendingTxid, spentConfirmed, \
+                markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                ROW_NUMBER() OVER (PARTITION BY unknownPot \
+                                   ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                            markerCreatedAt DESC, markerRowid DESC) AS potRank \
+         FROM (SELECT pp.gameId AS gameId, pp.potTxid AS potTxid, \
+                  pp.potVout AS potVout, pp.recoveryHeight AS recoveryHeight, \
+                  pp.opponentIdentity AS opponentIdentity, \
+                  r.spent AS spent, r.spendingTxid AS spendingTxid, \
+                  r.spentConfirmed AS spentConfirmed, \
+                  pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
+                  r.createdAt AS potCreatedAt, \
+                  CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                  ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
+                                     ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+           FROM potparty_records pp \
+           LEFT JOIN pot_records r \
+                  ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
+           WHERE pp.identity = ?) \
+         WHERE rn = 1) \
+       ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                markerCreatedAt DESC, markerRowid DESC \
+       LIMIT {probe}) w \
+     LEFT JOIN pot_beefs b ON b.txid = lower(w.spendingTxid) \
+     ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+              w.markerCreatedAt DESC, w.markerRowid DESC",
+        quota = RECOVERY_VIEW_UNKNOWN_QUOTA,
+        probe = RECOVERY_VIEW_MAX_ROWS + 1,
+    )
 }
 
-/// Hard bound on `/recovery-view` MARKER ROWS per request (#323 defect 3).
-/// This is a row cap, not a pot cap: duplicate marker rows for one pot are
-/// collapsed AFTER the read (see [`assemble_recovery_view`]), so the served
-/// entry count is ≤ this. Sized well above [`crate::results::RESULTS_MAX_ROWS`]
-/// (100 distinct pots) precisely BECAUSE the duplicates are counted here —
-/// the audit's worst observed ratio was 18 rows for 12 games (1.5×), so 400
-/// rows leaves generous headroom over a 100-pot recovery while still turning
-/// an unbounded identity-scoped D1 read — one that runs on EVERY app open,
-/// the #255 per-request amplifier class — into a bounded one.
+/// Hard bound on `/recovery-view` DISTINCT POTS served per request (#323).
+/// The SQL dedupes per pot before the window, so this is a pot cap, not a
+/// marker-row cap — a flood of markers for one pot occupies exactly one slot.
 ///
-/// TRUNCATION IS SILENT AT THE SQL LAYER and that is a stated residual: a
-/// caller at the cap cannot tell a full answer from a truncated one. It is
-/// bounded-and-honest-enough today only because the cap is far above any
-/// real identity's marker count; if a real caller ever approaches it, this
-/// needs the `casesTruncated`-style honesty bit `/live-view` carries.
-pub const RECOVERY_VIEW_MAX_ROWS: usize = 400;
+/// Matches [`crate::results::RESULTS_MAX_ROWS`] (100): the two views are
+/// driven by the same `potparty_records` scope for the same identity, so a
+/// caller whose `/results` page is complete has a complete `/recovery-view`
+/// page too.
+pub const RECOVERY_VIEW_MAX_ROWS: usize = 100;
+
+/// How many of the newest pots ABSENT from `pot_records` are promoted into
+/// the main `/recovery-view` tier instead of being demoted behind every
+/// indexed pot. Mirrors [`crate::results::RESULTS_UNKNOWN_POT_QUOTA`] and
+/// exists for the same reason: a strict existence tier silently becomes a
+/// FILTER once `LIMIT` binds, dropping the genuinely fresh pot whose `tm_pot`
+/// admission is still in flight — precisely the pot a recovering client most
+/// needs — while an unbounded promotion would let free, invented-pot rows
+/// occupy the whole page.
+pub const RECOVERY_VIEW_UNKNOWN_QUOTA: usize = 10;
 
 /// One `/recovery-view` joined row, host-typed: the caller's potparty facts
 /// plus the LEFT-JOINed pot-spend status and the spender's stored BEEF. The
@@ -530,19 +603,19 @@ pub struct RecoveryEntry {
 /// returns newest-first). Any beef decode/extract failure degrades that
 /// entry's `spenderRawHex` to null (never a wrong byte) — the same fail-safe
 /// as [`assemble_pots_view`].
-pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> Vec<RecoveryEntry> {
-    // #323 defect 3 — collapse duplicate MARKER rows for one pot.
-    // `potparty_records` is keyed `PRIMARY KEY (txid, outputIndex)` — the
-    // marker's own outpoint — so one identity legitimately holds many rows
-    // for one pot: every republish is a new row, and any third party may
-    // file one (the overlay admits markers by BYTE FORMAT, never by
-    // signature). The prod audit saw 18 rows for 12 games. `assemble_results`
-    // already dedupes on exactly this key ("duplicate marker rows (garbage
-    // coexists by design)"); this brings the one identity-scoped view that
-    // lacked it up to the same rule. The SQL orders newest-first, so the
-    // FIRST row for a pot is the freshest marker — keep it, drop the rest.
+pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bool) {
+    // #323 — the SQL already dedupes per pot (`rn = 1`), so this belt only
+    // catches a future SQL change that drops that window; it is NOT the
+    // primary defence and must not be mistaken for one. Dedupe here alone
+    // would still let a marker flood evict honest pots inside the LIMIT.
+    //
+    // TRUNCATION: the window takes MAX_ROWS + 1, so more than MAX_ROWS
+    // surviving rows means the page is incomplete. That bit is load-bearing,
+    // not cosmetic — it is what makes a flood DETECTABLE rather than a
+    // silently-short answer that looks complete.
     let mut seen = std::collections::HashSet::new();
-    rows.into_iter()
+    let deduped: Vec<RecoveryRow> = rows
+        .into_iter()
         .filter(|r| {
             seen.insert((
                 r.game_id.to_ascii_lowercase(),
@@ -550,6 +623,11 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> Vec<RecoveryEntry> {
                 r.pot_vout,
             ))
         })
+        .collect();
+    let truncated = deduped.len() > RECOVERY_VIEW_MAX_ROWS;
+    let entries = deduped
+        .into_iter()
+        .take(RECOVERY_VIEW_MAX_ROWS)
         .map(|r| {
             let spender_raw_hex = match (&r.spending_txid, &r.spender_beef_hex) {
                 (Some(spender), Some(beef_hex)) => {
@@ -569,7 +647,8 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> Vec<RecoveryEntry> {
                 spender_raw_hex,
             }
         })
-        .collect()
+        .collect();
+    (entries, truncated)
 }
 
 /// Assemble the `/recovery-view` wire body:
@@ -578,7 +657,7 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> Vec<RecoveryEntry> {
 /// `tip` mirrors `/pots-view` (the recovery-height gate needs it) and is
 /// `null` on a chaintracks fault — the D1 facts still serve, and the client
 /// falls back to its own `/tip`.
-pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>) -> String {
+pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>, truncated: bool) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -595,7 +674,12 @@ pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>) -> String
             })
         })
         .collect();
-    json!({ "tip": tip, "entries": arr }).to_string()
+    // #323 HIGH-1 — `truncated` is what makes a marker FLOOD detectable
+    // instead of a silently-short page that looks complete. `potparty_records`
+    // is attacker-writable (byte-format admission, no signature), so a caller
+    // seeing `truncated: true` must treat the page as INCOMPLETE rather than
+    // as "these are all my pots".
+    json!({ "tip": tip, "entries": arr, "truncated": truncated }).to_string()
 }
 
 /// Assemble the `/beef/:txid` wire body: `{"txid","beef":[<bytes>]}` (bytes
@@ -869,7 +953,16 @@ fn marker_anchored(
 ) -> bool {
     match status_by_pot.get(&m.pot_txid.to_ascii_lowercase()) {
         Some(st) => {
+            // #323 HIGH-3 — the spend must be CONFIRMED. `anchored` is the
+            // leaderboard's COUNTING gate, so an unconfirmed pointer here
+            // publishes a `chainProven` win on the public board from a
+            // displaceable intent. The concrete shape: a coop settle that
+            // never mined, displaced by the tower-enforced settle that paid
+            // the OPPONENT, would still count as a win for the wrong player.
+            // Same bar as `refund_view::derive_refund_status` and
+            // `assemble_results` (#323 defect 1).
             st.spent == Some(true)
+                && st.spent_confirmed == Some(true)
                 && st
                     .spending_txid
                     .as_deref()
@@ -1868,17 +1961,61 @@ mod tests {
     #[test]
     fn recovery_view_sql_shape() {
         let sql = recovery_view_sql();
-        // JOINs the pot outpoint for spend status and the spender's BEEF.
+        // JOINs the pot outpoint for spend status; the BEEF join now sits
+        // OUTSIDE the window, on survivors only, so a marker flood can never
+        // drag real BLOBs along with it (#323 HIGH-1).
         assert!(sql.contains(
-            "LEFT JOIN pot_records r ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout"
+            "LEFT JOIN pot_records r \
+                  ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout"
         ));
-        assert!(sql.contains("LEFT JOIN pot_beefs b ON b.txid = lower(r.spendingTxid)"));
+        assert!(sql.contains("LEFT JOIN pot_beefs b ON b.txid = lower(w.spendingTxid)"));
         assert!(sql.contains("hex(b.beef) AS spenderBeef"));
-        // Keyed by ONE identity; newest first.
+        // Keyed by ONE identity.
         assert!(sql.contains("WHERE pp.identity = ?"));
-        assert!(sql.contains("ORDER BY pp.createdAt DESC"));
         // Exactly one bind placeholder (single-identity query, not batched).
         assert_eq!(sql.matches('?').count(), 1);
+
+        // #323 HIGH-1 — the three anti-flood properties, asserted
+        // individually so losing any ONE of them fails loudly. A marker
+        // flood on an attacker-writable identity must not be able to evict
+        // the caller's real pots.
+        //
+        // 1. dedupe in SQL, OLDEST marker per pot wins (anti-squat: a later
+        //    marker cannot displace the original, and one pot takes one slot).
+        assert!(
+            sql.contains(
+                "ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
+                                     ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn"
+            ),
+            "per-pot dedupe window missing: {sql}"
+        );
+        assert!(sql.contains("WHERE rn = 1"), "dedupe filter missing: {sql}");
+        // 2. rank by the POT's own admission stamp — an attacker cannot
+        //    backdate or advance `pot_records.createdAt` by filing markers.
+        assert!(
+            sql.contains("ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC"),
+            "pot-stamp ranking missing: {sql}"
+        );
+        // 3. a reserved quota for unknown pots, so ghost rows occupy a
+        //    bounded slice instead of the whole page.
+        assert!(
+            sql.contains(&format!(
+                "CASE WHEN unknownPot = 0 OR potRank <= {RECOVERY_VIEW_UNKNOWN_QUOTA} THEN 0 ELSE 1 END AS tier"
+            )),
+            "unknown-pot quota tier missing or not tied to the const: {sql}"
+        );
+        // The window takes MAX_ROWS + 1 so truncation is DETECTABLE. Pinned
+        // as an exact equality against the const — LOW-1: a `contains("LIMIT")`
+        // (or any prefix match) passes with LIMIT 4000 and proves nothing.
+        assert!(
+            sql.contains(&format!("LIMIT {}", RECOVERY_VIEW_MAX_ROWS + 1)),
+            "probe LIMIT must be RECOVERY_VIEW_MAX_ROWS + 1: {sql}"
+        );
+        assert_eq!(
+            sql.matches("LIMIT ").count(),
+            1,
+            "exactly one LIMIT, so the pin above cannot be satisfied by a second one: {sql}"
+        );
     }
 
     #[test]
@@ -1924,7 +2061,7 @@ mod tests {
                 spender_beef_hex: None,
             },
         ];
-        let out = assemble_recovery_view(rows);
+        let (out, _truncated) = assemble_recovery_view(rows);
         assert_eq!(out.len(), 3);
         // Joined spent pot: the raw rides back, order preserved.
         assert_eq!(out[0].pot_txid, txid_a());
@@ -1965,24 +2102,46 @@ mod tests {
         };
         // Three marker rows for ONE (game, pot, vout) — the republish shape.
         let rows = vec![dup(0x11), dup(0x11), dup(0x11)];
-        let entries = assemble_recovery_view(rows);
+        let (entries, _truncated) = assemble_recovery_view(rows);
         assert_eq!(entries.len(), 1, "duplicate marker rows must collapse");
 
         // Distinct pots are NOT collapsed (dedupe must not eat real rows).
-        let entries = assemble_recovery_view(vec![dup(0x11), dup(0x22)]);
+        let (entries, _) = assemble_recovery_view(vec![dup(0x11), dup(0x22)]);
         assert_eq!(entries.len(), 2, "distinct games must survive dedupe");
+
+        // A flood of DISTINCT ghost pots cannot silently shorten the page:
+        // past the cap the truncation bit fires, so an incomplete answer is
+        // never served as a complete one (#323 HIGH-1).
+        let flood: Vec<RecoveryRow> = (0..(RECOVERY_VIEW_MAX_ROWS + 5))
+            .map(|i| {
+                let mut r = dup(0x11);
+                r.game_id = format!("{i:064x}");
+                r.pot_txid = format!("{:064x}", 0x1000 + i);
+                r
+            })
+            .collect();
+        let (entries, truncated) = assemble_recovery_view(flood);
+        assert_eq!(entries.len(), RECOVERY_VIEW_MAX_ROWS, "page is capped");
+        assert!(truncated, "a page past the cap MUST report truncated");
+        // Exactly at the cap is NOT truncated (no false alarm).
+        let exact: Vec<RecoveryRow> = (0..RECOVERY_VIEW_MAX_ROWS)
+            .map(|i| {
+                let mut r = dup(0x11);
+                r.game_id = format!("{i:064x}");
+                r.pot_txid = format!("{:064x}", 0x2000 + i);
+                r
+            })
+            .collect();
+        let (entries, truncated) = assemble_recovery_view(exact);
+        assert_eq!(entries.len(), RECOVERY_VIEW_MAX_ROWS);
+        assert!(
+            !truncated,
+            "a full-but-complete page must not claim truncation"
+        );
 
         // The SQL is bounded — an identity-scoped view with no window is an
         // unbounded D1 read on every app open (#255 amplifier class).
-        let sql = recovery_view_sql();
-        // Positive assertion on the EXACT bound, so the literal in the SQL
-        // and RECOVERY_VIEW_MAX_ROWS cannot drift apart (two derivations of
-        // one number is its own trap — this pin is the single source).
-        assert!(
-            sql.contains(&format!("LIMIT {RECOVERY_VIEW_MAX_ROWS}")),
-            "recovery_view_sql LIMIT must equal RECOVERY_VIEW_MAX_ROWS \
-             ({RECOVERY_VIEW_MAX_ROWS}): {sql}"
-        );
+        // (SQL shape + the LIMIT/quota pins live in `recovery_view_sql_shape`.)
     }
 
     #[test]
@@ -1998,7 +2157,7 @@ mod tests {
             spent_confirmed: Some(true),
             spender_beef_hex: Some("not-hex!!".to_string()),
         }];
-        let out = assemble_recovery_view(rows);
+        let (out, _truncated) = assemble_recovery_view(rows);
         // Pointer facts survive; only the raw degrades to null.
         assert_eq!(out[0].spent, Some(true));
         assert_eq!(out[0].spender_raw_hex, None);
@@ -2031,7 +2190,7 @@ mod tests {
             },
         ];
         let v: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&entries, Some(958_800))).unwrap();
+            serde_json::from_str(&recovery_view_body(&entries, Some(958_800), false)).unwrap();
         assert_eq!(v["tip"], 958_800);
         let arr = v["entries"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -2052,11 +2211,12 @@ mod tests {
         assert!(arr[1]["spenderRawHex"].is_null());
         // A chaintracks fault serves entries with a null tip.
         let v2: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&entries, None)).unwrap();
+            serde_json::from_str(&recovery_view_body(&entries, None, false)).unwrap();
         assert!(v2["tip"].is_null());
         assert_eq!(v2["entries"].as_array().unwrap().len(), 2);
         // An empty result (invalid/empty identity) is a well-formed body.
-        let v3: serde_json::Value = serde_json::from_str(&recovery_view_body(&[], None)).unwrap();
+        let v3: serde_json::Value =
+            serde_json::from_str(&recovery_view_body(&[], None, false)).unwrap();
         assert!(v3["tip"].is_null());
         assert_eq!(v3["entries"].as_array().unwrap().len(), 0);
     }
@@ -2109,6 +2269,76 @@ mod tests {
     /// entry of `spent_by` (pot txid byte → settle txid byte) marks that pot
     /// spent by that settle txid; pots absent from the map have NO row (unknown
     /// ⇒ un-anchored).
+    /// Like [`statuses_for`] but with the confirmation flag EXPLICIT.
+    /// `statuses_for` hardcodes `spent_confirmed: true`, so before #323 no
+    /// leaderboard cell could express a PARKED spend at all — which is why
+    /// the counting gate shipped without one.
+    fn statuses_for_confirmed(
+        markers: &[ResultMarkerRow],
+        spent_by: &HashMap<u8, u8>,
+        confirmed: bool,
+    ) -> Vec<OutpointStatus> {
+        let ops = leaderboard_pot_outpoints(markers);
+        let mut rows: Vec<PotRecordRow> = Vec::new();
+        for op in &ops {
+            for (pot, settle) in spent_by {
+                if op.db_txid() == tx(*pot) {
+                    rows.push(PotRecordRow {
+                        txid: op.txid.clone(),
+                        vout: 0,
+                        spent: true,
+                        spending_txid: Some(tx(*settle)),
+                        spent_confirmed: confirmed,
+                    });
+                }
+            }
+        }
+        assemble_statuses(&ops, &rows)
+    }
+
+    /// #323 HIGH-3 — an UNCONFIRMED (parked) settle must never count on the
+    /// public leaderboard. `marker_anchored` is the counting gate, so a coop
+    /// settle that never mined — displaced by the tower-enforced settle that
+    /// paid the OPPONENT — would otherwise publish a `chainProven` win for
+    /// the wrong player.
+    #[test]
+    fn an_unconfirmed_settle_never_counts_on_the_leaderboard() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let markers = vec![mk(1, &a, &b, 1, 2, true, Some("000102030c"), 100, 0)];
+        let spent = HashMap::from([(1u8, 2u8)]);
+
+        // CONTROL: confirmed ⇒ it counts (so the test discriminates).
+        let lb = aggregate_leaderboard(
+            &markers,
+            &statuses_for_confirmed(&markers, &spent, true),
+            &no_proofs(),
+            200,
+        );
+        assert_eq!(lb.hands.len(), 1, "a CONFIRMED settle counts");
+        assert!(lb.hands[0].anchored);
+        assert!(
+            lb.board.iter().any(|r| r.wins > 0),
+            "the confirmed win is on the board"
+        );
+
+        // THE DEFECT: same rows, spend recorded but NOT confirmed.
+        let lb = aggregate_leaderboard(
+            &markers,
+            &statuses_for_confirmed(&markers, &spent, false),
+            &no_proofs(),
+            200,
+        );
+        assert!(
+            lb.hands.is_empty(),
+            "a PARKED settle must not publish a hand"
+        );
+        assert!(
+            lb.board.iter().all(|r| r.wins == 0),
+            "a PARKED settle must not publish a win"
+        );
+    }
+
     fn statuses_for(
         markers: &[ResultMarkerRow],
         spent_by: &HashMap<u8, u8>,

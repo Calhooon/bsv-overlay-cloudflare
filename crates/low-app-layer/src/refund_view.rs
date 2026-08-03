@@ -14,6 +14,18 @@
 //!
 //! ## Honesty model (mirrors `/results`' `outcome`/`outcomeSource`)
 //!
+//! RECONCILED 2026-08-03 (#323): the two views now share ONE confirmation
+//! bar, and it is stated here so the "mirrors `/results`" claim above is
+//! checkable rather than asserted. Until #323, `/results` derived a verdict
+//! from `spent = 1` ALONE while this view already required a confirmed
+//! spend — so the two genuinely disagreed and this comment was false. The
+//! shared bar is now: a spend counts as a LANDING iff `spentConfirmed = 1`
+//! OR the spender carries a chaintracks-verified proof
+//! (`pot_beefs.proof_verified`, the #323 MEDIUM-4 allowance for rows the
+//! migration stamped 0). A recorded-but-unconfirmed pointer is a
+//! displaceable INTENT in both views, and both still SERVE it as a raw fact
+//! while refusing to derive any conclusion from it.
+//!
 //! The `status`/`statusSource` pair never asserts what the data doesn't
 //! prove:
 //!

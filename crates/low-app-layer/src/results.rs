@@ -1218,8 +1218,24 @@ pub fn assemble_results(
         // incomplete — never guess". The raw pointer facts (`settleTxid`,
         // `spent`, `spentConfirmed`) still SERVE below: surface the attempt,
         // never consume it as a landing.
-        if let (Some(true), Some(true), Some(settle)) =
-            (r.spent, r.spent_confirmed, settle_lc.as_deref())
+        // #323 MEDIUM-4 — the confirmation bar accepts EITHER the
+        // `spentConfirmed` flag OR a chaintracks-VERIFIED spender proof.
+        //
+        // Decided explicitly rather than fail-closing on the flag alone: the
+        // column was added by migration with default 0, so pre-existing rows
+        // whose spend is genuinely MINED can carry `spentConfirmed = 0`.
+        // Gating on the flag only would silently un-resolve real historical
+        // settles — an honest-but-useless answer where a stronger proof is
+        // already in hand. `spender_proof_verified` is that stronger proof:
+        // it is the overlay's chaintracks-verifying writers latching a real
+        // merkle proof for THIS spender (`sb.proof_verified`, joined on
+        // `sb.txid = spendingTxid`), and `assemble_results` already trusts it
+        // for `at.height` two hundred lines below. A parked tx that never
+        // mined can never acquire one, so this widens the bar toward CHAIN
+        // TRUTH, never away from it.
+        let confirmed_landing =
+            r.spent_confirmed == Some(true) || r.spender_proof_verified == Some(true);
+        if let (Some(true), true, Some(settle)) = (r.spent, confirmed_landing, settle_lc.as_deref())
         {
             // 1. The STORED verdict — trusted only when it was computed from
             //    THIS spend pointer (`verdictTxid == spendingTxid`; the
@@ -1861,10 +1877,32 @@ pub enum SpentObservation {
     /// WoC 200: a spender txid (lowercase hex) + whether WoC reports the
     /// spend confirmed.
     Spent { txid: String, confirmed: bool },
-    /// WoC 4xx: "unspent or not yet indexed".
+    /// WoC 404/410: "unspent or not yet indexed" — a real, if weak, answer.
     NotSpent,
-    /// Transport / 5xx / rate-limit / malformed body.
+    /// Transport / 5xx / rate-limit / auth / malformed body — we could not
+    /// look. NEVER an answer about the outpoint.
     Fault,
+}
+
+/// Map a NON-200 WoC `/spent` status to an observation (#323 HIGH-2).
+///
+/// Pure so it can be pinned: the route glue previously inlined
+/// `(400..500) => NotSpent`, which swallowed **429** — the single
+/// most-documented outage in this repo — as "unspent". That is a fault
+/// consumed as information: a genuinely spent outpoint under a WoC
+/// rate-limit reported `uncorroborated-unspent` with confidence, and the
+/// type's own doc four lines up already said rate-limit belongs in `Fault`.
+/// Comment and code disagreed; the code was wrong.
+///
+/// Only ABSENCE codes are an answer. Everything else — rate-limit, auth,
+/// malformed request, 5xx, transport — is "we could not look".
+pub fn woc_spent_status_observation(status: u16) -> SpentObservation {
+    match status {
+        // The outpoint is genuinely absent from the index.
+        404 | 410 => SpentObservation::NotSpent,
+        // 429 rate-limit, 401/403 auth, 400 malformed, 5xx, anything else.
+        _ => SpentObservation::Fault,
+    }
 }
 
 /// Bitails' corroboration of an UNSPENT claim.
@@ -3291,6 +3329,24 @@ mod tests {
         assert_eq!(confirmed[0].outcome, Outcome::Won);
 
         // THE DEFECT: same bytes, spentConfirmed = 0 (a parked intent).
+        // MEDIUM-4: a legacy row stamped spentConfirmed=0 by migration but
+        // carrying a chaintracks-VERIFIED spender proof still resolves — the
+        // stronger proof is honoured, so real historical settles are not
+        // silently un-resolved.
+        let mut legacy = mk(Some(false));
+        legacy.spender_proof_verified = Some(true);
+        let e = assemble_results(
+            &winner,
+            vec![legacy],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            e[0].verdict,
+            Some(PotVerdict::WinnerA),
+            "a VERIFIED spender proof is a landing even when the flag is 0"
+        );
+
         for parked in [Some(false), None] {
             let e = assemble_results(
                 &winner,
@@ -3396,6 +3452,41 @@ mod tests {
             body_of(&fault),
             body_of(&unverified),
             "a provider FAULT must be distinguishable from an unverifiable spender"
+        );
+    }
+
+    /// #323 HIGH-2 — a WoC rate-limit is a FAULT, not "unspent". Consuming
+    /// 429 as `NotSpent` turned the repo's most-documented outage into a
+    /// confident negative, and mislabelled it `uncorroborated-unspent`.
+    #[test]
+    fn a_woc_rate_limit_is_a_fault_not_an_unspent_answer() {
+        // Absence codes are a real answer.
+        for ok in [404u16, 410] {
+            assert_eq!(
+                woc_spent_status_observation(ok),
+                SpentObservation::NotSpent,
+                "{ok} means the outpoint is genuinely absent"
+            );
+        }
+        // Everything else means we could not look.
+        for fault in [429u16, 401, 403, 400, 500, 502, 503, 504] {
+            assert_eq!(
+                woc_spent_status_observation(fault),
+                SpentObservation::Fault,
+                "{fault} is a fault, never an answer about the outpoint"
+            );
+        }
+        // And the fault must be LEGIBLE end to end, not just internally.
+        let st = decide_spent_any(
+            &woc_spent_status_observation(429),
+            false,
+            UnspentCorroboration::Unknown,
+        );
+        assert!(!st.known);
+        assert_eq!(
+            st.reason,
+            Some(crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT),
+            "a 429 must report provider-fault, never uncorroborated-unspent"
         );
     }
 
