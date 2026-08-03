@@ -176,7 +176,12 @@ pub fn classify_pot_spend(f: &PotSpendFacts) -> Option<PotVerdict> {
     }
 
     if is_bare_2of3_lock(&pot_lock) {
-        return classify_bare_refund(&spender, pot_input.sequence, pot_sats, f.marker_recovery_height);
+        return classify_bare_refund(
+            &spender,
+            pot_input.sequence,
+            pot_sats,
+            f.marker_recovery_height,
+        );
     }
 
     None // unknown lock shape — never classified
@@ -210,7 +215,8 @@ fn classify_from_columns(
         return None; // conservation failed — the params do not describe this pot
     }
     let sb = crate::logic::decode_beef_hex(spender_beef_hex)?;
-    let sraw = crate::logic::extract_raw_tx_hex(&sb, settle_lc).and_then(|h| hex::decode(h).ok())?;
+    let sraw =
+        crate::logic::extract_raw_tx_hex(&sb, settle_lc).and_then(|h| hex::decode(h).ok())?;
     let spender = parse_raw_tx_verified(&sraw, settle_lc)?;
     let pot_input = spender
         .inputs
@@ -1034,9 +1040,8 @@ pub fn resolve_winner_hand(
 ) -> Option<WinnerHand> {
     let settle = settle_txid_lc?;
     let gc = claims?;
-    let is_party = |id: &str| {
-        id.eq_ignore_ascii_case(identity_lc) || id.eq_ignore_ascii_case(opponent_lc)
-    };
+    let is_party =
+        |id: &str| id.eq_ignore_ascii_case(identity_lc) || id.eq_ignore_ascii_case(opponent_lc);
     let relevant: Vec<&ClaimFact> = gc
         .claims
         .iter()
@@ -1360,7 +1365,9 @@ pub fn assemble_results(
 /// marker goes through `verified_claim` (real ECDSA over the reconstructed
 /// challenge) and an unverifiable one is DROPPED here, so nothing downstream
 /// ever sees a claim whose winner signature did not verify.
-pub fn claims_by_game(markers: &[ResultMarkerRow]) -> std::collections::HashMap<String, GameClaims> {
+pub fn claims_by_game(
+    markers: &[ResultMarkerRow],
+) -> std::collections::HashMap<String, GameClaims> {
     let mut map: std::collections::HashMap<String, GameClaims> = std::collections::HashMap::new();
     for m in markers {
         if let Some(fact) = verified_claim(m) {
@@ -2022,51 +2029,91 @@ mod tests {
 
         // A unanimous countersigned claim naming ME for THIS settle → won.
         let gc = claims_of(&[(&me, &opp, &settle, true)]);
-        let (o, src) =
-            derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
+        let (o, src) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &me,
+            &opp,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!((o, src), (Outcome::Won, Some("chain+claim")));
 
         // The same claim from the OPPONENT's perspective → lost (its OWN
         // countersig verified).
-        let (o, src) =
-            derive_outcome(Some(PotVerdict::WinnerA), &opp, &me, Some(&settle), Some(&gc));
+        let (o, src) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &opp,
+            &me,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!((o, src), (Outcome::Lost, Some("chain+claim")));
 
         // Conflicting claims (both parties claim the same settle) → nobody.
         let gc = claims_of(&[(&me, &opp, &settle, true), (&opp, &me, &settle, true)]);
-        let (o, _) =
-            derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
+        let (o, _) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &me,
+            &opp,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!(o, Outcome::Unresolved);
 
         // A winner-sig-only claim (no verified countersig): the WINNER's tier
         // is earned (its own verified key), but the LOSER is NEVER shown a
         // loss it did not countersign.
         let gc = claims_of(&[(&me, &opp, &settle, false)]);
-        let (o, src) =
-            derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
+        let (o, src) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &me,
+            &opp,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!((o, src), (Outcome::Won, Some("chain+claim")));
-        let (o, src) =
-            derive_outcome(Some(PotVerdict::WinnerA), &opp, &me, Some(&settle), Some(&gc));
+        let (o, src) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &opp,
+            &me,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!((o, src), (Outcome::Unresolved, None));
 
         // A countersig by a THIRD PARTY (claim's loser is not the caller)
         // never shows the caller a loss.
         let gc = claims_of(&[(&me, &ident(0xcc), &settle, true)]);
-        let (o, _) =
-            derive_outcome(Some(PotVerdict::WinnerA), &opp, &me, Some(&settle), Some(&gc));
+        let (o, _) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &opp,
+            &me,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!(o, Outcome::Unresolved);
 
         // A claim naming a DIFFERENT settle never corroborates this one.
         let gc = claims_of(&[(&me, &opp, &tx(0x33), true)]);
-        let (o, _) =
-            derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
+        let (o, _) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &me,
+            &opp,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!(o, Outcome::Unresolved);
 
         // A claimed winner OUTSIDE the two parties → unresolved (a foreign
         // marker can't award this pot to anyone).
         let gc = claims_of(&[(&ident(0xcc), &ident(0xdd), &settle, true)]);
-        let (o, _) =
-            derive_outcome(Some(PotVerdict::WinnerA), &me, &opp, Some(&settle), Some(&gc));
+        let (o, _) = derive_outcome(
+            Some(PotVerdict::WinnerA),
+            &me,
+            &opp,
+            Some(&settle),
+            Some(&gc),
+        );
         assert_eq!(o, Outcome::Unresolved);
 
         // No verdict at all → unresolved even with a pretty claim (a claim
@@ -3096,7 +3143,9 @@ mod tests {
         f.push(1);
         f.push(0x51);
         f.extend_from_slice(&0u32.to_le_bytes());
-        let f_id = bsv_rs::transaction::Transaction::from_binary(&f).unwrap().id();
+        let f_id = bsv_rs::transaction::Transaction::from_binary(&f)
+            .unwrap()
+            .id();
         // spender: spends funding:0.
         let mut s = Vec::new();
         s.extend_from_slice(&1u32.to_le_bytes());
@@ -3112,7 +3161,9 @@ mod tests {
         s.push(1);
         s.push(0x51);
         s.extend_from_slice(&0u32.to_le_bytes());
-        let s_id = bsv_rs::transaction::Transaction::from_binary(&s).unwrap().id();
+        let s_id = bsv_rs::transaction::Transaction::from_binary(&s)
+            .unwrap()
+            .id();
         (f, f_id, s, s_id)
     }
 
@@ -3175,7 +3226,6 @@ mod tests {
         assert_eq!(entries[1].spent, None);
         assert_eq!(entries[1].outcome, Outcome::Unresolved);
     }
-
 
     /// #323 defect 1 — a PARKED (recorded-but-unconfirmed) spender must
     /// never produce a verdict, an outcome, or a height. A non-final parked
@@ -3271,7 +3321,6 @@ mod tests {
         }
     }
 
-
     /// #323 defect 2 — `/spent-any` must not collapse "we could not look"
     /// into the same answer as "we looked and corroborated nothing".
     ///
@@ -3292,7 +3341,11 @@ mod tests {
     fn spent_any_distinguishes_a_fault_from_a_corroborated_negative() {
         let spender = "cd".repeat(32);
         // 1. Upstream fault — we could not look.
-        let fault = decide_spent_any(&SpentObservation::Fault, false, UnspentCorroboration::Unknown);
+        let fault = decide_spent_any(
+            &SpentObservation::Fault,
+            false,
+            UnspentCorroboration::Unknown,
+        );
         // 2. Looked, and corroborated genuinely unspent.
         let unspent = decide_spent_any(
             &SpentObservation::NotSpent,
@@ -3495,7 +3548,12 @@ mod tests {
         let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
 
         let fabricated = marker(
-            &game, &l, &h, &pot, &settle, None,
+            &game,
+            &l,
+            &h,
+            &pot,
+            &settle,
+            None,
             garbage_sig(),
             Some(garbage_sig()),
         );
@@ -3507,8 +3565,13 @@ mod tests {
         // Outcome: unresolved for BOTH parties — the honest player is never
         // shown a fabricated loss, the liar never a fabricated win.
         for (me, opp) in [(&h, &l), (&l, &h)] {
-            let (o, src) =
-                derive_outcome(Some(PotVerdict::WinnerA), me, opp, Some(&settle), map.get(&game));
+            let (o, src) = derive_outcome(
+                Some(PotVerdict::WinnerA),
+                me,
+                opp,
+                Some(&settle),
+                map.get(&game),
+            );
             assert_eq!((o, src), (Outcome::Unresolved, None));
         }
     }
@@ -3525,7 +3588,14 @@ mod tests {
 
         // Fully countersigned: winner → won, loser → lost (both verified).
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, None, w_sig.clone(), Some(l_sig),
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            None,
+            w_sig.clone(),
+            Some(l_sig),
         )]);
         let gc = map.get(&game).unwrap();
         assert_eq!(gc.claims.len(), 1);
@@ -3541,7 +3611,14 @@ mod tests {
         // itself countersign. (The old presence-only check called this
         // both-signed and reported `lost`.)
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, None, w_sig.clone(), Some(garbage_sig()),
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            None,
+            w_sig.clone(),
+            Some(garbage_sig()),
         )]);
         let gc = map.get(&game).unwrap();
         assert!(!gc.claims[0].loser_sig_verified);
@@ -3553,7 +3630,14 @@ mod tests {
         // A countersig by the WRONG key (the winner signing "the loser's"
         // countersig) never verifies under the loser identity either.
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, None, w_sig, Some(sign_result(&winner_w, &game, &challenge)),
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            None,
+            w_sig,
+            Some(sign_result(&winner_w, &game, &challenge)),
         )]);
         assert!(!map.get(&game).unwrap().claims[0].loser_sig_verified);
     }
@@ -3569,8 +3653,26 @@ mod tests {
         let ch_a = result_challenge_bytes(&game, &ia, &ib, &pot, &settle, None).unwrap();
         let ch_b = result_challenge_bytes(&game, &ib, &ia, &pot, &settle, None).unwrap();
         let map = claims_by_game(&[
-            marker(&game, &ia, &ib, &pot, &settle, None, sign_result(&a, &game, &ch_a), None),
-            marker(&game, &ib, &ia, &pot, &settle, None, sign_result(&b, &game, &ch_b), None),
+            marker(
+                &game,
+                &ia,
+                &ib,
+                &pot,
+                &settle,
+                None,
+                sign_result(&a, &game, &ch_a),
+                None,
+            ),
+            marker(
+                &game,
+                &ib,
+                &ia,
+                &pot,
+                &settle,
+                None,
+                sign_result(&b, &game, &ch_b),
+                None,
+            ),
         ]);
         let gc = map.get(&game).unwrap();
         assert_eq!(gc.claims.len(), 2, "both real claims verify");
@@ -3592,10 +3694,14 @@ mod tests {
         let (game, pot) = (tx(0x01), tx(0x02));
         let signed_settle = tx(0x03);
         let named_settle = tx(0x33);
-        let challenge =
-            result_challenge_bytes(&game, &w, &l, &pot, &signed_settle, None).unwrap();
+        let challenge = result_challenge_bytes(&game, &w, &l, &pot, &signed_settle, None).unwrap();
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &named_settle, None,
+            &game,
+            &w,
+            &l,
+            &pot,
+            &named_settle,
+            None,
             sign_result(&winner_w, &game, &challenge),
             None,
         )]);
@@ -3614,31 +3720,58 @@ mod tests {
         let (w, l) = (identity_of(&winner_w), identity_of(&loser_w));
         let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
         let cards = "0001020304"; // ordinals 0..4, canonical
-        let challenge =
-            result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cards)).unwrap();
+        let challenge = result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cards)).unwrap();
         let w_sig = sign_result(&winner_w, &game, &challenge);
 
         // Untampered → verifies.
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, Some(cards), w_sig.clone(), None,
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            Some(cards),
+            w_sig.clone(),
+            None,
         )]);
         assert_eq!(map.get(&game).unwrap().claims.len(), 1);
 
         // Unsorted-but-identical set → same canonical challenge → verifies.
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, Some("0403020100"), w_sig.clone(), None,
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            Some("0403020100"),
+            w_sig.clone(),
+            None,
         )]);
         assert_eq!(map.get(&game).unwrap().claims.len(), 1);
 
         // Tampered hand → dropped.
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, Some("0001020305"), w_sig.clone(), None,
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            Some("0001020305"),
+            w_sig.clone(),
+            None,
         )]);
         assert!(!map.contains_key(&game));
 
         // Malformed cards (duplicate ordinal) → unverifiable → dropped.
         let map = claims_by_game(&[marker(
-            &game, &w, &l, &pot, &settle, Some("0000010203"), w_sig, None,
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            Some("0000010203"),
+            w_sig,
+            None,
         )]);
         assert!(!map.contains_key(&game));
     }
@@ -3654,7 +3787,12 @@ mod tests {
         let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
         let ch_self = result_challenge_bytes(&game, &w, &w, &pot, &settle, None).unwrap();
         let map = claims_by_game(&[marker(
-            &game, &w, &w, &pot, &settle, None,
+            &game,
+            &w,
+            &w,
+            &pot,
+            &settle,
+            None,
             sign_result(&winner_w, &game, &ch_self),
             None,
         )]);
@@ -3713,9 +3851,16 @@ mod tests {
         let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
         let cards = "000102030c"; // A-2-3-4-5 wheel = 15
         let ch = result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cards)).unwrap();
-        let map =
-            claims_by_game(&[marker(&game, &w, &l, &pot, &settle, Some(cards),
-                sign_result(&winner_w, &game, &ch), None)]);
+        let map = claims_by_game(&[marker(
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            Some(cards),
+            sign_result(&winner_w, &game, &ch),
+            None,
+        )]);
         let gc = map.get(&game);
 
         let hand =
@@ -3744,10 +3889,24 @@ mod tests {
         // A v1 (no-cards) claim: the winner resolves, but no hand is on-chain
         // → None (never a fabricated hand).
         let ch = result_challenge_bytes(&game, &w, &l, &pot, &settle, None).unwrap();
-        let map = claims_by_game(&[marker(&game, &w, &l, &pot, &settle, None,
-            sign_result(&winner_w, &game, &ch), None)]);
-        assert!(resolve_winner_hand(Some(PotVerdict::WinnerA), &w, &l, Some(&settle),
-            map.get(&game)).is_none());
+        let map = claims_by_game(&[marker(
+            &game,
+            &w,
+            &l,
+            &pot,
+            &settle,
+            None,
+            sign_result(&winner_w, &game, &ch),
+            None,
+        )]);
+        assert!(resolve_winner_hand(
+            Some(PotVerdict::WinnerA),
+            &w,
+            &l,
+            Some(&settle),
+            map.get(&game)
+        )
+        .is_none());
 
         // Both parties publish REAL claims-with-cards for the same settle:
         // winner unanimity fails → no attributable hand.
@@ -3756,11 +3915,35 @@ mod tests {
         let chw = result_challenge_bytes(&game, &w, &l, &pot, &settle, Some(cw)).unwrap();
         let chl = result_challenge_bytes(&game, &l, &w, &pot, &settle, Some(cl)).unwrap();
         let map = claims_by_game(&[
-            marker(&game, &w, &l, &pot, &settle, Some(cw), sign_result(&winner_w, &game, &chw), None),
-            marker(&game, &l, &w, &pot, &settle, Some(cl), sign_result(&loser_w, &game, &chl), None),
+            marker(
+                &game,
+                &w,
+                &l,
+                &pot,
+                &settle,
+                Some(cw),
+                sign_result(&winner_w, &game, &chw),
+                None,
+            ),
+            marker(
+                &game,
+                &l,
+                &w,
+                &pot,
+                &settle,
+                Some(cl),
+                sign_result(&loser_w, &game, &chl),
+                None,
+            ),
         ]);
-        assert!(resolve_winner_hand(Some(PotVerdict::WinnerA), &w, &l, Some(&settle),
-            map.get(&game)).is_none());
+        assert!(resolve_winner_hand(
+            Some(PotVerdict::WinnerA),
+            &w,
+            &l,
+            Some(&settle),
+            map.get(&game)
+        )
+        .is_none());
     }
 
     #[test]
@@ -3773,8 +3956,16 @@ mod tests {
         let (game, pot, settle) = (tx(0x01), tx(0x02), tx(0x03));
         let cards = "000102030c"; // 15
         let ch = result_challenge_bytes(&game, &a, &b, &pot, &settle, Some(cards)).unwrap();
-        let map = claims_by_game(&[marker(&game, &a, &b, &pot, &settle, Some(cards),
-            sign_result(&a_w, &game, &ch), None)]);
+        let map = claims_by_game(&[marker(
+            &game,
+            &a,
+            &b,
+            &pot,
+            &settle,
+            Some(cards),
+            sign_result(&a_w, &game, &ch),
+            None,
+        )]);
         let hand =
             resolve_winner_hand(Some(PotVerdict::Tie), &a, &b, Some(&settle), map.get(&game))
                 .unwrap();
@@ -3805,7 +3996,9 @@ mod tests {
         // spender BLOB only when the stored verdict is stale/absent for the
         // current pointer or the proven height is missing (with EXPLICIT
         // NULL handling: `verdictTxid <> spendingTxid` alone is NULL-opaque).
-        assert!(sql.contains("LEFT JOIN pot_beefs fb ON w.pubA IS NULL AND fb.txid = lower(w.potTxid)"));
+        assert!(
+            sql.contains("LEFT JOIN pot_beefs fb ON w.pubA IS NULL AND fb.txid = lower(w.potTxid)")
+        );
         assert!(sql.contains("LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL"));
         assert!(sql.contains(
             "(w.verdict IS NULL OR w.verdictTxid IS NULL OR w.verdictTxid <> w.spendingTxid \

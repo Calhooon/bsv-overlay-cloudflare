@@ -112,7 +112,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<()>) -> Result<Response
         Err(e) => {
             console_warn!("[utxo-status] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     // One D1 query PER CHUNK (≤ D1_CHUNK_OUTPOINTS outpoints ⇒ ≤ 90 binds),
@@ -137,7 +137,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<()>) -> Result<Response
             Err(e) => {
                 console_warn!("[utxo-status] pot_records batch query failed: {e}");
                 return json_error("database query failed", 503);
-            },
+            }
         }
     }
 
@@ -170,7 +170,7 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Err(e) => {
             console_warn!("[beef] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     // pot_beefs first (durable), transactions second (lifecycle-managed).
@@ -199,28 +199,26 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // back to the legacy no-flag read and treat the row as UNVERIFIED —
         // availability is preserved, trust is not strengthened.
         let stmt = db.prepare(sql).bind(&[JsValue::from_str(&key)])?;
-        let (row, proof_verified): (Option<BeefRow>, bool) = match stmt.first::<BeefTrustRow>(None).await {
-            Ok(row) => {
-                let verified = row
-                    .as_ref()
-                    .and_then(|r| r.proof_verified)
-                    .unwrap_or(0.0)
-                    != 0.0;
-                (row.map(|r| BeefRow { beef: r.beef }), verified)
-            }
-            Err(e) => {
-                console_warn!("[beef] {table} trust query failed ({e}) — legacy no-flag read");
-                let stmt = db.prepare(legacy_sql).bind(&[JsValue::from_str(&key)])?;
-                match stmt.first::<BeefRow>(None).await {
-                    Ok(row) => (row, false),
-                    Err(e) => {
-                        console_warn!("[beef] {table} query failed: {e}");
-                        faulted = true;
-                        continue;
-                    },
+        let (row, proof_verified): (Option<BeefRow>, bool) =
+            match stmt.first::<BeefTrustRow>(None).await {
+                Ok(row) => {
+                    let verified =
+                        row.as_ref().and_then(|r| r.proof_verified).unwrap_or(0.0) != 0.0;
+                    (row.map(|r| BeefRow { beef: r.beef }), verified)
                 }
-            },
-        };
+                Err(e) => {
+                    console_warn!("[beef] {table} trust query failed ({e}) — legacy no-flag read");
+                    let stmt = db.prepare(legacy_sql).bind(&[JsValue::from_str(&key)])?;
+                    match stmt.first::<BeefRow>(None).await {
+                        Ok(row) => (row, false),
+                        Err(e) => {
+                            console_warn!("[beef] {table} query failed: {e}");
+                            faulted = true;
+                            continue;
+                        }
+                    }
+                }
+            };
         if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
             // Serve-time compaction (#192/#193, P4): once the overlay's
             // completion pass / Arcade MINED callback has stitched a
@@ -267,7 +265,7 @@ async fn chaintracks_present_height(
         Err(e) => {
             console_warn!("[{tag}] CHAINTRACKS binding unavailable: {e}");
             return Err(("chaintracks binding unavailable", 503));
-        },
+        }
     };
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
@@ -280,7 +278,7 @@ async fn chaintracks_present_height(
         Err(e) => {
             console_warn!("[{tag}] chaintracks fetch failed: {e}");
             return Err(("chaintracks fetch failed", 502));
-        },
+        }
     };
     if !(200..300).contains(&resp.status_code()) {
         console_warn!("[{tag}] chaintracks returned HTTP {}", resp.status_code());
@@ -291,14 +289,14 @@ async fn chaintracks_present_height(
         Err(e) => {
             console_warn!("[{tag}] chaintracks response not JSON: {e}");
             return Err(("chaintracks returned malformed JSON", 502));
-        },
+        }
     };
     match parse_present_height(&frame) {
         Some(height) => Ok(height),
         None => {
             console_warn!("[{tag}] chaintracks frame not a success/height: {frame}");
             Err(("chaintracks returned an unexpected frame", 502))
-        },
+        }
     }
 }
 
@@ -370,7 +368,7 @@ pub async fn pots_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Err(e) => {
             console_warn!("[pots-view] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     // One joined query PER CHUNK (records + spender BEEFs), merged into one
@@ -391,7 +389,7 @@ pub async fn pots_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
             Err(e) => {
                 console_warn!("[pots-view] pot_records join query failed: {e}");
                 return json_error("database query failed", 503);
-            },
+            }
         }
     }
 
@@ -477,7 +475,7 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Respon
         Err(e) => {
             console_warn!("[recovery-view] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     // ONE query: the caller's potparty rows JOINed to pot spend-status +
@@ -490,7 +488,7 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Respon
         Err(e) => {
             console_warn!("[recovery-view] potparty join query failed: {e}");
             return json_error("database query failed", 503);
-        },
+        }
     };
 
     let entries = assemble_recovery_view(rows);
@@ -586,7 +584,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         Err(e) => {
             console_warn!("[leaderboard] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     // 1) Recent result markers, newest first (mirrors ls_result recentResults).
@@ -596,13 +594,17 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     let stmt = db
         .prepare(markers_sql)
         .bind(&[JsValue::from_f64(limit as f64)])?;
-    let markers: Vec<ResultMarkerRow> = match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
-        Ok(rows) => rows.into_iter().filter_map(ResultRowD1::into_marker).collect(),
-        Err(e) => {
-            console_warn!("[leaderboard] result_markers_v2 query failed: {e}");
-            return json_error("database query failed", 503);
-        },
-    };
+    let markers: Vec<ResultMarkerRow> =
+        match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(ResultRowD1::into_marker)
+                .collect(),
+            Err(e) => {
+                console_warn!("[leaderboard] result_markers_v2 query failed: {e}");
+                return json_error("database query failed", 503);
+            }
+        };
 
     // 2) Pot spend-status join (potTxid:0), CHUNKED at D1_CHUNK_OUTPOINTS —
     // same discipline as /utxo-status. FAIL-SAFE: a chunk's D1 error is the
@@ -622,7 +624,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
             Err(e) => {
                 console_warn!("[leaderboard] pot_records batch query failed: {e}");
                 return json_error("database query failed", 503);
-            },
+            }
         }
     }
     let statuses = assemble_statuses(&outpoints, &pot_rows);
@@ -635,15 +637,25 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         std::collections::HashMap::new();
     let proof_sql = "SELECT gameId, winner, txid FROM proof_markers \
          ORDER BY createdAt DESC, rowid DESC LIMIT 2000";
-    match db.prepare(proof_sql).all().await.and_then(|r| r.results::<ProofPointerRowD1>()) {
+    match db
+        .prepare(proof_sql)
+        .all()
+        .await
+        .and_then(|r| r.results::<ProofPointerRowD1>())
+    {
         Ok(rows) => {
             for pr in rows {
                 proof_map
-                    .entry((pr.game_id.to_ascii_lowercase(), pr.winner.to_ascii_lowercase()))
+                    .entry((
+                        pr.game_id.to_ascii_lowercase(),
+                        pr.winner.to_ascii_lowercase(),
+                    ))
                     .or_insert(pr.txid);
             }
-        },
-        Err(e) => console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}"),
+        }
+        Err(e) => {
+            console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}")
+        }
     }
 
     // 4) Server-derived CHAIN classification of the spent pots (bsv-low #227)
@@ -797,7 +809,9 @@ async fn classify_spent_pots(
         let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
         for (pot, _) in chunk {
             binds.push(JsValue::from_str(pot));
-            binds.push(JsValue::from_f64(f64::from(crate::logic::LEADERBOARD_POT_VOUT)));
+            binds.push(JsValue::from_f64(f64::from(
+                crate::logic::LEADERBOARD_POT_VOUT,
+            )));
         }
         let stmt = match db.prepare(sql).bind(&binds) {
             Ok(s) => s,
@@ -806,14 +820,20 @@ async fn classify_spent_pots(
                 break;
             }
         };
-        match stmt.all().await.and_then(|r| r.results::<DecodedPotRowD1>()) {
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<DecodedPotRowD1>())
+        {
             Ok(rows) => {
                 let by_txid: std::collections::HashMap<String, DecodedPotRowD1> = rows
                     .into_iter()
                     .map(|r| (r.txid.to_ascii_lowercase(), r))
                     .collect();
                 for (pot, spender) in chunk {
-                    let Some(row) = by_txid.get(pot) else { continue };
+                    let Some(row) = by_txid.get(pot) else {
+                        continue;
+                    };
                     // The stored verdict counts ONLY for the spender being
                     // attributed (freshness: verdictTxid == the pointer this
                     // board read; a stale/differing one falls back).
@@ -829,7 +849,9 @@ async fn classify_spent_pots(
                         continue;
                     }
                     let (Some(v), Some(params)) = (
-                        row.verdict.as_deref().and_then(crate::results::PotVerdict::from_wire),
+                        row.verdict
+                            .as_deref()
+                            .and_then(crate::results::PotVerdict::from_wire),
                         row.covenant_params(),
                     ) else {
                         continue;
@@ -867,14 +889,15 @@ async fn classify_spent_pots(
     let mut beefs: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     for chunk in keys.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
+        let sql =
+            format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
         let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
         let stmt = match db.prepare(sql).bind(&binds) {
             Ok(s) => s,
             Err(e) => {
                 console_warn!("[leaderboard] pot_beefs bind failed (classification omitted): {e}");
                 return (verdicts, params_by_pot);
-            },
+            }
         };
         match stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
             Ok(rows) => {
@@ -883,12 +906,12 @@ async fn classify_spent_pots(
                         beefs.insert(r.txid.to_ascii_lowercase(), bytes);
                     }
                 }
-            },
+            }
             Err(e) => {
                 console_warn!("[leaderboard] pot_beefs query failed (classification partial): {e}");
                 // Keep whatever chunks already loaded — a missing BEEF only
                 // leaves its pot unclassified.
-            },
+            }
         }
     }
 
@@ -896,7 +919,8 @@ async fn classify_spent_pots(
         let (Some(fb), Some(sb)) = (beefs.get(pot), beefs.get(spender)) else {
             continue;
         };
-        let funding_raw = crate::logic::extract_raw_tx_hex(fb, pot).and_then(|h| hex::decode(h).ok());
+        let funding_raw =
+            crate::logic::extract_raw_tx_hex(fb, pot).and_then(|h| hex::decode(h).ok());
         let spender_raw =
             crate::logic::extract_raw_tx_hex(sb, spender).and_then(|h| hex::decode(h).ok());
         let (Some(fraw), Some(sraw)) = (funding_raw, spender_raw) else {
@@ -1197,7 +1221,7 @@ pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Err(e) => {
             console_warn!("[results] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     let stmt = db
@@ -1209,13 +1233,16 @@ pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             Err(e) => {
                 console_warn!("[results] potparty join query failed: {e}");
                 return json_error("database query failed", 503);
-            },
+            }
         };
 
     // Claims (won/lost attribution) — BEST-EFFORT: a fault here only leaves
     // winner-verdict games `unresolved`, never a 5xx (the chain-truth
     // tie/refund outcomes and the verdict field still serve).
-    let mut game_ids: Vec<String> = rows.iter().map(|r| r.game_id.to_ascii_lowercase()).collect();
+    let mut game_ids: Vec<String> = rows
+        .iter()
+        .map(|r| r.game_id.to_ascii_lowercase())
+        .collect();
     game_ids.sort_unstable();
     game_ids.dedup();
     let mut claim_markers: Vec<ResultMarkerRow> = Vec::new();
@@ -1228,7 +1255,7 @@ pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             Ok(rows) => claim_markers.extend(rows.into_iter().filter_map(ResultRowD1::into_marker)),
             Err(e) => {
                 console_warn!("[results] result_markers_v2 query failed (claims omitted): {e}");
-            },
+            }
         }
     }
     let claims = crate::results::claims_by_game(&claim_markers);
@@ -1413,7 +1440,10 @@ pub async fn refund_view(req: Request, ctx: RouteContext<()>) -> Result<Response
     let identity_lc = identity.to_ascii_lowercase();
 
     if !crate::logic::valid_identity(&identity_lc) {
-        return json_response(crate::refund_view::refund_view_body(&identity_lc, None, &[]), 200);
+        return json_response(
+            crate::refund_view::refund_view_body(&identity_lc, None, &[]),
+            200,
+        );
     }
 
     let db = match ctx.env.d1("OVERLAY_DB") {
@@ -1421,20 +1451,23 @@ pub async fn refund_view(req: Request, ctx: RouteContext<()>) -> Result<Response
         Err(e) => {
             console_warn!("[refund-view] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     let stmt = db
         .prepare(crate::refund_view::refund_view_sql())
         .bind(&[JsValue::from_str(&identity_lc)])?;
-    let rows: Vec<crate::refund_view::RefundViewRow> =
-        match stmt.all().await.and_then(|r| r.results::<RefundViewRowD1>()) {
-            Ok(rows) => rows.into_iter().map(RefundViewRowD1::into_row).collect(),
-            Err(e) => {
-                console_warn!("[refund-view] potparty join query failed: {e}");
-                return json_error("database query failed", 503);
-            },
-        };
+    let rows: Vec<crate::refund_view::RefundViewRow> = match stmt
+        .all()
+        .await
+        .and_then(|r| r.results::<RefundViewRowD1>())
+    {
+        Ok(rows) => rows.into_iter().map(RefundViewRowD1::into_row).collect(),
+        Err(e) => {
+            console_warn!("[refund-view] potparty join query failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
 
     // The tip AFTER the D1 facts (the gate math needs it; `null` on a fault
     // — gate fields degrade to null/false, statuses stay fail-safe).
@@ -1578,7 +1611,7 @@ async fn tower_case_fetch(
             Err(e) => {
                 console_warn!("[live-view] tower /case/{game_id} fetch failed: {e}");
                 return None;
-            },
+            }
         };
         let status = resp.status_code();
         // MEDIUM-3(a): a declared over-budget body is rejected pre-read.
@@ -1601,7 +1634,7 @@ async fn tower_case_fetch(
             Err(e) => {
                 console_warn!("[live-view] tower /case/{game_id} body stream failed: {e}");
                 return None;
-            },
+            }
         };
         let mut acc = crate::live_view::BodyAccumulator::new(crate::live_view::CASE_BODY_MAX_BYTES);
         {
@@ -1616,11 +1649,11 @@ async fn tower_case_fetch(
                             );
                             return None;
                         }
-                    },
+                    }
                     Some(Err(e)) => {
                         console_warn!("[live-view] tower /case/{game_id} body read failed: {e}");
                         return None;
-                    },
+                    }
                     None => break,
                 }
             }
@@ -1635,7 +1668,7 @@ async fn tower_case_fetch(
                 crate::live_view::CASE_FETCH_TIMEOUT_MS
             );
             None
-        },
+        }
     }
 }
 
@@ -1719,20 +1752,25 @@ async fn live_view_candidates(
                 console_warn!("[live-view] keyed candidate bind failed (chunk omitted): {e}");
                 faulted = true;
                 continue;
-            },
+            }
         };
-        match stmt.all().await.and_then(|r| r.results::<SeatMarkerRowD1>()) {
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<SeatMarkerRowD1>())
+        {
             Ok(fetched) => collect(fetched, &mut out),
             Err(e) => {
                 console_warn!("[live-view] keyed candidate query failed (partial): {e}");
                 faulted = true;
-            },
+            }
         }
     }
 
     for chunk in &plan.keyless {
         let sql = crate::live_view::keyless_candidates_sql(chunk.len());
-        let mut binds: Vec<JsValue> = Vec::with_capacity(crate::live_view::keyless_chunk_binds(chunk.len()));
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(crate::live_view::keyless_chunk_binds(chunk.len()));
         binds.push(JsValue::from_str(identity_lc));
         for (txid, vout) in chunk {
             binds.push(JsValue::from_str(txid));
@@ -1744,14 +1782,18 @@ async fn live_view_candidates(
                 console_warn!("[live-view] keyless candidate bind failed (chunk omitted): {e}");
                 faulted = true;
                 continue;
-            },
+            }
         };
-        match stmt.all().await.and_then(|r| r.results::<SeatMarkerRowD1>()) {
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<SeatMarkerRowD1>())
+        {
             Ok(fetched) => collect(fetched, &mut out),
             Err(e) => {
                 console_warn!("[live-view] keyless candidate query failed (partial): {e}");
                 faulted = true;
-            },
+            }
         }
     }
     (out, faulted)
@@ -1793,7 +1835,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Err(e) => {
             console_warn!("[live-view] request URL unavailable: {e}");
             return json_error("request url unavailable", 503);
-        },
+        }
     };
     let identity = url
         .query_pairs()
@@ -1803,7 +1845,10 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     let identity_lc = identity.to_ascii_lowercase();
 
     if !crate::logic::valid_identity(&identity_lc) {
-        return json_response(crate::live_view::live_view_body(&identity_lc, None, &[]), 200);
+        return json_response(
+            crate::live_view::live_view_body(&identity_lc, None, &[]),
+            200,
+        );
     }
 
     let db = match ctx.env.d1("OVERLAY_DB") {
@@ -1811,7 +1856,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Err(e) => {
             console_warn!("[live-view] OVERLAY_DB binding unavailable: {e}");
             return json_error("database unavailable", 503);
-        },
+        }
     };
 
     // LOW-7: same rule for the bind fault — through json_error, never `?`.
@@ -1823,7 +1868,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Err(e) => {
             console_warn!("[live-view] statement bind failed: {e}");
             return json_error("database query failed", 503);
-        },
+        }
     };
     let rows: Vec<crate::live_view::LiveViewRow> =
         match stmt.all().await.and_then(|r| r.results::<LiveViewRowD1>()) {
@@ -1831,7 +1876,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
             Err(e) => {
                 console_warn!("[live-view] potparty join query failed: {e}");
                 return json_error("database query failed", 503);
-            },
+            }
         };
 
     // LOW-6: the tip hop is BOUNDED (same with_timeout idiom as the case
@@ -1852,7 +1897,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
                     crate::live_view::TIP_FETCH_TIMEOUT_MS
                 );
                 None
-            },
+            }
         }
     };
     // HIGH-A: corroborate each POT from its OWN v2 candidate markers (the
@@ -1879,14 +1924,14 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
                     })
                     .await;
                 (corr, effective, fetched)
-            },
+            }
             Err(e) => {
                 // The SELECTED targets are then tagged "tower-unavailable"
                 // (empty fetched map): we should have asked and could not —
                 // honest unknown, never "no case".
                 console_warn!("[live-view] TOWER binding unavailable (cases omitted): {e}");
                 (corr, targets, std::collections::HashMap::new())
-            },
+            }
         }
     };
     let (tip, (corr, targets, fetched)) = futures_util::future::join(tip_fut, cases_fut).await;
@@ -1896,7 +1941,10 @@ pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     // when nothing was targeted or fetched.
     crate::live_view::apply_cases(&mut entries, &targets, &fetched);
 
-    json_response(crate::live_view::live_view_body(&identity_lc, tip, &entries), 200)
+    json_response(
+        crate::live_view::live_view_body(&identity_lc, tip, &entries),
+        200,
+    )
 }
 
 // ── /spent-any — server-side legacy outpoint reads (bsv-low #227 addendum) ──
@@ -1973,10 +2021,12 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             };
             let raw = match raw {
                 Some(r) => Some(r),
-                None => match provider_get(&format!("{BITAILS_BASE}/download/tx/{spender}")).await {
-                    Some((200, body)) if !body.is_empty() => Some(body),
-                    _ => None,
-                },
+                None => {
+                    match provider_get(&format!("{BITAILS_BASE}/download/tx/{spender}")).await {
+                        Some((200, body)) if !body.is_empty() => Some(body),
+                        _ => None,
+                    }
+                }
             };
             if let Some(raw) = raw {
                 spender_raw_ok = spender_raw_verifies(&raw, spender, txid_lc, vout);
@@ -1986,15 +2036,16 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             // Negative corroboration (never WoC-only). Bitails' outpoint
             // endpoint 500s at the time of writing — parse_bitails_unspent is
             // strict, so that fault surfaces as known:false (fail-safe).
-            bitails = match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}/output/{vout}/spent"))
-                .await
-            {
-                Some((status, body)) => {
-                    let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
-                    parse_bitails_unspent(status, v.as_ref())
-                }
-                None => UnspentCorroboration::Unknown,
-            };
+            bitails =
+                match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}/output/{vout}/spent"))
+                    .await
+                {
+                    Some((status, body)) => {
+                        let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                        parse_bitails_unspent(status, v.as_ref())
+                    }
+                    None => UnspentCorroboration::Unknown,
+                };
         }
         SpentObservation::Fault => {}
     }
@@ -2134,10 +2185,7 @@ struct BeefTrustRow {
 /// bumpless row: raw served, confirmed/height defer to the external leg
 /// (the #247 machinery). Weakens only unverified answers, never verified
 /// ones.
-async fn tx_any_index_leg(
-    ctx: &RouteContext<()>,
-    txid_lc: &str,
-) -> (Option<String>, Option<u64>) {
+async fn tx_any_index_leg(ctx: &RouteContext<()>, txid_lc: &str) -> (Option<String>, Option<u64>) {
     let Ok(db) = ctx.env.d1("OVERLAY_DB") else {
         console_warn!("[tx-any] OVERLAY_DB binding unavailable — break-glass leg only");
         return (None, None);
@@ -2154,7 +2202,7 @@ async fn tx_any_index_leg(
             Err(e) => {
                 console_warn!("[tx-any] {table} query failed: {e}");
                 continue;
-            },
+            }
         };
         let Some(row) = row else { continue };
         let proof_verified = row.proof_verified.unwrap_or(0.0) != 0.0;
@@ -2174,7 +2222,10 @@ async fn tx_any_index_leg(
 /// 404 behind a healthy route. See `txany.rs` for the full bar.
 async fn tx_any_external_leg(
     txid_lc: &str,
-) -> (crate::txany::TxObservation, crate::txany::AbsenceCorroboration) {
+) -> (
+    crate::txany::TxObservation,
+    crate::txany::AbsenceCorroboration,
+) {
     use crate::txany::{AbsenceCorroboration, TxObservation};
 
     let woc = match provider_get(&format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
@@ -2191,14 +2242,16 @@ async fn tx_any_external_leg(
                 };
                 let raw = match raw {
                     Some(r) => Some(r),
-                    None => match provider_get(&format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
-                        Some((200, body)) if !body.is_empty() => Some(body),
-                        _ => None,
-                    },
+                    None => {
+                        match provider_get(&format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
+                            Some((200, body)) if !body.is_empty() => Some(body),
+                            _ => None,
+                        }
+                    }
                 };
                 let raw_hex = raw.and_then(|r| crate::txany::verify_raw_bytes(&r, txid_lc));
                 TxObservation::Present { confirmed, raw_hex }
-            },
+            }
             Err(_) => TxObservation::Fault,
         },
         Some((404, _)) => TxObservation::Absent,
@@ -2216,8 +2269,11 @@ async fn tx_any_external_leg(
             // …and its tx route must prove healthy against the known-mined
             // anchor (route-rot would otherwise fake absence for every txid).
             if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
-                if let Some((200, body)) =
-                    provider_get(&format!("{BITAILS_BASE}/download/tx/{}", crate::txany::KNOWN_MINED_TXID)).await
+                if let Some((200, body)) = provider_get(&format!(
+                    "{BITAILS_BASE}/download/tx/{}",
+                    crate::txany::KNOWN_MINED_TXID
+                ))
+                .await
                 {
                     if !body.is_empty() {
                         BITAILS_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
@@ -2291,9 +2347,11 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         let Some(src_txid) = input.source_txid.as_deref() else {
                             continue;
                         };
-                        let st =
-                            spent_any_resolve(&src_txid.to_ascii_lowercase(), input.source_output_index)
-                                .await;
+                        let st = spent_any_resolve(
+                            &src_txid.to_ascii_lowercase(),
+                            input.source_output_index,
+                        )
+                        .await;
                         if crate::txany::input_proves_unconfirmable(
                             &key,
                             st.known,
@@ -2315,10 +2373,13 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
             TX_ANY_CACHE.with(|c| {
                 let mut map = c.borrow_mut();
                 map.retain(|_, (expiry, _)| *expiry > now);
-                map.insert(key.clone(), (now + crate::txany::TX_ANY_CACHE_TTL_MS, answer.clone()));
+                map.insert(
+                    key.clone(),
+                    (now + crate::txany::TX_ANY_CACHE_TTL_MS, answer.clone()),
+                );
             });
             answer
-        },
+        }
     };
 
     json_response(crate::txany::tx_any_body(&key, &answer), 200)
@@ -2381,15 +2442,25 @@ mod tests {
         // all and served the bump height regardless).
         let (beef, verified) = read(POT_BEEFS_TRUST_SQL, "pot1");
         assert_eq!(beef.as_deref(), Some("BEEF"));
-        assert_eq!(verified, Some(0), "structural has_proof must NOT read as trust");
+        assert_eq!(
+            verified,
+            Some(0),
+            "structural has_proof must NOT read as trust"
+        );
         let (_, verified) = read(TRANSACTIONS_TRUST_SQL, "tx1");
         assert_eq!(verified, Some(0));
 
         // The verifying writers latch — the same reads now answer trusted.
-        conn.execute("UPDATE pot_beefs SET proof_verified = 1 WHERE txid = 'pot1'", [])
-            .unwrap();
-        conn.execute("UPDATE transactions SET has_proof = 1 WHERE txid = 'tx1'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE pot_beefs SET proof_verified = 1 WHERE txid = 'pot1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transactions SET has_proof = 1 WHERE txid = 'tx1'",
+            [],
+        )
+        .unwrap();
         assert_eq!(read(POT_BEEFS_TRUST_SQL, "pot1").1, Some(1));
         assert_eq!(read(TRANSACTIONS_TRUST_SQL, "tx1").1, Some(1));
     }
@@ -2423,7 +2494,11 @@ mod tests {
         assert_eq!(r.cov_recovery_height, Some(900_200));
         assert_eq!(r.spent, Some(true));
         assert_eq!(r.spending_txid.as_deref(), Some("spender-1"));
-        assert_eq!(r.spent_confirmed, Some(false), "0.0 maps to Some(false), not None");
+        assert_eq!(
+            r.spent_confirmed,
+            Some(false),
+            "0.0 maps to Some(false), not None"
+        );
         assert_eq!(r.verdict.as_deref(), Some("refund"));
         assert_eq!(r.verdict_txid.as_deref(), Some("verdict-txid-1"));
         assert_eq!(r.spent_height, Some(900_170));
@@ -2496,7 +2571,11 @@ mod tests {
         assert_eq!(r.cov_pub_b.as_deref(), Some("covpubb-1"));
         assert_eq!(r.spent, Some(true));
         assert_eq!(r.spending_txid.as_deref(), Some("spender-1"));
-        assert_eq!(r.spent_confirmed, Some(false), "0.0 maps to Some(false), not None");
+        assert_eq!(
+            r.spent_confirmed,
+            Some(false),
+            "0.0 maps to Some(false), not None"
+        );
 
         let sparse: LiveViewRowD1 = serde_json::from_value(serde_json::json!({
             "identity": null,
@@ -2517,7 +2596,10 @@ mod tests {
         }))
         .expect("deserialize sparse row");
         let r = sparse.into_row();
-        assert_eq!(r.identity, "", "NULL identity degrades (fails corroboration), never faults");
+        assert_eq!(
+            r.identity, "",
+            "NULL identity degrades (fails corroboration), never faults"
+        );
         assert_eq!(r.opponent_identity, None);
         assert_eq!(r.cov_recovery_height, None);
         assert_eq!(r.identity_sig_hex, None);
@@ -2534,6 +2616,9 @@ mod tests {
         assert!(r.own_marker().is_none());
         let plan = crate::live_view::candidate_plan(std::slice::from_ref(&r));
         assert!(plan.keyed.is_empty());
-        assert_eq!(plan.keyless, vec![vec![(r.pot_txid.to_ascii_lowercase(), 0)]]);
+        assert_eq!(
+            plan.keyless,
+            vec![vec![(r.pot_txid.to_ascii_lowercase(), 0)]]
+        );
     }
 }

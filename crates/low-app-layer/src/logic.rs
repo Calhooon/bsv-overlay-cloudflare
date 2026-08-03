@@ -971,7 +971,11 @@ pub fn aggregate_leaderboard_attributed(
     // A marker is CONFIRMED (backend sense) when BOTH sig pushes are present.
     let confirmed = |i: usize| markers[i].loser_sig_hex.is_some();
     // The chain classification of marker i's pot spend, when one exists.
-    let verdict_of = |i: usize| verdict_by_pot.get(&markers[i].pot_txid.to_ascii_lowercase()).copied();
+    let verdict_of = |i: usize| {
+        verdict_by_pot
+            .get(&markers[i].pot_txid.to_ascii_lowercase())
+            .copied()
+    };
     // #230: the CHAIN-ATTRIBUTED winner of marker i's pot — the identity
     // that provably held the winning seat's committed settle key, when the
     // verdict names a winning seat and a verified v2 marker attributes it.
@@ -1279,7 +1283,6 @@ pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize)
     .to_string()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1530,9 +1533,18 @@ mod tests {
     #[test]
     fn assemble_maps_rows_input_ordered_and_fail_safe() {
         let ops = vec![
-            Outpoint { txid: txid_b(), vout: 1 }, // spent row
-            Outpoint { txid: txid_a(), vout: 0 }, // no row → unknown
-            Outpoint { txid: txid_a(), vout: 2 }, // unspent row
+            Outpoint {
+                txid: txid_b(),
+                vout: 1,
+            }, // spent row
+            Outpoint {
+                txid: txid_a(),
+                vout: 0,
+            }, // no row → unknown
+            Outpoint {
+                txid: txid_a(),
+                vout: 2,
+            }, // unspent row
         ];
         // Rows arrive in ARBITRARY DB order — assembly must re-order.
         let rows = vec![
@@ -1554,7 +1566,10 @@ mod tests {
         let out = assemble_statuses(&ops, &rows);
         assert_eq!(out.len(), 3);
         assert_eq!((out[0].known, out[0].spent), (true, Some(true)));
-        assert_eq!(out[0].spending_txid.as_deref(), Some("f0".repeat(32).as_str()));
+        assert_eq!(
+            out[0].spending_txid.as_deref(),
+            Some("f0".repeat(32).as_str())
+        );
         assert_eq!(out[0].spent_confirmed, Some(true));
         // Fail-safe middle: no row → known:false, spent:null,
         // spentConfirmed:null.
@@ -1569,7 +1584,10 @@ mod tests {
         // Caller sent UPPER hex; the DB row is lowercase — must still match,
         // and the echoed spelling stays the caller's.
         let upper = "AB".repeat(32);
-        let ops = vec![Outpoint { txid: upper.clone(), vout: 0 }];
+        let ops = vec![Outpoint {
+            txid: upper.clone(),
+            vout: 0,
+        }];
         let rows = vec![PotRecordRow {
             txid: "ab".repeat(32),
             vout: 0,
@@ -1657,7 +1675,10 @@ mod tests {
         assert!(one.contains("hex(b.beef) AS spenderBeef"));
         assert_eq!(one.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 1);
         let three = pots_view_join_sql(3);
-        assert_eq!(three.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 3);
+        assert_eq!(
+            three.matches("(p.txid = ? AND p.outputIndex = ?)").count(),
+            3
+        );
         assert_eq!(three.matches(" OR ").count(), 2);
     }
 
@@ -1665,7 +1686,10 @@ mod tests {
     fn extract_raw_tx_hex_roundtrip_and_misses() {
         let (beef_bytes, raw_hex, txid) = beef_fixture();
         // The carried tx extracts to its exact raw bytes (either txid case).
-        assert_eq!(extract_raw_tx_hex(&beef_bytes, &txid), Some(raw_hex.clone()));
+        assert_eq!(
+            extract_raw_tx_hex(&beef_bytes, &txid),
+            Some(raw_hex.clone())
+        );
         assert_eq!(
             extract_raw_tx_hex(&beef_bytes, &txid.to_ascii_uppercase()),
             Some(raw_hex)
@@ -1682,10 +1706,22 @@ mod tests {
         let (beef_bytes, raw_hex, spender) = beef_fixture();
         let beef_hex_upper = hex::encode(&beef_bytes).to_ascii_uppercase(); // SQLite hex() shape
         let ops = vec![
-            Outpoint { txid: txid_a(), vout: 0 }, // spent, beef joined
-            Outpoint { txid: txid_a(), vout: 1 }, // spent, beef row MISSING
-            Outpoint { txid: txid_b(), vout: 0 }, // unknown outpoint
-            Outpoint { txid: txid_b(), vout: 2 }, // known-unspent
+            Outpoint {
+                txid: txid_a(),
+                vout: 0,
+            }, // spent, beef joined
+            Outpoint {
+                txid: txid_a(),
+                vout: 1,
+            }, // spent, beef row MISSING
+            Outpoint {
+                txid: txid_b(),
+                vout: 0,
+            }, // unknown outpoint
+            Outpoint {
+                txid: txid_b(),
+                vout: 2,
+            }, // known-unspent
         ];
         let rows = vec![
             PotsViewRow {
@@ -1723,22 +1759,34 @@ mod tests {
         assert_eq!(out.len(), 4);
         // Joined: the raw rides back.
         assert_eq!(out[0].status.spent, Some(true));
-        assert_eq!(out[0].status.spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(
+            out[0].status.spending_txid.as_deref(),
+            Some(spender.as_str())
+        );
         assert_eq!(out[0].spender_raw_hex.as_deref(), Some(raw_hex.as_str()));
         // Spender recorded but no stored BEEF → pointer yes, raw null.
-        assert_eq!(out[1].status.spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(
+            out[1].status.spending_txid.as_deref(),
+            Some(spender.as_str())
+        );
         assert_eq!(out[1].spender_raw_hex, None);
         // Unknown: fail-safe nulls (never asserted unspent).
         assert_eq!((out[2].status.known, out[2].status.spent), (false, None));
         assert_eq!(out[2].spender_raw_hex, None);
         // Known-unspent: no spender, no raw.
-        assert_eq!((out[3].status.known, out[3].status.spent), (true, Some(false)));
+        assert_eq!(
+            (out[3].status.known, out[3].status.spent),
+            (true, Some(false))
+        );
         assert_eq!(out[3].spender_raw_hex, None);
     }
 
     #[test]
     fn assemble_pots_view_degrades_on_corrupt_beef() {
-        let ops = vec![Outpoint { txid: txid_a(), vout: 0 }];
+        let ops = vec![Outpoint {
+            txid: txid_a(),
+            vout: 0,
+        }];
         let rows = vec![PotsViewRow {
             record: PotRecordRow {
                 txid: txid_a(),
@@ -1757,18 +1805,25 @@ mod tests {
 
     #[test]
     fn pots_view_body_shape() {
-        let op = Outpoint { txid: txid_a(), vout: 0 };
+        let op = Outpoint {
+            txid: txid_a(),
+            vout: 0,
+        };
         let entries = vec![
             PotsViewEntry {
                 status: OutpointStatus::known(&op, true, Some("f0".repeat(32)), true),
                 spender_raw_hex: Some("aabb".to_string()),
             },
             PotsViewEntry {
-                status: OutpointStatus::unknown(&Outpoint { txid: txid_b(), vout: 1 }),
+                status: OutpointStatus::unknown(&Outpoint {
+                    txid: txid_b(),
+                    vout: 1,
+                }),
                 spender_raw_hex: None,
             },
         ];
-        let v: serde_json::Value = serde_json::from_str(&pots_view_body(&entries, Some(958_123))).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&pots_view_body(&entries, Some(958_123))).unwrap();
         assert_eq!(v["tip"], 958_123);
         let arr = v["entries"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -1888,7 +1943,6 @@ mod tests {
         assert_eq!(out[2].spender_raw_hex, None);
     }
 
-
     /// #323 defect 3 — `/recovery-view` must DEDUPE by pot and must be
     /// BOUNDED. `potparty_records` is keyed on the MARKER outpoint
     /// (`PRIMARY KEY (txid, outputIndex)`), so one identity legitimately
@@ -2002,8 +2056,7 @@ mod tests {
         assert!(v2["tip"].is_null());
         assert_eq!(v2["entries"].as_array().unwrap().len(), 2);
         // An empty result (invalid/empty identity) is a well-formed body.
-        let v3: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&[], None)).unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&recovery_view_body(&[], None)).unwrap();
         assert!(v3["tip"].is_null());
         assert_eq!(v3["entries"].as_array().unwrap().len(), 0);
     }
@@ -2056,7 +2109,10 @@ mod tests {
     /// entry of `spent_by` (pot txid byte → settle txid byte) marks that pot
     /// spent by that settle txid; pots absent from the map have NO row (unknown
     /// ⇒ un-anchored).
-    fn statuses_for(markers: &[ResultMarkerRow], spent_by: &HashMap<u8, u8>) -> Vec<OutpointStatus> {
+    fn statuses_for(
+        markers: &[ResultMarkerRow],
+        spent_by: &HashMap<u8, u8>,
+    ) -> Vec<OutpointStatus> {
         let ops = leaderboard_pot_outpoints(markers);
         let mut rows: Vec<PotRecordRow> = Vec::new();
         for op in &ops {
@@ -2089,7 +2145,10 @@ mod tests {
         // 8='10'(10), 9='J'(10), 10='Q'(10), 11='K'(10), 12='A'(1) → 41.
         assert_eq!(hand_score(&[8, 9, 10, 11, 12]), 41);
         // cardsHex parse: 10 hex, five distinct 0..=51.
-        assert_eq!(leaderboard_cards_from_hex("000102030c"), Some([0, 1, 2, 3, 12]));
+        assert_eq!(
+            leaderboard_cards_from_hex("000102030c"),
+            Some([0, 1, 2, 3, 12])
+        );
         assert_eq!(leaderboard_cards_from_hex("0001020303"), None); // dup
         assert_eq!(leaderboard_cards_from_hex("0001020334"), None); // 0x34=52 > 51
         assert_eq!(leaderboard_cards_from_hex("0102030405060708"), None); // wrong len
@@ -2124,7 +2183,10 @@ mod tests {
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
         assert_eq!(lb.board.len(), 1);
-        assert_eq!(lb.board[0].wins, 0, "a singly-signed marker never adds a win");
+        assert_eq!(
+            lb.board[0].wins, 0,
+            "a singly-signed marker never adds a win"
+        );
         assert!(!lb.board[0].proven);
         // The marker is STILL surfaced in evidence (anchored, loserSig null).
         assert_eq!(lb.board[0].evidence.len(), 1);
@@ -2260,7 +2322,11 @@ mod tests {
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8), (3, 4)]));
         let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
         assert_eq!(lb.hands.len(), 2);
-        assert_eq!(lb.hands[0].game_id, tx(1), "earlier claim wins the score tie");
+        assert_eq!(
+            lb.hands[0].game_id,
+            tx(1),
+            "earlier claim wins the score tie"
+        );
         assert_eq!(lb.hands[1].game_id, tx(2));
     }
 
@@ -2270,10 +2336,12 @@ mod tests {
         let b = ident(0xbb);
         let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let proofs =
-            HashMap::from([((tx(1), a.clone()), "proof-txid".to_string())]);
+        let proofs = HashMap::from([((tx(1), a.clone()), "proof-txid".to_string())]);
         let lb = aggregate_leaderboard(&markers, &statuses, &proofs, 200);
-        assert_eq!(lb.board[0].evidence[0].proof_txid.as_deref(), Some("proof-txid"));
+        assert_eq!(
+            lb.board[0].evidence[0].proof_txid.as_deref(),
+            Some("proof-txid")
+        );
         // Absent proof → null, count unchanged.
         let lb2 = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
         assert_eq!(lb2.board[0].evidence[0].proof_txid, None);
@@ -2297,7 +2365,11 @@ mod tests {
 
         // No classification → unchanged counting (backward compatible).
         let lb = aggregate_leaderboard_with_verdicts(
-            &markers, &statuses, &no_proofs(), 200, &HashMap::new(),
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &HashMap::new(),
         );
         assert_eq!(lb.board[0].wins, 1);
         assert_eq!(lb.hands.len(), 1);
@@ -2305,27 +2377,27 @@ mod tests {
 
         // Winner classification → still counts, verdict carried.
         let verdicts = HashMap::from([(tx(1), PotVerdict::WinnerA)]);
-        let lb = aggregate_leaderboard_with_verdicts(
-            &markers, &statuses, &no_proofs(), 200, &verdicts,
-        );
+        let lb =
+            aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
         assert_eq!(lb.board[0].wins, 1);
-        assert_eq!(lb.board[0].evidence[0].server_verdict, Some(PotVerdict::WinnerA));
+        assert_eq!(
+            lb.board[0].evidence[0].server_verdict,
+            Some(PotVerdict::WinnerA)
+        );
 
         // REFUND classification → the claimed win is chain-contradicted:
         // no wins, no hands, but the evidence (with verdict) survives for
         // the client to falsify.
         let verdicts = HashMap::from([(tx(1), PotVerdict::Refund)]);
-        let lb = aggregate_leaderboard_with_verdicts(
-            &markers, &statuses, &no_proofs(), 200, &verdicts,
-        );
+        let lb =
+            aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
         assert!(lb.board.is_empty(), "a refund is never a win");
         assert!(lb.hands.is_empty());
 
         // TIE classification → same exclusion.
         let verdicts = HashMap::from([(tx(1), PotVerdict::Tie)]);
-        let lb = aggregate_leaderboard_with_verdicts(
-            &markers, &statuses, &no_proofs(), 200, &verdicts,
-        );
+        let lb =
+            aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
         assert!(lb.board.is_empty(), "a tie is never a win");
         assert!(lb.hands.is_empty());
     }
@@ -2340,9 +2412,8 @@ mod tests {
         let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         let verdicts = HashMap::from([(tx(1), PotVerdict::WinnerA)]);
-        let lb = aggregate_leaderboard_with_verdicts(
-            &markers, &statuses, &no_proofs(), 200, &verdicts,
-        );
+        let lb =
+            aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
         let v: serde_json::Value =
             serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
         assert_eq!(v["board"][0]["evidence"][0]["serverVerdict"], "winner-a");
@@ -2410,7 +2481,10 @@ mod tests {
             .filter(|e| e.anchored)
             .map(|e| e.game_id.clone())
             .collect();
-        assert!(anchored_games.contains(&tx(46)), "2nd-chunk even pot anchored");
+        assert!(
+            anchored_games.contains(&tx(46)),
+            "2nd-chunk even pot anchored"
+        );
         assert!(!anchored_games.contains(&tx(47)), "odd pot un-anchored");
     }
 
@@ -2693,9 +2767,6 @@ mod tests {
         assert_eq!(clamp_leaderboard_limit(None), LEADERBOARD_DEFAULT_LIMIT);
         assert_eq!(clamp_leaderboard_limit(Some(50)), 50);
         assert_eq!(clamp_leaderboard_limit(Some(0)), 1);
-        assert_eq!(
-            clamp_leaderboard_limit(Some(99_999)),
-            LEADERBOARD_MAX_LIMIT
-        );
+        assert_eq!(clamp_leaderboard_limit(Some(99_999)), LEADERBOARD_MAX_LIMIT);
     }
 }

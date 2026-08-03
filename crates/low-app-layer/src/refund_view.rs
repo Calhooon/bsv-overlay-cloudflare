@@ -474,7 +474,13 @@ mod tests {
         );
         // Spent but unconfirmed — a displaceable intent, even with a verdict.
         assert_eq!(
-            derive_refund_status(Some(true), Some(false), Some(PotVerdict::Refund), true, true),
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::Refund),
+                true,
+                true
+            ),
             (RefundStatus::Unknown, None)
         );
         assert_eq!(
@@ -544,7 +550,7 @@ mod tests {
     #[test]
     fn blocks_to_gate_math() {
         let rows = vec![base_row()]; // recoveryHeight 900_123
-        // 45 blocks out.
+                                     // 45 blocks out.
         let e = &assemble_refund_view(rows.clone(), Some(900_078))[0];
         assert_eq!(e.blocks_to_gate, Some(45));
         assert!(!e.gate_passed);

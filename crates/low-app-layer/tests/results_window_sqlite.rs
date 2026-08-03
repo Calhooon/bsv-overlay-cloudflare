@@ -609,14 +609,12 @@ fn no_funding_bytes_means_no_seat_query() {
 /// recoveryHeight 956656).
 const ENFORCED_SETTLE_TXID: &str =
     "91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6";
-const ENFORCED_SETTLE_HEX: &str = include_str!(
-    "fixtures/91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6.hex"
-);
+const ENFORCED_SETTLE_HEX: &str =
+    include_str!("fixtures/91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6.hex");
 const ENFORCED_FUNDING_TXID: &str =
     "c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563";
-const ENFORCED_FUNDING_HEX: &str = include_str!(
-    "fixtures/c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563.hex"
-);
+const ENFORCED_FUNDING_HEX: &str =
+    include_str!("fixtures/c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563.hex");
 
 /// Wrap a real raw-tx fixture in a minimal (unproven) BEEF — the bytes
 /// `pot_beefs` would durably hold.
@@ -639,8 +637,7 @@ fn insert_beef(conn: &Connection, txid: &str, beef: &[u8]) {
 /// admission stores them (extracted through the shipped decoder).
 fn enforced_pot_columns() -> low_app_layer::results::CovenantParams {
     let raw = hex::decode(ENFORCED_FUNDING_HEX.trim()).unwrap();
-    let ftx =
-        low_app_layer::results::parse_raw_tx_verified(&raw, ENFORCED_FUNDING_TXID).unwrap();
+    let ftx = low_app_layer::results::parse_raw_tx_verified(&raw, ENFORCED_FUNDING_TXID).unwrap();
     low_app_layer::results::extract_covenant_params(&ftx.outputs[0].1).unwrap()
 }
 
@@ -747,7 +744,6 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
     .unwrap()
 }
 
-
 /// The gated joins surface "no BLOB fetched" the same way a missing
 /// `pot_beefs` row always has: `hex(NULL)` is the EMPTY STRING in SQLite
 /// (never SQL NULL) — shape-identical to pre-#284, and `decode_beef_hex("")`
@@ -777,13 +773,27 @@ fn a_decoded_row_serves_verdict_and_params_with_no_blob_fetch() {
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
     // BLOB rows EXIST — the gate must leave them untouched.
-    insert_beef(&conn, ENFORCED_FUNDING_TXID, &beef_bytes_of(ENFORCED_FUNDING_HEX));
-    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+    insert_beef(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        &beef_bytes_of(ENFORCED_FUNDING_HEX),
+    );
+    insert_beef(
+        &conn,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
 
     let rows = query_results_rows(&conn, &victim);
     assert_eq!(rows.len(), 1);
-    assert!(no_blob(&rows[0].funding_beef_hex), "no funding BLOB fetched");
-    assert!(no_blob(&rows[0].spender_beef_hex), "no spender BLOB fetched");
+    assert!(
+        no_blob(&rows[0].funding_beef_hex),
+        "no funding BLOB fetched"
+    );
+    assert!(
+        no_blob(&rows[0].spender_beef_hex),
+        "no spender BLOB fetched"
+    );
     assert_eq!(rows[0].verdict.as_deref(), Some("winner-a"));
 
     // The full assembler answers from columns alone.
@@ -821,12 +831,23 @@ fn a_legacy_row_still_classifies_via_the_beef_fallback() {
     )
     .unwrap();
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
-    insert_beef(&conn, ENFORCED_FUNDING_TXID, &beef_bytes_of(ENFORCED_FUNDING_HEX));
-    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+    insert_beef(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        &beef_bytes_of(ENFORCED_FUNDING_HEX),
+    );
+    insert_beef(
+        &conn,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
 
     let rows = query_results_rows(&conn, &victim);
     assert_eq!(rows.len(), 1);
-    assert!(!no_blob(&rows[0].funding_beef_hex), "legacy row fetches the BLOBs");
+    assert!(
+        !no_blob(&rows[0].funding_beef_hex),
+        "legacy row fetches the BLOBs"
+    );
     assert!(!no_blob(&rows[0].spender_beef_hex));
     assert_eq!(rows[0].lock_kind, None);
 
@@ -866,11 +887,18 @@ fn a_stale_verdict_is_not_trusted_and_falls_back() {
         true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
-    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+    insert_beef(
+        &conn,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
 
     let rows = query_results_rows(&conn, &victim);
     assert_eq!(rows.len(), 1);
-    assert!(no_blob(&rows[0].funding_beef_hex), "params are columns — no funding BLOB");
+    assert!(
+        no_blob(&rows[0].funding_beef_hex),
+        "params are columns — no funding BLOB"
+    );
     assert!(
         !no_blob(&rows[0].spender_beef_hex),
         "a stale verdict re-opens the spender BLOB"
@@ -906,11 +934,15 @@ fn a_fresh_verdict_without_height_still_fetches_the_spender_blob() {
         Some("winner-a"),
         Some(ENFORCED_SETTLE_TXID),
         None, // spentHeight NULL on a CONFIRMED spend (production shape:
-              // a confirming write with no parseable bump leaves it NULL)
+        // a confirming write with no parseable bump leaves it NULL)
         true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
-    insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
+    insert_beef(
+        &conn,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
 
     let rows = query_results_rows(&conn, &victim);
     assert!(no_blob(&rows[0].funding_beef_hex));
@@ -924,7 +956,11 @@ fn a_fresh_verdict_without_height_still_fetches_the_spender_blob() {
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
     );
-    assert_eq!(entries[0].verdict, Some(PotVerdict::WinnerA), "column verdict trusted");
+    assert_eq!(
+        entries[0].verdict,
+        Some(PotVerdict::WinnerA),
+        "column verdict trusted"
+    );
     assert_eq!(
         entries[0].at_height, None,
         "a proofless spender BEEF honestly yields no height — never a guess"
@@ -953,7 +989,7 @@ fn spender_beef_height_is_gated_on_the_verified_latch() {
         Some("winner-a"),
         Some(ENFORCED_SETTLE_TXID),
         None, // spentHeight NULL — the BEEF fallback is the only height
-              // source; the spend itself is CONFIRMED
+        // source; the spend itself is CONFIRMED
         true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
@@ -977,7 +1013,10 @@ fn spender_beef_height_is_gated_on_the_verified_latch() {
     insert_beef(&conn, ENFORCED_SETTLE_TXID, &bumped);
 
     let rows = query_results_rows(&conn, &victim);
-    assert!(!no_blob(&rows[0].spender_beef_hex), "the fallback BLOB is fetched");
+    assert!(
+        !no_blob(&rows[0].spender_beef_hex),
+        "the fallback BLOB is fetched"
+    );
     assert_eq!(
         rows[0].spender_proof_verified,
         Some(false),
