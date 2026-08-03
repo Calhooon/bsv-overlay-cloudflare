@@ -1908,6 +1908,10 @@ struct SpentAnyCached {
     spent: Option<bool>,
     spending_txid: Option<String>,
     spent_confirmed: Option<bool>,
+    /// #323 defect 2 — WHY the answer is `known:false`, cached alongside it
+    /// so a fault stays legible for the whole TTL instead of decaying into
+    /// an unexplained negative on the next read.
+    reason: Option<&'static str>,
 }
 
 thread_local! {
@@ -2001,6 +2005,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
         spent: st.spent,
         spending_txid: st.spending_txid,
         spent_confirmed: st.spent_confirmed,
+        reason: st.reason,
     }
 }
 
@@ -2069,6 +2074,7 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<()>) -> Result<Response>
             spent: row.spent,
             spending_txid: row.spending_txid,
             spent_confirmed: row.spent_confirmed,
+            reason: row.reason,
         });
     }
 

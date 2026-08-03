@@ -1201,7 +1201,21 @@ pub fn assemble_results(
         let mut verdict = None;
         let mut at_height = None;
         let mut seat = None;
-        if let (Some(true), Some(settle)) = (r.spent, settle_lc.as_deref()) {
+        // #323 defect 1 — the spend must be CONFIRMED before any verdict,
+        // outcome, height or hand is derived from it. `spent = 1` with
+        // `spentConfirmed = 0` is a RECORDED-BUT-UNCONFIRMED pointer: a
+        // non-final parked tx is a displaceable INTENT, not a landing, and
+        // deriving from it asserts what the chain does not prove (it served
+        // a never-mined spender on 7 of 8 refunds in the 2026-08-03
+        // real-wallet audit). This is the SAME bar
+        // `refund_view::derive_refund_status` already applies — "recorded-
+        // but-unconfirmed (a displaceable intent, not a landing):
+        // incomplete — never guess". The raw pointer facts (`settleTxid`,
+        // `spent`, `spentConfirmed`) still SERVE below: surface the attempt,
+        // never consume it as a landing.
+        if let (Some(true), Some(true), Some(settle)) =
+            (r.spent, r.spent_confirmed, settle_lc.as_deref())
+        {
             // 1. The STORED verdict — trusted only when it was computed from
             //    THIS spend pointer (`verdictTxid == spendingTxid`; the
             //    overlay enforced the stake-conservation check at write
@@ -1875,16 +1889,29 @@ pub fn decide_spent_any(
                 crate::logic::OutpointStatus::known(&op, true, Some(txid.clone()), *confirmed)
             } else {
                 // Unverifiable pointer → honest unknown, never a bare claim.
-                crate::logic::OutpointStatus::unknown(&op)
+                // #323 defect 2: say WHY. A CONFIRMED spend whose raw could
+                // not be fetched (WoC 429 — a documented operational fact
+                // here — or a Bitails fault) lands in this arm, and without
+                // a reason it is indistinguishable from "nothing there".
+                crate::logic::OutpointStatus::unknown_because(
+                    &op,
+                    crate::logic::SPENT_ANY_REASON_UNVERIFIED_SPENDER,
+                )
             }
         }
         SpentObservation::NotSpent => match bitails_unspent {
             UnspentCorroboration::ConfirmedUnspent => {
                 crate::logic::OutpointStatus::known(&op, false, None, false)
             }
-            UnspentCorroboration::Unknown => crate::logic::OutpointStatus::unknown(&op),
+            UnspentCorroboration::Unknown => crate::logic::OutpointStatus::unknown_because(
+                &op,
+                crate::logic::SPENT_ANY_REASON_UNCORROBORATED,
+            ),
         },
-        SpentObservation::Fault => crate::logic::OutpointStatus::unknown(&op),
+        SpentObservation::Fault => crate::logic::OutpointStatus::unknown_because(
+            &op,
+            crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT,
+        ),
     }
 }
 
@@ -3147,6 +3174,176 @@ mod tests {
         // The never-spent pot keeps its fail-safe nulls.
         assert_eq!(entries[1].spent, None);
         assert_eq!(entries[1].outcome, Outcome::Unresolved);
+    }
+
+
+    /// #323 defect 1 — a PARKED (recorded-but-unconfirmed) spender must
+    /// never produce a verdict, an outcome, or a height. A non-final parked
+    /// tx is a displaceable INTENT, not a landing: the same bar
+    /// `refund_view::derive_refund_status` already applies ("recorded-but-
+    /// unconfirmed (a displaceable intent, not a landing): incomplete —
+    /// never guess"). The raw pointer facts still SERVE (surface, never
+    /// consume) so the client can see what was attempted.
+    #[test]
+    fn a_parked_unconfirmed_spender_yields_no_verdict_and_no_outcome() {
+        let (ka, pa) = real_key(41);
+        let (kb, pb) = real_key(42);
+        let w_winner = wallet_of(0x51);
+        let w_loser = wallet_of(0x52);
+        let winner = identity_of(&w_winner);
+        let loser = identity_of(&w_loser);
+        let gid = tx(0x01);
+        let params = params_with_keys(&pa, &pb);
+
+        let lock = covenant_lock(&params);
+        let f_raw = raw_tx(&"11".repeat(32), 0, 0xffff_ffff, &[(1000, lock)], 0);
+        let f_id = bsv_rs::transaction::Transaction::from_binary(&f_raw)
+            .unwrap()
+            .id();
+        let outs = vec![
+            (10u64, p2pkh_lock(&params.rake_pkh)),
+            (980u64, p2pkh_lock(&params.pay_pkh_a)),
+        ];
+        let s_raw = raw_tx(&f_id, 0, 0xffff_ffff, &outs, 0);
+        let s_id = bsv_rs::transaction::Transaction::from_binary(&s_raw)
+            .unwrap()
+            .id();
+        let marker = real_seat_marker(&ka, &pa, &w_winner, &winner, &loser, &gid, &f_id, 0);
+        let _ = &kb;
+
+        let mk = |confirmed: Option<bool>| ResultsRow {
+            identity: marker.identity.clone(),
+            game_id: gid.clone(),
+            pot_txid: f_id.clone(),
+            pot_vout: 0,
+            recovery_height: marker.recovery_height,
+            opponent_identity: marker.opponent_identity.clone(),
+            spent: Some(true),
+            spending_txid: Some(s_id.clone()),
+            spent_confirmed: confirmed,
+            funding_beef_hex: Some(beef_hex_of(&f_raw)),
+            spender_beef_hex: Some(beef_hex_of(&s_raw)),
+            seat_settle_pubkey: Some(marker.seat_settle_pubkey.clone()),
+            seat_sig_hex: Some(marker.seat_sig_hex.clone()),
+            marker_sig_hex: Some(marker.identity_sig_hex.clone()),
+            ..Default::default()
+        };
+
+        // CONTROL: the identical row, CONFIRMED, does resolve. Without this
+        // the test could pass because the fixture never classified at all.
+        let confirmed = assemble_results(
+            &winner,
+            vec![mk(Some(true))],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(confirmed[0].verdict, Some(PotVerdict::WinnerA));
+        assert_eq!(confirmed[0].outcome, Outcome::Won);
+
+        // THE DEFECT: same bytes, spentConfirmed = 0 (a parked intent).
+        for parked in [Some(false), None] {
+            let e = assemble_results(
+                &winner,
+                vec![mk(parked)],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            );
+            assert_eq!(e.len(), 1);
+            assert_eq!(
+                e[0].verdict, None,
+                "an unconfirmed spender must never yield a verdict"
+            );
+            assert_eq!(
+                e[0].outcome,
+                Outcome::Unresolved,
+                "an unconfirmed spender must never yield an outcome"
+            );
+            assert_eq!(e[0].at_height, None, "no height from an unconfirmed spend");
+            assert!(
+                e[0].winner_hand.is_none(),
+                "no provable hand from an unconfirmed spend"
+            );
+            // Surface, never consume: the attempted pointer still serves,
+            // labelled by spentConfirmed, so the client can see the intent.
+            assert_eq!(e[0].settle_txid.as_deref(), Some(s_id.as_str()));
+            assert_eq!(e[0].spent, Some(true));
+            assert_eq!(e[0].spent_confirmed, parked);
+        }
+    }
+
+
+    /// #323 defect 2 — `/spent-any` must not collapse "we could not look"
+    /// into the same answer as "we looked and corroborated nothing".
+    ///
+    /// The issue filed this as "the pot has no `pot_records` row". That
+    /// diagnosis is WRONG: `/spent-any` never reads `pot_records` at all
+    /// (it is a live WoC+Bitails read — see `routes::spent_any_resolve`).
+    /// What actually happens is that a provider fault on the spender-raw
+    /// fetch — WoC 429s are a documented operational fact for this repo —
+    /// turns a CONFIRMED positive into `known:false`, indistinguishable
+    /// from a genuine negative. The misdiagnosis was itself caused by
+    /// `OutpointStatus::known`'s doc, which describes only the D1-backed
+    /// `/utxo-status` producer.
+    ///
+    /// Fail-safe direction is correct and MUST NOT change (never assert an
+    /// unverifiable pointer). What changes is that the REASON is surfaced,
+    /// so a fault is legible instead of masquerading as information.
+    #[test]
+    fn spent_any_distinguishes_a_fault_from_a_corroborated_negative() {
+        let spender = "cd".repeat(32);
+        // 1. Upstream fault — we could not look.
+        let fault = decide_spent_any(&SpentObservation::Fault, false, UnspentCorroboration::Unknown);
+        // 2. Looked, and corroborated genuinely unspent.
+        let unspent = decide_spent_any(
+            &SpentObservation::NotSpent,
+            false,
+            UnspentCorroboration::ConfirmedUnspent,
+        );
+        // 3. Spent per WoC, but the spender raw could not be verified.
+        let unverified = decide_spent_any(
+            &SpentObservation::Spent {
+                txid: spender.clone(),
+                confirmed: true,
+            },
+            false,
+            UnspentCorroboration::Unknown,
+        );
+        // 4. Looked, WoC says unspent, Bitails did not corroborate.
+        let uncorroborated = decide_spent_any(
+            &SpentObservation::NotSpent,
+            false,
+            UnspentCorroboration::Unknown,
+        );
+
+        // The corroborated negative is real information and stays known.
+        assert!(unspent.known, "a corroborated unspent is a real answer");
+        assert_eq!(unspent.spent, Some(false));
+
+        // The other three are all `known:false` — the FAIL-SAFE, unchanged.
+        for s in [&fault, &unverified, &uncorroborated] {
+            assert!(!s.known, "unverifiable input must stay known:false");
+            assert_eq!(s.spent, None, "never assert a spend we cannot verify");
+        }
+
+        // THE DEFECT: they are mutually indistinguishable on the wire, so a
+        // provider outage reads exactly like "nothing there" — which is how
+        // this got filed as a coverage hole in a table this route never reads.
+        let body_of = |s: &crate::logic::OutpointStatus| {
+            let mut e = s.clone();
+            e.txid = "ab".repeat(32);
+            e.vout = 0;
+            crate::logic::utxo_status_body(std::slice::from_ref(&e))
+        };
+        assert_ne!(
+            body_of(&fault),
+            body_of(&uncorroborated),
+            "a provider FAULT must be distinguishable from an un-corroborated negative"
+        );
+        assert_ne!(
+            body_of(&fault),
+            body_of(&unverified),
+            "a provider FAULT must be distinguishable from an unverifiable spender"
+        );
     }
 
     #[test]

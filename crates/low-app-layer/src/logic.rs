@@ -128,7 +128,15 @@ pub struct OutpointStatus {
     /// Caller's original txid spelling (echoed).
     pub txid: String,
     pub vout: u32,
-    /// Whether `pot_records` has a row for this outpoint.
+    /// Whether this surface has a verified answer for the outpoint.
+    ///
+    /// The MEANING IS PRODUCER-SPECIFIC, and conflating the two caused a
+    /// real misdiagnosis (#323 defect 2 was filed as a `pot_records`
+    /// coverage hole on a route that never reads that table):
+    /// - `/utxo-status` (D1-backed): `known` = a `pot_records` row exists.
+    /// - `/spent-any` (live WoC+Bitails): `known` = the providers gave an
+    ///   answer this surface could VERIFY. `pot_records` is never consulted.
+    ///   A provider fault therefore yields `known:false` — see [`Self::reason`].
     pub known: bool,
     /// `Some(bool)` for a known row, `None` (wire `null`) when unknown —
     /// FAIL-SAFE: an unknown outpoint is never asserted unspent.
@@ -140,11 +148,37 @@ pub struct OutpointStatus {
     /// overlay's pot `mark_spent`). `Some(bool)` for a known row, `None`
     /// (wire `null`) when unknown — same fail-safe shape as `spent`.
     pub spent_confirmed: Option<bool>,
+    /// WHY this answer is `known:false` — `None` on every `known:true` row
+    /// and on the D1-backed `/utxo-status` path (where absence genuinely
+    /// means "no row"). Set by `/spent-any` so an upstream OUTAGE is legible
+    /// instead of masquerading as "there is nothing there" (#323 defect 2).
+    ///
+    /// This SURFACES the ambiguity rather than resolving it: the fail-safe
+    /// answer is unchanged (an unverifiable pointer is never asserted), but
+    /// the caller — and the next auditor — can now tell a provider fault
+    /// from a corroborated negative. Deliberately NOT resolved by falling
+    /// back to `pot_records`: that table can hold a PARKED, never-mined
+    /// pointer (#323 defect 1), so a fallback would trade an honest unknown
+    /// for a confident wrong answer, and would break this route's contract
+    /// that every positive is raw-hash + input-match verified.
+    pub reason: Option<&'static str>,
 }
 
+/// `/spent-any`: an upstream provider faulted — we could not look. NOT a
+/// statement about the outpoint.
+pub const SPENT_ANY_REASON_PROVIDER_FAULT: &str = "provider-fault";
+/// `/spent-any`: a spender was reported but its raw could not be fetched or
+/// did not hash/input-match, so the pointer is unverifiable.
+pub const SPENT_ANY_REASON_UNVERIFIED_SPENDER: &str = "unverified-spender";
+/// `/spent-any`: reported unspent, but without the independent corroboration
+/// this surface requires before serving a negative.
+pub const SPENT_ANY_REASON_UNCORROBORATED: &str = "uncorroborated-unspent";
+
 impl OutpointStatus {
-    /// No `pot_records` row: `known:false, spent:null, spendingTxid:null,
-    /// spentConfirmed:null`.
+    /// No verified answer: `known:false, spent:null, spendingTxid:null,
+    /// spentConfirmed:null`, and no reason (the D1 `/utxo-status` shape,
+    /// where absence of a row IS the answer). `/spent-any` uses
+    /// [`Self::unknown_because`] so its faults stay legible.
     pub fn unknown(op: &Outpoint) -> Self {
         Self {
             txid: op.txid.clone(),
@@ -153,6 +187,15 @@ impl OutpointStatus {
             spent: None,
             spending_txid: None,
             spent_confirmed: None,
+            reason: None,
+        }
+    }
+
+    /// [`Self::unknown`] carrying WHY — the `/spent-any` shape.
+    pub fn unknown_because(op: &Outpoint, reason: &'static str) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::unknown(op)
         }
     }
 
@@ -171,6 +214,7 @@ impl OutpointStatus {
             spent: Some(spent),
             spending_txid,
             spent_confirmed: Some(spent_confirmed),
+            reason: None,
         }
     }
 }
@@ -189,6 +233,10 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
                 "spent": e.spent,
                 "spendingTxid": e.spending_txid,
                 "spentConfirmed": e.spent_confirmed,
+                // #323 defect 2 — present only when this surface could not
+                // verify an answer; null everywhere else (including every
+                // known:true row and the whole D1 /utxo-status path).
+                "reason": e.reason,
             })
         })
         .collect();
@@ -408,8 +456,26 @@ pub fn recovery_view_sql() -> &'static str {
      LEFT JOIN pot_records r ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
      LEFT JOIN pot_beefs b ON b.txid = lower(r.spendingTxid) \
      WHERE pp.identity = ? \
-     ORDER BY pp.createdAt DESC, pp.rowid DESC"
+     ORDER BY pp.createdAt DESC, pp.rowid DESC \
+     LIMIT 400"
 }
+
+/// Hard bound on `/recovery-view` MARKER ROWS per request (#323 defect 3).
+/// This is a row cap, not a pot cap: duplicate marker rows for one pot are
+/// collapsed AFTER the read (see [`assemble_recovery_view`]), so the served
+/// entry count is ≤ this. Sized well above [`crate::results::RESULTS_MAX_ROWS`]
+/// (100 distinct pots) precisely BECAUSE the duplicates are counted here —
+/// the audit's worst observed ratio was 18 rows for 12 games (1.5×), so 400
+/// rows leaves generous headroom over a 100-pot recovery while still turning
+/// an unbounded identity-scoped D1 read — one that runs on EVERY app open,
+/// the #255 per-request amplifier class — into a bounded one.
+///
+/// TRUNCATION IS SILENT AT THE SQL LAYER and that is a stated residual: a
+/// caller at the cap cannot tell a full answer from a truncated one. It is
+/// bounded-and-honest-enough today only because the cap is far above any
+/// real identity's marker count; if a real caller ever approaches it, this
+/// needs the `casesTruncated`-style honesty bit `/live-view` carries.
+pub const RECOVERY_VIEW_MAX_ROWS: usize = 400;
 
 /// One `/recovery-view` joined row, host-typed: the caller's potparty facts
 /// plus the LEFT-JOINed pot-spend status and the spender's stored BEEF. The
@@ -465,7 +531,25 @@ pub struct RecoveryEntry {
 /// entry's `spenderRawHex` to null (never a wrong byte) — the same fail-safe
 /// as [`assemble_pots_view`].
 pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> Vec<RecoveryEntry> {
+    // #323 defect 3 — collapse duplicate MARKER rows for one pot.
+    // `potparty_records` is keyed `PRIMARY KEY (txid, outputIndex)` — the
+    // marker's own outpoint — so one identity legitimately holds many rows
+    // for one pot: every republish is a new row, and any third party may
+    // file one (the overlay admits markers by BYTE FORMAT, never by
+    // signature). The prod audit saw 18 rows for 12 games. `assemble_results`
+    // already dedupes on exactly this key ("duplicate marker rows (garbage
+    // coexists by design)"); this brings the one identity-scoped view that
+    // lacked it up to the same rule. The SQL orders newest-first, so the
+    // FIRST row for a pot is the freshest marker — keep it, drop the rest.
+    let mut seen = std::collections::HashSet::new();
     rows.into_iter()
+        .filter(|r| {
+            seen.insert((
+                r.game_id.to_ascii_lowercase(),
+                r.pot_txid.to_ascii_lowercase(),
+                r.pot_vout,
+            ))
+        })
         .map(|r| {
             let spender_raw_hex = match (&r.spending_txid, &r.spender_beef_hex) {
                 (Some(spender), Some(beef_hex)) => {
@@ -1802,6 +1886,49 @@ mod tests {
         assert_eq!(out[2].spending_txid, None);
         assert_eq!(out[2].spent_confirmed, None);
         assert_eq!(out[2].spender_raw_hex, None);
+    }
+
+
+    /// #323 defect 3 — `/recovery-view` must DEDUPE by pot and must be
+    /// BOUNDED. `potparty_records` is keyed on the MARKER outpoint
+    /// (`PRIMARY KEY (txid, outputIndex)`), so one identity legitimately
+    /// holds many marker rows for one pot (each republish, and any third
+    /// party's marker, is its own row) — the prod audit saw 18 rows for 12
+    /// games. `assemble_results` already dedupes on exactly this key; this
+    /// is the same rule for the one identity-scoped view that lacked it.
+    #[test]
+    fn recovery_view_dedupes_by_pot_and_is_bounded() {
+        let dup = |g: u8| RecoveryRow {
+            game_id: format!("{:02x}", g).repeat(32),
+            pot_txid: txid_a(),
+            pot_vout: 0,
+            recovery_height: 958_504,
+            opponent_identity: format!("03{}", "bb".repeat(32)),
+            spent: None,
+            spending_txid: None,
+            spent_confirmed: None,
+            spender_beef_hex: None,
+        };
+        // Three marker rows for ONE (game, pot, vout) — the republish shape.
+        let rows = vec![dup(0x11), dup(0x11), dup(0x11)];
+        let entries = assemble_recovery_view(rows);
+        assert_eq!(entries.len(), 1, "duplicate marker rows must collapse");
+
+        // Distinct pots are NOT collapsed (dedupe must not eat real rows).
+        let entries = assemble_recovery_view(vec![dup(0x11), dup(0x22)]);
+        assert_eq!(entries.len(), 2, "distinct games must survive dedupe");
+
+        // The SQL is bounded — an identity-scoped view with no window is an
+        // unbounded D1 read on every app open (#255 amplifier class).
+        let sql = recovery_view_sql();
+        // Positive assertion on the EXACT bound, so the literal in the SQL
+        // and RECOVERY_VIEW_MAX_ROWS cannot drift apart (two derivations of
+        // one number is its own trap — this pin is the single source).
+        assert!(
+            sql.contains(&format!("LIMIT {RECOVERY_VIEW_MAX_ROWS}")),
+            "recovery_view_sql LIMIT must equal RECOVERY_VIEW_MAX_ROWS \
+             ({RECOVERY_VIEW_MAX_ROWS}): {sql}"
+        );
     }
 
     #[test]

@@ -645,6 +645,16 @@ fn enforced_pot_columns() -> low_app_layer::results::CovenantParams {
 }
 
 /// Insert a pot_records row WITH decoded columns (+ optional verdict).
+///
+/// `confirmed` is EXPLICIT and independent of `spent_height`. Production
+/// decouples them: `mark_spent_sql(confirmed=true, ..)` latches
+/// `spentConfirmed = 1` while writing `spentHeight = COALESCE(?, spentHeight)`,
+/// which is NULL whenever the confirming caller has no parseable bump. A
+/// CONFIRMED spend with a NULL height is therefore a real production state.
+/// This helper used to infer `spentConfirmed` from `spent_height.is_some()`,
+/// which modelled a state production never produces and left three tests
+/// silently exercising an UNCONFIRMED row while their names and comments
+/// claimed they were about height (#323).
 #[allow(clippy::too_many_arguments)]
 fn insert_decoded_pot(
     conn: &Connection,
@@ -655,6 +665,7 @@ fn insert_decoded_pot(
     verdict: Option<&str>,
     verdict_txid: Option<&str>,
     spent_height: Option<i64>,
+    confirmed: bool,
 ) {
     conn.execute(
         "INSERT OR IGNORE INTO pot_records \
@@ -668,7 +679,7 @@ fn insert_decoded_pot(
             txid,
             i32::from(spending_txid.is_some()),
             spending_txid,
-            i32::from(spent_height.is_some()),
+            i32::from(confirmed),
             hex::encode(p.pub_a),
             hex::encode(p.pub_b),
             hex::encode(p.pub_tower),
@@ -762,6 +773,7 @@ fn a_decoded_row_serves_verdict_and_params_with_no_blob_fetch() {
         Some("winner-a"),
         Some(ENFORCED_SETTLE_TXID),
         Some(800_000),
+        true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
     // BLOB rows EXIST — the gate must leave them untouched.
@@ -851,6 +863,7 @@ fn a_stale_verdict_is_not_trusted_and_falls_back() {
         Some("winner-b"),
         Some(&h64(0xd0)), // stale: not the current spendingTxid
         None,
+        true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
     insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
@@ -892,7 +905,9 @@ fn a_fresh_verdict_without_height_still_fetches_the_spender_blob() {
         4000,
         Some("winner-a"),
         Some(ENFORCED_SETTLE_TXID),
-        None, // spentHeight NULL — unconfirmed spend
+        None, // spentHeight NULL on a CONFIRMED spend (production shape:
+              // a confirming write with no parseable bump leaves it NULL)
+        true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
     insert_beef(&conn, ENFORCED_SETTLE_TXID, &beef_bytes_of(ENFORCED_SETTLE_HEX));
@@ -937,7 +952,9 @@ fn spender_beef_height_is_gated_on_the_verified_latch() {
         4000,
         Some("winner-a"),
         Some(ENFORCED_SETTLE_TXID),
-        None, // spentHeight NULL — the BEEF fallback is the only height source
+        None, // spentHeight NULL — the BEEF fallback is the only height
+              // source; the spend itself is CONFIRMED
+        true,
     );
     file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
 
