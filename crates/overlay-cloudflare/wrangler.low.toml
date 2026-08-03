@@ -30,7 +30,7 @@ database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
 [vars]
 ENVIRONMENT = "production"
 CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
-# HOSTING_URL intentionally UNSET 2026-08-03 (bsv-low #320): the */15 cron DOES fire and would re-publish all 17 ads every cycle post-fix until defect 3b lands. Re-set for the controlled one-cycle diagnosis.
+# HOSTING_URL intentionally UNSET 2026-08-03 (bsv-low #320): cron fires; re-enable only after defect 3b (chaintracks recent-block SPV gap) is fixed.
 WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # Lobby surface: mainline SHIP/SLAP (so the node can be discovered and can
 # index peer ads if ever needed) + the LOW poker lobby topic + the LOW
