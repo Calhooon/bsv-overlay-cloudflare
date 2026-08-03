@@ -739,11 +739,30 @@ fn build_engine_with_storage(
         ..Default::default()
     };
 
-    // ChainTracker — SPV verification via ChainTracks API
+    // ChainTracker — SPV verification via ChainTracks API.
+    //
+    // #320 defect 3b root cause: this slot used a PLAIN URL fetch while every
+    // other tracker consumer routes through `lookup_service_chain_tracker`.
+    // ChainTracks is a Worker on the SAME account, and a `workers.dev`
+    // subrequest to a same-account Worker loops back to the CALLER (bsv-low
+    // #148, documented on the sibling fn) — so the engine answered its own
+    // /findHeaderHexForHeight with its own 404, and `run_validation`'s SPV
+    // gate returned `BlockNotFound` for EVERY height, deterministically,
+    // since initial release. Victims: the ad self-admission (every
+    // sync_advertisements local submit) and any stock no-mode-header
+    // /submit whose BEEF carries a BUMP. ChainTracks itself was healthy the
+    // whole time. Same preference order as the sibling: service binding
+    // first, URL fetch only as the off-account fallback. The enablement
+    // condition (CHAIN_TRACKER_URL set) is unchanged — only the transport.
     let chain_tracker: Option<Box<dyn bsv_rs::transaction::ChainTracker>> =
         env.var("CHAIN_TRACKER_URL").ok().map(|v| {
-            Box::new(WorkerChainTracker::new(v.to_string()))
-                as Box<dyn bsv_rs::transaction::ChainTracker>
+            let ct_url = v.to_string();
+            match env.service("CHAINTRACKS") {
+                Ok(svc) => Box::new(WorkerChainTracker::with_service(ct_url, svc))
+                    as Box<dyn bsv_rs::transaction::ChainTracker>,
+                Err(_) => Box::new(WorkerChainTracker::new(ct_url))
+                    as Box<dyn bsv_rs::transaction::ChainTracker>,
+            }
         });
 
     // Network broadcaster — Arcade V2 is the overlay's SOLE network broadcaster
