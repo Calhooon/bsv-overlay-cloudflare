@@ -1335,12 +1335,29 @@ pub async fn admin_sync_advertisements(engine: &Engine) -> worker::Result<Respon
     worker::console_log!("POST /admin/syncAdvertisements");
 
     match engine.sync_advertisements().await {
-        Ok(()) => {
-            worker::console_log!("POST /admin/syncAdvertisements -> 200");
+        Ok(report) if report.ok() => {
+            // Body stays byte-identical to the pre-#320 success shape (parity
+            // posture); the report details land in the tail log.
+            worker::console_log!("POST /admin/syncAdvertisements -> 200 {report:?}");
             json_ok(&SuccessBody {
                 status: "success",
                 message: "Advertisements synced successfully",
             })
+        }
+        Ok(report) => {
+            // bsv-low #320 defect 3a: a failed create/submit must never
+            // masquerade as `success`. Full report in the body so the
+            // failing stage (create vs local submit vs revoke) and the
+            // engine's verbatim error are caller-visible.
+            worker::console_log!("POST /admin/syncAdvertisements -> 500 {report:?}");
+            json_response(
+                &serde_json::json!({
+                    "status": "error",
+                    "message": "advertisement sync completed with failures",
+                    "report": report,
+                }),
+                500,
+            )
         }
         Err(e) => {
             worker::console_log!("POST /admin/syncAdvertisements -> 400");

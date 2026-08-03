@@ -118,6 +118,56 @@ pub struct ProofCompletionSummary {
     pub already_proven: usize,
 }
 
+/// Outcome of one [`Engine::sync_advertisements`] run (bsv-low #320 defect
+/// 3a).
+///
+/// The engine used to swallow create/submit failures into `error!` and
+/// return `Ok(())`, so the admin route reported `success` while zero
+/// advertisements were admitted locally; a caller could not tell a
+/// converged no-op (`to_create == 0`) from a silent failure. Every field
+/// here is observational — the sync's behavior is unchanged, its outcome is
+/// no longer hidden.
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncAdvertisementsReport {
+    /// Advertisements the diff found missing (attempted this run). A
+    /// converged node reports 0 here.
+    pub to_create: usize,
+    /// Stale advertisements the diff said to revoke.
+    pub to_revoke: usize,
+    /// `advertiser.create_advertisements` failure, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_error: Option<String>,
+    /// Local `Engine::submit` failure for the created ads, verbatim — the
+    /// path that silently hid the self-admission failure live (our own
+    /// ls_ship/ls_slap never gained our ads, so every cycle re-created all
+    /// of them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_error: Option<String>,
+    /// Outputs admitted per topic by the local submit (from the STEAK).
+    /// A successful submit that admitted NOTHING (topic-manager refusal)
+    /// shows up here as explicit zeros.
+    pub admitted: std::collections::BTreeMap<String, usize>,
+    /// `advertiser.revoke_advertisements` failure, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoke_error: Option<String>,
+    /// Local `Engine::submit` failure for the revocation, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoke_submit_error: Option<String>,
+}
+
+impl SyncAdvertisementsReport {
+    /// True when nothing errored. NOTE: a submit that admitted zero outputs
+    /// is not an error at this layer — check `admitted` when `to_create > 0`.
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.create_error.is_none()
+            && self.submit_error.is_none()
+            && self.revoke_error.is_none()
+            && self.revoke_submit_error.is_none()
+    }
+}
+
 /// Internal result from Phase 1 + 2 validation.
 ///
 /// Carries per-topic admittance decisions, previous coins, and the parsed
@@ -1550,15 +1600,23 @@ impl Engine {
 
     /// Sync SHIP/SLAP advertisements with configured managers and services.
     ///
-    /// Creates missing advertisements and revokes stale ones.
-    pub async fn sync_advertisements(&self) -> Result<(), EngineError> {
+    /// Creates missing advertisements and revokes stale ones. Returns a
+    /// [`SyncAdvertisementsReport`] so a create/submit failure is VISIBLE to
+    /// the caller (bsv-low #320 defect 3a): this method used to swallow both
+    /// into `error!` and return `Ok(())`, so `/admin/syncAdvertisements`
+    /// reported `success` while zero advertisements were admitted locally —
+    /// a caller could not tell a converged no-op from a silent failure, and
+    /// every cycle re-created the full ad set.
+    pub async fn sync_advertisements(&self) -> Result<SyncAdvertisementsReport, EngineError> {
+        let mut report = SyncAdvertisementsReport::default();
+
         let Some(advertiser) = &self.advertiser else {
-            return Ok(()); // No advertiser configured
+            return Ok(report); // No advertiser configured
         };
 
         let hosting_url = match &self.config.hosting_url {
             Some(url) if !url.is_empty() => url.clone(),
-            _ => return Ok(()), // No hosting URL
+            _ => return Ok(report), // No hosting URL
         };
 
         // Get configured topics and services
@@ -1621,32 +1679,56 @@ impl Engine {
         // Create new advertisements
         let mut all_to_create = ships_to_create;
         all_to_create.extend(slaps_to_create);
+        report.to_create = all_to_create.len();
         if !all_to_create.is_empty() {
             match advertiser.create_advertisements(&all_to_create).await {
                 Ok(tagged_beef) => {
-                    if let Err(e) = self.submit(&tagged_beef, SubmitMode::CurrentTx).await {
-                        error!("Failed to submit new advertisements: {e}");
+                    match self.submit(&tagged_beef, SubmitMode::CurrentTx).await {
+                        Ok(steak) => {
+                            for (topic, instructions) in &steak {
+                                report
+                                    .admitted
+                                    .insert(topic.clone(), instructions.outputs_to_admit.len());
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to submit new advertisements: {e}");
+                            report.submit_error = Some(e.to_string());
+                        }
                     }
                 }
-                Err(e) => error!("Failed to create advertisements: {e}"),
+                Err(e) => {
+                    error!("Failed to create advertisements: {e}");
+                    report.create_error = Some(e.to_string());
+                }
             }
         }
 
         // Revoke stale advertisements
         let mut all_to_revoke = ships_to_revoke;
         all_to_revoke.extend(slaps_to_revoke);
+        report.to_revoke = all_to_revoke.len();
         if !all_to_revoke.is_empty() {
             match advertiser.revoke_advertisements(&all_to_revoke).await {
+                // An advertiser that declines to build a revocation (e.g. the
+                // CF advertiser's documented v1 no-op) returns an EMPTY
+                // TaggedBEEF — submitting it would only manufacture a parse
+                // error. Skip; the stale ads age out on-chain.
+                Ok(tagged_beef) if tagged_beef.topics.is_empty() => {}
                 Ok(tagged_beef) => {
                     if let Err(e) = self.submit(&tagged_beef, SubmitMode::CurrentTx).await {
                         error!("Failed to submit revocation: {e}");
+                        report.revoke_submit_error = Some(e.to_string());
                     }
                 }
-                Err(e) => error!("Failed to revoke advertisements: {e}"),
+                Err(e) => {
+                    error!("Failed to revoke advertisements: {e}");
+                    report.revoke_error = Some(e.to_string());
+                }
             }
         }
 
-        Ok(())
+        Ok(report)
     }
 
     // ========================================================================
@@ -4336,6 +4418,11 @@ mod tests {
         created: Arc<Mutex<Vec<AdvertisementData>>>,
         existing_ship: Vec<Advertisement>,
         existing_slap: Vec<Advertisement>,
+        /// Topic the returned TaggedBEEF is tagged with — a topic with no
+        /// registered manager forces the LOCAL submit to fail (#320 3a).
+        tag_topic: String,
+        /// Simulate a create_advertisements failure (#320 3a).
+        create_fails: bool,
     }
 
     impl TrackingAdvertiser {
@@ -4346,6 +4433,8 @@ mod tests {
                     created: created.clone(),
                     existing_ship: vec![],
                     existing_slap: vec![],
+                    tag_topic: "tm_test".to_string(),
+                    create_fails: false,
                 },
                 created,
             )
@@ -4360,8 +4449,11 @@ mod tests {
             &self,
             ads: &[AdvertisementData],
         ) -> Result<TaggedBEEF, AdvertiserError> {
+            if self.create_fails {
+                return Err(AdvertiserError::CreationFailed("mock create refused".into()));
+            }
             self.created.lock().unwrap().extend(ads.iter().cloned());
-            Ok(TaggedBEEF::new(test_beef(), vec!["tm_test".to_string()]))
+            Ok(TaggedBEEF::new(test_beef(), vec![self.tag_topic.clone()]))
         }
 
         async fn find_all_advertisements(
@@ -4454,6 +4546,101 @@ mod tests {
             ads.iter().any(|a| a.topic_or_service_name == "tm_test"),
             "tm_test should get a SHIP advertisement"
         );
+    }
+
+    // ── sync_advertisements report (bsv-low #320 defect 3a) ────────────
+    //
+    // Pre-#320 the engine returned `Ok(())` unconditionally: a failed
+    // create or a failed LOCAL submit was `error!`-logged and invisible to
+    // the caller — the admin route said `success` while the node's own
+    // ls_ship/ls_slap never gained its ads, so every cycle re-created the
+    // whole set. These cells pin the report contract.
+
+    fn sync_test_engine(adv: TrackingAdvertiser) -> Engine {
+        let mut managers: HashMap<String, Box<dyn TopicManagerTrait>> = HashMap::new();
+        managers.insert(
+            "tm_test".to_string(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
+        Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(MemoryStorage::new()),
+            Some(Box::new(adv)),
+            EngineConfig {
+                hosting_url: Some("https://valid.example.com".to_string()),
+                suppress_default_sync_advertisements: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_report_counts_admitted_outputs_on_success() {
+        let (adv, _) = TrackingAdvertiser::new();
+        let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
+        assert!(report.ok(), "clean run must report ok: {report:?}");
+        assert_eq!(report.to_create, 1, "tm_test was missing");
+        assert_eq!(
+            report.admitted.get("tm_test"),
+            Some(&1),
+            "the STEAK's admitted count must be surfaced: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_report_surfaces_local_submit_failure() {
+        // The TaggedBEEF comes back tagged for a topic with no registered
+        // manager → the LOCAL submit fails. That failure must be in the
+        // report, not swallowed (the live silent-failure shape).
+        let (mut adv, _) = TrackingAdvertiser::new();
+        adv.tag_topic = "tm_unregistered".to_string();
+        let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
+        assert!(!report.ok(), "a failed local submit must not report ok");
+        assert_eq!(report.to_create, 1);
+        let submit_error = report.submit_error.as_deref().unwrap_or_default();
+        assert!(
+            submit_error.contains("tm_unregistered"),
+            "verbatim engine error expected, got: {submit_error}"
+        );
+        assert!(report.admitted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_report_surfaces_create_failure() {
+        let (mut adv, _) = TrackingAdvertiser::new();
+        adv.create_fails = true;
+        let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
+        assert!(!report.ok());
+        assert!(
+            report
+                .create_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mock create refused"),
+            "{report:?}"
+        );
+        assert!(report.submit_error.is_none(), "create failed before submit");
+    }
+
+    #[tokio::test]
+    async fn sync_report_converged_noop_is_ok_and_creates_nothing() {
+        // A node whose own storage already lists its ads must attempt ZERO
+        // creates — the convergence direction of #320 defect 3 (live, the
+        // missing self-admission made every cycle re-create all 17 ads).
+        let (mut adv, created) = TrackingAdvertiser::new();
+        adv.existing_ship = vec![Advertisement {
+            protocol: Protocol::Ship,
+            identity_key: "02aa".to_string(),
+            domain: "https://valid.example.com".to_string(),
+            topic_or_service: "tm_test".to_string(),
+            beef: None,
+            output_index: None,
+        }];
+        let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(report.to_create, 0, "converged ⇒ nothing to create");
+        assert!(created.lock().unwrap().is_empty());
     }
 
     // ── complete_missing_proofs (#130) ─────────────────────────────────

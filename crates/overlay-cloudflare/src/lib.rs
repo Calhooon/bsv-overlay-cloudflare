@@ -981,8 +981,17 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
 
     // Sync advertisements (if advertiser + hosting URL are configured).
     // Publishes any new SHIP/SLAP ads on-chain so peers can discover us.
-    if let Err(e) = engine.sync_advertisements().await {
-        worker::console_log!("Scheduled: Ad sync error: {}", e);
+    match engine.sync_advertisements().await {
+        Ok(report) if report.ok() => {
+            worker::console_log!("Scheduled: Ad sync ok: {report:?}");
+        }
+        Ok(report) => {
+            // bsv-low #320 defect 3a — surface, never swallow.
+            worker::console_log!("Scheduled: Ad sync completed WITH FAILURES: {report:?}");
+        }
+        Err(e) => {
+            worker::console_log!("Scheduled: Ad sync error: {}", e);
+        }
     }
 
     // GASP sync with discovered peers. For each topic configured in
