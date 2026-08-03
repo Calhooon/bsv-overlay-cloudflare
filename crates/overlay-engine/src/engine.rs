@@ -184,15 +184,18 @@ impl SyncAdvertisementsReport {
         self.admitted.values().sum()
     }
 
-    /// True when the run errored nowhere AND, if it attempted creates, the
-    /// local submit actually admitted something (#320 M1): a submit that
-    /// succeeds but admits ZERO outputs is a non-error topic-manager
-    /// refusal — the ads never enter our own ls_ship/ls_slap, so the diff
-    /// re-creates (and re-pays for) the full set next cycle. That must not
-    /// read as success.
+    /// True when the run errored nowhere AND the local submit admitted
+    /// EVERY created ad (#320 M1 + delta D1): each advertisement is exactly
+    /// one output and change is never a SHIP/SLAP token, so full admission
+    /// means `admitted_total() >= to_create` (defensive `>=`). A weaker
+    /// `> 0` bar let a PARTIAL admit pass — the live set is 9 SHIP + 8 SLAP
+    /// in ONE tx with independent per-topic admission, so tm_ship admitting
+    /// its 9 while tm_slap refused all 8 read as success while the diff
+    /// re-created (re-paid for) the refused 8 every cycle. Subsumes the
+    /// converged no-op (`0 >= 0`).
     #[must_use]
     pub fn effective(&self) -> bool {
-        self.ok() && (self.to_create == 0 || self.admitted_total() > 0)
+        self.ok() && self.admitted_total() >= self.to_create
     }
 }
 
@@ -4460,9 +4463,10 @@ mod tests {
         created: Arc<Mutex<Vec<AdvertisementData>>>,
         existing_ship: Vec<Advertisement>,
         existing_slap: Vec<Advertisement>,
-        /// Topic the returned TaggedBEEF is tagged with — a topic with no
-        /// registered manager forces the LOCAL submit to fail (#320 3a).
-        tag_topic: String,
+        /// Topics the returned TaggedBEEF is tagged with — a topic with no
+        /// registered manager forces the LOCAL submit to fail (#320 3a);
+        /// several topics exercise independent per-topic admission (D1).
+        tag_topics: Vec<String>,
         /// Simulate a create_advertisements failure (#320 3a).
         create_fails: bool,
         /// Simulate a find_all_advertisements failure (#320 M2).
@@ -4479,7 +4483,7 @@ mod tests {
                     created: created.clone(),
                     existing_ship: vec![],
                     existing_slap: vec![],
-                    tag_topic: "tm_test".to_string(),
+                    tag_topics: vec!["tm_test".to_string()],
                     create_fails: false,
                     find_fails: false,
                     revoke_empty: false,
@@ -4501,7 +4505,7 @@ mod tests {
                 return Err(AdvertiserError::CreationFailed("mock create refused".into()));
             }
             self.created.lock().unwrap().extend(ads.iter().cloned());
-            Ok(TaggedBEEF::new(test_beef(), vec![self.tag_topic.clone()]))
+            Ok(TaggedBEEF::new(test_beef(), self.tag_topics.clone()))
         }
 
         async fn find_all_advertisements(
@@ -4648,7 +4652,7 @@ mod tests {
         // manager → the LOCAL submit fails. That failure must be in the
         // report, not swallowed (the live silent-failure shape).
         let (mut adv, _) = TrackingAdvertiser::new();
-        adv.tag_topic = "tm_unregistered".to_string();
+        adv.tag_topics = vec!["tm_unregistered".to_string()];
         let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
         assert!(!report.ok(), "a failed local submit must not report ok");
         assert_eq!(report.to_create, 1);
@@ -4732,6 +4736,45 @@ mod tests {
         assert!(
             !report.effective(),
             "zero admitted on a non-empty create must not read as success: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_report_partial_admit_is_not_effective() {
+        // Delta D1: TWO topics in one submitted tx, per-topic admission
+        // independent — tm_test admits its output, tm_refuse refuses all.
+        // admitted_total (1) > 0 but < to_create (2): the refused ads
+        // would be re-created (re-paid) every cycle, so this must NOT
+        // read as success.
+        let (mut adv, _) = TrackingAdvertiser::new();
+        adv.tag_topics = vec!["tm_test".to_string(), "tm_refuse".to_string()];
+        let mut managers: HashMap<String, Box<dyn TopicManagerTrait>> = HashMap::new();
+        managers.insert(
+            "tm_test".to_string(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
+        managers.insert(
+            "tm_refuse".to_string(),
+            Box::new(MockTopicManager::admitting(vec![])), // refuses everything
+        );
+        let engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(MemoryStorage::new()),
+            Some(Box::new(adv)),
+            EngineConfig {
+                hosting_url: Some("https://valid.example.com".to_string()),
+                suppress_default_sync_advertisements: true,
+                ..Default::default()
+            },
+        );
+        let report = engine.sync_advertisements().await.unwrap();
+        assert!(report.ok(), "no ERROR occurred: {report:?}");
+        assert_eq!(report.to_create, 2, "{report:?}");
+        assert_eq!(report.admitted_total(), 1, "{report:?}");
+        assert!(
+            !report.effective(),
+            "a partial admit must not read as success: {report:?}"
         );
     }
 
