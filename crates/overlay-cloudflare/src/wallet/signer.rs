@@ -44,6 +44,10 @@ const DEFAULT_SEQUENCE: u32 = 0xFFFF_FFFF;
 /// the standard BSV sighash.
 const SCOPE: u32 = SIGHASH_ALL | SIGHASH_FORKID;
 
+/// A resolved per-input signing plan: `(signing key, compressed pubkey
+/// bytes, sighash subscript)` — see [`resolve_p2pkh_input_key`].
+type ResolvedInputKey = (PrivateKey, Vec<u8>, Vec<u8>);
+
 /// P2PKH locking script length in bytes (`76 a9 14 <20> 88 ac`).
 const P2PKH_LOCK_LEN: usize = 25;
 /// Offset of the 20-byte pubkey hash inside a P2PKH script.
@@ -130,83 +134,15 @@ pub fn sign_transaction(
     // metadata; otherwise fall back to (b). Either way the resulting
     // child pubkey-hash MUST match the input's P2PKH hash160 — that's
     // our integrity check that we picked the right key.
-    let admin_root_pubkey = admin_key.public_key();
-    let admin_root_hash160 = admin_root_pubkey.hash160();
-
-    // Pre-compute (signing_key, signing_pubkey_bytes, subscript) per input.
-    //
-    // The subscript may need to be RECONSTRUCTED from the derived pubkey.
-    // rust-wallet-infra's `allocate_change_input` returns change UTXOs with
-    // `locking_script = ""` (their locking_script column is populated at
-    // processAction time for some outputs, not for change — the on-chain
-    // script is recovered from raw_tx at script_offset, which isn't in the
-    // response). When derivation metadata is present we can rebuild the
-    // expected P2PKH script locally: `76 a9 14 <hash160(derived_pubkey)> 88 ac`.
-    // This is exactly the script wallet-infra would have produced at the
-    // derived address. Matches bsv-wallet-toolbox-rs's symmetric approach
-    // (derive-then-sign-without-trusting-stored-script).
-    let per_input_keys: Vec<(PrivateKey, Vec<u8>, Vec<u8>)> = template
+    // Pre-compute (signing_key, signing_pubkey_bytes, subscript) per input
+    // via the shared resolver — see [`resolve_p2pkh_input_key`].
+    let per_input_keys: Vec<ResolvedInputKey> = template
         .inputs
         .iter()
         .zip(decoded_inputs.iter())
-        .map(
-            |(template_input, di)| -> Result<(PrivateKey, Vec<u8>, Vec<u8>), SignError> {
-                // Try BRC-29 derivation if metadata is present.
-                let has_derivation = template_input.derivation_prefix.is_some()
-                    && template_input.derivation_suffix.is_some()
-                    && template_input.sender_identity_key.is_some();
-
-                let signing_key = if has_derivation {
-                    let prefix = template_input.derivation_prefix.as_deref().unwrap_or("");
-                    let suffix = template_input.derivation_suffix.as_deref().unwrap_or("");
-                    let sender = template_input.sender_identity_key.as_deref().unwrap_or("");
-                    crate::wallet::brc42::derive_brc29_input_key(admin_key, prefix, suffix, sender)
-                        .map_err(|_| SignError::WrongKey)?
-                } else {
-                    admin_key.clone()
-                };
-                let signing_pubkey = signing_key.public_key();
-                let pubkey_hash = signing_pubkey.hash160();
-
-                // Resolve the script we'll use as subscript for sighash +
-                // trust check. Three cases:
-                //   1. wallet-infra gave us a non-empty P2PKH script → verify
-                //      its hash matches the derived (or root) pubkey.
-                //   2. wallet-infra gave us an empty script (change-UTXO
-                //      edge case) but we have derivation metadata → build
-                //      the P2PKH from the derived pubkey hash locally.
-                //   3. neither → fall back to root key and root-hash check.
-                let (final_key, subscript): (PrivateKey, Vec<u8>) = if !di.locking_script.is_empty()
-                {
-                    let input_hash = extract_p2pkh_hash(&di.locking_script)?;
-                    if pubkey_hash == input_hash {
-                        (signing_key, di.locking_script.clone())
-                    } else if input_hash == admin_root_hash160 {
-                        (admin_key.clone(), di.locking_script.clone())
-                    } else {
-                        return Err(SignError::WrongKey);
-                    }
-                } else if has_derivation {
-                    // Rebuild the P2PKH script wallet-infra would have
-                    // emitted at this derived address.
-                    let mut script = Vec::with_capacity(P2PKH_LOCK_LEN);
-                    script.extend_from_slice(&[0x76, 0xa9, 0x14]);
-                    script.extend_from_slice(&pubkey_hash);
-                    script.extend_from_slice(&[0x88, 0xac]);
-                    (signing_key, script)
-                } else {
-                    // No script, no derivation — assume root-owned P2PKH.
-                    let mut script = Vec::with_capacity(P2PKH_LOCK_LEN);
-                    script.extend_from_slice(&[0x76, 0xa9, 0x14]);
-                    script.extend_from_slice(&admin_root_hash160);
-                    script.extend_from_slice(&[0x88, 0xac]);
-                    (admin_key.clone(), script)
-                };
-
-                let pubkey_bytes = final_key.public_key().to_compressed().to_vec();
-                Ok((final_key, pubkey_bytes, subscript))
-            },
-        )
+        .map(|(template_input, di)| {
+            resolve_p2pkh_input_key(template_input, &di.locking_script, admin_key)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     // ── Step 3: build the parallel TxInput / TxOutput vectors bsv-rs's
@@ -333,6 +269,94 @@ fn decode_outputs(outputs: &[UnsignedOutput]) -> Result<Vec<DecodedOutput>, Sign
         });
     }
     Ok(out)
+}
+
+/// Resolve the signing key, its compressed pubkey bytes, and the sighash
+/// subscript for one P2PKH input. Shared by [`sign_transaction`] and the
+/// `InputUnlock::P2pkh` arm of [`sign_transaction_mixed`] so both paths give
+/// ONE answer for who owns an input (bsv-low #320 defect 1 — the mixed path
+/// used to check/sign with the root key only).
+///
+/// BRC-29 derivation metadata presence is `derivation_prefix` +
+/// `derivation_suffix`. `sender_identity_key` is deliberately NOT part of
+/// the presence check: rust-wallet-infra writes change rows with
+/// `sender_identity_key = NULL` as the canonical BRC-29 `Self_` marker
+/// (`create_action.rs:512-521`), and the ts-stack reference signs its own
+/// change with no sender field at all, defaulting the unlocker to the
+/// wallet's OWN key (`wallet-toolbox
+/// src/signer/methods/completeSignedTransaction.ts:39-52`). Requiring
+/// `Some` here made the signer fall back to the ROOT key for its own
+/// change — a hash160 that can never match the `Self_`-derived script its
+/// own [`reconstruct_change_outputs`] wrote → live `WrongKey`, one deposit
+/// = one ad cycle (bsv-low #320 defect 1).
+///
+/// Script resolution, three cases:
+///   1. non-empty script → verify its hash matches the derived (or root)
+///      pubkey;
+///   2. empty script (change-UTXO edge case) + derivation metadata → rebuild
+///      the P2PKH from the derived pubkey hash locally (what wallet-infra
+///      would have produced — see [`reconstruct_change_outputs`]);
+///   3. neither → assume root-owned P2PKH.
+fn resolve_p2pkh_input_key(
+    template_input: &UnsignedInput,
+    locking_script: &[u8],
+    admin_key: &PrivateKey,
+) -> Result<ResolvedInputKey, SignError> {
+    let admin_root_pubkey = admin_key.public_key();
+    let admin_root_hash160 = admin_root_pubkey.hash160();
+
+    let has_derivation =
+        template_input.derivation_prefix.is_some() && template_input.derivation_suffix.is_some();
+
+    let signing_key = if has_derivation {
+        let prefix = template_input.derivation_prefix.as_deref().unwrap_or("");
+        let suffix = template_input.derivation_suffix.as_deref().unwrap_or("");
+        // Absent/empty sender ⇒ `Self_`: derive with our own identity as the
+        // counterparty — the exact derivation `reconstruct_change_outputs`
+        // uses when it WRITES the change script. Never the root key.
+        let admin_pub_hex =
+            bsv_rs::primitives::encoding::to_hex(&admin_root_pubkey.to_compressed());
+        let sender = template_input
+            .sender_identity_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(admin_pub_hex.as_str());
+        crate::wallet::brc42::derive_brc29_input_key(admin_key, prefix, suffix, sender)
+            .map_err(|_| SignError::WrongKey)?
+    } else {
+        admin_key.clone()
+    };
+    let signing_pubkey = signing_key.public_key();
+    let pubkey_hash = signing_pubkey.hash160();
+
+    let (final_key, subscript): (PrivateKey, Vec<u8>) = if !locking_script.is_empty() {
+        let input_hash = extract_p2pkh_hash(locking_script)?;
+        if pubkey_hash == input_hash {
+            (signing_key, locking_script.to_vec())
+        } else if input_hash == admin_root_hash160 {
+            (admin_key.clone(), locking_script.to_vec())
+        } else {
+            return Err(SignError::WrongKey);
+        }
+    } else if has_derivation {
+        // Rebuild the P2PKH script wallet-infra would have emitted at this
+        // derived address.
+        let mut script = Vec::with_capacity(P2PKH_LOCK_LEN);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(&pubkey_hash);
+        script.extend_from_slice(&[0x88, 0xac]);
+        (signing_key, script)
+    } else {
+        // No script, no derivation — assume root-owned P2PKH.
+        let mut script = Vec::with_capacity(P2PKH_LOCK_LEN);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(&admin_root_hash160);
+        script.extend_from_slice(&[0x88, 0xac]);
+        (admin_key.clone(), script)
+    };
+
+    let pubkey_bytes = final_key.public_key().to_compressed().to_vec();
+    Ok((final_key, pubkey_bytes, subscript))
 }
 
 /// Replace empty-locking-script change outputs (as wallet-infra returns
@@ -504,8 +528,9 @@ pub enum InputUnlock<'a> {
 /// - [`SignError::Parse`] — malformed hex anywhere in the template
 /// - [`SignError::UnsupportedScript`] — a `P2pkh` variant was passed for a
 ///   non-P2PKH locking script
-/// - [`SignError::WrongKey`] — the admin pubkey-hash doesn't match a
-///   `P2pkh` input's script
+/// - [`SignError::WrongKey`] — neither the BRC-29-derived child nor the
+///   admin root owns a `P2pkh` input's script (see
+///   [`resolve_p2pkh_input_key`])
 /// - [`SignError::Crypto`] — ECDSA failure
 pub fn sign_transaction_mixed(
     template: &CreateActionResult,
@@ -522,17 +547,24 @@ pub fn sign_transaction_mixed(
         reconstruct_change_outputs(&template.outputs, &template.derivation_prefix, admin_key)?;
     let decoded_outputs = decode_outputs(&outputs_patched)?;
 
-    // For P2PKH inputs we still enforce the admin-owns-it check so a misconfig
-    // can't silently sign someone else's UTXO. PushDrop inputs have their own
-    // key binding (the locking pubkey in the old advert); we trust the caller
-    // to pass the right derived key.
-    let admin_hash160 = admin_key.public_key().hash160();
+    // For P2PKH inputs we still enforce the we-own-it check so a misconfig
+    // can't silently sign someone else's UTXO — but through the SAME
+    // resolver `sign_transaction` uses, so both paths give one answer for
+    // who owns an input (#320 defect 1: this loop used to accept the root
+    // hash160 only, so a BRC-29-derived input — e.g. wallet-infra's own
+    // `Self_` change — died WrongKey even though we hold the child key).
+    // PushDrop inputs have their own key binding (the locking pubkey in the
+    // old advert); we trust the caller to pass the right derived key.
+    let mut p2pkh_keys: Vec<Option<ResolvedInputKey>> = Vec::with_capacity(decoded_inputs.len());
     for (i, di) in decoded_inputs.iter().enumerate() {
         if matches!(unlocks[i], InputUnlock::P2pkh) {
-            let input_hash = extract_p2pkh_hash(&di.locking_script)?;
-            if input_hash != admin_hash160 {
-                return Err(SignError::WrongKey);
-            }
+            p2pkh_keys.push(Some(resolve_p2pkh_input_key(
+                &template.inputs[i],
+                &di.locking_script,
+                admin_key,
+            )?));
+        } else {
+            p2pkh_keys.push(None);
         }
     }
 
@@ -555,29 +587,39 @@ pub fn sign_transaction_mixed(
 
     let version_i32 = i32::try_from(template.version).map_err(|_| SignError::Parse("version"))?;
 
-    let admin_pubkey_bytes = admin_key.public_key().to_compressed();
     let mut unlocking_scripts: Vec<Vec<u8>> = Vec::with_capacity(decoded_inputs.len());
     for (i, di) in decoded_inputs.iter().enumerate() {
+        // P2PKH inputs sighash over the RESOLVED subscript (identical to the
+        // stored script when non-empty; reconstructed for empty change
+        // scripts — same rule as sign_transaction). PushDrop keeps the
+        // stored locking script.
+        let subscript: &[u8] = match &p2pkh_keys[i] {
+            Some((_, _, s)) => s,
+            None => &di.locking_script,
+        };
         let params = SighashParams {
             version: version_i32,
             inputs: &sighash_inputs,
             outputs: &sighash_outputs,
             locktime: template.lock_time,
             input_index: i,
-            subscript: &di.locking_script,
+            subscript,
             satoshis: di.satoshis,
             scope: SCOPE,
         };
         let sighash = compute_sighash_for_signing(&params);
 
-        let unlock_bytes = match &unlocks[i] {
-            InputUnlock::P2pkh => {
-                let ecdsa_sig = admin_key.sign(&sighash).map_err(|_| SignError::Crypto)?;
+        let unlock_bytes = match (&unlocks[i], &p2pkh_keys[i]) {
+            (InputUnlock::P2pkh, Some((key, pubkey_bytes, _))) => {
+                let ecdsa_sig = key.sign(&sighash).map_err(|_| SignError::Crypto)?;
                 let tx_sig = TransactionSignature::new(ecdsa_sig, SCOPE);
                 let sig_bytes = tx_sig.to_checksig_format();
-                build_p2pkh_unlock(&sig_bytes, &admin_pubkey_bytes)?
+                build_p2pkh_unlock(&sig_bytes, pubkey_bytes)?
             }
-            InputUnlock::PushDrop { key } => {
+            // Unreachable: p2pkh_keys[i] is Some for every P2pkh unlock by
+            // construction of the resolver loop above.
+            (InputUnlock::P2pkh, None) => return Err(SignError::Parse("p2pkh key unresolved")),
+            (InputUnlock::PushDrop { key }, _) => {
                 let ecdsa_sig = key.sign(&sighash).map_err(|_| SignError::Crypto)?;
                 let tx_sig = TransactionSignature::new(ecdsa_sig, SCOPE);
                 let sig_bytes = tx_sig.to_checksig_format();
@@ -853,6 +895,165 @@ mod tests {
         // One input, zero unlocks → count mismatch.
         let err = sign_transaction_mixed(&template, &key, &[]).unwrap_err();
         assert!(matches!(err, SignError::Parse(_)));
+    }
+
+    // ── #320 defect 1: NULL sender_identity_key = BRC-29 Self_ ─────────────
+
+    /// Extract the compressed pubkey the sole input's unlocking script
+    /// pushes (`[len sig][sig][0x21][33-byte pubkey]`).
+    fn unlock_pubkey_of_single_input(raw_tx: &[u8]) -> Vec<u8> {
+        // version(4) + input-count varint(1) + txid(32) + vout(4) = 41
+        let script_len = raw_tx[41] as usize;
+        let script = &raw_tx[42..42 + script_len];
+        assert_eq!(
+            script[script.len() - 34],
+            0x21,
+            "expected 33-byte pubkey push"
+        );
+        script[script.len() - 33..].to_vec()
+    }
+
+    /// A template whose sole input is a wallet-infra CHANGE row: locking
+    /// script = exactly what `reconstruct_change_outputs` writes for
+    /// (prefix, suffix), derivation metadata present, and the sender field
+    /// as given — `None` is wallet-infra's canonical `Self_` marker.
+    fn change_input_template(
+        key: &PrivateKey,
+        prefix: &str,
+        suffix: &str,
+        sender: Option<String>,
+    ) -> (CreateActionResult, Vec<u8>) {
+        let change_out = UnsignedOutput {
+            vout: 0,
+            satoshis: 4_607,
+            locking_script: String::new(),
+            derivation_suffix: Some(suffix.to_string()),
+        };
+        let patched = reconstruct_change_outputs(&[change_out], prefix, key).unwrap();
+        let change_script_hex = patched[0].locking_script.clone();
+        let change_script = from_hex(&change_script_hex).unwrap();
+        let out_script_hex = hex_encode(&p2pkh_for_key(key));
+        let template = CreateActionResult {
+            input_beef: vec![],
+            inputs: vec![UnsignedInput {
+                vin: 0,
+                source_txid: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+                    .to_string(),
+                source_vout: 17,
+                source_satoshis: 4_607,
+                source_locking_script: change_script_hex,
+                source_transaction: None,
+                derivation_prefix: Some(prefix.to_string()),
+                derivation_suffix: Some(suffix.to_string()),
+                sender_identity_key: sender,
+            }],
+            outputs: vec![UnsignedOutput {
+                vout: 0,
+                satoshis: 4_000,
+                locking_script: out_script_hex,
+                derivation_suffix: None,
+            }],
+            version: 1,
+            lock_time: 0,
+            reference: "change-ref".to_string(),
+            derivation_prefix: prefix.to_string(),
+        };
+        (template, change_script)
+    }
+
+    #[test]
+    fn null_sender_change_input_signs_as_self() {
+        // wallet-infra writes change rows with sender_identity_key = NULL as
+        // the canonical BRC-29 Self_ marker. The signer must derive with our
+        // OWN identity — the same child its reconstruct_change_outputs
+        // wrote — never fall back to the root key. Pre-fix this died
+        // WrongKey ("one deposit = one ad cycle", bsv-low #320).
+        let key = admin_key();
+        let (template, change_script) =
+            change_input_template(&key, "cHJlZml4QQ==", "c3VmZml4QQ==", None);
+        let signed =
+            sign_transaction(&template, &key).expect("NULL-sender change input must sign as Self_");
+        // The pin: the pubkey the unlock pushes hashes to EXACTLY the script
+        // reconstruct_change_outputs wrote — the input path and the output
+        // path agree on one key.
+        let unlock_pubkey = unlock_pubkey_of_single_input(&signed.raw_tx);
+        let mut hasher_input = extract_p2pkh_hash(&change_script).unwrap();
+        let unlock_hash = {
+            use bsv_rs::primitives::ec::PublicKey as Pk;
+            Pk::from_hex(&hex_encode(&unlock_pubkey)).unwrap().hash160()
+        };
+        assert_eq!(unlock_hash, hasher_input);
+        hasher_input = key.public_key().hash160();
+        assert_ne!(
+            unlock_hash, hasher_input,
+            "the change child must NOT be the root key"
+        );
+    }
+
+    #[test]
+    fn empty_string_sender_change_input_signs_as_self() {
+        // Defensive twin: a serializer that maps NULL to "" must get the
+        // same Self_ semantics, not a WrongKey.
+        let key = admin_key();
+        let (template, _) =
+            change_input_template(&key, "cHJlZml4QQ==", "c3VmZml4QQ==", Some(String::new()));
+        sign_transaction(&template, &key)
+            .expect("empty-string sender change input must sign as Self_");
+    }
+
+    #[test]
+    fn explicit_sender_derivation_still_honored() {
+        // Regression guard for the Other(counterparty) path: an input whose
+        // lock was derived from a real third-party sender must still resolve
+        // through that sender, not Self_.
+        let key = admin_key();
+        let sender_key = PrivateKey::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000003",
+        )
+        .unwrap();
+        let sender_hex = hex_encode(&sender_key.public_key().to_compressed());
+        let prefix = "cHJlZml4QQ==";
+        let suffix = "c3VmZml4QQ==";
+        let child = crate::wallet::brc42::derive_brc29_input_key(&key, prefix, suffix, &sender_hex)
+            .unwrap();
+        let child_script_hex = hex_encode(&p2pkh_for_key(&child));
+        let mut template = sample_template(&key);
+        template.inputs[0].source_locking_script = child_script_hex;
+        template.inputs[0].derivation_prefix = Some(prefix.to_string());
+        template.inputs[0].derivation_suffix = Some(suffix.to_string());
+        template.inputs[0].sender_identity_key = Some(sender_hex);
+        sign_transaction(&template, &key).expect("explicit-sender input must sign via Other");
+    }
+
+    #[test]
+    fn mixed_p2pkh_change_input_matches_pure_path() {
+        // The /renew-flow signer must give the same answer as
+        // sign_transaction for a BRC-29 change input (#320: it used to
+        // root-check only and die WrongKey).
+        let key = admin_key();
+        let (template, _) = change_input_template(&key, "cHJlZml4QQ==", "c3VmZml4QQ==", None);
+        let pure = sign_transaction(&template, &key).unwrap();
+        let mixed = sign_transaction_mixed(&template, &key, &[InputUnlock::P2pkh])
+            .expect("mixed P2pkh must resolve the change child");
+        assert_eq!(pure.raw_tx, mixed.raw_tx);
+        assert_eq!(pure.txid, mixed.txid);
+    }
+
+    #[test]
+    fn foreign_lock_with_derivation_metadata_still_refused() {
+        // Fail-closed guard: derivation metadata present but the script
+        // belongs to neither the derived child nor the root → WrongKey.
+        let key = admin_key();
+        let stranger = PrivateKey::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000004",
+        )
+        .unwrap();
+        let (mut template, _) = change_input_template(&key, "cHJlZml4QQ==", "c3VmZml4QQ==", None);
+        template.inputs[0].source_locking_script = hex_encode(&p2pkh_for_key(&stranger));
+        assert!(matches!(
+            sign_transaction(&template, &key),
+            Err(SignError::WrongKey)
+        ));
     }
 
     #[test]
