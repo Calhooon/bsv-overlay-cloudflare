@@ -1319,11 +1319,22 @@ pub fn check_admin_auth(req: &Request, env: &Env) -> Result<(), worker::Result<R
     }
 
     let provided = &auth_header["Bearer ".len()..];
-    if provided.is_empty() || provided != token {
+    if provided.is_empty() || !fixed_time_eq(provided.as_bytes(), token.as_bytes()) {
         return Err(json_error("Forbidden: Invalid credentials", 403));
     }
 
     Ok(())
+}
+
+/// Fixed-time byte comparison for the admin bearer token (#320 L1): the
+/// early-exit `!=` leaked how many leading bytes matched through timing.
+/// The fold touches every byte regardless of where the first mismatch is;
+/// only the token's LENGTH remains observable, which is not secret.
+fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // =============================================================================
@@ -1335,9 +1346,12 @@ pub async fn admin_sync_advertisements(engine: &Engine) -> worker::Result<Respon
     worker::console_log!("POST /admin/syncAdvertisements");
 
     match engine.sync_advertisements().await {
-        Ok(report) if report.ok() => {
+        Ok(report) if report.effective() => {
             // Body stays byte-identical to the pre-#320 success shape (parity
-            // posture); the report details land in the tail log.
+            // posture); the report details land in the tail log. `effective`
+            // — not `ok` — is the bar (#320 M1): a submit that succeeded but
+            // admitted ZERO outputs is a topic-manager refusal that re-runs
+            // (and re-pays for) the full create next cycle.
             worker::console_log!("POST /admin/syncAdvertisements -> 200 {report:?}");
             json_ok(&SuccessBody {
                 status: "success",
@@ -1345,10 +1359,11 @@ pub async fn admin_sync_advertisements(engine: &Engine) -> worker::Result<Respon
             })
         }
         Ok(report) => {
-            // bsv-low #320 defect 3a: a failed create/submit must never
-            // masquerade as `success`. Full report in the body so the
-            // failing stage (create vs local submit vs revoke) and the
-            // engine's verbatim error are caller-visible.
+            // bsv-low #320 defect 3a: a failed create/submit — or a
+            // zero-admit refusal (M1) — must never masquerade as `success`.
+            // Full report in the body so the failing stage (lookup vs create
+            // vs local submit vs revoke) and the engine's verbatim error are
+            // caller-visible.
             worker::console_log!("POST /admin/syncAdvertisements -> 500 {report:?}");
             json_response(
                 &serde_json::json!({
@@ -2178,6 +2193,18 @@ mod tests {
     use super::*;
     use overlay_engine::types::ServiceMetadata;
     use std::collections::HashMap;
+
+    // ── fixed_time_eq (#320 L1) ────────────────────────────────────────
+
+    #[test]
+    fn fixed_time_eq_matches_equal_bytes_only() {
+        assert!(fixed_time_eq(b"secret-token", b"secret-token"));
+        assert!(!fixed_time_eq(b"secret-token", b"secret-tokex"));
+        assert!(!fixed_time_eq(b"Xecret-token", b"secret-token"));
+        assert!(!fixed_time_eq(b"", b"secret-token"));
+        assert!(!fixed_time_eq(b"secret", b"secret-token"));
+        assert!(fixed_time_eq(b"", b""));
+    }
 
     #[test]
     fn build_dashboard_html_basic() {

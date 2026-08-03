@@ -189,9 +189,12 @@ impl<'a> Wallet<'a> {
     ///
     /// # Errors
     ///
-    /// Same variants as [`create_action`]. A `false` in the returned
-    /// `AbortActionResult.aborted` is NOT an error — it just means the tx
-    /// was already completed or not found.
+    /// Same variants as [`create_action`]. Note wallet-infra REFUSES an
+    /// abort of a completed / not-found / network-reached action with an
+    /// RPC error (`ValidationError` per its abortable-status gate in
+    /// abort_action.rs) rather than returning `aborted: false` — rollback
+    /// callers should treat such errors as "nothing to release" and keep
+    /// their original failure.
     ///
     /// [`create_action`]: Wallet::create_action
     pub async fn abort_action(

@@ -193,10 +193,12 @@ impl CloudflareAdvertiser {
     /// one failed sync.
     ///
     /// The abort's own outcome must never mask the original failure: both
-    /// are logged, the caller returns the original error either way. An
-    /// `aborted: false` result is fine — it means the action had already
-    /// completed (e.g. a post-`processAction` failure), so there was nothing
-    /// to release.
+    /// are logged, the caller returns the original error either way. For an
+    /// action that already completed or whose broadcast reached the network
+    /// (e.g. a post-`processAction` failure), wallet-infra REFUSES the abort
+    /// with an RPC error (`ValidationError` — abort_action.rs's abortable-
+    /// status gate), which lands in the `Err` arm below and is ignored:
+    /// there was nothing to release.
     async fn abort_allocated(wallet: &dyn AdWalletOps, reference: &str) {
         let req = AbortActionRequest {
             reference: reference.to_string(),
@@ -329,10 +331,23 @@ impl CloudflareAdvertiser {
                 raw_tx: Some(signed.raw_tx.clone()),
                 send_with: vec![],
             };
-            wallet.process_action(&process_req).await.map_err(|e| {
+            let process_result = wallet.process_action(&process_req).await.map_err(|e| {
                 ad_log(&format!("advertiser: processAction FAILED {e}"));
                 AdvertiserError::CreationFailed(format!("processAction: {e}"))
             })?;
+            // #320 M3: an RPC-level Ok is a transport statement, not a
+            // broadcast verdict — check the per-tx result for a permanent
+            // failure before admitting locally / fanning out to trackers.
+            if let Some(status) = permanent_send_failure(&process_result, &signed.txid) {
+                ad_log(&format!(
+                    "advertiser: processAction returned permanent failure status={status} txid={}",
+                    signed.txid
+                ));
+                return Err(AdvertiserError::CreationFailed(format!(
+                    "processAction: permanent broadcast failure (status={status}) for txid {}",
+                    signed.txid
+                )));
+            }
             ad_log("advertiser: processAction OK");
 
             // Wrap the signed tx + its input ancestry in an AtomicBEEF.
@@ -474,6 +489,40 @@ impl Advertiser for CloudflareAdvertiser {
     }
 }
 
+/// Scan a `processAction` result for a permanent broadcast failure of
+/// `txid` (#320 M3).
+///
+/// Statuses come from the wallet-toolbox `SendWithResult` vocabulary plus
+/// wallet-infra's `proven_tx_reqs` terminal states: `failed`, `invalid`,
+/// `doubleSpend`. Anything else (`sending`, `unproven`, absent) is
+/// in-flight or fine and must NOT fail the pipeline.
+///
+/// **Known wallet-infra residual (stated, not silent):** as of today
+/// `process_action.rs` step 12 hardcodes `status: "sending"` in
+/// `send_with_results` even when its own broadcast branch just recorded a
+/// permanent DoubleSpend/InvalidTx in the DB — so this check cannot fire
+/// against the current server. It pins the canonical contract advertiser-
+/// side now; the wire becomes honest when wallet-infra reports its real
+/// per-branch status (tracked in bsv-low #320).
+fn permanent_send_failure(result: &ProcessActionResult, txid: &str) -> Option<String> {
+    const PERMANENT: [&str; 3] = ["failed", "invalid", "doubleSpend"];
+    for maybe in [&result.send_with_results, &result.not_delayed_results] {
+        let Some(value) = maybe else { continue };
+        let Some(entries) = value.as_array() else { continue };
+        for entry in entries {
+            if entry.get("txid").and_then(|t| t.as_str()) != Some(txid) {
+                continue;
+            }
+            if let Some(status) = entry.get("status").and_then(|s| s.as_str()) {
+                if PERMANENT.contains(&status) {
+                    return Some(status.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // #320 defect 2 — rollback contract tests
 // ────────────────────────────────────────────────────────────────────────────
@@ -552,6 +601,10 @@ mod tests {
         template: CreateActionResult,
         create_fails: bool,
         process_fails: bool,
+        /// When set, processAction returns Ok whose sendWithResults carries
+        /// this status for the submitted txid (#320 M3 — the RPC-Ok /
+        /// broadcast-failed shape).
+        process_status: Option<&'static str>,
         abort_fails: bool,
         calls: RefCell<Vec<String>>,
     }
@@ -562,6 +615,7 @@ mod tests {
                 template,
                 create_fails: false,
                 process_fails: false,
+                process_status: None,
                 abort_fails: false,
                 calls: RefCell::new(vec![]),
             }
@@ -591,14 +645,20 @@ mod tests {
         }
         async fn process_action(
             &self,
-            _req: &ProcessActionRequest,
+            req: &ProcessActionRequest,
         ) -> Result<ProcessActionResult, &'static str> {
             self.calls.borrow_mut().push("processAction".into());
             if self.process_fails {
                 return Err("mock processAction refused");
             }
+            let send_with_results = self.process_status.map(|status| {
+                serde_json::json!([{
+                    "txid": req.txid.clone().unwrap_or_default(),
+                    "status": status,
+                }])
+            });
             Ok(ProcessActionResult {
-                send_with_results: None,
+                send_with_results,
                 not_delayed_results: None,
                 log: None,
             })
@@ -671,6 +731,45 @@ mod tests {
             .expect_err("garbage input_beef must fail BEEF assembly");
         assert!(format!("{err}").contains("Beef::from_binary"), "err was: {err}");
         assert_eq!(wallet.aborted_refs(), vec![TEST_REF.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn permanent_broadcast_failure_fails_and_aborts() {
+        // #320 M3: processAction's RPC Ok with a per-tx PERMANENT failure
+        // status (failed/invalid/doubleSpend) must fail the pipeline —
+        // pre-fix the dead tx was admitted locally AND fanned out to the
+        // mainnet trackers while the report said success.
+        let admin = PrivateKey::from_hex(ADMIN_KEY_HEX).unwrap();
+        let mut wallet = MockWallet::new(template_locked_to(&admin, vec![]));
+        wallet.process_status = Some("doubleSpend");
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("a permanent broadcast failure must fail the pipeline");
+        assert!(
+            format!("{err}").contains("permanent broadcast failure"),
+            "err was: {err}"
+        );
+        assert_eq!(wallet.aborted_refs(), vec![TEST_REF.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn in_flight_send_status_is_not_a_failure() {
+        // The complement guard: wallet-infra's normal "sending" (and any
+        // in-flight status) must NOT fail the pipeline. BEEF assembly then
+        // fails on the empty input_beef — proving we got PAST the status
+        // check — and the message must NOT be the permanent-failure one.
+        let admin = PrivateKey::from_hex(ADMIN_KEY_HEX).unwrap();
+        let mut wallet = MockWallet::new(template_locked_to(&admin, vec![]));
+        wallet.process_status = Some("sending");
+        let err = advertiser()
+            .create_advertisements_with(&one_ad(), &wallet)
+            .await
+            .expect_err("empty input_beef still fails BEEF assembly");
+        assert!(
+            format!("{err}").contains("Beef::from_binary"),
+            "'sending' must pass the status check; err was: {err}"
+        );
     }
 
     #[tokio::test]

@@ -982,11 +982,12 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     // Sync advertisements (if advertiser + hosting URL are configured).
     // Publishes any new SHIP/SLAP ads on-chain so peers can discover us.
     match engine.sync_advertisements().await {
-        Ok(report) if report.ok() => {
+        Ok(report) if report.effective() => {
             worker::console_log!("Scheduled: Ad sync ok: {report:?}");
         }
         Ok(report) => {
-            // bsv-low #320 defect 3a — surface, never swallow.
+            // bsv-low #320 defect 3a/M1 — surface, never swallow (incl. the
+            // zero-admit refusal shape).
             worker::console_log!("Scheduled: Ad sync completed WITH FAILURES: {report:?}");
         }
         Err(e) => {

@@ -148,6 +148,15 @@ pub struct SyncAdvertisementsReport {
     /// A successful submit that admitted NOTHING (topic-manager refusal)
     /// shows up here as explicit zeros.
     pub admitted: std::collections::BTreeMap<String, usize>,
+    /// `advertiser.find_all_advertisements` failure, verbatim (#320 M2).
+    /// When set, creation was REFUSED this run: a blind read must never
+    /// become "current ads = none" and re-create (re-pay) the entire set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup_error: Option<String>,
+    /// Stale ads the diff wanted revoked but the advertiser declined to
+    /// build a revocation for (the CF advertiser's documented v1 no-op —
+    /// #320 L2). Distinguishes "revoke happened" from "revoke skipped".
+    pub revoke_skipped: usize,
     /// `advertiser.revoke_advertisements` failure, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoke_error: Option<String>,
@@ -158,13 +167,32 @@ pub struct SyncAdvertisementsReport {
 
 impl SyncAdvertisementsReport {
     /// True when nothing errored. NOTE: a submit that admitted zero outputs
-    /// is not an error at this layer — check `admitted` when `to_create > 0`.
+    /// is not an error at this layer — that refusal is [`Self::effective`]'s
+    /// job.
     #[must_use]
     pub fn ok(&self) -> bool {
         self.create_error.is_none()
             && self.submit_error.is_none()
+            && self.lookup_error.is_none()
             && self.revoke_error.is_none()
             && self.revoke_submit_error.is_none()
+    }
+
+    /// Total outputs admitted by the local submit across topics.
+    #[must_use]
+    pub fn admitted_total(&self) -> usize {
+        self.admitted.values().sum()
+    }
+
+    /// True when the run errored nowhere AND, if it attempted creates, the
+    /// local submit actually admitted something (#320 M1): a submit that
+    /// succeeds but admits ZERO outputs is a non-error topic-manager
+    /// refusal — the ads never enter our own ls_ship/ls_slap, so the diff
+    /// re-creates (and re-pays for) the full set next cycle. That must not
+    /// read as success.
+    #[must_use]
+    pub fn effective(&self) -> bool {
+        self.ok() && (self.to_create == 0 || self.admitted_total() > 0)
     }
 }
 
@@ -1628,15 +1656,26 @@ impl Engine {
             configured_services.retain(|s| s != "ls_ship" && s != "ls_slap");
         }
 
-        // Fetch current advertisements
-        let current_ship = advertiser
-            .find_all_advertisements(Protocol::Ship)
-            .await
-            .unwrap_or_default();
-        let current_slap = advertiser
-            .find_all_advertisements(Protocol::Slap)
-            .await
-            .unwrap_or_default();
+        // Fetch current advertisements. A read failure REFUSES creation
+        // (#320 M2): swallowing it into "current ads = none" made a
+        // transient D1/storage fault re-create — and re-pay for — the
+        // entire advertisement set, reported as a legitimate `to_create`.
+        let current_ship = match advertiser.find_all_advertisements(Protocol::Ship).await {
+            Ok(ads) => ads,
+            Err(e) => {
+                error!("Failed to read current SHIP advertisements — refusing to create: {e}");
+                report.lookup_error = Some(format!("ship: {e}"));
+                return Ok(report);
+            }
+        };
+        let current_slap = match advertiser.find_all_advertisements(Protocol::Slap).await {
+            Ok(ads) => ads,
+            Err(e) => {
+                error!("Failed to read current SLAP advertisements — refusing to create: {e}");
+                report.lookup_error = Some(format!("slap: {e}"));
+                return Ok(report);
+            }
+        };
 
         // Determine what to create
         let ships_to_create: Vec<AdvertisementData> = configured_topics
@@ -1713,8 +1752,11 @@ impl Engine {
                 // An advertiser that declines to build a revocation (e.g. the
                 // CF advertiser's documented v1 no-op) returns an EMPTY
                 // TaggedBEEF — submitting it would only manufacture a parse
-                // error. Skip; the stale ads age out on-chain.
-                Ok(tagged_beef) if tagged_beef.topics.is_empty() => {}
+                // error. Skip, but say so in the report (#320 L2): the stale
+                // ads stay on-chain until they age out.
+                Ok(tagged_beef) if tagged_beef.topics.is_empty() => {
+                    report.revoke_skipped = all_to_revoke.len();
+                }
                 Ok(tagged_beef) => {
                     if let Err(e) = self.submit(&tagged_beef, SubmitMode::CurrentTx).await {
                         error!("Failed to submit revocation: {e}");
@@ -4423,6 +4465,10 @@ mod tests {
         tag_topic: String,
         /// Simulate a create_advertisements failure (#320 3a).
         create_fails: bool,
+        /// Simulate a find_all_advertisements failure (#320 M2).
+        find_fails: bool,
+        /// Return the v1 no-op EMPTY TaggedBEEF from revoke (#320 L2).
+        revoke_empty: bool,
     }
 
     impl TrackingAdvertiser {
@@ -4435,6 +4481,8 @@ mod tests {
                     existing_slap: vec![],
                     tag_topic: "tm_test".to_string(),
                     create_fails: false,
+                    find_fails: false,
+                    revoke_empty: false,
                 },
                 created,
             )
@@ -4460,6 +4508,9 @@ mod tests {
             &self,
             protocol: Protocol,
         ) -> Result<Vec<Advertisement>, AdvertiserError> {
+            if self.find_fails {
+                return Err(AdvertiserError::LookupFailed("mock lookup refused".into()));
+            }
             match protocol {
                 Protocol::Ship => Ok(self.existing_ship.clone()),
                 Protocol::Slap => Ok(self.existing_slap.clone()),
@@ -4470,6 +4521,9 @@ mod tests {
             &self,
             _ads: &[Advertisement],
         ) -> Result<TaggedBEEF, AdvertiserError> {
+            if self.revoke_empty {
+                return Ok(TaggedBEEF::new(vec![], vec![]));
+            }
             Ok(TaggedBEEF::new(test_beef(), vec!["tm_test".to_string()]))
         }
 
@@ -4641,6 +4695,102 @@ mod tests {
         assert!(report.ok(), "{report:?}");
         assert_eq!(report.to_create, 0, "converged ⇒ nothing to create");
         assert!(created.lock().unwrap().is_empty());
+        assert!(
+            report.effective(),
+            "converged-noop is the one zero-admit shape that IS success"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_report_zero_admit_is_ok_but_not_effective() {
+        // #320 M1: the local submit SUCCEEDS but the topic manager admits
+        // ZERO outputs — a non-error refusal. The ads never enter our own
+        // ls_ship/ls_slap, so the diff re-creates (re-pays) the full set
+        // next cycle. `ok()` (errors-only) stays true; `effective()` must
+        // refuse, and the route keys success on `effective()`.
+        let (adv, _) = TrackingAdvertiser::new();
+        let mut managers: HashMap<String, Box<dyn TopicManagerTrait>> = HashMap::new();
+        managers.insert(
+            "tm_test".to_string(),
+            Box::new(MockTopicManager::admitting(vec![])), // refuses everything
+        );
+        let engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(MemoryStorage::new()),
+            Some(Box::new(adv)),
+            EngineConfig {
+                hosting_url: Some("https://valid.example.com".to_string()),
+                suppress_default_sync_advertisements: true,
+                ..Default::default()
+            },
+        );
+        let report = engine.sync_advertisements().await.unwrap();
+        assert!(report.ok(), "no ERROR occurred: {report:?}");
+        assert_eq!(report.to_create, 1);
+        assert_eq!(report.admitted_total(), 0, "{report:?}");
+        assert!(
+            !report.effective(),
+            "zero admitted on a non-empty create must not read as success: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_report_lookup_failure_refuses_creation() {
+        // #320 M2: a transient read failure must never become "current ads
+        // = none" and re-create (re-pay) the whole set — creation is
+        // REFUSED and the failure lands in the report.
+        let (mut adv, created) = TrackingAdvertiser::new();
+        adv.find_fails = true;
+        let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
+        assert!(!report.ok(), "{report:?}");
+        assert!(!report.effective());
+        assert!(
+            report
+                .lookup_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mock lookup refused"),
+            "{report:?}"
+        );
+        assert_eq!(report.to_create, 0, "creation refused, not attempted");
+        assert!(created.lock().unwrap().is_empty(), "no create call on a blind read");
+        assert!(report.submit_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_report_counts_skipped_revocations() {
+        // #320 L2: `to_revoke: N` with a v1 no-op advertiser must be
+        // distinguishable from a revoke that actually ran.
+        let (mut adv, _) = TrackingAdvertiser::new();
+        adv.revoke_empty = true;
+        adv.existing_ship = vec![
+            Advertisement {
+                protocol: Protocol::Ship,
+                identity_key: "02aa".to_string(),
+                domain: "https://valid.example.com".to_string(),
+                topic_or_service: "tm_test".to_string(),
+                beef: None,
+                output_index: None,
+            },
+            Advertisement {
+                protocol: Protocol::Ship,
+                identity_key: "02aa".to_string(),
+                domain: "https://valid.example.com".to_string(),
+                topic_or_service: "tm_stale".to_string(), // no longer configured
+                beef: None,
+                output_index: None,
+            },
+        ];
+        let report = sync_test_engine(adv).sync_advertisements().await.unwrap();
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(report.to_revoke, 1, "tm_stale is stale");
+        assert_eq!(
+            report.revoke_skipped, 1,
+            "the v1 no-op must be visible, not silent: {report:?}"
+        );
+        assert!(report.revoke_error.is_none());
+        assert!(report.revoke_submit_error.is_none());
     }
 
     // ── complete_missing_proofs (#130) ─────────────────────────────────
