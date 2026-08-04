@@ -739,7 +739,13 @@ pub struct ClaimFact {
 
 /// The BRC-43 protocol result claims are signed under —
 /// `result.ts::RESULT_PROTOCOL` = `[1, 'low result']`.
-fn result_protocol() -> bsv_rs::wallet::Protocol {
+///
+/// `pub` (#332) so producer-parity fixtures — the leaderboard attack cells
+/// and the `leaderboard_window_sqlite` integration harness — can SIGN real
+/// markers with the exact protocol the verifier checks, instead of
+/// re-deriving the tuple by convention (a duplicated format string is a
+/// boundary with no pin by construction).
+pub fn result_protocol() -> bsv_rs::wallet::Protocol {
     bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low result")
 }
 
@@ -762,7 +768,11 @@ fn canonical_cards_hex(cards_hex: &str) -> Option<String> {
 /// The canonical signed challenge — byte-identical to
 /// `result.ts::resultChallenge` (all fields lowercased; v2 binds the
 /// canonical sorted cards). Inputs must already be lowercase.
-fn result_challenge_bytes(
+///
+/// `pub` (#332) for the same producer-parity reason as [`result_protocol`]:
+/// fixtures that must mint REAL verifiable markers build the challenge here,
+/// never from a copied format string.
+pub fn result_challenge_bytes(
     game_id_lc: &str,
     winner_lc: &str,
     loser_lc: &str,

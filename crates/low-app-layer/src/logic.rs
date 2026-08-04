@@ -2492,17 +2492,109 @@ mod tests {
     fn tx(b: u8) -> String {
         format!("{b:02x}").repeat(32)
     }
-    /// 66-hex compressed identity pubkey from a byte (02 prefix + 64 hex).
-    fn ident(b: u8) -> String {
-        format!("02{}", format!("{b:02x}").repeat(32))
+
+    /// Deterministic test wallet per seed (the same test-key crypto the
+    /// `results` tests use — a pinned root private key).
+    fn seed_wallet(seed: u8) -> bsv_rs::wallet::ProtoWallet {
+        let key = bsv_rs::primitives::ec::PrivateKey::from_hex(&format!("{seed:064x}")).unwrap();
+        bsv_rs::wallet::ProtoWallet::new(Some(key))
     }
 
-    /// A result marker. `confirmed` ⇒ a loserSig push is present (backend's
-    /// "confirmed"); `cards` is a 10-hex v2 cards push or None (v1). The
-    /// marker txid is derived from game+winner+seq so distinct markers for the
-    /// same (game, winner) are distinct outpoints (the censorship-fix shape).
+    /// seed → identity and identity → seed maps for every nonzero byte seed,
+    /// computed once. #332: `ident()` used to mint arbitrary pubkey-SHAPED
+    /// strings; counting now VERIFIES marker signatures, so fixture
+    /// identities must be REAL keys the fixture can sign under, and `mk`
+    /// must be able to find the wallet behind an identity it is handed.
+    fn test_identities() -> &'static (HashMap<u8, String>, HashMap<String, u8>) {
+        static CACHE: std::sync::OnceLock<(HashMap<u8, String>, HashMap<String, u8>)> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(|| {
+            let mut fwd = HashMap::new();
+            let mut rev = HashMap::new();
+            for b in 1u8..=255 {
+                let id = seed_wallet(b).identity_key_hex().to_ascii_lowercase();
+                rev.insert(id.clone(), b);
+                fwd.insert(b, id);
+            }
+            (fwd, rev)
+        })
+    }
+
+    /// 66-hex compressed identity pubkey of the seed wallet (REAL key —
+    /// see [`test_identities`]).
+    fn ident(b: u8) -> String {
+        test_identities().0[&b].clone()
+    }
+
+    /// Sign the canonical result challenge as the CLIENT does (`result.ts`:
+    /// counterparty 'anyone', protocol `[1,'low result']`, keyID = gameId),
+    /// returning DER hex — the real producer recipe, via the exported
+    /// `results::result_challenge_bytes` / `results::result_protocol` so the
+    /// fixture cannot drift from the verifier by convention.
+    fn sign_result_as(seed: u8, game_id_lc: &str, challenge: &[u8]) -> String {
+        let sig = seed_wallet(seed)
+            .create_signature(bsv_rs::wallet::CreateSignatureArgs {
+                data: Some(challenge.to_vec()),
+                hash_to_directly_sign: None,
+                protocol_id: crate::results::result_protocol(),
+                key_id: game_id_lc.to_string(),
+                counterparty: Some(bsv_rs::wallet::Counterparty::Anyone),
+            })
+            .unwrap();
+        hex::encode(sig.signature)
+    }
+
+    /// A REAL-SIGNED result marker (#332): the winner signature always
+    /// verifies under `winner`; `confirmed` ⇒ a VERIFYING loser countersig is
+    /// present. `winner`/`loser` must be [`ident`] identities (the fixture
+    /// signs with the wallets behind them). `cards` is a 10-hex v2 cards push
+    /// or None (v1). The marker txid is derived from game+seq so distinct
+    /// markers for the same (game, winner) are distinct outpoints (the
+    /// censorship-fix shape).
     #[allow(clippy::too_many_arguments)]
     fn mk(
+        game: u8,
+        winner: &str,
+        loser: &str,
+        pot: u8,
+        settle: u8,
+        confirmed: bool,
+        cards: Option<&str>,
+        created: i64,
+        seq: u8,
+    ) -> ResultMarkerRow {
+        let rev = &test_identities().1;
+        let (w_lc, l_lc) = (winner.to_ascii_lowercase(), loser.to_ascii_lowercase());
+        let game_lc = tx(game);
+        let challenge = crate::results::result_challenge_bytes(
+            &game_lc,
+            &w_lc,
+            &l_lc,
+            &tx(pot),
+            &tx(settle),
+            cards,
+        )
+        .expect("fixture challenge must build");
+        ResultMarkerRow {
+            game_id: game_lc.clone(),
+            winner: winner.to_string(),
+            loser: loser.to_string(),
+            pot_txid: tx(pot),
+            settle_txid: tx(settle),
+            winner_sig_hex: sign_result_as(rev[&w_lc], &game_lc, &challenge),
+            loser_sig_hex: confirmed.then(|| sign_result_as(rev[&l_lc], &game_lc, &challenge)),
+            cards_hex: cards.map(str::to_string),
+            txid: format!("{game:02x}{seq:02x}").repeat(16),
+            created_at: Some(created),
+        }
+    }
+
+    /// A FORGED marker (#332 attack fixture): same shape as [`mk`] but both
+    /// signature pushes are plausibly-DER-shaped JUNK — exactly the bytes the
+    /// pre-#332 presence gate counted as "confirmed". `winner`/`loser` can be
+    /// ANY strings (no wallet needed — that is the attack's whole point).
+    #[allow(clippy::too_many_arguments)]
+    fn mk_forged(
         game: u8,
         winner: &str,
         loser: &str,
@@ -2751,7 +2843,9 @@ mod tests {
 
     #[test]
     fn board_ranks_by_wins_desc_then_identity() {
-        // A: 2 confirmed wins; B: 1; C: 1. Ordered A, then B/C by identity asc.
+        // A: 2 confirmed wins; B: 1; C: 1. Ordered A, then B/C by identity
+        // asc (real fixture keys since #332, so the tie order is computed
+        // from the derived identities rather than assumed from the seeds).
         let a = ident(0xaa);
         let b = ident(0x0b);
         let c = ident(0x0c);
@@ -2770,9 +2864,12 @@ mod tests {
         assert_eq!(lb.board.len(), 3);
         assert_eq!(lb.board[0].identity, a);
         assert_eq!(lb.board[0].wins, 2);
-        // b (0x0b…) sorts before c (0x0c…) at equal wins.
-        assert_eq!(lb.board[1].identity, b);
-        assert_eq!(lb.board[2].identity, c);
+        // At equal wins the LOWER identity (lowercase hex byte order) ranks
+        // first — assert against the computed order so the rule, not the
+        // seed choice, is what is pinned.
+        let (first, second) = if b < c { (&b, &c) } else { (&c, &b) };
+        assert_eq!(&lb.board[1].identity, first);
+        assert_eq!(&lb.board[2].identity, second);
     }
 
     #[test]
