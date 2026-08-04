@@ -4805,12 +4805,33 @@ mod tests {
         format!("02{}", "a1".repeat(32))
     }
 
+    /// Insert a pot row whose spend, when present, is CONFIRMED.
+    ///
+    /// `spentConfirmed` is derived from `spent` DELIBERATELY here and is
+    /// documented as such (#323 LOW-1). The hazard is not the derivation —
+    /// it is an UNDOCUMENTED one, which leaves callers believing they
+    /// exercised a PARKED row (`spent = 1, spentConfirmed = 0`, the shape
+    /// production reaches whenever a non-final refund is admitted before it
+    /// mines) when the fixture could never produce one. Pass an explicit
+    /// flag via [`insert_pot_with`] if a parked row is ever needed here.
     fn insert_pot(
         conn: &rusqlite::Connection,
         txid: &str,
         vout: u32,
         created_at: i64,
         spent: bool,
+    ) {
+        insert_pot_with(conn, txid, vout, created_at, spent, spent);
+    }
+
+    #[allow(dead_code)]
+    fn insert_pot_with(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        created_at: i64,
+        spent: bool,
+        confirmed: bool,
     ) {
         conn.execute(
             "INSERT OR IGNORE INTO pot_records \
@@ -4821,7 +4842,7 @@ mod tests {
                 vout,
                 i32::from(spent),
                 if spent { Some(h64(0xfe)) } else { None },
-                i32::from(spent),
+                i32::from(confirmed),
                 created_at
             ],
         )
