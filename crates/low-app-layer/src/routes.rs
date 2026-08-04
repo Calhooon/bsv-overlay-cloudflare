@@ -1028,14 +1028,13 @@ async fn classify_spent_pots(
             verdicts.insert(pot.clone(), v);
             // #230: keep the classified pot's COMMITTED lock params (from
             // the hash-verified funding bytes) for the seat attribution.
-            if let Some(params) = crate::results::parse_raw_tx_verified(&fraw, pot)
-                .and_then(|f| {
-                    f.outputs
-                        .get(crate::logic::LEADERBOARD_POT_VOUT as usize)
-                        .map(|(_, lock)| lock.clone())
-                })
-                .and_then(|lock| crate::results::extract_covenant_params(&lock))
-            {
+            // Reads through the ONE shared funding-raw walk — this was the
+            // third inline copy, and the only one shaped differently.
+            if let Some(params) = crate::results::covenant_params_from_funding_raw(
+                &fraw,
+                pot,
+                crate::logic::LEADERBOARD_POT_VOUT,
+            ) {
                 params_by_pot.insert(pot.clone(), params);
             }
         }
@@ -1363,9 +1362,22 @@ pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // be OLDER. Binding the keys removes ordering from the argument entirely
     // — a forged key cannot enter the result set. BEST-EFFORT: a fault here
     // only leaves seat attribution absent (claims still decide), never a 5xx.
-    let seat_markers = results_seat_markers(&db, &rows).await;
+    //
+    // The committed params are resolved ONCE here and threaded into BOTH
+    // consumers. They used to be computed for the seat fetch and DISCARDED,
+    // then re-derived per row inside `assemble_results` — a measured 2.0× CPU
+    // on the legacy-BEEF leg of a route that takes `identity` unauthenticated
+    // and whose row set attacker-writable dust markers populate (#314 class).
+    let params_by_pot = crate::results::covenant_params_by_pot(&rows);
+    let seat_markers = results_seat_markers(&db, &params_by_pot).await;
 
-    let entries = crate::results::assemble_results(&identity_lc, rows, &claims, &seat_markers);
+    let entries = crate::results::assemble_results(
+        &identity_lc,
+        rows,
+        &claims,
+        &seat_markers,
+        &params_by_pot,
+    );
     json_response(crate::results::results_body(&identity_lc, &entries), 200)
 }
 
@@ -1381,18 +1393,17 @@ pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 /// outcome) and never a 5xx.
 async fn results_seat_markers(
     db: &worker::D1Database,
-    rows: &[crate::results::ResultsRow],
+    params_by_pot: &std::collections::HashMap<(String, u32), crate::results::CovenantParams>,
 ) -> std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> {
     let mut out: std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> =
         std::collections::HashMap::new();
-    let params_by_pot = crate::results::covenant_params_by_pot(rows);
     if params_by_pot.is_empty() {
         return out;
     }
     // Chunking + bind construction live in `results::seat_marker_chunks` so
     // they are testable without a Worker (the re-gate's finding #3: this whole
     // delivery path could be deleted with no test failing).
-    for chunk in crate::results::seat_marker_chunks(&params_by_pot) {
+    for chunk in crate::results::seat_marker_chunks(params_by_pot) {
         let sql = crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
