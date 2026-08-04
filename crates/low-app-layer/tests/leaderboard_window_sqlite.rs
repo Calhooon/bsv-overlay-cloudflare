@@ -35,12 +35,58 @@ use bsv_overlay_cloudflare::d1_discovery::{mark_spent_sql, store_record_sql};
 use bsv_rs::primitives::ec::PrivateKey;
 use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet};
 use low_app_layer::logic::{
-    aggregate_leaderboard, assemble_statuses, leaderboard_body, leaderboard_markers_sql,
-    leaderboard_pot_outpoints, leaderboard_unknown_pot_quota, leaderboard_window_cut,
-    proof_pointers_sql, OutpointStatus, PotRecordRow, ResultMarkerRow,
-    LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS,
+    aggregate_leaderboard, aggregate_leaderboard_attributed, assemble_statuses, leaderboard_body,
+    leaderboard_markers_sql, leaderboard_pot_outpoints, leaderboard_unknown_pot_quota,
+    leaderboard_window_cut, proof_pointers_sql, Leaderboard, OutpointStatus, PotRecordRow,
+    ResultMarkerRow, LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS,
 };
+use low_app_layer::results::{PotVerdict, SeatAttribution};
 use rusqlite::{params, params_from_iter, Connection};
+
+/// The chain world (verdict + verified attribution) the ROUTE derives for a
+/// pot from `classify_spent_pots` + `seat_attributions`. Those pipelines have
+/// their OWN real-producer cells (`results.rs` seat-marker roundtrip,
+/// `classifier_real_txs.rs`); this harness proves the WINDOW SQL → anchor
+/// join → aggregate path, so it supplies the world directly. `WinnerA` +
+/// attribution naming `winner` in seat A.
+fn win_world(
+    entries: &[(&str, &str, &str)],
+) -> (
+    std::collections::HashMap<String, PotVerdict>,
+    std::collections::HashMap<String, SeatAttribution>,
+) {
+    let mut v = std::collections::HashMap::new();
+    let mut a = std::collections::HashMap::new();
+    for (pot, winner, loser) in entries {
+        v.insert(pot.to_ascii_lowercase(), PotVerdict::WinnerA);
+        a.insert(
+            pot.to_ascii_lowercase(),
+            SeatAttribution {
+                identity_a: Some(winner.to_ascii_lowercase()),
+                identity_b: Some(loser.to_ascii_lowercase()),
+            },
+        );
+    }
+    (v, a)
+}
+
+fn agg_world(
+    markers: &[ResultMarkerRow],
+    statuses: &[OutpointStatus],
+    world: &(
+        std::collections::HashMap<String, PotVerdict>,
+        std::collections::HashMap<String, SeatAttribution>,
+    ),
+) -> Leaderboard {
+    aggregate_leaderboard_attributed(
+        markers,
+        statuses,
+        &std::collections::HashMap::new(),
+        200,
+        &world.0,
+        &world.1,
+    )
+}
 
 /// A fresh in-memory SQLite carrying the REAL production schema (the same
 /// tolerance discipline as the sibling suites: only the re-run additive-ALTER
@@ -206,7 +252,7 @@ fn query_window(conn: &Connection, limit: usize) -> (Vec<ResultMarkerRow>, bool)
     let mut stmt = conn
         .prepare(&sql)
         .unwrap_or_else(|e| panic!("leaderboard_markers_sql did not PREPARE: {e}\n{sql}"));
-    let per_pot = 4usize; // overlay_discovery::result::storage::RESULT_ROWS_PER_POT
+    let per_pot = low_app_layer::logic::LEADERBOARD_RESULT_ROWS_PER_POT;
     let rows: Vec<(Option<String>, ResultMarkerRow)> = stmt
         .query_map(
             params![
@@ -293,7 +339,7 @@ fn file_proof(conn: &Connection, game: &str, winner: &str, marker_txid: &str, at
 fn query_proof_pointers(
     conn: &Connection,
     pairs: &[(String, String)],
-) -> std::collections::HashMap<(String, String), String> {
+) -> std::collections::HashMap<(String, String), Vec<String>> {
     let sql = proof_pointers_sql(pairs.len());
     let mut stmt = conn
         .prepare(&sql)
@@ -302,7 +348,8 @@ fn query_proof_pointers(
         .iter()
         .flat_map(|(g, w)| [g.clone(), w.clone()])
         .collect();
-    let mut out = std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
     let rows = stmt
         .query_map(params_from_iter(binds), |r| {
             Ok((
@@ -316,7 +363,8 @@ fn query_proof_pointers(
         .unwrap();
     for (g, w, txid) in rows {
         out.entry((g.to_ascii_lowercase(), w.to_ascii_lowercase()))
-            .or_insert(txid);
+            .or_default()
+            .push(txid);
     }
     out
 }
@@ -390,7 +438,8 @@ fn inflation_copies_reach_the_aggregate_and_mint_nothing() {
         "the honest marker must survive the window (a flood must not evict it)"
     );
     let statuses = statuses_from_db(&conn, &markers);
-    let lb = aggregate_leaderboard(&markers, &statuses, &std::collections::HashMap::new(), 200);
+    let world = win_world(&[(&pot, &identity(0x11), &identity(0x22))]);
+    let lb = agg_world(&markers, &statuses, &world);
     let wins_of = |id: &str| {
         lb.board
             .iter()
@@ -405,14 +454,14 @@ fn inflation_copies_reach_the_aggregate_and_mint_nothing() {
     assert_eq!(
         wins_of(&identity(0x11)),
         1,
-        "the honest countersigned win scores exactly once"
+        "the honest attributed win scores exactly once"
     );
 }
 
-/// #332 END TO END, attack (b) ERASURE — through the SHIPPED QUERY. ONE
-/// junk-sig marker carrying the victim's own gameId/pot/settle, naming the
-/// attacker as winner. Pre-#332 the group held two "confirmed" winners and
-/// NOBODY scored: the honest win vanished.
+/// #332 END TO END, attack (b) ERASURE — through the SHIPPED QUERY. A junk-sig
+/// marker naming the attacker as winner of the victim's real pot/settle
+/// reaches the aggregate alongside the honest marker; the chain spine awards
+/// the win to the attributed victim regardless.
 #[test]
 fn erasure_marker_reaches_the_aggregate_and_the_honest_win_survives() {
     let conn = production_schema_db();
@@ -448,7 +497,8 @@ fn erasure_marker_reaches_the_aggregate_and_the_honest_win_survives() {
     let (markers, _) = query_window(&conn, 200);
     assert_eq!(markers.len(), 2, "both markers reach the aggregate");
     let statuses = statuses_from_db(&conn, &markers);
-    let lb = aggregate_leaderboard(&markers, &statuses, &std::collections::HashMap::new(), 200);
+    let world = win_world(&[(&pot, &identity(0x11), &identity(0x22))]);
+    let lb = agg_world(&markers, &statuses, &world);
     let honest = lb
         .board
         .iter()
@@ -456,6 +506,111 @@ fn erasure_marker_reaches_the_aggregate_and_the_honest_win_survives() {
         .expect("the honest win must still be on the board");
     assert_eq!(honest.wins, 1);
     assert!(honest.proven, "its VERIFIED-countersigned tier survives");
+}
+
+/// CRITICAL-1 END TO END — the EARLIER-spam eviction that the interim design
+/// could not survive. The opponent files the 4 OLDEST rows for the victim's
+/// pot DURING the hand (junk sig, garbage settle); the honest winner's
+/// countersigned marker, published later, is EVICTED from the per-pot window.
+/// The window returns only junk, yet the chain spine (confirmed spend +
+/// verdict + attribution) still awards the win to the victim.
+#[test]
+fn earlier_spam_evicts_the_honest_marker_but_the_chain_win_survives() {
+    let conn = production_schema_db();
+    let pot = h64(0xea);
+    let settle = h64(0xeb);
+    let victim = identity(0x11);
+    let opponent = identity(0x22);
+    admit_pot(&conn, &pot, 1_000);
+    mark_spent_confirmed(&conn, &pot, &settle);
+    // 4 attacker rows stamped EARLIER (garbage settle, junk sigs) — the
+    // RESULT_ROWS_PER_POT oldest, so the honest marker is evicted.
+    for i in 0..4u8 {
+        file_result(
+            &conn,
+            &format!("{:064x}", 0xea00 + u32::from(i)),
+            &opponent,
+            &victim,
+            &pot,
+            &h64(0x99), // garbage settle
+            &junk_sig(),
+            Some(&junk_sig()),
+            &format!("{:064x}", 0xee00 + u32::from(i)),
+            10 + i64::from(i),
+        );
+    }
+    // The honest countersigned marker, published LATER.
+    file_honest_result(
+        &conn,
+        &h64(0x07),
+        0x11,
+        0x22,
+        &pot,
+        &settle,
+        true,
+        &h64(0xef),
+        9_000,
+    );
+
+    let (markers, _) = query_window(&conn, 200);
+    assert!(
+        markers.iter().all(|m| m.settle_txid == h64(0x99)),
+        "the per-pot window kept the 4 EARLIER junk rows; the honest marker is evicted"
+    );
+    let statuses = statuses_from_db(&conn, &markers);
+    let world = win_world(&[(&pot, &victim, &opponent)]);
+    let lb = agg_world(&markers, &statuses, &world);
+    let honest = lb
+        .board
+        .iter()
+        .find(|r| r.identity == victim)
+        .expect("the chain win survives eviction");
+    assert_eq!(honest.wins, 1, "eviction costs cards, never the win");
+    assert!(
+        honest.evidence.is_empty(),
+        "no honest marker survived ⇒ no evidence"
+    );
+    assert!(
+        lb.board.iter().all(|r| r.identity != opponent),
+        "the opponent's junk rows mint nothing"
+    );
+}
+
+/// CRITICAL-2 END TO END — evict-then-claim on an UNATTRIBUTED pot credits
+/// nobody. The attacker files 4 REAL-signed countersigned claims naming
+/// itself over the victim's real pot/settle; the pot is bare (no verdict/
+/// attribution). The window delivers the attacker rows to the aggregate and
+/// the aggregate ranks NOBODY — no public wrong-winner.
+#[test]
+fn evict_then_claim_on_a_bare_pot_credits_nobody_end_to_end() {
+    let conn = production_schema_db();
+    let pot = h64(0xfa);
+    let settle = h64(0xfb);
+    let attacker = 0x33u8;
+    let sock = 0x44u8;
+    admit_pot(&conn, &pot, 1_000);
+    mark_spent_confirmed(&conn, &pot, &settle);
+    for i in 0..4u8 {
+        file_honest_result(
+            &conn,
+            &format!("{:064x}", 0xfa00 + u32::from(i)),
+            attacker,
+            sock,
+            &pot,
+            &settle,
+            true,
+            &format!("{:064x}", 0xfe00 + u32::from(i)),
+            10 + i64::from(i),
+        );
+    }
+    let (markers, _) = query_window(&conn, 200);
+    let statuses = statuses_from_db(&conn, &markers);
+    // NO chain world — a bare/legacy pot.
+    let lb = aggregate_leaderboard(&markers, &statuses, &std::collections::HashMap::new(), 200);
+    assert!(
+        lb.board.is_empty(),
+        "an unattributed pot is UNRANKED — the forger's real-signed claims credit nobody"
+    );
 }
 
 /// The per-pot superset, EXECUTED: a marker flood on ONE pot occupies one
@@ -497,7 +652,10 @@ fn a_flood_on_one_pot_collapses_to_one_pot_slot_oldest_first() {
         );
     }
     let (markers, truncated) = query_window(&conn, 200);
-    assert!(markers.len() <= 4, "≤ RESULT_ROWS_PER_POT rows for one pot");
+    assert!(
+        markers.len() <= low_app_layer::logic::LEADERBOARD_RESULT_ROWS_PER_POT,
+        "≤ RESULT_ROWS_PER_POT rows for one pot"
+    );
     assert!(
         markers.iter().any(|m| m.game_id == honest_game),
         "oldest-first keeps the settle-time marker in the superset"
@@ -598,7 +756,21 @@ fn truncation_is_reported_only_when_the_page_is_short() {
     assert_eq!(all.len(), 5);
     assert!(!truncated, "5 pots inside a 10-pot page is complete");
     let statuses = statuses_from_db(&conn, &all);
-    let lb = aggregate_leaderboard(&all, &statuses, &std::collections::HashMap::new(), 200);
+    let world: Vec<(String, String, String)> = (0..5u8)
+        .map(|i| {
+            (
+                format!("{:064x}", 0x7000 + u32::from(i)),
+                identity(0x11),
+                identity(0x22),
+            )
+        })
+        .collect();
+    let world_refs: Vec<(&str, &str, &str)> = world
+        .iter()
+        .map(|(p, w, l)| (p.as_str(), w.as_str(), l.as_str()))
+        .collect();
+    let w = win_world(&world_refs);
+    let lb = agg_world(&all, &statuses, &w);
     assert_eq!(lb.board[0].wins, 5, "five distinct pots, five wins");
     let v: serde_json::Value =
         serde_json::from_str(&leaderboard_body(&lb, 1, all.len(), truncated)).unwrap();
@@ -613,21 +785,22 @@ fn truncation_is_reported_only_when_the_page_is_short() {
     assert_eq!(v["truncated"], true);
 }
 
-/// `proof_pointers_sql`, EXECUTED: keyed to the caller's own pairs, OLDEST
-/// per key. The pre-#332 flat `LIMIT 2000` newest-first scan was both
-/// evictable (2000 dust markers pushed every honest pointer out of the scan)
-/// and a REPOINT primitive (a later marker for the victim's own key replaced
-/// the honest drill-down). Neither survives keying + oldest-wins.
+/// `proof_pointers_sql`, EXECUTED (#332 HIGH-1): keyed to the caller's own
+/// pairs (so an unrelated flood is irrelevant — the pre-#332 flat
+/// `LIMIT 2000` scan was floodable), and returning a bounded SUPERSET per key
+/// rather than a single squattable slot. The honest pointer survives inside
+/// the superset; the CLIENT filters by transcript validity.
 #[test]
-fn proof_pointers_are_key_bound_and_oldest_wins() {
+fn proof_pointers_are_key_bound_and_return_a_superset() {
+    use low_app_layer::logic::PROOF_POINTERS_PER_KEY;
     let conn = production_schema_db();
     let game = h64(0x05);
     let winner = identity(0x11);
-    file_proof(&conn, &game, &winner, "txHONEST", 1_000);
-    // A later "repoint" attempt for the SAME key.
+    file_proof(&conn, &game, &winner, "txHONEST", 5_000);
+    // A repoint attempt AND a couple more for the same key — all land in the
+    // superset (no single-winner slot to squat).
     file_proof(&conn, &game, &winner, "txREPOINT", 9_000);
-    // An unrelated flood, far more rows than the old 2000-row scan would
-    // have kept ahead of the honest pointer.
+    // A large UNRELATED flood for a different key — must not touch this key.
     for i in 0..3_000u32 {
         file_proof(
             &conn,
@@ -638,15 +811,43 @@ fn proof_pointers_are_key_bound_and_oldest_wins() {
         );
     }
     let map = query_proof_pointers(&conn, &[(game.clone(), winner.clone())]);
-    assert_eq!(
-        map.get(&(game.clone(), winner.clone())).map(String::as_str),
-        Some("txHONEST"),
-        "the honest pointer survives both the flood and the repoint attempt"
+    let set = map
+        .get(&(game.clone(), winner.clone()))
+        .expect("the requested key returns its superset");
+    assert!(
+        set.contains(&"txHONEST".to_string()),
+        "the honest pointer is IN the superset the client will verify"
     );
-    assert_eq!(map.len(), 1, "exactly one row per requested key");
+    assert!(
+        set.len() <= PROOF_POINTERS_PER_KEY,
+        "the superset is bounded to PROOF_POINTERS_PER_KEY"
+    );
+    assert_eq!(map.len(), 1, "only the requested key is returned");
     // A key with no pointer simply yields nothing — never a fabricated hint.
     let none = query_proof_pointers(&conn, &[(h64(0x06), winner)]);
     assert!(none.is_empty());
+}
+
+/// The squat is STRUCTURALLY impossible now (Rule 3): even a pre-filed junk
+/// pointer for the victim's own key cannot own the drill-down, because the
+/// honest pointer still enters the bounded superset alongside it (until the
+/// key is flooded past the cap — a documented display-hint residual, never a
+/// false proof: the client verifies each candidate).
+#[test]
+fn a_prefiled_junk_pointer_cannot_own_a_victims_drilldown() {
+    let conn = production_schema_db();
+    let game = h64(0x08);
+    let winner = identity(0x11);
+    // Attacker pre-files (earliest) a junk pointer for the victim's key.
+    file_proof(&conn, &game, &winner, "txSQUAT", 1);
+    // The honest pointer publishes later.
+    file_proof(&conn, &game, &winner, "txHONEST", 9_999);
+    let map = query_proof_pointers(&conn, &[(game.clone(), winner.clone())]);
+    let set = &map[&(game, winner)];
+    assert!(
+        set.contains(&"txHONEST".to_string()),
+        "the honest pointer is served despite the earlier squat (no exclusive slot)"
+    );
 }
 
 /// Rule 16 — the freshness/quota constants this crate DUPLICATES from the

@@ -652,10 +652,12 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     // 3) proof_markers pointers, KEYED to the window's own (gameId, winner)
     // pairs (#332 — this replaces a flat `LIMIT 2000` newest-first scan
     // whose newest-per-key fold was floodable AND a repoint primitive; see
-    // `proof_pointers_sql`). The SQL keeps the OLDEST pointer per key
-    // (anti-squat), one row per key. BEST-EFFORT: a fault on any chunk only
-    // omits those pairs' proofTxid hint, never a 5xx and never a count.
-    let mut proof_map: std::collections::HashMap<(String, String), String> =
+    // `proof_pointers_sql`). The SQL returns a bounded SUPERSET per key
+    // (HIGH-1: gameId + winner are claimable names, so a single-pointer slot
+    // would be squattable — the client filters the set by transcript
+    // validity). BEST-EFFORT: a fault on any chunk only omits those pairs'
+    // proofTxids hint, never a 5xx and never a count.
+    let mut proof_map: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut seen_pairs = std::collections::HashSet::new();
@@ -702,7 +704,8 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
                             pr.game_id.to_ascii_lowercase(),
                             pr.winner.to_ascii_lowercase(),
                         ))
-                        .or_insert(pr.txid);
+                        .or_default()
+                        .push(pr.txid);
                 }
             }
             Err(e) => {
@@ -931,15 +934,24 @@ async fn classify_spent_pots(
     // fixed cap (#332). The former `LEADERBOARD_CLASSIFY_CAP = 64` was
     // ordered by attacker-controllable marker recency, so a flood could push
     // a victim's pot past the cap, deny it a verdict + attribution, and —
-    // now that the claim gate is verified — un-count a tower-enforced win
-    // (erasure through the cap). Post-#332 the partition is already bounded
-    // at ≤ `limit + 1` pots by the marker window (admission-stamp-ranked),
-    // and every pot the column tier resolved costs no BLOB at all. Worst
-    // case (every windowed pot legacy-unbackfilled, max `?limit=500`): ~500
-    // pots ⇒ ~1000 BEEF keys in ≤45-key chunks (≈23 D1 reads, single-digit
-    // MB transient) — priced in REAL admitted pots (a `tm_pot` row needs an
-    // on-chain LOW-template funding tx), not dust markers, and shrinking to
-    // zero as the #284 backfill completes.
+    // now the win is chain-derived — un-count a tower-enforced win (erasure
+    // through the cap). Post-#332 the partition is bounded at ≤ `limit + 1`
+    // pots by the marker window (admission-stamp-ranked), and every pot the
+    // column tier resolved costs no BLOB at all.
+    //
+    // COST, stated honestly (#332 MEDIUM-3 — the commit's earlier "≈23"
+    // counted only THIS tier). The worst case is `?limit=500`, every windowed
+    // pot legacy-unbackfilled: the request fans out to roughly the marker
+    // window (1) + `pot_records` status chunks (≈12) + proof-pointer chunks
+    // (≈12) + decoded-pots chunks (≈12) + `pot_beefs` chunks (≈23) + seat-
+    // marker chunks (≈21) ≈ **~81 D1 statements**, single-digit MB transient.
+    // Every one of those pots is a REAL admitted `tm_pot` row (an on-chain
+    // LOW-template funding tx — not a dust marker), so the fan-out is priced
+    // in real funding, and the whole tier-2 partition shrinks to zero as the
+    // #284 column backfill completes. Attribution (the only counting input an
+    // attacker cares about) is unaffected by this fan-out — it is
+    // committed-key-bound (`seat_markers_sql`), so a flood cannot enlarge the
+    // COUNTED set, only this best-effort classification work.
     let pairs: Vec<(String, String)> = all_pairs
         .into_iter()
         .filter(|(pot, _)| !column_resolved.contains(pot))
