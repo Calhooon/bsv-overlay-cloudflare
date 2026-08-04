@@ -2,6 +2,7 @@ pub mod advertiser;
 pub mod agent;
 pub mod collected;
 pub mod dm_delegation;
+pub mod hopparty;
 pub mod low;
 pub mod pot;
 pub mod potparty;
