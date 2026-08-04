@@ -132,9 +132,21 @@ pub const HOPS_VIEW_MAX_OUTPOINTS: usize = 100;
 /// to show).
 pub const HOPS_VIEW_UNKNOWN_HOP_QUOTA: usize = 10;
 
+/// Freshness window for promoting a hop the overlay has NOT yet indexed
+/// under `tm_lowfund` (bsv-low #283a semantics, adopted at the gate's
+/// MEDIUM-5): an unknown hop competes for a promoted slot only while its
+/// first marker is younger than this, and slots go OLDEST-first — the one
+/// order an attacker cannot jump by publishing MORE after seeing the
+/// victim's funding. MUST equal the overlay's
+/// `UNKNOWN_POT_PROMOTION_MAX_AGE_SECS`, which the sibling identity
+/// windows use; a test asserts that equality across the crate boundary
+/// (the runtime dependency does not exist, so the PIN carries it —
+/// Rule 16).
+pub const HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS: u64 = 3600;
+
 /// Per-request VERIFY budget (rows), spent in SERVED order — which the SQL
-/// makes quality order: tier-0 (chain-indexed) hops come before every
-/// never-indexed ghost. The bound exists because each row can cost up to
+/// makes QUALITY order: rows whose container demonstrably paid the claimed
+/// value, richest first, come before everything else. The bound exists because each row can cost up to
 /// two ECDSA verifications plus a BRC-42 derivation on a public,
 /// unauthenticated endpoint (the #314 MEDIUM-B read-time CPU class); the
 /// cheap script pre-filter (one hash160 + string compare) runs FIRST and
@@ -142,25 +154,101 @@ pub const HOPS_VIEW_UNKNOWN_HOP_QUOTA: usize = 10;
 /// labels the remaining rows `unknown` and raises the body's
 /// `verifyBudgetExhausted` bit (surfaced, never silently consumed —
 /// Rule 13). 150 covers the full honest page (≤100 outpoints × 1 honest
-/// marker) with headroom; only a flood can exhaust it.
+/// marker) with headroom.
+///
+/// MEASURED COST of exhausting it (gate MEDIUM-4, corrected from an
+/// earlier "only a flood can exhaust it" that understated this): a single
+/// transaction filing ~38 outpoints × the per-outpoint superset, or ~150
+/// marker rows, spends the budget. That is cheap. Two things keep it a
+/// DEGRADATION rather than an erasure: the budget is spent in the SQL's
+/// quality order, so a paid honest row is verified before any dust row can
+/// consume a slot (pinned by `budget_is_spent_in_quality_order`); and an
+/// unverified-for-lack-of-budget row is still SERVED with both signatures,
+/// so the client re-verifies locally. The bound is also PER-REQUEST, not
+/// per-identity, on a public unauthenticated route — the #314 MEDIUM-B
+/// class restated; closing that is #318's identity-auth + quota work, not
+/// this route's.
 pub const HOPS_VIEW_VERIFY_BUDGET: usize = 150;
 
 const _: () = assert!(HOPS_VIEW_UNKNOWN_HOP_QUOTA < HOPS_VIEW_MAX_OUTPOINTS);
 const _: () = assert!(HOPS_VIEW_VERIFY_BUDGET > HOPS_VIEW_MAX_OUTPOINTS);
 
-/// The single `/hops-view` SQL (ONE bind: the lowercase identity). The
-/// #281 window over the caller's `hopparty_records` rows LEFT-JOINed to
-/// `pot_records` on the hop outpoint `(txid, hopVout)`, then — OUTSIDE the
-/// window, on the bounded survivors only — the spender's
-/// `pot_beefs.proof_verified` latch (the shared #323 confirmation bar).
+/// The single `/hops-view` SQL. Binds: `?1` the lowercase identity, and —
+/// when `scoped_to_game` — `?2` a lowercase gameId.
 ///
-/// The verification facts need NO join at all: `hopLockHex`,
-/// `hopSatsOnChain` and `containerOutputs` are typed columns the overlay
-/// decoded from the marker's own container at admission (#310), so this
-/// query touches no BLOB, no `outputs` row, and no second topic.
-/// `finalRank <= MAX+1` fetches one outpoint beyond the page for the
-/// honest `truncated` bit; the LIMIT is a belt.
-pub fn hops_view_sql() -> String {
+/// # Ranking: on what the chain settled, never on arrival (gate HIGH-1)
+///
+/// `hopparty_records.identity` is attacker-writable by design, and the hop
+/// outpoint is `(container txid, hopVout)` — so ONE transaction with K dust
+/// P2PKH outputs plus K markers naming `hopVout = 0..K-1` mints K distinct
+/// hop outpoints, and `tm_lowfund` admits every P2PKH output of an
+/// explicitly-submitted tx, putting them all in the existence tier beside
+/// the victim's real hop. Ranking those by RECENCY (the first draft) let
+/// ~3,600 sats in one transaction permanently outrank an 80,800-sat hop:
+/// measured k=99 honest survives, **k=100 erased**.
+///
+/// The ranking is therefore led by a fact the attacker must PAY for, read
+/// off the container itself:
+///
+/// ```text
+/// paidTier = 0 when hopLockHex IS NOT NULL AND hopSatsOnChain = hopSats
+/// ```
+///
+/// i.e. the container really does pay the claimed value to the claimed
+/// settle key — the same predicate `markerVerified`'s bars 1+2 use.
+///
+/// **What actually prices the attack is the next key, `hopSatsOnChain
+/// DESC`** — the value the CHAIN records for that output, never the value
+/// the marker claims. Displacing an honest hop therefore costs *at least
+/// its value, locked in a real output, per attacker outpoint*: capital,
+/// not dust. This was verified by injection — neutering `paidTier` alone
+/// does NOT re-open the flood, because the value key already demotes dust,
+/// so the ordering doc must not credit the tier with work it does not do
+/// (Rule 10).
+///
+/// `paidTier` earns its place for a narrower, real reason: it demotes rows
+/// whose container has NO output at `hopVout` (or a mismatched one)
+/// DETERMINISTICALLY, instead of leaning on SQLite's convention that NULLs
+/// sort last under `DESC` — an engine detail this money-visible ordering
+/// should not depend on.
+///
+/// Ties on value break **OLDEST-first** (#283a again): a REACTIVE flood
+/// necessarily arrives after the hop it targets, and `createdAt` is
+/// server-stamped at admission, so an attacker can always be newer but can
+/// never backdate. (Paying oneself is cheap in
+/// BURN terms, which is exactly why this is a cost multiplier and not a
+/// closure; the closure is verify-then-page in
+/// [`assemble_hops_view`], where the identity signature — the one input an
+/// attacker cannot forge — decides the served order.)
+///
+/// The existence tier follows, with unknown-hop promotion on the #283a
+/// semantics the sibling windows use (gate MEDIUM-5): only hops whose
+/// first marker is younger than
+/// [`HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS`] compete, and slots go
+/// OLDEST-first — a newest-first quota handed all 10 promoted slots to an
+/// attacker's just-published ghosts, which is precisely the case where the
+/// honest hop's own `tm_lowfund` admission is still in flight.
+///
+/// **This is a SECURITY order, not a display preference** — it decides
+/// which rows survive the page bound under flood, nothing more. Clients
+/// should sort the returned entries however their screen wants.
+///
+/// `finalRank <= MAX+1` fetches one outpoint beyond the page so the
+/// `truncated` bit is honest; `scoped_to_game` narrows the window to one
+/// game, which helps a truncated caller **unless the flood names that same
+/// gameId** (measured: it does not help then — see the residual at
+/// [`assemble_hops_view`]).
+///
+/// The verification facts need NO join: `hopLockHex`, `hopSatsOnChain` and
+/// `containerOutputs` are typed columns the overlay decoded from the
+/// marker's own container at admission (#310), so this query touches no
+/// BLOB, no `outputs` row, and no second topic.
+pub fn hops_view_sql(scoped_to_game: bool) -> String {
+    let game_filter = if scoped_to_game {
+        " AND hp.gameId = ?2"
+    } else {
+        ""
+    };
     format!(
         "SELECT w.identity AS identity, w.gameId AS gameId, w.hopTxid AS hopTxid, \
                 w.hopVout AS hopVout, w.hopSats AS hopSats, \
@@ -177,28 +265,35 @@ pub fn hops_view_sql() -> String {
                   seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                   hopLockHex, hopSatsOnChain, containerOutputs, \
                   spent, spendingTxid, spentConfirmed, \
-                  markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, tier \
+                  markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
+                  paidTier, tier \
            FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                     seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                     hopLockHex, hopSatsOnChain, containerOutputs, \
                     spent, spendingTxid, spentConfirmed, \
-                    markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, tier, \
-                    DENSE_RANK() OVER (ORDER BY tier ASC, \
-                                                COALESCE(potCreatedAt, firstMarkerAt) DESC, \
+                    markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
+                    paidTier, tier, \
+                    DENSE_RANK() OVER (ORDER BY paidTier ASC, tier ASC, \
+                                                hopSatsOnChain DESC, \
+                                                COALESCE(potCreatedAt, firstMarkerAt) ASC, \
                                                 hopTxid ASC, hopVout ASC) AS finalRank \
            FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                     seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                     hopLockHex, hopSatsOnChain, containerOutputs, \
                     spent, spendingTxid, spentConfirmed, \
-                    markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, unknownHop, \
-                    CASE WHEN unknownHop = 0 OR hopRank <= {quota} THEN 0 ELSE 1 END AS tier \
+                    markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
+                    paidTier, unknownHop, \
+                    CASE WHEN unknownHop = 0 \
+                         OR (freshUnknown = 1 AND hopRank <= {quota}) \
+                         THEN 0 ELSE 1 END AS tier \
              FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                       seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                       hopLockHex, hopSatsOnChain, containerOutputs, \
                       spent, spendingTxid, spentConfirmed, \
-                      markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, unknownHop, \
-                      DENSE_RANK() OVER (PARTITION BY unknownHop \
-                                         ORDER BY COALESCE(potCreatedAt, firstMarkerAt) DESC, \
+                      markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
+                      paidTier, unknownHop, freshUnknown, \
+                      DENSE_RANK() OVER (PARTITION BY unknownHop, freshUnknown \
+                                         ORDER BY COALESCE(firstMarkerAt, 0) ASC, \
                                                   hopTxid ASC, hopVout ASC) AS hopRank \
                FROM (SELECT hp.identity AS identity, hp.gameId AS gameId, \
                         hp.txid AS hopTxid, hp.hopVout AS hopVout, \
@@ -217,26 +312,38 @@ pub fn hops_view_sql() -> String {
                         r.createdAt AS potCreatedAt, \
                         MIN(hp.createdAt) OVER (PARTITION BY hp.txid, hp.hopVout) \
                             AS firstMarkerAt, \
+                        CASE WHEN hp.hopLockHex IS NOT NULL \
+                                  AND hp.hopSatsOnChain = hp.hopSats \
+                             THEN 0 ELSE 1 END AS paidTier, \
                         CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownHop, \
+                        CASE WHEN r.txid IS NULL \
+                                  AND COALESCE(MIN(hp.createdAt) OVER \
+                                        (PARTITION BY hp.txid, hp.hopVout), 0) \
+                                      >= unixepoch() - {fresh_secs} \
+                             THEN 1 ELSE 0 END AS freshUnknown, \
                         ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout \
                                            ORDER BY hp.createdAt ASC, hp.rowid ASC) AS rn \
                  FROM hopparty_records hp \
                  LEFT JOIN pot_records r \
                         ON r.txid = hp.txid AND r.outputIndex = hp.hopVout \
-                 WHERE hp.identity = ?) \
+                 WHERE hp.identity = ?1{game_filter}) \
                WHERE rn <= {per_outpoint}))) \
            WHERE finalRank <= {rank_cap} \
-           ORDER BY tier ASC, COALESCE(potCreatedAt, firstMarkerAt) DESC, \
+           ORDER BY paidTier ASC, tier ASC, hopSatsOnChain DESC, \
+                    COALESCE(potCreatedAt, firstMarkerAt) ASC, \
                     hopTxid ASC, hopVout ASC, markerCreatedAt ASC, markerRowid ASC \
            LIMIT {row_cap}) w \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND sb.txid = lower(w.spendingTxid) \
-         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.firstMarkerAt) DESC, \
+         ORDER BY w.paidTier ASC, w.tier ASC, w.hopSatsOnChain DESC, \
+                  COALESCE(w.potCreatedAt, w.firstMarkerAt) ASC, \
                   w.hopTxid ASC, w.hopVout ASC, w.markerCreatedAt ASC, w.markerRowid ASC",
         quota = HOPS_VIEW_UNKNOWN_HOP_QUOTA,
+        fresh_secs = HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS,
         per_outpoint = HOPS_VIEW_ROWS_PER_OUTPOINT,
         rank_cap = HOPS_VIEW_MAX_OUTPOINTS + 1,
         row_cap = (HOPS_VIEW_MAX_OUTPOINTS + 1) * HOPS_VIEW_ROWS_PER_OUTPOINT,
+        game_filter = game_filter,
     )
 }
 
@@ -331,6 +438,33 @@ fn row_digest_parts(r: &HopsViewRow) -> Option<RowDigestParts> {
     Some((identity, opponent, game_id, settle_pk))
 }
 
+/// CANONICAL STRICT DER (gate MEDIUM-3, Rule 4c): re-encode the parsed
+/// `(r, s)` and demand byte-equality with the submitted bytes.
+///
+/// `Signature::from_der` is permissive — measured on a real verifying row,
+/// an `r` padded with a leading `0x00` (non-minimal INTEGER) and a garbage
+/// byte appended inside the SEQUENCE length both still VERIFIED, while
+/// high-S was already refused. The `67..=74` admission bounds constrain
+/// only LENGTH, so they pin nothing about the encoding.
+///
+/// Two reasons this matters even though the outpoint keying already denies
+/// an attacker the Rule-4-CORRECTION saturation (each variant still costs a
+/// whole container):
+///
+///  1. the Rule-16 golden vector pins ONE encoding while a permissive
+///     verifier accepts many, so a client emitting non-canonical DER would
+///     pass in production and fail the cross-repo pin — the drift would be
+///     found at the worst moment;
+///  2. it collapses the honest candidate set to exactly one byte string
+///     per signature, which is the property Rule 4c asks for.
+///
+/// This can never reject an honest marker: every LOW signing path emits
+/// `Signature::to_der()` output, which is by construction what this
+/// re-encodes to (pinned by the golden vector, which must still verify).
+fn is_canonical_der(sig_bytes: &[u8], sig: &bsv_rs::primitives::ec::Signature) -> bool {
+    sig.to_der() == sig_bytes
+}
+
 /// Verify the marker's SEAT signature: plain secp256k1 ECDSA under the
 /// marker's OWN `seatSettlePubkey` over sha256(hopparty seatsig preimage)
 /// — the byte layout is the overlay's [`overlay_discovery::hopparty::
@@ -354,6 +488,9 @@ pub fn verify_hop_seat_sig(r: &HopsViewRow) -> bool {
     let Ok(sig) = bsv_rs::primitives::ec::Signature::from_der(&sig_bytes) else {
         return false;
     };
+    if !is_canonical_der(&sig_bytes, &sig) {
+        return false; // non-canonical encoding — see `is_canonical_der`
+    }
     let hash = bsv_rs::primitives::hash::sha256(&preimage);
     pubkey.verify(&hash, &sig)
 }
@@ -375,6 +512,19 @@ pub fn verify_hop_identity_binding(r: &HopsViewRow) -> bool {
     ) else {
         return false;
     };
+    // Same canonical-DER bar as the seat signature. `anyone_sig_verifies`
+    // is shared with `/results` (whose own encoding posture is not this
+    // route's to change), so the bar is applied HERE, on this route's
+    // bytes, before delegating the BRC-42 verification.
+    let Ok(sig_bytes) = hex::decode(&r.identity_sig_hex) else {
+        return false;
+    };
+    let Ok(sig) = bsv_rs::primitives::ec::Signature::from_der(&sig_bytes) else {
+        return false;
+    };
+    if !is_canonical_der(&sig_bytes, &sig) {
+        return false;
+    }
     crate::results::anyone_sig_verifies(
         &r.identity.to_ascii_lowercase(),
         &r.game_id.to_ascii_lowercase(),
@@ -523,9 +673,51 @@ pub struct HopEntry {
 /// `truncated` (more than [`HOPS_VIEW_MAX_OUTPOINTS`] distinct outpoints
 /// survived — the SQL fetches one outpoint beyond the page on purpose) and
 /// `verify_budget_exhausted` (rows past [`HOPS_VIEW_VERIFY_BUDGET`] were
-/// labeled `unknown` without being checked). Order is preserved (the SQL
-/// already returns tiered-newest-outpoint-first). Pure — every branch is
-/// unit-testable without D1.
+/// labeled `unknown` without being checked).
+///
+/// # VERIFY-THEN-PAGE (gate HIGH-1's real closure)
+///
+/// The SQL orders candidates by what the chain settled (paid tier, then
+/// value), which raises the price of crowding the candidate set. But the
+/// property that actually cannot be forged is the **identity signature**:
+/// an attacker can mint a marker naming the victim's identity, can pay the
+/// claimed value, and can even mint a valid `seatSig` over the victim's
+/// identity with their own settle key — bars 1, 2 and 3a all pass — yet
+/// they can never produce bar 3b, the BRC-42 signature under the victim's
+/// identity key. So once verification has run, the served page is ordered
+/// **verified first**: an honest row that reached the candidate set can
+/// never be pushed off the page by rows that cannot verify, however many
+/// of them there are and however richly funded.
+///
+/// The sort is STABLE, so within each verification class the SQL's
+/// deterministic chain-fact order is preserved exactly.
+///
+/// # Residual, stated with its measured price
+///
+/// This reorders the PAGE; it does not enlarge the CANDIDATE set. Measured
+/// against the shipped SQL through the real producer chain:
+///
+/// | flood (one tx, k outpoints)              | honest row      |
+/// |------------------------------------------|-----------------|
+/// | dust, k = 400                            | present, VERIFIED, page position 0 |
+/// | value-matched (k × 80,800), REACTIVE     | present, VERIFIED, page position 0 |
+/// | value-matched, PRE-DATED (k = 100)       | **displaced**, `truncated: true`   |
+///
+/// So the surviving attack needs all three of: targeting a specific
+/// identity in advance; locking at least the honest hop's value per
+/// outpoint (100 × 80,800 = **8,080,000 sats** in one transaction); and
+/// landing before the victim funds. Against the pre-fix cost (~3,600 sats,
+/// reactive) that is ~2,244× the capital plus a change of kind —
+/// predictive, with the capital held for the wait.
+///
+/// It is the SAME residual class `partyFor` documents for
+/// `potparty_records` (#281): a discovery query has no verified key
+/// material to bind, so superset-plus-verify is the fallback, and the only
+/// real closures are priced admission or per-identity auth + quota (#318).
+/// `truncated` is set honestly throughout — the caller is never told a
+/// crowded page is complete — and `?gameId=` reaches a crowded-out row
+/// unless the flood names that same game. Pinned from the unsafe side by
+/// `a_predated_value_matched_flood_is_the_documented_residual`.
 pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool, bool) {
     // Distinct outpoints in served order; drop rows beyond the page.
     let mut outpoints: Vec<(String, u32)> = Vec::new();
@@ -540,10 +732,12 @@ pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool, bool)
 
     let mut verify_budget = HOPS_VIEW_VERIFY_BUDGET;
     let mut budget_exhausted = false;
-    let entries = rows
+    let mut entries: Vec<HopEntry> = rows
         .into_iter()
         .filter(|r| outpoints.contains(&(r.hop_txid.to_ascii_lowercase(), r.hop_vout)))
         .map(|r| {
+            // The budget is spent in the SQL's QUALITY order, so a paid
+            // honest row is verified before any dust row can consume a slot.
             let marker_verified = if verify_budget > 0 {
                 verify_budget -= 1;
                 derive_marker_verification(&r)
@@ -575,6 +769,15 @@ pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool, bool)
             }
         })
         .collect();
+
+    // VERIFY-THEN-PAGE: verified rows lead, then the ones we could not
+    // check (budget), then the refuted. STABLE, so the chain-fact order
+    // inside each class is the SQL's.
+    entries.sort_by_key(|e| match e.marker_verified {
+        MarkerVerification::Verified => 0u8,
+        MarkerVerification::Unknown => 1,
+        MarkerVerification::Unverified => 2,
+    });
     (entries, truncated, budget_exhausted)
 }
 
@@ -838,6 +1041,91 @@ mod tests {
         );
     }
 
+    /// gate MEDIUM-3 — CANONICAL STRICT DER (Rule 4c). The gate measured
+    /// three non-canonical encodings against a real verifying row: high-S
+    /// was already refused, but a NON-MINIMAL `r` INTEGER (leading 0x00)
+    /// and a trailing garbage byte inside the SEQUENCE both still
+    /// VERIFIED. Each is now refused by re-encoding the parsed `(r, s)`
+    /// and demanding byte-equality.
+    #[test]
+    fn non_canonical_der_is_refused_on_both_signature_bars() {
+        let base = real_row(0xa1, 0xaa);
+        // Positive control FIRST: the canonical row clears both bars, so
+        // the refusals below cannot pass for the wrong reason.
+        assert!(verify_hop_seat_sig(&base));
+        assert!(verify_hop_identity_binding(&base));
+        assert_eq!(derive_marker_verification(&base), MarkerVerification::Verified);
+
+        /// Re-encode a DER signature with a NON-MINIMAL `r` (a redundant
+        /// leading zero byte), keeping it parseable and the value equal.
+        fn pad_r(der_hex: &str) -> String {
+            let d = hex::decode(der_hex).unwrap();
+            assert_eq!(d[0], 0x30, "SEQUENCE");
+            let r_len = d[3] as usize;
+            let mut out = vec![0x30u8, 0, 0x02, (r_len + 1) as u8, 0x00];
+            out.extend_from_slice(&d[4..4 + r_len]); // r bytes
+            out.extend_from_slice(&d[4 + r_len..]); // the whole s INTEGER
+            let body = out.len() - 2;
+            out[1] = body as u8;
+            hex::encode(out)
+        }
+        /// Append a garbage byte INSIDE the SEQUENCE length.
+        fn append_junk(der_hex: &str) -> String {
+            let mut d = hex::decode(der_hex).unwrap();
+            d.push(0xff);
+            let body = d.len() - 2;
+            d[1] = body as u8;
+            hex::encode(d)
+        }
+
+        for mutate in [pad_r, append_junk] {
+            // …on the SEAT signature.
+            let mut r = base.clone();
+            r.seat_sig_hex = mutate(&base.seat_sig_hex);
+            assert_ne!(r.seat_sig_hex, base.seat_sig_hex, "the fixture really mutated");
+            assert!(
+                !verify_hop_seat_sig(&r),
+                "non-canonical seat DER must be refused: {}",
+                r.seat_sig_hex
+            );
+            assert_eq!(
+                derive_marker_verification(&r),
+                MarkerVerification::Unverified
+            );
+            // …and on the IDENTITY signature.
+            let mut r = base.clone();
+            r.identity_sig_hex = mutate(&base.identity_sig_hex);
+            assert!(
+                !verify_hop_identity_binding(&r),
+                "non-canonical identity DER must be refused: {}",
+                r.identity_sig_hex
+            );
+            assert_eq!(
+                derive_marker_verification(&r),
+                MarkerVerification::Unverified
+            );
+        }
+    }
+
+    /// The strict bar can never reject an HONEST marker: every LOW signing
+    /// path emits `Signature::to_der()`, which is by construction what the
+    /// re-encode produces. Driven through the real exported builders on the
+    /// FROZEN cross-repo golden vector — if the canonical rule ever
+    /// disagreed with the wire contract, this goes red (Rule 16).
+    #[test]
+    fn the_golden_vector_signatures_are_canonical_der() {
+        let script =
+            hex::decode(overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap();
+        let m = overlay_discovery::hopparty::parse_hopparty_marker(&script).unwrap();
+        for sig_bytes in [&m.seat_sig, &m.identity_sig] {
+            let sig = bsv_rs::primitives::ec::Signature::from_der(sig_bytes).unwrap();
+            assert!(
+                is_canonical_der(sig_bytes, &sig),
+                "the frozen golden vector must already be canonical DER"
+            );
+        }
+    }
+
     #[test]
     fn junk_seat_sig_never_verifies() {
         let mut r = real_row(0xa1, 0xaa);
@@ -1024,7 +1312,7 @@ mod tests {
     #[test]
     fn verify_budget_labels_overflow_unknown_and_surfaces_the_bit() {
         // Budget+1 rows across enough outpoints to stay on the page: the
-        // last row is labeled unknown WITHOUT being checked, and the bit is
+        // overflow is labeled unknown WITHOUT being checked, and the bit is
         // raised. (Rows share outpoints so the page bound doesn't cut them.)
         let mut rows: Vec<HopsViewRow> = Vec::new();
         for i in 0..HOPS_VIEW_MAX_OUTPOINTS {
@@ -1037,26 +1325,98 @@ mod tests {
                 rows.push(r);
             }
         }
-        assert!(rows.len() > HOPS_VIEW_VERIFY_BUDGET);
+        let total = rows.len();
+        assert!(total > HOPS_VIEW_VERIFY_BUDGET);
         let (entries, _, exhausted) = assemble_hops_view(rows);
         assert!(exhausted, "the budget bit must be surfaced");
+        // Counts, not positions: verify-then-page reorders the served list,
+        // so the CLASS SIZES are what encode "checked vs not looked at".
         assert_eq!(
-            entries[..HOPS_VIEW_VERIFY_BUDGET]
+            entries
                 .iter()
                 .filter(|e| e.marker_verified == MarkerVerification::Unverified)
                 .count(),
             HOPS_VIEW_VERIFY_BUDGET,
-            "in-budget rows were genuinely checked"
+            "exactly the budget many rows were genuinely checked"
         );
-        assert!(
-            entries[HOPS_VIEW_VERIFY_BUDGET..]
+        assert_eq!(
+            entries
                 .iter()
-                .all(|e| e.marker_verified == MarkerVerification::Unknown),
-            "past-budget rows are unknown (we could not look), never a verdict"
+                .filter(|e| e.marker_verified == MarkerVerification::Unknown)
+                .count(),
+            total - HOPS_VIEW_VERIFY_BUDGET,
+            "the remainder is unknown (we could not look), never a verdict"
         );
         // The honest page never exhausts the budget.
         let (_, _, exhausted) = assemble_hops_view(vec![real_row(0xa1, 0xaa)]);
         assert!(!exhausted);
+    }
+
+    /// VERIFY-THEN-PAGE (gate HIGH-1): a verified row always leads the
+    /// served page, however many unverifiable rows precede it in the SQL's
+    /// order — the identity signature is the input an attacker cannot
+    /// forge, so it, not arrival order, decides what the caller sees first.
+    #[test]
+    fn verified_rows_lead_the_page_and_the_order_is_stable() {
+        let honest = real_row(0xa1, 0xaa);
+        let mut rows: Vec<HopsViewRow> = Vec::new();
+        // 50 unverifiable rows FIRST in SQL order…
+        for i in 0..50u32 {
+            let mut junk = real_row(0xa1, 0xbb);
+            junk.hop_txid = format!("{i:064x}");
+            junk.seat_sig_hex = format!("3045{}", "ab".repeat(69));
+            rows.push(junk);
+        }
+        // …then the honest one.
+        rows.push(honest.clone());
+        let (entries, _, _) = assemble_hops_view(rows);
+        assert_eq!(
+            entries[0].marker_verified,
+            MarkerVerification::Verified,
+            "the verified row leads regardless of SQL position"
+        );
+        assert_eq!(entries[0].hop_txid, honest.hop_txid);
+        // STABLE within a class: the 50 junk rows keep their SQL order.
+        let junk_order: Vec<&String> = entries[1..].iter().map(|e| &e.hop_txid).collect();
+        let expected: Vec<String> = (0..50u32).map(|i| format!("{i:064x}")).collect();
+        assert_eq!(
+            junk_order,
+            expected.iter().collect::<Vec<_>>(),
+            "the chain-fact order inside a class must be preserved exactly"
+        );
+    }
+
+    /// The budget is spent in the SQL's QUALITY order, so a paid honest row
+    /// is verified before dust rows can consume slots (gate MEDIUM-4's
+    /// degradation bound).
+    #[test]
+    fn budget_is_spent_in_quality_order() {
+        // The honest row FIRST (as the SQL's paid-tier ordering puts it),
+        // then budget-many dust rows.
+        let mut rows = vec![real_row(0xa1, 0xaa)];
+        // Share outpoints (4 rows each, the per-outpoint superset) so the
+        // PAGE bound does not cut the flood before the BUDGET binds.
+        for i in 0..50u32 {
+            for _ in 0..HOPS_VIEW_ROWS_PER_OUTPOINT {
+                let mut junk = real_row(0xa1, 0xbb);
+                junk.hop_txid = format!("{i:064x}");
+                junk.seat_sig_hex = format!("3045{}", "ab".repeat(69));
+                rows.push(junk);
+            }
+        }
+        assert!(rows.len() > HOPS_VIEW_VERIFY_BUDGET);
+        let (entries, _, exhausted) = assemble_hops_view(rows);
+        assert!(exhausted, "the flood does exhaust the budget");
+        let honest = entries
+            .iter()
+            .find(|e| e.hop_txid == real_row(0xa1, 0xaa).hop_txid)
+            .expect("the honest row is still served");
+        assert_eq!(
+            honest.marker_verified,
+            MarkerVerification::Verified,
+            "the honest row is verified FIRST — a budget flood degrades the \
+             attacker's own rows to unknown, never the honest one"
+        );
     }
 
     #[test]
@@ -1106,7 +1466,7 @@ mod tests {
 
     #[test]
     fn hops_view_sql_shape() {
-        let sql = hops_view_sql();
+        let sql = hops_view_sql(false);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
         assert!(
             sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout"),
@@ -1122,12 +1482,22 @@ mod tests {
             "one outpoint beyond the page — the honest truncated bit"
         );
         // The verification facts are TYPED COLUMNS decoded at admission —
-        // no `outputs` join, no topic dependency, no BLOB. Positive counts
-        // (one per nesting level + the aliasing SELECT + the outer
-        // projection), so a rename fails loudly rather than vacuously.
-        assert_eq!(sql.matches("hopLockHex").count(), 8);
-        assert_eq!(sql.matches("hopSatsOnChain").count(), 8);
+        // no `outputs` join, no topic dependency, no BLOB. POSITIVE counts,
+        // so a rename or a dropped nesting level fails loudly rather than
+        // vacuously. The numbers are the per-level occurrence counts (one
+        // per SELECT level, plus the aliasing projection, plus — for
+        // hopSatsOnChain — the paid-tier CASE and the two ORDER BYs);
+        // re-derive them deliberately if the nesting changes, never by
+        // pasting whatever the failure prints.
+        assert_eq!(sql.matches("hopLockHex").count(), 9);
+        assert_eq!(sql.matches("hopSatsOnChain").count(), 12);
         assert_eq!(sql.matches("containerOutputs").count(), 8);
+        // The ranking leads on chain-settled facts, never on arrival.
+        assert!(sql.contains("CASE WHEN hp.hopLockHex IS NOT NULL"));
+        assert!(sql.contains("ORDER BY paidTier ASC, tier ASC, hopSatsOnChain DESC"));
+        // #283a semantics: freshness-gated, OLDEST-first promotion.
+        assert!(sql.contains(&format!("unixepoch() - {HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS}")));
+        assert!(sql.contains("ORDER BY COALESCE(firstMarkerAt, 0) ASC"));
         let banned_join = ["tm_low", "fund'"].concat(); // split so it never matches itself
         assert!(
             !sql.contains(&banned_join),

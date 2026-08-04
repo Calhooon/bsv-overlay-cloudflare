@@ -178,6 +178,16 @@ pub const HOPPARTY_GAME_ID_LEN: usize = 32;
 pub const HOPPARTY_U32_LEN: usize = 4;
 /// hopSats push length (bytes) — a little-endian u64 (sats are u64 in the
 /// tx format; see the module docs for why this is not 4).
+///
+/// PARSING accepts the full u64 range; the value is NOT range-checked here
+/// because admission is structural only. Gate LOW: a value `>= 2^63` is
+/// silently wrapped when D1 binds it (`d1::QVal: From<u64>` casts to
+/// `i64`), so such a row's DISPLAYED `hopSats` is wrong. The fail
+/// direction is safe and self-correcting: the wrapped value no longer
+/// rebuilds the identity challenge, so the row can never be `verified` —
+/// it is served as `unverified` junk, which is what a marker claiming
+/// 92+ million BTC of hop is. Only a junk row is affected; an honest hop
+/// is bounded by the ante (~1e5 sats).
 pub const HOPPARTY_U64_LEN: usize = 8;
 /// Minimum sig push length (bytes) — a DER ECDSA signature. 67 (not 68) is
 /// LOAD-BEARING, inherited from potparty's F5: RFC6979 is DETERMINISTIC
@@ -430,6 +440,28 @@ pub fn parse_hopparty_marker(script: &[u8]) -> Option<HoppartyMarker> {
     })
 }
 
+/// The FROZEN cross-repo GOLDEN marker script, hex (bsv-low #315).
+///
+/// The EXACT `OP_RETURN` bytes for a hopparty marker built with
+/// `PrivateKey(1)` as the identity and `PrivateKey(2)`'s pubkey as the
+/// opponent, in the PRODUCTION layout (hop at output 0, marker at
+/// output 1). Every signature is REAL, RFC6979-deterministic ECDSA over
+/// the real preimages — `golden_vector_derives_and_parses` derives them at
+/// runtime through the real exported builders and asserts byte-equality
+/// with this pin, so it can never be hand-typed drift.
+///
+/// PUBLIC so sibling crates pin against the same bytes rather than
+/// transcribing them (Rule 16: share the constant, not the convention) —
+/// `low-app-layer` uses it to prove the canonical-DER bar accepts the
+/// frozen contract. The bsv-low CLIENT pins the identical hex; regenerate
+/// BOTH copies together or not at all.
+///
+/// Fixed inputs: gameId = 32×0xcc, hopVout = 0, hopSats = 1_234_567
+/// (LE on wire: `87 d6 12 00 00 00 00 00`), seatSettlePubkey = the real
+/// BRC-42 `[2,'low settle']` derivation (keyID = gameId, counterparty =
+/// opponent, forSelf).
+pub const GOLDEN_HOPPARTY_HEX: &str = "006a0f4c4f572f686f7070617274792f7631210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee520cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc04000000000887d61200000000002103d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee473045022100c7a9ca2ea77941819dab702159a805844ec5fbea10db2049a264feb64f177edf0220047a7220ab3748c3d3686e4ae4a59035518599d63d58e69b07bc4be3f3a9658b47304502210082d6a006ea2064abae63f3c89cc9b1f4be8fae5d038c374e053cd84b8bd2392e022075e9cf71422df875ba72159f3c84e619c8e66f43b4e4335e399fa0aa01f27720";
+
 /// True iff `script` is a well-formed `LOW/hopparty/v1` marker.
 pub fn is_hopparty_marker_script(script: &[u8]) -> bool {
     parse_hopparty_marker(script).is_some()
@@ -569,7 +601,6 @@ pub(crate) mod tests {
     // seatSettlePubkey = the REAL BRC-42 `[2,'low settle']` derivation
     // (keyID = gameId, counterparty = opponent, forSelf) from
     // PrivateKey(1)'s wallet — exactly what the client wallet derives.
-    pub(crate) const GOLDEN_HOPPARTY_HEX: &str = "006a0f4c4f572f686f7070617274792f7631210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee520cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc04000000000887d61200000000002103d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee473045022100c7a9ca2ea77941819dab702159a805844ec5fbea10db2049a264feb64f177edf0220047a7220ab3748c3d3686e4ae4a59035518599d63d58e69b07bc4be3f3a9658b47304502210082d6a006ea2064abae63f3c89cc9b1f4be8fae5d038c374e053cd84b8bd2392e022075e9cf71422df875ba72159f3c84e619c8e66f43b4e4335e399fa0aa01f27720";
 
     /// Golden-vector inputs shared by the derive test and the lookup
     /// fixture cell.
@@ -678,13 +709,13 @@ pub(crate) mod tests {
         let derived = build_golden_marker();
         assert_eq!(
             hex::encode(&derived),
-            GOLDEN_HOPPARTY_HEX,
+            super::GOLDEN_HOPPARTY_HEX,
             "the derived golden marker drifted from the cross-repo pin \
              (wire contract, bsv-low #315) — fix the builder/derivation, \
              never the pin"
         );
 
-        let script = hex::decode(GOLDEN_HOPPARTY_HEX).expect("golden hex decodes");
+        let script = hex::decode(super::GOLDEN_HOPPARTY_HEX).expect("golden hex decodes");
         let m = parse_hopparty_marker(&script)
             .expect("the GOLDEN vector MUST parse (wire contract, bsv-low #315)");
         // identity = compressed pubkey for PrivateKey(1) = secp256k1 G.
@@ -719,7 +750,7 @@ pub(crate) mod tests {
     /// fixture is real crypto, never decorative hex).
     #[test]
     fn golden_vector_signatures_verify() {
-        let script = hex::decode(GOLDEN_HOPPARTY_HEX).unwrap();
+        let script = hex::decode(super::GOLDEN_HOPPARTY_HEX).unwrap();
         let m = parse_hopparty_marker(&script).unwrap();
 
         // seatSig: plain ECDSA under seatSettlePubkey over sha256(preimage).

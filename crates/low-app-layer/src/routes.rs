@@ -1668,12 +1668,17 @@ impl HopsViewRowD1 {
 /// container's own hop lock AND value — filter-for-display, rows never
 /// dropped). Full trust model: `hops_view.rs` module docs.
 ///
+/// Optional `&gameId=<64-hex>` scopes the window to one game — the escape
+/// hatch that makes `truncated` actionable (a flood can crowd the default
+/// page; it cannot hide a row the caller asks for by game).
+///
 /// Fail-safe shape mirrors `/refund-view`: a missing/invalid identity is
-/// an EMPTY 200 result (never an error); a D1 fault is a 503; a
-/// chaintracks fault only degrades `tip` to `null` — the D1 facts still
-/// serve. ONE bounded D1 query (≤[`crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS`]
-/// hop outpoints ×[`crate::hops_view::HOPS_VIEW_ROWS_PER_OUTPOINT`] rows,
-/// one identity bind, no BEEF blobs).
+/// an EMPTY 200 result (never an error); an invalid `gameId` is ignored
+/// (unscoped), never an error; a D1 fault is a 503; a chaintracks fault
+/// only degrades `tip` to `null` — the D1 facts still serve. ONE bounded
+/// D1 query (≤[`crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS`] hop outpoints
+/// ×[`crate::hops_view::HOPS_VIEW_ROWS_PER_OUTPOINT`] rows, no BEEF
+/// blobs).
 pub async fn hops_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let url = req.url()?;
     let identity = url
@@ -1698,9 +1703,23 @@ pub async fn hops_view(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         }
     };
 
+    // `?gameId=` is the ESCAPE HATCH for a truncated page (gate HIGH-1):
+    // a caller told `truncated` re-asks scoped to its own game and reaches
+    // its row regardless of how many outpoints a flood minted. An invalid
+    // gameId is IGNORED (treated as unscoped) rather than erroring — the
+    // fail-safe direction for a display surface.
+    let game_id_lc = url
+        .query_pairs()
+        .find(|(k, _)| k == "gameId")
+        .map(|(_, v)| v.into_owned().to_ascii_lowercase())
+        .filter(|g| g.len() == 64 && g.bytes().all(|b| b.is_ascii_hexdigit()));
+
     let stmt = db
-        .prepare(crate::hops_view::hops_view_sql())
-        .bind(&[JsValue::from_str(&identity_lc)])?;
+        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some()))
+        .bind(&match &game_id_lc {
+            Some(g) => vec![JsValue::from_str(&identity_lc), JsValue::from_str(g)],
+            None => vec![JsValue::from_str(&identity_lc)],
+        })?;
     let rows: Vec<crate::hops_view::HopsViewRow> = match stmt
         .all()
         .await

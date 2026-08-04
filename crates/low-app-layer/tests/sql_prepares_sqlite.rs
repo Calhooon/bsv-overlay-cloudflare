@@ -61,7 +61,9 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     let conn = production_schema_db();
     assert_prepares(&conn, "recovery_view_sql", &recovery_view_sql());
     assert_prepares(&conn, "refund_view_sql", &refund_view_sql());
-    assert_prepares(&conn, "hops_view_sql", &hops_view_sql());
+    assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false));
+    // Both arities of the gameId-scoped escape hatch must parse.
+    assert_prepares(&conn, "hops_view_sql(scoped)", &hops_view_sql(true));
     assert_prepares(&conn, "live_view_sql", &live_view_sql());
     assert_prepares(&conn, "results_sql", &results_sql());
     // #332 — the /leaderboard anti-flood marker window.

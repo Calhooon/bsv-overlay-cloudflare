@@ -691,6 +691,78 @@ mod tests {
         }
     }
 
+    /// bsv-low #315 gate HIGH-2 (lookup half) — the SERVED answer example
+    /// must publish exactly the keys the real serializer emits.
+    ///
+    /// `get_documentation()` `include_str!`s `docs/hopparty_lookup.md` and
+    /// the overlay serves it publicly. The gate found the example omitting
+    /// `hopLockHex`/`hopSatsOnChain`/`containerOutputs`, which the real
+    /// answer carries — a client written to the doc would not know the
+    /// fields that decide `markerVerified` exist. This drives the REAL
+    /// `lookup()` and compares its key set to the documented one, so the
+    /// two cannot drift (Rule 16: a property spanning doc and code cannot
+    /// be pinned inside either).
+    #[tokio::test]
+    async fn served_documentation_answer_keys_match_the_serializer() {
+        let (svc, _storage) = make_service_with_storage();
+        let settle = hex::encode(golden_settle_pubkey());
+        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01)
+            .await;
+        let answer = hops_for(&svc, &hex::encode(golden_identity()), None).await;
+        let mut real_keys: Vec<String> = answer[0]
+            .as_object()
+            .expect("the serializer emits objects")
+            .keys()
+            .cloned()
+            .collect();
+        real_keys.sort();
+
+        // Extract the quoted keys from the doc's ```json answer example.
+        // The example carries `<hex|null>` placeholders so it is not valid
+        // JSON; scan for `"key":` instead (a real scan of the example
+        // block, not of the whole document).
+        let doc = svc.get_documentation().await;
+        let example = doc
+            .split("## Answer")
+            .nth(1)
+            .and_then(|tail| tail.split("```json").nth(1))
+            .and_then(|tail| tail.split("```").next())
+            .expect("the served doc must carry a ```json answer example");
+        let mut doc_keys: Vec<String> = Vec::new();
+        let bytes: Vec<char> = example.chars().collect();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == '"' {
+                if let Some(end) = bytes[i + 1..].iter().position(|c| *c == '"') {
+                    let key: String = bytes[i + 1..i + 1 + end].iter().collect();
+                    // A KEY is a quoted run immediately followed by ':'.
+                    let after = bytes.get(i + 1 + end + 1).copied().unwrap_or(' ');
+                    if after == ':' && !doc_keys.contains(&key) {
+                        doc_keys.push(key);
+                    }
+                    i = i + 1 + end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        doc_keys.sort();
+
+        // POSITIVE count first: "matched nothing" must fail loudly.
+        assert_eq!(
+            doc_keys.len(),
+            real_keys.len(),
+            "the served answer example publishes {} keys, the serializer emits {}:\n\
+             documented: {doc_keys:?}\n serialized: {real_keys:?}",
+            doc_keys.len(),
+            real_keys.len()
+        );
+        assert_eq!(
+            doc_keys, real_keys,
+            "the served answer example drifted from the real serializer"
+        );
+    }
+
     /// bsv-low #315 Rule-16 CROSS-REPO BOUNDARY PIN (overlay half).
     ///
     /// `fixtures/ls_hopparty_hopsfor.fixture.json` is the EXACT `result`
