@@ -495,8 +495,8 @@ pub fn recovery_view_sql() -> String {
             w.spent AS spent, w.spendingTxid AS spendingTxid, \
             w.spentConfirmed AS spentConfirmed, \
             hex(b.beef) AS spenderBeef \
-     FROM (SELECT gameId, potTxid, potVout, recoveryHeight, opponentIdentity, \
-              spent, spendingTxid, spentConfirmed, \
+     FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+              opponentIdentity, spent, spendingTxid, spentConfirmed, \
               markerCreatedAt, markerRowid, potCreatedAt, \
               CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
        FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
