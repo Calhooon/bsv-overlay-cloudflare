@@ -66,10 +66,9 @@ pub struct HoppartyRecord {
     /// Game ID (32 bytes, lowercase hex).
     #[serde(rename = "gameId")]
     pub game_id: String,
-    /// The hop funding txid (32 bytes, lowercase hex).
-    #[serde(rename = "hopTxid")]
-    pub hop_txid: String,
-    /// The hop output index within `hop_txid`.
+    /// The hop output index within the marker's OWN CONTAINING TX. The hop
+    /// outpoint is `(txid, hop_vout)` — there is no separate hop txid
+    /// because the container IS the hop tx (see the module docs).
     #[serde(rename = "hopVout")]
     pub hop_vout: u32,
     /// The hop output's satoshi value (u64 — 8 bytes LE on the wire).
@@ -87,11 +86,29 @@ pub struct HoppartyRecord {
     /// (lowercase hex) — carried verbatim, verified by READERS, never here.
     #[serde(rename = "identitySigHex")]
     pub identity_sig_hex: String,
-    /// The txid carrying the marker OP_RETURN — half of the primary key.
-    /// NOTE: this can never equal `hop_txid` when the marker rides a tx
-    /// that also carries the hop (a tx cannot embed its own txid — hash
-    /// fixed point), so a same-tx carrier would need a wire revision; the
-    /// storage layer is deliberately agnostic about the carrier.
+    // ── the CONTAINER's own facts, decoded ONCE at admission (#310) ──────
+    // These are NOT claims: they are read out of the very transaction that
+    // carries the marker, which the engine hands the lookup service in
+    // whole-tx admission mode. Storing them typed at WRITE is what lets
+    // the read path compare claim-vs-chain with no BLOB re-parse and no
+    // dependency on a lifecycle-managed `outputs` row.
+    /// The locking script (lowercase hex) of the containing tx's output at
+    /// `hop_vout`. `None` IFF the container has no such output (provable
+    /// from `container_outputs`), which REFUTES the marker.
+    #[serde(rename = "hopLockHex")]
+    pub hop_lock_hex: Option<String>,
+    /// That output's satoshi value as the CHAIN records it. `None` in the
+    /// same absent case as `hop_lock_hex`.
+    #[serde(rename = "hopSatsOnChain")]
+    pub hop_sats_on_chain: Option<u64>,
+    /// How many outputs the containing tx has — makes "no output at
+    /// `hop_vout`" a PROVEN absence rather than a NULL anyone must guess
+    /// about (the unknown-vs-refuted distinction the reader depends on).
+    #[serde(rename = "containerOutputs")]
+    pub container_outputs: u32,
+    /// The txid carrying the marker OP_RETURN — half of the primary key,
+    /// and (since the 2026-08-04 revision) the HOP TXID itself: the marker
+    /// rides the hop transaction, so one txid names both.
     pub txid: String,
     /// The marker output's index within `txid` — the other half of the
     /// primary key.
@@ -118,7 +135,8 @@ pub enum HoppartyQuery {
     },
     /// "Which markers name this hop outpoint?" — oldest first (the honest
     /// marker rides the hop tx itself, so later dust can never spam its way
-    /// in front of it — the #281 byPot rationale).
+    /// in front of it — the #281 byPot rationale). `hopTxid` is the
+    /// marker's CONTAINING txid (one tx).
     #[serde(rename = "byHop")]
     ByHop {
         #[serde(rename = "hopTxid")]
@@ -230,7 +248,8 @@ impl HoppartyStorage for MemoryHoppartyStorage {
             std::collections::HashMap::new();
         let mut kept: Vec<&HoppartyRecord> = Vec::new();
         for r in records.iter().filter(|r| r.identity == identity) {
-            let n = per_outpoint.entry((r.hop_txid.as_str(), r.hop_vout)).or_insert(0);
+            // The hop outpoint is (containing txid, hopVout).
+            let n = per_outpoint.entry((r.txid.as_str(), r.hop_vout)).or_insert(0);
             if *n < HOPSFOR_ROWS_PER_OUTPOINT {
                 *n += 1;
                 kept.push(r);
@@ -244,7 +263,7 @@ impl HoppartyStorage for MemoryHoppartyStorage {
         let mut newest_of: std::collections::HashMap<(&str, u32), i64> =
             std::collections::HashMap::new();
         for r in &kept {
-            let e = newest_of.entry((r.hop_txid.as_str(), r.hop_vout)).or_insert(i64::MIN);
+            let e = newest_of.entry((r.txid.as_str(), r.hop_vout)).or_insert(i64::MIN);
             *e = (*e).max(r.created_at);
         }
         let mut outpoints: Vec<((&str, u32), i64)> = newest_of.into_iter().collect();
@@ -254,7 +273,7 @@ impl HoppartyStorage for MemoryHoppartyStorage {
             outpoints.iter().map(|(k, _)| *k).collect();
         let mut out: Vec<HoppartyRecord> = kept
             .into_iter()
-            .filter(|r| allowed.contains(&(r.hop_txid.as_str(), r.hop_vout)))
+            .filter(|r| allowed.contains(&(r.txid.as_str(), r.hop_vout)))
             .cloned()
             .collect();
         // Newest OUTPOINT first; within an outpoint oldest marker first
@@ -266,7 +285,7 @@ impl HoppartyStorage for MemoryHoppartyStorage {
             .collect();
         out.sort_by_key(|r| {
             (
-                *rank.get(&(r.hop_txid.clone(), r.hop_vout)).unwrap_or(&usize::MAX),
+                *rank.get(&(r.txid.clone(), r.hop_vout)).unwrap_or(&usize::MAX),
                 r.created_at,
             )
         });
@@ -284,7 +303,7 @@ impl HoppartyStorage for MemoryHoppartyStorage {
             .lock()
             .unwrap()
             .iter() // OLDEST first — insertion order
-            .filter(|r| r.hop_txid == hop_txid && r.hop_vout == hop_vout)
+            .filter(|r| r.txid == hop_txid && r.hop_vout == hop_vout)
             .take(limit)
             .cloned()
             .collect())
@@ -300,16 +319,19 @@ mod tests {
     use super::*;
 
     fn record(identity: &str, opponent: &str, txid: &str) -> HoppartyRecord {
+        let settle = format!("03{}", "c4".repeat(32));
         HoppartyRecord {
             identity: identity.into(),
             opponent_identity: opponent.into(),
             game_id: "11".repeat(32),
-            hop_txid: "22".repeat(32),
             hop_vout: 0,
             hop_sats: 80_800,
-            seat_settle_pubkey: format!("03{}", "c4".repeat(32)),
+            seat_settle_pubkey: settle,
             seat_sig_hex: "3045ab".into(),
             identity_sig_hex: "3045cd".into(),
+            hop_lock_hex: Some(format!("76a914{}88ac", "d4".repeat(20))),
+            hop_sats_on_chain: Some(80_800),
+            container_outputs: 2,
             txid: txid.into(),
             output_index: 0,
             created_at: 0, // ignored — storage assigns
@@ -331,6 +353,9 @@ mod tests {
         assert_eq!(rows[0].opponent_identity, "03bb");
         assert_eq!(rows[0].hop_sats, 80_800);
         assert_eq!(rows[0].seat_settle_pubkey, format!("03{}", "c4".repeat(32)));
+        // The container's decoded facts survive the round-trip.
+        assert_eq!(rows[0].hop_sats_on_chain, Some(80_800));
+        assert_eq!(rows[0].container_outputs, 2);
     }
 
     #[tokio::test]
@@ -353,34 +378,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_for_hop_is_oldest_first() {
+    async fn list_for_hop_filters_the_exact_outpoint() {
         let store = MemoryHoppartyStorage::new();
+        // Two markers on ONE container (hop tx): one naming vout 0, one
+        // naming vout 1 — different hop outpoints of the same tx.
         store
             .store_record(&record("02aa", "03bb", "txA"))
             .await
             .unwrap();
+        let mut other_vout = record("02aa", "03bb", "txA");
+        other_vout.hop_vout = 1;
+        other_vout.output_index = 2; // a distinct marker outpoint (the PK)
+        store.store_record(&other_vout).await.unwrap();
+        // A marker on a DIFFERENT container.
         store
             .store_record(&record("03bb", "02aa", "txB"))
             .await
             .unwrap();
-        // A different hop vout is NOT matched.
-        let mut other = record("02aa", "03bb", "txC");
-        other.hop_vout = 1;
-        store.store_record(&other).await.unwrap();
 
-        let rows = store.list_for_hop(&"22".repeat(32), 0, 100).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].txid, "txA", "oldest first");
-        assert_eq!(rows[1].txid, "txB");
+        let rows = store.list_for_hop("txA", 0, 100).await.unwrap();
+        assert_eq!(rows.len(), 1, "exact outpoint (txid, vout), not txid alone");
+        assert_eq!(rows[0].hop_vout, 0);
+        assert_eq!(store.list_for_hop("txA", 1, 100).await.unwrap().len(), 1);
+        assert!(store.list_for_hop("txA", 9, 100).await.unwrap().is_empty());
+        assert_eq!(store.list_for_hop("txB", 0, 100).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn list_for_identity_is_newest_outpoint_first_and_respects_limit() {
         let store = MemoryHoppartyStorage::new();
         for i in 0..5u8 {
-            let mut r = record("02aa", "03bb", &format!("tx{i}"));
-            r.hop_txid = format!("{i:02x}").repeat(32);
-            store.store_record(&r).await.unwrap();
+            // Each marker rides its own hop tx ⇒ its own hop outpoint.
+            store
+                .store_record(&record("02aa", "03bb", &format!("tx{i}")))
+                .await
+                .unwrap();
         }
         let rows = store.list_for_identity("02aa", 3).await.unwrap();
         assert_eq!(rows.len(), 3, "limit counts outpoints");
@@ -395,14 +427,16 @@ mod tests {
     #[tokio::test]
     async fn many_markers_for_one_hop_consume_one_slot_and_keep_the_oldest() {
         let store = MemoryHoppartyStorage::new();
-        // The victim's honest marker for its real hop, published FIRST.
-        let mut honest = record("02aa", "03bb", "txHONEST");
-        honest.hop_txid = "aa".repeat(32);
-        store.store_record(&honest).await.unwrap();
-        // 120 later markers naming ANOTHER hop, all naming the victim.
+        // The victim's honest marker on its real hop tx, published FIRST.
+        store
+            .store_record(&record("02aa", "03bb", "txHONEST"))
+            .await
+            .unwrap();
+        // 120 later markers on ONE attacker container (one hop outpoint),
+        // each a distinct marker outpoint via outputIndex.
         for i in 0..120u32 {
-            let mut junk = record("02aa", "03cc", &format!("txJUNK{i}"));
-            junk.hop_txid = "bb".repeat(32);
+            let mut junk = record("02aa", "03cc", "txJUNK");
+            junk.output_index = i + 1;
             store.store_record(&junk).await.unwrap();
         }
         let rows = store.list_for_identity("02aa", 100).await.unwrap();
@@ -414,8 +448,8 @@ mod tests {
             "the honest hop survives the flood"
         );
         // Within the junk outpoint, the OLDEST rows were kept.
-        assert!(rows.iter().any(|r| r.txid == "txJUNK0"));
-        assert!(!rows.iter().any(|r| r.txid == "txJUNK119"));
+        assert!(rows.iter().any(|r| r.output_index == 1));
+        assert!(!rows.iter().any(|r| r.output_index == 120));
     }
 
     #[tokio::test]

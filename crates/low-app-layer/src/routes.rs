@@ -1614,6 +1614,15 @@ struct HopsViewRowD1 {
     identity_sig_hex: String,
     #[serde(rename = "markerTxid")]
     marker_txid: String,
+    #[serde(rename = "markerVout")]
+    marker_vout: f64,
+    /// The CONTAINER's decoded facts (#310 decode-at-write in the overlay).
+    #[serde(rename = "hopLockHex")]
+    hop_lock_hex: Option<String>,
+    #[serde(rename = "hopSatsOnChain")]
+    hop_sats_on_chain: Option<f64>,
+    #[serde(rename = "containerOutputs")]
+    container_outputs: f64,
     spent: Option<f64>,
     #[serde(rename = "spendingTxid")]
     spending_txid: Option<String>,
@@ -1621,8 +1630,6 @@ struct HopsViewRowD1 {
     spent_confirmed: Option<f64>,
     #[serde(rename = "spenderProofVerified")]
     spender_proof_verified: Option<f64>,
-    #[serde(rename = "hopLockHex")]
-    hop_lock_hex: Option<String>,
 }
 
 impl HopsViewRowD1 {
@@ -1638,13 +1645,16 @@ impl HopsViewRowD1 {
             seat_sig_hex: self.seat_sig_hex,
             identity_sig_hex: self.identity_sig_hex,
             marker_txid: self.marker_txid,
+            marker_vout: self.marker_vout as u32,
             spent: self.spent.map(|v| v != 0.0),
             spending_txid: self.spending_txid,
             spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
             spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
-            // Belt for the SQL's NULL-vs-'' distinction: an empty lock hex
-            // can never be a real script — treat it as absent (unknown).
+            // Stored as a typed column by the overlay's decode-at-write; an
+            // impossible empty string reads as absent (which REFUTES).
             hop_lock_hex: self.hop_lock_hex.filter(|s| !s.is_empty()),
+            hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
+            container_outputs: self.container_outputs as u32,
         }
     }
 }
@@ -1654,9 +1664,9 @@ impl HopsViewRowD1 {
 /// (`hopparty_records`), joined to the `tm_lowfund`-indexed hop outpoint
 /// for spent/unspent status (honesty pair; an un-indexed hop is `unknown`,
 /// never asserted-unspent) and labeled with the read-time
-/// `markerVerified` validity FILTER (seatSig + identitySig + the admitted
-/// hop lock — filter-for-display, rows never dropped). Full trust model:
-/// `hops_view.rs` module docs.
+/// `markerVerified` validity FILTER (seatSig + identitySig + the
+/// container's own hop lock AND value — filter-for-display, rows never
+/// dropped). Full trust model: `hops_view.rs` module docs.
 ///
 /// Fail-safe shape mirrors `/refund-view`: a missing/invalid identity is
 /// an EMPTY 200 result (never an error); a D1 fault is a 503; a

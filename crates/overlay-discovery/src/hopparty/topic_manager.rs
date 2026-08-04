@@ -104,8 +104,8 @@ impl TopicManager for HoppartyTopicManager {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::tests::{
-        golden_game_id, golden_hop_txid, golden_identity, golden_marker, golden_opponent,
-        golden_sats, golden_settle_pubkey, golden_sig, golden_vout, marker_script, push_data,
+        golden_game_id, golden_identity, golden_marker, golden_opponent, golden_sats,
+        golden_settle_pubkey, golden_sig, golden_vout, marker_script, push_data,
     };
     use super::super::HOPPARTY_TAG;
     use super::*;
@@ -114,7 +114,7 @@ pub(crate) mod tests {
 
     /// A valid hopparty-marker `TransactionOutput` (0-sat OP_RETURN).
     pub(crate) fn make_hopparty_output(game_id: &[u8; 32]) -> TransactionOutput {
-        let script = golden_marker(game_id, &golden_hop_txid(), golden_vout());
+        let script = golden_marker(game_id, golden_vout());
         TransactionOutput {
             satoshis: Some(0),
             locking_script: LockingScript::from_binary(&script).unwrap(),
@@ -140,8 +140,8 @@ pub(crate) mod tests {
         use crate::potparty::tests::{golden_marker as pp_v1, golden_marker_v2 as pp_v2};
         use crate::potparty::topic_manager::PotpartyTopicManager;
         for script in [
-            pp_v1(&golden_game_id(), &golden_hop_txid(), 0),
-            pp_v2(&golden_game_id(), &golden_hop_txid(), 0),
+            pp_v1(&golden_game_id(), &[0x22u8; 32], 0),
+            pp_v2(&golden_game_id(), &[0x22u8; 32], 0),
         ] {
             let out = TransactionOutput {
                 satoshis: Some(0),
@@ -198,7 +198,6 @@ pub(crate) mod tests {
             &golden_identity(),
             &golden_identity(),
             &golden_game_id(),
-            &golden_hop_txid(),
             golden_vout(),
             golden_sats(),
             &golden_settle_pubkey(),
@@ -221,7 +220,6 @@ pub(crate) mod tests {
         s.extend(push_data(&golden_identity()));
         s.extend(push_data(&golden_opponent()));
         s.extend(push_data(&golden_game_id()));
-        s.extend(push_data(&golden_hop_txid()));
         s.extend(push_data(&golden_vout().to_le_bytes()));
         s.extend(push_data(&(golden_sats() as u32).to_le_bytes())); // 4B, not 8B
         s.extend(push_data(&golden_settle_pubkey()));
@@ -237,12 +235,9 @@ pub(crate) mod tests {
 
     // ── Whole-transaction admission via BEEF ─────────────────────────────
 
-    /// A mixed-outputs tx (a P2PKH beside the marker — whatever tx the
-    /// client ends up carrying the marker on): the manager must admit
-    /// exactly the marker output and skip the money. (NOTE: the ledgered
-    /// "second output on the hop tx" carry-over cannot name the SAME tx's
-    /// hop outpoint — a tx cannot embed its own txid — so the carrier
-    /// shape is the client half's decision; this manager is agnostic.)
+    /// The PRODUCTION shape: the marker rides the hop `createAction` as a
+    /// SECOND OUTPUT beside the hop P2PKH. The manager must admit exactly
+    /// the marker output and skip the money.
     #[tokio::test]
     async fn identify_admissible_outputs_over_beef() {
         let marker = make_hopparty_output(&golden_game_id());

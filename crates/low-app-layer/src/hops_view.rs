@@ -6,11 +6,11 @@
 //! NO identity-keyed server row: `tm_lowfund` indexes the bare outpoint and
 //! `potparty_records` only fills at JOIN-assembly, so a seat that funded a
 //! hop and died pre-JOIN was invisible to every per-identity view (the
-//! #256 ~80.8k-sat class). Stage 2b adds the `LOW/hopparty/v1` marker
-//! (published at hop time, indexed by `tm_hopparty` → `hopparty_records`;
-//! the carrier-tx shape is the client half's decision — a tx cannot embed
-//! its own txid, so the marker cannot ride the very tx whose outpoint it
-//! names); this view joins those rows to the
+//! #256 ~80.8k-sat class). Stage 2b adds the `LOW/hopparty/v1` marker,
+//! which RIDES THE HOP TRANSACTION as a second output (indexed by
+//! `tm_hopparty` → `hopparty_records`): the marker names its hop by VOUT
+//! only and the containing tx supplies the txid, so the hop outpoint is
+//! `(hopparty_records.txid, hopVout)`. This view joins those rows to the
 //! `tm_lowfund`-indexed hop outpoint and answers, for one identity: which
 //! hops did you mark, are they spent (JOIN / hop sweep) or still in
 //! flight, and does each marker actually VERIFY.
@@ -44,43 +44,66 @@
 //! ## `markerVerified` — the read-time validity FILTER (never an authority)
 //!
 //! Admission is byte-format-only by doctrine, so every served row is an
-//! UNVERIFIED claim until read time. Per the #315 hybrid, the marker is
-//! chain-checkable: the hop output is `P2PKH(hash160(seatSettlePubkey))`,
-//! so this view re-derives the P2PKH lock from the marker's own pubkey and
-//! compares it against the hop output script the overlay ADMITTED (the
-//! engine's `outputs` row for the `tm_lowfund` topic — hash-bound chain
-//! bytes: the script at (txid, vout) is committed by the txid). On top of
-//! the script bar, both signatures are verified with the `results.rs`
-//! recipe: `seatSig` as plain ECDSA under `seatSettlePubkey` over
-//! sha256(hopparty seatsig preimage), and `identitySig` with the BRC-42
-//! 'anyone' round-trip under the marker's identity (protocol
-//! `[1,'low potparty']` — the SAME constant `/results` verifies potparty
-//! markers under; the version tag inside the challenge separates the
-//! domains).
+//! UNVERIFIED claim until read time. Three bars, all against facts the
+//! CONTAINER itself supplies:
+//!
+//!  1. **The hop lock.** The hop output is
+//!     `P2PKH(hash160(seatSettlePubkey))`, so this re-derives that script
+//!     from the marker's own pubkey and compares it to the container's
+//!     output at `hopVout` (`hopparty_records.hopLockHex`, decoded ONCE at
+//!     admission from the very BEEF admitted — #310/#284 decode-at-write;
+//!     the script at `(txid, vout)` is committed by the txid, so this is
+//!     hash-bound chain truth).
+//!  2. **The hop VALUE.** That same output's satoshis must equal the
+//!     marker's claimed `hopSats` (`hopSatsOnChain`). This bar is what
+//!     makes the replay case below cost real money.
+//!  3. **Both signatures**, with the `results.rs` recipe: `seatSig` as
+//!     plain ECDSA under `seatSettlePubkey` over sha256(hopparty seatsig
+//!     preimage), and `identitySig` with the BRC-42 'anyone' round-trip
+//!     under the marker's identity (protocol `[1,'low potparty']` — the
+//!     SAME constant `/results` verifies potparty markers under; the
+//!     version tag inside the challenge separates the domains).
+//!
+//! Reading the container's own decoded columns — rather than joining the
+//! engine's `outputs` table on the `tm_lowfund` topic, which the first
+//! draft did — is both cleaner and strictly more available: the hop tx is
+//! the marker's own container, so the facts are guaranteed present for
+//! every admitted row, they cannot be lifecycle-evicted when the hop is
+//! spent, they need no second topic to have been submitted, and they carry
+//! the SATOSHIS (which an `outputs`/`pot_records` join does not).
 //!
 //! Three-valued, `unknown` first-class:
 //!
-//! - `verified`   — both signatures verify AND the admitted hop lock
-//!   equals `P2PKH(hash160(seatSettlePubkey))`;
-//! - `unverified` — a signature fails, a field is malformed, or the
-//!   admitted lock MISMATCHES the marker's pubkey;
-//! - `unknown`    — signatures verify but no admitted hop script is
-//!   available to check against (hop never indexed under `tm_lowfund`, or
-//!   its engine `outputs` row was lifecycle-evicted after the spend), or
-//!   the per-request verify budget ran out before this row
-//!   (`verifyBudgetExhausted` in the body surfaces that case — Rule 13:
-//!   an ambiguous signal is surfaced, never consumed as either verdict).
+//! - `verified`   — both signatures verify AND the container's output at
+//!   `hopVout` is `P2PKH(hash160(seatSettlePubkey))` paying exactly
+//!   `hopSats`;
+//! - `unverified` — a signature fails, a field is malformed, the lock or
+//!   the value MISMATCHES, or the container has no output at `hopVout` at
+//!   all (a PROVEN absence — `containerOutputs` says how many it has —
+//!   which refutes the marker rather than leaving it open);
+//! - `unknown`    — the per-request verify budget ran out before this row
+//!   (`verifyBudgetExhausted` in the body surfaces that case — Rule 13: an
+//!   ambiguous signal is surfaced, never consumed as either verdict).
 //!
 //! Rows failing the filter are SERVED and labeled — filter-for-display,
 //! never silently dropped, never an authority decision (the signatures
 //! ride back in the body so the client re-verifies).
 //!
+//! ### What the container buys, and the one residual it leaves
+//!
+//! Because the marker rides the hop tx, `SIGHASH_ALL` makes the funding
+//! wallet's signature commit the marker bytes: **the entity that funded
+//! the hop provably authored the marker.** Neither digest can bind the
+//! containing txid (a tx cannot embed its own txid), so what remains is a
+//! PAID REPLAY, analysed at [`derive_marker_verification`].
+//!
 //! ## The window (the #281 shape, SUPERSET per outpoint)
 //!
 //! `hopparty_records.identity` is attacker-writable (byte-format
 //! admission), so the SQL reuses the identity-window discipline: `limit`
-//! counts HOP OUTPOINTS ([`HOPS_VIEW_MAX_OUTPOINTS`]), a hop-existence
-//! tier against `pot_records` demotes markers naming never-indexed hops
+//! counts HOP OUTPOINTS ([`HOPS_VIEW_MAX_OUTPOINTS`], keyed
+//! `(txid, hopVout)`), a hop-existence tier against `pot_records` demotes
+//! markers naming never-indexed hops
 //! (with [`HOPS_VIEW_UNKNOWN_HOP_QUOTA`] promoted slots so a genuinely
 //! fresh hop whose `tm_lowfund` admission is in flight is not hidden), and
 //! each outpoint serves up to [`HOPS_VIEW_ROWS_PER_OUTPOINT`] OLDEST rows —
@@ -127,12 +150,16 @@ const _: () = assert!(HOPS_VIEW_VERIFY_BUDGET > HOPS_VIEW_MAX_OUTPOINTS);
 
 /// The single `/hops-view` SQL (ONE bind: the lowercase identity). The
 /// #281 window over the caller's `hopparty_records` rows LEFT-JOINed to
-/// `pot_records` on the hop outpoint, then — OUTSIDE the window, on the
-/// bounded survivors only — the spender's `pot_beefs.proof_verified` latch
-/// (the shared #323 confirmation bar) and the ADMITTED hop lock script
-/// (`outputs`, `tm_lowfund` topic, `hex(outputScript)` — 25 bytes for a
-/// P2PKH, never a BEEF blob). `finalRank <= MAX+1` fetches one outpoint
-/// beyond the page for the honest `truncated` bit; the LIMIT is a belt.
+/// `pot_records` on the hop outpoint `(txid, hopVout)`, then — OUTSIDE the
+/// window, on the bounded survivors only — the spender's
+/// `pot_beefs.proof_verified` latch (the shared #323 confirmation bar).
+///
+/// The verification facts need NO join at all: `hopLockHex`,
+/// `hopSatsOnChain` and `containerOutputs` are typed columns the overlay
+/// decoded from the marker's own container at admission (#310), so this
+/// query touches no BLOB, no `outputs` row, and no second topic.
+/// `finalRank <= MAX+1` fetches one outpoint beyond the page for the
+/// honest `truncated` bit; the LIMIT is a belt.
 pub fn hops_view_sql() -> String {
     format!(
         "SELECT w.identity AS identity, w.gameId AS gameId, w.hopTxid AS hopTxid, \
@@ -140,54 +167,62 @@ pub fn hops_view_sql() -> String {
                 w.opponentIdentity AS opponentIdentity, \
                 w.seatSettlePubkey AS seatSettlePubkey, w.seatSigHex AS seatSigHex, \
                 w.identitySigHex AS identitySigHex, w.markerTxid AS markerTxid, \
+                w.markerVout AS markerVout, \
+                w.hopLockHex AS hopLockHex, w.hopSatsOnChain AS hopSatsOnChain, \
+                w.containerOutputs AS containerOutputs, \
                 w.spent AS spent, w.spendingTxid AS spendingTxid, \
                 w.spentConfirmed AS spentConfirmed, \
-                sb.proof_verified AS spenderProofVerified, \
-                CASE WHEN o.outputScript IS NULL THEN NULL \
-                     ELSE hex(o.outputScript) END AS hopLockHex \
+                sb.proof_verified AS spenderProofVerified \
          FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
-                  seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, \
+                  seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
+                  hopLockHex, hopSatsOnChain, containerOutputs, \
                   spent, spendingTxid, spentConfirmed, \
                   markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, tier \
            FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
-                    seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, \
+                    seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
+                    hopLockHex, hopSatsOnChain, containerOutputs, \
                     spent, spendingTxid, spentConfirmed, \
                     markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, tier, \
                     DENSE_RANK() OVER (ORDER BY tier ASC, \
                                                 COALESCE(potCreatedAt, firstMarkerAt) DESC, \
                                                 hopTxid ASC, hopVout ASC) AS finalRank \
            FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
-                    seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, \
+                    seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
+                    hopLockHex, hopSatsOnChain, containerOutputs, \
                     spent, spendingTxid, spentConfirmed, \
                     markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, unknownHop, \
                     CASE WHEN unknownHop = 0 OR hopRank <= {quota} THEN 0 ELSE 1 END AS tier \
              FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
-                      seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, \
+                      seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
+                      hopLockHex, hopSatsOnChain, containerOutputs, \
                       spent, spendingTxid, spentConfirmed, \
                       markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, unknownHop, \
                       DENSE_RANK() OVER (PARTITION BY unknownHop \
                                          ORDER BY COALESCE(potCreatedAt, firstMarkerAt) DESC, \
                                                   hopTxid ASC, hopVout ASC) AS hopRank \
                FROM (SELECT hp.identity AS identity, hp.gameId AS gameId, \
-                        hp.hopTxid AS hopTxid, hp.hopVout AS hopVout, \
+                        hp.txid AS hopTxid, hp.hopVout AS hopVout, \
                         hp.hopSats AS hopSats, \
                         hp.opponentIdentity AS opponentIdentity, \
                         hp.seatSettlePubkey AS seatSettlePubkey, \
                         hp.seatSigHex AS seatSigHex, \
                         hp.identitySigHex AS identitySigHex, \
-                        hp.txid AS markerTxid, \
+                        hp.txid AS markerTxid, hp.outputIndex AS markerVout, \
+                        hp.hopLockHex AS hopLockHex, \
+                        hp.hopSatsOnChain AS hopSatsOnChain, \
+                        hp.containerOutputs AS containerOutputs, \
                         r.spent AS spent, r.spendingTxid AS spendingTxid, \
                         r.spentConfirmed AS spentConfirmed, \
                         hp.createdAt AS markerCreatedAt, hp.rowid AS markerRowid, \
                         r.createdAt AS potCreatedAt, \
-                        MIN(hp.createdAt) OVER (PARTITION BY hp.hopTxid, hp.hopVout) \
+                        MIN(hp.createdAt) OVER (PARTITION BY hp.txid, hp.hopVout) \
                             AS firstMarkerAt, \
                         CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownHop, \
-                        ROW_NUMBER() OVER (PARTITION BY hp.hopTxid, hp.hopVout \
+                        ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout \
                                            ORDER BY hp.createdAt ASC, hp.rowid ASC) AS rn \
                  FROM hopparty_records hp \
                  LEFT JOIN pot_records r \
-                        ON r.txid = hp.hopTxid AND r.outputIndex = hp.hopVout \
+                        ON r.txid = hp.txid AND r.outputIndex = hp.hopVout \
                  WHERE hp.identity = ?) \
                WHERE rn <= {per_outpoint}))) \
            WHERE finalRank <= {rank_cap} \
@@ -196,8 +231,6 @@ pub fn hops_view_sql() -> String {
            LIMIT {row_cap}) w \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND sb.txid = lower(w.spendingTxid) \
-         LEFT JOIN outputs o ON o.txid = w.hopTxid AND o.outputIndex = w.hopVout \
-              AND o.topic = 'tm_lowfund' \
          ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.firstMarkerAt) DESC, \
                   w.hopTxid ASC, w.hopVout ASC, w.markerCreatedAt ASC, w.markerRowid ASC",
         quota = HOPS_VIEW_UNKNOWN_HOP_QUOTA,
@@ -223,18 +256,28 @@ pub struct HopsViewRow {
     pub seat_settle_pubkey: String,
     pub seat_sig_hex: String,
     pub identity_sig_hex: String,
-    /// The txid carrying the marker OP_RETURN.
+    /// The txid carrying the marker OP_RETURN — the SAME tx as the hop
+    /// (the marker rides it), so this equals `hop_txid` by construction.
     pub marker_txid: String,
+    /// The marker output's index within that tx.
+    pub marker_vout: u32,
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
     pub spent_confirmed: Option<bool>,
     /// `pot_beefs.proof_verified` for the recorded spender — the second
     /// accepted confirmation signal (#323 shared bar). `None` = no row.
     pub spender_proof_verified: Option<bool>,
-    /// `hex(outputs.outputScript)` for the hop outpoint under the
-    /// `tm_lowfund` topic — the ADMITTED (hash-bound) hop lock, when the
-    /// engine still holds it. `None` ⇒ the script bar answers `unknown`.
+    /// The CONTAINER's own output at `hop_vout`: its locking script
+    /// (lowercase hex), decoded at admission (#310). `None` IFF the
+    /// container has no such output — a PROVEN absence (see
+    /// `container_outputs`) that REFUTES the marker.
     pub hop_lock_hex: Option<String>,
+    /// That output's satoshi value as the chain records it. `None` in the
+    /// same absent case.
+    pub hop_sats_on_chain: Option<u64>,
+    /// How many outputs the container has — makes the absence above
+    /// provable rather than ambiguous.
+    pub container_outputs: u32,
 }
 
 /// The three-valued read-time marker verification — `unknown` first-class.
@@ -269,8 +312,9 @@ pub fn expected_hop_lock_hex(seat_settle_pubkey_hex: &str) -> Option<String> {
 }
 
 /// The decoded byte shapes of a row's digest-relevant hex fields:
-/// (identity, opponent, gameId, hopTxid, seatSettlePubkey).
-type RowDigestParts = (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>);
+/// (identity, opponent, gameId, seatSettlePubkey). No hop txid — the
+/// container supplies it and no digest can bind it.
+type RowDigestParts = (Vec<u8>, Vec<u8>, [u8; 32], Vec<u8>);
 
 /// Decode the row's hex fields into the byte shapes the shared digest
 /// builders take. `None` on any malformed field.
@@ -278,16 +322,13 @@ fn row_digest_parts(r: &HopsViewRow) -> Option<RowDigestParts> {
     let identity = hex::decode(r.identity.to_ascii_lowercase()).ok()?;
     let opponent = hex::decode(r.opponent_identity.to_ascii_lowercase()).ok()?;
     let game_id_v = hex::decode(r.game_id.to_ascii_lowercase()).ok()?;
-    let hop_txid_v = hex::decode(r.hop_txid.to_ascii_lowercase()).ok()?;
     let settle_pk = hex::decode(r.seat_settle_pubkey.to_ascii_lowercase()).ok()?;
-    if game_id_v.len() != 32 || hop_txid_v.len() != 32 {
+    if game_id_v.len() != 32 {
         return None;
     }
     let mut game_id = [0u8; 32];
     game_id.copy_from_slice(&game_id_v);
-    let mut hop_txid = [0u8; 32];
-    hop_txid.copy_from_slice(&hop_txid_v);
-    Some((identity, opponent, game_id, hop_txid, settle_pk))
+    Some((identity, opponent, game_id, settle_pk))
 }
 
 /// Verify the marker's SEAT signature: plain secp256k1 ECDSA under the
@@ -296,12 +337,12 @@ fn row_digest_parts(r: &HopsViewRow) -> Option<RowDigestParts> {
 /// hopparty_seatsig_preimage`] (one source of truth across the crates).
 /// Any malformed key/sig/field is `false` (refused).
 pub fn verify_hop_seat_sig(r: &HopsViewRow) -> bool {
-    let Some((identity, _, game_id, hop_txid, _)) = row_digest_parts(r) else {
+    let Some((identity, _, game_id, _)) = row_digest_parts(r) else {
         return false;
     };
-    let Some(preimage) = overlay_discovery::hopparty::hopparty_seatsig_preimage(
-        &game_id, &hop_txid, r.hop_vout, &identity,
-    ) else {
+    let Some(preimage) =
+        overlay_discovery::hopparty::hopparty_seatsig_preimage(&game_id, r.hop_vout, &identity)
+    else {
         return false;
     };
     let Ok(pubkey) = bsv_rs::primitives::ec::PublicKey::from_hex(&r.seat_settle_pubkey) else {
@@ -326,11 +367,11 @@ pub fn verify_hop_seat_sig(r: &HopsViewRow) -> bool {
 /// hop — the potparty F1 shape — and land a "verified" row in the victim's
 /// view. Only the named identity can mint this signature.
 pub fn verify_hop_identity_binding(r: &HopsViewRow) -> bool {
-    let Some((identity, opponent, game_id, hop_txid, settle_pk)) = row_digest_parts(r) else {
+    let Some((identity, opponent, game_id, settle_pk)) = row_digest_parts(r) else {
         return false;
     };
     let Some(challenge) = overlay_discovery::hopparty::hopparty_identity_challenge(
-        &identity, &opponent, &game_id, &hop_txid, r.hop_vout, r.hop_sats, &settle_pk,
+        &identity, &opponent, &game_id, r.hop_vout, r.hop_sats, &settle_pk,
     ) else {
         return false;
     };
@@ -344,19 +385,61 @@ pub fn verify_hop_identity_binding(r: &HopsViewRow) -> bool {
 }
 
 /// The read-time validity FILTER for one row (module docs). Order is
-/// cost-aware: the script bar (one hash160 + a compare) runs FIRST so a
-/// mismatched lock refuses with zero curve work; the two signature bars
-/// only run on rows the script bar did not already refuse.
+/// cost-aware: the container bars (a hash160 + two compares) run FIRST, so
+/// a mismatched lock or value refuses with zero curve work; the two
+/// signature bars only run on rows the container bars did not already
+/// refuse.
+///
+/// # The residual: a PAID REPLAY, and why it is not patched here
+///
+/// Neither digest can bind the containing txid (a tx cannot embed its own
+/// txid), so the marker bytes are portable. An attacker can copy an
+/// admitted marker verbatim into a transaction of their own and place an
+/// output at `hopVout` that satisfies both container bars. `seatSettlePubkey`
+/// is public, so they CAN construct the lock — but the value bar means the
+/// replay only verifies if that output pays **`hopSats` to the victim's own
+/// settle key**, i.e. the attacker must GIVE THE VICTIM the full hop amount
+/// (~80,800 sats in the #256 class, plus fees) for every noise row they
+/// mint, and the victim can spend it: they hold the settle key. The effect
+/// is bounded, self-defeating, and fails in the honest direction — an extra
+/// `verified` row in the victim's own view, never a lost or altered one.
+/// The `truncated` bit stays honest under it because each replay is a
+/// distinct outpoint.
+///
+/// **No app-layer signature is invented to close it** (Rule 4 / the epoch
+/// doc's recorded mistake). The only bar that would close it must bind the
+/// container's INPUTS to the identity, and that is not available: the hop
+/// is funded by arbitrary BRC-42 wallet children, and proving a wallet
+/// child belongs to identity X server-side needs the very derivation this
+/// design exists to avoid. What the container DOES buy is unforgeable
+/// authorship of the honest row (`SIGHASH_ALL` commits the marker bytes to
+/// the funding signature), which is the property that matters for the
+/// money path.
+///
+/// # Legacy limit, stated plainly
+///
+/// Hops created BEFORE this ships carry no marker and never will — the
+/// marker must ride the hop tx, and that tx is already on chain. Those hops
+/// stay invisible to `/hops-view` forever. This is the same acknowledged
+/// limit #319 carries for retrofitting potparty markers; it is not a
+/// regression (today they are invisible too), but it means `/hops-view` is
+/// a going-forward surface, not a backfill.
 pub fn derive_marker_verification(r: &HopsViewRow) -> MarkerVerification {
     let Some(expected) = expected_hop_lock_hex(&r.seat_settle_pubkey) else {
         return MarkerVerification::Unverified; // malformed pubkey
     };
-    if let Some(lock) = &r.hop_lock_hex {
-        if !lock.eq_ignore_ascii_case(&expected) {
-            // The ADMITTED hop lock does not pay the marker's key —
-            // definite mismatch, refused before any ECDSA.
-            return MarkerVerification::Unverified;
-        }
+    // Bar 1+2: the CONTAINER's own output at hopVout. Absence here is
+    // PROVEN (the container is fully known), so it refutes rather than
+    // leaving the row open.
+    let (Some(lock), Some(on_chain_sats)) = (&r.hop_lock_hex, r.hop_sats_on_chain) else {
+        return MarkerVerification::Unverified;
+    };
+    if !lock.eq_ignore_ascii_case(&expected) {
+        return MarkerVerification::Unverified;
+    }
+    if on_chain_sats != r.hop_sats {
+        // The value bar — what makes the replay above cost real money.
+        return MarkerVerification::Unverified;
     }
     if !verify_hop_seat_sig(r) {
         return MarkerVerification::Unverified;
@@ -364,13 +447,7 @@ pub fn derive_marker_verification(r: &HopsViewRow) -> MarkerVerification {
     if !verify_hop_identity_binding(r) {
         return MarkerVerification::Unverified;
     }
-    match r.hop_lock_hex {
-        // Signatures AND the admitted-lock match: fully verified.
-        Some(_) => MarkerVerification::Verified,
-        // Signatures hold but no admitted script exists to check against —
-        // `unknown`, never asserted verified (and never failed).
-        None => MarkerVerification::Unknown,
-    }
+    MarkerVerification::Verified
 }
 
 /// The `/hops-view` status enum (module-docs table).
@@ -430,7 +507,10 @@ pub struct HopEntry {
     /// the server's filter is display labeling, never an authority.
     pub seat_sig_hex: String,
     pub identity_sig_hex: String,
+    /// The marker's containing tx = the hop tx, and the marker's own vout
+    /// within it (so a client can fetch the exact OP_RETURN back).
     pub marker_txid: String,
+    pub marker_vout: u32,
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
     pub spent_confirmed: Option<bool>,
@@ -485,6 +565,7 @@ pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool, bool)
                 seat_sig_hex: r.seat_sig_hex,
                 identity_sig_hex: r.identity_sig_hex,
                 marker_txid: r.marker_txid,
+                marker_vout: r.marker_vout,
                 spent: r.spent,
                 spending_txid: r.spending_txid,
                 spent_confirmed: r.spent_confirmed,
@@ -525,6 +606,7 @@ pub fn hops_view_body(
                 "seatSigHex": e.seat_sig_hex,
                 "identitySigHex": e.identity_sig_hex,
                 "markerTxid": e.marker_txid,
+                "markerVout": e.marker_vout,
                 "spent": e.spent,
                 "spendingTxid": e.spending_txid,
                 "spentConfirmed": e.spent_confirmed,
@@ -571,6 +653,9 @@ mod tests {
     /// 'anyone' identity signature over the exact challenge — the same
     /// crypto the client will produce.
     pub(crate) fn real_row(identity_seed: u8, hop_txid_byte: u8) -> HopsViewRow {
+        // `hop_txid_byte` varies the CONTAINER (= the hop tx). It is not in
+        // any digest — the container supplies it — so varying it must not
+        // disturb either signature; the cells below rely on that.
         let wallet = wallet_of(identity_seed);
         let identity_hex = wallet.identity_key_hex().to_ascii_lowercase();
         let identity = hex::decode(&identity_hex).unwrap();
@@ -597,10 +682,9 @@ mod tests {
             .to_ascii_lowercase();
         let settle_pk = hex::decode(&settle_pub_hex).unwrap();
 
-        let preimage = overlay_discovery::hopparty::hopparty_seatsig_preimage(
-            &game_id, &hop_txid, hop_vout, &identity,
-        )
-        .unwrap();
+        let preimage =
+            overlay_discovery::hopparty::hopparty_seatsig_preimage(&game_id, hop_vout, &identity)
+                .unwrap();
         let seat_sig = wallet
             .create_signature(CreateSignatureArgs {
                 data: Some(preimage),
@@ -613,7 +697,7 @@ mod tests {
             .signature;
 
         let challenge = overlay_discovery::hopparty::hopparty_identity_challenge(
-            &identity, &opponent, &game_id, &hop_txid, hop_vout, hop_sats, &settle_pk,
+            &identity, &opponent, &game_id, hop_vout, hop_sats, &settle_pk,
         )
         .unwrap();
         let identity_sig = wallet
@@ -637,43 +721,119 @@ mod tests {
             seat_settle_pubkey: settle_pub_hex.clone(),
             seat_sig_hex: hex::encode(seat_sig),
             identity_sig_hex: hex::encode(identity_sig),
-            marker_txid: h64(0xc1),
+            // The marker rides the hop tx, so markerTxid == hopTxid.
+            marker_txid: hex::encode(hop_txid),
+            marker_vout: 1,
             spent: Some(false),
             spending_txid: None,
             spent_confirmed: Some(false),
             spender_proof_verified: None,
-            // The admitted hop lock MATCHES the settle pubkey by default.
+            // The container's output at hopVout pays the settle key exactly
+            // the claimed value — the fully VERIFYING shape by default.
             hop_lock_hex: expected_hop_lock_hex(&settle_pub_hex),
+            hop_sats_on_chain: Some(hop_sats),
+            container_outputs: 2,
         }
     }
 
     // ── markerVerified derivation matrix ─────────────────────────────────
 
     #[test]
-    fn real_marker_with_matching_admitted_lock_is_verified() {
-        // The positive control: both real sigs + a matching admitted lock
-        // reach and clear every bar.
+    fn real_marker_in_a_matching_container_is_verified() {
+        // The positive control: both real sigs + the container's own output
+        // at hopVout paying the settle key exactly hopSats — every bar
+        // reached and cleared.
         let r = real_row(0xa1, 0xaa);
         assert!(verify_hop_seat_sig(&r));
         assert!(verify_hop_identity_binding(&r));
         assert_eq!(derive_marker_verification(&r), MarkerVerification::Verified);
     }
 
+    /// The container is fully known at admission, so "no output at
+    /// hopVout" REFUTES the marker — it never leaves it open.
     #[test]
-    fn absent_admitted_lock_is_unknown_not_failed() {
+    fn a_container_without_that_output_refutes_the_marker() {
         let mut r = real_row(0xa1, 0xaa);
         r.hop_lock_hex = None;
-        assert_eq!(derive_marker_verification(&r), MarkerVerification::Unknown);
+        r.hop_sats_on_chain = None;
+        assert_eq!(
+            derive_marker_verification(&r),
+            MarkerVerification::Unverified,
+            "PROVEN absence refutes; it is not an unknown"
+        );
     }
 
     #[test]
-    fn mismatched_admitted_lock_is_unverified() {
+    fn mismatched_container_lock_is_unverified() {
         let mut r = real_row(0xa1, 0xaa);
-        // The chain says the hop pays a DIFFERENT key than the marker
-        // claims — refused (this is the pre-filter: no ECDSA needed).
+        // The container's output at hopVout pays a DIFFERENT key than the
+        // marker claims — refused with zero curve work.
         r.hop_lock_hex = Some(format!("76a914{}88ac", "aa".repeat(20)));
         assert_eq!(
             derive_marker_verification(&r),
+            MarkerVerification::Unverified
+        );
+    }
+
+    /// The VALUE bar — the one that makes the replay residual cost money.
+    /// A container that pays the right key the WRONG amount is refused.
+    #[test]
+    fn mismatched_container_value_is_unverified() {
+        for on_chain in [0u64, 1, 80_799, 80_801, u64::MAX] {
+            let mut r = real_row(0xa1, 0xaa);
+            r.hop_sats_on_chain = Some(on_chain);
+            assert_eq!(
+                derive_marker_verification(&r),
+                MarkerVerification::Unverified,
+                "claimed 80_800 vs on-chain {on_chain} must refuse"
+            );
+        }
+        // Positive control: the exact value clears.
+        assert_eq!(
+            derive_marker_verification(&real_row(0xa1, 0xaa)),
+            MarkerVerification::Verified
+        );
+    }
+
+    /// The PAID REPLAY residual, executed rather than asserted: the marker
+    /// bytes are portable (no digest binds the containing txid), so the
+    /// SAME signatures verify inside an attacker's container — but ONLY if
+    /// that container pays `hopSats` to the VICTIM's settle key. The cell
+    /// pins both halves: the replay verifies (so the residual is real and
+    /// documented, not imagined), and every cheaper variant refuses.
+    #[test]
+    fn a_replay_verifies_only_when_the_attacker_actually_pays_the_victim() {
+        let honest = real_row(0xa1, 0xaa);
+        // The attacker's own container — a different txid entirely.
+        let mut replay = honest.clone();
+        replay.hop_txid = h64(0x99);
+        replay.marker_txid = h64(0x99);
+        // Paying the victim's key the full amount: this DOES verify.
+        assert_eq!(
+            derive_marker_verification(&replay),
+            MarkerVerification::Verified,
+            "the documented residual: a replay that really pays the victim verifies"
+        );
+        // Every cheaper variant fails: paying less…
+        let mut cheap = replay.clone();
+        cheap.hop_sats_on_chain = Some(1);
+        assert_eq!(
+            derive_marker_verification(&cheap),
+            MarkerVerification::Unverified
+        );
+        // …or paying someone else.
+        let mut elsewhere = replay.clone();
+        elsewhere.hop_lock_hex = Some(format!("76a914{}88ac", "77".repeat(20)));
+        assert_eq!(
+            derive_marker_verification(&elsewhere),
+            MarkerVerification::Unverified
+        );
+        // …or omitting the output.
+        let mut omitted = replay;
+        omitted.hop_lock_hex = None;
+        omitted.hop_sats_on_chain = None;
+        assert_eq!(
+            derive_marker_verification(&omitted),
             MarkerVerification::Unverified
         );
     }
@@ -687,9 +847,10 @@ mod tests {
             derive_marker_verification(&r),
             MarkerVerification::Unverified
         );
-        // Even with the admitted lock ABSENT, junk sigs are failed, never
-        // laundered into `unknown`.
+        // Even with the container's output ABSENT, junk sigs are failed,
+        // never laundered into `unknown`.
         r.hop_lock_hex = None;
+        r.hop_sats_on_chain = None;
         assert_eq!(
             derive_marker_verification(&r),
             MarkerVerification::Unverified
@@ -718,11 +879,19 @@ mod tests {
         r.hop_sats += 1;
         assert!(verify_hop_seat_sig(&r), "seat preimage does not bind sats");
         assert!(!verify_hop_identity_binding(&r), "identity challenge does");
-        // The hop outpoint is bound by BOTH.
+        // The hop VOUT is bound by BOTH digests.
         let mut r = real_row(0xa1, 0xaa);
-        r.hop_txid = h64(0xdd);
+        r.hop_vout += 1;
         assert!(!verify_hop_seat_sig(&r));
         assert!(!verify_hop_identity_binding(&r));
+        // The containing TXID is bound by NEITHER — it cannot be (a tx
+        // cannot embed its own txid), which is exactly the paid-replay
+        // residual pinned above. Stated here so the boundary is explicit.
+        let mut r = real_row(0xa1, 0xaa);
+        r.hop_txid = h64(0xdd);
+        r.marker_txid = h64(0xdd);
+        assert!(verify_hop_seat_sig(&r), "no digest binds the container txid");
+        assert!(verify_hop_identity_binding(&r));
         // The identity is bound by BOTH (a thief cannot re-pair a genuine
         // seatSig with a different identity).
         let mut r = real_row(0xa1, 0xaa);
@@ -737,7 +906,6 @@ mod tests {
             |r: &mut HopsViewRow| r.seat_settle_pubkey = "zz".into(),
             |r: &mut HopsViewRow| r.seat_settle_pubkey = "02abcd".into(),
             |r: &mut HopsViewRow| r.game_id = "11".into(),
-            |r: &mut HopsViewRow| r.hop_txid = "gg".repeat(32),
             |r: &mut HopsViewRow| r.identity = String::new(),
             |r: &mut HopsViewRow| r.seat_sig_hex = "nothex".into(),
             |r: &mut HopsViewRow| r.identity_sig_hex = String::new(),
@@ -764,13 +932,8 @@ mod tests {
         let identity = hex::decode(&r.identity).unwrap();
         let game_id: [u8; 32] = hex::decode(&r.game_id).unwrap().try_into().unwrap();
         let mut potparty_pre =
-            overlay_discovery::hopparty::hopparty_seatsig_preimage(
-                &game_id,
-                &hex::decode(&r.hop_txid).unwrap().try_into().unwrap(),
-                r.hop_vout,
-                &identity,
-            )
-            .unwrap();
+            overlay_discovery::hopparty::hopparty_seatsig_preimage(&game_id, r.hop_vout, &identity)
+                .unwrap();
         // Swap the 24-byte domain prefix for potparty-v2's.
         potparty_pre[..24].copy_from_slice(b"LOW/potparty/v2/seatsig|");
         let opponent_pub = bsv_rs::primitives::ec::PublicKey::from_hex(&r.opponent_identity)
@@ -871,7 +1034,6 @@ mod tests {
                 // Junk sig so a CHECKED row is Unverified — distinguishing
                 // checked (unverified) from unchecked (unknown).
                 r.seat_sig_hex = format!("3045{}", "ab".repeat(69));
-                r.hop_lock_hex = None;
                 rows.push(r);
             }
         }
@@ -904,7 +1066,6 @@ mod tests {
         junk.seat_sig_hex = format!("3045{}", "ab".repeat(69));
         junk.spent = None;
         junk.spent_confirmed = None;
-        junk.hop_lock_hex = None;
         let (entries, truncated, exhausted) = assemble_hops_view(vec![verified.clone(), junk]);
         let body = hops_view_body(&verified.identity, Some(960_000), &entries, truncated, exhausted);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -920,6 +1081,8 @@ mod tests {
         assert_eq!(e0["statusSource"], json!("chain"));
         assert_eq!(e0["markerVerified"], json!("verified"));
         assert_eq!(e0["seatSettlePubkey"], json!(verified.seat_settle_pubkey));
+        assert_eq!(e0["markerTxid"], json!(verified.hop_txid), "the marker rides the hop tx");
+        assert_eq!(e0["markerVout"], json!(1));
         // The junk row is SERVED, labeled — never dropped.
         let e1 = &v["hops"][1];
         assert_eq!(e1["markerVerified"], json!("unverified"));
@@ -945,7 +1108,10 @@ mod tests {
     fn hops_view_sql_shape() {
         let sql = hops_view_sql();
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
-        assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.hopTxid, hp.hopVout"));
+        assert!(
+            sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout"),
+            "the hop outpoint is (containing txid, hopVout)"
+        );
         assert!(
             sql.contains(&format!("rn <= {HOPS_VIEW_ROWS_PER_OUTPOINT}")),
             "bounded SUPERSET per outpoint — never rn = 1 (verify-at-read)"
@@ -955,15 +1121,18 @@ mod tests {
             sql.contains(&format!("finalRank <= {}", HOPS_VIEW_MAX_OUTPOINTS + 1)),
             "one outpoint beyond the page — the honest truncated bit"
         );
-        // The admitted-lock join is topic-scoped and OUTSIDE the window.
-        assert!(sql.contains("o.topic = 'tm_lowfund'"));
-        // hex(NULL) is '' in SQLite (not NULL) — the CASE keeps a missed
-        // join distinguishable from an empty script (unknown, never a
-        // mismatch).
-        assert!(sql.contains(
-            "CASE WHEN o.outputScript IS NULL THEN NULL \
-                     ELSE hex(o.outputScript) END AS hopLockHex"
-        ));
+        // The verification facts are TYPED COLUMNS decoded at admission —
+        // no `outputs` join, no topic dependency, no BLOB. Positive counts
+        // (one per nesting level + the aliasing SELECT + the outer
+        // projection), so a rename fails loudly rather than vacuously.
+        assert_eq!(sql.matches("hopLockHex").count(), 8);
+        assert_eq!(sql.matches("hopSatsOnChain").count(), 8);
+        assert_eq!(sql.matches("containerOutputs").count(), 8);
+        let banned_join = ["tm_low", "fund'"].concat(); // split so it never matches itself
+        assert!(
+            !sql.contains(&banned_join),
+            "the container supplies the hop facts — no outputs/tm_lowfund join"
+        );
         // The shared confirmation bar's latch is fetched.
         assert!(sql.contains("sb.proof_verified AS spenderProofVerified"));
         // No BEEF blob is ever hauled (25-byte P2PKH scripts only).

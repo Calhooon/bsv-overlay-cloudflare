@@ -7,14 +7,43 @@
 //! P2PKH outpoint, and `potparty_records` rows are only published at
 //! JOIN-assembly — so a seat that funds its hop and dies BEFORE the join
 //! leaves ZERO identity-keyed server rows (the #256 ~80.8k-sat class). At
-//! hop time the seat publishes this tiny signed `OP_RETURN` marker naming
-//! its identity, the opponent, the game, the hop outpoint, the hop value,
-//! and its settle pubkey. (The ledgered "second output on the hop
-//! `createAction` itself" carry-over cannot name the SAME tx's outpoint —
-//! a tx cannot embed its own txid — so the carrier tx shape is the CLIENT
-//! half's decision; this index is agnostic about the carrier.) `/hops-view` (low-app-layer) joins
-//! it to the `tm_lowfund`-indexed hop outpoint to answer "which hops of
-//! mine are in flight?".
+//! hop time the seat publishes this tiny signed `OP_RETURN` marker as a
+//! SECOND OUTPUT ON THE HOP TRANSACTION ITSELF, naming its identity, the
+//! opponent, the game, the hop VOUT, the hop value, and its settle pubkey.
+//!
+//! # The container supplies the txid (the 2026-08-04 wire revision)
+//!
+//! The marker carries NO `hopTxid` push. A transaction cannot embed its
+//! own txid (a hash fixed point), so a marker riding the hop tx could
+//! never name it — and the first draft of this format tried to do both.
+//! The resolution is that `hopTxid` was never information the MARKER
+//! needed to carry: it is information the CONTAINER already has. **The hop
+//! outpoint is `(the marker's own containing txid, hopVout)`**, and the
+//! overlay knows the containing txid at admission — it is half the primary
+//! key. Four properties fall out, and they are why this is strictly better
+//! than a standalone marker tx rather than a workaround:
+//!
+//!  1. **Zero extra wallet approval** — the marker rides the hop's own
+//!     `createAction` (`stake.ts:4451-4458`, whose `randomizeOutputs:
+//!     false` is load-bearing: it keeps the hop at a STABLE vout).
+//!  2. **Network-enforced AUTHORSHIP.** `SIGHASH_ALL` commits every
+//!     output, so the wallet signature funding the hop commits the marker
+//!     bytes: the entity that funded the hop provably authored the marker.
+//!     Impersonation of the FUNDER becomes unrepresentable, not merely
+//!     detectable. (`PLAN-PICKUP-2026-08-03.md:254` said the hop marker
+//!     "CANNOT inherit this property by construction" — that reasoning was
+//!     about SETTLE-key binding and remains true for the settle key;
+//!     wallet-key binding over the container was available all along.)
+//!  3. **Atomic with funding** — the marker cannot fail independently of
+//!     the hop, killing the #221 forever-hang class for this surface.
+//!  4. **Retry needs no wallet at all.** If the overlay is down at submit
+//!     time the tx is already on-chain, so recovery is a plain re-SUBMIT
+//!     of the same BEEF, never a re-sign — the Rule 4b property that a
+//!     recovery path must degrade toward working, not toward proving.
+//!
+//! `/hops-view` (low-app-layer) joins these rows to the
+//! `tm_lowfund`-indexed hop outpoint to answer "which hops of mine are in
+//! flight?".
 //!
 //! Like `tm_potparty`, this is an `OP_RETURN` data-carrier topic admitted by
 //! BYTE FORMAT ONLY — the overlay is an INDEX, not an authority. There is
@@ -37,7 +66,7 @@
 //!
 //! # Marker wire format (`LOW/hopparty/v1`)
 //!
-//! `OP_FALSE OP_RETURN` (0x00 0x6a) followed by EXACTLY TEN minimal data
+//! `OP_FALSE OP_RETURN` (0x00 0x6a) followed by EXACTLY NINE minimal data
 //! pushes — the cross-repo CONTRACT with the bsv-low client (bsv-low #315;
 //! versioning copies the #230 potparty-v2 contract verbatim):
 //!
@@ -47,13 +76,14 @@
 //! | 1 | identity         | 33 bytes (publishing seat's compressed pubkey)|
 //! | 2 | opponentIdentity | 33 bytes (the other seat's compressed pubkey) |
 //! | 3 | gameId           | 32 bytes                                      |
-//! | 4 | hopTxid          | 32 bytes                                      |
-//! | 5 | hopVout          | 4 bytes little-endian (u32)                   |
-//! | 6 | hopSats          | 8 bytes little-endian (u64)                   |
-//! | 7 | seatSettlePubkey | 33 bytes (compressed `[2,'low settle']` key — |
+//! | 4 | hopVout          | 4 bytes little-endian (u32)                   |
+//! | 5 | hopSats          | 8 bytes little-endian (u64)                   |
+//! | 6 | seatSettlePubkey | 33 bytes (compressed `[2,'low settle']` key — |
 //! |   |                  | the key the hop output pays)                  |
-//! | 8 | seatSig          | DER ECDSA, 67..=74 bytes (BY the settle key)  |
-//! | 9 | identitySig      | DER ECDSA, 67..=74 bytes (BY the identity)    |
+//! | 7 | seatSig          | DER ECDSA, 67..=74 bytes (BY the settle key)  |
+//! | 8 | identitySig      | DER ECDSA, 67..=74 bytes (BY the identity)    |
+//!
+//! There is NO `hopTxid` push: the containing tx IS the hop tx (above).
 //!
 //! `hopSats` is 8 bytes because satoshi amounts are u64 in the transaction
 //! format itself (a 4-byte u32 caps at ~42.9 BSV); the potparty precedent's
@@ -75,16 +105,20 @@
 //!   (lowercase), counterparty 'anyone'):
 //!   [`hopparty_identity_challenge`] =
 //!   `UTF-8("LOW/hopparty/v1") ‖ identity(33) ‖ opponentIdentity(33) ‖
-//!    gameId(32) ‖ hopTxid(32) ‖ hopVout(4 LE) ‖ hopSats(8 LE) ‖
-//!    seatSettlePubkey(33)`.
+//!    gameId(32) ‖ hopVout(4 LE) ‖ hopSats(8 LE) ‖ seatSettlePubkey(33)`.
 //! - **seatSig** (plain ECDSA by the settle key over a SINGLE sha256 — the
 //!   BRC-100 `createSignature({data})` hash):
 //!   [`hopparty_seatsig_preimage`] =
-//!   `UTF-8("LOW/hopparty/v1/seatsig|") ‖ gameId(32) ‖ hopTxid(32) ‖
-//!    hopVout(4 LE) ‖ identity(33)` — the exact potparty-v2 seatsig layout
-//!   with the hopparty domain tag (both tags are 24 ASCII bytes, so the two
-//!   preimage families share a fixed 125-byte layout and differ in the
-//!   domain prefix alone).
+//!   `UTF-8("LOW/hopparty/v1/seatsig|") ‖ gameId(32) ‖ hopVout(4 LE) ‖
+//!    identity(33)` (93 bytes) — the potparty-v2 seatsig layout minus the
+//!   txid, under the hopparty domain tag.
+//!
+//! NEITHER digest can bind the containing txid (the same fixed point), so
+//! neither pins WHICH tx carries the marker. What pins that is the
+//! container's own wallet signature (`SIGHASH_ALL`). The residual this
+//! leaves — a paid REPLAY of the marker bytes into an attacker's own tx —
+//! is analysed at the verification site
+//! (`low_app_layer::hops_view::derive_marker_verification`).
 //!
 //! # Lookup (`ls_hopparty`)
 //!
@@ -95,6 +129,9 @@
 //! {"type": "byHop", "hopTxid": "<64 hex chars>", "hopVout": 0}
 //! ```
 //!
+//! `byHop`'s `hopTxid` is the marker's CONTAINING txid (they are the same
+//! tx — above), so it filters `txid = ? AND hopVout = ?`.
+//!
 //! `hopsFor` counts HOP OUTPOINTS (newest first) and returns a BOUNDED
 //! SUPERSET per outpoint (the #281 lesson: a layer that cannot verify
 //! signatures must never choose which row is real); `byHop` returns markers
@@ -104,9 +141,15 @@
 //! [{"identity": "<hex>", "opponentIdentity": "<hex>", "gameId": "<hex>",
 //!   "hopTxid": "<hex>", "hopVout": 0, "hopSats": 1234567,
 //!   "seatSettlePubkey": "<hex>", "seatSigHex": "<hex>",
-//!   "identitySigHex": "<hex>", "txid": "<hex>", "outputIndex": 0,
-//!   "createdAt": 1234567890}]
+//!   "identitySigHex": "<hex>", "hopLockHex": "<hex|null>",
+//!   "hopSatsOnChain": 1234567, "containerOutputs": 2,
+//!   "txid": "<hex>", "outputIndex": 0, "createdAt": 1234567890}]
 //! ```
+//!
+//! `hopTxid` is a re-presentation of `txid` (one tx), and the three
+//! `hop*OnChain`/`container*` fields are the CONTAINER's own facts,
+//! decoded ONCE at admission (#310 decode-at-write) — never re-parsed at
+//! read. They are what a reader compares the marker's CLAIMS against.
 
 pub mod lookup_service;
 pub mod storage;
@@ -122,15 +165,15 @@ pub const HOPPARTY_TAG: &[u8] = b"LOW/hopparty/v1";
 /// prefix). MUST stay byte-identical to the client's
 /// `HOPPARTY_SEATSIG_DOMAIN`.
 pub const HOPPARTY_SEATSIG_DOMAIN: &[u8] = b"LOW/hopparty/v1/seatsig|";
-/// Number of minimal data pushes in a well-formed hopparty marker.
-pub const HOPPARTY_FIELD_COUNT: usize = 10;
+/// Number of minimal data pushes in a well-formed hopparty marker. NINE
+/// since the 2026-08-04 revision — `hopTxid` was deleted because the
+/// containing tx IS the hop tx (module docs).
+pub const HOPPARTY_FIELD_COUNT: usize = 9;
 /// identity / opponentIdentity / seatSettlePubkey push length (bytes) — a
 /// compressed secp256k1 pubkey.
 pub const HOPPARTY_IDENTITY_KEY_LEN: usize = 33;
 /// gameId push length (bytes).
 pub const HOPPARTY_GAME_ID_LEN: usize = 32;
-/// hopTxid push length (bytes).
-pub const HOPPARTY_TXID_LEN: usize = 32;
 /// hopVout push length (bytes) — a little-endian u32.
 pub const HOPPARTY_U32_LEN: usize = 4;
 /// hopSats push length (bytes) — a little-endian u64 (sats are u64 in the
@@ -158,9 +201,10 @@ pub struct HoppartyMarker {
     pub opponent: Vec<u8>,
     /// The 32-byte game id.
     pub game_id: [u8; 32],
-    /// The 32-byte hop funding txid.
-    pub hop_txid: [u8; 32],
-    /// The hop output index within `hop_txid` (u32, little-endian on wire).
+    /// The hop output index within the marker's OWN CONTAINING TX (u32,
+    /// little-endian on wire). The hop outpoint is `(containing txid,
+    /// hop_vout)` — there is no `hop_txid` field because a tx cannot embed
+    /// its own txid (module docs).
     pub hop_vout: u32,
     /// The hop output's satoshi value (u64, little-endian on wire).
     pub hop_sats: u64,
@@ -179,8 +223,8 @@ pub struct HoppartyMarker {
 /// The EXACT cross-repo seatSig preimage (bsv-low #315; the client's
 /// hopparty twin of `potPartySeatSigPreimage`):
 ///
-///   `"LOW/hopparty/v1/seatsig|" ‖ gameId(32) ‖ hopTxid(32) ‖ hopVout(4 LE)
-///    ‖ identity(33)`
+///   `"LOW/hopparty/v1/seatsig|" ‖ gameId(32) ‖ hopVout(4 LE) ‖
+///    identity(33)`  (93 bytes)
 ///
 /// `seatSig` is ECDSA over **sha256(preimage)** (single SHA-256 — the
 /// BRC-100 `createSignature({data})` hash), made by the settle PRIVATE key
@@ -190,25 +234,25 @@ pub struct HoppartyMarker {
 /// server-side. `None` when `identity` is not 33 bytes (an unbuildable
 /// preimage can never verify — fail-safe).
 ///
-/// Binding: {gameId, hopTxid:hopVout, identity}. The identity is IN the
-/// preimage, so a thief cannot pair a genuine seatSig with a different
-/// identity; gameId + the hop outpoint pin it to one hop. Domain
-/// separation: the fixed ASCII tag makes this preimage family disjoint from
-/// every potparty preimage and every money digest (BIP-143 sighashes are
-/// double-SHA-256 of tx preimages; requesterSig JSON starts with `{`).
+/// Binding: {gameId, hopVout, identity}. The identity is IN the preimage,
+/// so a thief cannot pair a genuine seatSig with a different identity.
+/// It does NOT bind the containing txid — impossible by the same fixed
+/// point — so what pins the marker to ONE tx is that tx's own wallet
+/// signature under `SIGHASH_ALL`. Domain separation: the fixed ASCII tag
+/// makes this preimage family disjoint from every potparty preimage and
+/// every money digest (BIP-143 sighashes are double-SHA-256 of tx
+/// preimages; requesterSig JSON starts with `{`).
 pub fn hopparty_seatsig_preimage(
     game_id: &[u8; 32],
-    hop_txid: &[u8; 32],
     hop_vout: u32,
     identity: &[u8],
 ) -> Option<Vec<u8>> {
     if identity.len() != HOPPARTY_IDENTITY_KEY_LEN {
         return None;
     }
-    let mut out = Vec::with_capacity(HOPPARTY_SEATSIG_DOMAIN.len() + 32 + 32 + 4 + 33);
+    let mut out = Vec::with_capacity(HOPPARTY_SEATSIG_DOMAIN.len() + 32 + 4 + 33);
     out.extend_from_slice(HOPPARTY_SEATSIG_DOMAIN);
     out.extend_from_slice(game_id);
-    out.extend_from_slice(hop_txid);
     out.extend_from_slice(&hop_vout.to_le_bytes());
     out.extend_from_slice(identity);
     Some(out)
@@ -224,7 +268,6 @@ pub fn hopparty_identity_challenge(
     identity: &[u8],
     opponent: &[u8],
     game_id: &[u8; 32],
-    hop_txid: &[u8; 32],
     hop_vout: u32,
     hop_sats: u64,
     seat_settle_pubkey: &[u8],
@@ -235,12 +278,11 @@ pub fn hopparty_identity_challenge(
     {
         return None;
     }
-    let mut out = Vec::with_capacity(HOPPARTY_TAG.len() + 33 + 33 + 32 + 32 + 4 + 8 + 33);
+    let mut out = Vec::with_capacity(HOPPARTY_TAG.len() + 33 + 33 + 32 + 4 + 8 + 33);
     out.extend_from_slice(HOPPARTY_TAG);
     out.extend_from_slice(identity);
     out.extend_from_slice(opponent);
     out.extend_from_slice(game_id);
-    out.extend_from_slice(hop_txid);
     out.extend_from_slice(&hop_vout.to_le_bytes());
     out.extend_from_slice(&hop_sats.to_le_bytes());
     out.extend_from_slice(seat_settle_pubkey);
@@ -308,7 +350,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
 /// `Some(marker)` IFF the script is `OP_FALSE OP_RETURN` (0x00 0x6a)
 /// followed by EXACTLY [`HOPPARTY_FIELD_COUNT`] pushes with the exact shape
 /// (tag == [`HOPPARTY_TAG`]; identity 33; opponentIdentity 33; gameId 32;
-/// hopTxid 32; hopVout 4; hopSats 8; seatSettlePubkey 33; seatSig 67..=74;
+/// hopVout 4; hopSats 8; seatSettlePubkey 33; seatSig 67..=74;
 /// identitySig 67..=74) AND `identity != opponentIdentity`. Everything else
 /// — a bare `OP_RETURN`, ANY other tag (both potparty tags included), a
 /// wrong length, extra/missing pushes, a self-paired marker — is `None`.
@@ -328,10 +370,9 @@ pub fn parse_hopparty_marker(script: &[u8]) -> Option<HoppartyMarker> {
     if data.len() != HOPPARTY_FIELD_COUNT {
         return None;
     }
-    let (identity_b, opponent_b) = (data[1], data[2]);
-    let (game_id_b, hop_txid_b) = (data[3], data[4]);
-    let (hop_vout_b, hop_sats_b) = (data[5], data[6]);
-    let (settle_pk_b, seat_sig_b, identity_sig_b) = (data[7], data[8], data[9]);
+    let (identity_b, opponent_b, game_id_b) = (data[1], data[2], data[3]);
+    let (hop_vout_b, hop_sats_b) = (data[4], data[5]);
+    let (settle_pk_b, seat_sig_b, identity_sig_b) = (data[6], data[7], data[8]);
 
     if identity_b.len() != HOPPARTY_IDENTITY_KEY_LEN {
         return None;
@@ -346,9 +387,6 @@ pub fn parse_hopparty_marker(script: &[u8]) -> Option<HoppartyMarker> {
         return None;
     }
     if game_id_b.len() != HOPPARTY_GAME_ID_LEN {
-        return None;
-    }
-    if hop_txid_b.len() != HOPPARTY_TXID_LEN {
         return None;
     }
     if hop_vout_b.len() != HOPPARTY_U32_LEN {
@@ -369,8 +407,6 @@ pub fn parse_hopparty_marker(script: &[u8]) -> Option<HoppartyMarker> {
 
     let mut game_id = [0u8; 32];
     game_id.copy_from_slice(game_id_b);
-    let mut hop_txid = [0u8; 32];
-    hop_txid.copy_from_slice(hop_txid_b);
     let hop_vout = u32::from_le_bytes([hop_vout_b[0], hop_vout_b[1], hop_vout_b[2], hop_vout_b[3]]);
     let hop_sats = u64::from_le_bytes([
         hop_sats_b[0],
@@ -386,7 +422,6 @@ pub fn parse_hopparty_marker(script: &[u8]) -> Option<HoppartyMarker> {
         identity: identity_b.to_vec(),
         opponent: opponent_b.to_vec(),
         game_id,
-        hop_txid,
         hop_vout,
         hop_sats,
         seat_settle_pubkey: settle_pk_b.to_vec(),
@@ -433,7 +468,6 @@ pub(crate) mod tests {
         identity: &[u8],
         opponent: &[u8],
         game_id: &[u8; 32],
-        hop_txid: &[u8; 32],
         hop_vout: u32,
         hop_sats: u64,
         seat_settle_pubkey: &[u8],
@@ -445,7 +479,6 @@ pub(crate) mod tests {
         s.extend(push_data(identity));
         s.extend(push_data(opponent));
         s.extend(push_data(game_id));
-        s.extend(push_data(hop_txid));
         s.extend(push_data(&hop_vout.to_le_bytes()));
         s.extend(push_data(&hop_sats.to_le_bytes()));
         s.extend(push_data(seat_settle_pubkey));
@@ -474,9 +507,6 @@ pub(crate) mod tests {
     pub(crate) fn golden_game_id() -> [u8; 32] {
         [0x11u8; 32]
     }
-    pub(crate) fn golden_hop_txid() -> [u8; 32] {
-        [0x22u8; 32]
-    }
     pub(crate) fn golden_vout() -> u32 {
         0
     }
@@ -489,13 +519,12 @@ pub(crate) mod tests {
         s
     }
 
-    /// A valid marker over the golden identities with chosen gameId / hop.
-    pub(crate) fn golden_marker(game_id: &[u8; 32], hop_txid: &[u8; 32], vout: u32) -> Vec<u8> {
+    /// A valid marker over the golden identities with chosen gameId / vout.
+    pub(crate) fn golden_marker(game_id: &[u8; 32], vout: u32) -> Vec<u8> {
         marker_script(
             &golden_identity(),
             &golden_opponent(),
             game_id,
-            hop_txid,
             vout,
             golden_sats(),
             &golden_settle_pubkey(),
@@ -511,10 +540,7 @@ pub(crate) mod tests {
         // Same 24-byte length as LOW/potparty/v2/seatsig| — one fixed
         // preimage layout, two disjoint domains.
         assert_eq!(HOPPARTY_SEATSIG_DOMAIN.len(), 24);
-        assert_eq!(
-            HOPPARTY_SEATSIG_DOMAIN.len(),
-            crate::potparty::POTPARTY_TAG.len() + b"/seatsig|".len() + 0
-        );
+        assert_eq!(HOPPARTY_SEATSIG_DOMAIN, b"LOW/hopparty/v1/seatsig|".as_slice());
         assert_ne!(
             HOPPARTY_SEATSIG_DOMAIN,
             b"LOW/potparty/v2/seatsig|".as_slice()
@@ -534,13 +560,16 @@ pub(crate) mod tests {
     // caught in CI, not on-chain. NEVER regenerate this to match a parser
     // change — fix the parser to match the contract instead.
     //
-    // Fixed inputs: gameId = 32×0xcc, hopTxid = 32×0xdd, hopVout = 1,
+    // Fixed inputs: gameId = 32×0xcc, hopVout = 0 (the PRODUCTION layout —
+    // the hop is output 0 and the marker rides at output 1, which is what
+    // `randomizeOutputs: false` guarantees; the non-zero LE decode is
+    // proven separately by `le_encoding_of_vout_and_sats`),
     // hopSats = 1_234_567 (little-endian on wire: 87 d6 12 00 00 00 00 00 —
     // a value that proves both LE order and the 8-byte width);
     // seatSettlePubkey = the REAL BRC-42 `[2,'low settle']` derivation
     // (keyID = gameId, counterparty = opponent, forSelf) from
     // PrivateKey(1)'s wallet — exactly what the client wallet derives.
-    pub(crate) const GOLDEN_HOPPARTY_HEX: &str = "006a0f4c4f572f686f7070617274792f7631210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee520cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd04010000000887d61200000000002103d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee473045022100d578c4df584ab2bb86a324c902de7a7b38685a0ea25f7d0a27c0d510f516738a02203d8cb847db70748335b4d682faaff769180386ff3cd451cc89b0c0f36c52d484463044022053392b77fab3e27ec719cc23b80bfe76b514dcb9f539c94f978788684d882335022014a89fc59724925d2f6c487711f3210f682784a9719bfaf2357d0d2e38c193ce";
+    pub(crate) const GOLDEN_HOPPARTY_HEX: &str = "006a0f4c4f572f686f7070617274792f7631210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee520cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc04000000000887d61200000000002103d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee473045022100c7a9ca2ea77941819dab702159a805844ec5fbea10db2049a264feb64f177edf0220047a7220ab3748c3d3686e4ae4a59035518599d63d58e69b07bc4be3f3a9658b47304502210082d6a006ea2064abae63f3c89cc9b1f4be8fae5d038c374e053cd84b8bd2392e022075e9cf71422df875ba72159f3c84e619c8e66f43b4e4335e399fa0aa01f27720";
 
     /// Golden-vector inputs shared by the derive test and the lookup
     /// fixture cell.
@@ -548,7 +577,6 @@ pub(crate) mod tests {
         bsv_rs::wallet::ProtoWallet, // identity wallet = PrivateKey(1)
         Vec<u8>,                     // opponent pubkey = PrivateKey(2)'s
         [u8; 32],                    // gameId
-        [u8; 32],                    // hopTxid
         u32,                         // hopVout
         u64,                         // hopSats
     ) {
@@ -558,14 +586,7 @@ pub(crate) mod tests {
         let opponent_key =
             bsv_rs::primitives::ec::PrivateKey::from_hex(&format!("{:064x}", 2u8)).unwrap();
         let opponent = hex::decode(opponent_key.public_key().to_hex()).unwrap();
-        (
-            identity_wallet,
-            opponent,
-            [0xccu8; 32],
-            [0xddu8; 32],
-            1,
-            1_234_567,
-        )
+        (identity_wallet, opponent, [0xccu8; 32], 0, 1_234_567)
     }
 
     /// Build the golden marker script the way the CLIENT will: real BRC-42
@@ -577,7 +598,7 @@ pub(crate) mod tests {
         use bsv_rs::wallet::{
             Counterparty, CreateSignatureArgs, GetPublicKeyArgs, Protocol, SecurityLevel,
         };
-        let (wallet, opponent, game_id, hop_txid, hop_vout, hop_sats) = golden_vector_inputs();
+        let (wallet, opponent, game_id, hop_vout, hop_sats) = golden_vector_inputs();
         let identity = hex::decode(wallet.identity_key_hex()).unwrap();
         let game_id_hex = hex::encode(game_id);
         let opponent_pub =
@@ -601,8 +622,7 @@ pub(crate) mod tests {
 
         // seatSig: the settle key signs sha256(preimage) — via the SAME
         // wallet derivation (createSignature under [2,'low settle']).
-        let preimage =
-            hopparty_seatsig_preimage(&game_id, &hop_txid, hop_vout, &identity).unwrap();
+        let preimage = hopparty_seatsig_preimage(&game_id, hop_vout, &identity).unwrap();
         let seat_sig = wallet
             .create_signature(CreateSignatureArgs {
                 data: Some(preimage),
@@ -620,7 +640,6 @@ pub(crate) mod tests {
             &identity,
             &opponent,
             &game_id,
-            &hop_txid,
             hop_vout,
             hop_sats,
             &settle_pub,
@@ -641,7 +660,6 @@ pub(crate) mod tests {
             &identity,
             &opponent,
             &game_id,
-            &hop_txid,
             hop_vout,
             hop_sats,
             &settle_pub,
@@ -681,8 +699,7 @@ pub(crate) mod tests {
             "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
         );
         assert_eq!(m.game_id, [0xccu8; 32]);
-        assert_eq!(m.hop_txid, [0xddu8; 32]);
-        assert_eq!(m.hop_vout, 1);
+        assert_eq!(m.hop_vout, 0, "the production layout: hop at output 0");
         assert_eq!(m.hop_sats, 1_234_567, "8-byte little-endian u64");
         // The settle pubkey from the REAL [2,'low settle'] derivation of
         // PrivateKey(1) against PrivateKey(2) with keyID cc… — the same
@@ -707,7 +724,7 @@ pub(crate) mod tests {
 
         // seatSig: plain ECDSA under seatSettlePubkey over sha256(preimage).
         let preimage =
-            hopparty_seatsig_preimage(&m.game_id, &m.hop_txid, m.hop_vout, &m.identity).unwrap();
+            hopparty_seatsig_preimage(&m.game_id, m.hop_vout, &m.identity).unwrap();
         let pubkey =
             bsv_rs::primitives::ec::PublicKey::from_bytes(&m.seat_settle_pubkey).unwrap();
         let sig = bsv_rs::primitives::ec::Signature::from_der(&m.seat_sig).unwrap();
@@ -721,7 +738,6 @@ pub(crate) mod tests {
             &m.identity,
             &m.opponent,
             &m.game_id,
-            &m.hop_txid,
             m.hop_vout,
             m.hop_sats,
             &m.seat_settle_pubkey,
@@ -757,7 +773,6 @@ pub(crate) mod tests {
                 &golden_identity(),
                 &golden_opponent(),
                 &golden_game_id(),
-                &golden_hop_txid(),
                 7,
                 golden_sats(),
                 &golden_settle_pubkey(),
@@ -769,7 +784,6 @@ pub(crate) mod tests {
             assert_eq!(m.identity, golden_identity());
             assert_eq!(m.opponent, golden_opponent());
             assert_eq!(m.game_id, golden_game_id());
-            assert_eq!(m.hop_txid, golden_hop_txid());
             assert_eq!(m.hop_vout, 7);
             assert_eq!(m.hop_sats, golden_sats());
             assert_eq!(m.seat_settle_pubkey, golden_settle_pubkey());
@@ -788,7 +802,6 @@ pub(crate) mod tests {
             &golden_identity(),
             &golden_opponent(),
             &golden_game_id(),
-            &golden_hop_txid(),
             vout,
             sats,
             &golden_settle_pubkey(),
@@ -825,7 +838,6 @@ pub(crate) mod tests {
         s.push(0x4c);
         s.push(32);
         s.extend_from_slice(&golden_game_id());
-        s.extend(push_data(&golden_hop_txid()));
         s.extend(push_data(&golden_vout().to_le_bytes()));
         s.extend(push_data(&golden_sats().to_le_bytes()));
         s.extend(push_data(&golden_settle_pubkey()));
@@ -844,7 +856,7 @@ pub(crate) mod tests {
         p.push(0x4c);
         p.push(32);
         p.extend_from_slice(&golden_game_id());
-        p.extend(push_data(&golden_hop_txid()));
+        p.extend(push_data(&[0x22u8; 32]));
         p.extend(push_data(&golden_vout().to_le_bytes()));
         p.extend(push_data(&golden_vout().to_le_bytes()));
         p.extend(push_data(&golden_sig()));
@@ -859,7 +871,6 @@ pub(crate) mod tests {
             &golden_identity(),
             &golden_identity(), // opponent slot = the SAME key
             &golden_game_id(),
-            &golden_hop_txid(),
             golden_vout(),
             golden_sats(),
             &golden_settle_pubkey(),
@@ -887,7 +898,6 @@ pub(crate) mod tests {
             s.extend(push_data(&golden_identity()));
             s.extend(push_data(&golden_opponent()));
             s.extend(push_data(&golden_game_id()));
-            s.extend(push_data(&golden_hop_txid()));
             s.extend(push_data(&golden_vout().to_le_bytes()));
             s.extend(push_data(&golden_sats().to_le_bytes()));
             s.extend(push_data(&golden_settle_pubkey()));
@@ -901,16 +911,15 @@ pub(crate) mod tests {
         // The reverse leak: a well-formed hopparty marker must be None to
         // the POTPARTY parser (its 10-push count matches v2's, so the tag
         // dispatch is the only wall — prove it holds).
-        let hop = golden_marker(&golden_game_id(), &golden_hop_txid(), 0);
+        let hop = golden_marker(&golden_game_id(), 0);
         assert!(
             crate::potparty::parse_potparty_marker(&hop).is_none(),
             "a hopparty marker must never parse as potparty"
         );
         // And well-formed potparty v1/v2 markers are None to THIS parser.
-        let pp_v1 = crate::potparty::tests::golden_marker(&golden_game_id(), &golden_hop_txid(), 0);
+        let pp_v1 = crate::potparty::tests::golden_marker(&golden_game_id(), &[0x22u8; 32], 0);
         assert!(parse_hopparty_marker(&pp_v1).is_none());
-        let pp_v2 =
-            crate::potparty::tests::golden_marker_v2(&golden_game_id(), &golden_hop_txid(), 0);
+        let pp_v2 = crate::potparty::tests::golden_marker_v2(&golden_game_id(), &[0x22u8; 32], 0);
         assert!(parse_hopparty_marker(&pp_v2).is_none());
         // Positive control for the refusal legs above: the same 10-push body
         // under the RIGHT tag parses (the gate is reached and cleared).
@@ -924,7 +933,7 @@ pub(crate) mod tests {
         assert!(parse_hopparty_marker(&[]).is_none());
         assert!(parse_hopparty_marker(&[0x00]).is_none());
         // A bare OP_RETURN (0x6a without OP_FALSE) is NOT the prefix.
-        let script = golden_marker(&golden_game_id(), &golden_hop_txid(), golden_vout());
+        let script = golden_marker(&golden_game_id(), golden_vout());
         assert!(parse_hopparty_marker(&script[1..]).is_none());
     }
 
@@ -936,7 +945,6 @@ pub(crate) mod tests {
                 &vec![0x02u8; len],
                 &golden_opponent(),
                 &golden_game_id(),
-                &golden_hop_txid(),
                 golden_vout(),
                 golden_sats(),
                 &golden_settle_pubkey(),
@@ -949,7 +957,6 @@ pub(crate) mod tests {
                 &golden_identity(),
                 &vec![0x03u8; len],
                 &golden_game_id(),
-                &golden_hop_txid(),
                 golden_vout(),
                 golden_sats(),
                 &golden_settle_pubkey(),
@@ -962,7 +969,6 @@ pub(crate) mod tests {
                 &golden_identity(),
                 &golden_opponent(),
                 &golden_game_id(),
-                &golden_hop_txid(),
                 golden_vout(),
                 golden_sats(),
                 &vec![0x02u8; len],
@@ -974,33 +980,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wrong_game_id_or_txid_length_rejected() {
-        // gameId 31 bytes.
-        let mut s = vec![0x00, 0x6a];
-        s.extend(push_data(HOPPARTY_TAG));
-        s.extend(push_data(&golden_identity()));
-        s.extend(push_data(&golden_opponent()));
-        s.extend(push_data(&[0x11u8; 31]));
-        s.extend(push_data(&golden_hop_txid()));
-        s.extend(push_data(&golden_vout().to_le_bytes()));
-        s.extend(push_data(&golden_sats().to_le_bytes()));
-        s.extend(push_data(&golden_settle_pubkey()));
-        s.extend(push_data(&golden_sig()));
-        s.extend(push_data(&golden_sig()));
-        assert!(parse_hopparty_marker(&s).is_none());
-        // hopTxid 33 bytes.
+    fn wrong_game_id_length_rejected() {
+        // gameId 31 / 33 bytes — strict length. (There is no hopTxid push
+        // to test since the 2026-08-04 revision: the container supplies it.)
+        for bad in [31usize, 33] {
+            let mut s = vec![0x00, 0x6a];
+            s.extend(push_data(HOPPARTY_TAG));
+            s.extend(push_data(&golden_identity()));
+            s.extend(push_data(&golden_opponent()));
+            s.extend(push_data(&vec![0x11u8; bad]));
+            s.extend(push_data(&golden_vout().to_le_bytes()));
+            s.extend(push_data(&golden_sats().to_le_bytes()));
+            s.extend(push_data(&golden_settle_pubkey()));
+            s.extend(push_data(&golden_sig()));
+            s.extend(push_data(&golden_sig()));
+            assert!(parse_hopparty_marker(&s).is_none(), "gameId len {bad}");
+        }
+    }
+
+    /// The DELETED push, pinned from the outside: a 10-push marker in the
+    /// OLD shape (a 32-byte hopTxid between gameId and hopVout) must NOT
+    /// parse. This is the executable form of the commit's "removed the
+    /// hopTxid push" claim — it fails loudly if the field is ever
+    /// reinstated without a version bump.
+    #[test]
+    fn the_old_ten_push_shape_with_hoptxid_no_longer_parses() {
         let mut s = vec![0x00, 0x6a];
         s.extend(push_data(HOPPARTY_TAG));
         s.extend(push_data(&golden_identity()));
         s.extend(push_data(&golden_opponent()));
         s.extend(push_data(&golden_game_id()));
-        s.extend(push_data(&[0x22u8; 33]));
+        s.extend(push_data(&[0x22u8; 32])); // the deleted hopTxid push
         s.extend(push_data(&golden_vout().to_le_bytes()));
         s.extend(push_data(&golden_sats().to_le_bytes()));
         s.extend(push_data(&golden_settle_pubkey()));
         s.extend(push_data(&golden_sig()));
         s.extend(push_data(&golden_sig()));
-        assert!(parse_hopparty_marker(&s).is_none());
+        assert_eq!(
+            read_pushes(&s[2..]).len(),
+            10,
+            "the fixture really is the old 10-push shape"
+        );
+        assert!(
+            parse_hopparty_marker(&s).is_none(),
+            "the pre-revision 10-push shape must be refused"
+        );
+        // Positive control: the SAME body minus that one push parses.
+        assert!(parse_hopparty_marker(&golden_marker(&golden_game_id(), golden_vout())).is_some());
     }
 
     #[test]
@@ -1013,7 +1039,6 @@ pub(crate) mod tests {
             s.extend(push_data(&golden_identity()));
             s.extend(push_data(&golden_opponent()));
             s.extend(push_data(&golden_game_id()));
-            s.extend(push_data(&golden_hop_txid()));
             s.extend(push_data(&vec![0x01u8; len])); // vout: wrong width
             s.extend(push_data(&golden_sats().to_le_bytes()));
             s.extend(push_data(&golden_settle_pubkey()));
@@ -1028,7 +1053,6 @@ pub(crate) mod tests {
             s.extend(push_data(&golden_identity()));
             s.extend(push_data(&golden_opponent()));
             s.extend(push_data(&golden_game_id()));
-            s.extend(push_data(&golden_hop_txid()));
             s.extend(push_data(&golden_vout().to_le_bytes()));
             s.extend(push_data(&vec![0x01u8; len])); // sats: wrong width
             s.extend(push_data(&golden_settle_pubkey()));
@@ -1046,7 +1070,6 @@ pub(crate) mod tests {
                 &golden_identity(),
                 &golden_opponent(),
                 &golden_game_id(),
-                &golden_hop_txid(),
                 golden_vout(),
                 golden_sats(),
                 &golden_settle_pubkey(),
@@ -1059,7 +1082,6 @@ pub(crate) mod tests {
                 &golden_identity(),
                 &golden_opponent(),
                 &golden_game_id(),
-                &golden_hop_txid(),
                 golden_vout(),
                 golden_sats(),
                 &golden_settle_pubkey(),
@@ -1070,8 +1092,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Push-count refusals: 8, 9 and 11 pushes (the spec'd cells). Every
-    /// prefix of the ten-push shape is rejected, and an 11th push is too.
+    /// Push-count refusals: every prefix of the NINE-push shape (so the 7-
+    /// and 8-push cases are covered), and a 10th push.
     #[test]
     fn wrong_push_counts_rejected() {
         let pushes: Vec<Vec<u8>> = vec![
@@ -1079,25 +1101,24 @@ pub(crate) mod tests {
             push_data(&golden_identity()),
             push_data(&golden_opponent()),
             push_data(&golden_game_id()),
-            push_data(&golden_hop_txid()),
             push_data(&golden_vout().to_le_bytes()),
             push_data(&golden_sats().to_le_bytes()),
             push_data(&golden_settle_pubkey()),
             push_data(&golden_sig()),
         ];
-        // 1..=9 pushes (incl. the 8- and 9-push cases): all rejected.
+        // 1..=8 pushes: all rejected.
         let mut s = vec![0x00, 0x6a];
         for p in &pushes {
             s.extend_from_slice(p);
             assert!(
                 parse_hopparty_marker(&s).is_none(),
-                "a marker with fewer than 10 pushes must be rejected"
+                "a marker with fewer than 9 pushes must be rejected"
             );
         }
-        // 11 pushes: the golden marker + one extra.
-        let mut s = golden_marker(&golden_game_id(), &golden_hop_txid(), golden_vout());
+        // 10 pushes: the golden marker + one extra.
+        let mut s = golden_marker(&golden_game_id(), golden_vout());
         s.extend(push_data(&[0x99u8; 4]));
-        assert!(parse_hopparty_marker(&s).is_none(), "an 11th push is not the format");
+        assert!(parse_hopparty_marker(&s).is_none(), "a 10th push is not the format");
     }
 
     #[test]
@@ -1108,7 +1129,6 @@ pub(crate) mod tests {
         s.extend(push_data(&golden_identity()));
         s.extend(push_data(&golden_opponent()));
         s.extend(push_data(&golden_game_id()));
-        s.extend(push_data(&golden_hop_txid()));
         s.extend(push_data(&golden_vout().to_le_bytes()));
         s.extend(push_data(&golden_sats().to_le_bytes()));
         s.extend(push_data(&golden_settle_pubkey()));
@@ -1138,19 +1158,14 @@ pub(crate) mod tests {
 
     #[test]
     fn seatsig_preimage_layout_and_domain_separation() {
-        let p = hopparty_seatsig_preimage(&golden_game_id(), &golden_hop_txid(), 7, &golden_identity())
-            .unwrap();
-        assert_eq!(p.len(), 24 + 32 + 32 + 4 + 33, "fixed 125-byte layout");
+        let p = hopparty_seatsig_preimage(&golden_game_id(), 7, &golden_identity()).unwrap();
+        assert_eq!(p.len(), 24 + 32 + 4 + 33, "fixed 93-byte layout");
         assert!(p.starts_with(HOPPARTY_SEATSIG_DOMAIN));
         assert_eq!(&p[24..56], &golden_game_id());
-        assert_eq!(&p[56..88], &golden_hop_txid());
-        assert_eq!(&p[88..92], &7u32.to_le_bytes());
-        assert_eq!(&p[92..125], golden_identity().as_slice());
+        assert_eq!(&p[56..60], &7u32.to_le_bytes());
+        assert_eq!(&p[60..93], golden_identity().as_slice());
         // A malformed identity can never build a preimage (fail-safe).
-        assert!(
-            hopparty_seatsig_preimage(&golden_game_id(), &golden_hop_txid(), 7, &[0x02; 32])
-                .is_none()
-        );
+        assert!(hopparty_seatsig_preimage(&golden_game_id(), 7, &[0x02; 32]).is_none());
         // Same layout as potparty-v2's seatsig preimage, DIFFERENT domain:
         // the two families can never collide byte-for-byte.
         assert_ne!(&p[..24], b"LOW/potparty/v2/seatsig|".as_slice());
@@ -1162,27 +1177,24 @@ pub(crate) mod tests {
             &golden_identity(),
             &golden_opponent(),
             &golden_game_id(),
-            &golden_hop_txid(),
             7,
             golden_sats(),
             &golden_settle_pubkey(),
         )
         .unwrap();
-        assert_eq!(c.len(), 15 + 33 + 33 + 32 + 32 + 4 + 8 + 33);
+        assert_eq!(c.len(), 15 + 33 + 33 + 32 + 4 + 8 + 33);
         assert!(c.starts_with(HOPPARTY_TAG), "the tag IS the domain separator");
         assert_eq!(&c[15..48], golden_identity().as_slice());
         assert_eq!(&c[48..81], golden_opponent().as_slice());
         assert_eq!(&c[81..113], &golden_game_id());
-        assert_eq!(&c[113..145], &golden_hop_txid());
-        assert_eq!(&c[145..149], &7u32.to_le_bytes());
-        assert_eq!(&c[149..157], &golden_sats().to_le_bytes());
-        assert_eq!(&c[157..190], golden_settle_pubkey().as_slice());
+        assert_eq!(&c[113..117], &7u32.to_le_bytes());
+        assert_eq!(&c[117..125], &golden_sats().to_le_bytes());
+        assert_eq!(&c[125..158], golden_settle_pubkey().as_slice());
         // Malformed key lengths can never build a challenge.
         assert!(hopparty_identity_challenge(
             &[0x02; 32],
             &golden_opponent(),
             &golden_game_id(),
-            &golden_hop_txid(),
             7,
             golden_sats(),
             &golden_settle_pubkey(),

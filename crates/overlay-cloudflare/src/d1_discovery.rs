@@ -3280,8 +3280,6 @@ struct HoppartyRow {
     opponent_identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
-    #[serde(rename = "hopTxid")]
-    hop_txid: String,
     #[serde(rename = "hopVout")]
     hop_vout: f64,
     #[serde(rename = "hopSats")]
@@ -3292,6 +3290,13 @@ struct HoppartyRow {
     seat_sig_hex: String,
     #[serde(rename = "identitySigHex")]
     identity_sig_hex: String,
+    /// The CONTAINER's decoded facts (#310 decode-at-write).
+    #[serde(rename = "hopLockHex")]
+    hop_lock_hex: Option<String>,
+    #[serde(rename = "hopSatsOnChain")]
+    hop_sats_on_chain: Option<f64>,
+    #[serde(rename = "containerOutputs")]
+    container_outputs: f64,
     txid: String,
     #[serde(rename = "outputIndex")]
     output_index: f64,
@@ -3305,12 +3310,14 @@ impl HoppartyRow {
             identity: self.identity,
             opponent_identity: self.opponent_identity,
             game_id: self.game_id,
-            hop_txid: self.hop_txid,
             hop_vout: self.hop_vout as u32,
             hop_sats: self.hop_sats as u64,
             seat_settle_pubkey: self.seat_settle_pubkey,
             seat_sig_hex: self.seat_sig_hex,
             identity_sig_hex: self.identity_sig_hex,
+            hop_lock_hex: self.hop_lock_hex,
+            hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
+            container_outputs: self.container_outputs as u32,
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
@@ -3342,22 +3349,24 @@ fn hopparty_err(e: String) -> HoppartyStorageError {
     HoppartyStorageError::Database(e)
 }
 
-const HOPPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, hopTxid, hopVout, \
-     hopSats, seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex, createdAt \
+const HOPPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, hopVout, \
+     hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
+     containerOutputs, txid, outputIndex, createdAt \
      FROM hopparty_records";
 
 /// The SHIPPED `hopparty_records` insert (INSERT OR IGNORE on the
 /// `(txid, outputIndex)` primary key). Exported so the real-SQLite cells
 /// (low-app-layer `tests/hops_view_sqlite.rs`) EXECUTE the exact production
 /// write shape rather than a transcription of it. BINDS, in order:
-/// identity, opponentIdentity, gameId, hopTxid, hopVout, hopSats,
-/// seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex,
-/// createdAt.
+/// identity, opponentIdentity, gameId, hopVout, hopSats, seatSettlePubkey,
+/// seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain,
+/// containerOutputs, txid, outputIndex, createdAt.
 pub fn hopparty_store_sql() -> &'static str {
     "INSERT OR IGNORE INTO hopparty_records \
-     (identity, opponentIdentity, gameId, hopTxid, hopVout, hopSats, \
-      seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex, createdAt) \
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+     (identity, opponentIdentity, gameId, hopVout, hopSats, \
+      seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
+      containerOutputs, txid, outputIndex, createdAt) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 }
 
 /// `ls_hopparty hopsFor` — the identity-scoped hops-in-flight window: the
@@ -3367,9 +3376,10 @@ pub fn hopparty_store_sql() -> &'static str {
 /// explicit ORDER BY at every level, `limit` counting OUTPOINTS) with two
 /// differences:
 ///
-///  - the outpoint columns are `hopTxid`/`hopVout` and each outpoint yields
-///    up to [`HOPSFOR_ROWS_PER_OUTPOINT`] OLDEST rows (a SUPERSET, not a
-///    representative — hopparty is read-verified in `/hops-view`, and a
+///  - the hop OUTPOINT is `(txid, hopVout)` — the marker rides the hop tx,
+///    so the containing txid IS the hop txid — and each outpoint yields up
+///    to [`HOPSFOR_ROWS_PER_OUTPOINT`] OLDEST rows (a SUPERSET, not a
+///    representative: hopparty is read-verified in `/hops-view`, and a
 ///    layer that cannot verify signatures must never choose which row is
 ///    real; see the constant's doc in `overlay_discovery::hopparty`);
 ///  - there is no v1/v2 group split (one version), so the row cap is
@@ -3382,52 +3392,59 @@ pub fn hopparty_store_sql() -> &'static str {
 /// (unknown-hop promotion slots), `?4` row cap.
 pub fn hopparty_list_for_identity_sql() -> String {
     format!(
-        "SELECT identity, opponentIdentity, gameId, hopTxid, hopVout, hopSats, \
-            seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex, createdAt \
-     FROM (SELECT identity, opponentIdentity, gameId, hopTxid, hopVout, hopSats, \
-                  seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex, \
-                  createdAt, markerRowid, potCreatedAt, potFirstMarkerAt, tier, \
+        "SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
+            seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
+            containerOutputs, txid, outputIndex, createdAt \
+     FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
+                  seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
+                  containerOutputs, txid, outputIndex, createdAt, markerRowid, \
+                  potCreatedAt, potFirstMarkerAt, tier, \
                   DENSE_RANK() OVER (ORDER BY tier ASC, \
                                               COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
-                                              hopTxid ASC, hopVout ASC) AS finalRank \
-           FROM (SELECT identity, opponentIdentity, gameId, hopTxid, hopVout, hopSats, \
-                        seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex, \
-                        createdAt, markerRowid, potCreatedAt, potFirstMarkerAt, \
+                                              txid ASC, hopVout ASC) AS finalRank \
+           FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
+                        seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                        hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+                        markerRowid, potCreatedAt, potFirstMarkerAt, \
                         CASE WHEN unknownPot = 0 \
                              OR (freshUnknown = 1 AND potRank <= ?3) \
                              THEN 0 ELSE 1 END AS tier \
-                 FROM (SELECT identity, opponentIdentity, gameId, hopTxid, hopVout, hopSats, \
-                              seatSettlePubkey, seatSigHex, identitySigHex, txid, outputIndex, \
-                              createdAt, markerRowid, potCreatedAt, potFirstMarkerAt, unknownPot, \
+                 FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
+                              seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                              hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+                              markerRowid, potCreatedAt, potFirstMarkerAt, unknownPot, \
                               {fresh} AS freshUnknown, \
                               DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
                                                  ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
-                                                          hopTxid ASC, hopVout ASC) AS potRank \
+                                                          txid ASC, hopVout ASC) AS potRank \
                        FROM (SELECT hp.identity AS identity, \
                                     hp.opponentIdentity AS opponentIdentity, \
-                                    hp.gameId AS gameId, hp.hopTxid AS hopTxid, \
-                                    hp.hopVout AS hopVout, hp.hopSats AS hopSats, \
+                                    hp.gameId AS gameId, hp.hopVout AS hopVout, \
+                                    hp.hopSats AS hopSats, \
                                     hp.seatSettlePubkey AS seatSettlePubkey, \
                                     hp.seatSigHex AS seatSigHex, \
                                     hp.identitySigHex AS identitySigHex, \
+                                    hp.hopLockHex AS hopLockHex, \
+                                    hp.hopSatsOnChain AS hopSatsOnChain, \
+                                    hp.containerOutputs AS containerOutputs, \
                                     hp.txid AS txid, hp.outputIndex AS outputIndex, \
                                     hp.createdAt AS createdAt, hp.rowid AS markerRowid, \
                                     r.createdAt AS potCreatedAt, \
-                                    MIN(hp.createdAt) OVER (PARTITION BY hp.hopTxid, \
+                                    MIN(hp.createdAt) OVER (PARTITION BY hp.txid, \
                                                                          hp.hopVout) \
                                         AS potFirstMarkerAt, \
                                     CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
-                                    ROW_NUMBER() OVER (PARTITION BY hp.hopTxid, hp.hopVout \
+                                    ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout \
                                                        ORDER BY hp.createdAt ASC, \
                                                                 hp.rowid ASC) AS rn \
                              FROM hopparty_records hp \
                              LEFT JOIN pot_records r \
-                                    ON r.txid = hp.hopTxid AND r.outputIndex = hp.hopVout \
+                                    ON r.txid = hp.txid AND r.outputIndex = hp.hopVout \
                              WHERE hp.identity = ?1) \
                        WHERE rn <= {per_outpoint}))) \
      WHERE finalRank <= ?2 \
      ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
-              hopTxid ASC, hopVout ASC, createdAt ASC, markerRowid ASC \
+              txid ASC, hopVout ASC, createdAt ASC, markerRowid ASC \
      LIMIT ?4",
         per_outpoint = HOPSFOR_ROWS_PER_OUTPOINT,
         fresh = fresh_unknown_expr(),
@@ -3440,7 +3457,7 @@ pub fn hopparty_list_for_identity_sql() -> String {
 /// the SHIPPED string.
 pub fn hopparty_list_for_hop_sql() -> String {
     format!(
-        "{HOPPARTY_SELECT} WHERE hopTxid = ? AND hopVout = ? \
+        "{HOPPARTY_SELECT} WHERE txid = ? AND hopVout = ? \
          ORDER BY createdAt ASC, rowid ASC LIMIT ?"
     )
 }
@@ -3452,12 +3469,14 @@ impl HoppartyStorage for D1HoppartyStorage {
             .bind(record.identity.as_str())
             .bind(record.opponent_identity.as_str())
             .bind(record.game_id.as_str())
-            .bind(record.hop_txid.as_str())
             .bind(record.hop_vout)
             .bind(record.hop_sats)
             .bind(record.seat_settle_pubkey.as_str())
             .bind(record.seat_sig_hex.as_str())
             .bind(record.identity_sig_hex.as_str())
+            .bind(record.hop_lock_hex.as_deref())
+            .bind(record.hop_sats_on_chain)
+            .bind(record.container_outputs)
             .bind(record.txid.as_str())
             .bind(record.output_index)
             .bind(current_unix_seconds_i64())
@@ -6198,18 +6217,20 @@ mod tests {
     // ── bsv-low #315: hopparty D1 storage (tm_hopparty / ls_hopparty) ─────
 
     /// File a hopparty marker via the SHIPPED `hopparty_store_sql()` — the
-    /// exact production write, exact bind order.
+    /// exact production write, exact bind order. `txid` is the CONTAINER
+    /// (= the hop tx); the hop outpoint is `(txid, hop_vout)`.
     #[allow(clippy::too_many_arguments)]
     fn insert_hopparty(
         conn: &rusqlite::Connection,
         identity: &str,
-        hop_txid: &str,
+        container_txid: &str,
+        marker_vout: u32,
         hop_vout: u32,
         hop_sats: u64,
-        marker_txid: &str,
-        marker_vout: u32,
+        on_chain_sats: Option<u64>,
         created_at: i64,
     ) {
+        let settle = format!("03{}", "c4".repeat(32));
         // The production write stamps `current_unix_seconds_i64()`; the
         // test binds a controlled stamp in the SAME slot so ordering
         // assertions are deterministic (the SQL string is the shipped one).
@@ -6217,15 +6238,17 @@ mod tests {
             hopparty_store_sql(),
             rusqlite::params![
                 identity,
-                h64(0xbb),                       // opponentIdentity
-                h64(0x11),                       // gameId
-                hop_txid,
+                h64(0xbb), // opponentIdentity
+                h64(0x11), // gameId
                 hop_vout,
                 hop_sats as i64,
-                format!("03{}", "c4".repeat(32)), // seatSettlePubkey
-                "3045seat",                       // seatSigHex
-                "3045id",                         // identitySigHex
-                marker_txid,
+                settle,
+                "3045seat",
+                "3045id",
+                on_chain_sats.map(|_| format!("76a914{}88ac", "d4".repeat(20))),
+                on_chain_sats.map(|v| v as i64),
+                2i64, // containerOutputs
+                container_txid,
                 marker_vout,
                 created_at
             ],
@@ -6235,39 +6258,42 @@ mod tests {
 
     /// The SHIPPED hopparty insert + both list SQLs on the production
     /// schema: outpoint-keyed replay is a no-op, `byHop` is oldest-first,
-    /// and `hopsFor` serves a bounded per-outpoint SUPERSET (never a
-    /// one-row collapse — verification happens at READ in `/hops-view`).
+    /// `hopsFor` serves a bounded per-outpoint SUPERSET (never a one-row
+    /// collapse — verification happens at READ in `/hops-view`), and the
+    /// CONTAINER's decoded facts survive the round-trip.
     #[test]
     fn hopparty_store_and_windows_real_sqlite() {
         let conn = production_schema_db();
         let victim = victim_id();
-        let hop = h64(0xaa);
+        let hop = h64(0xaa); // the container = the hop tx
         // The hop outpoint is indexed via tm_lowfund (pot_records).
         insert_pot(&conn, &hop, 0, 1_000, false);
-        // The honest marker (published ON the hop tx), then a same-outpoint
-        // replay (different opponent bytes would still be ignored — PK).
-        insert_hopparty(&conn, &victim, &hop, 0, 80_800, "txHONEST", 1, 1_001);
-        insert_hopparty(&conn, &victim, &hop, 0, 99_999, "txHONEST", 1, 9_999);
+        // The honest marker (output 1 of the hop tx), then a same-outpoint
+        // replay — ignored on the PK.
+        insert_hopparty(&conn, &victim, &hop, 1, 0, 80_800, Some(80_800), 1_001);
+        insert_hopparty(&conn, &victim, &hop, 1, 0, 99_999, Some(99_999), 9_999);
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM hopparty_records", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "same-outpoint replay is a no-op (INSERT OR IGNORE)");
 
-        // Forged markers naming the same hop, stamped EARLIER than honest —
-        // the superset must keep the honest row (rn <= 4, oldest-first).
-        for i in 0..2 {
-            insert_hopparty(&conn, &victim, &hop, 0, 1, &format!("txFORGED{i}"), 0, 100 + i);
+        // Two more markers on the SAME container naming the same hop
+        // outpoint at distinct marker vouts, stamped EARLIER — the superset
+        // must keep the honest row (rn <= 4, oldest-first).
+        for i in 0..2u32 {
+            insert_hopparty(&conn, &victim, &hop, 2 + i, 0, 1, Some(1), 100 + i as i64);
         }
         let sql = hopparty_list_for_identity_sql();
         let mut stmt = conn.prepare(&sql).expect("shipped hopsFor SQL parses");
-        let rows: Vec<(String, String, i64)> = stmt
+        let rows: Vec<(i64, i64, Option<i64>, i64)> = stmt
             .query_map(
                 rusqlite::params![victim, 10u32, unknown_pot_quota(10) as u32, 40u32],
                 |r| {
                     Ok((
-                        r.get::<_, String>("txid")?,
-                        r.get::<_, String>("hopTxid")?,
+                        r.get::<_, i64>("outputIndex")?,
                         r.get::<_, i64>("hopSats")?,
+                        r.get::<_, Option<i64>>("hopSatsOnChain")?,
+                        r.get::<_, i64>("containerOutputs")?,
                     ))
                 },
             )
@@ -6276,45 +6302,82 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3, "superset: all three rows for the one outpoint");
         assert!(
-            rows.iter().any(|(t, _, s)| t == "txHONEST" && *s == 80_800),
+            rows.iter().any(|(vout, sats, _, _)| *vout == 1 && *sats == 80_800),
             "two earlier-stamped forgeries must NOT evict the honest row \
              (verification-before-collapse: the reader decides)"
         );
+        // The CONTAINER's decoded facts reach the outer select.
+        assert!(rows.iter().all(|(_, _, on_chain, outs)| on_chain.is_some() && *outs == 2));
         // Within the outpoint: oldest first (the total order the reader
         // labels through).
-        assert_eq!(rows[0].0, "txFORGED0");
+        assert_eq!(rows[0].0, 2, "the oldest-stamped marker leads");
 
-        // byHop: oldest first through the shipped SQL.
+        // byHop: oldest first through the shipped SQL, keyed on the hop
+        // OUTPOINT (container txid + hopVout).
         let mut stmt = conn.prepare(&hopparty_list_for_hop_sql()).unwrap();
-        let by_hop: Vec<String> = stmt
+        let by_hop: Vec<i64> = stmt
             .query_map(rusqlite::params![hop, 0u32, 10u32], |r| {
-                r.get::<_, String>("txid")
+                r.get::<_, i64>("outputIndex")
             })
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(by_hop, vec!["txFORGED0", "txFORGED1", "txHONEST"]);
+        assert_eq!(by_hop, vec![2, 3, 1]);
+        // A different hopVout of the same container matches nobody.
+        let mut stmt = conn.prepare(&hopparty_list_for_hop_sql()).unwrap();
+        assert_eq!(
+            stmt.query_map(rusqlite::params![hop, 9u32, 10u32], |r| r
+                .get::<_, i64>("outputIndex"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    /// A marker whose CONTAINER lacks an output at hopVout stores NULL
+    /// on-chain facts with `containerOutputs` making the absence PROVEN —
+    /// the unknown-vs-refuted distinction the reader depends on.
+    #[test]
+    fn hopparty_absent_container_output_stores_proven_absence() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        insert_hopparty(&conn, &victim, &h64(0xaa), 1, 7, 80_800, None, 1_000);
+        let sql = hopparty_list_for_identity_sql();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let (lock, on_chain, outs): (Option<String>, Option<i64>, i64) = stmt
+            .query_row(
+                rusqlite::params![victim, 10u32, unknown_pot_quota(10) as u32, 40u32],
+                |r| {
+                    Ok((
+                        r.get("hopLockHex")?,
+                        r.get("hopSatsOnChain")?,
+                        r.get("containerOutputs")?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(lock.is_none() && on_chain.is_none());
+        assert_eq!(outs, 2, "absence is PROVEN by the container's output count");
     }
 
     /// The existence tier: markers naming hops the overlay never indexed
     /// (absent from `pot_records`) sort behind indexed hops beyond the
-    /// fresh-unknown quota — and `limit` counts OUTPOINTS. Mirrors the
-    /// potparty/potrefund window behaviour on the hopparty columns.
+    /// fresh-unknown quota — and `limit` counts OUTPOINTS.
     #[test]
     fn hopparty_window_tiers_unknown_hops_and_counts_outpoints() {
         let conn = production_schema_db();
         let victim = victim_id();
-        // Three REAL (indexed) hops, newest pot first expected.
+        // Three REAL (indexed) hop txs, newest first expected.
         for i in 1u8..=3 {
             let hop = h64(0x10 + i);
             insert_pot(&conn, &hop, 0, 1_000 + i as i64, false);
-            insert_hopparty(&conn, &victim, &hop, 0, 500, &format!("txM{i}"), 1, 1_000 + i as i64);
+            insert_hopparty(&conn, &victim, &hop, 1, 0, 500, Some(500), 1_000 + i as i64);
         }
-        // Five GHOST hops (never indexed), all with ANCIENT stamps (outside
-        // the fresh-unknown promotion window) — demoted behind every real
+        // Five GHOST containers (never indexed) with ANCIENT stamps
+        // (outside the fresh-unknown window) — demoted behind every real
         // hop, but still served.
         for i in 0..5u8 {
-            insert_hopparty(&conn, &victim, &h64(0xe0 + i), 0, 1, &format!("txG{i}"), 0, 10 + i as i64);
+            insert_hopparty(&conn, &victim, &h64(0xe0 + i), 1, 0, 1, Some(1), 10 + i as i64);
         }
 
         let sql = hopparty_list_for_identity_sql();
@@ -6322,13 +6385,11 @@ mod tests {
         let hops: Vec<String> = stmt
             .query_map(
                 rusqlite::params![victim, 4u32, unknown_pot_quota(4) as u32, 16u32],
-                |r| r.get::<_, String>("hopTxid"),
+                |r| r.get::<_, String>("txid"),
             )
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        // 4 outpoints total on the page (limit counts OUTPOINTS): the three
-        // real hops FIRST (tier 0, newest pot first), then one demoted ghost.
         let mut distinct: Vec<&String> = Vec::new();
         for h in &hops {
             if !distinct.contains(&h) {
@@ -6340,7 +6401,7 @@ mod tests {
         assert_eq!(*distinct[1], h64(0x12));
         assert_eq!(*distinct[2], h64(0x11));
         assert!(
-            distinct[3].starts_with("e0") || distinct[3].starts_with("e"),
+            distinct[3].starts_with('e'),
             "the demoted tier fills the remainder; got {}",
             distinct[3]
         );
@@ -6354,8 +6415,8 @@ mod tests {
     fn hopparty_identity_window_is_partitioned_tiered_and_ordered() {
         let sql = hopparty_list_for_identity_sql();
         assert!(
-            sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.hopTxid, hp.hopVout"),
-            "the window must partition on the hop OUTPOINT"
+            sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout"),
+            "the window must partition on the hop OUTPOINT (container txid + vout)"
         );
         assert!(
             sql.contains("AS unknownPot") && sql.contains("potRank <= ?"),
@@ -6378,6 +6439,9 @@ mod tests {
             "seatSettlePubkey",
             "seatSigHex",
             "identitySigHex",
+            "hopLockHex",
+            "hopSatsOnChain",
+            "containerOutputs",
         ] {
             assert!(
                 sql.matches(col).count() >= 4,

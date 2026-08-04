@@ -1,9 +1,12 @@
 [
   {
+    "containerOutputs": 2,
     "createdAt": 1,
     "gameId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "hopLockHex": "76a914bead80017bd8cf4fbe8eea907a74592f80a54b1288ac",
     "hopSats": 42000,
-    "hopTxid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "hopSatsOnChain": 42000,
+    "hopTxid": "bf419c348cfe946933754bf0feef285a07e125e1c74a6f9548065520c457537d",
     "hopVout": 0,
     "identity": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
     "identitySigHex": "3045777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
@@ -11,20 +14,23 @@
     "outputIndex": 1,
     "seatSettlePubkey": "03c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
     "seatSigHex": "3045777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
-    "txid": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+    "txid": "bf419c348cfe946933754bf0feef285a07e125e1c74a6f9548065520c457537d"
   },
   {
+    "containerOutputs": 2,
     "createdAt": 0,
     "gameId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "hopLockHex": "76a914f3642a4ab3fa9cff0e119171fb6060cda945615c88ac",
     "hopSats": 1234567,
-    "hopTxid": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    "hopVout": 1,
+    "hopSatsOnChain": 1234567,
+    "hopTxid": "22df8fa570b7204ae8c7ddbcc41c77bf1e2f2df2e04f23b458da83bb2f6f94b3",
+    "hopVout": 0,
     "identity": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    "identitySigHex": "3044022053392b77fab3e27ec719cc23b80bfe76b514dcb9f539c94f978788684d882335022014a89fc59724925d2f6c487711f3210f682784a9719bfaf2357d0d2e38c193ce",
+    "identitySigHex": "304502210082d6a006ea2064abae63f3c89cc9b1f4be8fae5d038c374e053cd84b8bd2392e022075e9cf71422df875ba72159f3c84e619c8e66f43b4e4335e399fa0aa01f27720",
     "opponentIdentity": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
     "outputIndex": 1,
     "seatSettlePubkey": "03d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee",
-    "seatSigHex": "3045022100d578c4df584ab2bb86a324c902de7a7b38685a0ea25f7d0a27c0d510f516738a02203d8cb847db70748335b4d682faaff769180386ff3cd451cc89b0c0f36c52d484",
-    "txid": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    "seatSigHex": "3045022100c7a9ca2ea77941819dab702159a805844ec5fbea10db2049a264feb64f177edf0220047a7220ab3748c3d3686e4ae4a59035518599d63d58e69b07bc4be3f3a9658b",
+    "txid": "22df8fa570b7204ae8c7ddbcc41c77bf1e2f2df2e04f23b458da83bb2f6f94b3"
   }
 ]

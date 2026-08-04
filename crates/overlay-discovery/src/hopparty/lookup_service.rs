@@ -1,6 +1,19 @@
 //! HOPPARTY Lookup Service — indexes and queries LOW hop-in-flight markers
 //! (bsv-low #315).
 //!
+//! Admission mode is WHOLE-TX (the `ls_pot` precedent, not `ls_potparty`'s
+//! locking-script mode) for one reason: since the 2026-08-04 wire
+//! revision the marker names its hop by VOUT ONLY and the CONTAINING
+//! transaction supplies the txid — so the container is part of the
+//! record's meaning, and the service must see it. Having it, the service
+//! also decodes the container's output at `hopVout` ONCE at write
+//! (`hopLockHex`, `hopSatsOnChain`, `containerOutputs` — #310
+//! decode-at-write): a pure re-presentation of the very bytes being
+//! admitted, exactly the #284 posture. **This is not validation** — the
+//! record is stored whatever the container says, and NOTHING is refused
+//! on it; the READER (`low-app-layer /hops-view`) compares the marker's
+//! claims against those facts and labels the row.
+//!
 //! When outputs are admitted to `tm_hopparty`, this service parses the
 //! `LOW/hopparty/v1` marker and stores one row per marker OUTPOINT
 //! `(txid, outputIndex)` via [`HoppartyStorage`] — EVERY admitted marker is
@@ -19,6 +32,7 @@
 //! record is NEVER removed (mirrors `ls_potparty`'s permanence).
 
 use async_trait::async_trait;
+use bsv_rs::transaction::Transaction;
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
@@ -48,7 +62,9 @@ impl HoppartyLookupService {
 #[async_trait(?Send)]
 impl LookupService for HoppartyLookupService {
     fn admission_mode(&self) -> AdmissionMode {
-        AdmissionMode::LockingScript
+        // Whole-tx: the CONTAINER supplies the hop txid and the hop
+        // output's script/value (module docs).
+        AdmissionMode::WholeTx
     }
 
     fn spend_notification_mode(&self) -> SpendNotificationMode {
@@ -61,19 +77,14 @@ impl LookupService for HoppartyLookupService {
         &self,
         payload: &OutputAdmittedByTopic,
     ) -> Result<(), LookupServiceError> {
-        let (txid, output_index, topic, locking_script) = match payload {
-            OutputAdmittedByTopic::LockingScript {
-                txid,
+        let (atomic_beef, output_index, topic) = match payload {
+            OutputAdmittedByTopic::WholeTx {
+                atomic_beef,
                 output_index,
                 topic,
-                locking_script,
                 ..
-            } => (txid, *output_index, topic, locking_script),
-            _ => {
-                return Err(LookupServiceError::Other(
-                    "Expected locking-script mode".into(),
-                ))
-            }
+            } => (atomic_beef, *output_index, topic),
+            _ => return Err(LookupServiceError::Other("Expected whole-tx mode".into())),
         };
 
         // Only index tm_hopparty outputs.
@@ -81,25 +92,54 @@ impl LookupService for HoppartyLookupService {
             return Ok(());
         }
 
+        // Parse the CONTAINING tx out of the BEEF (the same subject-tx
+        // selection the topic manager used). Unparseable → no-op, never a
+        // spurious record (the `ls_pot` posture).
+        let tx = match Transaction::from_beef(atomic_beef, None) {
+            Ok(tx) => tx,
+            Err(e) => {
+                debug!("HOPPARTY: admitted beef did not parse — skipped: {e}");
+                return Ok(());
+            }
+        };
+        let Some(marker_output) = tx.outputs.get(output_index as usize) else {
+            debug!("HOPPARTY: admitted output index out of range — skipped");
+            return Ok(());
+        };
+
         // The topic manager already validated the marker; re-parse to
         // recover the fields for the index (defensive — the TM should never
         // admit anything this can't parse).
-        let Some(marker) = parse_hopparty_marker(locking_script) else {
+        let Some(marker) = parse_hopparty_marker(&marker_output.locking_script.to_binary()) else {
             debug!("HOPPARTY: admitted output is not a parseable marker — skipped");
             return Ok(());
         };
+
+        // The hop txid IS this tx (the marker rides the hop).
+        let txid = tx.id();
+
+        // #310 decode-at-write: the CONTAINER's own output at hopVout.
+        // Absent (hopVout >= |outputs|) stores NULLs, and `containerOutputs`
+        // makes that absence PROVEN rather than ambiguous. No refusal here —
+        // the reader labels.
+        let container_outputs = tx.outputs.len() as u32;
+        let hop_output = tx.outputs.get(marker.hop_vout as usize);
+        let hop_lock_hex = hop_output.map(|o| hex::encode(o.locking_script.to_binary()));
+        let hop_sats_on_chain = hop_output.and_then(|o| o.satoshis);
 
         let record = HoppartyRecord {
             identity: hex::encode(&marker.identity),
             opponent_identity: hex::encode(&marker.opponent),
             game_id: hex::encode(marker.game_id),
-            hop_txid: hex::encode(marker.hop_txid),
             hop_vout: marker.hop_vout,
             hop_sats: marker.hop_sats,
             seat_settle_pubkey: hex::encode(&marker.seat_settle_pubkey),
             seat_sig_hex: hex::encode(&marker.seat_sig),
             identity_sig_hex: hex::encode(&marker.identity_sig),
-            txid: txid.to_string(),
+            hop_lock_hex,
+            hop_sats_on_chain,
+            container_outputs,
+            txid,
             output_index,
             created_at: 0, // assigned by the storage layer at insert
         };
@@ -170,12 +210,20 @@ impl LookupService for HoppartyLookupService {
                     "identity": r.identity,
                     "opponentIdentity": r.opponent_identity,
                     "gameId": r.game_id,
-                    "hopTxid": r.hop_txid,
+                    // The container IS the hop tx, so `hopTxid` is a
+                    // re-presentation of `txid` computed in exactly ONE
+                    // place — never a second stored source that could drift.
+                    "hopTxid": r.txid,
                     "hopVout": r.hop_vout,
                     "hopSats": r.hop_sats,
                     "seatSettlePubkey": r.seat_settle_pubkey,
                     "seatSigHex": r.seat_sig_hex,
                     "identitySigHex": r.identity_sig_hex,
+                    // The CONTAINER's decoded facts (#310) — what a reader
+                    // compares the claims above against.
+                    "hopLockHex": r.hop_lock_hex,
+                    "hopSatsOnChain": r.hop_sats_on_chain,
+                    "containerOutputs": r.container_outputs,
                     "txid": r.txid,
                     "outputIndex": r.output_index,
                     "createdAt": r.created_at,
@@ -244,11 +292,12 @@ fn normalize_txid(value: &str) -> Result<String, LookupServiceError> {
 mod tests {
     use super::super::storage::MemoryHoppartyStorage;
     use super::super::tests::{
-        build_golden_marker, golden_game_id, golden_hop_txid, golden_identity, golden_marker,
-        golden_opponent, golden_sats, golden_settle_pubkey, golden_sig, golden_vector_inputs,
-        marker_script,
+        build_golden_marker, golden_game_id, golden_identity, golden_marker, golden_opponent,
+        golden_sats, golden_settle_pubkey, golden_sig, golden_vector_inputs, marker_script,
     };
     use super::*;
+    use bsv_rs::script::LockingScript;
+    use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput};
 
     fn make_service_with_storage() -> (HoppartyLookupService, Rc<MemoryHoppartyStorage>) {
         let storage = Rc::new(MemoryHoppartyStorage::new());
@@ -260,15 +309,62 @@ mod tests {
         make_service_with_storage().0
     }
 
-    fn admit(txid: &str, output_index: u32, script: Vec<u8>) -> OutputAdmittedByTopic {
-        OutputAdmittedByTopic::LockingScript {
-            txid: txid.into(),
+    /// The P2PKH lock a hop paying `pubkey_hex` carries.
+    fn p2pkh_for(pubkey_hex: &str) -> String {
+        let pk = hex::decode(pubkey_hex).unwrap();
+        format!(
+            "76a914{}88ac",
+            hex::encode(bsv_rs::primitives::hash::hash160(&pk))
+        )
+    }
+
+    /// Build the PRODUCTION container: a tx whose output 0 is the hop
+    /// P2PKH and whose output 1 is the marker OP_RETURN — the exact shape
+    /// the client's hop `createAction` emits (`randomizeOutputs: false`
+    /// keeps the hop at a stable vout). Returns (atomic BEEF, txid).
+    fn container(hop_lock_hex: &str, hop_sats: u64, marker_script: &[u8], nonce: u8) -> (Vec<u8>, String) {
+        let mut tx = Tx::new();
+        // The nonce varies the input so distinct containers get distinct
+        // txids (a replay of the SAME bytes is a same-outpoint no-op).
+        tx.add_input(TransactionInput::new(format!("{nonce:02x}").repeat(32), 0))
+            .unwrap();
+        tx.add_output(TransactionOutput {
+            satoshis: Some(hop_sats),
+            locking_script: LockingScript::from_hex(hop_lock_hex).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        tx.add_output(TransactionOutput {
+            satoshis: Some(0),
+            locking_script: LockingScript::from_binary(marker_script).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let beef = tx.to_beef(true).expect("BEEF serialization");
+        let txid = Tx::from_beef(&beef, None).expect("engine-side parse").id();
+        (beef, txid)
+    }
+
+    fn admit_beef(beef: Vec<u8>, output_index: u32) -> OutputAdmittedByTopic {
+        OutputAdmittedByTopic::WholeTx {
+            atomic_beef: beef,
             output_index,
             topic: "tm_hopparty".into(),
-            satoshis: 0,
-            locking_script: script,
             off_chain_values: None,
         }
+    }
+
+    /// Admit a marker inside a well-formed container paying `settle_pub`.
+    async fn admit_marker(
+        svc: &HoppartyLookupService,
+        script: &[u8],
+        settle_pub_hex: &str,
+        hop_sats: u64,
+        nonce: u8,
+    ) -> String {
+        let (beef, txid) = container(&p2pkh_for(settle_pub_hex), hop_sats, script, nonce);
+        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        txid
     }
 
     async fn run_lookup(svc: &HoppartyLookupService, query: serde_json::Value) -> serde_json::Value {
@@ -308,7 +404,11 @@ mod tests {
     #[tokio::test]
     async fn modes_and_metadata() {
         let svc = make_service();
-        assert_eq!(svc.admission_mode(), AdmissionMode::LockingScript);
+        assert_eq!(
+            svc.admission_mode(),
+            AdmissionMode::WholeTx,
+            "the CONTAINER supplies the hop txid — the service must see it"
+        );
         assert_eq!(svc.spend_notification_mode(), SpendNotificationMode::None);
         let meta = svc.get_metadata().await;
         assert_eq!(meta.name, "HOPPARTY Lookup Service");
@@ -317,13 +417,15 @@ mod tests {
 
     // ── Admission + hopsFor (end-to-end through the real LS path) ────────
 
+    /// The container supplies the txid, and the container's OWN output at
+    /// hopVout is decoded once at write (#310) — hopTxid on the wire IS the
+    /// containing txid.
     #[tokio::test]
-    async fn marker_admitted_and_found_by_identity() {
+    async fn marker_admitted_container_supplies_txid_and_decoded_facts() {
         let (svc, storage) = make_service_with_storage();
-        let script = golden_marker(&golden_game_id(), &golden_hop_txid(), 3);
-        svc.output_admitted_by_topic(&admit("markerTx1", 0, script))
-            .await
-            .unwrap();
+        let settle = hex::encode(golden_settle_pubkey());
+        let script = golden_marker(&golden_game_id(), 0);
+        let txid = admit_marker(&svc, &script, &settle, golden_sats(), 0x01).await;
         assert_eq!(storage.record_count(), 1);
 
         let arr = hops_for(&svc, &golden_identity_hex(), None).await;
@@ -331,65 +433,70 @@ mod tests {
         assert_eq!(e["identity"], golden_identity_hex());
         assert_eq!(e["opponentIdentity"], golden_opponent_hex());
         assert_eq!(e["gameId"], "11".repeat(32));
-        assert_eq!(e["hopTxid"], "22".repeat(32));
-        assert_eq!(e["hopVout"], 3);
+        assert_eq!(e["hopVout"], 0);
         assert_eq!(e["hopSats"], golden_sats());
-        assert_eq!(e["seatSettlePubkey"], hex::encode(golden_settle_pubkey()));
+        assert_eq!(e["seatSettlePubkey"], settle);
         assert_eq!(e["seatSigHex"], hex::encode(golden_sig()));
         assert_eq!(e["identitySigHex"], hex::encode(golden_sig()));
-        assert_eq!(e["txid"], "markerTx1");
+        // The container's identity, in both senses.
+        assert_eq!(e["txid"], txid, "the marker's containing tx");
+        assert_eq!(e["hopTxid"], txid, "…which IS the hop tx");
+        assert_eq!(e["outputIndex"], 1);
+        // The decoded container facts.
+        assert_eq!(e["hopLockHex"], p2pkh_for(&settle));
+        assert_eq!(e["hopSatsOnChain"], golden_sats());
+        assert_eq!(e["containerOutputs"], 2);
         assert!(e["createdAt"].is_i64());
 
-        // byHop surfaces the same row.
-        let arr = by_hop(&svc, &"22".repeat(32), 3).await;
+        // byHop is keyed on that same txid.
+        let arr = by_hop(&svc, &txid, 0).await;
         assert_eq!(arr.as_array().unwrap().len(), 1);
-        // A different vout matches nobody.
-        let arr = by_hop(&svc, &"22".repeat(32), 9).await;
+        let arr = by_hop(&svc, &txid, 9).await;
         assert!(arr.as_array().unwrap().is_empty());
+    }
+
+    /// A marker naming a vout its OWN container does not have: stored (the
+    /// overlay never refuses), with the absence PROVEN by
+    /// `containerOutputs` rather than left ambiguous.
+    #[tokio::test]
+    async fn a_vout_the_container_lacks_is_stored_with_proven_absence() {
+        let (svc, storage) = make_service_with_storage();
+        let settle = hex::encode(golden_settle_pubkey());
+        // The marker claims hopVout 7; the container has 2 outputs.
+        let script = golden_marker(&golden_game_id(), 7);
+        admit_marker(&svc, &script, &settle, golden_sats(), 0x02).await;
+        assert_eq!(storage.record_count(), 1, "stored — admission never refuses");
+
+        let e = &hops_for(&svc, &golden_identity_hex(), None).await[0];
+        assert!(e["hopLockHex"].is_null());
+        assert!(e["hopSatsOnChain"].is_null());
+        assert_eq!(e["containerOutputs"], 2, "absence is PROVEN, not guessed");
     }
 
     #[tokio::test]
     async fn hops_for_filters_by_identity_only() {
         let (svc, _storage) = make_service_with_storage();
-        // Seat A's marker.
-        svc.output_admitted_by_topic(&admit(
-            "txA",
+        let settle = hex::encode(golden_settle_pubkey());
+        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01).await;
+        // Seat B's OWN marker on its own hop (seats flipped).
+        let b = marker_script(
+            &golden_opponent(),
+            &golden_identity(),
+            &golden_game_id(),
             0,
-            golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
-        ))
-        .await
-        .unwrap();
-        // Seat B's OWN marker for its own hop (seats flipped).
-        svc.output_admitted_by_topic(&admit(
-            "txB",
-            0,
-            marker_script(
-                &golden_opponent(),
-                &golden_identity(),
-                &golden_game_id(),
-                &[0x33u8; 32],
-                0,
-                golden_sats(),
-                &golden_settle_pubkey(),
-                &golden_sig(),
-                &golden_sig(),
-            ),
-        ))
-        .await
-        .unwrap();
+            golden_sats(),
+            &golden_settle_pubkey(),
+            &golden_sig(),
+            &golden_sig(),
+        );
+        admit_marker(&svc, &b, &settle, golden_sats(), 0x02).await;
 
         let arr = hops_for(&svc, &golden_identity_hex(), None).await;
-        let arr = arr.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["txid"], "txA");
-
+        assert_eq!(arr.as_array().unwrap().len(), 1);
         let arr = hops_for(&svc, &golden_opponent_hex(), None).await;
         assert_eq!(arr.as_array().unwrap().len(), 1);
-
-        // An identity in no hop sees an empty array.
         let stranger = "02".to_string() + &"ee".repeat(32);
-        let arr = hops_for(&svc, &stranger, None).await;
-        assert!(arr.as_array().unwrap().is_empty());
+        assert!(hops_for(&svc, &stranger, None).await.as_array().unwrap().is_empty());
     }
 
     // ── Ordering + limit ──────────────────────────────────────────────────
@@ -397,22 +504,18 @@ mod tests {
     #[tokio::test]
     async fn newest_outpoint_first_and_limit() {
         let (svc, _storage) = make_service_with_storage();
-        // FIVE DISTINCT HOPS — the window counts outpoints.
+        let settle = hex::encode(golden_settle_pubkey());
+        let mut txids = Vec::new();
         for i in 1u8..=5 {
-            svc.output_admitted_by_topic(&admit(
-                &format!("tx{i}"),
-                0,
-                golden_marker(&[i; 32], &[0xd0 + i; 32], 0),
-            ))
-            .await
-            .unwrap();
+            txids.push(
+                admit_marker(&svc, &golden_marker(&[i; 32], 0), &settle, golden_sats(), i).await,
+            );
         }
         let arr = hops_for(&svc, &golden_identity_hex(), Some(3)).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 3, "limit respected");
-        assert_eq!(arr[0]["txid"], "tx5", "newest hop first");
+        assert_eq!(arr[0]["txid"], txids[4], "newest hop first");
 
-        // limit clamps.
         assert_eq!(clamp_limit(None), DEFAULT_LIMIT);
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(1_000_000)), MAX_LIMIT);
@@ -423,13 +526,11 @@ mod tests {
     #[tokio::test]
     async fn same_outpoint_replay_is_a_noop() {
         let (svc, storage) = make_service_with_storage();
-        let script = golden_marker(&golden_game_id(), &golden_hop_txid(), 0);
-        svc.output_admitted_by_topic(&admit("txSAME", 0, script.clone()))
-            .await
-            .unwrap();
-        svc.output_admitted_by_topic(&admit("txSAME", 0, script))
-            .await
-            .unwrap();
+        let settle = hex::encode(golden_settle_pubkey());
+        let script = golden_marker(&golden_game_id(), 0);
+        let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &script, 0x01);
+        svc.output_admitted_by_topic(&admit_beef(beef.clone(), 1)).await.unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
         assert_eq!(storage.record_count(), 1, "same-outpoint replay is a no-op");
     }
 
@@ -438,12 +539,10 @@ mod tests {
     #[tokio::test]
     async fn ignores_non_tm_hopparty_topic() {
         let (svc, storage) = make_service_with_storage();
-        let mut payload = admit(
-            "tx1",
-            0,
-            golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
-        );
-        if let OutputAdmittedByTopic::LockingScript { ref mut topic, .. } = payload {
+        let settle = hex::encode(golden_settle_pubkey());
+        let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &golden_marker(&golden_game_id(), 0), 0x01);
+        let mut payload = admit_beef(beef, 1);
+        if let OutputAdmittedByTopic::WholeTx { ref mut topic, .. } = payload {
             *topic = "tm_potparty".into();
         }
         svc.output_admitted_by_topic(&payload).await.unwrap();
@@ -457,66 +556,78 @@ mod tests {
     /// `potparty_records`" claim, executed rather than asserted).
     #[tokio::test]
     async fn cross_tag_scripts_never_stored_either_direction() {
-        // potparty v1 + v2 scripts under tm_hopparty → skipped.
         let (svc, storage) = make_service_with_storage();
-        for script in [
-            crate::potparty::tests::golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
-            crate::potparty::tests::golden_marker_v2(&golden_game_id(), &golden_hop_txid(), 0),
-        ] {
-            svc.output_admitted_by_topic(&admit("txPP", 0, script))
-                .await
-                .unwrap();
+        let settle = hex::encode(golden_settle_pubkey());
+        for (i, script) in [
+            crate::potparty::tests::golden_marker(&golden_game_id(), &[0x22u8; 32], 0),
+            crate::potparty::tests::golden_marker_v2(&golden_game_id(), &[0x22u8; 32], 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &script, 0x10 + i as u8);
+            svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
         }
         assert_eq!(storage.record_count(), 0, "potparty scripts never stored");
 
         // The reverse: a hopparty script through the POTPARTY LS.
         let pp_storage = Rc::new(crate::potparty::storage::MemoryPotpartyStorage::new());
-        let pp_svc =
-            crate::potparty::lookup_service::PotpartyLookupService::new(pp_storage.clone());
+        let pp_svc = crate::potparty::lookup_service::PotpartyLookupService::new(pp_storage.clone());
         pp_svc
             .output_admitted_by_topic(&OutputAdmittedByTopic::LockingScript {
                 txid: "txHOP".into(),
-                output_index: 0,
+                output_index: 1,
                 topic: "tm_potparty".into(),
                 satoshis: 0,
-                locking_script: golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
+                locking_script: golden_marker(&golden_game_id(), 0),
                 off_chain_values: None,
             })
             .await
             .unwrap();
-        assert_eq!(pp_storage.record_count(), 0, "hopparty scripts never stored in potparty");
+        assert_eq!(pp_storage.record_count(), 0, "hopparty never stored in potparty");
 
         // Positive control: the same hopparty script under ITS topic stores.
-        svc.output_admitted_by_topic(&admit(
-            "txOK",
-            0,
-            golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
-        ))
-        .await
-        .unwrap();
+        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x20).await;
         assert_eq!(storage.record_count(), 1);
     }
 
     #[tokio::test]
     async fn ignores_non_marker_script() {
         let (svc, storage) = make_service_with_storage();
-        let p2pkh = hex::decode("76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac").unwrap();
-        svc.output_admitted_by_topic(&admit("tx1", 0, p2pkh))
-            .await
-            .unwrap();
+        let p2pkh = "76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac";
+        let (beef, _) = container(p2pkh, 546, &hex::decode(p2pkh).unwrap(), 0x01);
+        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
         assert_eq!(storage.record_count(), 0);
     }
 
     #[tokio::test]
-    async fn rejects_whole_tx_mode() {
+    async fn rejects_locking_script_mode() {
+        // The service opted into WHOLE-TX; the locking-script variant
+        // carries no container and must be refused outright.
         let svc = make_service();
-        let payload = OutputAdmittedByTopic::WholeTx {
-            atomic_beef: vec![],
-            output_index: 0,
+        let payload = OutputAdmittedByTopic::LockingScript {
+            txid: "tx1".into(),
+            output_index: 1,
             topic: "tm_hopparty".into(),
+            satoshis: 0,
+            locking_script: golden_marker(&golden_game_id(), 0),
             off_chain_values: None,
         };
         assert!(svc.output_admitted_by_topic(&payload).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unparseable_beef_is_a_noop_never_a_spurious_record() {
+        let (svc, storage) = make_service_with_storage();
+        svc.output_admitted_by_topic(&admit_beef(vec![0xde, 0xad], 1))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0);
+        // An output index past the container is likewise a no-op.
+        let settle = hex::encode(golden_settle_pubkey());
+        let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &golden_marker(&golden_game_id(), 0), 0x01);
+        svc.output_admitted_by_topic(&admit_beef(beef, 9)).await.unwrap();
+        assert_eq!(storage.record_count(), 0);
     }
 
     // ── Permanence: spend / eviction are no-ops ──────────────────────────
@@ -524,23 +635,18 @@ mod tests {
     #[tokio::test]
     async fn spend_and_eviction_never_remove_a_record() {
         let (svc, storage) = make_service_with_storage();
-        svc.output_admitted_by_topic(&admit(
-            "tx1",
-            0,
-            golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
-        ))
-        .await
-        .unwrap();
+        let settle = hex::encode(golden_settle_pubkey());
+        let txid = admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01).await;
         assert_eq!(storage.record_count(), 1);
 
         let spent = OutputSpent::None {
-            txid: "tx1".into(),
-            output_index: 0,
+            txid: txid.clone(),
+            output_index: 1,
             topic: "tm_hopparty".into(),
         };
         svc.output_spent(&spent).await.unwrap();
         assert_eq!(storage.record_count(), 1, "marker must survive a spend");
-        svc.output_evicted("tx1", 0).await.unwrap();
+        svc.output_evicted(&txid, 1).await.unwrap();
         assert_eq!(storage.record_count(), 1, "marker must survive an eviction");
     }
 
@@ -549,13 +655,8 @@ mod tests {
     #[tokio::test]
     async fn lookup_case_insensitive_hex() {
         let (svc, _storage) = make_service_with_storage();
-        svc.output_admitted_by_topic(&admit(
-            "txA",
-            0,
-            golden_marker(&golden_game_id(), &golden_hop_txid(), 0),
-        ))
-        .await
-        .unwrap();
+        let settle = hex::encode(golden_settle_pubkey());
+        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01).await;
         let arr = hops_for(&svc, &golden_identity_hex().to_uppercase(), None).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -594,15 +695,15 @@ mod tests {
     ///
     /// `fixtures/ls_hopparty_hopsfor.fixture.json` is the EXACT `result`
     /// array the real `lookup()` serializer emits for `hopsFor` over two
-    /// admitted markers — the first being the GOLDEN cross-repo marker
-    /// (real BRC-42 + RFC6979 crypto, `PrivateKey(1)`/`PrivateKey(2)`),
-    /// admitted through the REAL `output_admitted_by_topic` producer path
-    /// (never a hand-inserted row). The bsv-low CLIENT will pin a
-    /// byte-identical copy and drive it through ITS parser: rename a
-    /// serialized field HERE and this cell goes red; drift the client's
-    /// parser and its cell goes red. A property spanning two repos cannot
-    /// be pinned inside either one — regenerate BOTH copies together or
-    /// not at all.
+    /// markers admitted through the REAL `output_admitted_by_topic`
+    /// producer path (whole-tx, so the containers really do supply the
+    /// txids and the decoded facts). Row 1 carries the GOLDEN cross-repo
+    /// marker (real BRC-42 + RFC6979 crypto from PrivateKey(1)/(2)). The
+    /// bsv-low CLIENT will pin a byte-identical copy and drive it through
+    /// ITS parser: rename a serialized field HERE and this cell goes red;
+    /// drift the client's parser and its cell goes red. A property
+    /// spanning two repos cannot be pinned inside either one — regenerate
+    /// BOTH copies together or not at all.
     #[tokio::test]
     async fn hopsfor_answer_matches_cross_repo_fixture() {
         let fixture: serde_json::Value =
@@ -610,39 +711,45 @@ mod tests {
                 .expect("fixture parses");
 
         let (svc, storage) = make_service_with_storage();
-        // Row 1: the GOLDEN marker (hop outpoint dd…:1), admitted via the
-        // real LS admission path at marker outpoint c1…:1.
-        svc.output_admitted_by_topic(&admit(&"c1".repeat(32), 1, build_golden_marker()))
-            .await
-            .unwrap();
-        // Row 2: a second marker for the SAME identity naming a different
-        // hop (ee…:0) — deterministic dummy-DER sigs (admission is
-        // byte-shape only; the sig VALUES are exercised by the golden row).
-        let (wallet, opponent, game_id, _, _, _) = golden_vector_inputs();
+        let (wallet, opponent, game_id, hop_vout, hop_sats) = golden_vector_inputs();
+        // Row 1: the GOLDEN marker in the PRODUCTION container — the hop
+        // P2PKH at output 0 paying its REAL derived settle key exactly the
+        // hopSats it claims, the marker at output 1. This row is the
+        // canonical FULLY-VERIFYING example the client half pins against.
+        let golden = build_golden_marker();
+        let golden_settle = hex::encode(
+            &parse_hopparty_marker(&golden).expect("golden parses").seat_settle_pubkey,
+        );
+        let (beef, _) = container(&p2pkh_for(&golden_settle), hop_sats, &golden, 0xc1);
+        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        // Row 2: a second marker for the SAME identity on another hop tx —
+        // deterministic dummy-DER sigs (admission is byte-shape only; the
+        // sig VALUES are exercised by the golden row).
         let identity = hex::decode(wallet.identity_key_hex()).unwrap();
         let dummy_sig = {
             let mut s = vec![0x30u8, 0x45];
             s.extend_from_slice(&[0x77u8; 69]);
             s
         };
-        svc.output_admitted_by_topic(&admit(
-            &"c2".repeat(32),
-            1,
-            marker_script(
-                &identity,
-                &opponent,
-                &game_id,
-                &[0xeeu8; 32],
-                0,
-                42_000,
-                &golden_settle_pubkey(),
-                &dummy_sig,
-                &dummy_sig,
-            ),
-        ))
-        .await
-        .unwrap();
+        let second = marker_script(
+            &identity,
+            &opponent,
+            &game_id,
+            0,
+            42_000,
+            &golden_settle_pubkey(),
+            &dummy_sig,
+            &dummy_sig,
+        );
+        let (beef, _) = container(
+            &p2pkh_for(&hex::encode(golden_settle_pubkey())),
+            42_000,
+            &second,
+            0xc2,
+        );
+        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
         assert_eq!(storage.record_count(), 2);
+        assert_eq!(hop_vout, 0, "the golden vector rides the production layout");
 
         let answer = hops_for(&svc, &wallet.identity_key_hex(), None).await;
         assert_eq!(
