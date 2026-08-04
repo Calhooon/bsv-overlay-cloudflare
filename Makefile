@@ -17,6 +17,7 @@ help:
 	@echo "  wrangler-dev     wrangler dev in parity mode (:8787) — run in a separate shell"
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test --workspace with memory-storage feature"
+	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds"
 	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -79,6 +80,26 @@ parity-clean:
 
 test:
 	cargo test --workspace --features bsv-overlay-engine/memory-storage
+
+# THE GATE. Run this, not a hand-typed approximation of it.
+#
+# Every flag here was earned. `--all-targets` because a clippy run without it
+# lints no test target, and a campaign shipped a red clippy while reporting
+# "clippy 0" for exactly that reason. `--no-fail-fast` because cargo aborts
+# later binaries once one fails, which truncates the failing-test list and has
+# three times made a partial result read as a complete one. The wasm32 builds
+# because the workers are the deploy artifact and a native build proves nothing
+# about them.
+#
+# Check the SUCCESS MARKER in a separate command — a pipe returns the pipe's
+# exit code, never the build's.
+ci:
+	@set -e; \
+	cargo test --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast; \
+	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
+	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
+	cargo build -p low-app-layer --target wasm32-unknown-unknown --release; \
+	echo "✅ local CI green"
 
 extensions-build:
 	cargo build -p bsv-overlay-cloudflare --features extensions
