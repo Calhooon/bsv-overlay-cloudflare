@@ -642,4 +642,104 @@ mod tests {
             assert!(svc.lookup(&q).await.is_err(), "expected error for {bad}");
         }
     }
+
+    /// #335 (bsv-low) Rule-16 CROSS-REPO BOUNDARY PIN (overlay half).
+    ///
+    /// `fixtures/ls_potparty_partyfor.fixture.json` is the EXACT `result`
+    /// array the real `lookup()` serializer emits for `partyFor` — and a
+    /// byte-identical copy is asserted by the bsv-low CLIENT
+    /// (`app/src/lib/fixtures/ls_potparty_partyfor.fixture.json`, driven
+    /// through the real `lookupPotParty` parser + real signature
+    /// verification by `overlay.potpartyLookup.test.ts`). The client THROWS
+    /// on a structured row missing `identity`/`opponentIdentity`/`sigHex`
+    /// and drops any row that fails verification, so the two cells together
+    /// pin the wire contract that used to be held only by coincidence of
+    /// spelling: rename a serialized field HERE and this cell goes red
+    /// (lookup output != fixture); drift the client's parser and ITS cell
+    /// goes red (rows dropped / throw). A property spanning two repos cannot
+    /// be pinned inside either one — regenerate BOTH copies together or not
+    /// at all.
+    ///
+    /// The record literals below are Rust-side ON PURPOSE (not parsed out of
+    /// the fixture): deriving them from the fixture would make the
+    /// comparison circular. The sigs are genuine (signPotPartyMarker /
+    /// signPotPartyV2Marker under the client's fixed test key).
+    #[tokio::test]
+    async fn partyfor_answer_matches_cross_repo_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/ls_potparty_partyfor.fixture.json"))
+                .expect("fixture parses");
+
+        let identity = "02fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af";
+        let opponent = "03d528ecd9b696b54c907a9ed045447a79bb408ec39b68df504bb51f459bc3ffc9";
+        let record = |game_id: &str,
+                      pot_txid: &str,
+                      recovery_height: u32,
+                      sig_hex: &str,
+                      seat: Option<(&str, &str)>,
+                      txid: &str| PotpartyRecord {
+            identity: identity.into(),
+            opponent_identity: opponent.into(),
+            game_id: game_id.into(),
+            pot_txid: pot_txid.into(),
+            pot_vout: 0,
+            recovery_height,
+            sig_hex: sig_hex.into(),
+            seat_settle_pubkey: seat.map(|(pk, _)| pk.to_string()),
+            seat_sig_hex: seat.map(|(_, s)| s.to_string()),
+            txid: txid.into(),
+            output_index: 0,
+            created_at: 0, // ignored — storage stamps insertion order 0,1,2
+        };
+
+        let (svc, storage) = make_service_with_storage();
+        // Insertion order = created_at order: pot1 v1 (0), pot2 v1 (1),
+        // pot2 v2 (2). The partyFor window returns them newest-first.
+        storage
+            .store_record(&record(
+                &"11".repeat(32),
+                &"aa".repeat(32),
+                900_000,
+                "30450221009c63209518bc25ba20dac269f781a415a338eb910d04ee24b60a62f2f5d8431e022023185721992adae46be9e532b2d8930affce31f17d904d072ff55ae54600984e",
+                None,
+                &"c1".repeat(32),
+            ))
+            .await
+            .unwrap();
+        storage
+            .store_record(&record(
+                &"22".repeat(32),
+                &"bb".repeat(32),
+                900_100,
+                "3045022100b40b70f6bf11a7af3f31afa6e5052aa3ba87b13639789c192270cfbcece57abc022062cfd033d3ab32ee0626171bf584b484e2e9b722ea074286fb033430021c1d0c",
+                None,
+                &"c2".repeat(32),
+            ))
+            .await
+            .unwrap();
+        storage
+            .store_record(&record(
+                &"22".repeat(32),
+                &"bb".repeat(32),
+                900_100,
+                "3045022100fd60a6e60c19700afa75394660111c5762b2adff319f650214b907015e0d26bd02201fb0a2cbb43a4828867d8d4e3452586cd33530ce6807aa74acfdd0fc7fb7a8d1",
+                Some((
+                    "021012227c1931bdbcc58e96eacd1e0366642ec51277e3606343274b1639b7126d",
+                    "3045022100f6805d81fa74d3ea416569de4089666f6abac1bd16f7d4aee4b35866d421621d02203f6313f04e516c7a91b919352db5c1c65de21588a1903e083d5555670598d1e9",
+                )),
+                &"c3".repeat(32),
+            ))
+            .await
+            .unwrap();
+
+        let answer = party_for(&svc, identity, None).await;
+        assert_eq!(
+            answer, fixture,
+            "the serialized partyFor answer must match the cross-repo fixture BYTE-FOR-BYTE \
+             (field names are the wire contract with bsv-low's lookupPotParty)"
+        );
+        // Loud-count guard: the pin must be comparing three real rows, not
+        // two empty arrays agreeing with each other.
+        assert_eq!(answer.as_array().map(|a| a.len()), Some(3));
+    }
 }
