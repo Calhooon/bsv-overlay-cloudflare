@@ -80,6 +80,14 @@
 //!   verified); every other state keeps `case: null` under a four-valued
 //!   `caseSource` — UNKNOWN, never "no case". See the `live_view` module
 //!   docs.
+//! - `GET /hops-view?identity=<66-hex>` — the per-identity HOPS-IN-FLIGHT
+//!   view (bsv-low #315, #252 stage 2b): every hop the identity marked
+//!   (`hopparty_records`, tm_hopparty) joined to the `tm_lowfund`-indexed
+//!   hop outpoint for spent/unspent status (honesty pair; an un-indexed
+//!   hop is `unknown`, never asserted-unspent) plus the read-time
+//!   `markerVerified` validity filter (seatSig + identitySig + the
+//!   admitted hop lock re-derived from the marker's own settle pubkey —
+//!   display labeling, rows never dropped). See the `hops_view` module.
 //! - `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
 //!   (legacy, never-indexed) outpoints via SERVER-SIDE upstream reads (WoC
 //!   primary with raw hash-verification; a NEGATIVE needs Bitails
@@ -97,6 +105,7 @@
 
 pub mod compaction;
 pub mod cors;
+pub mod hops_view;
 pub mod live_view;
 pub mod logic;
 pub mod refund_view;
@@ -138,6 +147,7 @@ fn router() -> Router<'static, ()> {
         .get_async("/leaderboard", routes::leaderboard)
         .get_async("/results", routes::results)
         .get_async("/refund-view", routes::refund_view)
+        .get_async("/hops-view", routes::hops_view)
         .get_async("/live-view", routes::live_view)
         .get_async("/spent-any", routes::spent_any)
         .get_async("/tx-any/:txid", routes::tx_any)

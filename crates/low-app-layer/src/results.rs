@@ -405,8 +405,12 @@ pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
 }
 
 /// The BRC-43 protocol potparty markers sign their IDENTITY challenge under
-/// — `potParty.ts::POTPARTY_PROTOCOL` = `[1, 'low potparty']`.
-fn potparty_protocol() -> bsv_rs::wallet::Protocol {
+/// — `potParty.ts::POTPARTY_PROTOCOL` = `[1, 'low potparty']`. `pub(crate)`
+/// since bsv-low #315: hopparty identity signatures REUSE this wallet
+/// protocol id by the ledgered decision-3 (the version tag inside the
+/// challenge is the domain separator), so `/hops-view` verifies under the
+/// SAME constant rather than a second spelling that could drift.
+pub(crate) fn potparty_protocol() -> bsv_rs::wallet::Protocol {
     bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty")
 }
 
@@ -798,7 +802,7 @@ pub fn result_challenge_bytes(
 /// `anyoneVerifier.verifySignature({counterparty: signer, forSelf: false})`.
 /// Any malformed key/sig/derivation failure is simply `false` (fail-safe:
 /// an unverifiable signature never corroborates).
-fn anyone_sig_verifies(
+pub(crate) fn anyone_sig_verifies(
     signer_identity_hex: &str,
     key_id: &str,
     challenge: &[u8],
