@@ -23,6 +23,8 @@ use serde::Deserialize;
 use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
 
+use crate::auth::{AuthState, IdentityDecision};
+
 use crate::logic::{
     assemble_pots_view, assemble_recovery_view, assemble_statuses, batch_where_sql, beef_body,
     chunk_outpoints, clamp_leaderboard_limit, decode_beef_hex, health_body, leaderboard_body,
@@ -47,6 +49,69 @@ fn json_response(body: String, status: u16) -> Result<Response> {
 /// JSON error.
 fn json_error(msg: &str, status: u16) -> Result<Response> {
     json_response(serde_json::json!({ "error": msg }).to_string(), status)
+}
+
+/// The resolved view identity for an identity-scoped route, or the refusal
+/// response to return instead.
+pub(crate) enum ViewIdentity {
+    /// The effective identity (lowercase; empty string = none resolved — the
+    /// route's existing empty-view behavior applies).
+    Identity(String),
+    /// A refusal (mismatch 403 / strict-unauth 401) — return it as-is.
+    Refuse(Result<Response>),
+}
+
+/// THE identity seam for the five identity-scoped routes (bsv-low #318,
+/// Rule 15 — handlers receive the resolved identity from ONE place; none of
+/// them re-chooses between the session identity and the `?identity=` claim).
+///
+/// The decision itself is [`crate::auth::resolve_view_identity`]; this
+/// wrapper only extracts the query param and maps refusals to honest JSON:
+/// * session identity ≠ `?identity=` → 403 naming BOTH keys (never a silent
+///   preference for either — identity keys are public in this system, so
+///   echoing them is honest, not a leak);
+/// * strict mode + anonymous → 401 (defense in depth; the front door already
+///   refuses these before routing).
+///
+/// Errors go through `json_error`, never `?` (the live-view LOW-7 rule: an
+/// escaped error is a response with neither wildcard CORS nor `no-store`).
+pub(crate) fn view_identity(req: &Request, ctx: &RouteContext<AuthState>) -> ViewIdentity {
+    let url = match req.url() {
+        Ok(u) => u,
+        Err(e) => {
+            console_warn!("[auth] request URL unavailable: {e}");
+            return ViewIdentity::Refuse(json_error("request url unavailable", 503));
+        }
+    };
+    let query = url
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .map(|(_, v)| v.into_owned());
+    match crate::auth::resolve_view_identity(ctx.data.mode, &ctx.data.caller, query.as_deref()) {
+        IdentityDecision::Serve(id) => ViewIdentity::Identity(id.unwrap_or_default()),
+        IdentityDecision::RefuseMismatch {
+            session_identity,
+            query_identity,
+        } => {
+            crate::auth::count_mismatch_refused();
+            ViewIdentity::Refuse(json_response(
+                serde_json::json!({
+                    "error": "identity mismatch: the authenticated BRC-103/104 identity does not match the ?identity= parameter",
+                    "authenticatedIdentity": session_identity,
+                    "queryIdentity": query_identity,
+                })
+                .to_string(),
+                403,
+            ))
+        }
+        IdentityDecision::RefuseUnauthenticated => {
+            crate::auth::count_strict_refused_unauthenticated();
+            ViewIdentity::Refuse(json_error(
+                "authentication required: AUTH_ENFORCE is on — authenticate via the BRC-103/104 handshake at /.well-known/auth",
+                401,
+            ))
+        }
+    }
 }
 
 /// `pot_records` row as D1 returns it (numbers as f64 — codebase convention,
@@ -93,7 +158,7 @@ struct BeefRow {
 ///
 /// Fail-safe shape: an outpoint with no row is `known:false, spent:null` —
 /// this surface never asserts "unspent" for an outpoint it has never seen.
-pub async fn utxo_status(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let url = req.url()?;
     let Some(param) = url
         .query_pairs()
@@ -157,7 +222,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<()>) -> Result<Response
 /// unretained coin is cleaned up. Missing everywhere (no row, NULL/empty
 /// beef, undecodable) → 404, so the answer upgrades by itself once the
 /// overlay stores the tx.
-pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let Some(txid) = ctx.param("txid").cloned() else {
         return json_error("missing txid", 400);
     };
@@ -257,7 +322,7 @@ pub async fn beef(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
 /// served (binding 503, upstream 502); `/pots-view` maps any error to a
 /// `tip: null` body instead (the D1 facts are still worth serving).
 async fn chaintracks_present_height(
-    ctx: &RouteContext<()>,
+    ctx: &RouteContext<AuthState>,
     tag: &str,
 ) -> std::result::Result<u64, (&'static str, u16)> {
     let svc = match ctx.env.service("CHAINTRACKS") {
@@ -303,7 +368,7 @@ async fn chaintracks_present_height(
 /// `GET /tip` — present chain height via the `CHAINTRACKS` service binding
 /// (`GET /getPresentHeight`, the same route the overlay's chain tracker
 /// calls). A binding fault is 503, an upstream fault 502.
-pub async fn tip(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     match chaintracks_present_height(&ctx, "tip").await {
         Ok(height) => json_response(tip_body(height), 200),
         Err((msg, status)) => json_error(msg, status),
@@ -349,7 +414,7 @@ impl PotsViewRowD1 {
 /// BEEF — a HINT the client hash-verifies against `spendingTxid`); plus the
 /// chain `tip` in the same body (`null` on a chaintracks fault — the D1
 /// facts still serve, and the client falls back to `/tip`).
-pub async fn pots_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn pots_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let url = req.url()?;
     let Some(param) = url
         .query_pairs()
@@ -462,13 +527,13 @@ impl RecoveryRowD1 {
 /// with nothing indexed sees the same well-formed empty answer. A pot with a
 /// party marker but no `pot_records` row yet is `spent:null` (never asserted
 /// unspent). Public data only, read-only, no secrets.
-pub async fn recovery_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let url = req.url()?;
-    let identity = url
-        .query_pairs()
-        .find(|(k, _)| k == "identity")
-        .map(|(_, v)| v.into_owned())
-        .unwrap_or_default();
+pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #318: identity comes from the ONE auth seam (session identity wins;
+    // mismatch refuses; anonymous lenient = the legacy query-param claim).
+    let identity = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id,
+        ViewIdentity::Refuse(resp) => return resp,
+    };
 
     // Missing / empty / malformed identity → empty result, not an error.
     if !valid_identity(&identity) {
@@ -580,7 +645,7 @@ struct ProofPointerRowD1 {
 /// join is best-effort: a fault there only drops the `proofTxid` hint (null),
 /// never a count and never a 5xx. An over-full window is reported via the
 /// body's `truncated` bit — never a complete-looking partial answer.
-pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let url = req.url()?;
     let limit_raw = url
         .query_pairs()
@@ -1297,14 +1362,13 @@ impl ResultsRowD1 {
 /// over-50-outpoint 503 lesson: newest [`crate::results::RESULTS_MAX_ROWS`]
 /// marker rows, claims queried in chunks of at most
 /// [`crate::logic::D1_CHUNK_OUTPOINTS`] binds.
-pub async fn results(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let url = req.url()?;
-    let identity = url
-        .query_pairs()
-        .find(|(k, _)| k == "identity")
-        .map(|(_, v)| v.into_owned())
-        .unwrap_or_default();
-    let identity_lc = identity.to_ascii_lowercase();
+pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #318: identity comes from the ONE auth seam (session identity wins;
+    // mismatch refuses; anonymous lenient = the legacy query-param claim).
+    let identity_lc = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id,
+        ViewIdentity::Refuse(resp) => return resp,
+    };
 
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(crate::results::results_body(&identity_lc, &[]), 200);
@@ -1541,14 +1605,13 @@ impl RefundViewRowD1 {
 /// `null` — the D1 facts still serve. ONE bounded D1 query
 /// ([`crate::refund_view::REFUND_VIEW_MAX_ROWS`] pots, one identity bind, no
 /// BLOBs).
-pub async fn refund_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let url = req.url()?;
-    let identity = url
-        .query_pairs()
-        .find(|(k, _)| k == "identity")
-        .map(|(_, v)| v.into_owned())
-        .unwrap_or_default();
-    let identity_lc = identity.to_ascii_lowercase();
+pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #318: identity comes from the ONE auth seam (session identity wins;
+    // mismatch refuses; anonymous lenient = the legacy query-param claim).
+    let identity_lc = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id,
+        ViewIdentity::Refuse(resp) => return resp,
+    };
 
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
@@ -1698,14 +1761,15 @@ impl HopsViewRowD1 {
 /// D1 query (≤[`crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS`] hop outpoints
 /// ×[`crate::hops_view::HOPS_VIEW_ROWS_PER_OUTPOINT`] rows, no BEEF
 /// blobs).
-pub async fn hops_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #318: identity comes from the ONE auth seam (session identity wins;
+    // mismatch refuses; anonymous lenient = the legacy query-param claim).
+    let identity_lc = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id,
+        ViewIdentity::Refuse(resp) => return resp,
+    };
+    // `url` is still needed below for the `?gameId=` escape hatch.
     let url = req.url()?;
-    let identity = url
-        .query_pairs()
-        .find(|(k, _)| k == "identity")
-        .map(|(_, v)| v.into_owned())
-        .unwrap_or_default();
-    let identity_lc = identity.to_ascii_lowercase();
 
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
@@ -2108,22 +2172,14 @@ async fn live_view_candidates(
 /// [`crate::live_view::LIVE_VIEW_CASE_FANOUT_CAP`] concurrent bounded
 /// subrequests, run CONCURRENTLY with the (also bounded) chaintracks tip
 /// hop — the added latency is `max(tip, cases)`, not `tip + cases`.
-pub async fn live_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // LOW-7: `?` here would escape the handler and produce a default error
-    // response with neither wildcard CORS nor `no-store`.
-    let url = match req.url() {
-        Ok(u) => u,
-        Err(e) => {
-            console_warn!("[live-view] request URL unavailable: {e}");
-            return json_error("request url unavailable", 503);
-        }
+pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #318: identity comes from the ONE auth seam (session identity wins;
+    // mismatch refuses; anonymous lenient = the legacy query-param claim).
+    // LOW-7 holds: the seam maps a URL fault through `json_error`, never `?`.
+    let identity_lc = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id,
+        ViewIdentity::Refuse(resp) => return resp,
     };
-    let identity = url
-        .query_pairs()
-        .find(|(k, _)| k == "identity")
-        .map(|(_, v)| v.into_owned())
-        .unwrap_or_default();
-    let identity_lc = identity.to_ascii_lowercase();
 
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
@@ -2353,7 +2409,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
 /// cache. `known:false` is the honest answer for every provider fault or
 /// un-corroborated negative — this surface never asserts what it cannot
 /// verify (positives are raw-hash + input-match verified).
-pub async fn spent_any(req: Request, _ctx: RouteContext<()>) -> Result<Response> {
+pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Response> {
     let url = req.url()?;
     let Some(param) = url
         .query_pairs()
@@ -2470,7 +2526,7 @@ struct BeefTrustRow {
 /// bumpless row: raw served, confirmed/height defer to the external leg
 /// (the #247 machinery). Weakens only unverified answers, never verified
 /// ones.
-async fn tx_any_index_leg(ctx: &RouteContext<()>, txid_lc: &str) -> (Option<String>, Option<u64>) {
+async fn tx_any_index_leg(ctx: &RouteContext<AuthState>, txid_lc: &str) -> (Option<String>, Option<u64>) {
     let Ok(db) = ctx.env.d1("OVERLAY_DB") else {
         console_warn!("[tx-any] OVERLAY_DB binding unavailable — break-glass leg only");
         return (None, None);
@@ -2578,7 +2634,7 @@ async fn tx_any_external_leg(
 /// tx LOW broadcast; external indexers are break-glass for legacy/foreign
 /// txids only — owner doctrine, bsv-low #229). ~15 s in-isolate cache.
 /// Unknown is the honest answer for every fault (`present: null`).
-pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let Some(txid) = ctx.param("txid").cloned() else {
         return json_error("missing txid", 400);
     };
@@ -2671,12 +2727,23 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
 }
 
 /// `GET /health` — liveness only (no DB touch).
-pub fn health(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
-    json_response(health_body(), 200)
+pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #318 (Rule 13 — surface, don't consume): the auth mode + per-isolate
+    // counters ride the health body, so "unauthenticated but accepted" is a
+    // number the operator watches during the lenient soak, never a silent
+    // accept. The flip criterion is written at `crate::auth`'s module docs.
+    let mut body: serde_json::Value =
+        serde_json::from_str(&health_body()).unwrap_or_else(|_| serde_json::json!({}));
+    body["auth"] = crate::auth::auth_health_json(
+        ctx.data.mode,
+        ctx.data.auth_configured,
+        &crate::auth::counters_snapshot(),
+    );
+    json_response(body.to_string(), 200)
 }
 
 /// Catch-all: JSON 404 for any unknown route/method.
-pub fn not_found(req: Request, _ctx: RouteContext<()>) -> Result<Response> {
+pub fn not_found(req: Request, _ctx: RouteContext<AuthState>) -> Result<Response> {
     json_error(&format!("no such route: {}", req.path()), 404)
 }
 
