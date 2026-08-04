@@ -132,7 +132,8 @@ pub fn refund_view_sql() -> String {
                 w.spentHeight AS spentHeight, \
                 EXISTS(SELECT 1 FROM potrefund_records pr \
                        WHERE pr.potTxid = w.potTxid AND pr.potVout = w.potVout) \
-                    AS backupMarkerPresent \
+                    AS backupMarkerPresent, \
+                sb.proof_verified AS spenderProofVerified \
          FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                   spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
                   markerCreatedAt, markerRowid, potCreatedAt, \
@@ -163,6 +164,8 @@ pub fn refund_view_sql() -> String {
            ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
            LIMIT {rows}) w \
+         LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
+              AND sb.txid = lower(w.spendingTxid) \
          ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = REFUND_VIEW_UNKNOWN_POT_QUOTA,
@@ -201,6 +204,12 @@ pub struct RefundViewRow {
     /// marker row, so this is never proof a genuine backup exists (the
     /// reader verifies — module docs).
     pub backup_marker_present: bool,
+    /// bsv-low#304's VERIFIED proof latch for the recorded spender
+    /// (`pot_beefs.proof_verified`, joined on `spendingTxid`) — set only by
+    /// the overlay's chaintracks-verifying writers. #323 MEDIUM-1: this is
+    /// the SECOND accepted confirmation signal, so `/refund-view` and
+    /// `/results` share one bar. `None` = no spender row joined.
+    pub spender_proof_verified: Option<bool>,
 }
 
 impl RefundViewRow {
@@ -273,7 +282,14 @@ pub fn derive_refund_status(
     trusted_verdict: Option<PotVerdict>,
     gate_passed: bool,
     backup_marker_present: bool,
+    spender_proof_verified: Option<bool>,
 ) -> (RefundStatus, Option<&'static str>) {
+    // #323 MEDIUM-1 — ONE confirmation bar, shared with `assemble_results`:
+    // the `spentConfirmed` flag OR a chaintracks-VERIFIED spender proof.
+    // Without the second signal these two money surfaces DISAGREED on a
+    // legacy row the migration stamped 0: `/results` served `refund` at a
+    // proven height while this view said `unknown`.
+    let confirmed_landing = spent_confirmed == Some(true) || spender_proof_verified == Some(true);
     match spent {
         // `spent = 0` is the overlay's NON-OBSERVATION of a spend on an
         // indexed pot (the admission default), not a UTXO existence check —
@@ -299,7 +315,7 @@ pub fn derive_refund_status(
             };
             (status, Some(source))
         }
-        Some(true) => match (spent_confirmed, trusted_verdict) {
+        Some(true) => match (confirmed_landing.then_some(true), trusted_verdict) {
             // Confirmed spend + a verdict decoded FOR that spender: the one
             // place this view asserts an outcome — pure chain truth.
             (Some(true), Some(PotVerdict::Refund)) => (RefundStatus::Landed, Some("chain")),
@@ -355,6 +371,7 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
                 verdict,
                 gate_passed,
                 r.backup_marker_present,
+                r.spender_proof_verified,
             );
             RefundEntry {
                 game_id: r.game_id,
@@ -421,6 +438,7 @@ mod tests {
             pot_txid: h64(0xaa),
             pot_vout: 0,
             marker_recovery_height: 900_123,
+            spender_proof_verified: None,
             cov_recovery_height: None,
             spent: Some(false),
             spending_txid: None,
@@ -434,15 +452,95 @@ mod tests {
 
     // ── status derivation table ─────────────────────────────────────────────
 
+    /// #323 MEDIUM-1 — the two money surfaces share ONE confirmation bar.
+    ///
+    /// This cell exists because the previous round asserted that sharing in
+    /// a COMMENT while the code did not implement it: `proof_verified`
+    /// appeared in this file exactly once, inside the sentence claiming it
+    /// was used. A legacy row the migration stamped `spentConfirmed = 0`
+    /// then resolved as `refund` on `/results` and `unknown` here. The claim
+    /// is now executable, so it cannot rot into a lie again.
+    #[test]
+    fn a_verified_spender_proof_is_a_landing_here_exactly_as_in_results() {
+        // The parked intent: no flag, no proof ⇒ unknown on BOTH surfaces.
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::Refund),
+                true,
+                true,
+                None
+            ),
+            (RefundStatus::Unknown, None),
+            "a recorded-but-unconfirmed pointer is a displaceable intent"
+        );
+        // The legacy shape: flag 0, but a chaintracks-VERIFIED spender proof.
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::Refund),
+                true,
+                true,
+                Some(true)
+            ),
+            (RefundStatus::Landed, Some("chain")),
+            "a VERIFIED spender proof is a landing even when the flag is 0"
+        );
+        // And it supersedes correctly for a non-refund verdict too.
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                None,
+                Some(PotVerdict::WinnerA),
+                true,
+                true,
+                Some(true)
+            ),
+            (RefundStatus::Superseded, Some("chain")),
+        );
+        // An UNVERIFIED proof latch is not a signal (never a guess).
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::Refund),
+                true,
+                true,
+                Some(false)
+            ),
+            (RefundStatus::Unknown, None),
+        );
+    }
+
+    /// The SQL must actually FETCH the signal the bar reads — otherwise the
+    /// widened rule is inoperative in production (the producer-level check).
+    #[test]
+    fn refund_view_sql_fetches_the_spender_proof_latch() {
+        let sql = refund_view_sql();
+        assert!(
+            sql.contains("sb.proof_verified AS spenderProofVerified"),
+            "the proof latch must be SELECTed: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
+              AND sb.txid = lower(w.spendingTxid)"
+            ),
+            "the join must sit OUTSIDE the window, on survivors only: {sql}"
+        );
+    }
+
     #[test]
     fn unspent_below_gate_is_armed() {
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, false, false),
+            derive_refund_status(Some(false), Some(false), None, false, false, None),
             (RefundStatus::Armed, Some("chain"))
         );
         // A published backup upgrades the SOURCE, not the status.
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, false, true),
+            derive_refund_status(Some(false), Some(false), None, false, true, None),
             (RefundStatus::Armed, Some("chain+marker"))
         );
     }
@@ -450,11 +548,11 @@ mod tests {
     #[test]
     fn unspent_past_gate_is_gate_open() {
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, true, false),
+            derive_refund_status(Some(false), Some(false), None, true, false, None),
             (RefundStatus::GateOpen, Some("chain"))
         );
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, true, true),
+            derive_refund_status(Some(false), Some(false), None, true, true, None),
             (RefundStatus::GateOpen, Some("chain+marker"))
         );
     }
@@ -462,7 +560,14 @@ mod tests {
     #[test]
     fn confirmed_refund_verdict_is_landed() {
         assert_eq!(
-            derive_refund_status(Some(true), Some(true), Some(PotVerdict::Refund), true, true),
+            derive_refund_status(
+                Some(true),
+                Some(true),
+                Some(PotVerdict::Refund),
+                true,
+                true,
+                None
+            ),
             (RefundStatus::Landed, Some("chain"))
         );
     }
@@ -471,7 +576,7 @@ mod tests {
     fn confirmed_settle_verdicts_are_superseded() {
         for v in [PotVerdict::WinnerA, PotVerdict::WinnerB, PotVerdict::Tie] {
             assert_eq!(
-                derive_refund_status(Some(true), Some(true), Some(v), false, true),
+                derive_refund_status(Some(true), Some(true), Some(v), false, true, None),
                 (RefundStatus::Superseded, Some("chain"))
             );
         }
@@ -481,7 +586,7 @@ mod tests {
     fn incomplete_facts_are_unknown_never_guessed() {
         // No pot_records row at all.
         assert_eq!(
-            derive_refund_status(None, None, None, true, true),
+            derive_refund_status(None, None, None, true, true, None),
             (RefundStatus::Unknown, None)
         );
         // Spent but unconfirmed — a displaceable intent, even with a verdict.
@@ -491,17 +596,18 @@ mod tests {
                 Some(false),
                 Some(PotVerdict::Refund),
                 true,
-                true
+                true,
+                None
             ),
             (RefundStatus::Unknown, None)
         );
         assert_eq!(
-            derive_refund_status(Some(true), None, None, false, false),
+            derive_refund_status(Some(true), None, None, false, false, None),
             (RefundStatus::Unknown, None)
         );
         // Confirmed spend, no trusted decoded verdict.
         assert_eq!(
-            derive_refund_status(Some(true), Some(true), None, false, true),
+            derive_refund_status(Some(true), Some(true), None, false, true, None),
             (RefundStatus::Unknown, None)
         );
     }

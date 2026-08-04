@@ -159,6 +159,11 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<RefundViewRow> {
             verdict_txid: r.get("verdictTxid")?,
             spent_height: r.get::<_, Option<i64>>("spentHeight")?.map(|v| v as u64),
             backup_marker_present: r.get::<_, i64>("backupMarkerPresent")? != 0,
+            // #323 MEDIUM-1 — the second confirmation signal, read through
+            // the REAL SQL so the shared bar is proven against the schema.
+            spender_proof_verified: r
+                .get::<_, Option<i64>>("spenderProofVerified")?
+                .map(|v| v != 0),
         })
     })
     .expect("query")

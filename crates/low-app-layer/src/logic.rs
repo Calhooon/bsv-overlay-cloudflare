@@ -490,6 +490,7 @@ pub fn recovery_view_sql() -> String {
     format!(
         "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
             w.recoveryHeight AS recoveryHeight, \
+            w.covRecoveryHeight AS covRecoveryHeight, \
             w.opponentIdentity AS opponentIdentity, \
             w.spent AS spent, w.spendingTxid AS spendingTxid, \
             w.spentConfirmed AS spentConfirmed, \
@@ -498,14 +499,15 @@ pub fn recovery_view_sql() -> String {
               spent, spendingTxid, spentConfirmed, \
               markerCreatedAt, markerRowid, potCreatedAt, \
               CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
-       FROM (SELECT gameId, potTxid, potVout, recoveryHeight, opponentIdentity, \
-                spent, spendingTxid, spentConfirmed, \
+       FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                opponentIdentity, spent, spendingTxid, spentConfirmed, \
                 markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
                 ROW_NUMBER() OVER (PARTITION BY unknownPot \
                                    ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                                             markerCreatedAt DESC, markerRowid DESC) AS potRank \
          FROM (SELECT pp.gameId AS gameId, pp.potTxid AS potTxid, \
                   pp.potVout AS potVout, pp.recoveryHeight AS recoveryHeight, \
+                  r.recoveryHeight AS covRecoveryHeight, \
                   pp.opponentIdentity AS opponentIdentity, \
                   r.spent AS spent, r.spendingTxid AS spendingTxid, \
                   r.spentConfirmed AS spentConfirmed, \
@@ -563,8 +565,16 @@ pub struct RecoveryRow {
     pub pot_txid: String,
     /// The pot output index within `pot_txid`.
     pub pot_vout: u32,
-    /// The pre-signed refund's recovery height.
+    /// The caller's OWN potparty marker height — byte-format-admitted, a
+    /// HINT. #323 MEDIUM-3: under oldest-marker-wins an attacker who files
+    /// a marker BEFORE the victim's own becomes the sole source of this
+    /// field, and `/recovery-view` serves no `sigHex` for the client to
+    /// collapse candidates itself — so the covenant value below is preferred.
     pub recovery_height: u32,
+    /// The COVENANT-COMMITTED recoveryHeight decoded from the admitted
+    /// funding lock (#284) — CHAIN TRUTH, unforgeable by a marker filer.
+    /// `None` for bare/legacy rows.
+    pub cov_recovery_height: Option<u64>,
     /// The opponent seat's compressed identity pubkey (33 bytes, lowercase
     /// hex).
     pub opponent_identity: String,
@@ -587,7 +597,12 @@ pub struct RecoveryEntry {
     pub game_id: String,
     pub pot_txid: String,
     pub pot_vout: u32,
-    pub recovery_height: u32,
+    /// The height this view SERVES: the covenant-committed value when
+    /// decoded (chain truth), else the caller's marker value (hint), each
+    /// range-checked — via the shared `served_recovery_height`, so
+    /// `/recovery-view`, `/refund-view` and `/live-view` cannot drift on
+    /// the sourcing rule (#323 MEDIUM-3).
+    pub recovery_height: Option<u64>,
     pub opponent_identity: String,
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
@@ -613,6 +628,15 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
     // surviving rows means the page is incomplete. That bit is load-bearing,
     // not cosmetic — it is what makes a flood DETECTABLE rather than a
     // silently-short answer that looks complete.
+    // #323 LOW-2 — the Rust key must not be NARROWER than the SQL's, or the
+    // belt could collapse two rows the SQL kept and the truncation bit would
+    // then say COMPLETE when it is not (the one direction that lies).
+    // SQL dedupes on case-sensitive `(potTxid, potVout)`; this adds `gameId`
+    // and lowercases. Lowercasing is safe (it can only MERGE rows the SQL
+    // treated as distinct, and `pot_records`/`pot_beefs` keys are lowercase
+    // by write convention). Adding `gameId` makes the key strictly WIDER, so
+    // it can only ever keep more rows, never fewer — and any extra row is
+    // counted before `truncated` is computed.
     let mut seen = std::collections::HashSet::new();
     let deduped: Vec<RecoveryRow> = rows
         .into_iter()
@@ -639,7 +663,10 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
                 game_id: r.game_id,
                 pot_txid: r.pot_txid,
                 pot_vout: r.pot_vout,
-                recovery_height: r.recovery_height,
+                recovery_height: crate::refund_view::served_recovery_height(
+                    r.cov_recovery_height,
+                    r.recovery_height,
+                ),
                 opponent_identity: r.opponent_identity,
                 spent: r.spent,
                 spending_txid: r.spending_txid,
@@ -943,6 +970,23 @@ pub struct Leaderboard {
     pub hands: Vec<LeaderboardHandRow>,
 }
 
+/// Is this outpoint status a CONFIRMED landing — the one basis on which a
+/// verdict may be derived (#323)?
+///
+/// Extracted from `routes::classify_spent_pots` (MEDIUM-5) because that file
+/// is the one this repo flags as silently deletable: the 2026-07-28 re-gate
+/// showed a whole delivery there could be removed with the suite still
+/// green. A money-relevant predicate must live where the other pure rules
+/// live, and be pinned there.
+///
+/// `spent = 1` ALONE is not enough: the overlay's unconfirmed write path
+/// stamps `verdict`/`verdictTxid` while leaving `spentConfirmed = 0`, so a
+/// PARKED spender would otherwise mint a real verdict — which can both
+/// create a chain-attributed win and erase an honest claim.
+pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
+    status.spent == Some(true) && status.spent_confirmed == Some(true)
+}
+
 /// True iff the marker is anchored: its `potTxid:0` is recorded spent by the
 /// named `settleTxid` in `pot_records` — the SAME anchor `/utxo-status`
 /// reports. An unknown/unspent/differently-spent pot is NOT anchored
@@ -961,8 +1005,7 @@ fn marker_anchored(
             // the OPPONENT, would still count as a win for the wrong player.
             // Same bar as `refund_view::derive_refund_status` and
             // `assemble_results` (#323 defect 1).
-            st.spent == Some(true)
-                && st.spent_confirmed == Some(true)
+            is_confirmed_landing(st)
                 && st
                     .spending_txid
                     .as_deref()
@@ -1958,6 +2001,72 @@ mod tests {
         assert!(!valid_identity(&"g".repeat(66)));
     }
 
+    /// #323 MEDIUM-3 — the SERVED recoveryHeight prefers the COVENANT-
+    /// COMMITTED value over the marker's unverified one.
+    ///
+    /// This matters more under oldest-marker-wins: an attacker who files a
+    /// marker BEFORE the victim's own becomes the sole surviving source of
+    /// this field, and `/recovery-view` serves no `sigHex` for the client to
+    /// collapse candidates itself. The covenant value is chain truth and a
+    /// marker filer cannot forge it.
+    #[test]
+    fn the_served_recovery_height_prefers_covenant_truth() {
+        let row = |cov: Option<u64>, marker: u32| RecoveryRow {
+            game_id: "11".repeat(32),
+            pot_txid: txid_a(),
+            pot_vout: 0,
+            recovery_height: marker,
+            cov_recovery_height: cov,
+            opponent_identity: format!("03{}", "bb".repeat(32)),
+            spent: None,
+            spending_txid: None,
+            spent_confirmed: None,
+            spender_beef_hex: None,
+        };
+        // Covenant truth wins over a hostile marker's value.
+        let (out, _) = assemble_recovery_view(vec![row(Some(958_504), 1)]);
+        assert_eq!(out[0].recovery_height, Some(958_504));
+        // No covenant value (bare/legacy) ⇒ the marker hint is served.
+        let (out, _) = assemble_recovery_view(vec![row(None, 958_600)]);
+        assert_eq!(out[0].recovery_height, Some(958_600));
+        // Out-of-range values are refused rather than shown as a countdown.
+        let (out, _) = assemble_recovery_view(vec![row(None, 0)]);
+        assert_eq!(out[0].recovery_height, None);
+    }
+
+    /// The SQL must FETCH the covenant height, else the preference above is
+    /// inoperative in production (producer-level check).
+    #[test]
+    fn recovery_view_sql_fetches_the_covenant_height() {
+        let sql = recovery_view_sql();
+        assert!(
+            sql.contains("r.recoveryHeight AS covRecoveryHeight"),
+            "covenant height must be SELECTed from pot_records: {sql}"
+        );
+        assert!(sql.contains("w.covRecoveryHeight AS covRecoveryHeight"));
+    }
+
+    /// #323 MEDIUM-5 — the confirmed-landing predicate, pinned where it
+    /// lives rather than inside `routes.rs`.
+    #[test]
+    fn is_confirmed_landing_requires_both_flags() {
+        let op = Outpoint {
+            txid: txid_a(),
+            vout: 0,
+        };
+        let mk = |spent, confirmed| {
+            let mut s = OutpointStatus::known(&op, spent, Some("ab".repeat(32)), confirmed);
+            s.spent = Some(spent);
+            s.spent_confirmed = Some(confirmed);
+            s
+        };
+        assert!(is_confirmed_landing(&mk(true, true)));
+        assert!(!is_confirmed_landing(&mk(true, false)), "parked intent");
+        assert!(!is_confirmed_landing(&mk(false, true)));
+        // Unknown (no pot_records row) is never a landing.
+        assert!(!is_confirmed_landing(&OutpointStatus::unknown(&op)));
+    }
+
     #[test]
     fn recovery_view_sql_shape() {
         let sql = recovery_view_sql();
@@ -2004,17 +2113,30 @@ mod tests {
             )),
             "unknown-pot quota tier missing or not tied to the const: {sql}"
         );
-        // The window takes MAX_ROWS + 1 so truncation is DETECTABLE. Pinned
-        // as an exact equality against the const — LOW-1: a `contains("LIMIT")`
-        // (or any prefix match) passes with LIMIT 4000 and proves nothing.
-        assert!(
-            sql.contains(&format!("LIMIT {}", RECOVERY_VIEW_MAX_ROWS + 1)),
-            "probe LIMIT must be RECOVERY_VIEW_MAX_ROWS + 1: {sql}"
-        );
+        // The window takes MAX_ROWS + 1 so truncation is DETECTABLE.
+        //
+        // #323 MEDIUM-2 — PARSE the integer and compare NUMERICALLY. The
+        // previous version called itself "an exact equality against the
+        // const" while remaining a `contains`, which is a PREFIX match:
+        // `LIMIT 1010` contains `LIMIT 101`, so a 10x window shipped green
+        // under an assertion whose own comment warned against exactly that.
+        // The `count() == 1` guard closed a different hole and did not help.
+        let limits: Vec<u64> = sql
+            .match_indices("LIMIT ")
+            .map(|(i, _)| {
+                sql[i + "LIMIT ".len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .expect("LIMIT must be followed by an integer")
+            })
+            .collect();
+        assert_eq!(limits.len(), 1, "exactly one LIMIT: {sql}");
         assert_eq!(
-            sql.matches("LIMIT ").count(),
-            1,
-            "exactly one LIMIT, so the pin above cannot be satisfied by a second one: {sql}"
+            limits[0],
+            (RECOVERY_VIEW_MAX_ROWS + 1) as u64,
+            "probe LIMIT must be RECOVERY_VIEW_MAX_ROWS + 1: {sql}"
         );
     }
 
@@ -2029,6 +2151,7 @@ mod tests {
                 pot_txid: txid_a(),
                 pot_vout: 0,
                 recovery_height: 958_504,
+                cov_recovery_height: None,
                 opponent_identity: format!("03{}", "bb".repeat(32)),
                 spent: Some(true),
                 spending_txid: Some(spender.clone()),
@@ -2041,6 +2164,7 @@ mod tests {
                 pot_txid: txid_b(),
                 pot_vout: 1,
                 recovery_height: 958_600,
+                cov_recovery_height: None,
                 opponent_identity: format!("03{}", "cc".repeat(32)),
                 spent: Some(true),
                 spending_txid: Some(spender.clone()),
@@ -2054,6 +2178,7 @@ mod tests {
                 pot_txid: "ef".repeat(32),
                 pot_vout: 2,
                 recovery_height: 958_700,
+                cov_recovery_height: None,
                 opponent_identity: format!("03{}", "dd".repeat(32)),
                 spent: None,
                 spending_txid: None,
@@ -2065,7 +2190,7 @@ mod tests {
         assert_eq!(out.len(), 3);
         // Joined spent pot: the raw rides back, order preserved.
         assert_eq!(out[0].pot_txid, txid_a());
-        assert_eq!(out[0].recovery_height, 958_504);
+        assert_eq!(out[0].recovery_height, Some(958_504));
         assert_eq!(out[0].spent, Some(true));
         assert_eq!(out[0].spending_txid.as_deref(), Some(spender.as_str()));
         assert_eq!(out[0].spent_confirmed, Some(true));
@@ -2094,6 +2219,7 @@ mod tests {
             pot_txid: txid_a(),
             pot_vout: 0,
             recovery_height: 958_504,
+            cov_recovery_height: None,
             opponent_identity: format!("03{}", "bb".repeat(32)),
             spent: None,
             spending_txid: None,
@@ -2151,6 +2277,7 @@ mod tests {
             pot_txid: txid_a(),
             pot_vout: 0,
             recovery_height: 958_504,
+            cov_recovery_height: None,
             opponent_identity: format!("03{}", "bb".repeat(32)),
             spent: Some(true),
             spending_txid: Some("f0".repeat(32)),
@@ -2170,7 +2297,7 @@ mod tests {
                 game_id: "11".repeat(32),
                 pot_txid: txid_a(),
                 pot_vout: 0,
-                recovery_height: 958_504,
+                recovery_height: Some(958_504),
                 opponent_identity: format!("03{}", "bb".repeat(32)),
                 spent: Some(true),
                 spending_txid: Some("f0".repeat(32)),
@@ -2181,7 +2308,7 @@ mod tests {
                 game_id: "33".repeat(32),
                 pot_txid: "ef".repeat(32),
                 pot_vout: 2,
-                recovery_height: 958_700,
+                recovery_height: Some(958_700),
                 opponent_identity: format!("03{}", "dd".repeat(32)),
                 spent: None,
                 spending_txid: None,

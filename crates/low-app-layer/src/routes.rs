@@ -424,6 +424,10 @@ struct RecoveryRowD1 {
     spent_confirmed: Option<f64>,
     #[serde(rename = "spenderBeef")]
     spender_beef: Option<String>,
+    /// #323 MEDIUM-3 — the covenant-committed height from `pot_records`;
+    /// chain truth, preferred over the marker's unverified value.
+    #[serde(rename = "covRecoveryHeight")]
+    cov_recovery_height: Option<f64>,
 }
 
 impl RecoveryRowD1 {
@@ -433,6 +437,7 @@ impl RecoveryRowD1 {
             pot_txid: self.pot_txid,
             pot_vout: self.pot_vout as u32,
             recovery_height: self.recovery_height as u32,
+            cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
             opponent_identity: self.opponent_identity,
             spent: self.spent.map(|v| v != 0.0),
             spending_txid: self.spending_txid,
@@ -793,7 +798,7 @@ async fn classify_spent_pots(
         // `PotVerdict` here — which can both CREATE a chain-attributed win
         // and ERASE an honest claim via `chain_contradicted`. `spent_confirmed`
         // was already in the struct; it was simply not read.
-        if s.spent == Some(true) && s.spent_confirmed == Some(true) {
+        if crate::logic::is_confirmed_landing(s) {
             if let Some(spender) = &s.spending_txid {
                 let pot = s.txid.to_ascii_lowercase();
                 if seen.insert(pot.clone()) {
@@ -1400,6 +1405,10 @@ struct RefundViewRowD1 {
     spent_height: Option<f64>,
     #[serde(rename = "backupMarkerPresent")]
     backup_marker_present: f64,
+    /// #323 MEDIUM-1 — `pot_beefs.proof_verified` for the recorded spender;
+    /// the second accepted confirmation signal, shared with `/results`.
+    #[serde(rename = "spenderProofVerified")]
+    spender_proof_verified: Option<f64>,
 }
 
 impl RefundViewRowD1 {
@@ -1409,6 +1418,7 @@ impl RefundViewRowD1 {
             pot_txid: self.pot_txid,
             pot_vout: self.pot_vout as u32,
             marker_recovery_height: self.recovery_height as u32,
+            spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
             cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
             spent: self.spent.map(|v| v != 0.0),
             spending_txid: self.spending_txid,
