@@ -294,11 +294,23 @@ pub(crate) mod tests {
     async fn served_documentation_wire_table_matches_the_parser() {
         let doc = HoppartyTopicManager::new().get_documentation().await;
 
-        // ── Parse the wire-format table: rows shaped `| N | name | … |`.
-        // (A table parse, so PROSE mentioning a field name — e.g. the
-        // paragraph explaining that hopTxid is absent — cannot satisfy or
-        // break it. Rule 9's "the scanner counts prose" mode.)
-        let rows: Vec<(usize, String)> = doc
+        // ── Parse the wire-format table: rows shaped `| N | name | … |`,
+        // SCOPED to the `## Wire format` section (delta gate NEW-LOW-D).
+        //
+        // The claim to make carefully: prose can never SATISFY this scan
+        // (a table row needs ≥4 pipe cells with a numeric second cell), but
+        // an unscoped scan over the whole file could be BROKEN by ordinary
+        // documentation — a sentence containing `| 4 | …` pipes, or a
+        // second correct markdown table elsewhere. That fails loudly rather
+        // than silently, so it was hygiene not security; it is fixed the
+        // way the sibling `served_documentation_answer_keys_match_the_serializer`
+        // already does it, by splitting to the section first.
+        let section = doc
+            .split("## Wire format")
+            .nth(1)
+            .and_then(|tail| tail.split("\n## ").next())
+            .expect("the served doc must carry a `## Wire format` section");
+        let rows: Vec<(usize, String)> = section
             .lines()
             .filter_map(|line| {
                 let cells: Vec<&str> = line.trim().split('|').map(str::trim).collect();

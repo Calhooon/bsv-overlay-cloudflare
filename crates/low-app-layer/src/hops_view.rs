@@ -199,9 +199,16 @@ const _: () = assert!(HOPS_VIEW_VERIFY_BUDGET > HOPS_VIEW_MAX_OUTPOINTS);
 ///
 /// **What actually prices the attack is the next key, `hopSatsOnChain
 /// DESC`** — the value the CHAIN records for that output, never the value
-/// the marker claims. Displacing an honest hop therefore costs *at least
-/// its value, locked in a real output, per attacker outpoint*: capital,
-/// not dust. This was verified by injection — neutering `paidTier` alone
+/// the marker claims. Displacing an honest hop therefore requires an
+/// output of at least its value per attacker outpoint.
+///
+/// That is a real bar against DUST, and it is weaker than it first looks
+/// against a funded attacker: the value is paid to the attacker's OWN key,
+/// and `hopSatsOnChain` is decoded once at admission and never re-read, so
+/// a single coin CHAINED through k transactions satisfies it k times at
+/// ~one hop of peak, fully recoverable, capital. See the re-priced
+/// residual at [`assemble_hops_view`] — do not restate this key as a cost
+/// multiplier without reading it. This was verified by injection — neutering `paidTier` alone
 /// does NOT re-open the flood, because the value key already demotes dust,
 /// so the ordering doc must not credit the tier with work it does not do
 /// (Rule 10).
@@ -692,32 +699,60 @@ pub struct HopEntry {
 /// The sort is STABLE, so within each verification class the SQL's
 /// deterministic chain-fact order is preserved exactly.
 ///
-/// # Residual, stated with its measured price
+/// # Residual, RE-PRICED at the delta gate (the first pricing was wrong)
 ///
-/// This reorders the PAGE; it does not enlarge the CANDIDATE set. Measured
-/// against the shipped SQL through the real producer chain:
+/// This reorders the PAGE; it does not enlarge the CANDIDATE set, and the
+/// ranking still reads its top keys from an attacker-writable table. What
+/// the ranking DID close, measured through the real producer chain: the
+/// original ~3,600-sat dust flood is dead (dust at k=400 leaves the honest
+/// row at page position 0, Verified — whether the flood is reactive or
+/// pre-dated).
 ///
-/// | flood (one tx, k outpoints)              | honest row      |
-/// |------------------------------------------|-----------------|
-/// | dust, k = 400                            | present, VERIFIED, page position 0 |
-/// | value-matched (k × 80,800), REACTIVE     | present, VERIFIED, page position 0 |
-/// | value-matched, PRE-DATED (k = 100)       | **displaced**, `truncated: true`   |
+/// What survives is **reactive, single-actor, permanent, and cheap**:
 ///
-/// So the surviving attack needs all three of: targeting a specific
-/// identity in advance; locking at least the honest hop's value per
-/// outpoint (100 × 80,800 = **8,080,000 sats** in one transaction); and
-/// landing before the victim funds. Against the pre-fix cost (~3,600 sats,
-/// reactive) that is ~2,244× the capital plus a change of kind —
-/// predictive, with the capital held for the wait.
+/// | shape (k = 100 outpoints)                    | honest row | cost |
+/// |----------------------------------------------|-----------|------|
+/// | dust, reactive or pre-dated                  | position 0, Verified | — |
+/// | paid at EXACTLY the hop value, reactive      | position 0, Verified | — |
+/// | **paid at hop value + 1, REACTIVE**          | **absent**, `truncated:true` | ~3.5k sats burned |
+/// | **one coin CHAINED through k txs**           | **absent**, `truncated:true` | ~5.2k burned, ~86k peak capital |
 ///
-/// It is the SAME residual class `partyFor` documents for
-/// `potparty_records` (#281): a discovery query has no verified key
-/// material to bind, so superset-plus-verify is the fallback, and the only
-/// real closures are priced admission or per-identity auth + quota (#318).
-/// `truncated` is set honestly throughout — the caller is never told a
-/// crowded page is complete — and `?gameId=` reaches a crowded-out row
-/// unless the flood names that same game. Pinned from the unsafe side by
-/// `a_predated_value_matched_flood_is_the_documented_residual`.
+/// Three corrections to what an earlier revision of this comment claimed,
+/// each of which mattered (Rule 10 — the most specific claim was the most
+/// wrong):
+///
+///  1. **Pre-dating is NOT required.** Paying exactly the hop value lands
+///     on the `COALESCE(potCreatedAt, firstMarkerAt) ASC` tie-break, so the
+///     honest row won on AGE, not on the value key. One satoshi more skips
+///     the tie-break entirely and evicts reactively. Threshold unchanged
+///     at exactly k=100 (k=99 present, k=100 absent).
+///  2. **The capital is ~ONE hop, not k hops.** `hopSatsOnChain` is decoded
+///     once at admission and never re-read, so spending the outputs
+///     afterwards does not restore the honest row: the attacker chains a
+///     SINGLE coin through k transactions, each spending the previous
+///     output into the next minus fee, one marker each. Measured peak
+///     capital ≈ 86,000 sats (~1.06× the victim's hop) and FULLY
+///     RECOVERABLE.
+///  3. **The burn barely moved** — ~1.0–1.4× the pre-fix cost, not the
+///     ~2,244× an earlier revision claimed. The honest summary is: burn
+///     roughly unchanged, peak *recoverable* capital raised ~23×.
+///
+/// And the price **scales with the victim's own ante**, so a low-stakes hop
+/// is proportionally cheaper to erase.
+///
+/// Disposition: tracked residual, not a money-loss regression — the honest
+/// row is HIDDEN, never altered, `truncated: true` is always set, and the
+/// signatures ride back for client re-verification. It is the same class
+/// #281 documents for `partyFor` (a discovery query has no verified key
+/// material to bind). **Closure direction for the issue, not this branch:**
+/// the only inputs an attacker cannot supply are #318's per-identity auth +
+/// quota, or promoting on the identity signature the SQL cannot currently
+/// see (a `seatSigValid`-at-admission ORDERING HINT, re-verified
+/// unconditionally downstream — the same shape recommended for #283).
+///
+/// Pinned from the UNSAFE side by
+/// `a_value_plus_one_reactive_flood_is_the_documented_residual` and
+/// `a_chained_single_coin_flood_is_the_documented_residual`.
 pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool, bool) {
     // Distinct outpoints in served order; drop rows beyond the page.
     let mut outpoints: Vec<(String, u32)> = Vec::new();

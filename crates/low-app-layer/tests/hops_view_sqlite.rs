@@ -956,41 +956,88 @@ fn a_value_matched_reactive_flood_cannot_evict_either() {
     }
 }
 
-/// The DOCUMENTED RESIDUAL, pinned from the UNSAFE side so it cannot drift
-/// into a silent regression or a silent fix nobody noticed.
+/// The DOCUMENTED RESIDUAL (1 of 2), pinned from the UNSAFE side so it
+/// cannot drift into a silent regression or a silent fix nobody noticed.
 ///
-/// An attacker who (a) targets a specific identity IN ADVANCE, (b) locks
-/// ≥ the honest hop's value per outpoint — 100 × 80,800 = **8,080,000
-/// sats** in one transaction — and (c) lands it BEFORE the victim ever
-/// funds that hop, still displaces the honest row from the default page.
-/// Measured: honestPresent=false, truncated=true.
-///
-/// Versus the pre-fix attack (~3,600 sats, REACTIVE) that is a ~2,244×
-/// capital increase plus a change of kind: predictive rather than
-/// reactive, with the capital held for the whole waiting period. It is the
-/// same residual class `partyFor` documents for `potparty_records` (#281:
-/// discovery cannot bind verified key material, so superset-plus-verify is
-/// the fallback), and it has the same two real closures — priced admission,
-/// or per-identity auth + quota (#318). `truncated: true` is set honestly
-/// throughout, so the caller is never told a crowded page is complete.
+/// **REACTIVE eviction at hop value + 1.** The first remediation tested a
+/// flood paid at EXACTLY the hop value, which lands on the oldest-first
+/// tie-break — so the honest row won on AGE and the residual was written
+/// up as requiring a PRE-DATED flood. It does not: one satoshi more skips
+/// the tie-break and evicts reactively. Threshold measured at exactly
+/// k=100 (k=99 present, k=100 absent), i.e. unchanged from pre-fix; only
+/// the per-outpoint value requirement moved.
 #[test]
-fn a_predated_value_matched_flood_is_the_documented_residual() {
+fn a_value_plus_one_reactive_flood_is_the_documented_residual() {
     let conn = production_schema_db();
     let honest = build_marker(0xa1, GAME, 0, 80_800, true);
-    // The flood lands FIRST — the attacker knew the identity in advance.
-    flood_container(&conn, 0xa1, 100, 80_800, 10);
-    let honest_txid = admit_marker(&conn, &honest, 80_800, 0x01, 5_000);
-    admit_hop(&conn, &honest_txid, 80_800, 5_000);
+    let honest_txid = admit_marker(&conn, &honest, 80_800, 0x01, 1_000);
+    admit_hop(&conn, &honest_txid, 80_800, 1_000);
+    // REACTIVE: strictly later than the honest hop. Paid at value + 1.
+    flood_container(&conn, 0xa1, 100, 80_801, 5_000);
 
     let (entries, truncated, _) = assemble_hops_view(query_rows(&conn, &honest.identity_hex));
     assert!(
         !entries.iter().any(|e| e.hop_txid == honest_txid),
-        "this cell pins the RESIDUAL: if the honest row now survives a \
-         pre-dated value-matched flood, the residual is CLOSED and this \
-         cell (and the docs quoting it) must be rewritten — do not delete \
-         it silently"
+        "this cell pins the RESIDUAL: if a REACTIVE value+1 flood no longer \
+         evicts, the residual is CLOSED and the pricing in \
+         `assemble_hops_view` (and this cell) must be rewritten — do not \
+         delete it silently"
     );
     assert!(truncated, "and the caller is told the page is incomplete");
+
+    // The boundary is exactly 100: one fewer and the honest row survives,
+    // so the number in the docs is measured, not rounded.
+    let conn = production_schema_db();
+    let honest_txid = admit_marker(&conn, &honest, 80_800, 0x01, 1_000);
+    admit_hop(&conn, &honest_txid, 80_800, 1_000);
+    flood_container(&conn, 0xa1, 99, 80_801, 5_000);
+    let (entries, _, _) = assemble_hops_view(query_rows(&conn, &honest.identity_hex));
+    assert!(
+        entries.iter().any(|e| e.hop_txid == honest_txid),
+        "k=99 must still leave the honest row on the page"
+    );
+}
+
+/// The DOCUMENTED RESIDUAL (2 of 2): **the capital is ~ONE hop, not k.**
+///
+/// `hopSatsOnChain` is decoded once at admission and never re-read, so
+/// spending the outputs afterwards does not restore the honest row. The
+/// attacker therefore chains a SINGLE coin through k transactions — each
+/// spending the previous output into the next minus fee, one marker each —
+/// satisfying the value key k times at ~one hop of peak, fully
+/// recoverable, capital (measured ≈ 86,000 sats ≈ 1.06× the victim's hop).
+#[test]
+fn a_chained_single_coin_flood_is_the_documented_residual() {
+    let conn = production_schema_db();
+    let honest = build_marker(0xa1, GAME, 0, 80_800, true);
+    let honest_txid = admit_marker(&conn, &honest, 80_800, 0x01, 1_000);
+    admit_hop(&conn, &honest_txid, 80_800, 1_000);
+
+    let peak = 86_000u64;
+    for i in 0..100u32 {
+        let value = peak - 50 * i as u64; // fee decay along the chain
+        assert!(value > 80_800, "every link must still outrank the hop");
+        let m = build_marker(0xa1, GAME, 0, value, false);
+        let (beef, _) = container(
+            &expected_hop_lock_hex(&m.settle_pub_hex).unwrap(),
+            value,
+            &m.script,
+            (i % 251) as u8 + 3,
+        );
+        let txid = admit_container(&conn, &beef, 1, 5_000 + i as i64);
+        // Submitted under tm_lowfund too — free, and what buys the
+        // existence tier. (Omitting this made an earlier pass of this
+        // measurement read falsely clean.)
+        admit_hop(&conn, &txid, value as i64, 5_000 + i as i64);
+    }
+
+    let (entries, truncated, _) = assemble_hops_view(query_rows(&conn, &honest.identity_hex));
+    assert!(
+        !entries.iter().any(|e| e.hop_txid == honest_txid),
+        "this cell pins the RESIDUAL: a chained single coin still evicts at \
+         ~one hop of peak recoverable capital"
+    );
+    assert!(truncated);
 }
 
 /// The `?gameId=` escape hatch reaches a row a flood crowded off the
@@ -1049,6 +1096,36 @@ fn the_gameid_scope_reaches_a_crowded_out_row() {
         .expect("the gameId scope must reach the caller's own row");
     assert_eq!(row.marker_verified, MarkerVerification::Verified);
     assert!(!scoped_truncated, "and the scoped page is complete");
+}
+
+/// …and the OTHER half of that measurement, which the first remediation
+/// left untested while `routes.rs` claimed the scope "cannot hide a row
+/// the caller asks for by game". It can: the gameId is one of the nine
+/// pushes in the victim's own on-chain marker, so naming it is free, and a
+/// SAME-gameId flood defeats the scope exactly as it defeats the default
+/// page. Pinned from the UNSAFE side so the doc and the behaviour cannot
+/// drift apart again.
+#[test]
+fn the_gameid_scope_does_not_escape_a_same_game_flood() {
+    let conn = production_schema_db();
+    let honest = build_marker(0xa1, GAME, 0, 80_800, true);
+    let honest_txid = admit_marker(&conn, &honest, 80_800, 0x01, 1_000);
+    admit_hop(&conn, &honest_txid, 80_800, 1_000);
+    // The flood names the victim's OWN gameId, reactively, at value + 1.
+    flood_container(&conn, 0xa1, 100, 80_801, 5_000);
+
+    let (scoped, scoped_truncated, _) = assemble_hops_view(query_rows_scoped(
+        &conn,
+        &honest.identity_hex,
+        &hex::encode(GAME),
+    ));
+    assert!(
+        !scoped.iter().any(|e| e.hop_txid == honest_txid),
+        "the scoped query is NOT an escape hatch against a same-game flood \
+         — if this ever passes, `routes.rs` and the residual docs must be \
+         rewritten to match"
+    );
+    assert!(scoped_truncated, "the scoped page is honestly flagged incomplete");
 }
 
 
@@ -1125,8 +1202,9 @@ fn an_out_of_range_hop_sats_row_is_served_unverified_never_verified() {
     let m = build_marker(0xa1, GAME, 0, u64::MAX, true);
     let (beef, _) = container(
         &expected_hop_lock_hex(&m.settle_pub_hex).unwrap(),
-        // A container cannot really pay u64::MAX either; pay what it can.
-        21_000_000_00_000_000,
+        // A container cannot really pay u64::MAX either; pay the whole
+        // 21M-BTC supply in sats.
+        2_100_000_000_000_000,
         &m.script,
         0x01,
     );
@@ -1142,34 +1220,49 @@ fn an_out_of_range_hop_sats_row_is_served_unverified_never_verified() {
 }
 
 
-/// `paidTier`'s ACTUAL job (see the ordering doc): a row whose container
-/// has no output at `hopVout` is demoted deterministically, rather than
-/// relying on SQLite's NULLs-sort-last-under-DESC convention. Pinned
-/// because the injection round showed the tier does NOT carry the flood
-/// defence, so its real contribution has to be stated and tested or
-/// deleted.
+/// `paidTier`'s ACTUAL job — and this cell had to be RE-FIXTURED, because
+/// the first version of it was blind to the key it names (delta gate
+/// NEW-MEDIUM-C: the fix for a decorative pin produced a second decorative
+/// pin).
+///
+/// The first fixture used a GHOST refuted row (absent from `pot_records`),
+/// so the EXISTENCE tier demoted it whether or not `paidTier` worked —
+/// neutering `paidTier` left the cell green. The shape that actually needs
+/// `paidTier` is an **INDEXED** row whose container output at `hopVout` is
+/// the attacker's own large change output while the marker claims a
+/// different (tiny) `hopSats`: `hopSatsOnChain DESC` would otherwise
+/// promote it on a value the attacker never committed to the claim, for
+/// free.
 #[test]
-fn a_refuted_row_sorts_below_a_paid_one_regardless_of_null_ordering() {
+fn an_indexed_refuted_row_sorts_below_a_paid_one() {
     let conn = production_schema_db();
-    // A row whose container LACKS the named output (hopSatsOnChain NULL).
-    let refuted = build_marker(0xa1, GAME, 7, 900_000, true);
-    let (beef, _) = container(
-        &expected_hop_lock_hex(&refuted.settle_pub_hex).unwrap(),
-        900_000,
-        &refuted.script,
+    // The attacker: a container whose output 0 is a large change output,
+    // with a marker claiming a 1-sat hop at that vout. hopSatsOnChain is
+    // large; the CLAIM does not match it ⇒ paidTier = 1.
+    let attacker = build_marker(0xa1, GAME, 0, 1, false);
+    let (beef, attacker_txid) = container(
+        &expected_hop_lock_hex(&attacker.settle_pub_hex).unwrap(),
+        9_000_000, // the attacker's own change, not a payment for the claim
+        &attacker.script,
         0x02,
     );
-    let refuted_txid = admit_container(&conn, &beef, 1, 10);
-    // The honest, paid, LOWER-value row.
+    admit_container(&conn, &beef, 1, 500);
+    // INDEXED under tm_lowfund — so the existence tier canNOT be what
+    // demotes it. This is the sensitivity the first fixture lacked.
+    admit_hop(&conn, &attacker_txid, 9_000_000, 500);
+
+    // The honest, paid, far LOWER-value row.
     let honest = build_marker(0xa1, GAME, 0, 80_800, true);
     let honest_txid = admit_marker(&conn, &honest, 80_800, 0x01, 1_000);
+    admit_hop(&conn, &honest_txid, 80_800, 1_000);
 
     let rows = query_rows(&conn, &honest.identity_hex);
     let pos = |t: &str| rows.iter().position(|r| r.hop_txid == t).unwrap();
     assert!(
-        pos(&honest_txid) < pos(&refuted_txid),
-        "a paid row must outrank one whose container lacks the output, \
-         even though the refuted row claims the larger value"
+        pos(&honest_txid) < pos(&attacker_txid),
+        "a PAID row must outrank an INDEXED row whose big on-chain value was \
+         never committed to its claim — this is paidTier's whole job, and \
+         the cell must go red when paidTier is neutered"
     );
 }
 
@@ -1204,3 +1297,4 @@ fn a_predated_dust_flood_is_repelled_by_the_value_key() {
         );
     }
 }
+

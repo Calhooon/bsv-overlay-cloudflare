@@ -1668,9 +1668,17 @@ impl HopsViewRowD1 {
 /// container's own hop lock AND value — filter-for-display, rows never
 /// dropped). Full trust model: `hops_view.rs` module docs.
 ///
-/// Optional `&gameId=<64-hex>` scopes the window to one game — the escape
-/// hatch that makes `truncated` actionable (a flood can crowd the default
-/// page; it cannot hide a row the caller asks for by game).
+/// Optional `&gameId=<64-hex>` scopes the window to one game. It narrows
+/// the flood surface — a flood naming OTHER games is escaped completely —
+/// but it is **NOT a general escape hatch, and must not be described as
+/// one**: the gameId is one of the nine pushes in the victim's own
+/// on-chain marker, the same object that reveals the identity, so naming
+/// it costs an attacker nothing. Measured: a flood on the SAME gameId
+/// leaves the honest row ABSENT with `truncated: true` under the scoped
+/// query too. A truncated caller therefore still has no guaranteed way to
+/// reach its own row against a TARGETED flood — that gap is the tracked
+/// residual documented at `hops_view::assemble_hops_view`, closing via
+/// #318 (per-identity auth + quota).
 ///
 /// Fail-safe shape mirrors `/refund-view`: a missing/invalid identity is
 /// an EMPTY 200 result (never an error); an invalid `gameId` is ignored
