@@ -51,3 +51,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # is linked into the wasm32 Worker build.
 rusqlite = { version = "0.32", features = ["bundled"] }
 bsv-overlay-cloudflare = { version = "0.1", path = "../overlay-cloudflare" }
+# #318 real-crypto auth round-trip (tests/auth_real_crypto_roundtrip.rs):
+# the SDK's REAL BRC-103 `Peer` on both ends (the implementation the
+# middleware ports 1:1), real ECDSA over real random keys — never a mocked
+# verify. `auth` pulls tokio; the extra features are dev-only and never
+# reach the wasm32 worker build.
+bsv-rs = { workspace = true, features = ["auth"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+async-trait = "0.1"
