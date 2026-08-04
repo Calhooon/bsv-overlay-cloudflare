@@ -29,6 +29,7 @@ use low_app_layer::logic::{
     batch_where_sql, leaderboard_markers_sql, pots_view_join_sql, proof_pointers_sql,
     recovery_view_sql,
 };
+use low_app_layer::hops_view::hops_view_sql;
 use low_app_layer::refund_view::refund_view_sql;
 use low_app_layer::results::{claims_sql, decoded_pots_sql, results_sql, seat_markers_sql};
 use rusqlite::Connection;
@@ -60,6 +61,9 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     let conn = production_schema_db();
     assert_prepares(&conn, "recovery_view_sql", &recovery_view_sql());
     assert_prepares(&conn, "refund_view_sql", &refund_view_sql());
+    assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false));
+    // Both arities of the gameId-scoped escape hatch must parse.
+    assert_prepares(&conn, "hops_view_sql(scoped)", &hops_view_sql(true));
     assert_prepares(&conn, "live_view_sql", &live_view_sql());
     assert_prepares(&conn, "results_sql", &results_sql());
     // #332 — the /leaderboard anti-flood marker window.

@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 92;
+pub const OVERLAY_MIGRATION_COUNT: usize = 97;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -856,6 +856,58 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // The completion-pass candidate scan (`WHERE proof_verified = 0 …`).
     "CREATE INDEX IF NOT EXISTS idx_pot_beefs_proof_verified \
      ON pot_beefs(proof_verified)",
+    // ── bsv-low #315: LOW hop-in-flight markers (tm_hopparty / ls_hopparty,
+    // #252 stage 2b) ─────────────────────────────────────────────────────
+    // One row per marker OUTPOINT (txid, outputIndex) — EVERY admitted
+    // marker is kept via INSERT OR IGNORE on the primary key (the
+    // tm_result censorship lesson; admission is byte-format-only, so an
+    // identity-keyed first-marker-wins index would be front-runnable for
+    // one dust OP_RETURN). Rows are NEVER deleted (a hop-in-flight fact is
+    // permanent recovery history; the OP_RETURN is provably unspendable).
+    //
+    // THE MARKER RIDES THE HOP TX, so `txid` is BOTH the marker's
+    // containing txid and the HOP txid — there is no `hopTxid` column,
+    // because a transaction cannot embed its own txid and the container
+    // already has it (the 2026-08-04 wire revision). The hop outpoint is
+    // `(txid, hopVout)`.
+    //
+    // TYPED + INDEXED FROM THE FIRST MIGRATION (#310 decode-at-write):
+    // every wire field is its own typed column, never a raw blob re-parsed
+    // at read — AND the three `hop*OnChain`/`containerOutputs` columns are
+    // the CONTAINER's own facts, decoded once at admission from the very
+    // BEEF being admitted (the #284 posture: a pure re-presentation of
+    // hash-bound bytes, chosen by nobody). They are what the app-layer
+    // reader compares the marker's CLAIMS against, which is why the read
+    // path needs no `outputs` join and no BEEF re-parse. hopLockHex /
+    // hopSatsOnChain are NULL exactly when the container has no output at
+    // hopVout — an absence PROVEN by containerOutputs, not guessed.
+    // Signature bytes are carried back verbatim; the overlay never
+    // verifies them (the reader labels; clients re-verify).
+    "CREATE TABLE IF NOT EXISTS hopparty_records (
+        identity TEXT NOT NULL,
+        opponentIdentity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        hopVout INTEGER NOT NULL,
+        hopSats INTEGER NOT NULL,
+        seatSettlePubkey TEXT NOT NULL,
+        seatSigHex TEXT NOT NULL,
+        identitySigHex TEXT NOT NULL,
+        hopLockHex TEXT,
+        hopSatsOnChain INTEGER,
+        containerOutputs INTEGER NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // hopsFor filters by identity and orders by createdAt; the hop
+    // outpoint (txid, hopVout) serves byHop and the /hops-view window; the
+    // /live-view identity+gameId join key gets its own index.
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_identity ON hopparty_records(identity)",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_identity_created \
+     ON hopparty_records(identity, createdAt)",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_hop ON hopparty_records(txid, hopVout)",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_game ON hopparty_records(gameId)",
 ];
 
 // =============================================================================
@@ -975,6 +1027,66 @@ mod tests {
             sql.trim_start().starts_with("ALTER TABLE pot_records")
                 && sql.contains("spentConfirmed INTEGER NOT NULL DEFAULT 0")
         }));
+    }
+
+    /// bsv-low #315: `hopparty_records` is TYPED + INDEXED from its FIRST
+    /// migration (#310 decode-at-write) — every wire field its own NOT NULL
+    /// typed column, PK on the marker outpoint, and all four query indexes
+    /// present as CREATE (idempotent), never a later ALTER.
+    #[test]
+    fn hopparty_records_migration_present_typed_and_indexed() {
+        let create = OVERLAY_MIGRATIONS
+            .iter()
+            .find(|sql| sql.contains("CREATE TABLE IF NOT EXISTS hopparty_records"))
+            .expect("hopparty_records CREATE TABLE migration exists");
+        for col in [
+            "identity TEXT NOT NULL",
+            "opponentIdentity TEXT NOT NULL",
+            "gameId TEXT NOT NULL",
+            "hopVout INTEGER NOT NULL",
+            "hopSats INTEGER NOT NULL",
+            "seatSettlePubkey TEXT NOT NULL",
+            "seatSigHex TEXT NOT NULL",
+            "identitySigHex TEXT NOT NULL",
+            "hopLockHex TEXT",
+            "hopSatsOnChain INTEGER",
+            "containerOutputs INTEGER NOT NULL",
+            "txid TEXT NOT NULL",
+            "outputIndex INTEGER NOT NULL",
+            "createdAt INTEGER",
+            "PRIMARY KEY (txid, outputIndex)",
+        ] {
+            assert!(create.contains(col), "hopparty_records must declare: {col}");
+        }
+        // The 2026-08-04 revision DELETED the hopTxid column: the marker
+        // rides the hop tx, so `txid` is the hop txid. Asserted positively
+        // (the needle is built split so it cannot match itself in source).
+        let deleted = ["hop", "Txid"].concat();
+        assert!(
+            !create.contains(&deleted),
+            "hopparty_records must NOT carry a {deleted} column — the container supplies it"
+        );
+        for idx in [
+            "idx_hopparty_identity ON hopparty_records(identity)",
+            "idx_hopparty_identity_created",
+            "idx_hopparty_hop ON hopparty_records(txid, hopVout)",
+            "idx_hopparty_game ON hopparty_records(gameId)",
+        ] {
+            assert!(
+                OVERLAY_MIGRATIONS
+                    .iter()
+                    .any(|sql| sql.starts_with("CREATE INDEX IF NOT EXISTS") && sql.contains(idx)),
+                "hopparty index missing: {idx}"
+            );
+        }
+        // No ALTER ever touches this table — first-migration-typed, and the
+        // append-only rule means it must stay that way.
+        assert!(
+            !OVERLAY_MIGRATIONS
+                .iter()
+                .any(|sql| sql.trim_start().starts_with("ALTER TABLE hopparty_records")),
+            "hopparty_records is typed from the FIRST migration — no ALTERs"
+        );
     }
 
     #[test]

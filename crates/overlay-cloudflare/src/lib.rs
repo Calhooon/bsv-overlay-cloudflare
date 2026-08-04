@@ -38,6 +38,9 @@ use overlay_discovery::collected::topic_manager::CollectedTopicManager;
 use overlay_discovery::dm_delegation::lookup_service::DmDelegationLookupService;
 use overlay_discovery::dm_delegation::storage::DmDelegationStorage;
 use overlay_discovery::dm_delegation::topic_manager::DmDelegationTopicManager;
+use overlay_discovery::hopparty::lookup_service::HoppartyLookupService;
+use overlay_discovery::hopparty::storage::HoppartyStorage;
+use overlay_discovery::hopparty::topic_manager::HoppartyTopicManager;
 use overlay_discovery::low::lookup_service::LowLookupService;
 use overlay_discovery::low::storage::LowStorage;
 use overlay_discovery::low::topic_manager::LowTopicManager;
@@ -77,9 +80,9 @@ use crate::broadcaster::{ArcadeBroadcaster, WorkerBroadcaster};
 use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::ensure_overlay_migrations;
 use crate::d1_discovery::{
-    D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1LowStorage, D1PotStorage,
-    D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage, D1RevealStorage,
-    D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
+    D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1HoppartyStorage, D1LowStorage,
+    D1PotStorage, D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage,
+    D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
 use crate::health_checker::WorkerHealthChecker;
@@ -156,6 +159,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
     let potrefund_storage: Rc<dyn PotrefundStorage> =
         Rc::new(D1PotrefundStorage::new(db.clone()));
+    let hopparty_storage: Rc<dyn HoppartyStorage> = Rc::new(D1HoppartyStorage::new(db.clone()));
     // DB handle for GET /health/invariants (#192/#193, P4) — the engine build
     // below consumes `db`.
     let ops_db = db.clone();
@@ -175,6 +179,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         proof_storage.clone(),
         potparty_storage.clone(),
         potrefund_storage.clone(),
+        hopparty_storage.clone(),
     );
 
     // Hosting URL for web UI
@@ -368,6 +373,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
     let potrefund_storage: Rc<dyn PotrefundStorage> =
         Rc::new(D1PotrefundStorage::new(db.clone()));
+    let hopparty_storage: Rc<dyn HoppartyStorage> = Rc::new(D1HoppartyStorage::new(db.clone()));
     Ok(build_engine_with_storage(
         db,
         env,
@@ -384,6 +390,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         proof_storage,
         potparty_storage,
         potrefund_storage,
+        hopparty_storage,
     ))
 }
 
@@ -435,6 +442,7 @@ fn build_engine_with_storage(
     proof_storage: Rc<dyn ProofStorage>,
     potparty_storage: Rc<dyn PotpartyStorage>,
     potrefund_storage: Rc<dyn PotrefundStorage>,
+    hopparty_storage: Rc<dyn HoppartyStorage>,
 ) -> Engine {
     // Storage
     let storage = Box::new(D1Storage::new(db));
@@ -523,6 +531,12 @@ fn build_engine_with_storage(
                 managers.insert(
                     "tm_potrefund".into(),
                     Box::new(PotrefundTopicManager::new()),
+                );
+            }
+            "tm_hopparty" => {
+                managers.insert(
+                    "tm_hopparty".into(),
+                    Box::new(HoppartyTopicManager::new()),
                 );
             }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
@@ -625,6 +639,12 @@ fn build_engine_with_storage(
                 lookup_services.insert(
                     "ls_potrefund".into(),
                     Box::new(PotrefundLookupService::new(potrefund_storage.clone())),
+                );
+            }
+            "ls_hopparty" => {
+                lookup_services.insert(
+                    "ls_hopparty".into(),
+                    Box::new(HoppartyLookupService::new(hopparty_storage.clone())),
                 );
             }
             other => worker::console_warn!("LOOKUP_SERVICES: unknown entry '{other}' — skipped"),
@@ -977,6 +997,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
     let potrefund_storage: Rc<dyn PotrefundStorage> =
         Rc::new(D1PotrefundStorage::new(db.clone()));
+    let hopparty_storage: Rc<dyn HoppartyStorage> = Rc::new(D1HoppartyStorage::new(db.clone()));
     // Keep a DB handle for the observability writes (#192/#193, P4) — the
     // engine build below consumes `db`.
     let ops_db = db.clone();
@@ -996,6 +1017,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         proof_storage.clone(),
         potparty_storage.clone(),
         potrefund_storage.clone(),
+        hopparty_storage.clone(),
     );
 
     // Sync advertisements (if advertiser + hosting URL are configured).

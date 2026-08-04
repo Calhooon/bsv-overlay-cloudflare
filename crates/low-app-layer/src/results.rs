@@ -424,11 +424,15 @@ pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
 /// The BRC-43 protocol potparty markers sign their IDENTITY challenge under
 /// — `potParty.ts::POTPARTY_PROTOCOL` = `[1, 'low potparty']`.
 ///
-/// `pub` for the same producer-parity reason as [`result_protocol`]: the
-/// `results_window_sqlite` integration fixtures must MINT genuinely verifiable
-/// v2 markers with the exact protocol the verifier checks, rather than
-/// re-deriving the tuple by convention (a duplicated format string is a
-/// boundary with no pin by construction — Rule 16).
+/// `pub` (not `pub(crate)`) for two reasons that both reduce to Rule 16 —
+/// share the constant, never the convention:
+/// 1. producer parity, as for [`result_protocol`]: the `results_window_sqlite`
+///    integration fixtures must MINT genuinely verifiable v2 markers with the
+///    exact protocol the verifier checks, rather than re-deriving the tuple.
+/// 2. bsv-low #315: hopparty identity signatures REUSE this wallet protocol id
+///    by the ledgered decision-3 (the version tag inside the challenge is the
+///    domain separator), so `/hops-view` verifies under the SAME constant
+///    rather than a second spelling that could drift.
 pub fn potparty_protocol() -> bsv_rs::wallet::Protocol {
     bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty")
 }
@@ -1029,7 +1033,7 @@ pub fn result_challenge_bytes(
 /// `anyoneVerifier.verifySignature({counterparty: signer, forSelf: false})`.
 /// Any malformed key/sig/derivation failure is simply `false` (fail-safe:
 /// an unverifiable signature never corroborates).
-fn anyone_sig_verifies(
+pub(crate) fn anyone_sig_verifies(
     signer_identity_hex: &str,
     key_id: &str,
     challenge: &[u8],

@@ -1590,6 +1590,176 @@ pub async fn refund_view(req: Request, ctx: RouteContext<()>) -> Result<Response
     )
 }
 
+// ── /hops-view — per-identity hops-in-flight view (bsv-low #315, stage 2b) ──
+
+/// `/hops-view` joined row as D1 returns it (the `hops_view_sql` shape):
+/// the caller's hopparty marker fields + the hop outpoint's `pot_records`
+/// spend columns + the spender's verified-proof latch + the ADMITTED hop
+/// lock script hex. Pot-side fields are `Option` because both LEFT joins
+/// can MISS (NULL columns — fail-safe: never asserted unspent, script
+/// absence answers `markerVerified: unknown`).
+///
+/// DEPLOY ORDER: `hopparty_records` comes from the OVERLAY worker's
+/// additive migrations, so the overlay deploys (and runs its migrations)
+/// BEFORE this worker — the `refund_view` ordering. Against a
+/// pre-migration schema the whole query faults and the route answers 503
+/// for everyone (a fault is never shaped like an answer).
+#[derive(Deserialize)]
+struct HopsViewRowD1 {
+    identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "hopTxid")]
+    hop_txid: String,
+    #[serde(rename = "hopVout")]
+    hop_vout: f64,
+    #[serde(rename = "hopSats")]
+    hop_sats: f64,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    #[serde(rename = "seatSettlePubkey")]
+    seat_settle_pubkey: String,
+    #[serde(rename = "seatSigHex")]
+    seat_sig_hex: String,
+    #[serde(rename = "identitySigHex")]
+    identity_sig_hex: String,
+    #[serde(rename = "markerTxid")]
+    marker_txid: String,
+    #[serde(rename = "markerVout")]
+    marker_vout: f64,
+    /// The CONTAINER's decoded facts (#310 decode-at-write in the overlay).
+    #[serde(rename = "hopLockHex")]
+    hop_lock_hex: Option<String>,
+    #[serde(rename = "hopSatsOnChain")]
+    hop_sats_on_chain: Option<f64>,
+    #[serde(rename = "containerOutputs")]
+    container_outputs: f64,
+    spent: Option<f64>,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: Option<f64>,
+    #[serde(rename = "spenderProofVerified")]
+    spender_proof_verified: Option<f64>,
+}
+
+impl HopsViewRowD1 {
+    fn into_row(self) -> crate::hops_view::HopsViewRow {
+        crate::hops_view::HopsViewRow {
+            identity: self.identity,
+            game_id: self.game_id,
+            hop_txid: self.hop_txid,
+            hop_vout: self.hop_vout as u32,
+            hop_sats: self.hop_sats as u64,
+            opponent_identity: self.opponent_identity,
+            seat_settle_pubkey: self.seat_settle_pubkey,
+            seat_sig_hex: self.seat_sig_hex,
+            identity_sig_hex: self.identity_sig_hex,
+            marker_txid: self.marker_txid,
+            marker_vout: self.marker_vout as u32,
+            spent: self.spent.map(|v| v != 0.0),
+            spending_txid: self.spending_txid,
+            spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
+            spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
+            // Stored as a typed column by the overlay's decode-at-write; an
+            // impossible empty string reads as absent (which REFUTES).
+            hop_lock_hex: self.hop_lock_hex.filter(|s| !s.is_empty()),
+            hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
+            container_outputs: self.container_outputs as u32,
+        }
+    }
+}
+
+/// `GET /hops-view?identity=<66-hex>` — the per-identity HOPS-IN-FLIGHT
+/// view (bsv-low #315, #252 stage 2b): every hop the identity has marked
+/// (`hopparty_records`), joined to the `tm_lowfund`-indexed hop outpoint
+/// for spent/unspent status (honesty pair; an un-indexed hop is `unknown`,
+/// never asserted-unspent) and labeled with the read-time
+/// `markerVerified` validity FILTER (seatSig + identitySig + the
+/// container's own hop lock AND value — filter-for-display, rows never
+/// dropped). Full trust model: `hops_view.rs` module docs.
+///
+/// Optional `&gameId=<64-hex>` scopes the window to one game. It narrows
+/// the flood surface — a flood naming OTHER games is escaped completely —
+/// but it is **NOT a general escape hatch, and must not be described as
+/// one**: the gameId is one of the nine pushes in the victim's own
+/// on-chain marker, the same object that reveals the identity, so naming
+/// it costs an attacker nothing. Measured: a flood on the SAME gameId
+/// leaves the honest row ABSENT with `truncated: true` under the scoped
+/// query too. A truncated caller therefore still has no guaranteed way to
+/// reach its own row against a TARGETED flood — that gap is the tracked
+/// residual documented at `hops_view::assemble_hops_view`, closing via
+/// #318 (per-identity auth + quota).
+///
+/// Fail-safe shape mirrors `/refund-view`: a missing/invalid identity is
+/// an EMPTY 200 result (never an error); an invalid `gameId` is ignored
+/// (unscoped), never an error; a D1 fault is a 503; a chaintracks fault
+/// only degrades `tip` to `null` — the D1 facts still serve. ONE bounded
+/// D1 query (≤[`crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS`] hop outpoints
+/// ×[`crate::hops_view::HOPS_VIEW_ROWS_PER_OUTPOINT`] rows, no BEEF
+/// blobs).
+pub async fn hops_view(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let url = req.url()?;
+    let identity = url
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let identity_lc = identity.to_ascii_lowercase();
+
+    if !crate::logic::valid_identity(&identity_lc) {
+        return json_response(
+            crate::hops_view::hops_view_body(&identity_lc, None, &[], false, false),
+            200,
+        );
+    }
+
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[hops-view] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        }
+    };
+
+    // `?gameId=` is the ESCAPE HATCH for a truncated page (gate HIGH-1):
+    // a caller told `truncated` re-asks scoped to its own game and reaches
+    // its row regardless of how many outpoints a flood minted. An invalid
+    // gameId is IGNORED (treated as unscoped) rather than erroring — the
+    // fail-safe direction for a display surface.
+    let game_id_lc = url
+        .query_pairs()
+        .find(|(k, _)| k == "gameId")
+        .map(|(_, v)| v.into_owned().to_ascii_lowercase())
+        .filter(|g| g.len() == 64 && g.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let stmt = db
+        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some()))
+        .bind(&match &game_id_lc {
+            Some(g) => vec![JsValue::from_str(&identity_lc), JsValue::from_str(g)],
+            None => vec![JsValue::from_str(&identity_lc)],
+        })?;
+    let rows: Vec<crate::hops_view::HopsViewRow> = match stmt
+        .all()
+        .await
+        .and_then(|r| r.results::<HopsViewRowD1>())
+    {
+        Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
+        Err(e) => {
+            console_warn!("[hops-view] hopparty join query failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
+
+    let (entries, truncated, budget_exhausted) = crate::hops_view::assemble_hops_view(rows);
+    // The tip AFTER the D1 facts (`null` on a fault — facts still serve).
+    let tip = chaintracks_present_height(&ctx, "hops-view").await.ok();
+    json_response(
+        crate::hops_view::hops_view_body(&identity_lc, tip, &entries, truncated, budget_exhausted),
+        200,
+    )
+}
+
 // ── /live-view — per-identity live-hand view (bsv-low #252 stage 2a step 3) ─
 
 /// `/live-view` joined row as D1 returns it (the `live_view_sql` shape): the
