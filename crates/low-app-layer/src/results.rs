@@ -610,26 +610,51 @@ pub enum SeatLetter {
 ///
 /// # SCOPE — exactly what `Chain` does and does not vouch for (Rule 8)
 ///
-/// `Chain` is a statement about **(potOutpoint, identity)** and NOTHING else.
-/// It says: *the caller holds a settle key this pot's covenant lock committed.*
+/// `Chain` is a statement about **(potOutpoint, identity)** and NOTHING else:
+/// *the caller holds a settle key this pot's covenant lock committed.*
 ///
-/// | wire field | covered by `Chain`? |
+/// **This table is EXHAUSTIVE over the 17 keys `results_body` emits.** A
+/// partial table headed "what Chain does and does not vouch for" invites
+/// exactly the reading it exists to prevent, so any new wire key must be added
+/// here — `the_existing_results_shape_is_unchanged_apart_from_the_added_keys`
+/// pins the key set, so a new key cannot arrive unnoticed.
+///
+/// | wire key | covered by `Chain`? |
 /// |---|---|
-/// | `potTxid` / `potVout` | YES — the seatSig preimage commits the outpoint |
-/// | `identity` (the query param) | YES — the F1 identity signature binds it |
-/// | `covRecoveryHeight` | YES (a chain fact about that outpoint) |
-/// | `spent` / `spentConfirmed` / `settleTxid` / `at.height` | the index's record for that OUTPOINT — honest, but chosen by the row |
+/// | `potTxid`, `potVout` | **YES** — the seatSig preimage commits the outpoint |
+/// | *(the `identity` query param)* | **YES** — the F1 identity signature binds it |
+/// | `covRecoveryHeight` | **YES** — decoded from that outpoint's own funding lock |
+/// | `potBinding`, `potBindingSource` | *(this field)* |
+/// | `spent`, `spentConfirmed`, `settleTxid`, `at` | the index's record FOR THAT OUTPOINT — honest, but the row chose the outpoint |
+/// | `verdict` | chain truth ABOUT THAT OUTPOINT (covenant template match) — same caveat |
+/// | `outcome`, `outcomeSource` | **YES in practice, by construction**: on a `Chain` row `my_seat` is `Some`, and `derive_outcome_with_seat` gives the seat path precedence over any claim, so a winner verdict resolves `won`/`lost` from the committed key. `tie`/`refund` are seat-symmetric chain truth. No claim can move either. |
 /// | **`gameId`** | **NO** — see [`ResultEntry::game_id_binding`] |
+/// | **`gameIdBinding`** | *(reports precisely that)* |
 /// | **`recoveryHeight`** (the marker hint) | **NO — attacker-owned even on a `Chain` row** |
 /// | **`opponentIdentity`** | **NO — attacker-owned even on a `Chain` row** |
+/// | **`hand`** (and every field inside it) | **NO — can be a REAL, signature-verified showdown belonging to a DIFFERENT game** |
 ///
-/// The last two are not hypothetical. `results_sql` collapses each pot to the
-/// OLDEST marker naming it, and that representative supplies the display
-/// fields; the gameId is public (it is in the victim's own on-chain marker),
-/// so an attacker re-using it with an earlier `createdAt` owns `recoveryHeight`
-/// and `opponentIdentity` on a row that still reads `Chain`. **Do not read
-/// "chain-bound" as row integrity.** Demonstrated by
-/// `a_chain_bound_row_still_carries_attacker_display_fields`.
+/// The three `NO` display fields are not hypothetical. `results_sql` collapses
+/// each pot to the OLDEST marker naming it and that representative supplies
+/// them; the gameId is public (it is in the victim's own on-chain marker), so
+/// an attacker re-using it with an earlier `createdAt` owns `recoveryHeight`
+/// and `opponentIdentity` on a row that still reads `Chain`
+/// (`a_chain_bound_row_still_carries_attacker_display_fields`).
+///
+/// **`hand` is the widest of them, and it was built to confirm it**
+/// (`the_hand_field_is_attacker_influenceable_on_a_chain_bound_row`).
+/// `assemble_results` looks claims up by the ROW's `gameId`, and
+/// `resolve_winner_hand`'s party check accepts the ROW's `opponentIdentity` —
+/// both attacker-ownable. An attacker who wins the representative-row race can
+/// point the row at a `gameId` under which only its OWN signed claim exists and
+/// name itself as the opponent, so the row serves that claim's cards. What it
+/// CANNOT do is attribute a hand to the victim (claims carry the winner's own
+/// verified signature) or move `outcome` (the seat path outranks claims) — so
+/// the observable result is a row reading `outcome: "won"` for the caller
+/// beside a `hand` naming someone else. **Do not render `hand` as this game's
+/// showdown unless `gameIdBinding == "chain"`.**
+///
+/// **Do not read "chain-bound" as row integrity.**
 ///
 /// # The gameId is deliberately NOT part of this
 ///
@@ -659,10 +684,20 @@ pub enum SeatLetter {
 ///
 /// Junk alone never flips because [`assemble_results`] re-injects the caller's
 /// OWN representative-row marker regardless of the SQL window; the attacker
-/// must first displace that row, which costs the extra marker. At 9 dust
-/// markers the honest marker sits at `rn = 9` in its `(pot, key)` slot, past
-/// [`SEAT_MARKERS_PER_KEY`], and rows are never deleted — so this one IS
-/// permanent, and saying otherwise would repeat the mistake this doc records.
+/// must first displace that row, which costs the extra marker.
+///
+/// Two properties of that residual are EXECUTED rather than asserted here —
+/// they are the whole basis on which the residual is being accepted, so they
+/// are the ones that must not rot into prose (Rule 10):
+///  - it does **not heal**: `residual_b_does_not_heal_when_the_victim_
+///    republishes` drives five honest republishes and stays `Unknown`;
+///  - displacement is a **race, not a volume attack**:
+///    `displacing_the_representative_row_requires_winning_the_race_not_volume`
+///    shows 500 late markers change nothing and one early marker wins, because
+///    `createdAt` is server-assigned at admission and cannot be backdated.
+///
+/// So the true cost is "9 dust markers AND having filed one before the
+/// victim's honest marker" — cheap, but not free, and not retroactive.
 ///
 /// Pre-vs-post for that attack (Rule 6, stated plainly): **before** this work
 /// the client read the marker hint, so those same markers produced a FALSE
