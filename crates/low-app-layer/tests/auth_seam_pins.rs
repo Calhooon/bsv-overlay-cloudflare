@@ -137,6 +137,38 @@ fn middleware_always_runs_with_allow_unauthenticated_false() {
     );
 }
 
+/// The public-route exemption is wired at the REAL producer (Rule 6b): the
+/// front door computes the disposition against `effective_mode(global, path)`,
+/// not the raw global — so strict enforcement can only ever reach an identity
+/// route. Pinned as the actual expression the front door dispatches on.
+#[test]
+fn front_door_dispatches_on_the_effective_per_route_mode() {
+    let auth = normalized_code("src/auth.rs");
+    // The front door derives the effective mode from the global + the path…
+    assert_eq!(
+        count(&auth, "letmode=effective_mode(global_mode,&path);"),
+        1,
+        "the front door must compute the effective (per-route) mode"
+    );
+    // …and dispatches the disposition on THAT mode, never the raw global.
+    assert_eq!(
+        count(&auth, "front_door_disposition(mode,auth_configured,auth_attempted)"),
+        1,
+        "the disposition must run on the effective mode"
+    );
+    assert_eq!(
+        count(&auth, "front_door_disposition(global_mode,"),
+        0,
+        "the disposition must NEVER run on the raw global mode (that would gate public routes)"
+    );
+    // effective_mode only widens to strict for the identity routes.
+    assert_eq!(
+        count(&auth, "route_requires_identity_auth(path)"),
+        1,
+        "effective_mode must key the exemption on route_requires_identity_auth"
+    );
+}
+
 /// `CallerAuth::Verified` is constructed from the middleware's verified
 /// result and NOWHERE else: one `CallerAuth::verified(` call in src/, and
 /// its argument is the middleware context's identity key.
@@ -216,7 +248,8 @@ fn every_front_door_outcome_is_counted() {
     assert!(full.contains(&marker), "auth.rs must still carry its test module");
     let auth = full[..full.find(&marker).unwrap()].to_string();
     let arms = [
-        ["Disposition::ProceedAnonymous=>{", "count_anonymous_served();"].concat(),
+        // The anonymous arm counts with the per-route split (route_idx).
+        ["Disposition::ProceedAnonymous=>{", "count_anonymous_served(route_idx);"].concat(),
         ["Disposition::RefuseUnauthenticated=>{", "count_strict_refused_unauthenticated();"].concat(),
         ["Disposition::RefuseMisconfigured=>{", "count_misconfigured_refused();"].concat(),
     ];

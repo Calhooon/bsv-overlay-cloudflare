@@ -31,10 +31,16 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 
 # #318 — the lenient→strict enforcement flip. "false" (or unset) = LENIENT:
 # unauthenticated reads serve exactly as pre-#318 but are counted on /health
-# (`anonymousServed`). Flip to "true" ONLY after the bsv-low client release
-# that authenticates app-layer reads has shipped and soaked (`anonymousServed`
-# ≈ 0) — see `src/auth.rs` module docs for the written closure criteria.
-# Rollback is flipping it back; no code change either way.
+# (`anonymousByRoute` per identity route + `publicServed`). "true" = STRICT:
+# the FIVE identity-scoped reads (/results, /refund-view, /live-view,
+# /recovery-view, /hops-view) require auth; every OTHER route stays PUBLIC and
+# is never refused (deliberate exemption — the overlay /lookup already serves
+# that data unauthenticated; /health included so liveness monitors survive the
+# flip). Ordering matters: set SERVER_PRIVATE_KEY + create AUTH_SESSIONS
+# BEFORE shipping the auth-enabled client (AuthFetch always handshakes, so an
+# auth client vs an unconfigured worker 503s), THEN ship + soak
+# (`anonymousByRoute` ≈ 0 for every identity route), THEN flip. Rollback is
+# flipping it back; no code change. Full closure criteria: `src/auth.rs` docs.
 [vars]
 AUTH_ENFORCE = "false"
 

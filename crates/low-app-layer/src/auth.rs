@@ -25,31 +25,52 @@
 //! #316 rollout-note failure shape). Therefore:
 //!
 //! * **Lenient (default, `AUTH_ENFORCE` unset/false):** an unauthenticated
-//!   request is SERVED exactly as before, but **counted** (`anonymousServed`,
-//!   surfaced on `/health` — Rule 13: surface, don't consume). A request that
-//!   ATTEMPTS auth is fully verified — an invalid signature is refused, never
-//!   silently downgraded to anonymous. When a request IS authenticated, the
-//!   verified identity WINS over `?identity=`, and a mismatch is REFUSED
-//!   (403, honest body), never silently coerced.
-//! * **Strict (`AUTH_ENFORCE=true`):** an unauthenticated request to an
-//!   identity-scoped view is refused with an honest 401 JSON body naming the
-//!   handshake path. Flip the var to enforce; flip it back for instant
+//!   request is SERVED exactly as before, but **counted** (per-identity-route
+//!   `anonymousByRoute` + `publicServed`, surfaced on `/health` — Rule 13:
+//!   surface, don't consume, and the count is per route so the operator can
+//!   tell WHICH read is still anonymous). A request that ATTEMPTS auth is
+//!   fully verified — an invalid signature is refused, never silently
+//!   downgraded to anonymous. When a request IS authenticated, the verified
+//!   identity WINS over `?identity=`, and a mismatch is REFUSED (403, honest
+//!   body), never silently coerced.
+//! * **Strict (`AUTH_ENFORCE=true`):** an unauthenticated request to one of
+//!   the five **identity-scoped** views ([`route_requires_identity_auth`]) is
+//!   refused with an honest 401 naming the handshake path. **Every OTHER route
+//!   is PUBLIC and is NEVER refused for lack of auth, in either mode** —
+//!   `/health`, `/leaderboard`, `/utxo-status`, `/pots-view`, `/beef`, `/tip`,
+//!   `/spent-any`, `/tx-any`, `/`. This is a DELIBERATE exemption
+//!   ([`effective_mode`] forces those routes lenient): they serve exactly the
+//!   data the public overlay `/lookup` already serves unauthenticated, so
+//!   strict-gating them would buy only quota-readiness, not confidentiality,
+//!   while breaking every public read (the #316 outage shape) and any liveness
+//!   monitor on `/health`. A public route STILL honours + signs auth when a
+//!   client presents it (so `AuthFetch` works against public routes too); it
+//!   just never REQUIRES it. Flip the var to enforce; flip it back for instant
 //!   rollback. No code change either way.
 //!
 //! **Closure criteria for the lenient window** (write-once, per Rule 6c —
 //! "a compatibility window that never closes is a permanent hole with better
 //! manners"):
-//!   1. the bsv-low client release that routes all five identity reads
-//!      through its existing `AuthFetch` is pinned + released;
-//!   2. soak: `/health`'s `anonymousServed` approaches zero while
-//!      `authenticatedServed` carries the traffic;
-//!   3. then flip `AUTH_ENFORCE=true`.
+//!   1. **First** provision the worker: set `SERVER_PRIVATE_KEY` and create
+//!      the `AUTH_SESSIONS` KV — BEFORE the auth-enabled client ships.
+//!      `AuthFetch` ALWAYS initiates the BRC-103 handshake, so an auth client
+//!      against an unconfigured worker gets a 503 (`RefuseMisconfigured`) on
+//!      every identity read; provisioning must lead, not follow.
+//!   2. then pin + release the bsv-low client that routes **every app-layer
+//!      read it makes** through its existing `AuthFetch` (the five
+//!      identity-scoped reads are the ones that must migrate before the flip;
+//!      the public reads may migrate too but are never gated);
+//!   3. soak: `/health`'s `anonymousByRoute` map approaches zero for every
+//!      identity route while `authenticatedServed` carries the traffic
+//!      (`publicServed` staying non-zero is fine — public routes are never
+//!      gated);
+//!   4. then flip `AUTH_ENFORCE=true` (identity routes only start refusing).
 //!
 //! **What a stale client experiences at closure:** an honest `401
-//! {"error":"authentication required…"}`. bsv-low `chainReads.ts` treats any
-//! non-200 as a thrown/warned failure with route-level fallback (e.g.
-//! `/recovery-view` falls back to overlay enumeration) — visible, never a
-//! silent wrong answer.
+//! {"error":"authentication required…"}` **on the five identity routes only**;
+//! its public reads keep working. bsv-low `chainReads.ts` treats any non-200
+//! as a thrown/warned failure with route-level fallback (e.g. `/recovery-view`
+//! falls back to overlay enumeration) — visible, never a silent wrong answer.
 //!
 //! ## Rule 8b — no forwardable identity header exists here
 //!
@@ -99,6 +120,48 @@ impl AuthMode {
             AuthMode::Lenient => "lenient",
             AuthMode::Strict => "strict",
         }
+    }
+}
+
+/// The five identity-scoped read routes — the ONLY routes strict enforcement
+/// gates. Order is the stable index used by the per-route anonymous counter
+/// ([`identity_route_index`] / `anonymousByRoute`); append, never reorder.
+pub const IDENTITY_ROUTES: [&str; 5] = [
+    "/results",
+    "/refund-view",
+    "/live-view",
+    "/recovery-view",
+    "/hops-view",
+];
+
+/// True iff `path` is one of the identity-scoped views. Every other route is
+/// PUBLIC (never refused for lack of auth — see the module docs' deliberate
+/// exemption; the overlay `/lookup` already serves the same data
+/// unauthenticated, so gating them buys only quota-readiness).
+pub fn route_requires_identity_auth(path: &str) -> bool {
+    identity_route_index(path).is_some()
+}
+
+/// The stable index of an identity route (for the per-route anon counter), or
+/// `None` for a public route.
+pub fn identity_route_index(path: &str) -> Option<usize> {
+    IDENTITY_ROUTES.iter().position(|r| *r == path)
+}
+
+/// The mode ACTUALLY applied to a given route. Global strict only bites the
+/// identity-scoped routes; a public route is ALWAYS lenient, so an anonymous
+/// public read is never refused regardless of `AUTH_ENFORCE`. (Auth is still
+/// honoured + the reply signed when a client presents it — lenient never
+/// downgrades an *attempted* auth, it only never *requires* one.)
+///
+/// The GLOBAL mode is what `/health` reports and what the identity seam reads
+/// (for identity routes `effective_mode == global`, so the seam is unaffected
+/// by this narrowing).
+pub fn effective_mode(global: AuthMode, path: &str) -> AuthMode {
+    if route_requires_identity_auth(path) {
+        global
+    } else {
+        AuthMode::Lenient
     }
 }
 
@@ -227,17 +290,43 @@ pub fn front_door_disposition(
 // at a time for wasm; atomics keep the native test build honest). They reset
 // on isolate recycle — they are a SOAK/monitoring surface on `/health`, not
 // an accounting ledger. The actionable consumer (Rule 13 corollary): the
-// operator watching `anonymousServed` → ~0 before flipping `AUTH_ENFORCE`.
+// operator watching `anonymousByRoute` → ~0 PER IDENTITY ROUTE before flipping
+// `AUTH_ENFORCE` — the per-route split tells them WHICH client read is still
+// unmigrated, not merely that some read is.
 
-static ANONYMOUS_SERVED: AtomicU64 = AtomicU64::new(0);
+// Anonymous serves on the FIVE identity routes, indexed by
+// [`IDENTITY_ROUTES`] order — the soak signal that must reach zero. AtomicU64
+// is not Copy, so the array is spelled out (a `[x; 5]` initializer won't do).
+static ANON_BY_ROUTE: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+// Anonymous serves on PUBLIC routes — expected to stay non-zero (public routes
+// are never gated), so NOT a migration blocker; surfaced separately so it
+// never masks a stuck identity route.
+static PUBLIC_SERVED: AtomicU64 = AtomicU64::new(0);
 static AUTHENTICATED_SERVED: AtomicU64 = AtomicU64::new(0);
 static AUTH_REFUSED: AtomicU64 = AtomicU64::new(0);
 static MISMATCH_REFUSED: AtomicU64 = AtomicU64::new(0);
 static STRICT_REFUSED_UNAUTHENTICATED: AtomicU64 = AtomicU64::new(0);
 static MISCONFIGURED_REFUSED: AtomicU64 = AtomicU64::new(0);
 
-pub fn count_anonymous_served() {
-    ANONYMOUS_SERVED.fetch_add(1, Ordering::Relaxed);
+/// Count an anonymous serve, split by route: `Some(i)` = the identity route at
+/// index `i` (the migration-tracked bucket); `None` = a public route.
+pub fn count_anonymous_served(identity_route: Option<usize>) {
+    match identity_route {
+        Some(i) if i < ANON_BY_ROUTE.len() => {
+            ANON_BY_ROUTE[i].fetch_add(1, Ordering::Relaxed);
+        }
+        // A public route, or an out-of-range index (impossible via
+        // identity_route_index, but fail toward the non-blocking bucket).
+        _ => {
+            PUBLIC_SERVED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 pub fn count_authenticated_served() {
     AUTHENTICATED_SERVED.fetch_add(1, Ordering::Relaxed);
@@ -259,7 +348,9 @@ pub fn count_misconfigured_refused() {
 /// renderer is natively testable against explicit values).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthCountersSnapshot {
-    pub anonymous_served: u64,
+    /// Anonymous serves per identity route, in [`IDENTITY_ROUTES`] order.
+    pub anon_by_route: [u64; 5],
+    pub public_served: u64,
     pub authenticated_served: u64,
     pub auth_refused: u64,
     pub mismatch_refused: u64,
@@ -268,8 +359,13 @@ pub struct AuthCountersSnapshot {
 }
 
 pub fn counters_snapshot() -> AuthCountersSnapshot {
+    let mut anon_by_route = [0u64; 5];
+    for (dst, src) in anon_by_route.iter_mut().zip(ANON_BY_ROUTE.iter()) {
+        *dst = src.load(Ordering::Relaxed);
+    }
     AuthCountersSnapshot {
-        anonymous_served: ANONYMOUS_SERVED.load(Ordering::Relaxed),
+        anon_by_route,
+        public_served: PUBLIC_SERVED.load(Ordering::Relaxed),
         authenticated_served: AUTHENTICATED_SERVED.load(Ordering::Relaxed),
         auth_refused: AUTH_REFUSED.load(Ordering::Relaxed),
         mismatch_refused: MISMATCH_REFUSED.load(Ordering::Relaxed),
@@ -278,20 +374,29 @@ pub fn counters_snapshot() -> AuthCountersSnapshot {
     }
 }
 
-/// The `/health` auth surface (Rule 13): mode + configured + counters, so
-/// "unauthenticated but accepted" is a NUMBER an operator watches during the
-/// soak, never a silent accept.
+/// The `/health` auth surface (Rule 13): the GLOBAL mode + configured +
+/// counters, so "unauthenticated but accepted" is a NUMBER an operator watches
+/// during the soak, never a silent accept. `anonymousByRoute` is keyed by the
+/// route path so the operator sees exactly which identity read is unmigrated.
 pub fn auth_health_json(
     mode: AuthMode,
     auth_configured: bool,
     c: &AuthCountersSnapshot,
 ) -> serde_json::Value {
+    let anon_by_route: serde_json::Map<String, serde_json::Value> = IDENTITY_ROUTES
+        .iter()
+        .zip(c.anon_by_route.iter())
+        .map(|(route, n)| ((*route).to_string(), json!(n)))
+        .collect();
     json!({
         "authMode": mode.as_str(),
         "authConfigured": auth_configured,
         // Per-isolate since last isolate recycle — a soak signal, not a ledger.
         "countersScope": "isolate",
-        "anonymousServed": c.anonymous_served,
+        // The migration-tracked bucket: every value must reach ~0 before the
+        // flip. Public-route anonymity is a separate, non-blocking count.
+        "anonymousByRoute": anon_by_route,
+        "publicServed": c.public_served,
         "authenticatedServed": c.authenticated_served,
         "authRefused": c.auth_refused,
         "mismatchRefused": c.mismatch_refused,
@@ -342,16 +447,32 @@ fn nonempty_var(env: &Env, name: &str) -> Option<String> {
 }
 
 /// Run the BRC-103/104 front door (the tower's `front_door_case` posture,
-/// adapted to a read surface with a lenient rollout window).
+/// adapted to a read surface with a lenient rollout window + a public-route
+/// exemption).
+///
+/// Strict enforcement gates ONLY the five identity-scoped routes: the
+/// disposition runs against [`effective_mode`] (public routes forced lenient),
+/// while the [`AuthState`] carries the GLOBAL mode — what `/health` reports and
+/// what the identity seam reads (`effective == global` on identity routes, so
+/// the seam is unaffected).
 ///
 /// The middleware is only invoked when the request ATTEMPTS auth (handshake
 /// path or `x-bsv-auth-*` headers — the middleware's OWN predicates, so the
 /// dispatch cannot drift from what `process_auth` would treat as auth). It
 /// always runs `allow_unauthenticated: false`: lenient-ness lives entirely in
 /// [`front_door_disposition`], so an attempted-but-invalid signature is
-/// REFUSED in both modes, never downgraded to anonymous.
+/// REFUSED in both modes, never downgraded to anonymous. A PUBLIC route with a
+/// valid auth attempt is still verified + signed (so `AuthFetch` works against
+/// public routes); it just can never be REQUIRED to authenticate.
 pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
-    let mode = AuthMode::from_flag(env.var("AUTH_ENFORCE").ok().map(|v| v.to_string()).as_deref());
+    let global_mode =
+        AuthMode::from_flag(env.var("AUTH_ENFORCE").ok().map(|v| v.to_string()).as_deref());
+    let path = req.path();
+    let route_idx = identity_route_index(&path);
+    // Public routes are exempt from strict enforcement (deliberate — see the
+    // module docs). The disposition uses the effective (per-route) mode; the
+    // state carries the global mode.
+    let mode = effective_mode(global_mode, &path);
     let server_key = nonempty_var(env, "SERVER_PRIVATE_KEY");
     let auth_configured = server_key.is_some() && env.kv("AUTH_SESSIONS").is_ok();
     let is_handshake = CloudflareTransport::is_handshake_request(&req);
@@ -359,11 +480,14 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
 
     match front_door_disposition(mode, auth_configured, auth_attempted) {
         Disposition::ProceedAnonymous => {
-            count_anonymous_served();
+            // Split the soak signal: an anonymous serve on an identity route is
+            // migration-tracked (`route_idx`); on a public route it's the
+            // non-blocking `publicServed` bucket.
+            count_anonymous_served(route_idx);
             Ok(FrontDoor::Proceed(
                 req,
                 AuthState {
-                    mode,
+                    mode: global_mode,
                     caller: CallerAuth::Anonymous,
                     auth_configured,
                     session: None,
@@ -376,7 +500,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 401,
                 &json!({
                     "error": "authentication required: AUTH_ENFORCE is on — authenticate via the BRC-103/104 handshake at /.well-known/auth (AuthFetch does this automatically)",
-                    "authMode": mode.as_str(),
+                    "authMode": global_mode.as_str(),
                 }),
             )
             .map(FrontDoor::Reply)
@@ -387,7 +511,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 503,
                 &json!({
                     "error": "auth unavailable: SERVER_PRIVATE_KEY / AUTH_SESSIONS is not configured on this worker",
-                    "authMode": mode.as_str(),
+                    "authMode": global_mode.as_str(),
                 }),
             )
             .map(FrontDoor::Reply)
@@ -429,7 +553,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                         Ok(FrontDoor::Proceed(
                             request,
                             AuthState {
-                                mode,
+                                mode: global_mode,
                                 // The ONLY `Verified` constructor call site —
                                 // fed exclusively by the middleware's
                                 // verified-signature result (Rule 8b).
@@ -631,7 +755,8 @@ mod tests {
     #[test]
     fn auth_health_json_surfaces_mode_and_every_counter() {
         let snap = AuthCountersSnapshot {
-            anonymous_served: 7,
+            anon_by_route: [7, 6, 5, 4, 3],
+            public_served: 9,
             authenticated_served: 3,
             auth_refused: 2,
             mismatch_refused: 1,
@@ -641,7 +766,17 @@ mod tests {
         let v = auth_health_json(AuthMode::Lenient, true, &snap);
         assert_eq!(v["authMode"], "lenient");
         assert_eq!(v["authConfigured"], true);
-        assert_eq!(v["anonymousServed"], 7);
+        // Per-route anon map, keyed by the actual route paths so the operator
+        // sees WHICH read is unmigrated.
+        assert_eq!(v["anonymousByRoute"]["/results"], 7);
+        assert_eq!(v["anonymousByRoute"]["/refund-view"], 6);
+        assert_eq!(v["anonymousByRoute"]["/live-view"], 5);
+        assert_eq!(v["anonymousByRoute"]["/recovery-view"], 4);
+        assert_eq!(v["anonymousByRoute"]["/hops-view"], 3);
+        // Exactly the five identity routes appear — no more, no less (a new
+        // identity route without a counter would show up as a missing key).
+        assert_eq!(v["anonymousByRoute"].as_object().unwrap().len(), 5);
+        assert_eq!(v["publicServed"], 9);
         assert_eq!(v["authenticatedServed"], 3);
         assert_eq!(v["authRefused"], 2);
         assert_eq!(v["mismatchRefused"], 1);
@@ -657,12 +792,97 @@ mod tests {
     fn counters_increment_through_the_real_count_fns() {
         // Delta-based (other tests may bump the shared statics).
         let before = counters_snapshot();
-        count_anonymous_served();
+        // An anonymous serve on identity route index 2 (/live-view) and a
+        // public one — the split must land in the right bucket.
+        count_anonymous_served(Some(2));
+        count_anonymous_served(None);
         count_authenticated_served();
         count_mismatch_refused();
         let after = counters_snapshot();
-        assert!(after.anonymous_served > before.anonymous_served);
+        assert!(after.anon_by_route[2] > before.anon_by_route[2]);
+        assert!(after.public_served > before.public_served);
         assert!(after.authenticated_served > before.authenticated_served);
         assert!(after.mismatch_refused > before.mismatch_refused);
+    }
+
+    // ── route classification / effective mode ──────────────────────────────
+
+    #[test]
+    fn only_the_five_identity_routes_require_auth() {
+        for r in IDENTITY_ROUTES {
+            assert!(route_requires_identity_auth(r), "{r} must require auth");
+            assert!(identity_route_index(r).is_some());
+        }
+        for public in [
+            "/health",
+            "/leaderboard",
+            "/utxo-status",
+            "/pots-view",
+            "/beef/abc",
+            "/tip",
+            "/spent-any",
+            "/tx-any/abc",
+            "/",
+            "/.well-known/auth",
+        ] {
+            assert!(
+                !route_requires_identity_auth(public),
+                "{public} must be public (never gated)"
+            );
+            assert!(identity_route_index(public).is_none());
+        }
+    }
+
+    #[test]
+    fn identity_route_index_matches_the_route_order() {
+        for (i, r) in IDENTITY_ROUTES.iter().enumerate() {
+            assert_eq!(identity_route_index(r), Some(i));
+        }
+    }
+
+    #[test]
+    fn effective_mode_forces_public_routes_lenient_but_keeps_global_on_identity() {
+        // Strict global: identity routes stay strict; public routes go lenient.
+        assert_eq!(
+            effective_mode(AuthMode::Strict, "/results"),
+            AuthMode::Strict
+        );
+        for public in ["/health", "/leaderboard", "/utxo-status", "/tip", "/"] {
+            assert_eq!(
+                effective_mode(AuthMode::Strict, public),
+                AuthMode::Lenient,
+                "{public} must be exempt from strict enforcement"
+            );
+        }
+        // Lenient global: everything is lenient (the flip is off).
+        for any in ["/results", "/health", "/tip"] {
+            assert_eq!(effective_mode(AuthMode::Lenient, any), AuthMode::Lenient);
+        }
+    }
+
+    /// The exemption's PAYOFF, made executable: under strict global, an
+    /// anonymous request to a public route is NEVER refused (it proceeds),
+    /// while an anonymous request to an identity route IS refused. This is the
+    /// #316-shape outage the coordinator flagged — pinned as a behavior.
+    #[test]
+    fn strict_global_refuses_identity_but_serves_public_anonymously() {
+        let global = AuthMode::Strict;
+        // configured worker, no auth attempted (anonymous):
+        for identity in IDENTITY_ROUTES {
+            let m = effective_mode(global, identity);
+            assert_eq!(
+                front_door_disposition(m, true, false),
+                Disposition::RefuseUnauthenticated,
+                "identity route {identity} must refuse anonymous under strict"
+            );
+        }
+        for public in ["/health", "/leaderboard", "/utxo-status", "/tip"] {
+            let m = effective_mode(global, public);
+            assert_eq!(
+                front_door_disposition(m, true, false),
+                Disposition::ProceedAnonymous,
+                "public route {public} must serve anonymous even under strict"
+            );
+        }
     }
 }
