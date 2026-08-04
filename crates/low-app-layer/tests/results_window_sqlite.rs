@@ -20,8 +20,9 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::results::{
-    assemble_results, covenant_params_by_pot, results_sql, seat_markers_sql, PotVerdict,
-    ResultsRow, RESULTS_UNKNOWN_POT_QUOTA, SEAT_MARKERS_BINDS_PER_POT, SEAT_MARKERS_PER_KEY,
+    assemble_results, covenant_params_by_pot, results_sql, seat_markers_sql, GameClaims,
+    PotVerdict, ResultsRow, SeatMarkerRow, RESULTS_UNKNOWN_POT_QUOTA,
+    SEAT_MARKERS_BINDS_PER_POT, SEAT_MARKERS_PER_KEY,
 };
 use rusqlite::{params, Connection};
 
@@ -38,6 +39,21 @@ const LEGACY_RESULTS_SQL: &str = "SELECT pp.gameId, pp.potTxid, pp.potVout, pp.r
      LEFT JOIN pot_beefs sb ON sb.txid = lower(r.spendingTxid) \
      WHERE pp.identity = ? \
      ORDER BY pp.createdAt DESC, pp.rowid DESC LIMIT 100";
+
+/// `assemble_results` driven EXACTLY as `routes::results` drives it: ONE
+/// `covenant_params_by_pot` resolution over the rows, threaded into the
+/// assembler. Hand-building the map would let a cell diverge from the only
+/// real producer (Rule 6b) — and re-resolving per row is the #314-class
+/// doubling the argument exists to make unrepresentable.
+fn assemble_like_the_route(
+    identity_lc: &str,
+    rows: Vec<ResultsRow>,
+    claims: &std::collections::HashMap<String, GameClaims>,
+    seat_markers: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
+) -> Vec<low_app_layer::results::ResultEntry> {
+    let params_by_pot = covenant_params_by_pot(&rows);
+    assemble_results(identity_lc, rows, claims, seat_markers, &params_by_pot)
+}
 
 /// A fresh in-memory SQLite carrying the REAL production schema.
 ///
@@ -812,7 +828,7 @@ fn a_decoded_row_serves_verdict_and_params_with_no_blob_fetch() {
     assert_eq!(rows[0].verdict.as_deref(), Some("winner-a"));
 
     // The full assembler answers from columns alone.
-    let entries = assemble_results(
+    let entries = assemble_like_the_route(
         &victim,
         rows.clone(),
         &std::collections::HashMap::new(),
@@ -866,7 +882,7 @@ fn a_legacy_row_still_classifies_via_the_beef_fallback() {
     assert!(!no_blob(&rows[0].spender_beef_hex));
     assert_eq!(rows[0].lock_kind, None);
 
-    let entries = assemble_results(
+    let entries = assemble_like_the_route(
         &victim,
         rows,
         &std::collections::HashMap::new(),
@@ -919,7 +935,7 @@ fn a_stale_verdict_is_not_trusted_and_falls_back() {
         "a stale verdict re-opens the spender BLOB"
     );
 
-    let entries = assemble_results(
+    let entries = assemble_like_the_route(
         &victim,
         rows,
         &std::collections::HashMap::new(),
@@ -965,7 +981,7 @@ fn a_fresh_verdict_without_height_still_fetches_the_spender_blob() {
         !no_blob(&rows[0].spender_beef_hex),
         "spentHeight NULL keeps the spender BEEF for the at.height fallback"
     );
-    let entries = assemble_results(
+    let entries = assemble_like_the_route(
         &victim,
         rows,
         &std::collections::HashMap::new(),
@@ -1037,7 +1053,7 @@ fn spender_beef_height_is_gated_on_the_verified_latch() {
         Some(false),
         "the shipped SQL carries the latch"
     );
-    let entries = assemble_results(
+    let entries = assemble_like_the_route(
         &victim,
         rows,
         &std::collections::HashMap::new(),
@@ -1057,7 +1073,7 @@ fn spender_beef_height_is_gated_on_the_verified_latch() {
     .unwrap();
     let rows = query_results_rows(&conn, &victim);
     assert_eq!(rows[0].spender_proof_verified, Some(true));
-    let entries = assemble_results(
+    let entries = assemble_like_the_route(
         &victim,
         rows,
         &std::collections::HashMap::new(),
@@ -1338,7 +1354,7 @@ fn a_parked_spend_yields_no_verdict_through_the_real_sql() {
         ENFORCED_SETTLE_TXID,
         &beef_bytes_of(ENFORCED_SETTLE_HEX),
     );
-    let confirmed = assemble_results(
+    let confirmed = assemble_like_the_route(
         &victim,
         query_results_rows(&conn, &victim),
         &std::collections::HashMap::new(),
@@ -1376,7 +1392,7 @@ fn a_parked_spend_yields_no_verdict_through_the_real_sql() {
         Some(false),
         "the production schema really does carry an unconfirmed spend"
     );
-    let parked = assemble_results(
+    let parked = assemble_like_the_route(
         &victim,
         rows,
         &std::collections::HashMap::new(),
@@ -1422,7 +1438,7 @@ fn a_parked_spend_yields_no_verdict_through_the_real_sql() {
 
 use low_app_layer::results::{
     potparty_protocol, potparty_v2_challenge, results_body, seat_marker_chunks, seatsig_preimage,
-    CovenantParams, SeatMarkerRow, SEAT_MARKERS_PER_KEY as SEAT_CAP,
+    CovenantParams, SEAT_MARKERS_PER_KEY as SEAT_CAP,
 };
 
 /// A real settle keypair: (privkey, 66-hex compressed pubkey lowercase).
@@ -1534,9 +1550,54 @@ fn file_real_v2_marker(
     .expect("insert real v2 potparty_records");
 }
 
-/// File a bare (v1) marker with an arbitrary identity / gameId / hint — the
-/// ATTACKER's primitive. Byte-format admission means this always lands.
+/// File ANY `potparty_records` row verbatim — the attacker's primitive.
+/// Admission is byte-format only, and the production write is `INSERT OR
+/// IGNORE` on the marker OUTPOINT, so every distinct marker txid lands.
 #[allow(clippy::too_many_arguments)]
+fn file_marker_row(
+    conn: &Connection,
+    identity: &str,
+    opponent: &str,
+    game_id: &str,
+    pot_txid: &str,
+    pot_vout: u32,
+    recovery_height: i64,
+    sig_hex: &str,
+    seat_pub: Option<&str>,
+    seat_sig: Option<&str>,
+    marker_txid: &str,
+    created_at: i64,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
+        params![
+            identity,
+            opponent,
+            game_id,
+            pot_txid,
+            pot_vout,
+            recovery_height,
+            sig_hex,
+            seat_pub,
+            seat_sig,
+            marker_txid,
+            created_at
+        ],
+    )
+    .expect("insert potparty_records");
+}
+
+/// A bare (v1) hostile marker: arbitrary identity / gameId / hint, NO seat
+/// fields.
+///
+/// MODELLING BOUNDARY (Rule 17): a v1 marker has `seatSettlePubkey IS NULL`,
+/// so it is dropped by `seat_markers_sql`'s prefilter and can never reach the
+/// signature bars. A cell using only this models the DISPLACEMENT adversary,
+/// NOT the signature adversary — use [`file_seatsig_only_marker`] for the
+/// latter.
 fn file_hostile_marker(
     conn: &Connection,
     identity: &str,
@@ -1546,22 +1607,65 @@ fn file_hostile_marker(
     marker_txid: &str,
     created_at: i64,
 ) {
-    conn.execute(
-        "INSERT OR IGNORE INTO potparty_records \
-         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
-          sigHex, txid, outputIndex, createdAt) \
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', ?6, 0, ?7)",
-        params![
-            identity,
-            h64(0xbb),
-            game_id,
-            pot_txid,
-            recovery_height,
-            marker_txid,
-            created_at
-        ],
-    )
-    .expect("insert hostile potparty_records");
+    file_marker_row(
+        conn,
+        identity,
+        &h64(0xbb),
+        game_id,
+        pot_txid,
+        0,
+        recovery_height,
+        "3045ab",
+        None,
+        None,
+        marker_txid,
+        created_at,
+    );
+}
+
+/// A v2-SHAPED marker whose `seatSig` is REAL — signed by `settle_key` over
+/// the shipped preimage naming the VICTIM's identity — but whose IDENTITY
+/// signature is junk.
+///
+/// This is the adversary the F1 bar exists for: a hostile counterparty (or
+/// anyone who owns a covenant pot) can make its OWN committed settle key sign
+/// a preimage embedding ANY identity. Only the named identity can produce the
+/// marker's identity signature, and that is the only thing standing between
+/// this marker and a chain-bound row. It clears the `seatSettlePubkey IS NOT
+/// NULL` prefilter, clears the committed-key membership check, and clears
+/// `verify_seat_marker` — so it genuinely REACHES
+/// `verify_identity_binding`.
+#[allow(clippy::too_many_arguments)]
+fn file_seatsig_only_marker(
+    conn: &Connection,
+    settle_key: &bsv_rs::primitives::ec::PrivateKey,
+    settle_pub_hex: &str,
+    victim_identity: &str,
+    game_id: &str,
+    pot_txid: &str,
+    pot_vout: u32,
+    recovery_height: i64,
+    marker_txid: &str,
+    created_at: i64,
+) {
+    let preimage = seatsig_preimage(game_id, pot_txid, pot_vout, victim_identity).unwrap();
+    let seat_sig = settle_key
+        .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+        .unwrap();
+    file_marker_row(
+        conn,
+        victim_identity,
+        &format!("02{}", "dd".repeat(32)),
+        game_id,
+        pot_txid,
+        pot_vout,
+        recovery_height,
+        "3045deadbeef", // junk identity signature — the F1 bar must catch it
+        Some(settle_pub_hex),
+        Some(&hex::encode(seat_sig.to_der())),
+        marker_txid,
+        created_at,
+    );
 }
 
 /// The seat-marker fetch EXACTLY as `routes::results_seat_markers` performs
@@ -1571,12 +1675,11 @@ fn file_hostile_marker(
 /// makes these cells producer-level proofs rather than primitive-level ones.
 fn fetch_seat_markers(
     conn: &Connection,
-    rows: &[ResultsRow],
+    params_by_pot: &std::collections::HashMap<(String, u32), CovenantParams>,
 ) -> std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>> {
     let mut out: std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>> =
         std::collections::HashMap::new();
-    let params_by_pot = covenant_params_by_pot(rows);
-    for chunk in seat_marker_chunks(&params_by_pot) {
+    for chunk in seat_marker_chunks(params_by_pot) {
         let sql = seat_markers_sql(chunk.len(), SEAT_CAP);
         let mut stmt = conn.prepare(&sql).unwrap();
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -1625,12 +1728,17 @@ fn fetch_seat_markers(
 /// actually parses.
 fn results_wire(conn: &Connection, identity_lc: &str) -> serde_json::Value {
     let rows = query_results_rows(conn, identity_lc);
-    let seat_markers = fetch_seat_markers(conn, &rows);
+    // ONE params resolution, threaded into BOTH consumers — the exact shape
+    // `routes::results` has, so a re-introduced per-row re-resolution would
+    // diverge from this harness (Rule 6b: drive the real producer).
+    let params_by_pot = covenant_params_by_pot(&rows);
+    let seat_markers = fetch_seat_markers(conn, &params_by_pot);
     let entries = assemble_results(
         identity_lc,
         rows,
         &std::collections::HashMap::new(),
         &seat_markers,
+        &params_by_pot,
     );
     serde_json::from_str(&results_body(identity_lc, &entries)).unwrap()
 }
@@ -1821,13 +1929,26 @@ fn a_hostile_marker_naming_a_real_foreign_pot_is_never_chain_bound() {
     assert_eq!(wire["results"].as_array().unwrap().len(), 1);
 }
 
-/// (2b) The narrower variant: the hostile marker names the VICTIM'S OWN pot
-/// under a FABRICATED gameId. The victim's genuine seat proof for that
-/// outpoint is in the fetch (the seat query is keyed by OUTPOINT), so a
-/// binding check that forgot the gameId filter would inherit it and report
-/// the forged row as chain-bound.
+/// (2b) **THE RE-GATE'S HIGH, now inverted into a regression pin.**
+///
+/// The attacker files ONE dust marker naming the victim's identity, the
+/// victim's REAL pot outpoint, a FABRICATED gameId and an EARLIER `createdAt`
+/// (always available: #252's backfill publishes honest markers weeks after a
+/// pot txid becomes public). That marker becomes the per-pot window's
+/// representative and owns the row's `gameId`.
+///
+/// An earlier revision gated `potBinding` on `marker.gameId == row.gameId`, so
+/// this ONE marker flipped the honest row to `unknown` — **permanently**:
+/// `createdAt ASC` sorts every republish later and rows are never deleted, so
+/// the victim could not heal it. That is Rule 19 (dissolving one
+/// attacker-writable input by depending on another) and Rule 6 (a self-healing
+/// false positive traded for a permanent lockout).
+///
+/// `potBinding` is now derived from OUTPOINT-KEYED inputs only, so it survives.
+/// The gameId agreement moved to the non-load-bearing `gameIdBinding`, which
+/// honestly reports `unknown` here.
 #[test]
-fn a_hostile_gameid_on_the_victims_own_pot_is_not_chain_bound() {
+fn one_dust_marker_with_a_forged_gameid_cannot_deny_the_money_word() {
     let conn = production_schema_db();
     let (ka, pa) = real_key(41);
     let (_kb, pb) = real_key(42);
@@ -1839,54 +1960,68 @@ fn a_hostile_gameid_on_the_victims_own_pot_is_not_chain_bound() {
     let pot = h64(0xaa);
     let p = params_committing(&pa, &pb, COMMITTED_HEIGHT);
     insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
-    // The victim's GENUINE marker — stamped LATER, so the per-pot window's
-    // oldest-first representative is the forgery (the display fields come
-    // from the hostile row; the money-relevant answer must not).
     file_real_v2_marker(
-        &conn,
-        &ka,
-        &pa,
-        &victim_w,
-        &opponent,
-        &real_game,
-        &pot,
-        0,
-        HONEST_HINT,
-        "txHONESTV2",
+        &conn, &ka, &pa, &victim_w, &opponent, &real_game, &pot, 0, HONEST_HINT, "txHONESTV2",
         9_000,
     );
+
+    // POSITIVE CONTROL: before the griefing marker, the honest row is bound.
+    assert_eq!(
+        wire_row(&results_wire(&conn, &victim), &pot)["potBinding"],
+        serde_json::json!("chain"),
+        "control: the honest row starts chain-bound"
+    );
+
     file_hostile_marker(
         &conn,
         &victim,
         &forged_game,
         &pot,
         HOSTILE_HINT,
-        "txFORGERY",
-        100,
+        "txGRIEF",
+        100, // EARLIER than the honest marker — owns the representative row
     );
 
     let wire = results_wire(&conn, &victim);
-    // One pot ⇒ one row, and it is the OLDEST marker (the forgery) that
-    // supplies the display fields — the documented #281 F1b residual.
     let r = wire_row(&wire, &pot);
+    // The forgery does own the DISPLAY fields — the documented #281 F1b
+    // residual, unchanged and not defended here.
     assert_eq!(
         r["gameId"],
         serde_json::json!(forged_game),
         "the oldest marker owns the display fields (documented residual)"
     );
     assert_eq!(r["recoveryHeight"], serde_json::json!(HOSTILE_HINT));
+    // …and it does NOT own the money word.
     assert_eq!(
         r["potBinding"],
-        serde_json::json!("unknown"),
-        "the seatSig preimage commits the gameId — the victim's genuine proof \
-         for this OUTPOINT does not bind the attacker's fabricated gameId"
+        serde_json::json!("chain"),
+        "ONE dust marker must not deny the money word — potBinding reads only \
+         outpoint-keyed inputs"
     );
-    assert!(r["potBindingSource"].is_null());
-    // The covenant height is still the honest chain fact about the pot.
+    assert_eq!(r["potBindingSource"], serde_json::json!("chain+seatkey"));
+    // The gameId agreement is honestly reported as unproven, and is
+    // decoration — a client must not gate money on it.
+    assert_eq!(
+        r["gameIdBinding"],
+        serde_json::json!("unknown"),
+        "the row's gameId is not attested by any committed key"
+    );
     assert_eq!(
         r["covRecoveryHeight"],
         serde_json::json!(COMMITTED_HEIGHT),
-        "a real committed height for a real pot — but unbound to this row"
+        "the committed height is the honest chain fact about the pot"
+    );
+
+    // AND it stays healed after the victim republishes (the pre-fix defect
+    // was permanent precisely because republishing could not help).
+    file_real_v2_marker(
+        &conn, &ka, &pa, &victim_w, &opponent, &real_game, &pot, 0, HONEST_HINT, "txREPUBLISH",
+        99_999,
+    );
+    assert_eq!(
+        wire_row(&results_wire(&conn, &victim), &pot)["potBinding"],
+        serde_json::json!("chain"),
     );
 }
 
@@ -2050,6 +2185,369 @@ fn the_legacy_beef_leg_still_answers_the_binding() {
         1,
         "the committed-key seat query really was issued for this pot"
     );
-    assert!(!fetch_seat_markers(&conn, &rows)
+    assert!(!fetch_seat_markers(&conn, &covenant_params_by_pot(&rows))
         .contains_key(&(ENFORCED_FUNDING_TXID.to_ascii_lowercase(), 0)));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PORTED FROM THE 2026-08-04 FROM-SCRATCH GATE (Rule 17: a demonstrated
+// attack belongs in the suite, not in a review comment).
+//
+// These six cells were built by the reviewer against this branch and are
+// ported rather than re-derived. Two of them found real defects:
+//   - the forged-gameId denial (fixed; pinned by
+//     `one_dust_marker_with_a_forged_gameid_cannot_deny_the_money_word`);
+//   - the F1 identity bar being unreached by any /results cell (fixed by
+//     `a_seatsig_only_marker_over_a_foreign_pot_is_refused_by_the_f1_bar`).
+// ════════════════════════════════════════════════════════════════════════
+
+/// The honest world these cells attack: the victim's covenant pot + the
+/// victim's own genuine v2 seat marker.
+fn honest_world(marker_at: i64) -> (Connection, String, String, String) {
+    let conn = production_schema_db();
+    let (ka, pa) = real_key(41);
+    let (_kb, pb) = real_key(42);
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    let game = h64(0x11);
+    let pot = h64(0xaa);
+    let p = params_committing(&pa, &pb, COMMITTED_HEIGHT);
+    insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
+    file_real_v2_marker(
+        &conn,
+        &ka,
+        &pa,
+        &victim_w,
+        &format!("02{}", "bb".repeat(32)),
+        &game,
+        &pot,
+        0,
+        HONEST_HINT,
+        "txHONEST",
+        marker_at,
+    );
+    (conn, victim, pot, game)
+}
+
+/// The MEASURED denial-cost table behind the residual documented on
+/// `PotBinding`. Executable so the numbers cannot rot into prose (Rule 10) —
+/// the previous residual comment named a mechanism that does not work as
+/// written AND a number 8× too high versus the real cheapest path.
+///
+/// [A] Junk under the honest committed key ALONE — the mechanism the old
+///     comment described — NEVER flips the binding, because
+///     `assemble_results` re-injects the caller's OWN representative-row
+///     marker regardless of the SQL window.
+/// [B] The attacker must FIRST displace the representative row; only then
+///     does the per-`(pot, key)` window decide, and the honest marker is
+///     evicted at exactly `SEAT_MARKERS_PER_KEY` junk rows.
+#[test]
+fn the_measured_denial_cost_table() {
+    // ---- [A] junk-only: never flips, at any volume we can afford to test.
+    for n in [0usize, 4, 8, 9, 16, 40] {
+        let (conn, victim, pot, game) = honest_world(50_000);
+        let (_ka, pa) = real_key(41);
+        for i in 0..n {
+            file_marker_row(
+                &conn,
+                &format!("02{}", "77".repeat(32)),
+                &format!("02{}", "88".repeat(32)),
+                &game,
+                &pot,
+                0,
+                1,
+                "3045junk",
+                Some(&pa), // the honest seat's OWN public committed key
+                Some("3045junkseat"),
+                &format!("txJUNK{i:04}"),
+                1_000 + i as i64,
+            );
+        }
+        assert_eq!(
+            wire_row(&results_wire(&conn, &victim), &pot)["potBinding"],
+            serde_json::json!("chain"),
+            "[A] junk under the committed key alone never flips (n={n}) — the \
+             caller's own representative-row marker is re-injected"
+        );
+    }
+
+    // ---- [B] displace the representative row, THEN flood the key slot.
+    // The displacer carries the REAL gameId so the gameId axis is not what
+    // fires — this isolates the window-eviction axis.
+    let mut flip: Option<usize> = None;
+    for n in 0..=9usize {
+        let (conn, victim, pot, game) = honest_world(50_000);
+        let (_ka, pa) = real_key(41);
+        file_hostile_marker(&conn, &victim, &game, &pot, 1, "txDISPLACE", 10);
+        for i in 0..n {
+            file_marker_row(
+                &conn,
+                &format!("02{}", "77".repeat(32)),
+                &format!("02{}", "88".repeat(32)),
+                &game,
+                &pot,
+                0,
+                1,
+                "3045junk",
+                Some(&pa),
+                Some("3045junkseat"),
+                &format!("txJUNK{i:04}"),
+                1_000 + i as i64,
+            );
+        }
+        let b = wire_row(&results_wire(&conn, &victim), &pot)["potBinding"].clone();
+        if b == serde_json::json!("unknown") && flip.is_none() {
+            flip = Some(n);
+        }
+    }
+    assert_eq!(
+        flip,
+        Some(SEAT_MARKERS_PER_KEY),
+        "[B] the honest marker is evicted at exactly SEAT_MARKERS_PER_KEY junk \
+         rows (plus the 1 displacer = {} markers total). This is the residual \
+         documented on `PotBinding`; it is permanent (rows are never deleted, \
+         and createdAt ASC keeps the junk ahead forever).",
+        SEAT_MARKERS_PER_KEY + 1
+    );
+}
+
+/// MEDIUM-3: `potBinding == "chain"` vouches for `(potOutpoint, identity)`
+/// and NOTHING ELSE. The gameId is public (it is in the victim's own on-chain
+/// marker), so an attacker re-using it with an earlier `createdAt` owns the
+/// representative row — and therefore `recoveryHeight` and
+/// `opponentIdentity` — while the binding still resolves.
+///
+/// This is the cell a client author must read before treating "chain-bound"
+/// as row integrity. It is a documented SCOPE limit, not a defect: the money
+/// word rides on `potBinding` + `covRecoveryHeight`, neither of which the
+/// representative row can move.
+#[test]
+fn a_chain_bound_row_still_carries_attacker_display_fields() {
+    let (conn, victim, pot, game) = honest_world(5_000);
+    let forged_opponent = format!("02{}", "ee".repeat(32));
+    file_marker_row(
+        &conn,
+        &victim,
+        &forged_opponent,
+        &game, // the REAL, PUBLIC gameId — so the binding still resolves
+        &pot,
+        0,
+        HOSTILE_HINT,
+        "3045junk",
+        None,
+        None,
+        "txDISPLAY",
+        100,
+    );
+    let wire = results_wire(&conn, &victim);
+    let r = wire_row(&wire, &pot);
+    assert_eq!(r["potBinding"], serde_json::json!("chain"));
+    assert_eq!(
+        r["gameIdBinding"],
+        serde_json::json!("chain"),
+        "even the gameId agrees — the attacker copied the real one"
+    );
+    assert_eq!(
+        r["recoveryHeight"],
+        serde_json::json!(HOSTILE_HINT),
+        "…yet the HINT is the attacker's. `potBinding` does NOT cover it."
+    );
+    assert_eq!(
+        r["opponentIdentity"],
+        serde_json::json!(forged_opponent),
+        "…and so is opponentIdentity. `potBinding` does NOT cover it."
+    );
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(COMMITTED_HEIGHT),
+        "the fields the money word rides on are untouched by the row"
+    );
+}
+
+/// **The F1 identity bar, genuinely REACHED.** A marker whose `seatSig` is a
+/// REAL signature by a key committed in THAT pot's lock, naming the VICTIM's
+/// identity, with a junk identity signature.
+///
+/// The gate found that no `/results` cell reached this bar: the v1 attack
+/// cell dies at `seat_markers_sql`'s `seatSettlePubkey IS NOT NULL` prefilter
+/// long before any signature is checked. This one clears the prefilter, the
+/// committed-key membership check and `verify_seat_marker`, so
+/// `verify_identity_binding` is the ONLY thing refusing it — rebind that
+/// function and this cell goes red.
+#[test]
+fn a_seatsig_only_marker_over_a_foreign_pot_is_refused_by_the_f1_bar() {
+    let conn = production_schema_db();
+    // The ATTACKER's own real covenant pot — the attacker holds pubA, and
+    // committed a recoveryHeight of 1 ("claimable now").
+    let (katt, patt_a) = real_key(77);
+    let (_kb, patt_b) = real_key(78);
+    let attacker_pot = h64(0xcc);
+    let p = params_committing(&patt_a, &patt_b, 1);
+    insert_decoded_pot(&conn, &attacker_pot, None, &p, 4_000, None, None, None, false);
+
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    file_seatsig_only_marker(
+        &conn,
+        &katt,
+        &patt_a,
+        &victim,
+        &h64(0x44),
+        &attacker_pot,
+        0,
+        HOSTILE_HINT,
+        "txSEATONLY",
+        1_000,
+    );
+    let wire = results_wire(&conn, &victim);
+    let r = wire_row(&wire, &attacker_pot);
+    assert_eq!(
+        r["potBinding"],
+        serde_json::json!("unknown"),
+        "only the victim can mint its own identity signature — a seatSig by \
+         the attacker's committed key must never bind the victim"
+    );
+    assert_eq!(r["gameIdBinding"], serde_json::json!("unknown"));
+    // And note what the row DOES honestly serve: an IN-RANGE committed height
+    // of 1, from a genuine covenant lock the attacker owns. The range check is
+    // not a security control — `potBinding` is.
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(1),
+        "a hostile lock may commit any in-range height; the range check is a \
+         no-fake-countdown rule, NOT a security bar"
+    );
+}
+
+/// The seat-marker REPLAY axis: the victim's genuine marker bytes re-filed
+/// against a different `potVout`. The seatSig preimage commits the vout, so
+/// the replay attributes nothing — and the invented outpoint has no
+/// `pot_records` row, so its height is null.
+#[test]
+fn a_genuine_marker_replayed_at_a_different_vout_is_not_chain_bound() {
+    let (conn, victim, pot, game) = honest_world(5_000);
+    let (ka, pa) = real_key(41);
+    // The ORIGINAL vout-0 seatSig bytes, filed against vout 1. Re-signing for
+    // vout 1 is impossible without pubA's private key.
+    let preimage = seatsig_preimage(&game, &pot, 0, &victim).unwrap();
+    let seat_sig = ka
+        .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+        .unwrap();
+    file_marker_row(
+        &conn,
+        &victim,
+        &format!("02{}", "bb".repeat(32)),
+        &game,
+        &pot,
+        1, // different vout
+        i64::from(HONEST_HINT),
+        "3045id",
+        Some(&pa),
+        Some(&hex::encode(seat_sig.to_der())),
+        "txREPLAYVOUT",
+        200,
+    );
+    let wire = results_wire(&conn, &victim);
+    let r1 = wire["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["potVout"] == serde_json::json!(1))
+        .expect("the vout-1 row is served");
+    assert_eq!(r1["potBinding"], serde_json::json!("unknown"));
+    assert!(r1["covRecoveryHeight"].is_null());
+    // …and the genuine vout-0 row is untouched by the replay.
+    assert_eq!(
+        wire_row(&wire, &pot)["potBinding"],
+        serde_json::json!("chain"),
+        "control: the replay does not disturb the real outpoint"
+    );
+}
+
+/// Rule 4c — `verify_seat_marker` requires CANONICAL STRICT DER. One honest
+/// seatSig must not be re-encodable into distinct still-verifying bytes:
+/// low-S is enforced by `verify`, and trailing-byte padding is refused by the
+/// re-encode-and-compare added for this finding.
+#[test]
+fn der_padding_is_refused_canonical_strict() {
+    use low_app_layer::results::verify_seat_marker;
+    let (ka, pa) = real_key(41);
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    let game = h64(0x11);
+    let pot = h64(0xaa);
+    let preimage = seatsig_preimage(&game, &pot, 0, &victim).unwrap();
+    let der = ka
+        .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+        .unwrap()
+        .to_der();
+    let m = SeatMarkerRow {
+        identity: victim.clone(),
+        opponent_identity: format!("02{}", "bb".repeat(32)),
+        game_id: game.clone(),
+        pot_txid: pot.clone(),
+        pot_vout: 0,
+        recovery_height: HONEST_HINT,
+        seat_settle_pubkey: pa.clone(),
+        seat_sig_hex: hex::encode(&der),
+        identity_sig_hex: String::new(),
+    };
+    // POSITIVE CONTROL — without this the refusals below prove nothing.
+    assert!(verify_seat_marker(&m), "the honest canonical seatSig verifies");
+
+    let mut padded = m.clone();
+    padded.seat_sig_hex = hex::encode([der.clone(), vec![0x00]].concat());
+    assert!(
+        !verify_seat_marker(&padded),
+        "a trailing-byte DER variant is DIFFERENT bytes that used to verify — \
+         an unbounded minting machine for any future cap/dedupe keyed on \
+         marker signature bytes"
+    );
+
+    // High-S: S' = n - S, re-encoded. Distinct bytes, must not verify.
+    let rlen = der[3] as usize;
+    let r = &der[4..4 + rlen];
+    let slen = der[5 + rlen] as usize;
+    let s = &der[6 + rlen..6 + rlen + slen];
+    let n =
+        hex::decode("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141").unwrap();
+    let mut sv = [0u8; 32];
+    let sb: Vec<u8> = if s.len() > 32 {
+        s[s.len() - 32..].to_vec()
+    } else {
+        s.to_vec()
+    };
+    sv[32 - sb.len()..].copy_from_slice(&sb);
+    let mut hi = [0u8; 32];
+    let mut borrow = 0i32;
+    for i in (0..32).rev() {
+        let d = i32::from(n[i]) - i32::from(sv[i]) - borrow;
+        if d < 0 {
+            hi[i] = (d + 256) as u8;
+            borrow = 1;
+        } else {
+            hi[i] = d as u8;
+            borrow = 0;
+        }
+    }
+    fn der_int(v: &[u8]) -> Vec<u8> {
+        let mut t = v.to_vec();
+        while t.len() > 1 && t[0] == 0 {
+            t.remove(0);
+        }
+        if t[0] & 0x80 != 0 {
+            t.insert(0, 0);
+        }
+        let mut o = vec![0x02, t.len() as u8];
+        o.extend(t);
+        o
+    }
+    let mut body = der_int(r);
+    body.extend(der_int(&hi));
+    let mut high_s = vec![0x30, body.len() as u8];
+    high_s.extend(body);
+    assert_ne!(high_s, der, "the high-S encoding really is different bytes");
+    let mut hs = m.clone();
+    hs.seat_sig_hex = hex::encode(&high_s);
+    assert!(!verify_seat_marker(&hs), "high-S must be refused");
 }

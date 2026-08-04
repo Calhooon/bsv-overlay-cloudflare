@@ -580,6 +580,48 @@ fn bare_pot_refund_classifies_only_with_the_exact_marker_height_gate() {
     assert_eq!(classify(Some(900_000), &winnerish, &wid), None);
 }
 
+/// The bare-refund rule's USABLE-BLOCK-HEIGHT gate, at the producer.
+///
+/// `classify_bare_refund` used to spell this inline (`h == 0 || h >=
+/// LOCKTIME_THRESHOLD`) — the exact negation of the shared
+/// `refund_view::valid_recovery_height`, in a MONEY-CLASSIFICATION path, in a
+/// file whose commit claimed the predicate was now shared. It is now the
+/// shared call; this cell pins the BEHAVIOUR so the fold cannot regress
+/// silently (nothing else went red when the predicate was neutered).
+///
+/// Both refused legs are genuinely reachable: the wire `nLockTime` equals the
+/// marker height in each, so the ONLY thing refusing them is the range rule.
+#[test]
+fn bare_pot_refund_refuses_unusable_marker_heights() {
+    let lock = bare_lock();
+    let funding = build_funding(&lock, 4000);
+    let funding_txid = txid_of(&funding);
+    let outs = vec![(1800u64, p2pkh(&[0xAAu8; 20])), (1800u64, p2pkh(&[0xBBu8; 20]))];
+    let classify = |h: u32| {
+        let sp = build_spender(&funding_txid, 0xffff_fffe, &outs, h);
+        let id = txid_of(&sp);
+        classify_pot_spend(&PotSpendFacts {
+            pot_txid: &funding_txid,
+            pot_vout: 0,
+            funding_raw: &funding,
+            spender_txid: &id,
+            spender_raw: &sp,
+            marker_recovery_height: Some(h),
+        })
+    };
+    // POSITIVE CONTROL — an IN-RANGE height on this exact fixture classifies,
+    // so the refusals below are about the range and not about the fixture.
+    assert_eq!(classify(900_000), Some(PotVerdict::Refund));
+    assert_eq!(classify(0), None, "0 is not a gate — never a refund");
+    assert_eq!(
+        classify(low_app_layer::results::LOCKTIME_THRESHOLD),
+        None,
+        "a timestamp-range value is not a block height"
+    );
+    assert_eq!(classify(low_app_layer::results::LOCKTIME_THRESHOLD - 1), Some(PotVerdict::Refund),
+        "…and the last in-range height still classifies (the bound is exact)");
+}
+
 // ── /spent-any building blocks with the real fixtures ───────────────────────
 
 #[test]
