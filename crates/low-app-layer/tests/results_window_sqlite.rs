@@ -1395,3 +1395,661 @@ fn a_parked_spend_yields_no_verdict_through_the_real_sql() {
     );
     assert_eq!(parked[0].spent_confirmed, Some(false));
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// CHAIN PROVENANCE on `/results` — `covRecoveryHeight` + `potBinding`
+// ════════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT these cells pin (a client-side adversarial gate, 2026-08-04):
+// the client's `'recoverable'` money-word and its row-corroboration
+// predicate were BOTH derived from data an attacker can write.
+//
+//  - `results_sql` keys on the BYTE-ADMITTED `identity` column, so anyone can
+//    file an `ls_potparty` marker naming a VICTIM's identity, with
+//    `recoveryHeight: 1` and ANY real unspent outpoint as `potTxid`, for one
+//    dust `OP_RETURN`. `/results` serves that row; the client rendered
+//    "Recoverable" off the marker's own `recoveryHeight`.
+//  - `spent` / `spentConfirmed` / `at.height` describe whichever pot THE ROW
+//    NAMES — i.e. the attacker's own pot, which the attacker can genuinely
+//    spend and confirm. Corroborating on them corroborates the attacker.
+//
+// The server already DECODES the chain-committed truth and simply did not
+// serve it. These cells drive the REAL producer chain end to end —
+// `results_sql` → `covenant_params_by_pot` → `seat_marker_chunks` →
+// `seat_markers_sql` → `assemble_results` → `results_body` — against the
+// PRODUCTION schema, and assert on the WIRE BODY (the contract the client
+// reads), never on an intermediate struct.
+
+use low_app_layer::results::{
+    potparty_protocol, potparty_v2_challenge, results_body, seat_marker_chunks, seatsig_preimage,
+    CovenantParams, SeatMarkerRow, SEAT_MARKERS_PER_KEY as SEAT_CAP,
+};
+
+/// A real settle keypair: (privkey, 66-hex compressed pubkey lowercase).
+fn real_key(seed: u8) -> (bsv_rs::primitives::ec::PrivateKey, String) {
+    let mut b = [0u8; 32];
+    b[31] = seed;
+    let k = bsv_rs::primitives::ec::PrivateKey::from_bytes(&b).unwrap();
+    let pk = k.public_key().to_hex().to_ascii_lowercase();
+    (k, pk)
+}
+
+fn wallet_of(seed: u8) -> bsv_rs::wallet::ProtoWallet {
+    let key = bsv_rs::primitives::ec::PrivateKey::from_hex(&format!("{seed:064x}")).unwrap();
+    bsv_rs::wallet::ProtoWallet::new(Some(key))
+}
+
+fn identity_of(w: &bsv_rs::wallet::ProtoWallet) -> String {
+    w.identity_key_hex().to_ascii_lowercase()
+}
+
+/// `CovenantParams` committing two REAL settle pubkeys — the shape the
+/// overlay's admission-time decode of a funding lock produces.
+fn params_committing(pub_a_hex: &str, pub_b_hex: &str, recovery_height: u64) -> CovenantParams {
+    let mut pub_a = [0u8; 33];
+    pub_a.copy_from_slice(&hex::decode(pub_a_hex).unwrap());
+    let mut pub_b = [0u8; 33];
+    pub_b.copy_from_slice(&hex::decode(pub_b_hex).unwrap());
+    CovenantParams {
+        pub_a,
+        pub_b,
+        pub_tower: [2u8; 33],
+        pay_pkh_a: [0xaa; 20],
+        pay_pkh_b: [0xbb; 20],
+        rake_pkh: [0xcc; 20],
+        stake_a: 2_000,
+        stake_b: 2_000,
+        fee_sats: 400,
+        recovery_height,
+    }
+}
+
+/// File a GENUINELY VERIFIABLE `LOW/potparty/v2` marker into the production
+/// `potparty_records` table: `seatSigHex` is a real ECDSA signature by
+/// `settle_key` over sha256 of the exact cross-repo preimage, and `sigHex` is
+/// a real BRC-42 'anyone' signature by the identity wallet over the exact v2
+/// challenge. Both preimage and challenge are built by the SHIPPED functions,
+/// so this fixture cannot drift from the verifier.
+#[allow(clippy::too_many_arguments)]
+fn file_real_v2_marker(
+    conn: &Connection,
+    settle_key: &bsv_rs::primitives::ec::PrivateKey,
+    settle_pub_hex: &str,
+    identity_wallet: &bsv_rs::wallet::ProtoWallet,
+    opponent_hex: &str,
+    game_id: &str,
+    pot_txid: &str,
+    pot_vout: u32,
+    recovery_height: u32,
+    marker_txid: &str,
+    created_at: i64,
+) {
+    let identity_hex = identity_of(identity_wallet);
+    let preimage = seatsig_preimage(game_id, pot_txid, pot_vout, &identity_hex).unwrap();
+    let seat_sig = settle_key
+        .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+        .unwrap();
+    let mut m = SeatMarkerRow {
+        identity: identity_hex.clone(),
+        opponent_identity: opponent_hex.to_string(),
+        game_id: game_id.to_string(),
+        pot_txid: pot_txid.to_string(),
+        pot_vout,
+        recovery_height,
+        seat_settle_pubkey: settle_pub_hex.to_string(),
+        seat_sig_hex: hex::encode(seat_sig.to_der()),
+        identity_sig_hex: String::new(),
+    };
+    let challenge = potparty_v2_challenge(&m).unwrap();
+    let sig = identity_wallet
+        .create_signature(bsv_rs::wallet::CreateSignatureArgs {
+            data: Some(challenge),
+            hash_to_directly_sign: None,
+            protocol_id: potparty_protocol(),
+            key_id: game_id.to_string(),
+            counterparty: Some(bsv_rs::wallet::Counterparty::Anyone),
+        })
+        .unwrap();
+    m.identity_sig_hex = hex::encode(sig.signature);
+
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
+        params![
+            m.identity,
+            m.opponent_identity,
+            m.game_id,
+            m.pot_txid,
+            m.pot_vout,
+            m.recovery_height,
+            m.identity_sig_hex,
+            m.seat_settle_pubkey,
+            m.seat_sig_hex,
+            marker_txid,
+            created_at
+        ],
+    )
+    .expect("insert real v2 potparty_records");
+}
+
+/// File a bare (v1) marker with an arbitrary identity / gameId / hint — the
+/// ATTACKER's primitive. Byte-format admission means this always lands.
+#[allow(clippy::too_many_arguments)]
+fn file_hostile_marker(
+    conn: &Connection,
+    identity: &str,
+    game_id: &str,
+    pot_txid: &str,
+    recovery_height: i64,
+    marker_txid: &str,
+    created_at: i64,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', ?6, 0, ?7)",
+        params![
+            identity,
+            h64(0xbb),
+            game_id,
+            pot_txid,
+            recovery_height,
+            marker_txid,
+            created_at
+        ],
+    )
+    .expect("insert hostile potparty_records");
+}
+
+/// The seat-marker fetch EXACTLY as `routes::results_seat_markers` performs
+/// it: `covenant_params_by_pot` over the joined rows → `seat_marker_chunks` →
+/// the shipped `seat_markers_sql`, bound `(potTxid, potVout, pubA, pubB)`.
+/// Driving the real chunker (rather than hand-feeding a marker map) is what
+/// makes these cells producer-level proofs rather than primitive-level ones.
+fn fetch_seat_markers(
+    conn: &Connection,
+    rows: &[ResultsRow],
+) -> std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>> {
+    let mut out: std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>> =
+        std::collections::HashMap::new();
+    let params_by_pot = covenant_params_by_pot(rows);
+    for chunk in seat_marker_chunks(&params_by_pot) {
+        let sql = seat_markers_sql(chunk.len(), SEAT_CAP);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        for b in &chunk {
+            binds.push(b.pot_txid.clone().into());
+            binds.push(i64::from(b.pot_vout).into());
+            binds.push(b.pub_a_hex.clone().into());
+            binds.push(b.pub_b_hex.clone().into());
+        }
+        let fetched = stmt
+            .query_map(rusqlite::params_from_iter(binds), |r| {
+                Ok(SeatMarkerRow {
+                    identity: r.get::<_, String>("identity")?.to_ascii_lowercase(),
+                    opponent_identity: r.get::<_, String>("opponentIdentity")?.to_ascii_lowercase(),
+                    game_id: r.get::<_, String>("gameId")?.to_ascii_lowercase(),
+                    pot_txid: r.get::<_, String>("potTxid")?.to_ascii_lowercase(),
+                    pot_vout: r.get::<_, i64>("potVout")? as u32,
+                    recovery_height: r.get::<_, i64>("recoveryHeight")? as u32,
+                    seat_settle_pubkey: r
+                        .get::<_, Option<String>>("seatSettlePubkey")?
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                    seat_sig_hex: r
+                        .get::<_, Option<String>>("seatSigHex")?
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                    identity_sig_hex: r
+                        .get::<_, Option<String>>("sigHex")?
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for m in fetched {
+            out.entry((m.pot_txid.clone(), m.pot_vout))
+                .or_default()
+                .push(m);
+        }
+    }
+    out
+}
+
+/// The WHOLE `/results` producer chain, ending at the wire body a client
+/// actually parses.
+fn results_wire(conn: &Connection, identity_lc: &str) -> serde_json::Value {
+    let rows = query_results_rows(conn, identity_lc);
+    let seat_markers = fetch_seat_markers(conn, &rows);
+    let entries = assemble_results(
+        identity_lc,
+        rows,
+        &std::collections::HashMap::new(),
+        &seat_markers,
+    );
+    serde_json::from_str(&results_body(identity_lc, &entries)).unwrap()
+}
+
+/// Find the wire row for a pot txid (the wire lowercases txids).
+fn wire_row<'a>(v: &'a serde_json::Value, pot_txid: &str) -> &'a serde_json::Value {
+    let want = pot_txid.to_ascii_lowercase();
+    v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["potTxid"] == serde_json::json!(want))
+        .unwrap_or_else(|| panic!("no /results row for pot {want}"))
+}
+
+/// The victim's committed recovery height — deliberately NOT the value any
+/// marker in these fixtures carries, so "which field did this come from" is
+/// always decidable.
+const COMMITTED_HEIGHT: u64 = 958_846;
+/// The hint the HONEST marker carries. Different from `COMMITTED_HEIGHT` on
+/// purpose: an honest client may legitimately hold a stale hint, and the two
+/// fields must stay separately observable.
+const HONEST_HINT: u32 = 958_800;
+/// The hostile marker's hint — "your refund is claimable NOW".
+const HOSTILE_HINT: i64 = 1;
+
+/// (1) POSITIVE CONTROL + the honest case. A covenant-decodable pot the
+/// caller holds a committed settle key in serves the COVENANT height as its
+/// own field and reports the row as CHAIN-BOUND — while the marker hint keeps
+/// its own name and its own (different) value.
+///
+/// This is also the reachability proof for cells (2)–(4): it shows the
+/// `potBinding == "chain"` leg is genuinely reachable through the real
+/// producer, so a `"unknown"` assertion elsewhere is evidence and not an
+/// input that died three validations earlier.
+#[test]
+fn a_covenant_pot_the_caller_holds_a_committed_key_in_is_chain_bound() {
+    let conn = production_schema_db();
+    let (ka, pa) = real_key(41);
+    let (_kb, pb) = real_key(42);
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    let opponent = format!("02{}", "bb".repeat(32));
+    let game = h64(0x11);
+    let pot = h64(0xaa);
+    let p = params_committing(&pa, &pb, COMMITTED_HEIGHT);
+
+    // An UNSPENT covenant pot — the exact state a "Recoverable" word is
+    // rendered in, and the state the old code could not check at all.
+    insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
+    file_real_v2_marker(
+        &conn,
+        &ka,
+        &pa,
+        &victim_w,
+        &opponent,
+        &game,
+        &pot,
+        0,
+        HONEST_HINT,
+        "txHONESTV2",
+        1_001,
+    );
+
+    let wire = results_wire(&conn, &victim);
+    let r = wire_row(&wire, &pot);
+    assert_eq!(
+        r["recoveryHeight"],
+        serde_json::json!(HONEST_HINT),
+        "the marker hint keeps its name and value (back-compat)"
+    );
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(COMMITTED_HEIGHT),
+        "the COVENANT-committed height is served as its own distinct field"
+    );
+    assert_eq!(
+        r["potBinding"],
+        serde_json::json!("chain"),
+        "POSITIVE CONTROL: the chain-bound leg is genuinely reachable"
+    );
+    assert_eq!(r["potBindingSource"], serde_json::json!("chain+seatkey"));
+    // Unspent ⇒ no verdict/outcome is asserted; the binding is orthogonal.
+    assert!(r["verdict"].is_null());
+    assert_eq!(r["outcome"], serde_json::json!("unresolved"));
+}
+
+/// (2) **THE ATTACK.** A hostile marker names the VICTIM's identity, an
+/// invented `gameId`, `recoveryHeight: 1`, and a REAL covenant pot outpoint
+/// that is NOT the victim's — one the attacker genuinely owns a seat in and
+/// can spend and confirm at will.
+///
+/// `/results` must serve that row (the overlay is an index, not an
+/// authority — refusing to serve it would be adjudication at the wrong
+/// layer) with the hostile hint UNCHANGED, and must report:
+///  - `potBinding: "unknown"` — nothing the network settled binds this
+///    outpoint to this gameId for this identity;
+///  - a `covRecoveryHeight` that is the ATTACKER pot's real committed height,
+///    NEVER the hostile hint — which is exactly why the client must gate on
+///    `potBinding`, not on the presence of a covenant height.
+#[test]
+fn a_hostile_marker_naming_a_real_foreign_pot_is_never_chain_bound() {
+    let conn = production_schema_db();
+    // The ATTACKER's own real covenant pot: their keys, their lock, their
+    // committed height. Everything about it is genuine.
+    let (katt_a, patt_a) = real_key(77);
+    let (_katt_b, patt_b) = real_key(78);
+    let attacker_w = wallet_of(0x60);
+    let attacker_pot = h64(0xcc);
+    let attacker_game = h64(0x33);
+    const ATTACKER_COMMITTED_HEIGHT: u64 = 700_000;
+    let p_att = params_committing(&patt_a, &patt_b, ATTACKER_COMMITTED_HEIGHT);
+    insert_decoded_pot(
+        &conn,
+        &attacker_pot,
+        None,
+        &p_att,
+        4_000,
+        None,
+        None,
+        None,
+        false,
+    );
+    // The attacker's OWN honest seat marker for their OWN pot — present, and
+    // correctly attributing the ATTACKER. It must not leak to the victim.
+    file_real_v2_marker(
+        &conn,
+        &katt_a,
+        &patt_a,
+        &attacker_w,
+        &format!("02{}", "dd".repeat(32)),
+        &attacker_game,
+        &attacker_pot,
+        0,
+        700_000,
+        "txATTACKERV2",
+        900,
+    );
+
+    // The forgery: one dust marker naming the VICTIM.
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    let forged_game = h64(0x44);
+    file_hostile_marker(
+        &conn,
+        &victim,
+        &forged_game,
+        &attacker_pot,
+        HOSTILE_HINT,
+        "txFORGERY",
+        5_000,
+    );
+
+    let wire = results_wire(&conn, &victim);
+    let r = wire_row(&wire, &attacker_pot);
+    // The row SERVES — the index does not adjudicate.
+    assert_eq!(
+        r["recoveryHeight"],
+        serde_json::json!(HOSTILE_HINT),
+        "the marker hint is served verbatim (unchanged, back-compat)"
+    );
+    // …and is reported as NOT chain-bound. This is the field the client's
+    // money word must gate on.
+    assert_eq!(
+        r["potBinding"],
+        serde_json::json!("unknown"),
+        "THE ATTACK: nothing the network settled binds this outpoint to this \
+         gameId for this identity"
+    );
+    assert!(r["potBindingSource"].is_null());
+    // The covenant height served is the ATTACKER POT's real committed value —
+    // never the hostile `1`. A client that gated on `covRecoveryHeight` alone
+    // would still be reading a fact about a pot it has no key in, which is
+    // precisely why the binding bit exists.
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(ATTACKER_COMMITTED_HEIGHT),
+        "the committed height describes the outpoint the ROW names, and the \
+         attacker names the outpoint — `potBinding` is the load-bearing gate"
+    );
+    assert_ne!(r["covRecoveryHeight"], serde_json::json!(HOSTILE_HINT));
+    // Nothing about the outcome is asserted either.
+    assert_eq!(r["outcome"], serde_json::json!("unresolved"));
+
+    // …and the attacker's own genuine seat proof for that pot did NOT leak
+    // into the victim's row: the seatSig preimage commits the gameId, and the
+    // identity signature is the attacker's, not the victim's.
+    assert_eq!(wire["results"].as_array().unwrap().len(), 1);
+}
+
+/// (2b) The narrower variant: the hostile marker names the VICTIM'S OWN pot
+/// under a FABRICATED gameId. The victim's genuine seat proof for that
+/// outpoint is in the fetch (the seat query is keyed by OUTPOINT), so a
+/// binding check that forgot the gameId filter would inherit it and report
+/// the forged row as chain-bound.
+#[test]
+fn a_hostile_gameid_on_the_victims_own_pot_is_not_chain_bound() {
+    let conn = production_schema_db();
+    let (ka, pa) = real_key(41);
+    let (_kb, pb) = real_key(42);
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    let opponent = format!("02{}", "bb".repeat(32));
+    let real_game = h64(0x11);
+    let forged_game = h64(0x99);
+    let pot = h64(0xaa);
+    let p = params_committing(&pa, &pb, COMMITTED_HEIGHT);
+    insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
+    // The victim's GENUINE marker — stamped LATER, so the per-pot window's
+    // oldest-first representative is the forgery (the display fields come
+    // from the hostile row; the money-relevant answer must not).
+    file_real_v2_marker(
+        &conn,
+        &ka,
+        &pa,
+        &victim_w,
+        &opponent,
+        &real_game,
+        &pot,
+        0,
+        HONEST_HINT,
+        "txHONESTV2",
+        9_000,
+    );
+    file_hostile_marker(
+        &conn,
+        &victim,
+        &forged_game,
+        &pot,
+        HOSTILE_HINT,
+        "txFORGERY",
+        100,
+    );
+
+    let wire = results_wire(&conn, &victim);
+    // One pot ⇒ one row, and it is the OLDEST marker (the forgery) that
+    // supplies the display fields — the documented #281 F1b residual.
+    let r = wire_row(&wire, &pot);
+    assert_eq!(
+        r["gameId"],
+        serde_json::json!(forged_game),
+        "the oldest marker owns the display fields (documented residual)"
+    );
+    assert_eq!(r["recoveryHeight"], serde_json::json!(HOSTILE_HINT));
+    assert_eq!(
+        r["potBinding"],
+        serde_json::json!("unknown"),
+        "the seatSig preimage commits the gameId — the victim's genuine proof \
+         for this OUTPOINT does not bind the attacker's fabricated gameId"
+    );
+    assert!(r["potBindingSource"].is_null());
+    // The covenant height is still the honest chain fact about the pot.
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(COMMITTED_HEIGHT),
+        "a real committed height for a real pot — but unbound to this row"
+    );
+}
+
+/// (3) A pot that is PRESENT and covenant-decodable but has no verifying seat
+/// marker at all: `unknown`, never an assertion. The covenant height still
+/// serves (it is an honest fact about the outpoint), which is exactly the
+/// separation the honesty pair exists to express.
+#[test]
+fn a_present_unverdicted_pot_with_no_seat_proof_is_unknown() {
+    let conn = production_schema_db();
+    let (_ka, pa) = real_key(41);
+    let (_kb, pb) = real_key(42);
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    let p = params_committing(&pa, &pb, COMMITTED_HEIGHT);
+    insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
+    // A v1 marker only — no seat binding exists for this pot at all.
+    file_marker(&conn, &victim, &pot, "txV1ONLY", 1_001);
+
+    let r = results_wire(&conn, &victim);
+    let r = wire_row(&r, &pot);
+    assert_eq!(r["potBinding"], serde_json::json!("unknown"));
+    assert!(r["potBindingSource"].is_null());
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(COMMITTED_HEIGHT),
+        "the committed height is a chain fact about the outpoint regardless"
+    );
+    assert!(r["verdict"].is_null(), "unspent ⇒ no verdict is asserted");
+    assert_eq!(r["outcome"], serde_json::json!("unresolved"));
+    // `spent: false` is the index's own record for THIS OUTPOINT — an honest
+    // fact, and still not corroboration of the ROW, because the row is what
+    // chose the outpoint. Unchanged by this work; asserted so the cell is
+    // explicit about which fields do and do not carry provenance.
+    assert_eq!(r["spent"], serde_json::json!(false));
+}
+
+/// (4) NO `pot_records` ROW AT ALL (an invented / not-yet-admitted pot): the
+/// covenant height is `null` and the binding is `unknown`. Nothing is
+/// asserted — in particular `spent` stays `null`, never a claimed-unspent.
+#[test]
+fn an_absent_pot_record_serves_null_height_and_unknown_binding() {
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let invented = h64(0xde);
+    file_hostile_marker(
+        &conn,
+        &victim,
+        &h64(0x44),
+        &invented,
+        HOSTILE_HINT,
+        "txINVENTED",
+        1_000,
+    );
+
+    let wire = results_wire(&conn, &victim);
+    let r = wire_row(&wire, &invented);
+    assert_eq!(r["recoveryHeight"], serde_json::json!(HOSTILE_HINT));
+    assert!(
+        r["covRecoveryHeight"].is_null(),
+        "no pot_records row ⇒ no committed height — explicit null, never the hint"
+    );
+    assert_eq!(r["potBinding"], serde_json::json!("unknown"));
+    assert!(r["potBindingSource"].is_null());
+    assert!(r["spent"].is_null(), "never asserted-unspent");
+    assert_eq!(r["outcome"], serde_json::json!("unresolved"));
+}
+
+/// (5) A committed height OUTSIDE the usable block-height range (0, or the
+/// nLockTime timestamp range) is `null`, not a fake countdown — the SAME
+/// range rule `/refund-view` and `/live-view` apply, through the shared
+/// `valid_recovery_height` predicate.
+#[test]
+fn an_unusable_committed_height_serves_null_not_a_fake_countdown() {
+    let conn = production_schema_db();
+    let (_ka, pa) = real_key(41);
+    let (_kb, pb) = real_key(42);
+    let victim = format!("02{}", "a1".repeat(32));
+    let pot = h64(0xaa);
+    // A covenant committing height 0 — "no gate", not "claimable now".
+    let p = params_committing(&pa, &pb, 0);
+    insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
+    file_marker(&conn, &victim, &pot, "txV1ONLY", 1_001);
+
+    let wire = results_wire(&conn, &victim);
+    assert!(
+        wire_row(&wire, &pot)["covRecoveryHeight"].is_null(),
+        "a committed 0 is not a usable height — null, never a countdown"
+    );
+}
+
+/// (6) The BEEF fallback leg reaches the binding too: a LEGACY row with no
+/// decoded `pot_records` columns resolves its committed params from the
+/// hash-verified funding BEEF, and the binding is answered from those. Pins
+/// that the hoisted `row_params` resolution did not quietly become
+/// columns-only (Rule 6b — the path production still has legacy rows on).
+#[test]
+fn the_legacy_beef_leg_still_answers_the_binding() {
+    let conn = production_schema_db();
+    let victim_w = wallet_of(0x51);
+    let victim = identity_of(&victim_w);
+    // The REAL mainnet pot c571d433 — a genuine covenant lock, decoded here
+    // from bytes, with NO decoded columns present.
+    conn.execute(
+        "INSERT OR IGNORE INTO pot_records (txid, outputIndex, spent, createdAt) \
+         VALUES (?1, 0, 0, 1000)",
+        params![ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    insert_beef(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        &beef_bytes_of(ENFORCED_FUNDING_HEX),
+    );
+    let p = enforced_pot_columns();
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txV1", 1_001);
+
+    let rows = query_results_rows(&conn, &victim);
+    assert!(
+        !no_blob(&rows[0].funding_beef_hex),
+        "the legacy leg really is exercised (the BLOB was fetched)"
+    );
+    assert_eq!(rows[0].lock_kind, None, "no decoded columns on this row");
+    // The committed params ARE recoverable from the bytes — so the binding's
+    // `unknown` below is about the missing seat proof, not a dead path.
+    assert_eq!(
+        covenant_params_by_pot(&rows).get(&(ENFORCED_FUNDING_TXID.to_string(), 0)),
+        Some(&p),
+        "positive control: the BEEF leg resolves the committed keys"
+    );
+    let wire = results_wire(&conn, &victim);
+    let r = wire_row(&wire, ENFORCED_FUNDING_TXID);
+    // The COMMITTED height is served on this leg too — re-decoded per request
+    // from the hash-verified funding lock, not read off a column. Pinned
+    // against the REAL mainnet pot's own committed value.
+    assert_eq!(
+        r["covRecoveryHeight"],
+        serde_json::json!(p.recovery_height),
+        "the legacy BEEF leg serves the covenant-committed height"
+    );
+    assert_eq!(
+        p.recovery_height, 956_656,
+        "the fixture's committed height is the real c571d433 value — pinned so \
+         the assertion above cannot move in sympathy with the code"
+    );
+    assert_eq!(
+        r["potBinding"],
+        serde_json::json!("unknown"),
+        "no seat marker exists for this pot — unknown, never optimistic"
+    );
+    // …and the seat query was genuinely ISSUED for this pot's committed keys
+    // (the chunker produced a bind for it) — the `unknown` above is "we
+    // looked and found nothing", not "we never looked".
+    let chunks = seat_marker_chunks(&covenant_params_by_pot(&rows));
+    assert_eq!(
+        chunks
+            .iter()
+            .flatten()
+            .filter(|b| b.pot_txid == ENFORCED_FUNDING_TXID && b.pub_a_hex == hex::encode(p.pub_a))
+            .count(),
+        1,
+        "the committed-key seat query really was issued for this pot"
+    );
+    assert!(!fetch_seat_markers(&conn, &rows)
+        .contains_key(&(ENFORCED_FUNDING_TXID.to_ascii_lowercase(), 0)));
+}

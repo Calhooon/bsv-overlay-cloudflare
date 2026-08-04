@@ -406,7 +406,13 @@ pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
 
 /// The BRC-43 protocol potparty markers sign their IDENTITY challenge under
 /// — `potParty.ts::POTPARTY_PROTOCOL` = `[1, 'low potparty']`.
-fn potparty_protocol() -> bsv_rs::wallet::Protocol {
+///
+/// `pub` for the same producer-parity reason as [`result_protocol`]: the
+/// `results_window_sqlite` integration fixtures must MINT genuinely verifiable
+/// v2 markers with the exact protocol the verifier checks, rather than
+/// re-deriving the tuple by convention (a duplicated format string is a
+/// boundary with no pin by construction — Rule 16).
+pub fn potparty_protocol() -> bsv_rs::wallet::Protocol {
     bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty")
 }
 
@@ -554,6 +560,118 @@ pub fn attribute_seats(
 pub enum SeatLetter {
     A,
     B,
+}
+
+/// Whether a `/results` row's `(potOutpoint, gameId, identity)` triple is
+/// bound by something the NETWORK SETTLED, or merely asserted by a marker.
+///
+/// # Why the row itself proves nothing
+///
+/// `tm_potparty` admits markers by BYTE FORMAT only (the overlay is an index,
+/// not an authority — repo doctrine). Every display field on a `/results` row
+/// therefore originates in an attacker-writable marker: `gameId`,
+/// `opponentIdentity`, `recoveryHeight`, and — because `results_sql` keys on
+/// the byte-admitted `identity` column — the fact that the row appears for
+/// this caller AT ALL. Anyone can file a marker naming a VICTIM's identity, a
+/// `recoveryHeight` of their choosing, and ANY real unspent outpoint as
+/// `potTxid`, for one dust `OP_RETURN`. Everything the row then reports about
+/// that outpoint (`spent`, `spentConfirmed`, `at.height`, and the committed
+/// params) is TRUE — of the ATTACKER's pot, which the attacker can genuinely
+/// spend and confirm at will. A client that reads those fields as
+/// corroboration is corroborating the attacker.
+///
+/// # What the chain does settle
+///
+/// The pot's covenant lock committed `pubA`/`pubB` — the seats' `[2,'low
+/// settle']` keys — INTO THE FUNDING OUTPUT, at funding time, before any
+/// outcome. A `LOW/potparty/v2` seat marker carries a `seatSig` BY one of
+/// those keys over the preimage `domain ‖ gameId ‖ potTxid ‖ potVout ‖
+/// identity` ([`seatsig_preimage`]), plus the identity's own signature over
+/// the whole marker ([`verify_identity_binding`], the F1 bar). So a marker
+/// that clears BOTH bars, whose key is one THIS pot's lock committed, and
+/// whose `gameId` is the ROW's `gameId`, is a network-settled binding of
+/// exactly the triple in question: only the committed key holder could sign
+/// it, only the named identity could publish it, and the key predates the
+/// outcome. This is the same spine `/leaderboard` counts wins on (#332 v3).
+///
+/// Anything short of that is [`PotBinding::Unknown`] — a FIRST-CLASS answer
+/// (Rule 13), never coerced to the optimistic value.
+///
+/// # Residuals — stated, not defended
+///
+/// 1. **Suppression, never forgery.** The committed settle keys are PUBLIC on
+///    chain, so [`SEAT_MARKERS_PER_KEY`] junk markers filed under the honest
+///    seat's own key evict the genuine one from the fetch window (#283c). The
+///    consequence here is `Unknown` — a client shows "checking", not a wrong
+///    money word. It is a DoS on the DISPLAY at a dust tx per row; the refund
+///    itself is a pre-signed spend the client already holds and is untouched.
+///    It self-heals the moment the honest marker is re-fetched within the
+///    window (#252's backfill republishes), so this is not a lockout (Rule 6).
+/// 2. **A v1 (pre-#230) pot has no seat binding to find** and answers
+///    `Unknown` forever. Under-reporting is the honest fail direction; those
+///    pots keep whatever legacy path already covered them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PotBinding {
+    /// PROVEN: a settle key committed in THIS pot's own lock signed this
+    /// `(gameId, potOutpoint, identity)` triple, and the identity signed the
+    /// marker carrying it.
+    Chain,
+    /// NOT PROVEN — the pot is not covenant-decodable, no verifying seat
+    /// marker for this game exists under the committed keys, the slot is
+    /// poisoned by conflicting markers, or the lock is degenerate. This is
+    /// "we cannot prove it", NOT "it is false".
+    Unknown,
+}
+
+impl PotBinding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PotBinding::Chain => "chain",
+            PotBinding::Unknown => "unknown",
+        }
+    }
+
+    /// The honesty PAIR — `(value, source)`, the shape `/results` already
+    /// uses for `outcome`/`outcomeSource` and `/refund-view` for
+    /// `status`/`statusSource`. The source is `None` for `Unknown`: there is
+    /// no provenance to name when nothing was proven.
+    pub fn pair(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            PotBinding::Chain => ("chain", Some("chain+seatkey")),
+            PotBinding::Unknown => ("unknown", None),
+        }
+    }
+}
+
+/// Is this row's `(potOutpoint, gameId, identity)` triple chain-bound?
+///
+/// The GAME-ID FILTER is the part [`my_seat`] does not do and must not be
+/// dropped: `seat_markers_sql` fetches by pot OUTPOINT, so the caller's
+/// genuine marker for its REAL game arrives in the candidate list for ANY row
+/// naming that outpoint. Without the filter, an attacker's row naming the
+/// victim's own pot under a FABRICATED `gameId` would inherit the victim's
+/// genuine seat proof and read as chain-bound. The `seatSig` preimage commits
+/// the gameId, so requiring `marker.gameId == row.gameId` is exactly the
+/// binding the signature already carries (Rule 4: the proof is in the
+/// payload).
+///
+/// `params` are the pot's OWN committed params, read from decoded
+/// `pot_records` columns or the hash-verified funding lock — never from a
+/// marker.
+pub fn chain_bound_seat(
+    params: &CovenantParams,
+    pot_txid_lc: &str,
+    pot_vout: u32,
+    game_id_lc: &str,
+    identity_lc: &str,
+    markers: &[SeatMarkerRow],
+) -> Option<SeatLetter> {
+    let for_this_game: Vec<SeatMarkerRow> = markers
+        .iter()
+        .filter(|m| m.game_id.eq_ignore_ascii_case(game_id_lc))
+        .cloned()
+        .collect();
+    my_seat(params, pot_txid_lc, pot_vout, identity_lc, &for_this_game)
 }
 
 /// The caller's proven seat for one pot, from its OWN verified v2 marker(s)
@@ -880,11 +998,26 @@ pub struct ResultEntry {
     pub game_id: String,
     pub pot_txid: String,
     pub pot_vout: u32,
+    /// The `ls_potparty` MARKER's recoveryHeight — an UNVERIFIED HINT. Kept
+    /// verbatim for backward compatibility (it is the `recoveryHeight` wire
+    /// field every deployed client already reads); see
+    /// [`ResultEntry::cov_recovery_height`] for the chain-committed value.
     pub recovery_height: u32,
+    /// The COVENANT-COMMITTED recoveryHeight of the pot outpoint this row
+    /// names, decoded from the funding LOCK (`pot_records`, keyed on the
+    /// OUTPOINT — a UTXO, not a claimable name) and range-checked by
+    /// [`crate::refund_view::valid_recovery_height`]. `None` when the pot is
+    /// not in the index, is not a covenant lock, or committed an unusable
+    /// height — never the marker's value, never a guess.
+    pub cov_recovery_height: Option<u64>,
     pub opponent_identity: String,
     pub settle_txid: Option<String>,
     pub spent: Option<bool>,
     pub spent_confirmed: Option<bool>,
+    /// Is the `(potOutpoint, gameId, identity)` triple chain-bound? See
+    /// [`PotBinding`] — `Unknown` is first-class and is the answer whenever
+    /// the chain does not prove it.
+    pub pot_binding: PotBinding,
     /// The chain-truth template classification (`winner-a`/`winner-b`/`tie`/
     /// `refund`), `None` = not classified.
     pub verdict: Option<PotVerdict>,
@@ -1111,26 +1244,35 @@ pub fn covenant_params_by_pot(
         }
         // Fallback (legacy un-backfilled rows): the hash-verified funding
         // bytes, exactly as pre-#284.
-        let Some(fb_hex) = &r.funding_beef_hex else {
-            continue;
-        };
-        let Some(fb) = crate::logic::decode_beef_hex(fb_hex) else {
-            continue;
-        };
-        let Some(fraw) =
-            crate::logic::extract_raw_tx_hex(&fb, &key.0).and_then(|h| hex::decode(h).ok())
-        else {
-            continue;
-        };
-        // Hash-verified funding bytes only — never a stored claim.
-        if let Some(p) = parse_raw_tx_verified(&fraw, &key.0)
-            .and_then(|f| spender_pot_prevout(&f, r.pot_vout))
-            .and_then(|(_, lock)| extract_covenant_params(&lock))
-        {
+        if let Some(p) = beef_covenant_params(r.funding_beef_hex.as_deref(), &key.0, r.pot_vout) {
             out.insert(key, p);
         }
     }
     out
+}
+
+/// The pot's COMMITTED covenant params recovered from a stored funding BEEF —
+/// the legacy (un-backfilled, `pot_records` columns absent) leg of params
+/// resolution. Hash-verified funding bytes only: the raw must hash to
+/// `pot_txid_lc` before its lock is read, so a garbled/substituted store row
+/// degrades to `None`, never to fabricated params.
+///
+/// Extracted so `covenant_params_by_pot` (which binds the seat-marker fetch)
+/// and `assemble_results` (which consumes it) resolve params through ONE
+/// function. They were two inline copies; agreement is not a property of a
+/// side (Rule 16), and the durable fix for "these two must agree" is a single
+/// shared predicate, not a test that calls both.
+fn beef_covenant_params(
+    funding_beef_hex: Option<&str>,
+    pot_txid_lc: &str,
+    pot_vout: u32,
+) -> Option<CovenantParams> {
+    let fb = crate::logic::decode_beef_hex(funding_beef_hex?)?;
+    let fraw =
+        crate::logic::extract_raw_tx_hex(&fb, pot_txid_lc).and_then(|h| hex::decode(h).ok())?;
+    parse_raw_tx_verified(&fraw, pot_txid_lc)
+        .and_then(|f| spender_pot_prevout(&f, pot_vout))
+        .and_then(|(_, lock)| extract_covenant_params(&lock))
 }
 
 /// Assemble the `/results` entries: dedupe rows to one per pot outpoint
@@ -1213,6 +1355,15 @@ pub fn assemble_results(
         // #284: the row's decoded covenant params (strictly reconstructed —
         // malformed stored hex yields None and the BEEF fallback applies).
         let column_params = r.column_covenant_params();
+        // The pot's COMMITTED params, resolved ONCE per row: the overlay's
+        // admission-time decode of the funding lock, else the hash-verified
+        // funding bytes. Hoisted out of the spend branch because the chain
+        // BINDING must be answerable for an UNSPENT pot — that is precisely
+        // the state a client renders a refund/"recoverable" money word in,
+        // and the state the marker-forgery attack targets.
+        let row_params = column_params.clone().or_else(|| {
+            beef_covenant_params(r.funding_beef_hex.as_deref(), &pot_txid_lc, r.pot_vout)
+        });
         let mut verdict = None;
         let mut at_height = None;
         let mut seat = None;
@@ -1326,21 +1477,9 @@ pub fn assemble_results(
             // (the overlay's admission-time decode of those same bytes)
             // first, else the hash-verified funding bytes.
             if verdict.is_some() {
-                let params = column_params.clone().or_else(|| {
-                    r.funding_beef_hex
-                        .as_deref()
-                        .and_then(crate::logic::decode_beef_hex)
-                        .and_then(|fb| {
-                            crate::logic::extract_raw_tx_hex(&fb, &pot_txid_lc)
-                                .and_then(|h| hex::decode(h).ok())
-                        })
-                        .and_then(|fraw| parse_raw_tx_verified(&fraw, &pot_txid_lc))
-                        .and_then(|f| spender_pot_prevout(&f, r.pot_vout))
-                        .and_then(|(_, lock)| extract_covenant_params(&lock))
-                });
-                seat = params.and_then(|p| {
+                seat = row_params.as_ref().and_then(|p| {
                     my_seat(
-                        &p,
+                        p,
                         &pot_txid_lc,
                         r.pot_vout,
                         identity_lc,
@@ -1353,6 +1492,27 @@ pub fn assemble_results(
             }
         }
         let game_lc = r.game_id.to_ascii_lowercase();
+        // The chain-bound provenance bit — computed for EVERY row, spent or
+        // not. `my_seat` answers "which committed slot is the caller",
+        // `chain_bound_seat` additionally requires the signed preimage to name
+        // THIS row's gameId, which is what makes it a binding of the row
+        // rather than of the outpoint alone.
+        let pot_binding = match row_params.as_ref().and_then(|p| {
+            chain_bound_seat(
+                p,
+                &pot_txid_lc,
+                r.pot_vout,
+                &game_lc,
+                identity_lc,
+                seat_markers
+                    .get(&(pot_txid_lc.clone(), r.pot_vout))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+        }) {
+            Some(_) => PotBinding::Chain,
+            None => PotBinding::Unknown,
+        };
         let opponent_lc = r.opponent_identity.to_ascii_lowercase();
         let game_claims = claims_by_game.get(&game_lc);
         let (outcome, outcome_source) = derive_outcome_with_seat(
@@ -1375,10 +1535,24 @@ pub fn assemble_results(
             pot_txid: r.pot_txid.to_ascii_lowercase(),
             pot_vout: r.pot_vout,
             recovery_height: r.recovery_height,
+            // The COMMITTED height, from the fully-reconstructed params first
+            // (a per-request decode of the hash-verified funding lock, which
+            // also validated every OTHER committed param), else the overlay's
+            // admission-time decode of those same bytes. The two legs cannot
+            // disagree for a decoded row — `column_covenant_params` BUILDS
+            // `row_params` out of `cov_recovery_height` — so the `.or` only
+            // ever covers a row whose stored params are individually present
+            // but not jointly reconstructible.
+            cov_recovery_height: row_params
+                .as_ref()
+                .map(|p| p.recovery_height)
+                .or(r.cov_recovery_height)
+                .and_then(crate::refund_view::valid_recovery_height),
             opponent_identity: opponent_lc,
             settle_txid: settle_lc,
             spent: r.spent,
             spent_confirmed: r.spent_confirmed,
+            pot_binding,
             verdict,
             outcome,
             outcome_source,
@@ -1410,22 +1584,55 @@ pub fn claims_by_game(
 
 /// Assemble the `/results` wire body:
 /// `{"identity","results":[{gameId,potTxid,potVout,recoveryHeight,
-/// opponentIdentity,settleTxid,spent,spentConfirmed,verdict,outcome,
-/// outcomeSource,at,hand}]}`. `at` is `{"height": <n|null>}` (block height
-/// when the settle's BEEF carries a verified BUMP; time is not tracked).
+/// covRecoveryHeight,opponentIdentity,settleTxid,spent,spentConfirmed,
+/// potBinding,potBindingSource,verdict,outcome,outcomeSource,at,hand}]}`.
+/// `at` is `{"height": <n|null>}` (block height when the settle's BEEF
+/// carries a verified BUMP; time is not tracked).
 /// `hand` (bsv-low #245) is the provable showdown —
 /// `{winnerIdentity,winnerCardsHex,winnerScore,isTie,loserCardsOnChain,note}`
 /// — or `null` when no hand is provable (refund / unrevealed / unresolved).
 /// Only the winner's five cards are on-chain; the loser's is never fabricated.
+///
+/// # ADDITIVE fields — `covRecoveryHeight`, `potBinding`, `potBindingSource`
+///
+/// Nothing above them changed name or meaning; `recoveryHeight` is still the
+/// caller's MARKER hint verbatim, so a deployed client is byte-unaffected in
+/// what it already reads (read-both/write-new, Rule 14).
+///
+/// The two new answers are DELIBERATELY NOT MERGED into the old field. A
+/// client gating a money word ("Recoverable") must be able to distinguish
+/// *the chain committed this height* from *a marker claims this height* — and
+/// merging them (as `/live-view`'s `served_recovery_height` does, where the
+/// value is a countdown and not a money word) would erase exactly that
+/// distinction.
+///
+/// **`covRecoveryHeight` alone is NOT sufficient to gate a money word.** It is
+/// an honest fact about the outpoint the ROW NAMES, and an attacker names the
+/// outpoint. A row filed by a stranger against their OWN covenant pot serves
+/// that pot's real committed height. `potBinding == "chain"` is the field that
+/// says the row's pot/game/identity triple is the caller's; the client must
+/// require BOTH.
 pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
+            let (binding, binding_source) = e.pot_binding.pair();
             json!({
                 "gameId": e.game_id,
                 "potTxid": e.pot_txid,
                 "potVout": e.pot_vout,
+                // UNCHANGED: the marker's UNVERIFIED hint (attacker-writable).
                 "recoveryHeight": e.recovery_height,
+                // NEW: the COVENANT-COMMITTED height decoded from the pot's
+                // own funding lock, or null. Never the marker's value.
+                "covRecoveryHeight": e.cov_recovery_height,
+                // NEW (honesty pair, same shape as outcome/outcomeSource):
+                // is this row's (potOutpoint, gameId, identity) triple bound
+                // by something the network settled? "chain" = a settle key
+                // committed in THIS pot's lock signed that exact triple;
+                // "unknown" = not proven (first-class, never optimistic).
+                "potBinding": binding,
+                "potBindingSource": binding_source,
                 "opponentIdentity": e.opponent_identity,
                 "settleTxid": e.settle_txid,
                 "spent": e.spent,
@@ -3528,10 +3735,12 @@ mod tests {
             pot_txid: tx(0x02),
             pot_vout: 0,
             recovery_height: 958_846,
+            cov_recovery_height: Some(958_800),
             opponent_identity: ident(0xbb),
             settle_txid: Some(tx(0x03)),
             spent: Some(true),
             spent_confirmed: Some(true),
+            pot_binding: PotBinding::Chain,
             verdict: Some(PotVerdict::Refund),
             outcome: Outcome::Refund,
             outcome_source: Some("chain"),
@@ -3550,6 +3759,139 @@ mod tests {
         assert_eq!(r["settleTxid"], tx(0x03));
         // A refund has no showdown → `hand` is JSON null (never fabricated).
         assert!(r["hand"].is_null());
+        // The two heights are SEPARATE wire fields — the marker hint keeps
+        // its name and value; the covenant truth gets its own.
+        assert_eq!(r["recoveryHeight"], 958_846);
+        assert_eq!(r["covRecoveryHeight"], 958_800);
+        assert_eq!(r["potBinding"], "chain");
+        assert_eq!(r["potBindingSource"], "chain+seatkey");
+    }
+
+    /// The honesty pair's UNKNOWN leg, and the absent covenant height, are
+    /// serialized EXPLICITLY — `potBinding: "unknown"` with a `null` source
+    /// and a `null` covenant height. Never omitted (an absent key is
+    /// indistinguishable from an old server) and never optimistic.
+    #[test]
+    fn results_body_serializes_unknown_as_a_first_class_answer() {
+        let me = ident(0xaa);
+        let e = ResultEntry {
+            game_id: tx(0x01),
+            pot_txid: tx(0x02),
+            pot_vout: 0,
+            recovery_height: 1, // the attacker's hint
+            cov_recovery_height: None,
+            opponent_identity: ident(0xbb),
+            settle_txid: None,
+            spent: None,
+            spent_confirmed: None,
+            pot_binding: PotBinding::Unknown,
+            verdict: None,
+            outcome: Outcome::Unresolved,
+            outcome_source: None,
+            at_height: None,
+            winner_hand: None,
+        };
+        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let r = &v["results"][0];
+        assert_eq!(r["recoveryHeight"], 1, "the hint serves unchanged");
+        assert!(
+            r["covRecoveryHeight"].is_null(),
+            "no covenant height ⇒ explicit null, never the hint"
+        );
+        assert_eq!(r["potBinding"], "unknown");
+        assert!(r["potBindingSource"].is_null());
+        // Both keys are PRESENT (not omitted) — "field absent" is reserved
+        // for an OLD SERVER, which is a different thing a client must handle
+        // differently (see the compatibility note on `results_body`).
+        let obj = r.as_object().unwrap();
+        assert!(obj.contains_key("covRecoveryHeight"));
+        assert!(obj.contains_key("potBinding"));
+        assert!(obj.contains_key("potBindingSource"));
+    }
+
+    /// BYTE-LEVEL BACKWARD COMPATIBILITY: for one existing entry, the
+    /// response differs from the pre-change shape ONLY by the three added
+    /// keys. Every key a deployed client already reads keeps its name, its
+    /// type and its value.
+    ///
+    /// The pre-change key set is written out as a LITERAL, not derived from
+    /// the current body — an equality whose two sides move together is
+    /// `f(x) == f(x)` in a costume (Rule 9), and deriving the "old" set from
+    /// today's code is exactly that.
+    #[test]
+    fn the_existing_results_shape_is_unchanged_apart_from_the_added_keys() {
+        const PRE_CHANGE_KEYS: [&str; 12] = [
+            "gameId",
+            "potTxid",
+            "potVout",
+            "recoveryHeight",
+            "opponentIdentity",
+            "settleTxid",
+            "spent",
+            "spentConfirmed",
+            "verdict",
+            "outcome",
+            "outcomeSource",
+            "at",
+        ];
+        const ADDED_KEYS: [&str; 3] = ["covRecoveryHeight", "potBinding", "potBindingSource"];
+        let me = ident(0xaa);
+        let e = ResultEntry {
+            game_id: tx(0x01),
+            pot_txid: tx(0x02),
+            pot_vout: 0,
+            recovery_height: 958_846,
+            cov_recovery_height: Some(958_800),
+            opponent_identity: ident(0xbb),
+            settle_txid: Some(tx(0x03)),
+            spent: Some(true),
+            spent_confirmed: Some(true),
+            pot_binding: PotBinding::Chain,
+            verdict: Some(PotVerdict::WinnerA),
+            outcome: Outcome::Won,
+            outcome_source: Some("chain+seatkey"),
+            at_height: Some(958_900),
+            winner_hand: Some(WinnerHand {
+                identity: me.clone(),
+                cards_hex: "000102030c".to_string(),
+                score: 15,
+                is_tie: false,
+            }),
+        };
+        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let obj = v["results"][0].as_object().unwrap();
+        // `hand` is pre-change too but is asserted by its own cell above; it
+        // is listed here only so the key-set equality is exhaustive.
+        let mut got: Vec<&str> = obj.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = PRE_CHANGE_KEYS
+            .iter()
+            .copied()
+            .chain(ADDED_KEYS)
+            .chain(["hand"])
+            .collect();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "the /results entry key set may only GROW by the three added keys"
+        );
+        // …and the pre-change values are byte-identical to what the old
+        // server emitted for this entry.
+        assert_eq!(obj["gameId"], json!(tx(0x01)));
+        assert_eq!(obj["potTxid"], json!(tx(0x02)));
+        assert_eq!(obj["potVout"], json!(0));
+        assert_eq!(obj["recoveryHeight"], json!(958_846));
+        assert_eq!(obj["opponentIdentity"], json!(ident(0xbb)));
+        assert_eq!(obj["settleTxid"], json!(tx(0x03)));
+        assert_eq!(obj["spent"], json!(true));
+        assert_eq!(obj["spentConfirmed"], json!(true));
+        assert_eq!(obj["verdict"], json!("winner-a"));
+        assert_eq!(obj["outcome"], json!("won"));
+        assert_eq!(obj["outcomeSource"], json!("chain+seatkey"));
+        assert_eq!(obj["at"], json!({ "height": 958_900 }));
+        // The top-level envelope is unchanged too.
+        assert_eq!(v.as_object().unwrap().len(), 2);
+        assert_eq!(v["identity"], me);
     }
 
     /// A winner ResultEntry carrying a showdown hand serializes the full
@@ -3562,10 +3904,12 @@ mod tests {
             pot_txid: tx(0x02),
             pot_vout: 0,
             recovery_height: 958_846,
+            cov_recovery_height: Some(958_800),
             opponent_identity: ident(0xbb),
             settle_txid: Some(tx(0x03)),
             spent: Some(true),
             spent_confirmed: Some(true),
+            pot_binding: PotBinding::Chain,
             verdict: Some(PotVerdict::WinnerA),
             outcome: Outcome::Won,
             outcome_source: Some("chain+claim"),
