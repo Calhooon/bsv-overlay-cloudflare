@@ -152,6 +152,18 @@ impl RevealTopicManager {
 /// simply skipped, never a trap). Adversarial-review MED, 2026-07-16 (the five
 /// sibling stores were converted then; `tm_reveal` was the Rule-7 orphan,
 /// swept under #335).
+///
+/// COVERAGE GAP shared by ALL SIX stores (result / collected / potparty /
+/// potrefund / proof / reveal — stated once, here, per the #335 gate LOW-2):
+/// no test pins the `checked_add` FORM itself. The native x86-64 test host
+/// (`usize = u64`) cannot construct the wrap, so reverting any of the six
+/// `read_pushes` to unchecked `i + len` keeps every suite green — the
+/// crafted-script cells pin only the bounds BEHAVIOR. What would close the
+/// gap, for all six at once: running the crafted-script cells on the real
+/// wasm32 target (wasm-bindgen-test / wasmtime), or a comment-stripped,
+/// syntax-positive source scan asserting the per-store `checked_add` count
+/// (the Rule 9 positive-count discipline). Do NOT close it with a per-store
+/// substring scan — that is exactly the fragile pin shape Rule 9 catalogues.
 fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut i = 0usize;
