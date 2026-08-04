@@ -562,20 +562,24 @@ struct ProofPointerRowD1 {
 /// gatherBoard`: 1 `ls_result` + up to 50 `ls_proof` + ~57 `/beef` + a
 /// `/utxo-status` batch, ranked client-side) into ONE call.
 ///
-/// Reads the recent `result_markers_v2` markers, JOINs each against the
-/// `pot_records` spend-status (the SAME table `/utxo-status` reads — CHUNKED at
-/// [`crate::logic::D1_CHUNK_OUTPOINTS`] so a large result set never trips D1's
-/// 100-bound-param cap), joins `proof_markers` for the `proofTxid` pointer, and
-/// aggregates + ranks with the client's exact `aggregateBoard` / `lowestHands`
-/// rules. See the `logic` module note for the trust decision: the server
-/// COUNTS on (both sigs present + anchored) and RETURNS the sigs + anchor so
-/// the client re-verifies and can falsify — it never asserts an ECDSA verify it
-/// did not perform.
+/// Reads the recent `result_markers_v2` markers through the anti-flood
+/// WINDOW ([`crate::logic::leaderboard_markers_sql`] — `limit` counts
+/// DISTINCT POTS since #332, per-pot superset, unknown-pot quota,
+/// admission-stamp rank, `limit + 1` truncation probe), JOINs each against
+/// the `pot_records` spend-status (the SAME table `/utxo-status` reads —
+/// CHUNKED at [`crate::logic::D1_CHUNK_OUTPOINTS`] so a large result set
+/// never trips D1's 100-bound-param cap), fetches `proof_markers` pointers
+/// KEYED to the window's own `(gameId, winner)` pairs, and aggregates +
+/// ranks. See the `logic` module note for the #332 trust model: counting
+/// inputs are the chain anchor + VERIFIED signatures + the #230 chain
+/// attribution; the markers themselves are display hints, returned verbatim
+/// in `evidence` so the client re-verifies and can falsify.
 ///
 /// FAIL-SAFE: a `pot_records` (or marker) D1 fault is the SAME 5xx the client
 /// already handles — NEVER a fabricated empty/all-zero board. The `proof_markers`
 /// join is best-effort: a fault there only drops the `proofTxid` hint (null),
-/// never a count and never a 5xx.
+/// never a count and never a 5xx. An over-full window is reported via the
+/// body's `truncated` bit — never a complete-looking partial answer.
 pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let url = req.url()?;
     let limit_raw = url
@@ -592,24 +596,35 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     };
 
-    // 1) Recent result markers, newest first (mirrors ls_result recentResults).
-    let markers_sql = "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
-         loserSigHex, cardsHex, txid, createdAt FROM result_markers_v2 \
-         ORDER BY createdAt DESC, rowid DESC LIMIT ?";
-    let stmt = db
-        .prepare(markers_sql)
-        .bind(&[JsValue::from_f64(limit as f64)])?;
-    let markers: Vec<ResultMarkerRow> =
-        match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
-            Ok(rows) => rows
-                .into_iter()
-                .filter_map(ResultRowD1::into_marker)
-                .collect(),
-            Err(e) => {
-                console_warn!("[leaderboard] result_markers_v2 query failed: {e}");
-                return json_error("database query failed", 503);
-            }
-        };
+    // 1) The recent-marker WINDOW (#332 / #335 item 2): pots newest-first by
+    // their own admission stamp, ≤ RESULT_ROWS_PER_POT rows per pot, ghost
+    // pots quota-bounded — the flat `ORDER BY createdAt DESC LIMIT ?` this
+    // replaces was a flood-to-evict primitive with no incompleteness signal.
+    // `limit + 1` pots are probed so truncation is DETECTABLE; the cut (and
+    // the honest bit) happen in `leaderboard_window_cut` before any
+    // malformed-row filtering can hide a pot.
+    let quota = crate::logic::leaderboard_unknown_pot_quota(limit);
+    let row_cap = (limit + 1) * overlay_discovery::result::storage::RESULT_ROWS_PER_POT;
+    let stmt = db.prepare(crate::logic::leaderboard_markers_sql()).bind(&[
+        JsValue::from_f64((limit + 1) as f64),
+        JsValue::from_f64(quota as f64),
+        JsValue::from_f64(row_cap as f64),
+    ])?;
+    let raw_rows: Vec<ResultRowD1> = match stmt.all().await.and_then(|r| r.results::<ResultRowD1>())
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            console_warn!("[leaderboard] result_markers_v2 window query failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
+    let pot_keys: Vec<Option<String>> = raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
+    let (cut, truncated) = crate::logic::leaderboard_window_cut(&pot_keys, limit);
+    let markers: Vec<ResultMarkerRow> = raw_rows
+        .into_iter()
+        .take(cut)
+        .filter_map(ResultRowD1::into_marker)
+        .collect();
 
     // 2) Pot spend-status join (potTxid:0), CHUNKED at D1_CHUNK_OUTPOINTS —
     // same discipline as /utxo-status. FAIL-SAFE: a chunk's D1 error is the
@@ -634,41 +649,76 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     }
     let statuses = assemble_statuses(&outpoints, &pot_rows);
 
-    // 3) proof_markers pointers (gameId, winner) → newest marker txid.
-    // BEST-EFFORT: a fault here only omits the proofTxid hint, never a 5xx.
-    // A generous LIMIT bounds the scan; ORDER BY createdAt DESC + or_insert
-    // keeps the newest pointer per (gameId, winner).
+    // 3) proof_markers pointers, KEYED to the window's own (gameId, winner)
+    // pairs (#332 — this replaces a flat `LIMIT 2000` newest-first scan
+    // whose newest-per-key fold was floodable AND a repoint primitive; see
+    // `proof_pointers_sql`). The SQL keeps the OLDEST pointer per key
+    // (anti-squat), one row per key. BEST-EFFORT: a fault on any chunk only
+    // omits those pairs' proofTxid hint, never a 5xx and never a count.
     let mut proof_map: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
-    let proof_sql = "SELECT gameId, winner, txid FROM proof_markers \
-         ORDER BY createdAt DESC, rowid DESC LIMIT 2000";
-    match db
-        .prepare(proof_sql)
-        .all()
-        .await
-        .and_then(|r| r.results::<ProofPointerRowD1>())
-    {
-        Ok(rows) => {
-            for pr in rows {
-                proof_map
-                    .entry((
-                        pr.game_id.to_ascii_lowercase(),
-                        pr.winner.to_ascii_lowercase(),
-                    ))
-                    .or_insert(pr.txid);
-            }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen_pairs = std::collections::HashSet::new();
+    for m in &markers {
+        if pairs.len() >= crate::logic::LEADERBOARD_PROOF_PAIRS_CAP {
+            break; // display-hint bound only — counts are unaffected
         }
-        Err(e) => {
-            console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}")
+        let key = (
+            m.game_id.to_ascii_lowercase(),
+            m.winner.to_ascii_lowercase(),
+        );
+        if seen_pairs.insert(key) {
+            // Bind the row's VERBATIM values (the same bytes the producer
+            // wrote), so the SQL byte-compare matches; map keys stay
+            // lowercase (the evidence lookup key).
+            pairs.push((m.game_id.clone(), m.winner.clone()));
+        }
+    }
+    for chunk in pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        for (g, w) in chunk {
+            binds.push(JsValue::from_str(g));
+            binds.push(JsValue::from_str(w));
+        }
+        let stmt = match db
+            .prepare(crate::logic::proof_pointers_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[leaderboard] proof_markers bind failed (proofTxid omitted): {e}");
+                continue;
+            }
+        };
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<ProofPointerRowD1>())
+        {
+            Ok(rows) => {
+                for pr in rows {
+                    proof_map
+                        .entry((
+                            pr.game_id.to_ascii_lowercase(),
+                            pr.winner.to_ascii_lowercase(),
+                        ))
+                        .or_insert(pr.txid);
+                }
+            }
+            Err(e) => {
+                console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}")
+            }
         }
     }
 
     // 4) Server-derived CHAIN classification of the spent pots (bsv-low #227)
     // — an ADDITIVE truth source folded in alongside the client claims.
-    // BEST-EFFORT + BOUNDED: at most LEADERBOARD_CLASSIFY_CAP pots (newest
-    // marker order), pot_beefs fetched in ≤45-bind chunks (the D1 param-cap
-    // discipline); any fault only omits classifications (counting falls back
-    // to the pre-#227 claim rules) — never a 5xx, never a fabricated verdict.
+    // BEST-EFFORT + BOUNDED: bounded by the WINDOW (≤ limit+1 pots, ranked by
+    // the pot's own admission stamp — #332 deleted the separate 64-pot cap,
+    // which an attacker could ORDER), pot_beefs fetched in ≤45-bind chunks
+    // (the D1 param-cap discipline); any fault only omits classifications
+    // (counting falls back to the claim rules) — never a 5xx, never a
+    // fabricated verdict.
     let (verdicts, params_by_pot) = classify_spent_pots(&db, &statuses).await;
 
     // 5) #230 seat attribution: the classified pots' verified potparty-v2
@@ -686,16 +736,11 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         &attributions,
     );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
-    json_response(leaderboard_body(&lb, computed_at, markers.len()), 200)
+    json_response(
+        leaderboard_body(&lb, computed_at, markers.len(), truncated),
+        200,
+    )
 }
-
-/// Hard bound on pots classified per `/leaderboard` request via the LEGACY
-/// BLOB fallback (each such pot costs two BLOB reads + two BEEF parses).
-/// #284: this cap now bounds ONLY the fallback partition — a pot whose
-/// decoded columns answer (verdict + params as pure column reads) costs no
-/// BLOB and is NOT capped. Once the backfill completes, the fallback
-/// partition — and with it this cap's effect — dies entirely.
-const LEADERBOARD_CLASSIFY_CAP: usize = 64;
 
 /// `pot_beefs` row for the classification fold: txid + `hex(beef)`.
 #[derive(Deserialize)]
@@ -768,10 +813,13 @@ impl DecodedPotRowD1 {
 ///    row carries a FRESH stored verdict (`verdictTxid` equal to the spender
 ///    being attributed — write-time classified, conservation enforced by the
 ///    overlay) plus strict column params. A pure column read.
-/// 2. **Legacy fallback (capped at [`LEADERBOARD_CLASSIFY_CAP`]):** the
-///    pre-#284 path — stored `pot_beefs` bytes, hash-verified, classified
-///    per request. Covers un-backfilled rows and stale verdicts; dies
-///    entirely once the backfill completes.
+/// 2. **Legacy fallback (bounded by the marker WINDOW, #332):** the pre-#284
+///    path — stored `pot_beefs` bytes, hash-verified, classified per request.
+///    Covers un-backfilled rows and stale verdicts; dies entirely once the
+///    backfill completes. It carried a separate 64-pot cap until #332; that
+///    cap was ordered by attacker-advanceable marker recency, so it could
+///    push a victim's pot out of classification (and out of attribution,
+///    un-counting a tower-enforced win). The window's own bound replaces it.
 ///
 /// Returns a lowercase-pot-txid → verdict map PLUS each classified pot's
 /// committed covenant params (the #230 attribution needs its lock keys);
@@ -787,8 +835,9 @@ async fn classify_spent_pots(
     let mut verdicts = std::collections::HashMap::new();
     let mut params_by_pot = std::collections::HashMap::new();
 
-    // ALL spent pots with a recorded spender, deduped, newest first (the
-    // fallback cap is applied AFTER the column partition below).
+    // ALL spent pots with a recorded spender, deduped, in WINDOW RANK order
+    // (#332: `statuses` follows the marker window, whose pot order is the
+    // pot's own admission stamp — not attacker-advanceable marker recency).
     let mut all_pairs: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for s in statuses {
@@ -813,7 +862,7 @@ async fn classify_spent_pots(
 
     // ── Tier 1: the decoded-column partition (no BLOB fetch, NO CAP) ──────
     // BEST-EFFORT: any fault leaves rows unresolved here and the fallback
-    // (still capped) picks them up — never a 5xx, never a guessed verdict.
+    // picks them up — never a 5xx, never a guessed verdict.
     let mut column_resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
     for chunk in all_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let sql = crate::results::decoded_pots_sql(chunk.len());
@@ -878,11 +927,22 @@ async fn classify_spent_pots(
         }
     }
 
-    // ── Tier 2: the legacy BLOB fallback, capped ──────────────────────────
+    // ── Tier 2: the legacy BLOB fallback — bounded by the WINDOW, not a
+    // fixed cap (#332). The former `LEADERBOARD_CLASSIFY_CAP = 64` was
+    // ordered by attacker-controllable marker recency, so a flood could push
+    // a victim's pot past the cap, deny it a verdict + attribution, and —
+    // now that the claim gate is verified — un-count a tower-enforced win
+    // (erasure through the cap). Post-#332 the partition is already bounded
+    // at ≤ `limit + 1` pots by the marker window (admission-stamp-ranked),
+    // and every pot the column tier resolved costs no BLOB at all. Worst
+    // case (every windowed pot legacy-unbackfilled, max `?limit=500`): ~500
+    // pots ⇒ ~1000 BEEF keys in ≤45-key chunks (≈23 D1 reads, single-digit
+    // MB transient) — priced in REAL admitted pots (a `tm_pot` row needs an
+    // on-chain LOW-template funding tx), not dust markers, and shrinking to
+    // zero as the #284 backfill completes.
     let pairs: Vec<(String, String)> = all_pairs
         .into_iter()
         .filter(|(pot, _)| !column_resolved.contains(pot))
-        .take(LEADERBOARD_CLASSIFY_CAP)
         .collect();
     if pairs.is_empty() {
         return (verdicts, params_by_pot);

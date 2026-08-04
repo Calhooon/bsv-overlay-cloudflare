@@ -846,6 +846,170 @@ pub fn clamp_leaderboard_limit(raw: Option<u32>) -> usize {
     }
 }
 
+/// Freshness window for the `/leaderboard` unknown-pot quota promotion —
+/// MUST equal the overlay's
+/// `d1_discovery::UNKNOWN_POT_PROMOTION_MAX_AGE_SECS` (#283a; same table,
+/// same attack, same honest race). The value is DUPLICATED here because
+/// `bsv-overlay-cloudflare` is a Worker-binary crate this pure read layer
+/// cannot link at runtime; the agreement is PINNED by an executing test in
+/// `tests/leaderboard_window_sqlite.rs` (Rule 16: share the constant or pin
+/// the boundary — a duplicated value with no pin is a boundary with no pin).
+pub const LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS: u64 = 3600;
+
+/// The `/leaderboard` unknown-pot promotion quota for a pot-window `limit` —
+/// MUST agree with the overlay's `d1_discovery::unknown_pot_quota` (#283b;
+/// pinned by the same executing agreement test as the freshness constant).
+pub fn leaderboard_unknown_pot_quota(limit: usize) -> usize {
+    (limit / 10).max(1)
+}
+
+/// Cap on DISTINCT `(gameId, winner)` pairs the route fetches `proof_markers`
+/// pointers for (#332). Pairs come from the marker window in rank order, so
+/// the honest population is ~1–2 per pot (≤ the pot limit); the cap only
+/// bounds the D1 chunk fan-out when an attacker stuffs a pot's
+/// [`overlay_discovery::result::storage::RESULT_ROWS_PER_POT`]-row superset
+/// with distinct invented gameIds. Exceeding it degrades ONLY the
+/// `proofTxid` display hint for the overflow pairs — never a count.
+pub const LEADERBOARD_PROOF_PAIRS_CAP: usize = 512;
+
+/// The `/leaderboard` recent-marker WINDOW (#332 / bsv-low#335 item 2) — the
+/// `/recovery-view` + `ls_result` (#282) anti-flood treatment applied to the
+/// query this route previously ran as a flat
+/// `ORDER BY createdAt DESC LIMIT ?`:
+///
+/// `result_markers_v2` admission is BYTE-FORMAT-ONLY, so the flat window was
+/// a flood-to-evict primitive — `limit` fresh dust markers displaced every
+/// honest result while the response still looked complete (no `truncated`
+/// bit existed). This mirrors the overlay's own hardened
+/// `result_window_sql` (#282) shape:
+///
+///  1. **Per-POT superset** — `ROW_NUMBER() OVER (PARTITION BY rm.potTxid
+///     ORDER BY rm.createdAt ASC, rm.rowid ASC) <= RESULT_ROWS_PER_POT`
+///     (the constant is IMPORTED from `overlay-discovery`, the same one the
+///     overlay window uses). One pot can never consume the window; the
+///     oldest rows are kept because oldest is the one order later spam
+///     cannot improve on. SQL never picks "the real row" — verification
+///     happens in `aggregate_leaderboard_attributed` (verification before
+///     collapse).
+///  2. **Pot-existence tier with the age-bounded quota** (`?2`): markers
+///     naming pots absent from `pot_records` are demoted behind every
+///     indexed pot, except the oldest-first quota of FRESH unknowns
+///     (younger than [`LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS`]) — a
+///     just-settled pot whose `tm_pot` admission is in flight must not be
+///     filtered, while every ghost ages out of the promoted set.
+///  3. **Pots ranked by the pot's own admission stamp**
+///     (`pot_records.createdAt`, which an attacker cannot move by filing
+///     markers), newest first; `DENSE_RANK` bounds the answer to `?1`
+///     DISTINCT POTS (the route binds `limit + 1` as a truncation probe —
+///     see [`leaderboard_window_cut`]).
+///
+/// BINDS: `?1` pot limit (probe), `?2` unknown-pot quota, `?3` row cap
+/// (`?1 × RESULT_ROWS_PER_POT` — a belt, never the truncation signal).
+/// EXECUTED (not string-pinned) by `tests/leaderboard_window_sqlite.rs`
+/// against the production migrations (#323: a `contains` assertion on a
+/// query must never be the only thing standing behind it).
+pub fn leaderboard_markers_sql() -> String {
+    const COLS: &str = "gameId, winner, loser, potTxid, settleTxid, \
+         winnerSigHex, loserSigHex, cardsHex, txid, createdAt";
+    let fresh = format!(
+        "CASE WHEN unknownPot = 1 AND COALESCE(potFirstMarkerAt, 0) >= \
+              unixepoch() - {LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS} \
+         THEN 1 ELSE 0 END"
+    );
+    format!(
+        "SELECT {COLS} \
+     FROM (SELECT {COLS}, markerRowid, potCreatedAt, potFirstMarkerAt, tier, \
+                  DENSE_RANK() OVER (ORDER BY tier ASC, \
+                                              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+                                              potTxid ASC) AS finalRank \
+           FROM (SELECT {COLS}, markerRowid, potCreatedAt, potFirstMarkerAt, \
+                        CASE WHEN unknownPot = 0 \
+                             OR (freshUnknown = 1 AND potRank <= ?2) \
+                             THEN 0 ELSE 1 END AS tier \
+                 FROM (SELECT {COLS}, markerRowid, potCreatedAt, potFirstMarkerAt, \
+                              unknownPot, \
+                              {fresh} AS freshUnknown, \
+                              DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
+                                                 ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
+                                                          potTxid ASC) AS potRank \
+                       FROM (SELECT rm.gameId AS gameId, rm.winner AS winner, \
+                                    rm.loser AS loser, rm.potTxid AS potTxid, \
+                                    rm.settleTxid AS settleTxid, \
+                                    rm.winnerSigHex AS winnerSigHex, \
+                                    rm.loserSigHex AS loserSigHex, \
+                                    rm.cardsHex AS cardsHex, \
+                                    rm.txid AS txid, rm.createdAt AS createdAt, \
+                                    rm.rowid AS markerRowid, \
+                                    r.potCreatedAt AS potCreatedAt, \
+                                    MIN(rm.createdAt) OVER (PARTITION BY rm.potTxid) \
+                                        AS potFirstMarkerAt, \
+                                    CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                                    ROW_NUMBER() OVER (PARTITION BY rm.potTxid \
+                                                       ORDER BY rm.createdAt ASC, \
+                                                                rm.rowid ASC) AS rn \
+                             FROM result_markers_v2 rm \
+                             LEFT JOIN (SELECT txid, MIN(createdAt) AS potCreatedAt \
+                                        FROM pot_records GROUP BY txid) r \
+                                    ON r.txid = rm.potTxid) \
+                       WHERE rn <= {per_pot}))) \
+     WHERE finalRank <= ?1 \
+     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+              potTxid ASC, markerRowid ASC \
+     LIMIT ?3",
+        per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
+    )
+}
+
+/// Cut the window at the `limit`-th DISTINCT pot and report whether MORE
+/// pots existed — the honest `truncated` bit (#335 item 2). The SQL binds
+/// `limit + 1` pots as a probe, so an over-full page here means the answer
+/// is INCOMPLETE and the route must say so rather than serve a
+/// complete-looking board (the fail mode the #317 audit called out: under a
+/// flood `resultCount == limit` and the wrong answer looks whole).
+///
+/// `pot_keys` are the rows' `potTxid` values IN WINDOW ORDER (the SQL ranks
+/// pots and returns each pot's rows contiguously); `None` (a malformed
+/// NULL-pot row) groups as one key, exactly as the SQL's
+/// `PARTITION BY rm.potTxid` groups NULLs.
+pub fn leaderboard_window_cut(pot_keys: &[Option<String>], limit: usize) -> (usize, bool) {
+    let mut seen = std::collections::HashSet::new();
+    for (i, k) in pot_keys.iter().enumerate() {
+        let key = k.as_deref().unwrap_or("").to_ascii_lowercase();
+        if seen.insert(key) && seen.len() > limit {
+            return (i, true);
+        }
+    }
+    (pot_keys.len(), false)
+}
+
+/// The `proof_markers` pointer fetch for a chunk of `n` `(gameId, winner)`
+/// pairs — 2 binds each, chunked at [`D1_CHUNK_OUTPOINTS`] (#332).
+///
+/// This replaces a flat `ORDER BY createdAt DESC LIMIT 2000` scan whose
+/// newest-per-key fold was BOTH floodable (2000 fresh dust markers evicted
+/// every honest pointer from the scan window) and a REPOINT primitive (a
+/// later marker for the victim's own `(gameId, winner)` silently replaced
+/// the honest drill-down pointer). Keying the fetch to the window's own
+/// pairs makes unrelated floods irrelevant, and OLDEST-per-key
+/// (`createdAt ASC, rowid ASC`, `rn = 1`) is anti-squat: a pointer, once
+/// published, cannot be displaced by publishing later. Residual (same
+/// family as `results_sql` F1b): a pointer PRE-filed before the honest one
+/// owns the key — it costs a dust tx per key, and the client
+/// transcript-verifies every fetched bundle, so the damage is a broken
+/// display hint, never a false proof.
+pub fn proof_pointers_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let pairs = vec!["(gameId = ? AND winner = ?)"; n].join(" OR ");
+    format!(
+        "SELECT gameId, winner, txid \
+         FROM (SELECT gameId, winner, txid, \
+                      ROW_NUMBER() OVER (PARTITION BY gameId, winner \
+                                         ORDER BY createdAt ASC, rowid ASC) AS rn \
+               FROM proof_markers WHERE {pairs}) \
+         WHERE rn = 1"
+    )
+}
+
 /// One `result_markers_v2` row, host-typed — every byte field carried verbatim
 /// (the overlay never verifies; the client does). `loser_sig_hex`/`cards_hex`
 /// are `None` for an unconfirmed / v1 marker. `created_at` is `None` only for a
@@ -1456,8 +1620,22 @@ pub fn aggregate_leaderboard_attributed(
 }
 
 /// Assemble the `/leaderboard` wire body (the endpoint CONTRACT):
-/// `{"board":[…],"hands":[…],"computedAt":<unix>,"resultCount":<int>}`.
-pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize) -> String {
+/// `{"board":[…],"hands":[…],"computedAt":<unix>,"resultCount":<int>,
+/// "truncated":<bool>}`.
+///
+/// `truncated` (#332 / #335 item 2) is the honest incompleteness bit the
+/// board previously lacked: `true` means the marker window held MORE
+/// distinct pots than the request's `limit`, so the answer is a PAGE, not
+/// the whole record — under a marker flood the pre-#332 body reported
+/// `resultCount == limit` and the wrong answer looked complete. Same
+/// contract as `/recovery-view`'s bit: additive, and a caller that ignores
+/// it sees exactly the old shape.
+pub fn leaderboard_body(
+    lb: &Leaderboard,
+    computed_at: i64,
+    result_count: usize,
+    truncated: bool,
+) -> String {
     let board: Vec<serde_json::Value> = lb
         .board
         .iter()
@@ -1521,6 +1699,7 @@ pub fn leaderboard_body(lb: &Leaderboard, computed_at: i64, result_count: usize)
         "hands": hands,
         "computedAt": computed_at,
         "resultCount": result_count,
+        "truncated": truncated,
     })
     .to_string()
 }
@@ -3064,7 +3243,7 @@ mod tests {
         let lb =
             aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
         assert_eq!(v["board"][0]["evidence"][0]["serverVerdict"], "winner-a");
     }
 
@@ -3146,7 +3325,7 @@ mod tests {
         let proofs = HashMap::from([((tx(1), a.clone()), "px".to_string())]);
         let lb = aggregate_leaderboard(&markers, &statuses, &proofs, 200);
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
         assert_eq!(v["computedAt"], 1_700_000_000_i64);
         assert_eq!(v["resultCount"], 1);
         let board = v["board"].as_array().unwrap();
@@ -3200,7 +3379,7 @@ mod tests {
             "the v2 cards the winner's signature binds must survive aggregation"
         );
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
         let ev = &v["board"][0]["evidence"][0];
         assert_eq!(
             ev["loserSigHex"],
@@ -3219,7 +3398,7 @@ mod tests {
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
         let ev = v["board"][0]["evidence"][0].as_object().unwrap();
         assert!(ev.contains_key("cardsHex"), "the key is always present");
         assert_eq!(ev["cardsHex"], serde_json::Value::Null);
@@ -3297,7 +3476,7 @@ mod tests {
         );
         // The wire body carries both tier flags + the falsifiable attribution.
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
         assert_eq!(v["board"][0]["wins"], 1);
         assert_eq!(v["board"][0]["proven"], false);
         assert_eq!(v["board"][0]["chainProven"], true);
@@ -3620,6 +3799,36 @@ mod tests {
         );
     }
 
+    /// #335 item 2 — the truncation cut + the honest wire bit.
+    #[test]
+    fn window_cut_and_truncated_bit_are_honest() {
+        // Rows arrive pot-grouped in rank order; the cut lands on the first
+        // row of the (limit+1)-th DISTINCT pot.
+        let keys: Vec<Option<String>> = vec![Some(tx(1)), Some(tx(1)), Some(tx(2)), Some(tx(3))];
+        assert_eq!(leaderboard_window_cut(&keys, 2), (3, true));
+        assert_eq!(leaderboard_window_cut(&keys, 3), (4, false));
+        // NULL-pot rows group as ONE key, exactly as the SQL's
+        // `PARTITION BY rm.potTxid` groups NULLs — a malformed flood is one
+        // pot, not many.
+        let keys2: Vec<Option<String>> = vec![None, None, Some(tx(1))];
+        assert_eq!(leaderboard_window_cut(&keys2, 1), (2, true));
+        assert_eq!(leaderboard_window_cut(&keys2, 2), (3, false));
+        // Case-insensitive pot keys collapse (pot txids are hex).
+        let keys3: Vec<Option<String>> = vec![Some(tx(1).to_uppercase()), Some(tx(1))];
+        assert_eq!(leaderboard_window_cut(&keys3, 1), (2, false));
+
+        // The body carries the bit — additive, both values.
+        let lb = Leaderboard {
+            board: vec![],
+            hands: vec![],
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1, 0, true)).unwrap();
+        assert_eq!(v["truncated"], true);
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1, 0, false)).unwrap();
+        assert_eq!(v["truncated"], false);
+    }
     #[test]
     fn clamp_limit_defaults_and_bounds() {
         assert_eq!(clamp_leaderboard_limit(None), LEADERBOARD_DEFAULT_LIMIT);
