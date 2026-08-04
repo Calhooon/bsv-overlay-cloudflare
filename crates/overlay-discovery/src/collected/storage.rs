@@ -12,6 +12,20 @@
 //! first, and rows are NEVER deleted (a collected fact is permanent, like a
 //! reveal). Replays / floods of markers for an already-recorded pair are
 //! therefore harmless no-ops.
+//!
+//! **KNOWN RESIDUAL (#335, bsv-low): this is a name-keyed slot** — the
+//! `(identity, gameId)` pair is claimable by anyone for one OP_RETURN fee
+//! (admission is byte-format-only), the exact squattable-namespace shape
+//! `result_markers` was re-keyed away from (Rule 2, network-enforcement
+//! rules). It is deliberately NOT re-keyed here: the sole consumer
+//! (bsv-low `chainReads.ts::collectedElsewhere`) verifies the row's sig
+//! under the reader's OWN identity, so a squatted slot only makes the
+//! victim's verify fail → treated as NOT collected → at worst an
+//! idempotent duplicate collect (the money-safe direction), while a safe
+//! re-key needs the full `result_markers_v2` supersede pattern (new table +
+//! read-both — D1 migrations re-execute on cold start, so never
+//! DROP/RENAME). Any NEW consumer of this table inherits the warning: a
+//! row's PRESENCE proves nothing — verify the sig, or do not read it.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -203,6 +203,19 @@ pub struct RefundViewRow {
     /// byte-format-admitted bit: either seat OR any third party can file a
     /// marker row, so this is never proof a genuine backup exists (the
     /// reader verifies — module docs).
+    ///
+    /// #335 (bsv-low) decision — **consumed nowhere today, and kept
+    /// unverified on purpose**: bsv-low's `chainReads.ts` /
+    /// `refundViewDisplay.ts` ignore it; its only effect is the
+    /// `chain+marker` statusSource WORDING below. Server-side verification
+    /// was considered and rejected — the app layer is an index, not an
+    /// authority (zanaadu invariant #3: indexers cache and serve, never
+    /// validate), and the marker's identity sig is the WEAKER proof anyway:
+    /// the backup raw's own 2-of-2 signatures are the network-verifiable
+    /// truth, which only the spending path can prove (Rule 4). A FIRST
+    /// CONSUMER of this bit inherits this warning: presence is a hint to go
+    /// fetch + verify the marker (sig AND raw) — it must never stand down a
+    /// safety mechanism or gate a credit by itself.
     pub backup_marker_present: bool,
     /// bsv-low#304's VERIFIED proof latch for the recorded spender
     /// (`pot_beefs.proof_verified`, joined on `spendingTxid`) — set only by
