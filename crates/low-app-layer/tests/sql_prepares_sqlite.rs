@@ -25,7 +25,10 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::live_view::{keyless_candidates_sql, live_view_sql};
-use low_app_layer::logic::{batch_where_sql, pots_view_join_sql, recovery_view_sql};
+use low_app_layer::logic::{
+    batch_where_sql, leaderboard_markers_sql, pots_view_join_sql, proof_pointers_sql,
+    recovery_view_sql,
+};
 use low_app_layer::refund_view::refund_view_sql;
 use low_app_layer::results::{claims_sql, decoded_pots_sql, results_sql, seat_markers_sql};
 use rusqlite::Connection;
@@ -59,6 +62,8 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "refund_view_sql", &refund_view_sql());
     assert_prepares(&conn, "live_view_sql", &live_view_sql());
     assert_prepares(&conn, "results_sql", &results_sql());
+    // #332 — the /leaderboard anti-flood marker window.
+    assert_prepares(&conn, "leaderboard_markers_sql", &leaderboard_markers_sql());
 }
 
 /// Every `n`-parameterised builder, at the boundaries that matter: one
@@ -83,9 +88,14 @@ fn every_batched_query_prepares_at_representative_arities() {
         assert_prepares(
             &conn,
             &format!("seat_markers_sql({n})"),
-            &seat_markers_sql(n),
+            &seat_markers_sql(n, low_app_layer::results::SEAT_MARKERS_PER_KEY),
         );
         assert_prepares(&conn, &format!("claims_sql({n})"), &claims_sql(n));
+        assert_prepares(
+            &conn,
+            &format!("proof_pointers_sql({n})"),
+            &proof_pointers_sql(n),
+        );
         assert_prepares(
             &conn,
             &format!("keyless_candidates_sql({n})"),
@@ -107,7 +117,13 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
             ("decoded_pots_sql", decoded_pots_sql(n), n * 2),
             // FOUR per pot: the outpoint pair plus the two COMMITTED settle
             // keys read from that pot's own funding lock.
-            ("seat_markers_sql", seat_markers_sql(n), n * 4),
+            (
+                "seat_markers_sql",
+                seat_markers_sql(n, low_app_layer::results::SEAT_MARKERS_PER_KEY),
+                n * 4,
+            ),
+            // #332: one (gameId, winner) PAIR per key.
+            ("proof_pointers_sql", proof_pointers_sql(n), n * 2),
         ] {
             let stmt = conn
                 .prepare(&sql)
