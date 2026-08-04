@@ -1,0 +1,52 @@
+{
+  "board": [
+    {
+      "chainProven": true,
+      "chainWins": [
+        {
+          "potTxid": "0303030303030303030303030303030303030303030303030303030303030303",
+          "settleTxid": "0404040404040404040404040404040404040404040404040404040404040404"
+        }
+      ],
+      "evidence": [
+        {
+          "anchored": true,
+          "cardsHex": null,
+          "chainAttributedWinner": "02f9502d540ca7d5ab09ea89e83889fa4bcd0b27f7eec5752f4fa07b1b19160f3b",
+          "gameId": "0303030303030303030303030303030303030303030303030303030303030303",
+          "loser": "03dfeeef1881101f2cb11644f3a2afdfc2045e19919152923f367a1767c11cceda",
+          "loserSigHex": "3044022015f8ee5b5232ae6f022b7674418b192f326f035eb1cf8c4aa2419d71e662f9ce022034421aa2a2f4e4eb5ee99cd624faafa052a6ee79e39a00095d940366bfbc536d",
+          "potTxid": "0303030303030303030303030303030303030303030303030303030303030303",
+          "proofTxid": null,
+          "proofTxids": [],
+          "serverVerdict": "winner-a",
+          "settleTxid": "0404040404040404040404040404040404040404040404040404040404040404",
+          "winner": "02f9502d540ca7d5ab09ea89e83889fa4bcd0b27f7eec5752f4fa07b1b19160f3b",
+          "winnerSigHex": "30440220205e98cacdc7183469fcde219c74924a49499686191a1a2de6176c2e8db25676022052219c51bf800498a7835453dfc65f0e66cc6b123f33e5fc3be66c6a2f720194"
+        }
+      ],
+      "identity": "02f9502d540ca7d5ab09ea89e83889fa4bcd0b27f7eec5752f4fa07b1b19160f3b",
+      "identityIsKey": false,
+      "proven": true,
+      "wins": 1
+    },
+    {
+      "chainProven": true,
+      "chainWins": [
+        {
+          "potTxid": "0101010101010101010101010101010101010101010101010101010101010101",
+          "settleTxid": "0202020202020202020202020202020202020202020202020202020202020202"
+        }
+      ],
+      "evidence": [],
+      "identity": "03eb49fd9f510469f4fe540e4b0664410f216cbbc90d97aed62af2e606110cc919",
+      "identityIsKey": true,
+      "proven": false,
+      "wins": 1
+    }
+  ],
+  "computedAt": 1700000000,
+  "hands": [],
+  "resultCount": 2,
+  "truncated": false
+}
