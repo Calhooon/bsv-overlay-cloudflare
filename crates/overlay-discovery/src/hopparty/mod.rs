@@ -7,10 +7,12 @@
 //! P2PKH outpoint, and `potparty_records` rows are only published at
 //! JOIN-assembly — so a seat that funds its hop and dies BEFORE the join
 //! leaves ZERO identity-keyed server rows (the #256 ~80.8k-sat class). At
-//! hop time the seat publishes this tiny signed `OP_RETURN` marker (as a
-//! SECOND OUTPUT on the hop `createAction` itself — no extra spend
-//! approval) naming its identity, the opponent, the game, the hop outpoint,
-//! the hop value, and its settle pubkey. `/hops-view` (low-app-layer) joins
+//! hop time the seat publishes this tiny signed `OP_RETURN` marker naming
+//! its identity, the opponent, the game, the hop outpoint, the hop value,
+//! and its settle pubkey. (The ledgered "second output on the hop
+//! `createAction` itself" carry-over cannot name the SAME tx's outpoint —
+//! a tx cannot embed its own txid — so the carrier tx shape is the CLIENT
+//! half's decision; this index is agnostic about the carrier.) `/hops-view` (low-app-layer) joins
 //! it to the `tm_lowfund`-indexed hop outpoint to answer "which hops of
 //! mine are in flight?".
 //!

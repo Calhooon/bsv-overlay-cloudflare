@@ -88,9 +88,10 @@ pub struct HoppartyRecord {
     #[serde(rename = "identitySigHex")]
     pub identity_sig_hex: String,
     /// The txid carrying the marker OP_RETURN — half of the primary key.
-    /// (The hop `createAction` carries the marker as a second output, so in
-    /// production this usually EQUALS `hop_txid` — but that is a producer
-    /// convention, never a storage invariant.)
+    /// NOTE: this can never equal `hop_txid` when the marker rides a tx
+    /// that also carries the hop (a tx cannot embed its own txid — hash
+    /// fixed point), so a same-tx carrier would need a wire revision; the
+    /// storage layer is deliberately agnostic about the carrier.
     pub txid: String,
     /// The marker output's index within `txid` — the other half of the
     /// primary key.

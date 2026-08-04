@@ -237,9 +237,12 @@ pub(crate) mod tests {
 
     // ── Whole-transaction admission via BEEF ─────────────────────────────
 
-    /// The PRODUCTION shape (bsv-low #315 carry-over): the marker rides the
-    /// hop `createAction` itself as a SECOND OUTPUT beside the hop P2PKH.
-    /// The manager must admit exactly the marker output and skip the money.
+    /// A mixed-outputs tx (a P2PKH beside the marker — whatever tx the
+    /// client ends up carrying the marker on): the manager must admit
+    /// exactly the marker output and skip the money. (NOTE: the ledgered
+    /// "second output on the hop tx" carry-over cannot name the SAME tx's
+    /// hop outpoint — a tx cannot embed its own txid — so the carrier
+    /// shape is the client half's decision; this manager is agnostic.)
     #[tokio::test]
     async fn identify_admissible_outputs_over_beef() {
         let marker = make_hopparty_output(&golden_game_id());
