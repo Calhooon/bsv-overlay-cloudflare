@@ -1401,11 +1401,20 @@ pub fn aggregate_leaderboard_attributed(
     use crate::results::PotVerdict;
     let mut counted: HashMap<String, (String, bool)> = HashMap::new();
     for (pot_lc, &verdict) in verdict_by_pot {
-        // Confirmed landing — re-checked here so the spine never depends on
-        // the route's filter.
+        // Confirmed landing WITH a recorded spender — re-checked here so the
+        // spine never depends on the route's filter. The `spending_txid.is_some()`
+        // limb makes the chain-win anchor invariant EXECUTABLE rather than a
+        // comment (#336/#337 delta LOW-2): a counted win is emitted with a
+        // `chainWins` anchor whose `settleTxid` is this spender, so a confirmed
+        // landing that somehow carried no spender (never observed — `mark_spent`
+        // always records one) must not be counted as a win the client then
+        // cannot re-derive. `is_confirmed_landing` stays deliberately "flag only"
+        // (its documented contract, shared with the classifier); the stricter
+        // bar lives HERE, where the anchor is built. Pinned by
+        // `confirmed_landing_without_spender_is_not_counted`.
         if !status_by_pot
             .get(pot_lc)
-            .is_some_and(|s| is_confirmed_landing(s))
+            .is_some_and(|s| is_confirmed_landing(s) && s.spending_txid.is_some())
         {
             continue;
         }
@@ -1442,9 +1451,10 @@ pub fn aggregate_leaderboard_attributed(
     // Every chain-counted win gets its (potTxid, settleTxid) on its owner's
     // board row, so the client re-derives the win from `/beef` INDEPENDENT of
     // the evictable result marker. The settle txid is the pot's own confirmed
-    // spender (a confirmed landing always records one — `is_confirmed_landing`
-    // gated `counted` above). Sorted per owner by pot txid so the wire body is
-    // a pure function of the data, never of map iteration order.
+    // spender, which the `counted` gate above now REQUIRES to be present
+    // (`spending_txid.is_some()`, LOW-2) — so this `let else` never `continue`s
+    // in practice; it stays as a total-function fail-safe. Sorted per owner by
+    // pot txid so the wire body is a pure function of the data.
     let mut chain_wins_by_owner: HashMap<String, Vec<ChainWinAnchor>> = HashMap::new();
     for (pot_lc, (owner_lc, _)) in &counted {
         let Some(settle) = status_by_pot
@@ -3842,6 +3852,46 @@ mod tests {
         );
         assert_eq!(lb.board[0].identity, w);
         assert!(!lb.board[0].identity_is_key);
+    }
+
+    /// #336/#337 LOW-2 (Rule 10 — the invariant is a CHECK, not a comment): the
+    /// chain-win anchor's `settleTxid` is the pot's confirmed spender, and the
+    /// `counted` gate now requires `spending_txid.is_some()`. A confirmed
+    /// landing that carried NO spender (never observed in production, but not
+    /// type-enforced) must therefore NOT be counted — a win the client could
+    /// never re-derive (no settle txid to feed `/beef`) is not minted.
+    #[test]
+    fn confirmed_landing_without_spender_is_not_counted() {
+        use crate::results::PotVerdict;
+        let w = ident(0xaa);
+        let l = ident(0xbb);
+        let key_a = ident(0x5a);
+        let key_b = ident(0x5b);
+        let markers = vec![mk(1, &w, &l, 1, 2, true, None, 100, 0)];
+        let verdicts = verdicts_of(&[(1, PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(1, Some(&w), Some(&l))]);
+        let params = params_of(&[(1, &key_a, &key_b)]);
+
+        // CONTROL: a normal confirmed landing WITH a spender counts, and carries
+        // exactly one chain-win anchor whose settleTxid is that spender.
+        let ok = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard_attributed(
+            &markers, &ok, &no_proofs(), 200, &verdicts, &attrs, &params,
+        );
+        assert_eq!(lb.board.len(), 1);
+        assert_eq!(lb.board[0].chain_wins.len(), 1);
+        assert_eq!(lb.board[0].chain_wins[0].settle_txid, tx(2));
+
+        // DEFECT SHAPE: same confirmed landing, but spending_txid stripped. Its
+        // `is_confirmed_landing` is still true (flag-only), so ONLY the new
+        // `spending_txid.is_some()` limb keeps it out of `counted`.
+        let mut no_spender = ok.clone();
+        assert!(is_confirmed_landing(&no_spender[0]), "flags still say confirmed");
+        no_spender[0].spending_txid = None;
+        let lb = aggregate_leaderboard_attributed(
+            &markers, &no_spender, &no_proofs(), 200, &verdicts, &attrs, &params,
+        );
+        assert!(lb.board.is_empty(), "a spender-less confirmed landing is not counted");
     }
 
     /// Adversarial (risk register B1/B5): the CHAIN decides the winner, and a
