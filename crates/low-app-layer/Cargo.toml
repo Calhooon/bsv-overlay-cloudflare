@@ -13,12 +13,19 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Pinned to the exact worker version the sibling overlay-cloudflare crate
-# resolves (0.7.5 in the workspace Cargo.lock) so the shared `[build]`
-# command `cargo install -q --version ^0.7 worker-build` works — worker-build
-# 0.8+ requires worker >= 0.8. Only `d1` is needed: this worker is a pure
-# READ surface (no queues, no durable objects, no secrets).
-worker = { version = "0.7.5", features = ["d1"] }
+# worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
+# BRC-103/104 middleware, the SAME major the low-watchtower pins — requires
+# `worker ^0.8`, so this crate moved off the sibling overlay-cloudflare's
+# 0.7.5 (the two crates build independently; worker-build for THIS crate is
+# ^0.8, see wrangler.toml [build]). Only `d1` is needed: this worker is a
+# pure READ surface (no queues, no durable objects).
+worker = { version = "0.8", features = ["d1"] }
+# BRC-103/104 mutual-auth front door (bsv-low #318) — the canonical public
+# middleware, pinned from crates.io at the same major the tower pins
+# (`workers/low-watchtower` pins "0.3"; NEVER a cargo path-patch — a dead
+# path-patch once stranded the relay on 0.2.0, see the middleware-lineage
+# note in bsv-low's decision log).
+bsv-middleware-cloudflare = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
@@ -44,3 +51,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # is linked into the wasm32 Worker build.
 rusqlite = { version = "0.32", features = ["bundled"] }
 bsv-overlay-cloudflare = { version = "0.1", path = "../overlay-cloudflare" }
+# #318 real-crypto auth round-trip (tests/auth_real_crypto_roundtrip.rs):
+# the SDK's REAL BRC-103 `Peer` on both ends (the implementation the
+# middleware ports 1:1), real ECDSA over real random keys — never a mocked
+# verify. `auth` pulls tokio; the extra features are dev-only and never
+# reach the wasm32 worker build.
+bsv-rs = { workspace = true, features = ["auth"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+async-trait = "0.1"

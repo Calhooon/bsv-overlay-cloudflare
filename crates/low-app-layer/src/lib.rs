@@ -103,6 +103,7 @@
 //! for a whole batch of outpoints — not a cache. Every response is
 //! `no-store`.
 
+pub mod auth;
 pub mod compaction;
 pub mod cors;
 pub mod hops_view;
@@ -113,15 +114,20 @@ pub mod results;
 mod routes;
 pub mod txany;
 
+use serde_json::Value;
 use worker::{event, Context, Env, Request, Response, Result, Router};
 
 /// Worker entry — HTTP request dispatch.
 ///
 /// OPTIONS preflight is answered before routing (it carries no body and must
-/// succeed for the browser to send the real GET). Every other response —
-/// success, 4xx, or 5xx — gets wildcard CORS stamped on the way out, so a
-/// cross-origin browser always sees the real status instead of an opaque
-/// network error.
+/// succeed for the browser to send the real GET). Every other request passes
+/// the BRC-103/104 FRONT DOOR (bsv-low #318, `auth::front_door` — lenient by
+/// default, strict behind `AUTH_ENFORCE`; the tower's posture) which resolves
+/// the caller's verified identity into the router data. Authenticated replies
+/// are SIGNED (`sign_json_response`) so `AuthFetch` clients verify the
+/// server. Every response — success, 4xx, or 5xx — gets wildcard CORS stamped
+/// on the way out, so a cross-origin browser always sees the real status
+/// instead of an opaque network error.
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
@@ -131,7 +137,37 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return cors::preflight();
     }
 
-    let mut resp = router().run(req, env).await?;
+    // BRC-103/104 front door: handshake replies / strict-mode refusals /
+    // middleware refusals return here; otherwise the request proceeds with
+    // the resolved [`auth::AuthState`] as the router data (in-process only —
+    // never a header a stranger could forge, see `auth`'s Rule 8b note).
+    let (req, state) = match auth::front_door(req, &env).await? {
+        auth::FrontDoor::Proceed(req, state) => (req, state),
+        auth::FrontDoor::Reply(mut resp) => {
+            cors::add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+    };
+    // Keep the session for reply-signing; the state moves into the router.
+    let session = state.session.clone();
+
+    let mut resp = router(state).run(req, env).await?;
+
+    // Sign the terminal JSON for an AUTHENTICATED caller (the tower's
+    // posture: re-serialize the handler's JSON at its own status code, sign,
+    // then stamp no-store + CORS back on — `sign_json_response` builds a
+    // fresh response, so the handler's cache header must be re-applied).
+    if let Some(session) = session {
+        let status = resp.status_code();
+        let value: Value = resp
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({ "error": "handler returned a non-JSON response" }));
+        resp = bsv_middleware_cloudflare::sign_json_response(&value, status, &[], &session)
+            .map_err(|e| worker::Error::from(e.to_string()))?;
+        resp.headers_mut().set("Content-Type", "application/json")?;
+        resp.headers_mut().set("Cache-Control", "no-store")?;
+    }
     cors::add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -139,8 +175,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// The route table. All GET, all JSON; unknown paths get a JSON 404 via the
 /// `or_else_any_method` catch-alls (worker-rs' default no-match 404 is plain
 /// text, so both `/` and the wildcard are registered explicitly).
-fn router() -> Router<'static, ()> {
-    Router::new()
+fn router(state: auth::AuthState) -> Router<'static, auth::AuthState> {
+    Router::with_data(state)
         .get_async("/utxo-status", routes::utxo_status)
         .get_async("/pots-view", routes::pots_view)
         .get_async("/recovery-view", routes::recovery_view)

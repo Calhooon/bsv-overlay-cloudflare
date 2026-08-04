@@ -10,18 +10,48 @@
 #   npx wrangler deploy   # from crates/low-app-layer/
 #
 # account_id comes from the CLOUDFLARE_ACCOUNT_ID environment variable.
-# No secrets: every route serves public chain facts.
+#
+# Secrets (bsv-low #318): ONE optional secret, `SERVER_PRIVATE_KEY` — the
+# worker's dedicated BRC-103/104 server identity (64-hex secp256k1 key,
+# DISTINCT from every other key in the system; set via
+# `npx wrangler secret put SERVER_PRIVATE_KEY`). Without it the front door
+# runs lenient-only (anonymous reads serve; auth-attempting requests get an
+# honest 503). Every route still serves public chain facts — auth binds
+# IDENTITY (and readies BRC-105 quota), it does not add confidentiality.
 
 name = "low-app-layer"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-12-01"
 
 [build]
-# Pin worker-build to ^0.7 — newer 0.8+ requires worker crate >= 0.8 but this
-# crate pins worker 0.7.5 (matching overlay-cloudflare). Without the version
-# pin, `cargo install` grabs the latest worker-build and the build fails with
-# "Unsupported version worker@0.7.5, expected at least worker@0.8.0".
-command = "cargo install -q --version ^0.7 worker-build && worker-build --release"
+# worker-build ^0.8 — this crate pins worker 0.8 (required by
+# bsv-middleware-cloudflare 0.3, the canonical BRC-103/104 middleware; the
+# sibling overlay-cloudflare stays on worker 0.7.5 / worker-build ^0.7).
+command = "cargo install -q --version ^0.8 worker-build && worker-build --release"
+
+# #318 — the lenient→strict enforcement flip. "false" (or unset) = LENIENT:
+# unauthenticated reads serve exactly as pre-#318 but are counted on /health
+# (`anonymousByRoute` per identity route + `publicServed`). "true" = STRICT:
+# the FIVE identity-scoped reads (/results, /refund-view, /live-view,
+# /recovery-view, /hops-view) require auth; every OTHER route stays PUBLIC and
+# is never refused (deliberate exemption — the overlay /lookup already serves
+# that data unauthenticated; /health included so liveness monitors survive the
+# flip). Ordering matters: set SERVER_PRIVATE_KEY + create AUTH_SESSIONS
+# BEFORE shipping the auth-enabled client (AuthFetch always handshakes, so an
+# auth client vs an unconfigured worker 503s), THEN ship + soak
+# (`anonymousByRoute` ≈ 0 for every identity route), THEN flip. Rollback is
+# flipping it back; no code change. Full closure criteria: `src/auth.rs` docs.
+[vars]
+AUTH_ENFORCE = "false"
+
+# BRC-103/104 session store for the auth middleware (`process_auth`'s
+# `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
+# placeholder by repo convention — the real namespace id is injected at
+# deploy time and never committed (create once with
+# `npx wrangler kv namespace create AUTH_SESSIONS`).
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "YOUR_KV_NAMESPACE_ID"  # set to your own KV namespace id
 
 # The SAME D1 database the low-overlay worker writes (wrangler.low.toml uses
 # the identical binding name + database_name). This worker only ever SELECTs
