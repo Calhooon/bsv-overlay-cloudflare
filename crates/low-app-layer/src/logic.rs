@@ -1157,6 +1157,20 @@ pub struct LeaderboardEvidence {
     pub chain_attributed_winner: Option<String>,
 }
 
+/// One chain-counted win's on-chain ANCHOR (bsv-low #336/#337): the pot
+/// funding txid (vout 0 is the pot) and the settle txid that spent it. The
+/// client re-derives the win from these via `/beef` (the covenant lock + the
+/// settle's output shape + the winning committed key) INDEPENDENT of any
+/// result marker — so a marker flood that evicts the honest countersigned
+/// marker (leaving `evidence` empty) can no longer erase the win client-side,
+/// and a KEY-ATTRIBUTED win (no result marker at all) still counts for a
+/// third-party viewer. It is a POINTER, never an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainWinAnchor {
+    pub pot_txid: String,
+    pub settle_txid: String,
+}
+
 /// One `board[i]` row — an identity's wins + its evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderboardBoardRow {
@@ -1187,6 +1201,13 @@ pub struct LeaderboardBoardRow {
     /// identity; a third party sees the key. Never a wrong winner, never a
     /// dropped win.
     pub identity_is_key: bool,
+    /// #336/#337: the on-chain anchors of THIS row's chain-counted wins — one
+    /// per counted pot, emitted for EVERY counted win (not only the
+    /// marker-less ones), so the client counts from chain facts rather than the
+    /// evictable result marker. Empty only when the row genuinely has no
+    /// chain-counted win. Sorted by `pot_txid` so the wire body is a pure
+    /// function of the data.
+    pub chain_wins: Vec<ChainWinAnchor>,
     pub evidence: Vec<LeaderboardEvidence>,
 }
 
@@ -1417,6 +1438,33 @@ pub fn aggregate_leaderboard_attributed(
         counted.insert(pot_lc.clone(), owner);
     }
 
+    // ── the chain-win ANCHORS (#336/#337), grouped by owner ─────────────────
+    // Every chain-counted win gets its (potTxid, settleTxid) on its owner's
+    // board row, so the client re-derives the win from `/beef` INDEPENDENT of
+    // the evictable result marker. The settle txid is the pot's own confirmed
+    // spender (a confirmed landing always records one — `is_confirmed_landing`
+    // gated `counted` above). Sorted per owner by pot txid so the wire body is
+    // a pure function of the data, never of map iteration order.
+    let mut chain_wins_by_owner: HashMap<String, Vec<ChainWinAnchor>> = HashMap::new();
+    for (pot_lc, (owner_lc, _)) in &counted {
+        let Some(settle) = status_by_pot
+            .get(pot_lc)
+            .and_then(|s| s.spending_txid.as_ref())
+        else {
+            continue;
+        };
+        chain_wins_by_owner
+            .entry(owner_lc.clone())
+            .or_default()
+            .push(ChainWinAnchor {
+                pot_txid: pot_lc.clone(),
+                settle_txid: settle.to_ascii_lowercase(),
+            });
+    }
+    for anchors in chain_wins_by_owner.values_mut() {
+        anchors.sort_by(|a, b| a.pot_txid.cmp(&b.pot_txid));
+    }
+
     // ── marker DECORATION, bounded to the chain-counted set (MEDIUM-3) ──────
     // `verified_claim` (real ECDSA) runs ONLY on markers whose pot is
     // chain-counted for the claimed winner — at most (counted pots ×
@@ -1540,6 +1588,9 @@ pub fn aggregate_leaderboard_attributed(
                 // resolved identity key — a display honesty bit, never a win
                 // change. The win is real regardless.
                 identity_is_key: *is_key_by_owner.get(id).unwrap_or(&false),
+                // #336/#337: the chain-win anchors for this owner (sorted by
+                // pot txid above) — the client's eviction-immune counting input.
+                chain_wins: chain_wins_by_owner.get(id).cloned().unwrap_or_default(),
                 evidence,
             }
         })
@@ -1648,6 +1699,18 @@ pub fn leaderboard_body(
                     })
                 })
                 .collect();
+            // #336/#337: the chain-win anchors — one `{potTxid, settleTxid}`
+            // per counted pot, the client's eviction-immune counting input.
+            let chain_wins: Vec<serde_json::Value> = r
+                .chain_wins
+                .iter()
+                .map(|c| {
+                    json!({
+                        "potTxid": c.pot_txid,
+                        "settleTxid": c.settle_txid,
+                    })
+                })
+                .collect();
             json!({
                 "identity": r.identity,
                 "wins": r.wins,
@@ -1663,6 +1726,10 @@ pub fn leaderboard_body(
                 // under the key, not attribute it to a player. Absent/false on
                 // a normally-attributed row.
                 "identityIsKey": r.identity_is_key,
+                // #336/#337: the chain-win anchors (absent-safe: an older
+                // client ignores the field; a newer one counts from it,
+                // independent of the evictable result marker).
+                "chainWins": chain_wins,
                 "evidence": evidence,
             })
         })
@@ -3378,6 +3445,61 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
         assert_eq!(v["board"][0]["evidence"][0]["serverVerdict"], "winner-a");
+    }
+
+    /// #336/#337 CROSS-REPO WIRE PIN (Rule 16 — share the ARTIFACT, not the
+    /// convention). The REAL serializer (`leaderboard_body`) drives a scenario
+    /// covering BOTH new shapes — an identity win with evidence + `chainWins`
+    /// (#336 coexistence) and a KEY-ATTRIBUTED win with EMPTY evidence +
+    /// `chainWins` + `identityIsKey` (#337) — and its output, normalized to the
+    /// canonical pretty form, must EQUAL the committed fixture BYTE-FOR-BYTE.
+    ///
+    /// The IDENTICAL bytes are checked into the bsv-low client
+    /// (`app/src/lib/fixtures/leaderboard_chain_wins.fixture.json`) and read
+    /// back by the real client PARSER + `gatherBoardFast`, so the producer's
+    /// output is proven acceptable to the consumer across the language boundary.
+    /// A serializer field-name/shape drift on this side goes RED here; a
+    /// parser drift on the client side goes red there; and the two copies are
+    /// byte-compared on the client so they can never diverge silently.
+    #[test]
+    fn chain_wins_body_matches_cross_repo_fixture() {
+        use crate::results::PotVerdict;
+        let w = ident(0xaa);
+        let l = ident(0xbb);
+        let key_a = ident(0x5a);
+        let key_b = ident(0x5b);
+        let markers = vec![
+            mk(1, &w, &l, 1, 2, true, None, 100, 0), // pot 1 — key-attributed (no attribution)
+            mk(3, &w, &l, 3, 4, true, None, 100, 0), // pot 3 — identity-attributed, countersigned
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8), (3u8, 4u8)]));
+        let verdicts = verdicts_of(&[(1, PotVerdict::WinnerA), (3, PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(3, Some(&w), Some(&l))]); // only pot 3 resolves an identity
+        let params = params_of(&[(1, &key_a, &key_b)]); // pot 1 falls back to the committed key
+        let lb = aggregate_leaderboard_attributed(
+            &markers, &statuses, &no_proofs(), 200, &verdicts, &attrs, &params,
+        );
+        // Loud-count guard: exactly two board rows, one of each new shape.
+        assert_eq!(lb.board.len(), 2, "the scenario must produce two board rows");
+        assert!(
+            lb.board.iter().any(|r| r.identity_is_key && r.evidence.is_empty() && r.chain_wins.len() == 1),
+            "a key-attributed row with empty evidence + a chain-win anchor (#337)"
+        );
+        assert!(
+            lb.board.iter().any(|r| !r.identity_is_key && !r.evidence.is_empty() && r.chain_wins.len() == 1),
+            "an identity row with evidence + a chain-win anchor (#336 coexistence)"
+        );
+        let body = leaderboard_body(&lb, 1_700_000_000, 2, false);
+        let pretty: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut got = serde_json::to_string_pretty(&pretty).unwrap();
+        got.push('\n');
+        let fixture = include_str!("fixtures/leaderboard_chain_wins.fixture.json");
+        assert_eq!(
+            got, fixture,
+            "the /leaderboard body must match the cross-repo fixture BYTE-FOR-BYTE — if this \
+             changed intentionally, regenerate the fixture and copy it byte-identically to \
+             app/src/lib/fixtures/leaderboard_chain_wins.fixture.json in bsv-low"
+        );
     }
 
     #[test]
