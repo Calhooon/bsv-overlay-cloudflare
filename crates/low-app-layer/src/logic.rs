@@ -761,45 +761,75 @@ pub fn health_body() -> String {
 // table `/utxo-status` reads) and the proof pointers (`proof_markers`) — so it
 // JOINs + ranks server-side and answers the whole board in ONE request.
 //
-// TRUST DECISION (documented, deliberate — the record surface must never
-// lie): the overlay ADMITS result markers by BYTE FORMAT ONLY and NEVER
-// verifies signatures; a marker's ECDSA sigs are BRC-42 `'anyone'`-keyed
-// (protocolID [1,'low result'], keyID = gameId), whose exact ProtoWallet
-// verify round-trip lives in the client (`result.ts verifyResultRow`).
-// Reproducing that key-derivation + verify in-worker is impractical and would
-// risk a SUBTLY-WRONG re-implementation on a money-adjacent surface. So this
-// endpoint COUNTS a win on the presence of BOTH signature pushes
-// (`winnerSigHex` AND `loserSigHex`) plus an on-chain ANCHOR (the pot spent by
-// the named settle txid, from `pot_records`) — the SAME anchor `/utxo-status`
-// reports — and RETURNS both sig hexes + the anchor flag in `evidence` so the
-// CLIENT re-verifies the sigs (and re-checks the covenant + anchor) and can
-// FALSIFY any win the server counted but did not cryptographically verify.
-// The backend organizes; the client verifies. It never asserts a verification
-// it did not perform, and every counted win is reconstructible from the
-// returned evidence. A singly-signed (unconfirmed) or un-anchored marker is
-// STILL returned in evidence (with `anchored`) but does NOT count.
+// TRUST MODEL (#332 — this paragraph REPLACES the original "presence-only"
+// trust decision, which the #317 architecture audit ranked DEFECTIVE): the
+// overlay still ADMITS result markers by BYTE FORMAT ONLY (an index, not an
+// authority), but this endpoint now VERIFIES a marker's signatures before it
+// COUNTS — the same `results::verified_claim` primitive `/results` counts
+// with (real BRC-42 `'anyone'` ECDSA over the reconstructed canonical
+// challenge; protocolID [1,'low result'], keyID = gameId; cross-vectored
+// against the TS SDK and production-proven by the lobby tokens). The
+// original note claimed that verify was "impractical in-worker"; `/results`
+// falsified that claim in #227, and the presence gate it justified —
+// `loserSigHex.is_some()` — let one dust OP_RETURN with junk sig bytes both
+// INFLATE a record and ERASE an honest win. A marker is now a DISPLAY HINT,
+// never a counting input: counting inputs are the chain anchor + verified
+// signatures + the #230 chain attribution. Every marker (verified or not)
+// is STILL returned verbatim in `evidence` so the client re-verifies and
+// can falsify; a win the server counts remains reconstructible from that
+// evidence.
 //
-// The counting + dedup + ranking rules MIRROR the client's
-// `aggregateBoard` / `lowestHands` EXACTLY (a divergence is a bug):
-//  - drop un-anchored markers before grouping;
+// The counting rules (the client's `aggregateBoard` / `lowestHands` rules,
+// hardened — the DELIBERATE divergences from the client are (a) real
+// signature verification before counting and (b) POT-keyed grouping; the
+// client re-verifies every evidence row itself, so a server-side
+// under-count is the only possible disagreement, and under-count is the
+// honest fail direction):
+//  - drop un-anchored markers before grouping (pot spent by the named
+//    settle, CONFIRMED — `pot_records`, the same anchor `/utxo-status`
+//    reports);
+//  - drop markers whose winner signature does not VERIFY (#332 — junk
+//    bytes count as nothing, exactly as `/results` treats them);
 //  - (#230) drop chain-CONTRADICTED markers (settle classified tie/refund,
 //    or the pot's winner chain-attributed to a DIFFERENT identity);
-//  - per gameId, FIRST (#230): a chain-attributed winner whose own anchored
-//    marker names it counts +1 (`chainProven` tier — countersigned or not;
-//    the #276 tower-enforced winner). Otherwise the claim rules:
-//  - a single distinct CONFIRMED (both-sig) winner counts +1;
-//    two conflicting confirmed winners (collusion garbage) count for NOBODY;
-//    with no confirmed claim, a single distinct winner counts +1 UNCONFIRMED
-//    (which never adds to `wins`); conflicting unconfirmed → nobody;
-//  - `wins` = countersigned + chain-attributed counted games; `proven` =
-//    ≥1 countersigned win (unchanged meaning); `chainProven` = ≥1
-//    chain-attributed win (the honest new tier — see the row docs);
-//  - `hands` = the lowest-score confirmed + anchored v2 (cards-carrying)
-//    hands, one per single-winner game, score ascending then earliest first
-//    (deliberately still countersigned-only — an accepted residual).
+//  - group by POT OUTPOINT, never by gameId (#332): a gameId is a FREE,
+//    claimable name (network-enforcement rule 2), so per-game grouping let
+//    N invented gameIds over ONE copied pot mint N wins; one pot is one
+//    hand and can count at most once;
+//  - per pot, FIRST (#230): a chain-attributed winner whose own anchored
+//    verified marker names it counts +1 (`chainProven` tier —
+//    countersigned or not; the #276 tower-enforced winner). Otherwise the
+//    claim rules:
+//  - a single distinct VERIFIED-countersigned winner counts +1;
+//    two conflicting verified-countersigned winners count for NOBODY
+//    (see the residual note below);
+//    with no countersigned claim, a single distinct verified winner counts
+//    +1 UNCONFIRMED (which never adds to `wins`); conflicting → nobody;
+//  - `wins` = countersigned + chain-attributed counted pots; `proven` =
+//    ≥1 VERIFIED-countersigned win; `chainProven` = ≥1 chain-attributed
+//    win;
+//  - `hands` = the lowest-score verified-countersigned + anchored v2
+//    (cards-carrying) hands, one per single-winner pot, score ascending
+//    then earliest first (deliberately still countersigned-only — an
+//    accepted residual).
+//
+// RESIDUAL, stated plainly (#332): signatures prove AUTHORSHIP, not
+// authority over the pot. For a pot with NO chain attribution (bare/legacy,
+// or no verified v2 seat markers), an attacker holding two keys can mint a
+// fully-verified countersigned claim over a copied real (potTxid,
+// settleTxid) — it cannot INFLATE (the pot group already holds the honest
+// claim, so the conflict rule counts nobody), but that same conflict
+// UN-COUNTS the honest claim: erasure at the cost of a real 2-key
+// countersigned forgery instead of one junk-byte dust output. Closing it
+// requires party attribution, which every covenant pot has (#230) — there
+// the forged claim is chain-contradicted and the honest win stands. The
+// fail direction is UNDER-count (unranked), never a wrong winner.
 
-/// Default `?limit` for `/leaderboard` (contract default). Bounds how many
-/// recent result markers are scanned — mirrors the client's `recentResults`.
+/// Default `?limit` for `/leaderboard` (contract default). Since #332 the
+/// limit counts DISTINCT POTS in the marker window (a settled hand ≙ one
+/// pot — the #282 `ls_result` semantics), not raw marker rows; each pot
+/// yields at most [`overlay_discovery::result::storage::RESULT_ROWS_PER_POT`]
+/// rows, so `resultCount` can exceed `limit` by that factor.
 pub const LEADERBOARD_DEFAULT_LIMIT: usize = 200;
 /// Hard cap on `?limit` — the same clamp the overlay's `ls_result` lookup
 /// service applies (1..=500).
@@ -1151,8 +1181,21 @@ pub fn aggregate_leaderboard_attributed(
         .iter()
         .map(|m| marker_anchored(m, &status_by_pot))
         .collect();
-    // A marker is CONFIRMED (backend sense) when BOTH sig pushes are present.
-    let confirmed = |i: usize| markers[i].loser_sig_hex.is_some();
+    // #332 — VERIFY each marker's signatures ONCE (real ECDSA over the
+    // reconstructed canonical challenge — the exact `verified_claim`
+    // primitive `/results` counts with). This replaces the audit-DEFECTIVE
+    // presence gate `loser_sig_hex.is_some()`, which arbitrary junk bytes
+    // satisfied: one dust OP_RETURN copying a real (potTxid, settleTxid)
+    // could then inflate a record or erase an honest win.
+    let facts: Vec<Option<crate::results::ClaimFact>> =
+        markers.iter().map(crate::results::verified_claim).collect();
+    // The winner's own signature VERIFIES under the claimed winner identity
+    // — the bar for a marker to be a counting input at all.
+    let verified = |i: usize| facts[i].is_some();
+    // A marker is CONFIRMED when the loser countersignature ALSO verifies
+    // under the claimed loser identity (`ClaimFact::loser_sig_verified` —
+    // never mere column presence).
+    let confirmed = |i: usize| facts[i].as_ref().is_some_and(|f| f.loser_sig_verified);
     // The chain classification of marker i's pot spend, when one exists.
     let verdict_of = |i: usize| {
         verdict_by_pot
@@ -1185,35 +1228,44 @@ pub fn aggregate_leaderboard_attributed(
         matches!(attributed_winner_of(i), Some(w) if !w.eq_ignore_ascii_case(&markers[i].winner))
     };
 
-    // ── wins: per-game dedup over ANCHORED markers (client aggregateBoard) ──
-    let mut by_game: HashMap<String, Vec<usize>> = HashMap::new();
+    // ── wins: per-POT dedup over ANCHORED + VERIFIED markers (#332) ────────
+    // Keyed on the pot OUTPOINT — chain truth — never on gameId, which is a
+    // FREE claimable name (network-enforcement rule 2): under per-game
+    // grouping, N invented gameIds over ONE copied real (potTxid,
+    // settleTxid) formed N independent single-winner groups and minted N
+    // wins. One pot is one hand; it counts at most once. (All markers in a
+    // group name the same settle by construction — `marker_anchored` binds
+    // the pot's recorded spender to each marker's own settleTxid.)
+    let mut by_pot: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, m) in markers.iter().enumerate() {
-        if anchored[i] && !chain_contradicted(i) {
-            by_game
-                .entry(m.game_id.to_ascii_lowercase())
+        if anchored[i] && verified(i) && !chain_contradicted(i) {
+            by_pot
+                .entry(m.pot_txid.to_ascii_lowercase())
                 .or_default()
                 .push(i);
         }
     }
-    // identity_lc → per-tier tallies (a game counts into `wins` at most once).
+    // identity_lc → per-tier tallies (a pot counts into `wins` at most once).
     #[derive(Default)]
     struct Tally {
-        /// Counted wins (countersigned OR chain-attributed), per-game deduped.
+        /// Counted wins (countersigned OR chain-attributed), per-pot deduped.
         wins: u32,
-        /// Unconfirmed single-winner games (never added to `wins`).
+        /// Unconfirmed single-winner pots (never added to `wins`).
         unconf: u32,
-        /// Games whose counted win carries the loser's countersignature.
+        /// Pots whose counted win carries the loser's VERIFIED countersig.
         countersigned: u32,
-        /// Games whose counted win is #230 chain-attributed.
+        /// Pots whose counted win is #230 chain-attributed.
         chain: u32,
     }
     let mut tally: HashMap<String, Tally> = HashMap::new();
-    for idxs in by_game.values() {
+    for idxs in by_pot.values() {
         // ── #230 first: a CHAIN-ATTRIBUTED winner that also claimed the pot
-        // (its own anchored marker names it — chain_contradicted already
-        // dropped every claim the attribution disagrees with) counts a WIN
-        // outright, countersigned or not. This is the #276 tower-enforced
-        // winner: verdict winner-X + proven holder of seat X's committed key.
+        // (its own anchored verified marker names it — chain_contradicted
+        // already dropped every claim the attribution disagrees with) counts
+        // a WIN outright, countersigned or not. This is the #276
+        // tower-enforced winner: verdict winner-X + proven holder of seat
+        // X's committed key. (One pot per group ⇒ at most one attributed
+        // winner; the set spelling is kept for the fall-through shape.)
         let chain_winners: HashSet<String> = idxs
             .iter()
             .filter(|&&i| {
@@ -1235,9 +1287,6 @@ pub fn aggregate_leaderboard_attributed(
             }
             continue;
         }
-        // (>1 chain winner is only reachable with garbage markers over
-        //  DIFFERENT pots inside one gameId — fall through to the
-        //  conservative claim rules rather than guess.)
 
         let confirmed_winners: HashSet<String> = idxs
             .iter()
@@ -1252,7 +1301,12 @@ pub fn aggregate_leaderboard_attributed(
             continue;
         }
         if confirmed_winners.len() > 1 {
-            continue; // conflicting confirmed claims → count nobody
+            // Conflicting VERIFIED countersigned claims → count nobody.
+            // (Unranked, never a guessed winner — see the module note's
+            // residual: on an unattributed pot this conflict is mintable by
+            // an attacker holding two keys, and the honest fail direction
+            // is under-count.)
+            continue;
         }
         // No confirmed claim: a single distinct winner counts UNCONFIRMED.
         let unconfirmed_winners: HashSet<String> = idxs
@@ -1337,8 +1391,10 @@ pub fn aggregate_leaderboard_attributed(
     });
     let board = rows.into_iter().map(|(r, _)| r).collect();
 
-    // ── hands: lowest-score confirmed + anchored v2 hands (lowestHands) ─────
-    let mut hand_by_game: HashMap<String, Vec<usize>> = HashMap::new();
+    // ── hands: lowest-score VERIFIED-countersigned + anchored v2 hands ──────
+    // (#332: `confirmed` is now real dual-signature verification, and the
+    // grouping is per POT for the same claimable-name reason as wins.)
+    let mut hand_by_pot: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, m) in markers.iter().enumerate() {
         if !anchored[i] || !confirmed(i) || chain_contradicted(i) {
             continue;
@@ -1347,14 +1403,14 @@ pub fn aggregate_leaderboard_attributed(
         if leaderboard_cards_from_hex(ch).is_none() {
             continue;
         }
-        hand_by_game
-            .entry(m.game_id.to_ascii_lowercase())
+        hand_by_pot
+            .entry(m.pot_txid.to_ascii_lowercase())
             .or_default()
             .push(i);
     }
     // (row, created_at) so the score-tie break is the earliest claim.
     let mut hands: Vec<(LeaderboardHandRow, Option<i64>)> = Vec::new();
-    for idxs in hand_by_game.values() {
+    for idxs in hand_by_pot.values() {
         let winners: HashSet<String> = idxs
             .iter()
             .map(|&i| markers[i].winner.to_ascii_lowercase())
@@ -1362,8 +1418,11 @@ pub fn aggregate_leaderboard_attributed(
         if winners.len() != 1 {
             continue; // conflicting confirmed → count nobody (same as wins)
         }
-        // idxs is in ascending marker order; markers are newest-first, so the
-        // first index is the newest claim for the game (the client's claims[0]).
+        // The representative row: the first surviving index. Under the #332
+        // window ordering a pot's rows arrive OLDEST-first, so this is the
+        // pot's original verified claim; every candidate here carries the
+        // sole winner's OWN verified signature binding its cards, so any
+        // representative is that winner's true attested hand.
         let i = *idxs.iter().min().unwrap();
         let m = &markers[i];
         let cards = leaderboard_cards_from_hex(m.cards_hex.as_ref().unwrap()).unwrap();
@@ -3350,6 +3409,215 @@ mod tests {
             "unconfirmed stays unconfirmed without a verdict"
         );
         assert!(!lb.board[0].chain_proven);
+    }
+
+    // ── #332 attack cells (RED-verified against the pre-#332 gate) ──────────
+
+    /// #332 attack (a) — INFLATION. A real, confirmed `(potTxid, settleTxid)`
+    /// is PUBLIC data. The attacker copies it into N invented gameIds, each
+    /// marker naming itself winner with junk bytes in BOTH sig pushes.
+    /// Pre-#332 the presence gate (`loser_sig_hex.is_some()`) called every
+    /// copy "confirmed", each invented gameId formed its own single-winner
+    /// group, and the attacker gained N wins for N dust outputs.
+    #[test]
+    fn inflation_junk_sig_copies_of_a_public_settle_mint_no_wins() {
+        let w = ident(0x11);
+        let l = ident(0x22);
+        let attacker = ident(0xcc);
+        let mut markers = vec![mk(1, &w, &l, 1, 2, true, None, 100, 0)];
+        for g in 0..10u8 {
+            markers.push(mk_forged(
+                0x30 + g,
+                &attacker,
+                &w,
+                1,
+                2,
+                true,
+                None,
+                200 + i64::from(g),
+                g,
+            ));
+        }
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        let wins_of = |id: &str| {
+            lb.board
+                .iter()
+                .find(|r| r.identity == *id)
+                .map_or(0, |r| r.wins)
+        };
+        assert_eq!(
+            wins_of(&attacker),
+            0,
+            "junk-sig copies of a public (pot, settle) must mint NO wins"
+        );
+        assert_eq!(wins_of(&w), 1, "the honest countersigned win still scores");
+        assert!(
+            lb.board.iter().find(|r| r.identity == w).unwrap().proven,
+            "the honest win keeps its VERIFIED-countersigned tier"
+        );
+    }
+
+    /// #332 attack (b) — ERASURE. ONE marker carrying the victim's real
+    /// `gameId/potTxid/settleTxid`, `winner = attacker`, junk sigs. Pre-#332
+    /// the group then held two "confirmed" winners, the conflict rule counted
+    /// NOBODY, and the honest win vanished from the public record — the exact
+    /// defeat of the standing rule that an opponent must not be able to erase
+    /// a winner's record.
+    #[test]
+    fn erasure_one_junk_sig_marker_cannot_void_an_honest_countersigned_win() {
+        let w = ident(0x11);
+        let l = ident(0x22);
+        let attacker = ident(0xcc);
+        let markers = vec![
+            mk(1, &w, &l, 1, 2, true, None, 100, 0),
+            mk_forged(1, &attacker, &w, 1, 2, true, None, 200, 1),
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        let honest = lb
+            .board
+            .iter()
+            .find(|r| r.identity == w)
+            .expect("the honest win must still be on the board");
+        assert_eq!(
+            honest.wins, 1,
+            "one junk-sig marker must not void the honest countersigned win"
+        );
+        assert!(honest.proven);
+        assert!(
+            lb.board
+                .iter()
+                .find(|r| r.identity == attacker)
+                .is_none_or(|r| r.wins == 0),
+            "the forger gains nothing"
+        );
+    }
+
+    /// #332 — verification alone does NOT close the copy attack: an attacker
+    /// holding TWO keys mints fully-VERIFYING countersigned claims over the
+    /// copied `(potTxid, settleTxid)` under fresh gameIds (signatures prove
+    /// AUTHORSHIP, not authority over the pot). Per-POT grouping collapses
+    /// them into the honest pot's single group, so:
+    ///  - the attacker NEVER gains a win (pre-#332-grouping every invented
+    ///    gameId was its own single-winner group and every copy MINTED one);
+    ///  - on an UNATTRIBUTED pot the conflict also un-counts the honest
+    ///    claim — the DOCUMENTED residual, pinned here as intended
+    ///    behaviour: an UNDER-count (unranked), never a wrong winner;
+    ///  - with #230 attribution (every covenant pot) the copies are
+    ///    chain-contradicted and the honest win STANDS.
+    #[test]
+    fn sock_countersigned_gameid_copies_collapse_per_pot() {
+        let w = ident(0x11);
+        let l = ident(0x22);
+        let attacker = ident(0xcc);
+        let sock = ident(0xdd);
+        let mut markers = vec![mk(1, &w, &l, 1, 2, true, None, 100, 0)];
+        for g in 0..5u8 {
+            markers.push(mk(
+                0x40 + g,
+                &attacker,
+                &sock,
+                1,
+                2,
+                true,
+                None,
+                200 + i64::from(g),
+                g,
+            ));
+        }
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+
+        // Unattributed pot: nobody counts — the conservative direction.
+        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        let wins_of = |lb: &Leaderboard, id: &str| {
+            lb.board
+                .iter()
+                .find(|r| r.identity == *id)
+                .map_or(0, |r| r.wins)
+        };
+        assert_eq!(
+            wins_of(&lb, &attacker),
+            0,
+            "verified sock-pair copies must mint NO wins"
+        );
+        assert_eq!(
+            wins_of(&lb, &w),
+            0,
+            "residual, pinned as INTENDED: conflicting verified claims on an \
+             unattributed pot count nobody (under-count, never a wrong winner)"
+        );
+
+        // Attributed (covenant) pot: the honest win stands, the copies are
+        // chain-contradicted.
+        let verdicts = verdicts_of(&[(1, crate::results::PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(1, Some(&w), Some(&l))]);
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        assert_eq!(wins_of(&lb, &attacker), 0);
+        let honest = lb.board.iter().find(|r| r.identity == w).unwrap();
+        assert_eq!(
+            honest.wins, 1,
+            "with attribution the honest win survives the verified copies"
+        );
+        assert!(honest.chain_proven);
+    }
+
+    /// Standing product rule (leaderboard-tower-wins-count): a quitting
+    /// opponent must not be able to erase the winner's record. The
+    /// tower-enforced winner's claim is UNCOUNTERSIGNED (the loser is gone);
+    /// the quitter then files a junk-sig marker naming ITSELF. The chain
+    /// attribution both counts the honest win and contradicts the forgery.
+    ///
+    /// SCOPE, stated because a confident name would otherwise oversell it
+    /// (Rule 17): this cell does NOT observe the #332 defect — RED-verified
+    /// against the exact pre-#332 gate (presence `confirmed` + gameId
+    /// grouping) it stayed GREEN, because the #230 attribution precedence
+    /// dominates whenever a pot HAS an attribution. That NOT-RED result is
+    /// the executed half of #332's precedence trace: the defective gate only
+    /// ever decided on pots with NO chain attribution. What this cell does
+    /// pin is that precedence itself — RED-verified by stubbing
+    /// `attributed_winner_of` to `None`.
+    #[test]
+    fn a_quitting_opponents_junk_marker_cannot_erase_a_tower_enforced_win() {
+        let w = ident(0x11);
+        let l = ident(0x22);
+        let markers = vec![
+            mk(1, &w, &l, 1, 2, false, None, 100, 0),
+            mk_forged(1, &l, &w, 1, 2, true, None, 200, 1),
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let verdicts = verdicts_of(&[(1, crate::results::PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(1, Some(&w), Some(&l))]);
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+        );
+        let honest = lb
+            .board
+            .iter()
+            .find(|r| r.identity == w)
+            .expect("the tower-enforced winner keeps its record");
+        assert_eq!(honest.wins, 1);
+        assert!(honest.chain_proven);
+        assert!(!honest.proven, "no countersignature ⇒ proven stays false");
+        assert!(
+            lb.board
+                .iter()
+                .find(|r| r.identity == l)
+                .is_none_or(|r| r.wins == 0),
+            "the quitter's forgery counts nothing"
+        );
     }
 
     #[test]
