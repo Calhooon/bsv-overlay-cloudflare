@@ -1233,8 +1233,10 @@ pub fn assemble_results(
         // for `at.height` two hundred lines below. A parked tx that never
         // mined can never acquire one, so this widens the bar toward CHAIN
         // TRUTH, never away from it.
-        let confirmed_landing =
-            r.spent_confirmed == Some(true) || r.spender_proof_verified == Some(true);
+        let confirmed_landing = crate::logic::is_confirmed_landing_with_proof(
+            r.spent_confirmed,
+            r.spender_proof_verified,
+        );
         if let (Some(true), true, Some(settle)) = (r.spent, confirmed_landing, settle_lc.as_deref())
         {
             // 1. The STORED verdict — trusted only when it was computed from

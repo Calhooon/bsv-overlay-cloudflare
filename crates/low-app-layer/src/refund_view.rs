@@ -289,7 +289,8 @@ pub fn derive_refund_status(
     // Without the second signal these two money surfaces DISAGREED on a
     // legacy row the migration stamped 0: `/results` served `refund` at a
     // proven height while this view said `unknown`.
-    let confirmed_landing = spent_confirmed == Some(true) || spender_proof_verified == Some(true);
+    let confirmed_landing =
+        crate::logic::is_confirmed_landing_with_proof(spent_confirmed, spender_proof_verified);
     match spent {
         // `spent = 0` is the overlay's NON-OBSERVATION of a spend on an
         // indexed pot (the admission default), not a UTXO existence check —
@@ -452,16 +453,19 @@ mod tests {
 
     // ── status derivation table ─────────────────────────────────────────────
 
-    /// #323 MEDIUM-1 — the two money surfaces share ONE confirmation bar.
+    /// #323 — THIS VIEW honours a verified spender proof as a landing.
     ///
-    /// This cell exists because the previous round asserted that sharing in
-    /// a COMMENT while the code did not implement it: `proof_verified`
-    /// appeared in this file exactly once, inside the sentence claiming it
-    /// was used. A legacy row the migration stamped `spentConfirmed = 0`
-    /// then resolved as `refund` on `/results` and `unknown` here. The claim
-    /// is now executable, so it cannot rot into a lie again.
+    /// Named for what it actually proves. It was previously called
+    /// `..._exactly_as_in_results`, which over-claimed: it calls only
+    /// `derive_refund_status` and never touches the results side, so breaking
+    /// that side left this green. **An executable claim is only as strong as
+    /// the surface it executes against** — nastier than a false comment,
+    /// because a green cell with the right name reads as stronger evidence
+    /// than prose. The AGREEMENT is now structural instead of asserted: both
+    /// views call `logic::is_confirmed_landing_with_proof`, pinned by
+    /// `both_money_views_call_the_shared_bar`.
     #[test]
-    fn a_verified_spender_proof_is_a_landing_here_exactly_as_in_results() {
+    fn a_verified_spender_proof_is_a_landing_in_this_view() {
         // The parked intent: no flag, no proof ⇒ unknown on BOTH surfaces.
         assert_eq!(
             derive_refund_status(

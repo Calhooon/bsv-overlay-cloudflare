@@ -598,11 +598,24 @@ pub struct RecoveryEntry {
     pub pot_txid: String,
     pub pot_vout: u32,
     /// The height this view SERVES: the covenant-committed value when
-    /// decoded (chain truth), else the caller's marker value (hint), each
-    /// range-checked — via the shared `served_recovery_height`, so
-    /// `/recovery-view`, `/refund-view` and `/live-view` cannot drift on
-    /// the sourcing rule (#323 MEDIUM-3).
-    pub recovery_height: Option<u64>,
+    /// decoded and in range (CHAIN TRUTH, unforgeable by a marker filer),
+    /// else the caller's marker value verbatim (#323 MEDIUM-3).
+    ///
+    /// DELIBERATELY NOT `Option` — this field is in the client parser's
+    /// STRICT ENUMERATION CORE (`chainReads.ts::parseRecoveryView`), where a
+    /// non-number makes the WHOLE view return null, not the row. Serving
+    /// `null` would therefore be attacker-triggerable denial of the collapsed
+    /// recovery read: a marker filed with `recoveryHeight = 0` on a
+    /// bare/legacy pot (no covenant height) resolves to no valid height, and
+    /// under oldest-marker-wins that hostile marker survives dedupe — one
+    /// dust marker naming a victim would drop them to the slow overlay
+    /// enumeration on every app open. Fail-safe (no pot is hidden) but a
+    /// permanent degradation of the wiped-device money-discovery path.
+    ///
+    /// So when NEITHER source is in range we serve the marker value exactly
+    /// as before this change: the preference is strictly an improvement, and
+    /// the wire contract is byte-identical.
+    pub recovery_height: u32,
     pub opponent_identity: String,
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
@@ -666,7 +679,9 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
                 recovery_height: crate::refund_view::served_recovery_height(
                     r.cov_recovery_height,
                     r.recovery_height,
-                ),
+                )
+                .and_then(|h| u32::try_from(h).ok())
+                .unwrap_or(r.recovery_height),
                 opponent_identity: r.opponent_identity,
                 spent: r.spent,
                 spending_txid: r.spending_txid,
@@ -985,6 +1000,38 @@ pub struct Leaderboard {
 /// create a chain-attributed win and erase an honest claim.
 pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
     status.spent == Some(true) && status.spent_confirmed == Some(true)
+}
+
+/// Is a recorded spend a CONFIRMED LANDING for the two per-identity MONEY
+/// views (`/results` and `/refund-view`)?
+///
+/// The bar: the `spentConfirmed` flag OR a chaintracks-VERIFIED spender proof
+/// (`pot_beefs.proof_verified`). The second signal exists because the column
+/// was added by migration with default 0, so a pre-existing row whose spend
+/// genuinely MINED can carry `spentConfirmed = 0`; a parked tx that never
+/// mined can never acquire a verified proof, so this widens toward CHAIN
+/// TRUTH, never away from it.
+///
+/// # Why this is hoisted (#323, the fourth instance of one pattern)
+///
+/// This rule previously existed as TWO INLINE COPIES — one in
+/// `results::assemble_results`, one in `refund_view::derive_refund_status` —
+/// and a cell named for the two views "agreeing" called only ONE of them, so
+/// breaking the other side left the agreement cell green. **An executable
+/// claim is only as strong as the surface it executes against**, and that is
+/// nastier than a false comment because a green cell with the right name
+/// reads as stronger evidence than prose. The durable fix is not a second
+/// test: it is DELETING one of the copies so agreement is structural and a
+/// single pin covers both.
+///
+/// Note the sibling [`is_confirmed_landing`] is deliberately STRICTER (flag
+/// only): it serves the leaderboard/classifier pair, which has no spender
+/// BEEF join to read a proof latch from.
+pub fn is_confirmed_landing_with_proof(
+    spent_confirmed: Option<bool>,
+    spender_proof_verified: Option<bool>,
+) -> bool {
+    spent_confirmed == Some(true) || spender_proof_verified == Some(true)
 }
 
 /// True iff the marker is anchored: its `potTxid:0` is recorded spent by the
@@ -2025,13 +2072,28 @@ mod tests {
         };
         // Covenant truth wins over a hostile marker's value.
         let (out, _) = assemble_recovery_view(vec![row(Some(958_504), 1)]);
-        assert_eq!(out[0].recovery_height, Some(958_504));
+        assert_eq!(out[0].recovery_height, 958_504);
         // No covenant value (bare/legacy) ⇒ the marker hint is served.
         let (out, _) = assemble_recovery_view(vec![row(None, 958_600)]);
-        assert_eq!(out[0].recovery_height, Some(958_600));
-        // Out-of-range values are refused rather than shown as a countdown.
+        assert_eq!(out[0].recovery_height, 958_600);
+        // NEITHER source in range ⇒ the marker value VERBATIM, never null.
         let (out, _) = assemble_recovery_view(vec![row(None, 0)]);
-        assert_eq!(out[0].recovery_height, None);
+        assert_eq!(out[0].recovery_height, 0);
+
+        // #323 — the WIRE must always carry a NUMBER here. This field is in
+        // the client's STRICT enumeration core (`parseRecoveryView`), where a
+        // non-number returns null for the WHOLE view, not the row. Serving
+        // null would be attacker-triggerable denial of the collapsed recovery
+        // read: a marker filed with recoveryHeight 0 against a bare/legacy pot
+        // resolves to no valid height, and under oldest-marker-wins that
+        // hostile marker survives dedupe.
+        let (out, _) = assemble_recovery_view(vec![row(None, 0)]);
+        let body: serde_json::Value =
+            serde_json::from_str(&recovery_view_body(&out, Some(958_800), false)).unwrap();
+        assert!(
+            body["entries"][0]["recoveryHeight"].is_number(),
+            "recoveryHeight must be a NUMBER on the wire: {body}"
+        );
     }
 
     /// The SQL must FETCH the covenant height, else the preference above is
@@ -2048,6 +2110,80 @@ mod tests {
 
     /// #323 MEDIUM-5 — the confirmed-landing predicate, pinned where it
     /// lives rather than inside `routes.rs`.
+    /// #323 — the ONE bar both money views use. Because `/results` and
+    /// `/refund-view` now CALL this rather than each carrying a copy,
+    /// agreement is structural and this single pin covers both. The previous
+    /// round tested the two sides separately under a cell NAMED for their
+    /// agreement, and breaking one side left that cell green.
+    #[test]
+    fn is_confirmed_landing_with_proof_is_the_one_money_view_bar() {
+        // The flag alone.
+        assert!(is_confirmed_landing_with_proof(Some(true), None));
+        // A chaintracks-VERIFIED spender proof alone (the migrated-row case).
+        assert!(is_confirmed_landing_with_proof(Some(false), Some(true)));
+        assert!(is_confirmed_landing_with_proof(None, Some(true)));
+        // A PARKED intent: neither signal.
+        assert!(!is_confirmed_landing_with_proof(Some(false), None));
+        assert!(!is_confirmed_landing_with_proof(None, None));
+        // An UNVERIFIED latch is not a signal (never a guess).
+        assert!(!is_confirmed_landing_with_proof(Some(false), Some(false)));
+        // And it is strictly WIDER than the leaderboard's flag-only rule,
+        // never narrower — the two must not be confused.
+        let op = Outpoint {
+            txid: txid_a(),
+            vout: 0,
+        };
+        let mut st = OutpointStatus::known(&op, true, Some("ab".repeat(32)), false);
+        st.spent_confirmed = Some(false);
+        assert!(!is_confirmed_landing(&st));
+        assert!(is_confirmed_landing_with_proof(
+            st.spent_confirmed,
+            Some(true)
+        ));
+    }
+
+    /// Both money views must CALL the shared bar — not re-implement it. This
+    /// is the structural half: a future inline copy re-opens the divergence
+    /// the hoist closed.
+    #[test]
+    fn both_money_views_call_the_shared_bar() {
+        let results_src = include_str!("results.rs");
+        let refund_src = include_str!("refund_view.rs");
+        let needle = ["is_confirmed_landing", "_with_proof("].concat();
+        assert_eq!(
+            results_src.matches(needle.as_str()).count(),
+            1,
+            "results.rs must call the shared bar exactly once"
+        );
+        assert_eq!(
+            refund_src.matches(needle.as_str()).count(),
+            1,
+            "refund_view.rs must call the shared bar exactly once"
+        );
+        // And neither may carry an inline re-implementation. The needle is
+        // the DISJUNCTION that IS the bar (`… || … proof_verified == Some(true)`),
+        // not any mention of the field — `results.rs` legitimately passes the
+        // same latch to `verified_beef_block_height` for the at.height
+        // fallback, and a broader needle matched that unrelated call. Scoping
+        // an assertion wider than the construct is its own failure mode.
+        let disjunction = ["|| ", "spender_proof_verified == Some(true)"].concat();
+        for (name, src) in [("results.rs", results_src), ("refund_view.rs", refund_src)] {
+            let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(
+                flat.matches(disjunction.as_str()).count(),
+                0,
+                "{name} must not re-implement the bar inline"
+            );
+            // `r.`-qualified spelling of the same disjunction.
+            let qualified = ["|| ", "r.spender_proof_verified == Some(true)"].concat();
+            assert_eq!(
+                flat.matches(qualified.as_str()).count(),
+                0,
+                "{name} must not re-implement the bar inline (qualified form)"
+            );
+        }
+    }
+
     #[test]
     fn is_confirmed_landing_requires_both_flags() {
         let op = Outpoint {
@@ -2190,7 +2326,7 @@ mod tests {
         assert_eq!(out.len(), 3);
         // Joined spent pot: the raw rides back, order preserved.
         assert_eq!(out[0].pot_txid, txid_a());
-        assert_eq!(out[0].recovery_height, Some(958_504));
+        assert_eq!(out[0].recovery_height, 958_504);
         assert_eq!(out[0].spent, Some(true));
         assert_eq!(out[0].spending_txid.as_deref(), Some(spender.as_str()));
         assert_eq!(out[0].spent_confirmed, Some(true));
@@ -2297,7 +2433,7 @@ mod tests {
                 game_id: "11".repeat(32),
                 pot_txid: txid_a(),
                 pot_vout: 0,
-                recovery_height: Some(958_504),
+                recovery_height: 958_504,
                 opponent_identity: format!("03{}", "bb".repeat(32)),
                 spent: Some(true),
                 spending_txid: Some("f0".repeat(32)),
@@ -2308,7 +2444,7 @@ mod tests {
                 game_id: "33".repeat(32),
                 pot_txid: "ef".repeat(32),
                 pot_vout: 2,
-                recovery_height: Some(958_700),
+                recovery_height: 958_700,
                 opponent_identity: format!("03{}", "dd".repeat(32)),
                 spent: None,
                 spending_txid: None,
