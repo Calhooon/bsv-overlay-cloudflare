@@ -202,6 +202,34 @@ fn wrangler_config_and_code_agree_on_auth_contract_names() {
     // middleware will actually find.
 }
 
+/// Rule 13 made executable: every front-door outcome COUNTS itself — the
+/// lenient accept is "accepted and counted", never a silent accept, and the
+/// refusal paths are observable numbers on /health. Anchored on the arm
+/// construct (the match arm plus its first statement), not a region.
+#[test]
+fn every_front_door_outcome_is_counted() {
+    // Shipped code only — auth.rs's own test module also exercises the
+    // count fns (same scoping rationale + marker guard as the
+    // one-producer pin above).
+    let marker = ["#[cfg(", "test)]"].concat();
+    let full = normalized_code("src/auth.rs");
+    assert!(full.contains(&marker), "auth.rs must still carry its test module");
+    let auth = full[..full.find(&marker).unwrap()].to_string();
+    let arms = [
+        ["Disposition::ProceedAnonymous=>{", "count_anonymous_served();"].concat(),
+        ["Disposition::RefuseUnauthenticated=>{", "count_strict_refused_unauthenticated();"].concat(),
+        ["Disposition::RefuseMisconfigured=>{", "count_misconfigured_refused();"].concat(),
+    ];
+    for arm in &arms {
+        assert_eq!(count(&auth, arm), 1, "front-door arm must count itself: {arm}");
+    }
+    // The authenticated path counts once (the Authenticated+session arm)…
+    assert_eq!(count(&auth, "count_authenticated_served();"), 1);
+    // …and middleware refusals are counted at each refusal site (Err, the
+    // contract-break 500, and the non-handshake Response refusal).
+    assert_eq!(count(&auth, "count_auth_refused();"), 3);
+}
+
 /// The pinned needles genuinely match the current source (Rule 9's
 /// "assert the needle count is what you expect" applied to the helper
 /// itself): normalization keeps code and strips prose.
