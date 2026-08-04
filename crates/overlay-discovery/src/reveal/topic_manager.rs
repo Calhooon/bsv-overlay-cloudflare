@@ -143,12 +143,21 @@ impl RevealTopicManager {
 /// Walk minimal Bitcoin pushdata out of a byte slice → the pushed blobs,
 /// in order, stopping at the first non-push opcode / a truncated push
 /// (mirrors the app's `readPushes` and the tower's `read_pushes`).
+///
+/// EVERY offset advance uses CHECKED arithmetic. This worker runs on wasm32
+/// (`usize = u32`) with wrapping release arithmetic — an OP_PUSHDATA4 length
+/// of `0xFFFFFFFF` would make a naive `i + len` WRAP past the bounds guard and
+/// panic-trap the topic-manager `/submit` pass on a ~7-byte crafted script.
+/// `checked_add` → `None` on overflow → we stop cleanly (a malformed marker is
+/// simply skipped, never a trap). Adversarial-review MED, 2026-07-16 (the five
+/// sibling stores were converted then; `tm_reveal` was the Rule-7 orphan,
+/// swept under #335).
 fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         let op = bytes[i];
-        i += 1;
+        i += 1; // safe: i < bytes.len()
         let len = match op {
             n if n < 0x4c => n as usize,
             0x4c => {
@@ -160,7 +169,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
                 l
             }
             0x4d => {
-                if i + 2 > bytes.len() {
+                if i.checked_add(2).is_none_or(|e| e > bytes.len()) {
                     return out;
                 }
                 let l = bytes[i] as usize | ((bytes[i + 1] as usize) << 8);
@@ -168,7 +177,7 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
                 l
             }
             0x4e => {
-                if i + 4 > bytes.len() {
+                if i.checked_add(4).is_none_or(|e| e > bytes.len()) {
                     return out;
                 }
                 let l = (bytes[i] as usize)
@@ -180,11 +189,14 @@ fn read_pushes(bytes: &[u8]) -> Vec<&[u8]> {
             }
             _ => return out, // a non-push opcode — stop
         };
-        if i + len > bytes.len() {
-            return out;
+        // CHECKED: `i + len` can overflow u32 on wasm32; overflow ⇒ out of bounds ⇒ stop.
+        match i.checked_add(len) {
+            Some(end) if end <= bytes.len() => {
+                out.push(&bytes[i..end]);
+                i = end;
+            }
+            _ => return out,
         }
-        out.push(&bytes[i..i + len]);
-        i += len;
     }
     out
 }
@@ -550,6 +562,40 @@ pub(crate) mod tests {
             vec![0u8; 96], // not 160
         ]);
         assert!(RevealTopicManager::validate_reveal_output(&out).is_err());
+    }
+
+    #[test]
+    fn adversarial_pushdata_len_never_panics_or_wraps() {
+        // Adversarial-review MED (inherited from result/collected/potparty/
+        // potrefund/proof — tm_reveal was the Rule-7 orphan, swept under
+        // #335): an OP_PUSHDATA4 (0x4e) with len 0xFFFFFFFF on wasm32
+        // (usize=u32) would wrap `i + len` past the bounds guard → slice
+        // panic → topic-manager /submit trap. The crafted ~7-byte script
+        // must parse to None (not an artifact), never panic. Also probe
+        // OP_PUSHDATA2 and a truncated push.
+        //
+        // MODELLING BOUNDARY (Rule 17): this native test host is x86-64
+        // (usize=u64), where `i + 0xFFFFFFFF` cannot wrap — so the wrap
+        // itself is NOT constructible here and the pre-fix code also
+        // returns cleanly on this host. What this cell pins is the bounds
+        // BEHAVIOR (crafted lengths ⇒ clean stop, no slice, no panic);
+        // the overflow protection on the real wasm32 target is carried by
+        // the `checked_add` form itself, same as the five sibling stores.
+        for script in [
+            vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff, 0xff], // PUSHDATA4 max len, no data
+            vec![0x00u8, 0x6a, 0x4d, 0xff, 0xff],             // PUSHDATA2 max len, no data
+            vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff],       // PUSHDATA4 header truncated
+            vec![0x00u8, 0x6a, 0x4b],                         // a 75-byte push with no data
+        ] {
+            assert_eq!(
+                parse_reveal_artifact_script(&script).unwrap(),
+                None,
+                "crafted script must not parse"
+            );
+        }
+        // Direct read_pushes probe: the trap path is the len itself.
+        assert!(read_pushes(&[0x4e, 0xff, 0xff, 0xff, 0xff]).is_empty());
+        assert!(read_pushes(&[0x4d, 0xff, 0xff]).is_empty());
     }
 
     // ── Golden mainnet fixture ───────────────────────────────────────────
