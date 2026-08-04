@@ -249,19 +249,35 @@ impl RefundViewRow {
     }
 }
 
+/// The range check every served recovery height passes: a usable BLOCK-height
+/// gate is `0 < h < LOCKTIME_THRESHOLD`. `0` means "no gate committed" and a
+/// timestamp-range value is not a height at all — both answer `None` rather
+/// than a fake countdown.
+///
+/// Extracted (bsv-low #332 follow-up) so `/refund-view`, `/live-view` and
+/// `/results` share ONE predicate instead of three copies: "these must agree"
+/// is durably fixed by a single shared function, not by a test (Rule 10).
+pub fn valid_recovery_height(h: u64) -> Option<u64> {
+    (h > 0 && h < u64::from(LOCKTIME_THRESHOLD)).then_some(h)
+}
+
 /// The recovery height a per-identity view SERVES: the covenant-committed
 /// value when decoded (chain truth), else the caller's own marker value
 /// (hint), each range-checked — 0 or a timestamp-range value is `None` (no
 /// fake countdown). Shared by `/refund-view` and `/live-view` so the two
 /// surfaces can never drift on the sourcing rule.
+///
+/// NOTE `/results` deliberately does NOT use this MERGED answer: it serves the
+/// covenant leg and the marker leg as two DISTINCT wire fields, because a
+/// client gating a money word must be able to tell "the chain committed this"
+/// from "a marker claims this" (see [`crate::results::results_body`]).
 pub fn served_recovery_height(
     cov_recovery_height: Option<u64>,
     marker_recovery_height: u32,
 ) -> Option<u64> {
-    let valid = |h: u64| (h > 0 && h < u64::from(LOCKTIME_THRESHOLD)).then_some(h);
     cov_recovery_height
-        .and_then(valid)
-        .or_else(|| valid(u64::from(marker_recovery_height)))
+        .and_then(valid_recovery_height)
+        .or_else(|| valid_recovery_height(u64::from(marker_recovery_height)))
 }
 
 /// The `/refund-view` status enum (wire strings per the #252 stage-2 spec).
