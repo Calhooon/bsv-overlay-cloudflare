@@ -21,7 +21,7 @@
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::results::{
     assemble_results, covenant_params_by_pot, results_sql, seat_markers_sql, PotVerdict,
-    ResultsRow, RESULTS_UNKNOWN_POT_QUOTA, SEAT_MARKERS_BINDS_PER_POT,
+    ResultsRow, RESULTS_UNKNOWN_POT_QUOTA, SEAT_MARKERS_BINDS_PER_POT, SEAT_MARKERS_PER_KEY,
 };
 use rusqlite::{params, Connection};
 
@@ -476,7 +476,7 @@ fn seat_marker_keys(
     pub_a: &str,
     pub_b: &str,
 ) -> Vec<String> {
-    let sql = seat_markers_sql(1);
+    let sql = seat_markers_sql(1, SEAT_MARKERS_PER_KEY);
     assert_eq!(
         sql.matches('?').count(),
         SEAT_MARKERS_BINDS_PER_POT,
@@ -1220,7 +1220,7 @@ fn the_per_key_slot_cap_keeps_the_genuine_marker_behind_older_junk() {
     // …and the genuine marker, published later by the #252 backfill.
     file_v2_marker(&conn, &victim, &pot, "txGENUINE", &pub_a, 9_000);
 
-    let sql = seat_markers_sql(1);
+    let sql = seat_markers_sql(1, SEAT_MARKERS_PER_KEY);
     let mut stmt = conn.prepare(&sql).unwrap();
     let got: Vec<String> = stmt
         .query_map(params![pot, 0u32, pub_a, pub_b], |r| {
@@ -1279,7 +1279,7 @@ fn the_seat_slot_window_is_per_outpoint_not_per_txid() {
     // `potVout` in the PARTITION keeps their slot windows apart. (Binding a
     // single outpoint would filter the other vout out before the window and
     // prove nothing.)
-    let sql = seat_markers_sql(2);
+    let sql = seat_markers_sql(2, SEAT_MARKERS_PER_KEY);
     let mut stmt = conn.prepare(&sql).unwrap();
     let got: Vec<String> = stmt
         .query_map(

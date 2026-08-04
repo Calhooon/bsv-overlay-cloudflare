@@ -1723,7 +1723,25 @@ const _: () = assert!(RESULTS_UNKNOWN_POT_QUOTA < RESULTS_MAX_ROWS);
 /// the byte-format-only doctrine) or a verify-on-read pass over a
 /// deliberately wider window when attribution comes back empty. Tracked in
 /// bsv-low#283; widening this constant only moves the executed threshold.
+///
+/// This is the `/results` cap (a PER-IDENTITY view — the caller holds its own
+/// key↔identity mapping, so eviction only degrades ITS OWN attribution tier,
+/// with the countersigned claim path intact — see the sweep note in the #332
+/// v3 module doc). The `/leaderboard` uses [`LEADERBOARD_SEAT_CANDIDATES`]
+/// instead, because there the eviction was a PUBLIC concern until #332 v3
+/// decoupled the win from the attribution.
 pub const SEAT_MARKERS_PER_KEY: usize = 8;
+
+/// The `/leaderboard` seat-marker candidate cap (#332 v3). WIDE, because the
+/// board reads a superset per committed key and `attribute_seats` then
+/// VALIDITY-FILTERS it — so a junk flood must exceed this whole cap (a dust tx
+/// per row) merely to push the identity DISPLAY to the settle key, never to
+/// erase the (chain-counted) win. Set well above a realistic per-key flood;
+/// beyond it the identity honestly degrades to UNKNOWN (settle-key display),
+/// never no-win. Cost is bounded: at most this many small rows per committed
+/// key, and a flood large enough to fill it costs the attacker that many
+/// on-chain dust markers.
+pub const LEADERBOARD_SEAT_CANDIDATES: usize = 64;
 
 /// Pots per `seat_markers_sql` chunk. FOUR binds per pot (potTxid, potVout,
 /// pubA, pubB) — 24 × 4 = 96, under D1's 100-bound-param cap.
@@ -1774,8 +1792,9 @@ const _: () = assert!(
 /// claim path untouched. Distinguishing junk from honest inside SQL is
 /// impossible (verification needs ECDSA); the honest fix if it is ever
 /// observed is admission-side rate limiting, not a bigger window.
-pub fn seat_markers_sql(n: usize) -> String {
+pub fn seat_markers_sql(n: usize, cap: usize) -> String {
     debug_assert!(n >= 1);
+    debug_assert!(cap >= 1);
     let per_pot =
         vec!["(potTxid = ? AND potVout = ? AND seatSettlePubkey IN (?, ?))"; n].join(" OR ");
     format!(
@@ -1789,7 +1808,6 @@ pub fn seat_markers_sql(n: usize) -> String {
                WHERE seatSettlePubkey IS NOT NULL AND ({per_pot})) \
          WHERE rn <= {cap} \
          ORDER BY potTxid ASC, potVout ASC, seatSettlePubkey ASC, rn ASC",
-        cap = SEAT_MARKERS_PER_KEY,
     )
 }
 
@@ -2937,7 +2955,7 @@ mod tests {
                 );
                 // The SQL built for this chunk binds exactly what we supply.
                 assert_eq!(
-                    seat_markers_sql(chunk.len()).matches('?').count(),
+                    seat_markers_sql(chunk.len(), SEAT_MARKERS_PER_KEY).matches('?').count(),
                     chunk.len() * SEAT_MARKERS_BINDS_PER_POT,
                     "n={n}: bind arity matches the chunk"
                 );
@@ -3004,7 +3022,7 @@ mod tests {
     /// arity the caller depends on.
     #[test]
     fn f2_seat_markers_sql_filters_committed_keys_and_windows_per_slot() {
-        let sql = seat_markers_sql(3);
+        let sql = seat_markers_sql(3, SEAT_MARKERS_PER_KEY);
         assert_eq!(
             sql.matches('?').count(),
             3 * SEAT_MARKERS_BINDS_PER_POT,
@@ -3133,7 +3151,7 @@ mod tests {
         rows.push((ma, 9_000));
         rows.push((mb, 9_001));
 
-        let fetched = simulate_seat_fetch(&seat_markers_sql(1), (&pa, &pb), &rows);
+        let fetched = simulate_seat_fetch(&seat_markers_sql(1, SEAT_MARKERS_PER_KEY), (&pa, &pb), &rows);
         // The MONEY assertion first: attribution must credit both seats —
         // under the pre-fix order-dependent window this yields None/None
         // (45 older junk rows fill the pot's single window).
@@ -3166,7 +3184,7 @@ mod tests {
             junk.identity = idj;
             rows2.push((junk, 500 + i as i64));
         }
-        let fetched2 = simulate_seat_fetch(&seat_markers_sql(1), (&pa, &pb), &rows2);
+        let fetched2 = simulate_seat_fetch(&seat_markers_sql(1, SEAT_MARKERS_PER_KEY), (&pa, &pb), &rows2);
         let attr2 = attribute_seats(&p, &pot, 0, &fetched2);
         assert_eq!(
             attr2.identity_b.as_deref(),

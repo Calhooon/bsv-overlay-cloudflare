@@ -40,7 +40,10 @@ use low_app_layer::logic::{
     leaderboard_window_cut, proof_pointers_sql, Leaderboard, OutpointStatus, PotRecordRow,
     ResultMarkerRow, LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS,
 };
-use low_app_layer::results::{PotVerdict, SeatAttribution};
+use low_app_layer::results::{
+    attribute_seats, potparty_v2_challenge, seat_markers_sql, seatsig_preimage, CovenantParams,
+    PotVerdict, SeatAttribution, SeatMarkerRow, LEADERBOARD_SEAT_CANDIDATES, SEAT_MARKERS_PER_KEY,
+};
 use rusqlite::{params, params_from_iter, Connection};
 
 /// The chain world (verdict + verified attribution) the ROUTE derives for a
@@ -78,6 +81,9 @@ fn agg_world(
         std::collections::HashMap<String, SeatAttribution>,
     ),
 ) -> Leaderboard {
+    // The identity path doesn't read params, so an empty params map suffices
+    // for the identity-attributed harness cells (the settle-key FALLBACK is
+    // exercised end-to-end by the potparty-eviction cell).
     aggregate_leaderboard_attributed(
         markers,
         statuses,
@@ -85,6 +91,7 @@ fn agg_world(
         200,
         &world.0,
         &world.1,
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -847,6 +854,365 @@ fn a_prefiled_junk_pointer_cannot_own_a_victims_drilldown() {
     assert!(
         set.contains(&"txHONEST".to_string()),
         "the honest pointer is served despite the earlier squat (no exclusive slot)"
+    );
+}
+
+// ── #332 v3: the ATTRIBUTION-EVICTION close, end to end through the real
+// producer (`seat_markers_sql` → `attribute_seats` → the aggregate) ──────────
+
+/// A committed CovenantParams with the two seat settle keys set.
+fn params_with_keys(pub_a_hex: &str, pub_b_hex: &str) -> CovenantParams {
+    let mut a = [0u8; 33];
+    let mut b = [0u8; 33];
+    a.copy_from_slice(&hex::decode(pub_a_hex).unwrap());
+    b.copy_from_slice(&hex::decode(pub_b_hex).unwrap());
+    CovenantParams {
+        pub_a: a,
+        pub_b: b,
+        pub_tower: [2u8; 33],
+        pay_pkh_a: [0u8; 20],
+        pay_pkh_b: [0u8; 20],
+        rake_pkh: [0u8; 20],
+        stake_a: 500,
+        stake_b: 500,
+        fee_sats: 8,
+        recovery_height: 1,
+    }
+}
+
+/// File one `potparty_records` row (the topic manager's INSERT OR IGNORE
+/// shape) — `seat_settle_pubkey`/`seat_sig`/`id_sig` supplied by the caller
+/// (real or junk).
+#[allow(clippy::too_many_arguments)]
+fn file_potparty(
+    conn: &Connection,
+    identity: &str,
+    opponent: &str,
+    game: &str,
+    pot: &str,
+    seat_pub: &str,
+    seat_sig: &str,
+    id_sig: &str,
+    marker_txid: &str,
+    at: i64,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, ?4, 0, 900000, ?5, ?6, ?7, ?8, 0, ?9)",
+        params![
+            identity,
+            opponent,
+            game,
+            pot,
+            id_sig,
+            seat_pub,
+            seat_sig,
+            marker_txid,
+            at
+        ],
+    )
+    .expect("insert potparty_records");
+}
+
+/// File an HONEST v2 potparty marker: a REAL seatSig under the committed
+/// settle key, and a REAL identity sig by `identity_seed`'s wallet.
+#[allow(clippy::too_many_arguments)]
+fn file_honest_potparty(
+    conn: &Connection,
+    settle_key: &PrivateKey,
+    settle_pub: &str,
+    identity_seed: u8,
+    opponent: &str,
+    game: &str,
+    pot: &str,
+    marker_txid: &str,
+    at: i64,
+) {
+    let idw = wallet(identity_seed);
+    let id_hex = identity(identity_seed);
+    let preimage = seatsig_preimage(game, pot, 0, &id_hex).unwrap();
+    let hash = bsv_rs::primitives::hash::sha256(&preimage);
+    let seat_sig = hex::encode(settle_key.sign(&hash).unwrap().to_der());
+    // The identity sig is over the v2 challenge — build a SeatMarkerRow to
+    // reconstruct exactly the bytes `potparty_v2_challenge` hashes.
+    let probe = SeatMarkerRow {
+        identity: id_hex.clone(),
+        opponent_identity: opponent.to_string(),
+        game_id: game.to_string(),
+        pot_txid: pot.to_string(),
+        pot_vout: 0,
+        recovery_height: 900_000,
+        seat_settle_pubkey: settle_pub.to_string(),
+        seat_sig_hex: seat_sig.clone(),
+        identity_sig_hex: String::new(),
+    };
+    let challenge = potparty_v2_challenge(&probe).unwrap();
+    let id_sig = idw
+        .create_signature(CreateSignatureArgs {
+            data: Some(challenge),
+            hash_to_directly_sign: None,
+            protocol_id: bsv_rs::wallet::Protocol::new(
+                bsv_rs::wallet::SecurityLevel::App,
+                "low potparty",
+            ),
+            key_id: game.to_string(),
+            counterparty: Some(Counterparty::Anyone),
+        })
+        .unwrap();
+    file_potparty(
+        conn,
+        &id_hex,
+        opponent,
+        game,
+        pot,
+        settle_pub,
+        &seat_sig,
+        &hex::encode(id_sig.signature),
+        marker_txid,
+        at,
+    );
+}
+
+/// EXECUTE the shipped `seat_markers_sql` at `cap` and `attribute_seats` — the
+/// real producer path the route runs (`seat_attributions`), for one pot.
+fn attribution_from_db(
+    conn: &Connection,
+    pot: &str,
+    params: &CovenantParams,
+    cap: usize,
+) -> SeatAttribution {
+    let sql = seat_markers_sql(1, cap);
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("seat_markers_sql did not PREPARE: {e}\n{sql}"));
+    let rows: Vec<SeatMarkerRow> = stmt
+        .query_map(
+            params![
+                pot,
+                0i64,
+                hex::encode(params.pub_a),
+                hex::encode(params.pub_b)
+            ],
+            |r| {
+                Ok(SeatMarkerRow {
+                    identity: r.get::<_, String>("identity")?.to_ascii_lowercase(),
+                    opponent_identity: r.get::<_, String>("opponentIdentity")?.to_ascii_lowercase(),
+                    game_id: r.get::<_, String>("gameId")?.to_ascii_lowercase(),
+                    pot_txid: r.get::<_, String>("potTxid")?.to_ascii_lowercase(),
+                    pot_vout: r.get::<_, i64>("potVout")? as u32,
+                    recovery_height: r.get::<_, i64>("recoveryHeight")? as u32,
+                    seat_settle_pubkey: r
+                        .get::<_, String>("seatSettlePubkey")?
+                        .to_ascii_lowercase(),
+                    seat_sig_hex: r.get::<_, String>("seatSigHex")?.to_ascii_lowercase(),
+                    identity_sig_hex: r.get::<_, String>("sigHex")?.to_ascii_lowercase(),
+                })
+            },
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    attribute_seats(params, &pot.to_ascii_lowercase(), 0, &rows)
+}
+
+/// A raw settle key + its compressed pubkey hex (the covenant's committed
+/// seat key). Distinct from an IDENTITY key.
+fn settle_key(seed: u8) -> (PrivateKey, String) {
+    let k = PrivateKey::from_hex(&format!("{seed:064x}")).unwrap();
+    let pub_hex = k.public_key().to_hex();
+    (k, pub_hex)
+}
+
+/// THE HIGH, END TO END (the delta re-gate's finding). An attacker who knows
+/// the committed settle key files `SEAT_MARKERS_PER_KEY` junk potparty rows
+/// under it, stamped EARLIER, evicting the honest v2 seat marker from an
+/// rn<=cap window. At the OLD leaderboard cap (`SEAT_MARKERS_PER_KEY`) the
+/// honest marker is gone and `attribute_seats` returns NO identity — under the
+/// v2 spine that ERASED the win. Under #332 v3 the win is minted from the
+/// verdict + committed KEY, so it SURVIVES (under the settle key). RED-verify:
+/// injecting the v2 counting body makes this cell fail (wins 0).
+#[test]
+fn potparty_flood_evicts_the_identity_but_never_the_chain_win() {
+    let conn = production_schema_db();
+    let pot = h64(0xca);
+    let settle = h64(0xcb);
+    let game = h64(0x0a);
+    admit_pot(&conn, &pot, 1_000);
+    mark_spent_confirmed(&conn, &pot, &settle);
+    // The pot's committed keys: seat A is a real settle key the WINNER holds.
+    let (key_a, pub_a) = settle_key(0x31);
+    let (_key_b, pub_b) = settle_key(0x32);
+    let params = params_with_keys(&pub_a, &pub_b);
+    let winner_seed = 0x11u8;
+    let opponent = identity(0x22);
+    // The honest RESULT marker puts the pot in the leaderboard window (the
+    // board is seeded by published results); the attacker's flood is on the
+    // separate potparty_records table.
+    file_honest_result(
+        &conn,
+        &game,
+        0x11,
+        0x22,
+        &pot,
+        &settle,
+        true,
+        &h64(0xc0),
+        1_001,
+    );
+
+    // The attacker floods SEAT_MARKERS_PER_KEY junk rows under seat A's key,
+    // stamped EARLIER than the honest marker (byte-format junk — no valid sig).
+    for i in 0..SEAT_MARKERS_PER_KEY {
+        file_potparty(
+            &conn,
+            &identity(0x22),
+            &identity(0x11),
+            &game,
+            &pot,
+            &pub_a, // the committed key — passes the SQL prefilter
+            "3045abababab",
+            "3044cdcdcd",
+            &format!("{:064x}", 0xca00 + i),
+            10 + i as i64,
+        );
+    }
+    // The honest v2 marker, published LATER (the #252 backfill timing).
+    file_honest_potparty(
+        &conn,
+        &key_a,
+        &pub_a,
+        winner_seed,
+        &opponent,
+        &game,
+        &pot,
+        &h64(0xcf),
+        9_000,
+    );
+
+    let verdicts = std::collections::HashMap::from([(pot.clone(), PotVerdict::WinnerA)]);
+    let params_map = std::collections::HashMap::from([(pot.clone(), params.clone())]);
+    let (markers, _) = query_window(&conn, 200);
+    let statuses = statuses_from_db(&conn, &markers);
+
+    // At the OLD cap the honest marker is EVICTED ⇒ no identity.
+    let attr_old = attribution_from_db(&conn, &pot, &params, SEAT_MARKERS_PER_KEY);
+    assert!(
+        attr_old.winner_for(PotVerdict::WinnerA).is_none(),
+        "SEAT_MARKERS_PER_KEY junk rows evict the honest marker (identity lost)"
+    );
+    let attrs = std::collections::HashMap::from([(pot.clone(), attr_old)]);
+    let lb = aggregate_leaderboard_attributed(
+        &markers,
+        &statuses,
+        &std::collections::HashMap::new(),
+        200,
+        &verdicts,
+        &attrs,
+        &params_map,
+    );
+    // #332 v3: the win SURVIVES the eviction, under the committed settle key.
+    let row = lb
+        .board
+        .iter()
+        .find(|r| r.identity == pub_a)
+        .expect("the win survives the identity eviction, under the settle key");
+    assert_eq!(row.wins, 1);
+    assert!(
+        row.identity_is_key,
+        "identity unknown ⇒ keyed by the settle key"
+    );
+    assert!(row.chain_proven);
+}
+
+/// The DISPLAY is preserved for a REALISTIC flood: at the WIDE leaderboard
+/// candidate cap, `attribute_seats` validity-filters the same 8 junk rows and
+/// finds the honest verified marker filed later — so the win counts AND
+/// attributes to the honest IDENTITY.
+#[test]
+fn a_realistic_flood_still_attributes_to_the_honest_identity() {
+    let conn = production_schema_db();
+    let pot = h64(0xda);
+    let settle = h64(0xdb);
+    let game = h64(0x0b);
+    admit_pot(&conn, &pot, 1_000);
+    mark_spent_confirmed(&conn, &pot, &settle);
+    let (key_a, pub_a) = settle_key(0x41);
+    let (_key_b, pub_b) = settle_key(0x42);
+    let params = params_with_keys(&pub_a, &pub_b);
+    let winner_seed = 0x11u8;
+    let winner_id = identity(winner_seed);
+    let opponent = identity(0x22);
+    file_honest_result(
+        &conn,
+        &game,
+        0x11,
+        0x22,
+        &pot,
+        &settle,
+        true,
+        &h64(0xd0),
+        1_001,
+    );
+    for i in 0..SEAT_MARKERS_PER_KEY {
+        file_potparty(
+            &conn,
+            &identity(0x22),
+            &identity(0x11),
+            &game,
+            &pot,
+            &pub_a,
+            "3045abababab",
+            "3044cdcdcd",
+            &format!("{:064x}", 0xda00 + i),
+            10 + i as i64,
+        );
+    }
+    file_honest_potparty(
+        &conn,
+        &key_a,
+        &pub_a,
+        winner_seed,
+        &opponent,
+        &game,
+        &pot,
+        &h64(0xdf),
+        9_000,
+    );
+
+    // The WIDE candidate cap the route uses for the leaderboard: the honest
+    // marker (rn = 9 ≤ cap) enters the candidate set and the validity filter
+    // keeps it, dropping the 8 junk.
+    let attr = attribution_from_db(&conn, &pot, &params, LEADERBOARD_SEAT_CANDIDATES);
+    assert_eq!(
+        attr.winner_for(PotVerdict::WinnerA).map(str::to_string),
+        Some(winner_id.clone()),
+        "the verified honest marker survives the flood at the wide cap"
+    );
+    let verdicts = std::collections::HashMap::from([(pot.clone(), PotVerdict::WinnerA)]);
+    let params_map = std::collections::HashMap::from([(pot.clone(), params)]);
+    let attrs = std::collections::HashMap::from([(pot.clone(), attr)]);
+    let (markers, _) = query_window(&conn, 200);
+    let statuses = statuses_from_db(&conn, &markers);
+    let lb = aggregate_leaderboard_attributed(
+        &markers,
+        &statuses,
+        &std::collections::HashMap::new(),
+        200,
+        &verdicts,
+        &attrs,
+        &params_map,
+    );
+    let row = lb
+        .board
+        .iter()
+        .find(|r| r.identity == winner_id)
+        .expect("the win attributes to the honest identity");
+    assert_eq!(row.wins, 1);
+    assert!(
+        !row.identity_is_key,
+        "identity resolved ⇒ not key-attributed"
     );
 }
 

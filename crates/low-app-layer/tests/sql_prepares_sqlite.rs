@@ -88,7 +88,7 @@ fn every_batched_query_prepares_at_representative_arities() {
         assert_prepares(
             &conn,
             &format!("seat_markers_sql({n})"),
-            &seat_markers_sql(n),
+            &seat_markers_sql(n, low_app_layer::results::SEAT_MARKERS_PER_KEY),
         );
         assert_prepares(&conn, &format!("claims_sql({n})"), &claims_sql(n));
         assert_prepares(
@@ -117,7 +117,11 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
             ("decoded_pots_sql", decoded_pots_sql(n), n * 2),
             // FOUR per pot: the outpoint pair plus the two COMMITTED settle
             // keys read from that pot's own funding lock.
-            ("seat_markers_sql", seat_markers_sql(n), n * 4),
+            (
+                "seat_markers_sql",
+                seat_markers_sql(n, low_app_layer::results::SEAT_MARKERS_PER_KEY),
+                n * 4,
+            ),
             // #332: one (gameId, winner) PAIR per key.
             ("proof_pointers_sql", proof_pointers_sql(n), n * 2),
         ] {

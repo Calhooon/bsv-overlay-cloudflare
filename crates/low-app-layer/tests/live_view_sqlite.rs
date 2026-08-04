@@ -31,7 +31,7 @@ use low_app_layer::live_view::{
 use low_app_layer::logic::valid_identity;
 use low_app_layer::results::{
     potparty_v2_challenge, seat_markers_sql, seatsig_preimage, SeatMarkerRow,
-    SEAT_MARKERS_BINDS_PER_POT,
+    SEAT_MARKERS_BINDS_PER_POT, SEAT_MARKERS_PER_KEY,
 };
 use rusqlite::{params, Connection};
 
@@ -331,7 +331,7 @@ fn fetch_candidates(conn: &Connection, identity: &str, rows: &[LiveViewRow]) -> 
             binds.push(b.pub_b_hex.clone().into());
         }
         assert!(binds.len() == chunk.len() * SEAT_MARKERS_BINDS_PER_POT);
-        read(&seat_markers_sql(chunk.len()), binds);
+        read(&seat_markers_sql(chunk.len(), SEAT_MARKERS_PER_KEY), binds);
     }
     for chunk in &plan.keyless {
         let mut binds: Vec<rusqlite::types::Value> = vec![identity.to_string().into()];

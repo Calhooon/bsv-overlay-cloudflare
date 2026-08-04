@@ -724,11 +724,18 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     // fabricated verdict.
     let (verdicts, params_by_pot) = classify_spent_pots(&db, &statuses).await;
 
-    // 5) #230 seat attribution: the classified pots' verified potparty-v2
-    // seat-binding markers, joined to each pot's committed lock keys.
-    // BEST-EFFORT: any fault yields an empty map (counting falls back to
-    // the claim rules) — never a 5xx, never a guessed attribution.
-    let attributions = seat_attributions(&db, &params_by_pot).await;
+    // 5) #230 seat attribution — the DISPLAY identity mapping only (#332 v3:
+    // the WIN is counted from the verdict + committed key in the aggregate,
+    // so this can never erase a win, only resolve who to show it under). The
+    // candidate read is WIDENED to `LEADERBOARD_SEAT_CANDIDATES` (vs
+    // `SEAT_MARKERS_PER_KEY` on /results) so a realistic junk flood under the
+    // committed key cannot push the one VERIFIED honest marker out of the
+    // candidate set before `attribute_seats` validity-filters it. Beyond the
+    // cap the identity degrades to UNKNOWN (the aggregate keys the win by the
+    // settle key) — never to no-win. BEST-EFFORT: any fault yields an empty
+    // map → every counted win shows under its settle key, still never dropped.
+    let attributions =
+        seat_attributions(&db, &params_by_pot, crate::results::LEADERBOARD_SEAT_CANDIDATES).await;
 
     let lb = crate::logic::aggregate_leaderboard_attributed(
         &markers,
@@ -737,6 +744,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         limit,
         &verdicts,
         &attributions,
+        &params_by_pot,
     );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
     json_response(
@@ -1067,6 +1075,7 @@ struct SeatMarkerRowD1 {
 async fn seat_attributions(
     db: &worker::D1Database,
     params_by_pot: &std::collections::HashMap<String, crate::results::CovenantParams>,
+    candidate_cap: usize,
 ) -> std::collections::HashMap<String, crate::results::SeatAttribution> {
     let mut out = std::collections::HashMap::new();
     if params_by_pot.is_empty() {
@@ -1078,10 +1087,13 @@ async fn seat_attributions(
         std::collections::HashMap::new();
     for chunk in pots.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
         // F2 (2026-07-28 gate): the fetch is filtered to each pot's OWN
-        // COMMITTED settle keys and windowed PER KEY SLOT — order is not
-        // load-bearing, because the #252 backfill publishes honest markers
-        // long after a pot's txid became public (see `seat_markers_sql`).
-        let sql = crate::results::seat_markers_sql(chunk.len());
+        // COMMITTED settle keys and windowed PER KEY SLOT. #332 v3: the
+        // WINDOW CAP is the caller's `candidate_cap` — the leaderboard reads a
+        // WIDE candidate set so a junk flood under the committed key cannot
+        // push the verified honest marker out before `attribute_seats`
+        // validity-filters it (the win is already chain-counted, so this only
+        // decides IDENTITY vs settle-key display, never win vs no-win).
+        let sql = crate::results::seat_markers_sql(chunk.len(), candidate_cap);
         // Four binds per pot: (potTxid, potVout, pubA, pubB) — the keys come
         // from the pot's committed funding lock (decoded columns, or the
         // hash-verified funding bytes on the legacy fallback), never from a
@@ -1381,7 +1393,7 @@ async fn results_seat_markers(
     // they are testable without a Worker (the re-gate's finding #3: this whole
     // delivery path could be deleted with no test failing).
     for chunk in crate::results::seat_marker_chunks(&params_by_pot) {
-        let sql = crate::results::seat_markers_sql(chunk.len());
+        let sql = crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
         for b in &chunk {
@@ -1825,7 +1837,7 @@ async fn live_view_candidates(
     };
 
     for chunk in &plan.keyed {
-        let sql = crate::results::seat_markers_sql(chunk.len());
+        let sql = crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
         for b in chunk {
