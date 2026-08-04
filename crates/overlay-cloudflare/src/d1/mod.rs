@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 92;
+pub const OVERLAY_MIGRATION_COUNT: usize = 97;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -856,6 +856,44 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // The completion-pass candidate scan (`WHERE proof_verified = 0 …`).
     "CREATE INDEX IF NOT EXISTS idx_pot_beefs_proof_verified \
      ON pot_beefs(proof_verified)",
+    // ── bsv-low #315: LOW hop-in-flight markers (tm_hopparty / ls_hopparty,
+    // #252 stage 2b) ─────────────────────────────────────────────────────
+    // One row per marker OUTPOINT (txid, outputIndex) — EVERY admitted
+    // marker is kept via INSERT OR IGNORE on the primary key (the
+    // tm_result censorship lesson; admission is byte-format-only, so an
+    // identity-keyed first-marker-wins index would be front-runnable for
+    // one dust OP_RETURN). Rows are NEVER deleted (a hop-in-flight fact is
+    // permanent recovery history; the OP_RETURN is provably unspendable).
+    // TYPED + INDEXED FROM THE FIRST MIGRATION (#310 decode-at-write):
+    // every wire field is its own typed column — never a raw blob
+    // re-parsed at read. All 10 wire fields minus the tag, plus the marker
+    // outpoint + createdAt. hopSats is a u64 in an SQLite INTEGER (i64 —
+    // sats fit). Signature bytes are carried back verbatim; the overlay
+    // never verifies them (the app-layer /hops-view verifies at READ as a
+    // display filter, clients verify before acting).
+    "CREATE TABLE IF NOT EXISTS hopparty_records (
+        identity TEXT NOT NULL,
+        opponentIdentity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        hopTxid TEXT NOT NULL,
+        hopVout INTEGER NOT NULL,
+        hopSats INTEGER NOT NULL,
+        seatSettlePubkey TEXT NOT NULL,
+        seatSigHex TEXT NOT NULL,
+        identitySigHex TEXT NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // hopsFor filters by identity and orders by createdAt; /hops-view joins
+    // pot_records on (hopTxid, hopVout); the /live-view identity+gameId
+    // join key gets its own index.
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_identity ON hopparty_records(identity)",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_identity_created \
+     ON hopparty_records(identity, createdAt)",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_hop ON hopparty_records(hopTxid, hopVout)",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_game ON hopparty_records(gameId)",
 ];
 
 // =============================================================================
@@ -975,6 +1013,56 @@ mod tests {
             sql.trim_start().starts_with("ALTER TABLE pot_records")
                 && sql.contains("spentConfirmed INTEGER NOT NULL DEFAULT 0")
         }));
+    }
+
+    /// bsv-low #315: `hopparty_records` is TYPED + INDEXED from its FIRST
+    /// migration (#310 decode-at-write) — every wire field its own NOT NULL
+    /// typed column, PK on the marker outpoint, and all four query indexes
+    /// present as CREATE (idempotent), never a later ALTER.
+    #[test]
+    fn hopparty_records_migration_present_typed_and_indexed() {
+        let create = OVERLAY_MIGRATIONS
+            .iter()
+            .find(|sql| sql.contains("CREATE TABLE IF NOT EXISTS hopparty_records"))
+            .expect("hopparty_records CREATE TABLE migration exists");
+        for col in [
+            "identity TEXT NOT NULL",
+            "opponentIdentity TEXT NOT NULL",
+            "gameId TEXT NOT NULL",
+            "hopTxid TEXT NOT NULL",
+            "hopVout INTEGER NOT NULL",
+            "hopSats INTEGER NOT NULL",
+            "seatSettlePubkey TEXT NOT NULL",
+            "seatSigHex TEXT NOT NULL",
+            "identitySigHex TEXT NOT NULL",
+            "txid TEXT NOT NULL",
+            "outputIndex INTEGER NOT NULL",
+            "createdAt INTEGER",
+            "PRIMARY KEY (txid, outputIndex)",
+        ] {
+            assert!(create.contains(col), "hopparty_records must declare: {col}");
+        }
+        for idx in [
+            "idx_hopparty_identity ON hopparty_records(identity)",
+            "idx_hopparty_identity_created",
+            "idx_hopparty_hop ON hopparty_records(hopTxid, hopVout)",
+            "idx_hopparty_game ON hopparty_records(gameId)",
+        ] {
+            assert!(
+                OVERLAY_MIGRATIONS
+                    .iter()
+                    .any(|sql| sql.starts_with("CREATE INDEX IF NOT EXISTS") && sql.contains(idx)),
+                "hopparty index missing: {idx}"
+            );
+        }
+        // No ALTER ever touches this table — first-migration-typed, and the
+        // append-only rule means it must stay that way.
+        assert!(
+            !OVERLAY_MIGRATIONS
+                .iter()
+                .any(|sql| sql.trim_start().starts_with("ALTER TABLE hopparty_records")),
+            "hopparty_records is typed from the FIRST migration — no ALTERs"
+        );
     }
 
     #[test]
