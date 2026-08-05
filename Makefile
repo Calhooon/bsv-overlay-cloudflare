@@ -17,7 +17,8 @@ help:
 	@echo "  wrangler-dev     wrangler dev in parity mode (:8787) — run in a separate shell"
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test --workspace with memory-storage feature"
-	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds"
+	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-route"
+	@echo "  ci-route         Route-level /submit admission cells (part of ci; needs :8791/:8792)"
 	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -105,37 +106,55 @@ ci:
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
 	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
 	cargo build -p low-app-layer --target wasm32-unknown-unknown --release; \
+	$(MAKE) ci-route; \
 	echo "✅ local CI green"
 
-# OPT-IN route-level coverage for the #347 submit gate (Rule 22).
+# ROUTE-LEVEL coverage for the #347 submit gate (Rule 22). PART OF `ci`.
 #
-# `make ci` cannot reach the /submit ROUTE: it takes a worker::Request and only
-# runs on wasm, so the handler's use of the decision seam is unobservable to a
-# native cell. The exhaustive `match` on SubmitAction makes deleting the
-# refusal a COMPILE error and source pins cover the gate branch — but the
-# end-to-end proof that a fabrication is actually refused lives here.
+# Not optional, and that is the finding rather than a preference. `cargo test`
+# cannot reach the /submit ROUTE — it takes a worker::Request and only runs on
+# wasm — so the handler's USE of the decision seam is invisible to it. Two
+# separate re-gate probes proved the consequence: forcing `operator_authed` in
+# the route's derivation, and shadowing the gate flag with a rebinding. Both
+# COMPILED, both left the native suite fully GREEN, and both fully re-opened
+# the CRITICAL. This tier is the only thing that sees either.
 #
-# Stands up `wrangler dev --local` in strict mode and drives the real route
-# with the real attack shapes (zero-input and junk-input BEEFs, every header
-# spelling, the tm_potparty money topic, the kill switch, the operator token).
-# Not in `ci` because it needs a wrangler build + a listening port; run it
-# before touching submit_gate.rs or the submit route.
+# This repo has no CI pipeline — `make ci` run locally IS the gate — so a tier
+# outside `ci` is a tier nobody runs before push.
+#
+# Two workers: :8791 strict with extensions on (the main matrix), :8792 with
+# ENABLE_EXTENSIONS=false (the kill switch, which was itself a HIGH defect —
+# it used to route callers OFF the network gate). No network is required: the
+# public-path expectation asserts "never admitted, never 401", which holds as
+# 422 online and 502 offline, so this cannot flake.
 ci-route:
-	@echo "→ starting wrangler dev on :8791 (strict)…"
+	@echo "→ starting wrangler dev :8791 (strict) and :8792 (kill switch)…"
 	@cd crates/overlay-cloudflare && \
 	  npx wrangler dev --local --port 8791 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
-	    > /tmp/lane347-ci-route.log 2>&1 & \
-	  echo $$! > /tmp/lane347-ci-route.pid
+	    > /tmp/lane347-route-strict.log 2>&1 & \
+	  echo $$! > /tmp/lane347-route-strict.pid
+	@cd crates/overlay-cloudflare && \
+	  npx wrangler dev --local --port 8792 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:false \
+	    > /tmp/lane347-route-kill.log 2>&1 & \
+	  echo $$! > /tmp/lane347-route-kill.pid
 	@until curl -s -m 2 http://127.0.0.1:8791/listTopicManagers >/dev/null 2>&1; \
-	  do sleep 3; done; echo "→ up"
-	@node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
+	  do sleep 3; done
+	@until curl -s -m 2 http://127.0.0.1:8792/listTopicManagers >/dev/null 2>&1; \
+	  do sleep 3; done; echo "→ both up"
+	@KILL_SWITCH_BASE=http://127.0.0.1:8792 \
+	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
 	  rc=$$?; \
-	  kill `cat /tmp/lane347-ci-route.pid` 2>/dev/null; \
-	  rm -f /tmp/lane347-ci-route.pid; \
+	  kill `cat /tmp/lane347-route-strict.pid` 2>/dev/null; \
+	  kill `cat /tmp/lane347-route-kill.pid` 2>/dev/null; \
+	  rm -f /tmp/lane347-route-strict.pid /tmp/lane347-route-kill.pid; \
 	  exit $$rc
 
 extensions-build:

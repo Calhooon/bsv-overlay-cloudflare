@@ -525,12 +525,18 @@ pub async fn submit(
     // is precisely the primitive the enumeration-starvation money path needs.
     // Unset ⇒ nobody can authenticate ⇒ fail closed.
     let operator_authed = check_submit_operator_auth(&req, env);
-    let plan = crate::submit_gate::plan_submit(
-        mode_header.as_deref(),
-        extensions_enabled,
-        operator_authed,
-        gate_mode,
-    );
+    // ONE derivation. The decision is computed EXACTLY once and everything
+    // downstream — the counter, the refusal, the engine mode, the gate branch —
+    // reads that single value.
+    //
+    // It was previously derived TWICE from two separately-passed argument
+    // lists (`plan_submit(...)` for the counter, `action_for(...)` for
+    // behaviour). A re-gate flipped `operator_authed` to `true` on the
+    // behavioural call alone: it compiled, `make ci` stayed green, every caller
+    // became an "authenticated operator", and the counter kept reporting
+    // honestly from the other derivation. Two derivations of one decision is
+    // the defect — the fix is to delete one, not to pin their agreement
+    // (Rule 10).
     let action = crate::submit_gate::action_for(
         mode_header.as_deref(),
         extensions_enabled,
@@ -538,15 +544,14 @@ pub async fn submit(
         gate_mode,
     );
     let mode = action.engine_mode();
-    crate::submit_gate::note(plan.path, operator_authed, plan.decision);
+    crate::submit_gate::note(action);
 
     // EXHAUSTIVE match (Rule 22): the route consumes the decision as an enum,
     // so an arm cannot be deleted without breaking the BUILD. A previous
     // version read a struct field in an `if`, which a re-gate deleted outright
     // while the whole suite stayed green — reading a field is optional, an arm
-    // is not. `run_network_gate` is the single value the rest of the handler
-    // branches on, and it is produced HERE and nowhere else.
-    let run_network_gate = match action {
+    // is not.
+    match action {
         crate::submit_gate::SubmitAction::RefuseUnauthenticated(path) => {
             worker::console_log!(
                 "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
@@ -563,7 +568,7 @@ pub async fn submit(
                 401,
             );
         }
-        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_) => true,
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_) => {}
         crate::submit_gate::SubmitAction::ProceedWithoutGate {
             path,
             lenient_unbarred,
@@ -578,9 +583,8 @@ pub async fn submit(
                     path.as_str()
                 );
             }
-            false
         }
-    };
+    }
 
     // ── BROADCAST-GATED submit (bsv-low overlay-first, 2026-07-17; the
     // zanaadu invariant): the OVERLAY broadcasts, and NOTHING is admitted
@@ -603,7 +607,16 @@ pub async fn submit(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
-    if run_network_gate {
+    // Consumed DIRECTLY from the action: there is no local flag to shadow.
+    // A re-gate defeated both source pins with
+    // `let run_network_gate = run_network_gate && x.is_some() && x.is_none();`
+    // — a shadowed rebinding changes the VALUE, not the SYNTAX, so a source
+    // scan is structurally blind to it. Removing the local removes the class;
+    // `make ci`'s route tier is what covers the residual.
+    if matches!(
+        action,
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_)
+    ) {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
         // and NOTHING is admitted unless Arcade reports the SUBJECT
@@ -1353,13 +1366,9 @@ pub async fn request_foreign_gasp_node(
 }
 
 // =============================================================================
-// Admin auth
+// Submit-operator auth (#347) + admin auth
 // =============================================================================
 
-/// Check Bearer token in the `Authorization` header against `ADMIN_TOKEN` env var.
-///
-/// Returns `Ok(())` if the token matches, or an `Err` containing the appropriate
-/// 401/403 response to send back to the client.
 /// The `/submit` operator credential (`SUBMIT_OPERATOR_TOKEN`) — SEPARATE from
 /// `ADMIN_TOKEN` on purpose (#347 gate M1).
 ///
@@ -2362,26 +2371,41 @@ mod tests {
         out
     }
 
-    /// The gate branch must be EXACTLY the plan's value, with no extra
-    /// conjunct that could disable it. Probe F (`&& cfg!(…) && false`) makes
-    /// this count 0 → RED.
+    /// The gate branch must consume the action DIRECTLY, with no extra
+    /// conjunct. Probe F (`&& cfg!(…) && false`) makes this count 0 → RED.
+    ///
+    /// **Stated boundary (Rule 17):** this pin sees SYNTAX. It cannot see
+    /// probe F′, a shadowed rebinding of the flag, which changes the VALUE and
+    /// leaves every needle matching exactly once. That class is closed
+    /// STRUCTURALLY instead — the branch reads the action, so there is no local
+    /// to shadow — and backstopped by the route tier in `make ci`. Do not add
+    /// a third source pin for it; a source scan cannot see it.
     #[test]
     fn the_network_gate_branch_is_keyed_solely_on_the_derived_decision() {
         let src = code_only(include_str!("routes.rs"));
         // Split so the needle never appears whole in this file.
-        let needle = ["if run_network", "_gate {"].concat();
+        let needle = ["SubmitAction::ProceedWithNetwork", "Gate(_)"].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            1,
-            "expected EXACTLY one unconditional `{needle}` branch — a changed \
-             or extra conjunct disables the only public admission bar"
+            2,
+            "expected EXACTLY two references to the gated action — the match arm \
+             and the branch that runs the broadcast; a changed count means the \
+             only public admission bar moved or gained a conjunct"
         );
-        // And the value it branches on is produced by the seam, once.
-        let produced = ["let run_network_gate = match ", "action {"].concat();
+        // The decision is derived EXACTLY once (probe H: a second derivation
+        // from a separate argument list let one copy be flipped silently).
+        let derived = ["let action = crate::submit_gate::action_", "for("].concat();
         assert_eq!(
-            src.matches(&produced).count(),
+            src.matches(&derived).count(),
             1,
-            "the gate value must come from the exhaustive match on the seam"
+            "the decision must be derived exactly ONCE — two derivations is the \
+             probe-H defect, and the counter then reports the honest one"
+        );
+        let legacy = ["crate::submit_gate::plan_sub", "mit("].concat();
+        assert_eq!(
+            src.matches(&legacy).count(),
+            0,
+            "the route must not re-derive the plan beside the action"
         );
     }
 

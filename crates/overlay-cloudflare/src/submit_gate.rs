@@ -506,20 +506,40 @@ static STRICT_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Submits that took a barred path (the honest majority).
 static BARRED: AtomicU64 = AtomicU64::new(0);
 
-/// Record one submit's classification. Called once per `/submit`, before the
-/// engine runs, so a later engine error still leaves the admission-path signal
-/// visible.
-pub fn note(path: AdmissionPath, operator_authed: bool, decision: GateDecision) {
-    if decision == GateDecision::RefuseUnauthenticated {
-        STRICT_REFUSED.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    if !path.requires_operator_auth() {
-        BARRED.fetch_add(1, Ordering::Relaxed);
-    } else if operator_authed {
-        OPERATOR_UNGATED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        UNAUTHENTICATED_UNGATED.fetch_add(1, Ordering::Relaxed);
+/// Record one submit's classification, derived ENTIRELY from the action the
+/// route is about to act on.
+///
+/// It used to take `(path, operator_authed, decision)` — a second argument
+/// list, built beside a second `plan_submit(...)` call. A re-gate flipped
+/// `operator_authed` to `true` on ONLY the behavioural call: it compiled, the
+/// whole native suite stayed green, every caller was treated as an
+/// authenticated operator (the CRITICAL restored), and the counter went on
+/// reporting honestly because it was fed from the other derivation.
+///
+/// Two derivations of one decision is the defect; the fix is to DELETE one of
+/// them (Rule 10), not to test that they agree. There is now exactly one
+/// `action_for` call in the route and the counter reads its result, so no
+/// second argument list exists to diverge.
+pub fn note(action: SubmitAction) {
+    match action {
+        SubmitAction::RefuseUnauthenticated(_) => {
+            STRICT_REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+        SubmitAction::ProceedWithNetworkGate(_) => {
+            BARRED.fetch_add(1, Ordering::Relaxed);
+        }
+        SubmitAction::ProceedWithoutGate {
+            lenient_unbarred: true,
+            ..
+        } => {
+            UNAUTHENTICATED_UNGATED.fetch_add(1, Ordering::Relaxed);
+        }
+        SubmitAction::ProceedWithoutGate {
+            lenient_unbarred: false,
+            ..
+        } => {
+            OPERATOR_UNGATED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

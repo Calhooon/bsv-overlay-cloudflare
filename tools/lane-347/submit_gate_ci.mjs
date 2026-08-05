@@ -22,7 +22,7 @@
 import { randomBytes } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 
-const BASE = process.argv[2] ?? 'http://127.0.0.1:8791'
+const BASE_REF = { value: process.argv[2] ?? 'http://127.0.0.1:8791' }
 const SCRIPT = new URL('./submit_gate_attack.mjs', import.meta.url).pathname
 
 let failures = 0
@@ -34,7 +34,7 @@ function probe({ mode, shape, topic, token, label }) {
   const env = { ...process.env, SHAPE: shape ?? 'junk-input' }
   if (topic) env.TOPIC = topic
   if (token) env.OP_TOKEN = token
-  const out = execFileSync('node', [SCRIPT, BASE, mode, identity], {
+  const out = execFileSync('node', [SCRIPT, BASE_REF.value, mode, identity], {
     env,
     encoding: 'utf8',
   })
@@ -79,10 +79,18 @@ expect(
 )
 
 // ── The one public path is REFUSED BY THE NETWORK, never by us. ──
+//
+// Deliberately NOT pinned to 422: this runs inside `make ci`, and asserting a
+// specific broadcaster verdict would make the gate depend on Arcade being
+// reachable — a flake, and a flake is a bug. The PROPERTY that matters holds
+// either way: a fabrication on the public path is never admitted, and is never
+// refused by US (a 401 here would mean the gate had been mistaken for an
+// unbarred path). Online that is 422 `bad-txns-vin-empty`; offline it is a 502
+// transport failure. Both are correct; admitting it never is.
 expect(
   { mode: 'broadcast-gated', shape: 'zero-input', label: 'broadcast-gated (zero-input)' },
-  (r) => r.status === 422 && !r.admitted,
-  '422 — the real network rejects it (bad-txns-vin-empty); never a 401, and never admitted',
+  (r) => !r.admitted && !r.present && r.status !== 401 && r.status !== 200,
+  'never admitted and never 401 — 422 (network rejected) online, 502 (transport) offline',
 )
 
 // ── A legitimate operator still works (peer sync / migration must not break). ──
@@ -108,6 +116,31 @@ expect(
   refused,
   '401 — a bad credential must never be treated as absent-but-allowed',
 )
+
+// ── LOW-F: the kill switch must not disable the network gate. ──
+//
+// Runs against a SECOND worker (ENABLE_EXTENSIONS=false) started by the
+// Makefile on :8792. Last round's HIGH-1 was exactly this: the switch routed
+// callers OFF `broadcast-gated` and admitted a fabrication that even
+// origin/main refused. The Makefile used to CLAIM this leg existed; now it does.
+const KILL_BASE = process.env.KILL_SWITCH_BASE
+if (KILL_BASE) {
+  const saved = BASE_REF.value
+  BASE_REF.value = KILL_BASE
+  expect(
+    { mode: 'broadcast-gated', shape: 'zero-input', label: 'kill switch: broadcast-gated' },
+    (r) => !r.admitted && !r.present && r.status !== 401 && r.status !== 200,
+    'the kill switch must never route a caller off the network gate',
+  )
+  expect(
+    { mode: 'historical-tx-no-spv', shape: 'zero-input', label: 'kill switch: ungated header' },
+    (r) => !r.admitted && !r.present,
+    'with extensions off the header is ignored; the fabrication must not be admitted',
+  )
+  BASE_REF.value = saved
+} else {
+  results.push('SKIP  kill-switch leg (set KILL_SWITCH_BASE)')
+}
 
 console.log(results.join('\n'))
 if (failures) {
