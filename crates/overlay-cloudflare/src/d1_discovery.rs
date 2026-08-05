@@ -5230,6 +5230,7 @@ mod tests {
     /// verified at admission; `Some(false)` = at least one did not;
     /// `None` = a pre-migration row (never evaluated), which is what plain
     /// [`insert_potparty`] writes.
+    #[allow(clippy::too_many_arguments)]
     fn insert_potparty_latched(
         conn: &rusqlite::Connection,
         identity: &str,
