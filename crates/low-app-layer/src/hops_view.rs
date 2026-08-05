@@ -64,6 +64,12 @@
 //! submitter, beside the on-chain fee they already paid, and five of those
 //! six artifacts stop being representable rather than getting fixed.
 //!
+//! MEASURED, on the frozen golden marker, release build, native: a full
+//! 150-row budget cost **~47 ms of CPU per request**; the latched read costs
+//! **~107 ns** for the same 150 rows. That is ~4.4e5x, and it was per
+//! request, per reader, on a public unauthenticated route — the #314
+//! MEDIUM-B read-time CPU class, closed rather than bounded.
+//!
 //! The three bars the latch decided — all against facts the CONTAINER
 //! itself supplies, none of them a claim — are documented at
 //! `overlay_discovery::hopparty::validity::marker_valid`: the hop LOCK
