@@ -269,7 +269,12 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 97;
+///
+/// A LITERAL, deliberately — `OVERLAY_MIGRATIONS.len()` here would make
+/// `migrations_are_valid_sql`'s equality move on both sides at once and assert
+/// nothing (Rule 9). Bump it consciously when adding a migration.
+/// 97 → 100 for #327 S8: `collected_markers_v2` + its data carry + its index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 100;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -483,14 +488,16 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // the runner ignores the re-run "duplicate column" error
     // (`migration_error_is_benign`).
     "ALTER TABLE pot_records ADD COLUMN spentConfirmed INTEGER NOT NULL DEFAULT 0",
-    // LOW cross-device "already collected" markers (tm_collected /
-    // ls_collected, bsv-low #161). One row per (identity, gameId) pair —
-    // FIRST MARKER WINS: the lookup service inserts with INSERT OR IGNORE
-    // on the primary key, so a later marker for the same pair never
-    // overwrites the first, and rows are NEVER deleted (a collected fact is
-    // permanent, like a reveal; the OP_RETURN is provably unspendable).
-    // txid + sigHex are handed back verbatim to querying clients, which
-    // verify the sig under their OWN wallet — the overlay never does.
+    // LOW cross-device "already collected" markers, ORIGINAL (superseded)
+    // shape — kept verbatim because this runner re-executes every statement
+    // and shipped migrations are never edited. SUPERSEDED by
+    // `collected_markers_v2` below: the (identity, gameId) first-marker-wins
+    // primary key is the same squattable-namespace shape that was ripped out
+    // of `result_markers` as an adversarial-review HIGH (bsv-low #327 S8,
+    // epoch Rule 2). Admission is byte-format-only and the identityKey push is
+    // arbitrary attacker-supplied bytes, so a garbage-sig marker naming a
+    // VICTIM could permanently occupy the pair slot and censor that victim's
+    // genuine marker forever. No code writes or reads this table anymore.
     "CREATE TABLE IF NOT EXISTS collected_markers (
         identity TEXT NOT NULL,
         gameId TEXT NOT NULL,
@@ -499,6 +506,53 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         createdAt INTEGER,
         PRIMARY KEY (identity, gameId)
     )",
+    // LOW cross-device "already collected" markers (tm_collected /
+    // ls_collected, bsv-low #161), CURRENT shape. One row per marker OUTPOINT
+    // (txid, outputIndex) — EVERY admitted marker is kept: the lookup service
+    // inserts with INSERT OR IGNORE on the primary key, so a replayed submit of
+    // the same output is a no-op, but markers for the same (identity, gameId)
+    // from DIFFERENT txs ALL coexist. That is the whole fix (epoch Rule 3:
+    // exclusivity IS the bug — an index is a set, not a slot): a squatter can
+    // now only ever occupy the worthless outpoint it actually fabricated, and
+    // the victim's genuine marker sits alongside it. The CLIENT's signature
+    // verify separates them, which is what `app/src/lib/collected.ts`'s
+    // groupByKey + selectVerified was already written to do — that hardening
+    // was DEAD CODE against the old schema, because the genuine sibling row
+    // could never be stored (Rule 18: a fixture built from the same wrong model
+    // as the code confirms the model).
+    //
+    // Rows are NEVER deleted (a collected fact is permanent, like a reveal; the
+    // OP_RETURN is provably unspendable). txid + sigHex are handed back verbatim
+    // to querying clients, which verify the sig under their OWN wallet — the
+    // overlay never does.
+    //
+    // Why a NEW table instead of an in-place rebuild: the runner re-executes
+    // every statement on every cold start, so a copy/DROP/RENAME dance would
+    // re-run against the LIVE table on the next start. CREATE-only + a one-time
+    // INSERT OR IGNORE carry (below) is re-run-safe.
+    "CREATE TABLE IF NOT EXISTS collected_markers_v2 (
+        identity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        sigHex TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // Carry any rows admitted under the superseded shape into v2 with
+    // outputIndex 0 (the old schema never stored the vout; 0 is a harmless
+    // PK-only placeholder). Idempotent: OR IGNORE on the (txid, outputIndex)
+    // key + the source table is write-frozen, so re-runs are no-ops. Old rows
+    // with a NULL txid (nullable there, NOT NULL here) cannot be carried and
+    // are skipped. NEVER orphans an honest row — an existing genuine marker
+    // survives the re-key and keeps answering lookups.
+    "INSERT OR IGNORE INTO collected_markers_v2 \
+     (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+     SELECT identity, gameId, txid, 0, sigHex, createdAt \
+     FROM collected_markers WHERE txid IS NOT NULL",
+    // The ls_collected batched read filters `identity = ? AND gameId IN (…)`.
+    "CREATE INDEX IF NOT EXISTS idx_collected_markers_v2_identity_gameId \
+     ON collected_markers_v2(identity, gameId)",
     // LOW hand-result leaderboard markers, ORIGINAL (superseded) shape —
     // kept verbatim because this runner re-executes every statement and
     // shipped migrations are never edited. SUPERSEDED by
@@ -1198,20 +1252,37 @@ mod tests {
 
     #[test]
     fn result_markers_carry_migration_is_rerun_safe() {
-        // The one non-CREATE/ALTER migration: the result_markers →
-        // result_markers_v2 data carry. Pin the two properties that make
-        // it safe under the re-run-everything runner: OR IGNORE (PK
-        // dedups replays) and the NULL-txid filter (v2's txid is NOT
-        // NULL). And it must be the ONLY such statement.
+        // The non-CREATE/ALTER migrations: the `*_markers` → `*_markers_v2`
+        // data carries. Pin the two properties that make each safe under the
+        // re-run-everything runner: OR IGNORE (PK dedups replays) and the
+        // NULL-txid filter (v2's txid is NOT NULL).
+        //
+        // #327 S8 added the SECOND carry (collected_markers → _v2). The count
+        // is asserted POSITIVELY and each carry is matched by name, so adding
+        // a third without pinning it fails here loudly rather than slipping
+        // through an over-broad filter (Rule 9).
         let carries: Vec<&&str> = OVERLAY_MIGRATIONS
             .iter()
             .filter(|sql| sql.trim_start().to_uppercase().starts_with("INSERT"))
             .collect();
-        assert_eq!(carries.len(), 1, "exactly one data-carry migration");
-        let carry = carries[0];
-        assert!(carry.trim_start().starts_with("INSERT OR IGNORE INTO result_markers_v2"));
-        assert!(carry.contains("FROM result_markers WHERE txid IS NOT NULL"));
-        assert!(carry.contains("outputIndex"));
+        assert_eq!(carries.len(), 2, "exactly two data-carry migrations");
+        for (target, source) in [
+            ("result_markers_v2", "FROM result_markers WHERE txid IS NOT NULL"),
+            (
+                "collected_markers_v2",
+                "FROM collected_markers WHERE txid IS NOT NULL",
+            ),
+        ] {
+            let carry = carries
+                .iter()
+                .find(|sql| {
+                    sql.trim_start()
+                        .starts_with(&format!("INSERT OR IGNORE INTO {target}"))
+                })
+                .unwrap_or_else(|| panic!("no OR IGNORE carry into {target}"));
+            assert!(carry.contains(source), "{target} carry source");
+            assert!(carry.contains("outputIndex"), "{target} carry outputIndex");
+        }
     }
 
     #[test]
@@ -1233,6 +1304,7 @@ mod tests {
             "pot_records",
             "pot_beefs",
             "collected_markers",
+            "collected_markers_v2",
             "result_markers",
             "result_markers_v2",
             "proof_markers",

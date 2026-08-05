@@ -18,25 +18,38 @@ hex); `gameIds` the games being gathered.
 
 ## Answer
 
-A freeform, input-ordered JSON array — one entry per requested gameId:
+A freeform, input-ordered JSON array — **one entry per stored MARKER ROW**,
+grouped in request order:
 
 ```json
-[{"gameId": "<hex>", "identity": "<hex>", "txid": "<hex|null>",
-  "sigHex": "<hex|null>", "present": true}]
+[{"gameId": "<hex>", "identity": "<hex>", "txid": "<hex>",
+  "outputIndex": 0, "sigHex": "<hex|null>", "present": true}]
 ```
 
-A `(identity, gameId)` with no stored marker answers
-`{"present": false, "txid": null, "sigHex": null}` — fail-safe: an absent
-marker means "still offer Collect", never a hidden card. `sigHex` is the
-marker's raw DER signature push; the CLIENT verifies it under its own
-wallet (`verifySignature`, `[1,'low collected']` / keyID = gameId / self)
-— the overlay never does.
+**A gameId may appear MORE THAN ONCE.** Markers for one `(identity, gameId)`
+published by different transactions all coexist in the index, so the array can
+carry several entries for the same gameId. **Consumers MUST NOT assume one entry
+per requested gameId, and MUST NOT treat the first entry for a gameId as
+authoritative** — admission is byte-format-only and the overlay never verifies
+the signature, so any single row may be a stranger's. Verify `sigHex` under your
+own wallet (`verifySignature`, `[1,'low collected']` / keyID = gameId / self) and
+select the row that checks out; a row's PRESENCE proves nothing.
+
+A `(identity, gameId)` with no stored marker answers exactly one entry,
+`{"present": false, "txid": null, "outputIndex": null, "sigHex": null}` —
+fail-safe: an absent marker means "still offer Collect", never a hidden card.
 
 ## Index semantics
 
-One row per `(identity, gameId)`; **first marker wins** (`INSERT OR
-IGNORE` — a later marker for the same pair never overwrites the first)
-and rows are **never deleted**. A collected marker is a permanent fact
-and the admitted output is a provably-unspendable `OP_RETURN`;
-`spend_notification_mode` is `none` and spend/eviction are deliberate
-no-ops.
+One row per marker **OUTPOINT** `(txid, outputIndex)`; `INSERT OR IGNORE` on
+that key, so a replayed submit of the same output is a no-op while markers for
+one `(identity, gameId)` from different txs are ALL kept. Rows are **never
+deleted**. A collected marker is a permanent fact and the admitted output is a
+provably-unspendable `OP_RETURN`; `spend_notification_mode` is `none` and
+spend/eviction are deliberate no-ops.
+
+The superseded `(identity, gameId)` first-marker-wins key (bsv-low #327 S8) was
+a squattable namespace: both halves are public, so one free submit naming a
+victim could occupy that victim's slot at deal time and censor their genuine
+marker permanently. Keying on the outpoint removes the collision entirely — a
+squatter can only occupy the outpoint it actually fabricated.

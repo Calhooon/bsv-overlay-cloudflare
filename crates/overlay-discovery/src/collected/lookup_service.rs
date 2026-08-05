@@ -2,17 +2,26 @@
 //! markers (bsv-low #161).
 //!
 //! When outputs are admitted to `tm_collected`, this service parses the
-//! `LOW/collected/v1` marker and stores one row per `(identity, gameId)`
-//! via [`CollectedStorage`] (first marker wins). LOW clients ask
+//! `LOW/collected/v1` marker and stores one row per marker OUTPOINT
+//! `(txid, outputIndex)` via [`CollectedStorage`]. LOW clients ask
 //! `collectedFor` during the home/History card gather; the answer is a
-//! freeform, input-ordered JSON array (like `ls_pot`'s `spentStatus`), one
-//! entry per requested gameId, carrying the stored `txid` + `sigHex` so
-//! the CLIENT can verify the signature under its own wallet — the overlay
-//! never verifies it.
+//! freeform, input-ordered JSON array (like `ls_pot`'s `spentStatus`), ONE
+//! ENTRY PER STORED ROW, carrying the stored `txid` + `outputIndex` +
+//! `sigHex` so the CLIENT can verify the signature under its own wallet —
+//! the overlay never verifies it.
+//!
+//! **A gameId may appear more than once (bsv-low #327 S8).** Markers for one
+//! `(identity, gameId)` from different txs all coexist, so a consumer must not
+//! assume one entry per requested gameId nor treat the first as authoritative:
+//! admission is byte-format-only, so any single row may be a stranger's.
+//! Keying on the outpoint is what removes the old censorship — under the
+//! superseded `(identity, gameId)` key a squatter's row permanently displaced
+//! the victim's genuine marker.
 //!
 //! Fail-safe shape: a `(identity, gameId)` with no stored marker answers
-//! `{"present": false, "txid": null, "sigHex": null}` — an absent marker
-//! means "still offer Collect", never a hidden card.
+//! exactly one entry, `{"present": false, "txid": null, "outputIndex": null,
+//! "sigHex": null}` — an absent marker means "still offer Collect", never a
+//! hidden card.
 //!
 //! Permanence: a collected marker is a permanent fact and the admitted
 //! output is a provably-unspendable OP_RETURN. `spend_notification_mode`
@@ -63,13 +72,14 @@ impl LookupService for CollectedLookupService {
         &self,
         payload: &OutputAdmittedByTopic,
     ) -> Result<(), LookupServiceError> {
-        let (txid, topic, locking_script) = match payload {
+        let (txid, output_index, topic, locking_script) = match payload {
             OutputAdmittedByTopic::LockingScript {
                 txid,
+                output_index,
                 topic,
                 locking_script,
                 ..
-            } => (txid, topic, locking_script),
+            } => (txid, *output_index, topic, locking_script),
             _ => {
                 return Err(LookupServiceError::Other(
                     "Expected locking-script mode".into(),
@@ -93,12 +103,15 @@ impl LookupService for CollectedLookupService {
         let record = CollectedRecord {
             identity: hex::encode(&marker.identity_key),
             game_id: hex::encode(marker.game_id),
-            txid: Some(txid.to_string()),
+            txid: txid.to_string(),
+            output_index,
             sig_hex: Some(hex::encode(&marker.sig)),
         };
 
-        // First marker wins — the storage layer's insert-if-absent makes a
-        // replay / duplicate marker a harmless no-op.
+        // Keyed on the OUTPOINT: a replay of the same output is a harmless
+        // no-op, while a marker for the same (identity, gameId) from another
+        // tx becomes its own row — a squatter can no longer censor the
+        // victim's genuine marker (#327 S8).
         self.storage
             .store_record(&record)
             .await
@@ -162,31 +175,42 @@ impl LookupService for CollectedLookupService {
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
-        // Build an input-ordered array: one entry per requested gameId.
+        // Build an input-ordered array. ONE ENTRY PER ROW (#327 S8): a gameId
+        // with two admitted markers yields two entries, so a squatted row can
+        // no longer hide the genuine one — the CLIENT verifies each `sigHex`
+        // under its own identity and selects the one that checks out
+        // (`app/src/lib/collected.ts` groupByKey + selectVerified, which this
+        // re-key makes reachable for the first time).
+        //
+        // A gameId with NO markers still emits exactly one `present:false`
+        // entry: the fail-safe that keeps an absent marker from ever hiding a
+        // Collect card is unchanged.
         let mut entries = Vec::with_capacity(game_ids.len());
-        for (key, record) in keys.iter().zip(records) {
-            // Fail-safe: a pair with no stored marker is present:false with
-            // null txid/sigHex — an absent marker never hides a Collect card.
-            let (present, txid, sig_hex) = match record {
-                Some(r) => (
-                    true,
-                    r.txid
+        for (key, rows) in keys.iter().zip(records) {
+            if rows.is_empty() {
+                entries.push(serde_json::json!({
+                    "gameId": key,
+                    "identity": identity,
+                    "txid": serde_json::Value::Null,
+                    "outputIndex": serde_json::Value::Null,
+                    "sigHex": serde_json::Value::Null,
+                    "present": false,
+                }));
+                continue;
+            }
+            for r in rows {
+                entries.push(serde_json::json!({
+                    "gameId": key,
+                    "identity": identity,
+                    "txid": r.txid,
+                    "outputIndex": r.output_index,
+                    "sigHex": r
+                        .sig_hex
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
-                    r.sig_hex
-                        .map(serde_json::Value::String)
-                        .unwrap_or(serde_json::Value::Null),
-                ),
-                None => (false, serde_json::Value::Null, serde_json::Value::Null),
-            };
-
-            entries.push(serde_json::json!({
-                "gameId": key,
-                "identity": identity,
-                "txid": txid,
-                "sigHex": sig_hex,
-                "present": present,
-            }));
+                    "present": true,
+                }));
+            }
         }
 
         Ok(LookupResult::Answer(LookupAnswer::Freeform {
@@ -448,28 +472,65 @@ mod tests {
         assert_eq!(arr[0]["identity"], golden_identity_hex());
     }
 
-    // ── First marker wins through the producer path ──────────────────────
+    // ── #327 S8: every marker survives, through the producer path ────────
 
+    /// The INVERSION of the old `duplicate_marker_first_wins`.
+    ///
+    /// That cell asserted the DEFECT as the contract — a second marker for one
+    /// `(identity, gameId)` being dropped is precisely how a squatter censored
+    /// the victim's genuine marker forever. The behaviour was inherited and
+    /// never questioned, and the cell blessed it (Rule 11).
+    ///
+    /// Driven through the REAL producer (`output_admitted_by_topic` → storage →
+    /// `lookup`), not hand-fed records, so it proves the admission path itself
+    /// keeps both rows (Rule 6b).
     #[tokio::test]
-    async fn duplicate_marker_first_wins() {
+    async fn a_squat_cannot_censor_the_genuine_marker_through_the_producer() {
         let (svc, storage) = make_service_with_storage();
         let script = marker_script(&[0x11u8; 32], &golden_identity_key(), &golden_sig());
-        svc.output_admitted_by_topic(&admit("txFIRST", 0, script.clone()))
+        // The squatter's marker naming the victim lands FIRST…
+        svc.output_admitted_by_topic(&admit("txSQUAT", 0, script.clone()))
             .await
             .unwrap();
-        // A second marker tx for the SAME (identity, gameId) — ignored.
-        svc.output_admitted_by_topic(&admit("txSECOND", 0, script))
+        // …the victim's genuine marker, from a DIFFERENT tx, lands second.
+        svc.output_admitted_by_topic(&admit("txGENUINE", 0, script))
             .await
             .unwrap();
 
-        assert_eq!(storage.record_count(), 1);
+        assert_eq!(storage.record_count(), 2, "both markers stored");
         let arr = collected_for(
             &svc,
             &golden_identity_hex(),
             serde_json::json!(["11".repeat(32)]),
         )
         .await;
-        assert_eq!(arr[0]["txid"], "txFIRST", "first marker wins");
+        let arr = arr.as_array().expect("freeform answer is an array");
+        assert_eq!(arr.len(), 2, "the wire answer carries BOTH rows");
+        let txids: Vec<&str> = arr.iter().map(|e| e["txid"].as_str().unwrap()).collect();
+        assert!(txids.contains(&"txSQUAT"));
+        assert!(
+            txids.contains(&"txGENUINE"),
+            "the genuine marker must reach the client so its sig can verify"
+        );
+        for e in arr {
+            assert_eq!(e["present"], true);
+            assert_eq!(e["outputIndex"], 0);
+        }
+    }
+
+    /// A REPLAY of the same outpoint is still a no-op through the producer —
+    /// the property that keeps the set from being inflated by resubmission.
+    #[tokio::test]
+    async fn replaying_one_outpoint_through_the_producer_is_a_noop() {
+        let (svc, storage) = make_service_with_storage();
+        let script = marker_script(&[0x11u8; 32], &golden_identity_key(), &golden_sig());
+        svc.output_admitted_by_topic(&admit("txA", 0, script.clone()))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit("txA", 0, script))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 1);
     }
 
     // ── Admission filters ────────────────────────────────────────────────
