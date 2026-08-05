@@ -456,6 +456,26 @@ impl SubmitAction {
 }
 
 /// Derive the ACTION — the form the route is obliged to consume exhaustively.
+///
+/// **This also RECORDS the classification** ([`note`]), because the caller must
+/// not be able to choose what gets counted. `note` used to be `pub` and to take
+/// a `SubmitAction` by value, so the route could hand it a fabricated one: a
+/// re-gate passed `note(SubmitAction::ProceedWithNetworkGate(action.path()))`
+/// and every submit reported as `barred` while behaviour was unchanged — 0
+/// compile errors, native suite green, every source pin matching, and nothing
+/// in the route tier reads `/health/invariants`. Fixed the same way as probes H
+/// and F′: remove the class rather than document it (Rule 15 — don't hand a
+/// call site a decision it can get wrong; derive it). The counter is now fed by
+/// the derivation itself, so there is no second value for anyone to supply.
+///
+/// Consequence, stated because it is the point of the shape: one derivation
+/// feeds both behaviour and the metric, so a future single-derivation bug
+/// corrupts the metric instead of hiding behind an honest second copy.
+///
+/// **Boundary:** this makes the function impure. It is called exactly once per
+/// `/submit` in production (pinned by the `action_for(` count in `routes.rs`'s
+/// source pins), so there is no double-count; the native cells that call it do
+/// increment the process-local counters, which nothing asserts on.
 pub fn action_for(
     header: Option<&str>,
     extensions_enabled: bool,
@@ -463,7 +483,7 @@ pub fn action_for(
     mode: GateMode,
 ) -> SubmitAction {
     let plan = plan_submit(header, extensions_enabled, operator_authed, mode);
-    match plan.decision {
+    let action = match plan.decision {
         GateDecision::RefuseUnauthenticated => SubmitAction::RefuseUnauthenticated(plan.path),
         GateDecision::Proceed if plan.run_network_gate => {
             SubmitAction::ProceedWithNetworkGate(plan.path)
@@ -472,7 +492,9 @@ pub fn action_for(
             path: plan.path,
             lenient_unbarred: plan.unauthenticated_unbarred,
         },
-    }
+    };
+    note(action);
+    action
 }
 
 /// Derive the whole plan. The ONLY entry point the route uses.
@@ -509,6 +531,10 @@ static BARRED: AtomicU64 = AtomicU64::new(0);
 /// Record one submit's classification, derived ENTIRELY from the action the
 /// route is about to act on.
 ///
+/// **PRIVATE, and called only from [`action_for`]** — no caller can supply the
+/// argument, which is the whole point (see `action_for`'s doc for the re-gate
+/// that fabricated one while this was `pub`).
+///
 /// It used to take `(path, operator_authed, decision)` — a second argument
 /// list, built beside a second `plan_submit(...)` call. A re-gate flipped
 /// `operator_authed` to `true` on ONLY the behavioural call: it compiled, the
@@ -518,9 +544,9 @@ static BARRED: AtomicU64 = AtomicU64::new(0);
 ///
 /// Two derivations of one decision is the defect; the fix is to DELETE one of
 /// them (Rule 10), not to test that they agree. There is now exactly one
-/// `action_for` call in the route and the counter reads its result, so no
-/// second argument list exists to diverge.
-pub fn note(action: SubmitAction) {
+/// derivation, it does the counting itself, and no argument list is left to
+/// diverge.
+fn note(action: SubmitAction) {
     match action {
         SubmitAction::RefuseUnauthenticated(_) => {
             STRICT_REFUSED.fetch_add(1, Ordering::Relaxed);

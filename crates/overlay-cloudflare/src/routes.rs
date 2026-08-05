@@ -537,6 +537,13 @@ pub async fn submit(
     // honestly from the other derivation. Two derivations of one decision is
     // the defect — the fix is to delete one, not to pin their agreement
     // (Rule 10).
+    //
+    // The route does NOT report the classification either: `action_for` counts
+    // it internally. `submit_gate::note` was `pub` and took a `SubmitAction` by
+    // value, so a re-gate handed it a fabricated one — every submit reported as
+    // `barred` while behaviour was unchanged, with 0 compile errors, the native
+    // suite green and every source pin matching. There is now no argument for
+    // this route to get wrong (Rule 15: derive the decision, don't accept it).
     let action = crate::submit_gate::action_for(
         mode_header.as_deref(),
         extensions_enabled,
@@ -544,7 +551,6 @@ pub async fn submit(
         gate_mode,
     );
     let mode = action.engine_mode();
-    crate::submit_gate::note(action);
 
     // EXHAUSTIVE match (Rule 22): the route consumes the decision as an enum,
     // so an arm cannot be deleted without breaking the BUILD. A previous
@@ -2316,9 +2322,11 @@ mod tests {
     // ── #347 Rule 22: can anything observe the seam being IGNORED? ────────
     //
     // The exhaustive `match` on `SubmitAction` makes DELETING the refusal a
-    // compile error. It cannot cover the remaining branch — `if
-    // run_network_gate { …broadcast+SEEN… }` — which a re-gate disabled with a
-    // one-token `&& false` while all 1826 tests stayed green.
+    // compile error. It cannot cover the remaining branch — the
+    // `matches!(action, …ProceedWithNetworkGate(_))` guard on the
+    // broadcast+SEEN block — which two separate re-gates defeated (a `&& false`
+    // conjunct on its predecessor `if run_network_gate {`, and then a shadowed
+    // rebinding of that same local) while all 1826 tests stayed green.
     //
     // These are SOURCE pins, and source pins lie in five documented ways, so
     // each one below is: POSITIVE (an exact count, never `assert!(!contains)`,
@@ -2371,15 +2379,31 @@ mod tests {
         out
     }
 
-    /// The gate branch must consume the action DIRECTLY, with no extra
-    /// conjunct. Probe F (`&& cfg!(…) && false`) makes this count 0 → RED.
+    /// The gated action must be referenced EXACTLY twice — the match arm and
+    /// the branch that runs the broadcast. **What this observes is only that
+    /// the bar is still spelled where it was:** a reference that MOVED, was
+    /// RENAMED or was DELETED changes the count and fails loudly.
     ///
-    /// **Stated boundary (Rule 17):** this pin sees SYNTAX. It cannot see
-    /// probe F′, a shadowed rebinding of the flag, which changes the VALUE and
-    /// leaves every needle matching exactly once. That class is closed
-    /// STRUCTURALLY instead — the branch reads the action, so there is no local
-    /// to shadow — and backstopped by the route tier in `make ci`. Do not add
-    /// a third source pin for it; a source scan cannot see it.
+    /// **Stated boundary (Rule 17): it does NOT observe a defeat of the bar's
+    /// VALUE — in either known shape — and no source scan can.**
+    ///
+    /// * **An added conjunct.** The gate re-ran probe F as
+    ///   `&& arcade_url.is_some() && arcade_url.is_none()` appended to the
+    ///   branch condition: this count stayed at exactly 2, every pin here kept
+    ///   matching, and the native suite stayed GREEN with the sole public
+    ///   admission bar dead. (An earlier version of this comment claimed probe
+    ///   F drives this count to 0. That was true of the pin's PREVIOUS needle,
+    ///   the literal `if run_network_gate {`, and is false of this one —
+    ///   Rule 10: the claim out-ran the code it described.)
+    /// * **A shadowed rebinding** — probe F′ — which changes the VALUE while
+    ///   leaving every needle matching exactly once.
+    ///
+    /// Both value-level defeats are the ROUTE TIER's job; `make ci`'s
+    /// `ci-route` is what caught each of them. The shadowing shape is
+    /// additionally closed STRUCTURALLY — the branch consumes the action, so
+    /// there is no local left to shadow. Do not add a third source pin for the
+    /// conjunct case either: a source scan is structurally blind to it, and a
+    /// pin that claims to cover it is worse than no pin at all.
     #[test]
     fn the_network_gate_branch_is_keyed_solely_on_the_derived_decision() {
         let src = code_only(include_str!("routes.rs"));
@@ -2390,7 +2414,10 @@ mod tests {
             2,
             "expected EXACTLY two references to the gated action — the match arm \
              and the branch that runs the broadcast; a changed count means the \
-             only public admission bar moved or gained a conjunct"
+             only public admission bar MOVED, was RENAMED or was DELETED. An \
+             unchanged count does NOT mean the bar is live: an added conjunct \
+             leaves this at 2 (see this test's stated boundary) — that shape, \
+             and the shadowed rebinding, are the route tier's job"
         );
         // The decision is derived EXACTLY once (probe H: a second derivation
         // from a separate argument list let one copy be flipped silently).

@@ -87,6 +87,21 @@ expect(
 // refused by US (a 401 here would mean the gate had been mistaken for an
 // unbarred path). Online that is 422 `bad-txns-vin-empty`; offline it is a 502
 // transport failure. Both are correct; admitting it never is.
+//
+// MODELLING BOUNDARY (Rule 17 — stated at the assertion, because an unstated
+// one asserts more than it establishes). This expectation is a NEGATIVE
+// predicate: "not admitted, not 401, not 200". A regression that refused
+// `broadcast-gated` with, say, a 400 BEFORE the broadcast block was ever
+// reached would still satisfy it — "never admitted" stays true when the path
+// is broken as well as when it is working.
+//
+// So NOTHING here is a POSITIVE control that the gated path actually reaches
+// the broadcast + SEEN block. That control needs a real, funded, honestly
+// signed transaction, and `make ci` must neither spend sats nor require the
+// network — so it is deliberately out of scope for this tier, not an oversight.
+// The gated path's liveness is evidenced elsewhere (the bsv-low mainnet
+// overlay-first broadcast e2e); if that ever stops covering it, this tier is
+// NOT a substitute.
 expect(
   { mode: 'broadcast-gated', shape: 'zero-input', label: 'broadcast-gated (zero-input)' },
   (r) => !r.admitted && !r.present && r.status !== 401 && r.status !== 200,
