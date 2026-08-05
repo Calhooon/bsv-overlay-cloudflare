@@ -3761,23 +3761,185 @@ impl HoppartyRow {
     }
 }
 
+pub use hopparty_write::{hopparty_insert_query, HoppartyDb, LatchedHoppartyInsert};
+
+/// The hopparty write path as a CAPABILITY rather than a convention
+/// (bsv-low #362) — the same shape [`potparty_write`] landed for #283, for
+/// the same measured reason.
+///
+/// `store_record` needs a live `D1Database`, so it is unreachable in a
+/// native test. That is precisely how a write path gets silently neutered
+/// while the whole suite stays green: #283's adversarial gate replaced
+/// `store_record`'s body with an inline `INSERT … VALUES (…, NULL)` — same
+/// columns, same binds, latch dropped — and got **293 passed, 0 failed**,
+/// with every new production row landing in the legacy tier. A source-scan
+/// remediation was then defeated twice, once by a KEYWORD and once by CASE
+/// (epoch Rule 12a): you cannot enumerate your way to a property.
+///
+/// So this module removes the CAPABILITY to express the write any other way:
+///
+///  - [`LatchedHoppartyInsert`] has PRIVATE fields and exactly one
+///    constructor, [`hopparty_insert_query`], which binds the latch itself.
+///  - [`HoppartyDb`] owns the `D1Database` in a PRIVATE field and exposes no
+///    way to run an arbitrary write: `insert` takes a
+///    [`LatchedHoppartyInsert`] and nothing else, and the read method is
+///    barred to `SELECT` by the shared runtime predicate
+///    [`potparty_write::is_select_only`] — ONE bar for both tables, phrased
+///    as a property of the input rather than a list of forbidden spellings.
+///  - `D1HoppartyStorage.db` is a [`HoppartyDb`], so `store_record` — which
+///    lives outside this module — cannot reach a `D1Database` at all.
+///
+/// The gate's injection therefore no longer compiles: an inline `Query` has
+/// no way to be executed, and deleting the `hopparty_insert_query` call
+/// leaves nothing that can construct the only value `insert` accepts.
+///
+/// # The boundary, stated (epoch Rule 22)
+///
+/// This makes the CALL structurally mandatory. It does not make the D1
+/// round-trip observable natively — nothing here can. The predicate's
+/// verdict flowing into the bound column is pinned instead by
+/// `the_hopparty_admission_write_latches_marker_valid_through_the_real_writer`,
+/// which replays this module's own SQL and bind list against real SQLite and
+/// reads the column back.
+pub mod hopparty_write {
+    use super::{potparty_write::is_select_only, HoppartyRecord, Query};
+    use serde::de::DeserializeOwned;
+    use std::rc::Rc;
+    use worker::D1Database;
+
+    /// A hopparty INSERT that PROVABLY carries the `markerValid` latch.
+    ///
+    /// Both fields are private to this module and there is exactly one
+    /// constructor, so a value of this type is a proof that
+    /// [`hopparty_insert_query`] ran. [`HoppartyDb::insert`] accepts nothing
+    /// else.
+    pub struct LatchedHoppartyInsert {
+        query: Query,
+        marker_valid: bool,
+    }
+
+    impl LatchedHoppartyInsert {
+        /// The verdict this insert BINDS — the same evaluation, not a second
+        /// one. Telemetry reading this is reporting the value actually
+        /// written, so a future single-derivation bug corrupts the signal too
+        /// instead of hiding behind it (the #283 round-2 LOW-2 lesson).
+        pub fn marker_valid(&self) -> bool {
+            self.marker_valid
+        }
+
+        /// Read-only view of the built query, for the replay pin. Cannot be
+        /// executed (`Query::execute` consumes `self`) and cannot be mutated.
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    /// THE hopparty admission WRITE, as a pure value.
+    ///
+    /// `INSERT OR IGNORE` on the `(txid, outputIndex)` primary key — a
+    /// replayed submit of the same output is a no-op; markers for the same
+    /// identity from different txs are ALL kept; never overwrite, never
+    /// delete. `createdAt` is the SERVER's stamp (the record's own value is
+    /// ignored by the caller).
+    ///
+    /// `markerValid` is DECODED ONCE HERE, from facts already in hand: the
+    /// container's decoded output at `hopVout` (#310) and the two signatures
+    /// the marker carries. It is an ORDERING HINT, not an admission
+    /// decision: this cannot refuse a marker, a 0-latched row is stored and
+    /// served exactly as before, and `/hops-view` returns both signatures so
+    /// the client re-verifies.
+    ///
+    /// # A latched `0` is a VERDICT, not "not yet checked" (bsv-low#367)
+    ///
+    /// Nothing re-evaluates this column: it is written once, here, and no
+    /// `UPDATE hopparty_records SET markerValid` exists in production code.
+    /// A TRANSIENT predicate fault permanently demotes every honest row
+    /// admitted in that window to rank **0**, below even the legacy `NULL`
+    /// tier, with no self-healing path — the epoch Rule 6 trade, whose
+    /// victims are wiped-device users seeing a silently short enumeration
+    /// (Rule 14). That is why #367 is a **re-latch of every row**, not a
+    /// backfill of the `NULL` ones.
+    pub fn hopparty_insert_query(
+        record: &HoppartyRecord,
+        created_at: i64,
+    ) -> LatchedHoppartyInsert {
+        let marker_valid = overlay_discovery::hopparty::validity::record_marker_valid(record);
+        LatchedHoppartyInsert {
+            query: Query::new(
+                "INSERT OR IGNORE INTO hopparty_records \
+                 (identity, opponentIdentity, gameId, hopVout, hopSats, \
+                  seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                  hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+                  markerValid) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(record.identity.as_str())
+            .bind(record.opponent_identity.as_str())
+            .bind(record.game_id.as_str())
+            .bind(record.hop_vout)
+            .bind(record.hop_sats)
+            .bind(record.seat_settle_pubkey.as_str())
+            .bind(record.seat_sig_hex.as_str())
+            .bind(record.identity_sig_hex.as_str())
+            .bind(record.hop_lock_hex.as_deref())
+            .bind(record.hop_sats_on_chain)
+            .bind(record.container_outputs)
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(created_at)
+            .bind(i64::from(marker_valid)),
+            marker_valid,
+        }
+    }
+
+    /// The ONLY database handle [`super::D1HoppartyStorage`] holds.
+    pub struct HoppartyDb(Rc<D1Database>);
+
+    impl HoppartyDb {
+        pub fn new(db: Rc<D1Database>) -> Self {
+            Self(db)
+        }
+
+        /// Run a read. Generic over the row type, never over the write shape
+        /// — and guarded by the SHARED [`is_select_only`] capability bar, so
+        /// no write spelling can be smuggled through the read method (the
+        /// #283 round-3 finding: a needle is one keyword wide).
+        pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
+            if !is_select_only(q.sql()) {
+                return Err(super::potparty_write::NON_SELECT_ON_READ_PATH.to_string());
+            }
+            q.fetch_all(&self.0).await
+        }
+
+        /// Run THE hopparty admission write. Accepts nothing that did not
+        /// come from [`hopparty_insert_query`].
+        pub async fn insert(&self, insert: LatchedHoppartyInsert) -> Result<(), String> {
+            insert.query.execute(&self.0).await
+        }
+    }
+}
+
 /// Cloudflare D1 implementation of the HoppartyStorage trait
 /// (tm_hopparty / ls_hopparty, bsv-low #315).
 ///
-/// Schema: `hopparty_records` in `d1::OVERLAY_MIGRATIONS` — typed + indexed
-/// from the FIRST migration (#310 decode-at-write). Keyed by the marker
-/// OUTPOINT (txid, outputIndex); `INSERT OR IGNORE` makes a replayed submit
-/// of the same output a no-op, while markers for the same identity from
-/// DIFFERENT txs are ALL kept (the censorship-front-run fix). Rows are
-/// NEVER deleted. `createdAt` is stamped here at insert (the record's value
-/// is ignored).
+/// Schema: `hopparty_records` in `d1::OVERLAY_MIGRATIONS` — every WIRE field
+/// typed + indexed from the FIRST migration (#310 decode-at-write), plus the
+/// #362 `markerValid` verdict latch. Keyed by the marker OUTPOINT (txid,
+/// outputIndex); `INSERT OR IGNORE` makes a replayed submit of the same
+/// output a no-op, while markers for the same identity from DIFFERENT txs
+/// are ALL kept (the censorship-front-run fix). Rows are NEVER deleted.
+/// `createdAt` is stamped here at insert (the record's value is ignored).
 pub struct D1HoppartyStorage {
-    db: Rc<D1Database>,
+    /// A [`HoppartyDb`], NOT a `D1Database` — so this impl cannot express a
+    /// write that skips the latch (see [`hopparty_write`]).
+    db: HoppartyDb,
 }
 
 impl D1HoppartyStorage {
     pub fn new(db: Rc<D1Database>) -> Self {
-        Self { db }
+        Self {
+            db: HoppartyDb::new(db),
+        }
     }
 }
 
@@ -3790,21 +3952,6 @@ const HOPPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, hopVou
      containerOutputs, txid, outputIndex, createdAt \
      FROM hopparty_records";
 
-/// The SHIPPED `hopparty_records` insert (INSERT OR IGNORE on the
-/// `(txid, outputIndex)` primary key). Exported so the real-SQLite cells
-/// (low-app-layer `tests/hops_view_sqlite.rs`) EXECUTE the exact production
-/// write shape rather than a transcription of it. BINDS, in order:
-/// identity, opponentIdentity, gameId, hopVout, hopSats, seatSettlePubkey,
-/// seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain,
-/// containerOutputs, txid, outputIndex, createdAt.
-pub fn hopparty_store_sql() -> &'static str {
-    "INSERT OR IGNORE INTO hopparty_records \
-     (identity, opponentIdentity, gameId, hopVout, hopSats, \
-      seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
-      containerOutputs, txid, outputIndex, createdAt) \
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-}
-
 /// `ls_hopparty hopsFor` — the identity-scoped hops-in-flight window: the
 /// EXACT `potrefund_list_for_identity_sql` shape (per-OUTPOINT collapse to
 /// a bounded superset, hop-existence tier against `pot_records` — hops ARE
@@ -3815,14 +3962,28 @@ pub fn hopparty_store_sql() -> &'static str {
 ///  - the hop OUTPOINT is `(txid, hopVout)` — the marker rides the hop tx,
 ///    so the containing txid IS the hop txid — and each outpoint yields up
 ///    to [`HOPSFOR_ROWS_PER_OUTPOINT`] OLDEST rows (a SUPERSET, not a
-///    representative: hopparty is read-verified in `/hops-view`, and a
-///    layer that cannot verify signatures must never choose which row is
-///    real; see the constant's doc in `overlay_discovery::hopparty`);
+///    representative: a layer that picks "the real row" before anything
+///    verifies hands an attacker the eviction; see the constant's doc in
+///    `overlay_discovery::hopparty`);
 ///  - there is no v1/v2 group split (one version), so the row cap is
 ///    `limit × HOPSFOR_ROWS_PER_OUTPOINT`.
 ///
 /// Read `potparty_list_for_identity_sql`'s doc for the dust-DoS these
 /// bounds close and the residual they do not.
+///
+/// # The LATCHED VERDICT leads (bsv-low #362)
+///
+/// Same sweep as `/hops-view`, for the same reason: this window is a
+/// fixed-size slot over attacker-writable rows, and the one ordering an
+/// attacker can neither out-stamp nor out-number is *does this marker
+/// verify*. `markerValid` is decided at admission, so the window can lead on
+/// it — aggregated per outpoint via `MAX`, because `finalRank` counts
+/// OUTPOINTS and a key that differs between two rows of one outpoint would
+/// split it across ranks.
+///
+/// **Sort key, never a `WHERE`.** A refuted or legacy row is deprioritised,
+/// served, and carried back with both signatures verbatim so the caller
+/// re-verifies. Hiding it would recreate the invisible-money class (#358).
 ///
 /// BINDS (numbered): `?1` identity, `?2` limit (OUTPOINTS), `?3` quota
 /// (unknown-hop promotion slots), `?4` row cap.
@@ -3834,14 +3995,15 @@ pub fn hopparty_list_for_identity_sql() -> String {
      FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
                   seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
                   containerOutputs, txid, outputIndex, createdAt, markerRowid, \
-                  potCreatedAt, potFirstMarkerAt, tier, \
-                  DENSE_RANK() OVER (ORDER BY tier ASC, \
+                  potCreatedAt, potFirstMarkerAt, markerRank, outpointMarkerRank, tier, \
+                  DENSE_RANK() OVER (ORDER BY outpointMarkerRank DESC, tier ASC, \
                                               COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
                                               txid ASC, hopVout ASC) AS finalRank \
            FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
                         seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
                         hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
                         markerRowid, potCreatedAt, potFirstMarkerAt, \
+                        markerRank, outpointMarkerRank, \
                         CASE WHEN unknownPot = 0 \
                              OR (freshUnknown = 1 AND potRank <= ?3) \
                              THEN 0 ELSE 1 END AS tier \
@@ -3849,6 +4011,9 @@ pub fn hopparty_list_for_identity_sql() -> String {
                               seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
                               hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
                               markerRowid, potCreatedAt, potFirstMarkerAt, unknownPot, \
+                              markerRank, \
+                              MAX(markerRank) OVER (PARTITION BY txid, hopVout) \
+                                  AS outpointMarkerRank, \
                               {fresh} AS freshUnknown, \
                               DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
                                                  ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
@@ -3865,6 +4030,7 @@ pub fn hopparty_list_for_identity_sql() -> String {
                                     hp.containerOutputs AS containerOutputs, \
                                     hp.txid AS txid, hp.outputIndex AS outputIndex, \
                                     hp.createdAt AS createdAt, hp.rowid AS markerRowid, \
+                                    {marker_rank} AS markerRank, \
                                     r.createdAt AS potCreatedAt, \
                                     MIN(hp.createdAt) OVER (PARTITION BY hp.txid, \
                                                                          hp.hopVout) \
@@ -3879,11 +4045,15 @@ pub fn hopparty_list_for_identity_sql() -> String {
                              WHERE hp.identity = ?1) \
                        WHERE rn <= {per_outpoint}))) \
      WHERE finalRank <= ?2 \
-     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
-              txid ASC, hopVout ASC, createdAt ASC, markerRowid ASC \
+     ORDER BY outpointMarkerRank DESC, tier ASC, \
+              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+              txid ASC, hopVout ASC, markerRank DESC, createdAt ASC, markerRowid ASC \
      LIMIT ?4",
         per_outpoint = HOPSFOR_ROWS_PER_OUTPOINT,
         fresh = fresh_unknown_expr(),
+        // The SHARED rank expression — the column name and its three tiers
+        // live in the crate that WRITES them (epoch Rule 16).
+        marker_rank = overlay_discovery::hopparty::validity::marker_rank_expr("hp."),
     )
 }
 
@@ -3901,24 +4071,30 @@ pub fn hopparty_list_for_hop_sql() -> String {
 #[async_trait(?Send)]
 impl HoppartyStorage for D1HoppartyStorage {
     async fn store_record(&self, record: &HoppartyRecord) -> Result<(), HoppartyStorageError> {
-        Query::new(hopparty_store_sql())
-            .bind(record.identity.as_str())
-            .bind(record.opponent_identity.as_str())
-            .bind(record.game_id.as_str())
-            .bind(record.hop_vout)
-            .bind(record.hop_sats)
-            .bind(record.seat_settle_pubkey.as_str())
-            .bind(record.seat_sig_hex.as_str())
-            .bind(record.identity_sig_hex.as_str())
-            .bind(record.hop_lock_hex.as_deref())
-            .bind(record.hop_sats_on_chain)
-            .bind(record.container_outputs)
-            .bind(record.txid.as_str())
-            .bind(record.output_index)
-            .bind(current_unix_seconds_i64())
-            .execute(&self.db)
-            .await
-            .map_err(hopparty_err)
+        let insert = hopparty_insert_query(record, current_unix_seconds_i64());
+        // TELEMETRY, not a decision (the #283 gate-M5 posture). The frozen
+        // cross-repo golden makes a client/server crypto disagreement
+        // UNLIKELY; it does not make it DETECTABLE once deployed, and that
+        // class fails toward refusing HONEST work all at once (epoch
+        // Rule 16). A 0-latch is normal under a marker flood and abnormal on
+        // a quiet topic, so the RATE is the detector: a sustained stream of
+        // these with no flood in the logs means our predicate and the
+        // client's signer have drifted, and the right response is to look,
+        // not to change any behaviour here (epoch Rule 13).
+        //
+        // Read off the insert rather than re-evaluated: ONE
+        // `record_marker_valid` per admitted marker, and the log reports the
+        // value that is actually being written.
+        if !insert.marker_valid() {
+            worker::console_log!(
+                "[hopparty:markerinvalid] txid={} vout={} hopVout={} identity={}",
+                record.txid,
+                record.output_index,
+                record.hop_vout,
+                record.identity
+            );
+        }
+        self.db.insert(insert).await.map_err(hopparty_err)
     }
 
     async fn list_for_identity(
@@ -3926,12 +4102,15 @@ impl HoppartyStorage for D1HoppartyStorage {
         identity: &str,
         limit: usize,
     ) -> Result<Vec<HoppartyRecord>, HoppartyStorageError> {
-        let rows: Vec<HoppartyRow> = Query::new(hopparty_list_for_identity_sql())
-            .bind(identity)
-            .bind(limit as u32)
-            .bind(unknown_pot_quota(limit) as u32)
-            .bind(limit.saturating_mul(HOPSFOR_ROWS_PER_OUTPOINT) as u32)
-            .fetch_all(&self.db)
+        let rows: Vec<HoppartyRow> = self
+            .db
+            .fetch_all(
+                Query::new(hopparty_list_for_identity_sql())
+                    .bind(identity)
+                    .bind(limit as u32)
+                    .bind(unknown_pot_quota(limit) as u32)
+                    .bind(limit.saturating_mul(HOPSFOR_ROWS_PER_OUTPOINT) as u32),
+            )
             .await
             .map_err(hopparty_err)?;
         Ok(rows.into_iter().map(HoppartyRow::into_record).collect())
@@ -3943,11 +4122,14 @@ impl HoppartyStorage for D1HoppartyStorage {
         hop_vout: u32,
         limit: usize,
     ) -> Result<Vec<HoppartyRecord>, HoppartyStorageError> {
-        let rows: Vec<HoppartyRow> = Query::new(hopparty_list_for_hop_sql())
-            .bind(hop_txid)
-            .bind(hop_vout)
-            .bind(limit as u32)
-            .fetch_all(&self.db)
+        let rows: Vec<HoppartyRow> = self
+            .db
+            .fetch_all(
+                Query::new(hopparty_list_for_hop_sql())
+                    .bind(hop_txid)
+                    .bind(hop_vout)
+                    .bind(limit as u32),
+            )
             .await
             .map_err(hopparty_err)?;
         Ok(rows.into_iter().map(HoppartyRow::into_record).collect())
@@ -5639,7 +5821,8 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2, "both rows coexist — exclusivity WAS the bug");
         assert!(
-            rows.iter().any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
+            rows.iter()
+                .any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
             "the victim's genuine marker survives the squat: {rows:?}"
         );
 
@@ -5704,7 +5887,8 @@ mod tests {
             "the per-pair window must bound an unbounded mint"
         );
         assert!(
-            rows.iter().any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
+            rows.iter()
+                .any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
             "a PRE-FILED squat must not evict the victim's later genuine marker \
              — an oldest-first window would hand the squatter every slot: {rows:?}"
         );
@@ -5742,7 +5926,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "the honest pre-re-key row is carried, not orphaned");
+        assert_eq!(
+            count, 1,
+            "the honest pre-re-key row is carried, not orphaned"
+        );
 
         // Re-run (cold start): still exactly one row, no error.
         conn.execute_batch(carry).unwrap();
@@ -5753,7 +5940,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "carry is idempotent under the re-run-everything runner");
+        assert_eq!(
+            count, 1,
+            "carry is idempotent under the re-run-everything runner"
+        );
     }
 
     fn victim_id() -> String {
@@ -6504,6 +6694,139 @@ mod tests {
         assert_eq!(n, 2, "a 0-latched marker is STORED, never refused");
     }
 
+    /// The FROZEN cross-repo hopparty golden marker (bsv-low #315) —
+    /// RFC6979-deterministic real signatures. The only honest artifact
+    /// available here that a REAL signature check can pass; a hand-built
+    /// record would make the cell blind to the dimension it exists to
+    /// measure (epoch Rule 18).
+    fn golden_hopparty_record(marker_txid: &str, pays: bool) -> HoppartyRecord {
+        let m = overlay_discovery::hopparty::parse_hopparty_marker(
+            &hex::decode(overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap(),
+        )
+        .expect("the frozen golden parses");
+        // The CONTAINER's own output at hopVout, as the lookup service
+        // decodes it: honest = really pays the claimed value to the claimed
+        // settle key.
+        let lock =
+            overlay_discovery::hopparty::validity::expected_hop_lock_hex(&m.seat_settle_pubkey);
+        HoppartyRecord {
+            identity: hex::encode(&m.identity),
+            opponent_identity: hex::encode(&m.opponent),
+            game_id: hex::encode(m.game_id),
+            hop_vout: m.hop_vout,
+            hop_sats: m.hop_sats,
+            seat_settle_pubkey: hex::encode(&m.seat_settle_pubkey),
+            seat_sig_hex: hex::encode(&m.seat_sig),
+            identity_sig_hex: hex::encode(&m.identity_sig),
+            hop_lock_hex: if pays { lock } else { None },
+            hop_sats_on_chain: if pays { Some(m.hop_sats) } else { None },
+            container_outputs: 2,
+            txid: marker_txid.to_string(),
+            output_index: 1,
+            created_at: 0,
+        }
+    }
+
+    /// THE HOPPARTY WRITER PIN (bsv-low #362) — the #283 HIGH-2 lesson,
+    /// applied before it could be repeated.
+    ///
+    /// `store_record` needs a `D1Database` and cannot run natively, so
+    /// nothing else in this repo binds the writer to the predicate: replacing
+    /// its body with an inline `INSERT … VALUES (…, NULL)` would leave every
+    /// new production row in the legacy tier with the suite green (that is
+    /// exactly what happened to potparty: 293 passed, 0 failed). This drives
+    /// the REAL writer — `hopparty_insert_query`, the exact value
+    /// `store_record` executes — replays its OWN sql and bind list against
+    /// real SQLite with the production migrations, and reads the column back.
+    #[test]
+    fn the_hopparty_admission_write_latches_marker_valid_through_the_real_writer() {
+        let conn = production_schema_db();
+        let honest = golden_hopparty_record("txHOPGOLDEN", true);
+        exec_query(&conn, hopparty_insert_query(&honest, 4_321).query());
+
+        let (latched, at): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT markerValid, createdAt FROM hopparty_records \
+                 WHERE txid = 'txHOPGOLDEN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the row landed");
+        assert_eq!(
+            latched,
+            Some(1),
+            "the REAL client's genuinely-signed marker, in a container that \
+             really pays it, must latch 1 through the REAL writer — a \
+             constant/None/absent bind fails here"
+        );
+        assert_eq!(at, 4_321, "and createdAt is still the SERVER's stamp");
+
+        // A container that does NOT pay latches 0 — so the cell measures the
+        // PREDICATE's verdict flowing through the writer, not just "something
+        // was bound". The signatures are byte-identical in both rows.
+        let unpaid = golden_hopparty_record("txHOPUNPAID", false);
+        assert_eq!(unpaid.seat_sig_hex, honest.seat_sig_hex, "same signatures");
+        exec_query(&conn, hopparty_insert_query(&unpaid, 4_322).query());
+        let unpaid_latched: Option<i64> = conn
+            .query_row(
+                "SELECT markerValid FROM hopparty_records WHERE txid = 'txHOPUNPAID'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the unpaid row landed too — the latch NEVER refuses an admission");
+        assert_eq!(unpaid_latched, Some(0));
+
+        // …and a tampered SIGNATURE latches 0 with the container untouched,
+        // so both halves of the predicate are observed through the writer.
+        let mut forged = golden_hopparty_record("txHOPFORGED", true);
+        forged.identity_sig_hex = "30".to_string() + &forged.identity_sig_hex[2..];
+        forged.identity_sig_hex.push_str("00");
+        exec_query(&conn, hopparty_insert_query(&forged, 4_323).query());
+        let forged_latched: Option<i64> = conn
+            .query_row(
+                "SELECT markerValid FROM hopparty_records WHERE txid = 'txHOPFORGED'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the forged row landed too");
+        assert_eq!(forged_latched, Some(0));
+
+        // All three rows are present: the latch is a hint, never a gate.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hopparty_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3, "a 0-latched marker is STORED, never refused");
+    }
+
+    /// The hopparty writer's bind list and its SQL must agree in COUNT — a
+    /// dropped bind shifts every column silently (epoch Rule 9).
+    #[test]
+    fn the_hopparty_admission_write_binds_every_placeholder() {
+        let insert = hopparty_insert_query(&golden_hopparty_record("txN", true), 0);
+        let q = insert.query();
+        assert_eq!(q.sql().matches('?').count(), 15, "15 placeholders");
+        assert_eq!(q.params().len(), 15, "15 binds");
+        assert_eq!(
+            q.sql().matches(',').count(),
+            14 + 14,
+            "15 columns + 15 values = 28 separating commas"
+        );
+        assert!(
+            q.sql().contains("markerValid"),
+            "the latch column is written"
+        );
+        assert!(
+            matches!(q.params()[14], crate::d1::QVal::Int(1)),
+            "the LAST bind is the latch verdict for the golden: {:?}",
+            q.params()[14]
+        );
+        assert!(
+            insert.marker_valid(),
+            "the accessor reports the value actually bound — telemetry that \
+             reads it cannot disagree with the row"
+        );
+    }
+
     /// The writer's bind list and its SQL must agree in COUNT — a dropped
     /// bind shifts every column silently. Positive counts on both sides of a
     /// value that cannot move in sympathy (epoch Rule 9).
@@ -6744,25 +7067,71 @@ mod tests {
              the insert instead of re-deriving it"
         );
 
-        // ── The read-path bar's CALL SITE. `fetch_all` needs a live
+        // ── The read-path bar's CALL SITES. `fetch_all` needs a live
         // `D1Database`, so no native cell can watch it refuse — the same
         // unreachability that produced this whole class. The predicate is
         // pinned behaviourally by `the_potparty_read_path_admits_only_selects`;
-        // this pins that `fetch_all` still consults it, scoped to the guard
-        // EXPRESSION rather than a region (epoch Rule 9, fourth failure mode),
-        // so `&& false` or a swapped argument changes the needle.
+        // this pins that BOTH `fetch_all`s still consult it, scoped to the
+        // guard EXPRESSION rather than a region (epoch Rule 9, fourth failure
+        // mode), so `&& false` or a swapped argument changes the needle.
+        //
+        // TWO since #362: `potparty_write::PotpartyDb` and
+        // `hopparty_write::HoppartyDb` share ONE bar rather than each growing
+        // a copy (epoch Rule 10 — the durable fix for "these must agree" is
+        // one predicate, not two plus a test).
         assert_eq!(
             prod.matches(&["if !is_select", "_only(q.sql()) {"].concat())
                 .count(),
-            1,
-            "`fetch_all` guards on the read bar, in exactly that form — this \
-             is the door the round-3 gate walked through"
+            2,
+            "both read paths guard on the shared read bar, in exactly that \
+             form — this is the door the round-3 gate walked through"
         );
         assert_eq!(
             prod.matches(&["is_select", "_only("].concat()).count(),
+            3,
+            "the read bar is DEFINED once and CALLED twice (the import names \
+             it without parentheses) — a smaller number means a `fetch_all` \
+             stopped consulting it"
+        );
+    }
+
+    /// The #362 twin of the cell above, for `hopparty_records`. Same class,
+    /// same two axes the potparty needle was defeated on (keyword, then
+    /// case), so the needle is blind on both from the start and the real bar
+    /// is still the capability: `hopparty_write` owns the only `D1Database`
+    /// this module's hopparty storage can reach.
+    ///
+    /// BOUNDARY (epoch Rule 22): a belt. The verdict flowing into the bound
+    /// column is pinned behaviourally by
+    /// `the_hopparty_admission_write_latches_marker_valid_through_the_real_writer`.
+    #[test]
+    fn exactly_one_hopparty_insert_statement_exists_in_this_module() {
+        let prod = production_source();
+
+        let shouty = prod.to_ascii_uppercase();
+        assert_eq!(
+            shouty
+                .matches(&["INTO HOPPARTY", "_RECORDS"].concat())
+                .count(),
+            1,
+            "exactly ONE statement in this module writes `hopparty_records` — \
+             a second one (inline in `store_record`, or smuggled through \
+             `fetch_all` under ANY spelling OR CASE) is how the latch gets \
+             dropped while the suite stays green"
+        );
+        assert_eq!(
+            prod.matches(&["hopparty_insert", "_query("].concat())
+                .count(),
             2,
-            "the read bar is DEFINED once and USED once — a 1 here means \
-             `fetch_all` stopped consulting it"
+            "the pure producer is DEFINED once and CALLED once (by \
+             `store_record`) — a 1 here means the only call site is gone"
+        );
+        assert_eq!(
+            prod.matches(&["record_marker", "_valid("].concat()).count(),
+            1,
+            "the latch predicate is evaluated exactly ONCE per admitted \
+             marker — telemetry reads the verdict off the insert instead of \
+             re-deriving it"
         );
     }
 
@@ -7644,9 +8013,15 @@ mod tests {
 
     // ── bsv-low #315: hopparty D1 storage (tm_hopparty / ls_hopparty) ─────
 
-    /// File a hopparty marker via the SHIPPED `hopparty_store_sql()` — the
-    /// exact production write, exact bind order. `txid` is the CONTAINER
-    /// (= the hop tx); the hop outpoint is `(txid, hop_vout)`.
+    /// File a hopparty marker through the REAL writer
+    /// (`hopparty_insert_query`) — the exact production SQL and bind list,
+    /// replayed against real SQLite. `txid` is the CONTAINER (= the hop tx);
+    /// the hop outpoint is `(txid, hop_vout)`.
+    ///
+    /// The marker fields are junk, so every row here latches
+    /// `markerValid = 0` — which is the point for the WINDOW cells below: a
+    /// refuted row must still be stored, served and ordered, never dropped.
+    /// The latch's own behaviour is pinned separately, on the frozen golden.
     #[allow(clippy::too_many_arguments)]
     fn insert_hopparty(
         conn: &rusqlite::Connection,
@@ -7658,30 +8033,107 @@ mod tests {
         on_chain_sats: Option<u64>,
         created_at: i64,
     ) {
-        let settle = format!("03{}", "c4".repeat(32));
         // The production write stamps `current_unix_seconds_i64()`; the
-        // test binds a controlled stamp in the SAME slot so ordering
+        // test passes a controlled stamp to the SAME parameter so ordering
         // assertions are deterministic (the SQL string is the shipped one).
+        exec_query(
+            conn,
+            hopparty_insert_query(
+                &HoppartyRecord {
+                    identity: identity.to_string(),
+                    opponent_identity: h64(0xbb),
+                    game_id: h64(0x11),
+                    hop_vout,
+                    hop_sats,
+                    seat_settle_pubkey: format!("03{}", "c4".repeat(32)),
+                    seat_sig_hex: "3045seat".into(),
+                    identity_sig_hex: "3045id".into(),
+                    hop_lock_hex: on_chain_sats.map(|_| format!("76a914{}88ac", "d4".repeat(20))),
+                    hop_sats_on_chain: on_chain_sats,
+                    container_outputs: 2,
+                    txid: container_txid.to_string(),
+                    output_index: marker_vout,
+                    created_at: 0, // ignored by the writer — the stamp wins
+                },
+                created_at,
+            )
+            .query(),
+        );
+    }
+
+    /// bsv-low #362, BEHAVIOURALLY on real SQLite: in `ls_hopparty hopsFor`
+    /// the latched verdict LEADS, and a refuted or legacy row is still
+    /// SERVED behind it.
+    ///
+    /// Driven through the REAL writer for the verified row (the frozen
+    /// client golden, so the `1` is earned by real signatures) and through
+    /// the same writer for the junk rows (which earn their `0`). The legacy
+    /// row is the golden, un-latched afterwards — the only honest way to
+    /// produce one, since the writer always latches.
+    #[test]
+    fn the_hopparty_window_leads_on_the_latched_verdict_and_hides_nothing() {
+        let conn = production_schema_db();
+        let golden = golden_hopparty_record("txVERIFIED", true);
+        let identity = golden.identity.clone();
+
+        // A LEGACY row, stamped OLDEST so it leads on every key but the
+        // verdict — and a fresh unknown hop, so it also wins the tier.
+        let mut legacy = golden_hopparty_record("txLEGACY", true);
+        legacy.hop_vout += 1;
+        exec_query(&conn, hopparty_insert_query(&legacy, 100).query());
         conn.execute(
-            hopparty_store_sql(),
-            rusqlite::params![
-                identity,
-                h64(0xbb), // opponentIdentity
-                h64(0x11), // gameId
-                hop_vout,
-                hop_sats as i64,
-                settle,
-                "3045seat",
-                "3045id",
-                on_chain_sats.map(|_| format!("76a914{}88ac", "d4".repeat(20))),
-                on_chain_sats.map(|v| v as i64),
-                2i64, // containerOutputs
-                container_txid,
-                marker_vout,
-                created_at
-            ],
+            "UPDATE hopparty_records SET markerValid = NULL WHERE txid = 'txLEGACY'",
+            [],
         )
-        .expect("hopparty_store_sql");
+        .unwrap();
+
+        // Three REFUTED rows, older than the verified one.
+        for i in 0..3u32 {
+            insert_hopparty(
+                &conn,
+                &identity,
+                &format!("txJUNK{i}"),
+                1,
+                i,
+                80_800,
+                Some(80_800),
+                200 + i as i64,
+            );
+        }
+
+        // …and the verified one, NEWEST.
+        exec_query(&conn, hopparty_insert_query(&golden, 9_000).query());
+
+        // The verdict is an ORDERING HINT here and is deliberately NOT on
+        // the `ls_hopparty` wire: this window's callers re-verify the
+        // signatures they are handed, exactly as before, so adding a
+        // server-asserted label would be a new claim nobody asked for. The
+        // ORDER is the observable, and it is what this cell measures.
+        let sql = hopparty_list_for_identity_sql();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(rusqlite::params![identity, 100u32, 10u32, 400u32], |r| {
+                r.get("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 5, "EVERY row is served — never a WHERE");
+        assert_eq!(
+            rows[0], "txVERIFIED",
+            "the verified row leads despite being the NEWEST — the verdict \
+             is genuinely the leading key: {rows:?}"
+        );
+        assert_eq!(
+            rows[1], "txLEGACY",
+            "…then the legacy tier, above the refuted rows: {rows:?}"
+        );
+        assert_eq!(
+            rows[2..].iter().filter(|t| t.starts_with("txJUNK")).count(),
+            3,
+            "…and every refuted row is LAST, and PRESENT: {rows:?}"
+        );
     }
 
     /// The SHIPPED hopparty insert + both list SQLs on the production
@@ -7874,6 +8326,42 @@ mod tests {
         assert!(
             sql.contains(&format!("rn <= {HOPSFOR_ROWS_PER_OUTPOINT}")),
             "bounded SUPERSET per outpoint, never rn = 1"
+        );
+        // ── bsv-low #362: the latched verdict LEADS, and filters nothing.
+        assert!(
+            sql.contains(&overlay_discovery::hopparty::validity::marker_rank_expr(
+                "hp."
+            )),
+            "the rank CASE is the overlay's shared expression, verbatim"
+        );
+        assert_eq!(
+            sql.matches("DENSE_RANK() OVER (ORDER BY outpointMarkerRank DESC, tier ASC, ")
+                .count(),
+            1,
+            "the page-allocating rank leads on the latched verdict"
+        );
+        assert_eq!(
+            sql.matches("ORDER BY outpointMarkerRank DESC, tier ASC")
+                .count(),
+            2,
+            "the DENSE_RANK's ordering and the served ORDER BY both lead on it"
+        );
+        assert!(
+            sql.contains(
+                "MAX(markerRank) OVER (PARTITION BY txid, hopVout) \
+                                  AS outpointMarkerRank"
+            ),
+            "the OUTPOINT aggregate is what keeps finalRank counting outpoints"
+        );
+        // NEVER A WHERE. Exactly the three this window has always had
+        // (identity scope, per-outpoint superset, page rank). Asserted as a
+        // COUNT rather than an absent-substring needle, which would be one
+        // whitespace or one alias wide (epoch Rule 12a).
+        assert_eq!(
+            sql.matches("WHERE ").count(),
+            3,
+            "identity scope, rn <= superset, finalRank <= page — a fourth \
+             WHERE (in ANY spelling) means somebody started HIDING rows"
         );
         // Every wire column reaches the OUTER select (decode-at-write means
         // the reader needs no second query).

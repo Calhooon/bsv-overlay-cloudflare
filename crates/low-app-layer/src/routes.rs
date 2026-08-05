@@ -1702,6 +1702,9 @@ struct HopsViewRowD1 {
     hop_sats_on_chain: Option<f64>,
     #[serde(rename = "containerOutputs")]
     container_outputs: f64,
+    /// The #362 latched verdict. `None` = the row predates the migration.
+    #[serde(rename = "markerValid", default)]
+    marker_valid: Option<f64>,
     spent: Option<f64>,
     #[serde(rename = "spendingTxid")]
     spending_txid: Option<String>,
@@ -1734,6 +1737,10 @@ impl HopsViewRowD1 {
             hop_lock_hex: self.hop_lock_hex.filter(|s| !s.is_empty()),
             hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
             container_outputs: self.container_outputs as u32,
+            // NULL stays NULL — "never evaluated" is a distinct answer from
+            // "refuted", and collapsing it here would relabel every legacy
+            // row as a refutation (#362).
+            marker_valid: self.marker_valid.map(|v| v != 0.0),
         }
     }
 }
@@ -1742,10 +1749,12 @@ impl HopsViewRowD1 {
 /// view (bsv-low #315, #252 stage 2b): every hop the identity has marked
 /// (`hopparty_records`), joined to the `tm_lowfund`-indexed hop outpoint
 /// for spent/unspent status (honesty pair; an un-indexed hop is `unknown`,
-/// never asserted-unspent) and labeled with the read-time
-/// `markerVerified` validity FILTER (seatSig + identitySig + the
-/// container's own hop lock AND value — filter-for-display, rows never
-/// dropped). Full trust model: `hops_view.rs` module docs.
+/// never asserted-unspent) and labeled with `markerVerified` — the verdict
+/// the OVERLAY latched at admission (seatSig + identitySig + the container's
+/// own hop lock AND value). **This route runs no cryptography** (bsv-low
+/// #362): it reads `hopparty_records.markerValid` and sorts by it. Labels
+/// are for display; rows are never dropped. Full trust model:
+/// `hops_view.rs` module docs.
 ///
 /// Optional `&gameId=<64-hex>` scopes the window to one game. It narrows
 /// the flood surface — a flood naming OTHER games is escaped completely —
@@ -1778,7 +1787,7 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
 
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
-            crate::hops_view::hops_view_body(&identity_lc, None, &[], false, false),
+            crate::hops_view::hops_view_body(&identity_lc, None, &[], false),
             200,
         );
     }
@@ -1817,11 +1826,11 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             }
         };
 
-    let (entries, truncated, budget_exhausted) = crate::hops_view::assemble_hops_view(rows);
+    let (entries, truncated) = crate::hops_view::assemble_hops_view(rows);
     // The tip AFTER the D1 facts (`null` on a fault — facts still serve).
     let tip = chaintracks_present_height(&ctx, "hops-view").await.ok();
     json_response(
-        crate::hops_view::hops_view_body(&identity_lc, tip, &entries, truncated, budget_exhausted),
+        crate::hops_view::hops_view_body(&identity_lc, tip, &entries, truncated),
         200,
     )
 }

@@ -154,6 +154,7 @@
 pub mod lookup_service;
 pub mod storage;
 pub mod topic_manager;
+pub mod validity;
 
 /// The domain tag the app stamps — 15 bytes of ASCII, the same length as
 /// the potparty tags. The byte layout is the cross-repo CONTRACT (bsv-low

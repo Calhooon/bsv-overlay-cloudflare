@@ -293,7 +293,10 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// nothing (Rule 9). Bump it consciously when adding a migration.
 /// 97 → 100 for #327 S8: `collected_markers_v2` + its data carry + its index.
 /// 100 → 101 on the #283 merge: the `potparty_records.sigValid` ADD COLUMN.
-pub const OVERLAY_MIGRATION_COUNT: usize = 101;
+/// 101 → 102 for #362: the `hopparty_records.markerValid` ADD COLUMN — the
+/// same latch generalised to hop markers, which is what retires
+/// `/hops-view`'s read-time ECDSA and its 150-row verify budget.
+pub const OVERLAY_MIGRATION_COUNT: usize = 102;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1034,6 +1037,53 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // this same statement itself (`low_app_layer::schema`) because it never
     // runs this list; the two are pinned byte-identical.
     "ALTER TABLE potparty_records ADD COLUMN sigValid INTEGER",
+    // ── #362 hopparty marker-validity latch (decode-once at admission) ────
+    // The #283 pattern, generalised to hop markers, and for a sharper
+    // reason: `/hops-view` was answering "does this marker verify?" at READ
+    // time — two ECDSA verifies plus a BRC-42 derivation plus a container
+    // re-check, PER ROW, PER REQUEST — behind a rationing constant
+    // (`HOPS_VIEW_VERIFY_BUDGET = 150`). A budget on a correctness check
+    // means the check is on the wrong side of the system (epoch Rule 25):
+    // reads scale with readers, admissions scale with writers, and under
+    // read-time verification a junk row an attacker files ONCE makes every
+    // honest reader pay the ECDSA to reject it, forever.
+    //
+    // `markerValid` is computed once by
+    // `overlay_discovery::hopparty::validity::record_marker_valid` at write
+    // time, from facts already in hand: 1 = the container's own output at
+    // hopVout pays exactly the claimed hopSats to P2PKH(seatSettlePubkey)
+    // AND both signatures verified; 0 = at least one bar failed; NULL = the
+    // row predates this migration and was never evaluated.
+    //
+    // ORDERING HINT ONLY, exactly as sigValid: admission stays
+    // byte-format-only, a 0-latched marker is still stored and still SERVED
+    // (labelled `markerVerified: "unverified"`), and `/hops-view` carries
+    // both signatures back so the client re-verifies. It is a LEADING SORT
+    // KEY and never a `WHERE` — hiding a row would recreate the
+    // invisible-money class (#358).
+    //
+    // What it buys that the read-time filter could not: verification now
+    // happens BEFORE paging, so the top tier requires a container that
+    // really pays the VICTIM'S OWN settle key. The previously-documented
+    // evictions (a reactive flood at hop value + 1; one coin CHAINED through
+    // k transactions at ~1.06x the hop in RECOVERABLE capital) no longer
+    // reach it — measured in low-app-layer's hops_view_sqlite cells.
+    //
+    // NULLABLE on purpose: a MIGRATION cannot backfill it, because SQL
+    // cannot verify a signature. And unlike potparty there is not even a
+    // republish that could re-latch a legacy row — a hopparty marker must
+    // ride the hop transaction, which is already on chain. **The legacy tier
+    // is PERMANENT until the re-latch pass (bsv-low#367) lands**, whose
+    // closure criterion is EVERY row's markerValid equalling
+    // `record_marker_valid` recomputed at the pass's own predicate version —
+    // never "zero rows with markerValid IS NULL", which structurally skips
+    // the 0s a transient predicate fault would have created (Rule 6/14).
+    //
+    // Additive ALTER — the runner ignores the re-run "duplicate column"
+    // error (`migration_error_is_benign`). NOTE the app-layer Worker issues
+    // this same statement itself (`low_app_layer::schema`) because it never
+    // runs this list; the two are pinned byte-identical (epoch Rule 24).
+    "ALTER TABLE hopparty_records ADD COLUMN markerValid INTEGER",
 ];
 
 // =============================================================================
@@ -1208,13 +1258,22 @@ mod tests {
                 "hopparty index missing: {idx}"
             );
         }
-        // No ALTER ever touches this table — first-migration-typed, and the
-        // append-only rule means it must stay that way.
-        assert!(
-            !OVERLAY_MIGRATIONS
-                .iter()
-                .any(|sql| sql.trim_start().starts_with("ALTER TABLE hopparty_records")),
-            "hopparty_records is typed from the FIRST migration — no ALTERs"
+        // Every WIRE field is typed from the first migration; the only ALTER
+        // this table ever takes is the #362 validity LATCH, which is a
+        // DERIVED verdict rather than a wire field and therefore could not
+        // have existed before the predicate did. Asserted as an exhaustive
+        // list, so a future ALTER that quietly re-types or re-shapes a wire
+        // column has to come here and say so.
+        let alters: Vec<&&str> = OVERLAY_MIGRATIONS
+            .iter()
+            .filter(|sql| sql.trim_start().starts_with("ALTER TABLE hopparty_records"))
+            .collect();
+        assert_eq!(
+            alters,
+            vec![&"ALTER TABLE hopparty_records ADD COLUMN markerValid INTEGER"],
+            "hopparty_records takes exactly ONE ALTER — the #362 markerValid \
+             latch, additive and NULLABLE (a pre-migration NULL must stay \
+             observable: it means 'never evaluated', not 'refuted')"
         );
     }
 
@@ -1343,7 +1402,10 @@ mod tests {
             .collect();
         assert_eq!(carries.len(), 2, "exactly two data-carry migrations");
         for (target, source) in [
-            ("result_markers_v2", "FROM result_markers WHERE txid IS NOT NULL"),
+            (
+                "result_markers_v2",
+                "FROM result_markers WHERE txid IS NOT NULL",
+            ),
             (
                 "collected_markers_v2",
                 "FROM collected_markers WHERE txid IS NOT NULL",

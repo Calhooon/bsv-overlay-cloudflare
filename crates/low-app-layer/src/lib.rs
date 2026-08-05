@@ -148,17 +148,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return cors::preflight();
     }
 
-    // bsv-low #283: this Worker never runs `OVERLAY_MIGRATIONS`, and the
-    // overlay applies them on ITS cold start — so a cold isolate here can
-    // reach `pp.sigValid` before any request has warmed the overlay, and
-    // every recovery query fails to prepare with `no such column`. One
-    // additive, idempotent statement, at most once per isolate, removes the
-    // whole ordering hazard. Never fails the request; see `schema`.
+    // bsv-low #283 / #362: this Worker never runs `OVERLAY_MIGRATIONS`, and
+    // the overlay applies them on ITS cold start — so a cold isolate here can
+    // reach `pp.sigValid` or `hp.markerValid` before any request has warmed
+    // the overlay, and those queries fail to prepare with `no such column`.
+    // One additive, idempotent statement per latch column, at most once per
+    // isolate, removes the whole ordering hazard. Never fails the request;
+    // see `schema`.
     //
     // The returned token is what `router` demands (gate round 2, MED-3):
     // deleting this line, or wrapping it in `if false`, is a BUILD failure —
-    // there is no other way to obtain a `SigValidColumnEnsured`.
-    let schema_ready = schema::ensure_sig_valid_column(&env).await;
+    // there is no other way to obtain a `LatchColumnsEnsured`.
+    let schema_ready = schema::ensure_latch_columns(&env).await;
 
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
     // middleware refusals return here; otherwise the request proceeds with
@@ -198,14 +199,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// `or_else_any_method` catch-alls (worker-rs' default no-match 404 is plain
 /// text, so both `/` and the wildcard are registered explicitly).
 ///
-/// `_schema` is a [`schema::SigValidColumnEnsured`] and is deliberately
-/// unused: it is a CAPABILITY, not data. Every route below reads
-/// `pp.sigValid`, and this parameter is what makes the schema catch-up
-/// impossible to skip without failing the build (gate round 2, MED-3 —
-/// see the `schema` module doc). Do not delete it to silence a lint.
+/// `_schema` is a [`schema::LatchColumnsEnsured`] and is deliberately
+/// unused: it is a CAPABILITY, not data. Routes below read `pp.sigValid`
+/// and `hp.markerValid`, and this parameter is what makes the schema
+/// catch-up impossible to skip without failing the build (gate round 2,
+/// MED-3 — see the `schema` module doc). Do not delete it to silence a lint.
 fn router(
     state: auth::AuthState,
-    _schema: schema::SigValidColumnEnsured,
+    _schema: schema::LatchColumnsEnsured,
 ) -> Router<'static, auth::AuthState> {
     Router::with_data(state)
         .get_async("/utxo-status", routes::utxo_status)
