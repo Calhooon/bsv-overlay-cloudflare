@@ -191,12 +191,21 @@ async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
     row.map(|r| r.c.max(0.0) as u64).unwrap_or(0)
 }
 
-/// Read the three persistent counters into a JSON object (missing ⇒ 0).
+/// Read the persistent counters into a JSON object (missing ⇒ 0).
+///
+/// The #366 census rows share `ops_counters` but are EXCLUDED here — they are
+/// served structured under `submitReadinessCensus` (see [`census_json`]), and
+/// reporting the same numbers twice under two shapes invites a reader to
+/// depend on the flat spelling this module never promised. (Safe filter: no
+/// `submit_census_` row existed before #366, so nothing a reader saw is
+/// removed.)
 async fn read_counters(db: &D1Database) -> serde_json::Value {
-    let rows: Vec<CounterRow> = Query::new("SELECT name, value FROM ops_counters")
-        .fetch_all(db)
-        .await
-        .unwrap_or_default();
+    let rows: Vec<CounterRow> = Query::new(
+        "SELECT name, value FROM ops_counters WHERE name NOT LIKE 'submit_census_%'",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
     let mut obj = json!({
         COUNTER_PROOFS_COMPLETED: 0,
         COUNTER_FETCH_FAILED: 0,
@@ -209,6 +218,90 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         obj[r.name] = json!(r.value.max(0.0) as u64);
     }
     obj
+}
+
+/// The #366 broadcast-gated readiness census, shaped for `/health/invariants`.
+///
+/// Reads the durable `submit_census_*` rows (written by the `/submit` route —
+/// `routes.rs`, `ProceedWithoutGate` arm; names owned by
+/// [`crate::submit_census`]) and serves them as monotonic totals per
+/// (mode, population, state) plus the global reason breakdown.
+///
+/// READER CONTRACT, stated in the body itself because the reader is a human
+/// with `curl` (or a poller diffing two reads):
+/// * "the last N" = the DELTA between two reads of these monotonic totals.
+/// * a window whose `observed` delta is 0 is NO EVIDENCE — it carries a
+///   streak, it never credits one (bsv-low #341's `None`-not-`0` posture).
+///   The flip criterion is "client `wouldHaveFailed` delta is 0 across a
+///   window whose client `observed` delta is MEANINGFULLY POSITIVE, and the
+///   `couldNotEvaluate` bucket is understood" — never "the endpoint read 0".
+/// * arrive-only residual: these count only submits the overlay SERVED. A
+///   client that could not reach the overlay at all is invisible here, and an
+///   overlay outage is exactly when the client is least ready — that slice
+///   stays with the client-side warn (bsv-low #351).
+pub async fn census_json(db: &D1Database) -> serde_json::Value {
+    let rows: Vec<CounterRow> =
+        Query::new("SELECT name, value FROM ops_counters WHERE name LIKE 'submit_census_%'")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+    let value_of = |name: &str| -> u64 {
+        rows.iter()
+            .find(|r| r.name == name)
+            .map(|r| r.value.max(0.0) as u64)
+            .unwrap_or(0)
+    };
+
+    // byMode.{mode}.{population} = {gatedReady, wouldHaveFailed,
+    // couldNotEvaluate, observed} — driven off the ONE table the writer uses
+    // (`CENSUS_STATE_COUNTERS`), so a name cannot drift between write and
+    // read. Accumulated in a plain map first (no panic-capable JSON indexing
+    // on a request path).
+    let mut cells: std::collections::BTreeMap<(&str, &str), (u64, u64, u64)> =
+        std::collections::BTreeMap::new();
+    for (name, mode, population, state) in crate::submit_census::CENSUS_STATE_COUNTERS {
+        let v = value_of(name);
+        let cell = cells.entry((mode, population)).or_insert((0, 0, 0));
+        match state {
+            "ready" => cell.0 += v,
+            "would_fail" => cell.1 += v,
+            _ => cell.2 += v,
+        }
+    }
+    let mut mode_maps: std::collections::BTreeMap<&str, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for ((mode, population), (ready, fail, uneval)) in cells {
+        mode_maps.entry(mode).or_default().insert(
+            population.to_string(),
+            json!({
+                "gatedReady": ready,
+                "wouldHaveFailed": fail,
+                "couldNotEvaluate": uneval,
+                "observed": ready + fail + uneval,
+            }),
+        );
+    }
+    let mut by_mode = serde_json::Map::new();
+    for (mode, populations) in mode_maps {
+        by_mode.insert(mode.to_string(), serde_json::Value::Object(populations));
+    }
+
+    let mut reasons = serde_json::Map::new();
+    for (name, key) in crate::submit_census::CENSUS_REASON_COUNTERS {
+        reasons.insert(key.to_string(), json!(value_of(name)));
+    }
+
+    json!({
+        // Rule 13: the three states are served distinctly; `couldNotEvaluate`
+        // is never folded into either decided state.
+        "byMode": serde_json::Value::Object(by_mode),
+        "wouldFailAndUnevalReasons": serde_json::Value::Object(reasons),
+        // Monotonic totals — durable across isolate recycling (D1), unlike
+        // the per-isolate submitAdmission soak counters.
+        "semantics": "monotonic totals; 'last N' is a delta between reads",
+        "emptyWindowRule": "an observed delta of 0 across a window is NO EVIDENCE — it carries the streak, it never credits it (bsv-low #341)",
+        "arriveOnlyResidual": "counts only submits the overlay SERVED; an unreachable overlay is exactly when the client is least ready — that slice stays with the client-side warn (bsv-low #351)",
+    })
 }
 
 /// `GET /health/invariants[?strict=1]` — the proof-completion liveness surface.
@@ -258,6 +351,7 @@ pub async fn health_invariants(
 
     let counters = read_counters(db).await;
     let flagged = count_flagged(db, now - PROOFLESS_FLAG_MS).await;
+    let census = census_json(db).await;
 
     let status = if strict && dead { 503 } else { 200 };
     let body = json!({
@@ -279,6 +373,10 @@ pub async fn health_invariants(
         // must reach ~0 before SUBMIT_ENFORCE is flipped to true. Per-isolate and
         // therefore lossy — a soak signal, never an audit log.
         "submitAdmission": crate::submit_gate::counters_json(),
+        // #366: would every honest CLIENT submit survive `broadcast-gated`?
+        // The flip-criterion instrument for #347 criterion 1 — durable D1
+        // totals, three states (Rule 13), reader contract in `census_json`.
+        "submitReadinessCensus": census,
     });
 
     let mut resp = Response::from_json(&body)?.with_status(status);

@@ -37,7 +37,7 @@ const MAX_BATCH_EF_BYTES: usize = 2 * 1024 * 1024;
 /// submission no longer makes the relevant quantity. A missing subject (already
 /// mined / not in batch) is 0 bytes → never over the subject cap. Evaluated
 /// BEFORE any ARC POST so an oversized batch never reaches the network.
-fn subject_ef_over_cap(efs: &[crate::ef::EfTx], subject_txid: &str) -> Option<usize> {
+pub(crate) fn subject_ef_over_cap(efs: &[crate::ef::EfTx], subject_txid: &str) -> Option<usize> {
     let subject_ef_bytes = efs
         .iter()
         .find(|e| e.txid == subject_txid)
@@ -433,6 +433,10 @@ pub async fn submit(
     // SUBMIT_ENFORCE (the Rule 6c rollout flag) and SUBMIT_OPERATOR_TOKEN
     // (deliberately NOT ADMIN_TOKEN — see `check_submit_operator_auth`).
     env: &Env,
+    // #366: durable home for the readiness-census counters (`ops_counters`
+    // rows, bumped in the background via `ctx.wait_until`). Measurement only —
+    // nothing on the admission path reads it.
+    ops_db: std::rc::Rc<worker::D1Database>,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -589,6 +593,38 @@ pub async fn submit(
                     path.as_str()
                 );
             }
+            // ── #366 broadcast-gated READINESS CENSUS — measurement ONLY. ──
+            // Runs strictly AFTER the admission decision and touches nothing
+            // it reads: no broadcast, no refusal, no change to any status
+            // code or admission outcome (delete this block and every request
+            // behaves byte-identically). Classifies whether THIS body would
+            // have survived the gated arm's pre-network structural checks —
+            // the number the #347 flip criterion needs and nothing measured
+            // (the client half is a console.warn nobody reads).
+            //
+            // RESIDUAL (named): this counts only submits that ARRIVE. An
+            // overlay outage is exactly when the client is least ready; that
+            // slice stays with the client-side warn (bsv-low #351).
+            let verdict = crate::submit_census::census_verdict(&tagged_beef.beef);
+            let (state_counter, reason_counter) =
+                crate::submit_census::census_counters(path, lenient_unbarred, verdict);
+            worker::console_log!(
+                "POST /submit census(#366): path={} population={} verdict={} → {}",
+                path.as_str(),
+                if lenient_unbarred { "client" } else { "operator" },
+                verdict.as_str(),
+                state_counter
+            );
+            // Durable bump in the BACKGROUND — measurement adds no caller
+            // latency and a D1 fault can only lose a count, never a submit
+            // (`bump_counter` logs and swallows its own errors).
+            let census_db = ops_db.clone();
+            ctx.wait_until(async move {
+                crate::ops::bump_counter(&census_db, state_counter, 1).await;
+                if let Some(reason) = reason_counter {
+                    crate::ops::bump_counter(&census_db, reason, 1).await;
+                }
+            });
         }
     }
 

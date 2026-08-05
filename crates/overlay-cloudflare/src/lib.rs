@@ -25,6 +25,7 @@ pub mod proof_fetcher;
 pub mod queue;
 pub mod relatch;
 pub mod routes;
+pub mod submit_census;
 pub mod submit_gate;
 pub mod wallet;
 
@@ -237,6 +238,8 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 taal_api_key,
                 &ctx,
                 &env,
+                // #366 readiness census — durable counters in ops_counters.
+                ops_db.clone(),
             )
             .await
         }

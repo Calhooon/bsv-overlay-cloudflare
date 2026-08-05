@@ -124,9 +124,13 @@ ci:
 # This repo has no CI pipeline — `make ci` run locally IS the gate — so a tier
 # outside `ci` is a tier nobody runs before push.
 #
-# Two workers: :8791 strict with extensions on (the main matrix), :8792 with
+# Three workers: :8791 strict with extensions on (the main matrix), :8792 with
 # ENABLE_EXTENSIONS=false (the kill switch, which was itself a HIGH defect —
-# it used to route callers OFF the network gate). No network is required: the
+# it used to route callers OFF the network gate), and :8793 LENIENT
+# (SUBMIT_ENFORCE unset) for the #366 census's CLIENT-population leg — the
+# unauthenticated-ungated submit that strict :8791 rightly refuses is exactly
+# the population the census (and the #347 flip criterion) measures, so it can
+# only be driven where it is SERVED. No network is required: the
 # public-path expectation asserts "never admitted, never 401", which holds as
 # 422 online and 502 offline, so this cannot flake.
 #
@@ -192,6 +196,7 @@ ci-route:
 	@set -e; \
 	strict_log=/tmp/lane347-route-strict.log; \
 	kill_log=/tmp/lane347-route-kill.log; \
+	lenient_log=/tmp/lane366-route-lenient.log; \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -230,7 +235,8 @@ ci-route:
 	}; \
 	preflight 8791; \
 	preflight 8792; \
-	owned_ports="8791 8792"; \
+	preflight 8793; \
+	owned_ports="8791 8792 8793"; \
 	wait_up() { \
 	  _port=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -266,9 +272,20 @@ ci-route:
 	) > "$$kill_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up 8792 "$$kill_log" "kill switch"; \
-	echo "→ both up"; \
+	echo "→ starting wrangler dev :8793 (lenient — #366 census client-population leg)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8793 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var ENABLE_EXTENSIONS:true \
+	) > "$$lenient_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up 8793 "$$lenient_log" "lenient"; \
+	echo "→ all three up"; \
 	KILL_SWITCH_BASE=http://127.0.0.1:8792 \
-	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791
+	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
+	CENSUS_LENIENT_BASE=http://127.0.0.1:8793 \
+	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:8791
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`
