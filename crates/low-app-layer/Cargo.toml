@@ -15,10 +15,18 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
 # BRC-103/104 middleware, the SAME major the low-watchtower pins — requires
-# `worker ^0.8`, so this crate moved off the sibling overlay-cloudflare's
-# 0.7.5 (the two crates build independently; worker-build for THIS crate is
-# ^0.8, see wrangler.toml [build]). Only `d1` is needed: this worker is a
-# pure READ surface (no queues, no durable objects).
+# `worker ^0.8`. Only `d1` is needed: this worker is a pure READ surface (no
+# queues, no durable objects).
+#
+# #318 originally left the sibling `overlay-cloudflare` on worker 0.7.5 with
+# the note "the two crates build independently". THAT WAS FALSE and it cost a
+# month of undeployability (bsv-low #348): `worker-build` reads the WORKSPACE
+# Cargo.lock, and its per-crate disambiguation is dead code (off-by-one in
+# `Lockfile::get_package_version`, 0.7.5 → 0.8.5), so it takes the LOWEST
+# `worker` in the lock regardless of which crate it was invoked from. Plain
+# `cargo build` is fine with two majors, which is exactly why `make ci` stayed
+# green over an undeployable worker. THE WORKSPACE MAY HOLD EXACTLY ONE
+# `worker` VERSION — it is now 0.8 everywhere. Do not reintroduce a second.
 worker = { version = "0.8", features = ["d1"] }
 # BRC-103/104 mutual-auth front door (bsv-low #318) — the canonical public
 # middleware, pinned from crates.io at the same major the tower pins

@@ -5,11 +5,19 @@ compatibility_date = "2024-12-01"
 account_id = "<your-cloudflare-account-id>"
 
 [build]
-# Pin worker-build to ^0.7 — newer 0.8+ requires worker crate ≥0.8 but the
-# project pins worker 0.7.5. Without the version pin, `cargo install` grabs
-# the latest worker-build and the build fails with "Unsupported version
-# worker@0.7.5, expected at least worker@0.8.0".
-command = "cargo install -q --version ^0.7 worker-build && worker-build --release"
+# worker-build ^0.8 — MUST track the `worker` crate major/minor this workspace
+# resolves (bsv-low #348). worker-build's version gate reads the WORKSPACE
+# Cargo.lock, not this crate's resolved graph, and its per-crate disambiguation
+# is broken (an off-by-one in `Lockfile::get_package_version`, present in 0.7.5
+# through 0.8.5, makes the root-package branch unreachable for the name
+# `worker`), so it falls back to "first `worker` entry in the lock" — i.e. the
+# LOWEST version present anywhere in the workspace. That is why this repo can
+# hold exactly ONE `worker` version: until #348 it held two (0.7.5 here, 0.8.5
+# in low-app-layer) and `low-app-layer` was undeployable for a month while
+# `make ci` stayed green. Keep this pin, the `worker` dep, and
+# crates/low-app-layer/wrangler.toml's pin moving together — `make ci-deploy`
+# is the check that fails if they drift.
+command = "cargo install -q --version ^0.8 worker-build && worker-build --release"
 
 [[d1_databases]]
 binding = "OVERLAY_DB"

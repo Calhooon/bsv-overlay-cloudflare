@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy \
         wrangler-dev harness test extensions-build e2e-bsv-storage clean help
 
 help:
@@ -17,8 +17,9 @@ help:
 	@echo "  wrangler-dev     wrangler dev in parity mode (:8787) — run in a separate shell"
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test --workspace with memory-storage feature"
-	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-route"
+	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ci-route         Route-level /submit admission cells (part of ci; needs :8791/:8792)"
+	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -106,6 +107,7 @@ ci:
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
 	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
 	cargo build -p low-app-layer --target wasm32-unknown-unknown --release; \
+	$(MAKE) ci-deploy; \
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
 
@@ -267,6 +269,102 @@ ci-route:
 	echo "→ both up"; \
 	KILL_SWITCH_BASE=http://127.0.0.1:8792 \
 	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791
+
+# DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
+# whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`
+# was green every single day.
+#
+# The gap is structural, not an oversight. `cargo build --target wasm32` is
+# perfectly happy with two `worker` majors in one workspace. `worker-build` —
+# which runs ONLY at deploy time — is not: it resolves `worker` from the
+# WORKSPACE Cargo.lock and takes the LOWEST version present, because its
+# per-crate disambiguation is dead code (off-by-one in
+# `Lockfile::get_package_version`, `dep.chars().nth(package.len() + 1)` where
+# the space is at `package.len()`; verified present in worker-build 0.7.5,
+# 0.8.4 and 0.8.5). So the crate wanting the higher version simply cannot be
+# built for deploy, and NOTHING inside the gate could see it. A build that only
+# the deploy tool can fail, with no deploy step in the gate, has coverage
+# "none" — Rule 22's corollary. This target is the missing step.
+#
+# It runs the REAL thing: `wrangler deploy --dry-run` executes each config's
+# own `[build]` command (`cargo install --version ^N worker-build &&
+# worker-build --release`) and then bundles the shim, stopping only short of
+# upload. A hand-rolled `cargo build` substitute would reproduce exactly the
+# blind spot being closed, and a bare `worker-build` would not read the
+# wrangler configs — where the toolchain pin actually lives.
+#
+# ALL THREE deployable configs, not one per crate. `wrangler.toml` and
+# `wrangler.low.toml` share the overlay crate but carry SEPARATE pins, and
+# `low-overlay` is a live production worker: a pin that drifts in only one file
+# is precisely this bug's mirror image. The second overlay build is a warm
+# rebuild (~11s), which is cheap enough that "same crate" is not a reason to
+# skip a live config.
+#
+# MEASURED COST (M-series, warm cargo + wasm-opt/esbuild already downloaded):
+#   overlay wrangler.toml      12.5s
+#   overlay wrangler.low.toml  11.4s
+#   low-app-layer              4.2s
+#   total                      ~28s
+# Cold (first run on a machine) adds a one-off worker-build install (~55s) plus
+# wasm-opt/esbuild downloads. Against `ci-route`'s measured 1m46s worker
+# startup this is not the expensive part of the gate, so it goes IN `ci`.
+#
+# NETWORK: needs `npx wrangler` and, on a cold machine, the wasm-opt/esbuild
+# downloads — the same dependency `ci-route` already puts in the gate. It does
+# NOT need Cloudflare credentials; `--dry-run` never authenticates, and the
+# configs' account/database ids are committed placeholders.
+#
+# The plain `cargo build --target wasm32` steps in `ci` are kept even though
+# this target recompiles the same crates: they share the cargo cache (so they
+# cost ~0 here) and they give a clean compile error with no toolchain-install
+# or npx noise in front of it — and they are the only wasm coverage that
+# survives if this target ever has to be skipped offline.
+DEPLOY_CONFIGS ?= crates/overlay-cloudflare:wrangler.toml \
+                  crates/overlay-cloudflare:wrangler.low.toml \
+                  crates/low-app-layer:wrangler.toml
+ci-deploy:
+	@set -e; \
+	vers=$$(awk '/^name = "worker"$$/{getline; gsub(/[^0-9.]/,"",$$0); print}' Cargo.lock | sort -u); \
+	nv=$$(printf '%s\n' "$$vers" | sed '/^$$/d' | wc -l | tr -d ' '); \
+	if [ "$$nv" != "1" ]; then \
+	  echo "✗ ci-deploy: Cargo.lock holds $$nv \`worker\` versions —" $$vers; \
+	  echo "  worker-build takes the LOWEST one for EVERY crate in the workspace,"; \
+	  echo "  so any crate needing a higher one is undeployable (bsv-low #348)."; \
+	  echo "  The workspace may hold exactly ONE \`worker\` version."; \
+	  exit 1; \
+	fi; \
+	pins=$$(sed -n 's/^command = .*--version \^\([0-9][0-9.]*\) worker-build.*/\1/p' \
+	    crates/overlay-cloudflare/wrangler.toml \
+	    crates/overlay-cloudflare/wrangler.low.toml \
+	    crates/low-app-layer/wrangler.toml | sort -u); \
+	np=$$(printf '%s\n' "$$pins" | sed '/^$$/d' | wc -l | tr -d ' '); \
+	if [ "$$np" != "1" ]; then \
+	  echo "✗ ci-deploy: the wrangler [build] worker-build pins disagree —" $$pins; \
+	  echo "  every deployable config builds from the SAME workspace lock, so the"; \
+	  echo "  pins must match each other and the lock's worker $$vers."; \
+	  exit 1; \
+	fi; \
+	echo "→ ci-deploy preflight ok: worker $$vers, worker-build ^$$pins, 3 configs"; \
+	out=$$(mktemp -d /tmp/ci-deploy.XXXXXX); \
+	trap 'rm -rf "$$out"' EXIT; \
+	for cfg in $(DEPLOY_CONFIGS); do \
+	  d=$${cfg%%:*}; f=$${cfg##*:}; \
+	  printf '→ deploy dry-run %s/%s … ' "$$d" "$$f"; \
+	  if ( cd "$$d" && npx wrangler deploy --config "$$f" --dry-run \
+	         --outdir "$$out/bundle" ) > "$$out/log" 2>&1; then \
+	    echo "ok"; \
+	  else \
+	    echo "FAILED"; \
+	    echo "✗ ci-deploy: $$d/$$f does not build for DEPLOY. Nothing else in"; \
+	    echo "  'make ci' can see this class — do not work around it by skipping"; \
+	    echo "  this target. Full wrangler/worker-build output:"; \
+	    echo "  ──────── $$d/$$f ────────"; \
+	    cat "$$out/log"; \
+	    echo "  ────────────────────────"; \
+	    exit 1; \
+	  fi; \
+	done; \
+	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build"
 
 extensions-build:
 	cargo build -p bsv-overlay-cloudflare --features extensions

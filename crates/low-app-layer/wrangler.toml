@@ -25,8 +25,13 @@ compatibility_date = "2024-12-01"
 
 [build]
 # worker-build ^0.8 — this crate pins worker 0.8 (required by
-# bsv-middleware-cloudflare 0.3, the canonical BRC-103/104 middleware; the
-# sibling overlay-cloudflare stays on worker 0.7.5 / worker-build ^0.7).
+# bsv-middleware-cloudflare 0.3, the canonical BRC-103/104 middleware). Since
+# bsv-low #348 the WHOLE workspace is on worker 0.8, and it has to be:
+# worker-build's version gate reads the workspace Cargo.lock and picks the
+# lowest `worker` in it, so a second major anywhere in the workspace makes
+# whichever crate wants the higher one silently undeployable (only at deploy
+# time — `cargo build` does not care). Keep this pin in lockstep with
+# ../overlay-cloudflare/wrangler.toml and wrangler.low.toml.
 command = "cargo install -q --version ^0.8 worker-build && worker-build --release"
 
 # #318 — the lenient→strict enforcement flip. "false" (or unset) = LENIENT:

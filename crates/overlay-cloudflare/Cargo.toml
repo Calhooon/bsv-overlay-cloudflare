@@ -19,7 +19,14 @@ crate-type = ["cdylib", "rlib"]
 overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 bsv-rs = { workspace = true, features = ["wasm"] }
-bsv-middleware-cloudflare = "0.1"
+# 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
+# compatible with `worker 0.8` — and it is the SAME major the low-watchtower
+# and low-app-layer already pin, so the fleet is now on one middleware lineage
+# (the documented lineage trap: a stale pin is how the relay once stranded
+# itself on 0.2.0). This crate uses exactly two items from it —
+# `init_panic_hook()` and `WorkerStorageClient` — and both are unchanged
+# across the bump: 0.1 → 0.3 needed ZERO source edits here.
+bsv-middleware-cloudflare = "0.3"
 async-trait.workspace = true
 base64 = "0.22"
 hex.workspace = true
@@ -27,7 +34,20 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-worker = { version = "0.7", features = ["d1", "queue"] }
+# 0.8 (bsv-low #348, was 0.7). NOT a preference — a hard constraint of the
+# deploy toolchain: `worker-build` resolves `worker` from the WORKSPACE
+# Cargo.lock and takes the LOWEST version it finds there (its per-crate
+# disambiguation is dead code, an off-by-one in
+# `Lockfile::get_package_version` present from 0.7.5 through 0.8.5). So while
+# this crate sat on 0.7 the sibling `low-app-layer` — which needs 0.8 — could
+# not be deployed AT ALL, for a month, with `make ci` green the whole time.
+# THE WORKSPACE MAY HOLD EXACTLY ONE `worker` VERSION. If a crate here ever
+# needs a different one, it has to leave the workspace *and* stop depending on
+# anything in it (a path dev-dep drags the other version back into the lock).
+# 0.7 → 0.8 needed no source changes: the delta over the surface this crate
+# uses (console_log, Result, Fetch/Request/Headers/Env, D1, queue, scheduled)
+# is additive plus an internal JsFuture re-export move.
+worker = { version = "0.8", features = ["d1", "queue"] }
 js-sys = "0.3"
 
 [dev-dependencies]

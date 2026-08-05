@@ -196,29 +196,6 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4deac7298eb107a4d3e66666e28120f68cae157f16810f83d64dcbc174f20e7d"
-dependencies = [
- "async-trait",
- "base64",
- "bsv-rs",
- "console_error_panic_hook",
- "futures",
- "getrandom 0.2.17",
- "hex",
- "js-sys",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "worker 0.7.5",
-]
-
-[[package]]
-name = "bsv-middleware-cloudflare"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80b15850bc73d9f66d703b54ae6304f272ea4edf45e6544d8dff2dfa5e59d981"
@@ -237,7 +214,7 @@ dependencies = [
  "thiserror 1.0.69",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "worker 0.8.5",
+ "worker",
 ]
 
 [[package]]
@@ -246,7 +223,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "bsv-middleware-cloudflare 0.1.2",
+ "bsv-middleware-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "bsv-rs",
@@ -258,7 +235,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "worker 0.7.5",
+ "worker",
 ]
 
 [[package]]
@@ -1284,7 +1261,7 @@ name = "low-app-layer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bsv-middleware-cloudflare 0.3.2",
+ "bsv-middleware-cloudflare",
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
  "bsv-rs",
@@ -1295,7 +1272,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "worker 0.8.5",
+ "worker",
 ]
 
 [[package]]
@@ -2711,19 +2688,6 @@ dependencies = [
 
 [[package]]
 name = "wasm-streams"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "wasm-streams"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7d3be8814f5ba5f074491a469eed3d73c273ffad955f25ed1635efac4b0d269"
@@ -3072,36 +3036,6 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7267f3baa986254a8dace6f6a7c6ab88aef59f00c03aaad6749e048b5faaf6f6"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures-channel",
- "futures-util",
- "http",
- "http-body",
- "js-sys",
- "matchit",
- "pin-project",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "serde_urlencoded",
- "tokio",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams 0.5.0",
- "web-sys",
- "worker-macros 0.7.5",
- "worker-sys 0.7.5",
-]
-
-[[package]]
-name = "worker"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f8adbf6c9ae45b665dee995c5e3a342c2bd7d58a2e8ca5c75b50ce8b1b8bfd9"
@@ -3125,26 +3059,10 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.6.0",
+ "wasm-streams",
  "web-sys",
- "worker-macros 0.8.5",
- "worker-sys 0.8.5",
-]
-
-[[package]]
-name = "worker-macros"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7410081121531ec2fa111ab17b911efc601d7b6d590c0a92b847874ebeff0030"
-dependencies = [
- "async-trait",
- "proc-macro2",
- "quote",
- "syn",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-macro-support",
- "worker-sys 0.7.5",
+ "worker-macros",
+ "worker-sys",
 ]
 
 [[package]]
@@ -3160,19 +3078,7 @@ dependencies = [
  "syn",
  "wasm-bindgen",
  "wasm-bindgen-macro-support",
- "worker-sys 0.8.5",
-]
-
-[[package]]
-name = "worker-sys"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4777582bf8a04174a034cb336f3702eb0e5cb444a67fdaa4fd44454ff7e2dd95"
-dependencies = [
- "cfg-if",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
+ "worker-sys",
 ]
 
 [[package]]
