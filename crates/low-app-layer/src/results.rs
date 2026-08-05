@@ -318,7 +318,14 @@ pub fn verified_beef_block_height(
 
 /// The frozen seatSig domain tag — MUST equal the client's
 /// `potParty.ts::POTPARTY_SEATSIG_DOMAIN` byte-for-byte.
-pub const POTPARTY_SEATSIG_DOMAIN: &[u8] = b"LOW/potparty/v2/seatsig|";
+///
+/// Re-exported from `overlay-discovery`, which is where the potparty
+/// signature rules now live so the OVERLAY's admission-time `sigValid` latch
+/// (bsv-low #283) and THIS crate's read-time bars are literally the same
+/// code. Two copies of a signature rule across a crate boundary is a
+/// boundary with no pin (epoch Rule 16), and a drift between them would let
+/// the latch rank an honest marker last.
+pub use overlay_discovery::potparty::validity::POTPARTY_SEATSIG_DOMAIN;
 
 /// One raw v2 potparty marker row (from `potparty_records`), NOT yet
 /// verified — [`verify_seat_marker`] + [`verify_identity_binding`] (both
@@ -360,25 +367,20 @@ pub struct SeatMarkerRow {
 /// `seatSig` is ECDSA over a SINGLE sha256 of these bytes (the BRC-100
 /// `createSignature({data})` hash). `None` when any hex field is malformed —
 /// an unbuildable preimage can never verify (fail-safe).
+/// Hex wrapper over the shared `overlay-discovery` preimage builder — this
+/// crate holds hex strings, the shared rule holds bytes.
 pub fn seatsig_preimage(
     game_id_hex: &str,
     pot_txid_hex: &str,
     pot_vout: u32,
     identity_hex: &str,
 ) -> Option<Vec<u8>> {
-    let game_id = hex::decode(game_id_hex).ok()?;
-    let pot_txid = hex::decode(pot_txid_hex).ok()?;
-    let identity = hex::decode(identity_hex).ok()?;
-    if game_id.len() != 32 || pot_txid.len() != 32 || identity.len() != 33 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(POTPARTY_SEATSIG_DOMAIN.len() + 32 + 32 + 4 + 33);
-    out.extend_from_slice(POTPARTY_SEATSIG_DOMAIN);
-    out.extend_from_slice(&game_id);
-    out.extend_from_slice(&pot_txid);
-    out.extend_from_slice(&pot_vout.to_le_bytes());
-    out.extend_from_slice(&identity);
-    Some(out)
+    overlay_discovery::potparty::validity::seatsig_preimage(
+        &hex::decode(game_id_hex).ok()?,
+        &hex::decode(pot_txid_hex).ok()?,
+        pot_vout,
+        &hex::decode(identity_hex).ok()?,
+    )
 }
 
 /// Verify one v2 marker's SEAT signature: plain secp256k1 ECDSA under the
@@ -386,39 +388,26 @@ pub fn seatsig_preimage(
 /// derivation is needed (or possible) server-side — the settle key attests
 /// its own identity binding, and lock membership is checked separately by
 /// [`attribute_seats`]. Any malformed key/sig/field is `false` (refused).
+/// CANONICAL STRICT DER (Rule 4c) is enforced inside the shared rule:
+/// `from_der` tolerates trailing bytes, so the encoding is re-derived and
+/// byte-compared. Without it an observer mints unlimited distinct "valid"
+/// rows from one honest marker by padding it — which since #283 would be a
+/// way to fill a window with `sigValid = 1` rows.
+/// `der_padding_is_refused_canonical_strict` pins it here;
+/// `der_padded_seat_signature_does_not_latch_valid` pins it at the latch.
 pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
-    let Some(preimage) = seatsig_preimage(
-        &m.game_id.to_ascii_lowercase(),
-        &m.pot_txid.to_ascii_lowercase(),
-        m.pot_vout,
-        &m.identity.to_ascii_lowercase(),
+    let (Ok(game_id), Ok(pot_txid), Ok(identity), Ok(settle_pk), Ok(seat_sig)) = (
+        hex::decode(m.game_id.to_ascii_lowercase()),
+        hex::decode(m.pot_txid.to_ascii_lowercase()),
+        hex::decode(m.identity.to_ascii_lowercase()),
+        hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()),
+        hex::decode(m.seat_sig_hex.to_ascii_lowercase()),
     ) else {
         return false;
     };
-    let Ok(pubkey) = bsv_rs::primitives::ec::PublicKey::from_hex(&m.seat_settle_pubkey) else {
-        return false;
-    };
-    let Ok(sig_bytes) = hex::decode(&m.seat_sig_hex) else {
-        return false;
-    };
-    let Ok(sig) = bsv_rs::primitives::ec::Signature::from_der(&sig_bytes) else {
-        return false;
-    };
-    // CANONICAL STRICT DER (Rule 4c): re-encode and demand byte-equality.
-    // `from_der` tolerates trailing bytes, so without this an observer can
-    // mint unlimited distinct "valid" seat-marker signatures from one honest
-    // marker by padding it — turning any future cap, dedupe or set keyed on
-    // marker signature bytes into a cost multiplier. There is no such key
-    // today; closing it now is one line and costs an honest marker nothing
-    // (the client's wallet emits canonical DER, pinned by
-    // `golden_client_v2_marker_verifies_server_side`). Low-S is already
-    // enforced by `verify` — `der_padding_is_refused_canonical_strict` pins
-    // both legs.
-    if sig.to_der() != sig_bytes {
-        return false;
-    }
-    let hash = bsv_rs::primitives::hash::sha256(&preimage);
-    pubkey.verify(&hash, &sig)
+    overlay_discovery::potparty::validity::verify_seat_sig(
+        &game_id, &pot_txid, m.pot_vout, &identity, &settle_pk, &seat_sig,
+    )
 }
 
 /// The BRC-43 protocol potparty markers sign their IDENTITY challenge under
@@ -433,38 +422,22 @@ pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
 ///    by the ledgered decision-3 (the version tag inside the challenge is the
 ///    domain separator), so `/hops-view` verifies under the SAME constant
 ///    rather than a second spelling that could drift.
-pub fn potparty_protocol() -> bsv_rs::wallet::Protocol {
-    bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty")
-}
+pub use overlay_discovery::potparty::validity::potparty_protocol;
 
 /// The EXACT v2 IDENTITY-signature challenge — byte-identical to the
 /// client's `potPartyV2Challenge`: the v2 tag + every field (incl.
 /// `seatSettlePubkey`), all raw bytes, u32s little-endian. `None` when any
 /// hex field is malformed (an unbuildable challenge can never verify).
 pub fn potparty_v2_challenge(m: &SeatMarkerRow) -> Option<Vec<u8>> {
-    let identity = hex::decode(m.identity.to_ascii_lowercase()).ok()?;
-    let opponent = hex::decode(m.opponent_identity.to_ascii_lowercase()).ok()?;
-    let game_id = hex::decode(m.game_id.to_ascii_lowercase()).ok()?;
-    let pot_txid = hex::decode(m.pot_txid.to_ascii_lowercase()).ok()?;
-    let settle_pk = hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()).ok()?;
-    if identity.len() != 33
-        || opponent.len() != 33
-        || game_id.len() != 32
-        || pot_txid.len() != 32
-        || settle_pk.len() != 33
-    {
-        return None;
-    }
-    let mut out = Vec::with_capacity(15 + 33 + 33 + 32 + 32 + 4 + 4 + 33);
-    out.extend_from_slice(b"LOW/potparty/v2");
-    out.extend_from_slice(&identity);
-    out.extend_from_slice(&opponent);
-    out.extend_from_slice(&game_id);
-    out.extend_from_slice(&pot_txid);
-    out.extend_from_slice(&m.pot_vout.to_le_bytes());
-    out.extend_from_slice(&m.recovery_height.to_le_bytes());
-    out.extend_from_slice(&settle_pk);
-    Some(out)
+    overlay_discovery::potparty::validity::potparty_v2_challenge(
+        &hex::decode(m.identity.to_ascii_lowercase()).ok()?,
+        &hex::decode(m.opponent_identity.to_ascii_lowercase()).ok()?,
+        &hex::decode(m.game_id.to_ascii_lowercase()).ok()?,
+        &hex::decode(m.pot_txid.to_ascii_lowercase()).ok()?,
+        m.pot_vout,
+        m.recovery_height,
+        &hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()).ok()?,
+    )
 }
 
 /// Verify the marker's IDENTITY signature: the claimed `identity` really
