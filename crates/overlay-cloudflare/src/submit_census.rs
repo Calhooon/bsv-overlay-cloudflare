@@ -90,9 +90,14 @@
 //! ## Where the count lives, and its trust posture
 //!
 //! Durable name-keyed rows in the existing `ops_counters` table (additive
-//! upsert via [`crate::ops::bump_counter`] — no schema migration), written in
-//! the BACKGROUND (`ctx.wait_until`) so measurement adds no caller latency,
-//! and read on `GET /health/invariants` as `submitReadinessCensus`. Counters
+//! upsert via [`crate::ops::bump_counter`] — no schema migration). Cost
+//! split, stated precisely (gate LOW-1): the CLASSIFICATION
+//! ([`census_verdict`]) runs SYNCHRONOUSLY on every ungated submit — roughly
+//! two `Beef::from_binary` parses, the subject's `to_ef` conversions and an
+//! ancestor-closure BFS, all bounded by [`MAX_CENSUS_EVAL_BYTES`] — while
+//! only the durable D1 WRITE is backgrounded (`ctx.wait_until`), so the
+//! write adds no caller latency. Read on `GET /health/invariants` as
+//! `submitReadinessCensus`. Counters
 //! are MONOTONIC TOTALS: "the last N" is a delta between two reads, and an
 //! observation window whose `observed` delta is 0 is NO EVIDENCE — it carries
 //! a streak, it never credits one (the bsv-low #341

@@ -612,10 +612,14 @@ pub async fn submit(
                 verdict.as_str(),
                 state_counter
             );
-            // Durable bump in the BACKGROUND — measurement adds no caller
-            // latency and a D1 fault can only lose a count, never a submit
-            // (`bump_counter` logs and swallows its own errors; a missing
-            // binding logs and loses the count, never the request).
+            // Precisely (gate LOW-1): the CLASSIFICATION above is SYNCHRONOUS
+            // on every ungated submit — ~2 `Beef::from_binary` parses, the
+            // subject's EF conversions and an ancestry BFS, all bounded by
+            // `MAX_CENSUS_EVAL_BYTES` — and only the durable D1 WRITE below
+            // is backgrounded (`ctx.wait_until`). A D1 fault can only lose a
+            // count, never a submit (`bump_counter` logs and swallows its own
+            // errors; a missing binding logs and loses the count, never the
+            // request).
             match env.d1("OVERLAY_DB") {
                 Ok(census_db) => ctx.wait_until(async move {
                     crate::ops::bump_counter(&census_db, state_counter, 1).await;
