@@ -54,8 +54,10 @@ bsv-overlay-cloudflare/
 ## Dependencies
 
 - `bsv-rs` — BSV SDK for Rust (crates.io, `overlay` feature)
-- `bsv-middleware-cloudflare` — BRC-31 authentication middleware for CF Workers (crates.io)
-- `worker` — Cloudflare Workers Rust SDK
+- `bsv-middleware-cloudflare` — BRC-103/104 auth middleware for CF Workers (crates.io), pinned `0.3` — the same lineage the low-watchtower and low-app-layer pin
+- `worker` — Cloudflare Workers Rust SDK, pinned `0.8`
+
+**THE WORKSPACE MAY HOLD EXACTLY ONE `worker` VERSION** (bsv-low #348). `worker-build` — which runs only at DEPLOY time — resolves `worker` from the *workspace* `Cargo.lock` and takes the LOWEST version it finds there, for every crate, regardless of which crate directory it was invoked from; its per-crate disambiguation is dead code (off-by-one in `Lockfile::get_package_version`, verified in worker-build 0.7.5 / 0.8.4 / 0.8.5). Plain `cargo build` is perfectly happy with two majors, so a split is invisible to every native gate: `low-app-layer` sat undeployable for a month with `make ci` green throughout. If a crate ever needs a different `worker`, it must leave the workspace *and* stop depending on anything in it — a path dev-dep drags the other version straight back into the lock. `make ci-deploy` (part of `make ci`) is what enforces this: a lock/pin preflight plus a real `wrangler deploy --dry-run` of all three deployable configs.
 
 ## HTTP route set
 
@@ -123,6 +125,8 @@ wrangler secret put TAAL_API_KEY   # optional — enables /arc-ingest
 cd crates/overlay-cloudflare
 CLOUDFLARE_API_TOKEN="<token>" CLOUDFLARE_ACCOUNT_ID="<id>" wrangler deploy
 ```
+
+**Three deployable configs**, all built from the one workspace lock: `crates/overlay-cloudflare/wrangler.toml` (`bsv-overlay-cloudflare`), `crates/overlay-cloudflare/wrangler.low.toml` (`low-overlay`, LIVE — `wrangler deploy --config wrangler.low.toml`), and `crates/low-app-layer/wrangler.toml` (`low-app-layer`). Their `[build]` worker-build pins must all match each other and the lock's `worker`; `make ci-deploy` builds all three and refuses on drift. **A green `make ci` without `ci-deploy` is not evidence a worker can be deployed** — that gap is exactly bsv-low #348.
 
 - **Admin auth**: Bearer token on all `/admin/*` routes except `/admin/config`.
 - **Cron**: `*/15 * * * *` for ad sync + GASP peer sync.
