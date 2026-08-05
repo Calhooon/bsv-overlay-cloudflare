@@ -1424,7 +1424,8 @@ fn a_legacy_row_is_served_labelled_unknown_and_ranks_between_the_two_verdicts() 
 /// DEPLOY DAY, measured: when EVERY row is legacy the ordering is exactly
 /// what it was before the migration — the rank is constant, so every key
 /// below it decides, unchanged. The latch cannot make a pre-existing page
-/// worse; it can only fail to make it better (which is what #367 fixes).
+/// worse; it can only fail to make it better (which is what the #367
+/// re-latch sweep, `bsv_overlay_cloudflare::relatch`, retires row by row).
 #[test]
 fn an_all_legacy_table_orders_exactly_as_it_did_before_the_latch() {
     let conn = production_schema_db();
@@ -1441,9 +1442,11 @@ fn an_all_legacy_table_orders_exactly_as_it_did_before_the_latch() {
     assert!(
         !entries.iter().any(|e| e.hop_txid == honest_txid),
         "PRE-#362 BEHAVIOUR, unchanged: a value+1 reactive flood evicts when \
-         nothing is latched. This is the state #367 exists to retire, and it \
-         is PERMANENT until that pass runs — no republish can re-latch a \
-         marker whose transaction is already on chain."
+         nothing is latched. This is the state the #367 re-latch sweep \
+         exists to retire, and NOTHING ELSE can — no republish can re-latch \
+         a marker whose transaction is already on chain. The sweep is bounded \
+         per tick, so this remains the behaviour for any row it has not \
+         reached yet."
     );
     assert!(truncated);
     assert!(

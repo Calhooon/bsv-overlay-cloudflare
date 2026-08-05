@@ -23,6 +23,7 @@ pub mod ops;
 pub mod peer_crawler;
 pub mod proof_fetcher;
 pub mod queue;
+pub mod relatch;
 pub mod routes;
 pub mod submit_gate;
 pub mod wallet;
@@ -1251,6 +1252,19 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         backfill_summary.missing_beef,
     );
 
+    // 4b. The RE-LATCH fixpoint over the two admission-latched verdict columns
+    //     (bsv-low #355 potparty.sigValid + #367 hopparty.markerValid). Pure
+    //     re-reads of our own rows — no courier, no tracker, no BEEF parse —
+    //     and a bounded page per table per tick. This is the ONLY repair path
+    //     either column has: a hopparty marker rides a transaction already on
+    //     chain, so no republish can ever re-latch it, and a row a transient
+    //     predicate fault latched 0 sorts below even the legacy tier forever.
+    //     `changed`/`demoted` in the log lines are the regression detector.
+    let (pp_relatch, hp_relatch) =
+        crate::relatch::run_relatch(ops_db.clone(), crate::relatch::RELATCH_PAGE_LIMIT).await;
+    crate::relatch::log_relatch_summary(&pp_relatch);
+    crate::relatch::log_relatch_summary(&hp_relatch);
+
     // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
     //    #267 item c). The passes above only help txs the network HOLDS; an
     //    admitted tx the network never accepted (the #267 incident class)
@@ -1596,7 +1610,33 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
     )
     .await;
-    // 4b. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
+    // 4b. the #355/#367 RE-LATCH fixpoint over both verdict columns — same
+    //     bounds as the scheduled tick; pokeable so a predicate change can be
+    //     converged without waiting out the cron (the cron-poker doctrine).
+    let (pp_relatch, hp_relatch) =
+        crate::relatch::run_relatch(db.clone(), crate::relatch::RELATCH_PAGE_LIMIT).await;
+    crate::relatch::log_relatch_summary(&pp_relatch);
+    crate::relatch::log_relatch_summary(&hp_relatch);
+    let relatch_json: Vec<serde_json::Value> = [&pp_relatch, &hp_relatch]
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "table": s.table,
+                "scanned": s.scanned,
+                "changed": s.changed(),
+                "latched": s.latched,
+                "promoted": s.promoted,
+                "demoted": s.demoted,
+                "remaining": s.remaining,
+                "still_null": s.still_null,
+                "cursor": s.cursor,
+                "sweeps": s.sweeps,
+                "wrapped": s.wrapped,
+                "errors": s.errors,
+            })
+        })
+        .collect();
+    // 4c. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
     //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1);
     //     see the scheduled block's note.
     let tx_storage = D1Storage::new(db.clone());
@@ -1654,6 +1694,11 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "params_decoded": bf.decoded,
         "params_verdicts": bf.verdicts,
         "params_missing_beef": bf.missing_beef,
+        // #355/#367 re-latch counters, per table. `changed` is the fixpoint's
+        // progress AND the predicate-regression detector; `demoted` is the
+        // alarm (rows the predicate now refuses that it previously accepted);
+        // `still_null` is the legacy tier's remaining size.
+        "relatch": relatch_json,
         // #273 rebroadcast-backstop counters.
         "rebroadcast_scanned": rb.scanned,
         "rebroadcast_present": rb.present,

@@ -3212,9 +3212,10 @@ fn make_every_marker_legacy(conn: &Connection) {
 /// will not — `decidePartyStep` returns `'done'` the moment `lookupPotParty`
 /// reports an indexed row for the pot, and a legacy row IS an indexed row
 /// (pinned client-side at `potPartyPending.test.ts:190`). The legacy tier is
-/// therefore **PERMANENT absent a re-latch pass**, tracked as bsv-low#355
-/// (scoped to every row, not just the `NULL` ones) — so a reader consulting
-/// this control is told #355 is REQUIRED, not optional.
+/// therefore retired ONLY by the overlay's re-latch sweep — bsv-low#355,
+/// `bsv_overlay_cloudflare::relatch`, scoped to every row rather than just
+/// the `NULL` ones, and bounded per tick, so this control describes any row
+/// the sweep has not yet reached.
 /// It is real, and a deployment that runs the migration without the writer
 /// would leave every new row in it — which is why the migration and the
 /// `store_record` bind ship in the same commit.

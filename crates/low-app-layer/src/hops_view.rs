@@ -88,10 +88,13 @@
 //!   ran out", and it is not per-request, not attacker-inducible, and not
 //!   ambiguous about what happened.
 //!
-//! **The legacy tier is PERMANENT absent a re-latch pass (bsv-low#367).**
-//! It does not self-heal and must never be described as doing so: a
-//! hopparty marker must ride the hop transaction, and that transaction is
-//! already on chain, so no republish can re-latch an old row.
+//! **The legacy tier has exactly ONE retirement path — the re-latch pass
+//! (bsv-low#367, `bsv_overlay_cloudflare::relatch`, on the overlay's cron).**
+//! It does not self-heal and must never be described as doing so: a hopparty
+//! marker must ride the hop transaction, and that transaction is already on
+//! chain, so no republish can re-latch an old row. The pass is bounded per
+//! tick, so a row reads `unknown` until a sweep REACHES it — "the pass
+//! exists" is not "this row is latched".
 //!
 //! The verdict is a **leading SORT KEY and never a `WHERE`**. Both
 //! signatures ride back in the body so the client re-verifies; the server's
@@ -439,8 +442,9 @@ pub struct HopsViewRow {
     /// decided once at admission by
     /// `overlay_discovery::hopparty::validity::record_marker_valid`.
     /// `Some(true)` = every bar cleared, `Some(false)` = REFUTED,
-    /// `None` = the row predates the migration and was never evaluated
-    /// (PERMANENT absent the #367 re-latch pass — it does not self-heal).
+    /// `None` = the row predates the migration and the #367 re-latch sweep
+    /// has not reached it yet. Nothing else can clear it: this table cannot
+    /// self-heal by republish.
     pub marker_valid: Option<bool>,
 }
 
@@ -523,9 +527,9 @@ pub fn derive_marker_verification(marker_valid: Option<bool>) -> MarkerVerificat
     match marker_valid {
         Some(true) => MarkerVerification::Verified,
         Some(false) => MarkerVerification::Unverified,
-        // The row predates the latch. NOT "we could not look" — nothing
-        // per-request decides this, and it is PERMANENT absent the #367
-        // re-latch pass.
+        // The row predates the latch and the #367 re-latch sweep has not
+        // reached it yet. NOT "we could not look" — nothing per-request
+        // decides this, and no republish can clear it.
         None => MarkerVerification::Unknown,
     }
 }

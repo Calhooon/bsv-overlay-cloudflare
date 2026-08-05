@@ -721,16 +721,17 @@ pub enum SeatLetter {
 /// cannot GROW, and it does not shrink either.
 ///
 /// A migration cannot fix it — SQL cannot verify a signature — but the
-/// OVERLAY can: every input `record_sig_valid` needs is already in the row,
-/// so a bounded lazy pass (`SELECT … LIMIT N` -> compute -> `UPDATE`) is
-/// small and is tracked as bsv-low#355. It is a RE-LATCH OF EVERY ROW, not a
-/// backfill of the `NULL` ones: the column is written once by
-/// `INSERT OR IGNORE` and never re-evaluated, so a transient predicate fault
-/// pins the rows admitted during it at rank 0 — below the legacy tier,
-/// permanently (see the write site, `potparty_write::potparty_insert_query`).
-/// Closure criterion: every row's `sigValid` equals `record_sig_valid`
-/// recomputed at the pass's own predicate version. Until then, state the
-/// residual as permanent.
+/// OVERLAY can, and now does: every input `record_sig_valid` needs is already
+/// in the row, so a bounded lazy pass (`SELECT … LIMIT N` -> compute ->
+/// `UPDATE`) retires the tier (bsv-low#355, `bsv_overlay_cloudflare::relatch`,
+/// on the 15-minute cron). It is a RE-LATCH OF EVERY ROW, not a backfill of
+/// the `NULL` ones: the admission write is `INSERT OR IGNORE`, so a transient
+/// predicate fault pins the rows admitted during it at rank 0 — below the
+/// legacy tier — and a `NULL`-census would skip exactly those. Closure
+/// criterion: every row's `sigValid` equals `record_sig_valid` recomputed at
+/// the pass's own predicate version. Until a sweep has REACHED a given row,
+/// state that row's residual as present — the pass is bounded per tick, so
+/// "the pass exists" is not "your row is latched".
 ///
 /// Second residual: a **v1 (pre-#230) pot has no seat binding to find** and
 /// answers `Unknown` forever. Note this is not a fallback to something safer —

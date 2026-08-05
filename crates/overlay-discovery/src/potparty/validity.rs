@@ -63,25 +63,27 @@
 //! attacker cannot reach rank 2 to cause it), it needs a page over the row
 //! cap, and a first-time marker published after the migration is latched —
 //! but it lands hardest on DEPLOY DAY, when 100% of rows are legacy and the
-//! first latched rows start arriving. The lazy re-latch pass (bsv-low#355) is
-//! what actually retires it.
+//! first latched rows start arriving. The lazy re-latch pass (bsv-low#355,
+//! `bsv_overlay_cloudflare::relatch`) is what actually retires it.
 //!
 //! # A `0` IS A VERDICT, NOT "NOT YET CHECKED" (gate round 2, MED-4)
 //!
-//! `sigValid` is written once, by `INSERT OR IGNORE`, and re-evaluated by
-//! nothing: no `UPDATE potparty_records SET sigValid` exists in production
-//! code. A TRANSIENT fault in this predicate — a `bsv-rs` DER/`to_der`
-//! behaviour change, a wallet emitting a non-canonical signature during a
-//! rollout, a partial deploy — therefore demotes every honest row admitted
-//! in that window to rank 0 PERMANENTLY, below even the legacy tier, with no
-//! self-healing path. Pre-latch those rows ordered neutrally; post-latch they
-//! are last, forever (epoch Rule 6), and the victims are wiped-device users
-//! with a silently short enumeration who will never file a bug (Rule 14).
+//! A TRANSIENT fault in this predicate — a `bsv-rs` DER/`to_der` behaviour
+//! change, a wallet emitting a non-canonical signature during a rollout, a
+//! partial deploy — demotes every honest row admitted in that window to rank
+//! 0, below even the legacy tier. Pre-latch those rows ordered neutrally;
+//! post-latch they are last (epoch Rule 6), and the victims are wiped-device
+//! users with a silently short enumeration who will never file a bug
+//! (Rule 14).
 //!
-//! That is why bsv-low#355 is scoped as a **re-latch of every row**, with the
-//! closure criterion "every row's `sigValid` equals `record_sig_valid`
-//! recomputed at the pass's own predicate version". A `NULL`-only backfill
-//! structurally skips exactly the rows such a fault would have created.
+//! Until bsv-low#355 that was PERMANENT: the column was written once, by
+//! `INSERT OR IGNORE`, and re-evaluated by nothing. **It is now re-evaluated
+//! by the lazy re-latch pass** (`bsv_overlay_cloudflare::relatch`), whose
+//! closure criterion is "every row's `sigValid` equals [`record_sig_valid`]
+//! recomputed at the pass's own predicate version" — a FIXPOINT, deliberately
+//! not a `NULL` census, because a `NULL`-only backfill structurally skips
+//! exactly the rows such a fault would have created. Read a `0` as "this
+//! row's verdict is as old as the last sweep", never as "unchecked".
 //!
 //! # What an attacker would need to reach rank 2
 //!
