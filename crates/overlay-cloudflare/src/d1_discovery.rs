@@ -2166,22 +2166,59 @@ impl CollectedRow {
     }
 }
 
+/// Rows kept per `(identity, gameId)` in the batched collected-marker read.
+///
+/// The #327 S8 re-key removed EXCLUSIVITY, which was the bug — but removing a
+/// slot without adding a bound just trades a squat for unbounded growth
+/// (gate finding H6): `tm_collected` admits EVERY matching output, so one
+/// transaction with N marker OP_RETURNs mints N permanent rows for one
+/// victim's pair, and rows are never deleted. The sibling this supersede
+/// pattern was cloned from (`result_markers_v2`) carries a per-key window for
+/// exactly this reason; inherit the bound along with the pattern.
+///
+/// **Rule 6 — compare the failure modes, because a window can re-create the
+/// censorship the re-key removed.** Unbounded: the honest row is always
+/// returned, but the response grows without limit. Windowed: the response is
+/// bounded, and an attacker who fills the window can push the honest row out.
+/// That trade is acceptable HERE, and only here, because eviction on this
+/// surface is FAIL-SAFE: a missing marker reads as "not collected", so the
+/// Collect card stays VISIBLE and a re-collect is idempotent (the money-safe
+/// direction). On a recovery-enumeration surface the same trade would be a
+/// money bug, which is why `ls_potparty`/`ls_potrefund` need the full
+/// existence-tier treatment rather than a plain cap.
+const COLLECTED_ROWS_PER_PAIR: usize = 8;
+
 /// SQL for one batched collected-marker chunk (bsv-low #289): one
 /// `identity = ? AND gameId IN (…)` query replacing `n` individual round
 /// trips. Factored out so the real-SQLite test proves the SHIPPED string
 /// selects per-(identity, gameId) — never a same-gameId row belonging to a
 /// DIFFERENT identity.
 ///
-/// #327 S8: reads `collected_markers_v2` and returns EVERY marker row per
-/// pair (the old table is write-frozen and its rows were carried over by the
-/// one-time migration). The explicit ORDER BY makes the multi-row answer
-/// deterministic rather than leaving row order to the engine.
+/// #327 S8: reads `collected_markers_v2` and returns every marker row per pair
+/// (the old table is write-frozen and its rows were carried over by the
+/// one-time migration), bounded to [`COLLECTED_ROWS_PER_PAIR`] per pair.
+///
+/// **The ordering is chosen against the documented attack, not by habit.** The
+/// squat is PRE-EMPTIVE — filed at deal time, long before the victim ever
+/// collects — so `createdAt ASC` (oldest-first) would hand the squatter the
+/// whole window by construction and evict the genuine marker that arrives
+/// later. `DESC` keeps the most recent rows, so a pre-filed squat can never
+/// displace the victim's genuine marker; an attacker must instead out-file it
+/// afterwards, which under the #347 gate costs a real fee-bearing transaction
+/// per row. `txid` breaks ties so the window is deterministic.
 pub fn collected_records_batch_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(", ");
     format!(
-        "SELECT identity, gameId, txid, outputIndex, sigHex FROM collected_markers_v2 \
-         WHERE identity = ? AND gameId IN ({placeholders}) \
-         ORDER BY createdAt ASC, txid ASC, outputIndex ASC"
+        "SELECT identity, gameId, txid, outputIndex, sigHex FROM \
+           (SELECT identity, gameId, txid, outputIndex, sigHex, \
+                   ROW_NUMBER() OVER (PARTITION BY identity, gameId \
+                                      ORDER BY createdAt DESC, txid DESC, \
+                                               outputIndex DESC) AS rn \
+            FROM collected_markers_v2 \
+            WHERE identity = ? AND gameId IN ({placeholders})) \
+         WHERE rn <= {per_pair} \
+         ORDER BY gameId ASC, rn ASC",
+        per_pair = COLLECTED_ROWS_PER_PAIR,
     )
 }
 
@@ -2239,11 +2276,15 @@ impl CollectedStorage for D1CollectedStorage {
         identity: &str,
         game_id: &str,
     ) -> Result<Vec<CollectedRecord>, CollectedStorageError> {
-        let rows: Vec<CollectedRow> = Query::new(
+        // Same bound and same newest-first order as the batched read — two
+        // reads of one store that disagreed on either would be a boundary with
+        // no pin (Rule 16).
+        let rows: Vec<CollectedRow> = Query::new(format!(
             "SELECT identity, gameId, txid, outputIndex, sigHex FROM collected_markers_v2 \
              WHERE identity = ? AND gameId = ? \
-             ORDER BY createdAt ASC, txid ASC, outputIndex ASC",
-        )
+             ORDER BY createdAt DESC, txid DESC, outputIndex DESC \
+             LIMIT {COLLECTED_ROWS_PER_PAIR}"
+        ))
         .bind(identity)
         .bind(game_id)
         .fetch_all(&self.db)
@@ -2724,7 +2765,21 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// still displaces the victim's pots at the same ~`limit`-dust cost as before.
 /// The honest net gain is **from "any N junk rows" to "N junk rows naming
 /// real, recent pot txids"**, plus the outright death of the zero-forgery
-/// replay variant and of free invented-pot flooding. And eviction WITHIN a
+/// replay variant.
+///
+/// **CORRECTION (bsv-low #347).** This paragraph used to also claim "the
+/// outright death of free invented-pot flooding". That was FALSE, and it is
+/// the claim #347 was filed against: `tm_pot` admits a covenant output on byte
+/// STRUCTURE alone, so until admission is network-gated an attacker mints
+/// `pot_records` rows for pots that never existed, for free. A ghost row makes
+/// `unknownPot = 0` in the tier expression below, which promotes the paired
+/// victim-named markers to tier 0 with NO quota — bypassing the very reserve
+/// this window installs. Invented-pot flooding is being made *fee-bearing* by
+/// the #347 submit gate; the tier predicate itself is bsv-low #283's to bind
+/// to network reality, and this comment is corrected here only so it stops
+/// reading as evidence that the axis is closed (Rule 10).
+///
+/// And eviction WITHIN a
 /// pot now costs [`PARTYFOR_ROWS_PER_GROUP`] markers per group instead of one
 /// — a MITIGATION, not a closure: file one more than that and the honest row
 /// is evicted again. See [`PARTYFOR_ROWS_PER_GROUP`] for the measured size,
@@ -5150,6 +5205,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay, 0, "same outpoint never re-inserts");
+    }
+
+    /// H6: the re-key removed exclusivity, so the read must carry a BOUND —
+    /// and the bound must not re-create the censorship the re-key removed.
+    ///
+    /// Pins both halves against the real schema: the window caps rows per
+    /// pair, AND a pre-emptively filed squat can never displace the victim's
+    /// later genuine marker (which is what an oldest-first order would do).
+    #[test]
+    fn collected_window_is_bounded_and_a_prefiled_squat_cannot_evict_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let game = h64(0x11);
+
+        // The squatter pre-files a FULL window's worth at deal time (t=1..12),
+        // more than the cap, all naming the victim.
+        for i in 0..12u32 {
+            conn.execute(
+                "INSERT OR IGNORE INTO collected_markers_v2 \
+                 (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+                 VALUES (?1, ?2, ?3, ?4, 'sigJUNK', ?5)",
+                rusqlite::params![victim, game, h64(0xa0 + i as u8), i, i as i64 + 1],
+            )
+            .unwrap();
+        }
+        // The victim's GENUINE marker lands afterwards.
+        conn.execute(
+            "INSERT OR IGNORE INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 0, 'sigREAL', 99)",
+            rusqlite::params![victim, game, h64(0xbb)],
+        )
+        .unwrap();
+
+        let sql = collected_records_batch_sql(1);
+        let mut stmt = conn.prepare(&sql).expect("shipped batch SQL must parse");
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![victim, game], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(4)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert_eq!(
+            rows.len(),
+            COLLECTED_ROWS_PER_PAIR,
+            "the per-pair window must bound an unbounded mint"
+        );
+        assert!(
+            rows.iter().any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
+            "a PRE-FILED squat must not evict the victim's later genuine marker \
+             — an oldest-first window would hand the squatter every slot: {rows:?}"
+        );
     }
 
     /// The one-time carry migration must move a v1 row into v2 and be a no-op

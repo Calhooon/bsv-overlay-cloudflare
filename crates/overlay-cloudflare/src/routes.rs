@@ -501,53 +501,60 @@ pub async fn submit(
     // decision in its own right (epoch Rule 8b applied to a MODE rather than a
     // value: a gate selected by a caller-supplied discriminator is not a gate).
     //
-    // `ENABLE_EXTENSIONS=false` is the kill switch — it forces every submit
-    // onto the SPV-barred default regardless of header. Until #347 this var was
-    // dead config: set in both wrangler files, read nowhere.
+    // The ENTIRE decision comes from ONE call to `plan_submit`. The route may
+    // only read the resulting fields — it cannot re-derive, re-order or
+    // second-guess them. The wiring is the defect class here, so it is not
+    // allowed to live as inline branching (gate finding H1/M-5).
     let mode_header = req.headers().get("x-submit-mode").ok().flatten();
+    // Fail CLOSED on a typo: extensions are enabled ONLY on an explicit
+    // "true". Both wrangler configs set it explicitly, so this is safe, and a
+    // mangled value can no longer silently leave the ungated modes reachable.
     let extensions_enabled = env
         .var("ENABLE_EXTENSIONS")
         .ok()
         .map(|v| v.to_string())
-        .is_none_or(|v| !v.trim().eq_ignore_ascii_case("false"));
-    let path = crate::submit_gate::AdmissionPath::from_header(
-        mode_header.as_deref(),
-        extensions_enabled,
-    );
-    let mode = path.engine_mode();
-
-    // An unbarred path (`historical-tx-no-spv`: no SPV, no broadcast) is for
-    // operators and peer sync — never for the public. The credential is the
-    // existing ADMIN_TOKEN bearer; a barred path never consults it, so no
-    // honest client path is ever priced or throttled (Rule 20).
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
     let gate_mode = crate::submit_gate::GateMode::parse(
         env.var("SUBMIT_ENFORCE").ok().map(|v| v.to_string()).as_deref(),
     );
-    let operator_authed = check_admin_auth(&req, env).is_ok();
-    let decision = crate::submit_gate::decide(path, operator_authed, gate_mode);
-    crate::submit_gate::note(path, operator_authed, decision);
-    if decision == crate::submit_gate::GateDecision::RefuseUnauthenticated {
+    // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
+    // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
+    // (gate finding M1). Handing the watchtower the admin token would mean a
+    // tower compromise grants eviction of any outpoint from the index — which
+    // is precisely the primitive the enumeration-starvation money path needs.
+    // Unset ⇒ nobody can authenticate ⇒ fail closed.
+    let operator_authed = check_submit_operator_auth(&req, env);
+    let plan = crate::submit_gate::plan_submit(
+        mode_header.as_deref(),
+        extensions_enabled,
+        operator_authed,
+        gate_mode,
+    );
+    let mode = plan.engine_mode;
+    crate::submit_gate::note(plan.path, operator_authed, plan.decision);
+    if plan.decision == crate::submit_gate::GateDecision::RefuseUnauthenticated {
         worker::console_log!(
             "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
-            path.as_str()
+            plan.path.as_str()
         );
         return json_error(
             &format!(
                 "submit mode '{}' has no admission bar and is restricted to operators — \
-                 provide the operator Bearer token, or submit with 'broadcast-gated' \
-                 (an already-broadcast tx satisfies the network gate idempotently)",
-                path.as_str()
+                 submit with 'broadcast-gated' (the overlay broadcasts and admits only on \
+                 network acceptance; an already-broadcast tx satisfies it idempotently), \
+                 or present the submit-operator Bearer token",
+                plan.path.as_str()
             ),
             401,
         );
     }
-    if path.requires_operator_auth() && !operator_authed {
+    if plan.unauthenticated_unbarred {
         // Lenient window (Rule 6c). Counted above; logged here so the operator
-        // can see WHO is still on the unbarred path before flipping enforcement.
+        // can see WHO is still on an unbarred path before flipping enforcement.
         worker::console_log!(
             "POST /submit: UNAUTHENTICATED submit on unbarred path {} — served under the \
              lenient window (#347); set SUBMIT_ENFORCE=true to refuse",
-            path.as_str()
+            plan.path.as_str()
         );
     }
 
@@ -572,7 +579,7 @@ pub async fn submit(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
-    if path.network_gate_required() {
+    if plan.run_network_gate {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
         // and NOTHING is admitted unless Arcade reports the SUBJECT
@@ -1329,6 +1336,37 @@ pub async fn request_foreign_gasp_node(
 ///
 /// Returns `Ok(())` if the token matches, or an `Err` containing the appropriate
 /// 401/403 response to send back to the client.
+/// The `/submit` operator credential (`SUBMIT_OPERATOR_TOKEN`) — SEPARATE from
+/// `ADMIN_TOKEN` on purpose (#347 gate M1).
+///
+/// The admin token gates destructive index operations (`/admin/evictOutpoint`,
+/// `/admin/ban`, `/admin/startGASPSync`). Reusing it here would mean handing
+/// every submit operator — including the watchtower, which holds it in a
+/// worker secret — the ability to EVICT any outpoint from the index, which is
+/// exactly the primitive the enumeration-starvation money path needs. A submit
+/// operator gets permission to submit, and nothing else.
+///
+/// Unset or empty ⇒ always false (fail closed). Fixed-time comparison, same as
+/// the admin path.
+pub fn check_submit_operator_auth(req: &Request, env: &Env) -> bool {
+    let token = env
+        .secret("SUBMIT_OPERATOR_TOKEN")
+        .ok()
+        .map(|s| s.to_string())
+        .or_else(|| env.var("SUBMIT_OPERATOR_TOKEN").ok().map(|v| v.to_string()))
+        .unwrap_or_default();
+    if token.is_empty() {
+        return false;
+    }
+    let Some(header) = req.headers().get("Authorization").ok().flatten() else {
+        return false;
+    };
+    let Some(provided) = header.strip_prefix("Bearer ") else {
+        return false;
+    };
+    !provided.is_empty() && fixed_time_eq(provided.as_bytes(), token.as_bytes())
+}
+
 pub fn check_admin_auth(req: &Request, env: &Env) -> Result<(), worker::Result<Response>> {
     // Token source: prefer secret (wrangler secret put ADMIN_TOKEN),
     // fall back to [vars] / --var. Treat unset as empty string — any Bearer
