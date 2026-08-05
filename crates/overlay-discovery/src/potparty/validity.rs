@@ -38,12 +38,33 @@
 //!
 //! That bound matters, because a cross-language validity bar fails toward
 //! **refusing honest work** (epoch Rule 16): if this predicate ever
-//! disagreed with the client's signer, an honest marker would rank 0 — and
-//! ranking 0 in a window it is the only occupant of changes nothing. The
-//! agreement is pinned against FROZEN artifacts emitted by the real client
-//! producer (`golden_client_v1_marker_is_valid_server_side` /
+//! disagreed with the client's signer, every honest marker would rank 0 at
+//! once. Ranking 0 in a window it is the only occupant of changes nothing —
+//! but on a FULL page it is not nothing: the gate measured an honest
+//! in-flight pot latching 0 dropping off a full `/results` page where it was
+//! previously present. So "sort key, not filter" bounds the blast radius; it
+//! does not make the class harmless, and the honest statement is that a
+//! disagreement degrades toward the starvation this change exists to stop.
+//! Two things answer that: the agreement is pinned against FROZEN artifacts
+//! emitted by the real client producer
+//! (`golden_client_v1_marker_is_valid_server_side` /
 //! `golden_client_v2_marker_is_valid_server_side`), never against a fixture
-//! this crate signed for itself.
+//! this crate signed for itself — and a disagreement is DETECTABLE rather
+//! than merely unlikely: the overlay logs `[potparty:siginvalid]` on every
+//! 0-latch at admission, so a sustained rate with no marker flood in the
+//! logs is the signal to look (epoch Rule 13).
+//!
+//! # CROSS-TIER visibility, the other honest caveat
+//!
+//! "The legacy tier orders exactly as before" is true WITHIN that tier and
+//! false ACROSS tiers, which is a different sentence and the gate measured
+//! the difference: 5 legacy pots beside 100 latched ones went from 5/5
+//! visible pre-#283 to 0/5 on a full page. It is honest-vs-honest (an
+//! attacker cannot reach rank 2 to cause it), it needs a page over the row
+//! cap, and a first-time marker published after the migration is latched —
+//! but it lands hardest on DEPLOY DAY, when 100% of rows are legacy and the
+//! first latched rows start arriving. The lazy backfill named below is what
+//! actually retires it.
 //!
 //! # What an attacker would need to reach rank 2
 //!
@@ -82,13 +103,23 @@ pub const SIG_VALID_COLUMN: &str = "sigValid";
 /// | 1 | `NULL` | never evaluated — a row admitted BEFORE this migration |
 /// | 0 | `0` | evaluated, at least one signature did NOT verify |
 ///
-/// A two-tier scheme (treat `NULL` as valid) would leave the pre-migration
-/// window PERMANENT: a legacy junk row and a fresh honest republish would
-/// tie at the top and `createdAt ASC` would hand it back to the attacker.
-/// With three tiers the honest seat's next republish (`potPartyRepublish.ts`,
-/// bsv-low#252 — an existing sweep, not new client work) lands at rank 2 and
-/// outranks EVERY legacy row, so the residual **self-heals** instead of
-/// being permanent (epoch Rule 6).
+/// A two-tier scheme (treat `NULL` as valid) would be strictly worse — a
+/// legacy junk row and a latched honest row would tie at the top and
+/// `createdAt ASC` would hand the slot back to the attacker. Three tiers at
+/// least let ANY latched row outrank the whole legacy tier.
+///
+/// **What that does NOT buy, corrected after the adversarial gate (Rule 10).**
+/// An earlier revision of this note said the residual "self-heals" because
+/// the honest seat's next republish lands at rank 2. **The republish does not
+/// happen.** `decidePartyStep` (`app/src/lib/potPartyPending.ts:408`) returns
+/// `'done'` as soon as `lookupPotParty` reports an indexed row for the pot —
+/// and a LEGACY row is an indexed row — so the #252 sweep never re-publishes
+/// for a pot that already has one. It is pinned in-tree on the client at
+/// `potPartyPending.test.ts:190`. The legacy tier is therefore **PERMANENT
+/// absent a backfill**, and the backfill is tracked (see
+/// `d1::OVERLAY_MIGRATIONS`' note on the column). What heals in practice is
+/// only a pot whose honest marker is published for the FIRST time after the
+/// migration.
 ///
 /// `prefix` is the table alias plus `.` (e.g. `"pp."`), or `""` when the
 /// query has no alias.

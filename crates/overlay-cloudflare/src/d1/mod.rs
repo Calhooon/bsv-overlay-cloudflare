@@ -941,11 +941,26 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // window ORDER BY "does this verify", which is the only ordering an
     // attacker cannot out-stamp, out-number or (bsv-low#347) get for free.
     //
-    // NULLABLE on purpose and NEVER backfilled by an UPDATE: SQL cannot
-    // verify a signature, so the legacy tier drains by republish
-    // (`potPartyRepublish.ts`, bsv-low#252) rather than by a migration.
+    // NULLABLE on purpose: a MIGRATION cannot backfill it, because SQL
+    // cannot verify a signature.
+    //
+    // That is a fact about SQL, and an earlier revision of this note
+    // presented it as a fact about the SYSTEM ("the legacy tier drains by
+    // republish"). Both halves were wrong and the adversarial gate corrected
+    // them (Rule 10). (a) The republish does NOT happen: the client's
+    // `decidePartyStep` stops as soon as an indexed row exists for the pot,
+    // and a legacy row IS an indexed row. (b) The overlay is RUST and every
+    // input `record_sig_valid` needs is already in the row, so a bounded lazy
+    // backfill — `SELECT … WHERE sigValid IS NULL LIMIT N` -> compute ->
+    // `UPDATE` — is perfectly possible and small; it is simply not in this
+    // change. **So the legacy tier is PERMANENT until that backfill lands**
+    // (tracked as the #283 follow-up; closure criterion: zero rows with
+    // `sigValid IS NULL` remaining).
+    //
     // Additive ALTER — the runner ignores the re-run "duplicate column"
-    // error (`migration_error_is_benign`).
+    // error (`migration_error_is_benign`). NOTE the app-layer Worker issues
+    // this same statement itself (`low_app_layer::schema`) because it never
+    // runs this list; the two are pinned byte-identical.
     "ALTER TABLE potparty_records ADD COLUMN sigValid INTEGER",
 ];
 

@@ -2740,9 +2740,12 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// an all-legacy page, executed as the control).
 ///
 /// Residuals that remain, both bounded to the LEGACY tier (rows admitted
-/// before the latch migration, which is a draining population — the #252
-/// republish sweep lands a latched row for any pot the honest client still
-/// sees):
+/// before the latch migration). That population **cannot grow, but it does
+/// NOT drain on its own** — an earlier revision of this note claimed the
+/// #252 republish sweep would land a latched row for any pot the honest
+/// client still sees, and it will not: `decidePartyStep` stops the moment an
+/// indexed row exists for the pot, and a legacy row is an indexed row. It is
+/// permanent until the lazy backfill lands (tracked as the #283 follow-up):
 ///  - a legacy-vs-legacy contest is decided exactly as it was before, so an
 ///    attacker who filed junk BEFORE the migration keeps whatever advantage
 ///    that junk already had (`free_ghost_pot_records_do_erase_legacy_
@@ -3183,6 +3186,24 @@ pub fn potparty_insert_query(record: &PotpartyRecord, created_at: i64) -> Query 
 #[async_trait(?Send)]
 impl PotpartyStorage for D1PotpartyStorage {
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
+        // TELEMETRY, not a decision (bsv-low #283, gate M5). The golden cells
+        // make a client/server crypto disagreement UNLIKELY; they do not make
+        // it DETECTABLE once deployed, and that class fails toward refusing
+        // HONEST work all at once (epoch Rule 16). A 0-latch is normal under
+        // a marker flood and abnormal on a quiet topic, so the RATE is the
+        // detector: a sustained stream of these with no flood in the logs
+        // means our predicate and the client's signer have drifted, and the
+        // right response is to look, not to change any behaviour here.
+        // Surfaced rather than consumed (epoch Rule 13).
+        if !overlay_discovery::potparty::validity::record_sig_valid(record) {
+            worker::console_log!(
+                "[potparty:siginvalid] txid={} vout={} v2={} identity={}",
+                record.txid,
+                record.output_index,
+                record.seat_settle_pubkey.is_some(),
+                record.identity
+            );
+        }
         potparty_insert_query(record, current_unix_seconds_i64())
             .execute(&self.db)
             .await

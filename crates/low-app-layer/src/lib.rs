@@ -112,6 +112,7 @@ pub mod logic;
 pub mod refund_view;
 pub mod results;
 mod routes;
+pub mod schema;
 pub mod txany;
 
 use serde_json::Value;
@@ -135,6 +136,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     if cors::is_preflight(&req) {
         return cors::preflight();
+    }
+
+    // bsv-low #283: this Worker never runs `OVERLAY_MIGRATIONS`, and the
+    // overlay applies them on ITS cold start — so a cold isolate here can
+    // reach `pp.sigValid` before any request has warmed the overlay, and
+    // every recovery query fails to prepare with `no such column`. One
+    // additive, idempotent statement, at most once per isolate, removes the
+    // whole ordering hazard. Never fails the request; see `schema`.
+    if let Ok(db) = env.d1("OVERLAY_DB") {
+        schema::ensure_sig_valid_column(&db).await;
     }
 
     // BRC-103/104 front door: handshake replies / strict-mode refusals /

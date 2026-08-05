@@ -466,7 +466,8 @@ pub fn live_view_sql() -> String {
 ///
 /// Unchanged: the fail direction (corroboration OMITTED, never wrong), and
 /// the LEGACY tier (`sigValid IS NULL`, pre-migration rows) which orders
-/// exactly as before and drains by republish.
+/// exactly as before. That tier cannot grow but does NOT drain by itself —
+/// see the correction on `d1::OVERLAY_MIGRATIONS`' latch column.
 pub fn keyless_candidates_sql(n: usize) -> String {
     debug_assert!(n >= 1);
     let per_pot = vec!["(potTxid = ? AND potVout = ?)"; n].join(" OR ");

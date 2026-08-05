@@ -681,22 +681,51 @@ pub enum SeatLetter {
 /// [`SEAT_MARKERS_PER_KEY`] would only have moved the number; this removes
 /// the ordering from the argument (epoch Rule 3).
 ///
-/// **Fail direction, unchanged and load-bearing.** The latch is a sort key,
-/// never a filter: a row that latches `false` is still stored and still
-/// served (`a_row_whose_latch_says_false_is_still_served`), and
-/// [`attribute_seats`] re-verifies unconditionally and never reads it. So a
-/// server/client crypto disagreement degrades to the pre-#283 ordering, not
-/// to an outage — which matters, because that class fails toward refusing
-/// HONEST work all at once (epoch Rule 16).
+/// **Fail direction, and be precise about it — an earlier revision of this
+/// paragraph was not.** The latch is a sort key, never a filter: a row that
+/// latches `false` is still STORED and still SERVED
+/// (`a_row_whose_latch_says_false_is_still_served`), and [`attribute_seats`]
+/// re-verifies unconditionally and never reads it.
 ///
-/// **What is NOT closed: the LEGACY tier.** Rows admitted before the latch
-/// migration carry `sigValid IS NULL` and are ordered exactly as they were —
-/// `the_legacy_tier_still_has_the_pre_283_threshold` reproduces the old
-/// 9-marker flip on them, deliberately. That population cannot grow, and one
-/// latched republish (#252's sweep) outranks the whole of it, so the residual
-/// DRAINS and is self-healing rather than permanent (epoch Rule 6). It is
-/// SQL-unbackfillable by construction: verifying a signature is what the
-/// migration cannot do.
+/// The sentence that stood here — "a server/client crypto disagreement
+/// degrades to the pre-#283 ordering, not to an outage" — is FALSE, and the
+/// adversarial gate measured the counterexample: an honest, freshly funded,
+/// still-in-flight pot whose marker latched `0` was **absent** from a full
+/// page where pre-#283 it was present. On a page that is not full nothing
+/// changes; on a full one, ranking last is indistinguishable from the
+/// starvation this change exists to stop — visited on every honest user at
+/// once instead of on one victim. That is exactly why the class matters
+/// (epoch Rule 16: a cross-language validity bar fails toward refusing
+/// HONEST work).
+///
+/// Two things bound it, and neither is "it cannot happen": the agreement is
+/// pinned against artifacts the REAL client producer emits (the frozen v1
+/// and v2 goldens), and a disagreement is now DETECTABLE rather than merely
+/// unlikely — the overlay logs `[potparty:siginvalid]` per 0-latch at
+/// admission, so a sustained rate with no flood in the logs is the signal
+/// (epoch Rule 13: surface it, and make sure something can act on it).
+///
+/// **What is NOT closed: the LEGACY tier, and it is PERMANENT.** Rows
+/// admitted before the latch migration carry `sigValid IS NULL` and are
+/// ordered exactly as they were — `the_legacy_tier_still_has_the_pre_283_
+/// threshold` reproduces the old 9-marker flip on them, deliberately.
+///
+/// An earlier revision of this section said the tier "DRAINS and is
+/// self-healing rather than permanent", on the strength of the #252
+/// republish sweep. **That was false and the adversarial gate falsified it
+/// executably (Rule 10):** `decidePartyStep`
+/// (`app/src/lib/potPartyPending.ts:408`) returns `'done'` as soon as
+/// `lookupPotParty` reports an indexed row for the pot, and a legacy row IS
+/// an indexed row, so the sweep never republishes for exactly the pots that
+/// need it (pinned client-side at `potPartyPending.test.ts:190`). The tier
+/// cannot GROW, and it does not shrink either.
+///
+/// A migration cannot fix it — SQL cannot verify a signature — but the
+/// OVERLAY can: every input `record_sig_valid` needs is already in the row,
+/// so a bounded lazy backfill (`SELECT … WHERE sigValid IS NULL LIMIT N` ->
+/// compute -> `UPDATE`) is small and is tracked as the #283 follow-up.
+/// Closure criterion: zero rows with `sigValid IS NULL`. Until then, state
+/// the residual as permanent.
 ///
 /// Second residual: a **v1 (pre-#230) pot has no seat binding to find** and
 /// answers `Unknown` forever. Note this is not a fallback to something safer —
@@ -2127,8 +2156,8 @@ const _: () = assert!(RESULTS_UNKNOWN_POT_QUOTA < RESULTS_MAX_ROWS);
 /// wrong — the verify pass in [`attribute_seats`] drops every non-verifying
 /// row and never reads the latch. Residual: rows admitted before the latch
 /// migration (`sigValid IS NULL`) order exactly as they did
-/// (`the_legacy_tier_still_has_the_pre_283_threshold`); that tier drains and
-/// one latched republish outranks all of it.
+/// (`the_legacy_tier_still_has_the_pre_283_threshold`). That tier cannot
+/// grow and does NOT drain by itself — see the [`PotBinding`] correction.
 ///
 /// This is the `/results` cap (a PER-IDENTITY view — the caller holds its own
 /// key↔identity mapping, so eviction only degrades ITS OWN attribution tier,

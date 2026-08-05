@@ -155,9 +155,12 @@ fn file_party(
 /// something else (Rule 18 — which is how the v1-then-v2 cells started
 /// reporting the V2 row as the representative).
 ///
-/// Attacker rows deliberately do NOT call this: a forged v1 latches `0`, and
-/// leaving them at `NULL` is the WEAKER assumption (the legacy tier), so a
-/// cell that still shows the honest row winning proves more, not less.
+/// Attacker rows do NOT call this and do not need to: since the gate round,
+/// `file_party_game` / `file_junk_v2` compute their own latch from the REAL
+/// `record_sig_valid` on their stub bytes, which is `0` — exactly what an
+/// attacker's row gets in production. So the cells below measure
+/// latched-honest vs latched-forged, the general property their names claim,
+/// rather than latched-honest vs an unlatched legacy row.
 fn latch_honest_v1(conn: &Connection, marker_txid: &str) {
     let n = conn
         .execute(
@@ -181,11 +184,58 @@ fn file_party_game(
     conn.execute(
         "INSERT OR IGNORE INTO potparty_records \
          (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
-          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', NULL, NULL, ?6, 0, ?7)",
-        params![identity, h66(0xbb), game_id, pot_txid, recovery_height, marker_txid, at],
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt, \
+          sigValid) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', NULL, NULL, ?6, 0, ?7, ?8)",
+        params![
+            identity,
+            h66(0xbb),
+            game_id,
+            pot_txid,
+            recovery_height,
+            marker_txid,
+            at,
+            // The verdict the PRODUCTION writer would latch on these bytes.
+            // `'3045ab'` is not a signature, so it is 0 — which is what an
+            // ATTACKER's row latches, and every caller here that is modelling
+            // an attacker wants exactly that. The HONEST-v1 callers override
+            // via `latch_honest_v1`; see that helper for the boundary.
+            production_latch(identity, &h66(0xbb), game_id, pot_txid, 0, recovery_height as u32,
+                             "3045ab", None, None)
+        ],
     )
     .expect("insert potparty_records");
+}
+
+/// The `sigValid` the PRODUCTION writer would latch for these field values —
+/// the same `record_sig_valid` `D1PotpartyStorage::store_record` calls.
+#[allow(clippy::too_many_arguments)]
+fn production_latch(
+    identity: &str,
+    opponent: &str,
+    game_id: &str,
+    pot_txid: &str,
+    pot_vout: u32,
+    recovery_height: u32,
+    sig_hex: &str,
+    seat_pub: Option<&str>,
+    seat_sig: Option<&str>,
+) -> i32 {
+    use overlay_discovery::potparty::storage::PotpartyRecord;
+    i32::from(overlay_discovery::potparty::validity::record_sig_valid(&PotpartyRecord {
+        identity: identity.to_string(),
+        opponent_identity: opponent.to_string(),
+        game_id: game_id.to_string(),
+        pot_txid: pot_txid.to_string(),
+        pot_vout,
+        recovery_height,
+        sig_hex: sig_hex.to_string(),
+        seat_settle_pubkey: seat_pub.map(str::to_string),
+        seat_sig_hex: seat_sig.map(str::to_string),
+        txid: "00".repeat(32),
+        output_index: 0,
+        created_at: 0,
+    }))
 }
 
 // ── real-crypto v2 markers (the corroboration producer path) ────────────────
@@ -1011,12 +1061,21 @@ fn file_junk_v2(
     .unwrap();
     let pre = seatsig_preimage(game_id, pot_txid, 0, victim).expect("preimage");
     let sig = hex::encode(k.sign(&bsv_rs::primitives::hash::sha256(&pre)).unwrap().to_der());
+    // The production latch on these bytes: the seatSig is REAL (that is the
+    // point of this fixture) but `sigHex` is the same raw ECDSA blob rather
+    // than a BRC-42 'anyone' identity signature, so it latches 0 — exactly
+    // what an attacker's row gets in production.
+    let latch = production_latch(
+        victim, &h66(0xbb), game_id, pot_txid, 0, GATE as u32, &sig, Some(settle_pub), Some(&sig),
+    );
     conn.execute(
         "INSERT OR IGNORE INTO potparty_records \
          (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
-          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
-        params![victim, h66(0xbb), game_id, pot_txid, GATE, sig, settle_pub, sig, marker_txid, at],
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt, \
+          sigValid) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+        params![victim, h66(0xbb), game_id, pot_txid, GATE, sig, settle_pub, sig, marker_txid, at,
+                latch],
     )
     .expect("insert junk v2");
 }
