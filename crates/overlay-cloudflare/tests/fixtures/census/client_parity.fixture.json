@@ -1,0 +1,71 @@
+{
+  "generatedBy": "tools/lane-366/emit_census_parity_fixture.mts (real @bsv/sdk bodies, real beefGatedReadiness verdicts)",
+  "cases": [
+    {
+      "label": "ready-unmined: funded parent + spending subject",
+      "beefHex": "0200beef0002000100000000018813000000000000015100000000000100000001d5e891bc742a7a6c9fa2c534866f670d74d2694b2581aacb06eef8c3f751e34f000000000100ffffffff02000000000000000007006a04deadbeef2413000000000000015200000000",
+      "subjectTxid": "de9114a1f5e63adce547dcf158533dac45d8d84aca45854fd477be4c4e4e8eff",
+      "subjectProven": false,
+      "client": {
+        "ready": true,
+        "reason": null,
+        "subjectAssumed": false
+      }
+    },
+    {
+      "label": "ready-proven: subject with self-committing bump (mined claim)",
+      "beefHex": "0200beef01fe00350c0001010002ff8e4e4e4cbe77d44f8545ca4ad8d845ac3d5358f1dc47e5dc3ae6f5a11491de0101000100000001d5e891bc742a7a6c9fa2c534866f670d74d2694b2581aacb06eef8c3f751e34f000000000100ffffffff02000000000000000007006a04deadbeef2413000000000000015200000000",
+      "subjectTxid": "de9114a1f5e63adce547dcf158533dac45d8d84aca45854fd477be4c4e4e8eff",
+      "subjectProven": true,
+      "client": {
+        "ready": true,
+        "reason": null,
+        "subjectAssumed": false
+      }
+    },
+    {
+      "label": "not-ready: subject alone, sources absent (the #351 shape)",
+      "beefHex": "0200beef0001000100000001d5e891bc742a7a6c9fa2c534866f670d74d2694b2581aacb06eef8c3f751e34f000000000100ffffffff02000000000000000007006a04deadbeef2413000000000000015200000000",
+      "subjectTxid": "de9114a1f5e63adce547dcf158533dac45d8d84aca45854fd477be4c4e4e8eff",
+      "subjectProven": false,
+      "client": {
+        "ready": false,
+        "reason": "1 input source tx(s) absent or txid-only",
+        "subjectAssumed": false
+      }
+    },
+    {
+      "label": "not-ready: parent is a txid-only stub",
+      "beefHex": "0200beef000202d5e891bc742a7a6c9fa2c534866f670d74d2694b2581aacb06eef8c3f751e34f000100000001d5e891bc742a7a6c9fa2c534866f670d74d2694b2581aacb06eef8c3f751e34f000000000100ffffffff02000000000000000007006a04deadbeef2413000000000000015200000000",
+      "subjectTxid": "de9114a1f5e63adce547dcf158533dac45d8d84aca45854fd477be4c4e4e8eff",
+      "subjectProven": false,
+      "client": {
+        "ready": false,
+        "reason": "1 input source tx(s) absent or txid-only",
+        "subjectAssumed": false
+      }
+    },
+    {
+      "label": "not-ready: partial ancestry (one source absent)",
+      "beefHex": "0200beef00020001000000025dbcd5cd4ec95177a37fff601b7f5b9181ba8e3c273d4d1e13ad6c9e4f1b78b8000000000100ffffffff097a22ed972196bf1eae1ab41a056a1850aafd49cde3a31c43d0d4cec70dc53e000000000100ffffffff01941100000000000001520000000000010000000001b80b000000000000015100000000",
+      "subjectTxid": "2561c1929d709bac2f1276f06e66549be798691ba06d7ef3bafcd0b993dc3b61",
+      "subjectProven": false,
+      "client": {
+        "ready": false,
+        "reason": "1 input source tx(s) absent or txid-only",
+        "subjectAssumed": false
+      }
+    },
+    {
+      "label": "not-ready: unparseable garbage",
+      "beefHex": "deadbeef",
+      "subjectTxid": "0000000000000000000000000000000000000000000000000000000000000000",
+      "subjectProven": false,
+      "client": {
+        "ready": false,
+        "reason": "unparseable BEEF: Serialized BEEF must start with 4022206465 or 4022206466 but starts with 4022250974",
+        "subjectAssumed": true
+      }
+    }
+  ]
+}

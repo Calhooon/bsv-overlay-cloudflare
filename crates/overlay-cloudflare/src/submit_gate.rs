@@ -680,10 +680,17 @@ mod tests {
         for h in [None, Some("wat")] {
             assert!(ALL_ADMISSION_PATHS.contains(&AdmissionPath::from_header(h, true)));
         }
-        // No duplicates padding the set.
-        let mut seen = ALL_ADMISSION_PATHS.to_vec();
-        seen.dedup();
-        assert_eq!(seen.len(), ALL_ADMISSION_PATHS.len(), "duplicate variants");
+        // No duplicates padding the set — as a SET comparison. `Vec::dedup`
+        // only removes CONSECUTIVE duplicates, so a duplicate variant placed
+        // non-adjacently passed the old spelling (the same hole lane #366's
+        // probe C found in its own counter cell, fixed here for parity).
+        let distinct: std::collections::BTreeSet<&str> =
+            ALL_ADMISSION_PATHS.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            ALL_ADMISSION_PATHS.len(),
+            "duplicate variants"
+        );
     }
 
     /// The header→path mapping, including the two that share an engine mode.
