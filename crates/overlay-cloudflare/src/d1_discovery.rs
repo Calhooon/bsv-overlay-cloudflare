@@ -2765,21 +2765,7 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// still displaces the victim's pots at the same ~`limit`-dust cost as before.
 /// The honest net gain is **from "any N junk rows" to "N junk rows naming
 /// real, recent pot txids"**, plus the outright death of the zero-forgery
-/// replay variant.
-///
-/// **CORRECTION (bsv-low #347).** This paragraph used to also claim "the
-/// outright death of free invented-pot flooding". That was FALSE, and it is
-/// the claim #347 was filed against: `tm_pot` admits a covenant output on byte
-/// STRUCTURE alone, so until admission is network-gated an attacker mints
-/// `pot_records` rows for pots that never existed, for free. A ghost row makes
-/// `unknownPot = 0` in the tier expression below, which promotes the paired
-/// victim-named markers to tier 0 with NO quota — bypassing the very reserve
-/// this window installs. Invented-pot flooding is being made *fee-bearing* by
-/// the #347 submit gate; the tier predicate itself is bsv-low #283's to bind
-/// to network reality, and this comment is corrected here only so it stops
-/// reading as evidence that the axis is closed (Rule 10).
-///
-/// And eviction WITHIN a
+/// replay variant and of free invented-pot flooding. And eviction WITHIN a
 /// pot now costs [`PARTYFOR_ROWS_PER_GROUP`] markers per group instead of one
 /// — a MITIGATION, not a closure: file one more than that and the honest row
 /// is evicted again. See [`PARTYFOR_ROWS_PER_GROUP`] for the measured size,
