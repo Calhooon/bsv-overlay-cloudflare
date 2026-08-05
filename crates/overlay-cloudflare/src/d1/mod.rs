@@ -296,7 +296,10 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// 101 → 102 for #362: the `hopparty_records.markerValid` ADD COLUMN — the
 /// same latch generalised to hop markers, which is what retires
 /// `/hops-view`'s read-time ECDSA and its 150-row verify budget.
-pub const OVERLAY_MIGRATION_COUNT: usize = 102;
+/// 102 → 103 for #355 + #367: `relatch_cursors`, the durable scan position of
+/// the pass that re-latches BOTH verdict columns. One statement, one table,
+/// overlay-only (no other service reads it, so epoch Rule 24 does not bite).
+pub const OVERLAY_MIGRATION_COUNT: usize = 103;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1010,20 +1013,19 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // and a legacy row IS an indexed row. (b) The overlay is RUST and every
     // input `record_sig_valid` needs is already in the row, so a bounded lazy
     // re-latch pass — `SELECT … LIMIT N` -> compute -> `UPDATE` — is
-    // perfectly possible and small; it is simply not in this change. **So the
-    // legacy tier is PERMANENT until that pass lands** (bsv-low#355).
+    // perfectly possible and small. **That pass now exists**
+    // (`crate::relatch`, bsv-low#355 + #367), and it is what retires the
+    // legacy tier; it was not in the #283 change itself.
     //
-    // WRITE-ONCE, NEVER RE-EVALUATED, and that is the wider hazard (gate
-    // round 2, MED-4). This column is set by `INSERT OR IGNORE` and by
-    // nothing else — no `UPDATE potparty_records SET sigValid` exists in
-    // production code. So a TRANSIENT predicate fault (a `bsv-rs`
-    // DER/`to_der` behaviour change, a wallet emitting a non-canonical
-    // signature mid-rollout, a partial deploy) permanently demotes every
-    // honest row admitted in that window to rank 0 — BELOW the legacy tier,
-    // with no self-healing path. Pre-fix those rows ordered neutrally;
-    // post-fix they are last, forever. That is the Rule 6 trade, and its
-    // victims are wiped-device users with a silently short enumeration who
-    // will never file a bug (Rule 14).
+    // WRITE-ONCE AT ADMISSION, and that is the wider hazard (gate round 2,
+    // MED-4). A TRANSIENT predicate fault (a `bsv-rs` DER/`to_der` behaviour
+    // change, a wallet emitting a non-canonical signature mid-rollout, a
+    // partial deploy) demotes every honest row admitted in that window to
+    // rank 0 — BELOW the legacy tier. Pre-latch those rows ordered neutrally;
+    // post-latch they are last. That is the Rule 6 trade, and its victims are
+    // wiped-device users with a silently short enumeration who will never
+    // file a bug (Rule 14). Until #355 it was PERMANENT, because this column
+    // was set by `INSERT OR IGNORE` and by nothing else.
     //
     // #355 is therefore a RE-LATCH OF EVERY ROW, not a backfill of the NULL
     // ones, and its closure criterion is: **every row's `sigValid` equals
@@ -1031,6 +1033,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // reported as a count of rows changed plus a count still `NULL`. The
     // narrower "zero rows with `sigValid IS NULL`" criterion structurally
     // SKIPS the 0s, which are exactly the rows a fault would have created.
+    // The pass's UPDATE is the ONE other statement that writes this column
+    // (`potparty_write::potparty_relatch_query`); the cursor it rides on is
+    // `relatch_cursors`, at the end of this list.
     //
     // Additive ALTER — the runner ignores the re-run "duplicate column"
     // error (`migration_error_is_benign`). NOTE the app-layer Worker issues
@@ -1072,18 +1077,44 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // NULLABLE on purpose: a MIGRATION cannot backfill it, because SQL
     // cannot verify a signature. And unlike potparty there is not even a
     // republish that could re-latch a legacy row — a hopparty marker must
-    // ride the hop transaction, which is already on chain. **The legacy tier
-    // is PERMANENT until the re-latch pass (bsv-low#367) lands**, whose
-    // closure criterion is EVERY row's markerValid equalling
-    // `record_marker_valid` recomputed at the pass's own predicate version —
-    // never "zero rows with markerValid IS NULL", which structurally skips
-    // the 0s a transient predicate fault would have created (Rule 6/14).
+    // ride the hop transaction, which is already on chain. So the re-latch
+    // pass (`crate::relatch`, bsv-low#367) is the ONLY repair path this
+    // column can ever have; its closure criterion is EVERY row's markerValid
+    // equalling `record_marker_valid` recomputed at the pass's own predicate
+    // version — never "zero rows with markerValid IS NULL", which
+    // structurally skips the 0s a transient predicate fault would have
+    // created (Rule 6/14).
     //
     // Additive ALTER — the runner ignores the re-run "duplicate column"
     // error (`migration_error_is_benign`). NOTE the app-layer Worker issues
     // this same statement itself (`low_app_layer::schema`) because it never
     // runs this list; the two are pinned byte-identical (epoch Rule 24).
     "ALTER TABLE hopparty_records ADD COLUMN markerValid INTEGER",
+    // ── #355 + #367 re-latch cursors ──────────────────────────────────────
+    // The durable scan position of the lazy RE-LATCH pass (`crate::relatch`),
+    // one row per re-latched table, keyed by the table's own name.
+    //
+    // Both verdict columns above are written ONCE at admission and were, until
+    // that pass, re-evaluated by nothing. So a TRANSIENT predicate fault (a
+    // `bsv-rs` DER behaviour change, a wallet emitting a non-canonical
+    // signature mid-rollout, a partial deploy) permanently demoted every
+    // honest row admitted in its window to rank 0 — BELOW even the legacy
+    // NULL tier — with no self-healing path (epoch Rule 6). The pass sweeps
+    // EVERY row and rewrites any whose stored verdict differs from the
+    // predicate recomputed now; this table is what makes that sweep resumable
+    // across ticks instead of a repeated head-scan.
+    //
+    // `cursorRowid` is a rowid high-water mark WITHIN the current sweep and WRAPS
+    // to 0 at the tail (`sweeps` then increments), because the criterion is a
+    // FIXPOINT — "every row's verdict equals the predicate recomputed at the
+    // pass's own version" — not a one-shot backfill. Losing this table costs
+    // nothing but a restarted sweep: re-verifying a converged page writes
+    // nothing.
+    "CREATE TABLE IF NOT EXISTS relatch_cursors (
+        tableName TEXT PRIMARY KEY,
+        cursorRowid INTEGER NOT NULL DEFAULT 0,
+        sweeps INTEGER NOT NULL DEFAULT 0
+    )",
 ];
 
 // =============================================================================

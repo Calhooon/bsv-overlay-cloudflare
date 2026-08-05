@@ -67,27 +67,27 @@
 //!
 //! # A `0` IS A VERDICT, NOT "not yet checked"
 //!
-//! `markerValid` is written once, by `INSERT OR IGNORE`, and re-evaluated by
-//! nothing: no `UPDATE hopparty_records SET markerValid` exists in production
-//! code. A TRANSIENT fault in this predicate — a `bsv-rs` DER/`to_der`
-//! behaviour change, a wallet emitting a non-canonical signature during a
-//! rollout, a partial deploy — therefore demotes every honest row admitted in
-//! that window to rank 0 PERMANENTLY, with no self-healing path (epoch
-//! Rule 6), and its victims are wiped-device users seeing a silently short
-//! enumeration, i.e. the population least able to report it (Rule 14).
+//! A TRANSIENT fault in this predicate — a `bsv-rs` DER/`to_der` behaviour
+//! change, a wallet emitting a non-canonical signature during a rollout, a
+//! partial deploy — demotes every honest row admitted in that window to rank
+//! 0 (epoch Rule 6), and its victims are wiped-device users seeing a silently
+//! short enumeration, i.e. the population least able to report it (Rule 14).
 //!
-//! That is why the re-latch pass (bsv-low#367) is scoped as a pass over
-//! **EVERY row**, with the closure criterion "every row's `markerValid`
-//! equals [`record_marker_valid`] recomputed at the pass's own predicate
-//! version". A `WHERE markerValid IS NULL` census structurally skips exactly
-//! the rows such a fault would have created.
+//! Until bsv-low#367 that was PERMANENT and could not self-heal AT ALL: the
+//! column was written once, by `INSERT OR IGNORE`, re-evaluated by nothing,
+//! and a hopparty marker must ride the hop transaction — which is already on
+//! chain — so no republish could ever re-latch a row. **It is now
+//! re-evaluated by the lazy re-latch pass**
+//! (`bsv_overlay_cloudflare::relatch`), which is the ONLY repair path this
+//! table can have. Its closure criterion is "every row's `markerValid` equals
+//! [`record_marker_valid`] recomputed at the pass's own predicate version" —
+//! a FIXPOINT, deliberately not a `WHERE markerValid IS NULL` census, which
+//! structurally skips exactly the rows such a fault would have created.
 //!
-//! **Rows admitted before this change carry no verdict, and that is PERMANENT
-//! absent that pass.** It does not self-heal: a hopparty marker must ride the
-//! hop transaction, and that transaction is already on chain, so there is no
-//! republish that could re-latch it. `/hops-view` labels those rows
-//! `markerVerified: "unknown"` — which is now the ONLY producer of that word,
-//! and means "this row predates the latch", never "the budget ran out".
+//! Rows admitted before the migration carry no verdict until that pass
+//! reaches them. `/hops-view` labels them `markerVerified: "unknown"` — which
+//! is the ONLY producer of that word, and means "this row predates the latch
+//! and the sweep has not reached it yet", never "the budget ran out".
 
 use crate::hopparty::{hopparty_identity_challenge, hopparty_seatsig_preimage, HoppartyMarker};
 use crate::potparty::validity::canonical_der;

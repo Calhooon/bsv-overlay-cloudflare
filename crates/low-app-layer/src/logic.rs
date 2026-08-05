@@ -491,15 +491,19 @@ pub fn recovery_view_sql() -> String {
         "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
             w.recoveryHeight AS recoveryHeight, \
             w.covRecoveryHeight AS covRecoveryHeight, \
+            w.covPubA AS covPubA, w.covPubB AS covPubB, \
+            w.covPayPkhA AS covPayPkhA, w.covPayPkhB AS covPayPkhB, \
             w.opponentIdentity AS opponentIdentity, \
             w.spent AS spent, w.spendingTxid AS spendingTxid, \
             w.spentConfirmed AS spentConfirmed, \
             hex(b.beef) AS spenderBeef \
      FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+              covPubA, covPubB, covPayPkhA, covPayPkhB, \
               opponentIdentity, spent, spendingTxid, spentConfirmed, \
               markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
               CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
        FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                covPubA, covPubB, covPayPkhA, covPayPkhB, \
                 opponentIdentity, spent, spendingTxid, spentConfirmed, \
                 markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
                 potBestSigRank, \
@@ -510,6 +514,8 @@ pub fn recovery_view_sql() -> String {
          FROM (SELECT pp.gameId AS gameId, pp.potTxid AS potTxid, \
                   pp.potVout AS potVout, pp.recoveryHeight AS recoveryHeight, \
                   r.recoveryHeight AS covRecoveryHeight, \
+                  r.pubA AS covPubA, r.pubB AS covPubB, \
+                  r.payPkhA AS covPayPkhA, r.payPkhB AS covPayPkhB, \
                   pp.opponentIdentity AS opponentIdentity, \
                   r.spent AS spent, r.spendingTxid AS spendingTxid, \
                   r.spentConfirmed AS spentConfirmed, \
@@ -595,6 +601,12 @@ pub struct RecoveryRow {
     /// `hex(pot_beefs.beef)` for the recorded spender, `None` when the join
     /// missed (unspent, or the spender's BEEF was never stored).
     pub spender_beef_hex: Option<String>,
+    /// The pot's COMMITTED covenant keys (#343), decoded at admission from
+    /// its own funding lock (`pot_records`' #284 columns). `None` when the
+    /// pot has no row, is not a covenant lock, or its stored params are not
+    /// a complete well-formed set — see [`crate::results::CommittedKeys`],
+    /// including why a MISMATCH is not a not-yours claim.
+    pub committed_keys: Option<crate::results::CommittedKeys>,
 }
 
 /// One `/recovery-view` response entry: the caller's potparty facts plus the
@@ -632,6 +644,9 @@ pub struct RecoveryEntry {
     /// verify (hash == `spendingTxid`) before trusting. `None` whenever the
     /// spender or its bytes aren't available; never a guessed value.
     pub spender_raw_hex: Option<String>,
+    /// The pot's COMMITTED covenant keys (#343), or `None` = cannot say. See
+    /// [`crate::results::CommittedKeys`].
+    pub committed_keys: Option<crate::results::CommittedKeys>,
 }
 
 /// Map the joined rows to response entries, extracting each recorded
@@ -695,6 +710,9 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
                 spending_txid: r.spending_txid,
                 spent_confirmed: r.spent_confirmed,
                 spender_raw_hex,
+                // #343 — carried straight through: the row already holds the
+                // pot's committed keys, and this view never re-derives them.
+                committed_keys: r.committed_keys,
             }
         })
         .collect();
@@ -721,6 +739,22 @@ pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>, truncated
                 "spendingTxid": e.spending_txid,
                 "spentConfirmed": e.spent_confirmed,
                 "spenderRawHex": e.spender_raw_hex,
+                // NEW (#343): the pot's COMMITTED covenant keys from its own
+                // funding lock, or null. This is the WIPED-DEVICE case the
+                // field exists for — a device with no local money records
+                // still derives its own `[2,'low settle']` key and its own
+                // `counterparty:'self'` pay-home PKH and tests membership,
+                // instead of taking this server's shaping on trust.
+                //
+                // A MISMATCH IS NOT "NOT YOURS". The row's potTxid is
+                // attacker-chosen and these values are only as good as this
+                // server; a consumer treats absence and mismatch alike as
+                // CANNOT-SAY and re-derives from hash-verified bytes before
+                // acting on a negative. A match on `payPkhA`/`payPkhB` is the
+                // unforgeable half.
+                "committedKeys": crate::results::CommittedKeys::to_json(
+                    e.committed_keys.as_ref()
+                ),
             })
         })
         .collect();
@@ -2379,6 +2413,7 @@ mod tests {
             spending_txid: None,
             spent_confirmed: None,
             spender_beef_hex: None,
+            committed_keys: None,
         };
         // Covenant truth wins over a hostile marker's value.
         let (out, _) = assemble_recovery_view(vec![row(Some(958_504), 1)]);
@@ -2617,6 +2652,7 @@ mod tests {
                 spending_txid: Some(spender.clone()),
                 spent_confirmed: Some(true),
                 spender_beef_hex: Some(beef_hex_upper),
+                committed_keys: None,
             },
             // Pot spent, spender recorded but no stored BEEF → raw null.
             RecoveryRow {
@@ -2630,6 +2666,7 @@ mod tests {
                 spending_txid: Some(spender.clone()),
                 spent_confirmed: Some(false),
                 spender_beef_hex: None,
+                committed_keys: None,
             },
             // Party marker but NO pot_records row (spend never indexed) →
             // fail-safe: spent:null, never asserted unspent.
@@ -2644,6 +2681,7 @@ mod tests {
                 spending_txid: None,
                 spent_confirmed: None,
                 spender_beef_hex: None,
+                committed_keys: None,
             },
         ];
         let (out, _truncated) = assemble_recovery_view(rows);
@@ -2685,6 +2723,7 @@ mod tests {
             spending_txid: None,
             spent_confirmed: None,
             spender_beef_hex: None,
+            committed_keys: None,
         };
         // Three marker rows for ONE (game, pot, vout) — the republish shape.
         let rows = vec![dup(0x11), dup(0x11), dup(0x11)];
@@ -2743,6 +2782,7 @@ mod tests {
             spending_txid: Some("f0".repeat(32)),
             spent_confirmed: Some(true),
             spender_beef_hex: Some("not-hex!!".to_string()),
+            committed_keys: None,
         }];
         let (out, _truncated) = assemble_recovery_view(rows);
         // Pointer facts survive; only the raw degrades to null.
@@ -2763,6 +2803,7 @@ mod tests {
                 spending_txid: Some("f0".repeat(32)),
                 spent_confirmed: Some(true),
                 spender_raw_hex: Some("aabb".to_string()),
+                committed_keys: None,
             },
             RecoveryEntry {
                 game_id: "33".repeat(32),
@@ -2774,6 +2815,7 @@ mod tests {
                 spending_txid: None,
                 spent_confirmed: None,
                 spender_raw_hex: None,
+                committed_keys: None,
             },
         ];
         let v: serde_json::Value =

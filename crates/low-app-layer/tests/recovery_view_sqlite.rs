@@ -34,8 +34,8 @@
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use bsv_overlay_cloudflare::d1_discovery::{mark_spent_sql, store_record_sql};
 use low_app_layer::logic::{
-    assemble_recovery_view, recovery_view_sql, RecoveryRow, RECOVERY_VIEW_MAX_ROWS,
-    RECOVERY_VIEW_UNKNOWN_QUOTA,
+    assemble_recovery_view, recovery_view_body, recovery_view_sql, RecoveryRow,
+    RECOVERY_VIEW_MAX_ROWS, RECOVERY_VIEW_UNKNOWN_QUOTA,
 };
 use rusqlite::{params, Connection};
 
@@ -156,6 +156,16 @@ fn query_recovery_rows(conn: &Connection, identity: &str) -> Vec<RecoveryRow> {
             spending_txid: r.get("spendingTxid")?,
             spent_confirmed: r.get::<_, Option<i64>>("spentConfirmed")?.map(|v| v != 0),
             spender_beef_hex: r.get("spenderBeef")?,
+            // #343 — through the SHARED predicate, exactly as `RecoveryRowD1`
+            // does. Mapping these by hand here would make the cell blind to
+            // the one thing it can observe that a unit test cannot: that the
+            // shipped SQL really projects the four columns.
+            committed_keys: low_app_layer::results::CommittedKeys::from_columns(
+                r.get::<_, Option<String>>("covPubA")?.as_deref(),
+                r.get::<_, Option<String>>("covPubB")?.as_deref(),
+                r.get::<_, Option<String>>("covPayPkhA")?.as_deref(),
+                r.get::<_, Option<String>>("covPayPkhB")?.as_deref(),
+            ),
         })
     })
     .unwrap()
@@ -202,6 +212,132 @@ fn the_covenant_height_survives_every_projection_tier() {
     // And the ASSEMBLED entry prefers it over the marker's value of 1.
     let (entries, _) = assemble_recovery_view(rows);
     assert_eq!(entries[0].recovery_height, 958_504);
+}
+
+/// bsv-low#343 — the pot's COMMITTED covenant keys must survive all four
+/// projection tiers too, and arrive on the WIRE.
+///
+/// This is the wiped-device case the field exists for: the caller has no
+/// local money records and no funding BEEF in hand, so today's ownership
+/// anchor returns cannot-say and the row is taken on trust. With the
+/// committed keys served, the client answers the question itself from its own
+/// two derivations (its `[2,'low settle']` key and its `counterparty:'self'`
+/// pay-home PKH) — network enforcement instead of platform enforcement.
+///
+/// Driven end to end through the SHIPPED SQL, the SHIPPED row mapper and the
+/// SHIPPED body builder, because a column added to only three of the four
+/// projection tiers is exactly the outage the cell above exists for.
+#[test]
+fn the_committed_covenant_keys_survive_every_projection_tier_and_reach_the_wire() {
+    let conn = production_schema_db();
+    let me = h66(0xa5);
+    let pot = h64(0xc1);
+    admit_pot(&conn, &pot, 1_000, Some(958_504));
+    file_party(
+        &conn,
+        &me,
+        &h64(0x11),
+        &pot,
+        1,
+        "fe".repeat(32).as_str(),
+        1_001,
+    );
+
+    let rows = query_recovery_rows(&conn, &me);
+    assert_eq!(rows.len(), 1);
+    let keys = rows[0]
+        .committed_keys
+        .clone()
+        .expect("a covenant pot's committed keys survive the middle tiers");
+    // The values `admit_pot` wrote through the REAL `store_record_sql`.
+    assert_eq!(keys.pub_a, h66(0x0a));
+    assert_eq!(keys.pub_b, h66(0x0b));
+    assert_eq!(keys.pay_pkh_a, "aa".repeat(20));
+    assert_eq!(keys.pay_pkh_b, "bb".repeat(20));
+
+    let (entries, _) = assemble_recovery_view(rows);
+    let body: serde_json::Value =
+        serde_json::from_str(&recovery_view_body(&entries, Some(900_000), false)).unwrap();
+    let ck = &body["entries"][0]["committedKeys"];
+    assert_eq!(ck["pubA"], serde_json::json!(h66(0x0a)));
+    assert_eq!(ck["pubB"], serde_json::json!(h66(0x0b)));
+    assert_eq!(ck["payPkhA"], serde_json::json!("aa".repeat(20)));
+    assert_eq!(
+        ck["payPkhB"],
+        serde_json::json!("bb".repeat(20)),
+        "the PAY HOMES are the unforgeable half — a set without them would \
+         reduce the anchor to a name check"
+    );
+    // ADDITIVE: nothing a deployed client already reads moved.
+    assert_eq!(body["entries"][0]["recoveryHeight"], 958_504);
+    assert_eq!(body["entries"][0]["potTxid"], serde_json::json!(pot));
+}
+
+/// A pot with no decoded params serves `committedKeys: null` — CANNOT-SAY,
+/// which the client must not read as "not yours" (and which is the state a
+/// legacy un-backfilled row is in until the #284 pass reaches it).
+#[test]
+fn a_pot_without_decoded_params_serves_null_committed_keys() {
+    let conn = production_schema_db();
+    let me = h66(0xa6);
+    let pot = h64(0xc2);
+    admit_pot(&conn, &pot, 1_000, None); // bare/legacy: decoded columns NULL
+    file_party(
+        &conn,
+        &me,
+        &h64(0x11),
+        &pot,
+        958_600,
+        "fd".repeat(32).as_str(),
+        1_001,
+    );
+
+    let rows = query_recovery_rows(&conn, &me);
+    assert!(rows[0].committed_keys.is_none());
+    let (entries, _) = assemble_recovery_view(rows);
+    let body: serde_json::Value =
+        serde_json::from_str(&recovery_view_body(&entries, None, false)).unwrap();
+    assert!(
+        body["entries"][0]["committedKeys"].is_null(),
+        "null, and the KEY IS STILL PRESENT — an absent key and a null one \
+         must not be two different states for a consumer to handle"
+    );
+    assert!(body["entries"][0]
+        .as_object()
+        .unwrap()
+        .contains_key("committedKeys"));
+}
+
+/// A pot whose stored params are INCOMPLETE serves null — never a partial
+/// set. A consumer handed `{pubA, pubB, payPkhA: null}` would be invited to
+/// settle for the forgeable half of the check.
+#[test]
+fn a_partial_param_set_serves_null_rather_than_half_an_answer() {
+    let conn = production_schema_db();
+    let me = h66(0xa7);
+    let pot = h64(0xc3);
+    admit_pot(&conn, &pot, 1_000, Some(958_504));
+    // Blank ONE pay home — the unforgeable half — leaving the rest intact.
+    conn.execute(
+        "UPDATE pot_records SET payPkhB = NULL WHERE txid = ?1",
+        params![pot],
+    )
+    .unwrap();
+    file_party(
+        &conn,
+        &me,
+        &h64(0x11),
+        &pot,
+        1,
+        "fc".repeat(32).as_str(),
+        1_001,
+    );
+
+    let rows = query_recovery_rows(&conn, &me);
+    assert!(
+        rows[0].committed_keys.is_none(),
+        "all four or nothing — a half set is the state a consumer misreads"
+    );
 }
 
 /// A bare/legacy pot has no committed height: the marker value is served,

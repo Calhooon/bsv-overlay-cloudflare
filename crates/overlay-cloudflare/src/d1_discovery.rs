@@ -3004,29 +3004,66 @@ pub fn potrefund_list_for_identity_sql() -> String {
 /// concurrent insert can never shift rows across an already-fetched page
 /// boundary.
 ///
-/// # NOT RANK-ORDERED — the eighth potparty window (bsv-low#356)
+/// # DELIBERATELY NOT RANK-ORDERED — and that is the FIX, not the residual
+/// (bsv-low#354 / #356)
 ///
 /// #283 made `potparty_records.sigValid` the leading `ORDER BY` term in SEVEN
-/// queries. This is the eighth reader and it is deliberately NOT one of them,
-/// so state the residual here rather than let a reader infer the family
-/// property from its siblings (epoch Rule 8):
+/// queries. This is the eighth reader and it stays out of that family. State
+/// the reasoning here rather than let a reader infer the family property from
+/// the siblings (epoch Rule 8), because "the eighth one was forgotten" and
+/// "the eighth one must not have it" look identical from outside:
 ///
-///  - it is **not identity-scoped**, so #283's argument for why the rank is
-///    unforgeable ("a junk row must carry the victim's identity signature")
-///    does not apply here at all; and
-///  - the SQL is **shared with `POTREFUND_SELECT`**, and `potrefund_records`
-///    has no `sigValid` column — so a rank term cannot simply be added
-///    without splitting the query or the schema.
+///  1. **The rank is FORGEABLE in this window, so it would be a bar that does
+///     not bar.** `sigValid = 1` means the marker's signatures verify under
+///     the marker's OWN claimed identity and OWN claimed settle key. The
+///     seven ranked windows are identity-scoped or committed-key-scoped, so a
+///     junk row there must carry a signature from a key the attacker does not
+///     hold. Here the only scope is `potTxid`/`potVout` — payload CLAIMS, not
+///     this row's own outpoint — so a stranger names ITS OWN identity, signs
+///     with ITS OWN key, and latches rank 2 for free, 100 times. Adding the
+///     term would move nothing except what a reviewer believes is covered,
+///     which is worse than not adding it (epoch Rule 1 / the "cited as
+///     coverage" failure in Rule 9).
+///  2. **A mutable rank would break the page stability that IS the fix.** The
+///     `OFFSET` below is only safe because `(createdAt ASC, rowid ASC)` is
+///     append-only: new markers land at the tail and can never shift a row
+///     across a boundary the caller already fetched. `sigValid` is no longer
+///     immutable — the #355/#367 re-latch sweep (`crate::relatch`) rewrites
+///     it — so a rank-leading order would silently move rows BETWEEN pages
+///     mid-enumeration, which is exactly how a paging client loses the row it
+///     was paging toward.
+///  3. The SQL is **shared with `POTREFUND_SELECT`**, and `potrefund_records`
+///     has no `sigValid` column, so the term could not be added without a
+///     second spelling of one query — a cost worth paying for a real bar and
+///     not for one that is neither.
 ///
-/// The accepted mitigation is the `OFFSET` above, and it is only a mitigation
-/// while a caller USES it: `lookupPotPartyByPot` (`app/src/lib/overlay.ts`)
-/// sends neither `limit` nor `offset`, so it reads page 0 of `DEFAULT_LIMIT`
-/// forever and ~100 free rows (bsv-low#347: a marker is free, not
-/// dust-priced) stamped before the honest seats evict BOTH of them from the
-/// client's `attribute_seats` fold. Fail direction is the good one —
-/// attribution OMITTED, never wrong — and this is a display/attribution
-/// surface, not a money path, which is why it is filed rather than fixed
-/// here. bsv-low#356 tracks it; client-side paging is the likely answer.
+/// # What DOES close it: the caller can now page (bsv-low#354)
+///
+/// The window has been `LIMIT ? OFFSET ?` since #291 gate M2, and until now
+/// **no caller could reach the OFFSET**: `PotpartyQuery::ByPot` declared no
+/// such field and `list_for_pot` hard-bound 0. So the accepted mitigation
+/// ("a client that suspects burial pages `offset += limit`") was advice with
+/// no mechanism behind it — the Rule 13 failure where a truthful answer
+/// leaves its consumer no way to reach the right data. ~100 free rows
+/// (bsv-low#347: a marker is free, not dust-priced) stamped before the honest
+/// seats evicted BOTH of them from `lookupPotPartyByPot`'s `attribute_seats`
+/// fold, permanently, because rows are never deleted and `createdAt` is
+/// server-assigned.
+///
+/// `byPot` now takes `offset`, so every admitted row is reachable and the
+/// bound on a flood is the attacker's willingness to keep filing rather than
+/// the caller's page size. The fail direction was already the good one
+/// (attribution OMITTED, never wrong), which is why this was a display
+/// surface rather than a money path — but "the honest row is unreachable" is
+/// not a state to leave standing on a recovery-adjacent index.
+///
+/// The strictly stronger design remains available and is NOT this change:
+/// bind the pot's COMMITTED settle keys (read from its own funding lock) and
+/// serve this route through `seat_markers_sql`, which prefilters on keys an
+/// attacker cannot name. That is a different wire and a different question;
+/// it is worth doing when a consumer needs the overlay to have an opinion.
+/// This consumer verifies every row itself, so REACHABILITY is what it was
+/// missing.
 ///
 /// Built from the caller's own SELECT list so the tests execute the SHIPPED
 /// string rather than a transcription of it.
@@ -3035,6 +3072,38 @@ pub fn list_for_pot_sql(select: &str) -> String {
         "{select} WHERE potTxid = ? AND potVout = ? \
          ORDER BY createdAt ASC, rowid ASC LIMIT ? OFFSET ?"
     )
+}
+
+/// THE `byPot` query — statement AND bind list — as a pure value, for both
+/// callers (`ls_potparty` and `ls_potrefund`).
+///
+/// This exists because of a MEASURED gap, not for tidiness. `fetch_all` needs
+/// a live `D1Database`, so a native test cannot watch the storage impl bind
+/// anything (epoch Rule 22 — the same unreachability that let a latch column
+/// be silently bound `NULL` in #283 with the whole suite green). Executing
+/// [`list_for_pot_sql`] against real SQLite with hand-written params proves
+/// the STATEMENT and says nothing about the BINDS: replacing the page-start
+/// bind with a computed `0` in `list_for_pot` left every cell passing, which
+/// is #354's fix silently inoperative. RED-verified, and this builder is the
+/// remedy — the built value is inspectable (`Query::sql` / `Query::params`),
+/// so `the_by_pot_query_binds_the_page_start_for_both_callers` observes the
+/// exact four binds production sends.
+///
+/// One builder for both tables, so the pin covers both call sites rather than
+/// one of them (epoch Rule 10: the durable fix for "these two must agree" is
+/// deleting one of the copies).
+pub fn by_pot_query(
+    select: &str,
+    pot_txid: &str,
+    pot_vout: u32,
+    limit: usize,
+    offset: usize,
+) -> Query {
+    Query::new(list_for_pot_sql(select))
+        .bind(pot_txid)
+        .bind(pot_vout)
+        .bind(limit as u32)
+        .bind(offset as u32)
 }
 
 /// How many pots ABSENT from `pot_records` are promoted into the main tier
@@ -3245,7 +3314,10 @@ pub fn identity_window_row_cap(limit: usize, groups: usize) -> usize {
         .saturating_mul(PARTYFOR_ROWS_PER_GROUP)
 }
 
-pub use potparty_write::{potparty_insert_query, LatchedPotpartyInsert, PotpartyDb};
+pub use potparty_write::{
+    potparty_insert_query, potparty_relatch_query, LatchedPotpartyInsert, LatchedPotpartyRelatch,
+    PotpartyDb,
+};
 
 /// The potparty write path as a CAPABILITY rather than a convention
 /// (bsv-low #283, gate round 2 MED-2).
@@ -3368,23 +3440,24 @@ pub mod potparty_write {
     ///
     /// # A latched `0` is a VERDICT, not "not yet checked" (bsv-low#355)
     ///
-    /// Nothing re-evaluates this column: it is written once, by
-    /// `INSERT OR IGNORE`, and no `UPDATE potparty_records SET sigValid`
-    /// exists in production code. So a TRANSIENT predicate fault — a
-    /// `bsv-rs` DER/`to_der` behaviour change, a wallet emitting a
-    /// non-canonical signature during a rollout, a partial deploy —
-    /// permanently demotes every honest row admitted in that window to rank
-    /// **0**, which sorts BELOW the legacy (`NULL`) tier, with no
-    /// self-healing path. That is exactly the epoch Rule 6 trade (a
-    /// self-healing failure swapped for a permanent one) and its victims are
-    /// wiped-device users seeing a silently short enumeration, i.e. the
+    /// A TRANSIENT predicate fault — a `bsv-rs` DER/`to_der` behaviour
+    /// change, a wallet emitting a non-canonical signature during a rollout,
+    /// a partial deploy — demotes every honest row admitted in that window to
+    /// rank **0**, which sorts BELOW the legacy (`NULL`) tier. Its victims
+    /// are wiped-device users seeing a silently short enumeration, i.e. the
     /// population least able to report it (Rule 14).
     ///
-    /// This is why bsv-low#355 is a **re-latch of every row**, not a backfill
-    /// of the `NULL` ones: a criterion of "zero rows with `sigValid IS NULL`"
-    /// structurally skips the 0s, which are the rows a fault would have
-    /// created. Read a `0` as "this row's verdict is as old as the predicate
-    /// that produced it", never as "unchecked".
+    /// This write is `INSERT OR IGNORE`, so it never revisits a row. Until
+    /// bsv-low#355 nothing else did either, and the demotion was PERMANENT
+    /// (the epoch Rule 6 trade: a self-healing failure swapped for a
+    /// permanent one). The repair now exists and is the ONE other statement
+    /// in this module that touches the column:
+    /// [`potparty_relatch_query`], swept over EVERY row by
+    /// `crate::relatch` — never a backfill of the `NULL` ones, because a
+    /// criterion of "zero rows with `sigValid IS NULL`" structurally skips
+    /// the 0s, which are the rows a fault would have created. Read a `0` as
+    /// "this row's verdict is as old as the last sweep", never as
+    /// "unchecked".
     pub fn potparty_insert_query(
         record: &PotpartyRecord,
         created_at: i64,
@@ -3411,6 +3484,58 @@ pub mod potparty_write {
             .bind(record.output_index)
             .bind(created_at)
             .bind(i64::from(sig_valid)),
+            sig_valid,
+        }
+    }
+
+    /// A potparty RE-LATCH that PROVABLY carries a freshly recomputed
+    /// `sigValid` (bsv-low#355).
+    ///
+    /// Same capability shape as [`LatchedPotpartyInsert`], for the same
+    /// reason: private fields, exactly one constructor, and
+    /// [`PotpartyDb::relatch`] accepts nothing else. The pass therefore
+    /// cannot be handed a verdict to write — it can only ask for the row's
+    /// verdict to be RE-DERIVED (epoch Rule 15: don't hand a call site a
+    /// decision it can get wrong).
+    pub struct LatchedPotpartyRelatch {
+        query: Query,
+        sig_valid: bool,
+    }
+
+    impl LatchedPotpartyRelatch {
+        /// The verdict this UPDATE binds — the same evaluation, not a second
+        /// one.
+        pub fn sig_valid(&self) -> bool {
+            self.sig_valid
+        }
+
+        /// Read-only view of the built query, for the replay pin.
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    /// THE potparty RE-LATCH write, as a pure value (bsv-low#355).
+    ///
+    /// `UPDATE`, never `INSERT OR REPLACE`: rows in this table are never
+    /// rewritten, and only this one column may move. The row is addressed by
+    /// its OUTPOINT — the primary key — so this cannot touch a second row
+    /// however stale the cursor that produced the record is.
+    ///
+    /// The verdict is recomputed HERE, from the record as stored, by the same
+    /// [`overlay_discovery::potparty::validity::record_sig_valid`] the
+    /// admission write uses. "The pass's own predicate version" in #355's
+    /// closure criterion is therefore literally this call.
+    pub fn potparty_relatch_query(record: &PotpartyRecord) -> LatchedPotpartyRelatch {
+        let sig_valid = overlay_discovery::potparty::validity::record_sig_valid(record);
+        LatchedPotpartyRelatch {
+            query: Query::new(
+                "UPDATE potparty_records SET sigValid = ? \
+                 WHERE txid = ? AND outputIndex = ?",
+            )
+            .bind(i64::from(sig_valid))
+            .bind(record.txid.as_str())
+            .bind(record.output_index),
             sig_valid,
         }
     }
@@ -3479,6 +3604,13 @@ pub mod potparty_write {
         pub async fn insert(&self, insert: LatchedPotpartyInsert) -> Result<(), String> {
             insert.query.execute(&self.0).await
         }
+
+        /// Run THE potparty re-latch write (bsv-low#355). Accepts nothing that
+        /// did not come from [`potparty_relatch_query`], so this second write
+        /// path cannot become the door the capability bar was built to close.
+        pub async fn relatch(&self, update: LatchedPotpartyRelatch) -> Result<(), String> {
+            update.query.execute(&self.0).await
+        }
     }
 }
 
@@ -3538,23 +3670,184 @@ impl PotpartyStorage for D1PotpartyStorage {
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
-        // OLDEST FIRST — see `list_for_pot_sql` (bsv-low #281). The shared
-        // SQL is offset-pageable since gate M2; the potparty wire has no
-        // offset (its rows are small — no payload-bound cap forcing one),
-        // so this binds page 0.
+        // OLDEST FIRST, offset-pageable — see `list_for_pot_sql` for why
+        // paging rather than a rank is the answer for THIS window
+        // (bsv-low #281, #291 gate M2, #354/#356). Until #354 this bound a
+        // literal 0 and no caller could ask for anything else.
         let rows: Vec<PotpartyRow> = self
             .db
-            .fetch_all(
-                Query::new(list_for_pot_sql(POTPARTY_SELECT))
-                    .bind(pot_txid)
-                    .bind(pot_vout)
-                    .bind(limit as u32)
-                    .bind(0u32),
-            )
+            .fetch_all(by_pot_query(
+                POTPARTY_SELECT,
+                pot_txid,
+                pot_vout,
+                limit,
+                offset,
+            ))
             .await
             .map_err(potparty_err)?;
         Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
+    }
+}
+
+// ── #355 RE-LATCH: potparty_records ─────────────────────────────────────────
+
+/// The table name `relatch_cursors` keys this sweep by, and the log label.
+pub const POTPARTY_TABLE: &str = "potparty_records";
+
+/// The re-latch SCAN — every column [`record_sig_valid`] needs, plus the
+/// `rowid` the cursor rides on and the STORED verdict the pass compares
+/// against.
+///
+/// [`overlay_discovery::potparty::validity::record_sig_valid`]: the predicate
+///
+/// **`WHERE sigValid IS NULL` is deliberately absent and must stay absent.**
+/// A NULL-only filter skips every row a transient predicate fault latched `0`
+/// — the exact population #355 exists to repair, and the population that
+/// sorts BELOW even the legacy tier. The verdict column appears in the SELECT
+/// list and NOWHERE else in this statement.
+fn potparty_relatch_scan_sql() -> String {
+    use overlay_discovery::potparty::validity::SIG_VALID_COLUMN;
+    format!(
+        "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
+            recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+            txid, outputIndex, createdAt, rowid, {SIG_VALID_COLUMN} \
+         FROM potparty_records WHERE rowid > ? ORDER BY rowid ASC LIMIT ?"
+    )
+}
+
+/// Both convergence readouts in one aggregate: rows left in this sweep, and
+/// the size of the legacy tier. Reported, never used as a filter.
+fn potparty_relatch_census_sql() -> String {
+    use overlay_discovery::potparty::validity::SIG_VALID_COLUMN;
+    format!(
+        "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
+                COALESCE(SUM(CASE WHEN {SIG_VALID_COLUMN} IS NULL THEN 1 ELSE 0 END), 0) \
+                    AS stillNull \
+         FROM potparty_records"
+    )
+}
+
+/// A scanned potparty row: the record, its `rowid`, and its STORED verdict.
+#[derive(Deserialize)]
+struct PotpartyRelatchDbRow {
+    identity: String,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "potVout")]
+    pot_vout: f64,
+    #[serde(rename = "recoveryHeight")]
+    recovery_height: f64,
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+    #[serde(rename = "seatSettlePubkey", default)]
+    seat_settle_pubkey: Option<String>,
+    #[serde(rename = "seatSigHex", default)]
+    seat_sig_hex: Option<String>,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+    rowid: f64,
+    #[serde(rename = "sigValid", default)]
+    sig_valid: Option<f64>,
+}
+
+/// The pass's row shape for `potparty_records`.
+pub struct PotpartyRelatchRow {
+    rowid: i64,
+    stored: Option<bool>,
+    record: PotpartyRecord,
+}
+
+impl PotpartyRelatchDbRow {
+    fn into_row(self) -> PotpartyRelatchRow {
+        PotpartyRelatchRow {
+            rowid: self.rowid as i64,
+            stored: self.sig_valid.map(|v| v != 0.0),
+            record: PotpartyRecord {
+                identity: self.identity,
+                opponent_identity: self.opponent_identity,
+                game_id: self.game_id,
+                pot_txid: self.pot_txid,
+                pot_vout: self.pot_vout as u32,
+                recovery_height: self.recovery_height as u32,
+                sig_hex: self.sig_hex.unwrap_or_default(),
+                seat_settle_pubkey: self.seat_settle_pubkey,
+                seat_sig_hex: self.seat_sig_hex,
+                txid: self.txid,
+                output_index: self.output_index as u32,
+                created_at: self.created_at.unwrap_or(0.0) as i64,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RelatchCensusRow {
+    remaining: f64,
+    #[serde(rename = "stillNull")]
+    still_null: f64,
+}
+
+#[async_trait(?Send)]
+impl crate::relatch::RelatchTable for D1PotpartyStorage {
+    type Row = PotpartyRelatchRow;
+
+    fn table(&self) -> &'static str {
+        POTPARTY_TABLE
+    }
+    fn rowid(row: &Self::Row) -> i64 {
+        row.rowid
+    }
+    fn stored(row: &Self::Row) -> Option<bool> {
+        row.stored
+    }
+
+    async fn scan(&self, after_rowid: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+        let rows: Vec<PotpartyRelatchDbRow> = self
+            .db
+            .fetch_all(
+                Query::new(potparty_relatch_scan_sql())
+                    .bind(after_rowid)
+                    .bind(limit as u32),
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(PotpartyRelatchDbRow::into_row)
+            .collect())
+    }
+
+    async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+        // ONE evaluation of the predicate, inside the capability-typed UPDATE,
+        // and the compare reads it off that value — never a second derivation
+        // (the #283 gate's LOW-2 finding, avoided rather than repeated).
+        let update = potparty_relatch_query(&row.record);
+        let verdict = update.sig_valid();
+        if row.stored == Some(verdict) {
+            return Ok(None);
+        }
+        self.db.relatch(update).await?;
+        Ok(Some(verdict))
+    }
+
+    async fn census(&self, after_rowid: i64) -> Result<crate::relatch::RelatchCensus, String> {
+        let rows: Vec<RelatchCensusRow> = self
+            .db
+            .fetch_all(Query::new(potparty_relatch_census_sql()).bind(after_rowid))
+            .await?;
+        let r = rows.into_iter().next().ok_or("census returned no row")?;
+        Ok(crate::relatch::RelatchCensus {
+            remaining: r.remaining as u64,
+            still_null: r.still_null as u64,
+        })
     }
 }
 
@@ -3687,15 +3980,15 @@ impl PotrefundStorage for D1PotrefundStorage {
         offset: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
         // OLDEST FIRST, offset-pageable — see `list_for_pot_sql`
-        // (bsv-low #281 / #291 gate M2).
-        let rows: Vec<PotrefundRow> = Query::new(list_for_pot_sql(POTREFUND_SELECT))
-            .bind(pot_txid)
-            .bind(pot_vout)
-            .bind(limit as u32)
-            .bind(offset as u32)
-            .fetch_all(&self.db)
-            .await
-            .map_err(potrefund_err)?;
+        // (bsv-low #281 / #291 gate M2). Statement AND binds come from the
+        // SHARED `by_pot_query`, so the pin on that builder covers this call
+        // site too (bsv-low#354: a native test cannot watch a `fetch_all`
+        // bind anything).
+        let rows: Vec<PotrefundRow> =
+            by_pot_query(POTREFUND_SELECT, pot_txid, pot_vout, limit, offset)
+                .fetch_all(&self.db)
+                .await
+                .map_err(potrefund_err)?;
         Ok(rows.into_iter().map(PotrefundRow::into_record).collect())
     }
 }
@@ -3761,7 +4054,10 @@ impl HoppartyRow {
     }
 }
 
-pub use hopparty_write::{hopparty_insert_query, HoppartyDb, LatchedHoppartyInsert};
+pub use hopparty_write::{
+    hopparty_insert_query, hopparty_relatch_query, HoppartyDb, LatchedHoppartyInsert,
+    LatchedHoppartyRelatch,
+};
 
 /// The hopparty write path as a CAPABILITY rather than a convention
 /// (bsv-low #362) — the same shape [`potparty_write`] landed for #283, for
@@ -3851,14 +4147,15 @@ pub mod hopparty_write {
     ///
     /// # A latched `0` is a VERDICT, not "not yet checked" (bsv-low#367)
     ///
-    /// Nothing re-evaluates this column: it is written once, here, and no
-    /// `UPDATE hopparty_records SET markerValid` exists in production code.
-    /// A TRANSIENT predicate fault permanently demotes every honest row
-    /// admitted in that window to rank **0**, below even the legacy `NULL`
-    /// tier, with no self-healing path — the epoch Rule 6 trade, whose
-    /// victims are wiped-device users seeing a silently short enumeration
-    /// (Rule 14). That is why #367 is a **re-latch of every row**, not a
-    /// backfill of the `NULL` ones.
+    /// A TRANSIENT predicate fault demotes every honest row admitted in that
+    /// window to rank **0**, below even the legacy `NULL` tier — the epoch
+    /// Rule 6 trade, whose victims are wiped-device users seeing a silently
+    /// short enumeration (Rule 14). This write is `INSERT OR IGNORE` and
+    /// never revisits a row; until bsv-low#367 nothing else did either, and
+    /// for THIS table there was not even a republish that could (a hop marker
+    /// rides a transaction already on chain). The repair is
+    /// [`hopparty_relatch_query`], swept over EVERY row by `crate::relatch` —
+    /// never a backfill of the `NULL` ones.
     pub fn hopparty_insert_query(
         record: &HoppartyRecord,
         created_at: i64,
@@ -3892,6 +4189,52 @@ pub mod hopparty_write {
         }
     }
 
+    /// A hopparty RE-LATCH that PROVABLY carries a freshly recomputed
+    /// `markerValid` (bsv-low#367) — the [`LatchedPotpartyRelatch`] shape,
+    /// for the same reason and with the same guarantees.
+    pub struct LatchedHoppartyRelatch {
+        query: Query,
+        marker_valid: bool,
+    }
+
+    impl LatchedHoppartyRelatch {
+        /// The verdict this UPDATE binds — the same evaluation, not a second
+        /// one.
+        pub fn marker_valid(&self) -> bool {
+            self.marker_valid
+        }
+
+        /// Read-only view of the built query, for the replay pin.
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    /// THE hopparty RE-LATCH write, as a pure value (bsv-low#367).
+    ///
+    /// `UPDATE` on the OUTPOINT primary key; only `markerValid` moves. The
+    /// verdict is recomputed here by
+    /// [`overlay_discovery::hopparty::validity::record_marker_valid`] from
+    /// facts already in the row — including the container's decoded output
+    /// (#310) — so the pass needs no BEEF re-parse and no chain read.
+    ///
+    /// This is the ONLY repair path this table can ever have: a hopparty
+    /// marker rides the hop transaction, which is already on chain, so no
+    /// republish can re-latch a legacy row.
+    pub fn hopparty_relatch_query(record: &HoppartyRecord) -> LatchedHoppartyRelatch {
+        let marker_valid = overlay_discovery::hopparty::validity::record_marker_valid(record);
+        LatchedHoppartyRelatch {
+            query: Query::new(
+                "UPDATE hopparty_records SET markerValid = ? \
+                 WHERE txid = ? AND outputIndex = ?",
+            )
+            .bind(i64::from(marker_valid))
+            .bind(record.txid.as_str())
+            .bind(record.output_index),
+            marker_valid,
+        }
+    }
+
     /// The ONLY database handle [`super::D1HoppartyStorage`] holds.
     pub struct HoppartyDb(Rc<D1Database>);
 
@@ -3915,6 +4258,12 @@ pub mod hopparty_write {
         /// come from [`hopparty_insert_query`].
         pub async fn insert(&self, insert: LatchedHoppartyInsert) -> Result<(), String> {
             insert.query.execute(&self.0).await
+        }
+
+        /// Run THE hopparty re-latch write (bsv-low#367). Accepts nothing
+        /// that did not come from [`hopparty_relatch_query`].
+        pub async fn relatch(&self, update: LatchedHoppartyRelatch) -> Result<(), String> {
+            update.query.execute(&self.0).await
         }
     }
 }
@@ -4059,8 +4408,34 @@ pub fn hopparty_list_for_identity_sql() -> String {
 
 /// `ls_hopparty byHop` — OLDEST first (the honest marker rides the hop tx
 /// itself, so it is permanently at the head of the window — the #281 byPot
-/// rationale), offset page 0. Built from the shared select so tests execute
-/// the SHIPPED string.
+/// rationale), one page, no cursor. Built from the shared select so tests
+/// execute the SHIPPED string.
+///
+/// # Why this window is safe UNRANKED and UNPAGED, while `byPot` is not
+///
+/// The #362 gate accepted this as the one `hopparty_records` reader that does
+/// not lead on `markerValid`. That acceptance turned on an argument nobody
+/// had written down, so write it down (epoch Rule 8) — "we decided this is
+/// fine" and "we forgot this one" are indistinguishable from outside, and the
+/// sibling potparty window reached the OPPOSITE conclusion on the same
+/// question (bsv-low#354/#356).
+///
+/// **The partition is UNCROWDABLE by a third party.** `txid` here is the
+/// marker's OWN container transaction — the primary key's first half, a
+/// hash-bound fact — not a claim inside the payload. Every row in
+/// `WHERE txid = ? AND hopVout = ?` is therefore an output of ONE
+/// transaction, and the primary key `(txid, outputIndex)` admits at most one
+/// row per output. A stranger cannot add an output to a transaction that
+/// already exists, so the partition's size is fixed by whoever built the hop
+/// transaction, and a flood is not representable. Neither a rank nor a cursor
+/// buys anything against an adversary who cannot put a row in the set.
+///
+/// `list_for_pot_sql`'s partition is the opposite: `potTxid`/`potVout` are
+/// CLAIMS in the marker payload, so anyone can file unlimited rows naming a
+/// victim's pot from their own transactions. That window needs the cursor,
+/// and the rank would not have helped it. The distinction is exactly "is this
+/// key the row's own outpoint, or something the row asserts?" — worth asking
+/// of every partition in this file.
 pub fn hopparty_list_for_hop_sql() -> String {
     format!(
         "{HOPPARTY_SELECT} WHERE txid = ? AND hopVout = ? \
@@ -4133,6 +4508,162 @@ impl HoppartyStorage for D1HoppartyStorage {
             .await
             .map_err(hopparty_err)?;
         Ok(rows.into_iter().map(HoppartyRow::into_record).collect())
+    }
+}
+
+// ── #367 RE-LATCH: hopparty_records ─────────────────────────────────────────
+
+/// The table name `relatch_cursors` keys this sweep by, and the log label.
+pub const HOPPARTY_TABLE: &str = "hopparty_records";
+
+/// The re-latch SCAN — every column
+/// [`overlay_discovery::hopparty::validity::record_marker_valid`] needs
+/// (including the container's decoded facts, `hopLockHex` / `hopSatsOnChain`,
+/// which #310's decode-at-write already put on the row), plus the `rowid` the
+/// cursor rides on and the STORED verdict.
+///
+/// **`WHERE markerValid IS NULL` is deliberately absent and must stay
+/// absent** — see [`potparty_relatch_scan_sql`]. The verdict column appears in
+/// the SELECT list and nowhere else.
+fn hopparty_relatch_scan_sql() -> String {
+    use overlay_discovery::hopparty::validity::MARKER_VALID_COLUMN;
+    format!(
+        "SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
+            seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+            hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+            rowid, {MARKER_VALID_COLUMN} \
+         FROM hopparty_records WHERE rowid > ? ORDER BY rowid ASC LIMIT ?"
+    )
+}
+
+/// Both convergence readouts in one aggregate — see
+/// [`potparty_relatch_census_sql`].
+fn hopparty_relatch_census_sql() -> String {
+    use overlay_discovery::hopparty::validity::MARKER_VALID_COLUMN;
+    format!(
+        "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
+                COALESCE(SUM(CASE WHEN {MARKER_VALID_COLUMN} IS NULL THEN 1 ELSE 0 END), 0) \
+                    AS stillNull \
+         FROM hopparty_records"
+    )
+}
+
+/// A scanned hopparty row: the record, its `rowid`, and its STORED verdict.
+#[derive(Deserialize)]
+struct HoppartyRelatchDbRow {
+    identity: String,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "hopVout")]
+    hop_vout: f64,
+    #[serde(rename = "hopSats")]
+    hop_sats: f64,
+    #[serde(rename = "seatSettlePubkey")]
+    seat_settle_pubkey: String,
+    #[serde(rename = "seatSigHex")]
+    seat_sig_hex: String,
+    #[serde(rename = "identitySigHex")]
+    identity_sig_hex: String,
+    #[serde(rename = "hopLockHex", default)]
+    hop_lock_hex: Option<String>,
+    #[serde(rename = "hopSatsOnChain", default)]
+    hop_sats_on_chain: Option<f64>,
+    #[serde(rename = "containerOutputs")]
+    container_outputs: f64,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: f64,
+    #[serde(rename = "createdAt")]
+    created_at: Option<f64>,
+    rowid: f64,
+    #[serde(rename = "markerValid", default)]
+    marker_valid: Option<f64>,
+}
+
+/// The pass's row shape for `hopparty_records`.
+pub struct HoppartyRelatchRow {
+    rowid: i64,
+    stored: Option<bool>,
+    record: HoppartyRecord,
+}
+
+impl HoppartyRelatchDbRow {
+    fn into_row(self) -> HoppartyRelatchRow {
+        HoppartyRelatchRow {
+            rowid: self.rowid as i64,
+            stored: self.marker_valid.map(|v| v != 0.0),
+            record: HoppartyRecord {
+                identity: self.identity,
+                opponent_identity: self.opponent_identity,
+                game_id: self.game_id,
+                hop_vout: self.hop_vout as u32,
+                hop_sats: self.hop_sats as u64,
+                seat_settle_pubkey: self.seat_settle_pubkey,
+                seat_sig_hex: self.seat_sig_hex,
+                identity_sig_hex: self.identity_sig_hex,
+                hop_lock_hex: self.hop_lock_hex,
+                hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
+                container_outputs: self.container_outputs as u32,
+                txid: self.txid,
+                output_index: self.output_index as u32,
+                created_at: self.created_at.unwrap_or(0.0) as i64,
+            },
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl crate::relatch::RelatchTable for D1HoppartyStorage {
+    type Row = HoppartyRelatchRow;
+
+    fn table(&self) -> &'static str {
+        HOPPARTY_TABLE
+    }
+    fn rowid(row: &Self::Row) -> i64 {
+        row.rowid
+    }
+    fn stored(row: &Self::Row) -> Option<bool> {
+        row.stored
+    }
+
+    async fn scan(&self, after_rowid: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+        let rows: Vec<HoppartyRelatchDbRow> = self
+            .db
+            .fetch_all(
+                Query::new(hopparty_relatch_scan_sql())
+                    .bind(after_rowid)
+                    .bind(limit as u32),
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(HoppartyRelatchDbRow::into_row)
+            .collect())
+    }
+
+    async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+        // ONE evaluation — see the potparty twin.
+        let update = hopparty_relatch_query(&row.record);
+        let verdict = update.marker_valid();
+        if row.stored == Some(verdict) {
+            return Ok(None);
+        }
+        self.db.relatch(update).await?;
+        Ok(Some(verdict))
+    }
+
+    async fn census(&self, after_rowid: i64) -> Result<crate::relatch::RelatchCensus, String> {
+        let rows: Vec<RelatchCensusRow> = self
+            .db
+            .fetch_all(Query::new(hopparty_relatch_census_sql()).bind(after_rowid))
+            .await?;
+        let r = rows.into_iter().next().ok_or("census returned no row")?;
+        Ok(crate::relatch::RelatchCensus {
+            remaining: r.remaining as u64,
+            still_null: r.still_null as u64,
+        })
     }
 }
 
@@ -6798,6 +7329,462 @@ mod tests {
         assert_eq!(n, 3, "a 0-latched marker is STORED, never refused");
     }
 
+    // ── #355 + #367 — the RE-LATCH pass, driven against real SQLite ──────
+
+    /// Replay a production [`Query`] as a SELECT and hand each row back as a
+    /// JSON object keyed by the statement's OWN column names.
+    ///
+    /// Deserialising THAT through the production row struct is the point: it
+    /// pins the SELECT list against the `serde(rename)`s that read it, which
+    /// is the boundary a hand-written row mapper in a test would silently
+    /// paper over (epoch Rule 16 — a property spanning two components cannot
+    /// be pinned inside either one).
+    fn select_json(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        binds: &[i64],
+    ) -> Vec<serde_json::Value> {
+        let mut stmt = conn.prepare(sql).expect("the production SELECT prepares");
+        let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                let mut obj = serde_json::Map::new();
+                for (i, name) in cols.iter().enumerate() {
+                    let v = match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(i) => serde_json::json!(i),
+                        rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
+                        rusqlite::types::ValueRef::Text(t) => {
+                            serde_json::json!(String::from_utf8_lossy(t))
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => serde_json::json!(hex::encode(b)),
+                    };
+                    obj.insert(name.clone(), v);
+                }
+                Ok(serde_json::Value::Object(obj))
+            })
+            .expect("query_map");
+        rows.map(|r| r.expect("row")).collect()
+    }
+
+    /// `potparty_records` as a [`crate::relatch::RelatchTable`], over real
+    /// SQLite, executing the SHIPPED SQL and the SHIPPED row mapper.
+    ///
+    /// MODELLING BOUNDARY, stated here as well as in the cells (epoch
+    /// Rule 22): this drives the production statements, binds, row struct and
+    /// pass logic end to end. What it cannot drive is the `D1Database`
+    /// round-trip inside `D1PotpartyStorage`'s own `RelatchTable` impl —
+    /// `worker::D1Database` has no native constructor. That impl is three
+    /// lines per method and is where a wrong SQL builder would be substituted;
+    /// `the_d1_relatch_impls_use_the_shipped_statements` covers that seam by
+    /// value.
+    struct SqliteRelatchPotparty<'a>(&'a rusqlite::Connection);
+
+    #[async_trait(?Send)]
+    impl crate::relatch::RelatchTable for SqliteRelatchPotparty<'_> {
+        type Row = PotpartyRelatchRow;
+        fn table(&self) -> &'static str {
+            POTPARTY_TABLE
+        }
+        fn rowid(row: &Self::Row) -> i64 {
+            row.rowid
+        }
+        fn stored(row: &Self::Row) -> Option<bool> {
+            row.stored
+        }
+        async fn scan(&self, after: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+            Ok(
+                select_json(self.0, &potparty_relatch_scan_sql(), &[after, limit as i64])
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::from_value::<PotpartyRelatchDbRow>(v)
+                            .expect("the shipped SELECT list feeds the shipped row struct")
+                            .into_row()
+                    })
+                    .collect(),
+            )
+        }
+        async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+            let update = potparty_relatch_query(&row.record);
+            let verdict = update.sig_valid();
+            if row.stored == Some(verdict) {
+                return Ok(None);
+            }
+            exec_query(self.0, update.query());
+            Ok(Some(verdict))
+        }
+        async fn census(&self, after: i64) -> Result<crate::relatch::RelatchCensus, String> {
+            let rows = select_json(self.0, &potparty_relatch_census_sql(), &[after]);
+            let r: RelatchCensusRow =
+                serde_json::from_value(rows.into_iter().next().expect("one aggregate row"))
+                    .expect("the census SELECT feeds the census row struct");
+            Ok(crate::relatch::RelatchCensus {
+                remaining: r.remaining as u64,
+                still_null: r.still_null as u64,
+            })
+        }
+    }
+
+    /// `hopparty_records` as a [`crate::relatch::RelatchTable`] — same shape,
+    /// same boundary.
+    struct SqliteRelatchHopparty<'a>(&'a rusqlite::Connection);
+
+    #[async_trait(?Send)]
+    impl crate::relatch::RelatchTable for SqliteRelatchHopparty<'_> {
+        type Row = HoppartyRelatchRow;
+        fn table(&self) -> &'static str {
+            HOPPARTY_TABLE
+        }
+        fn rowid(row: &Self::Row) -> i64 {
+            row.rowid
+        }
+        fn stored(row: &Self::Row) -> Option<bool> {
+            row.stored
+        }
+        async fn scan(&self, after: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+            Ok(
+                select_json(self.0, &hopparty_relatch_scan_sql(), &[after, limit as i64])
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::from_value::<HoppartyRelatchDbRow>(v)
+                            .expect("the shipped SELECT list feeds the shipped row struct")
+                            .into_row()
+                    })
+                    .collect(),
+            )
+        }
+        async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+            let update = hopparty_relatch_query(&row.record);
+            let verdict = update.marker_valid();
+            if row.stored == Some(verdict) {
+                return Ok(None);
+            }
+            exec_query(self.0, update.query());
+            Ok(Some(verdict))
+        }
+        async fn census(&self, after: i64) -> Result<crate::relatch::RelatchCensus, String> {
+            let rows = select_json(self.0, &hopparty_relatch_census_sql(), &[after]);
+            let r: RelatchCensusRow =
+                serde_json::from_value(rows.into_iter().next().expect("one aggregate row"))
+                    .expect("the census SELECT feeds the census row struct");
+            Ok(crate::relatch::RelatchCensus {
+                remaining: r.remaining as u64,
+                still_null: r.still_null as u64,
+            })
+        }
+    }
+
+    /// The cursor store, running the SHIPPED `relatch_cursors` statements
+    /// against the production schema.
+    struct SqliteCursors<'a>(&'a rusqlite::Connection);
+
+    #[async_trait(?Send)]
+    impl crate::relatch::RelatchCursorStore for SqliteCursors<'_> {
+        async fn load(&self, table: &str) -> Result<crate::relatch::RelatchCursor, String> {
+            let mut stmt = self
+                .0
+                .prepare(crate::relatch::RELATCH_CURSOR_LOAD_SQL)
+                .expect("prepares");
+            let got = stmt.query_row([table], |r| {
+                Ok(crate::relatch::RelatchCursor {
+                    cursor: r.get::<_, i64>(0)?,
+                    sweeps: r.get::<_, i64>(1)? as u64,
+                })
+            });
+            match got {
+                Ok(c) => Ok(c),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    Ok(crate::relatch::RelatchCursor::default())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        async fn store(&self, table: &str, c: crate::relatch::RelatchCursor) -> Result<(), String> {
+            self.0
+                .execute(
+                    crate::relatch::RELATCH_CURSOR_STORE_SQL,
+                    rusqlite::params![table, c.cursor, c.sweeps as i64],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// Force a stored verdict WITHOUT going through the production writer —
+    /// the only way to manufacture the two populations the pass exists for
+    /// (a legacy `NULL`, and a `0`/`1` a transient fault got wrong).
+    fn poison_potparty(conn: &rusqlite::Connection, txid: &str, v: Option<i64>) {
+        conn.execute(
+            "UPDATE potparty_records SET sigValid = ?1 WHERE txid = ?2",
+            rusqlite::params![v, txid],
+        )
+        .expect("poison");
+    }
+
+    fn stored_potparty(conn: &rusqlite::Connection, txid: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT sigValid FROM potparty_records WHERE txid = ?1",
+            [txid],
+            |r| r.get(0),
+        )
+        .expect("the row exists")
+    }
+
+    /// THE #355 CLOSURE CRITERION, EXECUTED: every row's `sigValid` equals
+    /// `record_sig_valid` recomputed now — reached from ALL THREE starting
+    /// states, through the SHIPPED statements against the production schema.
+    ///
+    /// A `WHERE sigValid IS NULL` pass passes the first leg and fails the
+    /// other two, which is exactly why the criterion is a fixpoint and not a
+    /// NULL census (bsv-low#355's WIDENED section).
+    #[tokio::test]
+    async fn the_relatch_pass_reaches_the_fixpoint_from_null_zero_and_one() {
+        let conn = production_schema_db();
+        // An honest, genuinely-signed marker and a tampered twin, both landed
+        // through the REAL admission writer so the honest artifact is honest
+        // in the dimension under test (epoch Rule 18).
+        let honest = golden_potparty_record("txRELATCHOK");
+        let mut forged = golden_potparty_record("txRELATCHBAD");
+        forged.recovery_height += 1;
+        exec_query(&conn, potparty_insert_query(&honest, 10).query());
+        exec_query(&conn, potparty_insert_query(&forged, 11).query());
+
+        // The three populations, manufactured:
+        //  - LEGACY: admitted before the migration, never evaluated;
+        //  - FAULTED 0: an honest row a transient predicate fault refuted —
+        //    the row that sorts BELOW the legacy tier, forever;
+        //  - FAULTED 1: a junk row wrongly accepted.
+        poison_potparty(&conn, "txRELATCHOK", None);
+        poison_potparty(&conn, "txRELATCHBAD", Some(1));
+        let legacy = golden_potparty_record("txRELATCHLEGACY");
+        exec_query(&conn, potparty_insert_query(&legacy, 12).query());
+        poison_potparty(&conn, "txRELATCHLEGACY", None);
+        // …and one already-converged row, which must cost no write at all.
+        let mut converged = golden_potparty_record("txRELATCHCONV");
+        converged.pot_vout = 7;
+        exec_query(&conn, potparty_insert_query(&converged, 13).query());
+        assert_eq!(stored_potparty(&conn, "txRELATCHCONV"), Some(0));
+
+        let table = SqliteRelatchPotparty(&conn);
+        let cursors = SqliteCursors(&conn);
+        let s = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+
+        assert_eq!(s.scanned, 4);
+        assert_eq!(s.latched, 2, "both NULL rows now carry a verdict");
+        assert_eq!(
+            s.promoted, 0,
+            "no 0→1 here: the faulted honest row was NULLed, not zeroed"
+        );
+        assert_eq!(s.demoted, 1, "the wrongly-accepted forged row is refuted");
+        assert_eq!(s.errors, 0);
+        assert_eq!(s.still_null, 0, "the legacy tier is gone for these rows");
+
+        assert_eq!(stored_potparty(&conn, "txRELATCHOK"), Some(1));
+        assert_eq!(stored_potparty(&conn, "txRELATCHBAD"), Some(0));
+        assert_eq!(stored_potparty(&conn, "txRELATCHLEGACY"), Some(1));
+        assert_eq!(stored_potparty(&conn, "txRELATCHCONV"), Some(0));
+
+        // The 0→1 repair — the population a NULL-census structurally skips.
+        poison_potparty(&conn, "txRELATCHOK", Some(0));
+        let s2 = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!(
+            (s2.latched, s2.promoted, s2.demoted),
+            (0, 1, 0),
+            "a row a transient fault refuted is REPAIRED, not skipped"
+        );
+        assert_eq!(stored_potparty(&conn, "txRELATCHOK"), Some(1));
+
+        // Idempotence: the fixpoint is reached, so a further tick writes
+        // nothing…
+        let s3 = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!(s3.changed(), 0);
+        assert_eq!(s3.scanned, 4, "…while still VISITING every row");
+
+        // …and nothing was ever removed: the pass moves a sort key, never a
+        // row (epoch Rule 23).
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM potparty_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    /// The same criterion for `hopparty_records` (#367) — the table with NO
+    /// other repair path at all, because a hop marker rides a transaction
+    /// that is already on chain.
+    #[tokio::test]
+    async fn the_hopparty_relatch_pass_reaches_the_fixpoint_from_null_zero_and_one() {
+        let conn = production_schema_db();
+        let honest = golden_hopparty_record("txHOPRELATCH", true);
+        let unpaid = golden_hopparty_record("txHOPRELATCHBAD", false);
+        exec_query(&conn, hopparty_insert_query(&honest, 20).query());
+        exec_query(&conn, hopparty_insert_query(&unpaid, 21).query());
+        conn.execute(
+            "UPDATE hopparty_records SET markerValid = NULL WHERE txid = 'txHOPRELATCH'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE hopparty_records SET markerValid = 1 WHERE txid = 'txHOPRELATCHBAD'",
+            [],
+        )
+        .unwrap();
+
+        let table = SqliteRelatchHopparty(&conn);
+        let cursors = SqliteCursors(&conn);
+        let s = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!((s.scanned, s.latched, s.demoted, s.errors), (2, 1, 1, 0));
+
+        let read = |txid: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT markerValid FROM hopparty_records WHERE txid = ?1",
+                [txid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(read("txHOPRELATCH"), Some(1), "the legacy row is repaired");
+        assert_eq!(read("txHOPRELATCHBAD"), Some(0), "…and the junk refuted");
+
+        // 0 → 1, the population a NULL census skips.
+        conn.execute(
+            "UPDATE hopparty_records SET markerValid = 0 WHERE txid = 'txHOPRELATCH'",
+            [],
+        )
+        .unwrap();
+        let s2 = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!((s2.promoted, s2.latched, s2.demoted), (1, 0, 0));
+        assert_eq!(read("txHOPRELATCH"), Some(1));
+    }
+
+    /// The CURSOR is durable in the production table and the sweep WRAPS —
+    /// driven through the shipped `relatch_cursors` statements, so a cursor
+    /// that never persists (the failure that turns the pass into a repeated
+    /// head-scan of the first page) is visible here.
+    #[tokio::test]
+    async fn the_relatch_cursor_persists_and_wraps_through_the_production_table() {
+        let conn = production_schema_db();
+        for i in 0..5u32 {
+            let mut r = golden_potparty_record(&format!("txCURSOR{i}"));
+            r.pot_vout = i;
+            exec_query(&conn, potparty_insert_query(&r, 100 + i as i64).query());
+        }
+        let table = SqliteRelatchPotparty(&conn);
+        let cursors = SqliteCursors(&conn);
+
+        let a = crate::relatch::relatch_pass(&table, &cursors, 2).await;
+        assert_eq!((a.scanned, a.wrapped, a.remaining), (2, false, 3));
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT cursorRowid FROM relatch_cursors WHERE tableName = ?1",
+                [POTPARTY_TABLE],
+                |r| r.get(0),
+            )
+            .expect("the cursor row landed in the PRODUCTION table");
+        assert_eq!(persisted, a.cursor);
+        assert!(a.cursor > 0, "the cursor advanced");
+
+        let b = crate::relatch::relatch_pass(&table, &cursors, 2).await;
+        assert!(
+            b.cursor > a.cursor,
+            "the next tick RESUMED, never restarted"
+        );
+        let c = crate::relatch::relatch_pass(&table, &cursors, 2).await;
+        assert_eq!(
+            (c.scanned, c.wrapped, c.cursor, c.sweeps, c.remaining),
+            (1, true, 0, 1, 0),
+            "the tail wraps into a new sweep — the fixpoint, not a backfill"
+        );
+        let (persisted, sweeps): (i64, i64) = conn
+            .query_row(
+                "SELECT cursorRowid, sweeps FROM relatch_cursors WHERE tableName = ?1",
+                [POTPARTY_TABLE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((persisted, sweeps), (0, 1));
+
+        // The two tables keep INDEPENDENT cursors — one key each, so a busy
+        // potparty sweep can never starve the hopparty one.
+        let hop = SqliteRelatchHopparty(&conn);
+        let h = crate::relatch::relatch_pass(&hop, &cursors, 2).await;
+        assert_eq!(h.scanned, 0, "an empty hopparty table");
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM relatch_cursors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keys, 2, "one cursor per table");
+    }
+
+    /// The scan must NEVER filter on the verdict column: a `WHERE sigValid IS
+    /// NULL` pass would leave every faulted `0` unreachable forever.
+    ///
+    /// Asserted on the CONSTRUCT and, above, behaviourally — this cell is the
+    /// belt (epoch Rule 12a addendum: the behaviour is the bar, the scan is
+    /// the belt), and it is a POSITIVE count so it fails loudly if the needle
+    /// stops matching (Rule 9).
+    #[test]
+    fn neither_relatch_scan_filters_on_its_verdict_column() {
+        for (sql, col) in [
+            (
+                potparty_relatch_scan_sql(),
+                overlay_discovery::potparty::validity::SIG_VALID_COLUMN,
+            ),
+            (
+                hopparty_relatch_scan_sql(),
+                overlay_discovery::hopparty::validity::MARKER_VALID_COLUMN,
+            ),
+        ] {
+            assert_eq!(
+                sql.matches(col).count(),
+                1,
+                "the verdict column appears ONCE — in the SELECT list — and \
+                 never in a predicate: {sql}"
+            );
+            let (select_list, rest) = sql.split_once(" FROM ").expect("one FROM");
+            assert!(
+                select_list.contains(col),
+                "…and that one is the SELECT: {sql}"
+            );
+            assert!(
+                !rest.contains(col),
+                "a filter on the verdict column would strand every faulted 0: {sql}"
+            );
+            assert!(
+                rest.contains("WHERE rowid > ?") && rest.contains("ORDER BY rowid ASC"),
+                "the scan is rowid-cursored over ALL rows: {sql}"
+            );
+        }
+    }
+
+    /// The D1 impls must run the SHIPPED statements, not a private
+    /// transcription — the seam the SQLite tier above cannot reach (Rule 22).
+    /// Asserted by VALUE: the builders are pure, so the exact strings the D1
+    /// path prepares are checkable without a `D1Database`.
+    #[test]
+    fn the_relatch_statements_are_the_ones_the_writers_build() {
+        let up = potparty_relatch_query(&golden_potparty_record("txQ"));
+        assert_eq!(
+            up.query().sql(),
+            "UPDATE potparty_records SET sigValid = ? WHERE txid = ? AND outputIndex = ?"
+        );
+        assert_eq!(up.query().params().len(), 3, "verdict, txid, outputIndex");
+        assert!(up.sig_valid(), "the golden's verdict rides the update");
+
+        let hup = hopparty_relatch_query(&golden_hopparty_record("txQ", true));
+        assert_eq!(
+            hup.query().sql(),
+            "UPDATE hopparty_records SET markerValid = ? WHERE txid = ? AND outputIndex = ?"
+        );
+        assert_eq!(hup.query().params().len(), 3);
+        assert!(hup.marker_valid());
+
+        // Addressed by the OUTPOINT PRIMARY KEY, so a stale cursor can never
+        // splash a second row.
+        for sql in [up.query().sql(), hup.query().sql()] {
+            assert!(sql.contains("WHERE txid = ? AND outputIndex = ?"), "{sql}");
+            assert!(!sql.contains("INSERT") && !sql.contains("REPLACE"), "{sql}");
+        }
+    }
+
     /// The hopparty writer's bind list and its SQL must agree in COUNT — a
     /// dropped bind shifts every column silently (epoch Rule 9).
     #[test]
@@ -7061,10 +8048,38 @@ mod tests {
         );
         assert_eq!(
             prod.matches(&["record_sig", "_valid("].concat()).count(),
+            2,
+            "the latch predicate has exactly TWO call sites — the admission \
+             INSERT and the #355 re-latch UPDATE — and each evaluates it ONCE \
+             per row, reading the verdict off the built query rather than \
+             re-deriving it (gate round 2 LOW-2). A 3 means somebody added a \
+             second derivation beside a write; a 1 means a write stopped \
+             latching"
+        );
+
+        // ── The #355 RE-LATCH is the SECOND write this table now has, so it
+        // gets the same treatment as the first: exactly one UPDATE statement,
+        // reachable only through `PotpartyDb::relatch`, which accepts only a
+        // `LatchedPotpartyRelatch`. `INTO` does not appear in an UPDATE, so
+        // the needle above cannot see this statement at all — that gap IS the
+        // reason for this assertion (epoch Rule 7: when one instance of a
+        // class surfaces, sweep for the rest). Case-blind, split needle.
+        assert_eq!(
+            shouty
+                .matches(&["UPDATE POTPARTY", "_RECORDS"].concat())
+                .count(),
             1,
-            "the latch predicate is evaluated exactly ONCE per admitted \
-             marker (gate round 2 LOW-2) — telemetry reads the verdict off \
-             the insert instead of re-deriving it"
+            "exactly ONE statement in this module UPDATEs `potparty_records` \
+             — a second one is how a re-latch that binds a caller-supplied \
+             verdict (rather than a re-derived one) gets in"
+        );
+        assert_eq!(
+            prod.matches(&["potparty_relatch", "_query("].concat())
+                .count(),
+            2,
+            "the re-latch producer is DEFINED once and CALLED once (by the \
+             `RelatchTable` impl) — a 1 means the only call site is gone and \
+             the pass has stopped repairing anything"
         );
 
         // ── The read-path bar's CALL SITES. `fetch_all` needs a live
@@ -7128,10 +8143,29 @@ mod tests {
         );
         assert_eq!(
             prod.matches(&["record_marker", "_valid("].concat()).count(),
+            2,
+            "the latch predicate has exactly TWO call sites — the admission \
+             INSERT and the #367 re-latch UPDATE — each evaluating it ONCE \
+             per row and reading the verdict off the built query"
+        );
+
+        // The #367 re-latch write, treated exactly like the potparty twin —
+        // `INTO` does not appear in an UPDATE, so the needle above is blind
+        // to it.
+        assert_eq!(
+            shouty
+                .matches(&["UPDATE HOPPARTY", "_RECORDS"].concat())
+                .count(),
             1,
-            "the latch predicate is evaluated exactly ONCE per admitted \
-             marker — telemetry reads the verdict off the insert instead of \
-             re-deriving it"
+            "exactly ONE statement in this module UPDATEs `hopparty_records`"
+        );
+        assert_eq!(
+            prod.matches(&["hopparty_relatch", "_query("].concat())
+                .count(),
+            2,
+            "the re-latch producer is DEFINED once and CALLED once — this is \
+             the ONLY repair path this table can ever have, because a hop \
+             marker rides a transaction that is already on chain"
         );
     }
 
@@ -7711,6 +8745,204 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), n, "pages are disjoint (stable total order)");
         assert_eq!(n, 131, "pages cover every admitted row");
+    }
+
+    /// bsv-low#354/#356 — the POTPARTY `byPot` window, offset-paged through
+    /// the SHIPPED SQL.
+    ///
+    /// This window is not identity-scoped: `potTxid`/`potVout` are payload
+    /// CLAIMS, so a stranger files unlimited markers naming a victim's public
+    /// pot from its own transactions, and it can file them BEFORE funding, so
+    /// server-stamped `createdAt` puts them permanently at the head of the
+    /// oldest-first order. The SQL has been `LIMIT ? OFFSET ?` since #291
+    /// gate M2 and NO CALLER COULD REACH THE OFFSET — the mitigation existed
+    /// as advice with no mechanism (epoch Rule 13: a surfaced limitation with
+    /// no escape hatch is worse than an honest error).
+    ///
+    /// Both legs are asserted: page 0 really does bury both honest seats
+    /// (pinned from the unsafe side, so the cell measures the attack), and
+    /// paging really does reach them.
+    #[test]
+    fn potparty_by_pot_offset_pages_reach_buried_seat_markers_real_sqlite() {
+        let conn = production_schema_db();
+        let pot = h64(0xcd);
+        // 130 rows filed before funding, each naming its OWN identity — which
+        // is why a `sigValid` rank would not help here: every one of them can
+        // carry a genuinely valid signature under the key it names.
+        for i in 0..130u32 {
+            insert_potparty(
+                &conn,
+                &format!("02{:064x}", i),
+                &pot,
+                0,
+                &format!("txJUNK{i:03}"),
+                100 + i as i64,
+                None,
+            );
+        }
+        // The two honest seat markers, published AT funding.
+        insert_potparty(&conn, &victim_id(), &pot, 0, "txSEATA", 10_000, None);
+        insert_potparty(
+            &conn,
+            &format!("03{}", "b2".repeat(32)),
+            &pot,
+            0,
+            "txSEATB",
+            10_001,
+            None,
+        );
+
+        let sql = list_for_pot_sql(POTPARTY_SELECT);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut page = |limit: u32, offset: u32| -> Vec<String> {
+            stmt.query_map(rusqlite::params![pot, 0u32, limit, offset], |r| {
+                r.get::<_, String>("txid")
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        let p1 = page(100, 0);
+        assert_eq!(p1.len(), 100, "page 0 is LIMIT-bounded…");
+        assert!(
+            !p1.iter().any(|t| t.starts_with("txSEAT")),
+            "…and contains NEITHER seat: this is exactly the eviction \
+             bsv-low#354 filed, and it is what a caller that cannot page sees \
+             forever"
+        );
+
+        let p2 = page(100, 100);
+        assert_eq!(p2.len(), 32, "30 remaining junk rows + BOTH seats");
+        assert_eq!(
+            p2[p2.len() - 2..],
+            ["txSEATA".to_string(), "txSEATB".to_string()],
+            "both honest markers are REACHABLE by paging — the cap bounds a \
+             response, never the reachable set"
+        );
+
+        // Disjoint + covering: the total order is append-only, so pages
+        // partition it and a concurrent insert cannot shift a row across a
+        // boundary already fetched. (That stability is also why a MUTABLE
+        // rank term — `sigValid`, which the #355 sweep rewrites — must not
+        // lead this ORDER BY.)
+        let mut all: Vec<String> = p1.iter().chain(p2.iter()).cloned().collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "pages are disjoint");
+        assert_eq!(n, 132, "pages cover every admitted row");
+    }
+
+    /// The two `byX` windows partition on DIFFERENT KINDS of key, and that
+    /// difference is the whole reason one needs a cursor and the other does
+    /// not (see both SQL builders' docs).
+    ///
+    /// `ls_hopparty byHop` keys on `txid` — the marker's OWN container, a
+    /// primary-key half — so its partition holds only outputs of one
+    /// transaction and a stranger cannot add to it. `ls_potparty byPot` keys
+    /// on `potTxid`, a CLAIM inside the payload, so anyone can file unlimited
+    /// rows into it.
+    #[test]
+    fn the_by_hop_partition_keys_on_the_container_and_by_pot_on_a_claim() {
+        let by_hop = hopparty_list_for_hop_sql();
+        assert!(
+            by_hop.contains("WHERE txid = ? AND hopVout = ?"),
+            "byHop partitions on the marker's own container txid: {by_hop}"
+        );
+        assert!(
+            !by_hop.contains("potTxid"),
+            "…and never on a payload-claimed pot outpoint: {by_hop}"
+        );
+        // Uncrowdable ⇒ no cursor is owed. If this window ever gains a
+        // payload-claimed partition key, that argument dies and it needs
+        // `OFFSET` the way byPot now has it.
+        assert!(
+            !by_hop.contains("OFFSET"),
+            "byHop is single-page ON PURPOSE: {by_hop}"
+        );
+
+        let by_pot = list_for_pot_sql(POTPARTY_SELECT);
+        assert!(
+            by_pot.contains("WHERE potTxid = ? AND potVout = ?"),
+            "byPot partitions on a payload CLAIM: {by_pot}"
+        );
+        assert!(
+            by_pot.contains("OFFSET"),
+            "…which is why it must stay pageable: {by_pot}"
+        );
+    }
+
+    /// THE BIND PIN (bsv-low#354, from this lane's own RED-verification).
+    ///
+    /// `fetch_all` needs a live `D1Database`, so nothing native can watch the
+    /// storage impls bind anything — and a differently-spelled injection
+    /// proved the consequence: replacing `list_for_pot`'s page-start bind
+    /// with a computed `0` compiled and left every cell green, with #354's
+    /// fix inoperative and the client's offset silently discarded (epoch
+    /// Rule 22 / the #283 HIGH-2 class, caught before shipping this time).
+    ///
+    /// The builder is pure, so the value production sends is inspectable.
+    /// Both callers go through it, so this cell covers BOTH — asserting on
+    /// one surface while claiming two is the Rule 10 failure this avoids.
+    #[test]
+    fn the_by_pot_query_binds_the_page_start_for_both_callers() {
+        for select in [POTPARTY_SELECT, POTREFUND_SELECT] {
+            let q = by_pot_query(select, "aa", 7, 50, 500);
+            assert_eq!(q.sql(), list_for_pot_sql(select), "the SHIPPED statement");
+            assert_eq!(q.params().len(), 4, "potTxid, potVout, limit, offset");
+            assert_eq!(q.params()[0], crate::d1::QVal::Text("aa".into()));
+            assert_eq!(q.params()[1], crate::d1::QVal::Int(7));
+            assert_eq!(q.params()[2], crate::d1::QVal::Int(50));
+            assert_eq!(
+                q.params()[3],
+                crate::d1::QVal::Int(500),
+                "the PAGE START is the caller's, not a constant — a computed \
+                 0 here is #354 silently undone"
+            );
+            // …and it MOVES with the argument, so a bind that merely happens
+            // to equal one probe value cannot satisfy this.
+            assert_eq!(
+                by_pot_query(select, "aa", 0, 1, 0).params()[3],
+                crate::d1::QVal::Int(0)
+            );
+            assert_eq!(
+                by_pot_query(select, "aa", 0, 1, 12_345).params()[3],
+                crate::d1::QVal::Int(12_345)
+            );
+        }
+    }
+
+    /// The `byPot` rank decision, asserted on the CONSTRUCT: this window must
+    /// NOT lead on `sigValid`, and the reason is not "we forgot" (epoch
+    /// Rule 8 — write down which property a field carries).
+    ///
+    /// Two independent reasons, both load-bearing: the rank is FORGEABLE here
+    /// because nothing in the predicate is scoped to a key the attacker does
+    /// not hold, and `sigValid` is MUTABLE since the #355 re-latch sweep, so
+    /// leading on it would move rows between pages mid-enumeration and break
+    /// the offset paging that is the actual fix.
+    #[test]
+    fn the_by_pot_window_pages_and_never_ranks() {
+        let sql = list_for_pot_sql(POTPARTY_SELECT);
+        assert!(
+            sql.contains("ORDER BY createdAt ASC, rowid ASC LIMIT ? OFFSET ?"),
+            "append-only total order + a page cursor: {sql}"
+        );
+        assert_eq!(
+            sql.matches(overlay_discovery::potparty::validity::SIG_VALID_COLUMN)
+                .count(),
+            0,
+            "the verdict is neither ordered on nor filtered on in this \
+             window — see `list_for_pot_sql`'s doc for why adding it would be \
+             a bar that does not bar AND would break page stability: {sql}"
+        );
+        // The SHARED-SQL constraint the issue names, executed rather than
+        // asserted in prose: the same builder serves potrefund, whose table
+        // has no such column at all.
+        let refund = list_for_pot_sql(POTREFUND_SELECT);
+        assert!(refund.ends_with("ORDER BY createdAt ASC, rowid ASC LIMIT ? OFFSET ?"));
+        assert!(!refund.contains("sigValid"));
     }
 
     /// F6 — every other key in the system is the OUTPOINT. Two genuine pots

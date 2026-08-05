@@ -493,6 +493,17 @@ struct RecoveryRowD1 {
     /// chain truth, preferred over the marker's unverified value.
     #[serde(rename = "covRecoveryHeight")]
     cov_recovery_height: Option<f64>,
+    /// #343 — the pot's COMMITTED covenant keys (`pot_records`' #284 decoded
+    /// columns). `default` tolerates a read racing the additive migration;
+    /// an incomplete or malformed set collapses to `None` in `into_row`.
+    #[serde(rename = "covPubA", default)]
+    cov_pub_a: Option<String>,
+    #[serde(rename = "covPubB", default)]
+    cov_pub_b: Option<String>,
+    #[serde(rename = "covPayPkhA", default)]
+    cov_pay_pkh_a: Option<String>,
+    #[serde(rename = "covPayPkhB", default)]
+    cov_pay_pkh_b: Option<String>,
 }
 
 impl RecoveryRowD1 {
@@ -508,6 +519,15 @@ impl RecoveryRowD1 {
             spending_txid: self.spending_txid,
             spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
             spender_beef_hex: self.spender_beef,
+            // #343 — THE shared predicate, so `/recovery-view` and `/results`
+            // cannot disagree about what a servable key set is: all four
+            // present and structurally right, or None.
+            committed_keys: crate::results::CommittedKeys::from_columns(
+                self.cov_pub_a.as_deref(),
+                self.cov_pub_b.as_deref(),
+                self.cov_pay_pkh_a.as_deref(),
+                self.cov_pay_pkh_b.as_deref(),
+            ),
         }
     }
 }

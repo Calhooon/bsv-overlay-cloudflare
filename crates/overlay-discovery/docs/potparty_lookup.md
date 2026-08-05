@@ -10,11 +10,22 @@ pots, then re-derives keys and drives the refund/settle exits.
 
 ```json
 {"type": "partyFor", "identity": "<66 hex chars>", "limit": 50}
-{"type": "byPot", "potTxid": "<64 hex chars>", "potVout": 0, "limit": 50}
+{"type": "byPot", "potTxid": "<64 hex chars>", "potVout": 0, "limit": 50, "offset": 0}
 ```
 
 `identity` is a compressed identity pubkey (33 bytes hex). `limit` is
 optional — default 100, clamped to 1..=500.
+
+`byPot.offset` is optional (default 0 — the head of the oldest-first order)
+and **unclamped**: it is the page cursor, and every response stays
+`limit`-bounded regardless. Use it. This window is scoped only by the pot
+outpoint, which is a CLAIM inside each marker's payload rather than the
+marker's own outpoint, so anyone can file markers naming any pot — including
+before that pot is funded, which puts them permanently ahead of the honest
+seats in the server-stamped order. Page `offset += limit` until you have
+markers that verify for both seats, or until a page comes back short. A
+caller that reads page 0 only can be shown an answer with neither seat in
+it, forever.
 
 ## Answer
 
@@ -41,7 +52,13 @@ contract is: **the answer CONTAINS the honest row; the caller picks it.**
 - Rows naming a pot the overlay has never indexed sort behind the rest (so
   they cannot displace a real pot) but are still served, with a small reserved
   quota promoted so a pot whose admission is merely in flight stays visible.
-- `byPot` returns markers oldest first.
+- `byPot` returns markers oldest first, and is PAGEABLE (`offset`). Oldest-
+  first bounds a flood that arrives AFTER funding; it does nothing about one
+  that arrived before, so paging is what makes every admitted row reachable.
+- `byPot` is deliberately NOT ordered by marker validity, unlike the
+  identity-scoped windows. Validity here is self-asserted — a junk marker
+  names its own identity and signs with its own key — so ordering on it would
+  bar nothing while breaking the page stability that `offset` depends on.
 
 ```json
 [{"identity": "<hex>", "opponentIdentity": "<hex>", "gameId": "<hex>",

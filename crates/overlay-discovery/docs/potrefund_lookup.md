@@ -11,12 +11,17 @@ the tower failed.
 ## Queries
 
 ```json
-{"type": "byPot", "potTxid": "<64 hex chars>", "potVout": 0, "limit": 50}
+{"type": "byPot", "potTxid": "<64 hex chars>", "potVout": 0, "limit": 50, "offset": 0}
 {"type": "partyFor", "identity": "<66 hex chars>", "limit": 50}
 ```
 
 `identity` is a compressed identity pubkey (33 bytes hex). `limit` is
 optional — default 100, clamped to 1..=500.
+
+`byPot.offset` is optional (default 0) and unclamped — the page cursor that
+has existed since bsv-low #291 and was never documented here. A recovering
+client pages `offset += limit` past pre-funding junk to reach its own backup;
+the cap bounds a RESPONSE, never the reachable set.
 
 ## Answer
 
@@ -39,7 +44,7 @@ contract is: **the answer CONTAINS the honest row; the caller picks it.**
 - Rows naming a pot the overlay has never indexed sort behind the rest (so
   they cannot displace a real pot) but are still served, with a small reserved
   quota promoted so a pot whose admission is merely in flight stays visible.
-- `byPot` returns markers oldest first.
+- `byPot` returns markers oldest first, and is PAGEABLE (`offset`).
 
 ```json
 [{"identity": "<hex>", "gameId": "<hex>", "potTxid": "<hex>",
