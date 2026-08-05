@@ -3219,11 +3219,15 @@ pub use potparty_write::{potparty_insert_query, LatchedPotpartyInsert, PotpartyD
 /// round-trip observable natively — nothing here can. Two residuals, both
 /// deliberate and both louder than the hole they replace:
 ///
-///  - `fetch_all` is generic over the SELECT list, so an author determined to
-///    smuggle an INSERT through the READ method could. That is caught by
-///    `exactly_one_potparty_insert_statement_exists_in_this_module`, a
-///    Rule-9 positive-count pin: the potparty INSERT literal appears exactly
-///    ONCE in this file's non-comment source.
+///  - `fetch_all` is generic over the SELECT list, so an author could try to
+///    smuggle an INSERT through the READ method. Round 2 answered that with a
+///    source-scanning count of the INSERT literal, and the round-3 gate broke
+///    it by changing ONE keyword (`INSERT INTO` for `INSERT OR IGNORE INTO`)
+///    — 294 passed, 0 failed, every new row binding NULL. A needle is one
+///    keyword wide. The bar is now a CAPABILITY like everything else here:
+///    [`potparty_write::is_select_only`], enforced in `fetch_all`, refuses
+///    every non-`SELECT` regardless of spelling. The count pin stays behind
+///    it as the belt.
 ///  - The predicate's verdict flowing into the bound column is pinned by
 ///    `the_admission_write_latches_sig_valid_through_the_real_writer`, which
 ///    replays this module's own SQL and bind list against real SQLite.
@@ -3342,6 +3346,26 @@ pub mod potparty_write {
         }
     }
 
+    /// What [`PotpartyDb::fetch_all`] answers when handed a write.
+    pub const NON_SELECT_ON_READ_PATH: &str = "potparty read path accepts SELECT only";
+
+    /// Is this statement a READ? The bar [`PotpartyDb::fetch_all`] enforces.
+    ///
+    /// Kept pure and public so the bar is testable without a `D1Database` —
+    /// the same reason [`potparty_insert_query`] exists. Deliberately
+    /// keyword-blind rather than spelling-specific: it admits `SELECT` and
+    /// refuses everything else, so `INSERT`, `INSERT OR IGNORE`,
+    /// `INSERT OR REPLACE`, `REPLACE`, `UPDATE` and `DELETE` are all refused
+    /// by the same clause and no future write spelling slips past a needle.
+    ///
+    /// BOUNDARY: a read that legitimately needs a leading `WITH` (a CTE) or a
+    /// leading comment would be refused here. That is intended — widening
+    /// this predicate should be a deliberate edit with its own cell, not a
+    /// thing that happens by accident to a query builder.
+    pub fn is_select_only(sql: &str) -> bool {
+        sql.trim_start().to_ascii_uppercase().starts_with("SELECT")
+    }
+
     /// The ONLY database handle [`super::D1PotpartyStorage`] holds.
     ///
     /// The inner `D1Database` is private to this module, so the storage impl
@@ -3355,7 +3379,29 @@ pub mod potparty_write {
         }
 
         /// Run a read. Generic over the row type, never over the write shape.
+        ///
+        /// GUARDED (bsv-low #283, gate round 3). The round-2 remediation left
+        /// this door open and covered it with a source-scanning count of the
+        /// INSERT literal — which pins a STRING, not a property. The gate
+        /// changed exactly one keyword (`INSERT INTO` instead of
+        /// `INSERT OR IGNORE INTO`), routed a NULL-binding write through here
+        /// with `potparty_insert_query` still called and `record_sig_valid`
+        /// still evaluated once, and got 294 passed / 0 failed with #283
+        /// inoperative in production — round 1's exact defect, reconstituted
+        /// inside its own remediation. My RED-verification had reused the
+        /// injection's own spelling, which is epoch Rule 12a exactly: a pin
+        /// verified only against the injection it was written for pins that
+        /// injection.
+        ///
+        /// So the residual is now a CAPABILITY bar like the rest of this
+        /// module, not a needle: a non-`SELECT` never reaches D1 from here,
+        /// whatever it is spelled. [`is_select_only`] is pure, so the bar is
+        /// unit-testable without a `D1Database` — which is the whole problem
+        /// this module exists to solve.
         pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
+            if !is_select_only(q.sql()) {
+                return Err(NON_SELECT_ON_READ_PATH.to_string());
+            }
             q.fetch_all(&self.0).await
         }
 
@@ -6239,6 +6285,67 @@ mod tests {
         );
     }
 
+    /// THE READ PATH REFUSES A WRITE, WHATEVER IT IS SPELLED (bsv-low #283,
+    /// gate round 3).
+    ///
+    /// The round-3 gate defeated the round-2 source pin by changing one
+    /// keyword — `INSERT INTO` for `INSERT OR IGNORE INTO` — and smuggling a
+    /// NULL-binding write through `PotpartyDb::fetch_all`, with
+    /// `potparty_insert_query` still called and `record_sig_valid` still
+    /// evaluated once. 294 passed, 0 failed, and every new production row
+    /// would have landed in the legacy tier. The bar is now
+    /// `is_select_only`, and this cell measures the PROPERTY rather than the
+    /// spelling: a table of write forms, none of which shares a keyword
+    /// prefix with the others.
+    ///
+    /// POSITIVE CONTROL FIRST (epoch Rule 9, "the code under test is never
+    /// reached"): every read this module actually issues is driven through
+    /// the bar from its REAL builder, so a bar that refused everything —
+    /// which would pass every refusal leg — fails here.
+    ///
+    /// BOUNDARY (epoch Rule 22): this drives the PREDICATE. `fetch_all`'s
+    /// use of it needs a `D1Database` and is not reachable natively; that
+    /// call site is one `if` and is what the belt pin above watches.
+    #[test]
+    fn the_potparty_read_path_admits_only_selects() {
+        use crate::d1_discovery::potparty_write::is_select_only;
+
+        // ── Positive control: the REAL production readers, not hand-fed SQL.
+        for sql in [
+            potparty_list_for_identity_sql(),
+            list_for_pot_sql(POTPARTY_SELECT),
+            POTPARTY_SELECT.to_string(),
+        ] {
+            assert!(
+                is_select_only(&sql),
+                "a read this module really issues must clear the bar: {}",
+                &sql[..sql.len().min(60)]
+            );
+        }
+
+        // ── Every write form. The round-3 injection is the second entry.
+        for sql in [
+            "INSERT OR IGNORE INTO potparty_records (identity) VALUES (?)",
+            "INSERT INTO potparty_records (identity, sigValid) VALUES (?, NULL)",
+            "insert into potparty_records (identity) values (?)",
+            "  \n\t INSERT OR REPLACE INTO potparty_records (identity) VALUES (?)",
+            "REPLACE INTO potparty_records (identity) VALUES (?)",
+            "UPDATE potparty_records SET sigValid = NULL",
+            "DELETE FROM potparty_records",
+            "PRAGMA writable_schema = ON",
+            "",
+        ] {
+            assert!(
+                !is_select_only(sql),
+                "the read path must refuse this, whatever it is spelled: {sql}"
+            );
+        }
+
+        // Case and leading whitespace do not decide it either way.
+        assert!(is_select_only("   \n select 1"));
+        assert!(is_select_only("SELECT 1"));
+    }
+
     /// Strip Rust comments, leaving string literals intact.
     ///
     /// A scanner that counts PROSE has the same defect as a comment claiming
@@ -6337,27 +6444,49 @@ mod tests {
     /// can no longer reach a `D1Database`, so that injection does not
     /// compile.
     ///
-    /// This cell covers the one residual the capability leaves: `fetch_all`
-    /// is generic, so an author could still smuggle an INSERT through the
-    /// READ method. Positive exact counts, never `assert!(!contains)`
-    /// (epoch Rule 9); needles split so they cannot match this assertion's
-    /// own source; run over comment-stripped, test-module-free source.
+    /// This cell is the BELT behind `potparty_write::is_select_only`, which
+    /// is what actually closes the `fetch_all` door. Positive exact counts,
+    /// never `assert!(!contains)` (epoch Rule 9); needles split so they
+    /// cannot match this assertion's own source; run over comment-stripped,
+    /// test-module-free source.
+    ///
+    /// The INSERT needle is deliberately `INTO POTPARTY_RECORDS` over
+    /// UPPERCASED source, NOT the full `INSERT OR IGNORE INTO …` statement
+    /// head. Round 2 used the full head and the round-3 gate walked through
+    /// it by spelling the smuggled write `INSERT INTO` — one keyword, 294
+    /// passed, 0 failed, #283 inoperative. Narrowing to `INTO
+    /// potparty_records` was still not enough: my own RED-verification then
+    /// walked through THAT with a lowercase `replace into`. Every write form
+    /// (`INSERT`, `INSERT OR IGNORE`, `INSERT OR REPLACE`, `REPLACE`) must
+    /// name the table with `INTO`, and SQL is case-insensitive, so the needle
+    /// is now blind on both axes the two injections used.
     ///
     /// BOUNDARY (epoch Rule 22): this pins the SHAPE of the production
-    /// source, not the D1 round-trip. The verdict flowing into the bound
-    /// column is pinned behaviourally by
+    /// source, not the D1 round-trip, and it is a belt — the bar is the
+    /// runtime guard. The verdict flowing into the bound column is pinned
+    /// behaviourally by
     /// `the_admission_write_latches_sig_valid_through_the_real_writer`.
     #[test]
     fn exactly_one_potparty_insert_statement_exists_in_this_module() {
         let prod = production_source();
 
+        // CASE-BLIND, like the runtime bar. My own round-3 RED-verification
+        // caught this pin one more time: a lowercase `replace into
+        // potparty_records` smuggled through `fetch_all` compiled and left
+        // this cell GREEN — the needle was still spelling-sensitive, just one
+        // axis narrower than before. `is_select_only` refuses it at runtime
+        // either way, which is the argument for the bar being the bar and
+        // this being the belt.
+        let shouty = prod.to_ascii_uppercase();
         assert_eq!(
-            prod.matches(&["INSERT OR IGNORE INTO potparty", "_records"].concat())
+            shouty
+                .matches(&["INTO POTPARTY", "_RECORDS"].concat())
                 .count(),
             1,
-            "the potparty INSERT is written in exactly ONE place — a second \
-             one (inline in `store_record`, or smuggled through `fetch_all`) \
-             is how the latch gets dropped while the suite stays green"
+            "exactly ONE statement in this module writes `potparty_records` — \
+             a second one (inline in `store_record`, or smuggled through \
+             `fetch_all` under ANY spelling OR CASE) is how the latch gets \
+             dropped while the suite stays green"
         );
         assert_eq!(
             prod.matches(&["potparty_insert", "_query("].concat())
@@ -6372,6 +6501,27 @@ mod tests {
             "the latch predicate is evaluated exactly ONCE per admitted \
              marker (gate round 2 LOW-2) — telemetry reads the verdict off \
              the insert instead of re-deriving it"
+        );
+
+        // ── The read-path bar's CALL SITE. `fetch_all` needs a live
+        // `D1Database`, so no native cell can watch it refuse — the same
+        // unreachability that produced this whole class. The predicate is
+        // pinned behaviourally by `the_potparty_read_path_admits_only_selects`;
+        // this pins that `fetch_all` still consults it, scoped to the guard
+        // EXPRESSION rather than a region (epoch Rule 9, fourth failure mode),
+        // so `&& false` or a swapped argument changes the needle.
+        assert_eq!(
+            prod.matches(&["if !is_select", "_only(q.sql()) {"].concat())
+                .count(),
+            1,
+            "`fetch_all` guards on the read bar, in exactly that form — this \
+             is the door the round-3 gate walked through"
+        );
+        assert_eq!(
+            prod.matches(&["is_select", "_only("].concat()).count(),
+            2,
+            "the read bar is DEFINED once and USED once — a 1 here means \
+             `fetch_all` stopped consulting it"
         );
     }
 
