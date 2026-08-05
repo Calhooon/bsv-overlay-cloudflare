@@ -24,6 +24,7 @@ pub mod peer_crawler;
 pub mod proof_fetcher;
 pub mod queue;
 pub mod routes;
+pub mod submit_gate;
 pub mod wallet;
 
 use std::collections::HashMap;
@@ -228,7 +229,16 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
             // `ctx` is threaded in so the best-effort mainnet SHIP fan-out
             // runs via `wait_until` AFTER the response instead of inline
             // (it was costing the caller seconds on every submit).
-            submit(&engine, req, hosting_url.as_deref(), arcade_url, taal_api_key, &ctx).await
+            submit(
+                &engine,
+                req,
+                hosting_url.as_deref(),
+                arcade_url,
+                taal_api_key,
+                &ctx,
+                &env,
+            )
+            .await
         }
         (Method::Post, "/lookup") => lookup(&engine, req).await,
         (Method::Post, "/arc-ingest") => {

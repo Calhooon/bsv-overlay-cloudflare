@@ -36,11 +36,17 @@ reference-logs:
 ## -- Rust side (wrangler dev in parity mode) ----------------------------------
 
 # Parity defaults — TOPIC_MANAGERS / LOOKUP_SERVICES unset so the code-side
-# defaults apply (tm_ship,tm_slap / ls_ship,ls_slap). ENABLE_EXTENSIONS=false
-# disables the Rust-only superset (/admin/crawlPeers, X-History-Depth,
-# X-Submit-Mode, rich admin bodies). This is what the harness diffs against
-# mainline. Production deploys inherit wrangler.toml's [vars] which set the
-# full dolphinmilk stack.
+# defaults apply (tm_ship,tm_slap / ls_ship,ls_slap). This is what the harness
+# diffs against mainline. Production deploys inherit wrangler.toml's [vars]
+# which set the full dolphinmilk stack.
+#
+# ENABLE_EXTENSIONS=false: until bsv-low #347 this var was DEAD CONFIG — set in
+# both wrangler files and read nowhere in Rust, while this comment claimed it
+# disabled the Rust-only superset. It now genuinely gates ONE thing, the piece
+# that was a security hole: `x-submit-mode`. With it false, every /submit takes
+# the SPV-barred default path regardless of header (`submit_gate.rs`). The other
+# listed extensions (/admin/crawlPeers, X-History-Depth, rich admin bodies) are
+# still NOT gated by it — do not re-add that claim without adding the code.
 wrangler-dev:
 	cd crates/overlay-cloudflare && wrangler dev --local --port 8787 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_ship,tm_slap \

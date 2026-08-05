@@ -429,6 +429,9 @@ pub async fn submit(
     taal_api_key: Option<String>,
     // Worker context — used only to background the mainnet SHIP fan-out.
     ctx: &Context,
+    // #347: the submit-gate needs the env for ENABLE_EXTENSIONS (kill switch),
+    // SUBMIT_ENFORCE (the Rule 6c rollout flag) and the operator ADMIN_TOKEN.
+    env: &Env,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -493,19 +496,60 @@ pub async fn submit(
         off_chain_values,
     };
 
-    // Parse optional submit mode header (matches TS 'mode' parameter).
-    // Default: current-tx (broadcast + SPV). Alternatives for GASP sync and migration.
+    // ── #347: the admission path is DERIVED BY THE ENDPOINT, never chosen by
+    // the caller. The header is an INPUT to that derivation, never a gate
+    // decision in its own right (epoch Rule 8b applied to a MODE rather than a
+    // value: a gate selected by a caller-supplied discriminator is not a gate).
+    //
+    // `ENABLE_EXTENSIONS=false` is the kill switch — it forces every submit
+    // onto the SPV-barred default regardless of header. Until #347 this var was
+    // dead config: set in both wrangler files, read nowhere.
     let mode_header = req.headers().get("x-submit-mode").ok().flatten();
-    let mode = match mode_header.as_deref() {
-        Some("historical-tx") => overlay_engine::types::SubmitMode::HistoricalTx,
-        // broadcast-gated admits with the exact same engine semantics as
-        // historical-tx-no-spv (0-conf, no SPV) — the network gate below is
-        // what makes it stronger, not the engine mode.
-        Some("historical-tx-no-spv") | Some("broadcast-gated") => {
-            overlay_engine::types::SubmitMode::HistoricalTxNoSpv
-        }
-        _ => overlay_engine::types::SubmitMode::CurrentTx,
-    };
+    let extensions_enabled = env
+        .var("ENABLE_EXTENSIONS")
+        .ok()
+        .map(|v| v.to_string())
+        .is_none_or(|v| !v.trim().eq_ignore_ascii_case("false"));
+    let path = crate::submit_gate::AdmissionPath::from_header(
+        mode_header.as_deref(),
+        extensions_enabled,
+    );
+    let mode = path.engine_mode();
+
+    // An unbarred path (`historical-tx-no-spv`: no SPV, no broadcast) is for
+    // operators and peer sync — never for the public. The credential is the
+    // existing ADMIN_TOKEN bearer; a barred path never consults it, so no
+    // honest client path is ever priced or throttled (Rule 20).
+    let gate_mode = crate::submit_gate::GateMode::parse(
+        env.var("SUBMIT_ENFORCE").ok().map(|v| v.to_string()).as_deref(),
+    );
+    let operator_authed = check_admin_auth(&req, env).is_ok();
+    let decision = crate::submit_gate::decide(path, operator_authed, gate_mode);
+    crate::submit_gate::note(path, operator_authed, decision);
+    if decision == crate::submit_gate::GateDecision::RefuseUnauthenticated {
+        worker::console_log!(
+            "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
+            path.as_str()
+        );
+        return json_error(
+            &format!(
+                "submit mode '{}' has no admission bar and is restricted to operators — \
+                 provide the operator Bearer token, or submit with 'broadcast-gated' \
+                 (an already-broadcast tx satisfies the network gate idempotently)",
+                path.as_str()
+            ),
+            401,
+        );
+    }
+    if path.requires_operator_auth() && !operator_authed {
+        // Lenient window (Rule 6c). Counted above; logged here so the operator
+        // can see WHO is still on the unbarred path before flipping enforcement.
+        worker::console_log!(
+            "POST /submit: UNAUTHENTICATED submit on unbarred path {} — served under the \
+             lenient window (#347); set SUBMIT_ENFORCE=true to refuse",
+            path.as_str()
+        );
+    }
 
     // ── BROADCAST-GATED submit (bsv-low overlay-first, 2026-07-17; the
     // zanaadu invariant): the OVERLAY broadcasts, and NOTHING is admitted
@@ -528,7 +572,7 @@ pub async fn submit(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
-    if mode_header.as_deref() == Some("broadcast-gated") {
+    if path.network_gate_required() {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
         // and NOTHING is admitted unless Arcade reports the SUBJECT

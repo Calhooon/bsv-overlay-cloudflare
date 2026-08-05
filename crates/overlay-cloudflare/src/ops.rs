@@ -268,6 +268,10 @@ pub async fn health_invariants(db: &D1Database, env: &Env, strict: bool) -> work
         },
         "counters": counters,
         "prooflessOver24h": flagged,
+        // #347 soak signal (Rule 6c closure criterion 3): `unauthenticatedUngated`
+        // must reach ~0 before SUBMIT_ENFORCE is flipped to true. Per-isolate and
+        // therefore lossy — a soak signal, never an audit log.
+        "submitAdmission": crate::submit_gate::counters_json(),
     });
 
     let mut resp = Response::from_json(&body)?.with_status(status);
