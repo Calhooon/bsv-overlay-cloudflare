@@ -1129,6 +1129,125 @@ pub fn verified_claim(m: &ResultMarkerRow) -> Option<ClaimFact> {
     })
 }
 
+/// The four values a pot's OWN funding lock commits that let a client answer
+/// *"is this pot mine?"* with nothing but its own key derivations
+/// (bsv-low #343).
+///
+/// # Why serve them at all — network enforcement over platform enforcement
+///
+/// The client's ownership anchor re-derives from the funding lock, so today it
+/// needs either local money-write records or a `/beef/:potTxid` read plus a
+/// local decode. On a WIPED device — the population recovery exists for — it
+/// has neither at the moment it renders, so the anchor correctly answers
+/// CANNOT-SAY and the row degrades to server-shaped. Serving the committed
+/// values turns that into a check the client performs itself: derive MY
+/// `[2,'low settle']` key and MY `counterparty:'self'` pay-home PKH — the two
+/// facts no server can compute for me — and test membership against these.
+///
+/// # The asymmetry that makes it sound, and which half is load-bearing
+///
+/// A seat's SETTLE key is publicly derivable by its counterparty (BRC-42
+/// `forSelf: false`), so an opponent CAN build a covenant pot committing your
+/// settle key: a match on [`CommittedKeys::pub_a`]/[`CommittedKeys::pub_b`]
+/// alone proves the pot names you, not that you chose it. The PAY-HOME PKH is
+/// derived under `counterparty: 'self'` — ECDH(my_priv, my_pub) — which only
+/// the holder can compute, so a match on
+/// [`CommittedKeys::pay_pkh_a`]/[`CommittedKeys::pay_pkh_b`] is unforgeable.
+/// That is why the pay homes are served here as REQUIRED members of the set
+/// and not as an optional extra: without them the anchor is a name check.
+///
+/// # A MISMATCH IS NOT "NOT YOURS"
+///
+/// These values are as good as the server that served them, which is a strictly
+/// weaker guarantee than the client's own hash-verified decode of the funding
+/// raw. A row's `potTxid` is attacker-chosen (anyone can file a marker naming
+/// their own pot), so a non-match is a truthful statement about THAT OUTPOINT —
+/// but a compromised or merely stale app-layer can also produce a non-match for
+/// a pot that IS yours. **A consumer must therefore treat absence OR mismatch
+/// as CANNOT-SAY and re-derive from hash-verified bytes before acting**, and
+/// must never convert either into a NOT-YOURS claim or suppress a row. The
+/// productive direction is the match: it lets a wiped device anchor a row it
+/// could previously only take on trust.
+///
+/// # Provenance
+///
+/// Decoded from the pot's own on-chain funding output at the outpoint the row
+/// names — `pot_records`' #284 columns, written by the overlay at admission,
+/// where admission is gated on SEEN-ON-NETWORK. Network-backed CONTENT rather
+/// than an assertion (epoch Rule 21), which is what makes it safe to serve at
+/// all; it is not a substitute for the client's own derivations, which is why
+/// only the committed half travels.
+///
+/// ALL FOUR OR NOTHING. A half-populated set is exactly the state a consumer
+/// would misread — "I found no pay home, so I'll settle for the key match" —
+/// so the type cannot represent one (epoch Rule 15: make the wrong thing
+/// unrepresentable rather than documenting it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedKeys {
+    /// Seat A's committed SETTLE pubkey, 33 bytes, lowercase hex.
+    pub pub_a: String,
+    /// Seat B's committed SETTLE pubkey, 33 bytes, lowercase hex.
+    pub pub_b: String,
+    /// Seat A's committed PAY-HOME pubkey hash, 20 bytes, lowercase hex.
+    pub pay_pkh_a: String,
+    /// Seat B's committed PAY-HOME pubkey hash, 20 bytes, lowercase hex.
+    pub pay_pkh_b: String,
+}
+
+impl CommittedKeys {
+    /// From params the caller already resolved (decoded columns first, else
+    /// the hash-verified funding bytes — see [`covenant_params_by_pot`]).
+    pub fn from_params(p: &CovenantParams) -> Self {
+        Self {
+            pub_a: hex::encode(p.pub_a),
+            pub_b: hex::encode(p.pub_b),
+            pay_pkh_a: hex::encode(p.pay_pkh_a),
+            pay_pkh_b: hex::encode(p.pay_pkh_b),
+        }
+    }
+
+    /// From the four stored `pot_records` column values, as read.
+    ///
+    /// THE one predicate, used by every view that serves these (`/results`
+    /// and `/recovery-view`) so the two cannot disagree about what a servable
+    /// set is (epoch Rule 10 — one shared predicate beats two copies and a
+    /// test). Requires all four present and structurally right: 33-byte
+    /// pubkeys, 20-byte hashes, valid hex. Anything else is `None` —
+    /// CANNOT-SAY, never a partial answer, and never a fabricated one.
+    pub fn from_columns(
+        pub_a: Option<&str>,
+        pub_b: Option<&str>,
+        pay_pkh_a: Option<&str>,
+        pay_pkh_b: Option<&str>,
+    ) -> Option<Self> {
+        fn norm(v: Option<&str>, bytes: usize) -> Option<String> {
+            let lc = v?.to_ascii_lowercase();
+            let raw = hex::decode(&lc).ok()?;
+            (raw.len() == bytes).then_some(lc)
+        }
+        Some(Self {
+            pub_a: norm(pub_a, 33)?,
+            pub_b: norm(pub_b, 33)?,
+            pay_pkh_a: norm(pay_pkh_a, 20)?,
+            pay_pkh_b: norm(pay_pkh_b, 20)?,
+        })
+    }
+
+    /// The wire object, or `null` — the SAME shape on every view that serves
+    /// it, built here so a second view cannot spell it differently.
+    pub fn to_json(this: Option<&Self>) -> serde_json::Value {
+        match this {
+            Some(k) => json!({
+                "pubA": k.pub_a,
+                "pubB": k.pub_b,
+                "payPkhA": k.pay_pkh_a,
+                "payPkhB": k.pay_pkh_b,
+            }),
+            None => serde_json::Value::Null,
+        }
+    }
+}
+
 /// One `/results` response entry, pre-JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultEntry {
@@ -1177,6 +1296,11 @@ pub struct ResultEntry {
     /// unresolved winner). Only the winner's hand is on-chain — the loser's is
     /// never fabricated. See [`resolve_winner_hand`].
     pub winner_hand: Option<WinnerHand>,
+    /// The pot's COMMITTED covenant keys (bsv-low #343), or `None` when the
+    /// pot is absent from the index, is not a covenant lock, or its stored
+    /// params are malformed. See [`CommittedKeys`] — in particular, a
+    /// consumer must read `None` and a MISMATCH alike as cannot-say.
+    pub committed_keys: Option<CommittedKeys>,
 }
 
 /// The per-identity outcome enum (wire strings match bsv-low #227's spec).
@@ -1741,6 +1865,11 @@ pub fn assemble_results(
             outcome_source,
             at_height,
             winner_hand,
+            // #343: the pot's own committed keys, from the params the caller
+            // already resolved for this outpoint (decoded columns first, else
+            // the hash-verified funding bytes) — LOOKED UP, never re-derived
+            // here, so this cannot disagree with the binding computed above.
+            committed_keys: row_params.map(CommittedKeys::from_params),
         });
     }
     out
@@ -1852,6 +1981,21 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
                 "outcome": e.outcome.as_str(),
                 "outcomeSource": e.outcome_source,
                 "at": { "height": e.at_height },
+                // NEW (#343): the pot's COMMITTED covenant keys, decoded from
+                // its own funding lock, or null. Present so a WIPED device can
+                // ANSWER "is this pot mine?" with its own derivations (its
+                // `[2,'low settle']` key and its `counterparty:'self'` pay-home
+                // PKH) instead of trusting this server's classification —
+                // network enforcement over platform enforcement.
+                //
+                // NOT a claim about ownership, and a MISMATCH IS NOT "not
+                // yours": the row's potTxid is attacker-chosen and these values
+                // are only as good as this server, so a consumer treats absence
+                // and mismatch alike as CANNOT-SAY and re-derives from
+                // hash-verified bytes before acting on a negative. A MATCH on
+                // `payPkhA`/`payPkhB` is the unforgeable half — that derivation
+                // is `counterparty:'self'`, which nobody else can compute.
+                "committedKeys": CommittedKeys::to_json(e.committed_keys.as_ref()),
                 // The showdown (#245): the winner's five cards + low-sum, or
                 // null when no hand is provable. `loserCardsOnChain` is always
                 // false — the loser's hand is never revealed for a settle, and
@@ -3715,6 +3859,85 @@ mod tests {
         (f, f_id, s, s_id)
     }
 
+    /// #343 AT THE PRODUCER (epoch Rule 6b — a primitive-level proof is a
+    /// proof about a primitive).
+    ///
+    /// Driven through `assemble_like_the_route`, i.e. the SHIPPED
+    /// `covenant_params_by_pot` over the same rows and then the SHIPPED
+    /// `assemble_results` — so this measures the path the route takes, not a
+    /// hand-fed map. A row with the #284 decoded columns serves its committed
+    /// keys; a legacy row with neither columns nor funding bytes serves
+    /// `null` = CANNOT-SAY.
+    #[test]
+    fn the_committed_keys_reach_the_wire_through_the_route_path() {
+        let me = ident(0xaa);
+        let opp = ident(0xbb);
+        let (pub_a, pub_b) = (ident(0x0a), format!("03{}", "0b".repeat(32)));
+        let (pkh_a, pkh_b) = ("aa".repeat(20), "bb".repeat(20));
+        let covenant = ResultsRow {
+            identity: me.clone(),
+            game_id: tx(0x01),
+            pot_txid: tx(0x02),
+            pot_vout: 0,
+            recovery_height: 900_000,
+            opponent_identity: opp.clone(),
+            lock_kind: Some("covenant".into()),
+            pub_a: Some(pub_a.clone()),
+            pub_b: Some(pub_b.clone()),
+            pub_tower: Some(ident(0x0c)),
+            pay_pkh_a: Some(pkh_a.clone()),
+            pay_pkh_b: Some(pkh_b.clone()),
+            rake_pkh: Some("cc".repeat(20)),
+            stake_a: Some(500),
+            stake_b: Some(500),
+            fee_sats: Some(8),
+            cov_recovery_height: Some(900_100),
+            pot_sats: Some(1_000),
+            ..Default::default()
+        };
+        // A legacy row: no decoded columns, no funding bytes — nothing the
+        // server could honestly answer with.
+        let legacy = ResultsRow {
+            identity: me.clone(),
+            game_id: tx(0x03),
+            pot_txid: tx(0x04),
+            pot_vout: 0,
+            recovery_height: 900_000,
+            opponent_identity: opp,
+            ..Default::default()
+        };
+        let entries = assemble_like_the_route(
+            &me,
+            vec![covenant, legacy],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(entries.len(), 2);
+        let k = entries[0]
+            .committed_keys
+            .clone()
+            .expect("the covenant row's committed keys reach the entry");
+        assert_eq!((k.pub_a, k.pub_b), (pub_a, pub_b));
+        assert_eq!(
+            (k.pay_pkh_a, k.pay_pkh_b),
+            (pkh_a, pkh_b),
+            "the PAY HOMES travel — they are the half only the holder can \
+             derive, and without them the anchor is a name check"
+        );
+        assert!(
+            entries[1].committed_keys.is_none(),
+            "a legacy row is CANNOT-SAY, never a fabricated set"
+        );
+
+        // …and it survives the real serializer, in both states.
+        let body: serde_json::Value = serde_json::from_str(&results_body(&me, &entries)).unwrap();
+        assert_eq!(
+            body["results"][0]["committedKeys"]["payPkhA"],
+            json!("aa".repeat(20))
+        );
+        assert!(body["results"][1]["committedKeys"].is_null());
+    }
+
     #[test]
     fn assemble_results_dedupes_and_fail_safes() {
         let me = ident(0xaa);
@@ -4000,6 +4223,221 @@ mod tests {
         );
     }
 
+    // ── #343 — the pot's COMMITTED covenant keys on the wire ────────────
+
+    fn keys_fixture() -> CommittedKeys {
+        CommittedKeys {
+            pub_a: format!("02{}", "0a".repeat(32)),
+            pub_b: format!("03{}", "0b".repeat(32)),
+            pay_pkh_a: "aa".repeat(20),
+            pay_pkh_b: "bb".repeat(20),
+        }
+    }
+
+    /// ALL FOUR OR NOTHING, and structurally right. A half set is exactly the
+    /// state a consumer misreads — "no pay home, so I'll accept the key
+    /// match" — and the key match is the FORGEABLE half (a counterparty can
+    /// derive your settle key publicly; only you can derive your
+    /// `counterparty:'self'` pay home).
+    #[test]
+    fn committed_keys_from_columns_is_all_four_or_nothing() {
+        let k = keys_fixture();
+        let (a, b, pa, pb) = (
+            k.pub_a.as_str(),
+            k.pub_b.as_str(),
+            k.pay_pkh_a.as_str(),
+            k.pay_pkh_b.as_str(),
+        );
+        assert_eq!(
+            CommittedKeys::from_columns(Some(a), Some(b), Some(pa), Some(pb)),
+            Some(k.clone()),
+            "positive control: a complete well-formed set answers"
+        );
+        // Each member is independently load-bearing.
+        for (i, dropped) in ["pubA", "pubB", "payPkhA", "payPkhB"].iter().enumerate() {
+            let mut v = [Some(a), Some(b), Some(pa), Some(pb)];
+            v[i] = None;
+            assert_eq!(
+                CommittedKeys::from_columns(v[0], v[1], v[2], v[3]),
+                None,
+                "dropping {dropped} must collapse the whole set"
+            );
+        }
+        // Structure, not just presence: a truncated/oversized/non-hex value
+        // is refused rather than served as a key a client would compare. The
+        // two field kinds have DIFFERENT valid lengths, so they get different
+        // probes — a shared list would have let a 33-byte value stand in for
+        // a 20-byte one (it did, on the first run of this cell).
+        for bad in ["", "02", "zz", &"aa".repeat(34), &"aa".repeat(32)] {
+            assert_eq!(
+                CommittedKeys::from_columns(Some(bad), Some(b), Some(pa), Some(pb)),
+                None,
+                "malformed pubA {bad:?} (33 bytes required)"
+            );
+        }
+        for bad in ["", "aa", "zz", &"aa".repeat(21), &"aa".repeat(19)] {
+            assert_eq!(
+                CommittedKeys::from_columns(Some(a), Some(b), Some(bad), Some(pb)),
+                None,
+                "malformed payPkhA {bad:?} (20 bytes required)"
+            );
+        }
+        // …and the two lengths really are distinct bars: a 33-byte value is
+        // fine as a pubkey and refused as a pay home.
+        assert!(
+            CommittedKeys::from_columns(Some(&"aa".repeat(33)), Some(b), Some(pa), Some(pb))
+                .is_some()
+        );
+        assert!(
+            CommittedKeys::from_columns(Some(a), Some(b), Some(&"aa".repeat(33)), Some(pb))
+                .is_none()
+        );
+        // Case is normalised, not rejected — D1 has carried both cases.
+        let upper = CommittedKeys::from_columns(
+            Some(&a.to_ascii_uppercase()),
+            Some(&b.to_ascii_uppercase()),
+            Some(&pa.to_ascii_uppercase()),
+            Some(&pb.to_ascii_uppercase()),
+        );
+        assert_eq!(upper, Some(k), "uppercase hex is the same key set");
+    }
+
+    /// The two views must serve the SAME shape. Asserted through BOTH real
+    /// serializers, not through the shared helper only — a claim about two
+    /// surfaces agreeing has to call both (epoch Rule 10).
+    #[test]
+    fn both_views_serve_the_same_committed_keys_shape() {
+        let me = ident(0xaa);
+        let k = keys_fixture();
+        let e = ResultEntry {
+            game_id: tx(0x01),
+            pot_txid: tx(0x02),
+            pot_vout: 0,
+            recovery_height: 958_846,
+            cov_recovery_height: Some(958_800),
+            opponent_identity: ident(0xbb),
+            settle_txid: None,
+            spent: None,
+            spent_confirmed: None,
+            pot_binding: PotBinding::Unknown,
+            game_id_binding: PotBinding::Unknown,
+            verdict: None,
+            outcome: Outcome::Unresolved,
+            outcome_source: None,
+            at_height: None,
+            winner_hand: None,
+            committed_keys: Some(k.clone()),
+        };
+        let results: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let from_results = results["results"][0]["committedKeys"].clone();
+
+        let recovery: serde_json::Value = serde_json::from_str(&crate::logic::recovery_view_body(
+            &[crate::logic::RecoveryEntry {
+                game_id: tx(0x01),
+                pot_txid: tx(0x02),
+                pot_vout: 0,
+                recovery_height: 958_800,
+                opponent_identity: ident(0xbb),
+                spent: None,
+                spending_txid: None,
+                spent_confirmed: None,
+                spender_raw_hex: None,
+                committed_keys: Some(k.clone()),
+            }],
+            None,
+            false,
+        ))
+        .unwrap();
+        let from_recovery = recovery["entries"][0]["committedKeys"].clone();
+
+        assert_eq!(from_results, from_recovery, "one shape, two views");
+        assert_eq!(
+            from_results,
+            json!({
+                "pubA": k.pub_a,
+                "pubB": k.pub_b,
+                "payPkhA": k.pay_pkh_a,
+                "payPkhB": k.pay_pkh_b,
+            })
+        );
+        // …and CANNOT-SAY is the same on both: null, key present.
+        let none = CommittedKeys::to_json(None);
+        assert!(none.is_null());
+    }
+
+    /// #343 CROSS-REPO WIRE PIN (epoch Rule 16 — share the ARTIFACT, not the
+    /// convention; the `leaderboard_chain_wins.fixture.json` pattern).
+    ///
+    /// The REAL serializer drives both states this change can produce — an
+    /// entry WITH committed keys and one with `null` (cannot-say) — and its
+    /// output, normalized to the canonical pretty form, must equal the
+    /// committed fixture BYTE-FOR-BYTE.
+    ///
+    /// The identical bytes belong in the bsv-low client
+    /// (`app/src/lib/fixtures/results_committed_keys.fixture.json`), read back
+    /// by the real client parser, so the producer's output is proven
+    /// acceptable to the consumer across the language boundary. A cross-
+    /// language disagreement inside a value a client COMPARES fails toward
+    /// refusing honest work — here, toward telling a wiped device its own pot
+    /// is not its own — so it is pinned against bytes rather than assumed.
+    #[test]
+    fn committed_keys_body_matches_cross_repo_fixture() {
+        let me = ident(0xaa);
+        let base = ResultEntry {
+            game_id: tx(0x01),
+            pot_txid: tx(0x02),
+            pot_vout: 0,
+            recovery_height: 958_846,
+            cov_recovery_height: Some(958_800),
+            opponent_identity: ident(0xbb),
+            settle_txid: None,
+            spent: None,
+            spent_confirmed: None,
+            pot_binding: PotBinding::Unknown,
+            game_id_binding: PotBinding::Unknown,
+            verdict: None,
+            outcome: Outcome::Unresolved,
+            outcome_source: None,
+            at_height: None,
+            winner_hand: None,
+            committed_keys: Some(keys_fixture()),
+        };
+        let cannot_say = ResultEntry {
+            game_id: tx(0x03),
+            pot_txid: tx(0x04),
+            committed_keys: None,
+            ..base.clone()
+        };
+        // Loud-count guard: the scenario really covers BOTH states, so a
+        // fixture regenerated from a one-state run cannot pass quietly.
+        let entries = [base, cannot_say];
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.committed_keys.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.committed_keys.is_none())
+                .count(),
+            1
+        );
+        let pretty: serde_json::Value = serde_json::from_str(&results_body(&me, &entries)).unwrap();
+        let mut got = serde_json::to_string_pretty(&pretty).unwrap();
+        got.push('\n');
+        let fixture = include_str!("fixtures/results_committed_keys.fixture.json");
+        assert_eq!(
+            got, fixture,
+            "the /results committedKeys wire must match the cross-repo fixture \
+             BYTE-FOR-BYTE — if this changed intentionally, regenerate the \
+             fixture and copy it byte-identically to \
+             app/src/lib/fixtures/results_committed_keys.fixture.json in bsv-low"
+        );
+    }
+
     #[test]
     fn results_body_shape() {
         let me = ident(0xaa);
@@ -4020,6 +4458,7 @@ mod tests {
             outcome_source: Some("chain"),
             at_height: Some(958_900),
             winner_hand: None,
+            committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
         assert_eq!(v["identity"], me);
@@ -4065,6 +4504,7 @@ mod tests {
             outcome_source: None,
             at_height: None,
             winner_hand: None,
+            committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
         let r = &v["results"][0];
@@ -4109,11 +4549,16 @@ mod tests {
             "outcomeSource",
             "at",
         ];
-        const ADDED_KEYS: [&str; 4] = [
+        const ADDED_KEYS: [&str; 5] = [
             "covRecoveryHeight",
             "potBinding",
             "potBindingSource",
             "gameIdBinding",
+            // #343 — the pot's own committed covenant keys, so a wiped
+            // device can VERIFY ownership instead of trusting this server's
+            // classification. Additive: no existing key changed name, type
+            // or value, which is what the rest of this cell measures.
+            "committedKeys",
         ];
         let me = ident(0xaa);
         let e = ResultEntry {
@@ -4138,6 +4583,7 @@ mod tests {
                 score: 15,
                 is_tie: false,
             }),
+            committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
         let obj = v["results"][0].as_object().unwrap();
@@ -4154,7 +4600,7 @@ mod tests {
         want.sort_unstable();
         assert_eq!(
             got, want,
-            "the /results entry key set may only GROW by the four added keys"
+            "the /results entry key set may only GROW by the added keys"
         );
         // …and the pre-change values are byte-identical to what the old
         // server emitted for this entry.
@@ -4202,6 +4648,7 @@ mod tests {
                 score: 15,
                 is_tie: false,
             }),
+            committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
         let h = &v["results"][0]["hand"];

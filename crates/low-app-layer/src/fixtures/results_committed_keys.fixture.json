@@ -1,0 +1,54 @@
+{
+  "identity": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "results": [
+    {
+      "at": {
+        "height": null
+      },
+      "committedKeys": {
+        "payPkhA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payPkhB": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pubA": "020a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "pubB": "030b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+      },
+      "covRecoveryHeight": 958800,
+      "gameId": "0101010101010101010101010101010101010101010101010101010101010101",
+      "gameIdBinding": "unknown",
+      "hand": null,
+      "opponentIdentity": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "outcome": "unresolved",
+      "outcomeSource": null,
+      "potBinding": "unknown",
+      "potBindingSource": null,
+      "potTxid": "0202020202020202020202020202020202020202020202020202020202020202",
+      "potVout": 0,
+      "recoveryHeight": 958846,
+      "settleTxid": null,
+      "spent": null,
+      "spentConfirmed": null,
+      "verdict": null
+    },
+    {
+      "at": {
+        "height": null
+      },
+      "committedKeys": null,
+      "covRecoveryHeight": 958800,
+      "gameId": "0303030303030303030303030303030303030303030303030303030303030303",
+      "gameIdBinding": "unknown",
+      "hand": null,
+      "opponentIdentity": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "outcome": "unresolved",
+      "outcomeSource": null,
+      "potBinding": "unknown",
+      "potBindingSource": null,
+      "potTxid": "0404040404040404040404040404040404040404040404040404040404040404",
+      "potVout": 0,
+      "recoveryHeight": 958846,
+      "settleTxid": null,
+      "spent": null,
+      "spentConfirmed": null,
+      "verdict": null
+    }
+  ]
+}
