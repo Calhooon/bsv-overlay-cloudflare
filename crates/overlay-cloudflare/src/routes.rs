@@ -432,11 +432,8 @@ pub async fn submit(
     // #347: the submit-gate needs the env for ENABLE_EXTENSIONS (kill switch),
     // SUBMIT_ENFORCE (the Rule 6c rollout flag) and SUBMIT_OPERATOR_TOKEN
     // (deliberately NOT ADMIN_TOKEN — see `check_submit_operator_auth`).
+    // #366 also derives the census counters' D1 handle (`OVERLAY_DB`) from it.
     env: &Env,
-    // #366: durable home for the readiness-census counters (`ops_counters`
-    // rows, bumped in the background via `ctx.wait_until`). Measurement only —
-    // nothing on the admission path reads it.
-    ops_db: std::rc::Rc<worker::D1Database>,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -617,14 +614,19 @@ pub async fn submit(
             );
             // Durable bump in the BACKGROUND — measurement adds no caller
             // latency and a D1 fault can only lose a count, never a submit
-            // (`bump_counter` logs and swallows its own errors).
-            let census_db = ops_db.clone();
-            ctx.wait_until(async move {
-                crate::ops::bump_counter(&census_db, state_counter, 1).await;
-                if let Some(reason) = reason_counter {
-                    crate::ops::bump_counter(&census_db, reason, 1).await;
+            // (`bump_counter` logs and swallows its own errors; a missing
+            // binding logs and loses the count, never the request).
+            match env.d1("OVERLAY_DB") {
+                Ok(census_db) => ctx.wait_until(async move {
+                    crate::ops::bump_counter(&census_db, state_counter, 1).await;
+                    if let Some(reason) = reason_counter {
+                        crate::ops::bump_counter(&census_db, reason, 1).await;
+                    }
+                }),
+                Err(e) => {
+                    worker::console_log!("census(#366): OVERLAY_DB unavailable, count lost: {e}");
                 }
-            });
+            }
         }
     }
 

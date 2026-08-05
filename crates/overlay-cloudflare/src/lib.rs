@@ -238,8 +238,6 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 taal_api_key,
                 &ctx,
                 &env,
-                // #366 readiness census — durable counters in ops_counters.
-                ops_db.clone(),
             )
             .await
         }
