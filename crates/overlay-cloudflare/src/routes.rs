@@ -429,6 +429,10 @@ pub async fn submit(
     taal_api_key: Option<String>,
     // Worker context — used only to background the mainnet SHIP fan-out.
     ctx: &Context,
+    // #347: the submit-gate needs the env for ENABLE_EXTENSIONS (kill switch),
+    // SUBMIT_ENFORCE (the Rule 6c rollout flag) and SUBMIT_OPERATOR_TOKEN
+    // (deliberately NOT ADMIN_TOKEN — see `check_submit_operator_auth`).
+    env: &Env,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
@@ -493,19 +497,100 @@ pub async fn submit(
         off_chain_values,
     };
 
-    // Parse optional submit mode header (matches TS 'mode' parameter).
-    // Default: current-tx (broadcast + SPV). Alternatives for GASP sync and migration.
+    // ── #347: the admission path is DERIVED BY THE ENDPOINT, never chosen by
+    // the caller. The header is an INPUT to that derivation, never a gate
+    // decision in its own right (epoch Rule 8b applied to a MODE rather than a
+    // value: a gate selected by a caller-supplied discriminator is not a gate).
+    //
+    // The ENTIRE decision comes from ONE call to `plan_submit`. The route may
+    // only read the resulting fields — it cannot re-derive, re-order or
+    // second-guess them. The wiring is the defect class here, so it is not
+    // allowed to live as inline branching (gate finding H1/M-5).
     let mode_header = req.headers().get("x-submit-mode").ok().flatten();
-    let mode = match mode_header.as_deref() {
-        Some("historical-tx") => overlay_engine::types::SubmitMode::HistoricalTx,
-        // broadcast-gated admits with the exact same engine semantics as
-        // historical-tx-no-spv (0-conf, no SPV) — the network gate below is
-        // what makes it stronger, not the engine mode.
-        Some("historical-tx-no-spv") | Some("broadcast-gated") => {
-            overlay_engine::types::SubmitMode::HistoricalTxNoSpv
+    // Fail CLOSED on a typo: extensions are enabled ONLY on an explicit
+    // "true". Both wrangler configs set it explicitly, so this is safe, and a
+    // mangled value can no longer silently leave the ungated modes reachable.
+    let extensions_enabled = env
+        .var("ENABLE_EXTENSIONS")
+        .ok()
+        .map(|v| v.to_string())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    let gate_mode = crate::submit_gate::GateMode::parse(
+        env.var("SUBMIT_ENFORCE").ok().map(|v| v.to_string()).as_deref(),
+    );
+    // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
+    // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
+    // (gate finding M1). Handing the watchtower the admin token would mean a
+    // tower compromise grants eviction of any outpoint from the index — which
+    // is precisely the primitive the enumeration-starvation money path needs.
+    // Unset ⇒ nobody can authenticate ⇒ fail closed.
+    let operator_authed = check_submit_operator_auth(&req, env);
+    // ONE derivation. The decision is computed EXACTLY once and everything
+    // downstream — the counter, the refusal, the engine mode, the gate branch —
+    // reads that single value.
+    //
+    // It was previously derived TWICE from two separately-passed argument
+    // lists (`plan_submit(...)` for the counter, `action_for(...)` for
+    // behaviour). A re-gate flipped `operator_authed` to `true` on the
+    // behavioural call alone: it compiled, `make ci` stayed green, every caller
+    // became an "authenticated operator", and the counter kept reporting
+    // honestly from the other derivation. Two derivations of one decision is
+    // the defect — the fix is to delete one, not to pin their agreement
+    // (Rule 10).
+    //
+    // The route does NOT report the classification either: `action_for` counts
+    // it internally. `submit_gate::note` was `pub` and took a `SubmitAction` by
+    // value, so a re-gate handed it a fabricated one — every submit reported as
+    // `barred` while behaviour was unchanged, with 0 compile errors, the native
+    // suite green and every source pin matching. There is now no argument for
+    // this route to get wrong (Rule 15: derive the decision, don't accept it).
+    let action = crate::submit_gate::action_for(
+        mode_header.as_deref(),
+        extensions_enabled,
+        operator_authed,
+        gate_mode,
+    );
+    let mode = action.engine_mode();
+
+    // EXHAUSTIVE match (Rule 22): the route consumes the decision as an enum,
+    // so an arm cannot be deleted without breaking the BUILD. A previous
+    // version read a struct field in an `if`, which a re-gate deleted outright
+    // while the whole suite stayed green — reading a field is optional, an arm
+    // is not.
+    match action {
+        crate::submit_gate::SubmitAction::RefuseUnauthenticated(path) => {
+            worker::console_log!(
+                "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
+                path.as_str()
+            );
+            return json_error(
+                &format!(
+                    "submit mode '{}' has no admission bar and is restricted to operators — \
+                     submit with 'broadcast-gated' (the overlay broadcasts and admits only on \
+                     network acceptance; an already-broadcast tx satisfies it idempotently), \
+                     or present the submit-operator Bearer token",
+                    path.as_str()
+                ),
+                401,
+            );
         }
-        _ => overlay_engine::types::SubmitMode::CurrentTx,
-    };
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_) => {}
+        crate::submit_gate::SubmitAction::ProceedWithoutGate {
+            path,
+            lenient_unbarred,
+        } => {
+            if lenient_unbarred {
+                // Lenient window (Rule 6c). Counted above; logged here so the
+                // operator can see WHO is still on an unbarred path before
+                // flipping enforcement.
+                worker::console_log!(
+                    "POST /submit: UNAUTHENTICATED submit on unbarred path {} — served under \
+                     the lenient window (#347); set SUBMIT_ENFORCE=true to refuse",
+                    path.as_str()
+                );
+            }
+        }
+    }
 
     // ── BROADCAST-GATED submit (bsv-low overlay-first, 2026-07-17; the
     // zanaadu invariant): the OVERLAY broadcasts, and NOTHING is admitted
@@ -528,7 +613,16 @@ pub async fn submit(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
-    if mode_header.as_deref() == Some("broadcast-gated") {
+    // Consumed DIRECTLY from the action: there is no local flag to shadow.
+    // A re-gate defeated both source pins with
+    // `let run_network_gate = run_network_gate && x.is_some() && x.is_none();`
+    // — a shadowed rebinding changes the VALUE, not the SYNTAX, so a source
+    // scan is structurally blind to it. Removing the local removes the class;
+    // `make ci`'s route tier is what covers the residual.
+    if matches!(
+        action,
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_)
+    ) {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
         // and NOTHING is admitted unless Arcade reports the SUBJECT
@@ -1275,13 +1369,48 @@ pub async fn request_foreign_gasp_node(
 }
 
 // =============================================================================
-// Admin auth
+// Submit-operator auth (#347) + admin auth
 // =============================================================================
 
-/// Check Bearer token in the `Authorization` header against `ADMIN_TOKEN` env var.
+/// The `/submit` operator credential (`SUBMIT_OPERATOR_TOKEN`) — SEPARATE from
+/// `ADMIN_TOKEN` on purpose (#347 gate M1).
 ///
-/// Returns `Ok(())` if the token matches, or an `Err` containing the appropriate
-/// 401/403 response to send back to the client.
+/// The admin token gates destructive index operations (`/admin/evictOutpoint`,
+/// `/admin/ban`, `/admin/startGASPSync`). Reusing it here would mean handing
+/// every submit operator — including the watchtower, which holds it in a
+/// worker secret — the ability to EVICT any outpoint from the index, which is
+/// exactly the primitive the enumeration-starvation money path needs. A submit
+/// operator gets permission to submit, and nothing else.
+///
+/// Unset or empty ⇒ always false (fail closed). Fixed-time comparison, same as
+/// the admin path.
+pub fn check_submit_operator_auth(req: &Request, env: &Env) -> bool {
+    let token = env
+        .secret("SUBMIT_OPERATOR_TOKEN")
+        .ok()
+        .map(|s| s.to_string())
+        .or_else(|| env.var("SUBMIT_OPERATOR_TOKEN").ok().map(|v| v.to_string()))
+        .unwrap_or_default();
+    if token.is_empty() {
+        return false;
+    }
+    let Some(header) = req.headers().get("Authorization").ok().flatten() else {
+        return false;
+    };
+    let Some(provided) = header.strip_prefix("Bearer ") else {
+        return false;
+    };
+    !provided.is_empty() && fixed_time_eq(provided.as_bytes(), token.as_bytes())
+}
+
+/// The ADMIN credential (`ADMIN_TOKEN`) for the `/admin/*` routes — including
+/// the destructive ones (`/admin/evictOutpoint`, `/admin/ban`,
+/// `/admin/startGASPSync`).
+///
+/// Distinct from [`check_submit_operator_auth`]: `/submit` operators must NOT
+/// receive this token (#347 gate M1). Returns `Err(response)` so callers can
+/// short-circuit with mainline-compatible 401/403 bodies, where the submit
+/// check returns a plain `bool`.
 pub fn check_admin_auth(req: &Request, env: &Env) -> Result<(), worker::Result<Response>> {
     // Token source: prefer secret (wrangler secret put ADMIN_TOKEN),
     // fall back to [vars] / --var. Treat unset as empty string — any Bearer
@@ -2190,6 +2319,151 @@ pub fn not_found() -> worker::Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    // ── #347 Rule 22: can anything observe the seam being IGNORED? ────────
+    //
+    // The exhaustive `match` on `SubmitAction` makes DELETING the refusal a
+    // compile error. It cannot cover the remaining branch — the
+    // `matches!(action, …ProceedWithNetworkGate(_))` guard on the
+    // broadcast+SEEN block — which two separate re-gates defeated (a `&& false`
+    // conjunct on its predecessor `if run_network_gate {`, and then a shadowed
+    // rebinding of that same local) while all 1826 tests stayed green.
+    //
+    // These are SOURCE pins, and source pins lie in five documented ways, so
+    // each one below is: POSITIVE (an exact count, never `assert!(!contains)`,
+    // so a rotted needle fails loudly instead of passing vacuously); built
+    // from a SPLIT needle assembled at runtime so it cannot match itself
+    // inside this test; run over COMMENT-STRIPPED source so prose quoting the
+    // construct is not counted; and scoped to the CONSTRUCT, never a region.
+    //
+    // They are a backstop for one branch, not the primary defence. The primary
+    // defence is the enum. The executable end-to-end proof is
+    // `tools/lane-347/submit_gate_attack.mjs` via `make ci-route`.
+
+    /// Strip `//` line comments and `/* */` blocks so a pin counts CODE only.
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        let mut in_line = false;
+        let mut in_block = false;
+        while let Some(c) = chars.next() {
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                    out.push(c);
+                }
+                continue;
+            }
+            if in_block {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block = false;
+                }
+                continue;
+            }
+            if c == '/' {
+                match chars.peek() {
+                    Some('/') => {
+                        in_line = true;
+                        continue;
+                    }
+                    Some('*') => {
+                        chars.next();
+                        in_block = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// The gated action must be referenced EXACTLY twice — the match arm and
+    /// the branch that runs the broadcast. **What this observes is only that
+    /// the bar is still spelled where it was:** a reference that MOVED, was
+    /// RENAMED or was DELETED changes the count and fails loudly.
+    ///
+    /// **Stated boundary (Rule 17): it does NOT observe a defeat of the bar's
+    /// VALUE — in either known shape — and no source scan can.**
+    ///
+    /// * **An added conjunct.** The gate re-ran probe F as
+    ///   `&& arcade_url.is_some() && arcade_url.is_none()` appended to the
+    ///   branch condition: this count stayed at exactly 2, every pin here kept
+    ///   matching, and the native suite stayed GREEN with the sole public
+    ///   admission bar dead. (An earlier version of this comment claimed probe
+    ///   F drives this count to 0. That was true of the pin's PREVIOUS needle,
+    ///   the literal `if run_network_gate {`, and is false of this one —
+    ///   Rule 10: the claim out-ran the code it described.)
+    /// * **A shadowed rebinding** — probe F′ — which changes the VALUE while
+    ///   leaving every needle matching exactly once.
+    ///
+    /// Both value-level defeats are the ROUTE TIER's job; `make ci`'s
+    /// `ci-route` is what caught each of them. The shadowing shape is
+    /// additionally closed STRUCTURALLY — the branch consumes the action, so
+    /// there is no local left to shadow. Do not add a third source pin for the
+    /// conjunct case either: a source scan is structurally blind to it, and a
+    /// pin that claims to cover it is worse than no pin at all.
+    #[test]
+    fn the_network_gate_branch_is_keyed_solely_on_the_derived_decision() {
+        let src = code_only(include_str!("routes.rs"));
+        // Split so the needle never appears whole in this file.
+        let needle = ["SubmitAction::ProceedWithNetwork", "Gate(_)"].concat();
+        assert_eq!(
+            src.matches(&needle).count(),
+            2,
+            "expected EXACTLY two references to the gated action — the match arm \
+             and the branch that runs the broadcast; a changed count means the \
+             only public admission bar MOVED, was RENAMED or was DELETED. An \
+             unchanged count does NOT mean the bar is live: an added conjunct \
+             leaves this at 2 (see this test's stated boundary) — that shape, \
+             and the shadowed rebinding, are the route tier's job"
+        );
+        // The decision is derived EXACTLY once (probe H: a second derivation
+        // from a separate argument list let one copy be flipped silently).
+        let derived = ["let action = crate::submit_gate::action_", "for("].concat();
+        assert_eq!(
+            src.matches(&derived).count(),
+            1,
+            "the decision must be derived exactly ONCE — two derivations is the \
+             probe-H defect, and the counter then reports the honest one"
+        );
+        let legacy = ["crate::submit_gate::plan_sub", "mit("].concat();
+        assert_eq!(
+            src.matches(&legacy).count(),
+            0,
+            "the route must not re-derive the plan beside the action"
+        );
+    }
+
+    /// The refusal must remain a returned 401 inside the match arm. Deleting
+    /// the arm is a compile error; this catches it being neutered in place
+    /// (e.g. the `return` removed, or the status changed).
+    #[test]
+    fn the_unauthenticated_refusal_returns_401_from_the_seam_arm() {
+        let src = code_only(include_str!("routes.rs"));
+        let arm = ["SubmitAction::Refuse", "Unauthenticated(path) => {"].concat();
+        assert_eq!(
+            src.matches(&arm).count(),
+            1,
+            "the refusal arm must exist exactly once"
+        );
+        // The arm's body must still RETURN a 401 (not merely log).
+        let tail = &src[src.find(&arm).unwrap()..];
+        let body_end = tail.find("SubmitAction::ProceedWithNetworkGate").unwrap_or(tail.len());
+        let body = &tail[..body_end];
+        assert_eq!(
+            body.matches("401,").count(),
+            1,
+            "the refusal arm must return a 401"
+        );
+        assert_eq!(
+            body.matches("return json_error").count(),
+            1,
+            "the refusal must RETURN, not fall through"
+        );
+    }
+
     use super::*;
     use overlay_engine::types::ServiceMetadata;
     use std::collections::HashMap;

@@ -24,6 +24,7 @@ pub mod peer_crawler;
 pub mod proof_fetcher;
 pub mod queue;
 pub mod routes;
+pub mod submit_gate;
 pub mod wallet;
 
 use std::collections::HashMap;
@@ -234,6 +235,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 arcade_url,
                 taal_api_key,
                 &ctx,
+                &env,
             )
             .await
         }

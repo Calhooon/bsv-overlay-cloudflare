@@ -2133,14 +2133,17 @@ impl PotStorage for D1PotStorage {
 // D1CollectedStorage
 // =============================================================================
 
-/// Row for collected-marker queries. All columns are TEXT; `txid` /
-/// `sigHex` are nullable in the schema so they arrive `Option`.
+/// Row for collected-marker queries. `txid` is NOT NULL in the v2 schema (it
+/// is half the primary key); `sigHex` remains nullable. `outputIndex` is an
+/// INTEGER column that D1 hands back as a number.
 #[derive(Deserialize)]
 struct CollectedRow {
     identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
-    txid: Option<String>,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: u32,
     #[serde(rename = "sigHex")]
     sig_hex: Option<String>,
 }
@@ -2151,32 +2154,86 @@ impl CollectedRow {
             identity: self.identity,
             game_id: self.game_id,
             txid: self.txid,
+            output_index: self.output_index,
             sig_hex: self.sig_hex,
         }
     }
 }
 
+/// Rows kept per `(identity, gameId)` in the batched collected-marker read.
+///
+/// The #327 S8 re-key removed EXCLUSIVITY, which was the bug — but removing a
+/// slot without adding a bound just trades a squat for unbounded growth
+/// (gate finding H6): `tm_collected` admits EVERY matching output, so one
+/// transaction with N marker OP_RETURNs mints N permanent rows for one
+/// victim's pair, and rows are never deleted. The sibling this supersede
+/// pattern was cloned from (`result_markers_v2`) carries a per-key window for
+/// exactly this reason; inherit the bound along with the pattern.
+///
+/// **Rule 6 — compare the failure modes, because a window can re-create the
+/// censorship the re-key removed.** Unbounded: the honest row is always
+/// returned, but the response grows without limit. Windowed: the response is
+/// bounded, and an attacker who fills the window can push the honest row out.
+/// That trade is acceptable HERE, and only here, because eviction on this
+/// surface is FAIL-SAFE: a missing marker reads as "not collected", so the
+/// Collect card stays VISIBLE and a re-collect is idempotent (the money-safe
+/// direction). On a recovery-enumeration surface the same trade would be a
+/// money bug, which is why `ls_potparty`/`ls_potrefund` need the full
+/// existence-tier treatment rather than a plain cap.
+const COLLECTED_ROWS_PER_PAIR: usize = 8;
+
 /// SQL for one batched collected-marker chunk (bsv-low #289): one
-/// `identity = ? AND gameId IN (…)` query replacing `n` individual
-/// `get_record` round trips. Factored out so the real-SQLite test proves
-/// the SHIPPED string selects per-(identity, gameId) — never a same-gameId
-/// row belonging to a DIFFERENT identity.
+/// `identity = ? AND gameId IN (…)` query replacing `n` individual round
+/// trips. Factored out so the real-SQLite test proves the SHIPPED string
+/// selects per-(identity, gameId) — never a same-gameId row belonging to a
+/// DIFFERENT identity.
+///
+/// #327 S8: reads `collected_markers_v2` and returns every marker row per pair
+/// (the old table is write-frozen and its rows were carried over by the
+/// one-time migration), bounded to [`COLLECTED_ROWS_PER_PAIR`] per pair.
+///
+/// **The ordering is chosen against the documented attack, not by habit.** The
+/// squat is PRE-EMPTIVE — filed at deal time, long before the victim ever
+/// collects — so `createdAt ASC` (oldest-first) would hand the squatter the
+/// whole window by construction and evict the genuine marker that arrives
+/// later. `DESC` keeps the most recent rows, so a pre-filed squat can never
+/// displace the victim's genuine marker; an attacker must instead out-file it
+/// AFTERWARDS.
+///
+/// **Scope that post-hoc cost honestly:** out-filing costs a real fee-bearing
+/// transaction per row only once `SUBMIT_ENFORCE=true`. In the shipping
+/// default (lenient) it is still FREE — verified live. So today this ordering
+/// buys the PRE-EMPTIVE case only, which is the documented attack; the
+/// post-hoc case is bought by the strict flip, not by this `ORDER BY`.
+/// `txid` breaks ties so the window is deterministic.
 pub fn collected_records_batch_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(", ");
     format!(
-        "SELECT identity, gameId, txid, sigHex FROM collected_markers \
-         WHERE identity = ? AND gameId IN ({placeholders})"
+        "SELECT identity, gameId, txid, outputIndex, sigHex FROM \
+           (SELECT identity, gameId, txid, outputIndex, sigHex, \
+                   ROW_NUMBER() OVER (PARTITION BY identity, gameId \
+                                      ORDER BY createdAt DESC, txid DESC, \
+                                               outputIndex DESC) AS rn \
+            FROM collected_markers_v2 \
+            WHERE identity = ? AND gameId IN ({placeholders})) \
+         WHERE rn <= {per_pair} \
+         ORDER BY gameId ASC, rn ASC",
+        per_pair = COLLECTED_ROWS_PER_PAIR,
     )
 }
 
 /// Cloudflare D1 implementation of the CollectedStorage trait
 /// (tm_collected / ls_collected, bsv-low #161).
 ///
-/// Schema: `collected_markers` in `d1::OVERLAY_MIGRATIONS`. Keyed by
-/// (identity, gameId); `INSERT OR IGNORE` makes the FIRST marker for a
-/// pair win — a later marker never overwrites it — and rows are NEVER
-/// deleted (a collected fact is permanent, like a reveal; the lookup
-/// service's spend/eviction hooks are no-ops).
+/// Schema: `collected_markers_v2` in `d1::OVERLAY_MIGRATIONS`. Keyed by the
+/// marker OUTPOINT `(txid, outputIndex)`; `INSERT OR IGNORE` makes a replay of
+/// the same output a no-op while markers for one `(identity, gameId)` from
+/// DIFFERENT txs all coexist, and rows are NEVER deleted (a collected fact is
+/// permanent, like a reveal; the lookup service's spend/eviction hooks are
+/// no-ops).
+///
+/// The superseded `collected_markers` table is write-frozen — nothing here
+/// reads or writes it (#327 S8).
 pub struct D1CollectedStorage {
     db: Rc<D1Database>,
 }
@@ -2194,16 +2251,19 @@ fn collected_err(e: String) -> CollectedStorageError {
 #[async_trait(?Send)]
 impl CollectedStorage for D1CollectedStorage {
     async fn store_record(&self, record: &CollectedRecord) -> Result<(), CollectedStorageError> {
-        // INSERT OR IGNORE on the (identity, gameId) primary key — first
-        // marker wins; never overwrite, never delete.
+        // INSERT OR IGNORE on the (txid, outputIndex) primary key: a replayed
+        // submit of the same output is a no-op; a marker for the same
+        // (identity, gameId) from another tx is a NEW row. Never overwrite,
+        // never delete.
         Query::new(
-            "INSERT OR IGNORE INTO collected_markers \
-             (identity, gameId, txid, sigHex, createdAt) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(record.identity.as_str())
         .bind(record.game_id.as_str())
-        .bind(record.txid.as_deref())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
         .bind(record.sig_hex.as_deref())
         .bind(current_unix_seconds_i64())
         .execute(&self.db)
@@ -2211,39 +2271,45 @@ impl CollectedStorage for D1CollectedStorage {
         .map_err(collected_err)
     }
 
-    async fn get_record(
+    async fn get_records_for(
         &self,
         identity: &str,
         game_id: &str,
-    ) -> Result<Option<CollectedRecord>, CollectedStorageError> {
-        let row: Option<CollectedRow> = Query::new(
-            "SELECT identity, gameId, txid, sigHex FROM collected_markers \
-             WHERE identity = ? AND gameId = ?",
-        )
+    ) -> Result<Vec<CollectedRecord>, CollectedStorageError> {
+        // Same bound and same newest-first order as the batched read — two
+        // reads of one store that disagreed on either would be a boundary with
+        // no pin (Rule 16).
+        let rows: Vec<CollectedRow> = Query::new(format!(
+            "SELECT identity, gameId, txid, outputIndex, sigHex FROM collected_markers_v2 \
+             WHERE identity = ? AND gameId = ? \
+             ORDER BY createdAt DESC, txid DESC, outputIndex DESC \
+             LIMIT {COLLECTED_ROWS_PER_PAIR}"
+        ))
         .bind(identity)
         .bind(game_id)
-        .fetch_optional(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(collected_err)?;
-        Ok(row.map(CollectedRow::into_record))
+        Ok(rows.into_iter().map(CollectedRow::into_record).collect())
     }
 
-    /// Batched pair lookup (bsv-low #289): one `gameId IN (…)` query per
-    /// chunk instead of a D1 round trip per requested game. Alignment
-    /// contract (input order, `None` where no marker exists) preserved via
-    /// a gameId-keyed map — (identity, gameId) is the primary key, so at
-    /// most one row exists per requested gameId.
+    /// Batched pair lookup (bsv-low #289): one `gameId IN (…)` query per chunk
+    /// instead of a D1 round trip per requested game. Alignment contract (input
+    /// order, an EMPTY vec where no marker exists) preserved via a gameId-keyed
+    /// map of LISTS — under the #327 S8 outpoint key a pair can hold many rows,
+    /// so collapsing to one would silently re-create the censorship the re-key
+    /// removes.
     async fn get_records(
         &self,
         identity: &str,
         game_ids: &[String],
-    ) -> Result<Vec<Option<CollectedRecord>>, CollectedStorageError> {
+    ) -> Result<Vec<Vec<CollectedRecord>>, CollectedStorageError> {
         if game_ids.is_empty() {
             return Ok(Vec::new());
         }
         // D1 caps bound parameters (100); 1 per gameId + the identity.
         const CHUNK: usize = 90;
-        let mut by_game: std::collections::HashMap<String, CollectedRecord> =
+        let mut by_game: std::collections::HashMap<String, Vec<CollectedRecord>> =
             std::collections::HashMap::new();
         for chunk in game_ids.chunks(CHUNK) {
             let sql = collected_records_batch_sql(chunk.len());
@@ -2254,12 +2320,15 @@ impl CollectedStorage for D1CollectedStorage {
             let rows: Vec<CollectedRow> = q.fetch_all(&self.db).await.map_err(collected_err)?;
             for row in rows {
                 let record = row.into_record();
-                by_game.insert(record.game_id.clone(), record);
+                by_game
+                    .entry(record.game_id.clone())
+                    .or_default()
+                    .push(record);
             }
         }
         Ok(game_ids
             .iter()
-            .map(|game_id| by_game.get(game_id).cloned())
+            .map(|game_id| by_game.get(game_id).cloned().unwrap_or_default())
             .collect())
     }
 }
@@ -5485,15 +5554,17 @@ mod tests {
         let me = victim_id();
         let other = format!("03{}", "c3".repeat(32));
         conn.execute(
-            "INSERT INTO collected_markers (identity, gameId, txid, sigHex, createdAt) \
-             VALUES (?1, ?2, ?3, 'sig-a', 1)",
+            "INSERT INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 0, 'sig-a', 1)",
             rusqlite::params![me, h64(0x11), h64(0x01)],
         )
         .unwrap();
         // Same gameId, DIFFERENT identity — must not leak into my answer.
         conn.execute(
-            "INSERT INTO collected_markers (identity, gameId, txid, sigHex, createdAt) \
-             VALUES (?1, ?2, ?3, 'sig-b', 2)",
+            "INSERT INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 0, 'sig-b', 2)",
             rusqlite::params![other, h64(0x22), h64(0x02)],
         )
         .unwrap();
@@ -5513,6 +5584,176 @@ mod tests {
             "only MY marker answers — the other identity's gameId 0x22 row \
              never leaks in as a phantom 'collected'"
         );
+    }
+
+    /// #327 S8, through the SHIPPED SQL against the REAL production schema:
+    /// a pre-emptive squat can no longer censor the victim's genuine marker.
+    ///
+    /// This is the SQL-level counterpart of the storage-layer cell. It matters
+    /// separately because the censorship lived in the PRIMARY KEY, not in Rust:
+    /// under the superseded `(identity, gameId)` key the second INSERT was
+    /// silently dropped by the engine, so no amount of Rust-side testing could
+    /// have surfaced it (Rule 16 — the property spans the boundary, so it must
+    /// be pinned against the real database).
+    #[test]
+    fn a_squat_cannot_censor_the_genuine_marker_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let game = h64(0x11);
+
+        // 1. The SQUATTER files first, at deal time, naming the VICTIM — free,
+        //    byte-format-only admission, junk signature.
+        let squat = conn
+            .execute(
+                "INSERT OR IGNORE INTO collected_markers_v2 \
+                 (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+                 VALUES (?1, ?2, ?3, 0, 'sigJUNK', 1)",
+                rusqlite::params![victim, game, h64(0xaa)],
+            )
+            .unwrap();
+        assert_eq!(squat, 1);
+
+        // 2. The victim's GENUINE marker lands later, from a DIFFERENT tx.
+        //    Under the old (identity, gameId) key this INSERT OR IGNORE was a
+        //    silent no-op — that was the defect.
+        let genuine = conn
+            .execute(
+                "INSERT OR IGNORE INTO collected_markers_v2 \
+                 (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+                 VALUES (?1, ?2, ?3, 0, 'sigREAL', 2)",
+                rusqlite::params![victim, game, h64(0xbb)],
+            )
+            .unwrap();
+        assert_eq!(genuine, 1, "the genuine marker must be STORED, not ignored");
+
+        // 3. Both rows answer the shipped batched read, so the client can
+        //    verify the sigs and select its own.
+        let sql = collected_records_batch_sql(1);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![victim, game], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(4)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2, "both rows coexist — exclusivity WAS the bug");
+        assert!(
+            rows.iter().any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
+            "the victim's genuine marker survives the squat: {rows:?}"
+        );
+
+        // 4. …while a REPLAY of the squatter's own outpoint is still a no-op,
+        //    so the set cannot be inflated for free by resubmitting one output.
+        let replay = conn
+            .execute(
+                "INSERT OR IGNORE INTO collected_markers_v2 \
+                 (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+                 VALUES (?1, ?2, ?3, 0, 'sigOTHER', 3)",
+                rusqlite::params![victim, game, h64(0xaa)],
+            )
+            .unwrap();
+        assert_eq!(replay, 0, "same outpoint never re-inserts");
+    }
+
+    /// H6: the re-key removed exclusivity, so the read must carry a BOUND —
+    /// and the bound must not re-create the censorship the re-key removed.
+    ///
+    /// Pins both halves against the real schema: the window caps rows per
+    /// pair, AND a pre-emptively filed squat can never displace the victim's
+    /// later genuine marker (which is what an oldest-first order would do).
+    #[test]
+    fn collected_window_is_bounded_and_a_prefiled_squat_cannot_evict_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let game = h64(0x11);
+
+        // The squatter pre-files a FULL window's worth at deal time (t=1..12),
+        // more than the cap, all naming the victim.
+        for i in 0..12u32 {
+            conn.execute(
+                "INSERT OR IGNORE INTO collected_markers_v2 \
+                 (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+                 VALUES (?1, ?2, ?3, ?4, 'sigJUNK', ?5)",
+                rusqlite::params![victim, game, h64(0xa0 + i as u8), i, i as i64 + 1],
+            )
+            .unwrap();
+        }
+        // The victim's GENUINE marker lands afterwards.
+        conn.execute(
+            "INSERT OR IGNORE INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 0, 'sigREAL', 99)",
+            rusqlite::params![victim, game, h64(0xbb)],
+        )
+        .unwrap();
+
+        let sql = collected_records_batch_sql(1);
+        let mut stmt = conn.prepare(&sql).expect("shipped batch SQL must parse");
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![victim, game], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(4)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert_eq!(
+            rows.len(),
+            COLLECTED_ROWS_PER_PAIR,
+            "the per-pair window must bound an unbounded mint"
+        );
+        assert!(
+            rows.iter().any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
+            "a PRE-FILED squat must not evict the victim's later genuine marker \
+             — an oldest-first window would hand the squatter every slot: {rows:?}"
+        );
+    }
+
+    /// The one-time carry migration must move a v1 row into v2 and be a no-op
+    /// on re-run — the runner re-executes every statement on every cold start.
+    /// An honest row admitted before the re-key is NEVER orphaned (Rule 14:
+    /// read-both/write-new, nothing in flight is lost).
+    #[test]
+    fn collected_v1_rows_are_carried_into_v2_and_the_carry_is_rerun_safe() {
+        let conn = production_schema_db();
+        let me = victim_id();
+        // A row that predates the re-key, in the write-frozen v1 table.
+        conn.execute(
+            "INSERT INTO collected_markers (identity, gameId, txid, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 'sigOLD', 7)",
+            rusqlite::params![me, h64(0x11), h64(0xc1)],
+        )
+        .unwrap();
+
+        let carry = crate::d1::OVERLAY_MIGRATIONS
+            .iter()
+            .find(|sql| {
+                sql.trim_start()
+                    .starts_with("INSERT OR IGNORE INTO collected_markers_v2")
+            })
+            .expect("the S8 carry migration must exist");
+
+        conn.execute_batch(carry).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collected_markers_v2 WHERE txid = ?1",
+                rusqlite::params![h64(0xc1)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the honest pre-re-key row is carried, not orphaned");
+
+        // Re-run (cold start): still exactly one row, no error.
+        conn.execute_batch(carry).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collected_markers_v2 WHERE txid = ?1",
+                rusqlite::params![h64(0xc1)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "carry is idempotent under the re-run-everything runner");
     }
 
     fn victim_id() -> String {

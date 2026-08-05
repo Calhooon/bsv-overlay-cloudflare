@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs \
+.PHONY: parity reference-up reference-down reference-logs ci-route \
         wrangler-dev harness test extensions-build e2e-bsv-storage clean help
 
 help:
@@ -17,7 +17,8 @@ help:
 	@echo "  wrangler-dev     wrangler dev in parity mode (:8787) — run in a separate shell"
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test --workspace with memory-storage feature"
-	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds"
+	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-route"
+	@echo "  ci-route         Route-level /submit admission cells (part of ci; needs :8791/:8792)"
 	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -36,11 +37,17 @@ reference-logs:
 ## -- Rust side (wrangler dev in parity mode) ----------------------------------
 
 # Parity defaults — TOPIC_MANAGERS / LOOKUP_SERVICES unset so the code-side
-# defaults apply (tm_ship,tm_slap / ls_ship,ls_slap). ENABLE_EXTENSIONS=false
-# disables the Rust-only superset (/admin/crawlPeers, X-History-Depth,
-# X-Submit-Mode, rich admin bodies). This is what the harness diffs against
-# mainline. Production deploys inherit wrangler.toml's [vars] which set the
-# full dolphinmilk stack.
+# defaults apply (tm_ship,tm_slap / ls_ship,ls_slap). This is what the harness
+# diffs against mainline. Production deploys inherit wrangler.toml's [vars]
+# which set the full dolphinmilk stack.
+#
+# ENABLE_EXTENSIONS=false: until bsv-low #347 this var was DEAD CONFIG — set in
+# both wrangler files and read nowhere in Rust, while this comment claimed it
+# disabled the Rust-only superset. It now genuinely gates ONE thing, the piece
+# that was a security hole: `x-submit-mode`. With it false, every /submit takes
+# the SPV-barred default path regardless of header (`submit_gate.rs`). The other
+# listed extensions (/admin/crawlPeers, X-History-Depth, rich admin bodies) are
+# still NOT gated by it — do not re-add that claim without adding the code.
 wrangler-dev:
 	cd crates/overlay-cloudflare && wrangler dev --local --port 8787 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_ship,tm_slap \
@@ -99,7 +106,167 @@ ci:
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
 	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
 	cargo build -p low-app-layer --target wasm32-unknown-unknown --release; \
+	$(MAKE) ci-route; \
 	echo "✅ local CI green"
+
+# ROUTE-LEVEL coverage for the #347 submit gate (Rule 22). PART OF `ci`.
+#
+# Not optional, and that is the finding rather than a preference. `cargo test`
+# cannot reach the /submit ROUTE — it takes a worker::Request and only runs on
+# wasm — so the handler's USE of the decision seam is invisible to it. Two
+# separate re-gate probes proved the consequence: forcing `operator_authed` in
+# the route's derivation, and shadowing the gate flag with a rebinding. Both
+# COMPILED, both left the native suite fully GREEN, and both fully re-opened
+# the CRITICAL. This tier is the only thing that sees either.
+#
+# This repo has no CI pipeline — `make ci` run locally IS the gate — so a tier
+# outside `ci` is a tier nobody runs before push.
+#
+# Two workers: :8791 strict with extensions on (the main matrix), :8792 with
+# ENABLE_EXTENSIONS=false (the kill switch, which was itself a HIGH defect —
+# it used to route callers OFF the network gate). No network is required: the
+# public-path expectation asserts "never admitted, never 401", which holds as
+# 422 online and 502 offline, so this cannot flake.
+#
+# MODELLING BOUNDARY (stated here as well as at the assertion, Rule 17): that
+# public-path expectation is a NEGATIVE predicate. A regression that refused
+# `broadcast-gated` with a 400 BEFORE ever reaching the broadcast block would
+# still satisfy it, because "never admitted" stays true. Nothing in this tier
+# is a POSITIVE control that the gated path actually reaches the broadcast —
+# that needs a real funded transaction, which `make ci` must not require. See
+# `tools/lane-347/submit_gate_ci.mjs` for the same note at the expectation.
+#
+# BOUNDED STARTUP + OWNED TEARDOWN (gate LOW-J). Both waits used to be
+# `until curl…; do sleep 3; done` — unbounded, untrapped, and on the critical
+# path of the ONLY gate this repo has. A worker that cannot bind (stale
+# process, colliding dev server, build error) hung `make ci` forever with no
+# diagnostic and the wrangler log never surfaced, which is strictly worse than
+# failing: a hang is indistinguishable from "still running".
+#
+# Three things now hold, and each was VERIFIED by breaking it, not by reading:
+#
+#  1. PRE-FLIGHT. If either port is already bound we refuse immediately, name
+#     the holder, and exit non-zero. This is not just a faster timeout: a
+#     leftover worker on our port would SILENTLY SERVE this run's expectations
+#     from a stale binary, and every leg would pass against code that is not
+#     the code under test. Observed for real while fixing this — see (3).
+#  2. BOUNDED WAIT, with the MEASURED elapsed time in the message. Each attempt
+#     costs up to `curl -m 2` plus `ROUTE_UP_SLEEP`, so the wall bound is
+#     ~ROUTE_UP_TRIES × 5s ≈ 5 min, NOT tries × sleep. The first version of
+#     this fix printed `tries * sleep` and was wrong by 120s — a false claim in
+#     the very code written to make failures honest, so the message now reports
+#     what it measured (epoch Rule 10).
+#  3. TEARDOWN THAT DOES NOT TRUST THE PID. `npx wrangler dev` is a four-deep
+#     tree (npm exec → wrangler → cli.js → workerd) and in a NON-TTY run the
+#     wrangler parent can exit 1 while `workerd` keeps the socket. Measured: a
+#     green `make ci` left `npm exec wrangler dev --port 8792` orphaned at
+#     PPID 1, still LISTENing, in a process group the recipe shell never owned
+#     — so a `$!`-based or process-group kill silently freed nothing. Cleanup
+#     therefore kills the recorded pid's whole DESCENDANT TREE and then sweeps
+#     the two ports it pre-flighted as free, escalating to SIGKILL. Sweeping by
+#     port is only safe BECAUSE of (1): pre-flight proved nothing else held
+#     them, so anything listening at teardown is ours.
+#
+# `set -m` is deliberately NOT used. It emits `[1]+ Done(1)` job noise into the
+# gate output, and a process-group kill without it would target the recipe
+# shell's OWN group — i.e. make itself.
+#
+# The two workers are started SEQUENTIALLY (strict up, then kill switch) rather
+# than concurrently. They previously raced on one cargo target dir and logged
+# `Blocking waiting for file lock on package cache` — which serialises anyway,
+# so it cost wall-clock, not correctness, while widening the window in which a
+# hang looked normal. Measured after the change: zero lock-contention lines in
+# either log, and the second build is a warm-cache no-op.
+#
+# WHAT THIS RELOCATES (Rule 19): a hang became a TIMEOUT, so a machine slow
+# enough to need >~5 min for one worker's first response now FAILS the gate
+# where it previously (eventually) passed. That trade is deliberate — a false
+# red is diagnosable and a hang is not — and the headroom is real: a cold run
+# brought BOTH workers up in 1m46s total. Raise `ROUTE_UP_TRIES` rather than
+# deleting the bound.
+ROUTE_UP_TRIES ?= 60
+ROUTE_UP_SLEEP ?= 3
+ci-route:
+	@set -e; \
+	strict_log=/tmp/lane347-route-strict.log; \
+	kill_log=/tmp/lane347-route-kill.log; \
+	job_pids=""; owned_ports=""; \
+	kill_tree() { \
+	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
+	  kill -TERM "$$1" 2>/dev/null || true; \
+	}; \
+	cleanup() { \
+	  for _p in $$job_pids; do kill_tree "$$_p"; done; \
+	  _n=0; \
+	  while [ $$_n -lt 10 ]; do \
+	    _left=""; \
+	    for _pt in $$owned_ports; do \
+	      _left="$$_left $$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true)"; \
+	    done; \
+	    _left=$$(echo $$_left); \
+	    if [ -z "$$_left" ]; then break; fi; \
+	    kill -KILL $$_left 2>/dev/null || true; \
+	    _n=$$((_n+1)); sleep 1; \
+	  done; \
+	  if [ -n "$$_left" ]; then \
+	    echo "⚠ ci-route: could not free$$owned_ports (still held by:$$_left)"; \
+	  fi; \
+	}; \
+	trap 'cleanup; exit 130' INT TERM; \
+	trap cleanup EXIT; \
+	preflight() { \
+	  _held=$$(lsof -nP -tiTCP:$$1 -sTCP:LISTEN 2>/dev/null || true); \
+	  if [ -n "$$_held" ]; then \
+	    echo "✗ ci-route: :$$1 is ALREADY BOUND before we start — refusing to run."; \
+	    echo "  A leftover worker would serve this run's expectations from a STALE"; \
+	    echo "  binary and every leg would pass against code that is not under test."; \
+	    ps -o pid,ppid,command -p $$_held 2>/dev/null || true; \
+	    echo "  Free it with:  kill $$_held"; \
+	    return 1; \
+	  fi; \
+	  return 0; \
+	}; \
+	preflight 8791; \
+	preflight 8792; \
+	owned_ports="8791 8792"; \
+	wait_up() { \
+	  _port=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
+	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
+	    if curl -s -m 2 http://127.0.0.1:$$_port/listTopicManagers >/dev/null 2>&1; then \
+	      return 0; \
+	    fi; \
+	    _i=$$((_i+1)); sleep $(ROUTE_UP_SLEEP); \
+	  done; \
+	  echo ""; \
+	  echo "✗ ci-route: the $$_label worker never answered on :$$_port — gave up after"; \
+	  echo "  $$(( $$(date +%s) - _t0 ))s ($(ROUTE_UP_TRIES) attempts). The worker build most likely failed;"; \
+	  echo "  its wrangler log follows."; \
+	  echo "  ──────── $$_log ────────"; \
+	  cat "$$_log" 2>/dev/null || echo "  (no log written at $$_log)"; \
+	  echo "  ────────────────────────"; \
+	  return 1; \
+	}; \
+	echo "→ starting wrangler dev :8791 (strict)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8791 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
+	) > "$$strict_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up 8791 "$$strict_log" strict; \
+	echo "→ starting wrangler dev :8792 (kill switch)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8792 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:false \
+	) > "$$kill_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up 8792 "$$kill_log" "kill switch"; \
+	echo "→ both up"; \
+	KILL_SWITCH_BASE=http://127.0.0.1:8792 \
+	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791
 
 extensions-build:
 	cargo build -p bsv-overlay-cloudflare --features extensions

@@ -49,6 +49,43 @@ TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collecte
 LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
 ENABLE_EXTENSIONS = "true"
 
+# ── /submit admission gating (bsv-low #347) ───────────────────────────────
+#
+# SUBMIT_ENFORCE — the Rule 6c rollout flag for the /submit admission gate.
+#   unset / anything but "true"  = LENIENT (the shipping default): an
+#     unauthenticated submit on an UNBARRED path is served exactly as before
+#     but counted on /health/invariants as `submitAdmission.unauthenticatedUngated`.
+#   "true" = STRICT: those submits are refused 401. `broadcast-gated` — the
+#     one public path, barred by real network acceptance — is NEVER refused.
+#
+#   *** DO NOT SET THIS TO "true" BEFORE bsv-low #351 HAS SHIPPED AND SOAKED. ***
+#   The client's marker submits (submitPotPartyMarker / submitPotRefundBeef)
+#   still ride the ungated path, and THOSE ROWS ARE THE RECOVERY ENUMERATION a
+#   wiped device reads to find its own money. Every caller is fire-and-forget,
+#   so a 401 is swallowed silently: flipping early would leave a later wiped
+#   device with nothing to enumerate — re-creating, with our own hands, the
+#   money path #347 exists to close. Gate the flip on the RELEASES being
+#   pinned and soaked, never on the counter (it is attacker-writable:
+#   /health/invariants is unauthenticated).
+# SUBMIT_ENFORCE = "false"
+#
+# SUBMIT_OPERATOR_TOKEN — Bearer credential for the UNBARRED submit modes
+#   (historical-tx / historical-tx-no-spv / no-header), used by peer sync and
+#   migration tooling. Set via `wrangler secret put SUBMIT_OPERATOR_TOKEN`.
+#   Unset ⇒ nobody can authenticate ⇒ fail closed.
+#
+#   DELIBERATELY NOT ADMIN_TOKEN: that one also gates /admin/evictOutpoint,
+#   /admin/ban and /admin/startGASPSync, so issuing it to every submit
+#   operator (the watchtower included) would grant eviction of any outpoint
+#   from the index — exactly the primitive the enumeration-starvation money
+#   path needs.
+#
+# ENABLE_EXTENSIONS also acts as the submit kill switch: "true" enables the
+#   x-submit-mode header; ANYTHING ELSE (including a typo) disables it and
+#   forces every submit onto the default path. It can never route a caller OFF
+#   `broadcast-gated`, which is honoured unconditionally.
+
+
 # Service binding to the ChainTracks worker (same account). ls_low uses this to
 # resolve the chain tip for query-time table-expiry filtering (#148): a plain
 # workers.dev URL fetch to a same-account worker loops back to this worker (404),

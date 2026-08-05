@@ -1,0 +1,165 @@
+#!/usr/bin/env node
+/**
+ * #347 route-level ASSERTING harness — the executable half of `make ci-route`.
+ *
+ * `submit_gate_attack.mjs` PRINTS what happened; this ASSERTS it, so the
+ * attack is coverage rather than recorded prose (Rule 17: a demonstrated
+ * attack that lives only in a comment protects nothing, and the next refactor
+ * has no way to learn it existed).
+ *
+ * Covers the one thing no native cell can reach: the ROUTE's use of the
+ * decision seam. `make ci` cannot drive it — `submit()` takes a
+ * `worker::Request` and only runs on wasm — which is exactly how a re-gate
+ * disabled the sole public bar with all 1826 tests green (Rule 22).
+ *
+ * Expects `wrangler dev --local` on the given base with:
+ *   SUBMIT_ENFORCE=true, ENABLE_EXTENSIONS=true,
+ *   SUBMIT_OPERATOR_TOKEN=ci-submit-tok,
+ *   TOPIC_MANAGERS=tm_collected,tm_potparty
+ *
+ * Exit 0 = every expectation held. Non-zero = the gate regressed.
+ */
+import { randomBytes } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+
+const BASE_REF = { value: process.argv[2] ?? 'http://127.0.0.1:8791' }
+const SCRIPT = new URL('./submit_gate_attack.mjs', import.meta.url).pathname
+
+let failures = 0
+const results = []
+
+/** Drive the real attack script and return {status, admitted, present}. */
+function probe({ mode, shape, topic, token, label }) {
+  const identity = '02' + randomBytes(32).toString('hex').slice(0, 64)
+  const env = { ...process.env, SHAPE: shape ?? 'junk-input' }
+  if (topic) env.TOPIC = topic
+  if (token) env.OP_TOKEN = token
+  const out = execFileSync('node', [SCRIPT, BASE_REF.value, mode, identity], {
+    env,
+    encoding: 'utf8',
+  })
+  const status = Number(/status=(\d+)/.exec(out)?.[1] ?? -1)
+  return { label, status, admitted: /outputsToAdmit/.test(out), present: /"present":true/.test(out) }
+}
+
+function expect(spec, predicate, why) {
+  const r = probe(spec)
+  const ok = predicate(r)
+  results.push(`${ok ? 'PASS' : 'FAIL'}  ${r.label}  → status=${r.status} admitted=${r.admitted}`)
+  if (!ok) {
+    failures++
+    results.push(`      expected: ${why}`)
+  }
+  return r
+}
+
+const refused = (r) => r.status === 401 && !r.admitted && !r.present
+
+// ── The CRITICAL: SPV is not a bar. Every unbarred path, every spelling. ──
+for (const [mode, shape] of [
+  ['none', 'zero-input'],
+  ['none', 'junk-input'],
+  ['historical-tx', 'zero-input'],
+  ['historical-tx-no-spv', 'zero-input'],
+  ['HISTORICAL-TX', 'zero-input'],
+  ['historical-tx-no-spv', 'junk-input'],
+]) {
+  expect(
+    { mode, shape, label: `unauth ${mode} (${shape})` },
+    refused,
+    '401 — an unbarred path must never admit an unauthenticated fabrication',
+  )
+}
+
+// The money topic specifically (the enumeration-starvation escalation).
+expect(
+  { mode: 'none', shape: 'zero-input', topic: 'tm_potparty', label: 'unauth tm_potparty (zero-input)' },
+  refused,
+  '401 — victim-named potparty markers must not be admittable for free',
+)
+
+// ── The one public path is REFUSED BY THE NETWORK, never by us. ──
+//
+// Deliberately NOT pinned to 422: this runs inside `make ci`, and asserting a
+// specific broadcaster verdict would make the gate depend on Arcade being
+// reachable — a flake, and a flake is a bug. The PROPERTY that matters holds
+// either way: a fabrication on the public path is never admitted, and is never
+// refused by US (a 401 here would mean the gate had been mistaken for an
+// unbarred path). Online that is 422 `bad-txns-vin-empty`; offline it is a 502
+// transport failure. Both are correct; admitting it never is.
+//
+// MODELLING BOUNDARY (Rule 17 — stated at the assertion, because an unstated
+// one asserts more than it establishes). This expectation is a NEGATIVE
+// predicate: "not admitted, not 401, not 200". A regression that refused
+// `broadcast-gated` with, say, a 400 BEFORE the broadcast block was ever
+// reached would still satisfy it — "never admitted" stays true when the path
+// is broken as well as when it is working.
+//
+// So NOTHING here is a POSITIVE control that the gated path actually reaches
+// the broadcast + SEEN block. That control needs a real, funded, honestly
+// signed transaction, and `make ci` must neither spend sats nor require the
+// network — so it is deliberately out of scope for this tier, not an oversight.
+// The gated path's liveness is evidenced elsewhere (the bsv-low mainnet
+// overlay-first broadcast e2e); if that ever stops covering it, this tier is
+// NOT a substitute.
+expect(
+  { mode: 'broadcast-gated', shape: 'zero-input', label: 'broadcast-gated (zero-input)' },
+  (r) => !r.admitted && !r.present && r.status !== 401 && r.status !== 200,
+  'never admitted and never 401 — 422 (network rejected) online, 502 (transport) offline',
+)
+
+// ── A legitimate operator still works (peer sync / migration must not break). ──
+expect(
+  {
+    mode: 'historical-tx-no-spv',
+    shape: 'junk-input',
+    token: 'ci-submit-tok',
+    label: 'operator historical-tx-no-spv',
+  },
+  (r) => r.status === 200 && r.admitted,
+  '200 — an authenticated operator retains the ungated path',
+)
+
+// ── A wrong credential fails CLOSED. ──
+expect(
+  {
+    mode: 'historical-tx-no-spv',
+    shape: 'junk-input',
+    token: 'not-the-token',
+    label: 'wrong operator token',
+  },
+  refused,
+  '401 — a bad credential must never be treated as absent-but-allowed',
+)
+
+// ── LOW-F: the kill switch must not disable the network gate. ──
+//
+// Runs against a SECOND worker (ENABLE_EXTENSIONS=false) started by the
+// Makefile on :8792. Last round's HIGH-1 was exactly this: the switch routed
+// callers OFF `broadcast-gated` and admitted a fabrication that even
+// origin/main refused. The Makefile used to CLAIM this leg existed; now it does.
+const KILL_BASE = process.env.KILL_SWITCH_BASE
+if (KILL_BASE) {
+  const saved = BASE_REF.value
+  BASE_REF.value = KILL_BASE
+  expect(
+    { mode: 'broadcast-gated', shape: 'zero-input', label: 'kill switch: broadcast-gated' },
+    (r) => !r.admitted && !r.present && r.status !== 401 && r.status !== 200,
+    'the kill switch must never route a caller off the network gate',
+  )
+  expect(
+    { mode: 'historical-tx-no-spv', shape: 'zero-input', label: 'kill switch: ungated header' },
+    (r) => !r.admitted && !r.present,
+    'with extensions off the header is ignored; the fabrication must not be admitted',
+  )
+  BASE_REF.value = saved
+} else {
+  results.push('SKIP  kill-switch leg (set KILL_SWITCH_BASE)')
+}
+
+console.log(results.join('\n'))
+if (failures) {
+  console.error(`\n#347 route gate: ${failures} expectation(s) FAILED — the admission gate regressed.`)
+  process.exit(1)
+}
+console.log(`\n#347 route gate: all ${results.length} expectations held.`)
