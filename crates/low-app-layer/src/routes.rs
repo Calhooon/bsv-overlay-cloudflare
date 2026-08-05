@@ -1593,6 +1593,15 @@ struct RefundViewRowD1 {
     /// the second accepted confirmation signal, shared with `/results`.
     #[serde(rename = "spenderProofVerified")]
     spender_proof_verified: Option<f64>,
+    /// #217 durable timeline stamps (unix seconds). All three are nullable
+    /// and `default` — a join miss, or a row admitted before the
+    /// `firstSpentAt` migration, reads as absent rather than as a zero time.
+    #[serde(rename = "potAdmittedAt", default)]
+    pot_admitted_at: Option<f64>,
+    #[serde(rename = "firstPartyMarkerAt", default)]
+    first_party_marker_at: Option<f64>,
+    #[serde(rename = "firstSpentAt", default)]
+    first_spent_at: Option<f64>,
 }
 
 impl RefundViewRowD1 {
@@ -1611,6 +1620,11 @@ impl RefundViewRowD1 {
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
             backup_marker_present: self.backup_marker_present != 0.0,
+            // #217 — NULL stays None. A stamp is a unix SECOND, so the f64
+            // D1 hands back is exact well past any plausible clock.
+            pot_admitted_at: self.pot_admitted_at.map(|v| v as i64),
+            first_party_marker_at: self.first_party_marker_at.map(|v| v as i64),
+            first_spent_at: self.first_spent_at.map(|v| v as i64),
         }
     }
 }

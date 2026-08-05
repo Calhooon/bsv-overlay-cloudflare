@@ -16,7 +16,7 @@ use bsv_overlay_cloudflare::d1_discovery::{mark_spent_sql, store_record_sql};
 use low_app_layer::logic::valid_identity;
 use low_app_layer::refund_view::{
     assemble_refund_view, refund_view_body, refund_view_sql, RefundStatus, RefundViewRow,
-    REFUND_VIEW_MAX_ROWS, REFUND_VIEW_UNKNOWN_POT_QUOTA,
+    SeatAnchor, REFUND_VIEW_MAX_ROWS, REFUND_VIEW_UNKNOWN_POT_QUOTA,
 };
 use low_app_layer::results::PotVerdict;
 use rusqlite::{params, Connection};
@@ -222,6 +222,11 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<RefundViewRow> {
             spender_proof_verified: r
                 .get::<_, Option<i64>>("spenderProofVerified")?
                 .map(|v| v != 0),
+            // #217 durable timeline stamps, read by the SAME wire names the
+            // route's `RefundViewRowD1` deserializes.
+            pot_admitted_at: r.get::<_, Option<i64>>("potAdmittedAt")?,
+            first_party_marker_at: r.get::<_, Option<i64>>("firstPartyMarkerAt")?,
+            first_spent_at: r.get::<_, Option<i64>>("firstSpentAt")?,
         })
     })
     .expect("query")
@@ -665,5 +670,243 @@ fn row_cap_bounds_the_page_and_a_full_book_survives() {
     assert_eq!(
         rows[0].pot_txid,
         format!("{:064x}", 0x1000_u64 + (n as u64 - 1))
+    );
+}
+
+// ── #217 durable timeline (the presence audit trail, RECORD half) ───────────
+//
+// Every cell here drives the SHIPPED producers — `store_record_sql()` for the
+// pot admission stamp, the topic manager's INSERT for the marker stamp,
+// `mark_spent_sql()` for the hand-end stamp — and reads them back through the
+// SHIPPED `refund_view_sql()`. Nothing is hand-fed into `RefundViewRow`.
+
+/// The three stamps arrive with the values their producers wrote, and
+/// `seatAnchor` names the INDEX-backed one when the pot is indexed.
+#[test]
+fn the_timeline_serves_the_stamps_its_producers_wrote() {
+    let conn = production_schema_db();
+    let me = h66(0xa1);
+    let pot = h64(0xaa);
+    admit_pot(&conn, &pot, 1_000, Some(GATE));
+    file_party(&conn, &me, &pot, GATE, "txPARTY", 1_007);
+
+    // Unspent: the two START stamps are present, the END stamp is not — and
+    // absent must not read as a zero time.
+    let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_078))[0];
+    assert_eq!(e.pot_admitted_at, Some(1_000));
+    assert_eq!(e.first_party_marker_at, Some(1_007));
+    assert_eq!(
+        e.first_spent_at, None,
+        "no accepted spend write yet — and null is not 0"
+    );
+    assert_eq!(e.seat_anchor, Some(SeatAnchor::PotAdmission));
+
+    // A spend lands: the END stamp appears, the START stamps do not move.
+    mark_spent(&conn, &pot, &h64(0xfe), true, Some("refund"), Some(900_170));
+    let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_200))[0];
+    assert_eq!(
+        e.pot_admitted_at,
+        Some(1_000),
+        "start stamps are write-once"
+    );
+    assert_eq!(e.first_party_marker_at, Some(1_007));
+    assert!(
+        e.first_spent_at.is_some_and(|t| t > 1_000),
+        "the hand-end stamp is the observation time, not the admission time: {:?}",
+        e.first_spent_at
+    );
+    assert_eq!(e.spent_height, Some(900_170));
+}
+
+/// A JOIN MISS degrades the anchor honestly instead of fabricating a start.
+///
+/// The pot is never admitted, so `pot_records` has no row: `potAdmittedAt`
+/// and `firstSpentAt` are `null` (spend status genuinely unknown — the row
+/// already says `spent: null`) and the anchor falls back to the MARKER-backed
+/// stamp, which is exactly the weaker claim a consumer must be told about.
+#[test]
+fn a_join_miss_falls_back_to_the_marker_anchor_and_says_so() {
+    let conn = production_schema_db();
+    let me = h66(0xa1);
+    let ghost = h64(0xcc);
+    file_party(&conn, &me, &ghost, GATE, "txGHOST", 2_222);
+
+    let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_078))[0];
+    assert_eq!(e.spent, None, "never asserted unspent");
+    assert_eq!(e.pot_admitted_at, None);
+    assert_eq!(e.first_spent_at, None);
+    assert_eq!(e.first_party_marker_at, Some(2_222));
+    assert_eq!(
+        e.seat_anchor,
+        Some(SeatAnchor::PartyMarker),
+        "marker-backed, and the consumer is told which"
+    );
+    assert_eq!(e.seat_anchor.map(SeatAnchor::as_str), Some("party-marker"));
+}
+
+/// The hand-end stamp is WRITE-ONCE across the real spend lifecycle, and the
+/// #228 age anchor is NOT SERVED at all.
+///
+/// A 0-conf pointer, then its confirm, then a reorg-displacing spender: three
+/// accepted `mark_spent_sql` writes, each of which re-stamps `spentAt`. The
+/// served `firstSpentAt` must survive all three unchanged — the whole reason
+/// the durable stamp is a separate column. The sentinel makes MOVED and
+/// NOT-MOVED distinguishable without sleeping (all three writes land inside
+/// one wall-clock second).
+#[test]
+fn the_served_hand_end_stamp_survives_the_whole_spend_lifecycle() {
+    let conn = production_schema_db();
+    let me = h66(0xa1);
+    let pot = h64(0xaa);
+    admit_pot(&conn, &pot, 1_000, Some(GATE));
+    file_party(&conn, &me, &pot, GATE, "txPARTY", 1_007);
+
+    const SENTINEL: i64 = 1_000_000;
+    mark_spent(&conn, &pot, &h64(0xfe), false, Some("refund"), None);
+    conn.execute(
+        "UPDATE pot_records SET spentAt = ?1, firstSpentAt = ?1 WHERE txid = ?2",
+        params![SENTINEL, pot],
+    )
+    .expect("seed both anchors");
+
+    for (spender, height) in [(h64(0xfe), 900_170i64), (h64(0xef), 900_180)] {
+        mark_spent(&conn, &pot, &spender, true, None, Some(height));
+        let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_200))[0];
+        assert_eq!(
+            e.first_spent_at,
+            Some(SENTINEL),
+            "the served hand-end stamp must not move on the {spender} write"
+        );
+        assert_eq!(e.spent_height, Some(height as u64), "the height DID move");
+    }
+
+    // CONTROL, and the point of the cell: the moving anchor really did move,
+    // so "did not move" above is a measurement rather than a schema in which
+    // nothing changes. Read straight from the table — this view never serves
+    // `spentAt`, on purpose.
+    let moved: i64 = conn
+        .query_row(
+            "SELECT spentAt FROM pot_records WHERE txid = ?1",
+            params![pot],
+            |r| r.get(0),
+        )
+        .expect("spentAt");
+    assert!(
+        moved > SENTINEL,
+        "the #228 age anchor moved ({moved}) while the durable one held"
+    );
+    assert!(
+        !refund_view_sql().contains("spentAt AS"),
+        "`spentAt` is a MOVING age gate and must never be projected as an \
+         audit stamp — `firstSpentAt` is the served one"
+    );
+}
+
+/// AUDIT ONLY: no timeline stamp can move a money word.
+///
+/// Drives the real assembler over the real SQL twice — once with no timeline
+/// data reachable at all, once with every stamp present — and asserts the
+/// status half is byte-identical. A future edit that fed a stamp into
+/// `derive_refund_status` (the bar the issue sets: "must NOT become a money
+/// gate") fails here.
+#[test]
+fn the_timeline_never_moves_the_status() {
+    let bare = production_schema_db();
+    let stamped = production_schema_db();
+    let me = h66(0xa1);
+    let pot = h64(0xaa);
+
+    for conn in [&bare, &stamped] {
+        admit_pot(conn, &pot, 1_000, Some(GATE));
+        file_party(conn, &me, &pot, GATE, "txPARTY", 1_007);
+        mark_spent(conn, &pot, &h64(0xfe), true, Some("refund"), Some(900_170));
+    }
+    // Erase every timeline stamp on the control — nothing else differs.
+    bare.execute(
+        "UPDATE pot_records SET createdAt = NULL, firstSpentAt = NULL",
+        [],
+    )
+    .expect("strip pot stamps");
+    bare.execute("UPDATE potparty_records SET createdAt = NULL", [])
+        .expect("strip marker stamp");
+
+    let a = &assemble_refund_view(query_rows(&bare, &me), Some(900_200))[0];
+    let b = &assemble_refund_view(query_rows(&stamped, &me), Some(900_200))[0];
+    assert_eq!(a.status, b.status);
+    assert_eq!(a.status_source, b.status_source);
+    assert_eq!(a.verdict, b.verdict);
+    assert_eq!(a.gate_passed, b.gate_passed);
+    assert_eq!(a.blocks_to_gate, b.blocks_to_gate);
+    assert_eq!(a.recovery_height, b.recovery_height);
+    assert_eq!(a.status, RefundStatus::Landed, "positive control");
+    // …and the two really did differ in the timeline half.
+    assert_eq!(a.pot_admitted_at, None);
+    assert_eq!(a.seat_anchor, None, "neither stamp known ⇒ no anchor");
+    assert!(b.pot_admitted_at.is_some() && b.first_spent_at.is_some());
+    assert_eq!(b.seat_anchor, Some(SeatAnchor::PotAdmission));
+}
+
+/// The wire block: exact key set, nullability, and the ONE repeated value.
+#[test]
+fn the_timeline_wire_block_is_the_documented_shape() {
+    let conn = production_schema_db();
+    let me = h66(0xa1);
+    let pot = h64(0xaa);
+    admit_pot(&conn, &pot, 1_000, Some(GATE));
+    file_party(&conn, &me, &pot, GATE, "txPARTY", 1_007);
+    mark_spent(&conn, &pot, &h64(0xfe), true, Some("refund"), Some(900_170));
+
+    let entries = assemble_refund_view(query_rows(&conn, &me), Some(900_200));
+    let v: serde_json::Value =
+        serde_json::from_str(&refund_view_body(&me, Some(900_200), &entries)).expect("json");
+    let row = &v["refunds"][0];
+    let t = &row["timeline"];
+
+    let keys: std::collections::BTreeSet<&str> = t
+        .as_object()
+        .expect("timeline object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "firstPartyMarkerAt",
+            "firstSpentAt",
+            "potAdmittedAt",
+            "seatAnchor",
+            "spentHeight",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<&str>>(),
+        "the timeline key set is a contract"
+    );
+    assert_eq!(t["potAdmittedAt"], serde_json::json!(1_000));
+    assert_eq!(t["firstPartyMarkerAt"], serde_json::json!(1_007));
+    assert!(t["firstSpentAt"].is_i64());
+    assert_eq!(t["seatAnchor"], serde_json::json!("pot-admission"));
+    // ONE column, read once — the repeat can never disagree with the
+    // top-level field it mirrors.
+    assert_eq!(t["spentHeight"], row["spentHeight"]);
+    assert_eq!(t["spentHeight"], serde_json::json!(900_170));
+
+    // A pot with nothing to say says null, never 0 and never a missing key.
+    let ghost = h64(0xcc);
+    file_party(&conn, &me, &ghost, GATE, "txGHOST", 2_222);
+    let entries = assemble_refund_view(query_rows(&conn, &me), Some(900_200));
+    let v: serde_json::Value =
+        serde_json::from_str(&refund_view_body(&me, Some(900_200), &entries)).expect("json");
+    let g = v["refunds"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["potTxid"] == serde_json::json!(ghost))
+        .expect("the ghost row is SERVED, never hidden");
+    assert_eq!(g["timeline"]["potAdmittedAt"], serde_json::Value::Null);
+    assert_eq!(g["timeline"]["firstSpentAt"], serde_json::Value::Null);
+    assert_eq!(g["timeline"]["spentHeight"], serde_json::Value::Null);
+    assert_eq!(
+        g["timeline"]["seatAnchor"],
+        serde_json::json!("party-marker")
     );
 }
