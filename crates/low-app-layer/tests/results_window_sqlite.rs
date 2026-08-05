@@ -20,8 +20,8 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::results::{
-    assemble_results, covenant_params_by_pot, results_sql, seat_markers_sql, GameClaims,
-    PotVerdict, ResultsRow, SeatMarkerRow, RESULTS_UNKNOWN_POT_QUOTA,
+    assemble_results, attribute_seats, covenant_params_by_pot, results_sql, seat_markers_sql,
+    GameClaims, PotVerdict, ResultsRow, SeatMarkerRow, RESULTS_UNKNOWN_POT_QUOTA,
     SEAT_MARKERS_BINDS_PER_POT, SEAT_MARKERS_PER_KEY,
 };
 use rusqlite::{params, Connection};
@@ -2977,6 +2977,157 @@ fn the_victim_does_not_need_to_republish_to_be_bound() {
         serde_json::json!("chain"),
         "and still bound after five republishes"
     );
+}
+
+/// `seat_markers_sql` ALONE, pinned per-query (bsv-low #283, from the
+/// adversarial gate: its rank term could be removed with nothing going red,
+/// while it carries the #283c headline claim).
+///
+/// The other #283 cells reach this window through `assemble_results`, which
+/// ALSO re-injects the caller's own representative-row marker — so they can
+/// stay green on the strength of a different query. This one executes
+/// `seat_markers_sql` directly and asserts on what the WINDOW returned.
+///
+/// Two floods, both stamped EARLIER than the honest marker and stored
+/// physically first, so no incidental order can produce a pass:
+///   1. plain junk under the honest seat's own PUBLIC committed key, at 4×
+///      the cap (the pre-#283 threshold was exactly `SEAT_MARKERS_PER_KEY`);
+///   2. **24 DER-padded replays of the honest marker's identity signature** —
+///      the class both gates measured evicting the exact row it replays, back
+///      when `verify_identity_sig` had no canonical-DER bar. These now latch
+///      `sigValid = 0` and cannot crowd the window.
+#[test]
+fn the_seat_window_alone_keeps_the_verified_row_under_both_flood_classes() {
+    for padded_replay in [false, true] {
+        let (conn, _victim, pot, game) = honest_world(50_000);
+        let (_ka, pa) = real_key(41);
+        let (_kb, pb) = real_key(42);
+        let honest_sig: String = conn
+            .query_row(
+                "SELECT sigHex FROM potparty_records WHERE txid = 'txHONEST'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the honest marker is in place");
+        let honest_seat_sig: String = conn
+            .query_row(
+                "SELECT seatSigHex FROM potparty_records WHERE txid = 'txHONEST'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let honest_identity: String = conn
+            .query_row(
+                "SELECT identity FROM potparty_records WHERE txid = 'txHONEST'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let honest_opp: String = conn
+            .query_row(
+                "SELECT opponentIdentity FROM potparty_records WHERE txid = 'txHONEST'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        for i in 0..(SEAT_MARKERS_PER_KEY * 4) {
+            if padded_replay {
+                // A byte-for-byte replay of the honest marker with ONE
+                // trailing DER byte appended to the identity signature.
+                file_marker_row(
+                    &conn,
+                    &honest_identity,
+                    &honest_opp,
+                    &game,
+                    &pot,
+                    0,
+                    HONEST_HINT as i64,
+                    &format!("{honest_sig}00"),
+                    Some(&pa),
+                    Some(&honest_seat_sig),
+                    &format!("txPAD{i:04}"),
+                    10 + i as i64,
+                );
+            } else {
+                file_marker_row(
+                    &conn,
+                    &format!("02{}", "77".repeat(32)),
+                    &format!("02{}", "88".repeat(32)),
+                    &game,
+                    &pot,
+                    0,
+                    1,
+                    "3045junk",
+                    Some(&pa),
+                    Some("3045junkseat"),
+                    &format!("txJUNK{i:04}"),
+                    10 + i as i64,
+                );
+            }
+        }
+
+        let mut params_by_pot = std::collections::HashMap::new();
+        params_by_pot.insert((pot.clone(), 0u32), params_committing(&pa, &pb, COMMITTED_HEIGHT));
+        let fetched = fetch_seat_markers(&conn, &params_by_pot);
+        let rows = fetched.get(&(pot.to_ascii_lowercase(), 0)).expect("window returned rows");
+        assert!(
+            rows.len() <= SEAT_MARKERS_PER_KEY * 2,
+            "the window is still capped per key slot: {}",
+            rows.len()
+        );
+        assert!(
+            rows.iter().any(|m| m.identity_sig_hex == honest_sig.to_ascii_lowercase()),
+            "seat_markers_sql alone must return the VERIFIED row under a \
+             {}x-cap flood (padded_replay={padded_replay})",
+            4
+        );
+        // …and it is what `attribute_seats` then credits.
+        let attr = attribute_seats(
+            &params_committing(&pa, &pb, COMMITTED_HEIGHT),
+            &pot.to_ascii_lowercase(),
+            0,
+            rows,
+        );
+        assert_eq!(
+            attr.identity_a.as_deref(),
+            Some(honest_identity.to_ascii_lowercase().as_str()),
+            "and the honest seat is attributed (padded_replay={padded_replay})"
+        );
+    }
+}
+
+/// `results_sql` ALONE, pinned per-query: the REPRESENTATIVE-ROW collapse.
+///
+/// Asserts only on fields the representative row supplies (`gameId`,
+/// `recoveryHeight`, `opponentIdentity`) and NOT on `potBinding`, so it
+/// cannot pass on the strength of `seat_markers_sql`'s rank term — the two
+/// queries fail independently.
+#[test]
+fn the_representative_row_collapse_alone_prefers_the_verified_marker() {
+    let (conn, victim, pot, game) = honest_world(50_000);
+    // 200 displacers, ALL stamped earlier than the honest marker.
+    for i in 0..200 {
+        file_marker_row(
+            &conn,
+            &victim,
+            &format!("02{}", "ee".repeat(32)),
+            &h64(0x99),
+            &pot,
+            0,
+            HOSTILE_HINT,
+            "3045junk",
+            None,
+            None,
+            &format!("txDISP{i:04}"),
+            1 + i,
+        );
+    }
+    let rows = query_results_rows(&conn, &victim);
+    let row = rows.iter().find(|r| r.pot_txid.eq_ignore_ascii_case(&pot)).expect("row");
+    assert_eq!(row.game_id, game, "the verified marker represents the pot");
+    assert_eq!(row.recovery_height, HONEST_HINT);
+    assert_eq!(row.opponent_identity, format!("02{}", "bb".repeat(32)));
 }
 
 /// Rewrite every row to the PRE-MIGRATION shape (`sigValid IS NULL`) — the

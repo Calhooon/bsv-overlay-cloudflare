@@ -498,9 +498,7 @@ pub fn recovery_view_sql() -> String {
      FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
               opponentIdentity, spent, spendingTxid, spentConfirmed, \
               markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
-              CASE WHEN unknownPot = 0 \
-                   OR (potBestSigRank > 0 AND potRank <= {quota}) \
-                   THEN 0 ELSE 1 END AS tier \
+              CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
        FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                 opponentIdentity, spent, spendingTxid, spentConfirmed, \
                 markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
@@ -2570,9 +2568,7 @@ mod tests {
         //    provably-forged marker cannot occupy one at all.
         assert!(
             sql.contains(&format!(
-                "CASE WHEN unknownPot = 0 \
-                   OR (potBestSigRank > 0 AND potRank <= {RECOVERY_VIEW_UNKNOWN_QUOTA}) \
-                   THEN 0 ELSE 1 END AS tier"
+                "CASE WHEN unknownPot = 0 OR potRank <= {RECOVERY_VIEW_UNKNOWN_QUOTA} THEN 0 ELSE 1 END AS tier"
             )),
             "unknown-pot quota tier missing or not tied to the const: {sql}"
         );

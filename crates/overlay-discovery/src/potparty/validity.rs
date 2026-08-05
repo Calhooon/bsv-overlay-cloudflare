@@ -189,17 +189,50 @@ pub fn seatsig_preimage(
     Some(out)
 }
 
+/// CANONICAL STRICT DER + LOW-S (epoch Rule 4c), the ONE gate both signature
+/// bars go through.
+///
+/// `from_der` tolerates trailing bytes, so the encoding is re-derived and
+/// byte-compared; `is_low_s` is asserted here rather than inherited from
+/// whatever the verifier happens to do, because "the verifier enforces it"
+/// is a claim about a dependency and this is the layer that must not drift.
+///
+/// Why this is load-bearing for #283 specifically: the latch turns "does
+/// this verify" into a SORT KEY over a capped window, so any way to mint
+/// distinct byte strings that still latch `1` is a cost multiplier against
+/// the honest row. **Both gates executed exactly that** — 24 padded replays
+/// of one honest marker saturated `seat_markers_sql`'s 8-slot window and
+/// evicted the row they were replaying. The seat bar had this check from the
+/// start; the IDENTITY bar did not, and was harmless only because
+/// `verify_identity_binding` happened to share the leniency. A coincidence
+/// is not a design.
+///
+/// This can never reject an honest marker: the client's wallet emits
+/// canonical low-S DER, pinned end-to-end by the frozen goldens.
+///
+/// NOTE ON THE `is_low_s` LEG, because a reviewer will ask (Rule 1 says a
+/// dominated check is deleted): today it IS dominated — `Signature::to_der()`
+/// normalises to low-S, so a high-S input already fails the byte-compare. It
+/// stays because the dominating rule is a DEPENDENCY's current behaviour, not
+/// an on-chain one, and a silent change to `to_der` would re-open the axis
+/// with nothing left watching it. `no_malleated_variant_of_an_honest_marker_
+/// latches_valid` asserts the PROPERTY rather than which leg enforces it, so
+/// the pin survives either arrangement.
+fn canonical_der(sig: &[u8]) -> Option<bsv_rs::primitives::ec::Signature> {
+    let parsed = bsv_rs::primitives::ec::Signature::from_der(sig).ok()?;
+    if parsed.to_der() != sig || !parsed.is_low_s() {
+        return None;
+    }
+    Some(parsed)
+}
+
 /// Verify a marker's SEAT signature: plain secp256k1 ECDSA under the
 /// marker's OWN `seat_settle_pubkey` over sha256(preimage). Lock membership
 /// is a SEPARATE check the reader does against the pot's committed keys
 /// (`results::attribute_seats`) — this predicate deliberately knows nothing
 /// about any lock, because admission has no pot to read one from.
 ///
-/// CANONICAL STRICT DER (epoch Rule 4c): `from_der` tolerates trailing
-/// bytes, so the encoding is re-derived and byte-compared. Without it an
-/// observer mints unlimited distinct "valid" rows by padding one honest
-/// signature — which is exactly the cost multiplier this whole change
-/// exists to remove. Low-S is already enforced by `verify`.
+/// Signature encoding goes through [`canonical_der`] — see there for why.
 pub fn verify_seat_sig(
     game_id: &[u8],
     pot_txid: &[u8],
@@ -214,12 +247,9 @@ pub fn verify_seat_sig(
     let Ok(pubkey) = bsv_rs::primitives::ec::PublicKey::from_bytes(seat_settle_pubkey) else {
         return false;
     };
-    let Ok(sig) = bsv_rs::primitives::ec::Signature::from_der(seat_sig) else {
+    let Some(sig) = canonical_der(seat_sig) else {
         return false;
     };
-    if sig.to_der() != seat_sig {
-        return false;
-    }
     let hash = bsv_rs::primitives::hash::sha256(&preimage);
     pubkey.verify(&hash, &sig)
 }
@@ -232,6 +262,13 @@ pub fn verify_identity_sig(identity: &[u8], game_id: &[u8], challenge: &[u8], si
     let Ok(signer) = bsv_rs::primitives::ec::PublicKey::from_bytes(identity) else {
         return false;
     };
+    // Same bar as the seat signature — see `canonical_der`. Without it a
+    // padded or high-S replay of ONE honest marker mints unlimited distinct
+    // rows that all latch `sigValid = 1`, and 24 of them were measured
+    // evicting the very row they replay.
+    if canonical_der(sig).is_none() {
+        return false;
+    }
     bsv_rs::wallet::ProtoWallet::anyone()
         .verify_signature(bsv_rs::wallet::VerifySignatureArgs {
             data: Some(challenge.to_vec()),
@@ -450,18 +487,111 @@ mod tests {
         assert!(!marker_sig_valid(&pk), "seatSettlePubkey");
     }
 
-    /// DER PADDING (epoch Rule 4c/4d): an observer who can see one honest
-    /// marker must not be able to mint distinct rows that still latch
-    /// `valid` — otherwise the latch itself becomes the cost multiplier.
+    /// secp256k1 group order, for minting the high-S twin of a signature.
+    const SECP256K1_N: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+        0x41, 0x41,
+    ];
+
+    /// Minimal DER INTEGER: strip leading zeros, re-add one if the high bit
+    /// is set. Hand-rolled ON PURPOSE — `Signature::to_der()` silently
+    /// normalises to low-S, so using it here would produce a "twin" identical
+    /// to the original and the cell would assert nothing (it did, on the
+    /// first run; the `assert_ne!` caught it).
+    fn der_int(v: &[u8; 32]) -> Vec<u8> {
+        let mut b: &[u8] = v;
+        while b.len() > 1 && b[0] == 0 {
+            b = &b[1..];
+        }
+        let mut out = Vec::new();
+        if b[0] & 0x80 != 0 {
+            out.push(0x00);
+        }
+        out.extend_from_slice(b);
+        out
+    }
+
+    /// Re-encode a DER signature with `s -> N - s`. The result verifies under
+    /// the SAME key over the SAME digest (ECDSA is malleable in exactly this
+    /// way) but is a different byte string — the classic mint-unlimited-
+    /// valid-variants primitive, and a DIFFERENT SPELLING from trailing-byte
+    /// padding (epoch Rule 12a: a pin verified only against the injection it
+    /// was written for pins a string, not a property).
+    fn high_s_twin(der: &[u8]) -> Vec<u8> {
+        let sig = bsv_rs::primitives::ec::Signature::from_der(der).expect("parses");
+        let s = *sig.s();
+        // 256-bit N - s, big-endian, schoolbook borrow.
+        let mut hi = [0u8; 32];
+        let mut borrow = 0i32;
+        for i in (0..32).rev() {
+            let d = SECP256K1_N[i] as i32 - s[i] as i32 - borrow;
+            if d < 0 {
+                hi[i] = (d + 256) as u8;
+                borrow = 1;
+            } else {
+                hi[i] = d as u8;
+                borrow = 0;
+            }
+        }
+        let (r_b, s_b) = (der_int(sig.r()), der_int(&hi));
+        let mut out = vec![0x30, (4 + r_b.len() + s_b.len()) as u8, 0x02, r_b.len() as u8];
+        out.extend_from_slice(&r_b);
+        out.push(0x02);
+        out.push(s_b.len() as u8);
+        out.extend_from_slice(&s_b);
+        out
+    }
+
+    /// EPOCH RULE 4c, ON BOTH SIGNATURES AND BOTH MALLEABILITY AXES.
+    ///
+    /// An observer who can see one honest marker must not be able to mint
+    /// distinct rows that still latch `valid` — since #283 the latch is a
+    /// SORT KEY over a capped window, so unlimited `sigValid = 1` variants of
+    /// one honest marker are a cost multiplier against the row they replay.
+    /// Both adversarial gates executed this: **24 padded IDENTITY-signature
+    /// replays saturated `seat_markers_sql`'s 8-slot window and evicted the
+    /// exact honest row they were replaying**, because `verify_seat_sig`
+    /// re-encoded and byte-compared while `verify_identity_sig` did not. It
+    /// was harmless only because `verify_identity_binding` happened to share
+    /// the leniency — a coincidence, not a design.
+    ///
+    /// Four legs: {seat, identity} × {trailing-byte padding, high-S twin}.
     #[test]
-    fn der_padded_seat_signature_does_not_latch_valid() {
+    fn no_malleated_variant_of_an_honest_marker_latches_valid() {
         let base = golden(GOLDEN_V2_HEX);
+        assert!(marker_sig_valid(&base), "positive control: the golden latches");
+
+        // --- SEAT signature.
         let mut padded = base.clone();
         padded.seat_sig.as_mut().unwrap().push(0x00);
-        assert!(
-            !marker_sig_valid(&padded),
-            "a trailing-byte DER variant must not latch valid (canonical strict DER)"
-        );
+        assert!(!marker_sig_valid(&padded), "seat: trailing-byte DER padding");
+
+        let mut high_s = base.clone();
+        let twin = high_s_twin(base.seat_sig.as_ref().unwrap());
+        assert_ne!(&twin, base.seat_sig.as_ref().unwrap(), "the twin is different bytes");
+        high_s.seat_sig = Some(twin);
+        assert!(!marker_sig_valid(&high_s), "seat: high-S twin");
+
+        // --- IDENTITY signature (the leg the gates broke).
+        let mut padded_id = base.clone();
+        padded_id.sig.push(0x00);
+        assert!(!marker_sig_valid(&padded_id), "identity: trailing-byte DER padding");
+
+        let mut high_s_id = base.clone();
+        high_s_id.sig = high_s_twin(&base.sig);
+        assert_ne!(high_s_id.sig, base.sig, "the twin is different bytes");
+        assert!(!marker_sig_valid(&high_s_id), "identity: high-S twin");
+
+        // …and the same four legs on v1, which carries only the identity sig.
+        let v1 = golden(GOLDEN_V1_HEX);
+        assert!(marker_sig_valid(&v1), "positive control: the v1 golden latches");
+        let mut v1_padded = v1.clone();
+        v1_padded.sig.push(0x00);
+        assert!(!marker_sig_valid(&v1_padded), "v1 identity: padding");
+        let mut v1_high_s = v1.clone();
+        v1_high_s.sig = high_s_twin(&v1.sig);
+        assert!(!marker_sig_valid(&v1_high_s), "v1 identity: high-S twin");
     }
 
     /// A v1 marker's bytes are NOT a valid v2 marker's bytes and vice versa:

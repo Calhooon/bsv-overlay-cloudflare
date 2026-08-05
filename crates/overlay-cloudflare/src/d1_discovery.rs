@@ -2772,8 +2772,7 @@ pub fn potparty_list_for_identity_sql() -> String {
                         txid, outputIndex, createdAt, isV2, markerRowid, \
                         potCreatedAt, potFirstMarkerAt, potBestSigRank, \
                         CASE WHEN unknownPot = 0 \
-                             OR (freshUnknown = 1 AND potBestSigRank > 0 \
-                                 AND potRank <= ?3) \
+                             OR (freshUnknown = 1 AND potRank <= ?3) \
                              THEN 0 ELSE 1 END AS tier \
                  FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                               recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
@@ -2957,14 +2956,22 @@ pub fn list_for_pot_sql(select: &str) -> String {
 /// flood of ghosts kept continuously inside the freshness window and older
 /// than the victim's funding moment still took the slots — and per
 /// bsv-low#347 that flood is FREE, so the "O(sustained) cost" this note used
-/// to claim was never a cost at all). Promotion is additionally gated on
-/// `potBestSigRank > 0` and allocated verified-first, which an attacker
-/// cannot reach without the victim's identity key. The stamp heuristic is
-/// kept because it still orders the LEGACY tier, where no latch exists;
+/// to claim was never a cost at all). What bounds it now is that
+/// `potBestSigRank DESC` LEADS the page ordering, so a ghost sorts behind
+/// every honest pot whether it was promoted or not — promotion stopped
+/// being the decision. The stamp heuristic is kept because it still orders
+/// the LEGACY tier, where no latch exists;
 /// `sustained_fresh_older_ghost_flood_still_displaces_residual_real_sqlite`
 /// pins that legacy behaviour and
 /// `latched_ghosts_take_no_promoted_slot_real_sqlite` pins the closure for
 /// admitted rows.
+///
+/// An earlier revision of this change ALSO gated promotion on
+/// `potBestSigRank > 0`. It was deleted, not covered: the adversarial gate
+/// removed the conjunct from the shipped SQL and measured identical results
+/// at 0/50/200 ghosts with the honest row latching 1 or 0, because the
+/// leading rank term dominates it. Epoch Rule 1 — a check proven unreachable
+/// is re-derivation.
 ///
 /// # The guaranteed ~10% ghost share — CLOSED for latched rows (#283b)
 ///
@@ -2977,14 +2984,15 @@ pub fn list_for_pot_sql(select: &str) -> String {
 /// free, not dust-priced — so the guarantee was being handed to an attacker
 /// who paid nothing for it.
 ///
-/// It is closed without pricing anything, and without filtering anything.
-/// Promotion now additionally requires the pot's BEST marker to be something
-/// other than provably-forged (`potBestSigRank > 0`), and the slots inside
-/// the window are allocated verified-first. A ghost naming the victim cannot
-/// carry the victim's identity signature, so it cannot reach a promoted slot
-/// at all: `latched_ghosts_take_no_promoted_slot_real_sqlite` re-measures the
-/// #281 case at 50 ghosts (5x the quota, all inside the freshness window and
-/// all older than the honest marker) and displaces **zero** real pots.
+/// It is closed without pricing anything, and without filtering anything —
+/// and NOT by anything done to the quota itself. `potBestSigRank DESC` is
+/// the LEADING term of both the quota allocation and the page ordering, so a
+/// promoted ghost still sorts behind every honest pot and promotion stopped
+/// being the decision. A ghost naming the victim cannot carry the victim's
+/// identity signature, so it cannot outrank one:
+/// `latched_ghosts_take_no_promoted_slot_real_sqlite` re-measures the #281
+/// case at 50 ghosts (5x the quota, all inside the freshness window and all
+/// older than the honest marker) and displaces **zero** real pots.
 ///
 /// This is an ORDERING, not a filter — the fail direction is unchanged. A pot
 /// whose only marker latches `false` is DEMOTED, never dropped; it still
@@ -3123,47 +3131,62 @@ pub fn identity_window_row_cap(limit: usize, groups: usize) -> usize {
         .saturating_mul(PARTYFOR_ROWS_PER_GROUP)
 }
 
+/// THE potparty admission WRITE, as a pure value.
+///
+/// `store_record` is `potparty_insert_query(...).execute(db)` and nothing
+/// else, because `execute` needs a live `D1Database` and is therefore
+/// unreachable in a native test — which is precisely how a write path gets
+/// silently neutered while the whole suite stays green. The #283 adversarial
+/// gate demonstrated exactly that: binding `None` for `sigValid` here left
+/// every test passing and made the entire change inoperative (every new
+/// production row would land in the legacy tier). Splitting the query out
+/// gives the writer a BEHAVIOURAL pin — `the_admission_write_latches_sig_
+/// valid_through_the_real_writer` replays this query's own SQL and bind list
+/// against real SQLite and reads the column back.
+///
+/// INSERT OR IGNORE on the `(txid, outputIndex)` primary key — a replayed
+/// submit of the same output is a no-op; markers for the same identity from
+/// different txs are ALL kept; never overwrite, never delete.
+///
+/// `sigValid` is DECODED ONCE HERE — the #284 decode-at-write pattern applied
+/// to a predicate. It is an ORDERING HINT, not an admission decision: this
+/// cannot refuse a marker, a 0-latched row is stored and served exactly as
+/// before, and every consumer that concludes anything from a marker
+/// re-verifies. It exists because every downstream window is a slot allocated
+/// by an ordering an attacker controls, and "does this verify" is the one
+/// ordering an attacker can neither out-stamp nor out-number.
+pub fn potparty_insert_query(record: &PotpartyRecord, created_at: i64) -> Query {
+    Query::new(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, \
+          recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+          txid, outputIndex, createdAt, sigValid) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(record.identity.as_str())
+    .bind(record.opponent_identity.as_str())
+    .bind(record.game_id.as_str())
+    .bind(record.pot_txid.as_str())
+    .bind(record.pot_vout)
+    .bind(record.recovery_height)
+    .bind(record.sig_hex.as_str())
+    .bind(record.seat_settle_pubkey.as_deref())
+    .bind(record.seat_sig_hex.as_deref())
+    .bind(record.txid.as_str())
+    .bind(record.output_index)
+    .bind(created_at)
+    .bind(i64::from(
+        overlay_discovery::potparty::validity::record_sig_valid(record),
+    ))
+}
+
 #[async_trait(?Send)]
 impl PotpartyStorage for D1PotpartyStorage {
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
-        // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
-        // replayed submit of the same output is a no-op; markers for the
-        // same identity from different txs are ALL kept; never overwrite,
-        // never delete.
-        //
-        // #283: `sigValid` is DECODED ONCE HERE — the #284 decode-at-write
-        // pattern applied to a predicate. It is an ORDERING HINT, not an
-        // admission decision: this call cannot refuse a marker, a 0-latched
-        // row is stored and served exactly as before, and every consumer
-        // that concludes anything from a marker re-verifies. It exists
-        // because every downstream window is a slot allocated by an
-        // ordering an attacker controls, and "does this verify" is the one
-        // ordering an attacker can neither out-stamp nor out-number.
-        Query::new(
-            "INSERT OR IGNORE INTO potparty_records \
-             (identity, opponentIdentity, gameId, potTxid, potVout, \
-              recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
-              txid, outputIndex, createdAt, sigValid) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(record.identity.as_str())
-        .bind(record.opponent_identity.as_str())
-        .bind(record.game_id.as_str())
-        .bind(record.pot_txid.as_str())
-        .bind(record.pot_vout)
-        .bind(record.recovery_height)
-        .bind(record.sig_hex.as_str())
-        .bind(record.seat_settle_pubkey.as_deref())
-        .bind(record.seat_sig_hex.as_deref())
-        .bind(record.txid.as_str())
-        .bind(record.output_index)
-        .bind(current_unix_seconds_i64())
-        .bind(i64::from(
-            overlay_discovery::potparty::validity::record_sig_valid(record),
-        ))
-        .execute(&self.db)
-        .await
-        .map_err(potparty_err)
+        potparty_insert_query(record, current_unix_seconds_i64())
+            .execute(&self.db)
+            .await
+            .map_err(potparty_err)
     }
 
     async fn list_for_identity(
@@ -5741,6 +5764,132 @@ mod tests {
             !got.contains(&fresh),
             "KNOWN residual: a sustained older-but-fresh ghost flood still displaces — \
              if this starts PASSING, the allocation changed and the docs must move with it"
+        );
+    }
+
+    // ── #283 — the ADMISSION WRITER, pinned behaviourally ────────────────
+
+    /// The client's FROZEN golden v2 marker (real `@bsv/sdk` ProtoWallet
+    /// output, pinned in `app/src/lib/potParty.test.ts`) — the only honest
+    /// artifact available here that a REAL signature check can pass. Using a
+    /// hand-built record instead would make the cell blind to the dimension
+    /// it exists to measure (epoch Rule 18).
+    const GOLDEN_V2_MARKER_HEX: &str = "006a0f4c4f572f706f7470617274792f7632210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee520cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd04010000000428a00e002103d3e37fc9edbd1c225d703873b45f66368e86c633cb613252b3254ffe0b8ad5ee4630440220106a632f58753f6b9ebaf20d105874d3aed43c28dab90e8b6a8a51dbd610e1e402204c7837248995842ec551eb3c8510b5862f87bf0c54368534fd3d7c1e3b9a50fd473045022100d3ea901d46fa588cb2f20e0bb0a3c7e23f6320138efee69f9e506a8e79abbaa102207cfccbd475e5d9e789091acdfa7d81503b950ebf51da6a1ac9fec44c84553773";
+
+    fn golden_potparty_record(marker_txid: &str) -> PotpartyRecord {
+        let m = overlay_discovery::potparty::parse_potparty_marker(
+            &hex::decode(GOLDEN_V2_MARKER_HEX).unwrap(),
+        )
+        .expect("the frozen client golden parses");
+        PotpartyRecord {
+            identity: hex::encode(&m.identity),
+            opponent_identity: hex::encode(&m.opponent),
+            game_id: hex::encode(m.game_id),
+            pot_txid: hex::encode(m.pot_txid),
+            pot_vout: m.pot_vout,
+            recovery_height: m.recovery_height,
+            sig_hex: hex::encode(&m.sig),
+            seat_settle_pubkey: m.seat_settle_pubkey.as_ref().map(hex::encode),
+            seat_sig_hex: m.seat_sig.as_ref().map(hex::encode),
+            txid: marker_txid.to_string(),
+            output_index: 0,
+            created_at: 0,
+        }
+    }
+
+    /// Replay a [`Query`] built by production against real SQLite.
+    fn exec_query(conn: &rusqlite::Connection, q: &crate::d1::Query) {
+        let vals: Vec<rusqlite::types::Value> = q
+            .params()
+            .iter()
+            .map(|p| match p {
+                crate::d1::QVal::Null => rusqlite::types::Value::Null,
+                crate::d1::QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+                crate::d1::QVal::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                crate::d1::QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+                crate::d1::QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+                crate::d1::QVal::Float(f) => rusqlite::types::Value::Real(*f),
+            })
+            .collect();
+        conn.execute(q.sql(), rusqlite::params_from_iter(vals.iter()))
+            .expect("the production insert query must execute against the production schema");
+    }
+
+    /// THE WRITER PIN (bsv-low #283, from the adversarial gate's HIGH-2).
+    ///
+    /// Every other #283 cell in this repo RECONSTRUCTS the latch in its
+    /// fixture, because `store_record` needs a `D1Database` and cannot run
+    /// natively. So NOTHING bound the writer to the predicate: the gate
+    /// changed the `sigValid` bind to `None` and the entire suite stayed
+    /// green while every new production row landed in the legacy tier and
+    /// #283 did nothing at all. That is the "right check that never runs"
+    /// failure (epoch Rule 6b) in its purest form.
+    ///
+    /// This drives the REAL writer — `potparty_insert_query`, the exact value
+    /// `store_record` executes — and replays its OWN sql and bind list
+    /// against real SQLite with the production migrations, then reads the
+    /// column back. Binding a constant, a `None`, or the wrong record all
+    /// fail it.
+    #[test]
+    fn the_admission_write_latches_sig_valid_through_the_real_writer() {
+        let conn = production_schema_db();
+        let honest = golden_potparty_record("txGOLDEN");
+        exec_query(&conn, &potparty_insert_query(&honest, 1_234));
+
+        let (latched, at): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT sigValid, createdAt FROM potparty_records WHERE txid = 'txGOLDEN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the row landed");
+        assert_eq!(
+            latched,
+            Some(1),
+            "the REAL client's genuinely-signed marker must latch 1 through the \
+             REAL writer — a constant/None/absent bind fails here"
+        );
+        assert_eq!(at, 1_234, "and createdAt is still the SERVER's stamp");
+
+        // A tampered twin latches 0 — so the cell measures the PREDICATE's
+        // verdict flowing through the writer, not just "something was bound".
+        let mut forged = golden_potparty_record("txFORGED");
+        forged.recovery_height += 1;
+        exec_query(&conn, &potparty_insert_query(&forged, 1_235));
+        let forged_latched: Option<i64> = conn
+            .query_row(
+                "SELECT sigValid FROM potparty_records WHERE txid = 'txFORGED'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the forged row landed too — the latch NEVER refuses an admission");
+        assert_eq!(forged_latched, Some(0));
+
+        // Both rows are present: the latch is a hint, never an admission gate.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM potparty_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "a 0-latched marker is STORED, never refused");
+    }
+
+    /// The writer's bind list and its SQL must agree in COUNT — a dropped
+    /// bind shifts every column silently. Positive counts on both sides of a
+    /// value that cannot move in sympathy (epoch Rule 9).
+    #[test]
+    fn the_admission_write_binds_every_placeholder() {
+        let q = potparty_insert_query(&golden_potparty_record("txN"), 0);
+        assert_eq!(q.sql().matches('?').count(), 13, "13 placeholders");
+        assert_eq!(q.params().len(), 13, "13 binds");
+        assert_eq!(
+            q.sql().matches(',').count(),
+            12 + 12,
+            "13 columns + 13 values = 24 separating commas"
+        );
+        assert!(q.sql().contains("sigValid"), "the latch column is written");
+        assert!(
+            matches!(q.params()[12], crate::d1::QVal::Int(1)),
+            "the LAST bind is the latch verdict for the golden: {:?}",
+            q.params()[12]
         );
     }
 

@@ -391,9 +391,7 @@ pub fn live_view_sql() -> String {
                   covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                   covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
-                  CASE WHEN unknownPot = 0 \
-                       OR (potBestSigRank > 0 AND potRank <= {quota}) \
-                       THEN 0 ELSE 1 END AS tier \
+                  CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
                     covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                     covPubA, covPubB, spent, spendingTxid, spentConfirmed, \

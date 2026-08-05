@@ -1996,9 +1996,7 @@ pub fn results_sql() -> String {
                   opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                   spent, spendingTxid, spentConfirmed, {DECODED}, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
-                  CASE WHEN unknownPot = 0 \
-                       OR (potBestSigRank > 0 AND potRank <= {quota}) \
-                       THEN 0 ELSE 1 END AS tier \
+                  CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                     opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                     spent, spendingTxid, spentConfirmed, {DECODED}, \

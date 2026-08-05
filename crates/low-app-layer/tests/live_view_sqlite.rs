@@ -1117,3 +1117,82 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
         1
     );
 }
+
+/// `keyless_candidates_sql` ALONE, pinned per-query (bsv-low #283).
+///
+/// The RED harness found this query's rank term could be neutered with
+/// NOTHING going red — every other `/live-view` cell reaches its pot through
+/// the KEYED `seat_markers_sql` path (the pot has decoded committed keys), so
+/// the keyless fallback had no pin of its own. It is the path a **fresh pot
+/// whose `tm_pot` admission is still in flight** takes, i.e. exactly the pot
+/// a recovering client most needs, and it is the one window here with no
+/// committed-key prefilter — so junk under ANY key competes.
+///
+/// THE REACHABILITY TRAP THIS CELL HAD TO CLEAR, stated because the first
+/// version of it did not (epoch Rule 9, "the code under test is never
+/// reached"): `corroborate_rows` chains `r.own_marker()` — the representative
+/// row's OWN v2 columns — in FRONT of the candidate list. So whenever the
+/// representative row is itself the honest v2 marker, corroboration succeeds
+/// without the keyless window contributing anything, and the cell is green no
+/// matter what that query returns. The RED harness caught exactly this: the
+/// first draft stayed green under a keyless-only injection and only reddened
+/// under one that ALSO neutered `live_view_sql`.
+///
+/// So the world here is the PRODUCTION shape — honest v1 FIRST (it is the
+/// representative, and a v1 row has no seat columns, so `own_marker()` is
+/// `None`) — which forces the honest v2 to arrive through the keyless window
+/// or not at all. The pot is deliberately left OUT of `pot_records` so the
+/// keyed path cannot answer either.
+#[test]
+fn the_keyless_candidate_window_alone_keeps_the_verified_marker() {
+    let conn = production_schema_db();
+    let w = wallet_of(0x42);
+    let me = identity_of(&w);
+    let pot = h64(0xac);
+    let game = h64(0x23);
+
+    // The honest v1, OLDEST — the representative row, and no seat columns.
+    file_party_game(&conn, &me, &game, &pot, GATE, "txKV1", 1_001);
+    latch_honest_v1(&conn, "txKV1");
+
+    // Junk next: 4x the per-pot attempt cap, all EARLIER than the honest v2,
+    // under a settle key nothing committed (there is no lock to check
+    // against — that is what "keyless" means).
+    let atk = bsv_rs::primitives::ec::PrivateKey::from_bytes(&{
+        let mut b = [0u8; 32];
+        b[31] = 0xc7;
+        b
+    })
+    .unwrap()
+    .public_key()
+    .to_hex()
+    .to_ascii_lowercase();
+    for j in 0..(LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT * 4) {
+        file_junk_v2(&conn, &me, &game, &pot, 0xc7, &atk, &format!("txKJ{j:03}"), 100 + j as i64);
+    }
+    // …then the honest v2, LAST and NEWEST.
+    file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txKHONEST", 9_999, 0x52);
+
+    let rows = query_rows(&conn, &me);
+    let idx = rows.iter().position(|r| r.pot_txid == pot).expect("the unknown pot is served");
+    // POSITIVE CONTROLS for reachability — both must hold or the assertion
+    // below proves nothing about the keyless window.
+    assert!(
+        rows[idx].cov_pub_a.is_none(),
+        "this pot has NO decoded keys, so the KEYED candidate query cannot answer"
+    );
+    assert!(
+        rows[idx].seat_settle_pubkey.is_none(),
+        "the representative row is the v1 marker, so `own_marker()` contributes \
+         nothing and the honest v2 can ONLY arrive via keyless_candidates_sql"
+    );
+
+    let candidates = fetch_candidates(&conn, &me, &rows);
+    let corr = corroborate_rows(&me, &rows, &candidates);
+    assert_eq!(
+        corr.claims[idx].as_ref().map(|c| c.game_id.clone()),
+        Some(game),
+        "the keyless window must still return the VERIFIED marker under a 4x-cap \
+         flood of earlier junk"
+    );
+}

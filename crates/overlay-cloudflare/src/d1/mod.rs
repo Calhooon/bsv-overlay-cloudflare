@@ -12,6 +12,7 @@ use worker::{D1Database, D1PreparedStatement};
 // =============================================================================
 
 /// A value that can be bound to a D1 prepared statement.
+#[derive(Debug, Clone, PartialEq)]
 pub enum QVal {
     Null,
     Int(i64),
@@ -116,6 +117,23 @@ impl Query {
     pub fn bind(mut self, val: impl Into<QVal>) -> Self {
         self.params.push(val.into());
         self
+    }
+
+    /// The SQL text this query will prepare.
+    ///
+    /// Exists so a WRITE path can be pinned BEHAVIOURALLY without a
+    /// `D1Database` (bsv-low #283): `execute` needs a live D1 binding and is
+    /// unreachable natively, which is exactly how a writer can be silently
+    /// neutered while every test stays green. With these two accessors a test
+    /// can take the query the real writer builds and replay it against real
+    /// SQLite. Read-only; no way to mutate a built query.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// The bound parameters, in bind order. See [`Query::sql`].
+    pub fn params(&self) -> &[QVal] {
+        &self.params
     }
 
     pub fn prepare(self, db: &D1Database) -> Result<D1PreparedStatement, String> {
