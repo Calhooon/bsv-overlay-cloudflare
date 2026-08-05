@@ -1519,7 +1519,7 @@ impl Engine {
                 Err(e) => {
                     warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] unparseable BEEF, skipping");
                     continue;
-                },
+                }
             };
 
             // Already structurally proven? The stored BEEF carries a merkle bump
@@ -1582,7 +1582,7 @@ impl Engine {
                 Err(e) => {
                     warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] stitch failed");
                     summary.stitch_failed += 1;
-                },
+                }
             }
         }
 
@@ -1724,21 +1724,19 @@ impl Engine {
         report.to_create = all_to_create.len();
         if !all_to_create.is_empty() {
             match advertiser.create_advertisements(&all_to_create).await {
-                Ok(tagged_beef) => {
-                    match self.submit(&tagged_beef, SubmitMode::CurrentTx).await {
-                        Ok(steak) => {
-                            for (topic, instructions) in &steak {
-                                report
-                                    .admitted
-                                    .insert(topic.clone(), instructions.outputs_to_admit.len());
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to submit new advertisements: {e}");
-                            report.submit_error = Some(e.to_string());
+                Ok(tagged_beef) => match self.submit(&tagged_beef, SubmitMode::CurrentTx).await {
+                    Ok(steak) => {
+                        for (topic, instructions) in &steak {
+                            report
+                                .admitted
+                                .insert(topic.clone(), instructions.outputs_to_admit.len());
                         }
                     }
-                }
+                    Err(e) => {
+                        error!("Failed to submit new advertisements: {e}");
+                        report.submit_error = Some(e.to_string());
+                    }
+                },
                 Err(e) => {
                     error!("Failed to create advertisements: {e}");
                     report.create_error = Some(e.to_string());
@@ -2060,8 +2058,7 @@ impl Engine {
                     let outcome_success = matches!(sync_outcome, Some(Ok(())));
                     match sync_outcome {
                         None => {
-                            let budget_ms =
-                                self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
+                            let budget_ms = self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
                             let msg = format!(
                                 "{peer_url}: per-peer sync budget of {budget_ms} ms EXCEEDED — dropped (bsv-low#302)"
                             );
@@ -4172,7 +4169,11 @@ mod tests {
         // The hanging peer was dropped LOUDLY (an error entry) and the loop
         // CONTINUED: the good peer was still attempted and completed.
         assert_eq!(topic_result.errors.len(), 1, "one budget-exceeded error");
-        assert!(topic_result.errors[0].contains("budget"), "{:?}", topic_result.errors);
+        assert!(
+            topic_result.errors[0].contains("budget"),
+            "{:?}",
+            topic_result.errors
+        );
         assert_eq!(
             created.borrow().as_slice(),
             ["https://hang.example.com", "https://good.example.com"],
@@ -4280,7 +4281,10 @@ mod tests {
             crate::gasp::PEER_QUARANTINE_THRESHOLD + 1
         );
         let result = engine.start_gasp_sync().await.unwrap();
-        assert!(result.topics_synced["tm_test"].errors.is_empty(), "re-quarantined");
+        assert!(
+            result.topics_synced["tm_test"].errors.is_empty(),
+            "re-quarantined"
+        );
 
         // The peer comes back to life: age to the next re-probe, then answer
         // like a healthy peer → SUCCESS resets the count to 0 (full
@@ -4502,7 +4506,9 @@ mod tests {
             ads: &[AdvertisementData],
         ) -> Result<TaggedBEEF, AdvertiserError> {
             if self.create_fails {
-                return Err(AdvertiserError::CreationFailed("mock create refused".into()));
+                return Err(AdvertiserError::CreationFailed(
+                    "mock create refused".into(),
+                ));
             }
             self.created.lock().unwrap().extend(ads.iter().cloned());
             Ok(TaggedBEEF::new(test_beef(), self.tag_topics.clone()))
@@ -4797,7 +4803,10 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(report.to_create, 0, "creation refused, not attempted");
-        assert!(created.lock().unwrap().is_empty(), "no create call on a blind read");
+        assert!(
+            created.lock().unwrap().is_empty(),
+            "no create call on a blind read"
+        );
         assert!(report.submit_error.is_none());
     }
 
@@ -4915,7 +4924,10 @@ mod tests {
             .unwrap();
 
         let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
-        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        managers.insert(
+            "Hello".into(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
         let mut engine = Engine::new(
             managers,
             HashMap::new(),
@@ -4950,7 +4962,10 @@ mod tests {
         let summary = engine.complete_missing_proofs(50, 0).await.unwrap();
         assert_eq!(summary.scanned, 1);
         assert_eq!(summary.proofless, 1);
-        assert_eq!(summary.completed, 1, "the proofless BEEF should be completed");
+        assert_eq!(
+            summary.completed, 1,
+            "the proofless BEEF should be completed"
+        );
         assert_eq!(fetcher.calls.get(), 1);
 
         // The stored BEEF now carries a proof for the target tx + the output
@@ -4964,7 +4979,8 @@ mod tests {
         assert_eq!(out.block_height, Some(850_000));
         let beef = bsv_rs::transaction::Beef::from_binary(out.beef.as_ref().unwrap()).unwrap();
         assert!(
-            beef.find_txid(&txid).is_some_and(bsv_rs::transaction::BeefTx::has_proof),
+            beef.find_txid(&txid)
+                .is_some_and(bsv_rs::transaction::BeefTx::has_proof),
             "completed BEEF must prove the target tx"
         );
 
@@ -5019,7 +5035,10 @@ mod tests {
             .unwrap();
 
         let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
-        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        managers.insert(
+            "Hello".into(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
         let mut engine = Engine::new(
             managers,
             HashMap::new(),
@@ -5135,7 +5154,10 @@ mod tests {
             calls: Cell::new(0),
         });
         let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
-        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        managers.insert(
+            "Hello".into(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
         let mut engine = Engine::new(
             managers,
             HashMap::new(),
@@ -5175,9 +5197,8 @@ mod tests {
         for raw in proven_raws {
             let mut tx = Transaction::from_hex(raw).unwrap();
             let id = tx.id();
-            tx.merkle_path = Some(
-                MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap(),
-            );
+            tx.merkle_path =
+                Some(MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap());
             // to_beef(true) carries the merkle proof into the BEEF, so the row
             // genuinely IS proven — yet its flag stays 0 (insert path).
             let proven_beef = tx.to_beef(true).unwrap();
@@ -5213,7 +5234,10 @@ mod tests {
             calls: Cell::new(0),
         });
         let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
-        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        managers.insert(
+            "Hello".into(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
         let mut engine = Engine::new(
             managers,
             HashMap::new(),
@@ -5260,9 +5284,8 @@ mod tests {
         for raw in proven_raws {
             let mut tx = Transaction::from_hex(raw).unwrap();
             let id = tx.id();
-            tx.merkle_path = Some(
-                MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap(),
-            );
+            tx.merkle_path =
+                Some(MerklePath::from_hex(&single_leaf_bump_hex(&id, 800_000)).unwrap());
             let proven_beef = tx.to_beef(true).unwrap();
             storage
                 .insert_output(&Output {
@@ -5307,7 +5330,10 @@ mod tests {
             calls: Cell::new(0),
         });
         let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
-        managers.insert("Hello".into(), Box::new(MockTopicManager::admitting(vec![0])));
+        managers.insert(
+            "Hello".into(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
         let mut engine = Engine::new(
             managers,
             HashMap::new(),

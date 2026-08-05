@@ -222,7 +222,7 @@ fn code_257(t: &str) -> bool {
     while let Some(i) = t[from..].find("257") {
         let at = from + i;
         from = at + 1; // "257" is ASCII, so at+1 is always a char boundary.
-        // Word boundaries around the digits (a longer number is not the code).
+                       // Word boundaries around the digits (a longer number is not the code).
         if at > 0 && is_word_byte(bytes[at - 1]) {
             continue;
         }
@@ -383,7 +383,11 @@ async fn post_arc_raw(
 
 /// One raw `{ "rawTx": <hex> }` POST to an ARC-compatible `/v1/tx`, returning
 /// the classified verdict. `api_key: None` posts keyless (GorillaPool).
-async fn post_arc_tx(base_url: &str, api_key: Option<&str>, tx_hex: &str) -> Result<ArcOutcome, String> {
+async fn post_arc_tx(
+    base_url: &str,
+    api_key: Option<&str>,
+    tx_hex: &str,
+) -> Result<ArcOutcome, String> {
     let (status, text) = post_arc_raw(base_url, api_key, tx_hex).await?;
     arc_verdict(status, &text)
 }
@@ -404,7 +408,9 @@ pub async fn broadcast_tx_hex_gated(
         Ok(outcome) => return Ok(outcome),
         Err(e) => e,
     };
-    worker::console_log!("broadcast-gated: TAAL transport trouble ({taal_err}); trying GorillaPool");
+    worker::console_log!(
+        "broadcast-gated: TAAL transport trouble ({taal_err}); trying GorillaPool"
+    );
     match post_arc_tx(GORILLAPOOL_ARC_URL, None, tx_hex).await {
         Ok(outcome) => Ok(outcome),
         Err(gp_err) => Err(format!("taal: {taal_err}; gorillapool: {gp_err}")),
@@ -2115,7 +2121,10 @@ mod tests {
             (400, "plain text bad request"),
         ] {
             assert!(
-                matches!(classify_submit_response(status, body), SubmitOutcome::Transport(_)),
+                matches!(
+                    classify_submit_response(status, body),
+                    SubmitOutcome::Transport(_)
+                ),
                 "HTTP {status} must be Transport"
             );
         }
@@ -2237,7 +2246,8 @@ mod tests {
         }
         // An UNRECOGNISED status code falls through to the same pre-#260 path:
         // with the validation-failure error → SyncRejected …
-        let unrecognised = r#"{"error":"transaction failed validation","reason":"fee too low","status":465}"#;
+        let unrecognised =
+            r#"{"error":"transaction failed validation","reason":"fee too low","status":465}"#;
         assert!(matches!(
             classify_submit_response(400, unrecognised),
             SubmitOutcome::SyncRejected(_)
@@ -2353,7 +2363,12 @@ mod tests {
     #[test]
     fn corroborator_accept_requires_a_real_network_accept_marker() {
         // Genuine accepts: SEEN_ON_NETWORK or better.
-        for status in ["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES", "MINED", "IMMUTABLE"] {
+        for status in [
+            "SEEN_ON_NETWORK",
+            "SEEN_MULTIPLE_NODES",
+            "MINED",
+            "IMMUTABLE",
+        ] {
             let body = format!(r#"{{"txid":"ab","txStatus":"{status}","extraInfo":""}}"#);
             assert_eq!(
                 corroborator_verdict(200, &body).unwrap(),
@@ -2390,7 +2405,10 @@ mod tests {
         for s in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED", "INVALID", "MALFORMED"] {
             let body = format!(r#"{{"txid":"ab","txStatus":"{s}","extraInfo":"fee too low"}}"#);
             assert!(
-                matches!(corroborator_verdict(200, &body).unwrap(), ArcOutcome::Rejected(_)),
+                matches!(
+                    corroborator_verdict(200, &body).unwrap(),
+                    ArcOutcome::Rejected(_)
+                ),
                 "{s} must corroborate the rejection"
             );
         }
@@ -2402,7 +2420,10 @@ mod tests {
         }
         // Transport stays transport (Err) — 5xx, auth, misroute, rate-limit.
         for status in [400u16, 401, 403, 404, 429, 500, 502, 503] {
-            assert!(corroborator_verdict(status, "trouble").is_err(), "HTTP {status}");
+            assert!(
+                corroborator_verdict(status, "trouble").is_err(),
+                "HTTP {status}"
+            );
         }
         // Already-known in any dress = the network HAS the tx = accept.
         assert!(matches!(
@@ -2510,8 +2531,14 @@ mod tests {
     fn parent_and_subject() -> (Vec<EfTx>, String) {
         (
             vec![
-                EfTx { txid: "parent".into(), ef: vec![1, 2, 3] },
-                EfTx { txid: "subject".into(), ef: vec![4, 5] },
+                EfTx {
+                    txid: "parent".into(),
+                    ef: vec![1, 2, 3],
+                },
+                EfTx {
+                    txid: "subject".into(),
+                    ef: vec![4, 5],
+                },
             ],
             "subject".to_string(),
         )
@@ -2545,10 +2572,7 @@ mod tests {
                         &format!(r#"{{"txid":"subject","txStatus":"{status}"}}"#),
                     )
                 } else {
-                    corroborator_verdict(
-                        200,
-                        r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
-                    )
+                    corroborator_verdict(200, r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#)
                 }
             }
         })
@@ -2575,10 +2599,7 @@ mod tests {
                         r#"{"txid":"subject","txStatus":"REJECTED","extraInfo":"fee too low"}"#,
                     )
                 } else {
-                    corroborator_verdict(
-                        200,
-                        r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
-                    )
+                    corroborator_verdict(200, r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#)
                 }
             }
         })
@@ -2600,10 +2621,7 @@ mod tests {
                         "taal: fetch failed; gorillapool: fetch failed".into(),
                     )
                 } else {
-                    corroborator_verdict(
-                        200,
-                        r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#,
-                    )
+                    corroborator_verdict(200, r#"{"txid":"parent","txStatus":"SEEN_ON_NETWORK"}"#)
                 }
             }
         })
@@ -2655,10 +2673,7 @@ mod tests {
             let is_subject = tx_hex == subject_hex;
             async move {
                 if is_subject {
-                    corroborator_verdict(
-                        200,
-                        r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#,
-                    )
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
                 } else {
                     Err::<ArcOutcome, String>("parent transport boom".into())
                 }
@@ -2678,9 +2693,18 @@ mod tests {
         // (EF inlines source scripts + sats), so the happy path is ONE POST —
         // no ancestor primes at all. This is the N+1→1 latency fix.
         let efs = vec![
-            EfTx { txid: "g".into(), ef: vec![0xaa] }, // grandparent
-            EfTx { txid: "p".into(), ef: vec![0xbb] }, // parent
-            EfTx { txid: "subject".into(), ef: vec![0xcc] }, // subject last
+            EfTx {
+                txid: "g".into(),
+                ef: vec![0xaa],
+            }, // grandparent
+            EfTx {
+                txid: "p".into(),
+                ef: vec![0xbb],
+            }, // parent
+            EfTx {
+                txid: "subject".into(),
+                ef: vec![0xcc],
+            }, // subject last
         ];
         let order = std::cell::RefCell::new(Vec::<String>::new());
         let out = corroborate_batch_with(&efs, "subject", |tx_hex| {
@@ -2705,9 +2729,18 @@ mod tests {
         // ANCESTRY ORDER, then the subject is retried LAST and its primed
         // verdict is final — byte-identical to the pre-#272 semantics.
         let efs = vec![
-            EfTx { txid: "g".into(), ef: vec![0xaa] }, // grandparent
-            EfTx { txid: "p".into(), ef: vec![0xbb] }, // parent
-            EfTx { txid: "subject".into(), ef: vec![0xcc] }, // subject last
+            EfTx {
+                txid: "g".into(),
+                ef: vec![0xaa],
+            }, // grandparent
+            EfTx {
+                txid: "p".into(),
+                ef: vec![0xbb],
+            }, // parent
+            EfTx {
+                txid: "subject".into(),
+                ef: vec![0xcc],
+            }, // subject last
         ];
         let order = std::cell::RefCell::new(Vec::<String>::new());
         let primed = std::cell::Cell::new(false);
@@ -2746,7 +2779,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_missing_subject_in_efs_is_an_error() {
-        let efs = vec![EfTx { txid: "parent".into(), ef: vec![1, 2, 3] }];
+        let efs = vec![EfTx {
+            txid: "parent".into(),
+            ef: vec![1, 2, 3],
+        }];
         let out = corroborate_batch_with(&efs, "subject", |_tx_hex| async {
             corroborator_verdict(200, r#"{"txStatus":"SEEN_ON_NETWORK"}"#)
         })
@@ -3101,7 +3137,10 @@ mod tests {
             |_kind| async { Ok(ArcOutcome::Rejected("orphan / missing inputs".into())) },
         )
         .await;
-        assert!(out.is_err(), "a single-provider rejection must be Err/502, never Ok");
+        assert!(
+            out.is_err(),
+            "a single-provider rejection must be Err/502, never Ok"
+        );
 
         // Genuine corroborator accept (already-known/mined) → admit, under
         // OUR subject txid.
@@ -3302,8 +3341,14 @@ mod tests {
         // Subject-only vs full-batch bodies: attempt 1 submits ONE tx (the
         // subject's EF); the fallback batch is the concatenation of all legs.
         let efs = vec![
-            EfTx { txid: "parent".into(), ef: vec![1, 2, 3] },
-            EfTx { txid: "subject".into(), ef: vec![4, 5] },
+            EfTx {
+                txid: "parent".into(),
+                ef: vec![1, 2, 3],
+            },
+            EfTx {
+                txid: "subject".into(),
+                ef: vec![4, 5],
+            },
         ];
         let subject_only = &efs.iter().find(|e| e.txid == "subject").unwrap().ef;
         assert_eq!(subject_only.len(), 2, "subject-only body is the subject EF");
@@ -3315,7 +3360,10 @@ mod tests {
     #[test]
     fn arcade_fatal_reason_folds_in_extra_info_when_present() {
         // #209: the captured extraInfo is threaded into the reason text.
-        assert_eq!(arcade_fatal_reason("ab", "REJECTED", ""), "Arcade REJECTED ab");
+        assert_eq!(
+            arcade_fatal_reason("ab", "REJECTED", ""),
+            "Arcade REJECTED ab"
+        );
         assert_eq!(
             arcade_fatal_reason("ab", "REJECTED", "PROCESSING (4): failed to validate"),
             "Arcade REJECTED ab (PROCESSING (4): failed to validate)"
@@ -3325,7 +3373,10 @@ mod tests {
     #[test]
     fn verdict_accepts_2xx_ok_status() {
         let body = r#"{"txid":"ab","txStatus":"SEEN_ON_NETWORK","extraInfo":""}"#;
-        assert_eq!(arc_verdict(200, body).unwrap(), ArcOutcome::Accepted("ab".into()));
+        assert_eq!(
+            arc_verdict(200, body).unwrap(),
+            ArcOutcome::Accepted("ab".into())
+        );
     }
 
     #[test]
@@ -3342,7 +3393,10 @@ mod tests {
     #[test]
     fn verdict_rejects_orphan_extra_info() {
         let body = r#"{"txid":"ab","txStatus":"SEEN_ON_NETWORK","extraInfo":"tx is an ORPHAN"}"#;
-        assert!(matches!(arc_verdict(200, body).unwrap(), ArcOutcome::Rejected(_)));
+        assert!(matches!(
+            arc_verdict(200, body).unwrap(),
+            ArcOutcome::Rejected(_)
+        ));
     }
 
     #[test]
@@ -3351,8 +3405,14 @@ mod tests {
         // not shop for a second opinion.
         let v = arc_verdict(465, r#"{"detail":"fee too low"}"#).unwrap();
         assert!(matches!(v, ArcOutcome::Rejected(_)));
-        assert!(matches!(arc_verdict(460, "bad").unwrap(), ArcOutcome::Rejected(_)));
-        assert!(matches!(arc_verdict(473, "policy").unwrap(), ArcOutcome::Rejected(_)));
+        assert!(matches!(
+            arc_verdict(460, "bad").unwrap(),
+            ArcOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            arc_verdict(473, "policy").unwrap(),
+            ArcOutcome::Rejected(_)
+        ));
     }
 
     #[test]
@@ -3384,7 +3444,10 @@ mod tests {
         ));
         let dressed =
             r#"{"txid":"ab","txStatus":"REJECTED","extraInfo":"transaction already mined"}"#;
-        assert!(matches!(arc_verdict(200, dressed).unwrap(), ArcOutcome::Accepted(_)));
+        assert!(matches!(
+            arc_verdict(200, dressed).unwrap(),
+            ArcOutcome::Accepted(_)
+        ));
         // NEGATED forms are failures, not already-known.
         assert!(arc_verdict(500, "unknown transaction").is_err());
     }
@@ -3489,7 +3552,10 @@ mod tests {
             );
         }
         // Guard the guard: the corpus must actually exercise the hazard.
-        assert!(collisions > 5, "vacuous corpus: only {collisions} '257' hits");
+        assert!(
+            collisions > 5,
+            "vacuous corpus: only {collisions} '257' hits"
+        );
     }
 
     #[test]
@@ -3621,9 +3687,8 @@ mod tests {
                 }
             }
             // 4. the 2xx-error dress: `{txStatus} {extraInfo}`.
-            let two_xx = format!(
-                r#"{{"txid":"{txid}","txStatus":"REJECTED","extraInfo":"{prose}"}}"#
-            );
+            let two_xx =
+                format!(r#"{{"txid":"{txid}","txStatus":"REJECTED","extraInfo":"{prose}"}}"#);
             match arc_verdict(200, &two_xx).unwrap() {
                 ArcOutcome::Rejected(_) => {}
                 other => panic!("2xx {prose} must stay Rejected, got {other:?}"),
@@ -3641,7 +3706,9 @@ mod tests {
         let txid = REAL_LEDGER_TXIDS_CONTAINING_257[1];
         let body = arc_error_body(465, "Fee too low", known, txid);
         assert!(already_known(&body));
-        assert!(already_known(&overlay_422(&format!("ARC HTTP 465: {body}"))));
+        assert!(already_known(&overlay_422(&format!(
+            "ARC HTTP 465: {body}"
+        ))));
         assert!(already_known(&overlay_422(&format!("REJECTED {known}"))));
         match arc_verdict(465, &body).unwrap() {
             ArcOutcome::Accepted(_) => {}
@@ -3665,7 +3732,11 @@ mod tests {
         ] {
             assert!(!already_known(s), "substring 'mined' read as known: {s}");
         }
-        for s in ["MINED", "transaction already mined", "tx was mined in block"] {
+        for s in [
+            "MINED",
+            "transaction already mined",
+            "tx was mined in block",
+        ] {
             assert!(already_known(s), "real mined dress lost: {s}");
         }
         // The classification consequence: a non-2xx stale-block body is
@@ -3772,7 +3843,10 @@ mod tests {
         );
         let b = ArcadeBroadcaster::new("https://h.example");
         assert_eq!(b.txs_endpoint(), "https://h.example/txs");
-        assert_eq!(b.status_endpoint("deadbeef"), "https://h.example/tx/deadbeef");
+        assert_eq!(
+            b.status_endpoint("deadbeef"),
+            "https://h.example/tx/deadbeef"
+        );
     }
 
     #[test]

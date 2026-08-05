@@ -271,7 +271,10 @@ mod tests {
             .list_for_game_winner(&"11".repeat(32), "02aa", 10)
             .await
             .unwrap();
-        assert_eq!(rows[0].bundle, b"FIRST", "first insert for the outpoint kept");
+        assert_eq!(
+            rows[0].bundle, b"FIRST",
+            "first insert for the outpoint kept"
+        );
     }
 
     #[tokio::test]
@@ -317,7 +320,11 @@ mod tests {
             "limit": 5
         }))
         .unwrap();
-        let ProofQuery::ProofsFor { game_id, winner, limit } = q;
+        let ProofQuery::ProofsFor {
+            game_id,
+            winner,
+            limit,
+        } = q;
         assert_eq!(game_id.len(), 64);
         assert_eq!(winner.len(), 66);
         assert_eq!(limit, Some(5));

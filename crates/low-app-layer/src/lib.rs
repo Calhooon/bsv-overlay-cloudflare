@@ -19,10 +19,20 @@
 //!   a service binding (a plain workers.dev fetch to a same-account worker
 //!   loops back to the caller, so the binding is required).
 //!
-//! STRICTLY READ-ONLY: this worker NEVER writes to the DB. It runs no
-//! migrations (the overlay owns the schema), takes no queue, and holds no
-//! secrets — every route is a public GET over public chain facts, answered
-//! with wildcard CORS so the browser can call it cross-origin.
+//! STRICTLY READ-ONLY on DATA: this worker never inserts, updates or deletes
+//! a row. It takes no queue and holds no secrets — every route is a public
+//! GET over public chain facts, answered with wildcard CORS so the browser
+//! can call it cross-origin.
+//!
+//! **One exception, and it is DDL rather than data (bsv-low #283):** the
+//! overlay owns the schema and applies `OVERLAY_MIGRATIONS` on ITS cold
+//! start, which is not an ordering this worker can wait for — a cold isolate
+//! here can reach a column the overlay has not added yet and fail every
+//! recovery query with `no such column`. So [`schema`] issues ONE additive,
+//! idempotent `ALTER TABLE … ADD COLUMN` for the one column this worker reads
+//! and cannot serve without, at most once per isolate, pinned byte-identical
+//! to the overlay's own migration. It is not a migration runner and must not
+//! become one — see `docs/DEPLOY-ORDER-AND-SCHEMA.md`.
 //!
 //! Routes:
 //! - `GET /utxo-status?outpoints=<txid>.<vout>,…` — spent-status of up to 64
@@ -170,10 +180,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // fresh response, so the handler's cache header must be re-applied).
     if let Some(session) = session {
         let status = resp.status_code();
-        let value: Value = resp
-            .json()
-            .await
-            .unwrap_or_else(|_| serde_json::json!({ "error": "handler returned a non-JSON response" }));
+        let value: Value = resp.json().await.unwrap_or_else(
+            |_| serde_json::json!({ "error": "handler returned a non-JSON response" }),
+        );
         resp = bsv_middleware_cloudflare::sign_json_response(&value, status, &[], &session)
             .map_err(|e| worker::Error::from(e.to_string()))?;
         resp.headers_mut().set("Content-Type", "application/json")?;

@@ -56,24 +56,24 @@ fn admit_pot(conn: &Connection, txid: &str, created_at: i64, cov_height: Option<
         store_record_sql(),
         params![
             txid,
-            0i64,                                        // outputIndex
-            0i64,                                        // spent
-            Option::<String>::None,                      // spendingTxid
-            0i64,                                        // spentConfirmed
-            created_at,                                  // createdAt (test-controlled)
-            covenant.then_some("covenant"),              // lockKind
-            covenant.then(|| h66(0x0a)),                 // pubA
-            covenant.then(|| h66(0x0b)),                 // pubB
-            covenant.then(|| h66(0x0c)),                 // pubTower
-            covenant.then(|| "aa".repeat(20)),           // payPkhA
-            covenant.then(|| "bb".repeat(20)),           // payPkhB
-            covenant.then(|| "cc".repeat(20)),           // rakePkh
-            covenant.then_some(500i64),                  // stakeA
-            covenant.then_some(500i64),                  // stakeB
-            covenant.then_some(8i64),                    // feeSats
-            cov_height,                                  // recoveryHeight (committed)
-            covenant.then_some(1000i64),                 // potSats
-            i64::from(covenant),                         // paramsDecoded
+            0i64,                              // outputIndex
+            0i64,                              // spent
+            Option::<String>::None,            // spendingTxid
+            0i64,                              // spentConfirmed
+            created_at,                        // createdAt (test-controlled)
+            covenant.then_some("covenant"),    // lockKind
+            covenant.then(|| h66(0x0a)),       // pubA
+            covenant.then(|| h66(0x0b)),       // pubB
+            covenant.then(|| h66(0x0c)),       // pubTower
+            covenant.then(|| "aa".repeat(20)), // payPkhA
+            covenant.then(|| "bb".repeat(20)), // payPkhB
+            covenant.then(|| "cc".repeat(20)), // rakePkh
+            covenant.then_some(500i64),        // stakeA
+            covenant.then_some(500i64),        // stakeB
+            covenant.then_some(8i64),          // feeSats
+            cov_height,                        // recoveryHeight (committed)
+            covenant.then_some(1000i64),       // potSats
+            i64::from(covenant),               // paramsDecoded
         ],
     )
     .expect("store_record_sql");
@@ -94,7 +94,16 @@ fn mark_spent(
     match (confirmed, verdict) {
         (true, Some(v)) => conn.execute(
             sql,
-            params![spender, v, spender, spender, spent_height, spent_height, pot_txid, 0i64],
+            params![
+                spender,
+                v,
+                spender,
+                spender,
+                spent_height,
+                spent_height,
+                pot_txid,
+                0i64
+            ],
         ),
         (true, None) => conn.execute(
             sql,
@@ -121,7 +130,15 @@ fn file_party(
          (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
           sigHex, txid, outputIndex, createdAt) \
          VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', ?6, 0, ?7)",
-        params![identity, h66(0xbb), h64(0x11), pot_txid, recovery_height, marker_txid, at],
+        params![
+            identity,
+            h66(0xbb),
+            h64(0x11),
+            pot_txid,
+            recovery_height,
+            marker_txid,
+            at
+        ],
     )
     .expect("insert potparty_records");
 }
@@ -190,7 +207,9 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<RefundViewRow> {
             pot_txid: r.get("potTxid")?,
             pot_vout: r.get::<_, i64>("potVout")? as u32,
             marker_recovery_height: r.get::<_, i64>("recoveryHeight")? as u32,
-            cov_recovery_height: r.get::<_, Option<i64>>("covRecoveryHeight")?.map(|v| v as u64),
+            cov_recovery_height: r
+                .get::<_, Option<i64>>("covRecoveryHeight")?
+                .map(|v| v as u64),
             spent: r.get::<_, Option<i64>>("spent")?.map(|v| v != 0),
             spending_txid: r.get("spendingTxid")?,
             spent_confirmed: r.get::<_, Option<i64>>("spentConfirmed")?.map(|v| v != 0),
@@ -256,7 +275,11 @@ fn gate_open_at_and_past_the_gate() {
         let e = &assemble_refund_view(query_rows(&conn, &me), Some(tip as u64))[0];
         assert_eq!(e.status, RefundStatus::GateOpen);
         assert_eq!(e.status_source, Some("chain"));
-        assert_eq!(e.blocks_to_gate, Some(blocks), "clamped at 0, never negative");
+        assert_eq!(
+            e.blocks_to_gate,
+            Some(blocks),
+            "clamped at 0, never negative"
+        );
         assert!(e.gate_passed);
     }
 }
@@ -283,7 +306,14 @@ fn landed_on_a_confirmed_decoded_refund_verdict() {
 fn superseded_on_a_confirmed_settle_verdict() {
     let conn = production_schema_db();
     let (me, pot) = seed_armed_pot(&conn);
-    mark_spent(&conn, &pot, &h64(0xfe), true, Some("winner-a"), Some(900_150));
+    mark_spent(
+        &conn,
+        &pot,
+        &h64(0xfe),
+        true,
+        Some("winner-a"),
+        Some(900_150),
+    );
 
     let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_200))[0];
     assert_eq!(e.status, RefundStatus::Superseded);
@@ -344,8 +374,14 @@ fn unknown_on_every_incomplete_fact_set() {
     let noverdict_entry = entries.iter().find(|e| e.pot_txid == noverdict).unwrap();
     assert_eq!(noverdict_entry.verdict, None);
     let stale_entry = entries.iter().find(|e| e.pot_txid == stale).unwrap();
-    assert_eq!(stale_entry.verdict, None, "stale verdictTxid must not serve");
-    assert_eq!(stale_entry.spending_txid.as_deref(), Some(h64(0xf4).as_str()));
+    assert_eq!(
+        stale_entry.verdict, None,
+        "stale verdictTxid must not serve"
+    );
+    assert_eq!(
+        stale_entry.spending_txid.as_deref(),
+        Some(h64(0xf4).as_str())
+    );
     assert_eq!(stale_entry.spent_confirmed, Some(true));
 }
 
@@ -396,7 +432,10 @@ fn both_seats_backups_never_multiply_rows_and_bytes_never_leak() {
     // Display-only contract: the stored refund bytes NEVER reach the wire.
     let entries = assemble_refund_view(rows, Some(900_078));
     let body = refund_view_body(&me, Some(900_078), &entries);
-    assert!(!body.contains("0100de"), "refundRawHex bytes leaked into the body");
+    assert!(
+        !body.contains("0100de"),
+        "refundRawHex bytes leaked into the body"
+    );
     assert!(!body.contains("refundRawHex"));
 }
 
@@ -411,9 +450,12 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
     let stranger = h66(0xee);
     let rows = query_rows(&conn, &stranger);
     assert!(rows.is_empty());
-    let v: serde_json::Value =
-        serde_json::from_str(&refund_view_body(&stranger, None, &assemble_refund_view(rows, None)))
-            .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&refund_view_body(
+        &stranger,
+        None,
+        &assemble_refund_view(rows, None),
+    ))
+    .unwrap();
     assert_eq!(v["refunds"], serde_json::json!([]));
 
     // The route's invalid-identity guard (fail-safe-empty 200, never an
@@ -432,10 +474,21 @@ fn dust_replays_collapse_to_one_row_per_pot() {
     // WHICH row won the partition (delta round 2: with identical heights an
     // ASC→DESC drift in the oldest-representative ORDER BY passed unseen).
     for i in 0..40 {
-        file_party(&conn, &me, &pot, GATE + 1_000 + i, &format!("txREPLAY{i:03}"), 2_000 + i);
+        file_party(
+            &conn,
+            &me,
+            &pot,
+            GATE + 1_000 + i,
+            &format!("txREPLAY{i:03}"),
+            2_000 + i,
+        );
     }
     let rows = query_rows(&conn, &me);
-    assert_eq!(rows.len(), 1, "one pot ⇒ one row, whatever the replay count");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one pot ⇒ one row, whatever the replay count"
+    );
     // The representative is the OLDEST marker (the honest funding-time one) —
     // the only order an attacker cannot win by simply publishing later.
     assert_eq!(rows[0].marker_recovery_height, GATE as u32);
@@ -456,13 +509,27 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
     const REPLAYS: i64 = 60;
     const GHOSTS: u64 = 120;
     for i in 0..REPLAYS {
-        file_party(&conn, &me, &honest_pot, GATE, &format!("txREPLAY{i:03}"), 2_000 + i);
+        file_party(
+            &conn,
+            &me,
+            &honest_pot,
+            GATE,
+            &format!("txREPLAY{i:03}"),
+            2_000 + i,
+        );
     }
     let ghost_txid = |i: u64| format!("{:064x}", 0xdead_0000_u64 + i);
     for i in 0..GHOSTS {
         // Never admitted to pot_records — each a distinct partition, so only
         // the existence tier + quota bound them.
-        file_party(&conn, &me, &ghost_txid(i), GATE, &format!("txGHOST{i:03}"), 3_000 + i as i64);
+        file_party(
+            &conn,
+            &me,
+            &ghost_txid(i),
+            GATE,
+            &format!("txGHOST{i:03}"),
+            3_000 + i as i64,
+        );
     }
 
     let rows = query_rows(&conn, &me);
@@ -477,7 +544,10 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
     // sits inside the reserved quota — and here, with every ghost newer,
     // the quota is EXACTLY consumed: the newest quota-many ghosts.
     let pos = pots.iter().position(|t| **t == honest_pot).unwrap();
-    assert_eq!(pos, REFUND_VIEW_UNKNOWN_POT_QUOTA, "quota-many promoted ghosts, no more");
+    assert_eq!(
+        pos, REFUND_VIEW_UNKNOWN_POT_QUOTA,
+        "quota-many promoted ghosts, no more"
+    );
     let promoted: Vec<String> = (0..REFUND_VIEW_UNKNOWN_POT_QUOTA as u64)
         .map(|k| ghost_txid(GHOSTS - 1 - k))
         .collect();
@@ -489,7 +559,10 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
     // The demoted tier fills the remainder newest-first: the row after the
     // real pot is the newest UN-promoted ghost, and the oldest ghosts fell
     // off the page entirely.
-    assert_eq!(*pots[pos + 1], ghost_txid(GHOSTS - 1 - REFUND_VIEW_UNKNOWN_POT_QUOTA as u64));
+    assert_eq!(
+        *pots[pos + 1],
+        ghost_txid(GHOSTS - 1 - REFUND_VIEW_UNKNOWN_POT_QUOTA as u64)
+    );
     let dropped = (GHOSTS as usize + 1) - REFUND_VIEW_MAX_ROWS; // 21 oldest ghosts
     for i in 0..dropped as u64 {
         assert!(
@@ -575,12 +648,22 @@ fn row_cap_bounds_the_page_and_a_full_book_survives() {
     for i in 0..n {
         let pot = format!("{:064x}", 0x1000_u64 + i as u64);
         admit_pot(&conn, &pot, 1_000 + i as i64, Some(GATE));
-        file_party(&conn, &me, &pot, GATE, &format!("txM{i:03}"), 1_000 + i as i64);
+        file_party(
+            &conn,
+            &me,
+            &pot,
+            GATE,
+            &format!("txM{i:03}"),
+            1_000 + i as i64,
+        );
     }
     let rows = query_rows(&conn, &me);
     assert_eq!(rows.len(), REFUND_VIEW_MAX_ROWS, "hard cap");
     let unique: std::collections::HashSet<&String> = rows.iter().map(|r| &r.pot_txid).collect();
     assert_eq!(unique.len(), REFUND_VIEW_MAX_ROWS, "one row per pot");
     // Newest pots first — the 10 oldest fell off, not the newest.
-    assert_eq!(rows[0].pot_txid, format!("{:064x}", 0x1000_u64 + (n as u64 - 1)));
+    assert_eq!(
+        rows[0].pot_txid,
+        format!("{:064x}", 0x1000_u64 + (n as u64 - 1))
+    );
 }

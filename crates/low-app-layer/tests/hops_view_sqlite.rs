@@ -28,11 +28,11 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use bsv_overlay_cloudflare::d1_discovery::{hopparty_store_sql, mark_spent_sql, store_record_sql};
-use bsv_rs::wallet::{
-    Counterparty, CreateSignatureArgs, GetPublicKeyArgs, Protocol, ProtoWallet, SecurityLevel,
-};
 use bsv_rs::script::LockingScript;
 use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+use bsv_rs::wallet::{
+    Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
+};
 use low_app_layer::hops_view::{
     assemble_hops_view, expected_hop_lock_hex, hops_view_body, hops_view_sql, HopStatus,
     HopsViewRow, MarkerVerification, HOPS_VIEW_MAX_OUTPOINTS,
@@ -313,7 +313,14 @@ fn mark_hop_spent(conn: &Connection, hop_txid: &str, spender: &str, confirmed: b
     if confirmed {
         conn.execute(
             sql,
-            params![spender, spender, Option::<i64>::None, Option::<i64>::None, hop_txid, 0i64],
+            params![
+                spender,
+                spender,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                hop_txid,
+                0i64
+            ],
         )
     } else {
         conn.execute(sql, params![spender, hop_txid, 0i64])
@@ -386,10 +393,16 @@ fn real_marker_in_its_production_container_is_verified_and_unspent() {
 
     let rows = query_rows(&conn, &m.identity_hex);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].hop_txid, txid, "the container supplies the hop txid");
+    assert_eq!(
+        rows[0].hop_txid, txid,
+        "the container supplies the hop txid"
+    );
     assert_eq!(rows[0].marker_txid, txid, "…and it IS the marker's tx");
     assert_eq!(rows[0].marker_vout, 1);
-    assert_eq!(rows[0].hop_sats, 80_800, "8-byte LE sats round-trip the schema");
+    assert_eq!(
+        rows[0].hop_sats, 80_800,
+        "8-byte LE sats round-trip the schema"
+    );
     assert_eq!(rows[0].hop_sats_on_chain, Some(80_800), "the chain agrees");
     assert_eq!(rows[0].container_outputs, 2);
     assert_eq!(
@@ -408,7 +421,11 @@ fn real_marker_in_its_production_container_is_verified_and_unspent() {
         "positive control: real sigs + a container that really pays the claimed \
          value to the claimed key clears every bar"
     );
-    assert_eq!(e.game_id, hex::encode(GAME), "the /live-view join key rides each entry");
+    assert_eq!(
+        e.game_id,
+        hex::encode(GAME),
+        "the /live-view join key rides each entry"
+    );
 }
 
 // ── refusal labels: served, labeled, never dropped, never verified ─────────
@@ -568,7 +585,11 @@ fn opponent_minted_marker_with_victim_identity_is_unverified() {
     admit_hop(&conn, &txid, 80_800, 1_000);
 
     let rows = query_rows(&conn, &victim_hex);
-    assert_eq!(rows.len(), 1, "the row lands in the VICTIM's view (admission cannot stop it)");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the row lands in the VICTIM's view (admission cannot stop it)"
+    );
     assert_eq!(
         rows[0].hop_lock_hex.as_deref().map(str::to_ascii_lowercase),
         Some(expected_hop_lock_hex(&attacker_settle_hex).unwrap()),
@@ -599,7 +620,10 @@ fn a_replay_container_verifies_only_by_paying_the_victim() {
     // The attacker's replay: same marker bytes, different container, and it
     // really pays the victim's settle key the full amount.
     let paid_txid = admit_marker(&conn, &m, 80_800, 0x02, 2_000);
-    assert_ne!(paid_txid, honest_txid, "a distinct container ⇒ a distinct outpoint");
+    assert_ne!(
+        paid_txid, honest_txid,
+        "a distinct container ⇒ a distinct outpoint"
+    );
     // A cheaper replay: same bytes, 1 sat.
     let (beef, _) = container(
         &expected_hop_lock_hex(&m.settle_pub_hex).unwrap(),
@@ -640,7 +664,11 @@ fn unindexed_hop_is_unknown_status_but_still_verifiable() {
     admit_marker(&conn, &m, 80_800, 0x01, 1_001);
 
     let rows = query_rows(&conn, &m.identity_hex);
-    assert_eq!(rows.len(), 1, "an unindexed hop is still SERVED (promoted quota)");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an unindexed hop is still SERVED (promoted quota)"
+    );
     assert_eq!(rows[0].spent, None, "never asserted unspent");
     let (entries, _, _) = assemble_hops_view(rows);
     let e = &entries[0];
@@ -671,7 +699,10 @@ fn spend_statuses_confirmed_vs_parked() {
     let (entries, _, _) = assemble_hops_view(query_rows(&conn, &ma.identity_hex));
     assert_eq!(entries.len(), 2);
     let a = entries.iter().find(|e| e.hop_txid == a_txid).unwrap();
-    assert_eq!((a.status, a.status_source), (HopStatus::Spent, Some("chain")));
+    assert_eq!(
+        (a.status, a.status_source),
+        (HopStatus::Spent, Some("chain"))
+    );
     assert_eq!(a.spending_txid.as_deref(), Some(h64(0xfe).as_str()));
     let b = entries.iter().find(|e| e.hop_txid == b_txid).unwrap();
     assert_eq!((b.status, b.status_source), (HopStatus::Unknown, None));
@@ -692,7 +723,8 @@ fn forged_markers_cannot_evict_the_honest_row_in_either_stamp_order() {
         let honest_at = if honest_first { 500 } else { 5_000 };
         let junk = build_marker(0xa1, GAME, 0, 80_800, false);
         let mut tx = Transaction::new();
-        tx.add_input(TransactionInput::new("aa".repeat(32), 0)).unwrap();
+        tx.add_input(TransactionInput::new("aa".repeat(32), 0))
+            .unwrap();
         tx.add_output(TransactionOutput {
             satoshis: Some(80_800),
             locking_script: LockingScript::from_hex(
@@ -717,7 +749,11 @@ fn forged_markers_cannot_evict_the_honest_row_in_either_stamp_order() {
         admit_hop(&conn, &txid, 80_800, 900);
 
         let rows = query_rows(&conn, &m.identity_hex);
-        assert_eq!(rows.len(), 3, "the SUPERSET serves all three (order {honest_first})");
+        assert_eq!(
+            rows.len(),
+            3,
+            "the SUPERSET serves all three (order {honest_first})"
+        );
         let (entries, _, _) = assemble_hops_view(rows);
         assert_eq!(
             entries
@@ -781,10 +817,17 @@ fn truncation_bit_via_the_shipped_sql() {
     );
 
     let (entries, truncated, _) = assemble_hops_view(query_rows(&conn, &identity_hex));
-    assert!(truncated, "more outpoints than the page ⇒ honestly incomplete");
+    assert!(
+        truncated,
+        "more outpoints than the page ⇒ honestly incomplete"
+    );
     let distinct: std::collections::HashSet<&String> =
         entries.iter().map(|e| &e.hop_txid).collect();
-    assert_eq!(distinct.len(), HOPS_VIEW_MAX_OUTPOINTS, "page bound in outpoints");
+    assert_eq!(
+        distinct.len(),
+        HOPS_VIEW_MAX_OUTPOINTS,
+        "page bound in outpoints"
+    );
 
     // Drop the surplus hops → exactly the page → complete.
     conn.execute(
@@ -811,9 +854,10 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
     let rows = query_rows(&conn, &stranger);
     assert!(rows.is_empty());
     let (entries, truncated, exhausted) = assemble_hops_view(rows);
-    let v: serde_json::Value =
-        serde_json::from_str(&hops_view_body(&stranger, None, &entries, truncated, exhausted))
-            .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&hops_view_body(
+        &stranger, None, &entries, truncated, exhausted,
+    ))
+    .unwrap();
     assert_eq!(v["hops"], serde_json::json!([]));
     assert_eq!(v["truncated"], serde_json::json!(false));
 
@@ -845,7 +889,8 @@ fn pre_migration_schema_faults_the_query_the_routes_503_path() {
 /// all naming the VICTIM's identity. Returns the container txid.
 fn flood_container(conn: &Connection, victim_seed: u8, k: u32, dust: u64, at: i64) -> String {
     let mut tx = Transaction::new();
-    tx.add_input(TransactionInput::new("f1".repeat(32), 0)).unwrap();
+    tx.add_input(TransactionInput::new("f1".repeat(32), 0))
+        .unwrap();
     let mut markers = Vec::new();
     for v in 0..k {
         let m = build_marker(victim_seed, GAME, v, dust, false);
@@ -877,11 +922,25 @@ fn flood_container(conn: &Connection, victim_seed: u8, k: u32, dust: u64, at: i6
         conn.execute(
             store_record_sql(),
             params![
-                &txid, v as i64, 0i64, Option::<String>::None, 0i64, at + v as i64,
-                Some("p2pkh"), Option::<String>::None, Option::<String>::None,
-                Option::<String>::None, Option::<String>::None, Option::<String>::None,
-                Option::<String>::None, Option::<i64>::None, Option::<i64>::None,
-                Option::<i64>::None, Option::<i64>::None, Some(dust as i64), 1i64,
+                &txid,
+                v as i64,
+                0i64,
+                Option::<String>::None,
+                0i64,
+                at + v as i64,
+                Some("p2pkh"),
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                Some(dust as i64),
+                1i64,
             ],
         )
         .expect("store_record_sql");
@@ -912,8 +971,7 @@ fn a_dust_flood_cannot_evict_the_honest_verified_row() {
         admit_hop(&conn, &honest_txid, 80_800, 1_000);
         flood_container(&conn, 0xa1, k, 1, 5_000);
 
-        let (entries, truncated, _) =
-            assemble_hops_view(query_rows(&conn, &honest.identity_hex));
+        let (entries, truncated, _) = assemble_hops_view(query_rows(&conn, &honest.identity_hex));
         let honest_row = entries
             .iter()
             .find(|e| e.hop_txid == honest_txid)
@@ -952,7 +1010,10 @@ fn a_value_matched_reactive_flood_cannot_evict_either() {
             .find(|e| e.hop_txid == honest_txid)
             .unwrap_or_else(|| panic!("k={k}: the honest hop must survive"));
         assert_eq!(honest_row.marker_verified, MarkerVerification::Verified);
-        assert_eq!(entries.iter().position(|e| e.hop_txid == honest_txid), Some(0));
+        assert_eq!(
+            entries.iter().position(|e| e.hop_txid == honest_txid),
+            Some(0)
+        );
     }
 }
 
@@ -1053,7 +1114,8 @@ fn the_gameid_scope_reaches_a_crowded_out_row() {
     // A pre-dated, value-matched flood naming a DIFFERENT game.
     let other_game = [0x77u8; 32];
     let mut tx = Transaction::new();
-    tx.add_input(TransactionInput::new("f2".repeat(32), 0)).unwrap();
+    tx.add_input(TransactionInput::new("f2".repeat(32), 0))
+        .unwrap();
     let mut markers = Vec::new();
     for v in 0..120u32 {
         let m = build_marker(0xa1, other_game, v, 80_800, false);
@@ -1125,9 +1187,11 @@ fn the_gameid_scope_does_not_escape_a_same_game_flood() {
          — if this ever passes, `routes.rs` and the residual docs must be \
          rewritten to match"
     );
-    assert!(scoped_truncated, "the scoped page is honestly flagged incomplete");
+    assert!(
+        scoped_truncated,
+        "the scoped page is honestly flagged incomplete"
+    );
 }
-
 
 /// gate MEDIUM-5 — the two windows over `hopparty_records` must not
 /// disagree about unknown-hop promotion. The runtime dependency does not
@@ -1191,7 +1255,6 @@ fn fresh_ghosts_cannot_take_the_promotion_quota_from_an_older_unknown_hop() {
     }
 }
 
-
 /// gate LOW — a `hopSats >= 2^63` marker wraps at the D1 bind. Pinned so
 /// the SAFE fail direction is a property, not an accident: the wrapped
 /// value cannot rebuild the identity challenge, so the row is served as
@@ -1218,7 +1281,6 @@ fn an_out_of_range_hop_sats_row_is_served_unverified_never_verified() {
         "an out-of-range hopSats can never become verified"
     );
 }
-
 
 /// `paidTier`'s ACTUAL job — and this cell had to be RE-FIXTURED, because
 /// the first version of it was blind to the key it names (delta gate
@@ -1297,4 +1359,3 @@ fn a_predated_dust_flood_is_repelled_by_the_value_key() {
         );
     }
 }
-

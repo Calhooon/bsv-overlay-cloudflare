@@ -22,12 +22,8 @@ use overlay_discovery::low::storage::{
     LowRecord, LowRecordType, LowStorage, LowStorageError, LOW_BY_KEY_RESULT_CAP,
     OPEN_TABLES_PER_HOST_CAP, OPEN_TABLES_RESULT_CAP,
 };
-use overlay_discovery::pot::storage::{
-    pot_beef_has_proof, PotRecord, PotStorage, PotStorageError,
-};
-use overlay_discovery::potparty::storage::{
-    PotpartyRecord, PotpartyStorage, PotpartyStorageError,
-};
+use overlay_discovery::pot::storage::{pot_beef_has_proof, PotRecord, PotStorage, PotStorageError};
+use overlay_discovery::potparty::storage::{PotpartyRecord, PotpartyStorage, PotpartyStorageError};
 use overlay_discovery::potrefund::storage::{
     PotrefundRecord, PotrefundStorage, PotrefundStorageError,
 };
@@ -1236,19 +1232,19 @@ impl LowStorage for D1LowStorage {
 
     async fn find_by_game_id(&self, game_id: &str) -> Result<Vec<LowRecord>, LowStorageError> {
         let rows: Vec<LowRow> = Query::new(low_by_game_id_sql())
-        .bind(game_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(low_err)?;
+            .bind(game_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(low_err)?;
         Ok(low_records_from_rows(rows))
     }
 
     async fn find_by_host(&self, identity_key: &str) -> Result<Vec<LowRecord>, LowStorageError> {
         let rows: Vec<LowRow> = Query::new(low_by_host_sql())
-        .bind(identity_key)
-        .fetch_all(&self.db)
-        .await
-        .map_err(low_err)?;
+            .bind(identity_key)
+            .fetch_all(&self.db)
+            .await
+            .map_err(low_err)?;
         Ok(low_records_from_rows(rows))
     }
 
@@ -1376,11 +1372,11 @@ impl RevealStorage for D1RevealStorage {
         seat: u8,
     ) -> Result<Vec<RevealRecord>, RevealStorageError> {
         let rows: Vec<RevealRow> = Query::new(reveal_by_game_seat_sql())
-        .bind(game_id)
-        .bind(seat as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(reveal_err)?;
+            .bind(game_id)
+            .bind(seat as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(reveal_err)?;
         Ok(rows.into_iter().map(RevealRow::into_record).collect())
     }
 
@@ -1389,10 +1385,10 @@ impl RevealStorage for D1RevealStorage {
         game_id: &str,
     ) -> Result<Vec<RevealRecord>, RevealStorageError> {
         let rows: Vec<RevealRow> = Query::new(reveal_by_game_id_sql())
-        .bind(game_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(reveal_err)?;
+            .bind(game_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(reveal_err)?;
         Ok(rows.into_iter().map(RevealRow::into_record).collect())
     }
 }
@@ -1933,9 +1929,7 @@ impl PotStorage for D1PotStorage {
         }
         Ok(outpoints
             .iter()
-            .map(|(txid, output_index)| {
-                by_outpoint.get(&(txid.clone(), *output_index)).cloned()
-            })
+            .map(|(txid, output_index)| by_outpoint.get(&(txid.clone(), *output_index)).cloned())
             .collect())
     }
 
@@ -2745,7 +2739,7 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// #252 republish sweep would land a latched row for any pot the honest
 /// client still sees, and it will not: `decidePartyStep` stops the moment an
 /// indexed row exists for the pot, and a legacy row is an indexed row. It is
-/// permanent until the lazy backfill lands (tracked as the #283 follow-up):
+/// permanent until the lazy backfill lands (bsv-low#355):
 ///  - a legacy-vs-legacy contest is decided exactly as it was before, so an
 ///    attacker who filed junk BEFORE the migration keeps whatever advantage
 ///    that junk already had (`free_ghost_pot_records_do_erase_legacy_
@@ -3783,12 +3777,12 @@ impl ProofStorage for D1ProofStorage {
         limit: usize,
     ) -> Result<Vec<ProofRecord>, ProofStorageError> {
         let rows: Vec<ProofRow> = Query::new(proof_list_for_game_winner_sql())
-        .bind(game_id)
-        .bind(winner)
-        .bind(limit as u32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(proof_err)?;
+            .bind(game_id)
+            .bind(winner)
+            .bind(limit as u32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(proof_err)?;
         Ok(rows.into_iter().map(ProofRow::into_record).collect())
     }
 }
@@ -3820,7 +3814,9 @@ mod tests {
         }
         let candidates = |min_age: u64| -> Vec<String> {
             let sql = pot_beef_candidates_sql(16, min_age);
-            let mut stmt = conn.prepare(&sql).expect("shipped candidate SQL must parse");
+            let mut stmt = conn
+                .prepare(&sql)
+                .expect("shipped candidate SQL must parse");
             let mut got: Vec<String> = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
@@ -3867,11 +3863,9 @@ mod tests {
         // a verified row answers proof_verified = 1 (the Rust side then
         // refuses the admit overwrite: never weaken a verified answer).
         let (len, verified): (i64, i64) = conn
-            .query_row(
-                POT_BEEF_PROBE_SQL,
-                rusqlite::params!["fakebumped"],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row(POT_BEEF_PROBE_SQL, rusqlite::params!["fakebumped"], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(len, 3, "the verifying write replaced the bytes");
         assert_eq!(verified, 1);
@@ -3885,13 +3879,19 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(candidates(0), vec!["b1".to_string(), "b2".into(), "b3".into()]);
+        assert_eq!(
+            candidates(0),
+            vec!["b1".to_string(), "b2".into(), "b3".into()]
+        );
         conn.execute(
             &pot_beef_mark_proven_batch_sql(3),
             rusqlite::params!["b1", "b2", "b3"],
         )
         .unwrap();
-        assert!(candidates(0).is_empty(), "one batched statement latched all three");
+        assert!(
+            candidates(0).is_empty(),
+            "one batched statement latched all three"
+        );
     }
 
     #[test]
@@ -3910,7 +3910,10 @@ mod tests {
         };
         let r = row.into_record();
         assert_eq!(r.bundle, b"{\"v\":1}");
-        assert_eq!(r.bundle_b64, None, "legacy row: service falls back to encoding");
+        assert_eq!(
+            r.bundle_b64, None,
+            "legacy row: service falls back to encoding"
+        );
         assert_eq!(r.output_index, 2);
         assert_eq!(r.created_at, 1_234);
         assert_eq!(r.sig_hex, "3045ab");
@@ -4113,8 +4116,16 @@ mod tests {
         conn.execute(
             store_record_sql(),
             rusqlite::params![
-                txid, vout, 0i64, Option::<String>::None, 0i64, created_at, lock_kind, pub_a,
-                pub_a, pub_a, // pubB / pubTower ride the same fixture value
+                txid,
+                vout,
+                0i64,
+                Option::<String>::None,
+                0i64,
+                created_at,
+                lock_kind,
+                pub_a,
+                pub_a,
+                pub_a, // pubB / pubTower ride the same fixture value
                 Option::<String>::None,
                 Option::<String>::None,
                 Option::<String>::None,
@@ -4171,9 +4182,7 @@ mod tests {
                 sql,
                 rusqlite::params![spending_txid, v, spending_txid, txid, vout],
             ),
-            (false, None) => {
-                conn.execute(sql, rusqlite::params![spending_txid, txid, vout])
-            }
+            (false, None) => conn.execute(sql, rusqlite::params![spending_txid, txid, vout]),
         }
         .expect("mark_spent_sql executes");
     }
@@ -4200,7 +4209,15 @@ mod tests {
         // Pre-#284 admission (no decoded values), then a CONFIRMED spend
         // with a verdict + height.
         exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
-        exec_mark_spent(&conn, "potA", 0, "settleTx", true, Some("winner-a"), Some(800_000));
+        exec_mark_spent(
+            &conn,
+            "potA",
+            0,
+            "settleTx",
+            true,
+            Some("winner-a"),
+            Some(800_000),
+        );
         let before = read_pot_row(&conn, "potA", 0);
         assert_eq!(before.spent, 1);
         assert_eq!(before.verdict.as_deref(), Some("winner-a"));
@@ -4242,10 +4259,26 @@ mod tests {
     fn sql_unconfirmed_writer_cannot_displace_a_confirmed_verdict() {
         let conn = production_schema_db();
         exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
-        exec_mark_spent(&conn, "potA", 0, "realSettle", true, Some("winner-a"), Some(800_000));
+        exec_mark_spent(
+            &conn,
+            "potA",
+            0,
+            "realSettle",
+            true,
+            Some("winner-a"),
+            Some(800_000),
+        );
 
         // The attacker's unconfirmed claim — with its own forged verdict.
-        exec_mark_spent(&conn, "potA", 0, "forgedSpend", false, Some("winner-b"), None);
+        exec_mark_spent(
+            &conn,
+            "potA",
+            0,
+            "forgedSpend",
+            false,
+            Some("winner-b"),
+            None,
+        );
         let r = read_pot_row(&conn, "potA", 0);
         assert_eq!(r.spending_txid.as_deref(), Some("realSettle"));
         assert_eq!(r.verdict.as_deref(), Some("winner-a"));
@@ -4297,7 +4330,17 @@ mod tests {
         );
 
         // The overwrite attempts: a different stake, an empty-string key.
-        exec_store(&conn, "potA", 0, 2_000, Some("covenant"), Some(""), Some(999), Some(4), 1);
+        exec_store(
+            &conn,
+            "potA",
+            0,
+            2_000,
+            Some("covenant"),
+            Some(""),
+            Some(999),
+            Some(4),
+            1,
+        );
         let r = read_pot_row(&conn, "potA", 0);
         assert_eq!(r.stake_a, Some(1000), "stored 1000 survives incoming 999");
         assert_eq!(
@@ -4417,7 +4460,11 @@ mod tests {
         assert_eq!(after, before, "a stale CAS confirm changes NOTHING");
         assert_eq!(after.spending_txid.as_deref(), Some("settleS2"));
         assert_eq!(after.spent_confirmed, 1);
-        assert_eq!(after.spent_height, Some(802_000), "S2 never regains S1's height");
+        assert_eq!(
+            after.spent_height,
+            Some(802_000),
+            "S2 never regains S1's height"
+        );
         assert_eq!(read_spent_at(&conn, "potA"), before_at, "spentAt untouched");
 
         // The HIT case: pointer still the proof's spender. Sentinel the age
@@ -4430,15 +4477,29 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(exec_confirm_cas(&conn, "potB", 0, "settleS1", Some(800_000)));
+        assert!(exec_confirm_cas(
+            &conn,
+            "potB",
+            0,
+            "settleS1",
+            Some(800_000)
+        ));
         let r = read_pot_row(&conn, "potB", 0);
         assert_eq!(r.spent_confirmed, 1);
         assert_eq!(r.spent, 1);
-        assert_eq!(r.spending_txid.as_deref(), Some("settleS1"), "pointer untouched");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("settleS1"),
+            "pointer untouched"
+        );
         assert_eq!(r.spent_height, Some(800_000));
         assert_eq!(r.verdict.as_deref(), Some("tie"), "verdict pair untouched");
         assert_eq!(r.verdict_txid.as_deref(), Some("settleS1"));
-        assert_eq!(read_spent_at(&conn, "potB"), Some(12345), "spentAt not restamped");
+        assert_eq!(
+            read_spent_at(&conn, "potB"),
+            Some(12345),
+            "spentAt not restamped"
+        );
 
         // Same-pointer re-confirm with a NULL height keeps the stored one
         // (COALESCE — the mark_spent same-pointer semantics).
@@ -4587,7 +4648,9 @@ mod tests {
         insert_pot(&conn, &h64(0xbb), 0, 3, false);
 
         let sql = pot_spent_statuses_sql(3);
-        let mut stmt = conn.prepare(&sql).expect("batch SQL must parse on real SQLite");
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("batch SQL must parse on real SQLite");
         // Ask for (aa,1), (bb,0) and an absent (cc,0).
         let rows: Vec<(String, u32)> = stmt
             .query_map(
@@ -4686,7 +4749,13 @@ mod tests {
         insert_result(&conn, &winner, &honest_pot, "txHONEST", 1_001);
         // …then a post-hoc flood: replays on the real pot + ghost pots.
         for i in 0..60u32 {
-            insert_result(&conn, &winner, &honest_pot, &format!("txJUNK{i:03}"), 2_000 + i as i64);
+            insert_result(
+                &conn,
+                &winner,
+                &honest_pot,
+                &format!("txJUNK{i:03}"),
+                2_000 + i as i64,
+            );
         }
         for i in 0..120u32 {
             insert_result(
@@ -4698,7 +4767,10 @@ mod tests {
             );
         }
         for (scope, got) in [
-            ("resultsFor", result_window_col(&conn, Some(&winner), 100, "txid")),
+            (
+                "resultsFor",
+                result_window_col(&conn, Some(&winner), 100, "txid"),
+            ),
             ("recentResults", result_window_col(&conn, None, 100, "txid")),
         ] {
             assert!(
@@ -4863,8 +4935,15 @@ mod tests {
         // byte-identical.
         let wire_new = new_b64.clone().unwrap();
         let wire_old = BASE64.encode(hex::decode(old_hex).unwrap());
-        assert_eq!(wire_new, wire_old, "both read paths answer the same bundleBase64");
-        assert_eq!(wire_new, BASE64.encode(bundle), "…and it is the admitted bytes");
+        assert_eq!(
+            wire_new, wire_old,
+            "both read paths answer the same bundleBase64"
+        );
+        assert_eq!(
+            wire_new,
+            BASE64.encode(bundle),
+            "…and it is the admitted bytes"
+        );
     }
 
     // ── #290/#291: the low / reveal / collected shipped SQL ──────────────
@@ -4872,12 +4951,7 @@ mod tests {
     /// Insert a `low_records` row with an explicit TEXT `createdAt`
     /// (this table's `createdAt` is `datetime('now')` TEXT — the odd one
     /// out; every other LOW marker table stamps INTEGER unix seconds).
-    fn insert_low_for_host(
-        conn: &rusqlite::Connection,
-        txid: &str,
-        host: &str,
-        created_at: &str,
-    ) {
+    fn insert_low_for_host(conn: &rusqlite::Connection, txid: &str, host: &str, created_at: &str) {
         conn.execute(
             "INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, \
              gameId, stakeSats, rulesHash, relayUrl, expiryHeight, createdAt) \
@@ -4909,9 +4983,10 @@ mod tests {
         );
         let mut stmt = conn.prepare(&sql).expect("shipped lobby SQL must parse");
         let rows: Vec<(String, u64)> = stmt
-            .query_map(rusqlite::params!["table", 100u64, 5000u64, 800000u32], |row| {
-                Ok((row.get::<_, String>(1)?, row.get::<_, u64>(5)?))
-            })
+            .query_map(
+                rusqlite::params!["table", 100u64, 5000u64, 800000u32],
+                |row| Ok((row.get::<_, String>(1)?, row.get::<_, u64>(5)?)),
+            )
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -4920,7 +4995,10 @@ mod tests {
             vec![h64(0x03), h64(0x02), h64(0x01)],
             "newest-first by createdAt, not physical order"
         );
-        assert_eq!(rows[0].1, 1000, "full index row: stakeSats decoded column present");
+        assert_eq!(
+            rows[0].1, 1000,
+            "full index row: stakeSats decoded column present"
+        );
 
         // LIMIT proof: cap + 1 rows (each from a DISTINCT host, so the M3
         // per-host quota is not the binding constraint) ⇒ cap rows out, and
@@ -5131,7 +5209,9 @@ mod tests {
 
         let mut stmt = conn.prepare(&reveal_by_game_seat_sql()).unwrap();
         let txids: Vec<String> = stmt
-            .query_map(rusqlite::params![h64(0x11), 1u8], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![h64(0x11), 1u8], |row| {
+                row.get::<_, String>(0)
+            })
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -5144,7 +5224,11 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         txids.sort();
-        assert_eq!(txids, vec![h64(0x01), h64(0x02)], "both seats of the game, no leak");
+        assert_eq!(
+            txids,
+            vec![h64(0x01), h64(0x02)],
+            "both seats of the game, no leak"
+        );
     }
 
     /// #289: the batched collected-marker SQL selects per-(identity, gameId)
@@ -5688,7 +5772,15 @@ mod tests {
         for i in 0..100u32 {
             let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
             insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
-            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+            );
         }
         let fresh = h64(0xfa);
         insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 120, None);
@@ -5705,7 +5797,13 @@ mod tests {
                 None,
             );
         }
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
         assert!(
             got.contains(&fresh),
             "the fresh honest pot must survive newer ghost markers (#283a): {got:?}"
@@ -5725,7 +5823,15 @@ mod tests {
         for i in 0..100u32 {
             let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
             insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
-            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+            );
         }
         let fresh = h64(0xfa);
         insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None);
@@ -5742,7 +5848,13 @@ mod tests {
                 None,
             );
         }
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
         assert!(
             got.contains(&fresh),
             "stale ghosts must not displace the fresh pot's promoted slot: {got:?}"
@@ -5764,7 +5876,15 @@ mod tests {
         for i in 0..100u32 {
             let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
             insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
-            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+            );
         }
         let fresh = h64(0xfa);
         insert_potparty(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None);
@@ -5780,7 +5900,13 @@ mod tests {
                 None,
             );
         }
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
         assert!(
             !got.contains(&fresh),
             "KNOWN residual: a sustained older-but-fresh ghost flood still displaces — \
@@ -5978,7 +6104,13 @@ mod tests {
                 Some(false),
             );
         }
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
         let unique: std::collections::HashSet<&String> = got.iter().collect();
         for pot in &honest {
             assert!(
@@ -6005,14 +6137,28 @@ mod tests {
         for i in 0..100u32 {
             let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
             insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
-            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+            insert_potparty(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+            );
         }
         for i in 0..200u32 {
             let ghost = format!("{:064x}", 0xdead_0000u64 + i as u64);
             insert_pot(&conn, &ghost, 0, now, false);
             insert_potparty(&conn, &victim, &ghost, 0, &format!("txGP{i:03}"), now, None);
         }
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
         let unique: std::collections::HashSet<&String> = got.iter().collect();
         assert!(
             !unique.contains(&format!("{:064x}", 0x0000_1000u64)),
@@ -6049,7 +6195,16 @@ mod tests {
             );
         }
         let fresh = h64(0xfa);
-        insert_potparty_latched(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None, Some(true));
+        insert_potparty_latched(
+            &conn,
+            &victim,
+            &fresh,
+            0,
+            "txFRESH",
+            now - 30,
+            None,
+            Some(true),
+        );
         // 50 ghosts, ALL of them OLDER than the honest marker and inside the
         // freshness window — i.e. the sustained rolling flood that is still
         // a residual for legacy rows, five times the quota.
@@ -6065,7 +6220,13 @@ mod tests {
                 Some(false),
             );
         }
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
         let unique: std::collections::HashSet<&String> = got.iter().collect();
         assert!(
             unique.contains(&fresh),
@@ -6129,9 +6290,27 @@ mod tests {
         insert_pot(&conn, &pot, 0, 1_000, true);
         insert_potparty_latched(&conn, &victim, &pot, 0, "txONLY", 1_000, None, Some(false));
         let unknown = h64(0xac);
-        insert_potparty_latched(&conn, &victim, &unknown, 0, "txUNK", 1_001, None, Some(false));
-        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
-        assert!(got.contains(&pot), "an indexed pot is served whatever the latch says");
+        insert_potparty_latched(
+            &conn,
+            &victim,
+            &unknown,
+            0,
+            "txUNK",
+            1_001,
+            None,
+            Some(false),
+        );
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "potTxid",
+        );
+        assert!(
+            got.contains(&pot),
+            "an indexed pot is served whatever the latch says"
+        );
         assert!(
             got.contains(&unknown),
             "and an UNKNOWN pot is DEMOTED, never dropped — the fail direction \
@@ -6416,7 +6595,11 @@ mod tests {
         let p1 = page(100, 0);
         let p2 = page(100, 100);
         assert_eq!(p1.len(), 100, "page 1 LIMIT-bounded");
-        assert_eq!(p2.len(), 31, "page 2 = the remaining 30 junk + the honest row");
+        assert_eq!(
+            p2.len(),
+            31,
+            "page 2 = the remaining 30 junk + the honest row"
+        );
         assert!(
             !p1.contains(&"txHONEST".to_string()),
             "sanity: the buried row is NOT on page 1 (it needs paging)"
@@ -6785,7 +6968,7 @@ mod tests {
         let conn = production_schema_db();
         let victim = victim_id();
         let hop = h64(0xaa); // the container = the hop tx
-        // The hop outpoint is indexed via tm_lowfund (pot_records).
+                             // The hop outpoint is indexed via tm_lowfund (pot_records).
         insert_pot(&conn, &hop, 0, 1_000, false);
         // The honest marker (output 1 of the hop tx), then a same-outpoint
         // replay — ignored on the PK.
@@ -6819,14 +7002,21 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(rows.len(), 3, "superset: all three rows for the one outpoint");
+        assert_eq!(
+            rows.len(),
+            3,
+            "superset: all three rows for the one outpoint"
+        );
         assert!(
-            rows.iter().any(|(vout, sats, _, _)| *vout == 1 && *sats == 80_800),
+            rows.iter()
+                .any(|(vout, sats, _, _)| *vout == 1 && *sats == 80_800),
             "two earlier-stamped forgeries must NOT evict the honest row \
              (verification-before-collapse: the reader decides)"
         );
         // The CONTAINER's decoded facts reach the outer select.
-        assert!(rows.iter().all(|(_, _, on_chain, outs)| on_chain.is_some() && *outs == 2));
+        assert!(rows
+            .iter()
+            .all(|(_, _, on_chain, outs)| on_chain.is_some() && *outs == 2));
         // Within the outpoint: oldest first (the total order the reader
         // labels through).
         assert_eq!(rows[0].0, 2, "the oldest-stamped marker leads");
@@ -6896,7 +7086,16 @@ mod tests {
         // (outside the fresh-unknown window) — demoted behind every real
         // hop, but still served.
         for i in 0..5u8 {
-            insert_hopparty(&conn, &victim, &h64(0xe0 + i), 1, 0, 1, Some(1), 10 + i as i64);
+            insert_hopparty(
+                &conn,
+                &victim,
+                &h64(0xe0 + i),
+                1,
+                0,
+                1,
+                Some(1),
+                10 + i as i64,
+            );
         }
 
         let sql = hopparty_list_for_identity_sql();

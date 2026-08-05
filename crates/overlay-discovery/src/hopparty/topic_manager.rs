@@ -318,7 +318,10 @@ pub(crate) mod tests {
                 if cells.len() < 4 {
                     return None;
                 }
-                cells[1].parse::<usize>().ok().map(|i| (i, cells[2].to_string()))
+                cells[1]
+                    .parse::<usize>()
+                    .ok()
+                    .map(|i| (i, cells[2].to_string()))
             })
             .collect();
 

@@ -63,7 +63,7 @@
 //! attacker cannot reach rank 2 to cause it), it needs a page over the row
 //! cap, and a first-time marker published after the migration is latched —
 //! but it lands hardest on DEPLOY DAY, when 100% of rows are legacy and the
-//! first latched rows start arriving. The lazy backfill named below is what
+//! first latched rows start arriving. The lazy backfill (bsv-low#355) is what
 //! actually retires it.
 //!
 //! # What an attacker would need to reach rank 2
@@ -116,10 +116,9 @@ pub const SIG_VALID_COLUMN: &str = "sigValid";
 /// and a LEGACY row is an indexed row — so the #252 sweep never re-publishes
 /// for a pot that already has one. It is pinned in-tree on the client at
 /// `potPartyPending.test.ts:190`. The legacy tier is therefore **PERMANENT
-/// absent a backfill**, and the backfill is tracked (see
-/// `d1::OVERLAY_MIGRATIONS`' note on the column). What heals in practice is
-/// only a pot whose honest marker is published for the FIRST time after the
-/// migration.
+/// absent a backfill**, and the backfill is tracked as bsv-low#355. What
+/// heals in practice is only a pot whose honest marker is published for the
+/// FIRST time after the migration.
 ///
 /// `prefix` is the table alias plus `.` (e.g. `"pp."`), or `""` when the
 /// query has no alias.
@@ -443,7 +442,10 @@ mod tests {
     #[test]
     fn golden_client_v1_marker_is_valid_server_side() {
         let m = golden(GOLDEN_V1_HEX);
-        assert!(m.seat_settle_pubkey.is_none(), "the v1 golden is a v1 marker");
+        assert!(
+            m.seat_settle_pubkey.is_none(),
+            "the v1 golden is a v1 marker"
+        );
         assert!(
             marker_sig_valid(&m),
             "the client's REAL v1 identity signature must verify server-side"
@@ -453,7 +455,10 @@ mod tests {
     #[test]
     fn golden_client_v2_marker_is_valid_server_side() {
         let m = golden(GOLDEN_V2_HEX);
-        assert!(m.seat_settle_pubkey.is_some(), "the v2 golden is a v2 marker");
+        assert!(
+            m.seat_settle_pubkey.is_some(),
+            "the v2 golden is a v2 marker"
+        );
         assert!(
             marker_sig_valid(&m),
             "the client's REAL v2 identity + seat signatures must both verify server-side"
@@ -511,10 +516,10 @@ mod tests {
         // Re-pointing the settle key breaks BOTH (it is inside the v2
         // challenge AND it is the seatSig's verification key).
         let mut pk = base.clone();
-        pk.seat_settle_pubkey = Some(hex::decode(
-            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-        )
-        .unwrap());
+        pk.seat_settle_pubkey = Some(
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        );
         assert!(!marker_sig_valid(&pk), "seatSettlePubkey");
     }
 
@@ -566,7 +571,12 @@ mod tests {
             }
         }
         let (r_b, s_b) = (der_int(sig.r()), der_int(&hi));
-        let mut out = vec![0x30, (4 + r_b.len() + s_b.len()) as u8, 0x02, r_b.len() as u8];
+        let mut out = vec![
+            0x30,
+            (4 + r_b.len() + s_b.len()) as u8,
+            0x02,
+            r_b.len() as u8,
+        ];
         out.extend_from_slice(&r_b);
         out.push(0x02);
         out.push(s_b.len() as u8);
@@ -591,23 +601,36 @@ mod tests {
     #[test]
     fn no_malleated_variant_of_an_honest_marker_latches_valid() {
         let base = golden(GOLDEN_V2_HEX);
-        assert!(marker_sig_valid(&base), "positive control: the golden latches");
+        assert!(
+            marker_sig_valid(&base),
+            "positive control: the golden latches"
+        );
 
         // --- SEAT signature.
         let mut padded = base.clone();
         padded.seat_sig.as_mut().unwrap().push(0x00);
-        assert!(!marker_sig_valid(&padded), "seat: trailing-byte DER padding");
+        assert!(
+            !marker_sig_valid(&padded),
+            "seat: trailing-byte DER padding"
+        );
 
         let mut high_s = base.clone();
         let twin = high_s_twin(base.seat_sig.as_ref().unwrap());
-        assert_ne!(&twin, base.seat_sig.as_ref().unwrap(), "the twin is different bytes");
+        assert_ne!(
+            &twin,
+            base.seat_sig.as_ref().unwrap(),
+            "the twin is different bytes"
+        );
         high_s.seat_sig = Some(twin);
         assert!(!marker_sig_valid(&high_s), "seat: high-S twin");
 
         // --- IDENTITY signature (the leg the gates broke).
         let mut padded_id = base.clone();
         padded_id.sig.push(0x00);
-        assert!(!marker_sig_valid(&padded_id), "identity: trailing-byte DER padding");
+        assert!(
+            !marker_sig_valid(&padded_id),
+            "identity: trailing-byte DER padding"
+        );
 
         let mut high_s_id = base.clone();
         high_s_id.sig = high_s_twin(&base.sig);
@@ -616,7 +639,10 @@ mod tests {
 
         // …and the same four legs on v1, which carries only the identity sig.
         let v1 = golden(GOLDEN_V1_HEX);
-        assert!(marker_sig_valid(&v1), "positive control: the v1 golden latches");
+        assert!(
+            marker_sig_valid(&v1),
+            "positive control: the v1 golden latches"
+        );
         let mut v1_padded = v1.clone();
         v1_padded.sig.push(0x00);
         assert!(!marker_sig_valid(&v1_padded), "v1 identity: padding");
@@ -634,8 +660,10 @@ mod tests {
         // Pretend the v1 marker were a v2 one by attaching a settle key: the
         // v2 challenge is a different byte string, so it cannot verify.
         let mut faked = v1.clone();
-        faked.seat_settle_pubkey =
-            Some(hex::decode("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5").unwrap());
+        faked.seat_settle_pubkey = Some(
+            hex::decode("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+                .unwrap(),
+        );
         faked.seat_sig = Some(vec![0x30; 70]);
         assert!(!marker_sig_valid(&faked));
     }

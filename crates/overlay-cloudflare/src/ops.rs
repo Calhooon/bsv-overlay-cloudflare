@@ -181,14 +181,13 @@ pub async fn refresh_proofless_watch(db: &D1Database) -> u64 {
 
 /// Count proofless_watch rows first seen before `cutoff_ms`.
 async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
-    let row: Option<CountRow> = Query::new(
-        "SELECT COUNT(*) AS c FROM proofless_watch WHERE first_seen_ms < ?",
-    )
-    .bind(cutoff_ms)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<CountRow> =
+        Query::new("SELECT COUNT(*) AS c FROM proofless_watch WHERE first_seen_ms < ?")
+            .bind(cutoff_ms)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
     row.map(|r| r.c.max(0.0) as u64).unwrap_or(0)
 }
 
@@ -224,7 +223,11 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
 ///   on the status alone); 200 otherwise.
 /// - default (non-strict) → always HTTP 200 with the same JSON body (a probe
 ///   that reports the verdict without flapping the endpoint's own health).
-pub async fn health_invariants(db: &D1Database, env: &Env, strict: bool) -> worker::Result<Response> {
+pub async fn health_invariants(
+    db: &D1Database,
+    env: &Env,
+    strict: bool,
+) -> worker::Result<Response> {
     let now = now_ms();
 
     let hb: Option<HeartbeatRow> =
@@ -246,7 +249,11 @@ pub async fn health_invariants(db: &D1Database, env: &Env, strict: bool) -> work
 
     // Never-run (last_tick_ms == 0) is dead; otherwise dead iff too stale.
     let never_ran = last_tick_ms == 0;
-    let staleness_ms: i64 = if never_ran { -1 } else { (now - last_tick_ms).max(0) };
+    let staleness_ms: i64 = if never_ran {
+        -1
+    } else {
+        (now - last_tick_ms).max(0)
+    };
     let dead = never_ran || staleness_ms > max_stale_ms;
 
     let counters = read_counters(db).await;

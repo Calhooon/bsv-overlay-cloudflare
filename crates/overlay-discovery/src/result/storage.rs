@@ -92,7 +92,10 @@ pub enum ResultQuery {
     /// "Which hands has this identity won?" — the per-player leaderboard
     /// question. Newest first.
     #[serde(rename = "resultsFor")]
-    ResultsFor { identity: String, limit: Option<u32> },
+    ResultsFor {
+        identity: String,
+        limit: Option<u32>,
+    },
     /// "What settled recently?" — the global leaderboard feed. Newest
     /// first, across all identities.
     #[serde(rename = "recentResults")]
@@ -396,7 +399,12 @@ mod tests {
         let store = MemoryResultStorage::new();
         for i in 0..10u8 {
             store
-                .store_record(&record(&"11".repeat(32), "02aa", "03bb", &format!("txA{i}")))
+                .store_record(&record(
+                    &"11".repeat(32),
+                    "02aa",
+                    "03bb",
+                    &format!("txA{i}"),
+                ))
                 .await
                 .unwrap();
         }

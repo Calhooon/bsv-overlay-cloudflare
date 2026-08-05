@@ -32,7 +32,10 @@ fn normalized_code(path: &str) -> String {
         out.push(' ');
     }
     // Collapse ALL whitespace so wrapping/indentation cannot rot a needle.
-    out.split_whitespace().collect::<Vec<_>>().join(" ").replace(' ', "")
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(' ', "")
 }
 
 fn count(haystack: &str, needle: &str) -> usize {
@@ -127,8 +130,16 @@ fn middleware_always_runs_with_allow_unauthenticated_false() {
     let auth = normalized_code("src/auth.rs");
     let strict_opt = ["allow_unauthenticated:", "false"].concat();
     let lenient_opt = ["allow_unauthenticated:", "true"].concat();
-    assert_eq!(count(&auth, &strict_opt), 1, "exactly one options site, false");
-    assert_eq!(count(&auth, &lenient_opt), 0, "no allow_unauthenticated:true site");
+    assert_eq!(
+        count(&auth, &strict_opt),
+        1,
+        "exactly one options site, false"
+    );
+    assert_eq!(
+        count(&auth, &lenient_opt),
+        0,
+        "no allow_unauthenticated:true site"
+    );
     // And process_auth is invoked exactly once (the single front door).
     assert_eq!(
         count(&auth, "process_auth(req,env,&opts)"),
@@ -152,7 +163,10 @@ fn front_door_dispatches_on_the_effective_per_route_mode() {
     );
     // …and dispatches the disposition on THAT mode, never the raw global.
     assert_eq!(
-        count(&auth, "front_door_disposition(mode,auth_configured,auth_attempted)"),
+        count(
+            &auth,
+            "front_door_disposition(mode,auth_configured,auth_attempted)"
+        ),
         1,
         "the disposition must run on the effective mode"
     );
@@ -200,7 +214,10 @@ fn verified_identity_has_exactly_one_producer_the_middleware_result() {
     );
     let auth = normalized_code("src/auth.rs");
     assert_eq!(
-        count(&auth, &["CallerAuth::verified(", "&context.identity_key)"].concat()),
+        count(
+            &auth,
+            &["CallerAuth::verified(", "&context.identity_key)"].concat()
+        ),
         1,
         "and it must be fed by the middleware's verified context identity"
     );
@@ -213,10 +230,8 @@ fn verified_identity_has_exactly_one_producer_the_middleware_result() {
 #[test]
 fn wrangler_config_and_code_agree_on_auth_contract_names() {
     let auth = normalized_code("src/auth.rs");
-    let wrangler = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("wrangler.toml"),
-    )
-    .expect("read wrangler.toml");
+    let wrangler = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("wrangler.toml"))
+        .expect("read wrangler.toml");
 
     for name in ["AUTH_ENFORCE", "SERVER_PRIVATE_KEY", "AUTH_SESSIONS"] {
         assert!(
@@ -245,16 +260,35 @@ fn every_front_door_outcome_is_counted() {
     // one-producer pin above).
     let marker = ["#[cfg(", "test)]"].concat();
     let full = normalized_code("src/auth.rs");
-    assert!(full.contains(&marker), "auth.rs must still carry its test module");
+    assert!(
+        full.contains(&marker),
+        "auth.rs must still carry its test module"
+    );
     let auth = full[..full.find(&marker).unwrap()].to_string();
     let arms = [
         // The anonymous arm counts with the per-route split (route_idx).
-        ["Disposition::ProceedAnonymous=>{", "count_anonymous_served(route_idx);"].concat(),
-        ["Disposition::RefuseUnauthenticated=>{", "count_strict_refused_unauthenticated();"].concat(),
-        ["Disposition::RefuseMisconfigured=>{", "count_misconfigured_refused();"].concat(),
+        [
+            "Disposition::ProceedAnonymous=>{",
+            "count_anonymous_served(route_idx);",
+        ]
+        .concat(),
+        [
+            "Disposition::RefuseUnauthenticated=>{",
+            "count_strict_refused_unauthenticated();",
+        ]
+        .concat(),
+        [
+            "Disposition::RefuseMisconfigured=>{",
+            "count_misconfigured_refused();",
+        ]
+        .concat(),
     ];
     for arm in &arms {
-        assert_eq!(count(&auth, arm), 1, "front-door arm must count itself: {arm}");
+        assert_eq!(
+            count(&auth, arm),
+            1,
+            "front-door arm must count itself: {arm}"
+        );
     }
     // The authenticated path counts once (the Authenticated+session arm)…
     assert_eq!(count(&auth, "count_authenticated_served();"), 1);
@@ -278,7 +312,11 @@ fn normalizer_strips_comments_and_whitespace() {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let collapsed = code.split_whitespace().collect::<Vec<_>>().join("").to_string();
+    let collapsed = code
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("")
+        .to_string();
     assert!(collapsed.contains("letx=1;"));
     assert!(!collapsed.contains("view_identity"));
 }

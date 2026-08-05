@@ -875,9 +875,7 @@ impl PotStorage for MemoryPotStorage {
             .unwrap()
             .iter()
             .filter(|r| {
-                r.spent
-                    && !r.spent_confirmed
-                    && r.spending_txid.as_deref() == Some(spending_txid)
+                r.spent && !r.spent_confirmed && r.spending_txid.as_deref() == Some(spending_txid)
             })
             .cloned()
             .collect())
@@ -953,12 +951,18 @@ mod tests {
     async fn mark_spent_sets_spender() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleTx", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleTx", false, None, None)
+            .await
+            .unwrap();
 
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent);
         assert_eq!(r.spending_txid.as_deref(), Some("settleTx"));
-        assert!(!r.spent_confirmed, "unconfirmed spend must not latch the flag");
+        assert!(
+            !r.spent_confirmed,
+            "unconfirmed spend must not latch the flag"
+        );
         // No new row was created.
         assert_eq!(store.record_count(), 1);
     }
@@ -975,7 +979,10 @@ mod tests {
     async fn store_never_clobbers_a_spent_row_back_to_unspent() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleTx", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleTx", false, None, None)
+            .await
+            .unwrap();
 
         // A re-admission (e.g. GASP replay) must NOT erase the spender.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
@@ -990,8 +997,14 @@ mod tests {
         let store = MemoryPotStorage::new();
         // No admission first → mark_spent creates nothing (mirrors D1 UPDATE),
         // whether confirmed or not.
-        store.mark_spent("ghost", 0, "settleTx", false, None, None).await.unwrap();
-        store.mark_spent("ghost", 0, "settleTx", true, None, None).await.unwrap();
+        store
+            .mark_spent("ghost", 0, "settleTx", false, None, None)
+            .await
+            .unwrap();
+        store
+            .mark_spent("ghost", 0, "settleTx", true, None, None)
+            .await
+            .unwrap();
         assert_eq!(store.record_count(), 0);
         assert!(store.get_spent_status("ghost", 0).await.unwrap().is_none());
     }
@@ -1001,7 +1014,10 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store.store_record(&pot_record("potB", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleA", false, None, None)
+            .await
+            .unwrap();
 
         let a = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         let b = store.get_spent_status("potB", 0).await.unwrap().unwrap();
@@ -1017,7 +1033,10 @@ mod tests {
         store.store_record(&pot_record("potA", 0)).await.unwrap();
 
         // First unconfirmed claim on an unspent row → recorded.
-        store.mark_spent("potA", 0, "claim1", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "claim1", false, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent);
         assert_eq!(r.spending_txid.as_deref(), Some("claim1"));
@@ -1026,7 +1045,10 @@ mod tests {
         // A second unconfirmed claim by a DIFFERENT spender overwrites —
         // last-writer-wins among unconfirmed is deliberately preserved so an
         // honest later submit can still set the pointer.
-        store.mark_spent("potA", 0, "claim2", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "claim2", false, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert_eq!(r.spending_txid.as_deref(), Some("claim2"));
         assert!(!r.spent_confirmed);
@@ -1036,7 +1058,10 @@ mod tests {
     async fn confirmed_spend_latches_flag() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleTx", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleTx", true, None, None)
+            .await
+            .unwrap();
 
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent);
@@ -1048,11 +1073,17 @@ mod tests {
     async fn unconfirmed_never_clobbers_confirmed_pointer() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "realSettle", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "realSettle", true, None, None)
+            .await
+            .unwrap();
 
         // An attacker's unconfirmed claim must be REFUSED: pointer AND flag
         // unchanged.
-        store.mark_spent("potA", 0, "forgedSpend", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "forgedSpend", false, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent);
         assert_eq!(
@@ -1067,11 +1098,17 @@ mod tests {
     async fn confirmed_overwrites_confirmed_last_confirmed_wins() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settle1", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settle1", true, None, None)
+            .await
+            .unwrap();
 
         // A later CONFIRMED spend (e.g. reorg / better proof) still writes —
         // chain truth is last-confirmed-wins.
-        store.mark_spent("potA", 0, "settle2", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settle2", true, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert_eq!(r.spending_txid.as_deref(), Some("settle2"));
         assert!(r.spent_confirmed);
@@ -1081,11 +1118,17 @@ mod tests {
     async fn confirmed_overwrites_unconfirmed_claim() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "unconfirmedClaim", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "unconfirmedClaim", false, None, None)
+            .await
+            .unwrap();
 
         // The confirmed spend replaces the unconfirmed pointer and latches
         // the flag.
-        store.mark_spent("potA", 0, "realSettle", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "realSettle", true, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert_eq!(r.spending_txid.as_deref(), Some("realSettle"));
         assert!(r.spent_confirmed);
@@ -1095,7 +1138,10 @@ mod tests {
     async fn store_never_clobbers_confirmed_flag_on_readmission() {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settleTx", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleTx", true, None, None)
+            .await
+            .unwrap();
 
         // A re-admission (GASP replay) must not erase the confirmed flag.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
@@ -1168,8 +1214,14 @@ mod tests {
         store.store_beef("funding", &[1]).await.unwrap();
         store.store_beef("settle", &[2, 2]).await.unwrap();
         assert_eq!(store.beef_count(), 2);
-        assert_eq!(store.get_beef("funding").await.unwrap().as_deref(), Some(&[1u8][..]));
-        assert_eq!(store.get_beef("settle").await.unwrap().as_deref(), Some(&[2u8, 2][..]));
+        assert_eq!(
+            store.get_beef("funding").await.unwrap().as_deref(),
+            Some(&[1u8][..])
+        );
+        assert_eq!(
+            store.get_beef("settle").await.unwrap().as_deref(),
+            Some(&[2u8, 2][..])
+        );
     }
 
     #[test]
@@ -1209,8 +1261,11 @@ mod tests {
         use bsv_rs::transaction::{MerklePath, MerklePathLeaf, Transaction};
         let mut tx = Transaction::from_hex(raw).unwrap();
         let txid = tx.id();
-        let bump = MerklePath::new(800_000, vec![vec![MerklePathLeaf::new_txid(0, txid.clone())]])
-            .expect("valid single-leaf merkle path");
+        let bump = MerklePath::new(
+            800_000,
+            vec![vec![MerklePathLeaf::new_txid(0, txid.clone())]],
+        )
+        .expect("valid single-leaf merkle path");
         tx.merkle_path = Some(bump);
         (tx.to_beef(true).unwrap(), txid)
     }
@@ -1224,8 +1279,14 @@ mod tests {
         let (proofless_long, txid) = proofless_beef_with_filler(RAW_A, Some(RAW_B));
         let (proven_short, txid2) = proven_beef(RAW_A);
         assert_eq!(txid, txid2, "same subject tx");
-        assert!(!pot_beef_has_proof(&txid, &proofless_long), "fixture is proofless");
-        assert!(pot_beef_has_proof(&txid, &proven_short), "fixture is proven");
+        assert!(
+            !pot_beef_has_proof(&txid, &proofless_long),
+            "fixture is proofless"
+        );
+        assert!(
+            pot_beef_has_proof(&txid, &proven_short),
+            "fixture is proven"
+        );
         assert!(
             proven_short.len() < proofless_long.len(),
             "the proven+trimmed BEEF must be shorter to exercise the bypass"
@@ -1260,7 +1321,10 @@ mod tests {
 
         let (proofless_other, _) = proofless_beef_with_filler(RAW_A, None);
         assert!(!pot_beef_has_proof(&txid, &proofless_other));
-        store.compact_pot_beef(&txid, &proofless_other).await.unwrap();
+        store
+            .compact_pot_beef(&txid, &proofless_other)
+            .await
+            .unwrap();
         assert_eq!(
             store.get_beef(&txid).await.unwrap().as_deref(),
             Some(proofless_long.as_slice()),
@@ -1307,7 +1371,11 @@ mod tests {
         let (proven_a, txid_a) = proven_beef(RAW_A);
         assert_eq!(txid_a, proofless_txid);
         store.compact_pot_beef(&txid_a, &proven_a).await.unwrap();
-        assert!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().is_empty());
+        assert!(store
+            .find_pot_beefs_for_proof_check(10, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1341,13 +1409,23 @@ mod tests {
         store.store_record(&pot_record("potC", 0)).await.unwrap();
 
         // potA: spent, unconfirmed → a candidate.
-        store.mark_spent("potA", 0, "settleA", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settleA", false, None, None)
+            .await
+            .unwrap();
         // potB: spent, confirmed → NOT a candidate.
-        store.mark_spent("potB", 0, "settleB", true, None, None).await.unwrap();
+        store
+            .mark_spent("potB", 0, "settleB", true, None, None)
+            .await
+            .unwrap();
         // potC: never spent → NOT a candidate.
 
         let cands = store.find_spent_unconfirmed(10, 0).await.unwrap();
-        assert_eq!(cands.len(), 1, "only the spent-unconfirmed row is a candidate");
+        assert_eq!(
+            cands.len(),
+            1,
+            "only the spent-unconfirmed row is a candidate"
+        );
         assert_eq!(cands[0].txid, "potA");
         assert_eq!(
             cands[0].spending_txid.as_deref(),
@@ -1359,10 +1437,18 @@ mod tests {
     #[tokio::test]
     async fn find_spent_unconfirmed_empty_when_none() {
         let store = MemoryPotStorage::new();
-        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
+        assert!(store
+            .find_spent_unconfirmed(10, 0)
+            .await
+            .unwrap()
+            .is_empty());
         // An unspent admitted row is still not a candidate.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
+        assert!(store
+            .find_spent_unconfirmed(10, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1374,26 +1460,47 @@ mod tests {
         store.store_record(&pot_record("potA", 0)).await.unwrap();
 
         // 0-conf spend recorded → appears as a candidate.
-        store.mark_spent("potA", 0, "settle", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settle", false, None, None)
+            .await
+            .unwrap();
         assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
 
         // The chaser's upgrade (a chaintracks-verified spend).
-        store.mark_spent("potA", 0, "settle", true, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settle", true, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed, "confirmed spend latches the flag");
         assert!(
-            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
+            store
+                .find_spent_unconfirmed(10, 0)
+                .await
+                .unwrap()
+                .is_empty(),
             "a confirmed row is no longer a candidate"
         );
 
         // A later unconfirmed (forged) claim must NOT downgrade the row back
         // into the candidate set.
-        store.mark_spent("potA", 0, "forged", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "forged", false, None, None)
+            .await
+            .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed, "confirmed flag survives");
-        assert_eq!(r.spending_txid.as_deref(), Some("settle"), "pointer unchanged");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("settle"),
+            "pointer unchanged"
+        );
         assert!(
-            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
+            store
+                .find_spent_unconfirmed(10, 0)
+                .await
+                .unwrap()
+                .is_empty(),
             "an unconfirmed claim never re-surfaces a confirmed row"
         );
     }
@@ -1404,7 +1511,10 @@ mod tests {
         for i in 0..5u32 {
             let txid = format!("pot{i}");
             store.store_record(&pot_record(&txid, 0)).await.unwrap();
-            store.mark_spent(&txid, 0, "settle", false, None, None).await.unwrap();
+            store
+                .mark_spent(&txid, 0, "settle", false, None, None)
+                .await
+                .unwrap();
         }
         assert_eq!(store.find_spent_unconfirmed(2, 0).await.unwrap().len(), 2);
         assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 5);
@@ -1415,17 +1525,30 @@ mod tests {
     #[tokio::test]
     async fn find_unconfirmed_by_spending_txid_returns_only_that_spenders_rows() {
         let store = MemoryPotStorage::new();
-        for (pot, spender) in [("potA", "settleX"), ("potB", "settleX"), ("potC", "settleY")] {
+        for (pot, spender) in [
+            ("potA", "settleX"),
+            ("potB", "settleX"),
+            ("potC", "settleY"),
+        ] {
             store.store_record(&pot_record(pot, 0)).await.unwrap();
-            store.mark_spent(pot, 0, spender, false, None, None).await.unwrap();
+            store
+                .mark_spent(pot, 0, spender, false, None, None)
+                .await
+                .unwrap();
         }
         // A CONFIRMED settleX row is not a candidate (nothing left to latch).
         store.store_record(&pot_record("potD", 0)).await.unwrap();
-        store.mark_spent("potD", 0, "settleX", true, None, None).await.unwrap();
+        store
+            .mark_spent("potD", 0, "settleX", true, None, None)
+            .await
+            .unwrap();
         // An unspent row never appears.
         store.store_record(&pot_record("potE", 0)).await.unwrap();
 
-        let rows = store.find_unconfirmed_by_spending_txid("settleX").await.unwrap();
+        let rows = store
+            .find_unconfirmed_by_spending_txid("settleX")
+            .await
+            .unwrap();
         let mut pots: Vec<&str> = rows.iter().map(|r| r.txid.as_str()).collect();
         pots.sort_unstable();
         assert_eq!(pots, vec!["potA", "potB"]);
@@ -1444,14 +1567,24 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store.advance_clock(100_000); // pot ages far past any gate
-        store.mark_spent("potA", 0, "settle", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settle", false, None, None)
+            .await
+            .unwrap();
 
         assert!(
-            store.find_spent_unconfirmed(10, 1800).await.unwrap().is_empty(),
+            store
+                .find_spent_unconfirmed(10, 1800)
+                .await
+                .unwrap()
+                .is_empty(),
             "a fresh spend on an old pot still waits for its push"
         );
         store.advance_clock(1800);
-        assert_eq!(store.find_spent_unconfirmed(10, 1800).await.unwrap().len(), 1);
+        assert_eq!(
+            store.find_spent_unconfirmed(10, 1800).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1460,13 +1593,26 @@ mod tests {
         // deserves its own window, so an accepted overwrite resets the age.
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "claim1", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "claim1", false, None, None)
+            .await
+            .unwrap();
         store.advance_clock(1800); // claim1 is now old enough
-        assert_eq!(store.find_spent_unconfirmed(10, 1800).await.unwrap().len(), 1);
+        assert_eq!(
+            store.find_spent_unconfirmed(10, 1800).await.unwrap().len(),
+            1
+        );
 
-        store.mark_spent("potA", 0, "claim2", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "claim2", false, None, None)
+            .await
+            .unwrap();
         assert!(
-            store.find_spent_unconfirmed(10, 1800).await.unwrap().is_empty(),
+            store
+                .find_spent_unconfirmed(10, 1800)
+                .await
+                .unwrap()
+                .is_empty(),
             "the new pointer restarts the backstop window"
         );
     }
@@ -1477,11 +1623,21 @@ mod tests {
         // immediately (also the escape hatch if the gate must be turned off).
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
-        store.mark_spent("potA", 0, "settle", false, None, None).await.unwrap();
+        store
+            .mark_spent("potA", 0, "settle", false, None, None)
+            .await
+            .unwrap();
         store.store_beef("beefTx", &[1, 2, 3]).await.unwrap();
 
         assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
-        assert_eq!(store.find_pot_beefs_for_proof_check(10, 0).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .find_pot_beefs_for_proof_check(10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // ── #284 decoded columns: upsert / verdict atomicity / backfill scan ──
@@ -1522,7 +1678,10 @@ mod tests {
         let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
 
         // The backfill/re-admission upsert: decoded columns arrive.
-        store.store_record(&decoded_record("potA", 0)).await.unwrap();
+        store
+            .store_record(&decoded_record("potA", 0))
+            .await
+            .unwrap();
         let after = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         // Spend state byte-identical…
         assert_eq!(after.spent, before.spent);
@@ -1579,12 +1738,26 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "realSettle", true, Some("winner-a"), Some(800_000))
+            .mark_spent(
+                "potA",
+                0,
+                "realSettle",
+                true,
+                Some("winner-a"),
+                Some(800_000),
+            )
             .await
             .unwrap();
 
         store
-            .mark_spent("potA", 0, "forgedSpend", false, Some("winner-b"), Some(999_999))
+            .mark_spent(
+                "potA",
+                0,
+                "forgedSpend",
+                false,
+                Some("winner-b"),
+                Some(999_999),
+            )
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1685,7 +1858,11 @@ mod tests {
         let after = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert_eq!(after, before, "a stale CAS confirm changes NOTHING");
         assert_eq!(after.spending_txid.as_deref(), Some("settleS2"));
-        assert_eq!(after.spent_height, Some(802_000), "S2 never inherits S1's height");
+        assert_eq!(
+            after.spent_height,
+            Some(802_000),
+            "S2 never inherits S1's height"
+        );
         assert!(after.spent_confirmed);
     }
 
@@ -1709,7 +1886,11 @@ mod tests {
         assert!(hit);
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed);
-        assert_eq!(r.spending_txid.as_deref(), Some("settleS1"), "pointer untouched");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("settleS1"),
+            "pointer untouched"
+        );
         assert_eq!(r.spent_height, Some(800_000));
         assert_eq!(r.verdict, None, "the CAS never touches the verdict pair");
 
@@ -1768,7 +1949,10 @@ mod tests {
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
-        assert_eq!(r.spent_height, None, "a height is a fact of a verified BUMP only");
+        assert_eq!(
+            r.spent_height, None,
+            "a height is a fact of a verified BUMP only"
+        );
     }
 
     #[tokio::test]
@@ -1777,12 +1961,19 @@ mod tests {
         // Two undecoded (pre-#284) rows + one decoded.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store.store_record(&pot_record("potB", 0)).await.unwrap();
-        store.store_record(&decoded_record("potC", 0)).await.unwrap();
+        store
+            .store_record(&decoded_record("potC", 0))
+            .await
+            .unwrap();
 
         let cands = store.find_params_undecoded(10).await.unwrap();
         let mut txids: Vec<&str> = cands.iter().map(|r| r.txid.as_str()).collect();
         txids.sort_unstable();
-        assert_eq!(txids, vec!["potA", "potB"], "decoded rows are never candidates");
+        assert_eq!(
+            txids,
+            vec!["potA", "potB"],
+            "decoded rows are never candidates"
+        );
         assert_eq!(store.find_params_undecoded(1).await.unwrap().len(), 1);
 
         // Once decoded (even to an UNRECOGNIZED shape: lock_kind None,
@@ -1797,7 +1988,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.store_record(&decoded_record("potB", 0)).await.unwrap();
+        store
+            .store_record(&decoded_record("potB", 0))
+            .await
+            .unwrap();
         assert!(store.find_params_undecoded(10).await.unwrap().is_empty());
     }
 

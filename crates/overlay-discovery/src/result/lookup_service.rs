@@ -567,7 +567,10 @@ mod tests {
         // ORDER is not truth; the client's sig verify separates them).
         assert_eq!(arr[0]["txid"], "txGARBAGE");
         assert_eq!(arr[0]["winnerSigHex"], hex::encode(vec![0x30u8; 71]));
-        assert_eq!(arr[1]["txid"], "txGENUINE", "the genuine marker SURVIVES the front-run");
+        assert_eq!(
+            arr[1]["txid"], "txGENUINE",
+            "the genuine marker SURVIVES the front-run"
+        );
         assert_eq!(arr[1]["winnerSigHex"], hex::encode(golden_winner_sig()));
         assert_eq!(arr[1]["loserSigHex"], hex::encode(golden_loser_sig()));
         // Bytes back verbatim for both — the CLIENT's sig verify is what
@@ -703,10 +706,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_wrong_service_errors() {
         let svc = make_service();
-        let q = LookupQuestion::new(
-            "ls_collected",
-            serde_json::json!({"type": "recentResults"}),
-        );
+        let q = LookupQuestion::new("ls_collected", serde_json::json!({"type": "recentResults"}));
         assert!(svc.lookup(&q).await.is_err());
     }
 

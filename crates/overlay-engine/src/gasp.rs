@@ -423,8 +423,7 @@ impl<'a> GASPSync<'a> {
                             // Remember the lowest failed score so the persisted
                             // cursor cannot skip past it (see cap below).
                             let s = utxo.score as u64;
-                            min_failed_score =
-                                Some(min_failed_score.map_or(s, |cur| cur.min(s)));
+                            min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
                         }
                     }
                 }
@@ -613,14 +612,14 @@ impl<'a> GASPSync<'a> {
                                     output_metadata: None,
                                     inputs: None,
                                 }
-                            },
+                            }
                             // Default / production: no fetcher → ask the peer and
                             // propagate its error on failure (today's exact behavior).
                             None => {
                                 self.remote
                                     .request_node(&node.graph_id, &txid, oi, input_req.metadata)
                                     .await?
-                            },
+                            }
                         };
 
                         let spent_by_str = format!("{}.{}", node_txid, node.output_index);

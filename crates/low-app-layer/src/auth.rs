@@ -465,8 +465,12 @@ fn nonempty_var(env: &Env, name: &str) -> Option<String> {
 /// valid auth attempt is still verified + signed (so `AuthFetch` works against
 /// public routes); it just can never be REQUIRED to authenticate.
 pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
-    let global_mode =
-        AuthMode::from_flag(env.var("AUTH_ENFORCE").ok().map(|v| v.to_string()).as_deref());
+    let global_mode = AuthMode::from_flag(
+        env.var("AUTH_ENFORCE")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
     let path = req.path();
     let route_idx = identity_route_index(&path);
     // Public routes are exempt from strict enforcement (deliberate — see the
@@ -608,10 +612,25 @@ mod tests {
     #[test]
     fn auth_mode_only_explicit_optin_enforces() {
         for strict in ["1", "true", "TRUE", " strict ", "True"] {
-            assert_eq!(AuthMode::from_flag(Some(strict)), AuthMode::Strict, "{strict:?}");
+            assert_eq!(
+                AuthMode::from_flag(Some(strict)),
+                AuthMode::Strict,
+                "{strict:?}"
+            );
         }
-        for lenient in [None, Some(""), Some("false"), Some("0"), Some("yes"), Some("lenient")] {
-            assert_eq!(AuthMode::from_flag(lenient), AuthMode::Lenient, "{lenient:?}");
+        for lenient in [
+            None,
+            Some(""),
+            Some("false"),
+            Some("0"),
+            Some("yes"),
+            Some("lenient"),
+        ] {
+            assert_eq!(
+                AuthMode::from_flag(lenient),
+                AuthMode::Lenient,
+                "{lenient:?}"
+            );
         }
     }
 

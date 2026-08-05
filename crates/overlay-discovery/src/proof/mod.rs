@@ -360,7 +360,10 @@ pub(crate) mod tests {
         let script = golden_marker(&golden_game_id(), &bundle);
         // The bundle push header is 0x4d 0x20 0x4e (20000 LE).
         let bundle_push_at = script.len() - 20_000 - 3;
-        assert_eq!(&script[bundle_push_at..bundle_push_at + 3], &[0x4d, 0x20, 0x4e]);
+        assert_eq!(
+            &script[bundle_push_at..bundle_push_at + 3],
+            &[0x4d, 0x20, 0x4e]
+        );
 
         let m = parse_proof_marker(&script).expect("20 KB bundle must parse");
         assert_eq!(m.bundle.len(), 20_000);
@@ -394,7 +397,11 @@ pub(crate) mod tests {
             vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff],       // PUSHDATA4 header truncated
             vec![0x00u8, 0x6a, 0x4b],                         // a 75-byte push with no data
         ] {
-            assert_eq!(parse_proof_marker(&script), None, "crafted script must not parse");
+            assert_eq!(
+                parse_proof_marker(&script),
+                None,
+                "crafted script must not parse"
+            );
         }
         // Direct read_pushes probe: the trap path is the len itself.
         assert!(read_pushes(&[0x4e, 0xff, 0xff, 0xff, 0xff]).is_empty());
@@ -473,8 +480,7 @@ pub(crate) mod tests {
     #[test]
     fn wrong_identity_key_length_rejected() {
         for len in [32usize, 34, 65] {
-            let script =
-                marker_script(&[0x11u8; 32], &vec![0x02u8; len], &golden_sig(), b"{}");
+            let script = marker_script(&[0x11u8; 32], &vec![0x02u8; len], &golden_sig(), b"{}");
             assert!(
                 parse_proof_marker(&script).is_none(),
                 "winner len {len} must be rejected"
@@ -485,8 +491,7 @@ pub(crate) mod tests {
     #[test]
     fn sig_length_out_of_range_rejected() {
         for len in [0usize, 1, 67, 75, 100] {
-            let script =
-                marker_script(&[0x11u8; 32], &golden_winner(), &vec![0x30u8; len], b"{}");
+            let script = marker_script(&[0x11u8; 32], &golden_winner(), &vec![0x30u8; len], b"{}");
             assert!(
                 parse_proof_marker(&script).is_none(),
                 "sig len {len} must be rejected"

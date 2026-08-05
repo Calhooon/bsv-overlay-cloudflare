@@ -1804,15 +1804,17 @@ fn fetch_claims(
     conn: &Connection,
     rows: &[ResultsRow],
 ) -> std::collections::HashMap<String, low_app_layer::results::GameClaims> {
-    let mut gids: Vec<String> = rows.iter().map(|r| r.game_id.to_ascii_lowercase()).collect();
+    let mut gids: Vec<String> = rows
+        .iter()
+        .map(|r| r.game_id.to_ascii_lowercase())
+        .collect();
     gids.sort_unstable();
     gids.dedup();
     let mut markers: Vec<ResultMarkerRow> = Vec::new();
     for chunk in gids.chunks(low_app_layer::logic::D1_CHUNK_OUTPOINTS) {
         let sql = claims_sql(chunk.len());
         let mut stmt = conn.prepare(&sql).unwrap();
-        let binds: Vec<rusqlite::types::Value> =
-            chunk.iter().map(|g| g.clone().into()).collect();
+        let binds: Vec<rusqlite::types::Value> = chunk.iter().map(|g| g.clone().into()).collect();
         let got = stmt
             .query_map(rusqlite::params_from_iter(binds), |r| {
                 Ok(ResultMarkerRow {
@@ -2066,7 +2068,16 @@ fn one_dust_marker_with_a_forged_gameid_cannot_deny_the_money_word() {
     let p = params_committing(&pa, &pb, COMMITTED_HEIGHT);
     insert_decoded_pot(&conn, &pot, None, &p, 4_000, None, None, None, false);
     file_real_v2_marker(
-        &conn, &ka, &pa, &victim_w, &opponent, &real_game, &pot, 0, HONEST_HINT, "txHONESTV2",
+        &conn,
+        &ka,
+        &pa,
+        &victim_w,
+        &opponent,
+        &real_game,
+        &pot,
+        0,
+        HONEST_HINT,
+        "txHONESTV2",
         9_000,
     );
 
@@ -2127,7 +2138,16 @@ fn one_dust_marker_with_a_forged_gameid_cannot_deny_the_money_word() {
     // AND it stays healed after the victim republishes (the pre-fix defect
     // was permanent precisely because republishing could not help).
     file_real_v2_marker(
-        &conn, &ka, &pa, &victim_w, &opponent, &real_game, &pot, 0, HONEST_HINT, "txREPUBLISH",
+        &conn,
+        &ka,
+        &pa,
+        &victim_w,
+        &opponent,
+        &real_game,
+        &pot,
+        0,
+        HONEST_HINT,
+        "txREPUBLISH",
         99_999,
     );
     assert_eq!(
@@ -2420,7 +2440,8 @@ fn the_measured_denial_cost_table() {
         }
     }
     assert_eq!(
-        flip, None,
+        flip,
+        None,
         "[B] the displacer+flood attack has NO threshold any more (swept to \
          {} junk rows, 4x the old cap of {SEAT_MARKERS_PER_KEY}); pre-#283 it \
          flipped at exactly {SEAT_MARKERS_PER_KEY} junk + 1 displacer",
@@ -2514,7 +2535,17 @@ fn a_seatsig_only_marker_over_a_foreign_pot_is_refused_by_the_f1_bar() {
     let (_kb, patt_b) = real_key(78);
     let attacker_pot = h64(0xcc);
     let p = params_committing(&patt_a, &patt_b, 1);
-    insert_decoded_pot(&conn, &attacker_pot, None, &p, 4_000, None, None, None, false);
+    insert_decoded_pot(
+        &conn,
+        &attacker_pot,
+        None,
+        &p,
+        4_000,
+        None,
+        None,
+        None,
+        false,
+    );
 
     let victim_w = wallet_of(0x51);
     let victim = identity_of(&victim_w);
@@ -2624,7 +2655,10 @@ fn der_padding_is_refused_canonical_strict() {
         identity_sig_hex: String::new(),
     };
     // POSITIVE CONTROL — without this the refusals below prove nothing.
-    assert!(verify_seat_marker(&m), "the honest canonical seatSig verifies");
+    assert!(
+        verify_seat_marker(&m),
+        "the honest canonical seatSig verifies"
+    );
 
     let mut padded = m.clone();
     padded.seat_sig_hex = hex::encode([der.clone(), vec![0x00]].concat());
@@ -2837,7 +2871,10 @@ fn the_hand_field_is_no_longer_attacker_influenceable_on_a_chain_bound_row() {
     // gameId is the victim's own and IS attested by the committed key.
     assert_eq!(r["gameIdBinding"], serde_json::json!("chain"));
     assert_eq!(r["gameId"], serde_json::json!(real_game));
-    assert_eq!(r["opponentIdentity"], serde_json::json!(format!("02{}", "bb".repeat(32))));
+    assert_eq!(
+        r["opponentIdentity"],
+        serde_json::json!(format!("02{}", "bb".repeat(32)))
+    );
     // The outcome is NOT movable and never was: the seat proof outranks any
     // claim. Kept as the control that the attack still reaches a live row.
     assert_eq!(r["outcome"], serde_json::json!("won"));
@@ -2872,7 +2909,17 @@ fn an_attacker_pot_committing_the_victims_public_settle_key_is_not_chain_bound()
     let victim = identity_of(&victim_w);
     let attacker_pot = h64(0xcc);
     let p = params_committing(&pa, &patt_b, 700_000);
-    insert_decoded_pot(&conn, &attacker_pot, None, &p, 4_000, None, None, None, false);
+    insert_decoded_pot(
+        &conn,
+        &attacker_pot,
+        None,
+        &p,
+        4_000,
+        None,
+        None,
+        None,
+        false,
+    );
     // The best the attacker can do without the private key: a junk seatSig.
     file_marker_row(
         &conn,
@@ -3068,16 +3115,22 @@ fn the_seat_window_alone_keeps_the_verified_row_under_both_flood_classes() {
         }
 
         let mut params_by_pot = std::collections::HashMap::new();
-        params_by_pot.insert((pot.clone(), 0u32), params_committing(&pa, &pb, COMMITTED_HEIGHT));
+        params_by_pot.insert(
+            (pot.clone(), 0u32),
+            params_committing(&pa, &pb, COMMITTED_HEIGHT),
+        );
         let fetched = fetch_seat_markers(&conn, &params_by_pot);
-        let rows = fetched.get(&(pot.to_ascii_lowercase(), 0)).expect("window returned rows");
+        let rows = fetched
+            .get(&(pot.to_ascii_lowercase(), 0))
+            .expect("window returned rows");
         assert!(
             rows.len() <= SEAT_MARKERS_PER_KEY * 2,
             "the window is still capped per key slot: {}",
             rows.len()
         );
         assert!(
-            rows.iter().any(|m| m.identity_sig_hex == honest_sig.to_ascii_lowercase()),
+            rows.iter()
+                .any(|m| m.identity_sig_hex == honest_sig.to_ascii_lowercase()),
             "seat_markers_sql alone must return the VERIFIED row under a \
              {}x-cap flood (padded_replay={padded_replay})",
             4
@@ -3124,7 +3177,10 @@ fn the_representative_row_collapse_alone_prefers_the_verified_marker() {
         );
     }
     let rows = query_results_rows(&conn, &victim);
-    let row = rows.iter().find(|r| r.pot_txid.eq_ignore_ascii_case(&pot)).expect("row");
+    let row = rows
+        .iter()
+        .find(|r| r.pot_txid.eq_ignore_ascii_case(&pot))
+        .expect("row");
     assert_eq!(row.game_id, game, "the verified marker represents the pot");
     assert_eq!(row.recovery_height, HONEST_HINT);
     assert_eq!(row.opponent_identity, format!("02{}", "bb".repeat(32)));

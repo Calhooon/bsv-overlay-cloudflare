@@ -375,13 +375,9 @@ mod tests {
         // A 20 KB (OP_PUSHDATA2) bundle admits and comes back verbatim.
         let (svc, _storage) = make_service_with_storage();
         let bundle: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-        svc.output_admitted_by_topic(&admit(
-            "txBIG",
-            0,
-            golden_marker(&[0x11u8; 32], &bundle),
-        ))
-        .await
-        .unwrap();
+        svc.output_admitted_by_topic(&admit("txBIG", 0, golden_marker(&[0x11u8; 32], &bundle)))
+            .await
+            .unwrap();
 
         let arr = proofs_for(&svc, &"11".repeat(32), &golden_winner_hex(), None).await;
         let got = BASE64
@@ -395,20 +391,12 @@ mod tests {
     #[tokio::test]
     async fn proofs_for_filters_by_game_and_winner() {
         let (svc, _storage) = make_service_with_storage();
-        svc.output_admitted_by_topic(&admit(
-            "txA",
-            0,
-            golden_marker(&[0x11u8; 32], b"game11"),
-        ))
-        .await
-        .unwrap();
-        svc.output_admitted_by_topic(&admit(
-            "txB",
-            0,
-            golden_marker(&[0x22u8; 32], b"game22"),
-        ))
-        .await
-        .unwrap();
+        svc.output_admitted_by_topic(&admit("txA", 0, golden_marker(&[0x11u8; 32], b"game11")))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit("txB", 0, golden_marker(&[0x22u8; 32], b"game22")))
+            .await
+            .unwrap();
 
         // Only game 11's bundle for this winner.
         let arr = proofs_for(&svc, &"11".repeat(32), &golden_winner_hex(), None).await;
@@ -498,8 +486,13 @@ mod tests {
         // limit 0 clamps UP to 1; a huge limit clamps DOWN to 10.
         let arr = proofs_for(&svc, &"11".repeat(32), &golden_winner_hex(), Some(0)).await;
         assert_eq!(arr.as_array().unwrap().len(), 1);
-        let arr =
-            proofs_for(&svc, &"11".repeat(32), &golden_winner_hex(), Some(1_000_000)).await;
+        let arr = proofs_for(
+            &svc,
+            &"11".repeat(32),
+            &golden_winner_hex(),
+            Some(1_000_000),
+        )
+        .await;
         assert_eq!(arr.as_array().unwrap().len(), 5, "all five under the cap");
 
         // The clamp helper itself.

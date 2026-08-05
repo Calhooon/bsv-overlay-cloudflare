@@ -338,7 +338,9 @@ impl LookupService for PotLookupService {
                     // the spending tx's OWN input for it (its sequence feeds
                     // the refund height-gate check).
                     let pot_input_sequence = spending_tx.inputs.iter().find_map(|i| {
-                        (i.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(txid))
+                        (i.source_txid
+                            .as_deref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(txid))
                             && i.source_output_index == output_index)
                             .then_some(i.sequence)
                     })?;
@@ -561,7 +563,8 @@ mod tests {
         let mut tx = Tx::new();
         tx.add_input(TransactionInput::new(hex::encode([salt; 32]), 0))
             .unwrap();
-        tx.add_output(make_covenant_output(&dummy_params())).unwrap();
+        tx.add_output(make_covenant_output(&dummy_params()))
+            .unwrap();
         tx
     }
 
@@ -603,7 +606,10 @@ mod tests {
     }
 
     /// Run a spentStatus lookup and return the JSON array.
-    async fn spent_status(svc: &PotLookupService, outpoints: serde_json::Value) -> serde_json::Value {
+    async fn spent_status(
+        svc: &PotLookupService,
+        outpoints: serde_json::Value,
+    ) -> serde_json::Value {
         let q = LookupQuestion::new(
             "ls_pot",
             serde_json::json!({"type": "spentStatus", "outpoints": outpoints}),
@@ -620,7 +626,10 @@ mod tests {
     async fn modes_and_metadata() {
         let svc = make_service();
         assert_eq!(svc.admission_mode(), AdmissionMode::WholeTx);
-        assert_eq!(svc.spend_notification_mode(), SpendNotificationMode::WholeTx);
+        assert_eq!(
+            svc.spend_notification_mode(),
+            SpendNotificationMode::WholeTx
+        );
         let meta = svc.get_metadata().await;
         assert_eq!(meta.name, "POT Lookup Service");
         assert!(!svc.get_documentation().await.is_empty());
@@ -762,7 +771,11 @@ mod tests {
             .await
             .unwrap();
 
-        let rec = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        let rec = storage
+            .get_spent_status(&pot_txid, 0)
+            .await
+            .unwrap()
+            .unwrap();
         (rec, settle_txid)
     }
 
@@ -974,13 +987,18 @@ mod tests {
         let (svc, storage) = make_service_with_storage();
         // A tx whose only output is P2PKH — not a covenant.
         let mut tx = Tx::new();
-        tx.add_input(TransactionInput::new("00".repeat(32), 0)).unwrap();
+        tx.add_input(TransactionInput::new("00".repeat(32), 0))
+            .unwrap();
         tx.add_output(p2pkh_output()).unwrap();
         svc.output_admitted_by_topic(&admit(beef_of(&tx), 0))
             .await
             .unwrap();
         assert_eq!(storage.record_count(), 0);
-        assert_eq!(storage.beef_count(), 0, "non-covenant must not store a beef");
+        assert_eq!(
+            storage.beef_count(),
+            0,
+            "non-covenant must not store a beef"
+        );
     }
 
     // ── tm_lowfund (the hop-side index into the SAME store) ─────────────
@@ -998,7 +1016,8 @@ mod tests {
         let (svc, storage) = make_service_with_storage();
         // A hop-carrying funding tx: vout 0 = plain P2PKH (the hop).
         let mut tx = Tx::new();
-        tx.add_input(TransactionInput::new("11".repeat(32), 0)).unwrap();
+        tx.add_input(TransactionInput::new("11".repeat(32), 0))
+            .unwrap();
         tx.add_output(p2pkh_output()).unwrap();
         let hop_txid = tx.id();
         svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&tx), 0)))
@@ -1029,7 +1048,8 @@ mod tests {
         let (svc, storage) = make_service_with_storage();
         // Admit the hop under tm_lowfund…
         let mut hop = Tx::new();
-        hop.add_input(TransactionInput::new("22".repeat(32), 0)).unwrap();
+        hop.add_input(TransactionInput::new("22".repeat(32), 0))
+            .unwrap();
         hop.add_output(p2pkh_output()).unwrap();
         let hop_txid = hop.id();
         svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&hop), 0)))
@@ -1249,13 +1269,23 @@ mod tests {
             .await
             .unwrap();
 
-        let r = storage.get_spent_status(&funding.id(), 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&funding.id(), 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.params_decoded);
         assert_eq!(r.lock_kind.as_deref(), Some("covenant"));
         assert_eq!(r.pub_a.as_deref(), Some(hex::encode(p.pub_a).as_str()));
         assert_eq!(r.pub_b.as_deref(), Some(hex::encode(p.pub_b).as_str()));
-        assert_eq!(r.pay_pkh_a.as_deref(), Some(hex::encode(p.pay_pkh_a).as_str()));
-        assert_eq!(r.rake_pkh.as_deref(), Some(hex::encode(p.rake_pkh).as_str()));
+        assert_eq!(
+            r.pay_pkh_a.as_deref(),
+            Some(hex::encode(p.pay_pkh_a).as_str())
+        );
+        assert_eq!(
+            r.rake_pkh.as_deref(),
+            Some(hex::encode(p.rake_pkh).as_str())
+        );
         assert_eq!(r.stake_a, Some(1250));
         assert_eq!(r.stake_b, Some(1250));
         assert_eq!(r.fee_sats, Some(100));
@@ -1278,7 +1308,11 @@ mod tests {
         svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
             .await
             .unwrap();
-        let r = storage.get_spent_status(&funding.id(), 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&funding.id(), 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.params_decoded, "decode was ATTEMPTED and recorded");
         assert_eq!(r.lock_kind.as_deref(), Some("covenant"));
         assert_eq!(r.pub_a, None);
@@ -1299,13 +1333,20 @@ mod tests {
         let settle = spender_paying(
             &pot_txid,
             0,
-            &[(25, p2pkh_lock(&p.rake_pkh)), (2375, p2pkh_lock(&p.pay_pkh_a))],
+            &[
+                (25, p2pkh_lock(&p.rake_pkh)),
+                (2375, p2pkh_lock(&p.pay_pkh_a)),
+            ],
         );
         svc.output_spent(&spent(&pot_txid, 0, beef_of(&settle)))
             .await
             .unwrap();
 
-        let r = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&pot_txid, 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.spent);
         assert_eq!(r.spending_txid.as_deref(), Some(settle.id().as_str()));
         assert_eq!(r.verdict.as_deref(), Some("winner-a"));
@@ -1327,7 +1368,10 @@ mod tests {
         let mut settle = spender_paying(
             &pot_txid,
             0,
-            &[(25, p2pkh_lock(&p.rake_pkh)), (2375, p2pkh_lock(&p.pay_pkh_a))],
+            &[
+                (25, p2pkh_lock(&p.rake_pkh)),
+                (2375, p2pkh_lock(&p.pay_pkh_a)),
+            ],
         );
         let settle_txid = settle.id();
         settle.merkle_path = Some(single_tx_bump(&settle_txid, 800_000));
@@ -1341,9 +1385,17 @@ mod tests {
             .await
             .unwrap();
 
-        let r = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&pot_txid, 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.spent_confirmed);
-        assert_eq!(r.spent_height, Some(800_000), "the SPV-verified BUMP height");
+        assert_eq!(
+            r.spent_height,
+            Some(800_000),
+            "the SPV-verified BUMP height"
+        );
         assert_eq!(r.verdict.as_deref(), Some("winner-a"));
     }
 
@@ -1361,7 +1413,11 @@ mod tests {
         svc.output_spent(&spent(&pot_txid, 0, beef_of(&redirect)))
             .await
             .unwrap();
-        let r = storage.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&pot_txid, 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.spent);
         assert_eq!(r.verdict, None, "a non-template spend never classifies");
 
@@ -1384,7 +1440,10 @@ mod tests {
         let settle2 = spender_paying(
             &pot2,
             0,
-            &[(10, p2pkh_lock(&bad.rake_pkh)), (890, p2pkh_lock(&bad.pay_pkh_a))],
+            &[
+                (10, p2pkh_lock(&bad.rake_pkh)),
+                (890, p2pkh_lock(&bad.pay_pkh_a)),
+            ],
         );
         svc2.output_spent(&spent(&pot2, 0, beef_of(&settle2)))
             .await
@@ -1398,13 +1457,18 @@ mod tests {
     async fn lowfund_rows_are_p2pkh_kind_and_never_get_a_verdict() {
         let (svc, storage) = make_service_with_storage();
         let mut hop = Tx::new();
-        hop.add_input(TransactionInput::new("22".repeat(32), 0)).unwrap();
+        hop.add_input(TransactionInput::new("22".repeat(32), 0))
+            .unwrap();
         hop.add_output(p2pkh_output()).unwrap();
         let hop_txid = hop.id();
         svc.output_admitted_by_topic(&as_lowfund_admit(admit(beef_of(&hop), 0)))
             .await
             .unwrap();
-        let r = storage.get_spent_status(&hop_txid, 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&hop_txid, 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r.lock_kind.as_deref(), Some("p2pkh"));
         assert!(r.params_decoded);
         assert_eq!(r.pub_a, None, "a hop has no committed params");
@@ -1417,7 +1481,11 @@ mod tests {
             *topic = "tm_lowfund".into();
         }
         svc.output_spent(&payload).await.unwrap();
-        let r = storage.get_spent_status(&hop_txid, 0).await.unwrap().unwrap();
+        let r = storage
+            .get_spent_status(&hop_txid, 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.spent);
         assert_eq!(r.verdict, None, "p2pkh rows never carry a verdict");
     }

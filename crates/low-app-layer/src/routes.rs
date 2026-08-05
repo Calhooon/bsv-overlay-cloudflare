@@ -799,8 +799,12 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     // cap the identity degrades to UNKNOWN (the aggregate keys the win by the
     // settle key) — never to no-win. BEST-EFFORT: any fault yields an empty
     // map → every counted win shows under its settle key, still never dropped.
-    let attributions =
-        seat_attributions(&db, &params_by_pot, crate::results::LEADERBOARD_SEAT_CANDIDATES).await;
+    let attributions = seat_attributions(
+        &db,
+        &params_by_pot,
+        crate::results::LEADERBOARD_SEAT_CANDIDATES,
+    )
+    .await;
 
     let lb = crate::logic::aggregate_leaderboard_attributed(
         &markers,
@@ -1468,7 +1472,8 @@ async fn results_seat_markers(
     // they are testable without a Worker (the re-gate's finding #3: this whole
     // delivery path could be deleted with no test failing).
     for chunk in crate::results::seat_marker_chunks(params_by_pot) {
-        let sql = crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
+        let sql =
+            crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
         for b in &chunk {
@@ -1803,17 +1808,14 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             Some(g) => vec![JsValue::from_str(&identity_lc), JsValue::from_str(g)],
             None => vec![JsValue::from_str(&identity_lc)],
         })?;
-    let rows: Vec<crate::hops_view::HopsViewRow> = match stmt
-        .all()
-        .await
-        .and_then(|r| r.results::<HopsViewRowD1>())
-    {
-        Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
-        Err(e) => {
-            console_warn!("[hops-view] hopparty join query failed: {e}");
-            return json_error("database query failed", 503);
-        }
-    };
+    let rows: Vec<crate::hops_view::HopsViewRow> =
+        match stmt.all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
+            Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
+            Err(e) => {
+                console_warn!("[hops-view] hopparty join query failed: {e}");
+                return json_error("database query failed", 503);
+            }
+        };
 
     let (entries, truncated, budget_exhausted) = crate::hops_view::assemble_hops_view(rows);
     // The tip AFTER the D1 facts (`null` on a fault — facts still serve).
@@ -2082,7 +2084,8 @@ async fn live_view_candidates(
     };
 
     for chunk in &plan.keyed {
-        let sql = crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
+        let sql =
+            crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
         let mut binds: Vec<JsValue> =
             Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
         for b in chunk {
@@ -2526,7 +2529,10 @@ struct BeefTrustRow {
 /// bumpless row: raw served, confirmed/height defer to the external leg
 /// (the #247 machinery). Weakens only unverified answers, never verified
 /// ones.
-async fn tx_any_index_leg(ctx: &RouteContext<AuthState>, txid_lc: &str) -> (Option<String>, Option<u64>) {
+async fn tx_any_index_leg(
+    ctx: &RouteContext<AuthState>,
+    txid_lc: &str,
+) -> (Option<String>, Option<u64>) {
     let Ok(db) = ctx.env.d1("OVERLAY_DB") else {
         console_warn!("[tx-any] OVERLAY_DB binding unavailable — break-glass leg only");
         return (None, None);

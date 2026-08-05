@@ -231,9 +231,7 @@ impl LookupService for LowLookupService {
             // via the app-layer `/beef/:txid` for independent verification.
             let entries: Vec<serde_json::Value> = records
                 .iter()
-                .map(|r| {
-                    serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
-                })
+                .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
                 .collect();
             return Ok(LookupResult::Answer(LookupAnswer::Freeform {
                 result: serde_json::Value::Array(entries),
@@ -300,8 +298,7 @@ impl LowLookupService {
                 if pushdrop.fields.len() != LOW_TABLE_FIELD_COUNT {
                     return None;
                 }
-                let stake_sats =
-                    u64::from_le_bytes(pushdrop.fields[3].as_slice().try_into().ok()?);
+                let stake_sats = u64::from_le_bytes(pushdrop.fields[3].as_slice().try_into().ok()?);
                 let expiry_height =
                     u32::from_le_bytes(pushdrop.fields[6].as_slice().try_into().ok()?);
                 Some(LowRecord {
@@ -620,7 +617,11 @@ mod tests {
 
         let q = LookupQuestion::new("ls_low", serde_json::json!({"type": "findOpenTables"}));
         let results = svc.lookup(&q).await.unwrap().into_outputs().unwrap();
-        assert_eq!(results.len(), 1, "expired table must be excluded at query time");
+        assert_eq!(
+            results.len(),
+            1,
+            "expired table must be excluded at query time"
+        );
         assert_eq!(results[0].txid, "fresh");
     }
 

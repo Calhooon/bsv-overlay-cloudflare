@@ -22,7 +22,6 @@
 //! orchestrator's staging probe (handshake + authenticated GET against the
 //! deployed worker), per the lane report.
 
-
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
@@ -239,7 +238,9 @@ async fn wait_for(cond: impl Fn() -> bool, what: &str) {
 async fn real_keys_roundtrip_feeds_the_identity_seam() {
     let rig = rig().await;
     let payload = b"GET /results (identity-scoped view)".to_vec();
-    send(&rig, &payload).await.expect("honest exchange verifies");
+    send(&rig, &payload)
+        .await
+        .expect("honest exchange verifies");
     let received = rig.received.clone();
     wait_for(
         move || received.lock().unwrap().len() == 1,
@@ -248,7 +249,11 @@ async fn real_keys_roundtrip_feeds_the_identity_seam() {
     .await;
 
     let got = rig.received.lock().unwrap().clone();
-    assert_eq!(got.len(), 1, "server must deliver exactly one General message");
+    assert_eq!(
+        got.len(),
+        1,
+        "server must deliver exactly one General message"
+    );
     let (sender_hex, got_payload) = &got[0];
     assert_eq!(got_payload, &payload, "payload must survive the wire");
     assert_eq!(
@@ -264,7 +269,10 @@ async fn real_keys_roundtrip_feeds_the_identity_seam() {
     // The verified identity drives THE production seam.
     let caller = CallerAuth::verified(sender_hex);
     let session_id = sender_hex.to_ascii_lowercase();
-    let other_identity = PrivateKey::random().public_key().to_hex().to_ascii_lowercase();
+    let other_identity = PrivateKey::random()
+        .public_key()
+        .to_hex()
+        .to_ascii_lowercase();
     for mode in [AuthMode::Lenient, AuthMode::Strict] {
         // No query param → the authenticated session's view is served.
         assert_eq!(
@@ -515,7 +523,8 @@ async fn swapped_identity_with_live_attacker_session_is_refused_by_signature() {
 
     let errs = errors.lock().unwrap().clone();
     assert!(
-        errs.iter().any(|e| e.to_ascii_lowercase().contains("signature")),
+        errs.iter()
+            .any(|e| e.to_ascii_lowercase().contains("signature")),
         "with a live attacker session the refusal must come from SIGNATURE \
          verification (the counterparty pairing), not a missing session; got {errs:?}"
     );

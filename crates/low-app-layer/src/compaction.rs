@@ -77,7 +77,7 @@ pub fn compact_beef(subject_txid: &str, beef: &[u8]) -> Vec<u8> {
                 beef.len()
             );
             return beef.to_vec();
-        },
+        }
     };
 
     // Record the input on-wire format so we can re-serialize identically.
@@ -117,7 +117,7 @@ pub fn compact_beef(subject_txid: &str, beef: &[u8]) -> Vec<u8> {
                     beef.len()
                 );
                 return beef.to_vec();
-            },
+            }
         },
         None => parsed.to_binary(),
     };
@@ -235,18 +235,38 @@ mod tests {
         let out = compact_beef(&child_txid, &input);
 
         // Genuinely shrank.
-        assert!(out.len() < in_len, "expected shrink: {} -> {}", in_len, out.len());
+        assert!(
+            out.len() < in_len,
+            "expected shrink: {} -> {}",
+            in_len,
+            out.len()
+        );
 
         // Result: plain (format preserved), re-parses, subject + proven parent
         // retained, grandparent gone, SPV-verifiable.
         let mut re = Beef::from_binary(&out).unwrap();
-        assert!(!re.is_atomic(), "format preserved: plain input -> plain output");
-        assert!(re.find_txid(&child_txid).is_some(), "subject (child) retained");
-        assert!(re.find_txid(&parent_txid).is_some(), "proven parent retained");
-        assert!(re.find_txid(&gp_txid).is_none(), "redundant grandparent must be trimmed");
+        assert!(
+            !re.is_atomic(),
+            "format preserved: plain input -> plain output"
+        );
+        assert!(
+            re.find_txid(&child_txid).is_some(),
+            "subject (child) retained"
+        );
+        assert!(
+            re.find_txid(&parent_txid).is_some(),
+            "proven parent retained"
+        );
+        assert!(
+            re.find_txid(&gp_txid).is_none(),
+            "redundant grandparent must be trimmed"
+        );
         assert_eq!(re.txs.len(), 2);
         let vr = re.verify_valid(true);
         assert!(vr.valid, "compacted beef must be structurally valid");
-        assert!(!vr.roots.is_empty(), "a BUMP is retained, so a merkle root must compute");
+        assert!(
+            !vr.roots.is_empty(),
+            "a BUMP is retained, so a merkle root must compute"
+        );
     }
 }

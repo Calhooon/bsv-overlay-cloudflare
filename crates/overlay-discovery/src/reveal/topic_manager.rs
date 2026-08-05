@@ -679,7 +679,10 @@ pub(crate) mod tests {
         let instructions = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::HistoricalTxNoSpv)
+                &[],
+                None,
+                SubmitMode::HistoricalTxNoSpv,
+            )
             .await
             .unwrap();
         // Only the reveal artifact (index 1) is admitted.

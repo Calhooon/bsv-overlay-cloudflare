@@ -257,9 +257,7 @@ pub struct AdvertReapSummary {
 /// `resolve_tip`: `None` on no tracker or a fetch fault — but here the
 /// consumer is fail-CLOSED (reap nothing), the opposite direction of the
 /// lobby filter's fail-open. Never silent either way.
-pub async fn resolve_tip(
-    tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
-) -> Option<u32> {
+pub async fn resolve_tip(tracker: Option<&dyn bsv_rs::transaction::ChainTracker>) -> Option<u32> {
     match tracker {
         Some(ct) => match ct.current_height().await {
             Ok(h) => Some(h),
@@ -316,7 +314,10 @@ pub async fn reap_expired_adverts(
         return summary;
     };
 
-    let candidates = match storage.find_tables_expired_at_or_before(cutoff, limit).await {
+    let candidates = match storage
+        .find_tables_expired_at_or_before(cutoff, limit)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             push_log(&format!("[advert-reap] candidate scan failed: {e}"));
@@ -362,11 +363,7 @@ pub async fn reap_expired_adverts(
 #[async_trait::async_trait(?Send)]
 pub trait SpendProbeTransport {
     /// GET `url`, returning `(status, body)`; `Err` = transport fault.
-    async fn get(
-        &self,
-        url: &str,
-        header: Option<(&str, &str)>,
-    ) -> Result<(u16, String), String>;
+    async fn get(&self, url: &str, header: Option<(&str, &str)>) -> Result<(u16, String), String>;
 }
 
 /// The production transport — `worker::Fetch` via the shared
@@ -375,11 +372,7 @@ pub struct WorkerFetchTransport;
 
 #[async_trait::async_trait(?Send)]
 impl SpendProbeTransport for WorkerFetchTransport {
-    async fn get(
-        &self,
-        url: &str,
-        header: Option<(&str, &str)>,
-    ) -> Result<(u16, String), String> {
+    async fn get(&self, url: &str, header: Option<(&str, &str)>) -> Result<(u16, String), String> {
         http_get(url, header).await
     }
 }
@@ -549,7 +542,10 @@ mod tests {
 
     #[test]
     fn cutoff_is_tip_minus_margin() {
-        assert_eq!(reap_cutoff(Some(900_006), ADVERT_REAP_MARGIN_BLOCKS), Some(900_000));
+        assert_eq!(
+            reap_cutoff(Some(900_006), ADVERT_REAP_MARGIN_BLOCKS),
+            Some(900_000)
+        );
         assert_eq!(reap_cutoff(Some(6), 6), Some(0));
     }
 
@@ -559,14 +555,20 @@ mod tests {
     fn reap_predicate_margin_and_null_expiry() {
         let tip = 900_006u32;
         let cutoff = reap_cutoff(Some(tip), ADVERT_REAP_MARGIN_BLOCKS).unwrap();
-        assert!(should_reap(Some(900_000), cutoff), "expiry == tip - margin reaps");
+        assert!(
+            should_reap(Some(900_000), cutoff),
+            "expiry == tip - margin reaps"
+        );
         assert!(should_reap(Some(899_999), cutoff), "older reaps");
         assert!(
             !should_reap(Some(900_001), cutoff),
             "inside the margin window (expired but < margin below tip) stands"
         );
         assert!(!should_reap(Some(tip), cutoff), "unexpired stands");
-        assert!(!should_reap(None, cutoff), "NULL expiry is never reap evidence");
+        assert!(
+            !should_reap(None, cutoff),
+            "NULL expiry is never reap evidence"
+        );
     }
 
     // ── the reap pass over the real memory backend ───────────────────────
@@ -590,7 +592,10 @@ mod tests {
     #[tokio::test]
     async fn reap_pass_refuses_on_null_tip() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table("ancient", Some(1))).await.unwrap();
+        store
+            .store_record(&table("ancient", Some(1)))
+            .await
+            .unwrap();
 
         let s = reap_expired_adverts(&store, None, ADVERT_REAP_LIMIT).await;
         assert_eq!(
@@ -611,9 +616,18 @@ mod tests {
     async fn reap_pass_deletes_only_beyond_the_margin() {
         let store = MemoryLowStorage::new();
         let tip = 900_006u32;
-        store.store_record(&table("beyond", Some(900_000))).await.unwrap();
-        store.store_record(&table("inside", Some(900_003))).await.unwrap();
-        store.store_record(&table("fresh", Some(900_100))).await.unwrap();
+        store
+            .store_record(&table("beyond", Some(900_000)))
+            .await
+            .unwrap();
+        store
+            .store_record(&table("inside", Some(900_003)))
+            .await
+            .unwrap();
+        store
+            .store_record(&table("fresh", Some(900_100)))
+            .await
+            .unwrap();
         store.store_record(&table("no_expiry", None)).await.unwrap();
 
         let s = reap_expired_adverts(&store, Some(tip), ADVERT_REAP_LIMIT).await;
@@ -635,7 +649,10 @@ mod tests {
     #[tokio::test]
     async fn reap_pass_degenerate_tip_reports_resolved_but_reaps_nothing() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table("ancient", Some(1))).await.unwrap();
+        store
+            .store_record(&table("ancient", Some(1)))
+            .await
+            .unwrap();
 
         let s = reap_expired_adverts(&store, Some(3), ADVERT_REAP_LIMIT).await;
         assert_eq!(
@@ -647,7 +664,11 @@ mod tests {
                 delete_failed: 0
             }
         );
-        assert_eq!(store.record_count(), 1, "the row STANDS on a degenerate tip");
+        assert_eq!(
+            store.record_count(),
+            1,
+            "the row STANDS on a degenerate tip"
+        );
     }
 
     #[tokio::test]
@@ -700,7 +721,10 @@ mod tests {
 
     #[test]
     fn woc_spent_probe_parse_is_strict() {
-        let good = format!("{{\"txid\":\"{}\",\"status\":\"confirmed\"}}", "AB".repeat(32));
+        let good = format!(
+            "{{\"txid\":\"{}\",\"status\":\"confirmed\"}}",
+            "AB".repeat(32)
+        );
         assert_eq!(
             parse_woc_spent_probe(200, &good),
             SpentProbe::Spent {
@@ -714,12 +738,12 @@ mod tests {
             "4xx = unspent-or-unindexed"
         );
         for (status, body) in [
-            (500u16, ""),                          // provider fault
-            (429, ""),                             // rate-limited (gate L4) — never "unspent"
-            (200, "not json"),                     // malformed body
-            (200, "{\"noTxid\":true}"),            // missing pointer
-            (200, "{\"txid\":\"beef\"}"),          // short txid
-            (200, "{\"txid\":\"zz\"}"),            // non-hex
+            (500u16, ""),                 // provider fault
+            (429, ""),                    // rate-limited (gate L4) — never "unspent"
+            (200, "not json"),            // malformed body
+            (200, "{\"noTxid\":true}"),   // missing pointer
+            (200, "{\"txid\":\"beef\"}"), // short txid
+            (200, "{\"txid\":\"zz\"}"),   // non-hex
         ] {
             assert_eq!(
                 parse_woc_spent_probe(status, body),
@@ -766,10 +790,7 @@ mod tests {
     impl MockTransport {
         fn new(routes: Vec<(String, u16, String)>) -> Self {
             Self {
-                responses: routes
-                    .into_iter()
-                    .map(|(u, s, b)| (u, (s, b)))
-                    .collect(),
+                responses: routes.into_iter().map(|(u, s, b)| (u, (s, b))).collect(),
                 hits: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -837,7 +858,13 @@ mod tests {
 
         let s = confirm_advert_spends(&store, &transport, None, 10).await;
         assert_eq!(
-            (s.scanned, s.deleted, s.not_spent, s.unknown, s.delete_failed),
+            (
+                s.scanned,
+                s.deleted,
+                s.not_spent,
+                s.unknown,
+                s.delete_failed
+            ),
             (3, 1, 1, 1, 0)
         );
 
@@ -905,7 +932,10 @@ mod tests {
     async fn spend_pass_counts_a_failed_delete_and_leaves_the_row() {
         let store = FailingDelete(MemoryLowStorage::new());
         let advert = "44".repeat(32);
-        store.store_record(&table(&advert, Some(900_000))).await.unwrap();
+        store
+            .store_record(&table(&advert, Some(900_000)))
+            .await
+            .unwrap();
         let raw = raw_tx_spending(&advert, 0);
         let spender = bsv_rs::transaction::Transaction::from_binary(&raw)
             .unwrap()
@@ -929,7 +959,9 @@ mod tests {
         let advert_txid = "11".repeat(32);
         let raw = raw_tx_spending(&advert_txid, 0);
         let raw_hex = hex::encode(&raw);
-        let spender = bsv_rs::transaction::Transaction::from_binary(&raw).unwrap().id();
+        let spender = bsv_rs::transaction::Transaction::from_binary(&raw)
+            .unwrap()
+            .id();
 
         assert!(spender_raw_verifies(&raw_hex, &spender, &advert_txid, 0));
         assert!(

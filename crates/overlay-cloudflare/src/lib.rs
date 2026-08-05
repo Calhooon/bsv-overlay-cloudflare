@@ -11,9 +11,9 @@ pub mod ban_storage;
 pub mod broadcaster;
 pub mod chain_tracker;
 pub mod d1;
-pub mod ef;
 pub mod d1_discovery;
 pub mod d1_storage;
+pub mod ef;
 pub mod error;
 pub mod gasp_remote;
 pub mod health_checker;
@@ -157,8 +157,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
-    let potrefund_storage: Rc<dyn PotrefundStorage> =
-        Rc::new(D1PotrefundStorage::new(db.clone()));
+    let potrefund_storage: Rc<dyn PotrefundStorage> = Rc::new(D1PotrefundStorage::new(db.clone()));
     let hopparty_storage: Rc<dyn HoppartyStorage> = Rc::new(D1HoppartyStorage::new(db.clone()));
     // DB handle for GET /health/invariants (#192/#193, P4) — the engine build
     // below consumes `db`.
@@ -228,7 +227,15 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
             // `ctx` is threaded in so the best-effort mainnet SHIP fan-out
             // runs via `wait_until` AFTER the response instead of inline
             // (it was costing the caller seconds on every submit).
-            submit(&engine, req, hosting_url.as_deref(), arcade_url, taal_api_key, &ctx).await
+            submit(
+                &engine,
+                req,
+                hosting_url.as_deref(),
+                arcade_url,
+                taal_api_key,
+                &ctx,
+            )
+            .await
         }
         (Method::Post, "/lookup") => lookup(&engine, req).await,
         (Method::Post, "/arc-ingest") => {
@@ -371,8 +378,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
-    let potrefund_storage: Rc<dyn PotrefundStorage> =
-        Rc::new(D1PotrefundStorage::new(db.clone()));
+    let potrefund_storage: Rc<dyn PotrefundStorage> = Rc::new(D1PotrefundStorage::new(db.clone()));
     let hopparty_storage: Rc<dyn HoppartyStorage> = Rc::new(D1HoppartyStorage::new(db.clone()));
     Ok(build_engine_with_storage(
         db,
@@ -509,11 +515,16 @@ fn build_engine_with_storage(
             "tm_lowfund" => {
                 managers.insert(
                     "tm_lowfund".into(),
-                    Box::new(overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new()),
+                    Box::new(
+                        overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new(),
+                    ),
                 );
             }
             "tm_collected" => {
-                managers.insert("tm_collected".into(), Box::new(CollectedTopicManager::new()));
+                managers.insert(
+                    "tm_collected".into(),
+                    Box::new(CollectedTopicManager::new()),
+                );
             }
             "tm_result" => {
                 managers.insert("tm_result".into(), Box::new(ResultTopicManager::new()));
@@ -522,10 +533,7 @@ fn build_engine_with_storage(
                 managers.insert("tm_proof".into(), Box::new(ProofTopicManager::new()));
             }
             "tm_potparty" => {
-                managers.insert(
-                    "tm_potparty".into(),
-                    Box::new(PotpartyTopicManager::new()),
-                );
+                managers.insert("tm_potparty".into(), Box::new(PotpartyTopicManager::new()));
             }
             "tm_potrefund" => {
                 managers.insert(
@@ -534,10 +542,7 @@ fn build_engine_with_storage(
                 );
             }
             "tm_hopparty" => {
-                managers.insert(
-                    "tm_hopparty".into(),
-                    Box::new(HoppartyTopicManager::new()),
-                );
+                managers.insert("tm_hopparty".into(), Box::new(HoppartyTopicManager::new()));
             }
             other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
         }
@@ -995,8 +1000,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
-    let potrefund_storage: Rc<dyn PotrefundStorage> =
-        Rc::new(D1PotrefundStorage::new(db.clone()));
+    let potrefund_storage: Rc<dyn PotrefundStorage> = Rc::new(D1PotrefundStorage::new(db.clone()));
     let hopparty_storage: Rc<dyn HoppartyStorage> = Rc::new(D1HoppartyStorage::new(db.clone()));
     // Keep a DB handle for the observability writes (#192/#193, P4) — the
     // engine build below consumes `db`.
@@ -1266,12 +1270,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
             worker::console_log!("Scheduled: rebroadcast-backstop candidate scan failed: {e}");
             Vec::new()
         });
-    let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
-        rb_candidates,
-        taal_key.as_deref(),
-        None,
-    )
-    .await;
+    let rb =
+        crate::proof_fetcher::rebroadcast_absent_admitted(rb_candidates, taal_key.as_deref(), None)
+            .await;
     worker::console_log!(
         "Scheduled: rebroadcast-backstop (transactions) — scanned={} present={} \
          inconclusive={} rebroadcast={} failed={} budget_skipped={}",
@@ -1440,8 +1441,9 @@ async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Re
     // min_age 0: the drain is operator-driven and the fast path only ever
     // LATCHES verified truth — the #228 push-primary age gate protects
     // courier polling, which budget 0 already forbids.
-    let s = crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &fetcher, limit, 0)
-        .await;
+    let s =
+        crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &fetcher, limit, 0)
+            .await;
     Response::from_json(&serde_json::json!({
         "status": "ok",
         "limit": limit,
@@ -1608,12 +1610,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
             worker::console_log!("complete-proofs: rebroadcast candidate scan failed: {e}");
             Vec::new()
         });
-    let rb = crate::proof_fetcher::rebroadcast_absent_admitted(
-        rb_candidates,
-        taal_key.as_deref(),
-        None,
-    )
-    .await;
+    let rb =
+        crate::proof_fetcher::rebroadcast_absent_admitted(rb_candidates, taal_key.as_deref(), None)
+            .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;

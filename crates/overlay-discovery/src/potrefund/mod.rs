@@ -378,7 +378,9 @@ pub(crate) mod tests {
     fn large_refund_pushdata2_round_trips() {
         // The refund push rides OP_PUSHDATA2 (0x4d). Confirm the encoder
         // emitted a 0x4d prefix somewhere and the bytes survive verbatim.
-        let refund: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(7) & 0xff) as u8).collect();
+        let refund: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(7) & 0xff) as u8)
+            .collect();
         let script = marker_script(
             &golden_identity(),
             &golden_game_id(),

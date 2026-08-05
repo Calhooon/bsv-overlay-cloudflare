@@ -218,13 +218,15 @@ pub(crate) mod tests {
         let instructions = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::HistoricalTxNoSpv)
+                &[],
+                None,
+                SubmitMode::HistoricalTxNoSpv,
+            )
             .await
             .unwrap();
         // Only the marker (index 1) is admitted.
         assert_eq!(instructions.outputs_to_admit, vec![1]);
     }
-
 
     #[tokio::test]
     async fn topic_manager_trait_works() {

@@ -555,7 +555,11 @@ impl Storage for D1Storage {
 
         Ok(outpoints
             .iter()
-            .filter_map(|op| by_outpoint.get(&(op.txid.clone(), op.output_index)).cloned())
+            .filter_map(|op| {
+                by_outpoint
+                    .get(&(op.txid.clone(), op.output_index))
+                    .cloned()
+            })
             .collect())
     }
 
@@ -791,7 +795,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(all_proofless, 4, "nothing was deleted or proven by aging out");
+        assert_eq!(
+            all_proofless, 4,
+            "nothing was deleted or proven by aging out"
+        );
     }
 
     /// bsv-low#302: the SHIPPED peer-health upsert + select on the
@@ -833,7 +840,10 @@ mod tests {
         record("dead", false);
         let (fails, age) = health("dead");
         assert_eq!(fails, 3);
-        assert!(age.is_some_and(|a| (0..5).contains(&a)), "fresh attempt age ≈ 0: {age:?}");
+        assert!(
+            age.is_some_and(|a| (0..5).contains(&a)),
+            "fresh attempt age ≈ 0: {age:?}"
+        );
 
         // One success resets the streak to 0 — full re-admission.
         record("dead", true);
@@ -977,7 +987,9 @@ mod tests {
 
         // Ask for (aa,1), (cc,7) and one absent outpoint (bb,9).
         let sql = D1Storage::outputs_batch_sql(true, 3);
-        let mut stmt = conn.prepare(&sql).expect("batch SQL must parse on real SQLite");
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("batch SQL must parse on real SQLite");
         let rows: Vec<(String, u32)> = stmt
             .query_map(
                 rusqlite::params!["aa", 1u32, "cc", 7u32, "bb", 9u32],

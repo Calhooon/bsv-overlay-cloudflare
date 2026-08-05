@@ -954,8 +954,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // backfill — `SELECT … WHERE sigValid IS NULL LIMIT N` -> compute ->
     // `UPDATE` — is perfectly possible and small; it is simply not in this
     // change. **So the legacy tier is PERMANENT until that backfill lands**
-    // (tracked as the #283 follow-up; closure criterion: zero rows with
-    // `sigValid IS NULL` remaining).
+    // (bsv-low#355; closure criterion: zero rows with `sigValid IS NULL`).
     //
     // Additive ALTER — the runner ignores the re-run "duplicate column"
     // error (`migration_error_is_benign`). NOTE the app-layer Worker issues
@@ -1062,7 +1061,10 @@ mod tests {
             "D1_ERROR: Duplicate Column name: x"
         ));
         // Any OTHER error on an ALTER is NOT benign.
-        assert!(!migration_error_is_benign(alter, "no such table: pot_records"));
+        assert!(!migration_error_is_benign(
+            alter,
+            "no such table: pot_records"
+        ));
         assert!(!migration_error_is_benign(alter, "syntax error near ADD"));
         // A duplicate-column report from a non-ALTER statement is NOT benign.
         assert!(!migration_error_is_benign(
@@ -1170,7 +1172,8 @@ mod tests {
         // The additive v2-cards column migration exists and targets
         // result_markers_v2 (mirrors the pot_records spentConfirmed pin).
         assert!(OVERLAY_MIGRATIONS.iter().any(|sql| {
-            sql.trim_start().starts_with("ALTER TABLE result_markers_v2")
+            sql.trim_start()
+                .starts_with("ALTER TABLE result_markers_v2")
                 && sql.contains("ADD COLUMN cardsHex TEXT")
         }));
     }
@@ -1263,7 +1266,9 @@ mod tests {
             .collect();
         assert_eq!(carries.len(), 1, "exactly one data-carry migration");
         let carry = carries[0];
-        assert!(carry.trim_start().starts_with("INSERT OR IGNORE INTO result_markers_v2"));
+        assert!(carry
+            .trim_start()
+            .starts_with("INSERT OR IGNORE INTO result_markers_v2"));
         assert!(carry.contains("FROM result_markers WHERE txid IS NOT NULL"));
         assert!(carry.contains("outputIndex"));
     }

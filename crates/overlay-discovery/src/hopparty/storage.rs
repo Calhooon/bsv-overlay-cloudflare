@@ -249,7 +249,9 @@ impl HoppartyStorage for MemoryHoppartyStorage {
         let mut kept: Vec<&HoppartyRecord> = Vec::new();
         for r in records.iter().filter(|r| r.identity == identity) {
             // The hop outpoint is (containing txid, hopVout).
-            let n = per_outpoint.entry((r.txid.as_str(), r.hop_vout)).or_insert(0);
+            let n = per_outpoint
+                .entry((r.txid.as_str(), r.hop_vout))
+                .or_insert(0);
             if *n < HOPSFOR_ROWS_PER_OUTPOINT {
                 *n += 1;
                 kept.push(r);
@@ -263,7 +265,9 @@ impl HoppartyStorage for MemoryHoppartyStorage {
         let mut newest_of: std::collections::HashMap<(&str, u32), i64> =
             std::collections::HashMap::new();
         for r in &kept {
-            let e = newest_of.entry((r.txid.as_str(), r.hop_vout)).or_insert(i64::MIN);
+            let e = newest_of
+                .entry((r.txid.as_str(), r.hop_vout))
+                .or_insert(i64::MIN);
             *e = (*e).max(r.created_at);
         }
         let mut outpoints: Vec<((&str, u32), i64)> = newest_of.into_iter().collect();
@@ -285,7 +289,9 @@ impl HoppartyStorage for MemoryHoppartyStorage {
             .collect();
         out.sort_by_key(|r| {
             (
-                *rank.get(&(r.txid.clone(), r.hop_vout)).unwrap_or(&usize::MAX),
+                *rank
+                    .get(&(r.txid.clone(), r.hop_vout))
+                    .unwrap_or(&usize::MAX),
                 r.created_at,
             )
         });
@@ -374,7 +380,11 @@ mod tests {
         let rows = store.list_for_identity("02aa", 100).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].txid, "tx1");
-        assert!(store.list_for_identity("02cc", 100).await.unwrap().is_empty());
+        assert!(store
+            .list_for_identity("02cc", 100)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

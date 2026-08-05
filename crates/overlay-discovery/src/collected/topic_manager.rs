@@ -203,7 +203,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn identify_admissible_outputs_over_beef() {
-        let marker = make_collected_output(&golden_game_id(), &golden_identity_key(), &golden_sig());
+        let marker =
+            make_collected_output(&golden_game_id(), &golden_identity_key(), &golden_sig());
         // A change-style P2PKH first — must be skipped.
         let p2pkh = TransactionOutput {
             satoshis: Some(546),
@@ -225,13 +226,15 @@ pub(crate) mod tests {
         let instructions = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::HistoricalTxNoSpv)
+                &[],
+                None,
+                SubmitMode::HistoricalTxNoSpv,
+            )
             .await
             .unwrap();
         // Only the marker (index 1) is admitted.
         assert_eq!(instructions.outputs_to_admit, vec![1]);
     }
-
 
     #[tokio::test]
     async fn topic_manager_trait_works() {

@@ -76,24 +76,24 @@ fn admit_pot_keys(
         store_record_sql(),
         params![
             txid,
-            0i64,                                          // outputIndex
-            0i64,                                          // spent
-            Option::<String>::None,                        // spendingTxid
-            0i64,                                          // spentConfirmed
-            created_at,                                    // createdAt
-            covenant.then_some("covenant"),                // lockKind
-            covenant.then(|| pub_a.unwrap_or(h66(0x0a))),  // pubA
-            covenant.then(|| h66(0x0b)),                   // pubB
-            covenant.then(|| h66(0x0c)),                   // pubTower
-            covenant.then(|| "aa".repeat(20)),             // payPkhA
-            covenant.then(|| "bb".repeat(20)),             // payPkhB
-            covenant.then(|| "cc".repeat(20)),             // rakePkh
-            covenant.then_some(500i64),                    // stakeA
-            covenant.then_some(500i64),                    // stakeB
-            covenant.then_some(8i64),                      // feeSats
-            cov_height,                                    // recoveryHeight (committed)
-            covenant.then_some(1000i64),                   // potSats
-            i64::from(covenant),                           // paramsDecoded
+            0i64,                                         // outputIndex
+            0i64,                                         // spent
+            Option::<String>::None,                       // spendingTxid
+            0i64,                                         // spentConfirmed
+            created_at,                                   // createdAt
+            covenant.then_some("covenant"),               // lockKind
+            covenant.then(|| pub_a.unwrap_or(h66(0x0a))), // pubA
+            covenant.then(|| h66(0x0b)),                  // pubB
+            covenant.then(|| h66(0x0c)),                  // pubTower
+            covenant.then(|| "aa".repeat(20)),            // payPkhA
+            covenant.then(|| "bb".repeat(20)),            // payPkhB
+            covenant.then(|| "cc".repeat(20)),            // rakePkh
+            covenant.then_some(500i64),                   // stakeA
+            covenant.then_some(500i64),                   // stakeB
+            covenant.then_some(8i64),                     // feeSats
+            cov_height,                                   // recoveryHeight (committed)
+            covenant.then_some(1000i64),                  // potSats
+            i64::from(covenant),                          // paramsDecoded
         ],
     )
     .expect("store_record_sql");
@@ -116,7 +116,16 @@ fn mark_spent(
     match (confirmed, verdict) {
         (true, Some(v)) => conn.execute(
             sql,
-            params![spender, v, spender, spender, spent_height, spent_height, pot_txid, 0i64],
+            params![
+                spender,
+                v,
+                spender,
+                spender,
+                spent_height,
+                spent_height,
+                pot_txid,
+                0i64
+            ],
         ),
         (true, None) => conn.execute(
             sql,
@@ -140,7 +149,15 @@ fn file_party(
     marker_txid: &str,
     at: i64,
 ) {
-    file_party_game(conn, identity, &h64(0x11), pot_txid, recovery_height, marker_txid, at);
+    file_party_game(
+        conn,
+        identity,
+        &h64(0x11),
+        pot_txid,
+        recovery_height,
+        marker_txid,
+        at,
+    );
 }
 
 /// Latch an already-filed marker the way the PRODUCTION writer would for an
@@ -200,8 +217,17 @@ fn file_party_game(
             // ATTACKER's row latches, and every caller here that is modelling
             // an attacker wants exactly that. The HONEST-v1 callers override
             // via `latch_honest_v1`; see that helper for the boundary.
-            production_latch(identity, &h66(0xbb), game_id, pot_txid, 0, recovery_height as u32,
-                             "3045ab", None, None)
+            production_latch(
+                identity,
+                &h66(0xbb),
+                game_id,
+                pot_txid,
+                0,
+                recovery_height as u32,
+                "3045ab",
+                None,
+                None
+            )
         ],
     )
     .expect("insert potparty_records");
@@ -222,20 +248,22 @@ fn production_latch(
     seat_sig: Option<&str>,
 ) -> i32 {
     use overlay_discovery::potparty::storage::PotpartyRecord;
-    i32::from(overlay_discovery::potparty::validity::record_sig_valid(&PotpartyRecord {
-        identity: identity.to_string(),
-        opponent_identity: opponent.to_string(),
-        game_id: game_id.to_string(),
-        pot_txid: pot_txid.to_string(),
-        pot_vout,
-        recovery_height,
-        sig_hex: sig_hex.to_string(),
-        seat_settle_pubkey: seat_pub.map(str::to_string),
-        seat_sig_hex: seat_sig.map(str::to_string),
-        txid: "00".repeat(32),
-        output_index: 0,
-        created_at: 0,
-    }))
+    i32::from(overlay_discovery::potparty::validity::record_sig_valid(
+        &PotpartyRecord {
+            identity: identity.to_string(),
+            opponent_identity: opponent.to_string(),
+            game_id: game_id.to_string(),
+            pot_txid: pot_txid.to_string(),
+            pot_vout,
+            recovery_height,
+            sig_hex: sig_hex.to_string(),
+            seat_settle_pubkey: seat_pub.map(str::to_string),
+            seat_sig_hex: seat_sig.map(str::to_string),
+            txid: "00".repeat(32),
+            output_index: 0,
+            created_at: 0,
+        },
+    ))
 }
 
 // ── real-crypto v2 markers (the corroboration producer path) ────────────────
@@ -277,7 +305,9 @@ fn file_party_v2_real(
     .unwrap();
     let settle_pub = settle_key.public_key().to_hex().to_ascii_lowercase();
     let preimage = seatsig_preimage(game_id, pot_txid, 0, &identity).expect("preimage");
-    let seat_sig = settle_key.sign(&bsv_rs::primitives::hash::sha256(&preimage)).unwrap();
+    let seat_sig = settle_key
+        .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+        .unwrap();
     let seat_sig_hex = hex::encode(seat_sig.to_der());
     let m = SeatMarkerRow {
         identity: identity.clone(),
@@ -367,7 +397,9 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<LiveViewRow> {
             pot_vout: r.get::<_, i64>("potVout")? as u32,
             opponent_identity: r.get("opponentIdentity")?,
             marker_recovery_height: r.get::<_, i64>("recoveryHeight")? as u32,
-            cov_recovery_height: r.get::<_, Option<i64>>("covRecoveryHeight")?.map(|v| v as u64),
+            cov_recovery_height: r
+                .get::<_, Option<i64>>("covRecoveryHeight")?
+                .map(|v| v as u64),
             identity_sig_hex: r.get("sigHex")?,
             seat_settle_pubkey: r.get("seatSettlePubkey")?,
             seat_sig_hex: r.get("seatSigHex")?,
@@ -398,9 +430,7 @@ fn fetch_candidates(conn: &Connection, identity: &str, rows: &[LiveViewRow]) -> 
             .query_map(rusqlite::params_from_iter(binds), |r| {
                 Ok(SeatMarkerRow {
                     identity: r.get::<_, String>("identity")?.to_ascii_lowercase(),
-                    opponent_identity: r
-                        .get::<_, String>("opponentIdentity")?
-                        .to_ascii_lowercase(),
+                    opponent_identity: r.get::<_, String>("opponentIdentity")?.to_ascii_lowercase(),
                     game_id: r.get::<_, String>("gameId")?.to_ascii_lowercase(),
                     pot_txid: r.get::<_, String>("potTxid")?.to_ascii_lowercase(),
                     pot_vout: r.get::<_, i64>("potVout")? as u32,
@@ -423,7 +453,9 @@ fn fetch_candidates(conn: &Connection, identity: &str, rows: &[LiveViewRow]) -> 
             .collect::<Result<Vec<_>, _>>()
             .expect("candidate rows");
         for m in fetched {
-            out.entry((m.pot_txid.clone(), m.pot_vout)).or_default().push(m);
+            out.entry((m.pot_txid.clone(), m.pot_vout))
+                .or_default()
+                .push(m);
         }
     };
     for chunk in &plan.keyed {
@@ -531,13 +563,23 @@ fn confirmed_spend_is_excluded_even_without_a_verdict() {
     // no decoded verdict is just as settled (the verdict story is
     // /refund-view's and /results').
     mark_spent(&conn, &pot, &h64(0xfe), true, None, Some(900_150));
-    assert!(query_rows(&conn, &me).is_empty(), "confirmed spend is not live");
+    assert!(
+        query_rows(&conn, &me).is_empty(),
+        "confirmed spend is not live"
+    );
 
     // And with a verdict, equally excluded.
     let pot2 = h64(0xab);
     admit_pot(&conn, &pot2, 1_100, Some(GATE));
     file_party(&conn, &me, &pot2, GATE, "txPARTY2", 1_101);
-    mark_spent(&conn, &pot2, &h64(0xfd), true, Some("winner-a"), Some(900_160));
+    mark_spent(
+        &conn,
+        &pot2,
+        &h64(0xfd),
+        true,
+        Some("winner-a"),
+        Some(900_160),
+    );
     assert!(query_rows(&conn, &me).is_empty());
 }
 
@@ -558,7 +600,14 @@ fn mixed_set_keeps_only_the_live_pots() {
     let settled = h64(0xd2);
     admit_pot(&conn, &settled, 1_200, Some(GATE));
     file_party(&conn, &me, &settled, GATE, "txC", 1_201);
-    mark_spent(&conn, &settled, &h64(0xf2), true, Some("winner-b"), Some(900_150));
+    mark_spent(
+        &conn,
+        &settled,
+        &h64(0xf2),
+        true,
+        Some("winner-b"),
+        Some(900_150),
+    );
     // (d) join miss (never indexed) — INCLUDED as unknown/possibly-live.
     let ghost = h64(0xd3);
     file_party(&conn, &me, &ghost, GATE, "txD", 1_301);
@@ -569,7 +618,10 @@ fn mixed_set_keeps_only_the_live_pots() {
     assert!(pots.contains(&unspent.as_str()));
     assert!(pots.contains(&unconf.as_str()));
     assert!(pots.contains(&ghost.as_str()));
-    assert!(!pots.contains(&settled.as_str()), "settled pot must not appear");
+    assert!(
+        !pots.contains(&settled.as_str()),
+        "settled pot must not appear"
+    );
     // The ghost arrives with the fail-safe unknown shape — included but
     // never asserted unspent.
     let g = rows.iter().find(|r| r.pot_txid == ghost).unwrap();
@@ -619,9 +671,12 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
     let stranger = h66(0xee);
     let rows = query_rows(&conn, &stranger);
     assert!(rows.is_empty());
-    let v: serde_json::Value =
-        serde_json::from_str(&live_view_body(&stranger, None, &assemble(&conn, &stranger, None)))
-            .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&live_view_body(
+        &stranger,
+        None,
+        &assemble(&conn, &stranger, None),
+    ))
+    .unwrap();
     assert_eq!(v["live"], serde_json::json!([]));
     assert!(v["tip"].is_null());
 
@@ -641,10 +696,21 @@ fn dust_replays_collapse_to_one_row_per_pot_oldest_representative() {
     // row won the partition (the refund-view delta-round-2 lesson: identical
     // heights let an ASC→DESC ordering drift pass unseen).
     for i in 0..40 {
-        file_party(&conn, &me, &pot, GATE + 1_000 + i, &format!("txREPLAY{i:03}"), 2_000 + i);
+        file_party(
+            &conn,
+            &me,
+            &pot,
+            GATE + 1_000 + i,
+            &format!("txREPLAY{i:03}"),
+            2_000 + i,
+        );
     }
     let rows = query_rows(&conn, &me);
-    assert_eq!(rows.len(), 1, "one pot ⇒ one row, whatever the replay count");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one pot ⇒ one row, whatever the replay count"
+    );
     // The representative is the OLDEST marker (the honest funding-time one) —
     // the only order an attacker cannot win by simply publishing later.
     assert_eq!(rows[0].marker_recovery_height, GATE as u32);
@@ -665,11 +731,25 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
     const REPLAYS: i64 = 60;
     const GHOSTS: u64 = 120;
     for i in 0..REPLAYS {
-        file_party(&conn, &me, &honest_pot, GATE, &format!("txREPLAY{i:03}"), 2_000 + i);
+        file_party(
+            &conn,
+            &me,
+            &honest_pot,
+            GATE,
+            &format!("txREPLAY{i:03}"),
+            2_000 + i,
+        );
     }
     let ghost_txid = |i: u64| format!("{:064x}", 0xdead_0000_u64 + i);
     for i in 0..GHOSTS {
-        file_party(&conn, &me, &ghost_txid(i), GATE, &format!("txGHOST{i:03}"), 3_000 + i as i64);
+        file_party(
+            &conn,
+            &me,
+            &ghost_txid(i),
+            GATE,
+            &format!("txGHOST{i:03}"),
+            3_000 + i as i64,
+        );
     }
 
     let rows = query_rows(&conn, &me);
@@ -681,7 +761,10 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
         "the real pot survives exactly once (replays collapsed)"
     );
     let pos = pots.iter().position(|t| **t == honest_pot).unwrap();
-    assert_eq!(pos, LIVE_VIEW_UNKNOWN_POT_QUOTA, "quota-many promoted ghosts, no more");
+    assert_eq!(
+        pos, LIVE_VIEW_UNKNOWN_POT_QUOTA,
+        "quota-many promoted ghosts, no more"
+    );
     // The promoted slice is the NEWEST ghosts, newest first.
     let promoted: Vec<String> = (0..LIVE_VIEW_UNKNOWN_POT_QUOTA as u64)
         .map(|k| ghost_txid(GHOSTS - 1 - k))
@@ -699,23 +782,44 @@ fn row_cap_bounds_the_page_and_confirmed_pots_free_slots() {
     for i in 0..n {
         let pot = format!("{:064x}", 0x1000_u64 + i as u64);
         admit_pot(&conn, &pot, 1_000 + i as i64, Some(GATE));
-        file_party(&conn, &me, &pot, GATE, &format!("txM{i:03}"), 1_000 + i as i64);
+        file_party(
+            &conn,
+            &me,
+            &pot,
+            GATE,
+            &format!("txM{i:03}"),
+            1_000 + i as i64,
+        );
     }
     let rows = query_rows(&conn, &me);
     assert_eq!(rows.len(), LIVE_VIEW_MAX_ROWS, "hard cap");
     let unique: std::collections::HashSet<&String> = rows.iter().map(|r| &r.pot_txid).collect();
     assert_eq!(unique.len(), LIVE_VIEW_MAX_ROWS, "one row per pot");
     // Newest pots first — the 10 oldest fell off, not the newest.
-    assert_eq!(rows[0].pot_txid, format!("{:064x}", 0x1000_u64 + (n as u64 - 1)));
+    assert_eq!(
+        rows[0].pot_txid,
+        format!("{:064x}", 0x1000_u64 + (n as u64 - 1))
+    );
 
     // The filter runs BEFORE the window: confirming spends on the newest 10
     // pots frees their slots and the previously-evicted oldest pots return.
     for i in (n - 10)..n {
         let pot = format!("{:064x}", 0x1000_u64 + i as u64);
-        mark_spent(&conn, &pot, &h64(0xfe), true, Some("winner-a"), Some(900_150));
+        mark_spent(
+            &conn,
+            &pot,
+            &h64(0xfe),
+            true,
+            Some("winner-a"),
+            Some(900_150),
+        );
     }
     let rows = query_rows(&conn, &me);
-    assert_eq!(rows.len(), LIVE_VIEW_MAX_ROWS, "page refills from live pots only");
+    assert_eq!(
+        rows.len(),
+        LIVE_VIEW_MAX_ROWS,
+        "page refills from live pots only"
+    );
     assert_eq!(
         rows[0].pot_txid,
         format!("{:064x}", 0x1000_u64 + (n as u64 - 11)),
@@ -745,14 +849,17 @@ fn production_v1_then_v2_for_one_pot_still_corroborates() {
     // v1 lands FIRST (older createdAt) — it is what the window collapses to.
     file_party_game(&conn, &me, &game, &pot, GATE, "txV1", 1_001);
     latch_honest_v1(&conn, "txV1"); // an honest v1 is signed; see the helper
-    // v2 lands SECOND, fully genuine; commit its settle key in the pot lock
-    // so the membership pre-filter is exercised on the real path.
-    let settle_pub =
-        file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txV2", 1_002, 0x51);
+                                    // v2 lands SECOND, fully genuine; commit its settle key in the pot lock
+                                    // so the membership pre-filter is exercised on the real path.
+    let settle_pub = file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txV2", 1_002, 0x51);
     admit_pot_keys(&conn, &pot, 1_000, Some(GATE), Some(settle_pub.clone()));
 
     let rows = query_rows(&conn, &me);
-    assert_eq!(rows.len(), 1, "the two markers collapse to ONE representative row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the two markers collapse to ONE representative row"
+    );
     assert_eq!(
         rows[0].seat_settle_pubkey, None,
         "the representative IS the v1 row (this is what made the old gate inoperative)"
@@ -764,7 +871,9 @@ fn production_v1_then_v2_for_one_pot_still_corroborates() {
     assert_eq!(candidates.get(&(pot.clone(), 0)).map(Vec::len), Some(1));
     // …and corroboration succeeds, supplying the gameId as a join key.
     let corr = corroborate_rows(&me, &rows, &candidates);
-    let claim = corr.claims[0].as_ref().expect("the pot corroborates in the PRODUCTION shape");
+    let claim = corr.claims[0]
+        .as_ref()
+        .expect("the pot corroborates in the PRODUCTION shape");
     assert_eq!(claim.game_id, game);
     assert_eq!(corr.attempts, 1, "one honest candidate ⇒ one attempt");
     assert_eq!(fanout_targets(&rows, &corr.claims), vec![game.clone()]);
@@ -774,7 +883,11 @@ fn production_v1_then_v2_for_one_pot_still_corroborates() {
     assert!(e.marker_verified);
     assert_eq!(e.marker_source, "seat-signed");
     assert_eq!(e.opponent_identity_source, Some("seat-signed"));
-    assert_eq!(e.case_source, CaseProvenance::NotFetched, "eligible, pre-fan-out");
+    assert_eq!(
+        e.case_source,
+        CaseProvenance::NotFetched,
+        "eligible, pre-fan-out"
+    );
 }
 
 /// The same-second twin of the cell above: `createdAt` is server-side with
@@ -823,8 +936,16 @@ fn dust_window_cannot_starve_the_corroborated_pots_case_fetch() {
     // The victim's pot in the production shape: v1 then v2.
     file_party_game(&conn, &me, &real_game, &real_pot, GATE, "txREALv1", 1_001);
     latch_honest_v1(&conn, "txREALv1");
-    let settle_pub =
-        file_party_v2_real(&conn, &w, &real_game, &real_pot, GATE as u32, "txREALv2", 1_002, 0x51);
+    let settle_pub = file_party_v2_real(
+        &conn,
+        &w,
+        &real_game,
+        &real_pot,
+        GATE as u32,
+        "txREALv2",
+        1_002,
+        0x51,
+    );
     admit_pot_keys(&conn, &real_pot, 1_000, Some(GATE), Some(settle_pub));
 
     // Exactly QUOTA fresh ghost markers, distinct invented gameIds, all newer
@@ -851,13 +972,19 @@ fn dust_window_cannot_starve_the_corroborated_pots_case_fetch() {
     // ghosts AHEAD of the real pot, which the cell then showed was survivable
     // because the verify budget outranks position. Both properties hold now;
     // the position one got strictly better.
-    let pos = rows.iter().position(|r| r.pot_txid == real_pot).expect("real pot present");
+    let pos = rows
+        .iter()
+        .position(|r| r.pot_txid == real_pot)
+        .expect("real pot present");
     assert_eq!(
         pos, 0,
         "#283: the victim's own pot leads its own view (was: behind {} promoted ghosts)",
         LIVE_VIEW_UNKNOWN_POT_QUOTA
     );
-    assert!(corr.claims[pos].is_some(), "the real pot corroborates through the shipped path");
+    assert!(
+        corr.claims[pos].is_some(),
+        "the real pot corroborates through the shipped path"
+    );
     assert_eq!(
         corr.claims.iter().filter(|c| c.is_some()).count(),
         1,
@@ -900,7 +1027,11 @@ fn two_pots_one_gameid_serve_the_join_key_and_never_vouch_the_binding() {
     assert_eq!(rows.len(), 2, "two distinct live pots");
     assert!(corr.claims.iter().all(|c| c.is_some()));
     let targets = fanout_targets(&rows, &corr.claims);
-    assert_eq!(targets, vec![game.clone()], "one shared fetch for the shared gameId");
+    assert_eq!(
+        targets,
+        vec![game.clone()],
+        "one shared fetch for the shared gameId"
+    );
 
     // The tower answers with the game's PRIMARY case — a terminal one here
     // (per `primary_case`, a terminal record wins over a pending one). At
@@ -927,9 +1058,20 @@ fn two_pots_one_gameid_serve_the_join_key_and_never_vouch_the_binding() {
         // substituted key, and no client may read the pair as a verified
         // case↔pot binding.
         assert_eq!(e["case"]["status"], serde_json::json!("finalized_concede"));
-        assert_eq!(e["caseGameId"], serde_json::json!(game.clone()), "the join key is served");
-        assert_eq!(e["caseSource"], serde_json::json!("tower-by-gameid-unverified"));
-        assert_ne!(e["caseSource"], serde_json::json!("tower"), "the vouching tag is retired");
+        assert_eq!(
+            e["caseGameId"],
+            serde_json::json!(game.clone()),
+            "the join key is served"
+        );
+        assert_eq!(
+            e["caseSource"],
+            serde_json::json!("tower-by-gameid-unverified")
+        );
+        assert_ne!(
+            e["caseSource"],
+            serde_json::json!("tower"),
+            "the vouching tag is retired"
+        );
         assert_eq!(e["markerSource"], serde_json::json!("seat-signed"));
     }
 }
@@ -950,11 +1092,23 @@ fn a_reused_gameid_returns_a_foreign_terminal_case_and_the_tag_never_vouches() {
     let reused_game = h64(0x21); // minted by the hostile host, used before
     let pot = h64(0xaa);
     file_party_game(&conn, &me, &reused_game, &pot, GATE, "txV1", 1_001);
-    let pk = file_party_v2_real(&conn, &w, &reused_game, &pot, GATE as u32, "txV2", 1_002, 0x51);
+    let pk = file_party_v2_real(
+        &conn,
+        &w,
+        &reused_game,
+        &pot,
+        GATE as u32,
+        "txV2",
+        1_002,
+        0x51,
+    );
     admit_pot_keys(&conn, &pot, 1_000, Some(GATE), Some(pk));
 
     let (rows, corr) = corroborate(&conn, &me);
-    assert!(corr.claims[0].is_some(), "the victim's own marker DOES corroborate");
+    assert!(
+        corr.claims[0].is_some(),
+        "the victim's own marker DOES corroborate"
+    );
     let targets = fanout_targets(&rows, &corr.claims);
     assert_eq!(targets, vec![reused_game.clone()]);
 
@@ -968,7 +1122,11 @@ fn a_reused_gameid_returns_a_foreign_terminal_case_and_the_tag_never_vouches() {
     }))
     .expect("terminal case shapes");
     let mut entries = assemble_live_view(rows, &corr, Some(900_000));
-    apply_cases(&mut entries, &targets, &[(reused_game.clone(), foreign)].into());
+    apply_cases(
+        &mut entries,
+        &targets,
+        &[(reused_game.clone(), foreign)].into(),
+    );
     let body: serde_json::Value =
         serde_json::from_str(&live_view_body(&me, Some(900_000), &entries)).unwrap();
     let e = &body["live"][0];
@@ -1000,8 +1158,7 @@ fn foreign_key_junk_never_reaches_verification_on_a_known_pot() {
     let game = h64(0x21);
     let pot = h64(0xaa);
     file_party_game(&conn, &me, &game, &pot, GATE, "txV1", 1_001);
-    let honest_pk =
-        file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txV2", 1_005, 0x51);
+    let honest_pk = file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txV2", 1_005, 0x51);
     admit_pot_keys(&conn, &pot, 1_000, Some(GATE), Some(honest_pk.clone()));
     // 20 junk v2-shaped rows under a key the lock never committed, all
     // stamped BEFORE the honest marker.
@@ -1027,13 +1184,18 @@ fn foreign_key_junk_never_reaches_verification_on_a_known_pot() {
 
     let rows = query_rows(&conn, &me);
     let candidates = fetch_candidates(&conn, &me, &rows);
-    let fetched = candidates.get(&(pot.clone(), 0)).expect("candidates for the pot");
+    let fetched = candidates
+        .get(&(pot.clone(), 0))
+        .expect("candidates for the pot");
     assert!(
         fetched.iter().all(|m| m.seat_settle_pubkey == honest_pk),
         "the keyed query filtered every foreign-key row IN SQL"
     );
     let corr = corroborate_rows(&me, &rows, &candidates);
-    assert_eq!(corr.claims[0].as_ref().map(|c| c.game_id.clone()), Some(game));
+    assert_eq!(
+        corr.claims[0].as_ref().map(|c| c.game_id.clone()),
+        Some(game)
+    );
     assert_eq!(corr.attempts, 1, "zero curve time spent on 20 junk rows");
 }
 
@@ -1060,13 +1222,25 @@ fn file_junk_v2(
     })
     .unwrap();
     let pre = seatsig_preimage(game_id, pot_txid, 0, victim).expect("preimage");
-    let sig = hex::encode(k.sign(&bsv_rs::primitives::hash::sha256(&pre)).unwrap().to_der());
+    let sig = hex::encode(
+        k.sign(&bsv_rs::primitives::hash::sha256(&pre))
+            .unwrap()
+            .to_der(),
+    );
     // The production latch on these bytes: the seatSig is REAL (that is the
     // point of this fixture) but `sigHex` is the same raw ECDSA blob rather
     // than a BRC-42 'anyone' identity signature, so it latches 0 — exactly
     // what an attacker's row gets in production.
     let latch = production_latch(
-        victim, &h66(0xbb), game_id, pot_txid, 0, GATE as u32, &sig, Some(settle_pub), Some(&sig),
+        victim,
+        &h66(0xbb),
+        game_id,
+        pot_txid,
+        0,
+        GATE as u32,
+        &sig,
+        Some(settle_pub),
+        Some(&sig),
     );
     conn.execute(
         "INSERT OR IGNORE INTO potparty_records \
@@ -1074,8 +1248,19 @@ fn file_junk_v2(
           sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt, \
           sigValid) \
          VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
-        params![victim, h66(0xbb), game_id, pot_txid, GATE, sig, settle_pub, sig, marker_txid, at,
-                latch],
+        params![
+            victim,
+            h66(0xbb),
+            game_id,
+            pot_txid,
+            GATE,
+            sig,
+            settle_pub,
+            sig,
+            marker_txid,
+            at,
+            latch
+        ],
     )
     .expect("insert junk v2");
 }
@@ -1099,8 +1284,16 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
     // The victim's pot in the production shape (v1 then v2), OLDEST.
     file_party_game(&conn, &me, &victim_game, &victim_pot, GATE, "txV1", 1_001);
     latch_honest_v1(&conn, "txV1");
-    let my_pub =
-        file_party_v2_real(&conn, &w, &victim_game, &victim_pot, GATE as u32, "txV2", 1_002, 0x51);
+    let my_pub = file_party_v2_real(
+        &conn,
+        &w,
+        &victim_game,
+        &victim_pot,
+        GATE as u32,
+        "txV2",
+        1_002,
+        0x51,
+    );
     admit_pot_keys(&conn, &victim_pot, 1_000, Some(GATE), Some(my_pub));
 
     let n_pots = LIVE_VIEW_VERIFY_BUDGET / LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT;
@@ -1118,7 +1311,13 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
         .to_ascii_lowercase();
         // KNOWN (admitted) and NEWER than the victim's pot, committing the
         // attacker's own settle key so its junk passes the membership filter.
-        admit_pot_keys(&conn, &pot, 5_000 + p as i64, Some(GATE), Some(atk_pub.clone()));
+        admit_pot_keys(
+            &conn,
+            &pot,
+            5_000 + p as i64,
+            Some(GATE),
+            Some(atk_pub.clone()),
+        );
         file_party_game(
             &conn,
             &me,
@@ -1152,12 +1351,18 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
     // round-robin rescue is still asserted below and still load-bearing for
     // the LEGACY tier.
     let victim_idx = rows.iter().position(|r| r.pot_txid == victim_pot).unwrap();
-    let rank = quality_order(&rows).iter().position(|i| *i == victim_idx).unwrap();
+    let rank = quality_order(&rows)
+        .iter()
+        .position(|i| *i == victim_idx)
+        .unwrap();
     assert_eq!(
         rank, 0,
         "#283: the victim's own pot leads its own view (was: last of {n_pots})"
     );
-    assert!(corr.attempts <= LIVE_VIEW_VERIFY_BUDGET, "the CPU ceiling still holds");
+    assert!(
+        corr.attempts <= LIVE_VIEW_VERIFY_BUDGET,
+        "the CPU ceiling still holds"
+    );
     // …and round-robin still serves it.
     assert_eq!(
         corr.claims[victim_idx].as_ref().map(|c| c.game_id.clone()),
@@ -1172,7 +1377,10 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
     // The attacker's own pots stay honestly uncorroborated (their junk never
     // verifies) — never hidden, never vouched.
     assert_eq!(
-        entries.iter().filter(|e| e.marker_source == "seat-signed").count(),
+        entries
+            .iter()
+            .filter(|e| e.marker_source == "seat-signed")
+            .count(),
         1
     );
 }
@@ -1227,13 +1435,34 @@ fn the_keyless_candidate_window_alone_keeps_the_verified_marker() {
     .to_hex()
     .to_ascii_lowercase();
     for j in 0..(LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT * 4) {
-        file_junk_v2(&conn, &me, &game, &pot, 0xc7, &atk, &format!("txKJ{j:03}"), 100 + j as i64);
+        file_junk_v2(
+            &conn,
+            &me,
+            &game,
+            &pot,
+            0xc7,
+            &atk,
+            &format!("txKJ{j:03}"),
+            100 + j as i64,
+        );
     }
     // …then the honest v2, LAST and NEWEST.
-    file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txKHONEST", 9_999, 0x52);
+    file_party_v2_real(
+        &conn,
+        &w,
+        &game,
+        &pot,
+        GATE as u32,
+        "txKHONEST",
+        9_999,
+        0x52,
+    );
 
     let rows = query_rows(&conn, &me);
-    let idx = rows.iter().position(|r| r.pot_txid == pot).expect("the unknown pot is served");
+    let idx = rows
+        .iter()
+        .position(|r| r.pot_txid == pot)
+        .expect("the unknown pot is served");
     // POSITIVE CONTROLS for reachability — both must hold or the assertion
     // below proves nothing about the keyless window.
     assert!(

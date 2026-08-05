@@ -100,8 +100,8 @@ fn main() {
         b"LOW.gameutxo.v1".to_vec(),
         hex::decode(&identity_hex).unwrap(),
         game_id.to_vec(),
-        [0xBBu8; 32].to_vec(),          // pot txid
-        0u32.to_le_bytes().to_vec(),    // pot vout
+        [0xBBu8; 32].to_vec(),       // pot txid
+        0u32.to_le_bytes().to_vec(), // pot vout
     ];
     let pointer_output = make_signed_low_output(&signer, pointer_fields);
 

@@ -723,9 +723,9 @@ pub enum SeatLetter {
 /// A migration cannot fix it — SQL cannot verify a signature — but the
 /// OVERLAY can: every input `record_sig_valid` needs is already in the row,
 /// so a bounded lazy backfill (`SELECT … WHERE sigValid IS NULL LIMIT N` ->
-/// compute -> `UPDATE`) is small and is tracked as the #283 follow-up.
-/// Closure criterion: zero rows with `sigValid IS NULL`. Until then, state
-/// the residual as permanent.
+/// compute -> `UPDATE`) is small and is tracked as bsv-low#355. Closure
+/// criterion: zero rows with `sigValid IS NULL`. Until then, state the
+/// residual as permanent.
 ///
 /// Second residual: a **v1 (pre-#230) pot has no seat binding to find** and
 /// answers `Unknown` forever. Note this is not a fallback to something safer —
@@ -3419,7 +3419,9 @@ mod tests {
                 );
                 // The SQL built for this chunk binds exactly what we supply.
                 assert_eq!(
-                    seat_markers_sql(chunk.len(), SEAT_MARKERS_PER_KEY).matches('?').count(),
+                    seat_markers_sql(chunk.len(), SEAT_MARKERS_PER_KEY)
+                        .matches('?')
+                        .count(),
                     chunk.len() * SEAT_MARKERS_BINDS_PER_POT,
                     "n={n}: bind arity matches the chunk"
                 );
@@ -3615,7 +3617,11 @@ mod tests {
         rows.push((ma, 9_000));
         rows.push((mb, 9_001));
 
-        let fetched = simulate_seat_fetch(&seat_markers_sql(1, SEAT_MARKERS_PER_KEY), (&pa, &pb), &rows);
+        let fetched = simulate_seat_fetch(
+            &seat_markers_sql(1, SEAT_MARKERS_PER_KEY),
+            (&pa, &pb),
+            &rows,
+        );
         // The MONEY assertion first: attribution must credit both seats —
         // under the pre-fix order-dependent window this yields None/None
         // (45 older junk rows fill the pot's single window).
@@ -3648,7 +3654,11 @@ mod tests {
             junk.identity = idj;
             rows2.push((junk, 500 + i as i64));
         }
-        let fetched2 = simulate_seat_fetch(&seat_markers_sql(1, SEAT_MARKERS_PER_KEY), (&pa, &pb), &rows2);
+        let fetched2 = simulate_seat_fetch(
+            &seat_markers_sql(1, SEAT_MARKERS_PER_KEY),
+            (&pa, &pb),
+            &rows2,
+        );
         let attr2 = attribute_seats(&p, &pot, 0, &fetched2);
         assert_eq!(
             attr2.identity_b.as_deref(),
