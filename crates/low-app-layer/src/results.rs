@@ -722,9 +722,14 @@ pub enum SeatLetter {
 ///
 /// A migration cannot fix it — SQL cannot verify a signature — but the
 /// OVERLAY can: every input `record_sig_valid` needs is already in the row,
-/// so a bounded lazy backfill (`SELECT … WHERE sigValid IS NULL LIMIT N` ->
-/// compute -> `UPDATE`) is small and is tracked as bsv-low#355. Closure
-/// criterion: zero rows with `sigValid IS NULL`. Until then, state the
+/// so a bounded lazy pass (`SELECT … LIMIT N` -> compute -> `UPDATE`) is
+/// small and is tracked as bsv-low#355. It is a RE-LATCH OF EVERY ROW, not a
+/// backfill of the `NULL` ones: the column is written once by
+/// `INSERT OR IGNORE` and never re-evaluated, so a transient predicate fault
+/// pins the rows admitted during it at rank 0 — below the legacy tier,
+/// permanently (see the write site, `potparty_write::potparty_insert_query`).
+/// Closure criterion: every row's `sigValid` equals `record_sig_valid`
+/// recomputed at the pass's own predicate version. Until then, state the
 /// residual as permanent.
 ///
 /// Second residual: a **v1 (pre-#230) pot has no seat binding to find** and

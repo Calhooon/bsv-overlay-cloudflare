@@ -951,10 +951,28 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // `decidePartyStep` stops as soon as an indexed row exists for the pot,
     // and a legacy row IS an indexed row. (b) The overlay is RUST and every
     // input `record_sig_valid` needs is already in the row, so a bounded lazy
-    // backfill — `SELECT … WHERE sigValid IS NULL LIMIT N` -> compute ->
-    // `UPDATE` — is perfectly possible and small; it is simply not in this
-    // change. **So the legacy tier is PERMANENT until that backfill lands**
-    // (bsv-low#355; closure criterion: zero rows with `sigValid IS NULL`).
+    // re-latch pass — `SELECT … LIMIT N` -> compute -> `UPDATE` — is
+    // perfectly possible and small; it is simply not in this change. **So the
+    // legacy tier is PERMANENT until that pass lands** (bsv-low#355).
+    //
+    // WRITE-ONCE, NEVER RE-EVALUATED, and that is the wider hazard (gate
+    // round 2, MED-4). This column is set by `INSERT OR IGNORE` and by
+    // nothing else — no `UPDATE potparty_records SET sigValid` exists in
+    // production code. So a TRANSIENT predicate fault (a `bsv-rs`
+    // DER/`to_der` behaviour change, a wallet emitting a non-canonical
+    // signature mid-rollout, a partial deploy) permanently demotes every
+    // honest row admitted in that window to rank 0 — BELOW the legacy tier,
+    // with no self-healing path. Pre-fix those rows ordered neutrally;
+    // post-fix they are last, forever. That is the Rule 6 trade, and its
+    // victims are wiped-device users with a silently short enumeration who
+    // will never file a bug (Rule 14).
+    //
+    // #355 is therefore a RE-LATCH OF EVERY ROW, not a backfill of the NULL
+    // ones, and its closure criterion is: **every row's `sigValid` equals
+    // `record_sig_valid` recomputed at the pass's own predicate version** —
+    // reported as a count of rows changed plus a count still `NULL`. The
+    // narrower "zero rows with `sigValid IS NULL`" criterion structurally
+    // SKIPS the 0s, which are exactly the rows a fault would have created.
     //
     // Additive ALTER — the runner ignores the re-run "duplicate column"
     // error (`migration_error_is_benign`). NOTE the app-layer Worker issues

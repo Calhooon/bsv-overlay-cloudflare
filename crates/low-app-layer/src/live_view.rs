@@ -467,8 +467,10 @@ pub fn live_view_sql() -> String {
 ///
 /// Unchanged: the fail direction (corroboration OMITTED, never wrong), and
 /// the LEGACY tier (`sigValid IS NULL`, pre-migration rows) which orders
-/// exactly as before. That tier cannot grow but does NOT drain by itself —
-/// see the correction on `d1::OVERLAY_MIGRATIONS`' latch column (bsv-low#355).
+/// exactly as before. That tier cannot grow but does NOT drain by itself, and
+/// a rank-0 row is a write-once verdict that nothing re-evaluates — see the
+/// correction on `d1::OVERLAY_MIGRATIONS`' latch column, and bsv-low#355,
+/// which is a re-latch of EVERY row rather than a `NULL`-only backfill.
 pub fn keyless_candidates_sql(n: usize) -> String {
     debug_assert!(n >= 1);
     let per_pot = vec!["(potTxid = ? AND potVout = ?)"; n].join(" OR ");

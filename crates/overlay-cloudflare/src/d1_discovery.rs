@@ -2566,13 +2566,17 @@ impl PotpartyRow {
 /// no-ops). `createdAt` is stamped here at insert (the record's value is
 /// ignored) and drives the newest-first list ordering; `rowid DESC` breaks
 /// same-second ties in insertion order.
+/// The handle is a [`PotpartyDb`], NOT a bare `D1Database` — see
+/// [`potparty_write`] for why that type exists and what it makes impossible.
 pub struct D1PotpartyStorage {
-    db: Rc<D1Database>,
+    db: PotpartyDb,
 }
 
 impl D1PotpartyStorage {
     pub fn new(db: Rc<D1Database>) -> Self {
-        Self { db }
+        Self {
+            db: PotpartyDb::new(db),
+        }
     }
 }
 
@@ -2739,7 +2743,9 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// #252 republish sweep would land a latched row for any pot the honest
 /// client still sees, and it will not: `decidePartyStep` stops the moment an
 /// indexed row exists for the pot, and a legacy row is an indexed row. It is
-/// permanent until the lazy backfill lands (bsv-low#355):
+/// permanent until the lazy RE-LATCH pass lands (bsv-low#355 — every row, not
+/// just the `NULL` ones; see [`potparty_write::potparty_insert_query`] for
+/// why a rank-0 row is equally unrecoverable):
 ///  - a legacy-vs-legacy contest is decided exactly as it was before, so an
 ///    attacker who filed junk BEFORE the migration keeps whatever advantage
 ///    that junk already had (`free_ghost_pot_records_do_erase_legacy_
@@ -2836,6 +2842,24 @@ pub fn potparty_list_for_identity_sql() -> String {
 ///    to bring its ante home when the tower's dead-man switch never fired.
 ///    Displacing them off the window is displacing the money.
 ///
+/// # UNRANKED — and it carries the highest-stakes rows (gate round 2, LOW-3)
+///
+/// **WARNING to a first consumer.** Unlike its potparty sibling this window
+/// has NO validity rank: `potrefund_records` has no `sigValid` column, so the
+/// ordering is `tier ASC, potCreatedAt DESC` and nothing else. Victim-named
+/// potrefund markers and fabricated `pot_records` rows are BOTH free
+/// (bsv-low#347: `/submit` admission is byte-format-only and its SEEN-gate is
+/// caller-selected), so an attacker lands in tier 0, newest-first, ahead of
+/// the honest backups — the #283 displacement this family's other windows
+/// close, still open here.
+///
+/// It is not live today: no client consumes `ls_potrefund partyFor`
+/// (`app/src/lib/overlay.ts` reaches `ls_potrefund` only via `byPot`). That
+/// is the ONLY reason this is a note and not a defect. **Do not wire a
+/// consumer to it without closing the ordering first** — latch and rank the
+/// refund markers the way #283 ranked the potparty ones, or bind the pot's
+/// committed keys. Whoever wires it inherits the gap silently otherwise.
+///
 /// BINDS, in order: `identity`, `limit` (POTS), `quota` (unknown-pot slots),
 /// `row_cap`.
 pub fn potrefund_list_for_identity_sql() -> String {
@@ -2910,6 +2934,30 @@ pub fn potrefund_list_for_identity_sql() -> String {
 /// offset pages stable — new markers only ever APPEND at the tail, so a
 /// concurrent insert can never shift rows across an already-fetched page
 /// boundary.
+///
+/// # NOT RANK-ORDERED — the eighth potparty window (bsv-low#356)
+///
+/// #283 made `potparty_records.sigValid` the leading `ORDER BY` term in SEVEN
+/// queries. This is the eighth reader and it is deliberately NOT one of them,
+/// so state the residual here rather than let a reader infer the family
+/// property from its siblings (epoch Rule 8):
+///
+///  - it is **not identity-scoped**, so #283's argument for why the rank is
+///    unforgeable ("a junk row must carry the victim's identity signature")
+///    does not apply here at all; and
+///  - the SQL is **shared with `POTREFUND_SELECT`**, and `potrefund_records`
+///    has no `sigValid` column — so a rank term cannot simply be added
+///    without splitting the query or the schema.
+///
+/// The accepted mitigation is the `OFFSET` above, and it is only a mitigation
+/// while a caller USES it: `lookupPotPartyByPot` (`app/src/lib/overlay.ts`)
+/// sends neither `limit` nor `offset`, so it reads page 0 of `DEFAULT_LIMIT`
+/// forever and ~100 free rows (bsv-low#347: a marker is free, not
+/// dust-priced) stamped before the honest seats evict BOTH of them from the
+/// client's `attribute_seats` fold. Fail direction is the good one —
+/// attribution OMITTED, never wrong — and this is a display/attribution
+/// surface, not a money path, which is why it is filed rather than fixed
+/// here. bsv-low#356 tracks it; client-side paging is the likely answer.
 ///
 /// Built from the caller's own SELECT list so the tests execute the SHIPPED
 /// string rather than a transcription of it.
@@ -3128,58 +3176,201 @@ pub fn identity_window_row_cap(limit: usize, groups: usize) -> usize {
         .saturating_mul(PARTYFOR_ROWS_PER_GROUP)
 }
 
-/// THE potparty admission WRITE, as a pure value.
+pub use potparty_write::{potparty_insert_query, LatchedPotpartyInsert, PotpartyDb};
+
+/// The potparty write path as a CAPABILITY rather than a convention
+/// (bsv-low #283, gate round 2 MED-2).
 ///
-/// `store_record` is `potparty_insert_query(...).execute(db)` and nothing
-/// else, because `execute` needs a live `D1Database` and is therefore
-/// unreachable in a native test — which is precisely how a write path gets
-/// silently neutered while the whole suite stays green. The #283 adversarial
-/// gate demonstrated exactly that: binding `None` for `sigValid` here left
-/// every test passing and made the entire change inoperative (every new
-/// production row would land in the legacy tier). Splitting the query out
-/// gives the writer a BEHAVIOURAL pin — `the_admission_write_latches_sig_
-/// valid_through_the_real_writer` replays this query's own SQL and bind list
-/// against real SQLite and reads the column back.
+/// # What the first round got wrong
 ///
-/// INSERT OR IGNORE on the `(txid, outputIndex)` primary key — a replayed
-/// submit of the same output is a no-op; markers for the same identity from
-/// different txs are ALL kept; never overwrite, never delete.
+/// Round 1 split the INSERT into a pure producer (`potparty_insert_query`)
+/// and gave it a real replay pin. That pin is genuine — and the SECOND gate
+/// showed it pinned a function nobody was obliged to call: replacing
+/// `store_record`'s body with an inline `INSERT … sigValid) VALUES (…, NULL)`
+/// — same columns, same binds, latch dropped — left **293 passed, 0 failed**.
+/// Every new production row would have landed in the legacy tier with #283
+/// inoperative and the whole suite green. That is epoch Rule 22 verbatim: the
+/// producer is unreachable natively (`execute` needs a live `D1Database`), so
+/// the harness pins a seam and the seam's USE stays unobservable.
 ///
-/// `sigValid` is DECODED ONCE HERE — the #284 decode-at-write pattern applied
-/// to a predicate. It is an ORDERING HINT, not an admission decision: this
-/// cannot refuse a marker, a 0-latched row is stored and served exactly as
-/// before, and every consumer that concludes anything from a marker
-/// re-verifies. It exists because every downstream window is a slot allocated
-/// by an ordering an attacker controls, and "does this verify" is the one
-/// ordering an attacker can neither out-stamp nor out-number.
-pub fn potparty_insert_query(record: &PotpartyRecord, created_at: i64) -> Query {
-    Query::new(
-        "INSERT OR IGNORE INTO potparty_records \
-         (identity, opponentIdentity, gameId, potTxid, potVout, \
-          recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
-          txid, outputIndex, createdAt, sigValid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(record.identity.as_str())
-    .bind(record.opponent_identity.as_str())
-    .bind(record.game_id.as_str())
-    .bind(record.pot_txid.as_str())
-    .bind(record.pot_vout)
-    .bind(record.recovery_height)
-    .bind(record.sig_hex.as_str())
-    .bind(record.seat_settle_pubkey.as_deref())
-    .bind(record.seat_sig_hex.as_deref())
-    .bind(record.txid.as_str())
-    .bind(record.output_index)
-    .bind(created_at)
-    .bind(i64::from(
-        overlay_discovery::potparty::validity::record_sig_valid(record),
-    ))
+/// # The shape that closes it
+///
+/// A source-scanning pin would only have counted needles. Instead this module
+/// removes the CAPABILITY to express the write any other way, which is how
+/// the sibling bsv-low#347 lane closed the identical class (an exhaustive
+/// match: "reading a struct field is optional; an enum arm is not"):
+///
+///  - [`LatchedPotpartyInsert`] has PRIVATE fields and exactly one
+///    constructor, [`potparty_insert_query`], which binds the latch itself.
+///  - [`PotpartyDb`] owns the `D1Database` in a PRIVATE field and exposes no
+///    way to run an arbitrary write: `insert` takes a `LatchedPotpartyInsert`
+///    and nothing else.
+///  - `D1PotpartyStorage.db` is a `PotpartyDb`, so `store_record` — which
+///    lives outside this module — cannot reach a `D1Database` at all.
+///
+/// So the gate's injection no longer compiles: an inline `Query` has no way
+/// to be executed, and deleting the `potparty_insert_query` call leaves
+/// nothing that can construct the only value `insert` accepts. A compile
+/// error is strictly stronger than a failing test.
+///
+/// # The boundary, stated (epoch Rule 22)
+///
+/// This makes the CALL structurally mandatory. It does not make the D1
+/// round-trip observable natively — nothing here can. Two residuals, both
+/// deliberate and both louder than the hole they replace:
+///
+///  - `fetch_all` is generic over the SELECT list, so an author determined to
+///    smuggle an INSERT through the READ method could. That is caught by
+///    `exactly_one_potparty_insert_statement_exists_in_this_module`, a
+///    Rule-9 positive-count pin: the potparty INSERT literal appears exactly
+///    ONCE in this file's non-comment source.
+///  - The predicate's verdict flowing into the bound column is pinned by
+///    `the_admission_write_latches_sig_valid_through_the_real_writer`, which
+///    replays this module's own SQL and bind list against real SQLite.
+pub mod potparty_write {
+    use super::{PotpartyRecord, Query};
+    use serde::de::DeserializeOwned;
+    use std::rc::Rc;
+    use worker::D1Database;
+
+    /// A potparty INSERT that PROVABLY carries the `sigValid` latch.
+    ///
+    /// Both fields are private to this module and there is exactly one
+    /// constructor, so a value of this type is a proof that
+    /// [`potparty_insert_query`] ran. [`PotpartyDb::insert`] accepts nothing
+    /// else.
+    pub struct LatchedPotpartyInsert {
+        query: Query,
+        sig_valid: bool,
+    }
+
+    impl LatchedPotpartyInsert {
+        /// The verdict this insert BINDS — the same evaluation, not a second
+        /// one (gate round 2 LOW-2: `record_sig_valid` used to run twice per
+        /// admitted marker, once for telemetry and once for the bind, while
+        /// two comments claimed "once"). Telemetry that reads this is
+        /// reporting the value actually written, so a future single-derivation
+        /// bug corrupts the signal too instead of hiding behind it.
+        pub fn sig_valid(&self) -> bool {
+            self.sig_valid
+        }
+
+        /// Read-only view of the built query, for the replay pin. Cannot be
+        /// executed (`Query::execute` consumes `self`) and cannot be mutated.
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    /// THE potparty admission WRITE, as a pure value.
+    ///
+    /// `store_record` is `potparty_insert_query(...)` handed to
+    /// [`PotpartyDb::insert`] and nothing else, because `execute` needs a
+    /// live `D1Database` and is therefore unreachable in a native test —
+    /// which is precisely how a write path gets silently neutered while the
+    /// whole suite stays green. The #283 adversarial gate demonstrated
+    /// exactly that: binding `None` for `sigValid` here left every test
+    /// passing and made the entire change inoperative (every new production
+    /// row would land in the legacy tier). Splitting the query out gives the
+    /// writer a BEHAVIOURAL pin —
+    /// `the_admission_write_latches_sig_valid_through_the_real_writer`
+    /// replays this query's own SQL and bind list against real SQLite and
+    /// reads the column back — and the module's private fields make the call
+    /// itself unskippable (see the module doc).
+    ///
+    /// INSERT OR IGNORE on the `(txid, outputIndex)` primary key — a replayed
+    /// submit of the same output is a no-op; markers for the same identity
+    /// from different txs are ALL kept; never overwrite, never delete.
+    ///
+    /// `sigValid` is DECODED ONCE HERE — the #284 decode-at-write pattern
+    /// applied to a predicate, and "once" is now literally true: the verdict
+    /// is computed in this function and carried on
+    /// [`LatchedPotpartyInsert::sig_valid`] for every other reader. It is an
+    /// ORDERING HINT, not an admission decision: this cannot refuse a marker,
+    /// a 0-latched row is stored and served exactly as before, and every
+    /// consumer that concludes anything from a marker re-verifies. It exists
+    /// because every downstream window is a slot allocated by an ordering an
+    /// attacker controls, and "does this verify" is the one ordering an
+    /// attacker can neither out-stamp nor out-number.
+    ///
+    /// # A latched `0` is a VERDICT, not "not yet checked" (bsv-low#355)
+    ///
+    /// Nothing re-evaluates this column: it is written once, by
+    /// `INSERT OR IGNORE`, and no `UPDATE potparty_records SET sigValid`
+    /// exists in production code. So a TRANSIENT predicate fault — a
+    /// `bsv-rs` DER/`to_der` behaviour change, a wallet emitting a
+    /// non-canonical signature during a rollout, a partial deploy —
+    /// permanently demotes every honest row admitted in that window to rank
+    /// **0**, which sorts BELOW the legacy (`NULL`) tier, with no
+    /// self-healing path. That is exactly the epoch Rule 6 trade (a
+    /// self-healing failure swapped for a permanent one) and its victims are
+    /// wiped-device users seeing a silently short enumeration, i.e. the
+    /// population least able to report it (Rule 14).
+    ///
+    /// This is why bsv-low#355 is a **re-latch of every row**, not a backfill
+    /// of the `NULL` ones: a criterion of "zero rows with `sigValid IS NULL`"
+    /// structurally skips the 0s, which are the rows a fault would have
+    /// created. Read a `0` as "this row's verdict is as old as the predicate
+    /// that produced it", never as "unchecked".
+    pub fn potparty_insert_query(
+        record: &PotpartyRecord,
+        created_at: i64,
+    ) -> LatchedPotpartyInsert {
+        let sig_valid = overlay_discovery::potparty::validity::record_sig_valid(record);
+        LatchedPotpartyInsert {
+            query: Query::new(
+                "INSERT OR IGNORE INTO potparty_records \
+                 (identity, opponentIdentity, gameId, potTxid, potVout, \
+                  recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+                  txid, outputIndex, createdAt, sigValid) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(record.identity.as_str())
+            .bind(record.opponent_identity.as_str())
+            .bind(record.game_id.as_str())
+            .bind(record.pot_txid.as_str())
+            .bind(record.pot_vout)
+            .bind(record.recovery_height)
+            .bind(record.sig_hex.as_str())
+            .bind(record.seat_settle_pubkey.as_deref())
+            .bind(record.seat_sig_hex.as_deref())
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(created_at)
+            .bind(i64::from(sig_valid)),
+            sig_valid,
+        }
+    }
+
+    /// The ONLY database handle [`super::D1PotpartyStorage`] holds.
+    ///
+    /// The inner `D1Database` is private to this module, so the storage impl
+    /// — which lives outside it — has no way to run a write it did not build
+    /// through [`potparty_insert_query`]. See the module doc.
+    pub struct PotpartyDb(Rc<D1Database>);
+
+    impl PotpartyDb {
+        pub fn new(db: Rc<D1Database>) -> Self {
+            Self(db)
+        }
+
+        /// Run a read. Generic over the row type, never over the write shape.
+        pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
+            q.fetch_all(&self.0).await
+        }
+
+        /// Run THE potparty admission write. Accepts nothing that did not
+        /// come from [`potparty_insert_query`].
+        pub async fn insert(&self, insert: LatchedPotpartyInsert) -> Result<(), String> {
+            insert.query.execute(&self.0).await
+        }
+    }
 }
 
 #[async_trait(?Send)]
 impl PotpartyStorage for D1PotpartyStorage {
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
+        let insert = potparty_insert_query(record, current_unix_seconds_i64());
         // TELEMETRY, not a decision (bsv-low #283, gate M5). The golden cells
         // make a client/server crypto disagreement UNLIKELY; they do not make
         // it DETECTABLE once deployed, and that class fails toward refusing
@@ -3189,7 +3380,11 @@ impl PotpartyStorage for D1PotpartyStorage {
         // means our predicate and the client's signer have drifted, and the
         // right response is to look, not to change any behaviour here.
         // Surfaced rather than consumed (epoch Rule 13).
-        if !overlay_discovery::potparty::validity::record_sig_valid(record) {
+        //
+        // Read off the insert rather than re-evaluated (gate round 2 LOW-2):
+        // ONE `record_sig_valid` per admitted marker, and the log now reports
+        // the value that is actually being written.
+        if !insert.sig_valid() {
             worker::console_log!(
                 "[potparty:siginvalid] txid={} vout={} v2={} identity={}",
                 record.txid,
@@ -3198,10 +3393,7 @@ impl PotpartyStorage for D1PotpartyStorage {
                 record.identity
             );
         }
-        potparty_insert_query(record, current_unix_seconds_i64())
-            .execute(&self.db)
-            .await
-            .map_err(potparty_err)
+        self.db.insert(insert).await.map_err(potparty_err)
     }
 
     async fn list_for_identity(
@@ -3212,12 +3404,15 @@ impl PotpartyStorage for D1PotpartyStorage {
         // Per-pot + existence-tiered window — see
         // `potparty_list_for_identity_sql` for the dust-DoS this shape closes
         // (bsv-low #281).
-        let rows: Vec<PotpartyRow> = Query::new(potparty_list_for_identity_sql())
-            .bind(identity)
-            .bind(limit as u32)
-            .bind(unknown_pot_quota(limit) as u32)
-            .bind(identity_window_row_cap(limit, 2) as u32)
-            .fetch_all(&self.db)
+        let rows: Vec<PotpartyRow> = self
+            .db
+            .fetch_all(
+                Query::new(potparty_list_for_identity_sql())
+                    .bind(identity)
+                    .bind(limit as u32)
+                    .bind(unknown_pot_quota(limit) as u32)
+                    .bind(identity_window_row_cap(limit, 2) as u32),
+            )
             .await
             .map_err(potparty_err)?;
         Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
@@ -3233,12 +3428,15 @@ impl PotpartyStorage for D1PotpartyStorage {
         // SQL is offset-pageable since gate M2; the potparty wire has no
         // offset (its rows are small — no payload-bound cap forcing one),
         // so this binds page 0.
-        let rows: Vec<PotpartyRow> = Query::new(list_for_pot_sql(POTPARTY_SELECT))
-            .bind(pot_txid)
-            .bind(pot_vout)
-            .bind(limit as u32)
-            .bind(0u32)
-            .fetch_all(&self.db)
+        let rows: Vec<PotpartyRow> = self
+            .db
+            .fetch_all(
+                Query::new(list_for_pot_sql(POTPARTY_SELECT))
+                    .bind(pot_txid)
+                    .bind(pot_vout)
+                    .bind(limit as u32)
+                    .bind(0u32),
+            )
             .await
             .map_err(potparty_err)?;
         Ok(rows.into_iter().map(PotpartyRow::into_record).collect())
@@ -5981,7 +6179,7 @@ mod tests {
     fn the_admission_write_latches_sig_valid_through_the_real_writer() {
         let conn = production_schema_db();
         let honest = golden_potparty_record("txGOLDEN");
-        exec_query(&conn, &potparty_insert_query(&honest, 1_234));
+        exec_query(&conn, potparty_insert_query(&honest, 1_234).query());
 
         let (latched, at): (Option<i64>, i64) = conn
             .query_row(
@@ -6002,7 +6200,7 @@ mod tests {
         // verdict flowing through the writer, not just "something was bound".
         let mut forged = golden_potparty_record("txFORGED");
         forged.recovery_height += 1;
-        exec_query(&conn, &potparty_insert_query(&forged, 1_235));
+        exec_query(&conn, potparty_insert_query(&forged, 1_235).query());
         let forged_latched: Option<i64> = conn
             .query_row(
                 "SELECT sigValid FROM potparty_records WHERE txid = 'txFORGED'",
@@ -6024,7 +6222,8 @@ mod tests {
     /// value that cannot move in sympathy (epoch Rule 9).
     #[test]
     fn the_admission_write_binds_every_placeholder() {
-        let q = potparty_insert_query(&golden_potparty_record("txN"), 0);
+        let insert = potparty_insert_query(&golden_potparty_record("txN"), 0);
+        let q = insert.query();
         assert_eq!(q.sql().matches('?').count(), 13, "13 placeholders");
         assert_eq!(q.params().len(), 13, "13 binds");
         assert_eq!(
@@ -6037,6 +6236,142 @@ mod tests {
             matches!(q.params()[12], crate::d1::QVal::Int(1)),
             "the LAST bind is the latch verdict for the golden: {:?}",
             q.params()[12]
+        );
+    }
+
+    /// Strip Rust comments, leaving string literals intact.
+    ///
+    /// A scanner that counts PROSE has the same defect as a comment claiming
+    /// a fix — the text asserts the property instead of the code having it
+    /// (epoch Rule 9, "the scanner counts PROSE"). This file has no raw
+    /// strings and no `'"'` char literal, which is what keeps a
+    /// character-level stripper honest here; if either appears, this helper
+    /// must become a real parse.
+    fn strip_rust_comments(src: &str) -> String {
+        let b: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let (mut i, mut in_str, mut in_line, mut block) = (0usize, false, false, 0usize);
+        while i < b.len() {
+            let c = b[i];
+            let n = if i + 1 < b.len() { b[i + 1] } else { '\0' };
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                    out.push(c);
+                }
+                i += 1;
+            } else if block > 0 {
+                if c == '/' && n == '*' {
+                    block += 1;
+                    i += 2;
+                } else if c == '*' && n == '/' {
+                    block -= 1;
+                    i += 2;
+                } else {
+                    if c == '\n' {
+                        out.push(c);
+                    }
+                    i += 1;
+                }
+            } else if in_str {
+                if c == '\\' {
+                    out.push(c);
+                    if i + 1 < b.len() {
+                        out.push(n);
+                    }
+                    i += 2;
+                } else {
+                    if c == '"' {
+                        in_str = false;
+                    }
+                    out.push(c);
+                    i += 1;
+                }
+            } else if c == '/' && n == '/' {
+                in_line = true;
+                i += 2;
+            } else if c == '/' && n == '*' {
+                block = 1;
+                i += 2;
+            } else {
+                if c == '"' {
+                    in_str = true;
+                }
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// This module's PRODUCTION source, comments stripped and this test
+    /// module removed — so a scan can never count its own needles or a
+    /// fixture's SQL (epoch Rule 9, third failure mode).
+    fn production_source() -> String {
+        let stripped = strip_rust_comments(include_str!("d1_discovery.rs"));
+        let test_marker = ["#[cfg(", "test)]"].concat();
+        assert_eq!(
+            stripped.matches(&test_marker).count(),
+            1,
+            "exactly one test module in this file — the split below assumes it"
+        );
+        let prod = stripped
+            .split(&test_marker)
+            .next()
+            .expect("split always yields a first part")
+            .to_string();
+        assert!(
+            prod.contains(&["pub mod potparty", "_write {"].concat()),
+            "the production prefix must actually contain the write module"
+        );
+        prod
+    }
+
+    /// THE WRITE IS UNBYPASSABLE — the belt behind the compile error
+    /// (bsv-low #283, gate round 2 MED-2).
+    ///
+    /// Round 1's writer pin was real and pinned a function nobody was
+    /// obliged to call: the gate replaced `store_record`'s body with an
+    /// inline `INSERT … sigValid) VALUES (…, NULL)` and got 293 passed, 0
+    /// failed. `potparty_write` closes that by CAPABILITY — the storage impl
+    /// can no longer reach a `D1Database`, so that injection does not
+    /// compile.
+    ///
+    /// This cell covers the one residual the capability leaves: `fetch_all`
+    /// is generic, so an author could still smuggle an INSERT through the
+    /// READ method. Positive exact counts, never `assert!(!contains)`
+    /// (epoch Rule 9); needles split so they cannot match this assertion's
+    /// own source; run over comment-stripped, test-module-free source.
+    ///
+    /// BOUNDARY (epoch Rule 22): this pins the SHAPE of the production
+    /// source, not the D1 round-trip. The verdict flowing into the bound
+    /// column is pinned behaviourally by
+    /// `the_admission_write_latches_sig_valid_through_the_real_writer`.
+    #[test]
+    fn exactly_one_potparty_insert_statement_exists_in_this_module() {
+        let prod = production_source();
+
+        assert_eq!(
+            prod.matches(&["INSERT OR IGNORE INTO potparty", "_records"].concat())
+                .count(),
+            1,
+            "the potparty INSERT is written in exactly ONE place — a second \
+             one (inline in `store_record`, or smuggled through `fetch_all`) \
+             is how the latch gets dropped while the suite stays green"
+        );
+        assert_eq!(
+            prod.matches(&["potparty_insert", "_query("].concat())
+                .count(),
+            2,
+            "the pure producer is DEFINED once and CALLED once (by \
+             `store_record`) — a 1 here means the only call site is gone"
+        );
+        assert_eq!(
+            prod.matches(&["record_sig", "_valid("].concat()).count(),
+            1,
+            "the latch predicate is evaluated exactly ONCE per admitted \
+             marker (gate round 2 LOW-2) — telemetry reads the verdict off \
+             the insert instead of re-deriving it"
         );
     }
 

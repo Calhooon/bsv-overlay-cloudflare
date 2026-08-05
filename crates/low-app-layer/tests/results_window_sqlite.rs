@@ -3206,11 +3206,18 @@ fn make_every_marker_legacy(conn: &Connection) {
 /// So: the closure comes from the LATCH, not from anything else this change
 /// touched — and it covers rows admitted from the migration onward. Rows
 /// already in the table at migration time keep exactly the behaviour they
-/// had. That population drains (the #252 republish sweep lands a latched row
-/// for any pot an honest client still sees) and cannot grow, but it is real,
-/// and a deployment that runs the migration without the writer would leave
-/// every new row in it — which is why the migration and the `store_record`
-/// bind ship in the same commit.
+/// had. That population cannot grow, and it does **NOT drain on its own**:
+/// an earlier revision of this comment claimed the #252 republish sweep
+/// would land a latched row for any pot an honest client still sees, and it
+/// will not — `decidePartyStep` returns `'done'` the moment `lookupPotParty`
+/// reports an indexed row for the pot, and a legacy row IS an indexed row
+/// (pinned client-side at `potPartyPending.test.ts:190`). The legacy tier is
+/// therefore **PERMANENT absent a re-latch pass**, tracked as bsv-low#355
+/// (scoped to every row, not just the `NULL` ones) — so a reader consulting
+/// this control is told #355 is REQUIRED, not optional.
+/// It is real, and a deployment that runs the migration without the writer
+/// would leave every new row in it — which is why the migration and the
+/// `store_record` bind ship in the same commit.
 #[test]
 fn the_legacy_tier_still_has_the_pre_283_threshold() {
     let (conn, victim, pot, game) = honest_world(50_000);
@@ -3262,14 +3269,24 @@ fn the_legacy_tier_still_has_the_pre_283_threshold() {
             900_000 + rep,
         );
     }
-    // …and the drain: a republish lands a LATCHED row (this call does not go
-    // through `make_every_marker_legacy`), which outranks the whole legacy
-    // tier and heals the pot. That is the difference between the old
-    // PERMANENT residual and the new draining one (epoch Rule 6).
+    // MECHANISM, NOT A DRAIN — state the modelling boundary (epoch Rule 17).
+    // A republish lands a LATCHED row (this call does not go through
+    // `make_every_marker_legacy`), which outranks the whole legacy tier and
+    // heals the pot. That is what the latch BUYS if a republish happens.
+    //
+    // An earlier revision of this comment called it "the new draining one",
+    // which is the same falsified claim the doc block above corrects: in
+    // production the republish DOES NOT HAPPEN, because `decidePartyStep`
+    // returns `'done'` on any indexed row and a legacy row is indexed. This
+    // cell forces the republish the client would never make, so it measures
+    // the ordering, NOT the population. What heals in the field is only a pot
+    // whose honest marker is published for the FIRST time after the
+    // migration — everything else waits on the bsv-low#355 re-latch pass.
     assert_eq!(
         wire_row(&results_wire(&conn, &victim), &pot)["potBinding"],
         serde_json::json!("chain"),
-        "a single latched republish heals a legacy-tier eviction"
+        "a single latched republish heals a legacy-tier eviction — when one \
+         is made, which the #252 sweep does not do for an indexed pot"
     );
 }
 

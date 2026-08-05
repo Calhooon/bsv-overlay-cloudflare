@@ -154,9 +154,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // every recovery query fails to prepare with `no such column`. One
     // additive, idempotent statement, at most once per isolate, removes the
     // whole ordering hazard. Never fails the request; see `schema`.
-    if let Ok(db) = env.d1("OVERLAY_DB") {
-        schema::ensure_sig_valid_column(&db).await;
-    }
+    //
+    // The returned token is what `router` demands (gate round 2, MED-3):
+    // deleting this line, or wrapping it in `if false`, is a BUILD failure —
+    // there is no other way to obtain a `SigValidColumnEnsured`.
+    let schema_ready = schema::ensure_sig_valid_column(&env).await;
 
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
     // middleware refusals return here; otherwise the request proceeds with
@@ -172,7 +174,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Keep the session for reply-signing; the state moves into the router.
     let session = state.session.clone();
 
-    let mut resp = router(state).run(req, env).await?;
+    let mut resp = router(state, schema_ready).run(req, env).await?;
 
     // Sign the terminal JSON for an AUTHENTICATED caller (the tower's
     // posture: re-serialize the handler's JSON at its own status code, sign,
@@ -195,7 +197,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// The route table. All GET, all JSON; unknown paths get a JSON 404 via the
 /// `or_else_any_method` catch-alls (worker-rs' default no-match 404 is plain
 /// text, so both `/` and the wildcard are registered explicitly).
-fn router(state: auth::AuthState) -> Router<'static, auth::AuthState> {
+///
+/// `_schema` is a [`schema::SigValidColumnEnsured`] and is deliberately
+/// unused: it is a CAPABILITY, not data. Every route below reads
+/// `pp.sigValid`, and this parameter is what makes the schema catch-up
+/// impossible to skip without failing the build (gate round 2, MED-3 —
+/// see the `schema` module doc). Do not delete it to silence a lint.
+fn router(
+    state: auth::AuthState,
+    _schema: schema::SigValidColumnEnsured,
+) -> Router<'static, auth::AuthState> {
     Router::with_data(state)
         .get_async("/utxo-status", routes::utxo_status)
         .get_async("/pots-view", routes::pots_view)
