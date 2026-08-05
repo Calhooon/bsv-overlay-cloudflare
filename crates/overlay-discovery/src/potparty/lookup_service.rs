@@ -156,10 +156,21 @@ impl LookupService for PotpartyLookupService {
                 pot_txid,
                 pot_vout,
                 limit,
+                offset,
             } => {
                 let pot_txid = normalize_txid(&pot_txid)?;
                 self.storage
-                    .list_for_pot(&pot_txid, pot_vout, clamp_limit(limit))
+                    .list_for_pot(
+                        &pot_txid,
+                        pot_vout,
+                        clamp_limit(limit),
+                        // Page start (#354/#356): absent → the head of the
+                        // oldest-first order, so every deployed client keeps
+                        // exactly today's answer. Unclamped — a huge offset
+                        // is just an empty page, never a scan (the window is
+                        // still LIMIT-bounded).
+                        offset.unwrap_or(0) as usize,
+                    )
                     .await
                     .map_err(|e| LookupServiceError::StorageError(e.to_string()))?
             }
@@ -490,6 +501,83 @@ mod tests {
         // A different vout matches nobody.
         let arr = by_pot(&svc, &"22".repeat(32), 9).await;
         assert!(arr.as_array().unwrap().is_empty());
+    }
+
+    /// bsv-low#354/#356 — `byPot` is PAGEABLE end to end, through the real
+    /// wire shape.
+    ///
+    /// This window is scoped only by the pot outpoint, which is a payload
+    /// CLAIM, so a stranger's markers (including ones filed before the pot was
+    /// funded, which sort AHEAD of the honest seats in the server-stamped
+    /// order) can fill page 0. Until this change the wire carried no cursor
+    /// and page 0 was the whole reachable set.
+    #[tokio::test]
+    async fn by_pot_is_pageable_and_defaults_to_the_head() {
+        let (svc, _storage) = make_service_with_storage();
+        for (i, tx) in ["txA", "txB"].iter().enumerate() {
+            let script = if i == 0 {
+                golden_marker(&golden_game_id(), &golden_pot_txid(), 0)
+            } else {
+                marker_script(
+                    &golden_opponent(),
+                    &golden_identity(),
+                    &golden_game_id(),
+                    &golden_pot_txid(),
+                    0,
+                    golden_recovery_height(),
+                    &golden_sig(),
+                )
+            };
+            svc.output_admitted_by_topic(&admit(tx, 0, script))
+                .await
+                .unwrap();
+        }
+        let pot = "22".repeat(32);
+        let page = |limit: u32, offset: Option<u32>| {
+            let mut q = serde_json::json!({
+                "type": "byPot", "potTxid": pot, "potVout": 0, "limit": limit
+            });
+            if let Some(o) = offset {
+                q["offset"] = serde_json::json!(o);
+            }
+            q
+        };
+
+        // Page 0 of 1 buries the second seat; page 1 reaches it. Without the
+        // cursor the second row was unreachable at this limit, forever.
+        let p0 = run_lookup(&svc, page(1, Some(0))).await;
+        assert_eq!(p0.as_array().unwrap().len(), 1);
+        assert_eq!(p0[0]["txid"], "txA");
+        let p1 = run_lookup(&svc, page(1, Some(1))).await;
+        assert_eq!(p1[0]["txid"], "txB", "the buried seat is REACHABLE");
+        // Past the end is an empty page, never an error.
+        assert!(run_lookup(&svc, page(1, Some(99)))
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // ABSENT on the wire = the head of the order: every already-deployed
+        // caller keeps exactly the answer it gets today.
+        let none = run_lookup(&svc, page(1, None)).await;
+        assert_eq!(none[0]["txid"], "txA");
+    }
+
+    /// The SERVED contract must name the cursor (epoch Rule 16: an artifact
+    /// published as the spec is a contract surface, and it drifts from the
+    /// parser silently). The consumer on the far side reads this markdown,
+    /// not `PotpartyQuery`.
+    #[tokio::test]
+    async fn the_served_documentation_names_the_by_pot_cursor() {
+        let doc = make_service().get_documentation().await;
+        assert_eq!(
+            doc.matches("\"offset\"").count(),
+            1,
+            "the byPot example carries the cursor: {doc}"
+        );
+        assert!(
+            doc.contains("byPot.offset"),
+            "…and its semantics are spelled out, not left to be inferred"
+        );
     }
 
     // ── Ordering + limit ──────────────────────────────────────────────────

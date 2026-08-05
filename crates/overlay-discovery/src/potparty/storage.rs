@@ -102,6 +102,21 @@ pub enum PotpartyQuery {
         #[serde(rename = "potVout")]
         pot_vout: u32,
         limit: Option<u32>,
+        /// Page start (rows to skip in the oldest-first total order),
+        /// default 0 — the `ls_potrefund byPot` shape (bsv-low #291 gate
+        /// M2), added here by bsv-low#354/#356.
+        ///
+        /// This window is NOT identity-scoped: `potTxid`/`potVout` are
+        /// CLAIMS inside the marker payload, so a stranger can file
+        /// unlimited markers naming a victim's (public) pot outpoint from
+        /// its own transactions. Without a page cursor a client read page 0
+        /// forever and ~100 free rows stamped before the honest seats
+        /// evicted BOTH of them from the caller's attribution fold —
+        /// permanently, since rows are never deleted and `createdAt` is
+        /// server-assigned. Paging is what makes every admitted row
+        /// REACHABLE while each response stays payload-bounded.
+        #[serde(default)]
+        offset: Option<u32>,
     },
 }
 
@@ -164,11 +179,24 @@ pub trait PotpartyStorage {
     /// honest markers are published AT funding, so oldest-first puts them
     /// permanently at the head of the window — an attacker cannot spam its
     /// way in front of them after the fact.
+    ///
+    /// …unless it was there FIRST, which is the case this window could not
+    /// answer until bsv-low#354/#356. Markers can be filed before a pot is
+    /// funded (the outpoint is a payload claim, not this row's own txid), and
+    /// `createdAt` is server-stamped, so a stranger's pre-funding flood sits
+    /// permanently at the head of the order. `offset` (the `ls_potrefund`
+    /// shape, bsv-low #291 gate M2) is what makes every admitted row
+    /// REACHABLE: the caller pages `offset += limit` past the flood instead
+    /// of the cap silently amputating the honest tail. The total order is
+    /// append-only (`createdAt ASC, rowid ASC`), so pages are stable — a
+    /// concurrent insert can never shift a row across a boundary already
+    /// fetched.
     async fn list_for_pot(
         &self,
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError>;
 }
 
@@ -271,6 +299,7 @@ impl PotpartyStorage for MemoryPotpartyStorage {
         pot_txid: &str,
         pot_vout: u32,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<PotpartyRecord>, PotpartyStorageError> {
         Ok(self
             .records
@@ -278,6 +307,7 @@ impl PotpartyStorage for MemoryPotpartyStorage {
             .unwrap()
             .iter() // OLDEST first (bsv-low #281) — insertion order
             .filter(|r| r.pot_txid == pot_txid && r.pot_vout == pot_vout)
+            .skip(offset) // page start (#354/#356) — mirrors D1's OFFSET
             .take(limit)
             .cloned()
             .collect())
@@ -365,12 +395,81 @@ mod tests {
         other.pot_vout = 1;
         store.store_record(&other).await.unwrap();
 
-        let rows = store.list_for_pot(&"22".repeat(32), 0, 100).await.unwrap();
+        let rows = store
+            .list_for_pot(&"22".repeat(32), 0, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2, "both parties to vout 0");
         // OLDEST first (bsv-low #281) — later dust naming this pot can never
         // push the honest seat markers out of the window.
         assert_eq!(rows[0].txid, "txA", "oldest first");
         assert_eq!(rows[1].txid, "txB");
+    }
+
+    /// bsv-low#354/#356 — the byPot window is not identity-scoped, so a
+    /// stranger's PRE-FUNDING flood sits permanently at the head of the
+    /// oldest-first order and page 0 is all junk. `offset` is what makes the
+    /// honest seat markers reachable at all.
+    #[tokio::test]
+    async fn list_for_pot_pages_past_a_flood_at_the_head_of_the_order() {
+        let store = MemoryPotpartyStorage::new();
+        // The flood lands FIRST — markers may be filed before the pot is
+        // funded, and `createdAt` is server-stamped, so this order is not
+        // something the honest seats can beat.
+        for i in 0..8u8 {
+            store
+                .store_record(&record("02ee", "03ff", &format!("txJUNK{i}")))
+                .await
+                .unwrap();
+        }
+        store
+            .store_record(&record("02aa", "03bb", "txSEATA"))
+            .await
+            .unwrap();
+        store
+            .store_record(&record("03bb", "02aa", "txSEATB"))
+            .await
+            .unwrap();
+
+        let pot = "22".repeat(32);
+        // Page 0 at the flood's size: BOTH honest seats are invisible. This
+        // is the state the caller is in today, pinned from the unsafe side.
+        let page0 = store.list_for_pot(&pot, 0, 8, 0).await.unwrap();
+        assert_eq!(page0.len(), 8);
+        assert!(
+            !page0.iter().any(|r| r.txid.starts_with("txSEAT")),
+            "the honest markers are past the cap"
+        );
+        // …and page 1 reaches them, which is the whole point.
+        let page1 = store.list_for_pot(&pot, 0, 8, 8).await.unwrap();
+        assert_eq!(
+            page1.iter().map(|r| r.txid.as_str()).collect::<Vec<_>>(),
+            vec!["txSEATA", "txSEATB"],
+        );
+        // Pages do not overlap and do not skip: the order is a total one.
+        let all: Vec<String> = page0
+            .iter()
+            .chain(page1.iter())
+            .map(|r| r.txid.clone())
+            .collect();
+        assert_eq!(all.len(), 10);
+        assert_eq!(
+            all,
+            store
+                .list_for_pot(&pot, 0, 100, 0)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.txid.clone())
+                .collect::<Vec<_>>(),
+            "paging reconstructs the unpaged answer exactly"
+        );
+        // An offset past the end is an empty page, never an error.
+        assert!(store
+            .list_for_pot(&pot, 0, 8, 10_000)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -461,10 +560,31 @@ mod tests {
                 pot_txid,
                 pot_vout,
                 limit,
+                offset,
             } => {
                 assert_eq!(pot_txid.len(), 64);
                 assert_eq!(pot_vout, 3);
                 assert_eq!(limit, None);
+                // #354/#356: absent on the wire → the head of the order, so
+                // every already-deployed caller keeps exactly today's answer.
+                assert_eq!(offset, None);
+            }
+            other => panic!("expected ByPot, got {other:?}"),
+        }
+
+        // …and a caller that DOES page is parsed (the half the flood victim
+        // needs — without it "page past the junk" is advice, not a mechanism).
+        let q: PotpartyQuery = serde_json::from_value(serde_json::json!({
+            "type": "byPot",
+            "potTxid": "22".repeat(32),
+            "potVout": 0,
+            "limit": 500,
+            "offset": 500
+        }))
+        .unwrap();
+        match q {
+            PotpartyQuery::ByPot { limit, offset, .. } => {
+                assert_eq!((limit, offset), (Some(500), Some(500)));
             }
             other => panic!("expected ByPot, got {other:?}"),
         }
