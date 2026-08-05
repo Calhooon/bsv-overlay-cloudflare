@@ -94,7 +94,10 @@ pub enum PotrefundQuery {
     /// "Which pots have I published a refund backup for?" — completeness.
     /// At most one row per pot, newest pot first (bsv-low #281).
     #[serde(rename = "partyFor")]
-    PartyFor { identity: String, limit: Option<u32> },
+    PartyFor {
+        identity: String,
+        limit: Option<u32>,
+    },
 }
 
 /// Backend-agnostic storage for potrefund-marker records.
@@ -305,7 +308,10 @@ mod tests {
         // A different pot vout is NOT matched.
         store.store_record(&record("02aa", 1, "txC")).await.unwrap();
 
-        let rows = store.list_for_pot(&"22".repeat(32), 0, 100, 0).await.unwrap();
+        let rows = store
+            .list_for_pot(&"22".repeat(32), 0, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2, "both parties' backups for vout 0");
         // OLDEST first (bsv-low #281) — later dust naming this pot can never
         // bury the pre-signed refund that brings the money home.

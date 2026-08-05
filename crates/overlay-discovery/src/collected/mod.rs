@@ -308,7 +308,11 @@ pub(crate) mod tests {
             vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff],       // PUSHDATA4 header truncated
             vec![0x00u8, 0x6a, 0x4b],                         // a 75-byte push with no data
         ] {
-            assert_eq!(parse_collected_marker(&script), None, "crafted script must not parse");
+            assert_eq!(
+                parse_collected_marker(&script),
+                None,
+                "crafted script must not parse"
+            );
         }
         // Direct read_pushes probe: the trap path is the len itself.
         assert!(read_pushes(&[0x4e, 0xff, 0xff, 0xff, 0xff]).is_empty());

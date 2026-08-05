@@ -124,7 +124,9 @@ async fn ct_get(
 
     match service {
         Some(f) => f.fetch(url, Some(init)).await.map_err(|e| {
-            ChainTrackerError::NetworkError(format!("ChainTracks {ctx} (service binding) failed: {e}"))
+            ChainTrackerError::NetworkError(format!(
+                "ChainTracks {ctx} (service binding) failed: {e}"
+            ))
         }),
         None => {
             let request = worker::Request::new_with_init(&url, &init)
@@ -233,7 +235,10 @@ async fn fetch_is_valid_root(
 /// `success + null`. So failing safe changes nothing in practice while closing
 /// the latent trap; a genuinely-recent block is served a real header (matched
 /// below) or 404s (→ `BlockNotFound` at the caller), never silently accepted.
-fn root_matches_frame(header: Option<&CtBlockHeader>, root: &str) -> Result<bool, ChainTrackerError> {
+fn root_matches_frame(
+    header: Option<&CtBlockHeader>,
+    root: &str,
+) -> Result<bool, ChainTrackerError> {
     match header {
         Some(h) => Ok(h.merkle_root == root),
         None => Ok(false),

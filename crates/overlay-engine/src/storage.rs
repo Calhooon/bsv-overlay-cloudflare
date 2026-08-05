@@ -363,7 +363,9 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
         txid: &str,
         include_beef: bool,
     ) -> Result<Vec<Output>, StorageError> {
-        (**self).find_outputs_for_transaction(txid, include_beef).await
+        (**self)
+            .find_outputs_for_transaction(txid, include_beef)
+            .await
     }
     async fn find_utxos_for_topic(
         &self,
@@ -631,7 +633,10 @@ pub mod memory {
             // which is how a row legitimately flips proofless → proven.)
             let has_proof = bsv_rs::transaction::Beef::from_binary(beef)
                 .ok()
-                .and_then(|b| b.find_txid(txid).map(bsv_rs::transaction::BeefTx::has_proof))
+                .and_then(|b| {
+                    b.find_txid(txid)
+                        .map(bsv_rs::transaction::BeefTx::has_proof)
+                })
                 .unwrap_or(false);
             if has_proof {
                 self.proven.lock().unwrap().insert(txid.to_string());

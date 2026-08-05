@@ -641,7 +641,10 @@ mod tests {
         let p = sample_params();
         let winner_a = RawTx {
             inputs: vec![],
-            outputs: vec![(40, p2pkh_lock(&p.rake_pkh)), (3560, p2pkh_lock(&p.pay_pkh_a))],
+            outputs: vec![
+                (40, p2pkh_lock(&p.rake_pkh)),
+                (3560, p2pkh_lock(&p.pay_pkh_a)),
+            ],
             lock_time: 0,
         };
         assert_eq!(
@@ -650,12 +653,18 @@ mod tests {
         );
         // A redirect (right values, wrong home) never classifies.
         let redirect = RawTx {
-            outputs: vec![(40, p2pkh_lock(&p.rake_pkh)), (3560, p2pkh_lock(&[0xEE; 20]))],
+            outputs: vec![
+                (40, p2pkh_lock(&p.rake_pkh)),
+                (3560, p2pkh_lock(&[0xEE; 20])),
+            ],
             ..winner_a.clone()
         };
         assert_eq!(classify_covenant(&p, &redirect, 0xffff_ffff), None);
         // The refund shape needs the observed height gate.
-        let refund_outs = vec![(1800, p2pkh_lock(&p.pay_pkh_a)), (1800, p2pkh_lock(&p.pay_pkh_b))];
+        let refund_outs = vec![
+            (1800, p2pkh_lock(&p.pay_pkh_a)),
+            (1800, p2pkh_lock(&p.pay_pkh_b)),
+        ];
         let gated = RawTx {
             inputs: vec![],
             outputs: refund_outs.clone(),

@@ -497,13 +497,15 @@ pub fn recovery_view_sql() -> String {
             hex(b.beef) AS spenderBeef \
      FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
               opponentIdentity, spent, spendingTxid, spentConfirmed, \
-              markerCreatedAt, markerRowid, potCreatedAt, \
+              markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
               CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
        FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                 opponentIdentity, spent, spendingTxid, spentConfirmed, \
                 markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                potBestSigRank, \
                 ROW_NUMBER() OVER (PARTITION BY unknownPot \
-                                   ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                   ORDER BY potBestSigRank DESC, \
+                                            COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                                             markerCreatedAt DESC, markerRowid DESC) AS potRank \
          FROM (SELECT pp.gameId AS gameId, pp.potTxid AS potTxid, \
                   pp.potVout AS potVout, pp.recoveryHeight AS recoveryHeight, \
@@ -514,21 +516,27 @@ pub fn recovery_view_sql() -> String {
                   pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                   r.createdAt AS potCreatedAt, \
                   CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                  MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
+                      AS potBestSigRank, \
                   ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
-                                     ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+                                     ORDER BY {rank} DESC, \
+                                              pp.createdAt ASC, pp.rowid ASC) AS rn \
            FROM potparty_records pp \
            LEFT JOIN pot_records r \
                   ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
            WHERE pp.identity = ?) \
          WHERE rn = 1) \
-       ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+       ORDER BY potBestSigRank DESC, tier ASC, \
+                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                 markerCreatedAt DESC, markerRowid DESC \
        LIMIT {probe}) w \
      LEFT JOIN pot_beefs b ON b.txid = lower(w.spendingTxid) \
-     ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+     ORDER BY w.potBestSigRank DESC, w.tier ASC, \
+              COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
               w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = RECOVERY_VIEW_UNKNOWN_QUOTA,
         probe = RECOVERY_VIEW_MAX_ROWS + 1,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
     )
 }
 
@@ -1516,7 +1524,8 @@ pub fn aggregate_leaderboard_attributed(
                 .insert(pot_lc.clone());
         }
         // The winner's own signed cards (bound by the verified sig) → hands.
-        if fact.cards_hex.is_some() && leaderboard_cards_from_hex(&fact.cards_hex.unwrap()).is_some()
+        if fact.cards_hex.is_some()
+            && leaderboard_cards_from_hex(&fact.cards_hex.unwrap()).is_some()
         {
             let at = m.created_at.unwrap_or(i64::MAX);
             hand_marker
@@ -2526,24 +2535,38 @@ mod tests {
         // flood on an attacker-writable identity must not be able to evict
         // the caller's real pots.
         //
-        // 1. dedupe in SQL, OLDEST marker per pot wins (anti-squat: a later
-        //    marker cannot displace the original, and one pot takes one slot).
+        // 1. dedupe in SQL, VERIFIED-then-oldest marker per pot (bsv-low
+        //    #283: `createdAt ASC` alone was an out-stampable ordering — one
+        //    earlier junk row owned the pot's row. The admission-time
+        //    `sigValid` latch leads it now, and one pot still takes one slot).
         assert!(
-            sql.contains(
+            sql.contains(&format!(
                 "ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
-                                     ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn"
-            ),
+                                     ORDER BY {rank} DESC, \
+                                              pp.createdAt ASC, pp.rowid ASC) AS rn",
+                rank = overlay_discovery::potparty::validity::sig_rank_expr("pp.")
+            )),
             "per-pot dedupe window missing: {sql}"
         );
         assert!(sql.contains("WHERE rn = 1"), "dedupe filter missing: {sql}");
         // 2. rank by the POT's own admission stamp — an attacker cannot
         //    backdate or advance `pot_records.createdAt` by filing markers.
+        //    (A BACKSTOP since #283: a `pot_records` row is free to fabricate,
+        //    bsv-low#347, so the latch rank leads this too.)
         assert!(
-            sql.contains("ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC"),
-            "pot-stamp ranking missing: {sql}"
+            sql.contains(
+                "ORDER BY potBestSigRank DESC, \
+                 COALESCE(potCreatedAt, markerCreatedAt) DESC"
+            ),
+            "pot-stamp ranking missing (behind the #283 latch rank): {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY potBestSigRank DESC, tier ASC"),
+            "#283: the latch rank must lead the tier ordering: {sql}"
         );
         // 3. a reserved quota for unknown pots, so ghost rows occupy a
-        //    bounded slice instead of the whole page.
+        //    bounded slice instead of the whole page — and since #283 a
+        //    provably-forged marker cannot occupy one at all.
         assert!(
             sql.contains(&format!(
                 "CASE WHEN unknownPot = 0 OR potRank <= {RECOVERY_VIEW_UNKNOWN_QUOTA} THEN 0 ELSE 1 END AS tier"
@@ -3127,7 +3150,12 @@ mod tests {
         let b = ident(0xbb);
         let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &a, &b)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b)]),
+        );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].identity, a);
         assert_eq!(lb.board[0].wins, 1);
@@ -3168,7 +3196,12 @@ mod tests {
         let b = ident(0xbb);
         let markers = vec![mk(1, &a, &b, 1, 2, false, None, 100, 0)];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &a, &b)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b)]),
+        );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].wins, 1);
         assert!(lb.board[0].chain_proven);
@@ -3207,7 +3240,12 @@ mod tests {
         let b = ident(0xbb);
         let markers = vec![mk(1, &a, &b, 1, 2, true, Some("000102030c"), 100, 0)];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 9u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &a, &b)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b)]),
+        );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].wins, 1, "the chain win stands");
         assert!(
@@ -3229,7 +3267,12 @@ mod tests {
             mk(1, &a, &b, 1, 2, true, None, 101, 1),
         ];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &a, &b)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b)]),
+        );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].wins, 1, "one pot, one win");
         assert_eq!(lb.board[0].evidence.len(), 2, "both markers decorate");
@@ -3248,7 +3291,12 @@ mod tests {
             mk(1, &b, &a, 1, 2, true, None, 101, 1),
         ];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &a, &b)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b)]),
+        );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].identity, a);
         assert_eq!(lb.board[0].wins, 1);
@@ -3487,16 +3535,30 @@ mod tests {
         let attrs = attrs_of(&[(3, Some(&w), Some(&l))]); // only pot 3 resolves an identity
         let params = params_of(&[(1, &key_a, &key_b)]); // pot 1 falls back to the committed key
         let lb = aggregate_leaderboard_attributed(
-            &markers, &statuses, &no_proofs(), 200, &verdicts, &attrs, &params,
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+            &params,
         );
         // Loud-count guard: exactly two board rows, one of each new shape.
-        assert_eq!(lb.board.len(), 2, "the scenario must produce two board rows");
+        assert_eq!(
+            lb.board.len(),
+            2,
+            "the scenario must produce two board rows"
+        );
         assert!(
-            lb.board.iter().any(|r| r.identity_is_key && r.evidence.is_empty() && r.chain_wins.len() == 1),
+            lb.board
+                .iter()
+                .any(|r| r.identity_is_key && r.evidence.is_empty() && r.chain_wins.len() == 1),
             "a key-attributed row with empty evidence + a chain-win anchor (#337)"
         );
         assert!(
-            lb.board.iter().any(|r| !r.identity_is_key && !r.evidence.is_empty() && r.chain_wins.len() == 1),
+            lb.board
+                .iter()
+                .any(|r| !r.identity_is_key && !r.evidence.is_empty() && r.chain_wins.len() == 1),
             "an identity row with evidence + a chain-win anchor (#336 coexistence)"
         );
         let body = leaderboard_body(&lb, 1_700_000_000, 2, false);
@@ -3739,7 +3801,10 @@ mod tests {
         // WITHOUT the attribution: a verdict alone is UNRANKED (no row).
         let lb =
             aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
-        assert!(lb.board.is_empty(), "verdict without attribution ⇒ unranked");
+        assert!(
+            lb.board.is_empty(),
+            "verdict without attribution ⇒ unranked"
+        );
 
         // WITH it: the win counts, on the honest new tier.
         let lb = aggregate_leaderboard_attributed(
@@ -3876,7 +3941,13 @@ mod tests {
         // exactly one chain-win anchor whose settleTxid is that spender.
         let ok = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         let lb = aggregate_leaderboard_attributed(
-            &markers, &ok, &no_proofs(), 200, &verdicts, &attrs, &params,
+            &markers,
+            &ok,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+            &params,
         );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].chain_wins.len(), 1);
@@ -3886,12 +3957,24 @@ mod tests {
         // `is_confirmed_landing` is still true (flag-only), so ONLY the new
         // `spending_txid.is_some()` limb keeps it out of `counted`.
         let mut no_spender = ok.clone();
-        assert!(is_confirmed_landing(&no_spender[0]), "flags still say confirmed");
+        assert!(
+            is_confirmed_landing(&no_spender[0]),
+            "flags still say confirmed"
+        );
         no_spender[0].spending_txid = None;
         let lb = aggregate_leaderboard_attributed(
-            &markers, &no_spender, &no_proofs(), 200, &verdicts, &attrs, &params,
+            &markers,
+            &no_spender,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+            &params,
         );
-        assert!(lb.board.is_empty(), "a spender-less confirmed landing is not counted");
+        assert!(
+            lb.board.is_empty(),
+            "a spender-less confirmed landing is not counted"
+        );
     }
 
     /// Adversarial (risk register B1/B5): the CHAIN decides the winner, and a
@@ -4023,8 +4106,18 @@ mod tests {
             ));
         }
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &w, &l)]));
-        let wins_of = |id: &str| lb.board.iter().find(|r| r.identity == *id).map_or(0, |r| r.wins);
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &w, &l)]),
+        );
+        let wins_of = |id: &str| {
+            lb.board
+                .iter()
+                .find(|r| r.identity == *id)
+                .map_or(0, |r| r.wins)
+        };
         assert_eq!(
             wins_of(&attacker),
             0,
@@ -4071,7 +4164,12 @@ mod tests {
         // the victim — the chain facts the route derives independently of the
         // result markers.
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &w, &l)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &w, &l)]),
+        );
         let honest = lb
             .board
             .iter()
@@ -4105,7 +4203,19 @@ mod tests {
         // Attacker's 4 REAL-signed countersigned claims naming itself, over
         // the victim's real pot/settle; the honest marker is evicted (absent).
         let markers: Vec<ResultMarkerRow> = (0..4u8)
-            .map(|i| mk(0x60 + i, &attacker, &sock, 1, 2, true, None, 10 + i64::from(i), i))
+            .map(|i| {
+                mk(
+                    0x60 + i,
+                    &attacker,
+                    &sock,
+                    1,
+                    2,
+                    true,
+                    None,
+                    10 + i64::from(i),
+                    i,
+                )
+            })
             .collect();
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         // NO verdict, NO attribution — a bare/legacy pot.
@@ -4115,7 +4225,9 @@ mod tests {
             "an unattributed pot is UNRANKED — no wrong-winner, no win at all"
         );
         assert!(
-            !lb.board.iter().any(|r| r.identity == attacker || r.identity == w),
+            !lb.board
+                .iter()
+                .any(|r| r.identity == attacker || r.identity == w),
             "neither the forger nor the victim is credited on a bare pot"
         );
     }
@@ -4132,11 +4244,31 @@ mod tests {
         let sock = ident(0xdd);
         let mut markers = vec![mk(1, &w, &l, 1, 2, true, None, 100, 0)];
         for g in 0..5u8 {
-            markers.push(mk(0x40 + g, &attacker, &sock, 1, 2, true, None, 200 + i64::from(g), g));
+            markers.push(mk(
+                0x40 + g,
+                &attacker,
+                &sock,
+                1,
+                2,
+                true,
+                None,
+                200 + i64::from(g),
+                g,
+            ));
         }
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = agg(&markers, &statuses, &no_proofs(), &win_world(&[(1, &w, &l)]));
-        let wins_of = |id: &str| lb.board.iter().find(|r| r.identity == *id).map_or(0, |r| r.wins);
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &w, &l)]),
+        );
+        let wins_of = |id: &str| {
+            lb.board
+                .iter()
+                .find(|r| r.identity == *id)
+                .map_or(0, |r| r.wins)
+        };
         assert_eq!(wins_of(&attacker), 0, "sock copies mint nothing");
         assert_eq!(wins_of(&w), 1, "the attributed honest win stands");
     }

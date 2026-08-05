@@ -19,10 +19,20 @@
 //!   a service binding (a plain workers.dev fetch to a same-account worker
 //!   loops back to the caller, so the binding is required).
 //!
-//! STRICTLY READ-ONLY: this worker NEVER writes to the DB. It runs no
-//! migrations (the overlay owns the schema), takes no queue, and holds no
-//! secrets — every route is a public GET over public chain facts, answered
-//! with wildcard CORS so the browser can call it cross-origin.
+//! STRICTLY READ-ONLY on DATA: this worker never inserts, updates or deletes
+//! a row. It takes no queue and holds no secrets — every route is a public
+//! GET over public chain facts, answered with wildcard CORS so the browser
+//! can call it cross-origin.
+//!
+//! **One exception, and it is DDL rather than data (bsv-low #283):** the
+//! overlay owns the schema and applies `OVERLAY_MIGRATIONS` on ITS cold
+//! start, which is not an ordering this worker can wait for — a cold isolate
+//! here can reach a column the overlay has not added yet and fail every
+//! recovery query with `no such column`. So [`schema`] issues ONE additive,
+//! idempotent `ALTER TABLE … ADD COLUMN` for the one column this worker reads
+//! and cannot serve without, at most once per isolate, pinned byte-identical
+//! to the overlay's own migration. It is not a migration runner and must not
+//! become one — see `docs/DEPLOY-ORDER-AND-SCHEMA.md`.
 //!
 //! Routes:
 //! - `GET /utxo-status?outpoints=<txid>.<vout>,…` — spent-status of up to 64
@@ -112,6 +122,7 @@ pub mod logic;
 pub mod refund_view;
 pub mod results;
 mod routes;
+pub mod schema;
 pub mod txany;
 
 use serde_json::Value;
@@ -137,6 +148,18 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return cors::preflight();
     }
 
+    // bsv-low #283: this Worker never runs `OVERLAY_MIGRATIONS`, and the
+    // overlay applies them on ITS cold start — so a cold isolate here can
+    // reach `pp.sigValid` before any request has warmed the overlay, and
+    // every recovery query fails to prepare with `no such column`. One
+    // additive, idempotent statement, at most once per isolate, removes the
+    // whole ordering hazard. Never fails the request; see `schema`.
+    //
+    // The returned token is what `router` demands (gate round 2, MED-3):
+    // deleting this line, or wrapping it in `if false`, is a BUILD failure —
+    // there is no other way to obtain a `SigValidColumnEnsured`.
+    let schema_ready = schema::ensure_sig_valid_column(&env).await;
+
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
     // middleware refusals return here; otherwise the request proceeds with
     // the resolved [`auth::AuthState`] as the router data (in-process only —
@@ -151,7 +174,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Keep the session for reply-signing; the state moves into the router.
     let session = state.session.clone();
 
-    let mut resp = router(state).run(req, env).await?;
+    let mut resp = router(state, schema_ready).run(req, env).await?;
 
     // Sign the terminal JSON for an AUTHENTICATED caller (the tower's
     // posture: re-serialize the handler's JSON at its own status code, sign,
@@ -159,10 +182,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // fresh response, so the handler's cache header must be re-applied).
     if let Some(session) = session {
         let status = resp.status_code();
-        let value: Value = resp
-            .json()
-            .await
-            .unwrap_or_else(|_| serde_json::json!({ "error": "handler returned a non-JSON response" }));
+        let value: Value = resp.json().await.unwrap_or_else(
+            |_| serde_json::json!({ "error": "handler returned a non-JSON response" }),
+        );
         resp = bsv_middleware_cloudflare::sign_json_response(&value, status, &[], &session)
             .map_err(|e| worker::Error::from(e.to_string()))?;
         resp.headers_mut().set("Content-Type", "application/json")?;
@@ -175,7 +197,16 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// The route table. All GET, all JSON; unknown paths get a JSON 404 via the
 /// `or_else_any_method` catch-alls (worker-rs' default no-match 404 is plain
 /// text, so both `/` and the wildcard are registered explicitly).
-fn router(state: auth::AuthState) -> Router<'static, auth::AuthState> {
+///
+/// `_schema` is a [`schema::SigValidColumnEnsured`] and is deliberately
+/// unused: it is a CAPABILITY, not data. Every route below reads
+/// `pp.sigValid`, and this parameter is what makes the schema catch-up
+/// impossible to skip without failing the build (gate round 2, MED-3 —
+/// see the `schema` module doc). Do not delete it to silence a lint.
+fn router(
+    state: auth::AuthState,
+    _schema: schema::SigValidColumnEnsured,
+) -> Router<'static, auth::AuthState> {
     Router::with_data(state)
         .get_async("/utxo-status", routes::utxo_status)
         .get_async("/pots-view", routes::pots_view)

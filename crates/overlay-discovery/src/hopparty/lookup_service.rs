@@ -322,7 +322,12 @@ mod tests {
     /// P2PKH and whose output 1 is the marker OP_RETURN — the exact shape
     /// the client's hop `createAction` emits (`randomizeOutputs: false`
     /// keeps the hop at a stable vout). Returns (atomic BEEF, txid).
-    fn container(hop_lock_hex: &str, hop_sats: u64, marker_script: &[u8], nonce: u8) -> (Vec<u8>, String) {
+    fn container(
+        hop_lock_hex: &str,
+        hop_sats: u64,
+        marker_script: &[u8],
+        nonce: u8,
+    ) -> (Vec<u8>, String) {
         let mut tx = Tx::new();
         // The nonce varies the input so distinct containers get distinct
         // txids (a replay of the SAME bytes is a same-outpoint no-op).
@@ -363,11 +368,16 @@ mod tests {
         nonce: u8,
     ) -> String {
         let (beef, txid) = container(&p2pkh_for(settle_pub_hex), hop_sats, script, nonce);
-        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef, 1))
+            .await
+            .unwrap();
         txid
     }
 
-    async fn run_lookup(svc: &HoppartyLookupService, query: serde_json::Value) -> serde_json::Value {
+    async fn run_lookup(
+        svc: &HoppartyLookupService,
+        query: serde_json::Value,
+    ) -> serde_json::Value {
         let q = LookupQuestion::new("ls_hopparty", query);
         match svc.lookup(&q).await.unwrap() {
             LookupResult::Answer(LookupAnswer::Freeform { result }) => result,
@@ -387,7 +397,11 @@ mod tests {
         run_lookup(svc, q).await
     }
 
-    async fn by_hop(svc: &HoppartyLookupService, hop_txid: &str, hop_vout: u32) -> serde_json::Value {
+    async fn by_hop(
+        svc: &HoppartyLookupService,
+        hop_txid: &str,
+        hop_vout: u32,
+    ) -> serde_json::Value {
         let q = serde_json::json!({"type": "byHop", "hopTxid": hop_txid, "hopVout": hop_vout});
         run_lookup(svc, q).await
     }
@@ -465,7 +479,11 @@ mod tests {
         // The marker claims hopVout 7; the container has 2 outputs.
         let script = golden_marker(&golden_game_id(), 7);
         admit_marker(&svc, &script, &settle, golden_sats(), 0x02).await;
-        assert_eq!(storage.record_count(), 1, "stored — admission never refuses");
+        assert_eq!(
+            storage.record_count(),
+            1,
+            "stored — admission never refuses"
+        );
 
         let e = &hops_for(&svc, &golden_identity_hex(), None).await[0];
         assert!(e["hopLockHex"].is_null());
@@ -477,7 +495,14 @@ mod tests {
     async fn hops_for_filters_by_identity_only() {
         let (svc, _storage) = make_service_with_storage();
         let settle = hex::encode(golden_settle_pubkey());
-        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01).await;
+        admit_marker(
+            &svc,
+            &golden_marker(&golden_game_id(), 0),
+            &settle,
+            golden_sats(),
+            0x01,
+        )
+        .await;
         // Seat B's OWN marker on its own hop (seats flipped).
         let b = marker_script(
             &golden_opponent(),
@@ -496,7 +521,11 @@ mod tests {
         let arr = hops_for(&svc, &golden_opponent_hex(), None).await;
         assert_eq!(arr.as_array().unwrap().len(), 1);
         let stranger = "02".to_string() + &"ee".repeat(32);
-        assert!(hops_for(&svc, &stranger, None).await.as_array().unwrap().is_empty());
+        assert!(hops_for(&svc, &stranger, None)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     // ── Ordering + limit ──────────────────────────────────────────────────
@@ -529,8 +558,12 @@ mod tests {
         let settle = hex::encode(golden_settle_pubkey());
         let script = golden_marker(&golden_game_id(), 0);
         let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &script, 0x01);
-        svc.output_admitted_by_topic(&admit_beef(beef.clone(), 1)).await.unwrap();
-        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef.clone(), 1))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef, 1))
+            .await
+            .unwrap();
         assert_eq!(storage.record_count(), 1, "same-outpoint replay is a no-op");
     }
 
@@ -540,7 +573,12 @@ mod tests {
     async fn ignores_non_tm_hopparty_topic() {
         let (svc, storage) = make_service_with_storage();
         let settle = hex::encode(golden_settle_pubkey());
-        let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &golden_marker(&golden_game_id(), 0), 0x01);
+        let (beef, _) = container(
+            &p2pkh_for(&settle),
+            golden_sats(),
+            &golden_marker(&golden_game_id(), 0),
+            0x01,
+        );
         let mut payload = admit_beef(beef, 1);
         if let OutputAdmittedByTopic::WholeTx { ref mut topic, .. } = payload {
             *topic = "tm_potparty".into();
@@ -566,13 +604,16 @@ mod tests {
         .enumerate()
         {
             let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &script, 0x10 + i as u8);
-            svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+            svc.output_admitted_by_topic(&admit_beef(beef, 1))
+                .await
+                .unwrap();
         }
         assert_eq!(storage.record_count(), 0, "potparty scripts never stored");
 
         // The reverse: a hopparty script through the POTPARTY LS.
         let pp_storage = Rc::new(crate::potparty::storage::MemoryPotpartyStorage::new());
-        let pp_svc = crate::potparty::lookup_service::PotpartyLookupService::new(pp_storage.clone());
+        let pp_svc =
+            crate::potparty::lookup_service::PotpartyLookupService::new(pp_storage.clone());
         pp_svc
             .output_admitted_by_topic(&OutputAdmittedByTopic::LockingScript {
                 txid: "txHOP".into(),
@@ -584,10 +625,21 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(pp_storage.record_count(), 0, "hopparty never stored in potparty");
+        assert_eq!(
+            pp_storage.record_count(),
+            0,
+            "hopparty never stored in potparty"
+        );
 
         // Positive control: the same hopparty script under ITS topic stores.
-        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x20).await;
+        admit_marker(
+            &svc,
+            &golden_marker(&golden_game_id(), 0),
+            &settle,
+            golden_sats(),
+            0x20,
+        )
+        .await;
         assert_eq!(storage.record_count(), 1);
     }
 
@@ -596,7 +648,9 @@ mod tests {
         let (svc, storage) = make_service_with_storage();
         let p2pkh = "76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac";
         let (beef, _) = container(p2pkh, 546, &hex::decode(p2pkh).unwrap(), 0x01);
-        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef, 1))
+            .await
+            .unwrap();
         assert_eq!(storage.record_count(), 0);
     }
 
@@ -625,8 +679,15 @@ mod tests {
         assert_eq!(storage.record_count(), 0);
         // An output index past the container is likewise a no-op.
         let settle = hex::encode(golden_settle_pubkey());
-        let (beef, _) = container(&p2pkh_for(&settle), golden_sats(), &golden_marker(&golden_game_id(), 0), 0x01);
-        svc.output_admitted_by_topic(&admit_beef(beef, 9)).await.unwrap();
+        let (beef, _) = container(
+            &p2pkh_for(&settle),
+            golden_sats(),
+            &golden_marker(&golden_game_id(), 0),
+            0x01,
+        );
+        svc.output_admitted_by_topic(&admit_beef(beef, 9))
+            .await
+            .unwrap();
         assert_eq!(storage.record_count(), 0);
     }
 
@@ -636,7 +697,14 @@ mod tests {
     async fn spend_and_eviction_never_remove_a_record() {
         let (svc, storage) = make_service_with_storage();
         let settle = hex::encode(golden_settle_pubkey());
-        let txid = admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01).await;
+        let txid = admit_marker(
+            &svc,
+            &golden_marker(&golden_game_id(), 0),
+            &settle,
+            golden_sats(),
+            0x01,
+        )
+        .await;
         assert_eq!(storage.record_count(), 1);
 
         let spent = OutputSpent::None {
@@ -656,7 +724,14 @@ mod tests {
     async fn lookup_case_insensitive_hex() {
         let (svc, _storage) = make_service_with_storage();
         let settle = hex::encode(golden_settle_pubkey());
-        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01).await;
+        admit_marker(
+            &svc,
+            &golden_marker(&golden_game_id(), 0),
+            &settle,
+            golden_sats(),
+            0x01,
+        )
+        .await;
         let arr = hops_for(&svc, &golden_identity_hex().to_uppercase(), None).await;
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -706,8 +781,14 @@ mod tests {
     async fn served_documentation_answer_keys_match_the_serializer() {
         let (svc, _storage) = make_service_with_storage();
         let settle = hex::encode(golden_settle_pubkey());
-        admit_marker(&svc, &golden_marker(&golden_game_id(), 0), &settle, golden_sats(), 0x01)
-            .await;
+        admit_marker(
+            &svc,
+            &golden_marker(&golden_game_id(), 0),
+            &settle,
+            golden_sats(),
+            0x01,
+        )
+        .await;
         let answer = hops_for(&svc, &hex::encode(golden_identity()), None).await;
         let mut real_keys: Vec<String> = answer[0]
             .as_object()
@@ -790,10 +871,14 @@ mod tests {
         // canonical FULLY-VERIFYING example the client half pins against.
         let golden = build_golden_marker();
         let golden_settle = hex::encode(
-            &parse_hopparty_marker(&golden).expect("golden parses").seat_settle_pubkey,
+            &parse_hopparty_marker(&golden)
+                .expect("golden parses")
+                .seat_settle_pubkey,
         );
         let (beef, _) = container(&p2pkh_for(&golden_settle), hop_sats, &golden, 0xc1);
-        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef, 1))
+            .await
+            .unwrap();
         // Row 2: a second marker for the SAME identity on another hop tx —
         // deterministic dummy-DER sigs (admission is byte-shape only; the
         // sig VALUES are exercised by the golden row).
@@ -819,7 +904,9 @@ mod tests {
             &second,
             0xc2,
         );
-        svc.output_admitted_by_topic(&admit_beef(beef, 1)).await.unwrap();
+        svc.output_admitted_by_topic(&admit_beef(beef, 1))
+            .await
+            .unwrap();
         assert_eq!(storage.record_count(), 2);
         assert_eq!(hop_vout, 0, "the golden vector rides the production layout");
 

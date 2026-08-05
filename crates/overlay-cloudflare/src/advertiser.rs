@@ -100,8 +100,10 @@ pub(crate) trait AdWalletOps {
         &self,
         req: &ProcessActionRequest,
     ) -> Result<ProcessActionResult, &'static str>;
-    async fn abort_action(&self, req: &AbortActionRequest)
-        -> Result<AbortActionResult, &'static str>;
+    async fn abort_action(
+        &self,
+        req: &AbortActionRequest,
+    ) -> Result<AbortActionResult, &'static str>;
 }
 
 #[async_trait(?Send)]
@@ -508,7 +510,9 @@ fn permanent_send_failure(result: &ProcessActionResult, txid: &str) -> Option<St
     const PERMANENT: [&str; 3] = ["failed", "invalid", "doubleSpend"];
     for maybe in [&result.send_with_results, &result.not_delayed_results] {
         let Some(value) = maybe else { continue };
-        let Some(entries) = value.as_array() else { continue };
+        let Some(entries) = value.as_array() else {
+            continue;
+        };
         for entry in entries {
             if entry.get("txid").and_then(|t| t.as_str()) != Some(txid) {
                 continue;
@@ -729,7 +733,10 @@ mod tests {
             .create_advertisements_with(&one_ad(), &wallet)
             .await
             .expect_err("garbage input_beef must fail BEEF assembly");
-        assert!(format!("{err}").contains("Beef::from_binary"), "err was: {err}");
+        assert!(
+            format!("{err}").contains("Beef::from_binary"),
+            "err was: {err}"
+        );
         assert_eq!(wallet.aborted_refs(), vec![TEST_REF.to_string()]);
     }
 

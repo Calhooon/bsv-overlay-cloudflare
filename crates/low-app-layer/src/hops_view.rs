@@ -638,8 +638,10 @@ pub fn derive_hop_status(
         // Non-observation of a spend on an INDEXED hop (module docs).
         Some(false) => (HopStatus::Unspent, Some("chain")),
         Some(true) => {
-            if crate::logic::is_confirmed_landing_with_proof(spent_confirmed, spender_proof_verified)
-            {
+            if crate::logic::is_confirmed_landing_with_proof(
+                spent_confirmed,
+                spender_proof_verified,
+            ) {
                 (HopStatus::Spent, Some("chain"))
             } else {
                 // Recorded-but-unconfirmed: a displaceable intent.
@@ -873,7 +875,7 @@ pub fn hops_view_body(
 mod tests {
     use super::*;
     use bsv_rs::wallet::{
-        Counterparty, CreateSignatureArgs, GetPublicKeyArgs, Protocol, ProtoWallet, SecurityLevel,
+        Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
     };
 
     fn h64(seed: u8) -> String {
@@ -1089,7 +1091,10 @@ mod tests {
         // the refusals below cannot pass for the wrong reason.
         assert!(verify_hop_seat_sig(&base));
         assert!(verify_hop_identity_binding(&base));
-        assert_eq!(derive_marker_verification(&base), MarkerVerification::Verified);
+        assert_eq!(
+            derive_marker_verification(&base),
+            MarkerVerification::Verified
+        );
 
         /// Re-encode a DER signature with a NON-MINIMAL `r` (a redundant
         /// leading zero byte), keeping it parseable and the value equal.
@@ -1117,7 +1122,10 @@ mod tests {
             // …on the SEAT signature.
             let mut r = base.clone();
             r.seat_sig_hex = mutate(&base.seat_sig_hex);
-            assert_ne!(r.seat_sig_hex, base.seat_sig_hex, "the fixture really mutated");
+            assert_ne!(
+                r.seat_sig_hex, base.seat_sig_hex,
+                "the fixture really mutated"
+            );
             assert!(
                 !verify_hop_seat_sig(&r),
                 "non-canonical seat DER must be refused: {}",
@@ -1149,8 +1157,7 @@ mod tests {
     /// disagreed with the wire contract, this goes red (Rule 16).
     #[test]
     fn the_golden_vector_signatures_are_canonical_der() {
-        let script =
-            hex::decode(overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap();
+        let script = hex::decode(overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap();
         let m = overlay_discovery::hopparty::parse_hopparty_marker(&script).unwrap();
         for sig_bytes in [&m.seat_sig, &m.identity_sig] {
             let sig = bsv_rs::primitives::ec::Signature::from_der(sig_bytes).unwrap();
@@ -1213,7 +1220,10 @@ mod tests {
         let mut r = real_row(0xa1, 0xaa);
         r.hop_txid = h64(0xdd);
         r.marker_txid = h64(0xdd);
-        assert!(verify_hop_seat_sig(&r), "no digest binds the container txid");
+        assert!(
+            verify_hop_seat_sig(&r),
+            "no digest binds the container txid"
+        );
         assert!(verify_hop_identity_binding(&r));
         // The identity is bound by BOTH (a thief cannot re-pair a genuine
         // seatSig with a different identity).
@@ -1259,8 +1269,8 @@ mod tests {
                 .unwrap();
         // Swap the 24-byte domain prefix for potparty-v2's.
         potparty_pre[..24].copy_from_slice(b"LOW/potparty/v2/seatsig|");
-        let opponent_pub = bsv_rs::primitives::ec::PublicKey::from_hex(&r.opponent_identity)
-            .unwrap();
+        let opponent_pub =
+            bsv_rs::primitives::ec::PublicKey::from_hex(&r.opponent_identity).unwrap();
         let cross_sig = wallet
             .create_signature(CreateSignatureArgs {
                 data: Some(potparty_pre),
@@ -1310,7 +1320,10 @@ mod tests {
             (HopStatus::Unknown, None)
         );
         // No pot_records row: never asserted unspent.
-        assert_eq!(derive_hop_status(None, None, None), (HopStatus::Unknown, None));
+        assert_eq!(
+            derive_hop_status(None, None, None),
+            (HopStatus::Unknown, None)
+        );
     }
 
     // ── assembly: truncation + verify budget + body ──────────────────────
@@ -1330,8 +1343,7 @@ mod tests {
         assert_eq!(entries.len(), HOPS_VIEW_MAX_OUTPOINTS);
         assert!(truncated, "one outpoint past the page ⇒ truncated");
         // Exactly MAX outpoints: complete.
-        let (entries, truncated, _) =
-            assemble_hops_view(rows[..HOPS_VIEW_MAX_OUTPOINTS].to_vec());
+        let (entries, truncated, _) = assemble_hops_view(rows[..HOPS_VIEW_MAX_OUTPOINTS].to_vec());
         assert_eq!(entries.len(), HOPS_VIEW_MAX_OUTPOINTS);
         assert!(!truncated);
         // Multiple rows of ONE outpoint never count as multiple outpoints.
@@ -1462,7 +1474,13 @@ mod tests {
         junk.spent = None;
         junk.spent_confirmed = None;
         let (entries, truncated, exhausted) = assemble_hops_view(vec![verified.clone(), junk]);
-        let body = hops_view_body(&verified.identity, Some(960_000), &entries, truncated, exhausted);
+        let body = hops_view_body(
+            &verified.identity,
+            Some(960_000),
+            &entries,
+            truncated,
+            exhausted,
+        );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["identity"], json!(verified.identity));
         assert_eq!(v["tip"], json!(960_000));
@@ -1476,7 +1494,11 @@ mod tests {
         assert_eq!(e0["statusSource"], json!("chain"));
         assert_eq!(e0["markerVerified"], json!("verified"));
         assert_eq!(e0["seatSettlePubkey"], json!(verified.seat_settle_pubkey));
-        assert_eq!(e0["markerTxid"], json!(verified.hop_txid), "the marker rides the hop tx");
+        assert_eq!(
+            e0["markerTxid"],
+            json!(verified.hop_txid),
+            "the marker rides the hop tx"
+        );
         assert_eq!(e0["markerVout"], json!(1));
         // The junk row is SERVED, labeled — never dropped.
         let e1 = &v["hops"][1];
@@ -1531,7 +1553,9 @@ mod tests {
         assert!(sql.contains("CASE WHEN hp.hopLockHex IS NOT NULL"));
         assert!(sql.contains("ORDER BY paidTier ASC, tier ASC, hopSatsOnChain DESC"));
         // #283a semantics: freshness-gated, OLDEST-first promotion.
-        assert!(sql.contains(&format!("unixepoch() - {HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS}")));
+        assert!(sql.contains(&format!(
+            "unixepoch() - {HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS}"
+        )));
         assert!(sql.contains("ORDER BY COALESCE(firstMarkerAt, 0) ASC"));
         let banned_join = ["tm_low", "fund'"].concat(); // split so it never matches itself
         assert!(

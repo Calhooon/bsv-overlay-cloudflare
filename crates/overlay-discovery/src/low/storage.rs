@@ -280,17 +280,14 @@ impl LowStorage for MemoryLowStorage {
             .filter(|r| r.record_type == LowRecordType::Table)
             .filter(|r| {
                 let stake = r.stake_sats.unwrap_or(0);
-                stake_min.is_none_or(|min| stake >= min)
-                    && stake_max.is_none_or(|max| stake <= max)
+                stake_min.is_none_or(|min| stake >= min) && stake_max.is_none_or(|max| stake <= max)
             })
             // Query-time expiry (bsv-low #148): with a known tip, keep only
             // rows with `expiryHeight > tip` (strictly greater, mirroring the
             // client's `expiryHeight > tip` and the D1 `expiryHeight > ?`).
             // Tip absent => no filter (fail-open). A table row missing an
             // expiry is excluded under a tip, matching SQL `NULL > ?`.
-            .filter(|r| {
-                tip_height.is_none_or(|tip| r.expiry_height.is_some_and(|e| e > tip))
-            })
+            .filter(|r| tip_height.is_none_or(|tip| r.expiry_height.is_some_and(|e| e > tip)))
             .cloned()
             .collect();
         // NEWEST-FIRST (gate L2: same direction D1 returns), with the
@@ -436,8 +433,14 @@ mod tests {
     #[tokio::test]
     async fn store_and_find_open_tables() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table_record("tx1", 1000)).await.unwrap();
-        store.store_record(&table_record("tx2", 5000)).await.unwrap();
+        store
+            .store_record(&table_record("tx1", 1000))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record("tx2", 5000))
+            .await
+            .unwrap();
         store
             .store_record(&gameutxo_record("tx3", &"11".repeat(32)))
             .await
@@ -448,11 +451,17 @@ mod tests {
         assert_eq!(all.len(), 2);
 
         // Stake range filters
-        let low = store.find_open_tables(None, Some(2000), None).await.unwrap();
+        let low = store
+            .find_open_tables(None, Some(2000), None)
+            .await
+            .unwrap();
         assert_eq!(low.len(), 1);
         assert_eq!(low[0].txid, "tx1");
 
-        let high = store.find_open_tables(Some(2000), None, None).await.unwrap();
+        let high = store
+            .find_open_tables(Some(2000), None, None)
+            .await
+            .unwrap();
         assert_eq!(high.len(), 1);
         assert_eq!(high[0].txid, "tx2");
 
@@ -511,7 +520,10 @@ mod tests {
         }
         let rows = store.find_open_tables(None, None, None).await.unwrap();
         let flood = rows.iter().filter(|r| r.host_identity == "02ff").count();
-        assert_eq!(flood, OPEN_TABLES_PER_HOST_CAP, "flooder capped at its quota");
+        assert_eq!(
+            flood, OPEN_TABLES_PER_HOST_CAP,
+            "flooder capped at its quota"
+        );
         assert!(
             rows.iter().any(|r| r.txid == "txHONEST"),
             "the honest host's older table survives the flood"
@@ -533,10 +545,7 @@ mod tests {
             .unwrap();
 
         let tip = 899_500u32;
-        let visible = store
-            .find_open_tables(None, None, Some(tip))
-            .await
-            .unwrap();
+        let visible = store.find_open_tables(None, None, Some(tip)).await.unwrap();
         assert_eq!(visible.len(), 1, "only the non-expired table should return");
         assert_eq!(visible[0].txid, "fresh");
     }
@@ -576,13 +585,20 @@ mod tests {
 
         // tip unavailable → NO expiry filter → both visible (never hide all).
         let visible = store.find_open_tables(None, None, None).await.unwrap();
-        assert_eq!(visible.len(), 2, "tip=None must fail open (show all tables)");
+        assert_eq!(
+            visible.len(),
+            2,
+            "tip=None must fail open (show all tables)"
+        );
     }
 
     #[tokio::test]
     async fn find_by_game_id_returns_both_types() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table_record("tx1", 1000)).await.unwrap();
+        store
+            .store_record(&table_record("tx1", 1000))
+            .await
+            .unwrap();
         store
             .store_record(&gameutxo_record("tx2", &"11".repeat(32)))
             .await
@@ -605,7 +621,10 @@ mod tests {
         let mut other_host = table_record("tx2", 1000);
         other_host.host_identity = "03".repeat(33);
 
-        store.store_record(&table_record("tx1", 1000)).await.unwrap();
+        store
+            .store_record(&table_record("tx1", 1000))
+            .await
+            .unwrap();
         store.store_record(&other_host).await.unwrap();
 
         let results = store.find_by_host(&"02".repeat(33)).await.unwrap();
@@ -616,19 +635,31 @@ mod tests {
     #[tokio::test]
     async fn store_is_idempotent_per_outpoint() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table_record("tx1", 1000)).await.unwrap();
-        store.store_record(&table_record("tx1", 2000)).await.unwrap();
+        store
+            .store_record(&table_record("tx1", 1000))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record("tx1", 2000))
+            .await
+            .unwrap();
         assert_eq!(store.record_count(), 1);
 
         // Latest write wins
-        let results = store.find_open_tables(Some(1500), None, None).await.unwrap();
+        let results = store
+            .find_open_tables(Some(1500), None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[tokio::test]
     async fn delete_record_removes_only_matching_outpoint() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table_record("tx1", 1000)).await.unwrap();
+        store
+            .store_record(&table_record("tx1", 1000))
+            .await
+            .unwrap();
         store
             .store_record(&gameutxo_record("tx1", &"11".repeat(32)))
             .await
@@ -696,9 +727,7 @@ mod tests {
         assert!(matches!(q, LowQuery::ByHost { .. }));
 
         // Unknown type is an error
-        assert!(
-            serde_json::from_value::<LowQuery>(serde_json::json!({"type": "nope"})).is_err()
-        );
+        assert!(serde_json::from_value::<LowQuery>(serde_json::json!({"type": "nope"})).is_err());
     }
 
     // ── bsv-low#309: advert-lifecycle candidate scans ────────────────────
@@ -706,15 +735,25 @@ mod tests {
     #[tokio::test]
     async fn spend_check_scan_surfaces_only_table_rows_bounded() {
         let store = MemoryLowStorage::new();
-        store.store_record(&table_record("tx1", 1000)).await.unwrap();
-        store.store_record(&table_record("tx2", 1000)).await.unwrap();
+        store
+            .store_record(&table_record("tx1", 1000))
+            .await
+            .unwrap();
+        store
+            .store_record(&table_record("tx2", 1000))
+            .await
+            .unwrap();
         store
             .store_record(&gameutxo_record("tx3", &"11".repeat(32)))
             .await
             .unwrap();
 
         let cands = store.find_tables_for_spend_check(10).await.unwrap();
-        assert_eq!(cands.len(), 2, "table rows only — never the gameutxo pointer");
+        assert_eq!(
+            cands.len(),
+            2,
+            "table rows only — never the gameutxo pointer"
+        );
         assert!(cands.iter().all(|r| r.record_type == LowRecordType::Table));
 
         let bounded = store.find_tables_for_spend_check(1).await.unwrap();
@@ -762,7 +801,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bounded.len(), 1);
-        assert_eq!(bounded[0].txid, "below_cutoff", "the bound keeps the oldest");
+        assert_eq!(
+            bounded[0].txid, "below_cutoff",
+            "the bound keeps the oldest"
+        );
     }
 
     #[test]

@@ -33,44 +33,35 @@ use low_app_layer::results::{
 
 const ENFORCED_SETTLE_TXID: &str =
     "91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6";
-const ENFORCED_SETTLE_HEX: &str = include_str!(
-    "fixtures/91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6.hex"
-);
+const ENFORCED_SETTLE_HEX: &str =
+    include_str!("fixtures/91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6.hex");
 const ENFORCED_FUNDING_TXID: &str =
     "c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563";
-const ENFORCED_FUNDING_HEX: &str = include_str!(
-    "fixtures/c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563.hex"
-);
+const ENFORCED_FUNDING_HEX: &str =
+    include_str!("fixtures/c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563.hex");
 
 const COOP_SETTLE_TXID: &str = "176885049985a858244993ab5591bfeb61b9368ac12fc7f12540d0824e5f891e";
-const COOP_SETTLE_HEX: &str = include_str!(
-    "fixtures/176885049985a858244993ab5591bfeb61b9368ac12fc7f12540d0824e5f891e.hex"
-);
+const COOP_SETTLE_HEX: &str =
+    include_str!("fixtures/176885049985a858244993ab5591bfeb61b9368ac12fc7f12540d0824e5f891e.hex");
 const COOP_FUNDING_TXID: &str = "f513aaba305633f82d0a61bbff18b45deed20cb9e38bb52230fb32736b3ad410";
-const COOP_FUNDING_HEX: &str = include_str!(
-    "fixtures/f513aaba305633f82d0a61bbff18b45deed20cb9e38bb52230fb32736b3ad410.hex"
-);
+const COOP_FUNDING_HEX: &str =
+    include_str!("fixtures/f513aaba305633f82d0a61bbff18b45deed20cb9e38bb52230fb32736b3ad410.hex");
 
 const REFUND_TXID: &str = "3ca368b0ca4dcb31ba87977d7aaf3a4671eafa2c980864c880f96080c68cee36";
-const REFUND_HEX: &str = include_str!(
-    "fixtures/3ca368b0ca4dcb31ba87977d7aaf3a4671eafa2c980864c880f96080c68cee36.hex"
-);
+const REFUND_HEX: &str =
+    include_str!("fixtures/3ca368b0ca4dcb31ba87977d7aaf3a4671eafa2c980864c880f96080c68cee36.hex");
 const REFUND_FUNDING_TXID: &str =
     "5533ca32a296c58778a240cd7649392bf2e6b11ef63e1c71765913ebba093c59";
-const REFUND_FUNDING_HEX: &str = include_str!(
-    "fixtures/5533ca32a296c58778a240cd7649392bf2e6b11ef63e1c71765913ebba093c59.hex"
-);
+const REFUND_FUNDING_HEX: &str =
+    include_str!("fixtures/5533ca32a296c58778a240cd7649392bf2e6b11ef63e1c71765913ebba093c59.hex");
 
-const B_WINS_SETTLE_TXID: &str =
-    "2ba8b8520081a969406de03486ae27411d8f819d4f7c914593880413e0274cde";
-const B_WINS_SETTLE_HEX: &str = include_str!(
-    "fixtures/2ba8b8520081a969406de03486ae27411d8f819d4f7c914593880413e0274cde.hex"
-);
+const B_WINS_SETTLE_TXID: &str = "2ba8b8520081a969406de03486ae27411d8f819d4f7c914593880413e0274cde";
+const B_WINS_SETTLE_HEX: &str =
+    include_str!("fixtures/2ba8b8520081a969406de03486ae27411d8f819d4f7c914593880413e0274cde.hex");
 const B_WINS_FUNDING_TXID: &str =
     "336ca104240721c1c62a22786fb117381b02040b149d45cf6a1fbaf7fe033783";
-const B_WINS_FUNDING_HEX: &str = include_str!(
-    "fixtures/336ca104240721c1c62a22786fb117381b02040b149d45cf6a1fbaf7fe033783.hex"
-);
+const B_WINS_FUNDING_HEX: &str =
+    include_str!("fixtures/336ca104240721c1c62a22786fb117381b02040b149d45cf6a1fbaf7fe033783.hex");
 
 fn raw(hexstr: &str) -> Vec<u8> {
     hex::decode(hexstr.trim()).expect("fixture hex decodes")
@@ -104,7 +95,11 @@ fn enforced_covenant_settle_91309122_classifies_winner_a() {
         ENFORCED_SETTLE_TXID,
         &spender,
     ));
-    assert_eq!(v, Some(PotVerdict::WinnerA), "J.declaredWinner=A (decision log)");
+    assert_eq!(
+        v,
+        Some(PotVerdict::WinnerA),
+        "J.declaredWinner=A (decision log)"
+    );
 }
 
 #[test]
@@ -117,7 +112,11 @@ fn acceptance_hand_coop_settle_17688504_classifies_winner_a() {
         COOP_SETTLE_TXID,
         &spender,
     ));
-    assert_eq!(v, Some(PotVerdict::WinnerA), "seat A (MetaNet) won the acceptance hand");
+    assert_eq!(
+        v,
+        Some(PotVerdict::WinnerA),
+        "seat A (MetaNet) won the acceptance hand"
+    );
 }
 
 #[test]
@@ -129,13 +128,12 @@ fn refund_landed_3ca368b0_classifies_refund() {
     let ftx = parse_raw_tx_verified(&funding, REFUND_FUNDING_TXID).expect("funding parses");
     let p = extract_covenant_params(&ftx.outputs[0].1).expect("covenant params extract");
     assert_eq!(p.recovery_height, 958_846);
-    let v = classify_pot_spend(&facts(
-        REFUND_FUNDING_TXID,
-        &funding,
-        REFUND_TXID,
-        &spender,
-    ));
-    assert_eq!(v, Some(PotVerdict::Refund), "the 2026-07-21 refundLanded refund");
+    let v = classify_pot_spend(&facts(REFUND_FUNDING_TXID, &funding, REFUND_TXID, &spender));
+    assert_eq!(
+        v,
+        Some(PotVerdict::Refund),
+        "the 2026-07-21 refundLanded refund"
+    );
 }
 
 #[test]
@@ -206,7 +204,9 @@ fn build_spender(
 }
 
 fn txid_of(rawtx: &[u8]) -> String {
-    bsv_rs::transaction::Transaction::from_binary(rawtx).unwrap().id()
+    bsv_rs::transaction::Transaction::from_binary(rawtx)
+        .unwrap()
+        .id()
 }
 
 fn p2pkh(pkh: &[u8; 20]) -> Vec<u8> {
@@ -402,8 +402,16 @@ fn fill_template(
         push_minimal_int(recovery_height),
     ];
     let markers = [
-        "<pubA>", "<pubB>", "<pubTower>", "<payPkhA>", "<payPkhB>", "<rakePkh>", "<stakeA>",
-        "<stakeB>", "<feeSats>", "<recoveryHeight>",
+        "<pubA>",
+        "<pubB>",
+        "<pubTower>",
+        "<payPkhA>",
+        "<payPkhB>",
+        "<rakePkh>",
+        "<stakeA>",
+        "<stakeB>",
+        "<feeSats>",
+        "<recoveryHeight>",
     ];
     let mut filled = overlay_discovery::pot::POC5_TEMPLATE_HEX.trim().to_string();
     for (marker, fill) in markers.iter().zip(fills.iter()) {
@@ -545,7 +553,10 @@ fn bare_pot_refund_classifies_only_with_the_exact_marker_height_gate() {
     assert!(is_bare_2of3_lock(&lock));
     let funding = build_funding(&lock, 4000);
     let funding_txid = txid_of(&funding);
-    let outs = vec![(1800u64, p2pkh(&[0xAAu8; 20])), (1800u64, p2pkh(&[0xBBu8; 20]))];
+    let outs = vec![
+        (1800u64, p2pkh(&[0xAAu8; 20])),
+        (1800u64, p2pkh(&[0xBBu8; 20])),
+    ];
 
     let refund = build_spender(&funding_txid, 0xffff_fffe, &outs, 900_000);
     let refund_id = txid_of(&refund);
@@ -560,7 +571,10 @@ fn bare_pot_refund_classifies_only_with_the_exact_marker_height_gate() {
         })
     };
     // Marker height matches the wire locktime → refund.
-    assert_eq!(classify(Some(900_000), &refund, &refund_id), Some(PotVerdict::Refund));
+    assert_eq!(
+        classify(Some(900_000), &refund, &refund_id),
+        Some(PotVerdict::Refund)
+    );
     // No marker / wrong marker height → unresolved (never guessed).
     assert_eq!(classify(None, &refund, &refund_id), None);
     assert_eq!(classify(Some(899_999), &refund, &refund_id), None);
@@ -573,7 +587,10 @@ fn bare_pot_refund_classifies_only_with_the_exact_marker_height_gate() {
     let winnerish = build_spender(
         &funding_txid,
         0xffff_ffff,
-        &[(40u64, p2pkh(&[0xCCu8; 20])), (3560u64, p2pkh(&[0xAAu8; 20]))],
+        &[
+            (40u64, p2pkh(&[0xCCu8; 20])),
+            (3560u64, p2pkh(&[0xAAu8; 20])),
+        ],
         0,
     );
     let wid = txid_of(&winnerish);
@@ -596,7 +613,10 @@ fn bare_pot_refund_refuses_unusable_marker_heights() {
     let lock = bare_lock();
     let funding = build_funding(&lock, 4000);
     let funding_txid = txid_of(&funding);
-    let outs = vec![(1800u64, p2pkh(&[0xAAu8; 20])), (1800u64, p2pkh(&[0xBBu8; 20]))];
+    let outs = vec![
+        (1800u64, p2pkh(&[0xAAu8; 20])),
+        (1800u64, p2pkh(&[0xBBu8; 20])),
+    ];
     let classify = |h: u32| {
         let sp = build_spender(&funding_txid, 0xffff_fffe, &outs, h);
         let id = txid_of(&sp);
@@ -618,8 +638,11 @@ fn bare_pot_refund_refuses_unusable_marker_heights() {
         None,
         "a timestamp-range value is not a block height"
     );
-    assert_eq!(classify(low_app_layer::results::LOCKTIME_THRESHOLD - 1), Some(PotVerdict::Refund),
-        "…and the last in-range height still classifies (the bound is exact)");
+    assert_eq!(
+        classify(low_app_layer::results::LOCKTIME_THRESHOLD - 1),
+        Some(PotVerdict::Refund),
+        "…and the last in-range height still classifies (the bound is exact)"
+    );
 }
 
 // ── /spent-any building blocks with the real fixtures ───────────────────────
@@ -635,9 +658,24 @@ fn spender_raw_verification_uses_real_bytes() {
         0
     ));
     // Wrong vout / wrong outpoint / wrong claimed txid all refuse.
-    assert!(!spender_raw_verifies(&refund_raw, REFUND_TXID, REFUND_FUNDING_TXID, 1));
-    assert!(!spender_raw_verifies(&refund_raw, REFUND_TXID, ENFORCED_FUNDING_TXID, 0));
-    assert!(!spender_raw_verifies(&refund_raw, ENFORCED_SETTLE_TXID, REFUND_FUNDING_TXID, 0));
+    assert!(!spender_raw_verifies(
+        &refund_raw,
+        REFUND_TXID,
+        REFUND_FUNDING_TXID,
+        1
+    ));
+    assert!(!spender_raw_verifies(
+        &refund_raw,
+        REFUND_TXID,
+        ENFORCED_FUNDING_TXID,
+        0
+    ));
+    assert!(!spender_raw_verifies(
+        &refund_raw,
+        ENFORCED_SETTLE_TXID,
+        REFUND_FUNDING_TXID,
+        0
+    ));
 }
 
 #[test]
@@ -657,7 +695,11 @@ fn spent_any_decision_table_is_fail_safe() {
     assert!(!st.known);
     assert_eq!(st.spent, None);
     // Negative WITHOUT corroboration → honest unknown (never WoC-only).
-    let st = decide_spent_any(&SpentObservation::NotSpent, false, UnspentCorroboration::Unknown);
+    let st = decide_spent_any(
+        &SpentObservation::NotSpent,
+        false,
+        UnspentCorroboration::Unknown,
+    );
     assert!(!st.known);
     // Negative WITH clean corroboration → known unspent.
     let st = decide_spent_any(
@@ -668,7 +710,11 @@ fn spent_any_decision_table_is_fail_safe() {
     assert!(st.known);
     assert_eq!(st.spent, Some(false));
     // Fault → unknown.
-    let st = decide_spent_any(&SpentObservation::Fault, true, UnspentCorroboration::ConfirmedUnspent);
+    let st = decide_spent_any(
+        &SpentObservation::Fault,
+        true,
+        UnspentCorroboration::ConfirmedUnspent,
+    );
     assert!(!st.known);
 }
 
@@ -691,14 +737,20 @@ fn provider_body_parsers_are_strict() {
     let woc = serde_json::json!({ "txid": ENFORCED_SETTLE_TXID });
     assert!(matches!(
         parse_woc_spent_body(&woc),
-        SpentObservation::Spent { confirmed: false, .. }
+        SpentObservation::Spent {
+            confirmed: false,
+            ..
+        }
     ));
     // Malformed txid → Fault.
     assert_eq!(
         parse_woc_spent_body(&serde_json::json!({ "txid": "nope" })),
         SpentObservation::Fault
     );
-    assert_eq!(parse_woc_spent_body(&serde_json::json!({})), SpentObservation::Fault);
+    assert_eq!(
+        parse_woc_spent_body(&serde_json::json!({})),
+        SpentObservation::Fault
+    );
 
     // Bitails: ONLY an explicit spent:false at 200 corroborates unspent.
     let unspent = serde_json::json!({ "spent": false });
@@ -709,13 +761,22 @@ fn provider_body_parsers_are_strict() {
     // Their live 500 fault (observed 2026-07-22), contradictions, and
     // unknown shapes are all Unknown.
     let fault = serde_json::json!({ "statusCode": 500, "message": "Unhandled Error." });
-    assert_eq!(parse_bitails_unspent(500, Some(&fault)), UnspentCorroboration::Unknown);
+    assert_eq!(
+        parse_bitails_unspent(500, Some(&fault)),
+        UnspentCorroboration::Unknown
+    );
     assert_eq!(
         parse_bitails_unspent(200, Some(&serde_json::json!({ "spent": true }))),
         UnspentCorroboration::Unknown
     );
-    assert_eq!(parse_bitails_unspent(200, None), UnspentCorroboration::Unknown);
-    assert_eq!(parse_bitails_unspent(404, None), UnspentCorroboration::Unknown);
+    assert_eq!(
+        parse_bitails_unspent(200, None),
+        UnspentCorroboration::Unknown
+    );
+    assert_eq!(
+        parse_bitails_unspent(404, None),
+        UnspentCorroboration::Unknown
+    );
 }
 
 // ── the settle's mined height rides its BEEF BUMP ───────────────────────────

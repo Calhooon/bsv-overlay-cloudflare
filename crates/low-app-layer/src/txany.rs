@@ -41,7 +41,8 @@ use serde_json::json;
 /// route-sanity anchor the client used: bsv-low `homeCards.ts
 /// KNOWN_MINED_TXID`). If Bitails 404s THIS txid, its tx route is
 /// broken/moved and its 404s prove nothing.
-pub const KNOWN_MINED_TXID: &str = "f358a4dd67c9d7b3a295d05d7a23abc0b85ba1f95c8afa756f1f466419be5e1c";
+pub const KNOWN_MINED_TXID: &str =
+    "f358a4dd67c9d7b3a295d05d7a23abc0b85ba1f95c8afa756f1f466419be5e1c";
 
 /// Hard TTL for the in-isolate `/tx-any` cache, milliseconds (same figure as
 /// `/spent-any` — bounds upstream pressure; isolate recycling empties it).
@@ -159,9 +160,7 @@ pub fn decide_tx_any(
                 source: Some("index+external"),
                 unconfirmable: false,
             },
-            Some(TxObservation::Absent)
-                if absence == AbsenceCorroboration::CorroboratedAbsent =>
-            {
+            Some(TxObservation::Absent) if absence == AbsenceCorroboration::CorroboratedAbsent => {
                 TxAnyAnswer {
                     present: Some(false),
                     confirmed: None,
@@ -344,7 +343,10 @@ mod tests {
         for (external, absence) in [
             (TxObservation::Absent, AbsenceCorroboration::Unknown),
             (TxObservation::Fault, AbsenceCorroboration::Unknown),
-            (TxObservation::Fault, AbsenceCorroboration::CorroboratedAbsent),
+            (
+                TxObservation::Fault,
+                AbsenceCorroboration::CorroboratedAbsent,
+            ),
         ] {
             let a = decide_tx_any(Some(raw()), None, Some(&external), absence);
             assert_eq!((a.present, a.confirmed), (None, None), "{external:?}");

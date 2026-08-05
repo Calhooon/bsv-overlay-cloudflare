@@ -131,7 +131,10 @@ impl LookupService for RevealLookupService {
             } => {
                 let game_id = normalize_game_id(&game_id)?;
                 let seat = normalize_seat(seat)?;
-                (self.storage.find_by_game_seat(&game_id, seat).await, decoded)
+                (
+                    self.storage.find_by_game_seat(&game_id, seat).await,
+                    decoded,
+                )
             }
             RevealQuery::ByGameId { game_id, decoded } => {
                 let game_id = normalize_game_id(&game_id)?;

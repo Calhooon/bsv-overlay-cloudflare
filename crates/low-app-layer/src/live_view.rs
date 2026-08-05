@@ -334,8 +334,9 @@ pub const fn keyless_chunk_binds(pots: usize) -> usize {
     1 + pots * 2
 }
 
-const _: () =
-    assert!(keyless_chunk_binds(LIVE_VIEW_CANDIDATE_CHUNK_POTS) <= crate::logic::D1_MAX_BOUND_PARAMS);
+const _: () = assert!(
+    keyless_chunk_binds(LIVE_VIEW_CANDIDATE_CHUNK_POTS) <= crate::logic::D1_MAX_BOUND_PARAMS
+);
 
 /// Per-case-fetch timeout (ms). The fetches run CONCURRENTLY, so this also
 /// bounds the whole fan-out's added latency. 3 s is generous for a
@@ -390,14 +391,16 @@ pub fn live_view_sql() -> String {
          FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
                   covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                   covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
-                  markerCreatedAt, markerRowid, potCreatedAt, \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
                     covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                     covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                    potBestSigRank, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
-                                       ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                       ORDER BY potBestSigRank DESC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                                                 markerCreatedAt DESC, markerRowid DESC) AS potRank \
              FROM (SELECT pp.identity AS identity, pp.gameId AS gameId, pp.potTxid AS potTxid, \
                       pp.potVout AS potVout, pp.opponentIdentity AS opponentIdentity, \
@@ -411,21 +414,27 @@ pub fn live_view_sql() -> String {
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                      MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
+                          AS potBestSigRank, \
                       ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
-                                         ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
                FROM potparty_records pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ? \
                  AND (COALESCE(r.spent, 0) = 0 OR COALESCE(r.spentConfirmed, 0) = 0)) \
              WHERE rn = 1) \
-           ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+           ORDER BY potBestSigRank DESC, tier ASC, \
+                    COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
            LIMIT {rows}) w \
-         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+         ORDER BY w.potBestSigRank DESC, w.tier ASC, \
+                  COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = LIVE_VIEW_UNKNOWN_POT_QUOTA,
         rows = LIVE_VIEW_MAX_ROWS,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
     )
 }
 
@@ -442,15 +451,26 @@ pub fn live_view_sql() -> String {
 /// LIVE view must not hide) keeps the pre-existing semantics: verifiable
 /// without membership.
 ///
-/// Residual, documented and NOT defended in SQL (the same class as
-/// `seat_markers_sql`'s): with no committed keys to filter on, an attacker
-/// who knows the pot txid can file [`LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT`]
-/// v2-SHAPED junk rows stamped before the honest marker and evict it from
-/// this window. Fail-safe — corroboration is then OMITTED for that pot
-/// (`marker-unverified`, no case fetch), never wrong — and it self-heals the
-/// moment the pot is admitted, since the keyed path's membership filter
-/// rejects junk under foreign keys for free. SQL cannot pick "the row that
-/// verifies"; only admission-side pricing would close it.
+/// The residual this used to carry — "an attacker who knows the pot txid can
+/// file [`LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT`] v2-SHAPED junk rows stamped
+/// before the honest marker and evict it; SQL cannot pick the row that
+/// verifies; only admission-side pricing would close it" — is closed the same
+/// way [`crate::results::seat_markers_sql`]'s is (bsv-low #283): SQL does not
+/// have to PICK the verifying row, only to sort by a verdict latched at
+/// admission. `{rank}` is `potparty_records.sigValid` and it leads the
+/// window. Pricing was never on the table anyway (bsv-low#347: a marker is
+/// free, not dust-priced).
+///
+/// This window is BOTH identity- and outpoint-scoped, so a junk row must name
+/// the caller AND cannot carry the caller's identity signature — rank 0 at
+/// any volume or stamp.
+///
+/// Unchanged: the fail direction (corroboration OMITTED, never wrong), and
+/// the LEGACY tier (`sigValid IS NULL`, pre-migration rows) which orders
+/// exactly as before. That tier cannot grow but does NOT drain by itself, and
+/// a rank-0 row is a write-once verdict that nothing re-evaluates — see the
+/// correction on `d1::OVERLAY_MIGRATIONS`' latch column, and bsv-low#355,
+/// which is a re-latch of EVERY row rather than a `NULL`-only backfill.
 pub fn keyless_candidates_sql(n: usize) -> String {
     debug_assert!(n >= 1);
     let per_pot = vec!["(potTxid = ? AND potVout = ?)"; n].join(" OR ");
@@ -460,12 +480,14 @@ pub fn keyless_candidates_sql(n: usize) -> String {
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                       recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
                       ROW_NUMBER() OVER (PARTITION BY potTxid, potVout \
-                                         ORDER BY createdAt ASC, rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  createdAt ASC, rowid ASC) AS rn \
                FROM potparty_records \
                WHERE identity = ? AND seatSettlePubkey IS NOT NULL AND ({per_pot})) \
          WHERE rn <= {cap} \
          ORDER BY potTxid ASC, potVout ASC, rn ASC",
         cap = LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr(""),
     )
 }
 
@@ -726,8 +748,11 @@ pub fn corroborate_rows(
     rows: &[LiveViewRow],
     candidates: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
 ) -> Corroborated {
-    let mut out =
-        Corroborated { claims: vec![None; rows.len()], attempts: 0, unavailable: false };
+    let mut out = Corroborated {
+        claims: vec![None; rows.len()],
+        attempts: 0,
+        unavailable: false,
+    };
     // One entry per DISTINCT pot, in quality order (see `PotSlots`). Building
     // this costs string compares only — no curve work.
     let mut pots: Vec<PotSlots> = Vec::new();
@@ -740,7 +765,11 @@ pub fn corroborate_rows(
         }
         let mut slots: Vec<SeatMarkerRow> = Vec::new();
         let pool = r.own_marker().into_iter().chain(
-            candidates.get(&key).map(|l| l.iter().cloned()).into_iter().flatten(),
+            candidates
+                .get(&key)
+                .map(|l| l.iter().cloned())
+                .into_iter()
+                .flatten(),
         );
         for m in pool {
             if slots.len() >= LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT {
@@ -766,7 +795,11 @@ pub fn corroborate_rows(
             }
             slots.push(m);
         }
-        pots.push(PotSlots { key, rows: vec![i], slots });
+        pots.push(PotSlots {
+            key,
+            rows: vec![i],
+            slots,
+        });
     }
     // Round-robin by depth.
     let mut claim_by_pot: Vec<Option<VerifiedClaim>> = vec![None; pots.len()];
@@ -1013,7 +1046,11 @@ pub struct BodyAccumulator {
 
 impl BodyAccumulator {
     pub fn new(max: usize) -> Self {
-        Self { buf: Vec::new(), max, aborted: false }
+        Self {
+            buf: Vec::new(),
+            max,
+            aborted: false,
+        }
     }
 
     /// Accumulate one chunk. `false` ⇒ the budget is blown: the caller must
@@ -1068,7 +1105,7 @@ where
                 if !acc.push(&bytes) {
                     return None;
                 }
-            },
+            }
             Err(()) => return None,
         }
     }
@@ -1123,7 +1160,11 @@ where
     F: Fn(String) -> Fut,
     Fut: core::future::Future<Output = Option<CaseView>>,
 {
-    let capped: Vec<String> = targets.iter().take(LIVE_VIEW_CASE_FANOUT_CAP).cloned().collect();
+    let capped: Vec<String> = targets
+        .iter()
+        .take(LIVE_VIEW_CASE_FANOUT_CAP)
+        .cloned()
+        .collect();
     let futs: Vec<Fut> = capped.iter().map(|g| fetch_one(g.clone())).collect();
     let results = futures_util::future::join_all(futs).await;
     let fetched = capped
@@ -1391,7 +1432,11 @@ mod tests {
 
     /// Wrap claims as a [`Corroborated`] (no fault) for the pure assemblers.
     fn corr_of(claims: Vec<Option<VerifiedClaim>>) -> Corroborated {
-        Corroborated { claims, attempts: 0, unavailable: false }
+        Corroborated {
+            claims,
+            attempts: 0,
+            unavailable: false,
+        }
     }
 
     /// An entry from a base row with the corroboration state injected.
@@ -1399,7 +1444,9 @@ mod tests {
         let mut r = base_row();
         r.game_id = h64(game_seed);
         let claim = if verified { claim_for(&r) } else { None };
-        assemble_live_view(vec![r], &corr_of(vec![claim]), None).pop().unwrap()
+        assemble_live_view(vec![r], &corr_of(vec![claim]), None)
+            .pop()
+            .unwrap()
     }
 
     /// The exact shape `case.rs::view` serves for a pending case (fields
@@ -1459,7 +1506,9 @@ mod tests {
         let identity = identity_of(w);
         let (sk, settle_pub) = settle_key(settle_seed);
         let preimage = crate::results::seatsig_preimage(game_id, pot_txid, 0, &identity).unwrap();
-        let seat_sig = sk.sign(&bsv_rs::primitives::hash::sha256(&preimage)).unwrap();
+        let seat_sig = sk
+            .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+            .unwrap();
         let mut m = SeatMarkerRow {
             identity,
             opponent_identity: opponent.to_string(),
@@ -1495,7 +1544,9 @@ mod tests {
     fn hostile_marker(victim_lc: &str, game_id: &str, pot_txid: &str) -> SeatMarkerRow {
         let (sk, pk) = settle_key(0x99);
         let preimage = crate::results::seatsig_preimage(game_id, pot_txid, 0, victim_lc).unwrap();
-        let sig = sk.sign(&bsv_rs::primitives::hash::sha256(&preimage)).unwrap();
+        let sig = sk
+            .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+            .unwrap();
         SeatMarkerRow {
             identity: victim_lc.to_string(),
             opponent_identity: h66(0xbb),
@@ -1538,8 +1589,13 @@ mod tests {
         row.pot_txid = pot.clone();
         let m = real_marker(&w, 0x51, &game, &pot, &h66(0xbb));
         let c = corroborate_rows(&me, &[row.clone()], &candidates(vec![m]));
-        let claim = c.claims[0].as_ref().expect("the pot's v2 candidate corroborates");
-        assert_eq!(claim.game_id, game, "the CORROBORATED gameId, not the v1 row's");
+        let claim = c.claims[0]
+            .as_ref()
+            .expect("the pot's v2 candidate corroborates");
+        assert_eq!(
+            claim.game_id, game,
+            "the CORROBORATED gameId, not the v1 row's"
+        );
         assert_eq!(claim.opponent_identity, h66(0xbb));
         assert_eq!(c.attempts, 1, "one candidate, one attempt");
         // The served entry carries the corroborated values + the tag.
@@ -1553,7 +1609,11 @@ mod tests {
         assert!(c.claims[0].is_none());
         assert_eq!(c.attempts, 0, "a v1-only pot spends no curve time");
         let e = &assemble_live_view(vec![row], &c, None)[0];
-        assert_eq!(e.game_id, h64(0x77), "the unverified representative value, labeled");
+        assert_eq!(
+            e.game_id,
+            h64(0x77),
+            "the unverified representative value, labeled"
+        );
         assert_eq!(e.marker_source, "marker-unverified");
     }
 
@@ -1668,7 +1728,10 @@ mod tests {
         keyless.spent_confirmed = None;
         let c = corroborate_rows(&me, &[keyless], &candidates(vec![hostile]));
         assert!(c.claims[0].is_none());
-        assert_eq!(c.attempts, 1, "no committed keys ⇒ the signature bars decide");
+        assert_eq!(
+            c.attempts, 1,
+            "no committed keys ⇒ the signature bars decide"
+        );
 
         // The honest marker under a COMMITTED key survives the pre-filter.
         let good = real_marker(&w, 0x51, &h64(0x21), &pot, &h66(0xbb));
@@ -1705,7 +1768,10 @@ mod tests {
             }
         }
         let c = corroborate_rows(&me, &rows, &candidates(pool));
-        assert!(c.claims.iter().all(|x| x.is_none()), "nothing hostile corroborates");
+        assert!(
+            c.claims.iter().all(|x| x.is_none()),
+            "nothing hostile corroborates"
+        );
         assert_eq!(
             c.attempts, LIVE_VIEW_VERIFY_BUDGET,
             "the budget is the ceiling AND it is fully spendable"
@@ -1713,7 +1779,9 @@ mod tests {
         // Every row is still SERVED, honestly labeled.
         let entries = assemble_live_view(rows, &c, Some(900_000));
         assert_eq!(entries.len(), LIVE_VIEW_MAX_ROWS);
-        assert!(entries.iter().all(|e| e.marker_source == "marker-unverified"));
+        assert!(entries
+            .iter()
+            .all(|e| e.marker_source == "marker-unverified"));
     }
 
     #[test]
@@ -1725,7 +1793,10 @@ mod tests {
         r.spent_confirmed = None;
         let m = hostile_marker(&me, &h64(0x21), &r.pot_txid.clone());
         let c = corroborate_rows(&me, &[r], &candidates(vec![m.clone(), m.clone(), m]));
-        assert_eq!(c.attempts, 1, "the sweep's content-idempotent republish costs once");
+        assert_eq!(
+            c.attempts, 1,
+            "the sweep's content-idempotent republish costs once"
+        );
     }
 
     #[test]
@@ -1943,7 +2014,10 @@ mod tests {
         let mut entries = assemble_live_view(vec![r.clone()], &faulted, Some(900_078));
         // Nothing is fetched (no corroborated pot), and the tag survives
         // apply_cases untouched.
-        assert_eq!(fanout_targets(std::slice::from_ref(&r), &faulted.claims), Vec::<String>::new());
+        assert_eq!(
+            fanout_targets(std::slice::from_ref(&r), &faulted.claims),
+            Vec::<String>::new()
+        );
         apply_cases(&mut entries, &[], &std::collections::HashMap::new());
         let e = &entries[0];
         assert_eq!(e.marker_source, MARKER_SOURCE_UNAVAILABLE);
@@ -1957,11 +2031,21 @@ mod tests {
         assert!(e.case.is_none(), "case:null still means UNKNOWN");
         let v: serde_json::Value =
             serde_json::from_str(&live_view_body(&h66(0xa1), Some(900_078), &entries)).unwrap();
-        assert_eq!(v["live"][0]["markerSource"], serde_json::json!("corroboration-unavailable"));
-        assert_eq!(v["live"][0]["caseSource"], serde_json::json!("corroboration-unavailable"));
+        assert_eq!(
+            v["live"][0]["markerSource"],
+            serde_json::json!("corroboration-unavailable")
+        );
+        assert_eq!(
+            v["live"][0]["caseSource"],
+            serde_json::json!("corroboration-unavailable")
+        );
         // A corroborated row on the same (faulted) page keeps its real tags.
         let claim = claim_for(&r);
-        let mixed = Corroborated { claims: vec![claim], attempts: 1, unavailable: true };
+        let mixed = Corroborated {
+            claims: vec![claim],
+            attempts: 1,
+            unavailable: true,
+        };
         let e = &assemble_live_view(vec![r], &mixed, None)[0];
         assert_eq!(e.marker_source, MARKER_SOURCE_SEAT_SIGNED);
         assert_eq!(e.case_source, CaseProvenance::NotFetched);
@@ -2039,12 +2123,20 @@ mod tests {
         r.opponent_identity = Some(h66(0xbb).to_ascii_uppercase());
         let claim = claim_for(&r);
         let e = &assemble_live_view(vec![r.clone()], &corr_of(vec![claim]), None)[0];
-        assert_eq!(e.opponent_identity, Some(h66(0xbb)), "the corroborated claim");
+        assert_eq!(
+            e.opponent_identity,
+            Some(h66(0xbb)),
+            "the corroborated claim"
+        );
         assert_eq!(e.opponent_identity_source, Some("seat-signed"));
         assert_eq!(e.marker_source, "seat-signed");
 
         let e = &assemble_live_view(vec![r], &corr_of(vec![None]), None)[0];
-        assert_eq!(e.opponent_identity, Some(h66(0xbb)), "lowercased representative value");
+        assert_eq!(
+            e.opponent_identity,
+            Some(h66(0xbb)),
+            "lowercased representative value"
+        );
         assert_eq!(e.opponent_identity_source, Some("marker-unverified"));
         assert_eq!(e.marker_source, "marker-unverified");
 
@@ -2107,8 +2199,8 @@ mod tests {
             serde_json::json!(null),
             serde_json::json!([]),
             serde_json::json!("pending"),
-            serde_json::json!({}),                         // no status
-            serde_json::json!({ "status": 7 }),            // non-string status
+            serde_json::json!({}),              // no status
+            serde_json::json!({ "status": 7 }), // non-string status
             serde_json::json!({ "error": "no case for this game" }), // the 404 body shape
         ] {
             assert_eq!(shape_case(&v), None);
@@ -2178,7 +2270,10 @@ mod tests {
             assert_eq!(parse_case_body(code, &body), None, "HTTP {code}");
         }
         // Oversized / malformed bodies reject.
-        let huge = format!("{{\"status\":\"pending\",\"pad\":\"{}\"}}", "x".repeat(CASE_BODY_MAX_BYTES));
+        let huge = format!(
+            "{{\"status\":\"pending\",\"pad\":\"{}\"}}",
+            "x".repeat(CASE_BODY_MAX_BYTES)
+        );
         assert_eq!(parse_case_body(200, &huge), None);
         assert_eq!(parse_case_body(200, "not json"), None);
         assert_eq!(parse_case_body(200, ""), None);
@@ -2189,10 +2284,14 @@ mod tests {
     #[test]
     fn content_length_gate_rejects_only_a_provable_over_budget_body() {
         // Over budget: reject before a single body byte is read.
-        assert!(content_length_over_budget(Some(&(CASE_BODY_MAX_BYTES as u64 + 1).to_string())));
+        assert!(content_length_over_budget(Some(
+            &(CASE_BODY_MAX_BYTES as u64 + 1).to_string()
+        )));
         assert!(content_length_over_budget(Some("999999999999")));
         // Exactly at the ceiling / below: pass through to the budgeted read.
-        assert!(!content_length_over_budget(Some(&CASE_BODY_MAX_BYTES.to_string())));
+        assert!(!content_length_over_budget(Some(
+            &CASE_BODY_MAX_BYTES.to_string()
+        )));
         assert!(!content_length_over_budget(Some("0")));
         // Absent / unparseable / lying-shaped headers never REJECT (the
         // streamed budget is the enforcement, the header only an early exit)
@@ -2236,7 +2335,11 @@ mod tests {
         assert_eq!(
             read_case_body(
                 200,
-                vec![Ok(body.as_bytes()[..20].to_vec()), Err(()), Ok(body.clone().into_bytes())]
+                vec![
+                    Ok(body.as_bytes()[..20].to_vec()),
+                    Err(()),
+                    Ok(body.clone().into_bytes())
+                ]
             ),
             None
         );
@@ -2247,15 +2350,20 @@ mod tests {
         let pad = CASE_BODY_MAX_BYTES - "{\"status\":\"pending\",\"pad\":\"\"}".len();
         let exact = format!("{{\"status\":\"pending\",\"pad\":\"{}\"}}", "x".repeat(pad));
         assert_eq!(exact.len(), CASE_BODY_MAX_BYTES);
-        assert!(read_case_body(200, exact.as_bytes().chunks(4096).map(|c| Ok(c.to_vec()))).is_some());
+        assert!(
+            read_case_body(200, exact.as_bytes().chunks(4096).map(|c| Ok(c.to_vec()))).is_some()
+        );
         // A multi-byte UTF-8 char SPLIT across chunks must not fault (the
         // decode happens once, at the end).
         let s = "{\"status\":\"pending\",\"pad\":\"é\"}";
         let bytes = s.as_bytes().to_vec();
         let cut = bytes.len() - 3; // splits the 2-byte 'é'
         assert!(
-            read_case_body(200, vec![Ok(bytes[..cut].to_vec()), Ok(bytes[cut..].to_vec())])
-                .is_some(),
+            read_case_body(
+                200,
+                vec![Ok(bytes[..cut].to_vec()), Ok(bytes[cut..].to_vec())]
+            )
+            .is_some(),
             "a split UTF-8 sequence is not a fault"
         );
         // Truly invalid UTF-8 is a non-answer, not a panic.
@@ -2270,7 +2378,10 @@ mod tests {
         assert!(!acc.push(b"x"), "abort is sticky");
         assert_eq!(acc.finish(200), None);
         // An empty stream is a non-answer, not an empty "no case".
-        assert_eq!(read_case_body(200, Vec::<std::result::Result<Vec<u8>, ()>>::new()), None);
+        assert_eq!(
+            read_case_body(200, Vec::<std::result::Result<Vec<u8>, ()>>::new()),
+            None
+        );
     }
 
     // ── fan-out target selection ────────────────────────────────────────────
@@ -2303,13 +2414,25 @@ mod tests {
             h64(0x11),
             "the KNOWN pot's gameId is fetched FIRST despite sitting beyond the positional cap"
         );
-        assert_eq!(targets.len(), LIVE_VIEW_CASE_FANOUT_CAP, "remaining slots fill from unknowns");
-        assert_eq!(targets[1], h64(0x20), "window order within the unknown class");
+        assert_eq!(
+            targets.len(),
+            LIVE_VIEW_CASE_FANOUT_CAP,
+            "remaining slots fill from unknowns"
+        );
+        assert_eq!(
+            targets[1],
+            h64(0x20),
+            "window order within the unknown class"
+        );
     }
 
     #[test]
     fn fanout_never_targets_an_uncorroborated_row() {
-        let rows = vec![row(0x21, 0x61, true), row(0x22, 0x62, false), row(0x23, 0x63, true)];
+        let rows = vec![
+            row(0x21, 0x61, true),
+            row(0x22, 0x62, false),
+            row(0x23, 0x63, true),
+        ];
         let claims = vec![None, claim_for(&rows[1]), claim_for(&rows[2])];
         assert_eq!(
             fanout_targets(&rows, &claims),
@@ -2318,7 +2441,10 @@ mod tests {
         );
         // Missing entries count as uncorroborated (fail-safe), never a panic.
         assert_eq!(fanout_targets(&rows, &[]), Vec::<String>::new());
-        assert_eq!(fanout_targets(&rows, &[None, None, None]), Vec::<String>::new());
+        assert_eq!(
+            fanout_targets(&rows, &[None, None, None]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2328,10 +2454,18 @@ mod tests {
         rows[3].game_id = "not-a-game-id".into(); // unfetchable
         let claims: Vec<Option<VerifiedClaim>> = rows.iter().map(claim_for).collect();
         let targets = fanout_targets(&rows, &claims);
-        assert_eq!(targets.len(), LIVE_VIEW_CASE_FANOUT_CAP, "cap counts DISTINCT fetches");
+        assert_eq!(
+            targets.len(),
+            LIVE_VIEW_CASE_FANOUT_CAP,
+            "cap counts DISTINCT fetches"
+        );
         assert_eq!(targets[0], h64(0x20));
         assert!(!targets.contains(&"not-a-game-id".to_string()));
-        assert_eq!(targets.iter().filter(|g| **g == h64(0x20)).count(), 1, "dup fetched once");
+        assert_eq!(
+            targets.iter().filter(|g| **g == h64(0x20)).count(),
+            1,
+            "dup fetched once"
+        );
         for t in &targets {
             assert_eq!(*t, t.to_ascii_lowercase(), "tower route wants lowercase");
         }
@@ -2368,9 +2502,20 @@ mod tests {
         // "not-fetched", never "tower-unavailable" (asked and failed).
         let mut entries: Vec<LiveEntry> = (0..12u8).map(|i| entry(0x20 + i, true)).collect();
         apply_cases(&mut entries, &effective, &fetched);
-        assert_eq!(entries[1].case_source, CaseProvenance::TowerByGameIdUnverified);
-        assert_eq!(entries[0].case_source, CaseProvenance::TowerUnavailable, "asked, no answer");
-        assert_eq!(entries[9].case_source, CaseProvenance::NotFetched, "never asked");
+        assert_eq!(
+            entries[1].case_source,
+            CaseProvenance::TowerByGameIdUnverified
+        );
+        assert_eq!(
+            entries[0].case_source,
+            CaseProvenance::TowerUnavailable,
+            "asked, no answer"
+        );
+        assert_eq!(
+            entries[9].case_source,
+            CaseProvenance::NotFetched,
+            "never asked"
+        );
     }
 
     // ── attribution: the four-valued provenance ─────────────────────────────
@@ -2389,24 +2534,43 @@ mod tests {
         apply_cases(&mut entries, &targets, &fetched);
 
         assert_eq!(entries[0].case.as_ref(), Some(&cv));
-        assert_eq!(entries[0].case_source, CaseProvenance::TowerByGameIdUnverified);
-        assert_eq!(entries[0].case_game_id, Some(h64(0x21)), "the join key is served (HIGH-1a)");
+        assert_eq!(
+            entries[0].case_source,
+            CaseProvenance::TowerByGameIdUnverified
+        );
+        assert_eq!(
+            entries[0].case_game_id,
+            Some(h64(0x21)),
+            "the join key is served (HIGH-1a)"
+        );
 
         assert_eq!(entries[1].case, None, "asked and failed: still UNKNOWN");
         assert_eq!(entries[1].case_source, CaseProvenance::TowerUnavailable);
         assert_eq!(entries[1].case_game_id, None);
 
-        assert_eq!(entries[2].case, None, "beyond the cap: honestly not-fetched");
+        assert_eq!(
+            entries[2].case, None,
+            "beyond the cap: honestly not-fetched"
+        );
         assert_eq!(entries[2].case_source, CaseProvenance::NotFetched);
 
         assert_eq!(entries[3].case, None);
         assert_eq!(entries[3].case_source, CaseProvenance::MarkerUnverified);
 
         // The wire strings are exactly the documented four.
-        assert_eq!(CaseProvenance::TowerByGameIdUnverified.as_str(), "tower-by-gameid-unverified");
-        assert_eq!(CaseProvenance::TowerUnavailable.as_str(), "tower-unavailable");
+        assert_eq!(
+            CaseProvenance::TowerByGameIdUnverified.as_str(),
+            "tower-by-gameid-unverified"
+        );
+        assert_eq!(
+            CaseProvenance::TowerUnavailable.as_str(),
+            "tower-unavailable"
+        );
         assert_eq!(CaseProvenance::NotFetched.as_str(), "not-fetched");
-        assert_eq!(CaseProvenance::MarkerUnverified.as_str(), "marker-unverified");
+        assert_eq!(
+            CaseProvenance::MarkerUnverified.as_str(),
+            "marker-unverified"
+        );
     }
 
     #[test]
@@ -2438,7 +2602,11 @@ mod tests {
         // targets and an empty map — "we should have asked and could not" is
         // the same honest unknown, never "no case".
         let mut entries = vec![entry(0x21, true), entry(0x22, false)];
-        apply_cases(&mut entries, &[h64(0x21)], &std::collections::HashMap::new());
+        apply_cases(
+            &mut entries,
+            &[h64(0x21)],
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(entries[0].case_source, CaseProvenance::TowerUnavailable);
         assert_eq!(entries[0].case, None);
         assert_eq!(entries[1].case_source, CaseProvenance::MarkerUnverified);
@@ -2492,7 +2660,10 @@ mod tests {
         assert_eq!(e["potTxid"], serde_json::json!(h64(0xaa)));
         assert_eq!(e["potVout"], serde_json::json!(0));
         assert_eq!(e["opponentIdentity"], serde_json::json!(h66(0xbb)));
-        assert_eq!(e["opponentIdentitySource"], serde_json::json!("seat-signed"));
+        assert_eq!(
+            e["opponentIdentitySource"],
+            serde_json::json!("seat-signed")
+        );
         assert_eq!(e["markerSource"], serde_json::json!("seat-signed"));
         assert_eq!(e["recoveryHeight"], serde_json::json!(900_123));
         assert_eq!(e["blocksToGate"], serde_json::json!(45));
@@ -2501,7 +2672,10 @@ mod tests {
         assert!(e["spendingTxid"].is_null());
         assert_eq!(e["spentConfirmed"], serde_json::json!(false));
         assert!(e["case"].is_null(), "case null without a successful fetch");
-        assert!(e["caseGameId"].is_null(), "no join key without a fetched case");
+        assert!(
+            e["caseGameId"].is_null(),
+            "no join key without a fetched case"
+        );
         assert_eq!(e["caseSource"], serde_json::json!("not-fetched"));
 
         // With a fetched case: the shaped subset, the NON-VOUCHING source
@@ -2531,8 +2705,14 @@ mod tests {
         apply_cases(&mut entries, &[], &std::collections::HashMap::new());
         let v: serde_json::Value =
             serde_json::from_str(&live_view_body(&me, None, &entries)).unwrap();
-        assert_eq!(v["live"][0]["caseSource"], serde_json::json!("marker-unverified"));
-        assert_eq!(v["live"][0]["markerSource"], serde_json::json!("marker-unverified"));
+        assert_eq!(
+            v["live"][0]["caseSource"],
+            serde_json::json!("marker-unverified")
+        );
+        assert_eq!(
+            v["live"][0]["markerSource"],
+            serde_json::json!("marker-unverified")
+        );
         assert_eq!(
             v["live"][0]["opponentIdentitySource"],
             serde_json::json!("marker-unverified")
@@ -2541,7 +2721,8 @@ mod tests {
 
     #[test]
     fn live_view_body_empty_and_null_tip() {
-        let v: serde_json::Value = serde_json::from_str(&live_view_body("nope", None, &[])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&live_view_body("nope", None, &[])).unwrap();
         assert_eq!(v["identity"], serde_json::json!("nope"));
         assert!(v["tip"].is_null());
         assert_eq!(v["live"], serde_json::json!([]));

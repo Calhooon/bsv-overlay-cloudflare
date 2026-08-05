@@ -318,7 +318,14 @@ pub fn verified_beef_block_height(
 
 /// The frozen seatSig domain tag — MUST equal the client's
 /// `potParty.ts::POTPARTY_SEATSIG_DOMAIN` byte-for-byte.
-pub const POTPARTY_SEATSIG_DOMAIN: &[u8] = b"LOW/potparty/v2/seatsig|";
+///
+/// Re-exported from `overlay-discovery`, which is where the potparty
+/// signature rules now live so the OVERLAY's admission-time `sigValid` latch
+/// (bsv-low #283) and THIS crate's read-time bars are literally the same
+/// code. Two copies of a signature rule across a crate boundary is a
+/// boundary with no pin (epoch Rule 16), and a drift between them would let
+/// the latch rank an honest marker last.
+pub use overlay_discovery::potparty::validity::POTPARTY_SEATSIG_DOMAIN;
 
 /// One raw v2 potparty marker row (from `potparty_records`), NOT yet
 /// verified — [`verify_seat_marker`] + [`verify_identity_binding`] (both
@@ -360,25 +367,20 @@ pub struct SeatMarkerRow {
 /// `seatSig` is ECDSA over a SINGLE sha256 of these bytes (the BRC-100
 /// `createSignature({data})` hash). `None` when any hex field is malformed —
 /// an unbuildable preimage can never verify (fail-safe).
+/// Hex wrapper over the shared `overlay-discovery` preimage builder — this
+/// crate holds hex strings, the shared rule holds bytes.
 pub fn seatsig_preimage(
     game_id_hex: &str,
     pot_txid_hex: &str,
     pot_vout: u32,
     identity_hex: &str,
 ) -> Option<Vec<u8>> {
-    let game_id = hex::decode(game_id_hex).ok()?;
-    let pot_txid = hex::decode(pot_txid_hex).ok()?;
-    let identity = hex::decode(identity_hex).ok()?;
-    if game_id.len() != 32 || pot_txid.len() != 32 || identity.len() != 33 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(POTPARTY_SEATSIG_DOMAIN.len() + 32 + 32 + 4 + 33);
-    out.extend_from_slice(POTPARTY_SEATSIG_DOMAIN);
-    out.extend_from_slice(&game_id);
-    out.extend_from_slice(&pot_txid);
-    out.extend_from_slice(&pot_vout.to_le_bytes());
-    out.extend_from_slice(&identity);
-    Some(out)
+    overlay_discovery::potparty::validity::seatsig_preimage(
+        &hex::decode(game_id_hex).ok()?,
+        &hex::decode(pot_txid_hex).ok()?,
+        pot_vout,
+        &hex::decode(identity_hex).ok()?,
+    )
 }
 
 /// Verify one v2 marker's SEAT signature: plain secp256k1 ECDSA under the
@@ -386,39 +388,26 @@ pub fn seatsig_preimage(
 /// derivation is needed (or possible) server-side — the settle key attests
 /// its own identity binding, and lock membership is checked separately by
 /// [`attribute_seats`]. Any malformed key/sig/field is `false` (refused).
+/// CANONICAL STRICT DER (Rule 4c) is enforced inside the shared rule:
+/// `from_der` tolerates trailing bytes, so the encoding is re-derived and
+/// byte-compared. Without it an observer mints unlimited distinct "valid"
+/// rows from one honest marker by padding it — which since #283 would be a
+/// way to fill a window with `sigValid = 1` rows.
+/// `der_padding_is_refused_canonical_strict` pins it here;
+/// `der_padded_seat_signature_does_not_latch_valid` pins it at the latch.
 pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
-    let Some(preimage) = seatsig_preimage(
-        &m.game_id.to_ascii_lowercase(),
-        &m.pot_txid.to_ascii_lowercase(),
-        m.pot_vout,
-        &m.identity.to_ascii_lowercase(),
+    let (Ok(game_id), Ok(pot_txid), Ok(identity), Ok(settle_pk), Ok(seat_sig)) = (
+        hex::decode(m.game_id.to_ascii_lowercase()),
+        hex::decode(m.pot_txid.to_ascii_lowercase()),
+        hex::decode(m.identity.to_ascii_lowercase()),
+        hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()),
+        hex::decode(m.seat_sig_hex.to_ascii_lowercase()),
     ) else {
         return false;
     };
-    let Ok(pubkey) = bsv_rs::primitives::ec::PublicKey::from_hex(&m.seat_settle_pubkey) else {
-        return false;
-    };
-    let Ok(sig_bytes) = hex::decode(&m.seat_sig_hex) else {
-        return false;
-    };
-    let Ok(sig) = bsv_rs::primitives::ec::Signature::from_der(&sig_bytes) else {
-        return false;
-    };
-    // CANONICAL STRICT DER (Rule 4c): re-encode and demand byte-equality.
-    // `from_der` tolerates trailing bytes, so without this an observer can
-    // mint unlimited distinct "valid" seat-marker signatures from one honest
-    // marker by padding it — turning any future cap, dedupe or set keyed on
-    // marker signature bytes into a cost multiplier. There is no such key
-    // today; closing it now is one line and costs an honest marker nothing
-    // (the client's wallet emits canonical DER, pinned by
-    // `golden_client_v2_marker_verifies_server_side`). Low-S is already
-    // enforced by `verify` — `der_padding_is_refused_canonical_strict` pins
-    // both legs.
-    if sig.to_der() != sig_bytes {
-        return false;
-    }
-    let hash = bsv_rs::primitives::hash::sha256(&preimage);
-    pubkey.verify(&hash, &sig)
+    overlay_discovery::potparty::validity::verify_seat_sig(
+        &game_id, &pot_txid, m.pot_vout, &identity, &settle_pk, &seat_sig,
+    )
 }
 
 /// The BRC-43 protocol potparty markers sign their IDENTITY challenge under
@@ -433,38 +422,22 @@ pub fn verify_seat_marker(m: &SeatMarkerRow) -> bool {
 ///    by the ledgered decision-3 (the version tag inside the challenge is the
 ///    domain separator), so `/hops-view` verifies under the SAME constant
 ///    rather than a second spelling that could drift.
-pub fn potparty_protocol() -> bsv_rs::wallet::Protocol {
-    bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty")
-}
+pub use overlay_discovery::potparty::validity::potparty_protocol;
 
 /// The EXACT v2 IDENTITY-signature challenge — byte-identical to the
 /// client's `potPartyV2Challenge`: the v2 tag + every field (incl.
 /// `seatSettlePubkey`), all raw bytes, u32s little-endian. `None` when any
 /// hex field is malformed (an unbuildable challenge can never verify).
 pub fn potparty_v2_challenge(m: &SeatMarkerRow) -> Option<Vec<u8>> {
-    let identity = hex::decode(m.identity.to_ascii_lowercase()).ok()?;
-    let opponent = hex::decode(m.opponent_identity.to_ascii_lowercase()).ok()?;
-    let game_id = hex::decode(m.game_id.to_ascii_lowercase()).ok()?;
-    let pot_txid = hex::decode(m.pot_txid.to_ascii_lowercase()).ok()?;
-    let settle_pk = hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()).ok()?;
-    if identity.len() != 33
-        || opponent.len() != 33
-        || game_id.len() != 32
-        || pot_txid.len() != 32
-        || settle_pk.len() != 33
-    {
-        return None;
-    }
-    let mut out = Vec::with_capacity(15 + 33 + 33 + 32 + 32 + 4 + 4 + 33);
-    out.extend_from_slice(b"LOW/potparty/v2");
-    out.extend_from_slice(&identity);
-    out.extend_from_slice(&opponent);
-    out.extend_from_slice(&game_id);
-    out.extend_from_slice(&pot_txid);
-    out.extend_from_slice(&m.pot_vout.to_le_bytes());
-    out.extend_from_slice(&m.recovery_height.to_le_bytes());
-    out.extend_from_slice(&settle_pk);
-    Some(out)
+    overlay_discovery::potparty::validity::potparty_v2_challenge(
+        &hex::decode(m.identity.to_ascii_lowercase()).ok()?,
+        &hex::decode(m.opponent_identity.to_ascii_lowercase()).ok()?,
+        &hex::decode(m.game_id.to_ascii_lowercase()).ok()?,
+        &hex::decode(m.pot_txid.to_ascii_lowercase()).ok()?,
+        m.pot_vout,
+        m.recovery_height,
+        &hex::decode(m.seat_settle_pubkey.to_ascii_lowercase()).ok()?,
+    )
 }
 
 /// Verify the marker's IDENTITY signature: the claimed `identity` really
@@ -638,27 +611,27 @@ pub enum SeatLetter {
 /// | **`opponentIdentity`** | **NO — attacker-owned even on a `Chain` row** |
 /// | **`hand`** (and every field inside it) | **NO — can be a REAL, signature-verified showdown belonging to a DIFFERENT game** |
 ///
-/// The three `NO` display fields are not hypothetical. `results_sql` collapses
-/// each pot to the OLDEST marker naming it and that representative supplies
-/// them; the gameId is public (it is in the victim's own on-chain marker), so
-/// an attacker re-using it with an earlier `createdAt` owns `recoveryHeight`
-/// and `opponentIdentity` on a row that still reads `Chain`
-/// (`a_chain_bound_row_still_carries_attacker_display_fields`).
+/// The three `NO` rows are a SCOPE statement about what the bit means, and
+/// they stay `NO`: `Chain` is about `(potOutpoint, identity)`, full stop.
+/// What changed in #283 is their REACHABILITY. `results_sql` used to collapse
+/// each pot to the OLDEST marker naming it, so one earlier dust marker owned
+/// `gameId` / `recoveryHeight` / `opponentIdentity` on a row that still read
+/// `Chain`, and — because `assemble_results` looks claims up by the ROW's
+/// `gameId` and `resolve_winner_hand`'s party check accepts the ROW's
+/// `opponentIdentity` — a foreign `hand` with it. The collapse now ranks the
+/// admission-time `sigValid` latch before `createdAt`, and an attacker cannot
+/// forge the victim's identity signature, so it cannot become the
+/// representative at any stamp or volume
+/// (`a_chain_bound_row_no_longer_carries_attacker_display_fields`,
+/// `the_hand_field_is_no_longer_attacker_influenceable_on_a_chain_bound_row`,
+/// both rewritten from the cells that used to confirm the attack).
 ///
-/// **`hand` is the widest of them, and it was built to confirm it**
-/// (`the_hand_field_is_attacker_influenceable_on_a_chain_bound_row`).
-/// `assemble_results` looks claims up by the ROW's `gameId`, and
-/// `resolve_winner_hand`'s party check accepts the ROW's `opponentIdentity` —
-/// both attacker-ownable. An attacker who wins the representative-row race can
-/// point the row at a `gameId` under which only its OWN signed claim exists and
-/// name itself as the opponent, so the row serves that claim's cards. What it
-/// CANNOT do is attribute a hand to the victim (claims carry the winner's own
-/// verified signature) or move `outcome` (the seat path outranks claims) — so
-/// the observable result is a row reading `outcome: "won"` for the caller
-/// beside a `hand` naming someone else. **Do not render `hand` as this game's
-/// showdown unless `gameIdBinding == "chain"`.**
-///
-/// **Do not read "chain-bound" as row integrity.**
+/// **The client guidance does not change.** These fields are still not
+/// covered by `Chain`; they are covered by the representative marker's own
+/// signature, which is a different claim, and rows in the LEGACY tier
+/// (`sigValid IS NULL`, pre-migration) still order the old way. **Do not
+/// render `hand` as this game's showdown unless `gameIdBinding == "chain"`,
+/// and do not read "chain-bound" as row integrity.**
 ///
 /// # The gameId is deliberately NOT part of this
 ///
@@ -676,42 +649,88 @@ pub enum SeatLetter {
 /// Anything short of proof is [`PotBinding::Unknown`] — a FIRST-CLASS answer
 /// (Rule 13), never coerced to the optimistic value.
 ///
-/// # Residual — MEASURED, not estimated (`the_measured_denial_cost_table`)
+/// # The #283c denial axis — CLOSED. Re-MEASURED, not estimated.
 ///
-/// The only remaining denial axis is the #283c per-key window cap. Measured
-/// through the real producer, on an honest row:
+/// This section used to document a live residual and the numbers behind it.
+/// Both are kept, because a closure claim is only readable against what it
+/// closed (`the_measured_denial_cost_table`, run through the real producer):
 ///
-/// | attack | markers needed | result |
+/// | attack | pre-#283 | post-#283 |
 /// |---|---|---|
-/// | junk under the honest committed key ALONE | never flips (0/4/8/9/16/40 all `Chain`) | — |
-/// | displace the representative row + junk under the honest key | **9** (1 displacer + 8 junk) | `Unknown`, permanent |
+/// | junk under the honest committed key ALONE | never flips | never flips |
+/// | displace the representative row + junk under the honest key | flips at **9** (1 displacer + 8 junk), PERMANENT | **no threshold** — swept to 4× the cap |
 ///
-/// Junk alone never flips because [`assemble_results`] re-injects the caller's
-/// OWN representative-row marker regardless of the SQL window; the attacker
-/// must first displace that row, which costs the extra marker.
+/// The two properties on which the residual was being ACCEPTED were executed
+/// cells tagged as pinning a known limitation, with instructions to go red
+/// when this landed. Both did, and both are now closure cells:
+///  - it did not heal → `the_victim_does_not_need_to_republish_to_be_bound`
+///    (the victim never loses the binding in the first place, so healing is
+///    moot);
+///  - displacement needed a won wall-clock race →
+///    `winning_the_createdat_race_no_longer_displaces` (500 late markers
+///    still do nothing, and now 500 EARLY ones do nothing either).
 ///
-/// Two properties of that residual are EXECUTED rather than asserted here —
-/// they are the whole basis on which the residual is being accepted, so they
-/// are the ones that must not rot into prose (Rule 10):
-///  - it does **not heal**: `residual_b_does_not_heal_when_the_victim_
-///    republishes` drives five honest republishes and stays `Unknown`;
-///  - displacement is a **race, not a volume attack**:
-///    `displacing_the_representative_row_requires_winning_the_race_not_volume`
-///    shows 500 late markers change nothing and one early marker wins, because
-///    `createdAt` is server-assigned at admission and cannot be backdated.
+/// **What closed it.** The row that must win is "the one whose signatures
+/// VERIFY", and SQL cannot compute that — but it can ORDER BY it once
+/// somebody stores the answer. The overlay latches `potparty_records.sigValid`
+/// at admission (`overlay_discovery::potparty::validity`), and both
+/// [`results_sql`]'s representative-row collapse and [`seat_markers_sql`]'s
+/// per-key window rank it before `createdAt`. An attacker cannot reach the
+/// verified tier under a committed key without the victim's identity key or
+/// a settle key the victim's own lock committed. Widening
+/// [`SEAT_MARKERS_PER_KEY`] would only have moved the number; this removes
+/// the ordering from the argument (epoch Rule 3).
 ///
-/// So the true cost is "9 dust markers AND having filed one before the
-/// victim's honest marker" — cheap, but not free, and not retroactive.
+/// **Fail direction, and be precise about it — an earlier revision of this
+/// paragraph was not.** The latch is a sort key, never a filter: a row that
+/// latches `false` is still STORED and still SERVED
+/// (`a_row_whose_latch_says_false_is_still_served`), and [`attribute_seats`]
+/// re-verifies unconditionally and never reads it.
 ///
-/// Pre-vs-post for that attack (Rule 6, stated plainly): **before** this work
-/// the client read the marker hint, so those same markers produced a FALSE
-/// "recoverable"; **after**, they produce an honest permanent `Unknown`. The
-/// failure direction improved; the permanence did not, and 9 dust markers is
-/// cheap. Not closed here because no window size or sort order closes it — the
-/// row that must win is "the one whose `seatSigHex` VERIFIES", which SQL
-/// cannot compute. The named fix is bsv-low#283's verify-on-read pass over a
-/// wider window when attribution comes back empty; widening
-/// [`SEAT_MARKERS_PER_KEY`] only moves the number.
+/// The sentence that stood here — "a server/client crypto disagreement
+/// degrades to the pre-#283 ordering, not to an outage" — is FALSE, and the
+/// adversarial gate measured the counterexample: an honest, freshly funded,
+/// still-in-flight pot whose marker latched `0` was **absent** from a full
+/// page where pre-#283 it was present. On a page that is not full nothing
+/// changes; on a full one, ranking last is indistinguishable from the
+/// starvation this change exists to stop — visited on every honest user at
+/// once instead of on one victim. That is exactly why the class matters
+/// (epoch Rule 16: a cross-language validity bar fails toward refusing
+/// HONEST work).
+///
+/// Two things bound it, and neither is "it cannot happen": the agreement is
+/// pinned against artifacts the REAL client producer emits (the frozen v1
+/// and v2 goldens), and a disagreement is now DETECTABLE rather than merely
+/// unlikely — the overlay logs `[potparty:siginvalid]` per 0-latch at
+/// admission, so a sustained rate with no flood in the logs is the signal
+/// (epoch Rule 13: surface it, and make sure something can act on it).
+///
+/// **What is NOT closed: the LEGACY tier, and it is PERMANENT.** Rows
+/// admitted before the latch migration carry `sigValid IS NULL` and are
+/// ordered exactly as they were — `the_legacy_tier_still_has_the_pre_283_
+/// threshold` reproduces the old 9-marker flip on them, deliberately.
+///
+/// An earlier revision of this section said the tier "DRAINS and is
+/// self-healing rather than permanent", on the strength of the #252
+/// republish sweep. **That was false and the adversarial gate falsified it
+/// executably (Rule 10):** `decidePartyStep`
+/// (`app/src/lib/potPartyPending.ts:408`) returns `'done'` as soon as
+/// `lookupPotParty` reports an indexed row for the pot, and a legacy row IS
+/// an indexed row, so the sweep never republishes for exactly the pots that
+/// need it (pinned client-side at `potPartyPending.test.ts:190`). The tier
+/// cannot GROW, and it does not shrink either.
+///
+/// A migration cannot fix it — SQL cannot verify a signature — but the
+/// OVERLAY can: every input `record_sig_valid` needs is already in the row,
+/// so a bounded lazy pass (`SELECT … LIMIT N` -> compute -> `UPDATE`) is
+/// small and is tracked as bsv-low#355. It is a RE-LATCH OF EVERY ROW, not a
+/// backfill of the `NULL` ones: the column is written once by
+/// `INSERT OR IGNORE` and never re-evaluated, so a transient predicate fault
+/// pins the rows admitted during it at rank 0 — below the legacy tier,
+/// permanently (see the write site, `potparty_write::potparty_insert_query`).
+/// Closure criterion: every row's `sigValid` equals `record_sig_valid`
+/// recomputed at the pass's own predicate version. Until then, state the
+/// residual as permanent.
 ///
 /// Second residual: a **v1 (pre-#230) pot has no seat binding to find** and
 /// answers `Unknown` forever. Note this is not a fallback to something safer —
@@ -2010,14 +2029,16 @@ pub fn results_sql() -> String {
          FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                   opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                   spent, spendingTxid, spentConfirmed, {DECODED}, \
-                  markerCreatedAt, markerRowid, potCreatedAt, \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                     opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                     spent, spendingTxid, spentConfirmed, {DECODED}, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                    potBestSigRank, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
-                                       ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                       ORDER BY potBestSigRank DESC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                                                 markerCreatedAt DESC, markerRowid DESC) AS potRank \
              FROM (SELECT pp.identity AS identity, pp.gameId AS gameId, \
                       pp.potTxid AS potTxid, pp.potVout AS potVout, \
@@ -2038,14 +2059,18 @@ pub fn results_sql() -> String {
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                      MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
+                          AS potBestSigRank, \
                       ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
-                                         ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
                FROM potparty_records pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ?) \
              WHERE rn = 1) \
-           ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+           ORDER BY potBestSigRank DESC, tier ASC, \
+                    COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
            LIMIT {rows}) w \
          LEFT JOIN pot_beefs fb ON w.pubA IS NULL AND fb.txid = lower(w.potTxid) \
@@ -2053,10 +2078,12 @@ pub fn results_sql() -> String {
               AND (w.verdict IS NULL OR w.verdictTxid IS NULL \
                    OR w.verdictTxid <> w.spendingTxid OR w.spentHeight IS NULL) \
               AND sb.txid = lower(w.spendingTxid) \
-         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+         ORDER BY w.potBestSigRank DESC, w.tier ASC, \
+                  COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = RESULTS_UNKNOWN_POT_QUOTA,
         rows = RESULTS_MAX_ROWS,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
     )
 }
 
@@ -2104,23 +2131,38 @@ const _: () = assert!(RESULTS_UNKNOWN_POT_QUOTA < RESULTS_MAX_ROWS);
 /// publishes its own marker under its own committed key); the headroom
 /// absorbs benign duplicates (the sweep's content-idempotent republish).
 ///
-/// # KNOWN residual — eviction at exactly this bar (bsv-low #283c)
+/// # The eviction at exactly this bar is CLOSED (bsv-low #283c)
 ///
 /// The committed settle keys are PUBLIC on-chain, so the `IN (?,?)` key
-/// binding is a PREFILTER, not a barrier: an attacker can file well-formed
+/// binding is a PREFILTER, not a barrier: an attacker could file well-formed
 /// markers UNDER the honest seat's own committed key, and exactly
 /// [`SEAT_MARKERS_PER_KEY`] forged rows stamped ahead of the honest one
-/// evict it from the window (threshold executed in the #281 gate: 7 junk →
-/// honest survives, 8 → evicted). Fail-safe — attribution is then OMITTED,
-/// never wrong (the verify pass drops every non-verifying row).
+/// evicted it from the window (threshold executed in the #281 gate: 7 junk →
+/// honest survives, 8 → evicted).
 ///
-/// DO NOT half-fix this in SQL: no window size or sort order closes it —
-/// the row that must win is "the one whose `seatSigHex` VERIFIES", which
-/// SQL cannot compute. The real fixes are admission-side (rate-limit /
-/// price marker admission under a given key — an owner decision against
-/// the byte-format-only doctrine) or a verify-on-read pass over a
-/// deliberately wider window when attribution comes back empty. Tracked in
-/// bsv-low#283; widening this constant only moves the executed threshold.
+/// The note that stood here said not to half-fix it in SQL, because "the row
+/// that must win is the one whose `seatSigHex` VERIFIES, which SQL cannot
+/// compute", and named admission-side pricing or a verify-on-read pass as the
+/// only real fixes. The premise was right and the conclusion was one step
+/// short: SQL cannot COMPUTE it, but it can ORDER BY it once the answer is
+/// stored. It is now stored at admission
+/// (`overlay_discovery::potparty::validity`, the #284 decode-at-write pattern
+/// applied to a predicate) and [`seat_markers_sql`] ranks it before
+/// `createdAt`. Pricing was never available either — filing a marker is free,
+/// not dust-priced (bsv-low#347).
+///
+/// Re-measured through the real producer: the flip point is GONE, swept to
+/// four times this cap (`the_measured_denial_cost_table` [B]), and the victim
+/// never loses the binding at all
+/// (`the_victim_does_not_need_to_republish_to_be_bound`). Widening this
+/// constant would still only move a number, which is why it did not move.
+///
+/// Unchanged: this window's fail direction. Attribution is OMITTED, never
+/// wrong — the verify pass in [`attribute_seats`] drops every non-verifying
+/// row and never reads the latch. Residual: rows admitted before the latch
+/// migration (`sigValid IS NULL`) order exactly as they did
+/// (`the_legacy_tier_still_has_the_pre_283_threshold`). That tier cannot
+/// grow and does NOT drain by itself — see the [`PotBinding`] correction.
 ///
 /// This is the `/results` cap (a PER-IDENTITY view — the caller holds its own
 /// key↔identity mapping, so eviction only degrades ITS OWN attribution tier,
@@ -2182,14 +2224,26 @@ const _: () = assert!(
 /// - [`attribute_seats`] then requires BOTH signatures (seat + identity) on
 ///   whatever comes back, so a fetched junk row attributes nothing.
 ///
-/// Residual (documented, not defended in SQL): the committed pubkeys are
-/// public, so a determined spammer can copy the honest seat's OWN key and
-/// crowd that one slot's window. That costs a dust tx per row, is bounded
-/// to failing to CREDIT one pot's attribution (never a wrong attribution —
-/// the signature bars are unconditional), and leaves the countersigned
-/// claim path untouched. Distinguishing junk from honest inside SQL is
-/// impossible (verification needs ECDSA); the honest fix if it is ever
-/// observed is admission-side rate limiting, not a bigger window.
+/// **And since bsv-low #283 the ordering itself is no longer the attacker's
+/// to choose.** The paragraph that stood here said the committed pubkeys are
+/// public, so a spammer can copy the honest seat's OWN key and crowd that
+/// slot's window "at a dust tx per row", and that distinguishing junk from
+/// honest inside SQL is impossible because verification needs ECDSA. Two
+/// corrections: the rows are FREE, not dust-priced (bsv-low#347 — `/submit`
+/// has no auth and its SEEN-gate is chosen by a caller header); and SQL does
+/// not have to verify anything, it only has to sort by a verdict somebody
+/// else stored. `{rank}` below is `potparty_records.sigValid`, latched at
+/// admission by `overlay_discovery::potparty::validity::record_sig_valid`,
+/// and it is the FIRST term of the per-key window's `ROW_NUMBER`.
+///
+/// A row can therefore only outrank an honest one by carrying BOTH a seatSig
+/// under a key this pot's lock committed AND that identity's own signature —
+/// i.e. by holding a key the attacker does not have. Junk sorts last at any
+/// volume and any stamp.
+///
+/// SORT KEY, NEVER A FILTER: a `sigValid = 0` row is still returned when it
+/// is all there is, and [`attribute_seats`] still re-verifies every row it
+/// gets, so the latch can mis-order candidates and can never admit one.
 pub fn seat_markers_sql(n: usize, cap: usize) -> String {
     debug_assert!(n >= 1);
     debug_assert!(cap >= 1);
@@ -2201,11 +2255,13 @@ pub fn seat_markers_sql(n: usize, cap: usize) -> String {
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                       recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
                       ROW_NUMBER() OVER (PARTITION BY potTxid, potVout, seatSettlePubkey \
-                                         ORDER BY createdAt ASC, rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  createdAt ASC, rowid ASC) AS rn \
                FROM potparty_records \
                WHERE seatSettlePubkey IS NOT NULL AND ({per_pot})) \
          WHERE rn <= {cap} \
          ORDER BY potTxid ASC, potVout ASC, seatSettlePubkey ASC, rn ASC",
+        rank = overlay_discovery::potparty::validity::sig_rank_expr(""),
     )
 }
 
@@ -3368,7 +3424,9 @@ mod tests {
                 );
                 // The SQL built for this chunk binds exactly what we supply.
                 assert_eq!(
-                    seat_markers_sql(chunk.len(), SEAT_MARKERS_PER_KEY).matches('?').count(),
+                    seat_markers_sql(chunk.len(), SEAT_MARKERS_PER_KEY)
+                        .matches('?')
+                        .count(),
                     chunk.len() * SEAT_MARKERS_BINDS_PER_POT,
                     "n={n}: bind arity matches the chunk"
                 );
@@ -3564,7 +3622,11 @@ mod tests {
         rows.push((ma, 9_000));
         rows.push((mb, 9_001));
 
-        let fetched = simulate_seat_fetch(&seat_markers_sql(1, SEAT_MARKERS_PER_KEY), (&pa, &pb), &rows);
+        let fetched = simulate_seat_fetch(
+            &seat_markers_sql(1, SEAT_MARKERS_PER_KEY),
+            (&pa, &pb),
+            &rows,
+        );
         // The MONEY assertion first: attribution must credit both seats —
         // under the pre-fix order-dependent window this yields None/None
         // (45 older junk rows fill the pot's single window).
@@ -3597,7 +3659,11 @@ mod tests {
             junk.identity = idj;
             rows2.push((junk, 500 + i as i64));
         }
-        let fetched2 = simulate_seat_fetch(&seat_markers_sql(1, SEAT_MARKERS_PER_KEY), (&pa, &pb), &rows2);
+        let fetched2 = simulate_seat_fetch(
+            &seat_markers_sql(1, SEAT_MARKERS_PER_KEY),
+            (&pa, &pb),
+            &rows2,
+        );
         let attr2 = attribute_seats(&p, &pot, 0, &fetched2);
         assert_eq!(
             attr2.identity_b.as_deref(),

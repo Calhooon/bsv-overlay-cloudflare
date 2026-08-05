@@ -12,6 +12,7 @@ use worker::{D1Database, D1PreparedStatement};
 // =============================================================================
 
 /// A value that can be bound to a D1 prepared statement.
+#[derive(Debug, Clone, PartialEq)]
 pub enum QVal {
     Null,
     Int(i64),
@@ -116,6 +117,23 @@ impl Query {
     pub fn bind(mut self, val: impl Into<QVal>) -> Self {
         self.params.push(val.into());
         self
+    }
+
+    /// The SQL text this query will prepare.
+    ///
+    /// Exists so a WRITE path can be pinned BEHAVIOURALLY without a
+    /// `D1Database` (bsv-low #283): `execute` needs a live D1 binding and is
+    /// unreachable natively, which is exactly how a writer can be silently
+    /// neutered while every test stays green. With these two accessors a test
+    /// can take the query the real writer builds and replay it against real
+    /// SQLite. Read-only; no way to mutate a built query.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// The bound parameters, in bind order. See [`Query::sql`].
+    pub fn params(&self) -> &[QVal] {
+        &self.params
     }
 
     pub fn prepare(self, db: &D1Database) -> Result<D1PreparedStatement, String> {
@@ -269,7 +287,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 97;
+pub const OVERLAY_MIGRATION_COUNT: usize = 98;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -908,6 +926,59 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
      ON hopparty_records(identity, createdAt)",
     "CREATE INDEX IF NOT EXISTS idx_hopparty_hop ON hopparty_records(txid, hopVout)",
     "CREATE INDEX IF NOT EXISTS idx_hopparty_game ON hopparty_records(gameId)",
+    // ── #283 potparty marker-validity latch (decode-once at admission) ────
+    // Whether every signature the marker carries VERIFIED, computed once by
+    // `overlay_discovery::potparty::validity::record_sig_valid` at write
+    // time (the #284 decoded-columns pattern applied to a predicate instead
+    // of a value). 1 = all verified, 0 = at least one did not, NULL = the
+    // row predates this migration and was never evaluated.
+    //
+    // ORDERING HINT ONLY. Admission stays byte-format-only: this column
+    // changes no admission decision, a 0-latched marker is still stored and
+    // still served, and every consumer that draws a conclusion from a marker
+    // re-verifies unconditionally — so a lying or stale value can mis-order
+    // candidates and can never admit one. Its whole job is to let a SQL
+    // window ORDER BY "does this verify", which is the only ordering an
+    // attacker cannot out-stamp, out-number or (bsv-low#347) get for free.
+    //
+    // NULLABLE on purpose: a MIGRATION cannot backfill it, because SQL
+    // cannot verify a signature.
+    //
+    // That is a fact about SQL, and an earlier revision of this note
+    // presented it as a fact about the SYSTEM ("the legacy tier drains by
+    // republish"). Both halves were wrong and the adversarial gate corrected
+    // them (Rule 10). (a) The republish does NOT happen: the client's
+    // `decidePartyStep` stops as soon as an indexed row exists for the pot,
+    // and a legacy row IS an indexed row. (b) The overlay is RUST and every
+    // input `record_sig_valid` needs is already in the row, so a bounded lazy
+    // re-latch pass — `SELECT … LIMIT N` -> compute -> `UPDATE` — is
+    // perfectly possible and small; it is simply not in this change. **So the
+    // legacy tier is PERMANENT until that pass lands** (bsv-low#355).
+    //
+    // WRITE-ONCE, NEVER RE-EVALUATED, and that is the wider hazard (gate
+    // round 2, MED-4). This column is set by `INSERT OR IGNORE` and by
+    // nothing else — no `UPDATE potparty_records SET sigValid` exists in
+    // production code. So a TRANSIENT predicate fault (a `bsv-rs`
+    // DER/`to_der` behaviour change, a wallet emitting a non-canonical
+    // signature mid-rollout, a partial deploy) permanently demotes every
+    // honest row admitted in that window to rank 0 — BELOW the legacy tier,
+    // with no self-healing path. Pre-fix those rows ordered neutrally;
+    // post-fix they are last, forever. That is the Rule 6 trade, and its
+    // victims are wiped-device users with a silently short enumeration who
+    // will never file a bug (Rule 14).
+    //
+    // #355 is therefore a RE-LATCH OF EVERY ROW, not a backfill of the NULL
+    // ones, and its closure criterion is: **every row's `sigValid` equals
+    // `record_sig_valid` recomputed at the pass's own predicate version** —
+    // reported as a count of rows changed plus a count still `NULL`. The
+    // narrower "zero rows with `sigValid IS NULL`" criterion structurally
+    // SKIPS the 0s, which are exactly the rows a fault would have created.
+    //
+    // Additive ALTER — the runner ignores the re-run "duplicate column"
+    // error (`migration_error_is_benign`). NOTE the app-layer Worker issues
+    // this same statement itself (`low_app_layer::schema`) because it never
+    // runs this list; the two are pinned byte-identical.
+    "ALTER TABLE potparty_records ADD COLUMN sigValid INTEGER",
 ];
 
 // =============================================================================
@@ -1008,7 +1079,10 @@ mod tests {
             "D1_ERROR: Duplicate Column name: x"
         ));
         // Any OTHER error on an ALTER is NOT benign.
-        assert!(!migration_error_is_benign(alter, "no such table: pot_records"));
+        assert!(!migration_error_is_benign(
+            alter,
+            "no such table: pot_records"
+        ));
         assert!(!migration_error_is_benign(alter, "syntax error near ADD"));
         // A duplicate-column report from a non-ALTER statement is NOT benign.
         assert!(!migration_error_is_benign(
@@ -1116,7 +1190,8 @@ mod tests {
         // The additive v2-cards column migration exists and targets
         // result_markers_v2 (mirrors the pot_records spentConfirmed pin).
         assert!(OVERLAY_MIGRATIONS.iter().any(|sql| {
-            sql.trim_start().starts_with("ALTER TABLE result_markers_v2")
+            sql.trim_start()
+                .starts_with("ALTER TABLE result_markers_v2")
                 && sql.contains("ADD COLUMN cardsHex TEXT")
         }));
     }
@@ -1209,7 +1284,9 @@ mod tests {
             .collect();
         assert_eq!(carries.len(), 1, "exactly one data-carry migration");
         let carry = carries[0];
-        assert!(carry.trim_start().starts_with("INSERT OR IGNORE INTO result_markers_v2"));
+        assert!(carry
+            .trim_start()
+            .starts_with("INSERT OR IGNORE INTO result_markers_v2"));
         assert!(carry.contains("FROM result_markers WHERE txid IS NOT NULL"));
         assert!(carry.contains("outputIndex"));
     }

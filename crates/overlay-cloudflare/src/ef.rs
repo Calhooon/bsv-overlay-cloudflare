@@ -101,7 +101,10 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
         };
 
         match convert() {
-            Ok(ef) => efs.push(EfTx { txid: txid.clone(), ef }),
+            Ok(ef) => efs.push(EfTx {
+                txid: txid.clone(),
+                ef,
+            }),
             Err(e) if txid == subject_txid => return Err(e),
             Err(e) => {
                 // Ancestor without its own sources — broadcast long ago by
@@ -220,11 +223,13 @@ mod tests {
     #[test]
     fn ef_batch_from_real_beef_has_marker_and_source_data() {
         let beef = build_unmined_beef();
-        let (efs, subject_txid) =
-            beef_to_ef_batch(&beef).expect("real BEEF must convert to EF");
+        let (efs, subject_txid) = beef_to_ef_batch(&beef).expect("real BEEF must convert to EF");
 
         assert_eq!(efs.len(), 1, "only the unmined subject is broadcast as EF");
-        assert_eq!(subject_txid, SUBJECT_TXID, "subject is the last (spending) tx");
+        assert_eq!(
+            subject_txid, SUBJECT_TXID,
+            "subject is the last (spending) tx"
+        );
         assert_eq!(efs[0].txid, SUBJECT_TXID, "the EF entry carries its txid");
 
         for EfTx { ef, .. } in &efs {
@@ -248,7 +253,10 @@ mod tests {
                     .as_ref()
                     .expect("each EF input must carry its source transaction");
                 let out = &src.outputs[input.source_output_index as usize];
-                assert!(out.satoshis.unwrap_or(0) > 0, "EF source output must carry sats");
+                assert!(
+                    out.satoshis.unwrap_or(0) > 0,
+                    "EF source output must carry sats"
+                );
             }
         }
     }
@@ -262,7 +270,10 @@ mod tests {
 
     #[test]
     fn ef_batch_rejects_garbage_beef() {
-        assert!(matches!(beef_to_ef_batch(&[0xde, 0xad]), Err(EfError::Parse(_))));
+        assert!(matches!(
+            beef_to_ef_batch(&[0xde, 0xad]),
+            Err(EfError::Parse(_))
+        ));
     }
 
     #[test]
@@ -277,7 +288,10 @@ mod tests {
         // both assertions below fail.
         let beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
         let (efs, subject_txid) = beef_to_ef_batch(&beef).unwrap();
-        assert!(efs.is_empty(), "fixture is the all-proven (mined-claim) shape");
+        assert!(
+            efs.is_empty(),
+            "fixture is the all-proven (mined-claim) shape"
+        );
         // Before: the subject CLAIMS a proof (the M1 poison, stored verbatim
         // pre-fix).
         let before = Beef::from_binary(&beef).unwrap();
@@ -323,7 +337,11 @@ mod tests {
         assert!(efs.is_empty(), "all-proven BEEF yields no EF legs");
         let raw = proven_subject_raw(&beef).expect("subject raw must extract");
         let tx = Transaction::from_binary(&raw).unwrap();
-        assert_eq!(tx.id(), subject_txid, "raw is content-addressed to the subject");
+        assert_eq!(
+            tx.id(),
+            subject_txid,
+            "raw is content-addressed to the subject"
+        );
         // Garbage → None (the caller refuses admission, fail-closed).
         assert!(proven_subject_raw(&[0xde, 0xad]).is_none());
         assert!(proven_subject_raw(&[]).is_none());

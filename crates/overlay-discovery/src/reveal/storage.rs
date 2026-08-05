@@ -90,10 +90,8 @@ pub trait RevealStorage {
 
     /// All reveal records for a game ID (lowercase hex), any seat, capped
     /// at [`REVEAL_RESULT_CAP`].
-    async fn find_by_game_id(
-        &self,
-        game_id: &str,
-    ) -> Result<Vec<RevealRecord>, RevealStorageError>;
+    async fn find_by_game_id(&self, game_id: &str)
+        -> Result<Vec<RevealRecord>, RevealStorageError>;
 }
 
 /// REVEAL storage errors.

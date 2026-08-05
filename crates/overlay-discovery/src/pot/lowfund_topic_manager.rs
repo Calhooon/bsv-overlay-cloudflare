@@ -106,7 +106,8 @@ mod tests {
     /// A one-input tx carrying the given locking scripts, as BEEF bytes.
     fn beef_with_outputs(scripts: Vec<Vec<u8>>) -> Vec<u8> {
         let mut tx = Tx::new();
-        tx.add_input(TransactionInput::new("00".repeat(32), 0)).unwrap();
+        tx.add_input(TransactionInput::new("00".repeat(32), 0))
+            .unwrap();
         for s in scripts {
             tx.add_output(TransactionOutput {
                 satoshis: Some(546),
@@ -132,7 +133,10 @@ mod tests {
         let got = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::CurrentTx)
+                &[],
+                None,
+                SubmitMode::CurrentTx,
+            )
             .await
             .unwrap();
         assert_eq!(got.outputs_to_admit, vec![0, 3]);
@@ -145,12 +149,14 @@ mod tests {
         let got = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::CurrentTx)
+                &[],
+                None,
+                SubmitMode::CurrentTx,
+            )
             .await
             .unwrap();
         assert!(got.outputs_to_admit.is_empty());
     }
-
 
     #[test]
     fn p2pkh_recognizer_is_exact() {

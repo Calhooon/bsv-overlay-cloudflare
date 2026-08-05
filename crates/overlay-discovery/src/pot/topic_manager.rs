@@ -204,7 +204,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn identify_admissible_outputs_over_beef() {
-        use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput as TxOut};
+        use bsv_rs::transaction::{
+            Transaction as Tx, TransactionInput, TransactionOutput as TxOut,
+        };
 
         // A P2PKH change/payout output (skipped) then the covenant pot (admitted).
         let p2pkh = TxOut {
@@ -228,7 +230,10 @@ pub(crate) mod tests {
         let instructions = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::HistoricalTxNoSpv)
+                &[],
+                None,
+                SubmitMode::HistoricalTxNoSpv,
+            )
             .await
             .unwrap();
         // Only the covenant pot (index 1) is admitted.
@@ -237,7 +242,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn identify_admits_nothing_for_all_p2pkh() {
-        use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput as TxOut};
+        use bsv_rs::transaction::{
+            Transaction as Tx, TransactionInput, TransactionOutput as TxOut,
+        };
         let p2pkh = TxOut {
             satoshis: Some(546),
             locking_script: LockingScript::from_hex(
@@ -256,7 +263,10 @@ pub(crate) mod tests {
         let instructions = mgr
             .identify_admissible_outputs(
                 &Tx::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::HistoricalTxNoSpv)
+                &[],
+                None,
+                SubmitMode::HistoricalTxNoSpv,
+            )
             .await
             .unwrap();
         assert!(instructions.outputs_to_admit.is_empty());

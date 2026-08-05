@@ -517,11 +517,7 @@ pub(crate) mod tests {
 
     /// A valid v2 marker script over the golden identities with a chosen
     /// gameId + cards + loserSig.
-    pub(crate) fn golden_marker_v2(
-        game_id: &[u8; 32],
-        cards: &[u8],
-        loser_sig: &[u8],
-    ) -> Vec<u8> {
+    pub(crate) fn golden_marker_v2(game_id: &[u8; 32], cards: &[u8], loser_sig: &[u8]) -> Vec<u8> {
         marker_script_v2(
             game_id,
             &golden_winner(),
@@ -553,7 +549,11 @@ pub(crate) mod tests {
     #[test]
     fn golden_vector_parses_exactly() {
         let script = hex::decode(GOLDEN_RESULT_HEX).expect("golden hex decodes");
-        assert_eq!(script.len(), 326, "confirmed golden vector is exactly 326 bytes");
+        assert_eq!(
+            script.len(),
+            326,
+            "confirmed golden vector is exactly 326 bytes"
+        );
 
         let m = parse_result_marker(&script).expect("golden vector must parse");
         assert_eq!(m.game_id, golden_game_id());
@@ -617,7 +617,11 @@ pub(crate) mod tests {
     #[test]
     fn v2_golden_vector_parses_exactly() {
         let script = hex::decode(GOLDEN_RESULT_V2_HEX).expect("v2 golden hex decodes");
-        assert_eq!(script.len(), 332, "confirmed v2 golden vector is exactly 332 bytes");
+        assert_eq!(
+            script.len(),
+            332,
+            "confirmed v2 golden vector is exactly 332 bytes"
+        );
 
         let m = parse_result_marker(&script).expect("v2 golden vector must parse");
         assert_eq!(m.game_id, golden_game_id());
@@ -683,7 +687,11 @@ pub(crate) mod tests {
             );
         }
         // The boundary itself is fine.
-        let script = golden_marker_v2(&golden_game_id(), &[47, 48, 49, 50, 51], &golden_loser_sig());
+        let script = golden_marker_v2(
+            &golden_game_id(),
+            &[47, 48, 49, 50, 51],
+            &golden_loser_sig(),
+        );
         assert!(parse_result_marker(&script).is_some(), "card 51 is valid");
     }
 
@@ -729,7 +737,10 @@ pub(crate) mod tests {
         s.extend(push_data(&golden_settle_txid()));
         s.extend(push_data(&golden_winner_sig()));
         s.extend(push_data(&golden_loser_sig()));
-        assert!(parse_result_marker(&s).is_none(), "v2 tag + 8 pushes rejected");
+        assert!(
+            parse_result_marker(&s).is_none(),
+            "v2 tag + 8 pushes rejected"
+        );
 
         // A v1 tag with the v2 body (9 pushes — a cards push) is malformed.
         let mut s = vec![0x00, 0x6a];
@@ -742,7 +753,10 @@ pub(crate) mod tests {
         s.extend(push_data(&golden_cards()));
         s.extend(push_data(&golden_winner_sig()));
         s.extend(push_data(&golden_loser_sig()));
-        assert!(parse_result_marker(&s).is_none(), "v1 tag + 9 pushes rejected");
+        assert!(
+            parse_result_marker(&s).is_none(),
+            "v1 tag + 9 pushes rejected"
+        );
     }
 
     #[test]
@@ -777,7 +791,11 @@ pub(crate) mod tests {
             vec![0x00u8, 0x6a, 0x4e, 0xff, 0xff, 0xff],       // PUSHDATA4 header truncated
             vec![0x00u8, 0x6a, 0x4b],                         // a 75-byte push with no data
         ] {
-            assert_eq!(parse_result_marker(&script), None, "crafted script must not parse");
+            assert_eq!(
+                parse_result_marker(&script),
+                None,
+                "crafted script must not parse"
+            );
         }
         // Direct read_pushes probe: the trap path is the len itself.
         assert!(read_pushes(&[0x4e, 0xff, 0xff, 0xff, 0xff]).is_empty());

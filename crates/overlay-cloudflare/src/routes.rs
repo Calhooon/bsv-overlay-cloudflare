@@ -1154,12 +1154,9 @@ pub async fn arc_ingest(
     //    settle/refund/sweep admits no outputs, so the ENGINE knows nothing
     //    about it (engine_res errors) while the pot stores are exactly where
     //    its proof belongs.
-    let pot = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(
-        pot_storage,
-        &txid,
-        &merkle_path,
-    )
-    .await;
+    let pot =
+        crate::proof_fetcher::apply_pushed_proof_to_pot_stores(pot_storage, &txid, &merkle_path)
+            .await;
 
     match engine_res {
         Ok(()) => {
@@ -1334,7 +1331,10 @@ fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 // =============================================================================
@@ -2332,9 +2332,15 @@ mod tests {
         // broadcast. The byte bound looks ONLY at the subject we submit, so a
         // 20-ancestor batch with a normal-sized subject passes.
         let mut efs: Vec<EfTx> = (0..20)
-            .map(|i| EfTx { txid: format!("anc{i}"), ef: vec![0u8; 1024] })
+            .map(|i| EfTx {
+                txid: format!("anc{i}"),
+                ef: vec![0u8; 1024],
+            })
             .collect();
-        efs.push(EfTx { txid: "subj".into(), ef: vec![0u8; 4096] });
+        efs.push(EfTx {
+            txid: "subj".into(),
+            ef: vec![0u8; 4096],
+        });
         assert_eq!(
             subject_ef_over_cap(&efs, "subj"),
             None,
@@ -2354,14 +2360,20 @@ mod tests {
             "a subject one byte over the bound is capped"
         );
         // Exactly at the bound is allowed.
-        let at = vec![EfTx { txid: "subj".into(), ef: vec![0u8; MAX_SUBJECT_EF_BYTES] }];
+        let at = vec![EfTx {
+            txid: "subj".into(),
+            ef: vec![0u8; MAX_SUBJECT_EF_BYTES],
+        }];
         assert_eq!(subject_ef_over_cap(&at, "subj"), None);
     }
 
     #[test]
     fn work_bound_cap_absent_subject_is_never_over() {
         // Subject already mined / not present → 0 bytes → never capped.
-        let efs = vec![EfTx { txid: "other".into(), ef: vec![0u8; 8] }];
+        let efs = vec![EfTx {
+            txid: "other".into(),
+            ef: vec![0u8; 8],
+        }];
         assert_eq!(subject_ef_over_cap(&efs, "subj"), None);
     }
 
@@ -2374,8 +2386,14 @@ mod tests {
         // attacker force a multi-MB ARC POST + ~40 s of worker poll per request
         // (a double-spend subject: 202 then async REJECTED → the fallback fires).
         // The total-batch bound catches it BEFORE any ARC submit.
-        let mut efs = vec![EfTx { txid: "subj".into(), ef: vec![0u8; 4096] }]; // subject fine
-        efs.push(EfTx { txid: "fat-ancestor".into(), ef: vec![0u8; MAX_BATCH_EF_BYTES] });
+        let mut efs = vec![EfTx {
+            txid: "subj".into(),
+            ef: vec![0u8; 4096],
+        }]; // subject fine
+        efs.push(EfTx {
+            txid: "fat-ancestor".into(),
+            ef: vec![0u8; MAX_BATCH_EF_BYTES],
+        });
         let total = 4096 + MAX_BATCH_EF_BYTES;
         assert_eq!(
             subject_ef_over_cap(&efs, "subj"),
@@ -2385,10 +2403,20 @@ mod tests {
         // A total exactly at the bound is allowed — small subject + ancestry
         // that sums (with the subject) to exactly the batch cap.
         let at = vec![
-            EfTx { txid: "subj".into(), ef: vec![0u8; 4096] },
-            EfTx { txid: "anc".into(), ef: vec![0u8; MAX_BATCH_EF_BYTES - 4096] },
+            EfTx {
+                txid: "subj".into(),
+                ef: vec![0u8; 4096],
+            },
+            EfTx {
+                txid: "anc".into(),
+                ef: vec![0u8; MAX_BATCH_EF_BYTES - 4096],
+            },
         ];
-        assert_eq!(subject_ef_over_cap(&at, "subj"), None, "total exactly at the batch bound is allowed");
+        assert_eq!(
+            subject_ef_over_cap(&at, "subj"),
+            None,
+            "total exactly at the batch bound is allowed"
+        );
     }
 
     #[test]
@@ -2437,7 +2465,11 @@ mod tests {
             r#"{{"txid":"{CB_TXID}","merklePath":"beef00","blockHeight":850000,"txStatus":"MINED"}}"#
         );
         match classify_arc_ingest_body(&body).unwrap() {
-            ArcIngestBody::Proof { txid, merkle_path, block_height } => {
+            ArcIngestBody::Proof {
+                txid,
+                merkle_path,
+                block_height,
+            } => {
                 assert_eq!(txid, CB_TXID);
                 assert_eq!(merkle_path, "beef00");
                 assert_eq!(block_height, Some(850_000));

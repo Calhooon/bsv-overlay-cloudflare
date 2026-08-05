@@ -392,3 +392,105 @@ fn the_view_is_scoped_to_one_identity() {
     assert!(query_recovery_rows(&conn, &me).is_empty());
     assert_eq!(query_recovery_rows(&conn, &other).len(), 1);
 }
+
+/// File a potparty marker with an explicit #283 admission-time latch.
+///
+/// MODELLING BOUNDARY (epoch Rule 17): this SETS `sigValid` instead of
+/// deriving it from real signatures, because what this file tests is the
+/// ORDERING the column drives. The column's own correctness is established
+/// against the frozen artifacts the real client producer emits
+/// (`overlay_discovery::potparty::validity`) and through the real writer path
+/// (`results_window_sqlite`'s `production_latch`).
+#[allow(clippy::too_many_arguments)]
+fn file_party_latched(
+    conn: &Connection,
+    identity: &str,
+    game_id: &str,
+    pot_txid: &str,
+    recovery_height: i64,
+    marker_txid: &str,
+    at: i64,
+    sig_valid: bool,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, txid, outputIndex, createdAt, sigValid) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', ?6, 0, ?7, ?8)",
+        params![
+            identity,
+            h66(0xbb),
+            game_id,
+            pot_txid,
+            recovery_height,
+            marker_txid,
+            at,
+            i32::from(sig_valid)
+        ],
+    )
+    .expect("insert potparty_records");
+}
+
+/// bsv-low #283 on `/recovery-view`. The flood this window's quota was NEVER
+/// on the path of (bsv-low#347): one FREE fabricated `pot_records` row per
+/// ghost makes every ghost read `unknownPot = 0`, so it lands in tier 0
+/// ordered freshest-first and the reserved unknown-pot quota is irrelevant.
+/// 200 of them against a 100-row page erase the victim's own pots.
+///
+/// The bound is not a quota and not a price — it is that a ghost must NAME
+/// the victim to appear in this identity-scoped window, and the marker's
+/// identity signature binds that name.
+#[test]
+fn free_ghost_pot_records_cannot_erase_the_recovery_view() {
+    let conn = production_schema_db();
+    let me = h66(0xa9);
+    let mut honest = Vec::new();
+    for i in 0..50u64 {
+        let pot = format!("{:064x}", 0x7000_u64 + i);
+        admit_pot(&conn, &pot, 1_000 + i as i64, Some(959_000));
+        file_party_latched(
+            &conn,
+            &me,
+            &h64(0x31),
+            &pot,
+            1,
+            &format!("txH{i:03}"),
+            1_000 + i as i64,
+            true,
+        );
+        honest.push(pot);
+    }
+    for i in 0..200u64 {
+        let ghost = format!("{:064x}", 0xdead_0000_u64 + i);
+        admit_pot(&conn, &ghost, 9_000 + i as i64, None); // free, fabricated
+        file_party_latched(
+            &conn,
+            &me,
+            &h64(0x31),
+            &ghost,
+            1,
+            &format!("txG{i:03}"),
+            9_000 + i as i64,
+            false,
+        );
+    }
+    let rows = query_recovery_rows(&conn, &me);
+    let pots: Vec<&String> = rows.iter().map(|r| &r.pot_txid).collect();
+    for pot in &honest {
+        assert!(
+            pots.contains(&pot),
+            "every honest pot survives 200 free ghost pot_records rows: {pot} missing"
+        );
+    }
+
+    // LEGACY CONTROL (epoch Rule 12a): demote every row to the pre-migration
+    // shape and the same flood erases the page.
+    conn.execute("UPDATE potparty_records SET sigValid = NULL", [])
+        .expect("legacy-ize");
+    let legacy = query_recovery_rows(&conn, &me);
+    let legacy_pots: Vec<&String> = legacy.iter().map(|r| &r.pot_txid).collect();
+    assert!(
+        !legacy_pots.contains(&&honest[0]),
+        "PRE-#283 CONTROL: the same flood erases an all-legacy page"
+    );
+}

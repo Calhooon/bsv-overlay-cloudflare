@@ -419,10 +419,14 @@ async fn transient_failure_caps_cursor_and_recovers() {
             &self,
             request: &GASPInitialRequest,
         ) -> Result<GASPInitialResponse, GASPError> {
-            let utxos = [utxo("tx1", 0, 10.0), utxo("tx2", 0, 20.0), utxo("tx3", 0, 30.0)]
-                .into_iter()
-                .filter(|u| u.score as u64 >= request.since)
-                .collect();
+            let utxos = [
+                utxo("tx1", 0, 10.0),
+                utxo("tx2", 0, 20.0),
+                utxo("tx3", 0, 30.0),
+            ]
+            .into_iter()
+            .filter(|u| u.score as u64 >= request.since)
+            .collect();
             Ok(GASPInitialResponse {
                 utxo_list: utxos,
                 since: request.since,
@@ -432,7 +436,9 @@ async fn transient_failure_caps_cursor_and_recovers() {
             &self,
             _: &GASPInitialResponse,
         ) -> Result<GASPInitialReply, GASPError> {
-            Ok(GASPInitialReply { utxo_list: Vec::new() })
+            Ok(GASPInitialReply {
+                utxo_list: Vec::new(),
+            })
         }
         async fn request_node(
             &self,
@@ -1147,7 +1153,9 @@ async fn clamped_responder_pages_to_completion_in_one_run() {
     // 2,500 rows: more than TWO clamped pages (max clamp 1,000), so a
     // single-page OR a two-page truncation both fail this probe.
     const N: u64 = 2_500;
-    let utxos: Vec<GASPOutput> = (1..=N).map(|i| utxo(&format!("tx{i}"), 0, i as f64)).collect();
+    let utxos: Vec<GASPOutput> = (1..=N)
+        .map(|i| utxo(&format!("tx{i}"), 0, i as f64))
+        .collect();
     let requests = std::rc::Rc::new(Mutex::new(0u32));
     let remote = ClampingRemote {
         utxos,
@@ -1240,10 +1248,18 @@ async fn clamped_responder_pages_to_completion_without_a_requested_limit() {
     // 1,200 rows: more than TWO default pages (500), so single-page AND
     // two-page truncation both fail this probe.
     const N: u64 = 1_200;
-    let utxos: Vec<GASPOutput> = (1..=N).map(|i| utxo(&format!("tx{i}"), 0, i as f64)).collect();
+    let utxos: Vec<GASPOutput> = (1..=N)
+        .map(|i| utxo(&format!("tx{i}"), 0, i as f64))
+        .collect();
     let local = TrackingGASPStorage::new(vec![]);
 
-    let mut gasp = GASPSync::new(Box::new(local), Box::new(ClampingRemote { utxos }), 0, "[TEST]", true);
+    let mut gasp = GASPSync::new(
+        Box::new(local),
+        Box::new(ClampingRemote { utxos }),
+        0,
+        "[TEST]",
+        true,
+    );
     gasp.sync(None).await.unwrap();
 
     assert_eq!(

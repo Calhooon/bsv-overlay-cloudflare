@@ -130,10 +130,7 @@ impl LowTopicManager {
     /// linkage for either record type.
     ///
     /// `fields` is the full field list including the trailing signature.
-    fn validate_common(
-        pushdrop: &PushDrop,
-        record_name: &str,
-    ) -> Result<bool, String> {
+    fn validate_common(pushdrop: &PushDrop, record_name: &str) -> Result<bool, String> {
         // Field[1]: host identity key (33-byte compressed pubkey)
         if pushdrop.fields[1].len() != 33 {
             return Err(format!("{record_name}: identity key must be 33 bytes"));
@@ -313,11 +310,11 @@ pub(crate) mod tests {
         vec![
             LOW_TABLE_TAG.to_vec(),
             hex::decode(identity).unwrap(),
-            [0x11u8; 32].to_vec(),                    // gameId
-            stake_sats.to_le_bytes().to_vec(),        // stake sats (8B LE)
-            [0x22u8; 32].to_vec(),                    // rules hash
-            relay_url.as_bytes().to_vec(),            // relay URL
-            expiry_height.to_le_bytes().to_vec(),     // expiry height (4B LE)
+            [0x11u8; 32].to_vec(),                // gameId
+            stake_sats.to_le_bytes().to_vec(),    // stake sats (8B LE)
+            [0x22u8; 32].to_vec(),                // rules hash
+            relay_url.as_bytes().to_vec(),        // relay URL
+            expiry_height.to_le_bytes().to_vec(), // expiry height (4B LE)
         ]
     }
 
@@ -327,9 +324,9 @@ pub(crate) mod tests {
         vec![
             LOW_GAMEUTXO_TAG.to_vec(),
             hex::decode(identity).unwrap(),
-            [0x11u8; 32].to_vec(),                // gameId
-            [0x33u8; 32].to_vec(),                // pot txid
-            pot_vout.to_le_bytes().to_vec(),      // pot vout (4B LE)
+            [0x11u8; 32].to_vec(),           // gameId
+            [0x33u8; 32].to_vec(),           // pot txid
+            pot_vout.to_le_bytes().to_vec(), // pot vout (4B LE)
         ]
     }
 
@@ -464,7 +461,10 @@ pub(crate) mod tests {
     #[test]
     fn table_open_oversize_relay_url_rejected() {
         let signer = PrivateKey::random();
-        let long_url = format!("https://{}.example.com", "a".repeat(LOW_MAX_RELAY_URL_BYTES));
+        let long_url = format!(
+            "https://{}.example.com",
+            "a".repeat(LOW_MAX_RELAY_URL_BYTES)
+        );
         let fields = table_open_data_fields(&signer, 1000, &long_url, 900000);
         let output = make_signed_low_output(&signer, fields);
         assert!(LowTopicManager::validate_low_output(&output).is_err());
@@ -635,7 +635,10 @@ pub(crate) mod tests {
         let instructions = mgr
             .identify_admissible_outputs(
                 &Transaction::from_beef(&beef, None).expect("engine-side parse"),
-                &[], None, SubmitMode::HistoricalTxNoSpv)
+                &[],
+                None,
+                SubmitMode::HistoricalTxNoSpv,
+            )
             .await
             .unwrap();
         assert_eq!(instructions.outputs_to_admit, vec![0, 2]);

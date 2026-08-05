@@ -24,12 +24,12 @@
 //! new builder added tomorrow is covered the moment it is listed here.
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
+use low_app_layer::hops_view::hops_view_sql;
 use low_app_layer::live_view::{keyless_candidates_sql, live_view_sql};
 use low_app_layer::logic::{
     batch_where_sql, leaderboard_markers_sql, pots_view_join_sql, proof_pointers_sql,
     recovery_view_sql,
 };
-use low_app_layer::hops_view::hops_view_sql;
 use low_app_layer::refund_view::refund_view_sql;
 use low_app_layer::results::{claims_sql, decoded_pots_sql, results_sql, seat_markers_sql};
 use rusqlite::Connection;

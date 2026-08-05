@@ -136,13 +136,15 @@ pub fn refund_view_sql() -> String {
                 sb.proof_verified AS spenderProofVerified \
          FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                   spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
-                  markerCreatedAt, markerRowid, potCreatedAt, \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                     spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                    potBestSigRank, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
-                                       ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                       ORDER BY potBestSigRank DESC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                                                 markerCreatedAt DESC, markerRowid DESC) AS potRank \
              FROM (SELECT pp.gameId AS gameId, pp.potTxid AS potTxid, \
                       pp.potVout AS potVout, pp.recoveryHeight AS recoveryHeight, \
@@ -154,22 +156,28 @@ pub fn refund_view_sql() -> String {
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                      MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
+                          AS potBestSigRank, \
                       ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
-                                         ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
                FROM potparty_records pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ?) \
              WHERE rn = 1) \
-           ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+           ORDER BY potBestSigRank DESC, tier ASC, \
+                    COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
            LIMIT {rows}) w \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND sb.txid = lower(w.spendingTxid) \
-         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+         ORDER BY w.potBestSigRank DESC, w.tier ASC, \
+                  COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = REFUND_VIEW_UNKNOWN_POT_QUOTA,
         rows = REFUND_VIEW_MAX_ROWS,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
     )
 }
 

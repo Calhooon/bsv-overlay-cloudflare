@@ -572,7 +572,10 @@ pub(crate) mod tests {
         // Same 24-byte length as LOW/potparty/v2/seatsig| — one fixed
         // preimage layout, two disjoint domains.
         assert_eq!(HOPPARTY_SEATSIG_DOMAIN.len(), 24);
-        assert_eq!(HOPPARTY_SEATSIG_DOMAIN, b"LOW/hopparty/v1/seatsig|".as_slice());
+        assert_eq!(
+            HOPPARTY_SEATSIG_DOMAIN,
+            b"LOW/hopparty/v1/seatsig|".as_slice()
+        );
         assert_ne!(
             HOPPARTY_SEATSIG_DOMAIN,
             b"LOW/potparty/v2/seatsig|".as_slice()
@@ -632,8 +635,7 @@ pub(crate) mod tests {
         let (wallet, opponent, game_id, hop_vout, hop_sats) = golden_vector_inputs();
         let identity = hex::decode(wallet.identity_key_hex()).unwrap();
         let game_id_hex = hex::encode(game_id);
-        let opponent_pub =
-            bsv_rs::primitives::ec::PublicKey::from_bytes(&opponent).unwrap();
+        let opponent_pub = bsv_rs::primitives::ec::PublicKey::from_bytes(&opponent).unwrap();
 
         // The seat's settle pubkey: [2,'low settle'], keyID = gameId,
         // counterparty = opponent, forSelf — the derivation whose pubkey the
@@ -754,10 +756,8 @@ pub(crate) mod tests {
         let m = parse_hopparty_marker(&script).unwrap();
 
         // seatSig: plain ECDSA under seatSettlePubkey over sha256(preimage).
-        let preimage =
-            hopparty_seatsig_preimage(&m.game_id, m.hop_vout, &m.identity).unwrap();
-        let pubkey =
-            bsv_rs::primitives::ec::PublicKey::from_bytes(&m.seat_settle_pubkey).unwrap();
+        let preimage = hopparty_seatsig_preimage(&m.game_id, m.hop_vout, &m.identity).unwrap();
+        let pubkey = bsv_rs::primitives::ec::PublicKey::from_bytes(&m.seat_settle_pubkey).unwrap();
         let sig = bsv_rs::primitives::ec::Signature::from_der(&m.seat_sig).unwrap();
         assert!(
             pubkey.verify(&bsv_rs::primitives::hash::sha256(&preimage), &sig),
@@ -790,7 +790,10 @@ pub(crate) mod tests {
             })
             .map(|r| r.valid)
             .unwrap_or(false);
-        assert!(valid, "golden identitySig must verify with the anyone round-trip");
+        assert!(
+            valid,
+            "golden identitySig must verify with the anyone round-trip"
+        );
     }
 
     // ── Round-trips ───────────────────────────────────────────────────────
@@ -1149,7 +1152,10 @@ pub(crate) mod tests {
         // 10 pushes: the golden marker + one extra.
         let mut s = golden_marker(&golden_game_id(), golden_vout());
         s.extend(push_data(&[0x99u8; 4]));
-        assert!(parse_hopparty_marker(&s).is_none(), "a 10th push is not the format");
+        assert!(
+            parse_hopparty_marker(&s).is_none(),
+            "a 10th push is not the format"
+        );
     }
 
     #[test]
@@ -1214,7 +1220,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(c.len(), 15 + 33 + 33 + 32 + 4 + 8 + 33);
-        assert!(c.starts_with(HOPPARTY_TAG), "the tag IS the domain separator");
+        assert!(
+            c.starts_with(HOPPARTY_TAG),
+            "the tag IS the domain separator"
+        );
         assert_eq!(&c[15..48], golden_identity().as_slice());
         assert_eq!(&c[48..81], golden_opponent().as_slice());
         assert_eq!(&c[81..113], &golden_game_id());

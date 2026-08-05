@@ -76,6 +76,7 @@
 pub mod lookup_service;
 pub mod storage;
 pub mod topic_manager;
+pub mod validity;
 
 /// The domain tag the app stamps. v1 = `(tag, identity, opponentIdentity,
 /// gameId, potTxid, potVout, recoveryHeight, sig)`. 15 bytes of ASCII —
