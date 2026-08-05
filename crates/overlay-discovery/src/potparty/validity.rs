@@ -268,7 +268,11 @@ pub fn seatsig_preimage(
 /// with nothing left watching it. `no_malleated_variant_of_an_honest_marker_
 /// latches_valid` asserts the PROPERTY rather than which leg enforces it, so
 /// the pin survives either arrangement.
-fn canonical_der(sig: &[u8]) -> Option<bsv_rs::primitives::ec::Signature> {
+///
+/// `pub(crate)` since bsv-low #362: the hopparty latch goes through this
+/// EXACT gate rather than a second copy of it (epoch Rule 10 — the durable
+/// fix for "these two must agree" is one shared predicate, not a test).
+pub(crate) fn canonical_der(sig: &[u8]) -> Option<bsv_rs::primitives::ec::Signature> {
     let parsed = bsv_rs::primitives::ec::Signature::from_der(sig).ok()?;
     if parsed.to_der() != sig || !parsed.is_low_s() {
         return None;
