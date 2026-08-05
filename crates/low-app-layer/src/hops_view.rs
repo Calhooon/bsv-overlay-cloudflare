@@ -1104,12 +1104,28 @@ mod tests {
     /// THE #362 SHAPE PINS: the latched verdict is a LEADING SORT KEY, built
     /// from the OVERLAY's shared expression, and it is NEVER a filter.
     ///
-    /// The `WHERE` half is the one that matters most and it is asserted
-    /// positively rather than by absence-of-a-string: the query has exactly
-    /// the three `WHERE`s it has always had (identity scope, per-outpoint
-    /// superset, page rank), so a fourth one — however it is spelled — fails
-    /// here. A bare "does not contain `WHERE markerValid`" needle would be
-    /// one whitespace or one alias wide (epoch Rule 12a).
+    /// # This cell is a BELT. The bar is behavioural. (Measured, Rule 12a)
+    ///
+    /// An earlier revision of this doc claimed the `WHERE` count meant "a
+    /// fourth `WHERE` — however it is spelled — fails here". **RED-verified
+    /// false**: folding `AND COALESCE(hp.markerValid, 1) <> 0` into the
+    /// EXISTING identity `WHERE` compiles, hides every refuted row, and
+    /// leaves this cell GREEN. One `AND` defeated it. That is the rule
+    /// itself — you cannot enumerate your way to a property — recorded here
+    /// rather than papered over.
+    ///
+    /// What DOES observe that injection is the real-SQLite behaviour, which
+    /// runs the shipped query against rows of every verdict class and counts
+    /// what comes back:
+    /// `hops_view_sqlite.rs::junk_sig_marker_is_served_labeled_unverified_never_verified`
+    /// (RED-confirmed against exactly that injection) and
+    /// `…::a_legacy_row_is_served_labelled_unknown_and_ranks_between_the_two_verdicts`.
+    /// Row conservation is a property; a clause count is a spelling.
+    ///
+    /// The counts below are kept because they are cheap and they DO see a
+    /// whole new clause, a demoted sort key, or a rank expression that
+    /// stopped being the overlay's. They are blind to an `AND`, and now say
+    /// so.
     #[test]
     fn the_latched_verdict_leads_every_order_and_filters_nothing() {
         for scoped in [false, true] {
@@ -1147,16 +1163,33 @@ mod tests {
                 "MAX(markerRank) OVER (PARTITION BY hopTxid, hopVout) \
                           AS outpointMarkerRank"
             ));
-            // NEVER A WHERE. Exactly the three the window has always had —
-            // and the `?gameId=` scope must not add a fourth, which is why
-            // the count is asserted for BOTH shapes rather than one.
+            // Exactly the three clauses the window has always had (identity
+            // scope, rn <= superset, finalRank <= page). BLIND to a term
+            // ANDed into one of them — see the doc above; the behavioural
+            // cells are what cover that.
             assert_eq!(
                 sql.matches("WHERE ").count(),
                 3,
-                "identity scope, rn <= superset, finalRank <= page — and \
-                 nothing else. A fourth WHERE (in ANY spelling) means \
-                 somebody started HIDING rows: {sql}"
+                "a whole new WHERE clause appeared: {sql}"
             );
+            // The three names a filter would have to reach for, counted where
+            // they legitimately appear. Any EXTRA use — in a WHERE, a HAVING,
+            // a CASE that nulls a row out, or an ANDed term — moves one of
+            // these. Still a count, still a belt: re-derive them deliberately
+            // if the nesting changes, never by pasting a failure's output.
+            //
+            //   markerValid = 10: 2 in the rank CASE, 2 in L0's alias, 4
+            //     carried through L1..L4, 2 in the outer projection.
+            //   markerRank = 8: L0's alias, L1's carry + its MAX(), L2/L3/L4
+            //     carries, the L4 ORDER BY, the outer ORDER BY. (It does NOT
+            //     overlap `outpointMarkerRank` — that one capitalises the M.)
+            //   outpointMarkerRank = 7: L1's alias, L2/L3/L4 carries, the
+            //     DENSE_RANK ordering, the L4 ORDER BY, the outer ORDER BY.
+            // The `?gameId=` scope adds no rank identifier, so both shapes
+            // must agree — which is why this runs inside the `scoped` loop.
+            assert_eq!(sql.matches("markerValid").count(), 10, "{sql}");
+            assert_eq!(sql.matches("markerRank").count(), 8, "{sql}");
+            assert_eq!(sql.matches("outpointMarkerRank").count(), 7, "{sql}");
             assert!(sql.contains("WHERE hp.identity = ?1"));
             assert!(sql.contains(&format!("WHERE rn <= {HOPS_VIEW_ROWS_PER_OUTPOINT}")));
             assert!(sql.contains(&format!(
