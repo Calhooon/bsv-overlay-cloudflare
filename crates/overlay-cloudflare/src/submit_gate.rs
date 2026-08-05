@@ -154,13 +154,19 @@
 //! `SEEN_ON_NETWORK` gate (rank 7), so a mined tx reads as `Reached`. A
 //! re-submit of an already-broadcast tx therefore passes the gate idempotently.
 //!
-//! **The prerequisite that is NOT free, and it splits by producer:** the gated
-//! path first converts the BEEF to Extended Format, and
-//! `ef::beef_to_ef_batch` hard-errors when the SUBJECT's source transactions
-//! are absent from the BEEF. A single-tx proofless BEEF therefore returns 400
-//! *before any network call*. The browser client is fine (it merges ancestry on
-//! its gated path); the watchtower's `wrap_raw_tx_beef_v1` single-tx wrapper is
-//! not, which is why step 2 above offers it the token as well as migration.
+//! **The prerequisite that is NOT free:** the gated path first converts the
+//! BEEF to Extended Format, and `ef::beef_to_ef_batch` hard-errors when the
+//! SUBJECT's source transactions are absent from the BEEF. A single-tx
+//! proofless BEEF therefore returns 400 *before any network call*.
+//!
+//! **BOTH honest producers are blocked on this today** — that is what makes
+//! bsv-low #351 the enabler rather than a follow-up. `overlay.ts::submitBeef`
+//! builds `new Beef()` + `mergeRawTx` with NO ancestry and ten marker surfaces
+//! route through it; the watchtower's `wrap_raw_tx_beef_v1` wraps a bare raw
+//! tx. (An earlier version of this paragraph said "the browser client is fine
+//! (it merges ancestry on its gated path)" — that describes
+//! `broadcastViaOverlay`, a DIFFERENT producer, and is false for the callers
+//! that matter. It contradicted the closure criteria thirty lines above it.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -171,9 +177,12 @@ use overlay_engine::types::SubmitMode;
 /// endpoint allows it (Rule 15: derive the decision, don't accept it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionPath {
-    /// No mode header — engine `CurrentTx`. Barred by SPV.
+    /// No mode header — engine `CurrentTx`. **NOT barred**: the engine's SPV
+    /// pass is not an admission bar (see [`AdmissionPath::has_bar`]). Operator only.
     CurrentTx,
-    /// `historical-tx` — engine `HistoricalTx`. Barred by SPV.
+    /// `historical-tx` — engine `HistoricalTx`. **NOT barred** for the same
+    /// reason as [`CurrentTx`](Self::CurrentTx); the name is the wire mode's,
+    /// not a claim about admission. Operator only.
     HistoricalSpv,
     /// `broadcast-gated` — the overlay broadcasts and admits only on
     /// `SEEN_ON_NETWORK`. Barred by the network.
@@ -182,8 +191,26 @@ pub enum AdmissionPath {
     HistoricalUngated,
 }
 
-/// Every variant, for exhaustive property pins. Adding a variant without
-/// adding it here fails [`AdmissionPath::as_str`]'s exhaustive match first.
+/// Every variant, for exhaustive property pins.
+///
+/// **This array can silently shrink, and four pins quantify over it** — the
+/// same "subject leaves its field of view" mode that produced the #347
+/// CRITICAL, in this same file. A re-gate proved it: a fifth variant reachable
+/// from a public header, with arms in `engine_mode`/`as_str`/`from_header` but
+/// NOT here, compiled and left every "exhaustive" pin green.
+///
+/// Note the trap in the OBVIOUS fix: a "variant count" computed by iterating
+/// this array always equals its length, so it is `f(x) == f(x)` in a costume
+/// (Rule 9 — "is there an edit that changes both sides at once?"). It was
+/// tried here first and passed probe G unchanged.
+///
+/// What actually closes it is
+/// `every_header_reachable_path_is_covered_by_the_pinned_set`, which pins the
+/// property that matters rather than a count: it reads the header literals out
+/// of [`AdmissionPath::from_header`]'s own source, drives each one through it,
+/// and asserts every reachable result is in this array. A variant reachable
+/// from a new public header is then RED whether or not anyone remembers to
+/// update a number.
 pub const ALL_ADMISSION_PATHS: [AdmissionPath; 4] = [
     AdmissionPath::CurrentTx,
     AdmissionPath::HistoricalSpv,
@@ -195,7 +222,9 @@ impl AdmissionPath {
     /// Map the `x-submit-mode` header to a path.
     ///
     /// `extensions_enabled == false` is the KILL SWITCH: the header is ignored
-    /// entirely and every submit takes the SPV-barred default. Before #347 the
+    /// and every submit takes the default path — which is itself UNBARRED and
+    /// therefore operator-only. `broadcast-gated` is exempt and honoured
+    /// unconditionally, so the switch can never route a caller off the gate. Before #347 the
     /// `ENABLE_EXTENSIONS` var was dead config — set in both wrangler configs,
     /// read nowhere in Rust — while the Makefile claimed it disabled
     /// `X-Submit-Mode`. That claim is now true.
@@ -265,6 +294,17 @@ impl AdmissionPath {
     /// network accept THIS transaction* — and it refuses both shapes
     /// (`bad-txns-vin-empty` for the first). So it is the one public path;
     /// everything else is operator-only.
+    /// **Scope:** this classification governs the `/submit` ROUTE only. Other
+    /// admission entry points (`engine.submit` for GASP sync, `peer_crawler`)
+    /// admit on paths classified unbarred here; they are not route-reachable
+    /// (GASP is `Disabled` for every LOW topic and the peer list is pinned),
+    /// but the invariant is about the public HTTP surface, not the engine.
+    ///
+    /// Kept as a distinct name from [`network_gate_required`](Self::network_gate_required)
+    /// even though the two are now the same predicate: they answer different
+    /// questions ("is this path defensible?" vs "does the route run the
+    /// broadcast block?"), and collapsing them would make a future divergence
+    /// silent. If a second genuine bar ever exists, only this one changes.
     pub fn has_bar(self) -> bool {
         self.network_gate_required()
     }
@@ -349,8 +389,20 @@ pub fn decide(path: AdmissionPath, operator_authed: bool, mode: GateMode) -> Gat
 /// ZERO automated coverage — deleting the entire refusal from `routes.rs`
 /// compiled and left CI fully green. **The wiring IS the defect class** (#347
 /// was a wiring bug, not a logic bug), so it cannot live only as inline route
-/// code. Everything the route needs is computed here and the route may only
-/// read these fields; there is no second way for it to express the decision.
+/// code.
+///
+/// **An earlier version of this doc claimed "there is no second way for it to
+/// express the decision". That was FALSE and is exactly the failure it warns
+/// about** (Rule 22): a re-gate deleted the whole 401 block and disabled the
+/// gate branch, and BOTH left 1826/1826 green. The struct made the route
+/// *tidier*, not its use *observable*, and the claim then sat in the source
+/// where it would stop the next auditor from running the check (Rule 10).
+///
+/// What actually constrains the route now is [`SubmitAction`]: the route
+/// consumes it through an EXHAUSTIVE match, so deleting the refusal arm is a
+/// COMPILE ERROR rather than a silent green. See
+/// [`crate::routes::tests`]' source pins for the branch that a match cannot
+/// cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmitPlan {
     /// The derived admission path.
@@ -364,6 +416,63 @@ pub struct SubmitPlan {
     /// Whether this submit is an unauthenticated caller on an unbarred path
     /// (the lenient-window signal the operator logs and counts).
     pub unauthenticated_unbarred: bool,
+}
+
+/// What the route must DO — consumed through an exhaustive `match`, so an arm
+/// cannot be deleted without breaking the build (Rule 22: the test is whether
+/// anything can observe the seam being IGNORED).
+///
+/// A bare `SubmitPlan` could not deliver that: reading a struct field is
+/// optional, and a probe that simply removed the `if plan.decision == …`
+/// block compiled and stayed green. An enum arm is not optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitAction {
+    /// Unbarred path + unauthenticated + strict → honest 401.
+    RefuseUnauthenticated(AdmissionPath),
+    /// The one public path: run the broadcast + SEEN gate, then admit.
+    ProceedWithNetworkGate(AdmissionPath),
+    /// An operator on an unbarred path, or the lenient window → admit
+    /// without the gate. `lenient_unbarred` marks the counted soak case.
+    ProceedWithoutGate {
+        path: AdmissionPath,
+        lenient_unbarred: bool,
+    },
+}
+
+impl SubmitAction {
+    /// The engine mode this action submits under.
+    pub fn engine_mode(self) -> SubmitMode {
+        self.path().engine_mode()
+    }
+
+    /// The admission path this action was derived from.
+    pub fn path(self) -> AdmissionPath {
+        match self {
+            Self::RefuseUnauthenticated(p) => p,
+            Self::ProceedWithNetworkGate(p) => p,
+            Self::ProceedWithoutGate { path, .. } => path,
+        }
+    }
+}
+
+/// Derive the ACTION — the form the route is obliged to consume exhaustively.
+pub fn action_for(
+    header: Option<&str>,
+    extensions_enabled: bool,
+    operator_authed: bool,
+    mode: GateMode,
+) -> SubmitAction {
+    let plan = plan_submit(header, extensions_enabled, operator_authed, mode);
+    match plan.decision {
+        GateDecision::RefuseUnauthenticated => SubmitAction::RefuseUnauthenticated(plan.path),
+        GateDecision::Proceed if plan.run_network_gate => {
+            SubmitAction::ProceedWithNetworkGate(plan.path)
+        }
+        GateDecision::Proceed => SubmitAction::ProceedWithoutGate {
+            path: plan.path,
+            lenient_unbarred: plan.unauthenticated_unbarred,
+        },
+    }
 }
 
 /// Derive the whole plan. The ONLY entry point the route uses.
@@ -458,6 +567,79 @@ mod tests {
         assert_eq!(barred, vec![&AdmissionPath::NetworkGated]);
     }
 
+    /// MEDIUM-B: no path reachable from a PUBLIC HEADER may escape the pinned
+    /// set, or every "exhaustive" pin in this module silently stops covering it.
+    ///
+    /// A re-gate (probe G) added a fifth variant with arms in `engine_mode`,
+    /// `as_str` and `from_header` but NOT in `ALL_ADMISSION_PATHS`: it compiled
+    /// and all 1826 tests stayed green — the same "subject leaves its field of
+    /// view" mode that produced the original CRITICAL, in this same file.
+    ///
+    /// This pins the PROPERTY, not a count: the header literals are read out of
+    /// `from_header`'s own source (so a new header cannot be added without this
+    /// cell seeing it), driven through the real function, and every result must
+    /// be a member of the pinned set. Built per Rule 9 — a POSITIVE count of
+    /// the literals found, a needle split so it cannot match itself, and
+    /// comments stripped so prose is never counted.
+    #[test]
+    fn every_header_reachable_path_is_covered_by_the_pinned_set() {
+        let src = include_str!("submit_gate.rs");
+        // Isolate `from_header`'s body (the construct, not a region — Rule 9).
+        let sig = ["pub fn from_", "header("].concat();
+        let start = src.find(&sig).expect("from_header must exist");
+        let body = &src[start..];
+        let end = body.find("\n    }").expect("from_header body must terminate");
+        let body = &body[..end];
+        // Strip line comments so a doc example can never inflate the corpus.
+        let code: String = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Every `Some("…")` arm literal in the real matcher.
+        let mut headers: Vec<String> = Vec::new();
+        let open = ["Some(", "\""].concat();
+        let mut rest = code.as_str();
+        while let Some(i) = rest.find(&open) {
+            rest = &rest[i + open.len()..];
+            if let Some(j) = rest.find('"') {
+                headers.push(rest[..j].to_string());
+                rest = &rest[j + 1..];
+            }
+        }
+        assert!(
+            headers.len() >= 3,
+            "expected at least the three known mode literals, found {headers:?} \
+             — the scan drifted and this cell is asserting nothing"
+        );
+
+        // The property: every header-reachable path is in the pinned set.
+        for h in &headers {
+            for extensions in [true, false] {
+                let path = AdmissionPath::from_header(Some(h), extensions);
+                assert!(
+                    ALL_ADMISSION_PATHS.contains(&path),
+                    "header {h:?} (extensions={extensions}) reaches {} which is \
+                     NOT in ALL_ADMISSION_PATHS — every exhaustive pin in this \
+                     module is silently not covering it",
+                    path.as_str()
+                );
+            }
+        }
+        // The default and an unknown header too.
+        for h in [None, Some("wat")] {
+            assert!(ALL_ADMISSION_PATHS.contains(&AdmissionPath::from_header(h, true)));
+        }
+        // No duplicates padding the set.
+        let mut seen = ALL_ADMISSION_PATHS.to_vec();
+        seen.dedup();
+        assert_eq!(seen.len(), ALL_ADMISSION_PATHS.len(), "duplicate variants");
+    }
+
     /// The header→path mapping, including the two that share an engine mode.
     #[test]
     fn header_maps_to_the_intended_path() {
@@ -469,8 +651,8 @@ mod tests {
                 Some("historical-tx-no-spv"),
                 AdmissionPath::HistoricalUngated,
             ),
-            // An unknown mode must fall to the SPV-barred default, never to
-            // the unbarred path.
+            // An unknown mode must fall to the DEFAULT path (itself unbarred
+            // and therefore operator-only), never be treated as a public one.
             (Some("wat"), AdmissionPath::CurrentTx),
             (Some(""), AdmissionPath::CurrentTx),
         ];
@@ -578,6 +760,94 @@ mod tests {
         let plan = plan_submit(Some("broadcast-gated"), true, false, GateMode::Strict);
         assert_eq!(plan.decision, GateDecision::Proceed);
         assert!(plan.run_network_gate, "the honest public path must be GATED");
+    }
+
+    /// `action_for` is what the ROUTE consumes, so it needs its own cells —
+    /// pinning `plan_submit` alone leaves the plan→action mapping uncovered.
+    ///
+    /// Found by RED-verifying the route harness: neutering the Refuse mapping
+    /// HERE (returning `ProceedWithoutGate` instead) left the route's
+    /// exhaustive match intact, the source pins matching, and the ENTIRE
+    /// native suite green — only the HTTP harness caught it. That is Rule 16
+    /// in miniature: both sides of the boundary were pinned and the boundary
+    /// itself was not.
+    #[test]
+    fn action_for_maps_every_decision_to_the_action_the_route_consumes() {
+        // The refusal must become the Refuse action, not a silent proceed.
+        assert_eq!(
+            action_for(None, true, false, GateMode::Strict),
+            SubmitAction::RefuseUnauthenticated(AdmissionPath::CurrentTx),
+        );
+        assert_eq!(
+            action_for(Some("historical-tx-no-spv"), true, false, GateMode::Strict),
+            SubmitAction::RefuseUnauthenticated(AdmissionPath::HistoricalUngated),
+        );
+        // The one public path always gates, in every mode, authed or not.
+        for mode in [GateMode::Lenient, GateMode::Strict] {
+            for authed in [false, true] {
+                assert_eq!(
+                    action_for(Some("broadcast-gated"), true, authed, mode),
+                    SubmitAction::ProceedWithNetworkGate(AdmissionPath::NetworkGated),
+                );
+            }
+        }
+        // An operator on an unbarred path proceeds ungated and is NOT counted
+        // as the lenient soak case.
+        assert_eq!(
+            action_for(Some("historical-tx-no-spv"), true, true, GateMode::Strict),
+            SubmitAction::ProceedWithoutGate {
+                path: AdmissionPath::HistoricalUngated,
+                lenient_unbarred: false,
+            },
+        );
+        // The lenient window proceeds ungated and IS counted.
+        assert_eq!(
+            action_for(Some("historical-tx-no-spv"), true, false, GateMode::Lenient),
+            SubmitAction::ProceedWithoutGate {
+                path: AdmissionPath::HistoricalUngated,
+                lenient_unbarred: true,
+            },
+        );
+    }
+
+    /// Exhaustively: `action_for` must agree with `plan_submit` for EVERY
+    /// input, so the two cannot drift (the plan is the seam, the action is
+    /// what the route sees).
+    #[test]
+    fn action_for_agrees_with_plan_submit_everywhere() {
+        for header in [
+            None,
+            Some("historical-tx"),
+            Some("historical-tx-no-spv"),
+            Some("broadcast-gated"),
+            Some("wat"),
+        ] {
+            for extensions in [true, false] {
+                for authed in [false, true] {
+                    for mode in [GateMode::Lenient, GateMode::Strict] {
+                        let plan = plan_submit(header, extensions, authed, mode);
+                        let action = action_for(header, extensions, authed, mode);
+                        assert_eq!(action.path(), plan.path);
+                        assert_eq!(action.engine_mode(), plan.engine_mode);
+                        match action {
+                            SubmitAction::RefuseUnauthenticated(_) => assert_eq!(
+                                plan.decision,
+                                GateDecision::RefuseUnauthenticated,
+                                "a Refuse action must come from a Refuse decision"
+                            ),
+                            SubmitAction::ProceedWithNetworkGate(_) => {
+                                assert_eq!(plan.decision, GateDecision::Proceed);
+                                assert!(plan.run_network_gate);
+                            }
+                            SubmitAction::ProceedWithoutGate { .. } => {
+                                assert_eq!(plan.decision, GateDecision::Proceed);
+                                assert!(!plan.run_network_gate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The wiring seam: a refused submit never runs the gate, a barred one

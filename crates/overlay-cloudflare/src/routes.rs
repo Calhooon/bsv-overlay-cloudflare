@@ -430,7 +430,8 @@ pub async fn submit(
     // Worker context — used only to background the mainnet SHIP fan-out.
     ctx: &Context,
     // #347: the submit-gate needs the env for ENABLE_EXTENSIONS (kill switch),
-    // SUBMIT_ENFORCE (the Rule 6c rollout flag) and the operator ADMIN_TOKEN.
+    // SUBMIT_ENFORCE (the Rule 6c rollout flag) and SUBMIT_OPERATOR_TOKEN
+    // (deliberately NOT ADMIN_TOKEN — see `check_submit_operator_auth`).
     env: &Env,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
@@ -530,33 +531,56 @@ pub async fn submit(
         operator_authed,
         gate_mode,
     );
-    let mode = plan.engine_mode;
+    let action = crate::submit_gate::action_for(
+        mode_header.as_deref(),
+        extensions_enabled,
+        operator_authed,
+        gate_mode,
+    );
+    let mode = action.engine_mode();
     crate::submit_gate::note(plan.path, operator_authed, plan.decision);
-    if plan.decision == crate::submit_gate::GateDecision::RefuseUnauthenticated {
-        worker::console_log!(
-            "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
-            plan.path.as_str()
-        );
-        return json_error(
-            &format!(
-                "submit mode '{}' has no admission bar and is restricted to operators — \
-                 submit with 'broadcast-gated' (the overlay broadcasts and admits only on \
-                 network acceptance; an already-broadcast tx satisfies it idempotently), \
-                 or present the submit-operator Bearer token",
-                plan.path.as_str()
-            ),
-            401,
-        );
-    }
-    if plan.unauthenticated_unbarred {
-        // Lenient window (Rule 6c). Counted above; logged here so the operator
-        // can see WHO is still on an unbarred path before flipping enforcement.
-        worker::console_log!(
-            "POST /submit: UNAUTHENTICATED submit on unbarred path {} — served under the \
-             lenient window (#347); set SUBMIT_ENFORCE=true to refuse",
-            plan.path.as_str()
-        );
-    }
+
+    // EXHAUSTIVE match (Rule 22): the route consumes the decision as an enum,
+    // so an arm cannot be deleted without breaking the BUILD. A previous
+    // version read a struct field in an `if`, which a re-gate deleted outright
+    // while the whole suite stayed green — reading a field is optional, an arm
+    // is not. `run_network_gate` is the single value the rest of the handler
+    // branches on, and it is produced HERE and nowhere else.
+    let run_network_gate = match action {
+        crate::submit_gate::SubmitAction::RefuseUnauthenticated(path) => {
+            worker::console_log!(
+                "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
+                path.as_str()
+            );
+            return json_error(
+                &format!(
+                    "submit mode '{}' has no admission bar and is restricted to operators — \
+                     submit with 'broadcast-gated' (the overlay broadcasts and admits only on \
+                     network acceptance; an already-broadcast tx satisfies it idempotently), \
+                     or present the submit-operator Bearer token",
+                    path.as_str()
+                ),
+                401,
+            );
+        }
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_) => true,
+        crate::submit_gate::SubmitAction::ProceedWithoutGate {
+            path,
+            lenient_unbarred,
+        } => {
+            if lenient_unbarred {
+                // Lenient window (Rule 6c). Counted above; logged here so the
+                // operator can see WHO is still on an unbarred path before
+                // flipping enforcement.
+                worker::console_log!(
+                    "POST /submit: UNAUTHENTICATED submit on unbarred path {} — served under \
+                     the lenient window (#347); set SUBMIT_ENFORCE=true to refuse",
+                    path.as_str()
+                );
+            }
+            false
+        }
+    };
 
     // ── BROADCAST-GATED submit (bsv-low overlay-first, 2026-07-17; the
     // zanaadu invariant): the OVERLAY broadcasts, and NOTHING is admitted
@@ -579,7 +603,7 @@ pub async fn submit(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
-    if plan.run_network_gate {
+    if run_network_gate {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
         // and NOTHING is admitted unless Arcade reports the SUBJECT
@@ -1367,6 +1391,14 @@ pub fn check_submit_operator_auth(req: &Request, env: &Env) -> bool {
     !provided.is_empty() && fixed_time_eq(provided.as_bytes(), token.as_bytes())
 }
 
+/// The ADMIN credential (`ADMIN_TOKEN`) for the `/admin/*` routes — including
+/// the destructive ones (`/admin/evictOutpoint`, `/admin/ban`,
+/// `/admin/startGASPSync`).
+///
+/// Distinct from [`check_submit_operator_auth`]: `/submit` operators must NOT
+/// receive this token (#347 gate M1). Returns `Err(response)` so callers can
+/// short-circuit with mainline-compatible 401/403 bodies, where the submit
+/// check returns a plain `bool`.
 pub fn check_admin_auth(req: &Request, env: &Env) -> Result<(), worker::Result<Response>> {
     // Token source: prefer secret (wrangler secret put ADMIN_TOKEN),
     // fall back to [vars] / --var. Treat unset as empty string — any Bearer
@@ -2272,6 +2304,115 @@ pub fn not_found() -> worker::Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    // ── #347 Rule 22: can anything observe the seam being IGNORED? ────────
+    //
+    // The exhaustive `match` on `SubmitAction` makes DELETING the refusal a
+    // compile error. It cannot cover the remaining branch — `if
+    // run_network_gate { …broadcast+SEEN… }` — which a re-gate disabled with a
+    // one-token `&& false` while all 1826 tests stayed green.
+    //
+    // These are SOURCE pins, and source pins lie in five documented ways, so
+    // each one below is: POSITIVE (an exact count, never `assert!(!contains)`,
+    // so a rotted needle fails loudly instead of passing vacuously); built
+    // from a SPLIT needle assembled at runtime so it cannot match itself
+    // inside this test; run over COMMENT-STRIPPED source so prose quoting the
+    // construct is not counted; and scoped to the CONSTRUCT, never a region.
+    //
+    // They are a backstop for one branch, not the primary defence. The primary
+    // defence is the enum. The executable end-to-end proof is
+    // `tools/lane-347/submit_gate_attack.mjs` via `make ci-route`.
+
+    /// Strip `//` line comments and `/* */` blocks so a pin counts CODE only.
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        let mut in_line = false;
+        let mut in_block = false;
+        while let Some(c) = chars.next() {
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                    out.push(c);
+                }
+                continue;
+            }
+            if in_block {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block = false;
+                }
+                continue;
+            }
+            if c == '/' {
+                match chars.peek() {
+                    Some('/') => {
+                        in_line = true;
+                        continue;
+                    }
+                    Some('*') => {
+                        chars.next();
+                        in_block = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// The gate branch must be EXACTLY the plan's value, with no extra
+    /// conjunct that could disable it. Probe F (`&& cfg!(…) && false`) makes
+    /// this count 0 → RED.
+    #[test]
+    fn the_network_gate_branch_is_keyed_solely_on_the_derived_decision() {
+        let src = code_only(include_str!("routes.rs"));
+        // Split so the needle never appears whole in this file.
+        let needle = ["if run_network", "_gate {"].concat();
+        assert_eq!(
+            src.matches(&needle).count(),
+            1,
+            "expected EXACTLY one unconditional `{needle}` branch — a changed \
+             or extra conjunct disables the only public admission bar"
+        );
+        // And the value it branches on is produced by the seam, once.
+        let produced = ["let run_network_gate = match ", "action {"].concat();
+        assert_eq!(
+            src.matches(&produced).count(),
+            1,
+            "the gate value must come from the exhaustive match on the seam"
+        );
+    }
+
+    /// The refusal must remain a returned 401 inside the match arm. Deleting
+    /// the arm is a compile error; this catches it being neutered in place
+    /// (e.g. the `return` removed, or the status changed).
+    #[test]
+    fn the_unauthenticated_refusal_returns_401_from_the_seam_arm() {
+        let src = code_only(include_str!("routes.rs"));
+        let arm = ["SubmitAction::Refuse", "Unauthenticated(path) => {"].concat();
+        assert_eq!(
+            src.matches(&arm).count(),
+            1,
+            "the refusal arm must exist exactly once"
+        );
+        // The arm's body must still RETURN a 401 (not merely log).
+        let tail = &src[src.find(&arm).unwrap()..];
+        let body_end = tail.find("SubmitAction::ProceedWithNetworkGate").unwrap_or(tail.len());
+        let body = &tail[..body_end];
+        assert_eq!(
+            body.matches("401,").count(),
+            1,
+            "the refusal arm must return a 401"
+        );
+        assert_eq!(
+            body.matches("return json_error").count(),
+            1,
+            "the refusal must RETURN, not fall through"
+        );
+    }
+
     use super::*;
     use overlay_engine::types::ServiceMetadata;
     use std::collections::HashMap;

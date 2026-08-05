@@ -171,11 +171,46 @@ npx wrangler secret put ADMIN_TOKEN
 npx wrangler secret put SERVER_PRIVATE_KEY
 # Optional — enables /arc-ingest and ARC broadcast of admitted transactions
 npx wrangler secret put TAAL_API_KEY
+# Optional — Bearer credential for the UNBARRED /submit modes (peer sync,
+# migration). Unset = fail closed. NOT the same token as ADMIN_TOKEN: that one
+# also gates /admin/evictOutpoint and /admin/ban, so sharing it would hand every
+# submit operator the ability to evict any outpoint from the index.
+npx wrangler secret put SUBMIT_OPERATOR_TOKEN
 
 # Deploy
 cd crates/overlay-cloudflare
 CLOUDFLARE_API_TOKEN="<token>" CLOUDFLARE_ACCOUNT_ID="<id>" wrangler deploy
 ```
+
+### `/submit` admission gating (bsv-low #347)
+
+`POST /submit` admits on the **admission path the endpoint derives**, never on
+the mode the caller asks for. Only `x-submit-mode: broadcast-gated` is a public
+path: the overlay broadcasts the transaction and admits it only once the network
+accepts it. Every other path (`historical-tx`, `historical-tx-no-spv`, and the
+no-header default) carries **no bar** — SPV is not one, because a zero-input or
+fabricated-child transaction has nothing to prove — so they are restricted to
+operators holding `SUBMIT_OPERATOR_TOKEN`.
+
+`SUBMIT_ENFORCE` controls the rollout:
+
+| value | behaviour |
+|---|---|
+| unset / not `"true"` | **lenient (default)** — unbarred submits are served as before, but counted at `/health/invariants` → `submitAdmission.unauthenticatedUngated` |
+| `"true"` | **strict** — unauthenticated submits on an unbarred path are refused `401`. `broadcast-gated` is never refused, in any configuration |
+
+> **Do not set `SUBMIT_ENFORCE=true` before bsv-low #351 has shipped and
+> soaked.** The client's `submitPotPartyMarker` / `submitPotRefundBeef` still
+> ride the ungated path, and those rows *are* the recovery enumeration a wiped
+> device reads to find its own money. Every caller is fire-and-forget, so a
+> `401` is swallowed silently — flipping early would leave a later wiped device
+> with nothing to enumerate. Gate the flip on the **releases** being pinned and
+> soaked, never on the counter: `/health/invariants` is unauthenticated, so an
+> adversary can hold that number wherever they like.
+
+`ENABLE_EXTENSIONS` doubles as the kill switch — set to anything other than
+`"true"` it disables the `x-submit-mode` header entirely. It can never route a
+caller *off* `broadcast-gated`.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the deeper architecture, testing
 matrix, and deployment reference.

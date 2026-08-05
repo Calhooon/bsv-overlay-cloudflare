@@ -2204,8 +2204,14 @@ const COLLECTED_ROWS_PER_PAIR: usize = 8;
 /// whole window by construction and evict the genuine marker that arrives
 /// later. `DESC` keeps the most recent rows, so a pre-filed squat can never
 /// displace the victim's genuine marker; an attacker must instead out-file it
-/// afterwards, which under the #347 gate costs a real fee-bearing transaction
-/// per row. `txid` breaks ties so the window is deterministic.
+/// AFTERWARDS.
+///
+/// **Scope that post-hoc cost honestly:** out-filing costs a real fee-bearing
+/// transaction per row only once `SUBMIT_ENFORCE=true`. In the shipping
+/// default (lenient) it is still FREE — verified live. So today this ordering
+/// buys the PRE-EMPTIVE case only, which is the documented attack; the
+/// post-hoc case is bought by the strict flip, not by this `ORDER BY`.
+/// `txid` breaks ties so the window is deterministic.
 pub fn collected_records_batch_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(", ");
     format!(

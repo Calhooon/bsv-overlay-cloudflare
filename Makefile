@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs \
+.PHONY: parity reference-up reference-down reference-logs ci-route \
         wrangler-dev harness test extensions-build e2e-bsv-storage clean help
 
 help:
@@ -106,6 +106,37 @@ ci:
 	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
 	cargo build -p low-app-layer --target wasm32-unknown-unknown --release; \
 	echo "✅ local CI green"
+
+# OPT-IN route-level coverage for the #347 submit gate (Rule 22).
+#
+# `make ci` cannot reach the /submit ROUTE: it takes a worker::Request and only
+# runs on wasm, so the handler's use of the decision seam is unobservable to a
+# native cell. The exhaustive `match` on SubmitAction makes deleting the
+# refusal a COMPILE error and source pins cover the gate branch — but the
+# end-to-end proof that a fabrication is actually refused lives here.
+#
+# Stands up `wrangler dev --local` in strict mode and drives the real route
+# with the real attack shapes (zero-input and junk-input BEEFs, every header
+# spelling, the tm_potparty money topic, the kill switch, the operator token).
+# Not in `ci` because it needs a wrangler build + a listening port; run it
+# before touching submit_gate.rs or the submit route.
+ci-route:
+	@echo "→ starting wrangler dev on :8791 (strict)…"
+	@cd crates/overlay-cloudflare && \
+	  npx wrangler dev --local --port 8791 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
+	    > /tmp/lane347-ci-route.log 2>&1 & \
+	  echo $$! > /tmp/lane347-ci-route.pid
+	@until curl -s -m 2 http://127.0.0.1:8791/listTopicManagers >/dev/null 2>&1; \
+	  do sleep 3; done; echo "→ up"
+	@node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
+	  rc=$$?; \
+	  kill `cat /tmp/lane347-ci-route.pid` 2>/dev/null; \
+	  rm -f /tmp/lane347-ci-route.pid; \
+	  exit $$rc
 
 extensions-build:
 	cargo build -p bsv-overlay-cloudflare --features extensions
