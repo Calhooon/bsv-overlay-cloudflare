@@ -269,7 +269,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 }
 
 /// Number of overlay migration statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 97;
+pub const OVERLAY_MIGRATION_COUNT: usize = 98;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -908,6 +908,27 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
      ON hopparty_records(identity, createdAt)",
     "CREATE INDEX IF NOT EXISTS idx_hopparty_hop ON hopparty_records(txid, hopVout)",
     "CREATE INDEX IF NOT EXISTS idx_hopparty_game ON hopparty_records(gameId)",
+    // ── #283 potparty marker-validity latch (decode-once at admission) ────
+    // Whether every signature the marker carries VERIFIED, computed once by
+    // `overlay_discovery::potparty::validity::record_sig_valid` at write
+    // time (the #284 decoded-columns pattern applied to a predicate instead
+    // of a value). 1 = all verified, 0 = at least one did not, NULL = the
+    // row predates this migration and was never evaluated.
+    //
+    // ORDERING HINT ONLY. Admission stays byte-format-only: this column
+    // changes no admission decision, a 0-latched marker is still stored and
+    // still served, and every consumer that draws a conclusion from a marker
+    // re-verifies unconditionally — so a lying or stale value can mis-order
+    // candidates and can never admit one. Its whole job is to let a SQL
+    // window ORDER BY "does this verify", which is the only ordering an
+    // attacker cannot out-stamp, out-number or (bsv-low#347) get for free.
+    //
+    // NULLABLE on purpose and NEVER backfilled by an UPDATE: SQL cannot
+    // verify a signature, so the legacy tier drains by republish
+    // (`potPartyRepublish.ts`, bsv-low#252) rather than by a migration.
+    // Additive ALTER — the runner ignores the re-run "duplicate column"
+    // error (`migration_error_is_benign`).
+    "ALTER TABLE potparty_records ADD COLUMN sigValid INTEGER",
 ];
 
 // =============================================================================

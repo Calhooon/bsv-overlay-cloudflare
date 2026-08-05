@@ -2627,7 +2627,7 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 ///    vanishes from `creditSweep`'s recovery list. The v1 sibling must
 ///    always be there.
 ///
-/// # ARCHITECTURE — verification before collapse
+/// # ARCHITECTURE — verification before collapse, and then a STORED verdict
 ///
 /// (2026-07-28 owner steer; the principle this whole family of bugs comes
 /// from, stated here because it generalises.)
@@ -2660,6 +2660,27 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// discovery query, so its caller does not yet know which pots — let alone
 /// which keys — to bind. Superset-plus-verify is the fallback for that case
 /// only.
+///
+/// **What changed in bsv-low #283.** "SQL cannot verify a signature" is
+/// still true, and "no sort order fixes this" was true only because nobody
+/// had STORED the answer. `sigValid` is decoded once at admission
+/// (`overlay_discovery::potparty::validity`, the #284 decode-at-write
+/// pattern applied to a predicate) and
+/// [`sig_rank_expr`](overlay_discovery::potparty::validity::sig_rank_expr)
+/// is now the FIRST ordering term at every level of this window:
+/// within-pot (`rn`), quota allocation (`potRank`), promotion (`tier`), and
+/// the page itself (`finalRank`).
+///
+/// The architecture is unchanged where it matters: this query still does not
+/// DECIDE anything (the latch is a sort key, never a `WHERE`; a 0-latched row
+/// is still served, still in the superset, and the consumer still verifies
+/// before collapsing). What it no longer does is hand the ORDER to the
+/// attacker. And the reason the latch is not itself forgeable HERE is that
+/// this window is scoped `WHERE pp.identity = ?1`: to appear in the victim's
+/// answer at all a row must NAME the victim, and the identity signature is
+/// over a challenge that binds that identity — so an attacker's row is
+/// `sigValid = 0` by construction, whatever it does with stamps, volume, or
+/// `pot_records`.
 ///
 /// # The bounds, all deterministic
 ///
@@ -2694,22 +2715,43 @@ const POTPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, potTxi
 /// `limit × 2 groups × PARTYFOR_ROWS_PER_GROUP`, and the cap is a BELT — the
 /// filters already guarantee it, so it can never cut a pot in half.
 ///
-/// # Residual — stated plainly, because the improvement is modest
+/// # Residual — and a CORRECTION to what the #281 revision claimed here
 ///
-/// This does NOT make the window expensive to fill. An attacker who copies
-/// `limit` REAL, recently-admitted pot txids out of the very index being
-/// queried — they are public — and files one marker per pot naming the victim
-/// still displaces the victim's pots at the same ~`limit`-dust cost as before.
-/// The honest net gain is **from "any N junk rows" to "N junk rows naming
-/// real, recent pot txids"**, plus the outright death of the zero-forgery
-/// replay variant and of free invented-pot flooding. And eviction WITHIN a
-/// pot now costs [`PARTYFOR_ROWS_PER_GROUP`] markers per group instead of one
-/// — a MITIGATION, not a closure: file one more than that and the honest row
-/// is evicted again. See [`PARTYFOR_ROWS_PER_GROUP`] for the measured size,
-/// and for the only two things that would actually close it (binding verified
-/// key material, which discovery has none of; or making admission cost
-/// something, which is an owner decision about the byte-format-only
-/// doctrine).
+/// The paragraph this replaces said the #281 shape achieved "the outright
+/// death of free invented-pot flooding" and priced the remaining attack at
+/// "`limit` dust markers". **Both were wrong, and the second was wrong in the
+/// direction that made the first look true.** bsv-low#347: `/submit` has no
+/// auth and no rate limit, and its SEEN-gate is selected by a caller-supplied
+/// `x-submit-mode` header — so filing a marker costs nothing, and so does
+/// filing the `pot_records` row that makes a ghost pot read `unknownPot = 0`
+/// and skip the quota path entirely (`tm_pot` admits any structurally
+/// covenant-shaped output with no signature). The #281 window's ordering was
+/// therefore free to defeat, not dust-priced, and the quota it introduced was
+/// never on the attacker's path at all.
+///
+/// **What actually bounds it now is not a price and not a quota — it is that
+/// the attacker cannot produce the victim's identity signature.** Every row
+/// in this window names the victim (`WHERE pp.identity = ?1`), the identity
+/// signature binds that name, and `sigValid` is latched from it at admission
+/// and sorted on first. Executed:
+/// `free_ghost_pot_records_cannot_erase_the_victims_pots_real_sqlite` — 200
+/// free ghosts, each with its own fabricated `pot_records` row stamped NOW,
+/// against a 100-pot page: **zero honest pots displaced** (the same 200 erase
+/// an all-legacy page, executed as the control).
+///
+/// Residuals that remain, both bounded to the LEGACY tier (rows admitted
+/// before the latch migration, which is a draining population — the #252
+/// republish sweep lands a latched row for any pot the honest client still
+/// sees):
+///  - a legacy-vs-legacy contest is decided exactly as it was before, so an
+///    attacker who filed junk BEFORE the migration keeps whatever advantage
+///    that junk already had (`free_ghost_pot_records_do_erase_legacy_
+///    unlatched_rows_real_sqlite`, `sustained_fresh_older_ghost_flood_
+///    still_displaces_residual_real_sqlite`);
+///  - within a pot, [`PARTYFOR_ROWS_PER_GROUP`] LEGACY junk rows still evict
+///    a LEGACY honest row. A latched honest row is never evicted by junk at
+///    any volume (`a_latched_marker_is_never_evicted_within_its_pot_
+///    real_sqlite`, executed at 4x the group cap).
 pub fn potparty_list_for_identity_sql() -> String {
     // NUMBERED parameters (?1 identity, ?2 limit, ?3 quota, ?4 row_cap): the
     // quota appears twice and the identity sits in the INNERMOST subquery, so
@@ -2721,24 +2763,27 @@ pub fn potparty_list_for_identity_sql() -> String {
      FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                   recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                   txid, outputIndex, createdAt, isV2, markerRowid, \
-                  potCreatedAt, potFirstMarkerAt, tier, \
-                  DENSE_RANK() OVER (ORDER BY tier ASC, \
+                  potCreatedAt, potFirstMarkerAt, potBestSigRank, tier, \
+                  DENSE_RANK() OVER (ORDER BY potBestSigRank DESC, tier ASC, \
                                               COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
                                               potTxid ASC, potVout ASC) AS finalRank \
            FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                         recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                         txid, outputIndex, createdAt, isV2, markerRowid, \
-                        potCreatedAt, potFirstMarkerAt, \
+                        potCreatedAt, potFirstMarkerAt, potBestSigRank, \
                         CASE WHEN unknownPot = 0 \
-                             OR (freshUnknown = 1 AND potRank <= ?3) \
+                             OR (freshUnknown = 1 AND potBestSigRank > 0 \
+                                 AND potRank <= ?3) \
                              THEN 0 ELSE 1 END AS tier \
                  FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                               recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                               txid, outputIndex, createdAt, isV2, markerRowid, \
                               potCreatedAt, potFirstMarkerAt, unknownPot, \
+                              potBestSigRank, \
                               {fresh} AS freshUnknown, \
                               DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
-                                                 ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
+                                                 ORDER BY potBestSigRank DESC, \
+                                                          COALESCE(potFirstMarkerAt, 0) ASC, \
                                                           potTxid ASC, potVout ASC) AS potRank \
                        FROM (SELECT pp.identity AS identity, \
                                     pp.opponentIdentity AS opponentIdentity, \
@@ -2757,11 +2802,14 @@ pub fn potparty_list_for_identity_sql() -> String {
                                     CASE WHEN pp.seatSettlePubkey IS NULL \
                                          THEN 0 ELSE 1 END AS isV2, \
                                     CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                                    MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
+                                        AS potBestSigRank, \
                                     ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout, \
                                                                     CASE WHEN \
                                                                       pp.seatSettlePubkey IS NULL \
                                                                       THEN 0 ELSE 1 END \
-                                                       ORDER BY pp.createdAt ASC, \
+                                                       ORDER BY {rank} DESC, \
+                                                                pp.createdAt ASC, \
                                                                 pp.rowid ASC) AS rn \
                              FROM potparty_records pp \
                              LEFT JOIN pot_records r \
@@ -2769,11 +2817,13 @@ pub fn potparty_list_for_identity_sql() -> String {
                              WHERE pp.identity = ?1) \
                        WHERE rn <= {per_group}))) \
      WHERE finalRank <= ?2 \
-     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
+     ORDER BY potBestSigRank DESC, tier ASC, \
+              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
               potTxid ASC, potVout ASC, isV2 DESC, markerRowid ASC \
      LIMIT ?4",
         per_group = PARTYFOR_ROWS_PER_GROUP,
         fresh = fresh_unknown_expr(),
+        rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
     )
 }
 
@@ -2900,23 +2950,46 @@ pub fn list_for_pot_sql(select: &str) -> String {
 /// than the freshness window (a stale unknown is a ghost with probability
 /// →1 and is only ever demoted-not-dropped), and slots inside the window go
 /// OLDEST-first — the one order an attacker cannot jump by filing MORE
-/// markers after seeing the victim's funding. Residual, stated plainly: an
-/// attacker who keeps ≥quota ghost markers CONTINUOUSLY inside every
-/// freshness window (a rolling dust flood, ~quota markers/hour forever, vs
-/// 10 markers ONCE before this fix) can still pre-date a victim's funding
-/// moment and occupy the slots. That raises cost from O(1) to O(sustained);
-/// the closures remain the #281-documented ones (verified-key binding —
-/// impossible for discovery — or priced admission, an owner decision).
+/// markers after seeing the victim's funding.
 ///
-/// # The guaranteed ~10% ghost share (bsv-low #283b — documented, accepted)
+/// **That allocation is now a BACKSTOP, not the bar.** It is a heuristic
+/// over stamps, and a heuristic over stamps left a residual (a rolling
+/// flood of ghosts kept continuously inside the freshness window and older
+/// than the victim's funding moment still took the slots — and per
+/// bsv-low#347 that flood is FREE, so the "O(sustained) cost" this note used
+/// to claim was never a cost at all). Promotion is additionally gated on
+/// `potBestSigRank > 0` and allocated verified-first, which an attacker
+/// cannot reach without the victim's identity key. The stamp heuristic is
+/// kept because it still orders the LEGACY tier, where no latch exists;
+/// `sustained_fresh_older_ghost_flood_still_displaces_residual_real_sqlite`
+/// pins that legacy behaviour and
+/// `latched_ghosts_take_no_promoted_slot_real_sqlite` pins the closure for
+/// admitted rows.
 ///
-/// The quota ITSELF hands an invented-pot flood up to `limit/10` promoted
-/// slots for free: 50 ghost markers displace exactly `quota` real pots
-/// (executed in the #281 gate; main displaced 50). This only bites a victim
-/// whose REAL pot count exceeds `limit - quota` (>90 pots at the default
-/// page), is strictly better than the pre-#281 total erasure, and is the
-/// price of never filtering a genuinely fresh pot. Accepted; revisit only
-/// with priced admission.
+/// # The guaranteed ~10% ghost share — CLOSED for latched rows (#283b)
+///
+/// The quota ITSELF used to hand an invented-pot flood up to `limit/10`
+/// promoted slots: 50 ghost markers displaced exactly `quota` real pots
+/// (executed in the #281 gate; pre-#281 main displaced 50). The note that
+/// stood here called that "the price of never filtering a genuinely fresh
+/// pot" and said to revisit it only with priced admission. Priced admission
+/// was never available — bsv-low#347 established that filing a marker is
+/// free, not dust-priced — so the guarantee was being handed to an attacker
+/// who paid nothing for it.
+///
+/// It is closed without pricing anything, and without filtering anything.
+/// Promotion now additionally requires the pot's BEST marker to be something
+/// other than provably-forged (`potBestSigRank > 0`), and the slots inside
+/// the window are allocated verified-first. A ghost naming the victim cannot
+/// carry the victim's identity signature, so it cannot reach a promoted slot
+/// at all: `latched_ghosts_take_no_promoted_slot_real_sqlite` re-measures the
+/// #281 case at 50 ghosts (5x the quota, all inside the freshness window and
+/// all older than the honest marker) and displaces **zero** real pots.
+///
+/// This is an ORDERING, not a filter — the fail direction is unchanged. A pot
+/// whose only marker latches `false` is DEMOTED, never dropped; it still
+/// appears behind every indexed pot, which is exactly what a stale unknown
+/// already did (`a_false_latch_never_removes_a_row_real_sqlite`).
 pub fn unknown_pot_quota(limit: usize) -> usize {
     (limit / 10).max(1)
 }
@@ -3057,12 +3130,21 @@ impl PotpartyStorage for D1PotpartyStorage {
         // replayed submit of the same output is a no-op; markers for the
         // same identity from different txs are ALL kept; never overwrite,
         // never delete.
+        //
+        // #283: `sigValid` is DECODED ONCE HERE — the #284 decode-at-write
+        // pattern applied to a predicate. It is an ORDERING HINT, not an
+        // admission decision: this call cannot refuse a marker, a 0-latched
+        // row is stored and served exactly as before, and every consumer
+        // that concludes anything from a marker re-verifies. It exists
+        // because every downstream window is a slot allocated by an
+        // ordering an attacker controls, and "does this verify" is the one
+        // ordering an attacker can neither out-stamp nor out-number.
         Query::new(
             "INSERT OR IGNORE INTO potparty_records \
              (identity, opponentIdentity, gameId, potTxid, potVout, \
               recoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
-              txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              txid, outputIndex, createdAt, sigValid) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.identity.as_str())
         .bind(record.opponent_identity.as_str())
@@ -3076,6 +3158,9 @@ impl PotpartyStorage for D1PotpartyStorage {
         .bind(record.txid.as_str())
         .bind(record.output_index)
         .bind(current_unix_seconds_i64())
+        .bind(i64::from(
+            overlay_discovery::potparty::validity::record_sig_valid(record),
+        ))
         .execute(&self.db)
         .await
         .map_err(potparty_err)
@@ -5140,6 +5225,44 @@ mod tests {
         .expect("insert potparty_records");
     }
 
+    /// File a potparty marker WITH the #283 admission-time validity latch
+    /// set. `sig_valid`: `Some(true)` = every signature the marker carries
+    /// verified at admission; `Some(false)` = at least one did not;
+    /// `None` = a pre-migration row (never evaluated), which is what plain
+    /// [`insert_potparty`] writes.
+    fn insert_potparty_latched(
+        conn: &rusqlite::Connection,
+        identity: &str,
+        pot_txid: &str,
+        pot_vout: u32,
+        marker_txid: &str,
+        created_at: i64,
+        settle_pubkey: Option<&str>,
+        sig_valid: Option<bool>,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO potparty_records \
+             (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+              sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt, \
+              sigValid) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '3045id', ?7, ?8, ?9, 0, ?10, ?11)",
+            rusqlite::params![
+                identity,
+                h64(0xbb),
+                h64(0x11),
+                pot_txid,
+                pot_vout,
+                850_000,
+                settle_pubkey,
+                settle_pubkey.map(|_| "3045seat"),
+                marker_txid,
+                created_at,
+                sig_valid.map(i32::from)
+            ],
+        )
+        .expect("insert potparty_records");
+    }
+
     fn insert_potrefund(
         conn: &rusqlite::Connection,
         identity: &str,
@@ -5617,6 +5740,231 @@ mod tests {
             !got.contains(&fresh),
             "KNOWN residual: a sustained older-but-fresh ghost flood still displaces — \
              if this starts PASSING, the allocation changed and the docs must move with it"
+        );
+    }
+
+    // ── #283 — the marker-validity latch (`sigValid`) ────────────────────
+    //
+    // Everything above this line files markers with `sigValid = NULL`, i.e.
+    // rows admitted BEFORE the latch migration. That is deliberate: those
+    // cells keep measuring the LEGACY tier, which is exactly the population
+    // whose behaviour must not change. The cells below file the same attacks
+    // with the latch set, which is what a marker admitted by the deployed
+    // writer carries.
+
+    /// THE ATTACK THE QUOTA NEVER SAW (bsv-low#347 + #283a).
+    ///
+    /// `unknownPot = 0` means only "a `pot_records` row exists". `tm_pot`
+    /// admits any structurally-covenant-shaped output with no signature, and
+    /// `/submit`'s SEEN-gate is selected by a caller-supplied header — so an
+    /// attacker files a `pot_records` row for a pot that does not exist, for
+    /// FREE, and its ghost marker lands in tier 0 ordered `potCreatedAt
+    /// DESC` (freshest first). It never touches `unknown_pot_quota` at all:
+    /// no quota allocation, however clever, bounds this.
+    ///
+    /// What DOES bound it is that the window is per-IDENTITY. To appear in
+    /// the victim's answer the ghost must NAME the victim's identity, and
+    /// the marker's identity signature is over a challenge binding that
+    /// identity — so a ghost naming the victim latches `sigValid = 0` and
+    /// sorts behind every honest row, whatever `pot_records` says about it.
+    ///
+    /// Executed at 200 ghosts against a 100-pot page: TWICE the page size,
+    /// all with fresher pot rows than every honest pot.
+    #[test]
+    fn free_ghost_pot_records_cannot_erase_the_victims_pots_real_sqlite() {
+        let now = now_secs();
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let mut honest = Vec::new();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty_latched(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+                Some(true),
+            );
+            honest.push(pot);
+        }
+        // 200 free ghosts: each gets its own fabricated `pot_records` row,
+        // stamped NOW, so each is tier 0 AND newer than every honest pot.
+        for i in 0..200u32 {
+            let ghost = format!("{:064x}", 0xdead_0000u64 + i as u64);
+            insert_pot(&conn, &ghost, 0, now, false);
+            insert_potparty_latched(
+                &conn,
+                &victim,
+                &ghost,
+                0,
+                &format!("txGP{i:03}"),
+                now,
+                None,
+                Some(false),
+            );
+        }
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let unique: std::collections::HashSet<&String> = got.iter().collect();
+        for pot in &honest {
+            assert!(
+                unique.contains(pot),
+                "every honest pot must survive 200 free ghost pot_records rows: \
+                 {} missing, {} pots returned",
+                pot,
+                unique.len()
+            );
+        }
+        assert_eq!(unique.len(), 100, "and the page is the honest 100");
+    }
+
+    /// The SAME 200 ghosts against a victim whose markers are all LEGACY
+    /// (`sigValid = NULL`) erase the page. This is the pre-latch behaviour,
+    /// executed rather than asserted — it is what makes the cell above a
+    /// measurement instead of a tautology (epoch Rule 12a: the control must
+    /// be able to fail).
+    #[test]
+    fn free_ghost_pot_records_do_erase_legacy_unlatched_rows_real_sqlite() {
+        let now = now_secs();
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty(&conn, &victim, &pot, 0, &format!("txM{i:03}"), 1_000 + i as i64, None);
+        }
+        for i in 0..200u32 {
+            let ghost = format!("{:064x}", 0xdead_0000u64 + i as u64);
+            insert_pot(&conn, &ghost, 0, now, false);
+            insert_potparty(&conn, &victim, &ghost, 0, &format!("txGP{i:03}"), now, None);
+        }
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let unique: std::collections::HashSet<&String> = got.iter().collect();
+        assert!(
+            !unique.contains(&format!("{:064x}", 0x0000_1000u64)),
+            "PRE-LATCH CONTROL: free ghost pot rows DO erase an all-legacy page \
+             — if this starts passing, the legacy tier changed and the residual \
+             note in `sig_rank_expr` must move with it"
+        );
+    }
+
+    /// #283a/#283b closed for latched rows: ghost markers can occupy NO
+    /// promoted quota slot, because promotion now requires the pot's best
+    /// marker to be something other than provably-forged. The #281 gate's
+    /// executed numbers were "10 ghosts ⇒ the fresh pot goes ABSENT" and
+    /// "50 ghosts ⇒ exactly 10 real pots displaced (the quota)". Re-measured
+    /// here at 50 — five times the quota — with the fresh pot present and
+    /// every real pot kept.
+    #[test]
+    fn latched_ghosts_take_no_promoted_slot_real_sqlite() {
+        let now = now_secs();
+        let conn = production_schema_db();
+        let victim = victim_id();
+        for i in 0..100u32 {
+            let pot = format!("{:064x}", 0x0000_1000u64 + i as u64);
+            insert_pot(&conn, &pot, 0, 1_000 + i as i64, true);
+            insert_potparty_latched(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txM{i:03}"),
+                1_000 + i as i64,
+                None,
+                Some(true),
+            );
+        }
+        let fresh = h64(0xfa);
+        insert_potparty_latched(&conn, &victim, &fresh, 0, "txFRESH", now - 30, None, Some(true));
+        // 50 ghosts, ALL of them OLDER than the honest marker and inside the
+        // freshness window — i.e. the sustained rolling flood that is still
+        // a residual for legacy rows, five times the quota.
+        for i in 0..50u32 {
+            insert_potparty_latched(
+                &conn,
+                &victim,
+                &format!("{:064x}", 0xdead_beefu64 + i as u64),
+                0,
+                &format!("txGL{i:03}"),
+                now - 600 + i as i64,
+                None,
+                Some(false),
+            );
+        }
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        let unique: std::collections::HashSet<&String> = got.iter().collect();
+        assert!(
+            unique.contains(&fresh),
+            "the fresh in-flight pot keeps its promoted slot under a 50-ghost flood"
+        );
+        assert_eq!(
+            unique.len(),
+            100,
+            "and the flood displaces ZERO real pots (was: exactly quota=10)"
+        );
+    }
+
+    /// An honest marker is never EVICTED within its own pot by forged
+    /// siblings, whatever their stamps: `PARTYFOR_ROWS_PER_GROUP` junk rows
+    /// stamped EARLIER used to take the whole group. Rank-first ordering
+    /// puts the verified row at `rn = 1` regardless.
+    #[test]
+    fn a_latched_marker_is_never_evicted_within_its_pot_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xaa);
+        insert_pot(&conn, &pot, 0, 1_000, true);
+        // Forged siblings first (EARLIER stamps AND physically first), then
+        // the honest row — so no incidental order can produce a pass.
+        for i in 0..(PARTYFOR_ROWS_PER_GROUP as u32 * 4) {
+            insert_potparty_latched(
+                &conn,
+                &victim,
+                &pot,
+                0,
+                &format!("txJ{i:03}"),
+                10 + i as i64,
+                None,
+                Some(false),
+            );
+        }
+        insert_potparty_latched(&conn, &victim, &pot, 0, "txHONEST", 9_999, None, Some(true));
+        let got = window_col(
+            &conn,
+            &potparty_list_for_identity_sql(),
+            &victim,
+            100,
+            "txid",
+        );
+        assert!(
+            got.contains(&"txHONEST".to_string()),
+            "the verified marker survives 4x the group cap of earlier forgeries: {got:?}"
+        );
+    }
+
+    /// FAIL DIRECTION (the property that makes this safe to ship): the latch
+    /// is a SORT KEY, never a filter. A lone marker that latches `false` —
+    /// the shape a cross-language signer disagreement would produce — is
+    /// still served, and its pot is still on the page. Ranking last in a
+    /// window you are the only occupant of changes nothing.
+    #[test]
+    fn a_false_latch_never_removes_a_row_real_sqlite() {
+        let conn = production_schema_db();
+        let victim = victim_id();
+        let pot = h64(0xab);
+        insert_pot(&conn, &pot, 0, 1_000, true);
+        insert_potparty_latched(&conn, &victim, &pot, 0, "txONLY", 1_000, None, Some(false));
+        let unknown = h64(0xac);
+        insert_potparty_latched(&conn, &victim, &unknown, 0, "txUNK", 1_001, None, Some(false));
+        let got = window_col(&conn, &potparty_list_for_identity_sql(), &victim, 100, "potTxid");
+        assert!(got.contains(&pot), "an indexed pot is served whatever the latch says");
+        assert!(
+            got.contains(&unknown),
+            "and an UNKNOWN pot is DEMOTED, never dropped — the fail direction \
+             the promotion tier has always had"
         );
     }
 
