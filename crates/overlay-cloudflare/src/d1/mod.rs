@@ -299,7 +299,11 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// 102 → 103 for #355 + #367: `relatch_cursors`, the durable scan position of
 /// the pass that re-latches BOTH verdict columns. One statement, one table,
 /// overlay-only (no other service reads it, so epoch Rule 24 does not bite).
-pub const OVERLAY_MIGRATION_COUNT: usize = 103;
+/// 103 → 104 for #217: `pot_records.firstSpentAt`, the WRITE-ONCE durable
+/// hand-END anchor (`spentAt` is the #228 MOVING age gate and cannot double as
+/// an audit fact). `/refund-view` reads it, so epoch Rule 24 DOES bite — the
+/// app-layer issues the same statement itself (`low_app_layer::schema`).
+pub const OVERLAY_MIGRATION_COUNT: usize = 104;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1115,6 +1119,44 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         cursorRowid INTEGER NOT NULL DEFAULT 0,
         sweeps INTEGER NOT NULL DEFAULT 0
     )",
+    // ── #217 durable hand-END anchor (the presence audit trail, RECORD half) ─
+    // `pot_records.firstSpentAt`: the FIRST time this overlay recorded an
+    // ACCEPTED spend pointer for this pot outpoint, in unix seconds. Written
+    // preserve-or-now (`COALESCE(firstSpentAt, unixepoch())`) by every branch
+    // of `d1_discovery::mark_spent_sql`, so it is WRITE-ONCE and MONOTONE.
+    //
+    // Why the existing `spentAt` could not serve this. `spentAt` is the #228
+    // backstop AGE anchor and is deliberately RE-STAMPED by every accepted
+    // spend write — an unconfirmed pointer, then its confirm, then a
+    // reorg-displacing spender each reset it, on purpose, so the poll chaser
+    // measures from the CURRENT pointer. That makes it a correct age gate and
+    // a WRONG audit fact: read as "the hand ended at", it silently answers
+    // "the last time anything happened to this pot's spend". A field whose
+    // meaning depends on which writer touched it last is exactly the shape
+    // #217 forbids, so the durable stamp is a SEPARATE column with a separate
+    // name and neither is derivable from the other.
+    //
+    // PROVENANCE, stated because the consumer must not guess (epoch Rule 21's
+    // covenant-vs-marker sort): this is a SERVER-OBSERVED time — when THIS
+    // overlay saw the spend — not a network fact and not a client claim. The
+    // network-anchored complement is `spentHeight` (the height of an
+    // SPV-verified BUMP), which is why `/refund-view` serves the two together
+    // and never collapses them. Nothing in this schema stores a
+    // CLIENT-CLAIMED timestamp; if one is ever added it needs its own column
+    // name, never this one.
+    //
+    // NULL is a first-class answer and is PERMANENT for rows whose spend was
+    // recorded before this migration (epoch Rule 6/25: a migration cannot
+    // backfill a time nobody observed, and there is no republish that could
+    // re-latch it — unlike `sigValid`, no re-latch pass can ever repair this
+    // column). NULL means "no accepted spend write since this shipped", never
+    // "unspent" — the `spent`/`spentConfirmed` pair answers that.
+    //
+    // Additive ALTER — the runner ignores the re-run "duplicate column" error
+    // (`migration_error_is_benign`). NOTE the app-layer Worker issues this
+    // same statement itself (`low_app_layer::schema`) because it never runs
+    // this list; the two are pinned byte-identical (epoch Rule 24).
+    "ALTER TABLE pot_records ADD COLUMN firstSpentAt INTEGER",
 ];
 
 // =============================================================================

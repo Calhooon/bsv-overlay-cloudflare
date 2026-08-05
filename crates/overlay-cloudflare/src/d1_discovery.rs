@@ -1648,29 +1648,52 @@ fn pot_err(e: String) -> PotStorageError {
 /// every ACCEPTED spend write resets the age, so the poll chaser's gate
 /// measures from the CURRENT spend pointer (its push gets its chance first).
 /// A refused unconfirmed-vs-confirmed write touches nothing (WHERE misses).
+///
+/// # #217 durable hand-END anchor (`firstSpentAt`)
+///
+/// Every branch ALSO carries `firstSpentAt = COALESCE(firstSpentAt,
+/// unixepoch())` — preserve-or-now, so the column is WRITE-ONCE and MONOTONE
+/// across the whole life of the row. It rides the same statement as the
+/// pointer it records, so it can never be stamped by a write the WHERE clause
+/// refused: an unconfirmed claim against a confirmed pointer touches neither
+/// anchor, exactly as before.
+///
+/// The two anchors are deliberately NOT the same field and neither is
+/// derivable from the other. `spentAt` MOVES (that is its job — it is the
+/// #228 age gate, re-stamped by the confirm, by a reorg-displacing spender,
+/// by any accepted re-write); `firstSpentAt` never moves after its first
+/// write and is the only durable "when did this pot's spend first reach the
+/// index" fact. `/refund-view` serves `firstSpentAt` and does NOT serve
+/// `spentAt`, because a moving anchor read as an audit timestamp is a field
+/// whose meaning depends on who wrote it last (bsv-low #217). No bind is
+/// added: `COALESCE(firstSpentAt, unixepoch())` takes no parameter, so the
+/// documented bind order above is unchanged.
 pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     match (confirmed, with_verdict) {
         (true, true) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
-                 spentAt = unixepoch(), verdict = ?, verdictTxid = ?, \
+                 spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
+                 verdict = ?, verdictTxid = ?, \
                  spentHeight = CASE WHEN spendingTxid = ? \
                                THEN COALESCE(?, spentHeight) ELSE ? END \
              WHERE txid = ? AND outputIndex = ?"
         }
         (true, false) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
-                 spentAt = unixepoch(), \
+                 spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
                  spentHeight = CASE WHEN spendingTxid = ? \
                                THEN COALESCE(?, spentHeight) ELSE ? END \
              WHERE txid = ? AND outputIndex = ?"
         }
         (false, true) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch(), \
+                 firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
                  verdict = ?, verdictTxid = ? \
              WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
         }
         (false, false) => {
-            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch() \
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch(), \
+                 firstSpentAt = COALESCE(firstSpentAt, unixepoch()) \
              WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
         }
     }
@@ -5075,6 +5098,48 @@ mod tests {
         }
     }
 
+    /// #217 — EVERY branch carries the preserve-or-now durable anchor, and
+    /// the moving one is still there.
+    ///
+    /// A string pin only (the executed proof is
+    /// `sql_first_spent_at_is_write_once_while_spent_at_moves`); it exists
+    /// because a branch that silently LOST the clause would leave that
+    /// executed cell green on the three branches it does exercise.
+    #[test]
+    fn mark_spent_sql_stamps_the_durable_anchor_on_every_branch() {
+        let mut seen = 0;
+        for confirmed in [false, true] {
+            for with_verdict in [false, true] {
+                let sql = mark_spent_sql(confirmed, with_verdict);
+                assert!(
+                    sql.contains("firstSpentAt = COALESCE(firstSpentAt, unixepoch())"),
+                    "preserve-or-now missing from ({confirmed}, {with_verdict}): {sql}"
+                );
+                // The MOVING anchor is unconditional; the durable one must
+                // never be written as a bare re-stamp.
+                assert!(sql.contains("spentAt = unixepoch()"), "{sql}");
+                assert!(!sql.contains("firstSpentAt = unixepoch()"), "{sql}");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 4, "all four branches were inspected");
+    }
+
+    /// #217 — the BACKFILL's guarded verdict write touches NEITHER anchor.
+    ///
+    /// `verdict_cas_sql` deliberately does not reset the #228 age anchor; it
+    /// must not mint a durable hand-end time either, because it records no
+    /// spend observation of its own — it attaches a verdict to a pointer
+    /// somebody else already observed.
+    #[test]
+    fn verdict_cas_sql_touches_neither_spend_time_anchor() {
+        let sql = verdict_cas_sql();
+        assert!(!sql.contains("spentAt"), "{sql}");
+        assert!(!sql.contains("firstSpentAt"), "{sql}");
+        // Positive control: this really is the verdict writer.
+        assert!(sql.contains("verdict"), "{sql}");
+    }
+
     // ── #284 store/mark SQL EXECUTED against the production schema ────────
     // String pins are a backstop only (the #230 gate lesson); the contract —
     // re-admission never regresses spend state, verdict atomic with the
@@ -5097,12 +5162,17 @@ mod tests {
         verdict_txid: Option<String>,
         spent_height: Option<i64>,
         created_at: Option<i64>,
+        /// The #228 MOVING age anchor — re-stamped by every accepted write.
+        spent_at: Option<i64>,
+        /// The #217 DURABLE hand-end anchor — write-once, never re-stamped.
+        first_spent_at: Option<i64>,
     }
 
     fn read_pot_row(conn: &rusqlite::Connection, txid: &str, vout: u32) -> SqlPotRow {
         conn.query_row(
             "SELECT spent, spendingTxid, spentConfirmed, lockKind, pubA, stakeA, potSats, \
-                    paramsDecoded, verdict, verdictTxid, spentHeight, createdAt \
+                    paramsDecoded, verdict, verdictTxid, spentHeight, createdAt, \
+                    spentAt, firstSpentAt \
              FROM pot_records WHERE txid = ?1 AND outputIndex = ?2",
             rusqlite::params![txid, vout],
             |r| {
@@ -5119,10 +5189,31 @@ mod tests {
                     verdict_txid: r.get(9)?,
                     spent_height: r.get(10)?,
                     created_at: r.get(11)?,
+                    spent_at: r.get(12)?,
+                    first_spent_at: r.get(13)?,
                 })
             },
         )
         .expect("pot row present")
+    }
+
+    /// Force both spend-time anchors to a known value, so a later write's
+    /// effect on each is DISCRIMINATING.
+    ///
+    /// Both `spentAt` and `firstSpentAt` are stamped with `unixepoch()` by
+    /// the producer, and a test writes both within the same wall-clock
+    /// second — so "did the second write move it?" is unanswerable by
+    /// comparing two producer-written values. Seeding a sentinel far in the
+    /// past makes MOVED and NOT-MOVED distinguishable without sleeping.
+    fn seed_spend_anchors(conn: &rusqlite::Connection, txid: &str, vout: u32, at: i64) {
+        let n = conn
+            .execute(
+                "UPDATE pot_records SET spentAt = ?1, firstSpentAt = ?1 \
+                 WHERE txid = ?2 AND outputIndex = ?3",
+                rusqlite::params![at, txid, vout],
+            )
+            .expect("seed anchors");
+        assert_eq!(n, 1, "the seed must hit exactly the row under test");
     }
 
     /// Execute the shipped `store_record_sql()` with the given decoded
@@ -5330,6 +5421,155 @@ mod tests {
         // — SAME pointer, so the height survives).
         exec_mark_spent(&conn, "potA", 0, "settleTx", true, None, None);
         assert_eq!(read_pot_row(&conn, "potA", 0).spent_height, Some(801_234));
+    }
+
+    /// #217 — the DURABLE hand-end anchor, executed: absent until a spend is
+    /// accepted, then WRITE-ONCE, while `spentAt` keeps moving underneath it.
+    ///
+    /// The three properties are asserted in the same run because the value of
+    /// the durable anchor is exactly that it and the moving anchor DIVERGE —
+    /// asserting either alone would pass against a schema where `firstSpentAt`
+    /// is just a second copy of `spentAt` (which is the defect this column
+    /// exists to prevent: an audit timestamp whose meaning depends on which
+    /// writer touched it last).
+    #[test]
+    fn sql_first_spent_at_is_write_once_while_spent_at_moves() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+
+        // 1. A fresh admission stamps NEITHER — NULL means "no accepted
+        //    spend write", never "unspent" (that is `spent`/`spentConfirmed`).
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spent, 0);
+        assert_eq!(r.spent_at, None);
+        assert_eq!(r.first_spent_at, None);
+
+        // 2. The FIRST accepted write (a 0-conf pointer) stamps both, in the
+        //    same statement, so they agree at birth.
+        exec_mark_spent(&conn, "potA", 0, "settleTx", false, Some("refund"), None);
+        let born = read_pot_row(&conn, "potA", 0);
+        assert!(born.first_spent_at.is_some(), "the first spend stamps it");
+        assert_eq!(
+            born.first_spent_at, born.spent_at,
+            "one statement writes both, so they are equal at birth"
+        );
+
+        // 3. Seed BOTH to a sentinel far in the past, then let the confirm —
+        //    a genuinely later, accepted write — land. `spentAt` must move
+        //    (it is the #228 age gate); `firstSpentAt` must NOT.
+        const SENTINEL: i64 = 1_000_000;
+        seed_spend_anchors(&conn, "potA", 0, SENTINEL);
+        exec_mark_spent(&conn, "potA", 0, "settleTx", true, None, Some(800_000));
+        let after_confirm = read_pot_row(&conn, "potA", 0);
+        assert_eq!(
+            after_confirm.first_spent_at,
+            Some(SENTINEL),
+            "the durable anchor never moves after its first write"
+        );
+        assert!(
+            after_confirm.spent_at.is_some_and(|t| t > SENTINEL),
+            "the #228 age anchor DOES move — {:?}",
+            after_confirm.spent_at
+        );
+
+        // 4. …and it survives a pointer CHANGE too (a reorg-confirmed second
+        //    spender resets the height and the age, never the hand-end time).
+        seed_spend_anchors(&conn, "potA", 0, SENTINEL);
+        exec_mark_spent(&conn, "potA", 0, "otherSpend", true, None, Some(800_009));
+        let after_swap = read_pot_row(&conn, "potA", 0);
+        assert_eq!(after_swap.spending_txid.as_deref(), Some("otherSpend"));
+        assert_eq!(after_swap.spent_height, Some(800_009), "the height reset");
+        assert_eq!(
+            after_swap.first_spent_at,
+            Some(SENTINEL),
+            "a pointer change does not re-date the hand"
+        );
+        assert!(after_swap.spent_at.is_some_and(|t| t > SENTINEL));
+    }
+
+    /// #217 — EVERY branch of the writer stamps the durable anchor, EXECUTED.
+    ///
+    /// A fresh pot per branch, so each of the four statements is the FIRST
+    /// accepted write on its own row. Without this, losing the clause from a
+    /// single branch was caught only by the string pin
+    /// (`mark_spent_sql_stamps_the_durable_anchor_on_every_branch`) — measured
+    /// during RED verification: dropping it from `(true, false)` alone left
+    /// every executed cell green, because they all seed or stamp through a
+    /// DIFFERENT branch. A capability bar beats a needle, so the behaviour is
+    /// now pinned per branch too.
+    #[test]
+    fn sql_every_mark_spent_branch_stamps_the_durable_anchor_on_a_fresh_row() {
+        for (i, (confirmed, with_verdict)) in
+            [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let conn = production_schema_db();
+            let pot = format!("pot{i}");
+            exec_store(&conn, &pot, 0, 1_000, None, None, None, None, 0);
+            assert_eq!(read_pot_row(&conn, &pot, 0).first_spent_at, None);
+
+            exec_mark_spent(
+                &conn,
+                &pot,
+                0,
+                "spender",
+                confirmed,
+                with_verdict.then_some("refund"),
+                confirmed.then_some(800_000),
+            );
+            let r = read_pot_row(&conn, &pot, 0);
+            assert_eq!(r.spending_txid.as_deref(), Some("spender"), "write landed");
+            assert!(
+                r.first_spent_at.is_some(),
+                "branch ({confirmed}, {with_verdict}) accepted a spend without \
+                 stamping the durable hand-end anchor"
+            );
+        }
+    }
+
+    /// #217 — a REFUSED write stamps neither anchor.
+    ///
+    /// The durable anchor rides the same statement as the pointer, so the
+    /// `spentConfirmed = 0` guard covers it: an attacker filing unconfirmed
+    /// claims against a confirmed pot cannot mint, move, or first-touch the
+    /// hand-end time. The pot is set up so the anchors are ALREADY seeded —
+    /// a version that only checked "still NULL" would pass trivially on a
+    /// build where the guard was dropped but the row happened to be fresh.
+    #[test]
+    fn sql_a_refused_unconfirmed_write_touches_neither_spend_time_anchor() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(
+            &conn,
+            "potA",
+            0,
+            "realSettle",
+            true,
+            Some("winner-a"),
+            Some(800_000),
+        );
+
+        const SENTINEL: i64 = 1_000_000;
+        seed_spend_anchors(&conn, "potA", 0, SENTINEL);
+        exec_mark_spent(
+            &conn,
+            "potA",
+            0,
+            "forgedSpend",
+            false,
+            Some("winner-b"),
+            None,
+        );
+
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spending_txid.as_deref(), Some("realSettle"), "guard held");
+        assert_eq!(r.first_spent_at, Some(SENTINEL));
+        assert_eq!(
+            r.spent_at,
+            Some(SENTINEL),
+            "the refused write reset nothing — the WHERE missed"
+        );
     }
 
     // ── 2026-07-28 gate findings, executed against the production schema ──

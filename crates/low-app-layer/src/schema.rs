@@ -44,9 +44,17 @@
 //! only DDL here and D1 migrations in this project are append-only.
 //!
 //! **Scope, stated so it does not creep:** this is not a migration runner and
-//! must not become one. It is ONE STATEMENT PER LATCH COLUMN this worker
-//! reads and cannot serve without — two today ([`SIG_VALID_ALTER`],
-//! [`MARKER_VALID_ALTER`]) — and nothing else. There is no ordering, no
+//! must not become one. It is ONE STATEMENT PER COLUMN this worker READS and
+//! cannot serve without — three today ([`SIG_VALID_ALTER`],
+//! [`MARKER_VALID_ALTER`], [`FIRST_SPENT_AT_ALTER`]) — and nothing else.
+//!
+//! The membership test is "does a shipped query in this crate NAME the
+//! column", not "is it a verdict latch": #217's `firstSpentAt` is a plain
+//! timestamp rather than a latch, but `/refund-view` selects it, and a
+//! `SELECT` naming an absent column fails to PREPARE exactly as
+//! `pp.sigValid` did — same outage, same remedy, so the list is named for
+//! the hazard rather than for the two columns that happened to arrive first.
+//! There is no ordering, no
 //! versioning and no failure bookkeeping here; every statement is an
 //! independent `ALTER TABLE … ADD COLUMN` whose only outcomes are "added" and
 //! "already there". Anything richer belongs in the overlay's
@@ -94,9 +102,19 @@ pub const SIG_VALID_ALTER: &str = "ALTER TABLE potparty_records ADD COLUMN sigVa
 /// ISSUE).
 pub const MARKER_VALID_ALTER: &str = "ALTER TABLE hopparty_records ADD COLUMN markerValid INTEGER";
 
+/// The #217 durable hand-END anchor, same contract. NOT a latch — it is the
+/// write-once unix-second stamp of the first accepted spend pointer, which
+/// `/refund-view` serves in its `timeline` block. It is here for the identical
+/// reason the two latches are: `refund_view_sql` names `r.firstSpentAt`, so a
+/// cold app-layer isolate against a schema the overlay has not warmed fails to
+/// PREPARE and 503s the route outright (epoch Rule 24: a column one service
+/// READS must be added by a statement that service can also ISSUE).
+pub const FIRST_SPENT_AT_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN firstSpentAt INTEGER";
+
 /// Every statement this module issues, in no significant order — each is
 /// independently idempotent, so arrival order cannot matter.
-pub const LATCH_COLUMN_ALTERS: &[&str] = &[SIG_VALID_ALTER, MARKER_VALID_ALTER];
+pub const LATCH_COLUMN_ALTERS: &[&str] =
+    &[SIG_VALID_ALTER, MARKER_VALID_ALTER, FIRST_SPENT_AT_ALTER];
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
 ///
@@ -210,8 +228,8 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            2,
-            "sigValid (#283), markerValid (#362)"
+            3,
+            "sigValid (#283), markerValid (#362), firstSpentAt (#217)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt

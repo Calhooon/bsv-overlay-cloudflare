@@ -61,6 +61,71 @@
 //! The server cannot see tower arm state or client dormancy — that honesty
 //! gap stays client-side (stage 2a client work).
 //!
+//! ## The durable `timeline` block (bsv-low #217 — the presence RECORD half)
+//!
+//! Presence and timing live in the ephemeral relay + client localStorage, so
+//! there is no durable "when did this hand start / end" for history, disputes
+//! or analytics. This block is the persistent complement. It is
+//! **DISPLAY/AUDIT ONLY and must never become a money gate** — no status, no
+//! credit, no gate, and nothing in [`derive_refund_status`] reads it. The
+//! LIVE presence signal stays the relay's `lastSeenMs`.
+//!
+//! Every value is a STORED column served by a plain `SELECT`; the route
+//! computes no timestamp of its own. What each one IS, because a consumer
+//! must never have to guess (epoch Rule 21's covenant-vs-marker sort, epoch
+//! Rule 13's "surface it, do not consume it"):
+//!
+//! | field | what it is a time OF | provenance |
+//! |---|---|---|
+//! | `potAdmittedAt` | THIS overlay first admitting the pot's FUNDING output (`pot_records.createdAt`, write-once — the conflict update never touches it) | server-observed, over an index entry that only exists because a real funded output was submitted |
+//! | `firstPartyMarkerAt` | THIS overlay admitting the OLDEST party marker NAMING THE CALLER for this outpoint (`potparty_records.createdAt`) | server-observed, over **attacker-writable content** |
+//! | `firstSpentAt` | THIS overlay first recording an ACCEPTED spend pointer (`pot_records.firstSpentAt`, write-once) | server-observed |
+//! | `spentHeight` | the BLOCK the spend confirmed in | NETWORK-ANCHORED (an SPV-verified BUMP), the strongest of the four |
+//!
+//! **No timestamp here is client-claimed, and none may become one.** No LOW
+//! marker carries a time push, so nothing an attacker writes can move any of
+//! these values; what an attacker CAN do is make a marker exist. That is why
+//! `firstPartyMarkerAt` is named for the marker rather than for the seat: the
+//! representative row is chosen sig-valid-first (the #283 latch) then oldest,
+//! but `tm_potparty` admission is byte-format-only, so on a pot with no
+//! sig-valid marker the oldest row naming the caller may have been filed by
+//! somebody else (the #281 F1b residual, inherited whole). If a
+//! client-CLAIMED time is ever recorded, it needs its own column and its own
+//! field name — never one of these.
+//!
+//! `seatAnchor` is the actionable bit (Rule 13's corollary: a provenance
+//! label the consumer cannot act on is telemetry, not information). It names
+//! which stamp a consumer should read as the hand's START:
+//! `"pot-admission"` when `potAdmittedAt` exists — index-backed, the pot's
+//! own funding output is in the index; `"party-marker"` when only
+//! `firstPartyMarkerAt` does — marker-backed, i.e. the weaker claim, and the
+//! consumer's action is to treat the start time as approximate and unattested
+//! (the pot itself is a JOIN MISS, which the row already says via
+//! `spent: null`); `null` when neither is known, which is not a defect to
+//! hide — an un-indexed pot with no admitted marker genuinely has no start
+//! time here.
+//!
+//! **What is NOT served, deliberately:** `pot_records.spentAt`. It is the
+//! #228 backstop AGE anchor and is re-stamped by every accepted spend write
+//! (the 0-conf pointer, its confirm, a reorg-displacing spender), which makes
+//! it a correct age gate and a lying audit stamp — one field whose meaning
+//! depends on which writer touched it last. `firstSpentAt` exists precisely
+//! so the durable question has its own column.
+//!
+//! **Permanent NULLs, said plainly (epoch Rule 6):** `firstSpentAt` is NULL
+//! for every pot whose spend was recorded before that migration, and no
+//! backfill or re-latch pass can ever repair it — SQL cannot recover a time
+//! nobody observed. This is not self-healing. `null` there means "no accepted
+//! spend write since #217 shipped", never "unspent" (`spent`/`spentConfirmed`
+//! answer that).
+//!
+//! **Still missing, and it is not fixable in this layer:** a seat LEAVING.
+//! Every LOW overlay topic rides a transaction, and leaving a table produces
+//! none — so no leave/abandon event reaches the overlay at the moment it
+//! happens. `firstSpentAt` on a `refund` verdict is the closest durable
+//! proxy (the hand ended in a refund, at this observed time), and it is a
+//! proxy for the RESOLUTION, not for the walk-away.
+//!
 //! ## The gate math
 //!
 //! `blocksToGate = max(0, recoveryHeight - tip)` when both are known, else
@@ -121,6 +186,15 @@ const _: () = assert!(REFUND_VIEW_UNKNOWN_POT_QUOTA < REFUND_VIEW_MAX_ROWS);
 /// `potrefund_records` for `backupMarkerPresent`. No BLOB is ever touched.
 /// `pot_records.recoveryHeight` is aliased `covRecoveryHeight` (the potparty
 /// marker owns the bare name), mirroring `results_sql`.
+///
+/// # #217 timeline columns
+///
+/// Three stamps ride out of the window unchanged — `potCreatedAt` and
+/// `markerCreatedAt` were ALREADY selected (the #281 ordering keys) and are
+/// now merely PROJECTED, and `r.firstSpentAt` is threaded up beside
+/// `spentHeight`. Nothing is computed: this stays one bounded query, and
+/// every served time is a stored column (epoch Rule 25 — a fact computable
+/// at admission is never recomputed at read).
 pub fn refund_view_sql() -> String {
     format!(
         "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
@@ -130,16 +204,21 @@ pub fn refund_view_sql() -> String {
                 w.spentConfirmed AS spentConfirmed, \
                 w.verdict AS verdict, w.verdictTxid AS verdictTxid, \
                 w.spentHeight AS spentHeight, \
+                w.potCreatedAt AS potAdmittedAt, \
+                w.markerCreatedAt AS firstPartyMarkerAt, \
+                w.firstSpentAt AS firstSpentAt, \
                 EXISTS(SELECT 1 FROM potrefund_records pr \
                        WHERE pr.potTxid = w.potTxid AND pr.potVout = w.potVout) \
                     AS backupMarkerPresent, \
                 sb.proof_verified AS spenderProofVerified \
          FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                   spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
+                  firstSpentAt, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                     spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
+                    firstSpentAt, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
                     potBestSigRank, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
@@ -153,6 +232,7 @@ pub fn refund_view_sql() -> String {
                       r.spentConfirmed AS spentConfirmed, \
                       r.verdict AS verdict, r.verdictTxid AS verdictTxid, \
                       r.spentHeight AS spentHeight, \
+                      r.firstSpentAt AS firstSpentAt, \
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
@@ -231,6 +311,53 @@ pub struct RefundViewRow {
     /// the SECOND accepted confirmation signal, so `/refund-view` and
     /// `/results` share one bar. `None` = no spender row joined.
     pub spender_proof_verified: Option<bool>,
+    /// #217 — `pot_records.createdAt`: THIS overlay's admission of the pot's
+    /// FUNDING output, unix seconds, write-once. `None` on a join miss.
+    pub pot_admitted_at: Option<i64>,
+    /// #217 — `potparty_records.createdAt` of the window REPRESENTATIVE:
+    /// admission of the oldest (sig-valid-preferred) marker NAMING the
+    /// caller for this outpoint. Marker-backed — see the module docs.
+    pub first_party_marker_at: Option<i64>,
+    /// #217 — `pot_records.firstSpentAt`: THIS overlay's FIRST accepted spend
+    /// pointer for the pot, unix seconds, write-once. `None` = no accepted
+    /// spend write since the column shipped (PERMANENT for older rows) —
+    /// never "unspent".
+    pub first_spent_at: Option<i64>,
+}
+
+/// Which stamp a consumer should read as the hand's START, and how strong it
+/// is. The actionable half of the #217 timeline's provenance (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatAnchor {
+    /// `potAdmittedAt` — INDEX-backed: the pot's own funding output is in
+    /// `pot_records`, so a real funded output was submitted for it.
+    PotAdmission,
+    /// `firstPartyMarkerAt` — MARKER-backed: no `pot_records` row, so the
+    /// only stamp is the admission of a byte-format-admitted marker naming
+    /// the caller. Treat the start time as approximate and unattested.
+    PartyMarker,
+}
+
+impl SeatAnchor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeatAnchor::PotAdmission => "pot-admission",
+            SeatAnchor::PartyMarker => "party-marker",
+        }
+    }
+
+    /// Prefer the index-backed stamp; fall back to the marker one; `None`
+    /// when neither exists (never a fabricated start time).
+    pub fn choose(
+        pot_admitted_at: Option<i64>,
+        first_party_marker_at: Option<i64>,
+    ) -> Option<Self> {
+        if pot_admitted_at.is_some() {
+            Some(SeatAnchor::PotAdmission)
+        } else {
+            first_party_marker_at.map(|_| SeatAnchor::PartyMarker)
+        }
+    }
 }
 
 impl RefundViewRow {
@@ -389,6 +516,15 @@ pub struct RefundEntry {
     pub spent_height: Option<u64>,
     pub status: RefundStatus,
     pub status_source: Option<&'static str>,
+    /// #217 durable timeline — AUDIT ONLY. None of these four feed
+    /// [`derive_refund_status`] (checked by
+    /// `the_timeline_never_moves_the_status`); the money words above are
+    /// derived from spend/verdict facts exactly as before.
+    pub pot_admitted_at: Option<i64>,
+    pub first_party_marker_at: Option<i64>,
+    pub first_spent_at: Option<i64>,
+    /// Which of the two start stamps to read, and how strong it is.
+    pub seat_anchor: Option<SeatAnchor>,
 }
 
 /// Assemble the joined rows + chain tip into response entries. Order is
@@ -426,6 +562,12 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
                 spent_height: r.spent_height,
                 status,
                 status_source,
+                // #217 — carried through verbatim, AFTER the status is
+                // derived, and never an input to it.
+                pot_admitted_at: r.pot_admitted_at,
+                first_party_marker_at: r.first_party_marker_at,
+                first_spent_at: r.first_spent_at,
+                seat_anchor: SeatAnchor::choose(r.pot_admitted_at, r.first_party_marker_at),
             }
         })
         .collect()
@@ -434,7 +576,17 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
 /// Assemble the `/refund-view` wire body:
 /// `{"identity","tip":<height|null>,"refunds":[{gameId,potTxid,potVout,
 /// recoveryHeight,blocksToGate,gatePassed,backupMarkerPresent,spent,
-/// spendingTxid,spentConfirmed,verdict,spentHeight,status,statusSource}]}`.
+/// spendingTxid,spentConfirmed,verdict,spentHeight,status,statusSource,
+/// timeline}]}`, with
+/// `timeline = {potAdmittedAt,firstPartyMarkerAt,firstSpentAt,spentHeight,
+/// seatAnchor}` — the #217 durable audit stamps, every one a stored column
+/// and every one nullable. `timeline.spentHeight` is THE SAME value as the
+/// row's top-level `spentHeight` (one column, read once, repeated so the
+/// timeline is self-contained and its one NETWORK-ANCHORED entry sits beside
+/// the three server-observed ones); the two can never disagree and a cell
+/// pins that. `seatAnchor` is `"pot-admission"`, `"party-marker"` or `null`.
+/// See the module docs for what each stamp is a time OF — the block is
+/// AUDIT-ONLY and gates nothing.
 /// `tip` mirrors `/recovery-view` (`null` on a chaintracks fault — the D1
 /// facts still serve; the gate fields then degrade to `null`/`false`).
 pub fn refund_view_body(identity: &str, tip: Option<u64>, entries: &[RefundEntry]) -> String {
@@ -456,6 +608,13 @@ pub fn refund_view_body(identity: &str, tip: Option<u64>, entries: &[RefundEntry
                 "spentHeight": e.spent_height,
                 "status": e.status.as_str(),
                 "statusSource": e.status_source,
+                "timeline": {
+                    "potAdmittedAt": e.pot_admitted_at,
+                    "firstPartyMarkerAt": e.first_party_marker_at,
+                    "firstSpentAt": e.first_spent_at,
+                    "spentHeight": e.spent_height,
+                    "seatAnchor": e.seat_anchor.map(SeatAnchor::as_str),
+                },
             })
         })
         .collect();
@@ -485,6 +644,9 @@ mod tests {
             verdict_txid: None,
             spent_height: None,
             backup_marker_present: false,
+            pot_admitted_at: None,
+            first_party_marker_at: None,
+            first_spent_at: None,
         }
     }
 
