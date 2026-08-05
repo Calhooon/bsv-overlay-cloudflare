@@ -56,11 +56,13 @@
 //!   BEFORE any network call (flat 400 / 429 / fail-closed mined-claim 502).
 //!   This is THE number the #347 flip reads: every count here is an honest
 //!   submit the flip would strand.
-//! * **`CouldNotEvaluate`** — the census could not honestly decide. Two named
-//!   classes: an all-proven mined-claim whose fate is the network
-//!   corroboration this census must not perform, and a body over the census
-//!   work bound. Never folded into either other state — a flip decision that
-//!   reads 0 fails must ALSO read (and reason about) this bucket.
+//! * **`CouldNotEvaluate`** — the census could not honestly decide. Three
+//!   named classes: an all-proven mined-claim whose fate is the network
+//!   corroboration this census must not perform; a body over the census work
+//!   bound; and a body whose sorted-last "subject" does not cover the BEEF
+//!   with its ancestry (subject identification unreliable). Never folded into
+//!   either other state — a flip decision that reads 0 fails must ALSO read
+//!   (and reason about) this bucket.
 //!
 //! ## Divergence from the client predicate, stated rather than hidden
 //!
@@ -139,9 +141,10 @@ pub enum UnevalWhy {
     /// Body over [`MAX_CENSUS_EVAL_BYTES`] — evaluation skipped, not attempted
     /// (write-time-scale work is not owed to a measurement).
     BodyOverEvalBound,
-    /// Another BEEF entry SPENDS the sorted-last "subject" — the route's
-    /// subject identification (`sort_txs(); last()`) is unreliable for this
-    /// body, so a structural green would be a false one.
+    /// A data-carrying BEEF entry sits OUTSIDE the sorted-last "subject"'s
+    /// in-BEEF ancestor closure — the route's subject identification
+    /// (`sort_txs(); last()`) is unreliable for this body, so a structural
+    /// green would be a false one.
     ///
     /// FOUND BY THE CROSS-LANGUAGE FIXTURE, not by design: a partial-ancestry
     /// body (subject spending one in-BEEF and one absent parent) sorts the
@@ -151,7 +154,9 @@ pub enum UnevalWhy {
     /// sort) said not-ready. The gated route itself would broadcast the wrong
     /// tx and land on the NETWORK's verdict for it — unknowable here, so the
     /// honest state is the third one. An honest submit never trips this: its
-    /// subject is last and childless within its own BEEF.
+    /// subject is the tip of its own ancestry, so the closure covers every
+    /// entry (see [`beef_has_entries_outside_subject_ancestry`] for the
+    /// probe-earned generalisation from "childless" to "closure-covering").
     SubjectAmbiguous,
 }
 
@@ -225,36 +230,70 @@ pub fn census_verdict(beef_bytes: &[u8]) -> CensusVerdict {
         };
     }
     // A structural GREEN is only honest if the sorted-last entry actually IS
-    // the subject. If any other entry in the BEEF SPENDS it, the sort was
-    // poisoned (the real subject is in a front group) and the gated route
-    // would broadcast the wrong tx — see `UnevalWhy::SubjectAmbiguous`. Only
-    // the green needs this guard: a structural refusal (above) stands
-    // regardless of which tx the caller meant.
-    if subject_has_in_beef_child(beef_bytes, &subject_txid) {
+    // the subject. In an honest submit the subject is the TIP of its own
+    // ancestry: every data-carrying entry in the BEEF is reachable from it by
+    // walking input source references. Any stray entry outside that closure
+    // means the sort was poisoned (the real subject sits in a front group)
+    // and the gated route would broadcast the wrong tx — see
+    // `UnevalWhy::SubjectAmbiguous`. Only the green needs this guard: a
+    // structural refusal (above) stands regardless of which tx the caller
+    // meant.
+    if beef_has_entries_outside_subject_ancestry(beef_bytes, &subject_txid) {
         return CensusVerdict::CouldNotEvaluate(UnevalWhy::SubjectAmbiguous);
     }
     CensusVerdict::GatedReady
 }
 
-/// Does any transaction in the BEEF spend an output of `subject_txid`?
+/// Is any data-carrying BEEF entry OUTSIDE the sorted-last subject's in-BEEF
+/// ancestor closure?
 ///
-/// An honest submit's subject is the tip of its own ancestry — childless
-/// within the BEEF — so a hit means the route's `last()` landed on an
-/// ANCESTOR. A parse failure returns `false`: unreachable here in practice
-/// (the caller only asks after `beef_to_ef_batch` parsed the same bytes), and
-/// a non-answer must not manufacture a verdict.
-fn subject_has_in_beef_child(beef_bytes: &[u8], subject_txid: &str) -> bool {
+/// An honest submit's subject is the tip of its own ancestry, so the closure
+/// covers the whole body — including the recovery shape whose unconvertible
+/// ancestor is still REFERENCED by the subject (in-closure, not a stray).
+/// Probe history, because each spelling was earned by a NOT-RED:
+/// * v1 asked "does anything spend the subject?" — caught the fixture's
+///   partial-ancestry mis-sort, but went blind the moment the stray's
+///   dangling reference pointed outside the BEEF entirely (RED-probe F2: one
+///   byte flipped in a child's prevout txid left the stray unlinked to the
+///   sorted-last parent, and the census read a false green again).
+/// * the closure test subsumes v1: a stray that spends the subject and a
+///   stray that spends nothing in the BEEF are both simply NOT ANCESTORS.
+///
+/// A parse failure returns `false`: unreachable in practice (the caller only
+/// asks after `beef_to_ef_batch` parsed the same bytes), and a non-answer
+/// must not manufacture a verdict.
+fn beef_has_entries_outside_subject_ancestry(beef_bytes: &[u8], subject_txid: &str) -> bool {
+    use std::collections::{HashMap, HashSet};
     let Ok(beef) = bsv_rs::transaction::Beef::from_binary(beef_bytes) else {
         return false;
     };
-    beef.txs.iter().any(|btx| {
-        btx.txid() != subject_txid
-            && btx.tx().is_some_and(|tx| {
-                tx.inputs
-                    .iter()
-                    .any(|i| i.source_txid.as_deref() == Some(subject_txid))
-            })
-    })
+    // Entries with transaction data (mirrors the gated arm's source map:
+    // `if let Some(tx) = btx.tx()`). Txid-only stubs carry nothing that could
+    // be mis-broadcast, so they are neither closure members nor strays.
+    let mut txs: HashMap<String, bsv_rs::transaction::Transaction> = HashMap::new();
+    for btx in &beef.txs {
+        if let Some(tx) = btx.tx() {
+            txs.insert(btx.txid(), tx.clone());
+        }
+    }
+    // BFS the subject's ancestor closure over in-BEEF edges.
+    let mut closure: HashSet<String> = HashSet::new();
+    let mut frontier = vec![subject_txid.to_string()];
+    while let Some(txid) = frontier.pop() {
+        if !closure.insert(txid.clone()) {
+            continue;
+        }
+        if let Some(tx) = txs.get(&txid) {
+            for input in &tx.inputs {
+                if let Some(src) = &input.source_txid {
+                    if txs.contains_key(src) && !closure.contains(src) {
+                        frontier.push(src.clone());
+                    }
+                }
+            }
+        }
+    }
+    txs.keys().any(|txid| !closure.contains(txid))
 }
 
 // ── durable counter names (rows in `ops_counters`; read by `ops::census_json`) ─
@@ -455,6 +494,23 @@ mod tests {
         // Ancestry-carrying (proven parent + unmined subject — the honest
         // wallet AtomicBEEF shape) → structurally ready.
         assert_eq!(census_verdict(&ancestry_carrying_beef()), CensusVerdict::GatedReady);
+        // The honest RECOVERY shape (adversarial review 2026-07-17 finding 5,
+        // same construction as ef.rs's skips-unconvertible-ancestor cell): the
+        // parent rides UNPROVEN and WITHOUT its own sources. The gated arm
+        // skips it and broadcasts the subject, so the census must stay GREEN —
+        // the ancestor is IN the subject's closure, never a stray (the guard
+        // that flags mis-sorted bodies must not flag this one).
+        let recovery = {
+            let mut beef = Beef::new();
+            let parent_raw = {
+                let pb = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+                pb.txs.last().unwrap().tx().unwrap().to_hex()
+            };
+            beef.merge_transaction(Transaction::from_hex(&parent_raw).unwrap());
+            beef.merge_transaction(Transaction::from_hex(SUBJECT_RAW_HEX.trim()).unwrap());
+            beef.to_binary()
+        };
+        assert_eq!(census_verdict(&recovery), CensusVerdict::GatedReady);
         // All-proven mined claim → the network corroboration this census must
         // not perform: the THIRD state, never collapsed (Rule 13).
         let mined_claim = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap().to_binary();
