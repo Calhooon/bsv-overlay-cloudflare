@@ -143,6 +143,31 @@ fn file_party(
     file_party_game(conn, identity, &h64(0x11), pot_txid, recovery_height, marker_txid, at);
 }
 
+/// Latch an already-filed marker the way the PRODUCTION writer would for an
+/// HONEST v1 marker (bsv-low #283).
+///
+/// MODELLING BOUNDARY (epoch Rule 17). `file_party` / `file_party_game` write
+/// `sigHex = '3045ab'`, a stub — a real v1 marker carries a genuine BRC-42
+/// identity signature and `record_sig_valid` latches it `1`. Cells that model
+/// the HONEST v1 half of the production shape (bsv-low publishes v1 and THEN
+/// v2 for each pot) must say so, or the fixture's honest artifact is a stub
+/// in exactly the dimension under test and the cell silently measures
+/// something else (Rule 18 — which is how the v1-then-v2 cells started
+/// reporting the V2 row as the representative).
+///
+/// Attacker rows deliberately do NOT call this: a forged v1 latches `0`, and
+/// leaving them at `NULL` is the WEAKER assumption (the legacy tier), so a
+/// cell that still shows the honest row winning proves more, not less.
+fn latch_honest_v1(conn: &Connection, marker_txid: &str) {
+    let n = conn
+        .execute(
+            "UPDATE potparty_records SET sigValid = 1 WHERE txid = ?1",
+            params![marker_txid],
+        )
+        .expect("latch honest v1");
+    assert_eq!(n, 1, "latch_honest_v1 matched no marker: {marker_txid}");
+}
+
 /// v1 marker with an explicit (possibly attacker-chosen) gameId.
 fn file_party_game(
     conn: &Connection,
@@ -228,22 +253,51 @@ fn file_party_v2_real(
             counterparty: Some(Counterparty::Anyone),
         })
         .unwrap();
+    let id_sig_hex = hex::encode(id_sig.signature);
+    // #283: the latch the PRODUCTION writer would compute for exactly these
+    // field values — `D1PotpartyStorage::store_record` calls the same
+    // `record_sig_valid`. Driving it here rather than hard-coding 1 is what
+    // makes this a producer-level proof (epoch Rule 6b) and keeps the fixture
+    // from being a stub in the dimension under test (Rule 18).
+    let latch = i32::from(overlay_discovery::potparty::validity::record_sig_valid(
+        &overlay_discovery::potparty::storage::PotpartyRecord {
+            identity: identity.clone(),
+            opponent_identity: h66(0xbb),
+            game_id: game_id.to_string(),
+            pot_txid: pot_txid.to_string(),
+            pot_vout: 0,
+            recovery_height,
+            sig_hex: id_sig_hex.clone(),
+            seat_settle_pubkey: Some(settle_pub.clone()),
+            seat_sig_hex: Some(seat_sig_hex.clone()),
+            txid: marker_txid.to_string(),
+            output_index: 0,
+            created_at: at,
+        },
+    ));
+    assert_eq!(
+        latch, 1,
+        "the harness's REAL v2 marker must latch valid — if this fires, the \
+         fixture and the shipped predicate have diverged"
+    );
     conn.execute(
         "INSERT OR IGNORE INTO potparty_records \
          (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
-          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt) \
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+          sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt, \
+          sigValid) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
         params![
             identity,
             h66(0xbb),
             game_id,
             pot_txid,
             recovery_height as i64,
-            hex::encode(id_sig.signature),
+            id_sig_hex,
             settle_pub,
             seat_sig_hex,
             marker_txid,
-            at
+            at,
+            latch
         ],
     )
     .expect("insert v2 potparty_records");
@@ -640,6 +694,7 @@ fn production_v1_then_v2_for_one_pot_still_corroborates() {
 
     // v1 lands FIRST (older createdAt) — it is what the window collapses to.
     file_party_game(&conn, &me, &game, &pot, GATE, "txV1", 1_001);
+    latch_honest_v1(&conn, "txV1"); // an honest v1 is signed; see the helper
     // v2 lands SECOND, fully genuine; commit its settle key in the pot lock
     // so the membership pre-filter is exercised on the real path.
     let settle_pub =
@@ -684,6 +739,7 @@ fn production_v1_and_v2_at_the_same_second_still_corroborates() {
     let game = h64(0x22);
     let pot = h64(0xab);
     file_party_game(&conn, &me, &game, &pot, GATE, "txV1same", 1_001);
+    latch_honest_v1(&conn, "txV1same"); // an honest v1 is signed; see the helper
     let pk = file_party_v2_real(&conn, &w, &game, &pot, GATE as u32, "txV2same", 1_001, 0x51);
     admit_pot_keys(&conn, &pot, 1_000, Some(GATE), Some(pk));
 
@@ -716,12 +772,15 @@ fn dust_window_cannot_starve_the_corroborated_pots_case_fetch() {
     let real_game = h64(0x21);
     // The victim's pot in the production shape: v1 then v2.
     file_party_game(&conn, &me, &real_game, &real_pot, GATE, "txREALv1", 1_001);
+    latch_honest_v1(&conn, "txREALv1");
     let settle_pub =
         file_party_v2_real(&conn, &w, &real_game, &real_pot, GATE as u32, "txREALv2", 1_002, 0x51);
     admit_pot_keys(&conn, &real_pot, 1_000, Some(GATE), Some(settle_pub));
 
-    // Exactly QUOTA fresh ghost markers, distinct invented gameIds, all
-    // newer than the honest marker. Cost to the attacker: 10 OP_RETURNs.
+    // Exactly QUOTA fresh ghost markers, distinct invented gameIds, all newer
+    // than the honest marker. Cost to the attacker: NOTHING — bsv-low#347,
+    // `/submit` is unauthenticated and its SEEN-gate is opt-in, so the
+    // "10 OP_RETURNs" this comment used to quote was never a price.
     let ghost_pot = |i: u64| format!("{:064x}", 0xdead_0000_u64 + i);
     let ghost_game = |i: u64| format!("{:064x}", 0xbeef_0000_u64 + i);
     for i in 0..LIVE_VIEW_UNKNOWN_POT_QUOTA as u64 {
@@ -737,10 +796,17 @@ fn dust_window_cannot_starve_the_corroborated_pots_case_fetch() {
     }
 
     let (rows, corr) = corroborate(&conn, &me);
-    // The window shape that used to starve: 10 promoted ghosts AHEAD of the
-    // real pot.
+    // #283: the ghosts no longer occupy the window head at all. This used to
+    // assert `pos == LIVE_VIEW_UNKNOWN_POT_QUOTA` — quota-many promoted
+    // ghosts AHEAD of the real pot, which the cell then showed was survivable
+    // because the verify budget outranks position. Both properties hold now;
+    // the position one got strictly better.
     let pos = rows.iter().position(|r| r.pot_txid == real_pot).expect("real pot present");
-    assert_eq!(pos, LIVE_VIEW_UNKNOWN_POT_QUOTA, "ghosts occupy the whole window head");
+    assert_eq!(
+        pos, 0,
+        "#283: the victim's own pot leads its own view (was: behind {} promoted ghosts)",
+        LIVE_VIEW_UNKNOWN_POT_QUOTA
+    );
     assert!(corr.claims[pos].is_some(), "the real pot corroborates through the shipped path");
     assert_eq!(
         corr.claims.iter().filter(|c| c.is_some()).count(),
@@ -973,6 +1039,7 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
     let victim_game = h64(0x21);
     // The victim's pot in the production shape (v1 then v2), OLDEST.
     file_party_game(&conn, &me, &victim_game, &victim_pot, GATE, "txV1", 1_001);
+    latch_honest_v1(&conn, "txV1");
     let my_pub =
         file_party_v2_real(&conn, &w, &victim_game, &victim_pot, GATE as u32, "txV2", 1_002, 0x51);
     admit_pot_keys(&conn, &victim_pot, 1_000, Some(GATE), Some(my_pub));
@@ -1018,11 +1085,19 @@ fn attacker_funded_known_pots_cannot_starve_the_victims_verify_attempt() {
 
     let (rows, corr) = corroborate(&conn, &me);
     assert_eq!(rows.len(), 1 + n_pots, "every live pot is served");
-    // The starvation SHAPE is present: the victim's pot sorts LAST among the
-    // known class, behind every crowded attacker pot.
+    // #283: the starvation SHAPE is gone at the source. This used to assert
+    // `rank == n_pots` — the victim's pot LAST in quality order, behind every
+    // crowded attacker pot, which the round-robin allotment then rescued.
+    // The attacker's rows latch `sigValid = 0` (their junk v2 does not
+    // verify) so they cannot lead the victim's own view any more. The
+    // round-robin rescue is still asserted below and still load-bearing for
+    // the LEGACY tier.
     let victim_idx = rows.iter().position(|r| r.pot_txid == victim_pot).unwrap();
     let rank = quality_order(&rows).iter().position(|i| *i == victim_idx).unwrap();
-    assert_eq!(rank, n_pots, "victim is last in quality order");
+    assert_eq!(
+        rank, 0,
+        "#283: the victim's own pot leads its own view (was: last of {n_pots})"
+    );
     assert!(corr.attempts <= LIVE_VIEW_VERIFY_BUDGET, "the CPU ceiling still holds");
     // …and round-robin still serves it.
     assert_eq!(

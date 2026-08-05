@@ -126,6 +126,45 @@ fn file_party(
     .expect("insert potparty_records");
 }
 
+/// File a potparty marker with an explicit #283 admission-time latch.
+///
+/// MODELLING BOUNDARY (epoch Rule 17), stated because it is not obvious: this
+/// helper SETS `sigValid` rather than computing it from real signatures. What
+/// these cells test is the ORDERING the column drives, not the column's
+/// value. The value's correctness is established where it belongs — against
+/// the frozen artifacts the real client producer emits
+/// (`overlay_discovery::potparty::validity` goldens) and through the real
+/// writer path (`results_window_sqlite`'s `production_latch`). A cell here
+/// that minted its own signatures would only re-encode this file's model of
+/// the wire format.
+fn file_party_latched(
+    conn: &Connection,
+    identity: &str,
+    pot_txid: &str,
+    recovery_height: i64,
+    marker_txid: &str,
+    at: i64,
+    sig_valid: bool,
+) {
+    conn.execute(
+        "INSERT OR IGNORE INTO potparty_records \
+         (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+          sigHex, txid, outputIndex, createdAt, sigValid) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, '3045ab', ?6, 0, ?7, ?8)",
+        params![
+            identity,
+            h66(0xbb),
+            h64(0x11),
+            pot_txid,
+            recovery_height,
+            marker_txid,
+            at,
+            i32::from(sig_valid)
+        ],
+    )
+    .expect("insert potparty_records");
+}
+
 /// File a refund-backup marker — `D1PotrefundStorage::store_record`'s
 /// `INSERT OR IGNORE` shape (the raw bytes are stored but must NEVER be
 /// served by this view).
@@ -460,6 +499,72 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
     }
     // Ghost rows arrive with the fail-safe unknown shape (spent null).
     assert!(rows[0].spent.is_none() && rows[0].pot_txid != honest_pot);
+}
+
+/// bsv-low #283 on `/refund-view` — the same 120-ghost flood as the cell
+/// above, plus the bypass the quota never saw (bsv-low#347): a FREE
+/// `pot_records` row per ghost, so every ghost reads `unknownPot = 0`, lands
+/// unconditionally in tier 0 ordered freshest-first, and never touches the
+/// quota at all. Pre-#283 that erases the page outright — no quota
+/// allocation, however clever, bounds it.
+///
+/// It cannot now, because this window is scoped to ONE identity and the
+/// ghost must NAME the victim to appear in it: the marker's identity
+/// signature binds that name, so a ghost latches `sigValid = 0` and sorts
+/// behind every honest row whatever `pot_records` says about its pot.
+///
+/// This is the money-visible recovery surface, so both legs are executed:
+/// the flood, and the LEGACY control that shows the flood is genuinely
+/// capable of erasing the page.
+#[test]
+fn free_ghost_pot_records_cannot_erase_the_refund_view() {
+    const GHOSTS: u64 = 120;
+    let ghost_txid = |i: u64| format!("{:064x}", 0xdead_0000_u64 + i);
+
+    // ---- with the latch: the honest pot is FIRST, every ghost behind it.
+    let conn = production_schema_db();
+    let (me, honest_pot) = seed_armed_pot(&conn);
+    conn.execute(
+        "UPDATE potparty_records SET sigValid = 1 WHERE potTxid = ?1",
+        params![honest_pot],
+    )
+    .expect("latch the honest marker");
+    for i in 0..GHOSTS {
+        // A fabricated pot_records row: free, stamped NOW-ish, so the ghost
+        // is INDEXED as far as this query can tell.
+        conn.execute(
+            "INSERT OR IGNORE INTO pot_records (txid, outputIndex, spent, \
+             spentConfirmed, createdAt) VALUES (?1, 0, 0, 0, ?2)",
+            params![ghost_txid(i), 9_000 + i as i64],
+        )
+        .expect("free ghost pot_records row");
+        file_party_latched(
+            &conn,
+            &me,
+            &ghost_txid(i),
+            GATE,
+            &format!("txGHOST{i:03}"),
+            9_000 + i as i64,
+            false,
+        );
+    }
+    let rows = query_rows(&conn, &me);
+    assert_eq!(
+        rows[0].pot_txid, honest_pot,
+        "the victim's real pot is the FIRST row under a 120-ghost flood that \
+         bypasses the unknown-pot quota entirely"
+    );
+
+    // ---- LEGACY CONTROL: same world, every row pre-migration. The flood
+    // erases the honest pot from the page, which is what makes the leg above
+    // a measurement rather than a tautology (epoch Rule 12a).
+    conn.execute("UPDATE potparty_records SET sigValid = NULL", [])
+        .expect("legacy-ize");
+    let legacy = query_rows(&conn, &me);
+    assert!(
+        !legacy.iter().any(|r| r.pot_txid == honest_pot),
+        "PRE-#283 CONTROL: the same flood erases an all-legacy page"
+    );
 }
 
 #[test]

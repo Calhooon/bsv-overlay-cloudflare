@@ -390,14 +390,18 @@ pub fn live_view_sql() -> String {
          FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
                   covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                   covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
-                  markerCreatedAt, markerRowid, potCreatedAt, \
-                  CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
+                  CASE WHEN unknownPot = 0 \
+                       OR (potBestSigRank > 0 AND potRank <= {quota}) \
+                       THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
                     covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                     covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
+                    potBestSigRank, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
-                                       ORDER BY COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                       ORDER BY potBestSigRank DESC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                                                 markerCreatedAt DESC, markerRowid DESC) AS potRank \
              FROM (SELECT pp.identity AS identity, pp.gameId AS gameId, pp.potTxid AS potTxid, \
                       pp.potVout AS potVout, pp.opponentIdentity AS opponentIdentity, \
@@ -411,21 +415,27 @@ pub fn live_view_sql() -> String {
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
+                      MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
+                          AS potBestSigRank, \
                       ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
-                                         ORDER BY pp.createdAt ASC, pp.rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
                FROM potparty_records pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ? \
                  AND (COALESCE(r.spent, 0) = 0 OR COALESCE(r.spentConfirmed, 0) = 0)) \
              WHERE rn = 1) \
-           ORDER BY tier ASC, COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+           ORDER BY potBestSigRank DESC, tier ASC, \
+                    COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
            LIMIT {rows}) w \
-         ORDER BY w.tier ASC, COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
+         ORDER BY w.potBestSigRank DESC, w.tier ASC, \
+                  COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = LIVE_VIEW_UNKNOWN_POT_QUOTA,
         rows = LIVE_VIEW_MAX_ROWS,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
     )
 }
 
@@ -442,15 +452,23 @@ pub fn live_view_sql() -> String {
 /// LIVE view must not hide) keeps the pre-existing semantics: verifiable
 /// without membership.
 ///
-/// Residual, documented and NOT defended in SQL (the same class as
-/// `seat_markers_sql`'s): with no committed keys to filter on, an attacker
-/// who knows the pot txid can file [`LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT`]
-/// v2-SHAPED junk rows stamped before the honest marker and evict it from
-/// this window. Fail-safe — corroboration is then OMITTED for that pot
-/// (`marker-unverified`, no case fetch), never wrong — and it self-heals the
-/// moment the pot is admitted, since the keyed path's membership filter
-/// rejects junk under foreign keys for free. SQL cannot pick "the row that
-/// verifies"; only admission-side pricing would close it.
+/// The residual this used to carry — "an attacker who knows the pot txid can
+/// file [`LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT`] v2-SHAPED junk rows stamped
+/// before the honest marker and evict it; SQL cannot pick the row that
+/// verifies; only admission-side pricing would close it" — is closed the same
+/// way [`crate::results::seat_markers_sql`]'s is (bsv-low #283): SQL does not
+/// have to PICK the verifying row, only to sort by a verdict latched at
+/// admission. `{rank}` is `potparty_records.sigValid` and it leads the
+/// window. Pricing was never on the table anyway (bsv-low#347: a marker is
+/// free, not dust-priced).
+///
+/// This window is BOTH identity- and outpoint-scoped, so a junk row must name
+/// the caller AND cannot carry the caller's identity signature — rank 0 at
+/// any volume or stamp.
+///
+/// Unchanged: the fail direction (corroboration OMITTED, never wrong), and
+/// the LEGACY tier (`sigValid IS NULL`, pre-migration rows) which orders
+/// exactly as before and drains by republish.
 pub fn keyless_candidates_sql(n: usize) -> String {
     debug_assert!(n >= 1);
     let per_pot = vec!["(potTxid = ? AND potVout = ?)"; n].join(" OR ");
@@ -460,12 +478,14 @@ pub fn keyless_candidates_sql(n: usize) -> String {
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
                       recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
                       ROW_NUMBER() OVER (PARTITION BY potTxid, potVout \
-                                         ORDER BY createdAt ASC, rowid ASC) AS rn \
+                                         ORDER BY {rank} DESC, \
+                                                  createdAt ASC, rowid ASC) AS rn \
                FROM potparty_records \
                WHERE identity = ? AND seatSettlePubkey IS NOT NULL AND ({per_pot})) \
          WHERE rn <= {cap} \
          ORDER BY potTxid ASC, potVout ASC, rn ASC",
         cap = LIVE_VIEW_CANDIDATE_ATTEMPTS_PER_POT,
+        rank = overlay_discovery::potparty::validity::sig_rank_expr(""),
     )
 }
 
