@@ -148,6 +148,14 @@ pub struct OutpointStatus {
     /// overlay's pot `mark_spent`). `Some(bool)` for a known row, `None`
     /// (wire `null`) when unknown — same fail-safe shape as `spent`.
     pub spent_confirmed: Option<bool>,
+    /// #371 witness pair — populated only by the D1 batch producer
+    /// (`batch_where_sql` → [`assemble_statuses`]): the overlay's own
+    /// `network_seen` witness for the recorded spender, and the spender's
+    /// bytes-finality latch. `None` from every other producer (`/spent-any`,
+    /// legacy constructors), which keeps those rows on the strict confirmed
+    /// bar. NOT serialized to any wire body — an in-process counting input.
+    pub spender_seen: Option<bool>,
+    pub spender_final: Option<bool>,
     /// WHY this answer is `known:false` — `None` on every `known:true` row
     /// and on the D1-backed `/utxo-status` path (where absence genuinely
     /// means "no row"). Set by `/spent-any` so an upstream OUTAGE is legible
@@ -187,6 +195,8 @@ impl OutpointStatus {
             spent: None,
             spending_txid: None,
             spent_confirmed: None,
+            spender_seen: None,
+            spender_final: None,
             reason: None,
         }
     }
@@ -200,12 +210,28 @@ impl OutpointStatus {
     }
 
     /// A found row: `known:true` with the row's spent flag + spender +
-    /// confirmation flag.
+    /// confirmation flag. No #371 witness fields — the `/spent-any`
+    /// (WoC-backed) producer and legacy callers have none, and their absence
+    /// keeps those rows on the strict confirmed bar.
     pub fn known(
         op: &Outpoint,
         spent: bool,
         spending_txid: Option<String>,
         spent_confirmed: bool,
+    ) -> Self {
+        Self::known_with_witness(op, spent, spending_txid, spent_confirmed, None, None)
+    }
+
+    /// [`Self::known`] carrying the #371 witness pair (the D1 batch read's
+    /// shape): the overlay's own `network_seen` witness for the recorded
+    /// spender + the spender's bytes-finality latch.
+    pub fn known_with_witness(
+        op: &Outpoint,
+        spent: bool,
+        spending_txid: Option<String>,
+        spent_confirmed: bool,
+        spender_seen: Option<bool>,
+        spender_final: Option<bool>,
     ) -> Self {
         Self {
             txid: op.txid.clone(),
@@ -214,6 +240,8 @@ impl OutpointStatus {
             spent: Some(spent),
             spending_txid,
             spent_confirmed: Some(spent_confirmed),
+            spender_seen,
+            spender_final,
             reason: None,
         }
     }
@@ -249,10 +277,19 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
 /// round trips (and the flaky edge cache) as the scaling mechanism.
 pub fn batch_where_sql(n: usize) -> String {
     debug_assert!((1..=MAX_OUTPOINTS).contains(&n), "parse_outpoints bounds n");
-    let clause = vec!["(txid = ? AND outputIndex = ?)"; n].join(" OR ");
+    let clause = vec!["(p.txid = ? AND p.outputIndex = ?)"; n].join(" OR ");
+    // #371 owner ruling (2026-08-06, "we shouldn't have to wait for confirm"):
+    // the batch status read carries the spender's bytes-finality latch and the
+    // overlay's OWN network witness, so the leaderboard's counting bar can
+    // accept a SEEN covenant settle — the network already validated the
+    // covenant spend; an invalid one would never be relayed.
     format!(
-        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed \
-         FROM pot_records WHERE {clause}"
+        "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
+                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen \
+         FROM pot_records p \
+         LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
+              AND ns.txid = lower(p.spendingTxid) \
+         WHERE {clause}"
     )
 }
 
@@ -266,6 +303,10 @@ pub struct PotRecordRow {
     pub spending_txid: Option<String>,
     /// Whether the recorded spend was SPV-confirmed when recorded.
     pub spent_confirmed: bool,
+    /// #371: the spender's bytes-finality latch (`None` = pre-migration row)
+    /// and the overlay's own `network_seen` witness for the recorded spender.
+    pub spender_final: Option<bool>,
+    pub spender_seen: Option<bool>,
 }
 
 /// Map the batch-query rows back onto the REQUESTED outpoints, input-ordered.
@@ -280,9 +321,14 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
                 .iter()
                 .find(|r| r.txid.eq_ignore_ascii_case(&key_txid) && r.vout == op.vout)
             {
-                Some(r) => {
-                    OutpointStatus::known(op, r.spent, r.spending_txid.clone(), r.spent_confirmed)
-                }
+                Some(r) => OutpointStatus::known_with_witness(
+                    op,
+                    r.spent,
+                    r.spending_txid.clone(),
+                    r.spent_confirmed,
+                    r.spender_seen,
+                    r.spender_final,
+                ),
                 None => OutpointStatus::unknown(op),
             }
         })
@@ -1271,8 +1317,9 @@ pub struct Leaderboard {
     pub hands: Vec<LeaderboardHandRow>,
 }
 
-/// Is this outpoint status a CONFIRMED landing — the one basis on which a
-/// verdict may be derived (#323)?
+/// Is this outpoint status a COUNTED landing — the one basis on which a
+/// leaderboard verdict may be derived (#323, widened by the 2026-08-06 owner
+/// ruling)?
 ///
 /// Extracted from `routes::classify_spent_pots` (MEDIUM-5) because that file
 /// is the one this repo flags as silently deletable: the 2026-07-28 re-gate
@@ -1284,8 +1331,26 @@ pub struct Leaderboard {
 /// stamps `verdict`/`verdictTxid` while leaving `spentConfirmed = 0`, so a
 /// PARKED spender would otherwise mint a real verdict — which can both
 /// create a chain-attributed win and erase an honest claim.
+///
+/// # The #371 arm (owner ruling, 2026-08-06: "we shouldn't have to wait for
+/// confirm to see it on the leaderboard")
+///
+/// A spend the overlay ITSELF witnessed the network accept (`spender_seen`,
+/// the `network_seen` latch — never a caller claim) whose bytes parse FINAL
+/// (`spender_final`) is a miner-validated covenant spend: an invalid one
+/// would never be relayed, so SEEN ∧ FINAL already proves a finished game.
+/// The #332 lesson ("nothing evictable or unconfirmed in a counting path")
+/// is preserved because the arm's inputs are the overlay's own broadcast
+/// verdicts and a write-latched parse — an attacker-planted unconfirmed
+/// pointer from the ungated `/submit` carries NEITHER. Accepted residual
+/// (same as the display half's): a SEEN-never-mined settle counts until a
+/// competing CONFIRMED spend displaces the pointer, at which point the count
+/// self-corrects — and a different-verdict competitor requires a second
+/// valid quorum signature set, inside the accountable trust model.
 pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
-    status.spent == Some(true) && status.spent_confirmed == Some(true)
+    status.spent == Some(true)
+        && (status.spent_confirmed == Some(true)
+            || (status.spender_seen == Some(true) && status.spender_final == Some(true)))
 }
 
 /// Is a recorded spend a LANDING the money views (`/results`,
@@ -1325,11 +1390,11 @@ pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
 /// test: it is DELETING one of the copies so agreement is structural and a
 /// single pin covers both.
 ///
-/// Note the sibling [`is_confirmed_landing`] is deliberately STRICTER (flag
-/// only): it serves the leaderboard/classifier pair, which has no spender
-/// BEEF join to read a proof latch from — and the leaderboard COUNTS wins,
-/// where the #332 lesson demands nothing evictable or unconfirmed in the
-/// counting path, so it does not get the #371 arm either.
+/// The sibling [`is_confirmed_landing`] serves the leaderboard/classifier
+/// pair from the batch-status read (no spender BEEF join, so no
+/// `proof_verified` arm) — since the 2026-08-06 owner ruling it carries the
+/// SAME seen∧final third arm, sourced from the batch read's own
+/// `network_seen` join (see its doc for why #332 survives the widening).
 pub fn is_confirmed_landing_with_proof(
     spent_confirmed: Option<bool>,
     spender_proof_verified: Option<bool>,
@@ -2070,11 +2135,15 @@ mod tests {
     fn batch_sql_shapes() {
         assert_eq!(
             batch_where_sql(1),
-            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
-             WHERE (txid = ? AND outputIndex = ?)"
+            "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
+                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen \
+         FROM pot_records p \
+         LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
+              AND ns.txid = lower(p.spendingTxid) \
+         WHERE (p.txid = ? AND p.outputIndex = ?)"
         );
         let three = batch_where_sql(3);
-        assert_eq!(three.matches("(txid = ? AND outputIndex = ?)").count(), 3);
+        assert_eq!(three.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 3);
         assert_eq!(three.matches(" OR ").count(), 2);
     }
 
@@ -2096,14 +2165,14 @@ mod tests {
         ];
         // Rows arrive in ARBITRARY DB order — assembly must re-order.
         let rows = vec![
-            PotRecordRow {
+            PotRecordRow { spender_final: None, spender_seen: None,
                 txid: txid_a(),
                 vout: 2,
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
             },
-            PotRecordRow {
+            PotRecordRow { spender_final: None, spender_seen: None,
                 txid: txid_b(),
                 vout: 1,
                 spent: true,
@@ -2136,7 +2205,7 @@ mod tests {
             txid: upper.clone(),
             vout: 0,
         }];
-        let rows = vec![PotRecordRow {
+        let rows = vec![PotRecordRow { spender_final: None, spender_seen: None,
             txid: "ab".repeat(32),
             vout: 0,
             spent: true,
@@ -2273,7 +2342,7 @@ mod tests {
         ];
         let rows = vec![
             PotsViewRow {
-                record: PotRecordRow {
+                record: PotRecordRow { spender_final: None, spender_seen: None,
                     txid: txid_a(),
                     vout: 0,
                     spent: true,
@@ -2283,7 +2352,7 @@ mod tests {
                 spender_beef_hex: Some(beef_hex_upper),
             },
             PotsViewRow {
-                record: PotRecordRow {
+                record: PotRecordRow { spender_final: None, spender_seen: None,
                     txid: txid_a(),
                     vout: 1,
                     spent: true,
@@ -2293,7 +2362,7 @@ mod tests {
                 spender_beef_hex: None,
             },
             PotsViewRow {
-                record: PotRecordRow {
+                record: PotRecordRow { spender_final: None, spender_seen: None,
                     txid: txid_b(),
                     vout: 2,
                     spent: false,
@@ -2336,7 +2405,7 @@ mod tests {
             vout: 0,
         }];
         let rows = vec![PotsViewRow {
-            record: PotRecordRow {
+            record: PotRecordRow { spender_final: None, spender_seen: None,
                 txid: txid_a(),
                 vout: 0,
                 spent: true,
@@ -2613,6 +2682,37 @@ mod tests {
         assert!(!is_confirmed_landing(&mk(false, true)));
         // Unknown (no pot_records row) is never a landing.
         assert!(!is_confirmed_landing(&OutpointStatus::unknown(&op)));
+
+        // ── The #371 arm (owner ruling 2026-08-06): SEEN ∧ FINAL counts an
+        // UNCONFIRMED spend; neither half alone does; an unspent row never
+        // does regardless of witness.
+        let with = |spent: bool, seen: Option<bool>, fin: Option<bool>| {
+            let mut s = mk(spent, false);
+            s.spender_seen = seen;
+            s.spender_final = fin;
+            s
+        };
+        assert!(
+            is_confirmed_landing(&with(true, Some(true), Some(true))),
+            "a network-witnessed FINAL settle counts at the SEEN bar"
+        );
+        assert!(
+            !is_confirmed_landing(&with(true, None, Some(true))),
+            "final bytes with no overlay witness: the Rule-21 plant stays out"
+        );
+        assert!(
+            !is_confirmed_landing(&with(true, Some(false), Some(true))),
+            "an explicit no-witness is not a witness"
+        );
+        assert!(
+            !is_confirmed_landing(&with(true, Some(true), Some(false))),
+            "a witnessed NON-FINAL spender is a parked refund — #323 verbatim"
+        );
+        assert!(
+            !is_confirmed_landing(&with(true, Some(true), None)),
+            "an unlatched finality is not finality"
+        );
+        assert!(!is_confirmed_landing(&with(false, Some(true), Some(true))));
     }
 
     #[test]
@@ -3071,7 +3171,7 @@ mod tests {
         for op in &ops {
             for (pot, settle) in spent_by {
                 if op.db_txid() == tx(*pot) {
-                    rows.push(PotRecordRow {
+                    rows.push(PotRecordRow { spender_final: None, spender_seen: None,
                         txid: op.txid.clone(),
                         vout: 0,
                         spent: true,
@@ -3138,7 +3238,7 @@ mod tests {
         for op in &ops {
             for (pot, settle) in spent_by {
                 if op.db_txid() == tx(*pot) {
-                    rows.push(PotRecordRow {
+                    rows.push(PotRecordRow { spender_final: None, spender_seen: None,
                         txid: op.txid.clone(),
                         vout: 0,
                         spent: true,
@@ -3718,7 +3818,7 @@ mod tests {
             for op in *chunk {
                 for (pot, settle) in &spent_by {
                     if op.db_txid() == tx(*pot) {
-                        pot_rows.push(PotRecordRow {
+                        pot_rows.push(PotRecordRow { spender_final: None, spender_seen: None,
                             txid: op.txid.clone(),
                             vout: 0,
                             spent: true,

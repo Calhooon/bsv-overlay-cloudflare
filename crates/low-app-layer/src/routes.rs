@@ -129,6 +129,12 @@ struct PotRowD1 {
     /// additive `spentConfirmed` migration.
     #[serde(rename = "spentConfirmed", default)]
     spent_confirmed: f64,
+    /// #371 witness pair; `default` tolerates a read racing the additive
+    /// migration — absent = no third arm (the strict confirmed bar).
+    #[serde(rename = "spenderFinal", default)]
+    spender_final: Option<f64>,
+    #[serde(rename = "spenderSeen", default)]
+    spender_seen: Option<f64>,
 }
 
 impl PotRowD1 {
@@ -139,6 +145,8 @@ impl PotRowD1 {
             spent: self.spent != 0.0,
             spending_txid: self.spending_txid,
             spent_confirmed: self.spent_confirmed != 0.0,
+            spender_final: self.spender_final.map(|v| v != 0.0),
+            spender_seen: self.spender_seen.map(|v| v != 0.0),
         }
     }
 }
@@ -401,6 +409,10 @@ impl PotsViewRowD1 {
                 spent: self.spent != 0.0,
                 spending_txid: self.spending_txid,
                 spent_confirmed: self.spent_confirmed != 0.0,
+                // /pots-view serves display hints, not counting inputs — the
+                // #371 witness pair stays absent (strict bar) here.
+                spender_final: None,
+                spender_seen: None,
             },
             spender_beef_hex: self.spender_beef,
         }
@@ -2538,6 +2550,9 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Re
             spent: row.spent,
             spending_txid: row.spending_txid,
             spent_confirmed: row.spent_confirmed,
+            // /spent-any is WoC-backed — no overlay witness, strict bar.
+            spender_seen: None,
+            spender_final: None,
             reason: row.reason,
         });
     }

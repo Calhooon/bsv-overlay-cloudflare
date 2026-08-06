@@ -313,18 +313,16 @@ fn query_window(conn: &Connection, limit: usize) -> (Vec<ResultMarkerRow>, bool)
     )
 }
 
-/// Build the `pot_records` spend-status join for a marker set, straight out
-/// of the SAME database the window read (the route's step 2, chunk logic
-/// aside — `batch_where_sql` is executed by `sql_prepares_sqlite`).
+/// Build the `pot_records` spend-status join for a marker set through the
+/// SHIPPED `batch_where_sql` (per-outpoint chunks of 1 — the route's step 2
+/// chunking aside), so the #371 `network_seen` witness join is exercised by
+/// the production string, not a hand-rolled twin (Rule 6b).
 fn statuses_from_db(conn: &Connection, markers: &[ResultMarkerRow]) -> Vec<OutpointStatus> {
     let ops = leaderboard_pot_outpoints(markers);
     let mut rows: Vec<PotRecordRow> = Vec::new();
     for op in &ops {
         let mut stmt = conn
-            .prepare(
-                "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed \
-                 FROM pot_records WHERE txid = ?1 AND outputIndex = ?2",
-            )
+            .prepare(&low_app_layer::logic::batch_where_sql(1))
             .unwrap();
         let mut got = stmt
             .query_map(params![op.db_txid(), op.vout as i64], |r| {
@@ -334,6 +332,10 @@ fn statuses_from_db(conn: &Connection, markers: &[ResultMarkerRow]) -> Vec<Outpo
                     spent: r.get::<_, i64>("spent")? != 0,
                     spending_txid: r.get("spendingTxid")?,
                     spent_confirmed: r.get::<_, i64>("spentConfirmed")? != 0,
+                    spender_final: r
+                        .get::<_, Option<i64>>("spenderFinal")?
+                        .map(|v| v != 0),
+                    spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
                 })
             })
             .unwrap()
@@ -525,6 +527,83 @@ fn erasure_marker_reaches_the_aggregate_and_the_honest_win_survives() {
         .expect("the honest win must still be on the board");
     assert_eq!(honest.wins, 1);
     assert!(honest.proven, "its VERIFIED-countersigned tier survives");
+}
+
+/// #371 owner ruling (2026-08-06) END TO END — "we shouldn't have to wait
+/// for confirm to see it on the leaderboard": an UNCONFIRMED settle the
+/// overlay ITSELF witnessed the network accept (`network_seen`) with FINAL
+/// bytes (`spenderFinal = 1`) COUNTS the win, through the production
+/// writers + the shipped `batch_where_sql` witness join. The two controls
+/// prove the conjunction: the same shape with NO witness latch (the
+/// ungated-/submit plant, epoch Rule 21) counts NOTHING, and witnessed but
+/// NON-FINAL (a parked refund pointer) counts nothing.
+#[test]
+fn a_seen_and_final_unconfirmed_settle_counts_on_the_board() {
+    let conn = production_schema_db();
+    let fin = |c: &Connection, pot: &str, settle: &str, f: i64| {
+        // The #371 unconfirmed mark_spent shape (no verdict): pointer +
+        // finality CASE binds, through the production SQL.
+        c.execute(
+            mark_spent_sql(false, false),
+            params![settle, settle, f, f, pot, 0i64],
+        )
+        .expect("mark_spent_sql");
+    };
+
+    // Seen + final, UNCONFIRMED: counts.
+    let pot = h64(0xa1);
+    let settle = h64(0xb1);
+    let game = h64(0x03);
+    admit_pot(&conn, &pot, 1_000);
+    fin(&conn, &pot, &settle, 1);
+    conn.execute(
+        bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
+        params![settle],
+    )
+    .expect("network_seen latch");
+    file_honest_result(&conn, &game, 0x11, 0x22, &pot, &settle, true, &h64(0xf5), 1_001);
+
+    // Final but UNWITNESSED: must not count.
+    let pot2 = h64(0xa2);
+    let settle2 = h64(0xb2);
+    let game2 = h64(0x04);
+    admit_pot(&conn, &pot2, 1_000);
+    fin(&conn, &pot2, &settle2, 1);
+    file_honest_result(&conn, &game2, 0x33, 0x44, &pot2, &settle2, true, &h64(0xf6), 1_002);
+
+    // Witnessed but NON-final: must not count.
+    let pot3 = h64(0xa3);
+    let settle3 = h64(0xb3);
+    let game3 = h64(0x05);
+    admit_pot(&conn, &pot3, 1_000);
+    fin(&conn, &pot3, &settle3, 0);
+    conn.execute(
+        bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
+        params![settle3],
+    )
+    .expect("network_seen latch");
+    file_honest_result(&conn, &game3, 0x55, 0x66, &pot3, &settle3, true, &h64(0xf7), 1_003);
+
+    let (markers, _) = query_window(&conn, 200);
+    let statuses = statuses_from_db(&conn, &markers);
+    let world = win_world(&[
+        (&pot, &identity(0x11), &identity(0x22)),
+        (&pot2, &identity(0x33), &identity(0x44)),
+        (&pot3, &identity(0x55), &identity(0x66)),
+    ]);
+    let lb = agg_world(&markers, &statuses, &world);
+    assert!(
+        lb.board.iter().any(|r| r.identity == identity(0x11) && r.wins == 1),
+        "a SEEN + FINAL unconfirmed settle counts at the ruling-3 bar"
+    );
+    assert!(
+        !lb.board.iter().any(|r| r.identity == identity(0x33)),
+        "final bytes with NO overlay witness never count (Rule 21 plant)"
+    );
+    assert!(
+        !lb.board.iter().any(|r| r.identity == identity(0x55)),
+        "a witnessed NON-FINAL spender never counts (#323 verbatim)"
+    );
 }
 
 /// CRITICAL-1 END TO END — the EARLIER-spam eviction that the interim design
