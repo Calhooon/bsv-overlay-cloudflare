@@ -693,6 +693,26 @@ pub struct RecoveryEntry {
     /// The pot's COMMITTED covenant keys (#343), or `None` = cannot say. See
     /// [`crate::results::CommittedKeys`].
     pub committed_keys: Option<crate::results::CommittedKeys>,
+    /// #252 stage A — a `collected_markers_v2` row EXISTS for
+    /// (caller identity, gameId). PRESENCE ONLY, and presence proves nothing
+    /// (admission is byte-format with no server-side sig verify — see the
+    /// overlay's collected storage docs): the client's Collect surface still
+    /// verifies marker signatures under its own wallet before treating a game
+    /// as collected. `None` = could not ask (query fault / racing migration)
+    /// — never conflated with `Some(false)` ("asked, no row"). Display /
+    /// dedup hint only; NEVER a money gate.
+    pub collected: Option<bool>,
+    /// #252 stage A — the caller's trust-gated outcome word for this pot,
+    /// REUSED verbatim from the `/results` derivation
+    /// (`derive_outcome_with_seat` — Rule 15: derived once, never
+    /// re-implemented here). `None` = the results derivation was unavailable
+    /// or did not cover this pot; the honesty pair below says how a present
+    /// word was derived.
+    pub outcome: Option<crate::results::Outcome>,
+    /// How `outcome` was derived (`"chain"` / `"chain+seatkey"` /
+    /// `"chain+claim"`), `None` for absent/unresolved — the same wire
+    /// contract as `/results`' `outcomeSource`.
+    pub outcome_source: Option<&'static str>,
 }
 
 /// Map the joined rows to response entries, extracting each recorded
@@ -759,10 +779,105 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
                 // #343 — carried straight through: the row already holds the
                 // pot's committed keys, and this view never re-derives them.
                 committed_keys: r.committed_keys,
+                // #252 stage A — filled by `apply_recovery_extras` AFTER
+                // assembly (the route's best-effort side reads); `None` here
+                // is the honest "not asked yet".
+                collected: None,
+                outcome: None,
+                outcome_source: None,
             }
         })
         .collect();
     (entries, truncated)
+}
+
+// ── #252 stage A — the /recovery-view read-behind extras ────────────────────
+
+/// The `collected_markers_v2` PRESENCE query for one identity over a chunk of
+/// gameIds: which of these games carry at least one admitted collected
+/// marker naming this identity? `DISTINCT gameId` — presence, never rows
+/// (the marker sig is verified CLIENT-side only; see [`RecoveryEntry::collected`]).
+/// Binds: identity, then `n` gameIds (all lowercase hex by write convention).
+pub fn collected_presence_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let marks = vec!["?"; n].join(", ");
+    format!(
+        "SELECT DISTINCT gameId FROM collected_markers_v2 \
+         WHERE identity = ? AND gameId IN ({marks})"
+    )
+}
+
+/// Proof that the #252 extras fold RAN over these entries — the ONLY way to
+/// obtain the argument [`recovery_view_body`] demands (private field, one
+/// constructor: [`apply_recovery_extras`]).
+///
+/// Why a proof type rather than a convention (Rule 22, the schema.rs
+/// `LatchColumnsEnsured` pattern): the extras' OFF state (`collected: null`,
+/// `outcome: null`) is a VALID tri-state wire answer, so if the route's fold
+/// call were deleted (or `if false`'d), every test would stay green while
+/// the feature died silently in production — the exact D1-latch-NULL class
+/// Rule 22 documents. With this type, deleting the fold is a BUILD failure.
+pub struct RecoveryEntriesReady(Vec<RecoveryEntry>);
+
+impl RecoveryEntriesReady {
+    /// The folded entries (read-only — the fold is the sole writer).
+    pub fn entries(&self) -> &[RecoveryEntry] {
+        &self.0
+    }
+}
+
+/// One pot outpoint's folded outcome pair: `(outcome, outcomeSource)`.
+type OutcomePair = (crate::results::Outcome, Option<&'static str>);
+/// The `(gameId, potTxid, potVout)` → [`OutcomePair`] fold index.
+type OutcomeIndex = std::collections::HashMap<(String, String, u32), OutcomePair>;
+
+/// Fold the route's two BEST-EFFORT side reads into the assembled entries —
+/// PURE, so the fold is natively testable (the D1 fetches themselves are the
+/// route's, like every other view).
+///
+/// * `outcomes`: the `/results` entries for the SAME identity (Rule 15 — the
+///   one derivation), matched on `(gameId, potTxid, potVout)` lowercase.
+///   `None` = the derivation was unavailable; every entry keeps
+///   `outcome: None`. An entry the results page does not cover (e.g. its own
+///   truncation window differs) also stays `None` — absence, never a guess.
+/// * `collected`: the set of gameIds (lowercase) with a marker row, or
+///   `None` = the presence query could not run — every entry keeps
+///   `collected: None` (cannot-say), NEVER `Some(false)`.
+pub fn apply_recovery_extras(
+    mut entries: Vec<RecoveryEntry>,
+    outcomes: Option<&[crate::results::ResultEntry]>,
+    collected: Option<&std::collections::HashSet<String>>,
+) -> RecoveryEntriesReady {
+    let outcome_map: Option<OutcomeIndex> = outcomes.map(|list| {
+        list.iter()
+            .map(|e| {
+                (
+                    (
+                        e.game_id.to_ascii_lowercase(),
+                        e.pot_txid.to_ascii_lowercase(),
+                        e.pot_vout,
+                    ),
+                    (e.outcome, e.outcome_source),
+                )
+            })
+            .collect()
+    });
+    for entry in &mut entries {
+        if let Some(set) = collected {
+            entry.collected = Some(set.contains(&entry.game_id.to_ascii_lowercase()));
+        }
+        if let Some(map) = &outcome_map {
+            if let Some((outcome, source)) = map.get(&(
+                entry.game_id.to_ascii_lowercase(),
+                entry.pot_txid.to_ascii_lowercase(),
+                entry.pot_vout,
+            )) {
+                entry.outcome = Some(*outcome);
+                entry.outcome_source = *source;
+            }
+        }
+    }
+    RecoveryEntriesReady(entries)
 }
 
 /// Assemble the `/recovery-view` wire body:
@@ -771,8 +886,13 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
 /// `tip` mirrors `/pots-view` (the recovery-height gate needs it) and is
 /// `null` on a chaintracks fault — the D1 facts still serve, and the client
 /// falls back to its own `/tip`.
-pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>, truncated: bool) -> String {
+pub fn recovery_view_body(
+    entries: &RecoveryEntriesReady,
+    tip: Option<u64>,
+    truncated: bool,
+) -> String {
     let arr: Vec<serde_json::Value> = entries
+        .entries()
         .iter()
         .map(|e| {
             json!({
@@ -801,6 +921,21 @@ pub fn recovery_view_body(entries: &[RecoveryEntry], tip: Option<u64>, truncated
                 "committedKeys": crate::results::CommittedKeys::to_json(
                     e.committed_keys.as_ref()
                 ),
+                // NEW (#252 stage A) — both ADDITIVE and read-behind (the
+                // deployed client's strict parser ignores unknown fields;
+                // stage B consumes them). Tri-state honesty: `null` =
+                // could-not-ask / not-derived, never conflated with a
+                // negative fact.
+                //
+                // `collected`: a collected_markers_v2 row EXISTS for this
+                // (identity, gameId) — PRESENCE ONLY; the client verifies
+                // marker sigs itself (a row's existence proves nothing).
+                "collected": e.collected,
+                // `outcome`/`outcomeSource`: the /results honesty pair,
+                // REUSED from the one derivation (Rule 15) — trust-gated
+                // exactly as /results serves it.
+                "outcome": e.outcome.map(crate::results::Outcome::as_str),
+                "outcomeSource": e.outcome_source,
             })
         })
         .collect();
@@ -2165,7 +2300,10 @@ mod tests {
          WHERE (p.txid = ? AND p.outputIndex = ?)"
         );
         let three = batch_where_sql(3);
-        assert_eq!(three.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 3);
+        assert_eq!(
+            three.matches("(p.txid = ? AND p.outputIndex = ?)").count(),
+            3
+        );
         assert_eq!(three.matches(" OR ").count(), 2);
     }
 
@@ -2187,14 +2325,18 @@ mod tests {
         ];
         // Rows arrive in ARBITRARY DB order — assembly must re-order.
         let rows = vec![
-            PotRecordRow { spender_final: None, spender_seen: None,
+            PotRecordRow {
+                spender_final: None,
+                spender_seen: None,
                 txid: txid_a(),
                 vout: 2,
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
             },
-            PotRecordRow { spender_final: None, spender_seen: None,
+            PotRecordRow {
+                spender_final: None,
+                spender_seen: None,
                 txid: txid_b(),
                 vout: 1,
                 spent: true,
@@ -2227,7 +2369,9 @@ mod tests {
             txid: upper.clone(),
             vout: 0,
         }];
-        let rows = vec![PotRecordRow { spender_final: None, spender_seen: None,
+        let rows = vec![PotRecordRow {
+            spender_final: None,
+            spender_seen: None,
             txid: "ab".repeat(32),
             vout: 0,
             spent: true,
@@ -2364,7 +2508,9 @@ mod tests {
         ];
         let rows = vec![
             PotsViewRow {
-                record: PotRecordRow { spender_final: None, spender_seen: None,
+                record: PotRecordRow {
+                    spender_final: None,
+                    spender_seen: None,
                     txid: txid_a(),
                     vout: 0,
                     spent: true,
@@ -2374,7 +2520,9 @@ mod tests {
                 spender_beef_hex: Some(beef_hex_upper),
             },
             PotsViewRow {
-                record: PotRecordRow { spender_final: None, spender_seen: None,
+                record: PotRecordRow {
+                    spender_final: None,
+                    spender_seen: None,
                     txid: txid_a(),
                     vout: 1,
                     spent: true,
@@ -2384,7 +2532,9 @@ mod tests {
                 spender_beef_hex: None,
             },
             PotsViewRow {
-                record: PotRecordRow { spender_final: None, spender_seen: None,
+                record: PotRecordRow {
+                    spender_final: None,
+                    spender_seen: None,
                     txid: txid_b(),
                     vout: 2,
                     spent: false,
@@ -2427,7 +2577,9 @@ mod tests {
             vout: 0,
         }];
         let rows = vec![PotsViewRow {
-            record: PotRecordRow { spender_final: None, spender_seen: None,
+            record: PotRecordRow {
+                spender_final: None,
+                spender_seen: None,
                 txid: txid_a(),
                 vout: 0,
                 spent: true,
@@ -2568,8 +2720,12 @@ mod tests {
         // resolves to no valid height, and under oldest-marker-wins that
         // hostile marker survives dedupe.
         let (out, _) = assemble_recovery_view(vec![row(None, 0)]);
-        let body: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&out, Some(958_800), false)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&recovery_view_body(
+            &apply_recovery_extras(out, None, None),
+            Some(958_800),
+            false,
+        ))
+        .unwrap();
         assert!(
             body["entries"][0]["recoveryHeight"].is_number(),
             "recoveryHeight must be a NUMBER on the wire: {body}"
@@ -2598,7 +2754,12 @@ mod tests {
     #[test]
     fn is_confirmed_landing_with_proof_is_the_one_money_view_bar() {
         // The flag alone.
-        assert!(is_confirmed_landing_with_proof(Some(true), None, None, None));
+        assert!(is_confirmed_landing_with_proof(
+            Some(true),
+            None,
+            None,
+            None
+        ));
         // A chaintracks-VERIFIED spender proof alone (the migrated-row case).
         assert!(is_confirmed_landing_with_proof(
             Some(false),
@@ -2606,9 +2767,19 @@ mod tests {
             None,
             None
         ));
-        assert!(is_confirmed_landing_with_proof(None, Some(true), None, None));
+        assert!(is_confirmed_landing_with_proof(
+            None,
+            Some(true),
+            None,
+            None
+        ));
         // A PARKED intent: no signal at all.
-        assert!(!is_confirmed_landing_with_proof(Some(false), None, None, None));
+        assert!(!is_confirmed_landing_with_proof(
+            Some(false),
+            None,
+            None,
+            None
+        ));
         assert!(!is_confirmed_landing_with_proof(None, None, None, None));
         // An UNVERIFIED latch is not a signal (never a guess).
         assert!(!is_confirmed_landing_with_proof(
@@ -2634,7 +2805,12 @@ mod tests {
             Some(true),
             Some(false)
         ));
-        assert!(!is_confirmed_landing_with_proof(None, None, Some(true), None));
+        assert!(!is_confirmed_landing_with_proof(
+            None,
+            None,
+            Some(true),
+            None
+        ));
         // FINAL alone is NOT enough: a final-looking spend pointer with no
         // network witness is exactly what a stranger can plant through the
         // ungated public /submit (epoch Rule 21) — it stays behind the
@@ -3016,6 +3192,9 @@ mod tests {
                 spent_confirmed: Some(true),
                 spender_raw_hex: Some("aabb".to_string()),
                 committed_keys: None,
+                collected: None,
+                outcome: None,
+                outcome_source: None,
             },
             RecoveryEntry {
                 game_id: "33".repeat(32),
@@ -3028,10 +3207,17 @@ mod tests {
                 spent_confirmed: None,
                 spender_raw_hex: None,
                 committed_keys: None,
+                collected: None,
+                outcome: None,
+                outcome_source: None,
             },
         ];
-        let v: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&entries, Some(958_800), false)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&recovery_view_body(
+            &apply_recovery_extras(entries.clone(), None, None),
+            Some(958_800),
+            false,
+        ))
+        .unwrap();
         assert_eq!(v["tip"], 958_800);
         let arr = v["entries"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -3051,13 +3237,21 @@ mod tests {
         assert!(arr[1]["spentConfirmed"].is_null());
         assert!(arr[1]["spenderRawHex"].is_null());
         // A chaintracks fault serves entries with a null tip.
-        let v2: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&entries, None, false)).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&recovery_view_body(
+            &apply_recovery_extras(entries, None, None),
+            None,
+            false,
+        ))
+        .unwrap();
         assert!(v2["tip"].is_null());
         assert_eq!(v2["entries"].as_array().unwrap().len(), 2);
         // An empty result (invalid/empty identity) is a well-formed body.
-        let v3: serde_json::Value =
-            serde_json::from_str(&recovery_view_body(&[], None, false)).unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&recovery_view_body(
+            &apply_recovery_extras(Vec::new(), None, None),
+            None,
+            false,
+        ))
+        .unwrap();
         assert!(v3["tip"].is_null());
         assert_eq!(v3["entries"].as_array().unwrap().len(), 0);
     }
@@ -3216,7 +3410,9 @@ mod tests {
         for op in &ops {
             for (pot, settle) in spent_by {
                 if op.db_txid() == tx(*pot) {
-                    rows.push(PotRecordRow { spender_final: None, spender_seen: None,
+                    rows.push(PotRecordRow {
+                        spender_final: None,
+                        spender_seen: None,
                         txid: op.txid.clone(),
                         vout: 0,
                         spent: true,
@@ -3283,7 +3479,9 @@ mod tests {
         for op in &ops {
             for (pot, settle) in spent_by {
                 if op.db_txid() == tx(*pot) {
-                    rows.push(PotRecordRow { spender_final: None, spender_seen: None,
+                    rows.push(PotRecordRow {
+                        spender_final: None,
+                        spender_seen: None,
                         txid: op.txid.clone(),
                         vout: 0,
                         spent: true,
@@ -3863,7 +4061,9 @@ mod tests {
             for op in *chunk {
                 for (pot, settle) in &spent_by {
                     if op.db_txid() == tx(*pot) {
-                        pot_rows.push(PotRecordRow { spender_final: None, spender_seen: None,
+                        pot_rows.push(PotRecordRow {
+                            spender_final: None,
+                            spender_seen: None,
                             txid: op.txid.clone(),
                             vout: 0,
                             spent: true,

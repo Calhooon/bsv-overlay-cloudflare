@@ -559,6 +559,12 @@ impl RecoveryRowD1 {
 /// with nothing indexed sees the same well-formed empty answer. A pot with a
 /// party marker but no `pot_records` row yet is `spent:null` (never asserted
 /// unspent). Public data only, read-only, no secrets.
+///
+/// #252 stage A (read-behind, additive): each entry also carries `collected`
+/// (a `collected_markers_v2` row exists for this identity+game — presence
+/// hint only, tri-state) and the `/results`-derived `outcome`/`outcomeSource`
+/// honesty pair (Rule 15: the one derivation, reused). Both best-effort:
+/// `null` on any fault, and the pre-existing fields never move.
 pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // #318: identity comes from the ONE auth seam (session identity wins;
     // mismatch refuses; anonymous lenient = the legacy query-param claim).
@@ -569,7 +575,14 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
 
     // Missing / empty / malformed identity → empty result, not an error.
     if !valid_identity(&identity) {
-        return json_response(recovery_view_body(&[], None, false), 200);
+        return json_response(
+            recovery_view_body(
+                &crate::logic::apply_recovery_extras(Vec::new(), None, None),
+                None,
+                false,
+            ),
+            200,
+        );
     }
 
     let db = match ctx.env.d1("OVERLAY_DB") {
@@ -594,8 +607,98 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
     };
 
     let (entries, truncated) = assemble_recovery_view(rows);
+
+    // #252 stage A — the two READ-BEHIND extras, both BEST-EFFORT (any fault
+    // serves `null` for its field and never disturbs the view's original
+    // fields or its 200): `outcome` REUSES the whole `/results` derivation
+    // for the same identity (Rule 15 — one derivation, never a re-spelled
+    // one), and `collected` is `collected_markers_v2` PRESENCE (the client
+    // still verifies marker sigs itself). The fold is the pure
+    // `apply_recovery_extras` (natively pinned); these two fetches are the
+    // route's, like every other view's D1 legs. An EMPTY view (identity with
+    // no pots — every fresh visitor) skips both side reads outright: there is
+    // nothing to annotate, and the /results gather is the expensive leg.
+    let outcome_entries = if entries.is_empty() {
+        None
+    } else {
+        match gather_result_entries(&db, &identity.to_ascii_lowercase()).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                console_warn!(
+                    "[recovery-view] results derivation unavailable (outcome served null): {e}"
+                );
+                None
+            }
+        }
+    };
+    let collected = collected_games_for(
+        &db,
+        &identity.to_ascii_lowercase(),
+        entries.iter().map(|e| e.game_id.to_ascii_lowercase()),
+    )
+    .await;
+    let entries = crate::logic::apply_recovery_extras(
+        entries,
+        outcome_entries.as_deref(),
+        collected.as_ref(),
+    );
+
     let tip = chaintracks_present_height(&ctx, "recovery-view").await.ok();
     json_response(recovery_view_body(&entries, tip, truncated), 200)
+}
+
+/// #252 stage A — which of these games carry a `collected_markers_v2` row for
+/// this identity? `Some(set)` = asked successfully (a game absent from the
+/// set was ASKED about and has no row); `None` = could not ask (bind/query
+/// fault, racing pre-migration schema) — the caller serves `null`, never a
+/// false "not collected". Chunked like every IN(...) read here.
+async fn collected_games_for(
+    db: &worker::D1Database,
+    identity_lc: &str,
+    game_ids: impl Iterator<Item = String>,
+) -> Option<std::collections::HashSet<String>> {
+    #[derive(Deserialize)]
+    struct GameIdRowD1 {
+        #[serde(rename = "gameId")]
+        game_id: String,
+    }
+    let mut ids: Vec<String> = game_ids.collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out = std::collections::HashSet::new();
+    if ids.is_empty() {
+        return Some(out);
+    }
+    for chunk in ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() + 1);
+        binds.push(JsValue::from_str(identity_lc));
+        for g in chunk {
+            binds.push(JsValue::from_str(g));
+        }
+        let stmt = match db
+            .prepare(crate::logic::collected_presence_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[recovery-view] collected bind failed (collected served null): {e}");
+                return None;
+            }
+        };
+        match stmt.all().await.and_then(|r| r.results::<GameIdRowD1>()) {
+            Ok(rows) => out.extend(rows.into_iter().map(|r| r.game_id.to_ascii_lowercase())),
+            Err(e) => {
+                // A whole-set None rather than a partial set: a partial answer
+                // would read `Some(false)` ("asked, no row") for games in the
+                // failed chunk — the one conflation the tri-state forbids.
+                console_warn!(
+                    "[recovery-view] collected query failed (collected served null): {e}"
+                );
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// `result_markers_v2` row as D1 returns it. `potTxid`/`settleTxid`/
@@ -1428,21 +1531,40 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
 
+    let entries = match gather_result_entries(&db, &identity_lc).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            console_warn!("[results] {e}");
+            return json_error("database query failed", 503);
+        }
+    };
+    json_response(crate::results::results_body(&identity_lc, &entries), 200)
+}
+
+/// The whole `/results` derivation for one identity — rows, claims, seat
+/// proofs, outcome words — extracted so `/recovery-view` REUSES it for its
+/// `outcome` field (#252 stage A, Rule 15: derive once; a second
+/// implementation of the outcome word would drift). `Err` = the PRIMARY
+/// results query failed (each caller keeps its own posture: `/results`
+/// answers 503, `/recovery-view` serves null outcomes — best-effort). The
+/// claims/seat legs stay BEST-EFFORT inside, exactly as before.
+async fn gather_result_entries(
+    db: &worker::D1Database,
+    identity_lc: &str,
+) -> std::result::Result<Vec<crate::results::ResultEntry>, String> {
     let stmt = db
         .prepare(crate::results::results_sql())
-        .bind(&[JsValue::from_str(&identity_lc)])?;
+        .bind(&[JsValue::from_str(identity_lc)])
+        .map_err(|e| format!("results bind failed: {e}"))?;
     let rows: Vec<crate::results::ResultsRow> =
         match stmt.all().await.and_then(|r| r.results::<ResultsRowD1>()) {
             Ok(rows) => rows.into_iter().map(ResultsRowD1::into_row).collect(),
-            Err(e) => {
-                console_warn!("[results] potparty join query failed: {e}");
-                return json_error("database query failed", 503);
-            }
+            Err(e) => return Err(format!("potparty join query failed: {e}")),
         };
 
     // Claims (won/lost attribution) — BEST-EFFORT: a fault here only leaves
-    // winner-verdict games `unresolved`, never a 5xx (the chain-truth
-    // tie/refund outcomes and the verdict field still serve).
+    // winner-verdict games `unresolved`, never a hard failure (the
+    // chain-truth tie/refund outcomes and the verdict field still serve).
     let mut game_ids: Vec<String> = rows
         .iter()
         .map(|r| r.game_id.to_ascii_lowercase())
@@ -1452,9 +1574,16 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     let mut claim_markers: Vec<ResultMarkerRow> = Vec::new();
     for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let binds: Vec<JsValue> = chunk.iter().map(|g| JsValue::from_str(g)).collect();
-        let stmt = db
+        let stmt = match db
             .prepare(crate::results::claims_sql(chunk.len()))
-            .bind(&binds)?;
+            .bind(&binds)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[results] claims bind failed (chunk omitted): {e}");
+                continue;
+            }
+        };
         match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
             Ok(rows) => claim_markers.extend(rows.into_iter().filter_map(ResultRowD1::into_marker)),
             Err(e) => {
@@ -1479,16 +1608,15 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // on the legacy-BEEF leg of a route that takes `identity` unauthenticated
     // and whose row set attacker-writable dust markers populate (#314 class).
     let params_by_pot = crate::results::covenant_params_by_pot(&rows);
-    let seat_markers = results_seat_markers(&db, &params_by_pot).await;
+    let seat_markers = results_seat_markers(db, &params_by_pot).await;
 
-    let entries = crate::results::assemble_results(
-        &identity_lc,
+    Ok(crate::results::assemble_results(
+        identity_lc,
         rows,
         &claims,
         &seat_markers,
         &params_by_pot,
-    );
-    json_response(crate::results::results_body(&identity_lc, &entries), 200)
+    ))
 }
 
 /// #230/#281 — the caller's v2 seat markers for the pots on this `/results`

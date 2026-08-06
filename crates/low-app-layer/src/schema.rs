@@ -138,6 +138,32 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
 pub const NETWORK_SEEN_CREATE: &str =
     "CREATE TABLE IF NOT EXISTS network_seen (txid TEXT PRIMARY KEY, seenAt INTEGER)";
 
+/// The #252 stage-A `collected_markers_v2` catch-up, same Rule-24 contract as
+/// [`NETWORK_SEEN_CREATE`]: `/recovery-view`'s `collected` presence query
+/// names the table, and a `SELECT` naming an absent table fails to PREPARE on
+/// a cold app-layer isolate against an unwarmed schema. (That leg is
+/// BEST-EFFORT — it would serve `collected: null` rather than 503 — but
+/// Rule 24's bar is by CONSTRUCTION, not by luck of the caller's posture,
+/// and the module's membership rule is "a shipped query names it".)
+/// Byte-identical to the owning overlay migration, pinned below. NOTE the
+/// column defs carry `NOT NULL` — inert in a CREATE-class statement (`IF NOT
+/// EXISTS` no-ops against an existing table and a CREATE never mutates
+/// existing rows), unlike an `ADD COLUMN NOT NULL`, which is why the
+/// ALTER-class ban on `NOT NULL` does not apply here.
+pub const COLLECTED_MARKERS_V2_CREATE: &str = "CREATE TABLE IF NOT EXISTS collected_markers_v2 (
+        identity TEXT NOT NULL,
+        gameId TEXT NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        sigHex TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )";
+
+/// Every CREATE-class catch-up this module issues. `IF NOT EXISTS` makes
+/// success the only benign outcome — any error is real and defers the latch.
+pub const CREATE_TABLE_CATCHUPS: &[&str] = &[NETWORK_SEEN_CREATE, COLLECTED_MARKERS_V2_CREATE];
+
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
 ///
 /// All-or-nothing on purpose: a partial success must retry the whole (tiny)
@@ -228,12 +254,15 @@ async fn apply(db: &worker::D1Database) {
             }
         }
     }
-    // #371: the CREATE-class catch-up. `IF NOT EXISTS` makes success the only
-    // benign outcome — any error is real, so it defers the latch and the next
-    // request retries, exactly like a non-benign ALTER failure above.
-    if let Err(e) = db.prepare(NETWORK_SEEN_CREATE).run().await {
-        all_ok = false;
-        worker::console_log!("[schema] CREATE deferred: {NETWORK_SEEN_CREATE} — {e}");
+    // The CREATE-class catch-ups (#371 network_seen, #252 collected_markers_v2).
+    // `IF NOT EXISTS` makes success the only benign outcome — any error is
+    // real, so it defers the latch and the next request retries, exactly like
+    // a non-benign ALTER failure above.
+    for stmt in CREATE_TABLE_CATCHUPS {
+        if let Err(e) = db.prepare(*stmt).run().await {
+            all_ok = false;
+            worker::console_log!("[schema] CREATE deferred: {stmt} — {e}");
+        }
     }
     if all_ok {
         APPLIED.store(true, Ordering::Release);
@@ -297,28 +326,49 @@ mod tests {
         }
     }
 
-    /// The #371 CREATE-class catch-up: byte-identical to the owning overlay
+    /// The CREATE-class catch-ups (#371 `network_seen`, #252
+    /// `collected_markers_v2`): each byte-identical to the owning overlay
     /// migration (epoch Rule 24 — share the artifact, not the convention),
     /// idempotent by construction (`IF NOT EXISTS`), and additive (no
-    /// DROP/RENAME/re-type/NOT NULL, single statement).
+    /// DROP/RENAME, single statement). Driven off [`CREATE_TABLE_CATCHUPS`]
+    /// so a third table added without a matching migration fails here.
+    ///
+    /// The owning migration is matched as "the migration that CREATEs this
+    /// table" — `collected_markers_v2` is also NAMED by its carry-INSERT and
+    /// index migrations, so a bare substring filter would match three.
+    ///
+    /// `NOT NULL` is deliberately NOT banned here (unlike the ALTER class):
+    /// inside `CREATE TABLE IF NOT EXISTS` it defines new-table columns and
+    /// never touches existing rows — the statement no-ops when the table
+    /// exists. `DEFAULT` likewise. The additive bans that DO matter for a
+    /// re-run-forever statement (DROP/RENAME/multi-statement) are asserted.
     #[test]
-    fn the_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
-        let hits: Vec<&&str> = bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
-            .iter()
-            .filter(|m| m.contains("network_seen"))
-            .collect();
-        assert_eq!(hits.len(), 1, "exactly one migration owns network_seen");
+    fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
-            *hits[0], NETWORK_SEEN_CREATE,
-            "the app-layer CREATE and the overlay migration must be the same statement"
+            CREATE_TABLE_CATCHUPS.len(),
+            2,
+            "network_seen (#371), collected_markers_v2 (#252 stage A)"
         );
-        assert!(NETWORK_SEEN_CREATE.starts_with("CREATE TABLE IF NOT EXISTS "));
-        let upper = NETWORK_SEEN_CREATE.to_ascii_uppercase();
-        for banned in ["DROP", "RENAME", "NOT NULL", "DEFAULT", ";"] {
-            assert!(
-                !upper.contains(banned),
-                "{NETWORK_SEEN_CREATE} must not contain {banned}"
+        for stmt in CREATE_TABLE_CATCHUPS {
+            assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");
+            let table = stmt["CREATE TABLE IF NOT EXISTS ".len()..]
+                .split([' ', '('])
+                .next()
+                .expect("a table name follows the prefix");
+            let hits: Vec<&&str> = bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .filter(|m| m.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table}")))
+                .collect();
+            assert_eq!(hits.len(), 1, "exactly one migration CREATEs {table}");
+            assert_eq!(
+                *hits[0], *stmt,
+                "the app-layer CREATE and the overlay migration must be the \
+                 same statement for {table}"
             );
+            let upper = stmt.to_ascii_uppercase();
+            for banned in ["DROP", "RENAME", ";"] {
+                assert!(!upper.contains(banned), "{stmt} must not contain {banned}");
+            }
         }
     }
 

@@ -34,8 +34,8 @@
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use bsv_overlay_cloudflare::d1_discovery::{mark_spent_sql, store_record_sql};
 use low_app_layer::logic::{
-    assemble_recovery_view, recovery_view_body, recovery_view_sql, RecoveryRow,
-    RECOVERY_VIEW_MAX_ROWS, RECOVERY_VIEW_UNKNOWN_QUOTA,
+    apply_recovery_extras, assemble_recovery_view, collected_presence_sql, recovery_view_body,
+    recovery_view_sql, RecoveryRow, RECOVERY_VIEW_MAX_ROWS, RECOVERY_VIEW_UNKNOWN_QUOTA,
 };
 use rusqlite::{params, Connection};
 
@@ -267,8 +267,12 @@ fn the_committed_covenant_keys_survive_every_projection_tier_and_reach_the_wire(
     assert_eq!(keys.pay_pkh_b, "bb".repeat(20));
 
     let (entries, _) = assemble_recovery_view(rows);
-    let body: serde_json::Value =
-        serde_json::from_str(&recovery_view_body(&entries, Some(900_000), false)).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&recovery_view_body(
+        &apply_recovery_extras(entries, None, None),
+        Some(900_000),
+        false,
+    ))
+    .unwrap();
     let ck = &body["entries"][0]["committedKeys"];
     assert_eq!(ck["pubA"], serde_json::json!(h66(0x0a)));
     assert_eq!(ck["pubB"], serde_json::json!(h66(0x0b)));
@@ -306,8 +310,12 @@ fn a_pot_without_decoded_params_serves_null_committed_keys() {
     let rows = query_recovery_rows(&conn, &me);
     assert!(rows[0].committed_keys.is_none());
     let (entries, _) = assemble_recovery_view(rows);
-    let body: serde_json::Value =
-        serde_json::from_str(&recovery_view_body(&entries, None, false)).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&recovery_view_body(
+        &apply_recovery_extras(entries, None, None),
+        None,
+        false,
+    ))
+    .unwrap();
     assert!(
         body["entries"][0]["committedKeys"].is_null(),
         "null, and the KEY IS STILL PRESENT — an absent key and a null one \
@@ -640,4 +648,236 @@ fn free_ghost_pot_records_cannot_erase_the_recovery_view() {
         !legacy_pots.contains(&&honest[0]),
         "PRE-#283 CONTROL: the same flood erases an all-legacy page"
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #252 stage A — the read-behind extras (`collected` / `outcome`), through the
+// PRODUCTION SQL against the real schema.
+//
+// BOUNDARY (Rule 22, stated): these cells execute the shipped
+// `collected_presence_sql` and the shipped pure fold `apply_recovery_extras`.
+// The route's TWO D1 side-fetches (`gather_result_entries`,
+// `collected_games_for`) need a live `D1Database` and are not natively
+// drivable — what makes their omission a BUILD error rather than a silent
+// null is the `RecoveryEntriesReady` proof type (`recovery_view_body` cannot
+// be called without the fold having run).
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The PRODUCTION collected-marker insert shape, verbatim from
+/// `d1_discovery.rs`'s `D1CollectedStorage::store_record` (the writer is a
+/// D1-bound trait impl, so the byte shape is mirrored here and any drift
+/// shows up as this INSERT failing against the migrated schema).
+const COLLECTED_INSERT: &str = "INSERT OR IGNORE INTO collected_markers_v2 \
+     (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+     VALUES (?, ?, ?, ?, ?, ?)";
+
+fn file_collected(conn: &Connection, identity: &str, game: &str, txid: &str) {
+    conn.execute(
+        COLLECTED_INSERT,
+        params![identity, game, txid, 0i64, Option::<String>::None, 1_000i64],
+    )
+    .expect("collected insert");
+}
+
+fn presence_set(
+    conn: &Connection,
+    identity: &str,
+    games: &[String],
+) -> std::collections::HashSet<String> {
+    let sql = collected_presence_sql(games.len());
+    let mut stmt = conn.prepare(&sql).expect("collected_presence_sql prepares");
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&identity as &dyn rusqlite::ToSql];
+    for g in games {
+        binds.push(g as &dyn rusqlite::ToSql);
+    }
+    stmt.query_map(&binds[..], |r| r.get::<_, String>(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+#[test]
+fn collected_presence_executes_and_scopes_by_identity_and_game() {
+    let conn = production_schema_db();
+    let me = h66(0xa9);
+    let other = h66(0xb9);
+    let g1 = h64(0x41);
+    let g2 = h64(0x42);
+    // My marker for g1; a STRANGER's marker for g2 (identity is attacker-
+    // suppliable — presence is scoped to the ASKING identity, so the
+    // stranger's row must not light my g2).
+    file_collected(&conn, &me, &g1, &h64(0x51));
+    file_collected(&conn, &other, &g2, &h64(0x52));
+    // A replayed submit of the SAME outpoint is a no-op (INSERT OR IGNORE) —
+    // presence stays a set, never a count.
+    file_collected(&conn, &me, &g1, &h64(0x51));
+
+    let set = presence_set(&conn, &me, &[g1.clone(), g2.clone()]);
+    assert!(set.contains(&g1), "my marker lights my game");
+    assert!(
+        !set.contains(&g2),
+        "a stranger's marker never lights my game"
+    );
+}
+
+#[test]
+fn the_extras_reach_the_wire_and_absent_stays_null() {
+    let conn = production_schema_db();
+    let me = h66(0xaa);
+    let collected_game = h64(0x43);
+    let uncollected_game = h64(0x44);
+    let pot1 = h64(0xc7);
+    let pot2 = h64(0xc8);
+    admit_pot(&conn, &pot1, 1_000, Some(958_600));
+    admit_pot(&conn, &pot2, 1_001, Some(958_601));
+    file_party(
+        &conn,
+        &me,
+        &collected_game,
+        &pot1,
+        958_600,
+        "e1".repeat(32).as_str(),
+        1_002,
+    );
+    file_party(
+        &conn,
+        &me,
+        &uncollected_game,
+        &pot2,
+        958_601,
+        "e2".repeat(32).as_str(),
+        1_003,
+    );
+    file_collected(&conn, &me, &collected_game, &h64(0x53));
+
+    let rows = query_recovery_rows(&conn, &me);
+    let (entries, _) = assemble_recovery_view(rows);
+    let set = presence_set(
+        &conn,
+        &me,
+        &entries
+            .iter()
+            .map(|e| e.game_id.clone())
+            .collect::<Vec<_>>(),
+    );
+    let folded = apply_recovery_extras(entries, None, Some(&set));
+    let body: serde_json::Value =
+        serde_json::from_str(&recovery_view_body(&folded, None, false)).unwrap();
+
+    let by_game = |g: &str| -> serde_json::Value {
+        body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["gameId"] == serde_json::json!(g))
+            .cloned()
+            .expect("entry present")
+    };
+    assert_eq!(
+        by_game(&collected_game)["collected"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        by_game(&uncollected_game)["collected"],
+        serde_json::json!(false)
+    );
+    // The outcome derivation was NOT run (None) — tri-state honesty: null,
+    // never a guessed word.
+    assert!(by_game(&collected_game)["outcome"].is_null());
+    assert!(by_game(&collected_game)["outcomeSource"].is_null());
+    // Could-not-ask (`collected: None`) is null too — asked-and-absent and
+    // could-not-ask must serialize DIFFERENTLY from true, and identically
+    // never as an error.
+    let unfolded: serde_json::Value = serde_json::from_str(&recovery_view_body(
+        &apply_recovery_extras(
+            {
+                let rows = query_recovery_rows(&conn, &me);
+                assemble_recovery_view(rows).0
+            },
+            None,
+            None,
+        ),
+        None,
+        false,
+    ))
+    .unwrap();
+    assert!(unfolded["entries"][0]["collected"].is_null());
+}
+
+#[test]
+fn the_outcome_word_is_the_results_derivation_reused_not_respelled() {
+    // Rule 15's executable half at this tier: the fold consumes REAL
+    // `ResultEntry` values (the /results assembler's own output type), and a
+    // matching (gameId, potTxid, potVout) hands its outcome/source through
+    // VERBATIM, while a near-miss (same game, different vout) stays null.
+    let conn = production_schema_db();
+    let me = h66(0xab);
+    let game = h64(0x45);
+    let pot = h64(0xc9);
+    admit_pot(&conn, &pot, 1_000, Some(958_600));
+    file_party(
+        &conn,
+        &me,
+        &game,
+        &pot,
+        958_600,
+        "e3".repeat(32).as_str(),
+        1_001,
+    );
+
+    let rows = query_recovery_rows(&conn, &me);
+    let (entries, _) = assemble_recovery_view(rows);
+    let mk = |vout: u32| low_app_layer::results::ResultEntry {
+        game_id: game.clone(),
+        pot_txid: pot.clone(),
+        pot_vout: vout,
+        recovery_height: 958_600,
+        cov_recovery_height: Some(958_600),
+        opponent_identity: h66(0xbb),
+        settle_txid: Some(h64(0x61)),
+        spent: Some(true),
+        spent_confirmed: Some(true),
+        pot_binding: low_app_layer::results::PotBinding::Unknown,
+        game_id_binding: low_app_layer::results::PotBinding::Unknown,
+        verdict: Some(low_app_layer::results::PotVerdict::WinnerA),
+        outcome: low_app_layer::results::Outcome::Won,
+        outcome_source: Some("chain+seatkey"),
+        at_height: Some(958_700),
+        winner_hand: None,
+        committed_keys: None,
+    };
+
+    // Matching outpoint: the word + source pass through verbatim.
+    let folded = apply_recovery_extras(entries.clone(), Some(&[mk(0)]), None);
+    let body: serde_json::Value =
+        serde_json::from_str(&recovery_view_body(&folded, None, false)).unwrap();
+    assert_eq!(body["entries"][0]["outcome"], serde_json::json!("won"));
+    assert_eq!(
+        body["entries"][0]["outcomeSource"],
+        serde_json::json!("chain+seatkey")
+    );
+
+    // Near-miss (different vout): absence, never a guess.
+    let folded2 = apply_recovery_extras(entries, Some(&[mk(1)]), None);
+    let body2: serde_json::Value =
+        serde_json::from_str(&recovery_view_body(&folded2, None, false)).unwrap();
+    assert!(body2["entries"][0]["outcome"].is_null());
+}
+
+#[test]
+fn the_rule24_catchup_alone_makes_the_presence_query_preparable() {
+    // The executable Rule-24 property: a FRESH database that has NEVER run
+    // the overlay's migrations (the cold app-layer isolate against an
+    // unwarmed schema), given ONLY this crate's own catch-up statement,
+    // can prepare the shipped presence query. Byte-identity with the owning
+    // migration is pinned in schema.rs.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(low_app_layer::schema::COLLECTED_MARKERS_V2_CREATE)
+        .expect("the catch-up statement runs on a bare database");
+    conn.prepare(&collected_presence_sql(3))
+        .expect("the shipped query prepares against the catch-up schema");
+    // …and re-running the catch-up is a no-op (IF NOT EXISTS), the property
+    // that makes it safe to issue once per isolate forever.
+    conn.execute_batch(low_app_layer::schema::COLLECTED_MARKERS_V2_CREATE)
+        .expect("idempotent re-run");
 }

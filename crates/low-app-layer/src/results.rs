@@ -4346,18 +4346,25 @@ mod tests {
         let from_results = results["results"][0]["committedKeys"].clone();
 
         let recovery: serde_json::Value = serde_json::from_str(&crate::logic::recovery_view_body(
-            &[crate::logic::RecoveryEntry {
-                game_id: tx(0x01),
-                pot_txid: tx(0x02),
-                pot_vout: 0,
-                recovery_height: 958_800,
-                opponent_identity: ident(0xbb),
-                spent: None,
-                spending_txid: None,
-                spent_confirmed: None,
-                spender_raw_hex: None,
-                committed_keys: Some(k.clone()),
-            }],
+            &crate::logic::apply_recovery_extras(
+                vec![crate::logic::RecoveryEntry {
+                    game_id: tx(0x01),
+                    pot_txid: tx(0x02),
+                    pot_vout: 0,
+                    recovery_height: 958_800,
+                    opponent_identity: ident(0xbb),
+                    spent: None,
+                    spending_txid: None,
+                    spent_confirmed: None,
+                    spender_raw_hex: None,
+                    committed_keys: Some(k.clone()),
+                    collected: None,
+                    outcome: None,
+                    outcome_source: None,
+                }],
+                None,
+                None,
+            ),
             None,
             false,
         ))
