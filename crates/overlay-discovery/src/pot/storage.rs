@@ -297,7 +297,11 @@ pub trait PotStorage {
     /// Backends that enumerate answer with
     /// `WHERE spent = 1 AND spentConfirmed = 0 ORDER BY RANDOM() LIMIT n`
     /// (RANDOM defeats head-of-queue starvation — the same shape as
-    /// [`find_pot_beefs_for_proof_check`](Self::find_pot_beefs_for_proof_check)).
+    /// [`find_pot_beefs_for_proof_check`](Self::find_pot_beefs_for_proof_check)),
+    /// excluding rows whose CURRENT pointer is latched structurally
+    /// unprovable (bsv-low handoff #2b — chasing a proof that conflicts
+    /// with a recorded confirmed spend wastes the budget forever; an
+    /// unknown/unlatched pointer stays a full candidate).
     /// Every returned row carries a `spending_txid` (a spent row always has
     /// one). Backends that can't enumerate return an empty `Vec` via this
     /// default → the chaser is a no-op.
@@ -443,7 +447,12 @@ pub trait PotStorage {
     /// Backends that track a verified latch answer with
     /// `WHERE proof_verified = 0 ORDER BY RANDOM() LIMIT n` (RANDOM defeats
     /// head-of-queue starvation — a never-mineable head must not starve the
-    /// tail). Backends that can't enumerate (or have nothing to complete) may
+    /// tail), additionally excluding rows LATCHED structurally unprovable
+    /// (bsv-low handoff #2b: a recorded confirmed spend of the same outpoint
+    /// by a different txid means the row can never mine — retired, not
+    /// polled forever; NULL/unexamined stays eligible, and the verifying
+    /// writers clear the latch so a reorg-proven row returns). Backends
+    /// that can't enumerate (or have nothing to complete) may
     /// return an empty `Vec` via this default → proof completion is a no-op.
     ///
     /// `min_age_secs` is the PUSH-PRIMARY BACKSTOP gate (bsv-low #228 /
@@ -559,6 +568,19 @@ pub struct MemoryPotStorage {
     /// writers); RESET by any admit-path `store_beef` byte write. A
     /// structural bump in stored bytes never enters this set by itself.
     verified: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// txids latched STRUCTURALLY UNPROVABLE (bsv-low handoff #2b) —
+    /// models the D1 `pot_beefs.structurally_unprovable` column: the
+    /// stored tx's own bytes spend a pot outpoint whose confirmed spend by
+    /// a DIFFERENT txid was recorded, so it can never mine. Latched ONLY
+    /// at a confirm moment (`mark_spent(confirmed)` /
+    /// `mark_confirmed_for_spender` hit), NEVER on an unconfirmed
+    /// displacement (Rule 6); CLEARED by every verifying writer AND on the
+    /// latched txid's own confirm (confirm beats the latch); PRESERVED by
+    /// admit-path `store_beef` rewrites. Where the D1 backend derives the
+    /// siblings from `potrefund_records.refundRawHex` (its cheapest
+    /// indexed source), this backend derives the SAME fact from the bytes
+    /// it actually owns: each stored beef's subject inputs.
+    unprovable: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl MemoryPotStorage {
@@ -582,6 +604,53 @@ impl MemoryPotStorage {
 
     fn now(&self) -> u64 {
         *self.clock_secs.lock().unwrap()
+    }
+
+    /// TEST OBSERVABILITY (#2b): whether `txid` is latched structurally
+    /// unprovable (the retirement latch the poll pools exclude on).
+    pub fn is_structurally_unprovable(&self, txid: &str) -> bool {
+        self.unprovable.lock().unwrap().contains(txid)
+    }
+
+    /// #2b retirement at a confirm moment (the memory twin of
+    /// `D1PotStorage::retire_superseded_after_confirm`): a spend of
+    /// `pot_txid:output_index` by `confirmed_spending_txid` was just
+    /// recorded CONFIRMED, so (1) the confirmed spender's own latch is
+    /// cleared (confirm beats the latch — the reorg direction), and
+    /// (2) every OTHER stored beef whose SUBJECT verifiably spends the
+    /// same outpoint is latched unprovable — derived from the bytes this
+    /// store actually owns (each beef's subject inputs; the D1 backend
+    /// uses its indexed `potrefund_records.refundRawHex` source for the
+    /// same fact). VERIFIED-proven rows are never latched (their proof is
+    /// chain truth); unparseable beefs are skipped (fail-safe: no latch).
+    fn retire_superseded_after_confirm(
+        &self,
+        pot_txid: &str,
+        output_index: u32,
+        confirmed_spending_txid: &str,
+    ) {
+        let mut unprovable = self.unprovable.lock().unwrap();
+        unprovable.retain(|t| !t.eq_ignore_ascii_case(confirmed_spending_txid));
+        let verified = self.verified.lock().unwrap();
+        for (txid, bytes) in self.beefs.lock().unwrap().iter() {
+            if txid.eq_ignore_ascii_case(confirmed_spending_txid) || verified.contains(txid) {
+                continue;
+            }
+            // Hash-bound parse: the stored key must be the subject txid, so
+            // a garbled row can never latch some other tx's identity.
+            let Ok(tx) = bsv_rs::transaction::Transaction::from_beef(bytes, Some(txid)) else {
+                continue;
+            };
+            let conflicts = tx.inputs.iter().any(|i| {
+                i.source_txid
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(pot_txid))
+                    && i.source_output_index == output_index
+            });
+            if conflicts {
+                unprovable.insert(txid.clone());
+            }
+        }
     }
 
     /// Whether a stamp clears the age gate: unknown (None) is OLD/eligible
@@ -650,6 +719,9 @@ impl PotStorage for MemoryPotStorage {
     ) -> Result<(), PotStorageError> {
         let now = self.now();
         let mut records = self.records.lock().unwrap();
+        // #2b: set when a CONFIRMED write is accepted — the retirement
+        // moment (never the unconfirmed branch: Rule 6).
+        let mut confirmed_written = false;
         // UPDATE-only: touch an existing row; absent outpoint is a no-op.
         for r in records.iter_mut() {
             if r.txid == txid && r.output_index == output_index {
@@ -712,8 +784,18 @@ impl PotStorage for MemoryPotStorage {
                         .lock()
                         .unwrap()
                         .insert((txid.to_string(), output_index), now);
+                    if confirmed {
+                        confirmed_written = true;
+                    }
                 }
             }
+        }
+        drop(records);
+        // #2b: a CONFIRMED spend record is the moment every OTHER stored tx
+        // spending this outpoint became structurally unprovable — retire
+        // them (and clear any stale latch on the confirmed spender).
+        if confirmed_written {
+            self.retire_superseded_after_confirm(txid, output_index, spending_txid);
         }
         Ok(())
     }
@@ -755,6 +837,7 @@ impl PotStorage for MemoryPotStorage {
         // semantics (None keeps the stored value); spent_at deliberately
         // untouched (the CAS idiom — a missed row keeps its true age).
         let mut records = self.records.lock().unwrap();
+        let mut hit = false;
         for r in records.iter_mut() {
             if r.txid == txid
                 && r.output_index == output_index
@@ -765,10 +848,17 @@ impl PotStorage for MemoryPotStorage {
                 if let Some(h) = spent_height {
                     r.spent_height = Some(h);
                 }
-                return Ok(true);
+                hit = true;
+                break;
             }
         }
-        Ok(false)
+        drop(records);
+        // #2b: a CAS HIT is a confirm moment — retire superseded siblings
+        // (a MISS confirmed nothing and latches nothing).
+        if hit {
+            self.retire_superseded_after_confirm(txid, output_index, spending_txid);
+        }
+        Ok(hit)
     }
 
     async fn find_params_undecoded(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
@@ -842,17 +932,22 @@ impl PotStorage for MemoryPotStorage {
         // (bsv-low#304): a row is a candidate until the VERIFIED latch is
         // set — a STRUCTURAL bump in the stored bytes does NOT drop it out
         // (admit-path bytes are untrusted; the pass re-verifies them).
+        // #2b: LATCHED structurally-unprovable rows are retired from the
+        // pool (they can never mine; the verified writers clear the latch
+        // if a reorg ever proves one). Un-latched rows stay eligible.
         // The #228 backstop age gate excludes rows younger than min_age_secs
         // (their proof is expected via /arc-ingest); unknown age = eligible.
         let verified = self.verified.lock().unwrap();
+        let unprovable = self.unprovable.lock().unwrap();
         let candidates: Vec<(String, Vec<u8>)> = self
             .beefs
             .lock()
             .unwrap()
             .iter()
-            .filter(|(txid, _)| !verified.contains(*txid))
+            .filter(|(txid, _)| !verified.contains(*txid) && !unprovable.contains(*txid))
             .map(|(txid, beef)| (txid.clone(), beef.clone()))
             .collect();
+        drop(unprovable);
         drop(verified);
         Ok(candidates
             .into_iter()
@@ -874,14 +969,26 @@ impl PotStorage for MemoryPotStorage {
         // randomize (tests are deterministic). The #228 backstop age gate
         // excludes rows whose spend was recorded less than min_age_secs ago
         // (the spending tx's push is still expected); unknown age = eligible.
+        // #2b: rows whose CURRENT pointer is latched structurally
+        // unprovable are excluded (mirrors `pot_spent_unconfirmed_sql`) —
+        // an un-latched or unknown pointer stays a full candidate.
+        let unprovable = self.unprovable.lock().unwrap();
         let candidates: Vec<PotRecord> = self
             .records
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.spent && !r.spent_confirmed)
+            .filter(|r| {
+                r.spent
+                    && !r.spent_confirmed
+                    && !r
+                        .spending_txid
+                        .as_deref()
+                        .is_some_and(|s| unprovable.contains(s))
+            })
             .cloned()
             .collect();
+        drop(unprovable);
         Ok(candidates
             .into_iter()
             .filter(|r| {
@@ -927,11 +1034,17 @@ impl PotStorage for MemoryPotStorage {
             .unwrap()
             .insert(txid.to_string(), new_beef.to_vec());
         self.verified.lock().unwrap().insert(txid.to_string());
+        // #2b confirm-beats-latch: a chaintracks-verified proof is chain
+        // truth — clear any stale supersession latch (the reorg direction;
+        // mirrors POT_BEEF_VERIFIED_WRITE_SQL's explicit NULL).
+        self.unprovable.lock().unwrap().remove(txid);
         Ok(())
     }
 
     async fn mark_pot_beef_proven(&self, txid: &str) -> Result<(), PotStorageError> {
         self.verified.lock().unwrap().insert(txid.to_string());
+        // #2b confirm-beats-latch (mirrors POT_BEEF_MARK_PROVEN_SQL).
+        self.unprovable.lock().unwrap().remove(txid);
         Ok(())
     }
 
@@ -2080,5 +2193,169 @@ mod tests {
 
         // Unknown type is an error.
         assert!(serde_json::from_value::<PotQuery>(serde_json::json!({"type": "nope"})).is_err());
+    }
+
+    // ── bsv-low handoff #2b: structurally-unprovable retirement (memory twin) ──
+
+    /// A REAL beef whose subject spends the given outpoints (one P2PKH
+    /// output, value salted so distinct salts give distinct txids);
+    /// returns `(beef_bytes, txid)`.
+    fn spending_beef(outpoints: &[(&str, u32)], salt: u8) -> (Vec<u8>, String) {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Beef, Transaction, TransactionInput, TransactionOutput};
+        let mut tx = Transaction::new();
+        for (txid, vout) in outpoints {
+            tx.add_input(TransactionInput::new((*txid).to_string(), *vout))
+                .unwrap();
+        }
+        tx.add_output(TransactionOutput {
+            satoshis: Some(1000 + u64::from(salt)),
+            locking_script: LockingScript::from_hex(
+                "76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac",
+            )
+            .unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    /// PIN (do not weaken): an UNCONFIRMED spend record must latch NOTHING
+    /// — a displaced-unconfirmed pointer can re-win (Rule 6: latching here
+    /// would trade a self-healing failure for a permanent one). Only the
+    /// CONFIRMED record retires the superseded sibling.
+    #[tokio::test]
+    async fn unconfirmed_spend_never_latches_confirmed_spend_retires_sibling() {
+        let store = MemoryPotStorage::new();
+        let pot = "aa".repeat(32);
+        store.store_record(&pot_record(&pot, 0)).await.unwrap();
+        let (settle_beef, settle_txid) = spending_beef(&[(&pot, 0)], 1);
+        let (refund_beef, refund_txid) = spending_beef(&[(&pot, 0)], 2);
+        store.store_beef(&settle_txid, &settle_beef).await.unwrap();
+        store.store_beef(&refund_txid, &refund_beef).await.unwrap();
+
+        // UNCONFIRMED record (the 0-conf submit): nothing latched, both
+        // spenders stay full poll candidates.
+        store
+            .mark_spent(&pot, 0, &settle_txid, false, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !store.is_structurally_unprovable(&refund_txid)
+                && !store.is_structurally_unprovable(&settle_txid),
+            "an UNCONFIRMED displacement must never latch (Rule 6)"
+        );
+        assert_eq!(
+            store
+                .find_pot_beefs_for_proof_check(10, 0)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // CONFIRMED record: the sibling refund is retired, the confirmed
+        // spender is not, and the pool excludes exactly the retired row.
+        store
+            .mark_spent(&pot, 0, &settle_txid, true, None, Some(830_000), None)
+            .await
+            .unwrap();
+        assert!(store.is_structurally_unprovable(&refund_txid));
+        assert!(!store.is_structurally_unprovable(&settle_txid));
+        let pool: Vec<String> = store
+            .find_pot_beefs_for_proof_check(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(!pool.contains(&refund_txid));
+        assert!(pool.contains(&settle_txid));
+    }
+
+    /// The #301 CAS confirm: a HIT retires the superseded sibling; a MISS
+    /// (pointer moved) confirmed nothing and must latch nothing.
+    #[tokio::test]
+    async fn cas_hit_retires_sibling_and_cas_miss_latches_nothing() {
+        let store = MemoryPotStorage::new();
+        let pot = "bb".repeat(32);
+        store.store_record(&pot_record(&pot, 0)).await.unwrap();
+        let (settle_beef, settle_txid) = spending_beef(&[(&pot, 0)], 1);
+        let (refund_beef, refund_txid) = spending_beef(&[(&pot, 0)], 2);
+        store.store_beef(&settle_txid, &settle_beef).await.unwrap();
+        store.store_beef(&refund_txid, &refund_beef).await.unwrap();
+        store
+            .mark_spent(&pot, 0, &settle_txid, false, None, None, None)
+            .await
+            .unwrap();
+
+        // MISS: the proof was verified for a spender that is no longer the
+        // pointer — nothing confirmed, nothing latched.
+        assert!(!store
+            .mark_confirmed_for_spender(&pot, 0, &refund_txid, None)
+            .await
+            .unwrap());
+        assert!(
+            !store.is_structurally_unprovable(&settle_txid)
+                && !store.is_structurally_unprovable(&refund_txid),
+            "a CAS MISS confirmed nothing and must latch nothing"
+        );
+
+        // HIT: the current pointer's proof verified — the sibling retires.
+        assert!(store
+            .mark_confirmed_for_spender(&pot, 0, &settle_txid, Some(830_000))
+            .await
+            .unwrap());
+        assert!(store.is_structurally_unprovable(&refund_txid));
+        assert!(!store.is_structurally_unprovable(&settle_txid));
+    }
+
+    /// Confirm beats the latch, and the chaser pool honors the latch on the
+    /// POINTER (the crafted multi-pot-input class): R spends potX:0 AND
+    /// potY:0; potX confirms S ⇒ R latched ⇒ potY's row (still pointing at
+    /// R) leaves the chaser pool; a verified writer clearing R re-admits it.
+    #[tokio::test]
+    async fn chaser_pool_excludes_latched_pointer_and_verified_writer_readmits() {
+        let store = MemoryPotStorage::new();
+        let pot_x = "cc".repeat(32);
+        let pot_y = "dd".repeat(32);
+        store.store_record(&pot_record(&pot_x, 0)).await.unwrap();
+        store.store_record(&pot_record(&pot_y, 0)).await.unwrap();
+        let (settle_beef, settle_txid) = spending_beef(&[(&pot_x, 0)], 1);
+        let (r_beef, r_txid) = spending_beef(&[(&pot_x, 0), (&pot_y, 0)], 2);
+        store.store_beef(&settle_txid, &settle_beef).await.unwrap();
+        store.store_beef(&r_txid, &r_beef).await.unwrap();
+
+        // potY's row points at R (unconfirmed claim).
+        store
+            .mark_spent(&pot_y, 0, &r_txid, false, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
+
+        // potX confirms S ⇒ R (which verifiably conflicts) is latched, and
+        // potY's row leaves the chaser pool with it.
+        store
+            .mark_spent(&pot_x, 0, &settle_txid, true, None, Some(830_000), None)
+            .await
+            .unwrap();
+        assert!(store.is_structurally_unprovable(&r_txid));
+        assert!(
+            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
+            "a row pointing at a latched spender is retired from the chaser pool"
+        );
+
+        // Reorg direction: a verified writer proving R clears the latch and
+        // the chaser resumes (self-healing preserved — Rule 6).
+        store.mark_pot_beef_proven(&r_txid).await.unwrap();
+        assert!(!store.is_structurally_unprovable(&r_txid));
+        assert_eq!(
+            store.find_spent_unconfirmed(10, 0).await.unwrap().len(),
+            1,
+            "clearing the latch re-admits the pointed-at row"
+        );
     }
 }

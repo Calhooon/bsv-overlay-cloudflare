@@ -1506,21 +1506,31 @@ pub(crate) const POT_BEEF_PROBE_SQL: &str =
 
 /// SHIPPED admit-path write: `proof_verified` FORCED to 0 (an admit bump is
 /// never a verified fact — bsv-low#304); `has_proof` records structure;
-/// createdAt is preserve-or-stamp (#228).
+/// createdAt is preserve-or-stamp (#228). The #2b retirement latch is
+/// PRESERVED (same subselect idiom as createdAt): a re-submitted superseded
+/// refund must not re-enter the poll pool — the confirm event that latched
+/// it fired once and never fires again, and new bytes for the same txid
+/// cannot change what its subject spends.
 pub(crate) const POT_BEEF_ADMIT_WRITE_SQL: &str =
-    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) \
-     VALUES (?, ?, COALESCE((SELECT createdAt FROM pot_beefs WHERE txid = ?), ?), ?, 0)";
+    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified, structurally_unprovable) \
+     VALUES (?, ?, COALESCE((SELECT createdAt FROM pot_beefs WHERE txid = ?), ?), ?, 0, \
+     (SELECT structurally_unprovable FROM pot_beefs WHERE txid = ?))";
 
 /// SHIPPED verifying write ([`D1PotStorage::compact_pot_beef`]): both
-/// latches set — the caller chaintracks-verified the bump.
+/// latches set — the caller chaintracks-verified the bump. The #2b
+/// retirement latch is EXPLICITLY cleared (confirm beats the latch — a
+/// verified proof is chain truth and must never stay suppressed by a
+/// stale supersession verdict, e.g. after a reorg).
 pub(crate) const POT_BEEF_VERIFIED_WRITE_SQL: &str =
-    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) \
-     VALUES (?, ?, ?, 1, 1)";
+    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified, structurally_unprovable) \
+     VALUES (?, ?, ?, 1, 1, NULL)";
 
 /// SHIPPED verified-latch flip ([`D1PotStorage::mark_pot_beef_proven`]) —
-/// no byte rewrite, no createdAt touch.
+/// no byte rewrite, no createdAt touch. Clears the #2b retirement latch
+/// (confirm beats the latch — same rationale as the compact write).
 pub(crate) const POT_BEEF_MARK_PROVEN_SQL: &str =
-    "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1 WHERE txid = ?";
+    "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1, structurally_unprovable = NULL \
+     WHERE txid = ?";
 
 /// Chunk size for the batched verified-latch flip (bsv-low#304 gate M-4) —
 /// one D1 statement per up-to-100 latched rows instead of one per row,
@@ -1533,18 +1543,133 @@ pub(crate) const POT_BEEF_MARK_PROVEN_CHUNK: usize = 100;
 pub(crate) fn pot_beef_mark_proven_batch_sql(n: usize) -> String {
     debug_assert!(n >= 1);
     let placeholders = vec!["?"; n].join(", ");
-    format!("UPDATE pot_beefs SET proof_verified = 1, has_proof = 1 WHERE txid IN ({placeholders})")
+    format!(
+        "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1, structurally_unprovable = NULL \
+         WHERE txid IN ({placeholders})"
+    )
 }
 
 /// SHIPPED completion-pass candidate scan (bsv-low#304: gated on the
 /// VERIFIED latch, not the structural flag).
+///
+/// #2b retirement: rows LATCHED structurally unprovable are EXCLUDED —
+/// `IS NOT 1`, deliberately, so a pre-migration/never-examined NULL row
+/// stays a full candidate (the fail direction is to poll MORE, never to
+/// starve a maybe-provable row). A latched row's only ways back into
+/// proof-land are the verified writers (push/compact — which CLEAR the
+/// latch) — exactly the confirm-beats-latch invariant.
 pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
     format!(
         "SELECT txid, hex(beef) AS beef FROM pot_beefs \
          WHERE proof_verified = 0 \
+           AND structurally_unprovable IS NOT 1 \
            AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
          ORDER BY RANDOM() LIMIT {limit}"
     )
+}
+
+/// SHIPPED #186 spend-chaser candidate scan, factored out of
+/// [`D1PotStorage::find_spent_unconfirmed`] so the real-SQLite cells execute
+/// the production string.
+///
+/// #2b retirement: a row whose CURRENT spend pointer is a LATCHED
+/// structurally-unprovable tx is excluded — chasing a proof for a tx that
+/// conflicts with a recorded chaintracks-verified spend wastes the tick
+/// budget forever. Reachable only through an exotic shape (a crafted
+/// multi-pot-input spend latched via a DIFFERENT pot's confirm while still
+/// the recorded pointer here — the ordinary superseded row retires via its
+/// own `spentConfirmed = 1` at the same confirm moment). NOT EXISTS is
+/// NULL-safe and matches only an explicit latch: an absent `pot_beefs` row
+/// or a NULL latch keeps the row a full candidate (fail-safe: chase MORE).
+/// Rule 6 holds: if the latched pointer ever really proves (reorg), the
+/// push path clears the latch and the row re-enters this pool.
+pub(crate) fn pot_spent_unconfirmed_sql(limit: u64, min_age_secs: u64) -> String {
+    format!(
+        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
+         WHERE spent = 1 AND spentConfirmed = 0 \
+           AND (spentAt IS NULL OR spentAt <= unixepoch() - {min_age_secs}) \
+           AND NOT EXISTS (SELECT 1 FROM pot_beefs pb \
+                           WHERE pb.txid = pot_records.spendingTxid \
+                             AND pb.structurally_unprovable = 1) \
+         ORDER BY RANDOM() LIMIT {limit}"
+    )
+}
+
+/// SHIPPED #2b confirm-beats-latch clear for the JUST-CONFIRMED spender's
+/// own row: run at every confirm moment BEFORE the sibling latch write, so
+/// a reorg that flips which competing spend of a pot outpoint confirmed
+/// (S first, later R) un-retires R the moment R's confirm is recorded —
+/// the latch can never suppress a tx the chain has since proven.
+pub(crate) const POT_BEEF_CLEAR_UNPROVABLE_SQL: &str =
+    "UPDATE pot_beefs SET structurally_unprovable = NULL WHERE txid = ?";
+
+/// SHIPPED #2b sibling read at a confirm moment: every potrefund marker's
+/// pre-signed refund raw for the confirmed pot outpoint. `refundRawHex` is
+/// UNTRUSTED wire bytes (`potrefund_records` has no validity latch) — the
+/// consumer ([`superseded_refund_txids`]) trusts NOTHING from the marker:
+/// it re-derives each txid from the raw itself and latches only when the
+/// raw's OWN bytes spend the confirmed outpoint. Bounded: an unretired
+/// overflow row just keeps polling (fail-safe).
+pub(crate) const POTREFUND_RAWS_FOR_POT_SQL: &str =
+    "SELECT refundRawHex FROM potrefund_records WHERE potTxid = ? AND potVout = ? LIMIT 256";
+
+/// SHIPPED #2b retirement latch write for `n` sibling txids: latch ONLY
+/// not-yet-VERIFIED rows (a row with a chaintracks-verified proof is chain
+/// truth — never overwrite it with a supersession verdict), and ONLY rows
+/// that already exist (UPDATE — the latch is about retiring stored poll
+/// candidates, never about minting rows for txids we hold no bytes for).
+pub(crate) fn pot_beef_retire_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "UPDATE pot_beefs SET structurally_unprovable = 1 \
+         WHERE proof_verified = 0 AND txid IN ({placeholders})"
+    )
+}
+
+/// PURE (#2b): the txids of superseded competing spends of
+/// `pot_txid:output_index`, derived from potrefund raw hexes at the moment
+/// a spend of that outpoint by `confirmed_spending_txid` was
+/// chaintracks-verified.
+///
+/// SECURITY: the marker's CLAIM (its potTxid/potVout columns) selects
+/// candidates only — the latchable FACT is re-derived from each raw's own
+/// bytes: the raw must parse AND actually spend the confirmed outpoint,
+/// and its txid is computed from those bytes (a fabricated marker can
+/// therefore only ever "latch" a tx that genuinely conflicts with the
+/// verified spend — which genuinely can never mine; it can never suppress
+/// an unrelated honest tx). The confirmed spender itself is excluded
+/// (case-insensitively), unparseable raws are skipped (fail-safe: no
+/// latch), and the result is deduplicated.
+pub(crate) fn superseded_refund_txids(
+    refund_raw_hexes: &[String],
+    pot_txid: &str,
+    output_index: u32,
+    confirmed_spending_txid: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in refund_raw_hexes {
+        let Ok(tx) = bsv_rs::transaction::Transaction::from_hex(raw) else {
+            continue; // not even a tx — nothing latchable (fail-safe)
+        };
+        let spends_confirmed_outpoint = tx.inputs.iter().any(|i| {
+            i.source_txid
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(pot_txid))
+                && i.source_output_index == output_index
+        });
+        if !spends_confirmed_outpoint {
+            continue; // the raw does not conflict with the confirmed spend
+        }
+        let txid = tx.id();
+        if txid.eq_ignore_ascii_case(confirmed_spending_txid) {
+            continue; // the confirmed spender is the one tx that DID prove
+        }
+        if !out.iter().any(|t| t.eq_ignore_ascii_case(&txid)) {
+            out.push(txid);
+        }
+    }
+    out
 }
 
 /// Row for the `pot_beefs` read-back: the BLOB as hex (`hex(beef) AS beef`) —
@@ -1604,6 +1729,106 @@ impl D1PotStorage {
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
+
+    /// #2b retirement, run at EVERY confirm moment for `(pot_txid,
+    /// output_index)` spent by `confirmed_spending_txid` — the moment the
+    /// supersession fact becomes knowable (epoch Rule 25) and the ONLY
+    /// moment it is ever written: both D1 confirm writers
+    /// ([`PotStorage::mark_spent`] `confirmed = true` and
+    /// [`PotStorage::mark_confirmed_for_spender`] on a CAS hit) funnel
+    /// through here, and NO unconfirmed path does (Rule 6: an unconfirmed
+    /// displacement can re-win, so it must never latch).
+    ///
+    /// Two writes, in load-bearing order:
+    /// 1. CLEAR the latch on the just-confirmed spender's own `pot_beefs`
+    ///    row (confirm beats the latch — the reorg direction);
+    /// 2. LATCH every OTHER tx verifiably conflicting with this confirmed
+    ///    spend: sibling candidates come from the pot's potrefund markers
+    ///    ([`POTREFUND_RAWS_FOR_POT_SQL`] — the cheapest correct source:
+    ///    one indexed SELECT vs parsing every stored `pot_beefs` blob, and
+    ///    the superseded pre-signed refund IS the dominant unprovable
+    ///    class), each VERIFIED against its raw's own bytes
+    ///    ([`superseded_refund_txids`]) before the UPDATE-only latch write
+    ///    ([`pot_beef_retire_sql`], which also refuses to touch
+    ///    VERIFIED-proven rows).
+    ///
+    /// BEST-EFFORT by contract: callers log a failure and never fail the
+    /// confirm itself — an unretired row simply keeps polling (fail-safe),
+    /// while the confirm is money-relevant truth that must land.
+    async fn retire_superseded_after_confirm(
+        &self,
+        pot_txid: &str,
+        output_index: u32,
+        confirmed_spending_txid: &str,
+    ) -> Result<u64, PotStorageError> {
+        // 1. Confirm beats the latch (unconditional, idempotent).
+        Query::new(POT_BEEF_CLEAR_UNPROVABLE_SQL)
+            .bind(confirmed_spending_txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+
+        // 2. Sibling candidates from the pot's refund markers.
+        let raws: Vec<RefundRawRow> = Query::new(POTREFUND_RAWS_FOR_POT_SQL)
+            .bind(pot_txid)
+            .bind(output_index)
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        let raw_hexes: Vec<String> = raws.into_iter().filter_map(|r| r.refund_raw_hex).collect();
+        let superseded = superseded_refund_txids(
+            &raw_hexes,
+            pot_txid,
+            output_index,
+            confirmed_spending_txid,
+        );
+        if superseded.is_empty() {
+            return Ok(0);
+        }
+        let mut q = Query::new(pot_beef_retire_sql(superseded.len()));
+        for txid in &superseded {
+            q = q.bind(txid.as_str());
+        }
+        q.execute(&self.db).await.map_err(pot_err)?;
+        Ok(superseded.len() as u64)
+    }
+
+    /// Best-effort wrapper around
+    /// [`retire_superseded_after_confirm`](Self::retire_superseded_after_confirm):
+    /// surfaces the outcome in the log (Rule 13 — the durable surfaced
+    /// number is `retiredUnprovableTotal` on /health/invariants) and
+    /// swallows the error so retirement hygiene can never fail a confirm.
+    async fn retire_superseded_best_effort(
+        &self,
+        pot_txid: &str,
+        output_index: u32,
+        confirmed_spending_txid: &str,
+    ) {
+        match self
+            .retire_superseded_after_confirm(pot_txid, output_index, confirmed_spending_txid)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => crate::proof_fetcher::push_log(&format!(
+                "[pot-retire] {pot_txid}:{output_index} confirmed by \
+                 {confirmed_spending_txid} — latched {n} superseded sibling(s) \
+                 structurally unprovable (#2b)"
+            )),
+            Err(e) => crate::proof_fetcher::push_log(&format!(
+                "[pot-retire] {pot_txid}:{output_index} sibling retirement failed \
+                 (rows keep polling — fail-safe): {e}"
+            )),
+        }
+    }
+}
+
+/// Row for the #2b sibling read ([`POTREFUND_RAWS_FOR_POT_SQL`]).
+/// `refundRawHex` is nullable in the schema — a NULL row is simply not a
+/// candidate (fail-safe: nothing latchable from it).
+#[derive(Deserialize)]
+struct RefundRawRow {
+    #[serde(rename = "refundRawHex")]
+    refund_raw_hex: Option<String>,
 }
 
 fn pot_err(e: String) -> PotStorageError {
@@ -1892,7 +2117,19 @@ impl PotStorage for D1PotStorage {
             .bind(output_index)
             .execute(&self.db)
             .await
-            .map_err(pot_err)
+            .map_err(pot_err)?;
+
+        // #2b: a CONFIRMED spend is the moment every OTHER stored tx
+        // spending this outpoint became structurally unprovable — retire
+        // them (and clear any stale latch on the confirmed spender:
+        // confirm beats the latch). ONLY the confirmed branch: an
+        // unconfirmed displacement can re-win and must never latch
+        // (Rule 6). Best-effort — never fails the confirm write above.
+        if confirmed {
+            self.retire_superseded_best_effort(txid, output_index, spending_txid)
+                .await;
+        }
+        Ok(())
     }
 
     async fn mark_verdict_for_spender(
@@ -1935,6 +2172,13 @@ impl PotStorage for D1PotStorage {
             .fetch_optional(&self.db)
             .await
             .map_err(pot_err)?;
+        // #2b: a CAS HIT is a confirm moment — retire the superseded
+        // siblings (and clear any stale latch on the confirmed spender).
+        // A MISS latches nothing: nothing was confirmed on this call.
+        if hit.is_some() {
+            self.retire_superseded_best_effort(txid, output_index, spending_txid)
+                .await;
+        }
         Ok(hit.is_some())
     }
 
@@ -2014,12 +2258,9 @@ impl PotStorage for D1PotStorage {
         // Push-primary backstop age gate (#228), anchored on spentAt (the
         // CURRENT spend pointer's record time): a young spend's proof is
         // expected via /arc-ingest. NULL spentAt (pre-migration) = eligible.
-        let sql = format!(
-            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
-             WHERE spent = 1 AND spentConfirmed = 0 \
-               AND (spentAt IS NULL OR spentAt <= unixepoch() - {min_age_secs}) \
-             ORDER BY RANDOM() LIMIT {limit}"
-        );
+        // #2b: rows pointed at a LATCHED structurally-unprovable spender are
+        // excluded — see `pot_spent_unconfirmed_sql` (the shipped string).
+        let sql = pot_spent_unconfirmed_sql(limit, min_age_secs);
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
     }
@@ -2077,13 +2318,16 @@ impl PotStorage for D1PotStorage {
         let has_proof = i64::from(pot_beef_has_proof(txid, beef));
         // createdAt is preserve-or-stamp (#228 backstop age anchor): a
         // longer-beef rewrite keeps the original first-store time so the
-        // push-primary backstop's age gate measures real age.
+        // push-primary backstop's age gate measures real age. The #2b
+        // retirement latch is preserved by the same subselect idiom (the
+        // sixth bind — new bytes cannot change what the subject spends).
         Query::new(POT_BEEF_ADMIT_WRITE_SQL)
             .bind(txid)
             .bind(beef)
             .bind(txid)
             .bind(current_unix_seconds_i64())
             .bind(has_proof)
+            .bind(txid)
             .execute(&self.db)
             .await
             .map_err(pot_err)
@@ -4911,12 +5155,26 @@ mod tests {
         // to 0 by the SQL itself, so the row STAYS a candidate.
         conn.execute(
             POT_BEEF_ADMIT_WRITE_SQL,
-            rusqlite::params!["fakebumped", vec![0xbeu8, 0xef], "fakebumped", 100i64, 1i64],
+            rusqlite::params![
+                "fakebumped",
+                vec![0xbeu8, 0xef],
+                "fakebumped",
+                100i64,
+                1i64,
+                "fakebumped"
+            ],
         )
         .unwrap();
         conn.execute(
             POT_BEEF_ADMIT_WRITE_SQL,
-            rusqlite::params!["proofless", vec![0xbeu8, 0xef], "proofless", 100i64, 0i64],
+            rusqlite::params![
+                "proofless",
+                vec![0xbeu8, 0xef],
+                "proofless",
+                100i64,
+                0i64,
+                "proofless"
+            ],
         )
         .unwrap();
         assert_eq!(
@@ -4955,7 +5213,7 @@ mod tests {
         for t in ["b1", "b2", "b3"] {
             conn.execute(
                 POT_BEEF_ADMIT_WRITE_SQL,
-                rusqlite::params![t, vec![0xbeu8, 0xef], t, 100i64, 1i64],
+                rusqlite::params![t, vec![0xbeu8, 0xef], t, 100i64, 1i64, t],
             )
             .unwrap();
         }
@@ -4971,6 +5229,289 @@ mod tests {
         assert!(
             candidates(0).is_empty(),
             "one batched statement latched all three"
+        );
+    }
+
+    // ── bsv-low handoff #2b: structurally-unprovable retirement ─────────────
+
+    /// In-memory SQLite with the FULL production migration list applied
+    /// (the existing verified-latch cell's idiom, factored for the #2b
+    /// cells).
+    fn sqlite_with_migrations() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        conn
+    }
+
+    /// A REAL raw tx spending `spend_txid:vout` with one P2PKH output whose
+    /// value is salted (distinct salts ⇒ distinct txids); returns
+    /// `(raw_hex, txid)`.
+    fn spender_raw(spend_txid: &str, vout: u32, salt: u8) -> (String, String) {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+        let mut tx = Transaction::new();
+        tx.add_input(TransactionInput::new(spend_txid.to_string(), vout))
+            .unwrap();
+        tx.add_output(TransactionOutput {
+            satoshis: Some(1000 + u64::from(salt)),
+            locking_script: LockingScript::from_hex(
+                "76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac",
+            )
+            .unwrap(),
+            change: false,
+        })
+        .unwrap();
+        (tx.to_hex(), tx.id())
+    }
+
+    #[test]
+    fn superseded_refund_txids_verifies_against_the_raws_own_bytes() {
+        let pot = hex::encode([0x77u8; 32]);
+        let other = hex::encode([0x88u8; 32]);
+        let (refund_raw, refund_txid) = spender_raw(&pot, 0, 1);
+        let (settle_raw, settle_txid) = spender_raw(&pot, 0, 2);
+        // A FABRICATED marker's raw: parses fine but spends a DIFFERENT
+        // outpoint — it does not conflict with the confirmed spend and must
+        // latch NOTHING (a planted marker can never suppress an unrelated
+        // honest tx).
+        let (decoy_raw, _) = spender_raw(&other, 0, 3);
+        // A raw spending the right txid but the WRONG vout: no conflict.
+        let (wrong_vout_raw, _) = spender_raw(&pot, 1, 4);
+
+        let raws = vec![
+            refund_raw.clone(),
+            settle_raw,          // the confirmed spender itself — excluded
+            decoy_raw,           // fabricated — filtered by its own bytes
+            wrong_vout_raw,      // different outpoint — filtered
+            "nothex!".into(),    // junk — skipped, never latches
+            refund_raw.clone(),  // duplicate — deduped
+        ];
+        // Case-insensitive spender exclusion: pass the settle txid UPPERCASED.
+        let got = superseded_refund_txids(&raws, &pot, 0, &settle_txid.to_uppercase());
+        assert_eq!(
+            got,
+            vec![refund_txid],
+            "exactly the genuinely-conflicting sibling, once"
+        );
+    }
+
+    /// The #2b pipeline over the SHIPPED SQL on the production schema:
+    /// latch-on-confirmed-displacement (sibling read → pure derivation →
+    /// retire write), pool exclusion, NULL-stays-eligible, chaser-pointer
+    /// exclusion, confirm-beats-latch (all three verified writers + the
+    /// clear), admit-rewrite preservation, and verified-row refusal.
+    #[test]
+    fn pot_beef_retirement_real_sqlite() {
+        let conn = sqlite_with_migrations();
+
+        let pot = hex::encode([0x77u8; 32]);
+        let (refund_raw, refund_txid) = spender_raw(&pot, 0, 1);
+        let (_settle_raw, settle_txid) = spender_raw(&pot, 0, 2);
+        let (decoy_raw, decoy_txid) = spender_raw(&hex::encode([0x88u8; 32]), 0, 3);
+
+        // Stored poll candidates (all proofless, latch NULL): the superseded
+        // refund, the settle, and an unrelated bystander.
+        for t in [&refund_txid, &settle_txid, &decoy_txid] {
+            conn.execute(
+                POT_BEEF_ADMIT_WRITE_SQL,
+                rusqlite::params![t, vec![0xbeu8, 0xef], t, 100i64, 0i64, t],
+            )
+            .unwrap();
+        }
+
+        // Potrefund markers for this pot: the genuine backup, a FABRICATED
+        // marker carrying the decoy's raw, and a NULL-raw row.
+        let insert_marker = |raw: Option<&str>, marker_txid: &str| {
+            conn.execute(
+                "INSERT INTO potrefund_records \
+                 (identity, gameId, potTxid, potVout, refundRawHex, sigHex, \
+                  txid, outputIndex, createdAt) \
+                 VALUES ('02aa', '11', ?, 0, ?, 'sig', ?, 0, 1)",
+                rusqlite::params![pot, raw, marker_txid],
+            )
+            .unwrap();
+        };
+        insert_marker(Some(&refund_raw), "marker1");
+        insert_marker(Some(&decoy_raw), "marker2");
+        insert_marker(None, "marker3");
+
+        // 1. The SHIPPED sibling read at the confirm moment.
+        let mut stmt = conn.prepare(POTREFUND_RAWS_FOR_POT_SQL).unwrap();
+        let raws: Vec<String> = stmt
+            .query_map(rusqlite::params![pot, 0i64], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(raws.len(), 2, "NULL raw rows carry nothing latchable");
+
+        // 2. The derivation: only the raw whose OWN bytes conflict with the
+        //    confirmed spend survives (decoy filtered, spender excluded).
+        let superseded = superseded_refund_txids(&raws, &pot, 0, &settle_txid);
+        assert_eq!(superseded, vec![refund_txid.clone()]);
+
+        // 3. The SHIPPED retire write → pool exclusion; NULL stays eligible.
+        let candidates = |min_age: u64| -> Vec<String> {
+            let mut stmt = conn.prepare(&pot_beef_candidates_sql(16, min_age)).unwrap();
+            let mut got: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            got.sort();
+            got
+        };
+        conn.execute(&pot_beef_retire_sql(1), rusqlite::params![refund_txid])
+            .unwrap();
+        let pool = candidates(0);
+        assert!(
+            !pool.contains(&refund_txid),
+            "the latched superseded refund left the poll pool"
+        );
+        assert!(
+            pool.contains(&settle_txid) && pool.contains(&decoy_txid),
+            "NULL (never-examined) rows stay eligible — the fail direction is polling MORE"
+        );
+
+        // 4. Chaser pool: a row pointing at the LATCHED refund is excluded;
+        //    a row pointing at the settle is chased; a row pointing at a tx
+        //    with NO pot_beefs row (unknown) is chased (fail-safe).
+        conn.execute_batch(&format!(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) \
+             VALUES ('{pot}', 0, 1, '{refund_txid}', 0); \
+             INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) \
+             VALUES ('otherpot', 0, 1, '{settle_txid}', 0); \
+             INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) \
+             VALUES ('thirdpot', 0, 1, 'neverstored', 0);"
+        ))
+        .unwrap();
+        let chaser = || -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&pot_spent_unconfirmed_sql(16, 0))
+                .unwrap();
+            let mut got: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            got.sort();
+            got
+        };
+        assert_eq!(
+            chaser(),
+            vec!["otherpot".to_string(), "thirdpot".into()],
+            "the latched pointer is retired; unknown/unlatched pointers stay chased"
+        );
+
+        // 5. Confirm beats the latch (the reorg direction): the clear write
+        //    re-admits BOTH pools.
+        conn.execute(POT_BEEF_CLEAR_UNPROVABLE_SQL, rusqlite::params![refund_txid])
+            .unwrap();
+        assert!(candidates(0).contains(&refund_txid));
+        assert_eq!(chaser().len(), 3);
+
+        // 6. Every verified writer clears the latch column.
+        let latch_of = |t: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT structurally_unprovable FROM pot_beefs WHERE txid = ?",
+                rusqlite::params![t],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        conn.execute(&pot_beef_retire_sql(1), rusqlite::params![refund_txid])
+            .unwrap();
+        assert_eq!(latch_of(&refund_txid), Some(1));
+        conn.execute(POT_BEEF_MARK_PROVEN_SQL, rusqlite::params![refund_txid])
+            .unwrap();
+        assert_eq!(latch_of(&refund_txid), None, "mark-proven clears the latch");
+
+        conn.execute(&pot_beef_retire_sql(1), rusqlite::params![decoy_txid])
+            .unwrap();
+        conn.execute(
+            &pot_beef_mark_proven_batch_sql(1),
+            rusqlite::params![decoy_txid],
+        )
+        .unwrap();
+        assert_eq!(latch_of(&decoy_txid), None, "the batch flip clears too");
+
+        conn.execute(&pot_beef_retire_sql(1), rusqlite::params![settle_txid])
+            .unwrap();
+        conn.execute(
+            POT_BEEF_VERIFIED_WRITE_SQL,
+            rusqlite::params![settle_txid, vec![0xbeu8, 0xef, 0x01], 200i64],
+        )
+        .unwrap();
+        assert_eq!(
+            latch_of(&settle_txid),
+            None,
+            "the verifying compact write clears explicitly"
+        );
+
+        // 7. An admit-path REWRITE preserves the latch (a re-submitted
+        //    superseded refund must not re-enter the pool)…
+        conn.execute(
+            POT_BEEF_ADMIT_WRITE_SQL,
+            rusqlite::params![
+                "keeper",
+                vec![0xbeu8],
+                "keeper",
+                100i64,
+                0i64,
+                "keeper"
+            ],
+        )
+        .unwrap();
+        conn.execute(&pot_beef_retire_sql(1), rusqlite::params!["keeper"])
+            .unwrap();
+        conn.execute(
+            POT_BEEF_ADMIT_WRITE_SQL,
+            rusqlite::params![
+                "keeper",
+                vec![0xbeu8, 0xef, 0x01],
+                "keeper",
+                100i64,
+                0i64,
+                "keeper"
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            latch_of("keeper"),
+            Some(1),
+            "an admit rewrite must PRESERVE the retirement latch"
+        );
+
+        // 8. …and the retire write refuses a VERIFIED-proven row (its proof
+        //    is chain truth — never overwritten by a supersession verdict).
+        assert_eq!(
+            conn.query_row(
+                "SELECT proof_verified FROM pot_beefs WHERE txid = ?",
+                rusqlite::params![refund_txid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "precondition: the refund row is verified after mark-proven"
+        );
+        conn.execute(&pot_beef_retire_sql(1), rusqlite::params![refund_txid])
+            .unwrap();
+        assert_eq!(
+            latch_of(&refund_txid),
+            None,
+            "a verified row is never latched"
         );
     }
 

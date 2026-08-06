@@ -177,27 +177,16 @@ pub async fn refresh_proofless_watch(db: &D1Database) -> u64 {
     // 1. Enrol proofless txids from both stores (bounded). First-seen is only
     //    set on the FIRST sighting (INSERT OR IGNORE keeps the original stamp).
     for table in ["pot_beefs", "transactions"] {
-        // ORDER BY RANDOM(): the enrol page is bounded, so with a >500 backlog a
-        // fixed (insertion) order would keep sampling the same head every tick
-        // and UNDERCOUNT the dead-pass signal (never-mineable rows deeper in the
-        // backlog would go unwatched). Random sampling makes every proofless row
-        // eventually visible to the flag. (INSERT OR IGNORE still preserves each
-        // row's original first-seen stamp, so the age stays real.)
-        let sql = format!(
-            "INSERT OR IGNORE INTO proofless_watch (txid, first_seen_ms) \
-             SELECT txid, ? FROM {table} WHERE has_proof = 0 \
-             ORDER BY RANDOM() LIMIT {WATCH_ENROLL_LIMIT}"
-        );
+        let sql = proofless_watch_enrol_sql(table);
         if let Err(e) = Query::new(sql).bind(ts).execute(db).await {
             worker::console_log!("[ops] proofless_watch enrol ({table}) failed: {e}");
         }
     }
 
-    // 2. GC: drop any txid that has since proven in either store.
-    let cleanup = "DELETE FROM proofless_watch WHERE \
-         txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1) OR \
-         txid IN (SELECT txid FROM transactions WHERE has_proof = 1)";
-    if let Err(e) = Query::new(cleanup).execute(db).await {
+    // 2. GC: drop any txid that has since proven in either store — or was
+    //    RETIRED structurally unprovable (#2b: residue must leave the watch,
+    //    or `prooflessOver24h` keeps conflating it with genuine backlog).
+    if let Err(e) = Query::new(PROOFLESS_WATCH_GC_SQL).execute(db).await {
         worker::console_log!("[ops] proofless_watch GC failed: {e}");
     }
 
@@ -211,6 +200,43 @@ pub async fn refresh_proofless_watch(db: &D1Database) -> u64 {
     }
     flagged
 }
+
+/// SHIPPED proofless-watch enrol page for one store (factored so the
+/// real-SQLite cell executes the production strings).
+///
+/// ORDER BY RANDOM(): the enrol page is bounded, so with a >500 backlog a
+/// fixed (insertion) order would keep sampling the same head every tick
+/// and UNDERCOUNT the dead-pass signal (never-mineable rows deeper in the
+/// backlog would go unwatched). Random sampling makes every proofless row
+/// eventually visible to the flag. (INSERT OR IGNORE still preserves each
+/// row's original first-seen stamp, so the age stays real.)
+///
+/// #2b: the `pot_beefs` page excludes LATCHED structurally-unprovable rows
+/// (`IS NOT 1` — NULL/pre-migration rows still enrol, fail-safe toward
+/// watching MORE): a retired row is RESIDUE, not backlog, and enrolling it
+/// would keep `prooflessOver24h` unable to tell the two apart. The
+/// `transactions` store has no such column (a pot settle/refund admits no
+/// outputs, so the superseded class never reaches that table).
+pub(crate) fn proofless_watch_enrol_sql(table: &str) -> String {
+    let unprovable_clause = if table == "pot_beefs" {
+        " AND structurally_unprovable IS NOT 1"
+    } else {
+        ""
+    };
+    format!(
+        "INSERT OR IGNORE INTO proofless_watch (txid, first_seen_ms) \
+         SELECT txid, ? FROM {table} WHERE has_proof = 0{unprovable_clause} \
+         ORDER BY RANDOM() LIMIT {WATCH_ENROLL_LIMIT}"
+    )
+}
+
+/// SHIPPED proofless-watch GC: drop txids that have since PROVEN in either
+/// store, or were RETIRED structurally unprovable (#2b) — both are "no
+/// longer genuine backlog", which is the only thing the 24h flag may count.
+pub(crate) const PROOFLESS_WATCH_GC_SQL: &str = "DELETE FROM proofless_watch WHERE \
+     txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1) OR \
+     txid IN (SELECT txid FROM transactions WHERE has_proof = 1) OR \
+     txid IN (SELECT txid FROM pot_beefs WHERE structurally_unprovable = 1)";
 
 /// Count proofless_watch rows first seen before `cutoff_ms`.
 async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
@@ -433,6 +459,20 @@ pub async fn health_invariants(
         .ok()
         .flatten()
         .map_or(-1, |r| r.c.max(0.0) as i64);
+    // #2b: rows RETIRED from the proof-poll pools as structurally
+    // unprovable (superseded competing spends of a confirmed pot outpoint,
+    // dominated by superseded pre-signed refunds). The Rule 13 surfaced
+    // number: `prooflessOver24h` above now counts GENUINE backlog only, and
+    // this is where the residue went — a LIVE count (a reorg-cleared latch
+    // honestly decrements), -1 = unreadable (pre-migration isolate),
+    // distinct from a real 0.
+    let retired_unprovable_total: i64 =
+        Query::new("SELECT COUNT(*) AS c FROM pot_beefs WHERE structurally_unprovable = 1")
+            .fetch_optional::<CountRow>(db)
+            .await
+            .ok()
+            .flatten()
+            .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
     let body = json!({
@@ -454,7 +494,11 @@ pub async fn health_invariants(
         // `arc_ingest_unauthorized_*_total` counters above.
         "arcIngestPushHealth": arc_ingest_push_health(&counters),
         "counters": counters,
+        // #2b: GENUINE backlog only — retired (structurally-unprovable)
+        // rows are excluded at enrol AND dropped by the watch GC.
         "prooflessOver24h": flagged,
+        // #2b: where the residue went (live count; -1 = table unreadable).
+        "retiredUnprovableTotal": retired_unprovable_total,
         // #371: lifetime network_seen latch count (-1 = table unreadable).
         "networkSeenTotal": network_seen_total,
         // #347 soak signal (Rule 6c closure criterion 3): `unauthenticatedUngated`
@@ -514,6 +558,65 @@ mod tests {
         assert_eq!(arc_ingest_push_health(&counters(1, 0, 0, 0)), "flowing");
         assert_eq!(arc_ingest_push_health(&counters(0, 1, 0, 0)), "flowing");
         assert_eq!(arc_ingest_push_health(&counters(5, 7, 3, 2)), "flowing");
+    }
+
+    /// bsv-low handoff #2b, real SQLite over the SHIPPED strings: the
+    /// proofless watch neither ENROLS a retired (structurally-unprovable)
+    /// row nor keeps one it already holds — `prooflessOver24h` counts
+    /// GENUINE backlog only, while NULL (never-examined) rows keep
+    /// enrolling (fail-safe: watch MORE).
+    #[test]
+    fn proofless_watch_excludes_retired_rows_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO pot_beefs (txid, beef, has_proof, structurally_unprovable) \
+             VALUES ('retired', x'beef', 0, 1); \
+             INSERT INTO pot_beefs (txid, beef, has_proof) VALUES ('backlog', x'beef', 0); \
+             INSERT INTO transactions (txid, beef, has_proof) VALUES ('enginetx', x'beef', 0);",
+        )
+        .unwrap();
+
+        // Enrol pages (the shipped per-table strings): the retired row is
+        // excluded; the NULL-latch row and the engine row enrol.
+        for table in ["pot_beefs", "transactions"] {
+            conn.execute(
+                &proofless_watch_enrol_sql(table),
+                rusqlite::params![1_000i64],
+            )
+            .unwrap();
+        }
+        let watched = |txid: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM proofless_watch WHERE txid = ?",
+                rusqlite::params![txid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(!watched("retired"), "a retired row is residue, not backlog");
+        assert!(watched("backlog"), "a NULL-latch row still enrols");
+        assert!(watched("enginetx"));
+
+        // A row retired AFTER enrolment is dropped by the GC (or the 24h
+        // flag would keep conflating residue with backlog forever).
+        conn.execute(
+            "UPDATE pot_beefs SET structurally_unprovable = 1 WHERE txid = 'backlog'",
+            [],
+        )
+        .unwrap();
+        conn.execute(PROOFLESS_WATCH_GC_SQL, []).unwrap();
+        assert!(!watched("backlog"), "the GC drops retired rows");
+        assert!(watched("enginetx"), "genuine backlog survives the GC");
     }
 
     #[test]

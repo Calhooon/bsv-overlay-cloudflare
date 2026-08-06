@@ -2875,6 +2875,102 @@ mod tests {
         assert_eq!(chase.confirmed, 0);
     }
 
+    // ── bsv-low handoff #2b: proof-poll retirement through the REAL passes ──
+
+    /// The #186 chaser's confirm is a retirement moment: once the settle's
+    /// proof chaintracks-verifies, the superseded pre-signed refund —
+    /// stored as poll-pool bytes when it was submitted as a spend — is
+    /// latched structurally unprovable and leaves the pot-beef poll pool,
+    /// through the REAL producers (mark_spent → find_spent_unconfirmed →
+    /// complete_spend_confirmations → mark_confirmed_for_spender →
+    /// retirement → find_pot_beefs_for_proof_check). Before the confirm,
+    /// NOTHING is latched (the no-unconfirmed-latch pin, pass-level).
+    #[tokio::test]
+    async fn chaser_confirm_retires_superseded_refund_from_the_poll_pool() {
+        let store = MemoryPotStorage::new();
+        let pot = "ee".repeat(32);
+        store.store_record(&undecoded_row(&pot)).await.unwrap();
+        let (settle_beef, settle_txid) =
+            spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
+        let (refund_beef, refund_txid) =
+            spender_beef(&pot, &[(2400, p2pkh_script(&[0xBB; 20]))]);
+        store.store_beef(&settle_txid, &settle_beef).await.unwrap();
+        store.store_beef(&refund_txid, &refund_beef).await.unwrap();
+        store
+            .mark_spent(&pot, 0, &settle_txid, false, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_pot_beefs_for_proof_check(10, 0)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "no confirm yet ⇒ nothing retired — both spenders still poll"
+        );
+
+        let fetcher = MockProofFetcher {
+            minable: [settle_txid.clone()].into_iter().collect(),
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.confirmed, 1);
+
+        let pool: Vec<String> = store
+            .find_pot_beefs_for_proof_check(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            !pool.contains(&refund_txid),
+            "the superseded refund is retired from the poll pool"
+        );
+        assert!(
+            pool.contains(&settle_txid),
+            "the confirmed spender still completes its own proof normally"
+        );
+    }
+
+    /// Confirm beats the latch through the PRODUCTION push path: a reorg
+    /// makes the latched refund the real spend, its chaintracks-verified
+    /// bump arrives via /arc-ingest, and `apply_pushed_proof_to_pot_stores`
+    /// (which deliberately reads the row DIRECTLY, not through the pool)
+    /// stitches, compacts, and clears the latch — the latch can never
+    /// suppress a real proof.
+    #[tokio::test]
+    async fn pushed_proof_for_a_latched_row_clears_the_latch() {
+        let store = MemoryPotStorage::new();
+        let pot = "ff".repeat(32);
+        store.store_record(&undecoded_row(&pot)).await.unwrap();
+        let (settle_beef, settle_txid) =
+            spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
+        let (refund_beef, refund_txid) =
+            spender_beef(&pot, &[(2400, p2pkh_script(&[0xBB; 20]))]);
+        store.store_beef(&settle_txid, &settle_beef).await.unwrap();
+        store.store_beef(&refund_txid, &refund_beef).await.unwrap();
+        // The settle confirms ⇒ the refund is latched and out of the pool.
+        store
+            .mark_spent(&pot, 0, &settle_txid, true, None, Some(u64::from(HEIGHT)), None)
+            .await
+            .unwrap();
+        assert!(store.is_structurally_unprovable(&refund_txid));
+
+        // The reorg: the REFUND's verified bump is pushed.
+        let bump_hex = single_tx_bump(&refund_txid, HEIGHT).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, &refund_txid, &bump_hex).await;
+        assert!(
+            s.pot_beef_compacted,
+            "the latch must not block the push path"
+        );
+        assert!(
+            !store.is_structurally_unprovable(&refund_txid),
+            "confirm beats the latch — the verified writer cleared it"
+        );
+        assert!(store.pot_beef_proof_verified(&refund_txid).await.unwrap());
+    }
+
     /// #301 gate M1 producer path (the RacingFetcher pattern for the PUSH
     /// consumer): a storage whose `find_unconfirmed_by_spending_txid`
     /// answers the stale selection and THEN displaces one selected row's

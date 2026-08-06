@@ -310,7 +310,14 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// publishes at the SEEN finality bar; non-final (parked refunds, #323) and
 /// unwitnessed (attacker-planted pointers, Rule 21) keep the merkle bar
 /// verbatim. Both read by the app-layer, so epoch Rule 24 bites for both.
-pub const OVERLAY_MIGRATION_COUNT: usize = 106;
+/// 106 → 107 for bsv-low handoff #2b: `pot_beefs.structurally_unprovable` —
+/// the proof-poll retirement latch for stored txs that can NEVER acquire a
+/// merkle proof because a chaintracks-verified spend of the same pot
+/// outpoint by a DIFFERENT txid was recorded (the dominant class: a
+/// superseded pre-signed refund, ~64% of refunds per bsv-low #369).
+/// Overlay-internal — the app-layer reads `pot_beefs` only through explicit
+/// `hex(beef)` joins, so epoch Rule 24 does NOT bite (no schema catch-up).
+pub const OVERLAY_MIGRATION_COUNT: usize = 107;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1192,6 +1199,30 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // network-accepted can publish early. NOTE the app-layer issues this same
     // statement (`low_app_layer::schema`, epoch Rule 24, pinned byte-identical).
     "ALTER TABLE pot_records ADD COLUMN spenderFinal INTEGER",
+    // ── bsv-low handoff #2b: the proof-poll RETIREMENT latch.
+    //
+    // `pot_beefs.structurally_unprovable`: 1 = this stored tx can never
+    // acquire a merkle proof — its OWN bytes spend a pot outpoint for which
+    // a chaintracks-verified spend by a DIFFERENT txid has been recorded
+    // (double-spend impossibility; the dominant class is a SUPERSEDED
+    // pre-signed refund, which never mines BY DESIGN). NULL = pre-migration /
+    // never examined — stays a full poll candidate (fail-safe: poll MORE).
+    //
+    // Latched ONLY at a confirm moment (epoch Rule 25 — the moment the fact
+    // becomes knowable): the D1 confirm writers (`mark_spent(confirmed)`,
+    // `mark_confirmed_for_spender` on a CAS hit) derive the superseded
+    // sibling txids from `potrefund_records.refundRawHex` VERIFIED against
+    // each raw's own bytes (the raw must actually spend the confirmed
+    // outpoint — a fabricated marker can never latch an unrelated honest
+    // tx). NEVER latched on an unconfirmed displacement (epoch Rule 6: a
+    // displaced-unconfirmed pointer can re-win; that latch would be
+    // permanent-vs-self-healing). Confirm BEATS the latch: every verified
+    // writer (`compact_pot_beef`, `mark_pot_beef_proven`, the batch flip)
+    // clears it, so a reorged-in row that really proves is never suppressed.
+    // Surfaced on /health/invariants as `retiredUnprovableTotal` (Rule 13).
+    // Overlay-internal: the app-layer reads pot_beefs only via explicit
+    // hex(beef) joins — no Rule 24 catch-up.
+    "ALTER TABLE pot_beefs ADD COLUMN structurally_unprovable INTEGER",
 ];
 
 // =============================================================================
