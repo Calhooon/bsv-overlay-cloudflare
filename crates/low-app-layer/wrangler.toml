@@ -64,7 +64,7 @@ STORAGE_EPOCH = "2026-08-06-zero-world-1"
 # `npx wrangler kv namespace create AUTH_SESSIONS`).
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"
-id = "022b3f903b7449c0bedf3e3eb8033cc4"  # low-app-layer-AUTH_SESSIONS (deploy id — do not commit)
+id = "YOUR_KV_NAMESPACE_ID"  # set to your own KV namespace id
 
 # The SAME D1 database the low-overlay worker writes (wrangler.low.toml uses
 # the identical binding name + database_name). This worker only ever SELECTs
@@ -73,7 +73,7 @@ id = "022b3f903b7449c0bedf3e3eb8033cc4"  # low-app-layer-AUTH_SESSIONS (deploy i
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
-database_id = "9930afce-6154-4d1e-b2a0-71a90065db0a"  # set to your own D1 database id
+database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
 
 # Service binding to the ChainTracks worker (same account). /tip uses this to
 # resolve the present chain height: a plain workers.dev URL fetch to a
