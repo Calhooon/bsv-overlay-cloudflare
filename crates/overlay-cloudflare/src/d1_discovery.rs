@@ -1446,6 +1446,10 @@ struct PotRow {
     verdict_txid: Option<String>,
     #[serde(rename = "spentHeight", default)]
     spent_height: Option<f64>,
+    /// `serde(default)` tolerates a read that races the additive #371
+    /// `spenderFinal` migration.
+    #[serde(rename = "spenderFinal", default)]
+    spender_final: Option<f64>,
 }
 
 impl PotRow {
@@ -1472,6 +1476,7 @@ impl PotRow {
             verdict: self.verdict,
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
+            spender_final: self.spender_final.map(|v| v != 0.0),
         }
     }
 }
@@ -1481,7 +1486,7 @@ impl PotRow {
 const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentConfirmed, \
      lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
      stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
-     verdict, verdictTxid, spentHeight";
+     verdict, verdictTxid, spentHeight, spenderFinal";
 
 /// Row for the `pot_beefs` length + verified-latch probe
 /// (`length(beef) AS len, proof_verified`). D1 returns numbers as f64;
@@ -1668,6 +1673,18 @@ fn pot_err(e: String) -> PotStorageError {
 /// whose meaning depends on who wrote it last (bsv-low #217). No bind is
 /// added: `COALESCE(firstSpentAt, unixepoch())` takes no parameter, so the
 /// documented bind order above is unchanged.
+///
+/// # #371 spender bytes-finality (`spenderFinal`)
+///
+/// Every variant ALSO carries
+/// `spenderFinal = CASE WHEN spendingTxid = ? THEN COALESCE(?, spenderFinal)
+/// ELSE ? END` — the exact LOW-1 pointer-riding CASE `spentHeight` uses, but
+/// on BOTH branches (an unconfirmed FINAL settle is precisely the row the
+/// #371 third arm publishes): a same-pointer re-write keeps-or-updates
+/// (`None` keeps), a pointer change RESETS to the incoming value (a new
+/// spender never inherits the old spender's finality). The CASE's
+/// `spendingTxid` probe reads the PRE-update value (SQLite UPDATE
+/// semantics), same as the height CASE.
 pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     match (confirmed, with_verdict) {
         (true, true) => {
@@ -1675,25 +1692,33 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
                  spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
                  verdict = ?, verdictTxid = ?, \
                  spentHeight = CASE WHEN spendingTxid = ? \
-                               THEN COALESCE(?, spentHeight) ELSE ? END \
+                               THEN COALESCE(?, spentHeight) ELSE ? END, \
+                 spenderFinal = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spenderFinal) ELSE ? END \
              WHERE txid = ? AND outputIndex = ?"
         }
         (true, false) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
                  spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
                  spentHeight = CASE WHEN spendingTxid = ? \
-                               THEN COALESCE(?, spentHeight) ELSE ? END \
+                               THEN COALESCE(?, spentHeight) ELSE ? END, \
+                 spenderFinal = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spenderFinal) ELSE ? END \
              WHERE txid = ? AND outputIndex = ?"
         }
         (false, true) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch(), \
                  firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
-                 verdict = ?, verdictTxid = ? \
+                 verdict = ?, verdictTxid = ?, \
+                 spenderFinal = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spenderFinal) ELSE ? END \
              WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
         }
         (false, false) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch(), \
-                 firstSpentAt = COALESCE(firstSpentAt, unixepoch()) \
+                 firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
+                 spenderFinal = CASE WHEN spendingTxid = ? \
+                               THEN COALESCE(?, spenderFinal) ELSE ? END \
              WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
         }
     }
@@ -1823,6 +1848,7 @@ impl PotStorage for D1PotStorage {
             .map_err(pot_err)
     }
 
+    #[allow(clippy::too_many_arguments)] // the write is atomic by design: every field rides the pointer
     async fn mark_spent(
         &self,
         txid: &str,
@@ -1831,6 +1857,7 @@ impl PotStorage for D1PotStorage {
         confirmed: bool,
         verdict: Option<&str>,
         spent_height: Option<u64>,
+        spender_final: Option<bool>,
     ) -> Result<(), PotStorageError> {
         // UPDATE-only: records the spender on an existing row (a nonexistent
         // outpoint is a no-op — an output must be admitted before it spends).
@@ -1857,6 +1884,10 @@ impl PotStorage for D1PotStorage {
             // ELSE (pointer-changed) height.
             q = q.bind(spending_txid).bind(spent_height).bind(spent_height);
         }
+        // #371 finality CASE binds (EVERY variant): the same-pointer probe,
+        // the COALESCE value, the ELSE (pointer-changed) value.
+        let final_i = spender_final.map(i64::from);
+        q = q.bind(spending_txid).bind(final_i).bind(final_i);
         q.bind(txid)
             .bind(output_index)
             .execute(&self.db)
@@ -5166,13 +5197,15 @@ mod tests {
         spent_at: Option<i64>,
         /// The #217 DURABLE hand-end anchor — write-once, never re-stamped.
         first_spent_at: Option<i64>,
+        /// The #371 spender bytes-finality latch (NULL / 0 / 1 as Option).
+        spender_final: Option<i64>,
     }
 
     fn read_pot_row(conn: &rusqlite::Connection, txid: &str, vout: u32) -> SqlPotRow {
         conn.query_row(
             "SELECT spent, spendingTxid, spentConfirmed, lockKind, pubA, stakeA, potSats, \
                     paramsDecoded, verdict, verdictTxid, spentHeight, createdAt, \
-                    spentAt, firstSpentAt \
+                    spentAt, firstSpentAt, spenderFinal \
              FROM pot_records WHERE txid = ?1 AND outputIndex = ?2",
             rusqlite::params![txid, vout],
             |r| {
@@ -5191,6 +5224,7 @@ mod tests {
                     created_at: r.get(11)?,
                     spent_at: r.get(12)?,
                     first_spent_at: r.get(13)?,
+                    spender_final: r.get(14)?,
                 })
             },
         )
@@ -5259,8 +5293,12 @@ mod tests {
 
     /// Execute the shipped `mark_spent_sql(...)` with the D1 impl's exact
     /// bind order (spendingTxid, [verdict, verdictTxid,] [confirmed only:
-    /// spendingTxid, spentHeight, spentHeight,] txid, outputIndex).
-    fn exec_mark_spent(
+    /// spendingTxid, spentHeight, spentHeight,] #371 finality CASE:
+    /// spendingTxid, spenderFinal, spenderFinal, then txid, outputIndex).
+    /// Callers that predate #371 use the `exec_mark_spent` wrapper (finality
+    /// = NULL, the pre-migration shape).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_mark_spent_final(
         conn: &rusqlite::Connection,
         txid: &str,
         vout: u32,
@@ -5268,8 +5306,10 @@ mod tests {
         confirmed: bool,
         verdict: Option<&str>,
         spent_height: Option<i64>,
+        spender_final: Option<bool>,
     ) {
         let sql = mark_spent_sql(confirmed, verdict.is_some());
+        let fin = spender_final.map(i64::from);
         match (confirmed, verdict) {
             (true, Some(v)) => conn.execute(
                 sql,
@@ -5280,6 +5320,9 @@ mod tests {
                     spending_txid,
                     spent_height,
                     spent_height,
+                    spending_txid,
+                    fin,
+                    fin,
                     txid,
                     vout
                 ],
@@ -5291,17 +5334,44 @@ mod tests {
                     spending_txid,
                     spent_height,
                     spent_height,
+                    spending_txid,
+                    fin,
+                    fin,
                     txid,
                     vout
                 ],
             ),
             (false, Some(v)) => conn.execute(
                 sql,
-                rusqlite::params![spending_txid, v, spending_txid, txid, vout],
+                rusqlite::params![spending_txid, v, spending_txid, spending_txid, fin, fin, txid, vout],
             ),
-            (false, None) => conn.execute(sql, rusqlite::params![spending_txid, txid, vout]),
+            (false, None) => conn.execute(
+                sql,
+                rusqlite::params![spending_txid, spending_txid, fin, fin, txid, vout],
+            ),
         }
         .expect("mark_spent_sql executes");
+    }
+
+    fn exec_mark_spent(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        vout: u32,
+        spending_txid: &str,
+        confirmed: bool,
+        verdict: Option<&str>,
+        spent_height: Option<i64>,
+    ) {
+        exec_mark_spent_final(
+            conn,
+            txid,
+            vout,
+            spending_txid,
+            confirmed,
+            verdict,
+            spent_height,
+            None,
+        );
     }
 
     /// Execute the shipped `verdict_cas_sql()` (the backfill's guarded
@@ -5799,6 +5869,94 @@ mod tests {
         // A pointer change WITH a height carries its own.
         exec_mark_spent(&conn, "potA", 0, "settleS3", true, None, Some(803_000));
         assert_eq!(read_pot_row(&conn, "potA", 0).spent_height, Some(803_000));
+    }
+
+    /// #371 — `spenderFinal` rides the pointer on BOTH branches, through the
+    /// PRODUCTION SQL: same-pointer `Some` overwrites / `None` keeps; a
+    /// pointer change RESETS to the incoming value (a new spender never
+    /// inherits the old spender's finality); and — unlike `spentHeight` —
+    /// the UNCONFIRMED branch carries it too, because an unconfirmed FINAL
+    /// settle is exactly the row the third arm publishes.
+    #[test]
+    fn sql_spender_final_rides_the_pointer_on_both_branches() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+
+        // Unconfirmed FINAL settle (the ruling-3 subject): latched.
+        exec_mark_spent_final(&conn, "potA", 0, "settleS1", false, None, None, Some(true));
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS1"));
+        assert_eq!(r.spender_final, Some(1));
+
+        // Same-pointer re-write with None KEEPS the latched value.
+        exec_mark_spent_final(&conn, "potA", 0, "settleS1", false, None, None, None);
+        assert_eq!(read_pot_row(&conn, "potA", 0).spender_final, Some(1));
+
+        // A DIFFERENT unconfirmed spender (displacement among unconfirmed)
+        // RESETS — including to NULL when the writer had no parse.
+        exec_mark_spent_final(&conn, "potA", 0, "refundR1", false, None, None, Some(false));
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spending_txid.as_deref(), Some("refundR1"));
+        assert_eq!(
+            r.spender_final,
+            Some(0),
+            "the non-final parked refund is latched non-final — the #323 bar holds"
+        );
+        exec_mark_spent_final(&conn, "potA", 0, "settleS2", true, None, Some(800_000), None);
+        let r = read_pot_row(&conn, "potA", 0);
+        assert_eq!(r.spending_txid.as_deref(), Some("settleS2"));
+        assert_eq!(
+            r.spender_final, None,
+            "a pointer change with no parse resets to NULL — S2 never inherits R1's verdict"
+        );
+
+        // Confirmed same-pointer write carries its own value.
+        exec_mark_spent_final(&conn, "potA", 0, "settleS2", true, None, None, Some(true));
+        assert_eq!(read_pot_row(&conn, "potA", 0).spender_final, Some(1));
+    }
+
+    /// #371 — the shipped `network_seen` latch write executes against the
+    /// production schema, is WRITE-ONCE (INSERT OR IGNORE keeps the first
+    /// stamp), and lowercases its key so the views' `lower(spendingTxid)`
+    /// join always matches.
+    #[test]
+    fn sql_network_seen_latch_is_write_once_and_lowercased() {
+        let conn = production_schema_db();
+        conn.execute(
+            crate::ops::NETWORK_SEEN_INSERT_SQL,
+            rusqlite::params!["ABCDEF01"],
+        )
+        .expect("latch executes");
+        let (txid, seen_at): (String, i64) = conn
+            .query_row("SELECT txid, seenAt FROM network_seen", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("one row");
+        assert_eq!(txid, "abcdef01", "keyed lowercase");
+        assert!(seen_at > 0, "stamped by unixepoch()");
+        // Re-latch: ignored, first stamp kept.
+        conn.execute(
+            "UPDATE network_seen SET seenAt = 1 WHERE txid = 'abcdef01'",
+            [],
+        )
+        .expect("age the row");
+        conn.execute(
+            crate::ops::NETWORK_SEEN_INSERT_SQL,
+            rusqlite::params!["abcDEF01"],
+        )
+        .expect("re-latch executes");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_seen", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 1, "write-once: no second row for a case variant");
+        let kept: i64 = conn
+            .query_row(
+                "SELECT seenAt FROM network_seen WHERE txid = 'abcdef01'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("kept");
+        assert_eq!(kept, 1, "INSERT OR IGNORE keeps the first stamp");
     }
 
     #[test]

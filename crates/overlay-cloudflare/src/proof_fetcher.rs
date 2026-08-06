@@ -1967,7 +1967,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_spent("potA", 0, "settleA", false, None, None)
+            .mark_spent("potA", 0, "settleA", false, None, None, None)
             .await
             .unwrap();
 
@@ -2005,7 +2005,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_spent("potA", 0, "settleA", false, None, None)
+            .mark_spent("potA", 0, "settleA", false, None, None, None)
             .await
             .unwrap();
 
@@ -2097,7 +2097,7 @@ mod tests {
             if !self.fired.replace(true) {
                 let (t, v, s, confirmed, h) = &self.displacement;
                 self.store
-                    .mark_spent(t, *v, s, *confirmed, None, *h)
+                    .mark_spent(t, *v, s, *confirmed, None, *h, None)
                     .await
                     .unwrap();
             }
@@ -2767,7 +2767,7 @@ mod tests {
         // both BEEFs durably stored.
         store.store_record(&undecoded_row(&cov_txid)).await.unwrap();
         store
-            .mark_spent(&cov_txid, 0, &settle_txid, false, None, None)
+            .mark_spent(&cov_txid, 0, &settle_txid, false, None, None, None)
             .await
             .unwrap();
         store.store_beef(&cov_txid, &cov_beef).await.unwrap();
@@ -2801,7 +2801,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_spent(&bare_txid, 0, &bspend_txid, false, None, None)
+            .mark_spent(&bare_txid, 0, &bspend_txid, false, None, None, None)
             .await
             .unwrap();
         store.store_beef(&bare_txid, &bare_beef).await.unwrap();
@@ -2893,6 +2893,7 @@ mod tests {
         async fn store_record(&self, r: &PotRecord) -> Result<(), PotStorageError> {
             self.inner.store_record(r).await
         }
+        #[allow(clippy::too_many_arguments)]
         async fn mark_spent(
             &self,
             txid: &str,
@@ -2901,6 +2902,7 @@ mod tests {
             confirmed: bool,
             verdict: Option<&str>,
             spent_height: Option<u64>,
+            spender_final: Option<bool>,
         ) -> Result<(), PotStorageError> {
             self.inner
                 .mark_spent(
@@ -2910,6 +2912,7 @@ mod tests {
                     confirmed,
                     verdict,
                     spent_height,
+                    spender_final,
                 )
                 .await
         }
@@ -2950,7 +2953,7 @@ mod tests {
             if !self.fired.replace(true) {
                 let (t, v, s, confirmed, h) = &self.displacement;
                 self.inner
-                    .mark_spent(t, *v, s, *confirmed, None, *h)
+                    .mark_spent(t, *v, s, *confirmed, None, *h, None)
                     .await?;
             }
             Ok(stale)
@@ -3018,6 +3021,7 @@ mod tests {
         async fn store_record(&self, r: &PotRecord) -> Result<(), PotStorageError> {
             self.0.store_record(r).await
         }
+        #[allow(clippy::too_many_arguments)]
         async fn mark_spent(
             &self,
             txid: &str,
@@ -3026,6 +3030,7 @@ mod tests {
             confirmed: bool,
             verdict: Option<&str>,
             spent_height: Option<u64>,
+            spender_final: Option<bool>,
         ) -> Result<(), PotStorageError> {
             self.0
                 .mark_spent(
@@ -3035,6 +3040,7 @@ mod tests {
                     confirmed,
                     verdict,
                     spent_height,
+                    spender_final,
                 )
                 .await
         }
@@ -3266,7 +3272,7 @@ mod tests {
         // Re-record the spend at clock time so spentAt is stamped by the real
         // producer (mark_spent).
         store
-            .mark_spent("potA", 0, "settleA", false, None, None)
+            .mark_spent("potA", 0, "settleA", false, None, None, None)
             .await
             .unwrap();
 

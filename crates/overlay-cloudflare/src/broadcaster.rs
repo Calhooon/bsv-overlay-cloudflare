@@ -2029,6 +2029,29 @@ impl ArcadeBroadcaster {
         }
     }
 
+    /// bsv-low #371: does Arcade ITSELF report `txid` at SEEN_ON_NETWORK or
+    /// better? One `GET /tx/{txid}`, no polling. `Orphan` is NOT seen (#267:
+    /// an orphan-pool residence is not a network accept), a fatal status is
+    /// not seen, an unknown txid / transport fault is not seen — every
+    /// non-Reached answer degrades to `false`, which for the caller means
+    /// "no latch, the merkle bar stays" (the pre-#371 behaviour). The echoed
+    /// txid MUST match the asked one (gate L4): Arcade's `GET /tx/{txid}`
+    /// always echoes the subject (#213 recorded bodies), so an absent or
+    /// different echo is an upstream answering about something else — it
+    /// must never latch OUR subject. Fails toward the merkle bar only.
+    pub async fn network_witnessed(&self, txid: &str) -> bool {
+        match self.tx_status(txid).await {
+            Some(r) => {
+                r.txid.eq_ignore_ascii_case(txid)
+                    && matches!(
+                        classify_arcade_status(&r.tx_status, "SEEN_ON_NETWORK"),
+                        GateVerdict::Reached
+                    )
+            }
+            None => false,
+        }
+    }
+
     /// `GET /tx/{txid}` → the parsed status response if Arcade knows the txid
     /// (non-empty `txStatus`), else `None`. Carries `extra_info` for reason
     /// text — see the [`ArcadeStatusResponse`] stale-extraInfo trap note.

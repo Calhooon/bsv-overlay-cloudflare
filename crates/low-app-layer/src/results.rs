@@ -926,6 +926,13 @@ pub struct ResultsRow {
     /// ONLY when this is `Some(true)`; a structural bump on an unverified
     /// row is never a height. `None` = no spender row joined.
     pub spender_proof_verified: Option<bool>,
+    /// #371: the overlay's OWN network witness for the recorded spender
+    /// (`network_seen` join — `Some(true)` iff a row exists) and the
+    /// spender's bytes-finality latch (`pot_records.spenderFinal`). Together
+    /// they are the verdict gate's third arm; `None` degrades to the merkle
+    /// arms.
+    pub spender_seen: Option<bool>,
+    pub spender_final: Option<bool>,
 }
 
 impl ResultsRow {
@@ -1689,6 +1696,8 @@ pub fn assemble_results(
         let confirmed_landing = crate::logic::is_confirmed_landing_with_proof(
             r.spent_confirmed,
             r.spender_proof_verified,
+            r.spender_seen,
+            r.spender_final,
         );
         if let (Some(true), true, Some(settle)) = (r.spent, confirmed_landing, settle_lc.as_deref())
         {
@@ -2132,7 +2141,7 @@ pub fn results_sql() -> String {
     // — the potparty marker owns the bare `recoveryHeight` name).
     const DECODED: &str = "lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
          stakeA, stakeB, feeSats, covRecoveryHeight, potSats, \
-         verdict, verdictTxid, spentHeight";
+         verdict, verdictTxid, spentHeight, spenderFinal";
     format!(
         // L4 — BEEF join, on the ≤{rows} survivors only (never inside the
         // window, where each dust replay would drag the real BLOBs along).
@@ -2169,8 +2178,10 @@ pub fn results_sql() -> String {
                 w.feeSats AS feeSats, w.covRecoveryHeight AS covRecoveryHeight, \
                 w.potSats AS potSats, w.verdict AS verdict, \
                 w.verdictTxid AS verdictTxid, w.spentHeight AS spentHeight, \
+                w.spenderFinal AS spenderFinal, \
                 hex(fb.beef) AS fundingBeef, hex(sb.beef) AS spenderBeef, \
-                sb.proof_verified AS spenderProofVerified \
+                sb.proof_verified AS spenderProofVerified, \
+                ns.txid IS NOT NULL AS spenderSeen \
          FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                   opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                   spent, spendingTxid, spentConfirmed, {DECODED}, \
@@ -2201,6 +2212,7 @@ pub fn results_sql() -> String {
                       r.recoveryHeight AS covRecoveryHeight, \
                       r.potSats AS potSats, r.verdict AS verdict, \
                       r.verdictTxid AS verdictTxid, r.spentHeight AS spentHeight, \
+                      r.spenderFinal AS spenderFinal, \
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
@@ -2223,6 +2235,8 @@ pub fn results_sql() -> String {
               AND (w.verdict IS NULL OR w.verdictTxid IS NULL \
                    OR w.verdictTxid <> w.spendingTxid OR w.spentHeight IS NULL) \
               AND sb.txid = lower(w.spendingTxid) \
+         LEFT JOIN network_seen ns ON w.spendingTxid IS NOT NULL \
+              AND ns.txid = lower(w.spendingTxid) \
          ORDER BY w.potBestSigRank DESC, w.tier ASC, \
                   COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",

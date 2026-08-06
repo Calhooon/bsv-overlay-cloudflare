@@ -1288,15 +1288,30 @@ pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
     status.spent == Some(true) && status.spent_confirmed == Some(true)
 }
 
-/// Is a recorded spend a CONFIRMED LANDING for the two per-identity MONEY
-/// views (`/results` and `/refund-view`)?
+/// Is a recorded spend a LANDING the money views (`/results`,
+/// `/refund-view`, `/hops-view`) may derive from?
 ///
-/// The bar: the `spentConfirmed` flag OR a chaintracks-VERIFIED spender proof
-/// (`pot_beefs.proof_verified`). The second signal exists because the column
-/// was added by migration with default 0, so a pre-existing row whose spend
-/// genuinely MINED can carry `spentConfirmed = 0`; a parked tx that never
-/// mined can never acquire a verified proof, so this widens toward CHAIN
-/// TRUTH, never away from it.
+/// Three arms, each a different provenance of the same fact:
+///
+/// 1. the `spentConfirmed` flag (the overlay SPV-verified the spend's bump);
+/// 2. a chaintracks-VERIFIED spender proof (`pot_beefs.proof_verified`) —
+///    exists because the flag column was added by migration with default 0,
+///    so a pre-existing row whose spend genuinely MINED can carry
+///    `spentConfirmed = 0`; a parked tx that never mined can never acquire a
+///    verified proof, so this widens toward CHAIN TRUTH, never away from it;
+/// 3. **bsv-low #371, owner ruling 3 ("SEEN_ON_NETWORK is the finality
+///    bar")**: the overlay ITSELF witnessed the network accept this spender
+///    (`network_seen` — written only by the broadcast-gated arm's own
+///    Arcade verdict or the ungated arm's Arcade corroboration, never from
+///    a caller's claim) AND the spender's own bytes parse as FINAL
+///    (`pot_records.spenderFinal`, latched at spend-record time). Both
+///    conjuncts are load-bearing: without `spender_final`, a tower-parked
+///    NON-FINAL refund that got network-witnessed would publish before its
+///    height gate (#323's exact defect); without `spender_seen`, an
+///    attacker-planted never-broadcast spend pointer from the ungated
+///    public `/submit` would publish a fabricated verdict (epoch Rule 21's
+///    worked-example defeat). `None` on either (pre-#371 rows) degrades to
+///    the merkle arms — honest, self-draining.
 ///
 /// # Why this is hoisted (#323, the fourth instance of one pattern)
 ///
@@ -1312,12 +1327,18 @@ pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
 ///
 /// Note the sibling [`is_confirmed_landing`] is deliberately STRICTER (flag
 /// only): it serves the leaderboard/classifier pair, which has no spender
-/// BEEF join to read a proof latch from.
+/// BEEF join to read a proof latch from — and the leaderboard COUNTS wins,
+/// where the #332 lesson demands nothing evictable or unconfirmed in the
+/// counting path, so it does not get the #371 arm either.
 pub fn is_confirmed_landing_with_proof(
     spent_confirmed: Option<bool>,
     spender_proof_verified: Option<bool>,
+    spender_seen: Option<bool>,
+    spender_final: Option<bool>,
 ) -> bool {
-    spent_confirmed == Some(true) || spender_proof_verified == Some(true)
+    spent_confirmed == Some(true)
+        || spender_proof_verified == Some(true)
+        || (spender_seen == Some(true) && spender_final == Some(true))
 }
 
 /// True iff the marker is anchored: its `potTxid:0` is recorded spent by the
@@ -2463,15 +2484,59 @@ mod tests {
     #[test]
     fn is_confirmed_landing_with_proof_is_the_one_money_view_bar() {
         // The flag alone.
-        assert!(is_confirmed_landing_with_proof(Some(true), None));
+        assert!(is_confirmed_landing_with_proof(Some(true), None, None, None));
         // A chaintracks-VERIFIED spender proof alone (the migrated-row case).
-        assert!(is_confirmed_landing_with_proof(Some(false), Some(true)));
-        assert!(is_confirmed_landing_with_proof(None, Some(true)));
-        // A PARKED intent: neither signal.
-        assert!(!is_confirmed_landing_with_proof(Some(false), None));
-        assert!(!is_confirmed_landing_with_proof(None, None));
+        assert!(is_confirmed_landing_with_proof(
+            Some(false),
+            Some(true),
+            None,
+            None
+        ));
+        assert!(is_confirmed_landing_with_proof(None, Some(true), None, None));
+        // A PARKED intent: no signal at all.
+        assert!(!is_confirmed_landing_with_proof(Some(false), None, None, None));
+        assert!(!is_confirmed_landing_with_proof(None, None, None, None));
         // An UNVERIFIED latch is not a signal (never a guess).
-        assert!(!is_confirmed_landing_with_proof(Some(false), Some(false)));
+        assert!(!is_confirmed_landing_with_proof(
+            Some(false),
+            Some(false),
+            None,
+            None
+        ));
+        // ── The #371 third arm: SEEN && FINAL, and nothing weaker. ──
+        // The overlay's own witness + final bytes: the ruling-3 bar.
+        assert!(is_confirmed_landing_with_proof(
+            Some(false),
+            None,
+            Some(true),
+            Some(true)
+        ));
+        // SEEN alone is NOT enough: a network-witnessed but NON-FINAL
+        // spender is a tower-parked refund before its height — publishing
+        // it is #323's exact defect.
+        assert!(!is_confirmed_landing_with_proof(
+            None,
+            None,
+            Some(true),
+            Some(false)
+        ));
+        assert!(!is_confirmed_landing_with_proof(None, None, Some(true), None));
+        // FINAL alone is NOT enough: a final-looking spend pointer with no
+        // network witness is exactly what a stranger can plant through the
+        // ungated public /submit (epoch Rule 21) — it stays behind the
+        // merkle bar.
+        assert!(!is_confirmed_landing_with_proof(
+            None,
+            None,
+            None,
+            Some(true)
+        ));
+        assert!(!is_confirmed_landing_with_proof(
+            None,
+            None,
+            Some(false),
+            Some(true)
+        ));
         // And it is strictly WIDER than the leaderboard's flag-only rule,
         // never narrower — the two must not be confused.
         let op = Outpoint {
@@ -2483,7 +2548,9 @@ mod tests {
         assert!(!is_confirmed_landing(&st));
         assert!(is_confirmed_landing_with_proof(
             st.spent_confirmed,
-            Some(true)
+            Some(true),
+            None,
+            None
         ));
     }
 

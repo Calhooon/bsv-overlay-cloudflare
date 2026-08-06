@@ -129,6 +129,26 @@ pub async fn record_completion_tick(
 /// Bump one persistent monotonic counter by `delta` (additive upsert).
 /// Best-effort — logs and swallows any D1 error (observability must never
 /// break the request that carries it).
+/// bsv-low #371: the shipped `network_seen` latch write — the overlay's OWN
+/// witness that the network accepted `txid`. Write-once (`INSERT OR IGNORE`;
+/// a seen fact never changes), keyed on the lowercased txid, stamped by
+/// SQLite (`unixepoch()`) so no clock bind is needed. A const so the
+/// real-SQLite tier executes the production string against the production
+/// schema.
+pub const NETWORK_SEEN_INSERT_SQL: &str =
+    "INSERT OR IGNORE INTO network_seen (txid, seenAt) VALUES (lower(?), unixepoch())";
+
+/// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only
+/// ACCELERATES verdict publication (the #371 third arm); a lost write leaves
+/// the row behind the merkle bar, which is the pre-#371 behaviour — so a D1
+/// fault is logged, never propagated.
+pub async fn latch_network_seen(db: &D1Database, txid: &str) {
+    let q = Query::new(NETWORK_SEEN_INSERT_SQL).bind(txid);
+    if let Err(e) = q.execute(db).await {
+        worker::console_log!("[#371] network_seen latch failed for {txid}: {e}");
+    }
+}
+
 pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
     if delta == 0 {
         return;
@@ -402,6 +422,17 @@ pub async fn health_invariants(
     let counters = read_counters(db).await;
     let flagged = count_flagged(db, now - PROOFLESS_FLAG_MS).await;
     let census = census_json(db).await;
+    // #371: total network_seen latches — the observable the ci-route tier
+    // asserts a submit MOVES (gate MEDIUM-1: both latch call sites are
+    // wasm-route-only, so without a served count the feature could be
+    // deleted with every native tier green). -1 = the table is unreadable
+    // (pre-migration isolate), distinct from a real 0 (Rule 13).
+    let network_seen_total: i64 = Query::new("SELECT COUNT(*) AS c FROM network_seen")
+        .fetch_optional::<CountRow>(db)
+        .await
+        .ok()
+        .flatten()
+        .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
     let body = json!({
@@ -424,6 +455,8 @@ pub async fn health_invariants(
         "arcIngestPushHealth": arc_ingest_push_health(&counters),
         "counters": counters,
         "prooflessOver24h": flagged,
+        // #371: lifetime network_seen latch count (-1 = table unreadable).
+        "networkSeenTotal": network_seen_total,
         // #347 soak signal (Rule 6c closure criterion 3): `unauthenticatedUngated`
         // must reach ~0 before SUBMIT_ENFORCE is flipped to true. Per-isolate and
         // therefore lossy — a soak signal, never an audit log.

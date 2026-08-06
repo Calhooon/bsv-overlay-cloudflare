@@ -303,7 +303,14 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// hand-END anchor (`spentAt` is the #228 MOVING age gate and cannot double as
 /// an audit fact). `/refund-view` reads it, so epoch Rule 24 DOES bite — the
 /// app-layer issues the same statement itself (`low_app_layer::schema`).
-pub const OVERLAY_MIGRATION_COUNT: usize = 104;
+/// 104 → 106 for bsv-low #371: `network_seen` (the overlay's OWN witness that
+/// the network accepted a txid — never a caller's claim) +
+/// `pot_records.spenderFinal` (the spender's bytes-finality, latched at spend
+/// record time). Together they are the third verdict-gate arm: seen AND final
+/// publishes at the SEEN finality bar; non-final (parked refunds, #323) and
+/// unwitnessed (attacker-planted pointers, Rule 21) keep the merkle bar
+/// verbatim. Both read by the app-layer, so epoch Rule 24 bites for both.
+pub const OVERLAY_MIGRATION_COUNT: usize = 106;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1157,6 +1164,34 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // same statement itself (`low_app_layer::schema`) because it never runs
     // this list; the two are pinned byte-identical (epoch Rule 24).
     "ALTER TABLE pot_records ADD COLUMN firstSpentAt INTEGER",
+    // ── bsv-low #371: the SEEN-latch pair that lets a verdict publish at the
+    // product's real finality bar (owner ruling 3: SEEN_ON_NETWORK is finality;
+    // merkle proofs arrive later and gate nothing).
+    //
+    // `network_seen`: one row per txid THIS OVERLAY ITSELF witnessed accepted
+    // by the network — written only (a) by the broadcast-gated submit arm on
+    // Arcade's SEEN_ON_NETWORK verdict, and (b) by the ungated arm's
+    // backgrounded Arcade corroboration (`GET /tx/{txid}` reaching
+    // SEEN_ON_NETWORK-or-better, orphan excluded per #267). NEVER written from
+    // a caller's claim: a stranger's /submit cannot mint a row for a tx the
+    // network has not seen, which is exactly why the app-layer may trust it
+    // (epoch Rule 21: an attacker-planted spend pointer carries no seen-latch
+    // and stays behind the merkle bar). Write-once (INSERT OR IGNORE), keyed
+    // on the txid the network accepted — not a claimable name (Rule 2).
+    // Read by the app-layer's /results, /refund-view and /hops-view (epoch
+    // Rule 24 bites: `low_app_layer::schema` issues this same statement,
+    // pinned byte-identical).
+    "CREATE TABLE IF NOT EXISTS network_seen (txid TEXT PRIMARY KEY, seenAt INTEGER)",
+    // `pot_records.spenderFinal`: 1 when the recorded spender's OWN BYTES parse
+    // as FINAL (`!(lockTime > 0 && any input sequence < 0xffffffff)`), 0 when
+    // non-final, NULL = recorded before this shipped (falls back to the merkle
+    // bar — honest, self-draining). Computed ONCE at spend-record time from the
+    // spending tx the engine already parsed (epoch Rule 25: never re-parse at
+    // read). A tower-parked NON-FINAL refund therefore keeps the #323
+    // confirmed-only bar VERBATIM; only a final spend the overlay itself saw
+    // network-accepted can publish early. NOTE the app-layer issues this same
+    // statement (`low_app_layer::schema`, epoch Rule 24, pinned byte-identical).
+    "ALTER TABLE pot_records ADD COLUMN spenderFinal INTEGER",
 ];
 
 // =============================================================================

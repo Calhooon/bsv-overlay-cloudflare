@@ -112,6 +112,9 @@ fn mark_spent(
     verdict: Option<&str>,
     spent_height: Option<i64>,
 ) {
+    // #371: the finality CASE binds (probe, value, value) ride EVERY
+    // variant; NULL here — the pre-migration shape.
+    let fin = Option::<i64>::None;
     let sql = mark_spent_sql(confirmed, verdict.is_some());
     match (confirmed, verdict) {
         (true, Some(v)) => conn.execute(
@@ -123,16 +126,32 @@ fn mark_spent(
                 spender,
                 spent_height,
                 spent_height,
+                spender,
+                fin,
+                fin,
                 pot_txid,
                 0i64
             ],
         ),
         (true, None) => conn.execute(
             sql,
-            params![spender, spender, spent_height, spent_height, pot_txid, 0i64],
+            params![
+                spender,
+                spender,
+                spent_height,
+                spent_height,
+                spender,
+                fin,
+                fin,
+                pot_txid,
+                0i64
+            ],
         ),
-        (false, Some(v)) => conn.execute(sql, params![spender, v, spender, pot_txid, 0i64]),
-        (false, None) => conn.execute(sql, params![spender, pot_txid, 0i64]),
+        (false, Some(v)) => conn.execute(
+            sql,
+            params![spender, v, spender, spender, fin, fin, pot_txid, 0i64],
+        ),
+        (false, None) => conn.execute(sql, params![spender, spender, fin, fin, pot_txid, 0i64]),
     }
     .expect("mark_spent_sql");
 }

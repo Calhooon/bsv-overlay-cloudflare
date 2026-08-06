@@ -97,11 +97,22 @@ fn admit_pot(conn: &Connection, txid: &str, created_at: i64, cov_height: Option<
     .expect("store_record_sql");
 }
 
-/// Record a CONFIRMED spend through the REAL `mark_spent_sql()` writer.
+/// Record a CONFIRMED spend through the REAL `mark_spent_sql()` writer
+/// (#371 finality CASE binds ride every variant; NULL here).
 fn mark_spent_confirmed(conn: &Connection, txid: &str, spender: &str, height: Option<i64>) {
     conn.execute(
         mark_spent_sql(true, false),
-        params![spender, spender, height, height, txid, 0i64],
+        params![
+            spender,
+            spender,
+            height,
+            height,
+            spender,
+            Option::<i64>::None,
+            Option::<i64>::None,
+            txid,
+            0i64
+        ],
     )
     .expect("mark_spent_sql");
 }

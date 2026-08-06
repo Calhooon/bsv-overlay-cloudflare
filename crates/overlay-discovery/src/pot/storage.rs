@@ -126,6 +126,16 @@ pub struct PotRecord {
     /// Block height from the SPV-verified BUMP at spend-confirm time.
     #[serde(rename = "spentHeight", default)]
     pub spent_height: Option<u64>,
+    /// bsv-low #371: whether the RECORDED spender's own bytes parse as FINAL
+    /// (`!(lockTime > 0 && any input sequence < 0xffffffff)`). A fact about
+    /// the spender the pointer names, so it RIDES THE POINTER exactly like
+    /// `spent_height` (same-pointer: `Some` overwrites / `None` keeps;
+    /// pointer change: reset to the incoming value, including `None`).
+    /// `None` = recorded before this shipped, or the writer had no parse —
+    /// readers fall back to the merkle bar. A tower-parked NON-FINAL refund
+    /// is `Some(false)` and keeps the #323 confirmed-only bar verbatim.
+    #[serde(rename = "spenderFinal", default)]
+    pub spender_final: Option<bool>,
 }
 
 impl PotRecord {
@@ -229,6 +239,13 @@ pub trait PotStorage {
     ///   branch never touches it (an accepted unconfirmed write always meets
     ///   a NULL height — heights only ride confirmed writes, which latch the
     ///   flag that then refuses unconfirmed writers).
+    /// - `spender_final` (bsv-low #371) is the spender's bytes-finality and
+    ///   RIDES THE POINTER on BOTH branches (unlike `spent_height`, which
+    ///   only rides confirmed writes — an unconfirmed final settle is exactly
+    ///   the row the #371 third arm exists for): same pointer ⇒ `Some`
+    ///   overwrites / `None` keeps; pointer change ⇒ RESET to the incoming
+    ///   value (a new spender never inherits the old spender's finality).
+    #[allow(clippy::too_many_arguments)] // the write is atomic by design: every field rides the pointer
     async fn mark_spent(
         &self,
         txid: &str,
@@ -237,6 +254,7 @@ pub trait PotStorage {
         confirmed: bool,
         verdict: Option<&str>,
         spent_height: Option<u64>,
+        spender_final: Option<bool>,
     ) -> Result<(), PotStorageError>;
 
     /// The record for an outpoint, or `None` if we never admitted it.
@@ -619,6 +637,7 @@ impl PotStorage for MemoryPotStorage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // the write is atomic by design: every field rides the pointer
     async fn mark_spent(
         &self,
         txid: &str,
@@ -627,12 +646,14 @@ impl PotStorage for MemoryPotStorage {
         confirmed: bool,
         verdict: Option<&str>,
         spent_height: Option<u64>,
+        spender_final: Option<bool>,
     ) -> Result<(), PotStorageError> {
         let now = self.now();
         let mut records = self.records.lock().unwrap();
         // UPDATE-only: touch an existing row; absent outpoint is a no-op.
         for r in records.iter_mut() {
             if r.txid == txid && r.output_index == output_index {
+                let same_pointer = r.spending_txid.as_deref() == Some(spending_txid);
                 let wrote = if confirmed {
                     // Chain truth: always write, latch spent_confirmed
                     // (last-confirmed-wins). The height rides ONLY the
@@ -641,7 +662,6 @@ impl PotStorage for MemoryPotStorage {
                     // keep-or-update (None keeps); pointer change ⇒ RESET to
                     // the incoming value (a new spender never inherits the
                     // old spender's height).
-                    let same_pointer = r.spending_txid.as_deref() == Some(spending_txid);
                     r.spent = true;
                     r.spending_txid = Some(spending_txid.to_string());
                     r.spent_confirmed = true;
@@ -665,6 +685,18 @@ impl PotStorage for MemoryPotStorage {
                     false
                 };
                 if wrote {
+                    // #371: the spender's bytes-finality rides the SAME
+                    // accepted write as the pointer, on BOTH branches (an
+                    // unconfirmed final settle is the third arm's subject):
+                    // same pointer ⇒ Some overwrites / None keeps; pointer
+                    // change ⇒ reset to the incoming value (incl. None).
+                    if same_pointer {
+                        if let Some(f) = spender_final {
+                            r.spender_final = Some(f);
+                        }
+                    } else {
+                        r.spender_final = spender_final;
+                    }
                     // Verdict rides the SAME accepted write as the pointer
                     // (atomic): Some sets both columns; None leaves both
                     // UNCHANGED (a stale verdict is neutralized by the
@@ -952,7 +984,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleTx", false, None, None)
+            .mark_spent("potA", 0, "settleTx", false, None, None, None)
             .await
             .unwrap();
 
@@ -980,7 +1012,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleTx", false, None, None)
+            .mark_spent("potA", 0, "settleTx", false, None, None, None)
             .await
             .unwrap();
 
@@ -998,11 +1030,11 @@ mod tests {
         // No admission first → mark_spent creates nothing (mirrors D1 UPDATE),
         // whether confirmed or not.
         store
-            .mark_spent("ghost", 0, "settleTx", false, None, None)
+            .mark_spent("ghost", 0, "settleTx", false, None, None, None)
             .await
             .unwrap();
         store
-            .mark_spent("ghost", 0, "settleTx", true, None, None)
+            .mark_spent("ghost", 0, "settleTx", true, None, None, None)
             .await
             .unwrap();
         assert_eq!(store.record_count(), 0);
@@ -1015,7 +1047,7 @@ mod tests {
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store.store_record(&pot_record("potB", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleA", false, None, None)
+            .mark_spent("potA", 0, "settleA", false, None, None, None)
             .await
             .unwrap();
 
@@ -1034,7 +1066,7 @@ mod tests {
 
         // First unconfirmed claim on an unspent row → recorded.
         store
-            .mark_spent("potA", 0, "claim1", false, None, None)
+            .mark_spent("potA", 0, "claim1", false, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1046,7 +1078,7 @@ mod tests {
         // last-writer-wins among unconfirmed is deliberately preserved so an
         // honest later submit can still set the pointer.
         store
-            .mark_spent("potA", 0, "claim2", false, None, None)
+            .mark_spent("potA", 0, "claim2", false, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1059,7 +1091,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleTx", true, None, None)
+            .mark_spent("potA", 0, "settleTx", true, None, None, None)
             .await
             .unwrap();
 
@@ -1074,14 +1106,14 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "realSettle", true, None, None)
+            .mark_spent("potA", 0, "realSettle", true, None, None, None)
             .await
             .unwrap();
 
         // An attacker's unconfirmed claim must be REFUSED: pointer AND flag
         // unchanged.
         store
-            .mark_spent("potA", 0, "forgedSpend", false, None, None)
+            .mark_spent("potA", 0, "forgedSpend", false, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1099,14 +1131,14 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settle1", true, None, None)
+            .mark_spent("potA", 0, "settle1", true, None, None, None)
             .await
             .unwrap();
 
         // A later CONFIRMED spend (e.g. reorg / better proof) still writes —
         // chain truth is last-confirmed-wins.
         store
-            .mark_spent("potA", 0, "settle2", true, None, None)
+            .mark_spent("potA", 0, "settle2", true, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1119,14 +1151,14 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "unconfirmedClaim", false, None, None)
+            .mark_spent("potA", 0, "unconfirmedClaim", false, None, None, None)
             .await
             .unwrap();
 
         // The confirmed spend replaces the unconfirmed pointer and latches
         // the flag.
         store
-            .mark_spent("potA", 0, "realSettle", true, None, None)
+            .mark_spent("potA", 0, "realSettle", true, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1139,7 +1171,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleTx", true, None, None)
+            .mark_spent("potA", 0, "settleTx", true, None, None, None)
             .await
             .unwrap();
 
@@ -1410,12 +1442,12 @@ mod tests {
 
         // potA: spent, unconfirmed → a candidate.
         store
-            .mark_spent("potA", 0, "settleA", false, None, None)
+            .mark_spent("potA", 0, "settleA", false, None, None, None)
             .await
             .unwrap();
         // potB: spent, confirmed → NOT a candidate.
         store
-            .mark_spent("potB", 0, "settleB", true, None, None)
+            .mark_spent("potB", 0, "settleB", true, None, None, None)
             .await
             .unwrap();
         // potC: never spent → NOT a candidate.
@@ -1461,14 +1493,14 @@ mod tests {
 
         // 0-conf spend recorded → appears as a candidate.
         store
-            .mark_spent("potA", 0, "settle", false, None, None)
+            .mark_spent("potA", 0, "settle", false, None, None, None)
             .await
             .unwrap();
         assert_eq!(store.find_spent_unconfirmed(10, 0).await.unwrap().len(), 1);
 
         // The chaser's upgrade (a chaintracks-verified spend).
         store
-            .mark_spent("potA", 0, "settle", true, None, None)
+            .mark_spent("potA", 0, "settle", true, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1485,7 +1517,7 @@ mod tests {
         // A later unconfirmed (forged) claim must NOT downgrade the row back
         // into the candidate set.
         store
-            .mark_spent("potA", 0, "forged", false, None, None)
+            .mark_spent("potA", 0, "forged", false, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1512,7 +1544,7 @@ mod tests {
             let txid = format!("pot{i}");
             store.store_record(&pot_record(&txid, 0)).await.unwrap();
             store
-                .mark_spent(&txid, 0, "settle", false, None, None)
+                .mark_spent(&txid, 0, "settle", false, None, None, None)
                 .await
                 .unwrap();
         }
@@ -1532,14 +1564,14 @@ mod tests {
         ] {
             store.store_record(&pot_record(pot, 0)).await.unwrap();
             store
-                .mark_spent(pot, 0, spender, false, None, None)
+                .mark_spent(pot, 0, spender, false, None, None, None)
                 .await
                 .unwrap();
         }
         // A CONFIRMED settleX row is not a candidate (nothing left to latch).
         store.store_record(&pot_record("potD", 0)).await.unwrap();
         store
-            .mark_spent("potD", 0, "settleX", true, None, None)
+            .mark_spent("potD", 0, "settleX", true, None, None, None)
             .await
             .unwrap();
         // An unspent row never appears.
@@ -1568,7 +1600,7 @@ mod tests {
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store.advance_clock(100_000); // pot ages far past any gate
         store
-            .mark_spent("potA", 0, "settle", false, None, None)
+            .mark_spent("potA", 0, "settle", false, None, None, None)
             .await
             .unwrap();
 
@@ -1594,7 +1626,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "claim1", false, None, None)
+            .mark_spent("potA", 0, "claim1", false, None, None, None)
             .await
             .unwrap();
         store.advance_clock(1800); // claim1 is now old enough
@@ -1604,7 +1636,7 @@ mod tests {
         );
 
         store
-            .mark_spent("potA", 0, "claim2", false, None, None)
+            .mark_spent("potA", 0, "claim2", false, None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1624,7 +1656,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settle", false, None, None)
+            .mark_spent("potA", 0, "settle", false, None, None, None)
             .await
             .unwrap();
         store.store_beef("beefTx", &[1, 2, 3]).await.unwrap();
@@ -1672,7 +1704,7 @@ mod tests {
         // with a verdict — the exact row state a backfill upsert meets.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleTx", true, Some("winner-a"), Some(800_000))
+            .mark_spent("potA", 0, "settleTx", true, Some("winner-a"), Some(800_000), None)
             .await
             .unwrap();
         let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1710,7 +1742,7 @@ mod tests {
 
         // Verdict Some rides the accepted write; verdict_txid = the pointer.
         store
-            .mark_spent("potA", 0, "settle1", false, Some("winner-a"), None)
+            .mark_spent("potA", 0, "settle1", false, Some("winner-a"), None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1720,7 +1752,7 @@ mod tests {
         // A confirm-only write (verdict None) latches the flag + height but
         // leaves the stored verdict UNCHANGED.
         store
-            .mark_spent("potA", 0, "settle1", true, None, Some(800_000))
+            .mark_spent("potA", 0, "settle1", true, None, Some(800_000), None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1745,6 +1777,7 @@ mod tests {
                 true,
                 Some("winner-a"),
                 Some(800_000),
+                None,
             )
             .await
             .unwrap();
@@ -1757,6 +1790,7 @@ mod tests {
                 false,
                 Some("winner-b"),
                 Some(999_999),
+                None,
             )
             .await
             .unwrap();
@@ -1776,11 +1810,11 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settle1", false, Some("tie"), None)
+            .mark_spent("potA", 0, "settle1", false, Some("tie"), None, None)
             .await
             .unwrap();
         store
-            .mark_spent("potA", 0, "settle2", false, None, None)
+            .mark_spent("potA", 0, "settle2", false, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1801,11 +1835,11 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleS1", false, None, None)
+            .mark_spent("potA", 0, "settleS1", false, None, None, None)
             .await
             .unwrap();
         store
-            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000))
+            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000), None)
             .await
             .unwrap();
         let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1840,12 +1874,12 @@ mod tests {
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         // The chaser "reads" the row while it points at S1 (unconfirmed)…
         store
-            .mark_spent("potA", 0, "settleS1", false, None, None)
+            .mark_spent("potA", 0, "settleS1", false, None, None, None)
             .await
             .unwrap();
         // …then a reorg-CONFIRMED S2 displaces S1 before the write lands.
         store
-            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000))
+            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000), None)
             .await
             .unwrap();
         let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1875,7 +1909,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleS1", false, None, None)
+            .mark_spent("potA", 0, "settleS1", false, None, None, None)
             .await
             .unwrap();
 
@@ -1917,11 +1951,11 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleS1", true, None, Some(800_000))
+            .mark_spent("potA", 0, "settleS1", true, None, Some(800_000), None)
             .await
             .unwrap();
         store
-            .mark_spent("potA", 0, "settleS2", true, None, None)
+            .mark_spent("potA", 0, "settleS2", true, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1929,11 +1963,11 @@ mod tests {
         assert_eq!(r.spent_height, None, "S2 never inherits S1's height");
         // Same-pointer re-confirm with None still KEEPS a height.
         store
-            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000))
+            .mark_spent("potA", 0, "settleS2", true, None, Some(802_000), None)
             .await
             .unwrap();
         store
-            .mark_spent("potA", 0, "settleS2", true, None, None)
+            .mark_spent("potA", 0, "settleS2", true, None, None, None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1945,7 +1979,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settle1", false, None, Some(777_777))
+            .mark_spent("potA", 0, "settle1", false, None, Some(777_777), None)
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();

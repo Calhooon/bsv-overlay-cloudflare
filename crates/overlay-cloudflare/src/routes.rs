@@ -552,6 +552,20 @@ pub async fn submit(
         gate_mode,
     );
     let mode = action.engine_mode();
+    // ── #371 SEEN corroboration flag — the UNGATED arm's latch feed. ──
+    // Read from the SAME `action` value the exhaustive match below consumes
+    // (no second derivation, no local a later edit can shadow into a gate —
+    // the #347 lesson; this flag only ever WIDENS observation, it gates
+    // nothing). The corroboration itself is scheduled AFTER `engine.submit`
+    // succeeds (adversarial gate MEDIUM-2): an unadmitted subject can never
+    // acquire a spend pointer, so corroborating it would mint a `network_seen`
+    // row nothing can ever join — pure free growth on a public route. The
+    // gated arm needs none of this: it latches synchronously on its own
+    // broadcast verdict.
+    let corroborate_seen_after_submit = matches!(
+        action,
+        crate::submit_gate::SubmitAction::ProceedWithoutGate { .. }
+    );
 
     // EXHAUSTIVE match (Rule 22): the route consumes the decision as an enum,
     // so an arm cannot be deleted without breaking the BUILD. A previous
@@ -746,6 +760,18 @@ pub async fn submit(
                     "broadcast-gated(arcade): network accepted {subject_txid} ({accepted}, {} EF leg(s)) — admitting",
                     efs.len()
                 );
+                // #371: the overlay ITSELF just witnessed the network accept
+                // this subject — latch it. Synchronous (one INSERT OR
+                // IGNORE): the verdict-publication JOIN must see the row no
+                // later than the spend pointer written by `engine.submit`
+                // below. Failure is logged inside and swallowed — the latch
+                // only accelerates; the merkle bar remains the fallback.
+                match env.d1("OVERLAY_DB") {
+                    Ok(db) => crate::ops::latch_network_seen(&db, &subject_txid).await,
+                    Err(e) => worker::console_log!(
+                        "#371: OVERLAY_DB unavailable, network_seen latch lost for {subject_txid}: {e}"
+                    ),
+                }
                 // #268 gate M1: a mined-claim admit (efs empty — the ONLY
                 // gated arm whose SUBJECT carries a submitter-supplied bump)
                 // proved NETWORK ACCEPTANCE, not SPV-mined-ness. STRIP the
@@ -926,6 +952,36 @@ pub async fn submit(
     // response, so the runtime keeps the isolate alive for it after we
     // answer. `tagged_beef` is MOVED (not cloned) — the diagnostics above are
     // its last synchronous reader — so backgrounding costs no extra BEEF copy.
+    // ── #371 SEEN corroboration — scheduled only now that `engine.submit`
+    // SUCCEEDED (gate MEDIUM-2: an unadmitted subject can never acquire a
+    // spend pointer, so its row could never join). NOT gated on
+    // `total_admitted`: a settle/refund/sweep admits ZERO outputs by design —
+    // its effect is the spend notification — and it is exactly the subject
+    // this latch exists for. The overlay asks Arcade about the SUBJECT
+    // itself, in the background, and latches `network_seen` ONLY on Arcade's
+    // own SEEN_ON_NETWORK-or-better answer (orphan excluded, #267). A
+    // never-broadcast attacker subject gets no row and stays behind the
+    // merkle bar; a corroboration fault degrades to exactly the pre-#371
+    // behaviour. Bounded: one subject parse + one GET per ADMITTED ungated
+    // submit, off the critical path (`wait_until`); the beef clone is capped
+    // by the 10MB body bound above (typical LOW BEEFs are KB-scale).
+    if corroborate_seen_after_submit {
+        if let Ok(seen_db) = env.d1("OVERLAY_DB") {
+            let beef_for_seen = tagged_beef.beef.clone();
+            let seen_arcade =
+                crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
+            ctx.wait_until(async move {
+                let subject =
+                    bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, None).map(|t| t.id());
+                if let Ok(subject) = subject {
+                    if seen_arcade.network_witnessed(&subject).await {
+                        crate::ops::latch_network_seen(&seen_db, &subject).await;
+                    }
+                }
+            });
+        }
+    }
+
     let fanout_started = js_sys::Date::now();
     if total_admitted > 0 {
         let owned_host = hosting_url.map(str::to_string);
@@ -2589,6 +2645,54 @@ mod tests {
             src.matches(&legacy).count(),
             0,
             "the route must not re-derive the plan beside the action"
+        );
+    }
+
+    /// #371 (gate MEDIUM-1): the `network_seen` latch must be CALLED from
+    /// exactly two places — the gated Accepted arm (synchronous) and the
+    /// post-`engine.submit` ungated corroboration closure. Positive count,
+    /// split needle, comments stripped (Rule 9).
+    ///
+    /// **Stated boundary (Rule 22): this pins the SPELLING, not the effect.**
+    /// The UNGATED producer's effect is behaviorally driven by the ci-route
+    /// lane (`tools/lane-371/network_seen_route_ci.mjs`: latch lands, refusal
+    /// refuses, refused bodies fan out nothing). The GATED arm's effect is
+    /// NOT hermetically drivable — every Arcade accept claim is corroborated
+    /// against hardcoded TAAL/GorillaPool hosts (`gate_accept_claim_with`),
+    /// and a corroborator-host knob added to the money broadcast path for
+    /// CI's sake is a worse trade — so its live bar is the deploy runbook:
+    /// `/health/invariants.networkSeenTotal` MUST move on the first real
+    /// gated settle after deploy.
+    #[test]
+    fn routes_call_the_network_seen_latch_from_both_arms() {
+        let src = code_only(include_str!("routes.rs"));
+        // Split mid-token so the needle never matches itself (Rule 9, third
+        // failure mode).
+        let needle = ["crate::ops::latch_net", "work_seen("].concat();
+        assert_eq!(
+            src.matches(&needle).count(),
+            2,
+            "expected EXACTLY two latch calls — the gated Accepted arm and the \
+             ungated post-submit corroboration; a changed count means a \
+             producer was deleted, moved or duplicated. An unchanged count \
+             does NOT prove either call executes — that is the ci-route \
+             lane's job (ungated) and the deploy-runbook networkSeenTotal \
+             check (gated)"
+        );
+        // The ungated corroboration must sit AFTER the engine submit (gate
+        // MEDIUM-2) — assert on the construct: the corroboration flag is
+        // consumed exactly once, and the `engine.submit` call appears before
+        // that consumption in source order.
+        let flag_use = ["if corroborate_seen_", "after_submit {"].concat();
+        assert_eq!(src.matches(&flag_use).count(), 1, "one consumption site");
+        let submit_at = src
+            .find("engine.submit(&tagged_beef, mode)")
+            .expect("the engine submit call exists");
+        let flag_at = src.find(&flag_use).expect("checked above");
+        assert!(
+            submit_at < flag_at,
+            "the ungated corroboration must be scheduled AFTER engine.submit \
+             (MEDIUM-2: no Arcade fan-out for subjects the engine refused)"
         );
     }
 

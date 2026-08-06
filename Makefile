@@ -208,6 +208,7 @@ ci-route:
 	kill_log=/tmp/lane347-route-kill.log; \
 	lenient_log=/tmp/lane366-route-lenient.log; \
 	arc_log=/tmp/lane-arc-ingest-route.log; \
+	seen_log=/tmp/lane371-route-seen.log; \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -248,7 +249,9 @@ ci-route:
 	preflight 8792; \
 	preflight 8793; \
 	preflight 8794; \
-	owned_ports="8791 8792 8793 8794"; \
+	preflight 8795; \
+	preflight 8796; \
+	owned_ports="8791 8792 8793 8794 8795 8796"; \
 	wait_up() { \
 	  _port=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -303,12 +306,24 @@ ci-route:
 	) > "$$arc_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up 8794 "$$arc_log" "arc-ingest"; \
-	echo "→ all four up"; \
+	echo "→ starting wrangler dev :8796 (network_seen — ARCADE_URL points at the lane-371 fixture on :8795)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8796 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var ENABLE_EXTENSIONS:true \
+	    --var ARCADE_URL:http://127.0.0.1:8795 \
+	) > "$$seen_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up 8796 "$$seen_log" "network_seen"; \
+	echo "→ all five up"; \
 	KILL_SWITCH_BASE=http://127.0.0.1:8792 \
 	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
 	CENSUS_LENIENT_BASE=http://127.0.0.1:8793 \
 	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:8791; \
-	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:8794
+	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:8794; \
+	FIXTURE_PORT=8795 \
+	  node tools/lane-371/network_seen_route_ci.mjs http://127.0.0.1:8796
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

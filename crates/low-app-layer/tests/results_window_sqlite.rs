@@ -768,6 +768,9 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             spender_proof_verified: r
                 .get::<_, Option<i64>>("spenderProofVerified")?
                 .map(|v| v != 0),
+            // #371 — the third-arm inputs, read through the REAL SQL.
+            spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
+            spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
         })
     })
     .unwrap()
@@ -1410,6 +1413,144 @@ fn a_parked_spend_yields_no_verdict_through_the_real_sql() {
         Some(ENFORCED_SETTLE_TXID.to_ascii_lowercase().as_str())
     );
     assert_eq!(parked[0].spent_confirmed, Some(false));
+}
+
+/// #371 END-TO-END on `/results` (the surface the issue was filed about):
+/// the real `mark_spent_sql` writer latches the spender's finality, the real
+/// `NETWORK_SEEN_INSERT_SQL` records the overlay's own witness, the SHIPPED
+/// `results_sql` joins both, and `assemble_results` publishes the VERDICT
+/// for an UNCONFIRMED settle (no `spentConfirmed`, no verified proof, no
+/// height) — owner ruling 3: SEEN_ON_NETWORK is the finality bar. Then each
+/// half alone is proven insufficient THROUGH THE SAME PIPELINE: finality
+/// with no witness (the ungated-/submit plant, epoch Rule 21) and a witness
+/// with no finality both stay verdict-less.
+#[test]
+fn a_seen_and_final_settle_classifies_with_no_proof_through_the_real_sql() {
+    use bsv_overlay_cloudflare::d1_discovery::mark_spent_sql;
+    use bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL;
+
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+
+    /// The #371 same-pointer finality write through the PRODUCTION SQL
+    /// (unconfirmed branch, no verdict): binds spendingTxid, then the
+    /// finality CASE (probe, value, value), then the outpoint.
+    fn latch_finality(conn: &Connection, pot: &str, spender: &str, fin: i64) {
+        conn.execute(
+            mark_spent_sql(false, false),
+            params![spender, spender, fin, fin, pot, 0i64],
+        )
+        .expect("mark_spent_sql finality write");
+    }
+
+    // ── THE RULING-3 SHAPE: parked pointer + SEEN witness + FINAL bytes. ──
+    let conn = production_schema_db();
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        None,
+        None,
+        None,
+        false, // unconfirmed: no flag, no height
+    );
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(
+        &conn,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
+    latch_finality(&conn, ENFORCED_FUNDING_TXID, ENFORCED_SETTLE_TXID, 1);
+    conn.execute(NETWORK_SEEN_INSERT_SQL, params![ENFORCED_SETTLE_TXID])
+        .expect("network_seen latch");
+
+    let rows = query_results_rows(&conn, &victim);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].spent_confirmed, Some(false), "no merkle-class signal");
+    assert_eq!(rows[0].spender_seen, Some(true), "the latch joined");
+    assert_eq!(rows[0].spender_final, Some(true), "the finality joined");
+    let served = assemble_like_the_route(
+        &victim,
+        rows,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(served.len(), 1);
+    assert!(
+        served[0].verdict.is_some(),
+        "SEEN + FINAL publishes the verdict with no merkle proof (ruling 3)"
+    );
+    assert_eq!(
+        served[0].at_height, None,
+        "no height is asserted — proofs arrive later and gate nothing"
+    );
+
+    // ── FINAL but UNWITNESSED: the ungated-/submit plant stays blocked. ──
+    let conn2 = production_schema_db();
+    insert_decoded_pot(
+        &conn2,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        None,
+        None,
+        None,
+        false,
+    );
+    file_marker(&conn2, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(
+        &conn2,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
+    latch_finality(&conn2, ENFORCED_FUNDING_TXID, ENFORCED_SETTLE_TXID, 1);
+    let planted = assemble_like_the_route(
+        &victim,
+        query_results_rows(&conn2, &victim),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        planted[0].verdict, None,
+        "final-looking bytes with NO network witness never classify (Rule 21)"
+    );
+
+    // ── WITNESSED but NON-FINAL: the parked refund stays blocked. ──
+    let conn3 = production_schema_db();
+    insert_decoded_pot(
+        &conn3,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        None,
+        None,
+        None,
+        false,
+    );
+    file_marker(&conn3, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    insert_beef(
+        &conn3,
+        ENFORCED_SETTLE_TXID,
+        &beef_bytes_of(ENFORCED_SETTLE_HEX),
+    );
+    latch_finality(&conn3, ENFORCED_FUNDING_TXID, ENFORCED_SETTLE_TXID, 0);
+    conn3
+        .execute(NETWORK_SEEN_INSERT_SQL, params![ENFORCED_SETTLE_TXID])
+        .expect("network_seen latch");
+    let parked = assemble_like_the_route(
+        &victim,
+        query_results_rows(&conn3, &victim),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        parked[0].verdict, None,
+        "a witnessed NON-FINAL spender never classifies — #323 verbatim"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════

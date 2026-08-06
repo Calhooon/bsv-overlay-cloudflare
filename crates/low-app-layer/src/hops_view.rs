@@ -301,17 +301,19 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
                 w.containerOutputs AS containerOutputs, w.markerValid AS markerValid, \
                 w.spent AS spent, w.spendingTxid AS spendingTxid, \
                 w.spentConfirmed AS spentConfirmed, \
-                sb.proof_verified AS spenderProofVerified \
+                sb.proof_verified AS spenderProofVerified, \
+                w.spenderFinal AS spenderFinal, \
+                ns.txid IS NOT NULL AS spenderSeen \
          FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                   seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                   hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
-                  spent, spendingTxid, spentConfirmed, \
+                  spent, spendingTxid, spentConfirmed, spenderFinal, \
                   markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
                   markerRank, outpointMarkerRank, paidTier, tier \
            FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                     seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                     hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
-                    spent, spendingTxid, spentConfirmed, \
+                    spent, spendingTxid, spentConfirmed, spenderFinal, \
                     markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
                     markerRank, outpointMarkerRank, paidTier, tier, \
                     DENSE_RANK() OVER (ORDER BY outpointMarkerRank DESC, \
@@ -322,7 +324,7 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
            FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                     seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                     hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
-                    spent, spendingTxid, spentConfirmed, \
+                    spent, spendingTxid, spentConfirmed, spenderFinal, \
                     markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
                     markerRank, outpointMarkerRank, paidTier, unknownHop, \
                     CASE WHEN unknownHop = 0 \
@@ -331,7 +333,7 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
              FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                       seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                       hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
-                      spent, spendingTxid, spentConfirmed, \
+                      spent, spendingTxid, spentConfirmed, spenderFinal, \
                       markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
                       markerRank, paidTier, unknownHop, freshUnknown, \
                       MAX(markerRank) OVER (PARTITION BY hopTxid, hopVout) \
@@ -354,6 +356,7 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
                         {marker_rank} AS markerRank, \
                         r.spent AS spent, r.spendingTxid AS spendingTxid, \
                         r.spentConfirmed AS spentConfirmed, \
+                        r.spenderFinal AS spenderFinal, \
                         hp.createdAt AS markerCreatedAt, hp.rowid AS markerRowid, \
                         r.createdAt AS potCreatedAt, \
                         MIN(hp.createdAt) OVER (PARTITION BY hp.txid, hp.hopVout) \
@@ -382,6 +385,8 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
            LIMIT {row_cap}) w \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND sb.txid = lower(w.spendingTxid) \
+         LEFT JOIN network_seen ns ON w.spendingTxid IS NOT NULL \
+              AND ns.txid = lower(w.spendingTxid) \
          ORDER BY w.outpointMarkerRank DESC, w.paidTier ASC, w.tier ASC, \
                   w.hopSatsOnChain DESC, \
                   COALESCE(w.potCreatedAt, w.firstMarkerAt) ASC, \
@@ -427,6 +432,13 @@ pub struct HopsViewRow {
     /// `pot_beefs.proof_verified` for the recorded spender — the second
     /// accepted confirmation signal (#323 shared bar). `None` = no row.
     pub spender_proof_verified: Option<bool>,
+    /// #371: the overlay's OWN network witness for the recorded spender
+    /// (`network_seen` join) + the spender bytes-finality latch
+    /// (`pot_records.spenderFinal`) — the shared bar's third arm. A hop
+    /// SWEEP is final by construction, so a swept hop shows `spent` at the
+    /// SEEN bar instead of waiting out the merkle proof.
+    pub spender_seen: Option<bool>,
+    pub spender_final: Option<bool>,
     /// The CONTAINER's own output at `hop_vout`: its locking script
     /// (lowercase hex), decoded at admission (#310). `None` IFF the
     /// container has no such output — a PROVEN absence (see
@@ -560,6 +572,8 @@ pub fn derive_hop_status(
     spent: Option<bool>,
     spent_confirmed: Option<bool>,
     spender_proof_verified: Option<bool>,
+    spender_seen: Option<bool>,
+    spender_final: Option<bool>,
 ) -> (HopStatus, Option<&'static str>) {
     match spent {
         // Non-observation of a spend on an INDEXED hop (module docs).
@@ -568,6 +582,8 @@ pub fn derive_hop_status(
             if crate::logic::is_confirmed_landing_with_proof(
                 spent_confirmed,
                 spender_proof_verified,
+                spender_seen,
+                spender_final,
             ) {
                 (HopStatus::Spent, Some("chain"))
             } else {
@@ -685,8 +701,13 @@ pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool) {
         .filter(|r| outpoints.contains(&(r.hop_txid.to_ascii_lowercase(), r.hop_vout)))
         .map(|r| {
             let marker_verified = derive_marker_verification(r.marker_valid);
-            let (status, status_source) =
-                derive_hop_status(r.spent, r.spent_confirmed, r.spender_proof_verified);
+            let (status, status_source) = derive_hop_status(
+                r.spent,
+                r.spent_confirmed,
+                r.spender_proof_verified,
+                r.spender_seen,
+                r.spender_final,
+            );
             HopEntry {
                 game_id: r.game_id,
                 hop_txid: r.hop_txid,
@@ -801,6 +822,8 @@ mod tests {
             spending_txid: None,
             spent_confirmed: Some(false),
             spender_proof_verified: None,
+            spender_seen: None,
+            spender_final: None,
             hop_lock_hex: Some(format!("76a914{}88ac", "d4".repeat(20))),
             hop_sats_on_chain: Some(80_800),
             container_outputs: 2,
@@ -968,31 +991,47 @@ mod tests {
     fn hop_status_table() {
         // Indexed, unspent.
         assert_eq!(
-            derive_hop_status(Some(false), Some(false), None),
+            derive_hop_status(Some(false), Some(false), None, None, None),
             (HopStatus::Unspent, Some("chain"))
         );
         // Confirmed spend (flag).
         assert_eq!(
-            derive_hop_status(Some(true), Some(true), None),
+            derive_hop_status(Some(true), Some(true), None, None, None),
             (HopStatus::Spent, Some("chain"))
         );
         // Confirmed via the verified spender proof (the #323 second signal).
         assert_eq!(
-            derive_hop_status(Some(true), Some(false), Some(true)),
+            derive_hop_status(Some(true), Some(false), Some(true), None, None),
             (HopStatus::Spent, Some("chain"))
         );
-        // Recorded-but-unconfirmed: a displaceable intent — unknown.
+        // #371 third arm: the overlay's own network witness + final bytes —
+        // a swept hop is `spent` at the SEEN bar, no merkle wait.
         assert_eq!(
-            derive_hop_status(Some(true), Some(false), None),
+            derive_hop_status(Some(true), Some(false), None, Some(true), Some(true)),
+            (HopStatus::Spent, Some("chain"))
+        );
+        // SEEN without finality, and finality without the witness, are each
+        // NOT a landing (the two halves of the third arm are conjunctive).
+        assert_eq!(
+            derive_hop_status(Some(true), Some(false), None, Some(true), Some(false)),
             (HopStatus::Unknown, None)
         );
         assert_eq!(
-            derive_hop_status(Some(true), None, Some(false)),
+            derive_hop_status(Some(true), Some(false), None, None, Some(true)),
+            (HopStatus::Unknown, None)
+        );
+        // Recorded-but-unconfirmed: a displaceable intent — unknown.
+        assert_eq!(
+            derive_hop_status(Some(true), Some(false), None, None, None),
+            (HopStatus::Unknown, None)
+        );
+        assert_eq!(
+            derive_hop_status(Some(true), None, Some(false), None, None),
             (HopStatus::Unknown, None)
         );
         // No pot_records row: never asserted unspent.
         assert_eq!(
-            derive_hop_status(None, None, None),
+            derive_hop_status(None, None, None, None, None),
             (HopStatus::Unknown, None)
         );
     }

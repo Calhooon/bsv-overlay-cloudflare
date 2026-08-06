@@ -210,15 +210,17 @@ pub fn refund_view_sql() -> String {
                 EXISTS(SELECT 1 FROM potrefund_records pr \
                        WHERE pr.potTxid = w.potTxid AND pr.potVout = w.potVout) \
                     AS backupMarkerPresent, \
-                sb.proof_verified AS spenderProofVerified \
+                sb.proof_verified AS spenderProofVerified, \
+                w.spenderFinal AS spenderFinal, \
+                ns.txid IS NOT NULL AS spenderSeen \
          FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                   spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
-                  firstSpentAt, \
+                  firstSpentAt, spenderFinal, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                     spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
-                    firstSpentAt, \
+                    firstSpentAt, spenderFinal, \
                     markerCreatedAt, markerRowid, potCreatedAt, unknownPot, \
                     potBestSigRank, \
                     ROW_NUMBER() OVER (PARTITION BY unknownPot \
@@ -233,6 +235,7 @@ pub fn refund_view_sql() -> String {
                       r.verdict AS verdict, r.verdictTxid AS verdictTxid, \
                       r.spentHeight AS spentHeight, \
                       r.firstSpentAt AS firstSpentAt, \
+                      r.spenderFinal AS spenderFinal, \
                       pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
@@ -252,6 +255,8 @@ pub fn refund_view_sql() -> String {
            LIMIT {rows}) w \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND sb.txid = lower(w.spendingTxid) \
+         LEFT JOIN network_seen ns ON w.spendingTxid IS NOT NULL \
+              AND ns.txid = lower(w.spendingTxid) \
          ORDER BY w.potBestSigRank DESC, w.tier ASC, \
                   COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
@@ -311,6 +316,13 @@ pub struct RefundViewRow {
     /// the SECOND accepted confirmation signal, so `/refund-view` and
     /// `/results` share one bar. `None` = no spender row joined.
     pub spender_proof_verified: Option<bool>,
+    /// #371: the overlay's OWN network witness for the recorded spender
+    /// (`network_seen` join) + the spender's bytes-finality latch
+    /// (`pot_records.spenderFinal`) — the verdict gate's third arm. A
+    /// non-final parked refund is `spender_final = Some(false)` and stays
+    /// behind the merkle bar (#323 verbatim).
+    pub spender_seen: Option<bool>,
+    pub spender_final: Option<bool>,
     /// #217 — `pot_records.createdAt`: THIS overlay's admission of the pot's
     /// FUNDING output, unix seconds, write-once. `None` on a join miss.
     pub pot_admitted_at: Option<i64>,
@@ -440,6 +452,7 @@ impl RefundStatus {
 /// Derive `(status, statusSource)` from the row facts — the honesty table in
 /// the module docs. NEVER guesses: every incomplete-fact combination is
 /// (`Unknown`, `None`).
+#[allow(clippy::too_many_arguments)] // every input is one row fact feeding one honesty table
 pub fn derive_refund_status(
     spent: Option<bool>,
     spent_confirmed: Option<bool>,
@@ -447,14 +460,24 @@ pub fn derive_refund_status(
     gate_passed: bool,
     backup_marker_present: bool,
     spender_proof_verified: Option<bool>,
+    spender_seen: Option<bool>,
+    spender_final: Option<bool>,
 ) -> (RefundStatus, Option<&'static str>) {
-    // #323 MEDIUM-1 — ONE confirmation bar, shared with `assemble_results`:
-    // the `spentConfirmed` flag OR a chaintracks-VERIFIED spender proof.
-    // Without the second signal these two money surfaces DISAGREED on a
-    // legacy row the migration stamped 0: `/results` served `refund` at a
-    // proven height while this view said `unknown`.
-    let confirmed_landing =
-        crate::logic::is_confirmed_landing_with_proof(spent_confirmed, spender_proof_verified);
+    // #323 MEDIUM-1 — ONE landing bar, shared with `assemble_results`:
+    // the `spentConfirmed` flag, a chaintracks-VERIFIED spender proof, or
+    // the #371 seen-and-final arm. Without the shared bar these money
+    // surfaces DISAGREED on a legacy row the migration stamped 0:
+    // `/results` served `refund` at a proven height while this view said
+    // `unknown`. Note the #371 arm can only mark a refund SUPERSEDED
+    // early (a final settle displaced the parked refund) — a landed
+    // REFUND is itself non-final until its height, so `spender_final =
+    // Some(false)` keeps it behind the merkle bar exactly as before.
+    let confirmed_landing = crate::logic::is_confirmed_landing_with_proof(
+        spent_confirmed,
+        spender_proof_verified,
+        spender_seen,
+        spender_final,
+    );
     match spent {
         // `spent = 0` is the overlay's NON-OBSERVATION of a spend on an
         // indexed pot (the admission default), not a UTXO existence check —
@@ -546,6 +569,8 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
                 gate_passed,
                 r.backup_marker_present,
                 r.spender_proof_verified,
+                r.spender_seen,
+                r.spender_final,
             );
             RefundEntry {
                 game_id: r.game_id,
@@ -636,6 +661,8 @@ mod tests {
             pot_vout: 0,
             marker_recovery_height: 900_123,
             spender_proof_verified: None,
+            spender_seen: None,
+            spender_final: None,
             cov_recovery_height: None,
             spent: Some(false),
             spending_txid: None,
@@ -673,6 +700,8 @@ mod tests {
                 Some(PotVerdict::Refund),
                 true,
                 true,
+                None,
+                None,
                 None
             ),
             (RefundStatus::Unknown, None),
@@ -686,7 +715,9 @@ mod tests {
                 Some(PotVerdict::Refund),
                 true,
                 true,
-                Some(true)
+                Some(true),
+                None,
+                None
             ),
             (RefundStatus::Landed, Some("chain")),
             "a VERIFIED spender proof is a landing even when the flag is 0"
@@ -699,7 +730,9 @@ mod tests {
                 Some(PotVerdict::WinnerA),
                 true,
                 true,
-                Some(true)
+                Some(true),
+                None,
+                None
             ),
             (RefundStatus::Superseded, Some("chain")),
         );
@@ -711,9 +744,63 @@ mod tests {
                 Some(PotVerdict::Refund),
                 true,
                 true,
+                Some(false),
+                None,
+                None
+            ),
+            (RefundStatus::Unknown, None),
+        );
+    }
+
+    /// #371 — the SEEN-and-final arm in THIS view's terms: a network-
+    /// witnessed FINAL settle marks the refund SUPERSEDED before any merkle
+    /// proof; a network-witnessed NON-FINAL spender (the parked refund
+    /// itself, as indexers report it) stays UNKNOWN — #323 verbatim; and a
+    /// final-looking pointer with NO witness (the ungated-/submit plant,
+    /// epoch Rule 21) stays UNKNOWN.
+    #[test]
+    fn seen_and_final_supersedes_early_but_neither_half_alone_does() {
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::WinnerA),
+                true,
+                true,
+                None,
+                Some(true),
+                Some(true)
+            ),
+            (RefundStatus::Superseded, Some("chain")),
+            "a SEEN final settle supersedes at the ruling-3 bar"
+        );
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::Refund),
+                true,
+                true,
+                None,
+                Some(true),
                 Some(false)
             ),
             (RefundStatus::Unknown, None),
+            "a SEEN but NON-FINAL spender is the parked refund — never a landing before its height"
+        );
+        assert_eq!(
+            derive_refund_status(
+                Some(true),
+                Some(false),
+                Some(PotVerdict::WinnerA),
+                true,
+                true,
+                None,
+                None,
+                Some(true)
+            ),
+            (RefundStatus::Unknown, None),
+            "final bytes with no network witness is an attacker-plantable pointer — merkle bar holds"
         );
     }
 
@@ -738,12 +825,12 @@ mod tests {
     #[test]
     fn unspent_below_gate_is_armed() {
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, false, false, None),
+            derive_refund_status(Some(false), Some(false), None, false, false, None, None, None),
             (RefundStatus::Armed, Some("chain"))
         );
         // A published backup upgrades the SOURCE, not the status.
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, false, true, None),
+            derive_refund_status(Some(false), Some(false), None, false, true, None, None, None),
             (RefundStatus::Armed, Some("chain+marker"))
         );
     }
@@ -751,11 +838,11 @@ mod tests {
     #[test]
     fn unspent_past_gate_is_gate_open() {
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, true, false, None),
+            derive_refund_status(Some(false), Some(false), None, true, false, None, None, None),
             (RefundStatus::GateOpen, Some("chain"))
         );
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, true, true, None),
+            derive_refund_status(Some(false), Some(false), None, true, true, None, None, None),
             (RefundStatus::GateOpen, Some("chain+marker"))
         );
     }
@@ -769,6 +856,8 @@ mod tests {
                 Some(PotVerdict::Refund),
                 true,
                 true,
+                None,
+                None,
                 None
             ),
             (RefundStatus::Landed, Some("chain"))
@@ -779,7 +868,7 @@ mod tests {
     fn confirmed_settle_verdicts_are_superseded() {
         for v in [PotVerdict::WinnerA, PotVerdict::WinnerB, PotVerdict::Tie] {
             assert_eq!(
-                derive_refund_status(Some(true), Some(true), Some(v), false, true, None),
+                derive_refund_status(Some(true), Some(true), Some(v), false, true, None, None, None),
                 (RefundStatus::Superseded, Some("chain"))
             );
         }
@@ -789,7 +878,7 @@ mod tests {
     fn incomplete_facts_are_unknown_never_guessed() {
         // No pot_records row at all.
         assert_eq!(
-            derive_refund_status(None, None, None, true, true, None),
+            derive_refund_status(None, None, None, true, true, None, None, None),
             (RefundStatus::Unknown, None)
         );
         // Spent but unconfirmed — a displaceable intent, even with a verdict.
@@ -800,17 +889,19 @@ mod tests {
                 Some(PotVerdict::Refund),
                 true,
                 true,
+                None,
+                None,
                 None
             ),
             (RefundStatus::Unknown, None)
         );
         assert_eq!(
-            derive_refund_status(Some(true), None, None, false, false, None),
+            derive_refund_status(Some(true), None, None, false, false, None, None, None),
             (RefundStatus::Unknown, None)
         );
         // Confirmed spend, no trusted decoded verdict.
         assert_eq!(
-            derive_refund_status(Some(true), Some(true), None, false, true, None),
+            derive_refund_status(Some(true), Some(true), None, false, true, None, None, None),
             (RefundStatus::Unknown, None)
         );
     }

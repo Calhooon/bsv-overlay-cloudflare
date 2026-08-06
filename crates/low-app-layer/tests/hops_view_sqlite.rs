@@ -334,10 +334,27 @@ fn admit_hop(conn: &Connection, hop_txid: &str, sats: i64, created_at: i64) {
 }
 
 /// Record a hop spend via the REAL `mark_spent_sql()` (no verdict — hops
-/// have none).
+/// have none). The #371 finality CASE binds ride every variant
+/// (probe, value, value); this legacy helper writes NULL finality — the
+/// pre-migration shape.
 fn mark_hop_spent(conn: &Connection, hop_txid: &str, spender: &str, confirmed: bool) {
     let sql = mark_spent_sql(confirmed, false);
     if confirmed {
+        conn.execute(
+            sql,
+            params![
+                spender,
+                spender,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                spender,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                hop_txid,
+                0i64
+            ],
+        )
+    } else {
         conn.execute(
             sql,
             params![
@@ -349,8 +366,6 @@ fn mark_hop_spent(conn: &Connection, hop_txid: &str, spender: &str, confirmed: b
                 0i64
             ],
         )
-    } else {
-        conn.execute(sql, params![spender, hop_txid, 0i64])
     }
     .expect("mark_spent_sql");
 }
@@ -391,6 +406,9 @@ fn query_rows_inner<P: rusqlite::Params>(
             spender_proof_verified: r
                 .get::<_, Option<i64>>("spenderProofVerified")?
                 .map(|v| v != 0),
+            // #371 — the third-arm inputs, read through the REAL SQL.
+            spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
+            spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
             // The route applies the same empty-is-absent belt.
             hop_lock_hex: r
                 .get::<_, Option<String>>("hopLockHex")?

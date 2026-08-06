@@ -111,10 +111,32 @@ pub const MARKER_VALID_ALTER: &str = "ALTER TABLE hopparty_records ADD COLUMN ma
 /// READS must be added by a statement that service can also ISSUE).
 pub const FIRST_SPENT_AT_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN firstSpentAt INTEGER";
 
-/// Every statement this module issues, in no significant order — each is
+/// The bsv-low #371 spender bytes-finality column, same contract: the three
+/// money views name `r.spenderFinal` in the verdict-gate third arm, so a cold
+/// app-layer isolate against an unwarmed schema fails to PREPARE without it
+/// (epoch Rule 24).
+pub const SPENDER_FINAL_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spenderFinal INTEGER";
+
+/// Every ALTER this module issues, in no significant order — each is
 /// independently idempotent, so arrival order cannot matter.
-pub const LATCH_COLUMN_ALTERS: &[&str] =
-    &[SIG_VALID_ALTER, MARKER_VALID_ALTER, FIRST_SPENT_AT_ALTER];
+pub const LATCH_COLUMN_ALTERS: &[&str] = &[
+    SIG_VALID_ALTER,
+    MARKER_VALID_ALTER,
+    FIRST_SPENT_AT_ALTER,
+    SPENDER_FINAL_ALTER,
+];
+
+/// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
+/// columns above but a different statement class: the three money views
+/// LEFT JOIN `network_seen`, and a `SELECT` naming an absent TABLE fails to
+/// PREPARE exactly as an absent column does. `CREATE TABLE IF NOT EXISTS` is
+/// idempotent BY CONSTRUCTION (re-running it against an existing table
+/// succeeds — no benign-error predicate is needed on either side), additive
+/// (no DROP/RENAME/re-type), and byte-identical to the owning overlay
+/// migration (pinned by `the_create_table_catchup_is_byte_identical…`).
+/// The membership rule is unchanged: a shipped query in this crate names it.
+pub const NETWORK_SEEN_CREATE: &str =
+    "CREATE TABLE IF NOT EXISTS network_seen (txid TEXT PRIMARY KEY, seenAt INTEGER)";
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
 ///
@@ -206,6 +228,13 @@ async fn apply(db: &worker::D1Database) {
             }
         }
     }
+    // #371: the CREATE-class catch-up. `IF NOT EXISTS` makes success the only
+    // benign outcome — any error is real, so it defers the latch and the next
+    // request retries, exactly like a non-benign ALTER failure above.
+    if let Err(e) = db.prepare(NETWORK_SEEN_CREATE).run().await {
+        all_ok = false;
+        worker::console_log!("[schema] CREATE deferred: {NETWORK_SEEN_CREATE} — {e}");
+    }
     if all_ok {
         APPLIED.store(true, Ordering::Release);
     }
@@ -228,8 +257,8 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            3,
-            "sigValid (#283), markerValid (#362), firstSpentAt (#217)"
+            4,
+            "sigValid (#283), markerValid (#362), firstSpentAt (#217), spenderFinal (#371)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt
@@ -265,6 +294,31 @@ mod tests {
             for banned in ["DROP", "RENAME", "NOT NULL", "DEFAULT", ";"] {
                 assert!(!upper.contains(banned), "{stmt} must not contain {banned}");
             }
+        }
+    }
+
+    /// The #371 CREATE-class catch-up: byte-identical to the owning overlay
+    /// migration (epoch Rule 24 — share the artifact, not the convention),
+    /// idempotent by construction (`IF NOT EXISTS`), and additive (no
+    /// DROP/RENAME/re-type/NOT NULL, single statement).
+    #[test]
+    fn the_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
+        let hits: Vec<&&str> = bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+            .iter()
+            .filter(|m| m.contains("network_seen"))
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one migration owns network_seen");
+        assert_eq!(
+            *hits[0], NETWORK_SEEN_CREATE,
+            "the app-layer CREATE and the overlay migration must be the same statement"
+        );
+        assert!(NETWORK_SEEN_CREATE.starts_with("CREATE TABLE IF NOT EXISTS "));
+        let upper = NETWORK_SEEN_CREATE.to_ascii_uppercase();
+        for banned in ["DROP", "RENAME", "NOT NULL", "DEFAULT", ";"] {
+            assert!(
+                !upper.contains(banned),
+                "{NETWORK_SEEN_CREATE} must not contain {banned}"
+            );
         }
     }
 

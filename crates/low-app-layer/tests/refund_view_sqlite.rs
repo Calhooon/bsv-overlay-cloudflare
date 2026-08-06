@@ -90,6 +90,21 @@ fn mark_spent(
     verdict: Option<&str>,
     spent_height: Option<i64>,
 ) {
+    mark_spent_final(conn, pot_txid, spender, confirmed, verdict, spent_height, None);
+}
+
+/// The full #371 shape: the finality CASE binds (probe, value, value) ride
+/// EVERY `mark_spent_sql` variant, exactly as the D1 impl binds them.
+#[allow(clippy::too_many_arguments)]
+fn mark_spent_final(
+    conn: &Connection,
+    pot_txid: &str,
+    spender: &str,
+    confirmed: bool,
+    verdict: Option<&str>,
+    spent_height: Option<i64>,
+    spender_final: Option<i64>,
+) {
     let sql = mark_spent_sql(confirmed, verdict.is_some());
     match (confirmed, verdict) {
         (true, Some(v)) => conn.execute(
@@ -101,16 +116,44 @@ fn mark_spent(
                 spender,
                 spent_height,
                 spent_height,
+                spender,
+                spender_final,
+                spender_final,
                 pot_txid,
                 0i64
             ],
         ),
         (true, None) => conn.execute(
             sql,
-            params![spender, spender, spent_height, spent_height, pot_txid, 0i64],
+            params![
+                spender,
+                spender,
+                spent_height,
+                spent_height,
+                spender,
+                spender_final,
+                spender_final,
+                pot_txid,
+                0i64
+            ],
         ),
-        (false, Some(v)) => conn.execute(sql, params![spender, v, spender, pot_txid, 0i64]),
-        (false, None) => conn.execute(sql, params![spender, pot_txid, 0i64]),
+        (false, Some(v)) => conn.execute(
+            sql,
+            params![
+                spender,
+                v,
+                spender,
+                spender,
+                spender_final,
+                spender_final,
+                pot_txid,
+                0i64
+            ],
+        ),
+        (false, None) => conn.execute(
+            sql,
+            params![spender, spender, spender_final, spender_final, pot_txid, 0i64],
+        ),
     }
     .expect("mark_spent_sql");
 }
@@ -222,6 +265,9 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<RefundViewRow> {
             spender_proof_verified: r
                 .get::<_, Option<i64>>("spenderProofVerified")?
                 .map(|v| v != 0),
+            // #371 — the third-arm inputs, read through the REAL SQL.
+            spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
+            spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
             // #217 durable timeline stamps, read by the SAME wire names the
             // route's `RefundViewRowD1` deserializes.
             pot_admitted_at: r.get::<_, Option<i64>>("potAdmittedAt")?,
@@ -324,6 +370,76 @@ fn superseded_on_a_confirmed_settle_verdict() {
     assert_eq!(e.status, RefundStatus::Superseded);
     assert_eq!(e.status_source, Some("chain"));
     assert_eq!(e.verdict, Some(PotVerdict::WinnerA));
+}
+
+/// #371 END-TO-END through the PRODUCTION pipeline: the real `mark_spent_sql`
+/// writer latches the spender's finality, the real `NETWORK_SEEN_INSERT_SQL`
+/// latch records the overlay's own witness, the real `refund_view_sql` joins
+/// both, and the view supersedes an UNCONFIRMED (no flag, no proof) settle at
+/// the ruling-3 SEEN bar. Each half alone is then proven insufficient through
+/// the same pipeline — the ungated-plant (final, unwitnessed) and the parked
+/// refund (witnessed, non-final) both stay UNKNOWN.
+#[test]
+fn seen_and_final_settle_supersedes_unconfirmed_end_to_end() {
+    let conn = production_schema_db();
+    let (me, pot) = seed_armed_pot(&conn);
+    let settle = h64(0xfe);
+
+    // The overlay's own SEEN witness + a FINAL spender, UNCONFIRMED spend.
+    mark_spent_final(&conn, &pot, &settle, false, Some("winner-a"), None, Some(1));
+    conn.execute(
+        bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
+        params![settle],
+    )
+    .expect("network_seen latch");
+
+    let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_200))[0];
+    assert_eq!(e.spent_confirmed, Some(false), "no merkle-class signal exists");
+    assert_eq!(
+        e.status,
+        RefundStatus::Superseded,
+        "SEEN + FINAL publishes at the ruling-3 bar with no merkle proof"
+    );
+    assert_eq!(e.status_source, Some("chain"));
+
+    // Half 1 alone — FINAL but UNWITNESSED (the ungated-/submit plant,
+    // epoch Rule 21): a fresh pot, same writer, no latch row.
+    let pot2 = h64(0xab);
+    admit_pot(&conn, &pot2, 1_000, Some(GATE));
+    file_party(&conn, &me, &pot2, GATE, "txPARTY2", 1_001);
+    let planted = h64(0xfd);
+    mark_spent_final(&conn, &pot2, &planted, false, Some("winner-a"), None, Some(1));
+    let e2 = assemble_refund_view(query_rows(&conn, &me), Some(900_200))
+        .into_iter()
+        .find(|e| e.pot_txid == pot2)
+        .expect("pot2 row");
+    assert_eq!(
+        e2.status,
+        RefundStatus::Unknown,
+        "final bytes with no network witness stay behind the merkle bar"
+    );
+
+    // Half 2 alone — WITNESSED but NON-FINAL (the parked refund as an
+    // indexer reports it): latch present, finality 0.
+    let pot3 = h64(0xac);
+    admit_pot(&conn, &pot3, 1_000, Some(GATE));
+    file_party(&conn, &me, &pot3, GATE, "txPARTY3", 1_001);
+    let parked = h64(0xfc);
+    mark_spent_final(&conn, &pot3, &parked, false, Some("refund"), None, Some(0));
+    conn.execute(
+        bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
+        params![parked],
+    )
+    .expect("network_seen latch");
+    let e3 = assemble_refund_view(query_rows(&conn, &me), Some(900_200))
+        .into_iter()
+        .find(|e| e.pot_txid == pot3)
+        .expect("pot3 row");
+    assert_eq!(
+        e3.status,
+        RefundStatus::Unknown,
+        "a witnessed NON-FINAL spender is the parked refund — the #323 bar holds verbatim"
+    );
 }
 
 #[test]

@@ -355,9 +355,24 @@ impl LookupService for PotLookupService {
             }
         };
 
+        // bsv-low #371: latch the spender's BYTES-FINALITY once, at record
+        // time, from the tx we already parsed (epoch Rule 25 — never re-parse
+        // at read). Final = not(nLockTime armed AND any input non-final);
+        // this is the exact client-side test (`stake.ts` settle-landing) and
+        // the inverse of the parked-refund shape (#323): a tower-parked
+        // refund is non-final by construction and stays behind the merkle
+        // bar; a cooperative settle is final and CANNOT be parked.
+        let spender_final = Some(
+            !(spending_tx.lock_time > 0
+                && spending_tx
+                    .inputs
+                    .iter()
+                    .any(|i| i.sequence < 0xffff_ffff)),
+        );
+
         // PERSIST the spender — never delete. This is the landing proof. The
-        // verdict (+ verified height) rides the SAME write, atomic with the
-        // pointer.
+        // verdict (+ verified height + bytes-finality) rides the SAME write,
+        // atomic with the pointer.
         self.storage
             .mark_spent(
                 txid,
@@ -366,6 +381,7 @@ impl LookupService for PotLookupService {
                 confirmed,
                 verdict,
                 spent_height,
+                spender_final,
             )
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;

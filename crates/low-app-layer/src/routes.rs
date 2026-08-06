@@ -1330,6 +1330,14 @@ struct ResultsRowD1 {
     /// overlay's additive migration — absent = unverified (fail-safe).
     #[serde(rename = "spenderProofVerified", default)]
     spender_proof_verified: Option<f64>,
+    /// #371: the overlay's own network witness (`network_seen` join — the
+    /// SQL projects `ns.txid IS NOT NULL`, so 0 = no row) and the spender
+    /// bytes-finality latch. `default` tolerates a read racing the additive
+    /// migration — absent = no third arm (fail-safe to the merkle bar).
+    #[serde(rename = "spenderSeen", default)]
+    spender_seen: Option<f64>,
+    #[serde(rename = "spenderFinal", default)]
+    spender_final: Option<f64>,
 }
 
 impl ResultsRowD1 {
@@ -1365,6 +1373,8 @@ impl ResultsRowD1 {
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
             spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
+            spender_seen: self.spender_seen.map(|v| v != 0.0),
+            spender_final: self.spender_final.map(|v| v != 0.0),
         }
     }
 }
@@ -1593,6 +1603,12 @@ struct RefundViewRowD1 {
     /// the second accepted confirmation signal, shared with `/results`.
     #[serde(rename = "spenderProofVerified")]
     spender_proof_verified: Option<f64>,
+    /// #371 third-arm inputs; `default` tolerates a read racing the additive
+    /// migration — absent = no third arm (fail-safe to the merkle bar).
+    #[serde(rename = "spenderSeen", default)]
+    spender_seen: Option<f64>,
+    #[serde(rename = "spenderFinal", default)]
+    spender_final: Option<f64>,
     /// #217 durable timeline stamps (unix seconds). All three are nullable
     /// and `default` — a join miss, or a row admitted before the
     /// `firstSpentAt` migration, reads as absent rather than as a zero time.
@@ -1612,6 +1628,8 @@ impl RefundViewRowD1 {
             pot_vout: self.pot_vout as u32,
             marker_recovery_height: self.recovery_height as u32,
             spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
+            spender_seen: self.spender_seen.map(|v| v != 0.0),
+            spender_final: self.spender_final.map(|v| v != 0.0),
             cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
             spent: self.spent.map(|v| v != 0.0),
             spending_txid: self.spending_txid,
@@ -1746,6 +1764,12 @@ struct HopsViewRowD1 {
     spent_confirmed: Option<f64>,
     #[serde(rename = "spenderProofVerified")]
     spender_proof_verified: Option<f64>,
+    /// #371 third-arm inputs; `default` tolerates a read racing the additive
+    /// migration — absent = no third arm (fail-safe to the merkle bar).
+    #[serde(rename = "spenderSeen", default)]
+    spender_seen: Option<f64>,
+    #[serde(rename = "spenderFinal", default)]
+    spender_final: Option<f64>,
 }
 
 impl HopsViewRowD1 {
@@ -1766,6 +1790,8 @@ impl HopsViewRowD1 {
             spending_txid: self.spending_txid,
             spent_confirmed: self.spent_confirmed.map(|v| v != 0.0),
             spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
+            spender_seen: self.spender_seen.map(|v| v != 0.0),
+            spender_final: self.spender_final.map(|v| v != 0.0),
             // Stored as a typed column by the overlay's decode-at-write; an
             // impossible empty string reads as absent (which REFUTES).
             hop_lock_hex: self.hop_lock_hex.filter(|s| !s.is_empty()),
