@@ -41,6 +41,19 @@ pub const COUNTER_ARC_INGEST_PUSHED: &str = "arc_ingest_pushed_total";
 /// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
 /// operation, not an error — it proves the webhook stream is alive.
 pub const COUNTER_ARC_INGEST_STATUS_IGNORED: &str = "arc_ingest_status_ignored_total";
+/// `/arc-ingest` callbacks REFUSED 401 because NO bearer token was presented in
+/// either accepted header. Diagnosis: a CONTRACT or CONFIG problem — the
+/// courier is not authenticating the way we read it — or unauthenticated noise.
+///
+/// This counter exists because its absence hid a month-long outage: the 401 arm
+/// bumped nothing, and `arc_ingest_status_ignored_total` is only reachable
+/// AFTER auth, so `{pushed: 0, statusIgnored: 0}` read identically for "nobody
+/// is calling us" and "every caller is being refused" (epoch Rule 13). The
+/// wrong one was believed.
+pub const COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: &str = "arc_ingest_unauthorized_no_token_total";
+/// `/arc-ingest` callbacks REFUSED 401 because a token WAS presented and did
+/// not equal the subject txid. Diagnosis: a stale registration, or a prober.
+pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_bad_token_total";
 
 /// Default staleness budget for `/health/invariants?strict=1`: 6 hours. The
 /// completion cron runs every 15 min (`wrangler.toml crons`), so 6h ≈ 24 dead
@@ -213,11 +226,48 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SPENDS_CONFIRMED: 0,
         COUNTER_ARC_INGEST_PUSHED: 0,
         COUNTER_ARC_INGEST_STATUS_IGNORED: 0,
+        COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: 0,
+        COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: 0,
     });
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);
     }
     obj
+}
+
+/// Derive the `/arc-ingest` push-path verdict from the four arc-ingest counters
+/// — the ONE distinction the health surface could not previously express.
+///
+/// * `"flowing"` — at least one callback got past auth (a proof push or an
+///   acknowledged status callback). The push path is live.
+/// * `"refusing"` — callbacks ARE arriving and every one of them is being
+///   401'd. This is the state that hid for a month: the primary proof source is
+///   down, everything is falling through to the ~30-min poll backstop, and the
+///   fix is a contract/config one (see the two `unauthorized_*` counters for
+///   which). **This is the pageable state.**
+/// * `"silent"` — no callback has ever arrived at all. Either nothing has been
+///   broadcast, or `X-CallbackUrl` is not being registered.
+///
+/// MODELLING BOUNDARY, stated here because a reader will otherwise assume more
+/// (epoch Rule 17): these are MONOTONIC LIFETIME totals, so this verdict is
+/// decisive only until the first accepted callback — after that it latches
+/// `"flowing"` forever. A later regression that starts 401ing everything is
+/// visible in the DELTA of the `unauthorized_*` counters between two reads
+/// (same reader contract as the #366 census), NOT in this field. It is a
+/// standing-start diagnosis, not a continuous alarm; wiring a pager to the
+/// delta is the follow-on.
+///
+/// It reports no number the `counters` object already reports — a second
+/// spelling of the same value is what `read_counters` deliberately avoids.
+fn arc_ingest_push_health(counters: &serde_json::Value) -> &'static str {
+    let v = |name: &str| counters.get(name).and_then(|x| x.as_u64()).unwrap_or(0);
+    let admitted = v(COUNTER_ARC_INGEST_PUSHED) + v(COUNTER_ARC_INGEST_STATUS_IGNORED);
+    let refused = v(COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN) + v(COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN);
+    match (admitted, refused) {
+        (0, 0) => "silent",
+        (0, _) => "refusing",
+        _ => "flowing",
+    }
 }
 
 /// The #366 broadcast-gated readiness census, shaped for `/health/invariants`.
@@ -367,6 +417,11 @@ pub async fn health_invariants(
             "stalenessMs": staleness_ms,
             "maxStaleMs": max_stale_ms,
         },
+        // Rule 13: "nobody is calling us" vs "everybody is being refused" are
+        // now distinguishable. See `arc_ingest_push_health` for the lifetime-
+        // total boundary — the continuous instrument is the DELTA of the two
+        // `arc_ingest_unauthorized_*_total` counters above.
+        "arcIngestPushHealth": arc_ingest_push_health(&counters),
         "counters": counters,
         "prooflessOver24h": flagged,
         // #347 soak signal (Rule 6c closure criterion 3): `unauthenticatedUngated`
@@ -383,4 +438,63 @@ pub async fn health_invariants(
     crate::routes::add_cors_headers(&mut resp);
     let _ = resp.headers_mut().set("Cache-Control", "no-store");
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the counters object the way `read_counters` does (all four
+    /// arc-ingest names present, defaulting to 0), then set the values.
+    fn counters(
+        pushed: u64,
+        status_ignored: u64,
+        no_token: u64,
+        bad_token: u64,
+    ) -> serde_json::Value {
+        json!({
+            COUNTER_ARC_INGEST_PUSHED: pushed,
+            COUNTER_ARC_INGEST_STATUS_IGNORED: status_ignored,
+            COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: no_token,
+            COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: bad_token,
+        })
+    }
+
+    #[test]
+    fn arc_ingest_push_health_separates_silent_from_refusing() {
+        // THE defect this counter pair exists for: before it, these two rows
+        // were the SAME observation (`{pushed: 0, statusIgnored: 0}`) and the
+        // wrong one was believed for a month.
+        assert_eq!(arc_ingest_push_health(&counters(0, 0, 0, 0)), "silent");
+        assert_eq!(arc_ingest_push_health(&counters(0, 0, 9, 0)), "refusing");
+        assert_eq!(arc_ingest_push_health(&counters(0, 0, 0, 9)), "refusing");
+        assert_ne!(
+            arc_ingest_push_health(&counters(0, 0, 0, 0)),
+            arc_ingest_push_health(&counters(0, 0, 9, 0)),
+        );
+    }
+
+    #[test]
+    fn arc_ingest_push_health_is_flowing_once_anything_gets_past_auth() {
+        // A verified proof push, an acknowledged status callback, or a mix with
+        // some refusals — all "flowing": the push path works.
+        assert_eq!(arc_ingest_push_health(&counters(1, 0, 0, 0)), "flowing");
+        assert_eq!(arc_ingest_push_health(&counters(0, 1, 0, 0)), "flowing");
+        assert_eq!(arc_ingest_push_health(&counters(5, 7, 3, 2)), "flowing");
+    }
+
+    #[test]
+    fn arc_ingest_push_health_reads_the_names_read_counters_serves() {
+        // Rule 16 (pin the boundary, not the sides): the verdict is computed
+        // off the object `read_counters` builds. A name that is ABSENT reads as
+        // 0 and can therefore only ever produce "silent" — the exact way this
+        // field could rot back into the pre-fix ambiguity. Asserted, not
+        // assumed, so a rename that misses one side goes red here.
+        let mut c = counters(0, 0, 4, 0);
+        assert_eq!(arc_ingest_push_health(&c), "refusing");
+        c.as_object_mut()
+            .unwrap()
+            .remove(COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN);
+        assert_eq!(arc_ingest_push_health(&c), "silent");
+    }
 }

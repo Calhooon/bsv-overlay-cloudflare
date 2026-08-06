@@ -1134,7 +1134,8 @@ fn serialize_aggregated_lookup(
 }
 
 /// Constant-time byte compare (no early return on first mismatch). Used to
-/// check the `X-CallbackToken` bearer without leaking length/prefix timing.
+/// check the Arcade callback bearer — in EITHER accepted header, see
+/// [`classify_arc_callback_auth`] — without leaking length/prefix timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1144,6 +1145,88 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// The verdict of `/arc-ingest` bearer-auth. THREE states, not two: a refusal
+/// because NO token was presented is a different operational fact from a
+/// refusal because a presented token did not match, and folding them together
+/// is what let this route 401 every real callback for a month with the health
+/// surface reading exactly like "nobody is calling us" (epoch Rule 13).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArcCallbackAuth {
+    /// A presented token equalled the subject txid (constant-time).
+    Authorized,
+    /// Neither accepted header carried a bearer token at all. Diagnosis:
+    /// a CONTRACT or CONFIG problem (the courier is not authenticating), or
+    /// unauthenticated noise hitting a public URL.
+    NoToken,
+    /// At least one token was presented and none matched the subject txid.
+    /// Diagnosis: a stale registration, or someone probing.
+    BadToken,
+}
+
+/// Extract the bearer credential from an `Authorization` header value.
+///
+/// RFC 7235: the scheme is case-insensitive. Anything that is not a `Bearer`
+/// challenge (e.g. `Basic …`) yields no candidate, as does an empty credential.
+fn bearer_credential(authorization: &str) -> Option<&str> {
+    let v = authorization.trim();
+    // `get(..6)` (never `split_at`) — a non-ASCII header value would put a
+    // char boundary mid-index and `split_at` panics on a request path.
+    let rest = v
+        .get(..6)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|_| &v[6..])?;
+    // A scheme must be followed by whitespace, never glued to the credential.
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let tok = rest.trim();
+    (!tok.is_empty()).then_some(tok)
+}
+
+/// Classify `/arc-ingest` bearer-auth against the body's subject txid. PURE —
+/// unit-tested natively AND driven through the real route by `make ci-route`.
+///
+/// **Arcade V2's published contract for `X-CallbackToken` is that it is "an
+/// opaque bearer token, sent on every outbound webhook as
+/// `Authorization: Bearer <token>`".** The webhook does NOT echo the
+/// `X-CallbackToken` request header. Reading only that header therefore refused
+/// EVERY proof callback Arcade has ever sent since #228 (delivery record for
+/// settle `ee37b606…`: 10 attempts, `lastResult: "status 401"`), silently
+/// demoting the primary proof path to the ~30-min poll backstop.
+///
+/// Both spellings are accepted, and acceptance is by ENUMERATE-AND-FILTER, not
+/// by header precedence: whichever header carries it, a candidate is admitted
+/// iff it equals the subject txid under [`constant_time_eq`]. First-header-wins
+/// would refuse a courier that sets `Authorization` for a proxy and carries the
+/// callback token in `X-CallbackToken`.
+///
+/// This WIDENS where the token may be read from and weakens NOTHING else: the
+/// value must still equal the body's subject txid, compared in constant time,
+/// and a merklePath is still re-verified against chaintracks before any stitch.
+pub(crate) fn classify_arc_callback_auth(
+    authorization: Option<&str>,
+    x_callback_token: Option<&str>,
+    subject_txid: &str,
+) -> ArcCallbackAuth {
+    let candidates: [Option<&str>; 2] = [
+        authorization.and_then(bearer_credential),
+        x_callback_token.map(str::trim).filter(|t| !t.is_empty()),
+    ];
+    let mut presented = false;
+    let mut matched = false;
+    for c in candidates.into_iter().flatten() {
+        presented = true;
+        // No early break — every candidate is compared, so the number of
+        // comparisons does not depend on which one matched.
+        matched |= constant_time_eq(c.as_bytes(), subject_txid.as_bytes());
+    }
+    match (presented, matched) {
+        (_, true) => ArcCallbackAuth::Authorized,
+        (true, false) => ArcCallbackAuth::BadToken,
+        (false, false) => ArcCallbackAuth::NoToken,
+    }
 }
 
 /// A classified `/arc-ingest` callback body (#228). PURE — unit-tested.
@@ -1193,9 +1276,12 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
 }
 
 /// POST /arc-ingest — Arcade V2 push callback (#192/#193, #259/#228; TAAL ARC
-/// parity too). The Arcade broadcaster registers `X-CallbackToken` = the
-/// SUBJECT txid at broadcast, so the callback echoes it: we bearer-auth by
-/// requiring `X-CallbackToken` to match the body's `txid` (constant-time).
+/// parity too). The Arcade broadcaster REGISTERS the subject txid as the
+/// `X-CallbackToken` request header at broadcast; Arcade then DELIVERS it back
+/// as `Authorization: Bearer <token>` on the webhook. Those are two different
+/// headers, and reading only the registration spelling 401'd every real
+/// callback for a month — see [`classify_arc_callback_auth`], which accepts
+/// either and still requires a constant-time match against the body's `txid`.
 ///
 /// **#228: this is the PRIMARY proof source** — arcade#259 delivers the MINED
 /// merklePath ~150 ms post-mine. A verified push lands in EVERY consumer:
@@ -1218,7 +1304,12 @@ pub async fn arc_ingest(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     ops_db: Option<&worker::D1Database>,
 ) -> worker::Result<Response> {
-    // Read the bearer token BEFORE consuming the body.
+    // Read the bearer credential BEFORE consuming the body. BOTH accepted
+    // spellings: `Authorization: Bearer <token>` is what Arcade V2 actually
+    // sends on the webhook (its published contract for `X-CallbackToken`), and
+    // `X-CallbackToken` is kept for TAAL ARC parity / other couriers / a future
+    // version. See `classify_arc_callback_auth`.
+    let authorization = req.headers().get("authorization").ok().flatten();
     let callback_token = req.headers().get("x-callbacktoken").ok().flatten();
 
     let raw = match req.text().await {
@@ -1237,10 +1328,33 @@ pub async fn arc_ingest(
     // broadcaster registered (constant-time). A missing/mismatched token means
     // this isn't a callback we scheduled → 401. Applies to STATUS callbacks
     // too — unauthenticated noise is refused before it is ever acknowledged.
-    match callback_token {
-        Some(tok) if constant_time_eq(tok.as_bytes(), txid.as_bytes()) => {}
-        _ => {
-            worker::console_log!("POST /arc-ingest -> 401 (bad X-CallbackToken)");
+    //
+    // COUNT the refusal (epoch Rule 13). Before this, the 401 arm bumped
+    // nothing and `arc_ingest_status_ignored_total` was only reachable AFTER
+    // auth — so "nobody is calling us" and "everybody is being refused" were
+    // literally indistinguishable on `/health/invariants` (both all-zero), and
+    // a real month-long outage of the PRIMARY proof path was misattributed.
+    match classify_arc_callback_auth(
+        authorization.as_deref(),
+        callback_token.as_deref(),
+        &txid,
+    ) {
+        ArcCallbackAuth::Authorized => {}
+        refused => {
+            let (counter, why) = match refused {
+                ArcCallbackAuth::NoToken => (
+                    crate::ops::COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN,
+                    "no bearer token in Authorization or X-CallbackToken",
+                ),
+                _ => (
+                    crate::ops::COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN,
+                    "token presented but != subject txid",
+                ),
+            };
+            worker::console_log!("POST /arc-ingest -> 401 ({why})");
+            if let Some(db) = ops_db {
+                crate::ops::bump_counter(db, counter, 1).await;
+            }
             return json_error("Unauthorized arc-ingest callback", 401);
         }
     }
@@ -2800,6 +2914,124 @@ mod tests {
             classify_arc_ingest_body(&garbage).unwrap(),
             ArcIngestBody::Proof { .. }
         ));
+    }
+
+    // ── /arc-ingest bearer-auth: read the header the SENDER actually sets ────
+    //
+    // MODELLING BOUNDARY (Rule 17): these are PURE cells over the classifier.
+    // They cannot prove the ROUTE reads the `Authorization` header off the real
+    // `worker::Request` — `cargo test` cannot build a `worker::Request`. That
+    // producer-level claim is pinned by `make ci-route`
+    // (`tools/lane-arc-ingest/arc_ingest_auth_ci.mjs`), which POSTs the real
+    // header to the real handler in `wrangler dev`. Neither tier alone is
+    // sufficient; both are in `make ci`.
+
+    #[test]
+    fn arc_ingest_accepts_the_authorization_bearer_arcade_actually_sends() {
+        // Arcade V2 sends the callback token as `Authorization: Bearer <token>`
+        // and does NOT echo `X-CallbackToken`. This exact shape was 401'd by
+        // every delivery since #228.
+        assert_eq!(
+            classify_arc_callback_auth(Some(&format!("Bearer {CB_TXID}")), None, CB_TXID),
+            ArcCallbackAuth::Authorized
+        );
+        // RFC 7235: the scheme is case-insensitive, and surrounding whitespace
+        // is not part of the credential.
+        for header in [
+            format!("bearer {CB_TXID}"),
+            format!("BEARER {CB_TXID}"),
+            format!("BeArEr   {CB_TXID}"),
+            format!("  Bearer {CB_TXID}  "),
+            format!("Bearer\t{CB_TXID}"),
+        ] {
+            assert_eq!(
+                classify_arc_callback_auth(Some(&header), None, CB_TXID),
+                ArcCallbackAuth::Authorized,
+                "{header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arc_ingest_still_accepts_the_x_callbacktoken_header_form() {
+        // The header form is KEPT (TAAL ARC parity / other couriers / a future
+        // Arcade version). This is the pre-fix path and must not regress.
+        assert_eq!(
+            classify_arc_callback_auth(None, Some(CB_TXID), CB_TXID),
+            ArcCallbackAuth::Authorized
+        );
+    }
+
+    #[test]
+    fn arc_ingest_admits_by_enumerate_and_filter_not_header_precedence() {
+        // A courier that puts a PROXY credential in `Authorization` and the
+        // callback token in `X-CallbackToken` must still be admitted — and vice
+        // versa. First-header-wins would refuse one of these two.
+        assert_eq!(
+            classify_arc_callback_auth(Some("Basic Zm9vOmJhcg=="), Some(CB_TXID), CB_TXID),
+            ArcCallbackAuth::Authorized
+        );
+        assert_eq!(
+            classify_arc_callback_auth(
+                Some(&format!("Bearer {CB_TXID}")),
+                Some("some-other-token"),
+                CB_TXID
+            ),
+            ArcCallbackAuth::Authorized
+        );
+    }
+
+    #[test]
+    fn arc_ingest_wrong_bearer_is_refused_as_bad_token() {
+        let wrong = "b".repeat(64);
+        for (auth, hdr) in [
+            (Some(format!("Bearer {wrong}")), None),
+            (None, Some(wrong.clone())),
+            (Some(format!("Bearer {wrong}")), Some(wrong.clone())),
+            // A truncated / extended token must not match either.
+            (Some(format!("Bearer {}", &CB_TXID[..63])), None),
+            (Some(format!("Bearer {CB_TXID}0")), None),
+        ] {
+            assert_eq!(
+                classify_arc_callback_auth(auth.as_deref(), hdr.as_deref(), CB_TXID),
+                ArcCallbackAuth::BadToken,
+                "{auth:?} / {hdr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arc_ingest_no_token_at_all_is_refused_as_a_distinct_state() {
+        // The whole point of the third state: a contract/config failure (no
+        // token presented) must not be reported as "someone probed us".
+        for (auth, hdr) in [
+            (None, None),
+            // Non-Bearer schemes carry no candidate.
+            (Some("Basic Zm9vOmJhcg==".to_string()), None),
+            (Some("Token abc".to_string()), None),
+            // Empty credentials are not credentials.
+            (Some("Bearer".to_string()), None),
+            (Some("Bearer   ".to_string()), None),
+            (None, Some(String::new())),
+            (None, Some("   ".to_string())),
+            // A scheme glued to the credential is not a Bearer challenge.
+            (Some(format!("Bearer{CB_TXID}")), None),
+        ] {
+            assert_eq!(
+                classify_arc_callback_auth(auth.as_deref(), hdr.as_deref(), CB_TXID),
+                ArcCallbackAuth::NoToken,
+                "{auth:?} / {hdr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arc_ingest_auth_never_panics_on_a_non_ascii_authorization_header() {
+        // `get(..6)`, never `split_at(6)` — a multi-byte char at the boundary
+        // would panic on a public request path.
+        for header in ["Béarer x", "🐟🐟", "Bé", "€€€"] {
+            let _ = classify_arc_callback_auth(Some(header), None, CB_TXID);
+        }
     }
 
     #[test]

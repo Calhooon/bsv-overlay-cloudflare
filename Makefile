@@ -18,7 +18,7 @@ help:
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test --workspace with memory-storage feature"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
-	@echo "  ci-route         Route-level /submit admission cells (part of ci; needs :8791/:8792)"
+	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs :8791-:8794)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
@@ -111,7 +111,8 @@ ci:
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
 
-# ROUTE-LEVEL coverage for the #347 submit gate (Rule 22). PART OF `ci`.
+# ROUTE-LEVEL coverage for the #347 submit gate AND `/arc-ingest` bearer-auth
+# (Rule 22). PART OF `ci`.
 #
 # Not optional, and that is the finding rather than a preference. `cargo test`
 # cannot reach the /submit ROUTE — it takes a worker::Request and only runs on
@@ -124,15 +125,24 @@ ci:
 # This repo has no CI pipeline — `make ci` run locally IS the gate — so a tier
 # outside `ci` is a tier nobody runs before push.
 #
-# Three workers: :8791 strict with extensions on (the main matrix), :8792 with
+# Four workers: :8791 strict with extensions on (the main matrix), :8792 with
 # ENABLE_EXTENSIONS=false (the kill switch, which was itself a HIGH defect —
-# it used to route callers OFF the network gate), and :8793 LENIENT
+# it used to route callers OFF the network gate), :8793 LENIENT
 # (SUBMIT_ENFORCE unset) for the #366 census's CLIENT-population leg — the
 # unauthenticated-ungated submit that strict :8791 rightly refuses is exactly
 # the population the census (and the #347 flip criterion) measures, so it can
-# only be driven where it is SERVED. No network is required: the
-# public-path expectation asserts "never admitted, never 401", which holds as
-# 422 online and 502 offline, so this cannot flake.
+# only be driven where it is SERVED — and :8794 with TAAL_API_KEY set, the ONLY
+# place `/arc-ingest` is mounted at all (`lib.rs` mirrors mainline and 404s the
+# route without it). No network is required by any leg: the /submit public-path
+# expectation asserts "never admitted, never 401", which holds as 422 online and
+# 502 offline; and every /arc-ingest body is a STATUS callback (no merklePath),
+# which reaches the auth gate and the acknowledgement arm without a chaintracks
+# lookup. Neither can flake.
+#
+# :8794 is a SEPARATE worker rather than TAAL_API_KEY on :8791 on purpose:
+# that key also arms the Arcade broadcaster on the /submit path, which would put
+# a real outbound ARC call inside `make ci` with a bogus key — trading a
+# network-free gate for a flaky one.
 #
 # MODELLING BOUNDARY (stated here as well as at the assertion, Rule 17): that
 # public-path expectation is a NEGATIVE predicate. A regression that refused
@@ -197,6 +207,7 @@ ci-route:
 	strict_log=/tmp/lane347-route-strict.log; \
 	kill_log=/tmp/lane347-route-kill.log; \
 	lenient_log=/tmp/lane366-route-lenient.log; \
+	arc_log=/tmp/lane-arc-ingest-route.log; \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -236,7 +247,8 @@ ci-route:
 	preflight 8791; \
 	preflight 8792; \
 	preflight 8793; \
-	owned_ports="8791 8792 8793"; \
+	preflight 8794; \
+	owned_ports="8791 8792 8793 8794"; \
 	wait_up() { \
 	  _port=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -281,11 +293,22 @@ ci-route:
 	) > "$$lenient_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up 8793 "$$lenient_log" "lenient"; \
-	echo "→ all three up"; \
+	echo "→ starting wrangler dev :8794 (arc-ingest — TAAL_API_KEY set, the only place the route is mounted)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8794 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var ENABLE_EXTENSIONS:true \
+	    --var TAAL_API_KEY:ci-arc-ingest-route-tier \
+	) > "$$arc_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up 8794 "$$arc_log" "arc-ingest"; \
+	echo "→ all four up"; \
 	KILL_SWITCH_BASE=http://127.0.0.1:8792 \
 	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
 	CENSUS_LENIENT_BASE=http://127.0.0.1:8793 \
-	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:8791
+	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:8791; \
+	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:8794
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`
