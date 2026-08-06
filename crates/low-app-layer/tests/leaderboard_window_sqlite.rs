@@ -332,9 +332,7 @@ fn statuses_from_db(conn: &Connection, markers: &[ResultMarkerRow]) -> Vec<Outpo
                     spent: r.get::<_, i64>("spent")? != 0,
                     spending_txid: r.get("spendingTxid")?,
                     spent_confirmed: r.get::<_, i64>("spentConfirmed")? != 0,
-                    spender_final: r
-                        .get::<_, Option<i64>>("spenderFinal")?
-                        .map(|v| v != 0),
+                    spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
                     spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
                 })
             })
@@ -561,7 +559,17 @@ fn a_seen_and_final_unconfirmed_settle_counts_on_the_board() {
         params![settle],
     )
     .expect("network_seen latch");
-    file_honest_result(&conn, &game, 0x11, 0x22, &pot, &settle, true, &h64(0xf5), 1_001);
+    file_honest_result(
+        &conn,
+        &game,
+        0x11,
+        0x22,
+        &pot,
+        &settle,
+        true,
+        &h64(0xf5),
+        1_001,
+    );
 
     // Final but UNWITNESSED: must not count.
     let pot2 = h64(0xa2);
@@ -569,7 +577,17 @@ fn a_seen_and_final_unconfirmed_settle_counts_on_the_board() {
     let game2 = h64(0x04);
     admit_pot(&conn, &pot2, 1_000);
     fin(&conn, &pot2, &settle2, 1);
-    file_honest_result(&conn, &game2, 0x33, 0x44, &pot2, &settle2, true, &h64(0xf6), 1_002);
+    file_honest_result(
+        &conn,
+        &game2,
+        0x33,
+        0x44,
+        &pot2,
+        &settle2,
+        true,
+        &h64(0xf6),
+        1_002,
+    );
 
     // Witnessed but NON-final: must not count.
     let pot3 = h64(0xa3);
@@ -582,7 +600,17 @@ fn a_seen_and_final_unconfirmed_settle_counts_on_the_board() {
         params![settle3],
     )
     .expect("network_seen latch");
-    file_honest_result(&conn, &game3, 0x55, 0x66, &pot3, &settle3, true, &h64(0xf7), 1_003);
+    file_honest_result(
+        &conn,
+        &game3,
+        0x55,
+        0x66,
+        &pot3,
+        &settle3,
+        true,
+        &h64(0xf7),
+        1_003,
+    );
 
     let (markers, _) = query_window(&conn, 200);
     let statuses = statuses_from_db(&conn, &markers);
@@ -593,7 +621,9 @@ fn a_seen_and_final_unconfirmed_settle_counts_on_the_board() {
     ]);
     let lb = agg_world(&markers, &statuses, &world);
     assert!(
-        lb.board.iter().any(|r| r.identity == identity(0x11) && r.wins == 1),
+        lb.board
+            .iter()
+            .any(|r| r.identity == identity(0x11) && r.wins == 1),
         "a SEEN + FINAL unconfirmed settle counts at the ruling-3 bar"
     );
     assert!(

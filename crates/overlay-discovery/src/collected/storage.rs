@@ -217,7 +217,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.record_count(), 1);
 
-        let rows = store.get_records_for("02aa", &"11".repeat(32)).await.unwrap();
+        let rows = store
+            .get_records_for("02aa", &"11".repeat(32))
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].txid, "tx1");
         assert_eq!(rows[0].sig_hex.as_deref(), Some("3045ab"));
@@ -273,7 +276,11 @@ mod tests {
             .unwrap();
 
         let rows = store.get_records_for("02victim", &gid).await.unwrap();
-        assert_eq!(rows.len(), 2, "both rows must coexist — exclusivity was the bug");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both rows must coexist — exclusivity was the bug"
+        );
         let txids: Vec<&str> = rows.iter().map(|r| r.txid.as_str()).collect();
         assert!(txids.contains(&"txSQUAT"));
         assert!(
@@ -341,7 +348,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.record_count(), 3);
 
-        let rows = store.get_records_for("02bb", &"11".repeat(32)).await.unwrap();
+        let rows = store
+            .get_records_for("02bb", &"11".repeat(32))
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].txid, "tx3");
     }

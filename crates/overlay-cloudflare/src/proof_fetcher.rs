@@ -2890,10 +2890,8 @@ mod tests {
         let store = MemoryPotStorage::new();
         let pot = "ee".repeat(32);
         store.store_record(&undecoded_row(&pot)).await.unwrap();
-        let (settle_beef, settle_txid) =
-            spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
-        let (refund_beef, refund_txid) =
-            spender_beef(&pot, &[(2400, p2pkh_script(&[0xBB; 20]))]);
+        let (settle_beef, settle_txid) = spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
+        let (refund_beef, refund_txid) = spender_beef(&pot, &[(2400, p2pkh_script(&[0xBB; 20]))]);
         store.store_beef(&settle_txid, &settle_beef).await.unwrap();
         store.store_beef(&refund_txid, &refund_beef).await.unwrap();
         store
@@ -2944,15 +2942,21 @@ mod tests {
         let store = MemoryPotStorage::new();
         let pot = "ff".repeat(32);
         store.store_record(&undecoded_row(&pot)).await.unwrap();
-        let (settle_beef, settle_txid) =
-            spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
-        let (refund_beef, refund_txid) =
-            spender_beef(&pot, &[(2400, p2pkh_script(&[0xBB; 20]))]);
+        let (settle_beef, settle_txid) = spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
+        let (refund_beef, refund_txid) = spender_beef(&pot, &[(2400, p2pkh_script(&[0xBB; 20]))]);
         store.store_beef(&settle_txid, &settle_beef).await.unwrap();
         store.store_beef(&refund_txid, &refund_beef).await.unwrap();
         // The settle confirms ⇒ the refund is latched and out of the pool.
         store
-            .mark_spent(&pot, 0, &settle_txid, true, None, Some(u64::from(HEIGHT)), None)
+            .mark_spent(
+                &pot,
+                0,
+                &settle_txid,
+                true,
+                None,
+                Some(u64::from(HEIGHT)),
+                None,
+            )
             .await
             .unwrap();
         assert!(store.is_structurally_unprovable(&refund_txid));

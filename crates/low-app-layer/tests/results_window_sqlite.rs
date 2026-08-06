@@ -1468,7 +1468,11 @@ fn a_seen_and_final_settle_classifies_with_no_proof_through_the_real_sql() {
 
     let rows = query_results_rows(&conn, &victim);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].spent_confirmed, Some(false), "no merkle-class signal");
+    assert_eq!(
+        rows[0].spent_confirmed,
+        Some(false),
+        "no merkle-class signal"
+    );
     assert_eq!(rows[0].spender_seen, Some(true), "the latch joined");
     assert_eq!(rows[0].spender_final, Some(true), "the finality joined");
     let served = assemble_like_the_route(

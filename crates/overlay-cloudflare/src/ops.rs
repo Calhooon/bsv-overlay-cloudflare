@@ -259,12 +259,11 @@ async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
 /// `submit_census_` row existed before #366, so nothing a reader saw is
 /// removed.)
 async fn read_counters(db: &D1Database) -> serde_json::Value {
-    let rows: Vec<CounterRow> = Query::new(
-        "SELECT name, value FROM ops_counters WHERE name NOT LIKE 'submit_census_%'",
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    let rows: Vec<CounterRow> =
+        Query::new("SELECT name, value FROM ops_counters WHERE name NOT LIKE 'submit_census_%'")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
     let mut obj = json!({
         COUNTER_PROOFS_COMPLETED: 0,
         COUNTER_FETCH_FAILED: 0,
@@ -364,8 +363,10 @@ pub async fn census_json(db: &D1Database) -> serde_json::Value {
             _ => cell.2 += v,
         }
     }
-    let mut mode_maps: std::collections::BTreeMap<&str, serde_json::Map<String, serde_json::Value>> =
-        std::collections::BTreeMap::new();
+    let mut mode_maps: std::collections::BTreeMap<
+        &str,
+        serde_json::Map<String, serde_json::Value>,
+    > = std::collections::BTreeMap::new();
     for ((mode, population), (ready, fail, uneval)) in cells {
         mode_maps.entry(mode).or_default().insert(
             population.to_string(),

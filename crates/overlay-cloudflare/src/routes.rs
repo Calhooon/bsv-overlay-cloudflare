@@ -517,7 +517,10 @@ pub async fn submit(
         .map(|v| v.to_string())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
     let gate_mode = crate::submit_gate::GateMode::parse(
-        env.var("SUBMIT_ENFORCE").ok().map(|v| v.to_string()).as_deref(),
+        env.var("SUBMIT_ENFORCE")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
     );
     // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
     // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
@@ -622,7 +625,11 @@ pub async fn submit(
             worker::console_log!(
                 "POST /submit census(#366): path={} population={} verdict={} → {}",
                 path.as_str(),
-                if lenient_unbarred { "client" } else { "operator" },
+                if lenient_unbarred {
+                    "client"
+                } else {
+                    "operator"
+                },
                 verdict.as_str(),
                 state_counter
             );
@@ -971,8 +978,8 @@ pub async fn submit(
             let seen_arcade =
                 crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
             ctx.wait_until(async move {
-                let subject =
-                    bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, None).map(|t| t.id());
+                let subject = bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, None)
+                    .map(|t| t.id());
                 if let Ok(subject) = subject {
                     if seen_arcade.network_witnessed(&subject).await {
                         crate::ops::latch_network_seen(&seen_db, &subject).await;
@@ -1390,11 +1397,7 @@ pub async fn arc_ingest(
     // auth — so "nobody is calling us" and "everybody is being refused" were
     // literally indistinguishable on `/health/invariants` (both all-zero), and
     // a real month-long outage of the PRIMARY proof path was misattributed.
-    match classify_arc_callback_auth(
-        authorization.as_deref(),
-        callback_token.as_deref(),
-        &txid,
-    ) {
+    match classify_arc_callback_auth(authorization.as_deref(), callback_token.as_deref(), &txid) {
         ArcCallbackAuth::Authorized => {}
         refused => {
             let (counter, why) = match refused {
@@ -2710,7 +2713,9 @@ mod tests {
         );
         // The arm's body must still RETURN a 401 (not merely log).
         let tail = &src[src.find(&arm).unwrap()..];
-        let body_end = tail.find("SubmitAction::ProceedWithNetworkGate").unwrap_or(tail.len());
+        let body_end = tail
+            .find("SubmitAction::ProceedWithNetworkGate")
+            .unwrap_or(tail.len());
         let body = &tail[..body_end];
         assert_eq!(
             body.matches("401,").count(),

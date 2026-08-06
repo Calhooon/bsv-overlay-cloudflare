@@ -1817,7 +1817,15 @@ mod tests {
         // with a verdict — the exact row state a backfill upsert meets.
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settleTx", true, Some("winner-a"), Some(800_000), None)
+            .mark_spent(
+                "potA",
+                0,
+                "settleTx",
+                true,
+                Some("winner-a"),
+                Some(800_000),
+                None,
+            )
             .await
             .unwrap();
         let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -2344,7 +2352,11 @@ mod tests {
             .unwrap();
         assert!(store.is_structurally_unprovable(&r_txid));
         assert!(
-            store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty(),
+            store
+                .find_spent_unconfirmed(10, 0)
+                .await
+                .unwrap()
+                .is_empty(),
             "a row pointing at a latched spender is retired from the chaser pool"
         );
 

@@ -90,7 +90,15 @@ fn mark_spent(
     verdict: Option<&str>,
     spent_height: Option<i64>,
 ) {
-    mark_spent_final(conn, pot_txid, spender, confirmed, verdict, spent_height, None);
+    mark_spent_final(
+        conn,
+        pot_txid,
+        spender,
+        confirmed,
+        verdict,
+        spent_height,
+        None,
+    );
 }
 
 /// The full #371 shape: the finality CASE binds (probe, value, value) ride
@@ -152,7 +160,14 @@ fn mark_spent_final(
         ),
         (false, None) => conn.execute(
             sql,
-            params![spender, spender, spender_final, spender_final, pot_txid, 0i64],
+            params![
+                spender,
+                spender,
+                spender_final,
+                spender_final,
+                pot_txid,
+                0i64
+            ],
         ),
     }
     .expect("mark_spent_sql");
@@ -394,7 +409,11 @@ fn seen_and_final_settle_supersedes_unconfirmed_end_to_end() {
     .expect("network_seen latch");
 
     let e = &assemble_refund_view(query_rows(&conn, &me), Some(900_200))[0];
-    assert_eq!(e.spent_confirmed, Some(false), "no merkle-class signal exists");
+    assert_eq!(
+        e.spent_confirmed,
+        Some(false),
+        "no merkle-class signal exists"
+    );
     assert_eq!(
         e.status,
         RefundStatus::Superseded,
@@ -408,7 +427,15 @@ fn seen_and_final_settle_supersedes_unconfirmed_end_to_end() {
     admit_pot(&conn, &pot2, 1_000, Some(GATE));
     file_party(&conn, &me, &pot2, GATE, "txPARTY2", 1_001);
     let planted = h64(0xfd);
-    mark_spent_final(&conn, &pot2, &planted, false, Some("winner-a"), None, Some(1));
+    mark_spent_final(
+        &conn,
+        &pot2,
+        &planted,
+        false,
+        Some("winner-a"),
+        None,
+        Some(1),
+    );
     let e2 = assemble_refund_view(query_rows(&conn, &me), Some(900_200))
         .into_iter()
         .find(|e| e.pot_txid == pot2)

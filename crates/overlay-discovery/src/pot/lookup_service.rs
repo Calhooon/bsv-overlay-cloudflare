@@ -364,10 +364,7 @@ impl LookupService for PotLookupService {
         // bar; a cooperative settle is final and CANNOT be parked.
         let spender_final = Some(
             !(spending_tx.lock_time > 0
-                && spending_tx
-                    .inputs
-                    .iter()
-                    .any(|i| i.sequence < 0xffff_ffff)),
+                && spending_tx.inputs.iter().any(|i| i.sequence < 0xffff_ffff)),
         );
 
         // PERSIST the spender — never delete. This is the landing proof. The

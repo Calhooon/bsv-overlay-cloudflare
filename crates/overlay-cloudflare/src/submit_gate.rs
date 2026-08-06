@@ -606,10 +606,7 @@ mod tests {
         // path is unbarred and therefore operator-only. (This previously
         // asserted only `HistoricalUngated` was unbarred, which was the false
         // premise: SPV was being counted as a bar.)
-        let barred: Vec<_> = ALL_ADMISSION_PATHS
-            .iter()
-            .filter(|p| p.has_bar())
-            .collect();
+        let barred: Vec<_> = ALL_ADMISSION_PATHS.iter().filter(|p| p.has_bar()).collect();
         assert_eq!(barred, vec![&AdmissionPath::NetworkGated]);
     }
 
@@ -634,7 +631,9 @@ mod tests {
         let sig = ["pub fn from_", "header("].concat();
         let start = src.find(&sig).expect("from_header must exist");
         let body = &src[start..];
-        let end = body.find("\n    }").expect("from_header body must terminate");
+        let end = body
+            .find("\n    }")
+            .expect("from_header body must terminate");
         let body = &body[..end];
         // Strip line comments so a doc example can never inflate the corpus.
         let code: String = body
@@ -758,7 +757,12 @@ mod tests {
             }
         }
         // The UNBARRED headers DO collapse when extensions are off…
-        for header in [Some("historical-tx"), Some("historical-tx-no-spv"), Some("wat"), None] {
+        for header in [
+            Some("historical-tx"),
+            Some("historical-tx-no-spv"),
+            Some("wat"),
+            None,
+        ] {
             assert_eq!(
                 AdmissionPath::from_header(header, false),
                 AdmissionPath::CurrentTx,
@@ -801,7 +805,11 @@ mod tests {
             AdmissionPath::HistoricalSpv,
             AdmissionPath::HistoricalUngated,
         ] {
-            assert!(!path.has_bar(), "{} must not count SPV as a bar", path.as_str());
+            assert!(
+                !path.has_bar(),
+                "{} must not count SPV as a bar",
+                path.as_str()
+            );
             assert!(path.requires_operator_auth(), "{}", path.as_str());
         }
         // The exact live probe that reproduced the CRITICAL: no header at all,
@@ -812,7 +820,10 @@ mod tests {
         // …and the same request WITH the honest public mode proceeds, gated.
         let plan = plan_submit(Some("broadcast-gated"), true, false, GateMode::Strict);
         assert_eq!(plan.decision, GateDecision::Proceed);
-        assert!(plan.run_network_gate, "the honest public path must be GATED");
+        assert!(
+            plan.run_network_gate,
+            "the honest public path must be GATED"
+        );
     }
 
     /// `action_for` is what the ROUTE consumes, so it needs its own cells —

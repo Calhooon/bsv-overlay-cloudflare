@@ -825,12 +825,30 @@ mod tests {
     #[test]
     fn unspent_below_gate_is_armed() {
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, false, false, None, None, None),
+            derive_refund_status(
+                Some(false),
+                Some(false),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None
+            ),
             (RefundStatus::Armed, Some("chain"))
         );
         // A published backup upgrades the SOURCE, not the status.
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, false, true, None, None, None),
+            derive_refund_status(
+                Some(false),
+                Some(false),
+                None,
+                false,
+                true,
+                None,
+                None,
+                None
+            ),
             (RefundStatus::Armed, Some("chain+marker"))
         );
     }
@@ -838,7 +856,16 @@ mod tests {
     #[test]
     fn unspent_past_gate_is_gate_open() {
         assert_eq!(
-            derive_refund_status(Some(false), Some(false), None, true, false, None, None, None),
+            derive_refund_status(
+                Some(false),
+                Some(false),
+                None,
+                true,
+                false,
+                None,
+                None,
+                None
+            ),
             (RefundStatus::GateOpen, Some("chain"))
         );
         assert_eq!(
@@ -868,7 +895,16 @@ mod tests {
     fn confirmed_settle_verdicts_are_superseded() {
         for v in [PotVerdict::WinnerA, PotVerdict::WinnerB, PotVerdict::Tie] {
             assert_eq!(
-                derive_refund_status(Some(true), Some(true), Some(v), false, true, None, None, None),
+                derive_refund_status(
+                    Some(true),
+                    Some(true),
+                    Some(v),
+                    false,
+                    true,
+                    None,
+                    None,
+                    None
+                ),
                 (RefundStatus::Superseded, Some("chain"))
             );
         }

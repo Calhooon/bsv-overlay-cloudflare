@@ -311,23 +311,78 @@ fn beef_has_entries_outside_subject_ancestry(beef_bytes: &[u8], subject_txid: &s
 /// carrying the `SUBMIT_OPERATOR_TOKEN` (the tower/peer/migration population,
 /// which #351 receipts also cover from the producer side).
 pub const CENSUS_STATE_COUNTERS: [(&str, &str, &str, &str); 18] = [
-    ("submit_census_current_tx_client_ready_total", "current-tx", "client", "ready"),
-    ("submit_census_current_tx_client_would_fail_total", "current-tx", "client", "would_fail"),
-    ("submit_census_current_tx_client_uneval_total", "current-tx", "client", "uneval"),
-    ("submit_census_current_tx_operator_ready_total", "current-tx", "operator", "ready"),
-    ("submit_census_current_tx_operator_would_fail_total", "current-tx", "operator", "would_fail"),
-    ("submit_census_current_tx_operator_uneval_total", "current-tx", "operator", "uneval"),
-    ("submit_census_historical_tx_client_ready_total", "historical-tx", "client", "ready"),
-    ("submit_census_historical_tx_client_would_fail_total", "historical-tx", "client", "would_fail"),
-    ("submit_census_historical_tx_client_uneval_total", "historical-tx", "client", "uneval"),
-    ("submit_census_historical_tx_operator_ready_total", "historical-tx", "operator", "ready"),
+    (
+        "submit_census_current_tx_client_ready_total",
+        "current-tx",
+        "client",
+        "ready",
+    ),
+    (
+        "submit_census_current_tx_client_would_fail_total",
+        "current-tx",
+        "client",
+        "would_fail",
+    ),
+    (
+        "submit_census_current_tx_client_uneval_total",
+        "current-tx",
+        "client",
+        "uneval",
+    ),
+    (
+        "submit_census_current_tx_operator_ready_total",
+        "current-tx",
+        "operator",
+        "ready",
+    ),
+    (
+        "submit_census_current_tx_operator_would_fail_total",
+        "current-tx",
+        "operator",
+        "would_fail",
+    ),
+    (
+        "submit_census_current_tx_operator_uneval_total",
+        "current-tx",
+        "operator",
+        "uneval",
+    ),
+    (
+        "submit_census_historical_tx_client_ready_total",
+        "historical-tx",
+        "client",
+        "ready",
+    ),
+    (
+        "submit_census_historical_tx_client_would_fail_total",
+        "historical-tx",
+        "client",
+        "would_fail",
+    ),
+    (
+        "submit_census_historical_tx_client_uneval_total",
+        "historical-tx",
+        "client",
+        "uneval",
+    ),
+    (
+        "submit_census_historical_tx_operator_ready_total",
+        "historical-tx",
+        "operator",
+        "ready",
+    ),
     (
         "submit_census_historical_tx_operator_would_fail_total",
         "historical-tx",
         "operator",
         "would_fail",
     ),
-    ("submit_census_historical_tx_operator_uneval_total", "historical-tx", "operator", "uneval"),
+    (
+        "submit_census_historical_tx_operator_uneval_total",
+        "historical-tx",
+        "operator",
+        "uneval",
+    ),
     (
         "submit_census_historical_tx_no_spv_client_ready_total",
         "historical-tx-no-spv",
@@ -411,7 +466,11 @@ pub fn census_counters(
         AdmissionPath::HistoricalSpv => "historical-tx",
         AdmissionPath::HistoricalUngated => "historical-tx-no-spv",
     };
-    let population = if client_population { "client" } else { "operator" };
+    let population = if client_population {
+        "client"
+    } else {
+        "operator"
+    };
     let state = match verdict {
         CensusVerdict::GatedReady => "ready",
         CensusVerdict::WouldHaveFailed(_) => "would_fail",
@@ -498,7 +557,10 @@ mod tests {
         );
         // Ancestry-carrying (proven parent + unmined subject — the honest
         // wallet AtomicBEEF shape) → structurally ready.
-        assert_eq!(census_verdict(&ancestry_carrying_beef()), CensusVerdict::GatedReady);
+        assert_eq!(
+            census_verdict(&ancestry_carrying_beef()),
+            CensusVerdict::GatedReady
+        );
         // The honest RECOVERY shape (adversarial review 2026-07-17 finding 5,
         // same construction as ef.rs's skips-unconvertible-ancestor cell): the
         // parent rides UNPROVEN and WITHOUT its own sources. The gated arm
@@ -679,8 +741,14 @@ mod tests {
         }
         // No duplicate names padding either table.
         for names in [
-            CENSUS_STATE_COUNTERS.iter().map(|(n, _, _, _)| *n).collect::<Vec<_>>(),
-            CENSUS_REASON_COUNTERS.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            CENSUS_STATE_COUNTERS
+                .iter()
+                .map(|(n, _, _, _)| *n)
+                .collect::<Vec<_>>(),
+            CENSUS_REASON_COUNTERS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
         ] {
             let mut sorted = names.clone();
             sorted.sort_unstable();

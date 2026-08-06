@@ -1776,12 +1776,8 @@ impl D1PotStorage {
             .await
             .map_err(pot_err)?;
         let raw_hexes: Vec<String> = raws.into_iter().filter_map(|r| r.refund_raw_hex).collect();
-        let superseded = superseded_refund_txids(
-            &raw_hexes,
-            pot_txid,
-            output_index,
-            confirmed_spending_txid,
-        );
+        let superseded =
+            superseded_refund_txids(&raw_hexes, pot_txid, output_index, confirmed_spending_txid);
         if superseded.is_empty() {
             return Ok(0);
         }
@@ -5288,11 +5284,11 @@ mod tests {
 
         let raws = vec![
             refund_raw.clone(),
-            settle_raw,          // the confirmed spender itself — excluded
-            decoy_raw,           // fabricated — filtered by its own bytes
-            wrong_vout_raw,      // different outpoint — filtered
-            "nothex!".into(),    // junk — skipped, never latches
-            refund_raw.clone(),  // duplicate — deduped
+            settle_raw,         // the confirmed spender itself — excluded
+            decoy_raw,          // fabricated — filtered by its own bytes
+            wrong_vout_raw,     // different outpoint — filtered
+            "nothex!".into(),   // junk — skipped, never latches
+            refund_raw.clone(), // duplicate — deduped
         ];
         // Case-insensitive spender exclusion: pass the settle txid UPPERCASED.
         let got = superseded_refund_txids(&raws, &pot, 0, &settle_txid.to_uppercase());
@@ -5398,9 +5394,7 @@ mod tests {
         ))
         .unwrap();
         let chaser = || -> Vec<String> {
-            let mut stmt = conn
-                .prepare(&pot_spent_unconfirmed_sql(16, 0))
-                .unwrap();
+            let mut stmt = conn.prepare(&pot_spent_unconfirmed_sql(16, 0)).unwrap();
             let mut got: Vec<String> = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
@@ -5417,8 +5411,11 @@ mod tests {
 
         // 5. Confirm beats the latch (the reorg direction): the clear write
         //    re-admits BOTH pools.
-        conn.execute(POT_BEEF_CLEAR_UNPROVABLE_SQL, rusqlite::params![refund_txid])
-            .unwrap();
+        conn.execute(
+            POT_BEEF_CLEAR_UNPROVABLE_SQL,
+            rusqlite::params![refund_txid],
+        )
+        .unwrap();
         assert!(candidates(0).contains(&refund_txid));
         assert_eq!(chaser().len(), 3);
 
@@ -5464,14 +5461,7 @@ mod tests {
         //    superseded refund must not re-enter the pool)…
         conn.execute(
             POT_BEEF_ADMIT_WRITE_SQL,
-            rusqlite::params![
-                "keeper",
-                vec![0xbeu8],
-                "keeper",
-                100i64,
-                0i64,
-                "keeper"
-            ],
+            rusqlite::params!["keeper", vec![0xbeu8], "keeper", 100i64, 0i64, "keeper"],
         )
         .unwrap();
         conn.execute(&pot_beef_retire_sql(1), rusqlite::params!["keeper"])
@@ -5884,7 +5874,16 @@ mod tests {
             ),
             (false, Some(v)) => conn.execute(
                 sql,
-                rusqlite::params![spending_txid, v, spending_txid, spending_txid, fin, fin, txid, vout],
+                rusqlite::params![
+                    spending_txid,
+                    v,
+                    spending_txid,
+                    spending_txid,
+                    fin,
+                    fin,
+                    txid,
+                    vout
+                ],
             ),
             (false, None) => conn.execute(
                 sql,
@@ -6443,7 +6442,16 @@ mod tests {
             Some(0),
             "the non-final parked refund is latched non-final — the #323 bar holds"
         );
-        exec_mark_spent_final(&conn, "potA", 0, "settleS2", true, None, Some(800_000), None);
+        exec_mark_spent_final(
+            &conn,
+            "potA",
+            0,
+            "settleS2",
+            true,
+            None,
+            Some(800_000),
+            None,
+        );
         let r = read_pot_row(&conn, "potA", 0);
         assert_eq!(r.spending_txid.as_deref(), Some("settleS2"));
         assert_eq!(
