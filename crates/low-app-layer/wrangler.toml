@@ -49,6 +49,14 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 [vars]
 AUTH_ENFORCE = "false"
 
+# Storage epoch (bsv-low THE ORDER item 2, owner-ruled 2026-08-06): served
+# verbatim by `GET /epoch` as {"storageEpoch": "<value>"}. BUMPING THIS VALUE
+# ORDERS EVERY CLIENT TO CLEAR ITS LOCAL low_* STATE AT ITS NEXT IDLE HOME
+# VISIT (bsv-low app/src/lib/storageEpoch.ts — live hands are guarded, the
+# cosmetic allowlist survives). Unset/empty serves {"storageEpoch": null},
+# which the client treats as "no wipe directive" (fail-safe).
+STORAGE_EPOCH = "2026-08-06-zero-world-1"
+
 # BRC-103/104 session store for the auth middleware (`process_auth`'s
 # `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
 # placeholder by repo convention — the real namespace id is injected at

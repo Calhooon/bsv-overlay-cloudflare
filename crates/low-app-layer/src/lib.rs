@@ -221,6 +221,7 @@ fn router(
         .get_async("/tx-any/:txid", routes::tx_any)
         .get_async("/beef/:txid", routes::beef)
         .get_async("/tip", routes::tip)
+        .get("/epoch", routes::epoch)
         .get("/health", routes::health)
         .or_else_any_method("/", routes::not_found)
         .or_else_any_method("/*catchall", routes::not_found)

@@ -2832,6 +2832,21 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     json_response(body.to_string(), 200)
 }
 
+/// `GET /epoch` — the storage-epoch directive (bsv-low THE ORDER item 2,
+/// owner-ruled 2026-08-06). Public + static: the `STORAGE_EPOCH` var,
+/// verbatim (trimmed), or LITERAL `null` when unset/empty — the client's
+/// fail-safe "no wipe directive". No D1 touch, no auth (a wipe directive is
+/// not identity-scoped), `no-store` via `json_response` so a bump propagates
+/// on the next probe. Bumping the var in wrangler.toml orders every client
+/// to clear its local `low_*` state at its next idle home visit
+/// (bsv-low `app/src/lib/storageEpoch.ts`).
+pub fn epoch(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    let v = crate::logic::normalize_storage_epoch(
+        ctx.env.var("STORAGE_EPOCH").ok().map(|v| v.to_string()),
+    );
+    json_response(crate::logic::epoch_body(v.as_deref()), 200)
+}
+
 /// Catch-all: JSON 404 for any unknown route/method.
 pub fn not_found(req: Request, _ctx: RouteContext<AuthState>) -> Result<Response> {
     json_error(&format!("no such route: {}", req.path()), 404)

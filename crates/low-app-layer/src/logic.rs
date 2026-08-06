@@ -838,6 +838,28 @@ pub fn health_body() -> String {
     json!({ "ok": true, "service": "low-app-layer" }).to_string()
 }
 
+// ── /epoch — the storage-epoch directive (bsv-low THE ORDER item 2,
+//    owner-ruled 2026-08-06) ────────────────────────────────────────────────
+//
+// A public, static answer read straight from the `STORAGE_EPOCH` var: bumping
+// that value in wrangler.toml orders every client to clear its local `low_*`
+// state at its next idle home visit (the client half lives in bsv-low
+// `app/src/lib/storageEpoch.ts`). No D1, no auth, `no-store` like every
+// other route. `null` is the FAIL-SAFE shape — the client treats it as "no
+// wipe directive", so an unset/empty var can never trigger a wipe.
+
+/// Normalize the raw `STORAGE_EPOCH` var: unset, empty, or whitespace-only →
+/// `None` (serve `null` — no directive), anything else → the trimmed value.
+pub fn normalize_storage_epoch(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Assemble the `/epoch` wire body: `{"storageEpoch":"<v>"}` or
+/// `{"storageEpoch":null}`.
+pub fn epoch_body(epoch: Option<&str>) -> String {
+    json!({ "storageEpoch": epoch }).to_string()
+}
+
 // ── /leaderboard — the server-side join + rank (bsv-low #38) ───────────────
 //
 // The zanaadu model completed for the leaderboard: the app-layer serves the
@@ -2465,6 +2487,29 @@ mod tests {
         let h: serde_json::Value = serde_json::from_str(&health_body()).unwrap();
         assert_eq!(h["ok"], true);
         assert_eq!(h["service"], "low-app-layer");
+    }
+
+    /// `/epoch` (bsv-low THE ORDER item 2): the wire shape is EXACTLY
+    /// `{"storageEpoch": <string|null>}`, and the fail-safe normalization —
+    /// unset/empty/whitespace-only var → `null` (the client's "no wipe
+    /// directive") — never invents a directive.
+    #[test]
+    fn epoch_body_shape_and_failsafe_normalization() {
+        // A set var serves the trimmed string.
+        let set = normalize_storage_epoch(Some("  2026-08-06-zero-world-1 ".into()));
+        assert_eq!(set.as_deref(), Some("2026-08-06-zero-world-1"));
+        let v: serde_json::Value = serde_json::from_str(&epoch_body(set.as_deref())).unwrap();
+        assert_eq!(v["storageEpoch"], "2026-08-06-zero-world-1");
+        assert_eq!(v.as_object().unwrap().len(), 1); // exactly the one field
+
+        // Unset / empty / whitespace-only all serve LITERAL null.
+        for raw in [None, Some(String::new()), Some("   ".to_string())] {
+            let none = normalize_storage_epoch(raw);
+            assert_eq!(none, None);
+            let n: serde_json::Value = serde_json::from_str(&epoch_body(none.as_deref())).unwrap();
+            assert!(n["storageEpoch"].is_null());
+            assert!(n.as_object().unwrap().contains_key("storageEpoch"));
+        }
     }
 
     // ── /recovery-view (bsv-low#189) ───────────────────────────────────
