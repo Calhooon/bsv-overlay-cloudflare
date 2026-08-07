@@ -2135,7 +2135,17 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
 /// Pre-#281 the `(gameId, potTxid, potVout)` dedupe kept both rows and the
 /// honest one survived to the claims lookup, so this IS a real (if narrow)
 /// regression on the fallback path, traded for the window bound.
-pub fn results_sql() -> String {
+/// #375: `written_off_before_ms` set ⇒ the innermost scan drops rows whose
+/// era anchor (`COALESCE(r.createdAt, pp.createdAt)` — the pot's admission
+/// stamp when indexed, else the marker's; both server-written unix seconds)
+/// pre-dates the cutoff, BEFORE the dedupe/quota windows run. This is the
+/// `/results` SPINE filter: the claims (`claims_sql`) and seat-proof
+/// (`seat_markers_sql`) legs are keyed to THIS page's gameIds/pots, so every
+/// derived surface — including `/recovery-view`'s reused outcome fold —
+/// inherits the write-off without its own clause. ONE extra bind (the
+/// cutoff, after the identity). `None` ⇒ byte-identical to the pre-#375
+/// query.
+pub fn results_sql(written_off_before_ms: Option<i64>) -> String {
     // The #284 decoded pot_records columns, threaded verbatim through every
     // window level (pot_records.recoveryHeight is aliased covRecoveryHeight
     // — the potparty marker owns the bare `recoveryHeight` name).
@@ -2224,7 +2234,7 @@ pub fn results_sql() -> String {
                FROM potparty_records pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-               WHERE pp.identity = ?) \
+               WHERE pp.identity = ?{era}) \
              WHERE rn = 1) \
            ORDER BY potBestSigRank DESC, tier ASC, \
                     COALESCE(potCreatedAt, markerCreatedAt) DESC, \
@@ -2243,6 +2253,11 @@ pub fn results_sql() -> String {
         quota = RESULTS_UNKNOWN_POT_QUOTA,
         rows = RESULTS_MAX_ROWS,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        era = crate::logic::era_filter_sql(
+            "COALESCE(r.createdAt, pp.createdAt)",
+            "?",
+            written_off_before_ms
+        ),
     )
 }
 
@@ -5200,7 +5215,7 @@ mod tests {
     fn results_and_claims_sql_are_bounded() {
         // The results query is single-bind and bounded (the over-50-outpoint
         // 503 lesson: bound every D1 statement).
-        let sql = results_sql();
+        let sql = results_sql(None);
         assert_eq!(sql.matches('?').count(), 1);
         assert!(sql.contains(&format!("LIMIT {RESULTS_MAX_ROWS}")));
         // #281 F7: the BEEF joins run on the OUTER select, against the ≤100
@@ -5259,6 +5274,41 @@ mod tests {
                 .matches('?')
                 .count(),
             crate::logic::D1_CHUNK_OUTPOINTS
+        );
+    }
+
+    /// #375 — the era filter on the `/results` SPINE: exactly one shared
+    /// fragment, at the innermost identity scan (before the dedupe/quota
+    /// windows), anchored `COALESCE(r.createdAt, pp.createdAt)`; stripping
+    /// it restores the `None` arm byte-for-byte. The claims and seat-proof
+    /// legs deliberately carry NO clause of their own — they are keyed to
+    /// this page's games/pots, so filtering the spine filters them.
+    #[test]
+    fn results_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        let with = results_sql(cutoff);
+        let without = results_sql(None);
+        assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
+        assert_eq!(
+            with.matches(&format!("WHERE pp.identity = ?{frag})"))
+                .count(),
+            1,
+            "the era filter rides the innermost identity scan"
+        );
+        assert_eq!(
+            with.replace(&frag, ""),
+            without,
+            "None must stay byte-identical to the pre-#375 query"
+        );
+        // The derived legs inherit via the spine — they gain no clause and
+        // no extra bind (positive pins on their unchanged bind counts).
+        assert_eq!(claims_sql(3).matches('?').count(), 3);
+        assert_eq!(
+            seat_markers_sql(2, SEAT_MARKERS_PER_KEY)
+                .matches('?')
+                .count(),
+            2 * SEAT_MARKERS_BINDS_PER_POT
         );
     }
 }

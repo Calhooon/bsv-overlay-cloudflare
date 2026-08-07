@@ -267,7 +267,7 @@ fn junk_sig() -> String {
 /// EXECUTE the shipped window query, mapping rows exactly as the worker's
 /// `ResultRowD1` does, and apply the route's own truncation cut.
 fn query_window(conn: &Connection, limit: usize) -> (Vec<ResultMarkerRow>, bool) {
-    let sql = leaderboard_markers_sql();
+    let sql = leaderboard_markers_sql(None);
     let mut stmt = conn
         .prepare(&sql)
         .unwrap_or_else(|e| panic!("leaderboard_markers_sql did not PREPARE: {e}\n{sql}"));
@@ -394,7 +394,7 @@ fn query_proof_pointers(
 #[test]
 fn the_new_leaderboard_queries_prepare_against_the_production_schema() {
     let conn = production_schema_db();
-    let sql = leaderboard_markers_sql();
+    let sql = leaderboard_markers_sql(None);
     conn.prepare(&sql)
         .unwrap_or_else(|e| panic!("leaderboard_markers_sql is not valid SQL: {e}\n{sql}"));
     for n in [1usize, 2, 5, 45] {
@@ -1353,5 +1353,120 @@ fn the_unknown_pot_constants_agree_with_the_overlay() {
             bsv_overlay_cloudflare::d1_discovery::unknown_pot_quota(limit),
             "quota must agree with the overlay's at limit {limit}"
         );
+    }
+}
+
+// ── #375 — the pre-launch era write-off ─────────────────────────────────────
+
+/// The DISTINCT pot txids the window serves under an era cutoff (`?4`).
+fn window_pot_txids_era(conn: &Connection, limit: usize, era_ms: i64) -> Vec<String> {
+    let sql = leaderboard_markers_sql(Some(era_ms));
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("leaderboard_markers_sql(era) did not PREPARE: {e}\n{sql}"));
+    let per_pot = low_app_layer::logic::LEADERBOARD_RESULT_ROWS_PER_POT;
+    let mut pots: Vec<String> = stmt
+        .query_map(
+            params![
+                (limit + 1) as i64,
+                leaderboard_unknown_pot_quota(limit) as i64,
+                ((limit + 1) * per_pot) as i64,
+                era_ms,
+            ],
+            |r| r.get::<_, Option<String>>("potTxid"),
+        )
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+        .into_iter()
+        .flatten()
+        .collect();
+    pots.dedup();
+    pots
+}
+
+/// #375 through the SHIPPED `/leaderboard` marker window — the spine the
+/// whole board counts from: a pot admitted one second before the cutoff is
+/// DROPPED (its post-cutoff result marker cannot resurrect it), the
+/// at-cutoff pot is KEPT (the `>=` boundary + the seconds→ms unit pin), an
+/// unknown pot anchors on its OLDEST marker stamp (per-pot MIN — later spam
+/// cannot move it), and the `None` arm serves the full window as today.
+#[test]
+fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
+    let conn = production_schema_db();
+    const CUT_MS: i64 = 1_754_500_000_000;
+    const CUT_SECS: i64 = CUT_MS / 1000;
+    let (w, l) = (identity(0x11), identity(0x22));
+
+    let pre = h64(0xd2);
+    let post = h64(0xd3);
+    admit_pot(&conn, &pre, CUT_SECS - 1);
+    admit_pot(&conn, &post, CUT_SECS);
+    for (i, (pot, at)) in [(&pre, CUT_SECS + 5), (&post, CUT_SECS + 6)]
+        .into_iter()
+        .enumerate()
+    {
+        file_result(
+            &conn,
+            &h64(0x21 + i as u8),
+            &w,
+            &l,
+            pot,
+            &h64(0xfe),
+            &junk_sig(),
+            None,
+            &format!("{:02x}", 0xe1 + i).repeat(32),
+            at,
+        );
+    }
+    // Unknown pots (no pot_records row): the oldest marker stamp anchors.
+    let unknown_pre = h64(0xd4);
+    let unknown_post = h64(0xd5);
+    file_result(
+        &conn,
+        &h64(0x23),
+        &w,
+        &l,
+        &unknown_pre,
+        &h64(0xfe),
+        &junk_sig(),
+        None,
+        &"e3".repeat(32),
+        CUT_SECS - 10,
+    );
+    file_result(
+        &conn,
+        &h64(0x24),
+        &w,
+        &l,
+        &unknown_post,
+        &h64(0xfe),
+        &junk_sig(),
+        None,
+        &"e4".repeat(32),
+        CUT_SECS + 10,
+    );
+
+    let served = window_pot_txids_era(&conn, 10, CUT_MS);
+    assert!(served.contains(&post), "the at-cutoff pot is KEPT (>= bar)");
+    assert!(
+        served.contains(&unknown_post),
+        "a fresh unknown pot with a post-cutoff marker is KEPT"
+    );
+    assert_eq!(
+        served.len(),
+        2,
+        "the pre-cutoff pot and the pre-cutoff unknown marker are DROPPED: {served:?}"
+    );
+
+    // The inert arm: the shipped None window serves all four pots.
+    let (markers, truncated) = query_window(&conn, 10);
+    assert!(!truncated);
+    let mut all: Vec<String> = markers.iter().map(|m| m.pot_txid.clone()).collect();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), 4, "None serves the full window: {all:?}");
+    for pot in [&pre, &post, &unknown_pre, &unknown_post] {
+        assert!(all.contains(pot), "{pot} missing from the None arm");
     }
 }

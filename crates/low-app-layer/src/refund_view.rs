@@ -195,7 +195,16 @@ const _: () = assert!(REFUND_VIEW_UNKNOWN_POT_QUOTA < REFUND_VIEW_MAX_ROWS);
 /// `spentHeight`. Nothing is computed: this stays one bounded query, and
 /// every served time is a stored column (epoch Rule 25 — a fact computable
 /// at admission is never recomputed at read).
-pub fn refund_view_sql() -> String {
+///
+/// # #375 era write-off
+///
+/// `written_off_before_ms` set ⇒ the innermost scan drops rows whose era
+/// anchor (`COALESCE(r.createdAt, pp.createdAt)` — the pot's admission stamp
+/// when indexed, else the marker's; both server-written unix seconds)
+/// pre-dates the cutoff, before the dedupe/quota windows run. ONE extra bind
+/// (the cutoff, after the identity). `None` ⇒ byte-identical to the
+/// pre-#375 query.
+pub fn refund_view_sql(written_off_before_ms: Option<i64>) -> String {
     format!(
         "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
                 w.recoveryHeight AS recoveryHeight, \
@@ -247,7 +256,7 @@ pub fn refund_view_sql() -> String {
                FROM potparty_records pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-               WHERE pp.identity = ?) \
+               WHERE pp.identity = ?{era}) \
              WHERE rn = 1) \
            ORDER BY potBestSigRank DESC, tier ASC, \
                     COALESCE(potCreatedAt, markerCreatedAt) DESC, \
@@ -263,6 +272,11 @@ pub fn refund_view_sql() -> String {
         quota = REFUND_VIEW_UNKNOWN_POT_QUOTA,
         rows = REFUND_VIEW_MAX_ROWS,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        era = crate::logic::era_filter_sql(
+            "COALESCE(r.createdAt, pp.createdAt)",
+            "?",
+            written_off_before_ms
+        ),
     )
 }
 
@@ -808,7 +822,7 @@ mod tests {
     /// widened rule is inoperative in production (the producer-level check).
     #[test]
     fn refund_view_sql_fetches_the_spender_proof_latch() {
-        let sql = refund_view_sql();
+        let sql = refund_view_sql(None);
         assert!(
             sql.contains("sb.proof_verified AS spenderProofVerified"),
             "the proof latch must be SELECTed: {sql}"
@@ -1081,7 +1095,7 @@ mod tests {
 
     #[test]
     fn refund_view_sql_shape() {
-        let sql = refund_view_sql();
+        let sql = refund_view_sql(None);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
         assert!(sql.contains(&format!("LIMIT {REFUND_VIEW_MAX_ROWS}")));
         assert!(sql.contains("PARTITION BY pp.potTxid, pp.potVout"));
@@ -1091,5 +1105,31 @@ mod tests {
         assert!(!sql.contains("refundRawHex"));
         // No BLOB is ever transferred.
         assert!(!sql.contains("hex("));
+    }
+
+    /// #375 — the era filter on `/refund-view`: exactly one shared fragment,
+    /// at the innermost identity scan (before the dedupe/quota windows),
+    /// anchored `COALESCE(r.createdAt, pp.createdAt)`; stripping it restores
+    /// the `None` arm byte-for-byte, and the cutoff is exactly one extra
+    /// bind.
+    #[test]
+    fn refund_view_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        let with = refund_view_sql(cutoff);
+        let without = refund_view_sql(None);
+        assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
+        assert_eq!(
+            with.matches(&format!("WHERE pp.identity = ?{frag})"))
+                .count(),
+            1,
+            "the era filter rides the innermost identity scan"
+        );
+        assert_eq!(with.matches('?').count(), 2, "identity + cutoff binds");
+        assert_eq!(
+            with.replace(&frag, ""),
+            without,
+            "None must stay byte-identical to the pre-#375 query"
+        );
     }
 }

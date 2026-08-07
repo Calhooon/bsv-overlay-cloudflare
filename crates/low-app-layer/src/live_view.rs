@@ -376,7 +376,17 @@ pub const CASE_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// docs), as do the pot's DECODED committed settle keys (`pubA`/`pubB`,
 /// #284) which drive the free membership pre-filter and the keyed candidate
 /// query. No BLOB is ever touched.
-pub fn live_view_sql() -> String {
+///
+/// # #375 era write-off
+///
+/// `written_off_before_ms` set ⇒ the innermost scan additionally drops rows
+/// whose era anchor (`COALESCE(r.createdAt, pp.createdAt)` — the pot's
+/// admission stamp when indexed, else the marker's; both server-written
+/// unix seconds) pre-dates the cutoff: a written-off pre-launch pot is
+/// never a LIVE hand, however its liveness columns read. ONE extra bind
+/// (the cutoff, after the identity). `None` ⇒ byte-identical to the
+/// pre-#375 query.
+pub fn live_view_sql(written_off_before_ms: Option<i64>) -> String {
     format!(
         "SELECT w.identity AS identity, w.gameId AS gameId, \
                 w.potTxid AS potTxid, w.potVout AS potVout, \
@@ -423,7 +433,7 @@ pub fn live_view_sql() -> String {
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ? \
-                 AND (COALESCE(r.spent, 0) = 0 OR COALESCE(r.spentConfirmed, 0) = 0)) \
+                 AND (COALESCE(r.spent, 0) = 0 OR COALESCE(r.spentConfirmed, 0) = 0){era}) \
              WHERE rn = 1) \
            ORDER BY potBestSigRank DESC, tier ASC, \
                     COALESCE(potCreatedAt, markerCreatedAt) DESC, \
@@ -435,6 +445,11 @@ pub fn live_view_sql() -> String {
         quota = LIVE_VIEW_UNKNOWN_POT_QUOTA,
         rows = LIVE_VIEW_MAX_ROWS,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        era = crate::logic::era_filter_sql(
+            "COALESCE(r.createdAt, pp.createdAt)",
+            "?",
+            written_off_before_ms
+        ),
     )
 }
 
@@ -2734,7 +2749,7 @@ mod tests {
 
     #[test]
     fn live_view_sql_shape() {
-        let sql = live_view_sql();
+        let sql = live_view_sql(None);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
         assert!(sql.contains(&format!("LIMIT {LIVE_VIEW_MAX_ROWS}")));
         assert!(sql.contains("PARTITION BY pp.potTxid, pp.potVout"));
@@ -2759,5 +2774,32 @@ mod tests {
         assert!(!sql.contains("hex("));
         assert!(!sql.contains("refundRawHex"));
         assert!(!sql.contains("potrefund_records"));
+    }
+
+    /// #375 — the era filter on `/live-view`: exactly one shared fragment,
+    /// at the innermost identity+liveness scan, anchored
+    /// `COALESCE(r.createdAt, pp.createdAt)`; stripping it restores the
+    /// `None` arm byte-for-byte, and the cutoff is exactly one extra bind.
+    #[test]
+    fn live_view_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        let with = live_view_sql(cutoff);
+        let without = live_view_sql(None);
+        assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
+        assert_eq!(
+            with.matches(&format!(
+                "(COALESCE(r.spent, 0) = 0 OR COALESCE(r.spentConfirmed, 0) = 0){frag})"
+            ))
+            .count(),
+            1,
+            "the era filter rides the innermost scan, beside the liveness predicate"
+        );
+        assert_eq!(with.matches('?').count(), 2, "identity + cutoff binds");
+        assert_eq!(
+            with.replace(&frag, ""),
+            without,
+            "None must stay byte-identical to the pre-#375 query"
+        );
     }
 }

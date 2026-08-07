@@ -55,19 +55,88 @@ fn assert_prepares(conn: &Connection, name: &str, sql: &str) {
     });
 }
 
-/// Every fixed-shape query builder.
+/// Every fixed-shape query builder — BOTH #375 era arms: the inert `None`
+/// (production default) and a set cutoff, since either arm shipping invalid
+/// is the same outage class.
 #[test]
 fn every_fixed_query_prepares_against_the_production_schema() {
     let conn = production_schema_db();
-    assert_prepares(&conn, "recovery_view_sql", &recovery_view_sql());
-    assert_prepares(&conn, "refund_view_sql", &refund_view_sql());
-    assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false));
+    const ERA: Option<i64> = Some(1_754_500_000_000);
+    assert_prepares(&conn, "recovery_view_sql", &recovery_view_sql(None));
+    assert_prepares(&conn, "recovery_view_sql(era)", &recovery_view_sql(ERA));
+    assert_prepares(&conn, "refund_view_sql", &refund_view_sql(None));
+    assert_prepares(&conn, "refund_view_sql(era)", &refund_view_sql(ERA));
+    assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false, None));
+    assert_prepares(&conn, "hops_view_sql(era)", &hops_view_sql(false, ERA));
     // Both arities of the gameId-scoped escape hatch must parse.
-    assert_prepares(&conn, "hops_view_sql(scoped)", &hops_view_sql(true));
-    assert_prepares(&conn, "live_view_sql", &live_view_sql());
-    assert_prepares(&conn, "results_sql", &results_sql());
+    assert_prepares(
+        &conn,
+        "hops_view_sql(scoped, None)",
+        &hops_view_sql(true, None),
+    );
+    assert_prepares(
+        &conn,
+        "hops_view_sql(scoped, era)",
+        &hops_view_sql(true, ERA),
+    );
+    assert_prepares(&conn, "live_view_sql", &live_view_sql(None));
+    assert_prepares(&conn, "live_view_sql(era)", &live_view_sql(ERA));
+    assert_prepares(&conn, "results_sql", &results_sql(None));
+    assert_prepares(&conn, "results_sql(era)", &results_sql(ERA));
     // #332 — the /leaderboard anti-flood marker window.
-    assert_prepares(&conn, "leaderboard_markers_sql", &leaderboard_markers_sql());
+    assert_prepares(
+        &conn,
+        "leaderboard_markers_sql",
+        &leaderboard_markers_sql(None),
+    );
+    assert_prepares(
+        &conn,
+        "leaderboard_markers_sql(era)",
+        &leaderboard_markers_sql(ERA),
+    );
+}
+
+/// #375 — the FIXED queries' bind arity, both era arms: the cutoff is
+/// exactly ONE extra parameter when set (for the `?N` queries,
+/// `parameter_count()` is the max index, which is exactly what the routes'
+/// positional bind vectors must fill).
+#[test]
+fn fixed_queries_declare_the_parameter_count_per_era_arm() {
+    let conn = production_schema_db();
+    const ERA: Option<i64> = Some(1_754_500_000_000);
+    for (name, sql, expected) in [
+        ("recovery_view_sql(None)", recovery_view_sql(None), 1),
+        ("recovery_view_sql(era)", recovery_view_sql(ERA), 2),
+        ("refund_view_sql(None)", refund_view_sql(None), 1),
+        ("refund_view_sql(era)", refund_view_sql(ERA), 2),
+        ("live_view_sql(None)", live_view_sql(None), 1),
+        ("live_view_sql(era)", live_view_sql(ERA), 2),
+        ("results_sql(None)", results_sql(None), 1),
+        ("results_sql(era)", results_sql(ERA), 2),
+        ("hops_view_sql(false, None)", hops_view_sql(false, None), 1),
+        ("hops_view_sql(false, era)", hops_view_sql(false, ERA), 2),
+        ("hops_view_sql(true, None)", hops_view_sql(true, None), 2),
+        ("hops_view_sql(true, era)", hops_view_sql(true, ERA), 3),
+        (
+            "leaderboard_markers_sql(None)",
+            leaderboard_markers_sql(None),
+            3,
+        ),
+        (
+            "leaderboard_markers_sql(era)",
+            leaderboard_markers_sql(ERA),
+            4,
+        ),
+    ] {
+        let stmt = conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("{name} did not prepare: {e}"));
+        assert_eq!(
+            stmt.parameter_count(),
+            expected,
+            "{name} must bind {expected} parameters"
+        );
+    }
 }
 
 /// Every `n`-parameterised builder, at the boundaries that matter: one
@@ -82,7 +151,13 @@ fn every_batched_query_prepares_at_representative_arities() {
         assert_prepares(
             &conn,
             &format!("pots_view_join_sql({n})"),
-            &pots_view_join_sql(n),
+            &pots_view_join_sql(n, None),
+        );
+        // #375 — the era arm of the one n-parameterised era-filtered builder.
+        assert_prepares(
+            &conn,
+            &format!("pots_view_join_sql({n}, era)"),
+            &pots_view_join_sql(n, Some(1_754_500_000_000)),
         );
         assert_prepares(
             &conn,
@@ -117,7 +192,13 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
     for n in [1usize, 2, 5, 20] {
         for (name, sql, expected) in [
             ("batch_where_sql", batch_where_sql(n), n * 2),
-            ("pots_view_join_sql", pots_view_join_sql(n), n * 2),
+            ("pots_view_join_sql", pots_view_join_sql(n, None), n * 2),
+            // #375: the cutoff is exactly one extra bind, appended LAST.
+            (
+                "pots_view_join_sql(era)",
+                pots_view_join_sql(n, Some(1_754_500_000_000)),
+                n * 2 + 1,
+            ),
             ("decoded_pots_sql", decoded_pots_sql(n), n * 2),
             // FOUR per pot: the outpoint pair plus the two COMMITTED settle
             // keys read from that pot's own funding lock.

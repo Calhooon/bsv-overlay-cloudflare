@@ -284,12 +284,26 @@ const _: () = assert!(HOPS_VIEW_UNKNOWN_HOP_QUOTA < HOPS_VIEW_MAX_OUTPOINTS);
 /// `containerOutputs` are typed columns the overlay decoded from the
 /// marker's own container at admission (#310), so this query touches no
 /// BLOB, no `outputs` row, and no second topic.
-pub fn hops_view_sql(scoped_to_game: bool) -> String {
+///
+/// # #375 era write-off
+///
+/// `written_off_before_ms` set ⇒ the innermost scan drops rows whose era
+/// anchor pre-dates the cutoff, before the per-outpoint windows / quota /
+/// `DENSE_RANK` run. Anchor: `COALESCE(r.createdAt, hp.createdAt)` — the
+/// hop container output's own `pot_records` admission stamp when indexed,
+/// else the hop marker's admission stamp (both server-written unix seconds
+/// via `current_unix_seconds_i64`; `hopparty_records.createdAt` is an
+/// INTEGER seconds column, same as every marker table here). This query
+/// uses NUMBERED binds, so the cutoff placeholder is `?2` unscoped / `?3`
+/// scoped — always the LAST bind. `None` ⇒ byte-identical to the pre-#375
+/// query.
+pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -> String {
     let game_filter = if scoped_to_game {
         " AND hp.gameId = ?2"
     } else {
         ""
     };
+    let era_placeholder = if scoped_to_game { "?3" } else { "?2" };
     format!(
         "SELECT w.identity AS identity, w.gameId AS gameId, w.hopTxid AS hopTxid, \
                 w.hopVout AS hopVout, w.hopSats AS hopSats, \
@@ -375,7 +389,7 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
                  FROM hopparty_records hp \
                  LEFT JOIN pot_records r \
                         ON r.txid = hp.txid AND r.outputIndex = hp.hopVout \
-                 WHERE hp.identity = ?1{game_filter}) \
+                 WHERE hp.identity = ?1{game_filter}{era}) \
                WHERE rn <= {per_outpoint}))) \
            WHERE finalRank <= {rank_cap} \
            ORDER BY outpointMarkerRank DESC, paidTier ASC, tier ASC, hopSatsOnChain DESC, \
@@ -402,6 +416,11 @@ pub fn hops_view_sql(scoped_to_game: bool) -> String {
         // live in the overlay crate that WRITES them (epoch Rule 16), so a
         // rename cannot leave this query silently reading nothing.
         marker_rank = overlay_discovery::hopparty::validity::marker_rank_expr("hp."),
+        era = crate::logic::era_filter_sql(
+            "COALESCE(r.createdAt, hp.createdAt)",
+            era_placeholder,
+            written_off_before_ms
+        ),
     )
 }
 
@@ -1106,7 +1125,7 @@ mod tests {
 
     #[test]
     fn hops_view_sql_shape() {
-        let sql = hops_view_sql(false);
+        let sql = hops_view_sql(false, None);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
         assert!(
             sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout"),
@@ -1150,6 +1169,45 @@ mod tests {
         assert!(!sql.contains("hex(sb.beef)") && !sql.contains("hex(hb.beef)"));
     }
 
+    /// #375 — the era filter on `/hops-view`: exactly one shared fragment,
+    /// at the innermost identity scan, anchored `COALESCE(r.createdAt,
+    /// hp.createdAt)` (the hop container's own admission stamp when indexed,
+    /// else the hop marker's — both server-written unix seconds). This
+    /// query uses NUMBERED binds, so the cutoff placeholder is `?2`
+    /// unscoped / `?3` scoped — always the LAST bind. Stripping the
+    /// fragment restores the `None` arm byte-for-byte in BOTH arities.
+    #[test]
+    fn hops_view_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        for (scoped, placeholder, where_prefix) in [
+            (false, "?2", "WHERE hp.identity = ?1"),
+            (true, "?3", "WHERE hp.identity = ?1 AND hp.gameId = ?2"),
+        ] {
+            let frag = crate::logic::era_filter_sql(
+                "COALESCE(r.createdAt, hp.createdAt)",
+                placeholder,
+                cutoff,
+            );
+            let with = hops_view_sql(scoped, cutoff);
+            let without = hops_view_sql(scoped, None);
+            assert_eq!(
+                with.matches(&frag).count(),
+                1,
+                "exactly one era fragment (scoped={scoped})"
+            );
+            assert_eq!(
+                with.matches(&format!("{where_prefix}{frag})")).count(),
+                1,
+                "the era filter rides the innermost identity scan (scoped={scoped})"
+            );
+            assert_eq!(
+                with.replace(&frag, ""),
+                without,
+                "None must stay byte-identical to the pre-#375 query (scoped={scoped})"
+            );
+        }
+    }
+
     /// THE #362 SHAPE PINS: the latched verdict is a LEADING SORT KEY, built
     /// from the OVERLAY's shared expression, and it is NEVER a filter.
     ///
@@ -1178,7 +1236,7 @@ mod tests {
     #[test]
     fn the_latched_verdict_leads_every_order_and_filters_nothing() {
         for scoped in [false, true] {
-            let sql = hops_view_sql(scoped);
+            let sql = hops_view_sql(scoped, None);
             // Built from the SHARED expression, not a local copy.
             assert!(
                 sql.contains(&overlay_discovery::hopparty::validity::marker_rank_expr(
@@ -1255,8 +1313,8 @@ mod tests {
     /// become a second filter dimension by accident.
     #[test]
     fn the_game_scope_adds_one_bind_and_one_and() {
-        let unscoped = hops_view_sql(false);
-        let scoped = hops_view_sql(true);
+        let unscoped = hops_view_sql(false, None);
+        let scoped = hops_view_sql(true, None);
         assert_eq!(scoped.matches('?').count(), 2);
         assert!(scoped.contains("WHERE hp.identity = ?1 AND hp.gameId = ?2"));
         assert_eq!(

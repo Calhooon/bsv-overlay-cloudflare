@@ -114,6 +114,40 @@ pub(crate) fn view_identity(req: &Request, ctx: &RouteContext<AuthState>) -> Vie
     }
 }
 
+/// #375 — the pre-launch era write-off cutoff (ms since epoch), read once
+/// per request from the `WRITTEN_OFF_BEFORE_MS` var (the `STORAGE_EPOCH`
+/// read pattern) and threaded into the money-listing SQL builders as an
+/// `Option<i64>`. `None` (unset/malformed var) is INERT — every query runs
+/// byte-identical to the un-configured build. The routes that consume it
+/// append the cutoff as ONE extra bind iff `Some`, matching the exactly-one
+/// placeholder [`crate::logic::era_filter_sql`] emits.
+fn written_off_before_ms(ctx: &RouteContext<AuthState>) -> Option<i64> {
+    let raw = crate::logic::normalize_written_off_before_ms(
+        ctx.env
+            .var("WRITTEN_OFF_BEFORE_MS")
+            .ok()
+            .map(|v| v.to_string()),
+    );
+    // Review MED-2 — the future-cutoff belt (`clamp_future_cutoff` docs): a
+    // well-formed WRONG value (extra digit, pasted future instant) must
+    // never blank every money view; refuse it LOUDLY, never silently.
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let clamped = crate::logic::clamp_future_cutoff(raw, now_ms);
+    if let (Some(raw_ms), None) = (raw, clamped) {
+        console_warn!(
+            "[era] WRITTEN_OFF_BEFORE_MS={raw_ms} is at/after now={now_ms} — MISCONFIGURED \
+             (the #375 cutoff must pre-date launch); treating as unset"
+        );
+    }
+    clamped
+}
+
+/// The #375 cutoff as a D1 bind value. Ms-since-epoch fits f64 exactly
+/// (`2^53` headroom) — the crate's number-bind convention.
+fn era_bind(ms: i64) -> JsValue {
+    JsValue::from_f64(ms as f64)
+}
+
 /// `pot_records` row as D1 returns it (numbers as f64 — codebase convention,
 /// see overlay-cloudflare `d1_discovery.rs`). Converted to the pure
 /// [`PotRecordRow`] for input-order assembly in `logic`.
@@ -453,14 +487,22 @@ pub async fn pots_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     // still binds 2 params per outpoint, so a >50-outpoint single query 503s).
     // FAIL-SAFE: any chunk's D1 error returns the SAME 503 and no body — a
     // failed chunk is unknown-for-those-rows, never a fabricated partial view.
+    // #375: a written-off pot's row is excluded by the SQL, so the outpoint
+    // assembles as the fail-safe `known:false` shape below — never an error.
+    let era = written_off_before_ms(&ctx);
     let mut rows: Vec<PotsViewRow> = Vec::with_capacity(outpoints.len());
     for chunk in chunk_outpoints(&outpoints) {
-        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2 + 1);
         for op in chunk {
             binds.push(JsValue::from_str(&op.db_txid()));
             binds.push(JsValue::from_f64(f64::from(op.vout)));
         }
-        let stmt = db.prepare(pots_view_join_sql(chunk.len())).bind(&binds)?;
+        if let Some(ms) = era {
+            binds.push(era_bind(ms));
+        }
+        let stmt = db
+            .prepare(pots_view_join_sql(chunk.len(), era))
+            .bind(&binds)?;
         match stmt.all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
             Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotsViewRowD1::into_row)),
             Err(e) => {
@@ -595,9 +637,13 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
 
     // ONE query: the caller's potparty rows JOINed to pot spend-status +
     // spender BEEFs. `potparty_records.identity` is lowercase hex.
-    let stmt = db
-        .prepare(recovery_view_sql())
-        .bind(&[JsValue::from_str(&identity.to_ascii_lowercase())])?;
+    // #375: the era cutoff rides as the LAST bind iff configured.
+    let era = written_off_before_ms(&ctx);
+    let mut binds: Vec<JsValue> = vec![JsValue::from_str(&identity.to_ascii_lowercase())];
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
+    let stmt = db.prepare(recovery_view_sql(era)).bind(&binds)?;
     let rows: Vec<RecoveryRow> = match stmt.all().await.and_then(|r| r.results::<RecoveryRowD1>()) {
         Ok(rows) => rows.into_iter().map(RecoveryRowD1::into_row).collect(),
         Err(e) => {
@@ -621,7 +667,9 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
     let outcome_entries = if entries.is_empty() {
         None
     } else {
-        match gather_result_entries(&db, &identity.to_ascii_lowercase()).await {
+        // #375: the same cutoff — the reused /results derivation must not
+        // resurrect a written-off pot through the outcome fold.
+        match gather_result_entries(&db, &identity.to_ascii_lowercase(), era).await {
             Ok(v) => Some(v),
             Err(e) => {
                 console_warn!(
@@ -805,11 +853,21 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     // malformed-row filtering can hide a pot.
     let quota = crate::logic::leaderboard_unknown_pot_quota(limit);
     let row_cap = (limit + 1) * overlay_discovery::result::storage::RESULT_ROWS_PER_POT;
-    let stmt = db.prepare(crate::logic::leaderboard_markers_sql()).bind(&[
+    // #375: the era cutoff rides as `?4` iff configured — the board counts
+    // from this spine, so every derived leg (statuses, classification,
+    // attribution, proof pointers) inherits the write-off.
+    let era = written_off_before_ms(&ctx);
+    let mut binds: Vec<JsValue> = vec![
         JsValue::from_f64((limit + 1) as f64),
         JsValue::from_f64(quota as f64),
         JsValue::from_f64(row_cap as f64),
-    ])?;
+    ];
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
+    let stmt = db
+        .prepare(crate::logic::leaderboard_markers_sql(era))
+        .bind(&binds)?;
     let raw_rows: Vec<ResultRowD1> = match stmt.all().await.and_then(|r| r.results::<ResultRowD1>())
     {
         Ok(rows) => rows,
@@ -1531,7 +1589,8 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
 
-    let entries = match gather_result_entries(&db, &identity_lc).await {
+    let entries = match gather_result_entries(&db, &identity_lc, written_off_before_ms(&ctx)).await
+    {
         Ok(entries) => entries,
         Err(e) => {
             console_warn!("[results] {e}");
@@ -1551,10 +1610,17 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
 async fn gather_result_entries(
     db: &worker::D1Database,
     identity_lc: &str,
+    written_off_before_ms: Option<i64>,
 ) -> std::result::Result<Vec<crate::results::ResultEntry>, String> {
+    // #375: the SPINE filter — the claims/seat legs below are keyed to this
+    // page's games/pots, so they inherit the write-off without a clause.
+    let mut binds: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
+    if let Some(ms) = written_off_before_ms {
+        binds.push(era_bind(ms));
+    }
     let stmt = db
-        .prepare(crate::results::results_sql())
-        .bind(&[JsValue::from_str(identity_lc)])
+        .prepare(crate::results::results_sql(written_off_before_ms))
+        .bind(&binds)
         .map_err(|e| format!("results bind failed: {e}"))?;
     let rows: Vec<crate::results::ResultsRow> =
         match stmt.all().await.and_then(|r| r.results::<ResultsRowD1>()) {
@@ -1825,9 +1891,15 @@ pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         }
     };
 
+    // #375: the era cutoff rides as the LAST bind iff configured.
+    let era = written_off_before_ms(&ctx);
+    let mut binds: Vec<JsValue> = vec![JsValue::from_str(&identity_lc)];
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
     let stmt = db
-        .prepare(crate::refund_view::refund_view_sql())
-        .bind(&[JsValue::from_str(&identity_lc)])?;
+        .prepare(crate::refund_view::refund_view_sql(era))
+        .bind(&binds)?;
     let rows: Vec<crate::refund_view::RefundViewRow> = match stmt
         .all()
         .await
@@ -2011,12 +2083,19 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .map(|(_, v)| v.into_owned().to_ascii_lowercase())
         .filter(|g| g.len() == 64 && g.bytes().all(|b| b.is_ascii_hexdigit()));
 
+    // #375: the era cutoff is always the LAST numbered bind (`?2` unscoped,
+    // `?3` scoped) iff configured.
+    let era = written_off_before_ms(&ctx);
+    let mut binds = match &game_id_lc {
+        Some(g) => vec![JsValue::from_str(&identity_lc), JsValue::from_str(g)],
+        None => vec![JsValue::from_str(&identity_lc)],
+    };
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
     let stmt = db
-        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some()))
-        .bind(&match &game_id_lc {
-            Some(g) => vec![JsValue::from_str(&identity_lc), JsValue::from_str(g)],
-            None => vec![JsValue::from_str(&identity_lc)],
-        })?;
+        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some(), era))
+        .bind(&binds)?;
     let rows: Vec<crate::hops_view::HopsViewRow> =
         match stmt.all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
             Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
@@ -2409,9 +2488,15 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     };
 
     // LOW-7: same rule for the bind fault — through json_error, never `?`.
+    // #375: the era cutoff rides as the LAST bind iff configured.
+    let era = written_off_before_ms(&ctx);
+    let mut binds: Vec<JsValue> = vec![JsValue::from_str(&identity_lc)];
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
     let stmt = match db
-        .prepare(crate::live_view::live_view_sql())
-        .bind(&[JsValue::from_str(&identity_lc)])
+        .prepare(crate::live_view::live_view_sql(era))
+        .bind(&binds)
     {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -2957,6 +3042,15 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
         ctx.data.auth_configured,
         &crate::auth::counters_snapshot(),
     );
+    // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
+    // future-cutoff belt, i.e. exactly what the views are filtering by and
+    // what /epoch serves. `null` = write-off inert. One glance answers
+    // "did my var take effect", so a refused misconfiguration is visible
+    // here rather than only in a per-request warn log.
+    body["writtenOffBeforeMs"] = match written_off_before_ms(&ctx) {
+        Some(ms) => serde_json::json!(ms),
+        None => serde_json::Value::Null,
+    };
     json_response(body.to_string(), 200)
 }
 
@@ -2968,11 +3062,19 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
 /// on the next probe. Bumping the var in wrangler.toml orders every client
 /// to clear its local `low_*` state at its next idle home visit
 /// (bsv-low `app/src/lib/storageEpoch.ts`).
+///
+/// #375 (ADDITIVE): the body also carries `writtenOffBeforeMs` — the
+/// pre-launch era write-off cutoff the money-listing views filter by, or
+/// `null` when unset (the client's fail-safe "no write-off"). The deployed
+/// client reads only `storageEpoch` and ignores unknown fields.
 pub fn epoch(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let v = crate::logic::normalize_storage_epoch(
         ctx.env.var("STORAGE_EPOCH").ok().map(|v| v.to_string()),
     );
-    json_response(crate::logic::epoch_body(v.as_deref()), 200)
+    json_response(
+        crate::logic::epoch_body(v.as_deref(), written_off_before_ms(&ctx)),
+        200,
+    )
 }
 
 /// Catch-all: JSON 404 for any unknown route/method.

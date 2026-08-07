@@ -32,7 +32,12 @@ pub const D1_CHUNK_OUTPOINTS: usize = 45;
 // Compile-time proof the chunk size can never exceed the D1 param cap. If
 // someone bumps D1_CHUNK_OUTPOINTS (or BINDS_PER_OUTPOINT) past the ceiling,
 // the crate stops building — the invariant is enforced, not merely commented.
-const _: () = assert!(D1_CHUNK_OUTPOINTS * BINDS_PER_OUTPOINT <= D1_MAX_BOUND_PARAMS);
+// STRICT `<`, not `<=`: `pots_view_join_sql`'s #375 era arm binds 2n+1, so
+// one slot past the outpoint binds must stay free — the proof covers the
+// WIDEST arm. With `<=`, bumping the chunk size to exactly the cap would
+// build green and 503 every full-chunk /pots-view, but ONLY once the era
+// cutoff is set (review LOW-1, the Rule 14 latent shape).
+const _: () = assert!(D1_CHUNK_OUTPOINTS * BINDS_PER_OUTPOINT < D1_MAX_BOUND_PARAMS);
 
 /// Split a requested outpoint batch into D1-safe sub-batches of at most
 /// [`D1_CHUNK_OUTPOINTS`], preserving input order. The route handlers run ONE
@@ -352,15 +357,28 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
 /// BEEF rides back in the same query. `lower()` defends against a mixed-case
 /// spendingTxid write (pot_beefs keys are lowercase); the join still resolves
 /// via the pot_beefs PRIMARY KEY per matched row.
-pub fn pots_view_join_sql(n: usize) -> String {
+/// #375: `written_off_before_ms` set ⇒ a pot whose ADMISSION stamp
+/// (`pot_records.createdAt`, unix seconds, server-written) pre-dates the
+/// cutoff is excluded — the requested outpoint then assembles as the
+/// fail-safe `known:false` shape, never a Collect-able status. ONE extra
+/// bind (the cutoff, LAST). `None` ⇒ byte-identical to the pre-#375 query.
+pub fn pots_view_join_sql(n: usize, written_off_before_ms: Option<i64>) -> String {
     debug_assert!((1..=MAX_OUTPOINTS).contains(&n), "parse_outpoints bounds n");
     let clause = vec!["(p.txid = ? AND p.outputIndex = ?)"; n].join(" OR ");
+    // The OR list needs its own parens once a conjunct follows it.
+    let where_clause = match written_off_before_ms {
+        None => format!("WHERE {clause}"),
+        Some(_) => format!(
+            "WHERE ({clause}){era}",
+            era = era_filter_sql("p.createdAt", "?", written_off_before_ms)
+        ),
+    };
     format!(
         "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
                 hex(b.beef) AS spenderBeef \
          FROM pot_records p \
          LEFT JOIN pot_beefs b ON b.txid = lower(p.spendingTxid) \
-         WHERE {clause}"
+         {where_clause}"
     )
 }
 
@@ -527,7 +545,18 @@ pub fn decode_beef_hex(hex_str: &str) -> Option<Vec<u8>> {
 ///
 /// The BEEF join sits OUTSIDE the window, on the survivors only, so a flood
 /// can never drag real BLOBs along with it.
-pub fn recovery_view_sql() -> String {
+/// #375: `written_off_before_ms` set ⇒ the innermost scan drops rows whose
+/// era anchor pre-dates the cutoff BEFORE the dedupe/quota windows run (a
+/// written-off ghost must not consume an unknown-pot quota slot). The anchor
+/// is `COALESCE(r.createdAt, pp.createdAt)` — the pot's OWN admission stamp
+/// when a `pot_records` row survives (a marker republish alone cannot
+/// resurface such a pot), else the marker's admission stamp (the fresh
+/// in-flight pot a recovering client most needs stays visible; the
+/// re-admission residual this fallback carries is stated ONCE, at
+/// `era_filter_sql`). ONE extra bind (the
+/// cutoff, after the identity). `None` ⇒ byte-identical to the pre-#375
+/// query.
+pub fn recovery_view_sql(written_off_before_ms: Option<i64>) -> String {
     // NOTE: any change here must keep the `w.`-qualified outer ORDER BY —
     // SQLite does not guarantee ordering survives a join otherwise.
     //
@@ -576,7 +605,7 @@ pub fn recovery_view_sql() -> String {
            FROM potparty_records pp \
            LEFT JOIN pot_records r \
                   ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-           WHERE pp.identity = ?) \
+           WHERE pp.identity = ?{era}) \
          WHERE rn = 1) \
        ORDER BY potBestSigRank DESC, tier ASC, \
                 COALESCE(potCreatedAt, markerCreatedAt) DESC, \
@@ -589,6 +618,11 @@ pub fn recovery_view_sql() -> String {
         quota = RECOVERY_VIEW_UNKNOWN_QUOTA,
         probe = RECOVERY_VIEW_MAX_ROWS + 1,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        era = era_filter_sql(
+            "COALESCE(r.createdAt, pp.createdAt)",
+            "?",
+            written_off_before_ms
+        ),
     )
 }
 
@@ -989,10 +1023,102 @@ pub fn normalize_storage_epoch(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Assemble the `/epoch` wire body: `{"storageEpoch":"<v>"}` or
-/// `{"storageEpoch":null}`.
-pub fn epoch_body(epoch: Option<&str>) -> String {
-    json!({ "storageEpoch": epoch }).to_string()
+// ── #375 — the one-shot pre-launch era write-off (owner-ruled) ──────────────
+//
+// A cutoff INSTANT (`WRITTEN_OFF_BEFORE_MS`, ms since epoch) is fixed before
+// launch; rows whose SERVER-OBSERVED admission stamp pre-dates it stop being
+// served by the money-listing views, so written-off test-era games never
+// render Collect affordances anywhere and a wiped device's recovery
+// enumeration is bounded. Because the cutoff pre-dates launch, no real
+// player can ever be behind it — the blunt DROP is the owner ruling (display
+// policy in this read-only app-layer; the overlay's admitted truth is
+// untouched). The client learns the same instant from `GET /epoch`.
+
+/// Normalize the raw `WRITTEN_OFF_BEFORE_MS` var: unset / empty / whitespace
+/// / non-numeric / zero / negative → `None` (INERT — every query is
+/// byte-identical to the un-configured build). A positive integer is the
+/// cutoff in MILLISECONDS since epoch. Fail-safe direction: a malformed var
+/// can only ever serve MORE history, never silently widen the write-off.
+pub fn normalize_written_off_before_ms(v: Option<String>) -> Option<i64> {
+    v.as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&ms| ms > 0)
+}
+
+/// #375 review MED-2 — the FUTURE-CUTOFF BELT. `WRITTEN_OFF_BEFORE_MS` is a
+/// hand-set one-shot, and the two adjacent one-character mistakes (an extra
+/// digit ⇒ effectively microseconds; a pasted FUTURE instant) both produce a
+/// well-formed value that would silently blank EVERY money view for EVERY
+/// current player — the one direction the write-off must never fail. A
+/// cutoff at/after `now` contradicts the ruling's own premise (the cutoff
+/// pre-dates launch, i.e. is in the past), so it reads as ABSENT — the same
+/// belt the client half carries (`writtenOffEra.ts`). Pure so it is
+/// unit-testable; the route reader supplies the worker clock and WARNS on a
+/// refusal (a silent clamp would hide the misconfiguration — Rule 13), and
+/// `/epoch` + `/health` serve the CLAMPED value so the wire never carries a
+/// number the server itself is ignoring.
+pub fn clamp_future_cutoff(cutoff_ms: Option<i64>, now_ms: i64) -> Option<i64> {
+    cutoff_ms.filter(|&ms| ms < now_ms)
+}
+
+/// THE ONE era predicate (#375) — the single place the write-off WHERE
+/// fragment (and its seconds→ms conversion) is spelled; every money-listing
+/// view builder consumes this, never a hand-copied clause (six copies would
+/// drift).
+///
+/// * `anchor_expr_secs` is a SQL expression in unix SECONDS — every
+///   `createdAt` this crate anchors on is written by the overlay's
+///   `current_unix_seconds_i64()` (pinned by the unit test in
+///   `tests/era_cutoff_sqlite.rs`). The `* 1000` here is the ONE conversion
+///   to the cutoff's ms unit; i64 seconds × 1000 cannot overflow SQLite's
+///   64-bit integer for any real clock.
+/// * The anchor must be a SERVER-OBSERVED admission stamp (`pot_records
+///   .createdAt`, or the marker table's own admission `createdAt` when no
+///   pot row exists) — NEVER caller-supplied content: a caller-supplied
+///   timestamp is attacker-owned.
+/// * `placeholder` is the bind marker for the cutoff (plain `?`, or `?N`
+///   for the numbered-bind queries) — emitted EXACTLY ONCE, so the caller
+///   appends exactly one bind iff the cutoff is `Some`.
+/// * `None` ⇒ empty string: the enclosing SQL is byte-identical to the
+///   pre-#375 query (pinned per view).
+/// * A NULL anchor is DROPPED when the cutoff is set (`NULL * 1000 >= ?` is
+///   NULL, i.e. not kept): every production write stamps `createdAt`, so a
+///   stampless row cannot be shown to post-date the cutoff — and the cutoff
+///   pre-dates launch, so nothing an honest player owns is behind it.
+/// * RESIDUAL, STATED (review MED-1): the anchor is ADMISSION time, not game
+///   era. A written-off pot whose `pot_records` row SURVIVES cannot be
+///   resurfaced by a marker republish (the COALESCE prefers the pot's
+///   pre-cutoff stamp) — but a pot with NO surviving row (never indexed, or
+///   gone in the 2026-08-06 D1 wipe) can be RE-ADMITTED by re-submitting its
+///   mined funding tx, which stamps a fresh post-cutoff anchor; a marker
+///   republish then resurfaces the game on the marker-fallback views. The
+///   leaderboard's per-pot MIN(createdAt) anchor resists the republish arm
+///   but not re-admission. Deliberately accepted as display-tier: re-added
+///   rows can only ADD (the filter sits under every quota/rank window, so
+///   they can never evict or out-rank a current player's row), money exits
+///   stay landing-proof-gated client-side, and the class starves once the
+///   client-half epoch wipe removes the old-era records that could be
+///   republished. Never re-claim the closed form the first draft of these
+///   comments claimed (Rule 10).
+pub fn era_filter_sql(anchor_expr_secs: &str, placeholder: &str, cutoff_ms: Option<i64>) -> String {
+    match cutoff_ms {
+        Some(_) => format!(" AND ({anchor_expr_secs} * 1000 >= {placeholder})"),
+        None => String::new(),
+    }
+}
+
+/// Assemble the `/epoch` wire body:
+/// `{"storageEpoch":<string|null>,"writtenOffBeforeMs":<number|null>}`.
+/// ADDITIVE (#375): the deployed client reads only `storageEpoch` and
+/// ignores unknown fields; `writtenOffBeforeMs: null` is the fail-safe "no
+/// write-off" shape, mirroring `storageEpoch`'s.
+pub fn epoch_body(epoch: Option<&str>, written_off_before_ms: Option<i64>) -> String {
+    json!({
+        "storageEpoch": epoch,
+        "writtenOffBeforeMs": written_off_before_ms,
+    })
+    .to_string()
 }
 
 // ── /leaderboard — the server-side join + rank (bsv-low #38) ───────────────
@@ -1153,11 +1279,30 @@ pub const LEADERBOARD_PROOF_PAIRS_CAP: usize = 512;
 ///     see [`leaderboard_window_cut`]).
 ///
 /// BINDS: `?1` pot limit (probe), `?2` unknown-pot quota, `?3` row cap
-/// (`?1 × RESULT_ROWS_PER_POT` — a belt, never the truncation signal).
-/// EXECUTED (not string-pinned) by `tests/leaderboard_window_sqlite.rs`
-/// against the production migrations (#323: a `contains` assertion on a
-/// query must never be the only thing standing behind it).
-pub fn leaderboard_markers_sql() -> String {
+/// (`?1 × RESULT_ROWS_PER_POT` — a belt, never the truncation signal), and
+/// — #375, only when `written_off_before_ms` is set — `?4` the write-off
+/// cutoff (ms). EXECUTED (not string-pinned) by
+/// `tests/leaderboard_window_sqlite.rs` against the production migrations
+/// (#323: a `contains` assertion on a query must never be the only thing
+/// standing behind it).
+///
+/// #375 placement: the era filter rides the `rn <= per_pot` level, where
+/// the per-pot anchor columns exist and are CONSTANT per pot — so a
+/// written-off pot drops ATOMICALLY (every marker row at once) before the
+/// existence tier / quota / `DENSE_RANK` windows run, and the board (the
+/// leaderboard counts from this spine) can never rank it. Anchor:
+/// `COALESCE(potCreatedAt, potFirstMarkerAt)` — the pot's own admission
+/// stamp when indexed, else the pot's OLDEST marker admission stamp (both
+/// server-written, per-pot MIN so later spam cannot move it forward).
+/// #375 anchor asymmetry, stated (review LOW-2): THIS view era-filters at
+/// the per-pot level on `COALESCE(potCreatedAt, potFirstMarkerAt)` where
+/// `potFirstMarkerAt` is the per-pot MIN over markers — so a post-cutoff
+/// marker REPUBLISH can never resurface a written-off pot here (the oldest
+/// stamp survives as the anchor). The four potparty-family views anchor on
+/// the PER-ROW `pp.createdAt` fallback instead and do not get that
+/// resistance (their residual is stated at `era_filter_sql`). Two rules,
+/// not one — do not assume this view's stronger property elsewhere.
+pub fn leaderboard_markers_sql(written_off_before_ms: Option<i64>) -> String {
     const COLS: &str = "gameId, winner, loser, potTxid, settleTxid, \
          winnerSigHex, loserSigHex, cardsHex, txid, createdAt";
     let fresh = format!(
@@ -1200,12 +1345,17 @@ pub fn leaderboard_markers_sql() -> String {
                              LEFT JOIN (SELECT txid, MIN(createdAt) AS potCreatedAt \
                                         FROM pot_records GROUP BY txid) r \
                                     ON r.txid = rm.potTxid) \
-                       WHERE rn <= {per_pot}))) \
+                       WHERE rn <= {per_pot}{era}))) \
      WHERE finalRank <= ?1 \
      ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
               potTxid ASC, markerRowid ASC \
      LIMIT ?3",
         per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
+        era = era_filter_sql(
+            "COALESCE(potCreatedAt, potFirstMarkerAt)",
+            "?4",
+            written_off_before_ms
+        ),
     )
 }
 
@@ -2453,16 +2603,46 @@ mod tests {
 
     #[test]
     fn pots_view_sql_shapes() {
-        let one = pots_view_join_sql(1);
+        let one = pots_view_join_sql(1, None);
         assert!(one.contains("LEFT JOIN pot_beefs b ON b.txid = lower(p.spendingTxid)"));
         assert!(one.contains("hex(b.beef) AS spenderBeef"));
         assert_eq!(one.matches("(p.txid = ? AND p.outputIndex = ?)").count(), 1);
-        let three = pots_view_join_sql(3);
+        let three = pots_view_join_sql(3, None);
         assert_eq!(
             three.matches("(p.txid = ? AND p.outputIndex = ?)").count(),
             3
         );
         assert_eq!(three.matches(" OR ").count(), 2);
+    }
+
+    /// #375 — the era filter on `/pots-view`: the shared fragment appears
+    /// EXACTLY ONCE (anchored on `pot_records.createdAt`, the pot's own
+    /// admission stamp), the OR list is parenthesized so the conjunct binds
+    /// the whole batch, and STRIPPING the fragment (plus the added parens)
+    /// yields the `None` arm byte-for-byte — the None-is-byte-identical
+    /// property, pinned positively rather than by a bare negative substring.
+    #[test]
+    fn pots_view_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        let frag = era_filter_sql("p.createdAt", "?", cutoff);
+        for n in [1usize, 3] {
+            let with = pots_view_join_sql(n, cutoff);
+            let without = pots_view_join_sql(n, None);
+            assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
+            // The fragment sits AFTER the parenthesized outpoint OR-list.
+            let clause = vec!["(p.txid = ? AND p.outputIndex = ?)"; n].join(" OR ");
+            assert_eq!(
+                with.matches(&format!("WHERE ({clause}){frag}")).count(),
+                1,
+                "the era conjunct applies to the WHOLE outpoint batch"
+            );
+            // Removing the era decoration restores the None arm exactly.
+            assert_eq!(
+                with.replace(&format!("({clause}){frag}"), &clause),
+                without,
+                "None must stay byte-identical to the pre-#375 query"
+            );
+        }
     }
 
     #[test]
@@ -2641,27 +2821,103 @@ mod tests {
         assert_eq!(h["service"], "low-app-layer");
     }
 
-    /// `/epoch` (bsv-low THE ORDER item 2): the wire shape is EXACTLY
-    /// `{"storageEpoch": <string|null>}`, and the fail-safe normalization —
-    /// unset/empty/whitespace-only var → `null` (the client's "no wipe
-    /// directive") — never invents a directive.
+    /// `/epoch` (bsv-low THE ORDER item 2, + #375): the wire shape is
+    /// EXACTLY `{"storageEpoch": <string|null>,
+    /// "writtenOffBeforeMs": <number|null>}`, and the fail-safe
+    /// normalization — unset/empty/whitespace-only var → `null` (the
+    /// client's "no wipe directive") — never invents a directive.
     #[test]
     fn epoch_body_shape_and_failsafe_normalization() {
         // A set var serves the trimmed string.
         let set = normalize_storage_epoch(Some("  2026-08-06-zero-world-1 ".into()));
         assert_eq!(set.as_deref(), Some("2026-08-06-zero-world-1"));
-        let v: serde_json::Value = serde_json::from_str(&epoch_body(set.as_deref())).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&epoch_body(set.as_deref(), Some(1_754_500_000_000))).unwrap();
         assert_eq!(v["storageEpoch"], "2026-08-06-zero-world-1");
-        assert_eq!(v.as_object().unwrap().len(), 1); // exactly the one field
+        assert_eq!(v["writtenOffBeforeMs"], 1_754_500_000_000i64);
+        assert_eq!(v.as_object().unwrap().len(), 2); // exactly the two fields
 
         // Unset / empty / whitespace-only all serve LITERAL null.
         for raw in [None, Some(String::new()), Some("   ".to_string())] {
             let none = normalize_storage_epoch(raw);
             assert_eq!(none, None);
-            let n: serde_json::Value = serde_json::from_str(&epoch_body(none.as_deref())).unwrap();
+            let n: serde_json::Value =
+                serde_json::from_str(&epoch_body(none.as_deref(), None)).unwrap();
             assert!(n["storageEpoch"].is_null());
             assert!(n.as_object().unwrap().contains_key("storageEpoch"));
+            // #375: the write-off field is PRESENT and literal null when
+            // unset — the client's fail-safe "no write-off" shape.
+            assert!(n["writtenOffBeforeMs"].is_null());
+            assert!(n.as_object().unwrap().contains_key("writtenOffBeforeMs"));
         }
+    }
+
+    /// #375 — `WRITTEN_OFF_BEFORE_MS` normalization: only a positive
+    /// integer becomes a cutoff; every malformed shape is INERT (`None`),
+    /// so a bad var can only serve MORE history, never widen the write-off.
+    #[test]
+    fn written_off_before_ms_normalization_edge_cases() {
+        // Valid: a positive ms instant, whitespace tolerated.
+        assert_eq!(
+            normalize_written_off_before_ms(Some("1754500000000".into())),
+            Some(1_754_500_000_000)
+        );
+        assert_eq!(
+            normalize_written_off_before_ms(Some("  1754500000000  ".into())),
+            Some(1_754_500_000_000)
+        );
+        // Inert: unset, empty, whitespace, junk, non-integer, zero, negative,
+        // overflow.
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("   ".to_string()),
+            Some("not-a-number".to_string()),
+            Some("1754500000000junk".to_string()),
+            Some("17545.5".to_string()),
+            Some("0".to_string()),
+            Some("-1".to_string()),
+            Some("-1754500000000".to_string()),
+            Some("99999999999999999999999999".to_string()), // > i64::MAX
+        ] {
+            assert_eq!(
+                normalize_written_off_before_ms(raw.clone()),
+                None,
+                "{raw:?} must normalize to the inert None"
+            );
+        }
+    }
+
+    /// #375 review MED-2 — the future-cutoff belt: a cutoff at/after `now`
+    /// is a misconfiguration and reads as ABSENT; strictly-past passes
+    /// through untouched; `None` stays `None`. The boundary is `<` (a
+    /// cutoff EQUAL to now is refused — "pre-dates launch" means the past).
+    #[test]
+    fn clamp_future_cutoff_refuses_at_or_after_now() {
+        const NOW: i64 = 1_754_500_000_000;
+        assert_eq!(clamp_future_cutoff(Some(NOW - 1), NOW), Some(NOW - 1));
+        assert_eq!(clamp_future_cutoff(Some(NOW), NOW), None);
+        assert_eq!(clamp_future_cutoff(Some(NOW + 1), NOW), None);
+        // The extra-digit (microseconds-looking) paste is a FUTURE instant.
+        assert_eq!(clamp_future_cutoff(Some(NOW * 10), NOW), None);
+        assert_eq!(clamp_future_cutoff(None, NOW), None);
+    }
+
+    /// #375 — the ONE era predicate: `None` emits NOTHING (the byte-identity
+    /// arm every view pins), `Some` emits exactly one fragment with exactly
+    /// one bind placeholder and the seconds→ms conversion (`* 1000`) spelled
+    /// exactly once.
+    #[test]
+    fn era_filter_sql_fragment_shape() {
+        assert_eq!(era_filter_sql("p.createdAt", "?", None), "");
+        let frag = era_filter_sql("p.createdAt", "?", Some(1_754_500_000_000));
+        assert_eq!(frag, " AND (p.createdAt * 1000 >= ?)");
+        // Exactly one placeholder / one conversion (positive counts).
+        assert_eq!(frag.matches('?').count(), 1);
+        assert_eq!(frag.matches("* 1000").count(), 1);
+        // Numbered-bind spelling for the ?N queries.
+        let numbered = era_filter_sql("COALESCE(a, b)", "?4", Some(1));
+        assert_eq!(numbered, " AND (COALESCE(a, b) * 1000 >= ?4)");
     }
 
     // ── /recovery-view (bsv-low#189) ───────────────────────────────────
@@ -2736,12 +2992,65 @@ mod tests {
     /// inoperative in production (producer-level check).
     #[test]
     fn recovery_view_sql_fetches_the_covenant_height() {
-        let sql = recovery_view_sql();
+        let sql = recovery_view_sql(None);
         assert!(
             sql.contains("r.recoveryHeight AS covRecoveryHeight"),
             "covenant height must be SELECTed from pot_records: {sql}"
         );
         assert!(sql.contains("w.covRecoveryHeight AS covRecoveryHeight"));
+    }
+
+    /// #375 — the era filter on `/recovery-view`: exactly one shared
+    /// fragment, at the INNERMOST scan (beside the identity bind, before
+    /// the dedupe/quota windows), anchored `COALESCE(r.createdAt,
+    /// pp.createdAt)`; stripping it restores the `None` arm byte-for-byte.
+    #[test]
+    fn recovery_view_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        let frag = era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        let with = recovery_view_sql(cutoff);
+        let without = recovery_view_sql(None);
+        assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
+        assert_eq!(
+            with.matches(&format!("WHERE pp.identity = ?{frag})"))
+                .count(),
+            1,
+            "the era filter rides the innermost identity scan"
+        );
+        assert_eq!(
+            with.replace(&frag, ""),
+            without,
+            "None must stay byte-identical to the pre-#375 query"
+        );
+    }
+
+    /// #375 — the era filter on the `/leaderboard` marker window (the spine
+    /// the whole board counts from): exactly one shared fragment, as bind
+    /// `?4`, at the `rn <=` level where the per-pot anchor columns are
+    /// constant per pot (a written-off pot drops atomically, before the
+    /// tier/quota/DENSE_RANK windows); stripping it restores the `None`
+    /// arm byte-for-byte.
+    #[test]
+    fn leaderboard_markers_sql_era_filter_shape_and_none_identity() {
+        let cutoff = Some(1_754_500_000_000i64);
+        let frag = era_filter_sql("COALESCE(potCreatedAt, potFirstMarkerAt)", "?4", cutoff);
+        let with = leaderboard_markers_sql(cutoff);
+        let without = leaderboard_markers_sql(None);
+        assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
+        assert_eq!(
+            with.matches(&format!(
+                "WHERE rn <= {per_pot}{frag}",
+                per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT
+            ))
+            .count(),
+            1,
+            "the era filter rides the per-pot window level"
+        );
+        assert_eq!(
+            with.replace(&frag, ""),
+            without,
+            "None must stay byte-identical to the pre-#375 query"
+        );
     }
 
     /// #323 MEDIUM-5 — the confirmed-landing predicate, pinned where it
@@ -2938,7 +3247,7 @@ mod tests {
 
     #[test]
     fn recovery_view_sql_shape() {
-        let sql = recovery_view_sql();
+        let sql = recovery_view_sql(None);
         // JOINs the pot outpoint for spend status; the BEEF join now sits
         // OUTSIDE the window, on survivors only, so a marker flood can never
         // drag real BLOBs along with it (#323 HIGH-1).

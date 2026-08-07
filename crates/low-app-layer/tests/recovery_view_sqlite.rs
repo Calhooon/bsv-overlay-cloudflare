@@ -149,7 +149,7 @@ fn file_party(
 /// EXECUTE the shipped `recovery_view_sql()` and map rows exactly as the
 /// worker's `RecoveryRowD1` does.
 fn query_recovery_rows(conn: &Connection, identity: &str) -> Vec<RecoveryRow> {
-    let sql = recovery_view_sql();
+    let sql = recovery_view_sql(None);
     let mut stmt = conn
         .prepare(&sql)
         .unwrap_or_else(|e| panic!("recovery_view_sql did not PREPARE: {e}\n{sql}"));
@@ -190,7 +190,7 @@ fn query_recovery_rows(conn: &Connection, identity: &str) -> Vec<RecoveryRow> {
 #[test]
 fn recovery_view_sql_prepares_against_the_production_schema() {
     let conn = production_schema_db();
-    let sql = recovery_view_sql();
+    let sql = recovery_view_sql(None);
     conn.prepare(&sql)
         .unwrap_or_else(|e| panic!("recovery_view_sql is not valid SQL: {e}\n{sql}"));
 }
@@ -880,4 +880,108 @@ fn the_rule24_catchup_alone_makes_the_presence_query_preparable() {
     // that makes it safe to issue once per isolate forever.
     conn.execute_batch(low_app_layer::schema::COLLECTED_MARKERS_V2_CREATE)
         .expect("idempotent re-run");
+}
+
+// ── #375 — the pre-launch era write-off ─────────────────────────────────────
+
+/// The pot-txid page served by the SHIPPED SQL under an era cutoff.
+fn recovery_pot_txids(conn: &Connection, identity: &str, era: Option<i64>) -> Vec<String> {
+    let sql = recovery_view_sql(era);
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("recovery_view_sql({era:?}) did not PREPARE: {e}\n{sql}"));
+    let map = |r: &rusqlite::Row| r.get::<_, String>("potTxid");
+    let rows = match era {
+        Some(ms) => stmt.query_map(params![identity, ms], map),
+        None => stmt.query_map(params![identity], map),
+    }
+    .expect("query");
+    rows.collect::<Result<Vec<_>, _>>().expect("rows")
+}
+
+/// #375 executed end to end through the SHIPPED SQL on the production
+/// schema, with rows written by the REAL producer writers:
+///
+/// * an indexed pot admitted ONE SECOND before the cutoff is DROPPED —
+///   even though its party marker was filed AFTER the cutoff (the POT
+///   admission stamp governs; a post-launch marker republish cannot
+///   resurrect a written-off pot);
+/// * an indexed pot admitted exactly AT the cutoff instant is KEPT — this
+///   is the boundary (`>=`) pin AND the unit pin in one: `createdAt` is
+///   unix SECONDS (`current_unix_seconds_i64`) and the cutoff is MS, so a
+///   missing (or doubled) `* 1000` conversion flips one of these two rows;
+/// * an UNKNOWN pot (no `pot_records` row) anchors on its marker's own
+///   admission stamp: pre-cutoff marker dropped, post-cutoff marker kept
+///   (the fresh in-flight pot a recovering client most needs);
+/// * `None` (the unset var) serves every row — the inert arm.
+#[test]
+fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
+    let conn = production_schema_db();
+    let me = h66(0xd1);
+    const CUT_MS: i64 = 1_754_500_000_000;
+    const CUT_SECS: i64 = CUT_MS / 1000;
+
+    let pre = h64(0xd2);
+    let post = h64(0xd3);
+    admit_pot(&conn, &pre, CUT_SECS - 1, Some(958_504));
+    admit_pot(&conn, &post, CUT_SECS, Some(958_504));
+    // BOTH markers are filed after the cutoff — the pot anchor decides.
+    file_party(
+        &conn,
+        &me,
+        &h64(0x21),
+        &pre,
+        1,
+        &"e1".repeat(32),
+        CUT_SECS + 5,
+    );
+    file_party(
+        &conn,
+        &me,
+        &h64(0x22),
+        &post,
+        1,
+        &"e2".repeat(32),
+        CUT_SECS + 6,
+    );
+    // Unknown pots: the marker admission stamp is the fallback anchor.
+    let unknown_pre = h64(0xd4);
+    let unknown_post = h64(0xd5);
+    file_party(
+        &conn,
+        &me,
+        &h64(0x23),
+        &unknown_pre,
+        1,
+        &"e3".repeat(32),
+        CUT_SECS - 10,
+    );
+    file_party(
+        &conn,
+        &me,
+        &h64(0x24),
+        &unknown_post,
+        1,
+        &"e4".repeat(32),
+        CUT_SECS + 10,
+    );
+
+    let served = recovery_pot_txids(&conn, &me, Some(CUT_MS));
+    assert!(served.contains(&post), "the at-cutoff pot is KEPT (>= bar)");
+    assert!(
+        served.contains(&unknown_post),
+        "a fresh unknown pot with a post-cutoff marker is KEPT"
+    );
+    assert_eq!(
+        served.len(),
+        2,
+        "the pre-cutoff pot and the pre-cutoff unknown marker are DROPPED: {served:?}"
+    );
+
+    // The inert arm: no cutoff, every row serves exactly as today.
+    let all = recovery_pot_txids(&conn, &me, None);
+    assert_eq!(all.len(), 4, "None serves the full history: {all:?}");
+    for pot in [&pre, &post, &unknown_pre, &unknown_post] {
+        assert!(all.contains(pot), "{pot} missing from the None arm");
+    }
 }

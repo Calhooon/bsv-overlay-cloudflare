@@ -406,7 +406,7 @@ fn file_party_v2_real(
 /// Execute the SHIPPED `live_view_sql()` and map rows exactly as the route
 /// does (same columns, same Option-ness).
 fn query_rows(conn: &Connection, identity: &str) -> Vec<LiveViewRow> {
-    let sql = live_view_sql();
+    let sql = live_view_sql(None);
     let mut stmt = conn.prepare(&sql).expect("prepare live_view_sql");
     stmt.query_map(params![identity], |r| {
         Ok(LiveViewRow {
@@ -1502,4 +1502,70 @@ fn the_keyless_candidate_window_alone_keeps_the_verified_marker() {
         "the keyless window must still return the VERIFIED marker under a 4x-cap \
          flood of earlier junk"
     );
+}
+
+// ── #375 — the pre-launch era write-off ─────────────────────────────────────
+
+/// The pot-txid page served by the SHIPPED SQL under an era cutoff.
+fn live_pot_txids(conn: &Connection, identity: &str, era: Option<i64>) -> Vec<String> {
+    let sql = live_view_sql(era);
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("live_view_sql({era:?}) did not PREPARE: {e}\n{sql}"));
+    let map = |r: &rusqlite::Row| r.get::<_, String>("potTxid");
+    let rows = match era {
+        Some(ms) => stmt.query_map(params![identity, ms], map),
+        None => stmt.query_map(params![identity], map),
+    }
+    .expect("query");
+    rows.collect::<Result<Vec<_>, _>>().expect("rows")
+}
+
+/// #375 through the SHIPPED `/live-view` SQL: a written-off pre-launch pot
+/// is never a LIVE hand. The pre-cutoff pot is UNSPENT — maximally "live"
+/// by the liveness predicate — and is dropped anyway; the at-cutoff pot is
+/// KEPT (the `>=` boundary + the seconds→ms unit pin); an unknown pot
+/// anchors on its marker stamp; `None` serves the full live page.
+#[test]
+fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
+    let conn = production_schema_db();
+    let me = h66(0xd1);
+    const CUT_MS: i64 = 1_754_500_000_000;
+    const CUT_SECS: i64 = CUT_MS / 1000;
+
+    let pre = h64(0xd2);
+    let post = h64(0xd3);
+    admit_pot(&conn, &pre, CUT_SECS - 1, Some(958_504));
+    admit_pot(&conn, &post, CUT_SECS, Some(958_504));
+    file_party(&conn, &me, &pre, 1, &"e1".repeat(32), CUT_SECS + 5);
+    file_party(&conn, &me, &post, 1, &"e2".repeat(32), CUT_SECS + 6);
+    let unknown_pre = h64(0xd4);
+    let unknown_post = h64(0xd5);
+    file_party(&conn, &me, &unknown_pre, 1, &"e3".repeat(32), CUT_SECS - 10);
+    file_party(
+        &conn,
+        &me,
+        &unknown_post,
+        1,
+        &"e4".repeat(32),
+        CUT_SECS + 10,
+    );
+
+    let served = live_pot_txids(&conn, &me, Some(CUT_MS));
+    assert!(served.contains(&post), "the at-cutoff pot is KEPT (>= bar)");
+    assert!(
+        served.contains(&unknown_post),
+        "a fresh unknown pot with a post-cutoff marker is KEPT"
+    );
+    assert_eq!(
+        served.len(),
+        2,
+        "the pre-cutoff pot and the pre-cutoff unknown marker are DROPPED: {served:?}"
+    );
+
+    let all = live_pot_txids(&conn, &me, None);
+    assert_eq!(all.len(), 4, "None serves the full live page: {all:?}");
+    for pot in [&pre, &post, &unknown_pre, &unknown_post] {
+        assert!(all.contains(pot), "{pot} missing from the None arm");
+    }
 }

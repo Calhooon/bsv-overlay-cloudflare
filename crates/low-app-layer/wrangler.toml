@@ -57,6 +57,21 @@ AUTH_ENFORCE = "false"
 # which the client treats as "no wipe directive" (fail-safe).
 STORAGE_EPOCH = "2026-08-06-zero-world-1"
 
+# #375 pre-launch era write-off cutoff (owner-ruled 2026-08-07), ms since
+# epoch. When set, every money-listing view (/pots-view /recovery-view
+# /results /refund-view /hops-view /live-view /leaderboard) DROPS rows whose
+# server-written admission anchor pre-dates it, and `GET /epoch` serves it as
+# {"writtenOffBeforeMs": <n>} for the client half (bsv-low
+# app/src/lib/writtenOffEra.ts). Empty/unset/malformed = INERT (every query
+# byte-identical to the unconfigured build). RULES FOR THE VALUE: it must be
+# IN THE PAST (a cutoff at/after now is refused at read time and warned —
+# the future-cutoff belt) and MUST PRE-DATE LAUNCH — that is the entire
+# fairness argument; bump it to launch-eve as a LAUNCH-RUNBOOK step. Choose
+# a second-aligned instant with margin (anchors are unix seconds; a
+# mid-second cutoff can drop up to ~1s of post-cutoff admissions). /health
+# echoes the ACTIVE (post-belt) value — check it after every change.
+WRITTEN_OFF_BEFORE_MS = ""
+
 # BRC-103/104 session store for the auth middleware (`process_auth`'s
 # `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
 # placeholder by repo convention — the real namespace id is injected at

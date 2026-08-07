@@ -225,7 +225,7 @@ fn results_window_survives_the_dust_attack() {
     let victim = format!("02{}", "a1".repeat(32));
     let honest_pot = seed_dust_attack(&conn, &victim);
 
-    let got = query_pot_txids(&conn, &results_sql(), &victim);
+    let got = query_pot_txids(&conn, &results_sql(None), &victim);
     assert_eq!(
         got.iter().filter(|t| **t == honest_pot).count(),
         1,
@@ -279,7 +279,7 @@ fn a_player_with_100_real_pots_still_sees_all_100() {
             9_000 + i64::from(i),
         );
     }
-    let got = query_pot_txids(&conn, &results_sql(), &victim);
+    let got = query_pot_txids(&conn, &results_sql(None), &victim);
     assert_eq!(got.len(), 100, "all 100 real pots returned");
     let unique: std::collections::HashSet<&String> = got.iter().collect();
     assert_eq!(unique.len(), 100, "one row per pot, no duplicates");
@@ -321,7 +321,7 @@ fn the_joined_chain_facts_still_come_back() {
         spender_beef: Option<String>,
     }
 
-    let sql = results_sql();
+    let sql = results_sql(None);
     let mut stmt = conn.prepare(&sql).unwrap();
     let rows: Vec<Joined> = stmt
         .query_map(params![victim], |r| {
@@ -367,7 +367,7 @@ fn an_unindexed_pot_is_demoted_but_never_dropped() {
     let legacy_pot = h64(0xcc);
     file_marker(&conn, &victim, &legacy_pot, "txLEGACY", 1_001);
 
-    let sql = results_sql();
+    let sql = results_sql(None);
     let mut stmt = conn.prepare(&sql).unwrap();
     let rows: Vec<(String, Option<i64>)> = stmt
         .query_map(params![victim], |r| {
@@ -414,7 +414,7 @@ fn results_window_is_plan_independent_and_deterministic() {
         );
     }
     let snapshot = |c: &Connection| -> Vec<(String, String)> {
-        let sql = results_sql();
+        let sql = results_sql(None);
         let mut stmt = c.prepare(&sql).unwrap();
         stmt.query_map(params![victim], |r| {
             Ok((
@@ -730,7 +730,7 @@ fn insert_decoded_pot(
 /// One joined `/results` row read exactly as `routes::ResultsRowD1` does
 /// (converted to the pure `ResultsRow` the assembler consumes).
 fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
-    let sql = results_sql();
+    let sql = results_sql(None);
     let mut stmt = conn.prepare(&sql).unwrap();
     stmt.query_map(params![identity], |r| {
         Ok(ResultsRow {
@@ -1108,7 +1108,7 @@ fn a_fresh_unindexed_pot_is_not_filtered_out_by_the_limit() {
     let fresh = h64(0xfa);
     file_marker(&conn, &victim, &fresh, "txFRESH", 9_999);
 
-    let got = query_pot_txids(&conn, &results_sql(), &victim);
+    let got = query_pot_txids(&conn, &results_sql(None), &victim);
     assert!(
         got.contains(&fresh),
         "a real-but-unindexed pot must not be filtered out by the window"
@@ -1148,7 +1148,7 @@ fn the_oldest_marker_represents_a_pot_even_when_stored_last() {
     // this test meaningful.
     file_marker(&conn, &victim, &pot, "txHONEST", 1_001);
 
-    let sql = results_sql();
+    let sql = results_sql(None);
     let mut stmt = conn.prepare(&sql).unwrap();
     let rows: Vec<String> = stmt
         .query_map(params![victim], |r| r.get::<_, String>("gameId"))
@@ -1185,7 +1185,7 @@ fn the_outer_order_is_pot_recency_not_storage_order() {
         expect.push(pot);
     }
     expect.reverse(); // newest POT first
-    let got = query_pot_txids(&conn, &results_sql(), &victim);
+    let got = query_pot_txids(&conn, &results_sql(None), &victim);
     assert_eq!(got, expect, "exact newest-pot-first sequence");
 }
 
@@ -1214,7 +1214,7 @@ fn two_pots_sharing_a_funding_txid_are_not_collapsed() {
     )
     .unwrap();
     assert_eq!(
-        query_pot_txids(&conn, &results_sql(), &victim).len(),
+        query_pot_txids(&conn, &results_sql(None), &victim).len(),
         2,
         "distinct outpoints are distinct pots"
     );
@@ -3546,4 +3546,63 @@ fn winning_the_createdat_race_no_longer_displaces() {
         serde_json::json!(game),
         "500 EARLY markers do nothing either — the ordering is not a clock"
     );
+}
+
+// ── #375 — the pre-launch era write-off ─────────────────────────────────────
+
+/// The pot-txid page served by the SHIPPED SQL under an era cutoff (the
+/// era-arm sibling of [`query_pot_txids`], which stays single-bind).
+fn query_pot_txids_era(conn: &Connection, identity: &str, era_ms: i64) -> Vec<String> {
+    let sql = results_sql(Some(era_ms));
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("results_sql(era) did not PREPARE: {e}\n{sql}"));
+    stmt.query_map(params![identity, era_ms], |r| r.get::<_, String>("potTxid"))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+}
+
+/// #375 through the SHIPPED `/results` SQL — the SPINE every derived
+/// surface (claims, seat proofs, `/recovery-view`'s outcome fold) is keyed
+/// from: a pot admitted one second before the cutoff is DROPPED even though
+/// its marker was filed after the cutoff (the pot admission stamp governs),
+/// the at-cutoff pot is KEPT (the `>=` boundary + the seconds→ms unit pin),
+/// an unknown pot anchors on its marker stamp, and `None` serves the full
+/// history exactly as today.
+#[test]
+fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
+    let conn = production_schema_db();
+    let me = format!("02{}", "d1".repeat(32));
+    const CUT_MS: i64 = 1_754_500_000_000;
+    const CUT_SECS: i64 = CUT_MS / 1000;
+
+    let pre = h64(0xd2);
+    let post = h64(0xd3);
+    insert_pot(&conn, &pre, CUT_SECS - 1, true);
+    insert_pot(&conn, &post, CUT_SECS, true);
+    file_marker(&conn, &me, &pre, &"e1".repeat(32), CUT_SECS + 5);
+    file_marker(&conn, &me, &post, &"e2".repeat(32), CUT_SECS + 6);
+    let unknown_pre = h64(0xd4);
+    let unknown_post = h64(0xd5);
+    file_marker(&conn, &me, &unknown_pre, &"e3".repeat(32), CUT_SECS - 10);
+    file_marker(&conn, &me, &unknown_post, &"e4".repeat(32), CUT_SECS + 10);
+
+    let served = query_pot_txids_era(&conn, &me, CUT_MS);
+    assert!(served.contains(&post), "the at-cutoff pot is KEPT (>= bar)");
+    assert!(
+        served.contains(&unknown_post),
+        "a fresh unknown pot with a post-cutoff marker is KEPT"
+    );
+    assert_eq!(
+        served.len(),
+        2,
+        "the pre-cutoff pot and the pre-cutoff unknown marker are DROPPED: {served:?}"
+    );
+
+    let all = query_pot_txids(&conn, &results_sql(None), &me);
+    assert_eq!(all.len(), 4, "None serves the full history: {all:?}");
+    for pot in [&pre, &post, &unknown_pre, &unknown_post] {
+        assert!(all.contains(pot), "{pot} missing from the None arm");
+    }
 }

@@ -373,12 +373,12 @@ fn mark_hop_spent(conn: &Connection, hop_txid: &str, spender: &str, confirmed: b
 /// Execute the SHIPPED `hops_view_sql(false)` and map rows exactly as the route
 /// does (same columns, same Option-ness).
 fn query_rows(conn: &Connection, identity: &str) -> Vec<HopsViewRow> {
-    query_rows_inner(conn, hops_view_sql(false), params![identity])
+    query_rows_inner(conn, hops_view_sql(false, None), params![identity])
 }
 
 /// The `?gameId=`-scoped window — the escape hatch a truncated caller uses.
 fn query_rows_scoped(conn: &Connection, identity: &str, game_id: &str) -> Vec<HopsViewRow> {
-    query_rows_inner(conn, hops_view_sql(true), params![identity, game_id])
+    query_rows_inner(conn, hops_view_sql(true, None), params![identity, game_id])
 }
 
 fn query_rows_inner<P: rusqlite::Params>(
@@ -921,7 +921,7 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
 fn pre_migration_schema_faults_the_query_the_routes_503_path() {
     let conn = Connection::open_in_memory().unwrap();
     assert!(
-        conn.prepare(&hops_view_sql(false)).is_err(),
+        conn.prepare(&hops_view_sql(false, None)).is_err(),
         "missing tables must FAULT the query (the route answers 503), \
          never serve an empty-but-complete-looking page"
     );
@@ -1491,7 +1491,7 @@ fn the_freshness_window_matches_the_overlay_sibling_windows() {
     );
     // …and the semantics, not just the number: freshness-gated, and slots
     // allocated OLDEST-first (a newest-first quota is attacker-jumpable).
-    let sql = hops_view_sql(false);
+    let sql = hops_view_sql(false, None);
     assert!(sql.contains("freshUnknown = 1"));
     assert!(sql.contains("ORDER BY COALESCE(firstMarkerAt, 0) ASC"));
 }
@@ -1639,6 +1639,117 @@ fn a_predated_dust_flood_is_repelled_by_the_value_key() {
             entries.iter().position(|e| e.hop_txid == honest_txid),
             Some(0),
             "k={k}: the paid hop outranks unpaid ghosts however old they are"
+        );
+    }
+}
+
+// ── #375 — the pre-launch era write-off ─────────────────────────────────────
+
+/// File a hop marker row DIRECTLY (the topic manager's column shape, stub
+/// sigs). MODELLING BOUNDARY (epoch Rule 17): the subject here is the era
+/// WINDOW arithmetic, which reads only the server-stamped `createdAt`
+/// columns — marker validity is orthogonal and pinned by this file's
+/// real-producer cells above.
+fn file_hop_marker(conn: &Connection, identity: &str, hop_txid: &str, marker_txid: &str, at: i64) {
+    conn.execute(
+        "INSERT OR IGNORE INTO hopparty_records \
+         (identity, opponentIdentity, gameId, hopVout, hopSats, \
+          seatSettlePubkey, seatSigHex, identitySigHex, containerOutputs, \
+          txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, ?3, 0, 900, ?4, '3045ab', '3045cd', 2, ?5, 1, ?6)",
+        params![
+            identity,
+            h66(0xbb),
+            hex::encode(GAME),
+            h66(0x0a),
+            marker_txid,
+            at
+        ],
+    )
+    .expect("insert hopparty_records");
+    // The window joins pot_records on (hp.txid, hp.hopVout) — hp.txid IS
+    // the container/hop txid in production; this stub writes marker rows
+    // whose txid is the hop txid, matching that join.
+    assert_eq!(marker_txid, hop_txid, "era cells key the marker by its hop");
+}
+
+/// The hop-txid page served by the SHIPPED SQL under an era cutoff, both
+/// arities (the cutoff is `?2` unscoped / `?3` scoped — always LAST).
+fn hops_txids(
+    conn: &Connection,
+    identity: &str,
+    scoped: Option<&str>,
+    era: Option<i64>,
+) -> Vec<String> {
+    let sql = hops_view_sql(scoped.is_some(), era);
+    let mut stmt = conn.prepare(&sql).unwrap_or_else(|e| {
+        panic!(
+            "hops_view_sql({:?}, {era:?}) did not PREPARE: {e}\n{sql}",
+            scoped.is_some()
+        )
+    });
+    let map = |r: &rusqlite::Row| r.get::<_, String>("hopTxid");
+    let rows = match (scoped, era) {
+        (None, None) => stmt.query_map(params![identity], map),
+        (None, Some(ms)) => stmt.query_map(params![identity, ms], map),
+        (Some(g), None) => stmt.query_map(params![identity, g], map),
+        (Some(g), Some(ms)) => stmt.query_map(params![identity, g, ms], map),
+    }
+    .expect("query");
+    rows.collect::<Result<Vec<_>, _>>().expect("rows")
+}
+
+/// #375 through the SHIPPED `/hops-view` SQL, BOTH arities: an indexed hop
+/// container admitted one second before the cutoff is DROPPED (its
+/// post-cutoff marker cannot resurrect it), the at-cutoff hop is KEPT (the
+/// `>=` boundary + the seconds→ms unit pin — `hopparty_records.createdAt`
+/// is INTEGER unix seconds like every marker table here), an un-indexed hop
+/// anchors on its marker stamp, and `None` serves the full page.
+#[test]
+fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
+    let conn = production_schema_db();
+    let me = h66(0xd1);
+    const CUT_MS: i64 = 1_754_500_000_000;
+    const CUT_SECS: i64 = CUT_MS / 1000;
+
+    let pre = h64(0xd2);
+    let post = h64(0xd3);
+    admit_hop(&conn, &pre, 900, CUT_SECS - 1);
+    admit_hop(&conn, &post, 900, CUT_SECS);
+    file_hop_marker(&conn, &me, &pre, &pre, CUT_SECS + 5);
+    file_hop_marker(&conn, &me, &post, &post, CUT_SECS + 6);
+    let unknown_pre = h64(0xd4);
+    let unknown_post = h64(0xd5);
+    file_hop_marker(&conn, &me, &unknown_pre, &unknown_pre, CUT_SECS - 10);
+    file_hop_marker(&conn, &me, &unknown_post, &unknown_post, CUT_SECS + 10);
+
+    let game = hex::encode(GAME);
+    for scope in [None, Some(game.as_str())] {
+        let served = hops_txids(&conn, &me, scope, Some(CUT_MS));
+        assert!(
+            served.contains(&post),
+            "the at-cutoff hop is KEPT (>= bar; scoped={})",
+            scope.is_some()
+        );
+        assert!(
+            served.contains(&unknown_post),
+            "a fresh un-indexed hop with a post-cutoff marker is KEPT (scoped={})",
+            scope.is_some()
+        );
+        assert_eq!(
+            served.len(),
+            2,
+            "the pre-cutoff hop and pre-cutoff unknown marker are DROPPED \
+             (scoped={}): {served:?}",
+            scope.is_some()
+        );
+
+        let all = hops_txids(&conn, &me, scope, None);
+        assert_eq!(
+            all.len(),
+            4,
+            "None serves the full page (scoped={}): {all:?}",
+            scope.is_some()
         );
     }
 }
