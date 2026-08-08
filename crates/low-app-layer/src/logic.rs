@@ -1046,6 +1046,19 @@ pub fn normalize_written_off_before_ms(v: Option<String>) -> Option<i64> {
         .filter(|&ms| ms > 0)
 }
 
+/// Normalize the raw `WRITTEN_OFF_BEFORE_HEIGHT` var (#375 review H1 — the
+/// client's chain-anchored rescue): unset/empty/junk/zero/negative → `None`.
+/// The height is CLIENT-PROTECTIVE ONLY — served verbatim on `/epoch`, never
+/// used in any SQL here: the client rescues a record from the write-off when
+/// the record's own recovery/lock height reaches it (a backdated writing
+/// clock can fake a stamp, never a chain height), and tip-sanes the seeding
+/// gate against it. A wrong value therefore cannot blank any server view;
+/// too high fails to rescue (stamp judgment stands), too low rescues extra
+/// (cards stay — the safe direction). Same parse as the ms var.
+pub fn normalize_written_off_before_height(v: Option<String>) -> Option<i64> {
+    normalize_written_off_before_ms(v)
+}
+
 /// #375 review MED-2 — the FUTURE-CUTOFF BELT. `WRITTEN_OFF_BEFORE_MS` is a
 /// hand-set one-shot, and the two adjacent one-character mistakes (an extra
 /// digit ⇒ effectively microseconds; a pasted FUTURE instant) both produce a
@@ -1113,10 +1126,15 @@ pub fn era_filter_sql(anchor_expr_secs: &str, placeholder: &str, cutoff_ms: Opti
 /// ADDITIVE (#375): the deployed client reads only `storageEpoch` and
 /// ignores unknown fields; `writtenOffBeforeMs: null` is the fail-safe "no
 /// write-off" shape, mirroring `storageEpoch`'s.
-pub fn epoch_body(epoch: Option<&str>, written_off_before_ms: Option<i64>) -> String {
+pub fn epoch_body(
+    epoch: Option<&str>,
+    written_off_before_ms: Option<i64>,
+    written_off_before_height: Option<i64>,
+) -> String {
     json!({
         "storageEpoch": epoch,
         "writtenOffBeforeMs": written_off_before_ms,
+        "writtenOffBeforeHeight": written_off_before_height,
     })
     .to_string()
 }
@@ -2823,7 +2841,8 @@ mod tests {
 
     /// `/epoch` (bsv-low THE ORDER item 2, + #375): the wire shape is
     /// EXACTLY `{"storageEpoch": <string|null>,
-    /// "writtenOffBeforeMs": <number|null>}`, and the fail-safe
+    /// "writtenOffBeforeMs": <number|null>,
+    /// "writtenOffBeforeHeight": <number|null>}`, and the fail-safe
     /// normalization — unset/empty/whitespace-only var → `null` (the
     /// client's "no wipe directive") — never invents a directive.
     #[test]
@@ -2831,18 +2850,23 @@ mod tests {
         // A set var serves the trimmed string.
         let set = normalize_storage_epoch(Some("  2026-08-06-zero-world-1 ".into()));
         assert_eq!(set.as_deref(), Some("2026-08-06-zero-world-1"));
-        let v: serde_json::Value =
-            serde_json::from_str(&epoch_body(set.as_deref(), Some(1_754_500_000_000))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&epoch_body(
+            set.as_deref(),
+            Some(1_754_500_000_000),
+            Some(961_000),
+        ))
+        .unwrap();
         assert_eq!(v["storageEpoch"], "2026-08-06-zero-world-1");
         assert_eq!(v["writtenOffBeforeMs"], 1_754_500_000_000i64);
-        assert_eq!(v.as_object().unwrap().len(), 2); // exactly the two fields
+        assert_eq!(v["writtenOffBeforeHeight"], 961_000i64);
+        assert_eq!(v.as_object().unwrap().len(), 3); // exactly the three fields
 
         // Unset / empty / whitespace-only all serve LITERAL null.
         for raw in [None, Some(String::new()), Some("   ".to_string())] {
             let none = normalize_storage_epoch(raw);
             assert_eq!(none, None);
             let n: serde_json::Value =
-                serde_json::from_str(&epoch_body(none.as_deref(), None)).unwrap();
+                serde_json::from_str(&epoch_body(none.as_deref(), None, None)).unwrap();
             assert!(n["storageEpoch"].is_null());
             assert!(n.as_object().unwrap().contains_key("storageEpoch"));
             // #375: the write-off field is PRESENT and literal null when

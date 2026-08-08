@@ -144,6 +144,17 @@ fn written_off_before_ms(ctx: &RouteContext<AuthState>) -> Option<i64> {
 
 /// The #375 cutoff as a D1 bind value. Ms-since-epoch fits f64 exactly
 /// (`2^53` headroom) — the crate's number-bind convention.
+/// The #375 HEIGHT cutoff (client-protective only — never SQL; see the
+/// normalizer's doc). Served verbatim on `/epoch` + echoed on `/health`.
+fn written_off_before_height(ctx: &RouteContext<AuthState>) -> Option<i64> {
+    crate::logic::normalize_written_off_before_height(
+        ctx.env
+            .var("WRITTEN_OFF_BEFORE_HEIGHT")
+            .ok()
+            .map(|v| v.to_string()),
+    )
+}
+
 fn era_bind(ms: i64) -> JsValue {
     JsValue::from_f64(ms as f64)
 }
@@ -3051,6 +3062,10 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
         Some(ms) => serde_json::json!(ms),
         None => serde_json::Value::Null,
     };
+    body["writtenOffBeforeHeight"] = match written_off_before_height(&ctx) {
+        Some(h) => serde_json::json!(h),
+        None => serde_json::Value::Null,
+    };
     json_response(body.to_string(), 200)
 }
 
@@ -3072,7 +3087,11 @@ pub fn epoch(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
         ctx.env.var("STORAGE_EPOCH").ok().map(|v| v.to_string()),
     );
     json_response(
-        crate::logic::epoch_body(v.as_deref(), written_off_before_ms(&ctx)),
+        crate::logic::epoch_body(
+            v.as_deref(),
+            written_off_before_ms(&ctx),
+            written_off_before_height(&ctx),
+        ),
         200,
     )
 }

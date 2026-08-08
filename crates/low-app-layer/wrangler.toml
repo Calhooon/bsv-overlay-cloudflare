@@ -72,6 +72,16 @@ STORAGE_EPOCH = "2026-08-06-zero-world-1"
 # echoes the ACTIVE (post-belt) value — check it after every change.
 WRITTEN_OFF_BEFORE_MS = ""
 
+# #375 companion (review H1): the write-off cutoff as a BLOCK HEIGHT — served
+# verbatim on /epoch as {"writtenOffBeforeHeight": <n>}, never used in SQL
+# here. CLIENT-PROTECTIVE ONLY: a record whose own recovery/lock height
+# reaches this height is CURRENT-era no matter what its wall-clock stamps say
+# (a backdated client clock cannot fake a chain height), and the client
+# tip-sanes its seeding gate against it. Set it TOGETHER with the ms cutoff:
+# the chain tip at (or just before) the same activation instant. Empty/unset
+# = no rescue belt (stamps alone decide — the pre-#375 posture).
+WRITTEN_OFF_BEFORE_HEIGHT = ""
+
 # BRC-103/104 session store for the auth middleware (`process_auth`'s
 # `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
 # placeholder by repo convention — the real namespace id is injected at
