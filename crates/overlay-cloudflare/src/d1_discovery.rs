@@ -15,6 +15,7 @@ use overlay_discovery::collected::storage::{
 use overlay_discovery::dm_delegation::storage::{
     DmDelegationRecord, DmDelegationStorage, DmDelegationStorageError,
 };
+use overlay_discovery::hand::storage::{HandRecord, HandStorage, HandStorageError};
 use overlay_discovery::hopparty::storage::{
     HoppartyRecord, HoppartyStorage, HoppartyStorageError, HOPSFOR_ROWS_PER_OUTPOINT,
 };
@@ -2612,6 +2613,173 @@ impl CollectedStorage for D1CollectedStorage {
                 q = q.bind(game_id.as_str());
             }
             let rows: Vec<CollectedRow> = q.fetch_all(&self.db).await.map_err(collected_err)?;
+            for row in rows {
+                let record = row.into_record();
+                by_game
+                    .entry(record.game_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Ok(game_ids
+            .iter()
+            .map(|game_id| by_game.get(game_id).cloned().unwrap_or_default())
+            .collect())
+    }
+}
+
+// =============================================================================
+// D1HandStorage
+// =============================================================================
+
+/// Row for hand-marker queries (bsv-low #382). All TEXT except
+/// `outputIndex` (INTEGER, D1 hands numbers back as f64).
+#[derive(Deserialize)]
+struct HandRow {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    identity: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "cardsHex")]
+    cards_hex: String,
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: u32,
+    #[serde(rename = "sigHex")]
+    sig_hex: Option<String>,
+}
+
+impl HandRow {
+    fn into_record(self) -> HandRecord {
+        HandRecord {
+            game_id: self.game_id,
+            identity: self.identity,
+            pot_txid: self.pot_txid,
+            cards_hex: self.cards_hex,
+            txid: self.txid,
+            output_index: self.output_index,
+            sig_hex: self.sig_hex,
+        }
+    }
+}
+
+/// Rows kept per gameId in the batched hand-marker read.
+///
+/// The outpoint key removes exclusivity (no slot to squat) but needs a bound
+/// or one transaction with N marker OP_RETURNs mints N permanent rows per
+/// game (the collected gate-H6 lesson, inherited with the pattern). The
+/// honest population per game is TWO rows (one per seat); 12 leaves headroom
+/// for republish duplicates and junk without unbounded growth. Newest-first
+/// (DESC) for the same reason as collected: the plausible squat is
+/// PRE-EMPTIVE (filed before the genuine settle-time publishes), so
+/// oldest-first would hand it the window. Eviction here is FAIL-SAFE: a
+/// pushed-out row just means the drill-down omits that hand (display-only,
+/// no money path reads this index).
+const HAND_ROWS_PER_GAME: usize = 12;
+
+/// SQL for one batched hand-marker chunk: one `gameId IN (…)` query replacing
+/// `n` round trips, bounded to [`HAND_ROWS_PER_GAME`] per game. Factored out
+/// so a real-SQLite test can prove the SHIPPED string against the shipped
+/// migrations.
+pub fn hand_records_batch_sql(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex FROM \
+           (SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, \
+                   ROW_NUMBER() OVER (PARTITION BY gameId \
+                                      ORDER BY createdAt DESC, txid DESC, \
+                                               outputIndex DESC) AS rn \
+            FROM hand_markers \
+            WHERE gameId IN ({placeholders})) \
+         WHERE rn <= {per_game} \
+         ORDER BY gameId ASC, rn ASC",
+        per_game = HAND_ROWS_PER_GAME,
+    )
+}
+
+/// Cloudflare D1 implementation of the HandStorage trait (tm_hand / ls_hand,
+/// bsv-low #382). Schema: `hand_markers` in `d1::OVERLAY_MIGRATIONS` —
+/// outpoint-keyed, `INSERT OR IGNORE`, rows never deleted (a revealed hand is
+/// a permanent fact; the lookup service's spend/eviction hooks are no-ops).
+pub struct D1HandStorage {
+    db: Rc<D1Database>,
+}
+
+impl D1HandStorage {
+    pub fn new(db: Rc<D1Database>) -> Self {
+        Self { db }
+    }
+}
+
+fn hand_err(e: String) -> HandStorageError {
+    HandStorageError::Database(e)
+}
+
+#[async_trait(?Send)]
+impl HandStorage for D1HandStorage {
+    async fn store_record(&self, record: &HandRecord) -> Result<(), HandStorageError> {
+        // INSERT OR IGNORE on the (txid, outputIndex) primary key: a replayed
+        // submit of the same output is a no-op; a marker for the same
+        // (gameId, identity) from another tx is a NEW row.
+        Query::new(
+            "INSERT OR IGNORE INTO hand_markers \
+             (gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.game_id.as_str())
+        .bind(record.identity.as_str())
+        .bind(record.pot_txid.as_str())
+        .bind(record.cards_hex.as_str())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(record.sig_hex.as_deref())
+        .bind(current_unix_seconds_i64())
+        .execute(&self.db)
+        .await
+        .map_err(hand_err)
+    }
+
+    async fn get_records_for_game(
+        &self,
+        game_id: &str,
+    ) -> Result<Vec<HandRecord>, HandStorageError> {
+        // Same bound and same newest-first order as the batched read (Rule 16:
+        // two reads of one store must not disagree).
+        let rows: Vec<HandRow> = Query::new(format!(
+            "SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex \
+             FROM hand_markers WHERE gameId = ? \
+             ORDER BY createdAt DESC, txid DESC, outputIndex DESC \
+             LIMIT {HAND_ROWS_PER_GAME}"
+        ))
+        .bind(game_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(hand_err)?;
+        Ok(rows.into_iter().map(HandRow::into_record).collect())
+    }
+
+    /// Batched lookup: one `gameId IN (…)` query per chunk. Alignment contract
+    /// (input order, EMPTY vec where nothing exists) preserved via a
+    /// gameId-keyed map of LISTS.
+    async fn get_records(
+        &self,
+        game_ids: &[String],
+    ) -> Result<Vec<Vec<HandRecord>>, HandStorageError> {
+        if game_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // D1 caps bound parameters (100); 1 per gameId.
+        const CHUNK: usize = 90;
+        let mut by_game: std::collections::HashMap<String, Vec<HandRecord>> =
+            std::collections::HashMap::new();
+        for chunk in game_ids.chunks(CHUNK) {
+            let sql = hand_records_batch_sql(chunk.len());
+            let mut q = Query::new(sql);
+            for game_id in chunk {
+                q = q.bind(game_id.as_str());
+            }
+            let rows: Vec<HandRow> = q.fetch_all(&self.db).await.map_err(hand_err)?;
             for row in rows {
                 let record = row.into_record();
                 by_game

@@ -39,6 +39,9 @@ use overlay_discovery::collected::lookup_service::CollectedLookupService;
 use overlay_discovery::collected::storage::CollectedStorage;
 use overlay_discovery::collected::topic_manager::CollectedTopicManager;
 use overlay_discovery::dm_delegation::lookup_service::DmDelegationLookupService;
+use overlay_discovery::hand::lookup_service::HandLookupService;
+use overlay_discovery::hand::storage::HandStorage;
+use overlay_discovery::hand::topic_manager::HandTopicManager;
 use overlay_discovery::dm_delegation::storage::DmDelegationStorage;
 use overlay_discovery::dm_delegation::topic_manager::DmDelegationTopicManager;
 use overlay_discovery::hopparty::lookup_service::HoppartyLookupService;
@@ -83,8 +86,8 @@ use crate::broadcaster::{ArcadeBroadcaster, WorkerBroadcaster};
 use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::ensure_overlay_migrations;
 use crate::d1_discovery::{
-    D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1HoppartyStorage, D1LowStorage,
-    D1PotStorage, D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage,
+    D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1HandStorage, D1HoppartyStorage,
+    D1LowStorage, D1PotStorage, D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage,
     D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
@@ -157,6 +160,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
     let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
+    let hand_storage: Rc<dyn HandStorage> = Rc::new(D1HandStorage::new(db.clone()));
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
@@ -177,6 +181,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         reveal_storage.clone(),
         pot_storage.clone(),
         collected_storage.clone(),
+        hand_storage.clone(),
         result_storage.clone(),
         proof_storage.clone(),
         potparty_storage.clone(),
@@ -379,6 +384,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
     let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
+    let hand_storage: Rc<dyn HandStorage> = Rc::new(D1HandStorage::new(db.clone()));
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
@@ -396,6 +402,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         reveal_storage,
         pot_storage,
         collected_storage,
+        hand_storage,
         result_storage,
         proof_storage,
         potparty_storage,
@@ -448,6 +455,7 @@ fn build_engine_with_storage(
     reveal_storage: Rc<dyn RevealStorage>,
     pot_storage: Rc<dyn PotStorage>,
     collected_storage: Rc<dyn CollectedStorage>,
+    hand_storage: Rc<dyn HandStorage>,
     result_storage: Rc<dyn ResultStorage>,
     proof_storage: Rc<dyn ProofStorage>,
     potparty_storage: Rc<dyn PotpartyStorage>,
@@ -529,6 +537,9 @@ fn build_engine_with_storage(
                     "tm_collected".into(),
                     Box::new(CollectedTopicManager::new()),
                 );
+            }
+            "tm_hand" => {
+                managers.insert("tm_hand".into(), Box::new(HandTopicManager::new()));
             }
             "tm_result" => {
                 managers.insert("tm_result".into(), Box::new(ResultTopicManager::new()));
@@ -624,6 +635,12 @@ fn build_engine_with_storage(
                 lookup_services.insert(
                     "ls_collected".into(),
                     Box::new(CollectedLookupService::new(collected_storage.clone())),
+                );
+            }
+            "ls_hand" => {
+                lookup_services.insert(
+                    "ls_hand".into(),
+                    Box::new(HandLookupService::new(hand_storage.clone())),
                 );
             }
             "ls_result" => {
@@ -751,6 +768,7 @@ fn build_engine_with_storage(
         "tm_pot",
         "tm_lowfund",
         "tm_collected",
+        "tm_hand",
         "tm_result",
         "tm_proof",
         "tm_potparty",
@@ -1001,6 +1019,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let reveal_storage: Rc<dyn RevealStorage> = Rc::new(D1RevealStorage::new(db.clone()));
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let collected_storage: Rc<dyn CollectedStorage> = Rc::new(D1CollectedStorage::new(db.clone()));
+    let hand_storage: Rc<dyn HandStorage> = Rc::new(D1HandStorage::new(db.clone()));
     let result_storage: Rc<dyn ResultStorage> = Rc::new(D1ResultStorage::new(db.clone()));
     let proof_storage: Rc<dyn ProofStorage> = Rc::new(D1ProofStorage::new(db.clone()));
     let potparty_storage: Rc<dyn PotpartyStorage> = Rc::new(D1PotpartyStorage::new(db.clone()));
@@ -1021,6 +1040,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         reveal_storage.clone(),
         pot_storage.clone(),
         collected_storage.clone(),
+        hand_storage.clone(),
         result_storage.clone(),
         proof_storage.clone(),
         potparty_storage.clone(),

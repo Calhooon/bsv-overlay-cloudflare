@@ -317,7 +317,11 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// superseded pre-signed refund, ~64% of refunds per bsv-low #369).
 /// Overlay-internal — the app-layer reads `pot_beefs` only through explicit
 /// `hex(beef)` joins, so epoch Rule 24 does NOT bite (no schema catch-up).
-pub const OVERLAY_MIGRATION_COUNT: usize = 107;
+/// 107 → 109 for bsv-low #382: `hand_markers` (per-seat showdown-hand marker
+/// index, outpoint-keyed from birth per the #327 S8 lesson) + its
+/// gameId/createdAt read index. Overlay-internal (clients read via /lookup
+/// ls_hand); display-only — no money path and no app-layer join reads it.
+pub const OVERLAY_MIGRATION_COUNT: usize = 109;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1223,6 +1227,34 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // Overlay-internal: the app-layer reads pot_beefs only via explicit
     // hex(beef) joins — no Rule 24 catch-up.
     "ALTER TABLE pot_beefs ADD COLUMN structurally_unprovable INTEGER",
+    // ── bsv-low #382: LOW per-seat showdown-hand markers (tm_hand/ls_hand).
+    //
+    // One row per marker OUTPOINT (the collected_markers_v2 #327 S8 key from
+    // birth — (gameId, identity) are both public claimable names and admission
+    // is byte-format-only, so any per-pair slot would be a censorship
+    // primitive). Every admitted marker kept; rows never deleted (a revealed
+    // hand is a permanent fact; the OP_RETURN is provably unspendable). The
+    // sig is verified CLIENT-side only, publicly, under the row's own named
+    // identity — the overlay derives no verdict and no view suppresses on
+    // presence. Display index only: no money path reads it.
+    // Overlay-internal for now (the client reads via /lookup ls_hand) — no
+    // app-layer schema catch-up (epoch Rule 24 does not bite yet; if /results
+    // later joins this table, the app-layer must issue this same statement).
+    "CREATE TABLE IF NOT EXISTS hand_markers (
+        gameId TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        potTxid TEXT NOT NULL,
+        cardsHex TEXT NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        sigHex TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    // The ls_hand batched read filters `gameId IN (…)` with a newest-first
+    // per-game window.
+    "CREATE INDEX IF NOT EXISTS idx_hand_markers_gameId_created \
+     ON hand_markers(gameId, createdAt)",
 ];
 
 // =============================================================================
