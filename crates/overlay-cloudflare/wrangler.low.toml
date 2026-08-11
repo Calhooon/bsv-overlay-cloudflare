@@ -28,7 +28,7 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
-database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
+database_id = "9930afce-6154-4d1e-b2a0-71a90065db0a"  # local deploy id — do not commit
 
 [vars]
 ENVIRONMENT = "production"
@@ -48,8 +48,8 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # + the pre-signed refund-backup recovery index (tm_potrefund /
 # ls_potrefund, bsv-low #191) + the hop-in-flight marker index
 # (tm_hopparty / ls_hopparty, bsv-low #315).
-TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
-LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
+TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_hand,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
+LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_hand,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
 ENABLE_EXTENSIONS = "true"
 
 # ── /submit admission gating (bsv-low #347) ───────────────────────────────
