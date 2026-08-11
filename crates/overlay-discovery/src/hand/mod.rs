@@ -17,8 +17,8 @@
 //! round-trip validates the carried sig under the marker's OWN named
 //! identity (`HAND_PROTOCOL = [1,'low hand']`, keyID = gameId,
 //! counterparty = 'anyone', challenge binding gameId + identity + potTxid
-//! + cards). A forged or junk marker never renders; a display hint only —
-//! no money path reads this index, ever.
+//! and cards). A forged or junk marker never renders; a display hint only,
+//! and no money path reads this index, ever.
 //!
 //! # Marker wire format (`LOW/hand/v1`)
 //!
@@ -55,11 +55,14 @@
 //!
 //! ```json
 //! [{"gameId": "<hex>", "identity": "<hex>", "potTxid": "<hex>",
-//!   "cardsHex": "<10 hex>", "sigHex": "<hex>", "txid": "<hex|null>"}]
+//!   "cardsHex": "<10 hex>", "txid": "<hex>", "outputIndex": 0,
+//!   "sigHex": "<hex|null>"}]
 //! ```
 //!
-//! An absent game simply contributes no rows — fail-safe silence: the
-//! history row omits the hand rather than guessing.
+//! (`sigHex` is null only for a row whose stored sig column was null, which
+//! the admit path never writes; `txid`/`outputIndex` are the marker outpoint.)
+//! An absent game simply contributes no rows — fail-safe silence: the history
+//! row omits the hand rather than guessing.
 
 pub mod lookup_service;
 pub mod storage;

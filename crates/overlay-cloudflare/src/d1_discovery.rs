@@ -2664,37 +2664,52 @@ impl HandRow {
     }
 }
 
-/// Rows kept per gameId in the batched hand-marker read.
+/// Rows kept per (gameId, identity) in the batched hand-marker read.
 ///
-/// The outpoint key removes exclusivity (no slot to squat) but needs a bound
-/// or one transaction with N marker OP_RETURNs mints N permanent rows per
-/// game (the collected gate-H6 lesson, inherited with the pattern). The
-/// honest population per game is TWO rows (one per seat); 12 leaves headroom
-/// for republish duplicates and junk without unbounded growth. Newest-first
-/// (DESC) for the same reason as collected: the plausible squat is
-/// PRE-EMPTIVE (filed before the genuine settle-time publishes), so
-/// oldest-first would hand it the window. Eviction here is FAIL-SAFE: a
-/// pushed-out row just means the drill-down omits that hand (display-only,
-/// no money path reads this index).
-const HAND_ROWS_PER_GAME: usize = 12;
+/// #382 gate finding 1 — the PARTITION IS PER-IDENTITY, not per-game, and that
+/// distinction is the whole censorship-isolation property (the exact shape the
+/// collected twin uses, `PARTITION BY identity, gameId`). `gameId` is a public
+/// on-chain value and admission is byte-format-only, so a `PARTITION BY gameId`
+/// window let a stranger file 12+ junk `LOW/hand/v1` markers naming any
+/// identity for a targeted game and EVICT BOTH SEATS' genuine markers from the
+/// newest-N window — an unhealable per-game censorship primitive that killed
+/// the feature for that game. Partitioning by (gameId, identity) isolates each
+/// identity in its OWN window: junk under other identities lives in other
+/// partitions and can never displace a genuine seat's row, and a same-identity
+/// PRE-EMPTIVE squat (filed before the settle-time publish) is beaten by the
+/// DESC ordering (the genuine, later row is newest). Post-hoc out-filing a
+/// seat's own partition costs a real fee-bearing tx per row once
+/// `SUBMIT_ENFORCE=true` (the collected post-hoc story, verbatim).
+///
+/// The honest population per (game, seat) is ONE row; 4 leaves headroom for a
+/// republish without unbounded growth. The RESIDUAL an identity-spray leaves —
+/// K distinct junk identities → up to K×4 rows returned for the game — is
+/// verify-rejected NOISE the client drops row by row; the two genuine seats'
+/// rows are ALWAYS returned (their partitions are never evicted), so the
+/// feature never breaks. Eviction is FAIL-SAFE regardless: a pushed-out row
+/// only omits a hand from the drill-down (display-only, no money path reads
+/// this index). The spray's response size is bounded the same way collected's
+/// is — by the `SUBMIT_ENFORCE` fee flip, not by this window.
+const HAND_ROWS_PER_SEAT: usize = 4;
 
 /// SQL for one batched hand-marker chunk: one `gameId IN (…)` query replacing
-/// `n` round trips, bounded to [`HAND_ROWS_PER_GAME`] per game. Factored out
-/// so a real-SQLite test can prove the SHIPPED string against the shipped
+/// `n` round trips, windowed to [`HAND_ROWS_PER_SEAT`] per (game, identity)
+/// (the per-identity isolation — see the const's doc). Factored out so a
+/// real-SQLite test can prove the SHIPPED string against the shipped
 /// migrations.
 pub fn hand_records_batch_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(", ");
     format!(
         "SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex FROM \
            (SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, \
-                   ROW_NUMBER() OVER (PARTITION BY gameId \
+                   ROW_NUMBER() OVER (PARTITION BY gameId, identity \
                                       ORDER BY createdAt DESC, txid DESC, \
                                                outputIndex DESC) AS rn \
             FROM hand_markers \
             WHERE gameId IN ({placeholders})) \
-         WHERE rn <= {per_game} \
-         ORDER BY gameId ASC, rn ASC",
-        per_game = HAND_ROWS_PER_GAME,
+         WHERE rn <= {per_seat} \
+         ORDER BY gameId ASC, identity ASC, rn ASC",
+        per_seat = HAND_ROWS_PER_SEAT,
     )
 }
 
@@ -2744,18 +2759,15 @@ impl HandStorage for D1HandStorage {
         &self,
         game_id: &str,
     ) -> Result<Vec<HandRecord>, HandStorageError> {
-        // Same bound and same newest-first order as the batched read (Rule 16:
-        // two reads of one store must not disagree).
-        let rows: Vec<HandRow> = Query::new(format!(
-            "SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex \
-             FROM hand_markers WHERE gameId = ? \
-             ORDER BY createdAt DESC, txid DESC, outputIndex DESC \
-             LIMIT {HAND_ROWS_PER_GAME}"
-        ))
-        .bind(game_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(hand_err)?;
+        // The SAME per-(game, identity) window as the batched read (Rule 16:
+        // two reads of one store must not disagree — a plain per-game LIMIT
+        // here would reopen the exact eviction the batch SQL closes). Reuse
+        // the shipped batch string with n = 1 so there is ONE window spelling.
+        let rows: Vec<HandRow> = Query::new(hand_records_batch_sql(1))
+            .bind(game_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(hand_err)?;
         Ok(rows.into_iter().map(HandRow::into_record).collect())
     }
 
@@ -7594,6 +7606,138 @@ mod tests {
 
     fn victim_id() -> String {
         format!("02{}", "a1".repeat(32))
+    }
+
+    // ── #382 hand_markers — the SHIPPED SQL against the REAL production schema.
+    //
+    // The collected twin's three real-SQLite cells (scopes / squat-cannot-
+    // censor / window-bounded-and-pre-file-cannot-evict) matter separately from
+    // the storage-layer cells because the property lives in the SQL window +
+    // the PRIMARY KEY, which Rust-side tests structurally cannot see (Rule 16).
+    // These are their hand-index counterparts, and cell 2 pins the gate
+    // finding-1 fix: the window partitions PER IDENTITY, so cross-identity junk
+    // can never evict a genuine seat's row.
+
+    /// One hand marker row into the real schema.
+    fn insert_hand(
+        conn: &rusqlite::Connection,
+        game: &str,
+        identity: &str,
+        txid: &str,
+        vout: u32,
+        created_at: i64,
+        cards_hex: &str,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO hand_markers \
+             (gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sig', ?7)",
+            rusqlite::params![game, identity, h64(0x33), cards_hex, txid, vout, created_at],
+        )
+        .unwrap();
+    }
+
+    fn hand_rows(conn: &rusqlite::Connection, game: &str) -> Vec<(String, String, String)> {
+        // (identity, txid, cardsHex) via the SHIPPED batch SQL (n = 1).
+        let sql = hand_records_batch_sql(1);
+        let mut stmt = conn.prepare(&sql).expect("shipped hand batch SQL must parse");
+        stmt.query_map(rusqlite::params![game], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// BOTH seats of a game answer the read — the whole point of the index.
+    #[test]
+    fn hand_batch_sql_returns_both_seats_real_sqlite() {
+        let conn = production_schema_db();
+        let game = h64(0x11);
+        let seat_a = format!("02{}", "a1".repeat(32));
+        let seat_b = format!("03{}", "b2".repeat(32));
+        insert_hand(&conn, &game, &seat_a, &h64(0x01), 0, 1, "000c1a2733");
+        insert_hand(&conn, &game, &seat_b, &h64(0x02), 0, 2, "0102030405");
+        let mut ids: Vec<String> = hand_rows(&conn, &game).into_iter().map(|r| r.0).collect();
+        ids.sort();
+        assert_eq!(ids, vec![seat_a, seat_b], "both seats' hands, no leak");
+    }
+
+    /// GATE FINDING 1 — the per-IDENTITY window: an identity-spraying squat can
+    /// never evict a genuine seat's row. Under the pre-fix `PARTITION BY gameId`
+    /// (window 12), 12+ junk markers naming the same game (any identity) filled
+    /// the newest-12 slots and the two genuine rows fell out — an unhealable
+    /// per-game censorship. Per (gameId, identity) each seat is isolated in its
+    /// own window and is ALWAYS returned.
+    #[test]
+    fn hand_window_is_per_identity_a_spray_cannot_evict_a_seat_real_sqlite() {
+        let conn = production_schema_db();
+        let game = h64(0x11);
+        let seat_a = format!("02{}", "a1".repeat(32));
+        // The genuine seat A publishes at settle (t=1).
+        insert_hand(&conn, &game, &seat_a, &h64(0x01), 0, 1, "000c1a2733");
+        // An attacker sprays 40 NEWER junk markers across 40 distinct
+        // identities for the SAME public gameId (t=100..140) — free under the
+        // lenient admission default.
+        for i in 0..40u8 {
+            let junk_id = format!("02{i:02x}{}", "cc".repeat(31));
+            insert_hand(&conn, &game, &junk_id, &h64(0xa0 ^ i), 0, 100 + i as i64, "0001020304");
+        }
+        let rows = hand_rows(&conn, &game);
+        // Seat A's genuine row is STILL present (its own partition was never
+        // touched) — the feature is not censorable by a stranger.
+        assert!(
+            rows.iter().any(|(id, txid, _)| *id == seat_a && *txid == h64(0x01)),
+            "the genuine seat's hand survives an identity-spray: {} rows",
+            rows.len()
+        );
+    }
+
+    /// A same-identity PRE-EMPTIVE squat (filed before the genuine settle-time
+    /// publish) cannot evict it — DESC keeps the newest, and the genuine row is
+    /// newer. Post-hoc out-filing a seat's own partition costs a fee per row
+    /// once SUBMIT_ENFORCE=true (the collected post-hoc story).
+    #[test]
+    fn hand_prefiled_same_identity_squat_cannot_evict_real_sqlite() {
+        let conn = production_schema_db();
+        let game = h64(0x11);
+        let victim = victim_id();
+        // The squatter pre-files a FULL per-seat window naming the VICTIM's
+        // identity at deal time (t=1..HAND_ROWS_PER_SEAT), all junk cards.
+        for i in 0..HAND_ROWS_PER_SEAT as u8 {
+            insert_hand(&conn, &game, &victim, &h64(0xa0 + i), i as u32, 1 + i as i64, "0001020304");
+        }
+        // The victim's GENUINE hand lands afterwards (t=99), a different tx.
+        insert_hand(&conn, &game, &victim, &h64(0xbb), 0, 99, "000c1a2733");
+        let rows = hand_rows(&conn, &game);
+        assert_eq!(
+            rows.len(),
+            HAND_ROWS_PER_SEAT,
+            "the per-(game, identity) window bounds an unbounded mint"
+        );
+        assert!(
+            rows.iter().any(|(_, txid, cards)| *txid == h64(0xbb) && cards == "000c1a2733"),
+            "a pre-filed squat must not evict the victim's later genuine hand: {rows:?}"
+        );
+    }
+
+    /// A replay of the same outpoint is a no-op — the property that makes the
+    /// outpoint re-key safe under a re-submitting client.
+    #[test]
+    fn hand_replaying_the_same_outpoint_is_a_noop_real_sqlite() {
+        let conn = production_schema_db();
+        let game = h64(0x11);
+        let seat = victim_id();
+        insert_hand(&conn, &game, &seat, &h64(0x01), 0, 1, "000c1a2733");
+        // Same (txid, outputIndex), different content — must not re-insert.
+        insert_hand(&conn, &game, &seat, &h64(0x01), 0, 2, "0102030405");
+        let rows = hand_rows(&conn, &game);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "000c1a2733", "same outpoint never overwrites");
     }
 
     /// Insert a pot row whose spend, when present, is CONFIRMED.

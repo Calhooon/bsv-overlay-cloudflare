@@ -147,13 +147,22 @@ impl LookupService for HandLookupService {
             )));
         }
 
-        let keys = game_ids
-            .iter()
-            .map(|g| normalize_game_id(g))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Normalize AND DEDUPE (gate finding 3): a repeated gameId zipped
+        // against the same stored rows would emit every row for that game N
+        // times — a client trusting one-entry-per-marker double-counts the
+        // hand. Dedupe here (order-preserving), so the answer holds each
+        // marker exactly once regardless of caller repetition.
+        let mut keys: Vec<String> = Vec::with_capacity(game_ids.len());
+        let mut seen = std::collections::HashSet::new();
+        for g in &game_ids {
+            let k = normalize_game_id(g)?;
+            if seen.insert(k.clone()) {
+                keys.push(k);
+            }
+        }
 
         // ONE batched storage call for the whole set — results aligned
-        // index-for-index with the request.
+        // index-for-index with the DEDUPED keys.
         let records = self
             .storage
             .get_records(&keys)
@@ -359,6 +368,26 @@ mod tests {
         let ids: Vec<String> = (0..=MAX_HAND_GAME_IDS).map(|_| "11".repeat(32)).collect();
         let err = svc.lookup(&question(ids)).await.unwrap_err();
         assert!(matches!(err, LookupServiceError::InvalidQuery(_)));
+    }
+
+    #[tokio::test]
+    async fn duplicate_game_ids_do_not_duplicate_rows() {
+        // Gate finding 3: a caller repeating a gameId must not get its rows
+        // emitted twice (a client trusting one-entry-per-marker double-counts).
+        let (svc, _) = make_service_with_storage();
+        let script = marker_script(
+            &golden_game_id(),
+            &golden_identity_key(),
+            &golden_pot_txid(),
+            &golden_cards(),
+            &golden_sig(),
+        );
+        svc.output_admitted_by_topic(&admitted(script, "aa".repeat(32).as_str(), 0))
+            .await
+            .unwrap();
+        let gid = hex::encode(golden_game_id());
+        let rows = answer_rows(svc.lookup(&question(vec![gid.clone(), gid])).await.unwrap());
+        assert_eq!(rows.len(), 1, "a repeated gameId must not duplicate its rows");
     }
 
     #[tokio::test]

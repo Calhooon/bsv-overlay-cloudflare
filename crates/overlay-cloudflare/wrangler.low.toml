@@ -28,7 +28,7 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
-database_id = "9930afce-6154-4d1e-b2a0-71a90065db0a"  # local deploy id — do not commit
+database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
 
 [vars]
 ENVIRONMENT = "production"

@@ -69,9 +69,18 @@ pub trait HandStorage {
     /// different tx is a NEW row. Never overwrites, never deletes.
     async fn store_record(&self, record: &HandRecord) -> Result<(), HandStorageError>;
 
-    /// EVERY marker admitted for `game_id` — empty when none was. A set, not
-    /// a winner: junk and genuine rows coexist; the CALLER's signature verify
+    /// The stored markers for `game_id` — empty when none was. A set, not a
+    /// winner: junk and genuine rows coexist; the CALLER's signature verify
     /// decides between them.
+    ///
+    /// SHIPPING BACKEND SEMANTICS: the D1 impl returns a per-(game, identity)
+    /// WINDOW (the newest [`HAND_ROWS_PER_SEAT`](crate) rows per identity — the
+    /// censorship-isolation window, see `d1_discovery`), NOT literally every
+    /// admitted row; the two genuine seats' rows are always present, and an
+    /// identity-spray's excess is bounded per identity. `MemoryHandStorage`
+    /// (tests only) returns everything in insertion order — enough for the
+    /// storage-shape cells, but the WINDOW semantics are proven only by the
+    /// real-SQLite tests over the shipped SQL.
     async fn get_records_for_game(
         &self,
         game_id: &str,
