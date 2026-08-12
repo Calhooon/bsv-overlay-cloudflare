@@ -902,11 +902,26 @@ impl CaseStatus {
 /// `case: null`, and `case: null` always means UNKNOWN — never "no case".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseProvenance {
-    /// The fetch for this pot's (corroborated) gameId succeeded. NON-
-    /// VOUCHING BY NAME: this is "the tower's answer for THIS gameId" — the
-    /// tower's public view is per-game and carries no pot outpoint, so the
-    /// case↔pot binding is NOT verified (module docs, including what
-    /// `caseGameId` can and cannot expose).
+    /// The fetch for this pot succeeded.
+    ///
+    /// SINCE 2026-08-12 THE FETCH IS OUTPOINT-SCOPED: we ask
+    /// `/case/:gameId/:txid/:vout` with the pot outpoint this row is
+    /// displaying (server-held, from `pot_records` — never a caller claim), so
+    /// the tower's answer IS bound to this pot by construction. The previous
+    /// by-name fetch had two problems: it could not vouch for the case↔pot
+    /// binding, and — since the co-signer DOs became outpoint-scoped — the
+    /// tower's game-level view 404s for every case actually opened, so this
+    /// tag was effectively unreachable and every row degraded to
+    /// `TowerUnavailable`.
+    ///
+    /// THE NAME AND WIRE VALUE (`"tower-by-gameid-unverified"`) ARE RETAINED
+    /// DELIBERATELY and now UNDER-CLAIM. They are a published contract that
+    /// `chainReads.ts` whitelists; emitting a new value before the client
+    /// knows it would make the client withdraw the case (its documented
+    /// degrade-on-unknown-tag rule), i.e. the server improvement would delete
+    /// the surface it just fixed. Renaming to an outpoint-bound tag is a
+    /// COORDINATED client-then-server change — exactly the "FUTURE caseSource
+    /// value" that client's own docs anticipate.
     TowerByGameIdUnverified,
     /// This pot's gameId was an EFFECTIVE fan-out target but no valid answer
     /// arrived — binding absent, timeout, non-200 (including the tower's

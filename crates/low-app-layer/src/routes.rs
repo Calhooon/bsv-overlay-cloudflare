@@ -2234,18 +2234,53 @@ async fn with_timeout<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Out
 /// memory limit and take the always-serving D1 half down with them.
 /// `parse_case_body`'s own length check stays as the belt (a body of
 /// exactly the ceiling is still accepted, +1 rejected).
+/// Build the tower's OUTPOINT-SCOPED case URL, or `None` if either id is
+/// malformed (the caller then simply does not ask, and `apply_cases` tags the
+/// row `tower-unavailable` — the honest "we should have asked and could not").
+///
+/// Extracted so the thing that actually changed on 2026-08-12 is unit-testable
+/// without a Worker: the tower's game-level `/case/:gameId` 404s for every
+/// outpoint-scoped case, so asking by name returned nothing for every row.
+pub(crate) fn tower_case_url(game_id: &str, pot_txid: &str, pot_vout: u32) -> Option<String> {
+    if !valid_txid(game_id) || !valid_txid(pot_txid) {
+        return None;
+    }
+    Some(format!("https://tower/case/{game_id}/{pot_txid}/{pot_vout}"))
+}
+
 async fn tower_case_fetch(
     svc: &worker::Fetcher,
     game_id: &str,
+    pot_txid: &str,
+    pot_vout: u32,
 ) -> Option<crate::live_view::CaseView> {
-    // Belt (LOW-8): this function interpolates `game_id` into a URL, so it
-    // re-asserts the txid shape itself instead of trusting every caller to
+    // Belt (LOW-8): this function interpolates both ids into a URL, so it
+    // re-asserts their shape itself instead of trusting every caller to
     // have run `fanout_targets` first.
     if !valid_txid(game_id) {
         console_warn!("[live-view] tower case fetch refused: malformed gameId");
         return None;
     }
-    let url = format!("https://tower/case/{game_id}");
+    if !valid_txid(pot_txid) {
+        console_warn!("[live-view] tower case fetch refused: malformed pot txid");
+        return None;
+    }
+    let url = tower_case_url(game_id, pot_txid, pot_vout)?;
+    // (URL built by `tower_case_url` above.)
+    // ASK BY OUTPOINT, not by name. Two reasons, one fatal and one structural:
+    //
+    // FATAL: since the co-signer DOs became outpoint-scoped, the tower's
+    // game-level `GET /case/:gameId` 404s for every case opened — so this
+    // fan-out asked a question the tower stopped answering and EVERY row's
+    // case degraded to null. Proven 2026-08-12 against a real enforced settle:
+    // `/case/:gameId` 404 while `/case/:gameId/:txid/:vout` served the full J.
+    //
+    // STRUCTURAL: a gameId is a claimable NAME (zanaadu invariant #2) and the
+    // tower's by-name answer carried no pot outpoint, which is exactly why the
+    // old tag could not vouch for the case<->pot binding. Asking with the
+    // outpoint we are displaying makes the answer bound to THIS pot by
+    // construction — the tag can finally vouch.
+
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
     let headers = Headers::new();
@@ -2563,9 +2598,27 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
                 let svc_ref = &svc;
                 // `run_fanout` returns the EFFECTIVE list, so apply_cases can
                 // only ever label targets that were really asked (LOW-F).
+                // gameId -> the pot outpoint we are DISPLAYING for it. Built
+                // from `rows` (pot_records), so the outpoint is server-held
+                // truth, never a caller claim.
+                let outpoints: std::collections::HashMap<String, (String, u32)> = rows
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.game_id.to_ascii_lowercase(),
+                            (r.pot_txid.clone(), r.pot_vout),
+                        )
+                    })
+                    .collect();
+                let outpoints_ref = &outpoints;
                 let (effective, fetched) =
                     crate::live_view::run_fanout(&targets, move |g: String| async move {
-                        tower_case_fetch(svc_ref, &g).await
+                        // No outpoint for this gameId ⇒ do not ask. The row is
+                        // then tagged `tower-unavailable` by `apply_cases`,
+                        // which is the honest answer: we should have asked and
+                        // could not.
+                        let (txid, vout) = outpoints_ref.get(&g)?;
+                        tower_case_fetch(svc_ref, &g, txid, *vout).await
                     })
                     .await;
                 (corr, effective, fetched)
@@ -3103,6 +3156,34 @@ pub fn not_found(req: Request, _ctx: RouteContext<AuthState>) -> Result<Response
 
 #[cfg(test)]
 mod tests {
+    // ── /live-view asks the tower BY OUTPOINT (2026-08-12) ────────────────
+    #[test]
+    fn tower_case_url_is_outpoint_scoped() {
+        let g = "9c476edee524f3fbdf0a5609eec431c7b344272b83a167810c8febc898ba0c25";
+        let pot = "021f165bd921c592af56aff093648b124e001d6dab738cd9d1987a900793483b";
+        // The path the tower actually answers. Measured 2026-08-12 against a
+        // real enforced settle: `/case/<gid>` → 404, `/case/<gid>/<txid>/<vout>`
+        // → the full J. Asking by name is why every live-view row's case was
+        // null.
+        assert_eq!(
+            super::tower_case_url(g, pot, 0).unwrap(),
+            format!("https://tower/case/{g}/{pot}/0")
+        );
+        assert!(super::tower_case_url(g, pot, 3).unwrap().ends_with("/3"));
+    }
+
+    /// A malformed id is never interpolated into the URL — the caller does not
+    /// ask at all, which `apply_cases` reports as `tower-unavailable`.
+    #[test]
+    fn tower_case_url_refuses_malformed_ids() {
+        let ok = "9c476edee524f3fbdf0a5609eec431c7b344272b83a167810c8febc898ba0c25";
+        assert!(super::tower_case_url("nope", ok, 0).is_none());
+        assert!(super::tower_case_url(ok, "nope", 0).is_none());
+        assert!(super::tower_case_url(ok, "", 0).is_none());
+        // No path traversal / injection can reach the tower.
+        assert!(super::tower_case_url(ok, "../../admin", 0).is_none());
+    }
+
     use super::*;
 
     /// bsv-low#304: the SHIPPED trusted-BEEF reads (`/tx-any` index leg +
