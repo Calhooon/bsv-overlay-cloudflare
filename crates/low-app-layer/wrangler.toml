@@ -118,3 +118,67 @@ service = "rust-chaintracks"
 [[services]]
 binding = "TOWER"
 service = "low-watchtower"
+
+# ══════════════════════════════════════════════════════════════════════════
+# beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
+#
+#   npx wrangler deploy --env beta
+#
+# Reads the BETA overlay's D1, so beta money views are built from beta rows
+# only and the whole environment can be wiped without touching prod. This
+# worker needs no topic-suffix awareness of its own: it never calls the
+# overlay and never filters on a `topic` column — the per-protocol tables it
+# reads (pot_records, potparty_records, result_markers_v2, …) are per-topic by
+# construction, so the database binding IS the isolation.
+#
+# ORDER MATTERS on a fresh beta D1: deploy + warm the BETA OVERLAY first (it
+# owns the schema). This worker only ALTERs/CREATEs a few latch columns and
+# two tables; against a database whose base tables don't exist yet those
+# statements fail as not-benign, so the migration latch never sets and every
+# request re-issues them until the overlay has run once.
+#
+# NOTHING is inherited from the blocks above — wrangler env sections do not
+# inherit vars, d1_databases, kv_namespaces or services. Every binding this
+# worker reads is redeclared here on purpose.
+# ══════════════════════════════════════════════════════════════════════════
+
+[env.beta]
+name = "low-app-layer-beta"
+
+[env.beta.vars]
+AUTH_ENFORCE = "false"
+# Beta's own storage epoch — bumping THIS orders beta clients to clear their
+# local state without touching prod clients.
+STORAGE_EPOCH = "beta-2026-08-12-1"
+# DELIBERATELY EMPTY (= inert), unlike prod. The #375 era write-off exists to
+# retire a pre-launch era of real player records; the beta database starts at
+# zero rows, so there is no old era to write off. Wiping beta is a DELETE
+# against the beta D1, not a cutoff. If beta ever needs to rehearse the
+# launch-eve bump, set both together (ms + height) exactly as prod does.
+WRITTEN_OFF_BEFORE_MS = ""
+WRITTEN_OFF_BEFORE_HEIGHT = ""
+
+# Beta's OWN session store. AUTH_SESSIONS and SERVER_PRIVATE_KEY are all-or-
+# nothing: the front door computes `configured = key AND kv`, and an
+# auth-attempting client against a half-configured worker gets 503 on EVERY
+# route — including /health — because the handshake is judged before route
+# exemptions. Set both, or neither.
+[[env.beta.kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "0f329fae1869418ea9c85dfc6fbd4ca4"  # low-app-layer-beta-AUTH_SESSIONS
+
+[[env.beta.d1_databases]]
+binding = "OVERLAY_DB"
+database_name = "low-overlay-db-beta"
+database_id = "49d4ecb7-5f4d-4ba5-b149-2939ca7262c3"
+
+[[env.beta.services]]
+binding = "CHAINTRACKS"
+service = "rust-chaintracks"
+
+# The BETA tower. Binding prod's here would let prod case answers bleed into
+# beta rows: the fan-out is by gameId and the case↔pot binding is explicitly
+# not verified. Absence would be safe (case: null); prod would not be.
+[[env.beta.services]]
+binding = "TOWER"
+service = "low-watchtower-beta"

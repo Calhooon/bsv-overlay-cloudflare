@@ -61,7 +61,7 @@ impl LookupService for UHRPLookupService {
         };
 
         // Only index tm_uhrp outputs.
-        if topic != "tm_uhrp" {
+        if !crate::name_matches(topic, "tm_uhrp") {
             return Ok(());
         }
 
@@ -160,7 +160,7 @@ impl LookupService for UHRPLookupService {
             _ => return Ok(()),
         };
 
-        if topic != "tm_uhrp" {
+        if !crate::name_matches(topic, "tm_uhrp") {
             return Ok(());
         }
 
@@ -185,7 +185,7 @@ impl LookupService for UHRPLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_uhrp" {
+        if !crate::name_matches(&question.service, "ls_uhrp") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_uhrp, got {}",
                 question.service

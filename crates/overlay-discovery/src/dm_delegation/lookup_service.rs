@@ -63,7 +63,7 @@ impl LookupService for DmDelegationLookupService {
         };
 
         // Only index tm_dm_delegation outputs.
-        if topic != "tm_dm_delegation" {
+        if !crate::name_matches(topic, "tm_dm_delegation") {
             return Ok(());
         }
 
@@ -169,7 +169,7 @@ impl LookupService for DmDelegationLookupService {
             } => (txid.as_str(), *output_index, topic.as_str()),
         };
 
-        if topic != "tm_dm_delegation" {
+        if !crate::name_matches(topic, "tm_dm_delegation") {
             return Ok(());
         }
 
@@ -193,7 +193,7 @@ impl LookupService for DmDelegationLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_dm_delegation" {
+        if !crate::name_matches(&question.service, "ls_dm_delegation") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_dm_delegation, got {}",
                 question.service

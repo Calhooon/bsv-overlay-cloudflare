@@ -110,7 +110,7 @@ impl LookupService for LowLookupService {
         };
 
         // Only index tm_low outputs
-        if topic != "tm_low" {
+        if !crate::name_matches(topic, "tm_low") {
             return Ok(());
         }
 
@@ -149,7 +149,7 @@ impl LookupService for LowLookupService {
             _ => return Ok(()),
         };
 
-        if topic != "tm_low" {
+        if !crate::name_matches(topic, "tm_low") {
             return Ok(());
         }
 
@@ -175,7 +175,7 @@ impl LookupService for LowLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_low" {
+        if !crate::name_matches(&question.service, "ls_low") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_low, got {}",
                 question.service

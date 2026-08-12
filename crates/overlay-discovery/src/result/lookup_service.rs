@@ -87,7 +87,7 @@ impl LookupService for ResultLookupService {
         };
 
         // Only index tm_result outputs.
-        if topic != "tm_result" {
+        if !crate::name_matches(topic, "tm_result") {
             return Ok(());
         }
 
@@ -146,7 +146,7 @@ impl LookupService for ResultLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_result" {
+        if !crate::name_matches(&question.service, "ls_result") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_result, got {}",
                 question.service

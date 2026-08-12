@@ -2,6 +2,7 @@ pub mod advertiser;
 pub mod agent;
 pub mod collected;
 pub mod dm_delegation;
+pub mod env_name;
 pub mod hand;
 pub mod hopparty;
 pub mod low;
@@ -15,3 +16,5 @@ pub mod ship;
 pub mod slap;
 pub mod uhrp;
 pub mod validation;
+
+pub use env_name::name_matches;

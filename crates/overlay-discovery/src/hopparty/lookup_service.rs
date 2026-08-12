@@ -88,7 +88,7 @@ impl LookupService for HoppartyLookupService {
         };
 
         // Only index tm_hopparty outputs.
-        if topic != "tm_hopparty" {
+        if !crate::name_matches(topic, "tm_hopparty") {
             return Ok(());
         }
 
@@ -170,7 +170,7 @@ impl LookupService for HoppartyLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_hopparty" {
+        if !crate::name_matches(&question.service, "ls_hopparty") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_hopparty, got {}",
                 question.service

@@ -173,7 +173,7 @@ impl LookupService for PotLookupService {
         // Index tm_pot (covenant) AND tm_lowfund (hop P2PKH) outputs — both
         // land in the same pot_records/pot_beefs landing-proof store, so the
         // app-layer's /utxo-status, /pots-view and /beef answer either kind.
-        if topic != "tm_pot" && topic != "tm_lowfund" {
+        if !crate::name_matches(topic, "tm_pot") && !crate::name_matches(topic, "tm_lowfund") {
             return Ok(());
         }
 
@@ -196,9 +196,17 @@ impl LookupService for PotLookupService {
             return Ok(());
         };
         let lock_bytes = output.locking_script.to_binary();
-        let shape_ok = match topic.as_str() {
-            "tm_pot" => is_pot_covenant_script(&lock_bytes),
-            _ => crate::pot::is_p2pkh_script(&lock_bytes), // tm_lowfund (gated above)
+        // Which of the two admitted topics this is. `name_matches` so an
+        // environment-suffixed deployment (`tm_pot_beta`) still classifies as
+        // the pot covenant: with a bare `== "tm_pot"` it would fall through to
+        // the hop arm and be shape-checked as P2PKH, then stored with
+        // `lockKind='p2pkh'` and no committed params — a silently mis-typed
+        // money record, not a clean rejection.
+        let is_pot_topic = crate::name_matches(topic, "tm_pot");
+        let shape_ok = if is_pot_topic {
+            is_pot_covenant_script(&lock_bytes)
+        } else {
+            crate::pot::is_p2pkh_script(&lock_bytes) // tm_lowfund (gated above)
         };
         if !shape_ok {
             debug!("POT: admitted output does not match its topic's script shape — skipped");
@@ -226,8 +234,10 @@ impl LookupService for PotLookupService {
             params_decoded: true,
             ..Default::default()
         };
-        match topic.as_str() {
-            "tm_pot" => {
+        // Same classification as the shape gate above — the two MUST agree, or
+        // an output shape-checked as a covenant would be stored as a hop.
+        if is_pot_topic {
+            {
                 record.lock_kind = Some("covenant".into());
                 match crate::pot::extract_covenant_params(&lock_bytes) {
                     Some(p) => {
@@ -250,10 +260,9 @@ impl LookupService for PotLookupService {
                     }
                 }
             }
-            _ => {
-                // tm_lowfund: a plain P2PKH hop — no committed params exist.
-                record.lock_kind = Some("p2pkh".into());
-            }
+        } else {
+            // tm_lowfund: a plain P2PKH hop — no committed params exist.
+            record.lock_kind = Some("p2pkh".into());
         }
 
         self.storage
@@ -289,7 +298,7 @@ impl LookupService for PotLookupService {
             _ => return Ok(()),
         };
 
-        if topic != "tm_pot" && topic != "tm_lowfund" {
+        if !crate::name_matches(topic, "tm_pot") && !crate::name_matches(topic, "tm_lowfund") {
             return Ok(());
         }
 
@@ -405,7 +414,7 @@ impl LookupService for PotLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_pot" {
+        if !crate::name_matches(&question.service, "ls_pot") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_pot, got {}",
                 question.service
@@ -1022,6 +1031,106 @@ mod tests {
             *topic = "tm_lowfund".into();
         }
         payload
+    }
+
+    fn with_topic(mut payload: OutputAdmittedByTopic, name: &str) -> OutputAdmittedByTopic {
+        if let OutputAdmittedByTopic::WholeTx { ref mut topic, .. } = payload {
+            *topic = name.into();
+        }
+        payload
+    }
+
+    // ── Environment-suffixed topics (the isolated beta stack) ────────────────
+
+    /// A `TOPIC_SUFFIX` deployment registers `tm_pot_beta`, and the pot record
+    /// it writes MUST be identical to prod's — same store, same `covenant`
+    /// lock kind, same decoded params.
+    ///
+    /// Under the previous exact-match guard this failed in the worst way
+    /// available: `output_admitted_by_topic` returned `Ok(())`, so `/submit`
+    /// answered 200 while indexing nothing, and every later lookup — the ones a
+    /// wiped device uses to find its own money — stayed empty forever.
+    #[tokio::test]
+    async fn suffixed_pot_topic_indexes_as_a_covenant() {
+        let (svc, storage) = make_service_with_storage();
+        // The REAL covenant builder, so this exercises the whole decode path —
+        // recognizer, shape gate and param extraction — under the suffix.
+        let p = real_params();
+        let funding = real_funding_tx(7, &p);
+        svc.output_admitted_by_topic(&with_topic(admit(beef_of(&funding), 0), "tm_pot_beta"))
+            .await
+            .unwrap();
+
+        assert_eq!(storage.record_count(), 1, "the suffixed topic IS indexed");
+        let r = storage
+            .get_spent_status(&funding.id(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        // Not merely stored — stored with the RIGHT type and the RIGHT params.
+        // The classification and the shape gate must agree, or a covenant pot
+        // is filed as a hop with its committed params thrown away.
+        assert_eq!(r.lock_kind.as_deref(), Some("covenant"));
+        assert!(r.params_decoded);
+        assert_eq!(r.pub_tower.as_deref(), Some(hex::encode(p.pub_tower).as_str()));
+        assert_eq!(r.stake_a, Some(p.stake_a));
+    }
+
+    /// The hop side of the same suffixed deployment.
+    #[tokio::test]
+    async fn suffixed_lowfund_topic_indexes_as_a_hop() {
+        let (svc, storage) = make_service_with_storage();
+        let mut tx = Tx::new();
+        tx.add_input(TransactionInput::new("13".repeat(32), 0))
+            .unwrap();
+        tx.add_output(p2pkh_output()).unwrap();
+        svc.output_admitted_by_topic(&with_topic(admit(beef_of(&tx), 0), "tm_lowfund_beta"))
+            .await
+            .unwrap();
+
+        let r = storage
+            .get_spent_status(&tx.id(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.lock_kind.as_deref(), Some("p2pkh"));
+    }
+
+    /// Suffix matching must not become "any name starting with tm_pot".
+    /// `tm_potparty` and `tm_potrefund` are DIFFERENT protocols with their own
+    /// stores; swallowing them here would file recovery markers as pots.
+    #[tokio::test]
+    async fn sibling_pot_topics_are_still_refused() {
+        for sibling in ["tm_potparty", "tm_potrefund", "tm_potparty_beta"] {
+            let (svc, storage) = make_service_with_storage();
+            svc.output_admitted_by_topic(&with_topic(admit(beef_of(&funding_tx(9)), 0), sibling))
+                .await
+                .unwrap();
+            assert_eq!(
+                storage.record_count(),
+                0,
+                "{sibling} must not be indexed by the pot service"
+            );
+        }
+    }
+
+    /// The lookup half: a suffixed deployment answers `ls_pot_beta`, and the
+    /// engine has already routed by exact key before this guard runs.
+    #[tokio::test]
+    async fn suffixed_service_name_is_answered() {
+        let (svc, _storage) = make_service_with_storage();
+        let q = LookupQuestion::new(
+            "ls_pot_beta",
+            serde_json::json!({"type": "spentStatus", "outpoints": []}),
+        );
+        assert!(svc.lookup(&q).await.is_ok());
+
+        // A different protocol's service name is still refused.
+        let wrong = LookupQuestion::new(
+            "ls_potparty_beta",
+            serde_json::json!({"type": "spentStatus", "outpoints": []}),
+        );
+        assert!(svc.lookup(&wrong).await.is_err());
     }
 
     #[tokio::test]

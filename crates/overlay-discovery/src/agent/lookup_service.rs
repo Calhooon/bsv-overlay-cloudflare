@@ -55,7 +55,7 @@ impl LookupService for AgentLookupService {
         };
 
         // Only index tm_agent outputs
-        if topic != "tm_agent" {
+        if !crate::name_matches(topic, "tm_agent") {
             return Ok(());
         }
 
@@ -173,7 +173,7 @@ impl LookupService for AgentLookupService {
             } => (txid.as_str(), *output_index, topic.as_str()),
         };
 
-        if topic != "tm_agent" {
+        if !crate::name_matches(topic, "tm_agent") {
             return Ok(());
         }
 
@@ -198,7 +198,7 @@ impl LookupService for AgentLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_agent" {
+        if !crate::name_matches(&question.service, "ls_agent") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_agent, got {}",
                 question.service

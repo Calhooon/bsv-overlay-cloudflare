@@ -780,6 +780,50 @@ fn build_engine_with_storage(
         );
     }
 
+    // ── Deploy-time topic namespace (`TOPIC_SUFFIX`, bsv-low beta stack) ─────
+    //
+    // The zanaadu model: ONE binary serves prod (suffix unset) and a fully
+    // isolated beta (`_beta`) whose rows can be wiped without touching prod.
+    // `TOPIC_MANAGERS` / `LOOKUP_SERVICES` stay BASE-named in every env — the
+    // suffix is applied HERE, in a single place, to the registered manager and
+    // service keys AND to the GASP sync map, so a topic added later cannot be
+    // forgotten by the namespacing.
+    //
+    // Fail-closed by construction: a suffixed deployment registers ONLY
+    // suffixed names, so a client aimed at the wrong stack asks for a topic
+    // this worker does not have and is refused. Neither direction can write a
+    // row into the other environment's index — which is the whole point, since
+    // those rows are money-recovery enumeration.
+    let topic_suffix = env
+        .var("TOPIC_SUFFIX")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    if !topic_suffix.is_empty() {
+        // SHIP and SLAP are NEVER suffixed. The engine hardcodes those four
+        // names for tracker bootstrap (`engine.rs` `tm_ship`/`tm_slap` arms),
+        // for suppressing self-advertisement of the discovery topics, and for
+        // peer discovery via `ls_ship`; the advertiser also submits its own
+        // ads under bare `tm_ship`/`tm_slap`, so suffixing them would make the
+        // ad self-admission fail `UnsupportedTopic`. Discovery is deliberately
+        // a shared, global namespace — it is the LOW protocol topics that must
+        // be per-environment.
+        let rekey = |k: String| -> String { crate::routes::suffixed_name(&k, &topic_suffix) };
+        managers = managers.into_iter().map(|(k, v)| (rekey(k), v)).collect();
+        lookup_services = lookup_services
+            .into_iter()
+            .map(|(k, v)| (rekey(k), v))
+            .collect();
+        // The GASP sync map is keyed by topic too, and a MISSING key is not
+        // inert: `engine.rs` defaults an unknown manager to `SyncTarget::Ship`.
+        // Leaving these bare would silently turn every deliberately-Disabled
+        // LOW topic into live peer discovery on the beta deploy.
+        sync_configuration = sync_configuration
+            .into_iter()
+            .map(|(k, v)| (rekey(k), v))
+            .collect();
+    }
+
     let config = EngineConfig {
         hosting_url: hosting_url.clone(),
         sync_configuration,

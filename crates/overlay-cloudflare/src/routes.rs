@@ -242,6 +242,9 @@ async fn build_health_response(
 
     // Env-driven registration set (same parsing rules as
     // `build_engine_with_storage` in lib.rs). Defaults = mainline parity set.
+    // `TOPIC_SUFFIX`-aware, like `parse_csv_env`: report the names the engine
+    // actually registers, never the bare base names.
+    let csv_suffix = env_topic_suffix(env);
     let parse_csv = |var: &str, default: &str| -> Vec<String> {
         env.var(var)
             .ok()
@@ -249,8 +252,9 @@ async fn build_health_response(
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| default.into())
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim())
             .filter(|s| !s.is_empty())
+            .map(|s| suffixed_name(s, &csv_suffix))
             .collect()
     };
     let topics = parse_csv("TOPIC_MANAGERS", "tm_ship,tm_slap");
@@ -1991,15 +1995,47 @@ pub async fn admin_stats(
     }))
 }
 
+/// Deploy-time topic namespace — see `lib.rs`'s `TOPIC_SUFFIX` block. Empty in
+/// prod, `_beta` on the isolated beta stack.
+pub(crate) fn env_topic_suffix(env: &worker::Env) -> String {
+    env.var("TOPIC_SUFFIX")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+/// Apply the deploy-time topic namespace to ONE topic/service name.
+///
+/// The single definition of the rule, shared by registration (`lib.rs`) and by
+/// the report surfaces here — if these two ever disagreed, `/health` would name
+/// topics the engine does not answer to.
+///
+/// SHIP and SLAP are never suffixed: discovery is a deliberately global,
+/// cross-environment namespace, and the engine hardcodes those four names for
+/// tracker bootstrap, self-ad suppression and peer discovery.
+pub(crate) fn suffixed_name(base: &str, suffix: &str) -> String {
+    match base {
+        "tm_ship" | "tm_slap" | "ls_ship" | "ls_slap" => base.to_string(),
+        _ => format!("{base}{suffix}"),
+    }
+}
+
+/// Parse a topic/service CSV env var into the names this worker ACTUALLY
+/// registers — i.e. with `TOPIC_SUFFIX` applied, exactly as `lib.rs` does at
+/// registration. Both callers are report surfaces (`/health`, `/status`), and a
+/// report that named `tm_low` while the engine answered only to `tm_low_beta`
+/// would send an operator debugging the wrong stack.
 fn parse_csv_env(env: &worker::Env, name: &str, default: &str) -> Vec<String> {
+    let suffix = env_topic_suffix(env);
     env.var(name)
         .ok()
         .map(|v| v.to_string())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| default.into())
         .split(',')
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        .map(|s| suffixed_name(s, &suffix))
         .collect()
 }
 

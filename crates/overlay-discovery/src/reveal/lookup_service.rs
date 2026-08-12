@@ -66,7 +66,7 @@ impl LookupService for RevealLookupService {
         };
 
         // Only index tm_reveal outputs.
-        if topic != "tm_reveal" {
+        if !crate::name_matches(topic, "tm_reveal") {
             return Ok(());
         }
 
@@ -113,7 +113,7 @@ impl LookupService for RevealLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_reveal" {
+        if !crate::name_matches(&question.service, "ls_reveal") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_reveal, got {}",
                 question.service

@@ -78,7 +78,7 @@ impl LookupService for PotpartyLookupService {
         };
 
         // Only index tm_potparty outputs.
-        if topic != "tm_potparty" {
+        if !crate::name_matches(topic, "tm_potparty") {
             return Ok(());
         }
 
@@ -134,7 +134,7 @@ impl LookupService for PotpartyLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_potparty" {
+        if !crate::name_matches(&question.service, "ls_potparty") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_potparty, got {}",
                 question.service

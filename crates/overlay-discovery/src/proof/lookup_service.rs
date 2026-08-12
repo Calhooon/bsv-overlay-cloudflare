@@ -90,7 +90,7 @@ impl LookupService for ProofLookupService {
         };
 
         // Only index tm_proof outputs.
-        if topic != "tm_proof" {
+        if !crate::name_matches(topic, "tm_proof") {
             return Ok(());
         }
 
@@ -145,7 +145,7 @@ impl LookupService for ProofLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_proof" {
+        if !crate::name_matches(&question.service, "ls_proof") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_proof, got {}",
                 question.service

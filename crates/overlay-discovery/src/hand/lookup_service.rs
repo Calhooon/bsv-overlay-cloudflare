@@ -80,7 +80,7 @@ impl LookupService for HandLookupService {
         };
 
         // Only index tm_hand outputs.
-        if topic != "tm_hand" {
+        if !crate::name_matches(topic, "tm_hand") {
             return Ok(());
         }
 
@@ -128,7 +128,7 @@ impl LookupService for HandLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_hand" {
+        if !crate::name_matches(&question.service, "ls_hand") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_hand, got {}",
                 question.service

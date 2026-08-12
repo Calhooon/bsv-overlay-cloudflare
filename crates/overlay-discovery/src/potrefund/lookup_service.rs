@@ -96,7 +96,7 @@ impl LookupService for PotrefundLookupService {
         };
 
         // Only index tm_potrefund outputs.
-        if topic != "tm_potrefund" {
+        if !crate::name_matches(topic, "tm_potrefund") {
             return Ok(());
         }
 
@@ -148,7 +148,7 @@ impl LookupService for PotrefundLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_potrefund" {
+        if !crate::name_matches(&question.service, "ls_potrefund") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_potrefund, got {}",
                 question.service

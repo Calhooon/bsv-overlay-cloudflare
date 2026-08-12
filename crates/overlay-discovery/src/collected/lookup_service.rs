@@ -88,7 +88,7 @@ impl LookupService for CollectedLookupService {
         };
 
         // Only index tm_collected outputs.
-        if topic != "tm_collected" {
+        if !crate::name_matches(topic, "tm_collected") {
             return Ok(());
         }
 
@@ -137,7 +137,7 @@ impl LookupService for CollectedLookupService {
     }
 
     async fn lookup(&self, question: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
-        if question.service != "ls_collected" {
+        if !crate::name_matches(&question.service, "ls_collected") {
             return Err(LookupServiceError::Unsupported(format!(
                 "Expected ls_collected, got {}",
                 question.service

@@ -109,3 +109,79 @@ max_retries = 3
 
 [triggers]
 crons = ["*/15 * * * *"]
+
+# ══════════════════════════════════════════════════════════════════════════
+# beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
+#
+#   npx wrangler deploy --config wrangler.low.toml --env beta
+#
+# Purpose: keep PROD STABLE. Beta runs the next client/server build against
+# real mainnet money, and its whole index can be WIPED without touching a
+# single prod row.
+#
+# Isolation is by BINDING **and** by NAME, the zanaadu model:
+#   - its own D1 (`low-overlay-db-beta`) — the real isolation, because the
+#     per-protocol index tables (pot_records, low_records, …) carry NO topic
+#     column, so a shared DB would be shared data no matter what the topics
+#     were called;
+#   - `TOPIC_SUFFIX = "_beta"` — every LOW topic/service registers as
+#     `tm_low_beta` / `ls_low_beta`, which makes a cross-stack mistake FAIL
+#     CLOSED instead of silently writing into the wrong index (a beta client
+#     aimed at prod asks for a topic prod does not have, and vice versa);
+#   - its own queue, its own HOSTING_URL, its own SERVER_PRIVATE_KEY. The
+#     last two are load-bearing: the advertiser revokes ads that are its own
+#     identity + hosting URL but no longer configured, so a beta sharing
+#     prod's key and URL would try to revoke PROD's entire SHIP/SLAP ad set.
+#
+# SHIP/SLAP are deliberately NOT suffixed (see src/lib.rs) — peer discovery
+# is a global namespace and the engine hardcodes those four names.
+#
+# WIPING BETA (the point of all this) — never against the prod database id:
+#   npx wrangler d1 execute low-overlay-db-beta --remote --command "DELETE FROM …"
+# ══════════════════════════════════════════════════════════════════════════
+
+[env.beta]
+name = "low-overlay-beta"
+
+[env.beta.vars]
+ENVIRONMENT = "production"
+# The per-environment topic namespace. MUST match the client's
+# VITE_OVERLAY_TOPIC_SUFFIX (app/.env.beta) — a mismatch means every submit
+# and lookup is refused, which is the intended fail-closed behaviour.
+# Lowercase letters + a single leading underscore ONLY: the BRC-87 name
+# validator rejects digits, so `_beta2` would make our own SHIP ad
+# self-reject.
+TOPIC_SUFFIX = "_beta"
+CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
+# Its OWN hosting URL — also what scopes this deploy's advertisement set.
+HOSTING_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
+WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+# BASE names in both envs — the suffix is applied at registration, in one
+# place (src/lib.rs), so a topic added later cannot be forgotten by it.
+TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_hand,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
+LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_hand,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
+ENABLE_EXTENSIONS = "true"
+
+[[env.beta.d1_databases]]
+binding = "OVERLAY_DB"
+database_name = "low-overlay-db-beta"
+# Committed deliberately, unlike the prod placeholder above: a D1 id is not a
+# secret (it is inert without the account API token), and an uncommitted id is
+# how a clean-checkout redeploy silently points at the wrong database.
+database_id = "49d4ecb7-5f4d-4ba5-b149-2939ca7262c3"
+
+[[env.beta.services]]
+binding = "CHAINTRACKS"
+service = "rust-chaintracks"
+
+[[env.beta.queues.producers]]
+queue = "low-overlay-mutations-beta"
+binding = "MUTATION_QUEUE"
+
+[[env.beta.queues.consumers]]
+queue = "low-overlay-mutations-beta"
+max_batch_size = 1
+max_retries = 3
+
+[env.beta.triggers]
+crons = ["*/15 * * * *"]
