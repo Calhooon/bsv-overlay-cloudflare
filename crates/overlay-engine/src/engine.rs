@@ -945,10 +945,16 @@ impl Engine {
             .get(&question.service)
             .ok_or_else(|| EngineError::LookupServiceNotFound(question.service.clone()))?;
 
-        let result = service
-            .lookup(question)
-            .await
-            .map_err(|e| EngineError::LookupFailed(e.to_string()))?;
+        // Preserve WHOSE fault it was. A lookup service reports a malformed
+        // query as `InvalidQuery` / `Unsupported`; stringifying both into
+        // `LookupFailed` (as this did) threw that away and reported every
+        // caller mistake as a 500.
+        let result = service.lookup(question).await.map_err(|e| match e {
+            LookupServiceError::InvalidQuery(m) | LookupServiceError::Unsupported(m) => {
+                EngineError::InvalidQuery(m)
+            }
+            other => EngineError::LookupFailed(other.to_string()),
+        })?;
 
         // Two paths per LookupResult:
         // - OutputList(refs): the LS yields outpoints; we hydrate each with
@@ -2316,6 +2322,15 @@ pub enum EngineError {
 
     #[error("lookup failed: {0}")]
     LookupFailed(String),
+
+    /// The CALLER's query was malformed — a bad identity key, a gameId that is
+    /// not 32 bytes of hex, a missing required field. Distinct from
+    /// `LookupFailed`, which means WE failed: without the distinction every
+    /// caller mistake was reported as a server fault (HTTP 500), so a malformed
+    /// query and a genuine outage were indistinguishable in logs and alerts on
+    /// an unauthenticated endpoint anyone can hit.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
 
     #[error("storage error: {0}")]
     StorageError(String),

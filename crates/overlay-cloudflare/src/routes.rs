@@ -56,6 +56,10 @@ fn engine_error_status(e: &EngineError) -> u16 {
         EngineError::LookupServiceNotFound(_) => 400, // matches mainline overlay-express 2.2.0
         EngineError::NodeNotFound => 400, // matches mainline for /requestForeignGASPNode
         EngineError::LookupFailed(_) => 500,
+        // The caller's query was malformed — their fault, not ours. Also the
+        // parity-aligned answer: mainline overlay-express 2.2.0 answers a bad
+        // request 400 (same as the two arms above).
+        EngineError::InvalidQuery(_) => 400,
         EngineError::StorageError(_) => 500,
         EngineError::BroadcastError(_) => 502,
         EngineError::SpvError(_) => 400,
@@ -2570,6 +2574,27 @@ pub fn not_found() -> worker::Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    use super::engine_error_status;
+    use overlay_engine::engine::EngineError;
+
+    /// WHOSE fault was it? A malformed query is the CALLER's and must answer
+    /// 4xx; only our own failures are 5xx. Before this, a lookup service's
+    /// `InvalidQuery` was stringified into `LookupFailed` and every caller
+    /// mistake answered 500 — so on an unauthenticated endpoint that anyone can
+    /// hit, a bad gameId and a real outage looked identical in logs and alerts.
+    #[test]
+    fn caller_errors_are_4xx_and_our_errors_are_5xx() {
+        // Caller's fault.
+        assert_eq!(engine_error_status(&EngineError::InvalidQuery("bad gameId".into())), 400);
+        assert_eq!(engine_error_status(&EngineError::UnsupportedTopic("tm_nope".into())), 400);
+        assert_eq!(engine_error_status(&EngineError::LookupServiceNotFound("ls_nope".into())), 400);
+        // Ours.
+        assert_eq!(engine_error_status(&EngineError::LookupFailed("db exploded".into())), 500);
+        assert_eq!(engine_error_status(&EngineError::StorageError("d1 down".into())), 500);
+        // Upstream's.
+        assert_eq!(engine_error_status(&EngineError::BroadcastError("arc 503".into())), 502);
+    }
+
     // ── #347 Rule 22: can anything observe the seam being IGNORED? ────────
     //
     // The exhaustive `match` on `SubmitAction` makes DELETING the refusal a
