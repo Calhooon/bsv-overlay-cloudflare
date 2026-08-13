@@ -6,7 +6,7 @@
 //!
 //! Ported from `~/bsv/overlay-services/src/Engine.ts` (1,337 lines).
 
-use bsv_rs::transaction::Transaction;
+use bsv_rs::transaction::{Beef, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
@@ -1084,9 +1084,22 @@ impl Engine {
                 return Ok(None);
             }
 
-            // Parse BEEF to get the transaction
-            let mut tx = Transaction::from_beef(beef_data, None)
-                .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+            // Start from the STORED BEEF, not from a re-parsed subject.
+            //
+            // #4: this used to be `Transaction::from_beef(beef_data, None)` followed
+            // by `tx.to_beef(true)`, which keeps only the subject transaction and
+            // therefore DESTROYS the stored BUMPs. Measured on prod before the fix:
+            // `ls_low` byGameId `73de6e48…` returned 1,172 B / 1 tx / 1 bump (PROVEN)
+            // with no header, and 676 B / 1 tx / 0 bumps with `x-history-depth: 3` —
+            // a caller asking for MORE provenance got back a BEEF no wallet can
+            // verify, silently, behind a 200.
+            //
+            // Accumulating into the stored BEEF fixes both halves: its own bumps
+            // survive, and so does any ancestry that arrived inside the submitted
+            // bytes but was never admitted as an output of its own (a foreign
+            // parent), which the `outputs_consumed` walk below cannot see.
+            let mut acc =
+                Beef::from_binary(beef_data).map_err(|e| EngineError::BeefParseError(e.to_string()))?;
 
             // For each consumed output, recursively hydrate and embed as source transaction
             for consumed in &output.outputs_consumed {
@@ -1099,33 +1112,22 @@ impl Engine {
                         .hydrate_utxo_history(&child_output, selector, current_depth + 1)
                         .await
                     {
-                        // Try to embed the child's transaction as a source transaction
-                        // on the appropriate input
+                        // MERGE the hydrated ancestor in, rather than embedding it
+                        // as a `source_transaction` on a re-parsed subject: a merge
+                        // carries the child's own BUMPs across, which is the whole
+                        // point of asking for history. An unparseable child is
+                        // skipped — never allowed to poison the accumulator.
                         if let Some(ref child_beef) = hydrated_child.beef {
-                            if let Ok(child_tx) = Transaction::from_beef(child_beef, None) {
-                                // Find the input that references this consumed output
-                                for input in &mut tx.inputs {
-                                    let source_txid = input.get_source_txid().unwrap_or_default();
-                                    if source_txid == consumed.txid
-                                        && input.source_output_index == consumed.output_index
-                                    {
-                                        input.source_transaction = Some(Box::new(child_tx.clone()));
-                                        break;
-                                    }
-                                }
+                            if let Ok(child) = Beef::from_binary(child_beef) {
+                                acc.merge_beef(&child);
                             }
                         }
                     }
                 }
             }
 
-            // Serialize back to BEEF with enriched ancestors
-            let enriched_beef = tx.to_beef(true).map_err(|e| {
-                EngineError::Other(format!("Failed to serialize enriched BEEF: {e}"))
-            })?;
-
             Ok(Some(Output {
-                beef: Some(enriched_beef),
+                beef: Some(acc.to_binary()),
                 ..output.clone()
             }))
         })
@@ -2552,6 +2554,64 @@ mod tests {
     }
 
     // ── Tests ──────────────────────────────────────────────────────────
+
+    /// #4 REGRESSION: history hydration must never DOWNGRADE provenance.
+    ///
+    /// `get_utxo_history` used to `Transaction::from_beef(beef, None)` and then
+    /// `tx.to_beef(true)`, which keeps only the subject and DROPS the stored
+    /// BUMPs. Measured on prod before the fix: `ls_low` byGameId `73de6e48…`
+    /// returned 1,172 B / 1 tx / 1 bump (PROVEN) with no header, and 676 B /
+    /// 1 tx / 0 bumps with `x-history-depth: 3`. A caller asking for MORE
+    /// provenance got a BEEF no wallet can verify — silently, behind a 200.
+    ///
+    /// There was NO test on this function at all, which is exactly how that
+    /// shipped. This one asserts the invariant that matters: whatever else
+    /// hydration does, a proof that went in comes back out.
+    #[tokio::test]
+    async fn history_hydration_preserves_the_stored_proof() {
+        use bsv_rs::transaction::Beef;
+
+        let engine = make_engine(vec![0]);
+        let stored = test_beef();
+        let bumps_before = Beef::from_binary(&stored)
+            .expect("fixture BEEF parses")
+            .bumps
+            .len();
+        assert!(
+            bumps_before > 0,
+            "fixture must actually carry a proof, or this cell proves nothing"
+        );
+
+        let output = Output {
+            txid: TEST_TXID.to_string(),
+            output_index: 0,
+            output_script: vec![0x76, 0xa9],
+            satoshis: 1000,
+            topic: "tm_test".to_string(),
+            spent: false,
+            // No admitted parents: hydration has nothing to add, so anything
+            // it REMOVES is pure loss — the cleanest form of the bug.
+            outputs_consumed: vec![],
+            consumed_by: vec![],
+            beef: Some(stored.clone()),
+            block_height: None,
+            score: Some(1000.0),
+        };
+
+        let hydrated = engine
+            .get_utxo_history(&output, Some(HistorySelector::Depth(3)))
+            .await
+            .expect("hydration must not error")
+            .expect("hydration must return the output");
+        let beef = Beef::from_binary(&hydrated.beef.expect("hydrated BEEF present"))
+            .expect("hydrated BEEF parses");
+
+        assert_eq!(
+            beef.bumps.len(),
+            bumps_before,
+            "asking for history must not strip the merkle proof (issue #4)"
+        );
+    }
 
     #[tokio::test]
     async fn test_submit_unsupported_topic_errors() {
