@@ -275,6 +275,141 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 /// unretained coin is cleaned up. Missing everywhere (no row, NULL/empty
 /// beef, undecodable) → 404, so the answer upgrades by itself once the
 /// overlay stores the tx.
+/// Load ONE stored BEEF by txid, with the same trust/compaction semantics
+/// `/beef/:txid` serves. `Ok(None)` = genuinely absent; `Err(())` = the read
+/// faulted (never shape a fault like a definitive not-found).
+///
+/// Factored out of `beef` so `/credit-beef` cannot drift from it: an assembled
+/// ancestry that trusted different bytes than the single-txid route would be a
+/// second source of truth for the same question.
+async fn load_stored_beef(db: &worker::D1Database, txid: &str) -> std::result::Result<Option<Vec<u8>>, ()> {
+    let key = txid.to_ascii_lowercase();
+    let mut faulted = false;
+    for (table, sql, legacy_sql) in [
+        (
+            "pot_beefs",
+            POT_BEEFS_TRUST_SQL,
+            "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?",
+        ),
+        (
+            "transactions",
+            TRANSACTIONS_TRUST_SQL,
+            "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?",
+        ),
+    ] {
+        let Ok(stmt) = db.prepare(sql).bind(&[JsValue::from_str(&key)]) else {
+            faulted = true;
+            continue;
+        };
+        let (row, proof_verified): (Option<BeefRow>, bool) =
+            match stmt.first::<BeefTrustRow>(None).await {
+                Ok(row) => {
+                    let verified =
+                        row.as_ref().and_then(|r| r.proof_verified).unwrap_or(0.0) != 0.0;
+                    (row.map(|r| BeefRow { beef: r.beef }), verified)
+                }
+                Err(_) => {
+                    let Ok(stmt) = db.prepare(legacy_sql).bind(&[JsValue::from_str(&key)]) else {
+                        faulted = true;
+                        continue;
+                    };
+                    match stmt.first::<BeefRow>(None).await {
+                        Ok(row) => (row, false),
+                        Err(e) => {
+                            console_warn!("[credit-beef] {table} query failed: {e}");
+                            faulted = true;
+                            continue;
+                        }
+                    }
+                }
+            };
+        if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
+            return Ok(Some(if proof_verified {
+                crate::compaction::compact_beef(&key, &bytes)
+            } else {
+                bytes
+            }));
+        }
+    }
+    if faulted {
+        return Err(());
+    }
+    Ok(None)
+}
+
+/// `GET /credit-beef/:txid` — the ancestry a WALLET needs to credit this
+/// subject, assembled from the index so the client stores nothing.
+///
+/// See `credit_beef` for why this exists and why `/lookup` +
+/// `x-history-depth` is not the vehicle (it strips bumps). The walk follows
+/// the TRANSACTION GRAPH via each unproven tx's input txids, merging stored
+/// BEEFs and preserving their proofs, and stops at any transaction that
+/// carries a bump.
+///
+/// `complete: false` is served with a 200 and the partial ancestry: the
+/// caller decides whether to retry (a parent may still be propagating). It is
+/// never dressed up as success — the flag is the contract.
+pub async fn credit_beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    let Some(txid) = ctx.param("txid").cloned() else {
+        return json_error("missing txid", 400);
+    };
+    if !valid_txid(&txid) {
+        return json_error("invalid txid (expect 64 hex chars)", 400);
+    }
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[credit-beef] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        }
+    };
+
+    let subject = match load_stored_beef(&db, &txid).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return json_error(&format!("BEEF not found for txid: {txid}"), 404),
+        Err(()) => return json_error("database query failed", 503),
+    };
+    let acc = match bsv_rs::transaction::Beef::from_binary(&subject) {
+        Ok(b) => b,
+        Err(e) => {
+            console_warn!("[credit-beef] stored subject BEEF unparseable for {txid}: {e}");
+            return json_error("stored BEEF unparseable", 500);
+        }
+    };
+
+    // Drive the SAME state machine the unit tests drive (`credit_beef::Walk`):
+    // the decisions — what to fetch, when to stop, what counts as complete —
+    // live in one place, and only the I/O differs here.
+    let mut walk = crate::credit_beef::Walk::new(acc);
+    while let Some(wanted) = walk.next_wanted() {
+        let mut progressed = false;
+        for parent in wanted {
+            match load_stored_beef(&db, &parent).await {
+                Ok(bytes) => {
+                    // A parent we do not hold (a foreign tx never submitted
+                    // through us) still counts as a fetch, so an absent row
+                    // ends the walk instead of spinning it.
+                    if walk.absorb(bytes.as_deref()) {
+                        progressed = true;
+                    }
+                }
+                Err(()) => return json_error("database query failed", 503),
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let complete = walk.is_complete();
+    let fetches = walk.fetches();
+    let bytes = walk.into_beef().to_binary();
+    json_response(
+        serde_json::json!({ "txid": txid, "beef": bytes, "complete": complete, "fetches": fetches }).to_string(),
+        200,
+    )
+}
+
 pub async fn beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let Some(txid) = ctx.param("txid").cloned() else {
         return json_error("missing txid", 400);

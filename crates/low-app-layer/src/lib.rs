@@ -116,6 +116,7 @@
 pub mod auth;
 pub mod compaction;
 pub mod cors;
+pub mod credit_beef;
 pub mod hops_view;
 pub mod live_view;
 pub mod logic;
@@ -220,6 +221,9 @@ fn router(
         .get_async("/spent-any", routes::spent_any)
         .get_async("/tx-any/:txid", routes::tx_any)
         .get_async("/beef/:txid", routes::beef)
+        // #209 follow-up: server-assembled credit ancestry, so the client
+        // never stores BEEF bytes to survive a reload (see `credit_beef`).
+        .get_async("/credit-beef/:txid", routes::credit_beef)
         .get_async("/tip", routes::tip)
         .get("/epoch", routes::epoch)
         .get("/health", routes::health)
