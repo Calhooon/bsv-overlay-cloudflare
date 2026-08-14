@@ -549,6 +549,123 @@ pub fn attribute_seats(
     out
 }
 
+/// One `LOW/hopparty` row, as `/hops-view` already reads them: the seat's
+/// settle pubkey, the identity that published it, and the overlay's LATCHED
+/// signature verdict (`markerValid`) computed at admission.
+#[derive(Debug, Clone)]
+pub struct HopSeatRow {
+    pub identity: String,
+    pub seat_settle_pubkey: String,
+    /// The latched `markerValid` column. `None` = a legacy row nobody
+    /// measured — never treated as verified (`/hops-view`'s own rule).
+    pub marker_valid: Option<bool>,
+}
+
+/// FILL seat slots the pot markers left empty, from the HOP markers.
+///
+/// ## Why this exists
+///
+/// Seat attribution used to depend solely on the `LOW/potparty/v2` marker,
+/// which a seat publishes at the END of a hand. That publish races teardown:
+/// on 2026-08-13 four 20k beta hands settled identically on chain, and one
+/// (`c9a4af3a…`) came back `unresolved` purely because ONE seat's v2 potparty
+/// marker never landed — 3 rows instead of 4. The pot was spent, confirmed,
+/// `verdict=winner-b`, and paid. Only the ATTRIBUTION was missing.
+///
+/// The same binding is published at FUND time, seconds into the hand, in
+/// `hopparty_records` — and for that very game BOTH seats were present and
+/// `markerValid`, written 8 seconds BEFORE the pot existed. Verified on the
+/// real row: the hop's `seatSettlePubkey` for `020d2811…` is byte-identical
+/// to its potparty one, and the pot's own committed `pubA`/`pubB` are exactly
+/// the two hop seat keys. The proof was in the index the whole time; nothing
+/// consulted it.
+///
+/// ## Why it is safe
+///
+/// The authority is unchanged and remains the CHAIN: a row whose
+/// `seatSettlePubkey` is not the pot's committed `pubA`/`pubB` attributes
+/// nothing. Those keys are decoded from the pot's OWN on-chain funding output,
+/// so a forged hop row buys an attacker nothing — it cannot name a key it does
+/// not hold, and holding the key is what the lock already means. The row only
+/// answers "which identity holds this committed key".
+///
+/// Signature trust follows `/hops-view` verbatim: the overlay verifies the
+/// marker at admission and latches `markerValid`; an unlatched (legacy `None`)
+/// or refuted row is refused here rather than silently relabelled.
+///
+/// FILL, never OVERRIDE: a slot the pot markers already attributed is left
+/// exactly as it was. The potparty marker binds the POT OUTPOINT directly,
+/// which is the stronger claim; this only speaks where that said nothing.
+/// Conflicting identities for one slot poison it, same as the pot path — an
+/// ambiguous answer is `unresolved`, never a guess.
+pub fn fill_seats_from_hop_markers(
+    attr: &mut SeatAttribution,
+    params: &CovenantParams,
+    hops: &[HopSeatRow],
+) {
+    if params.pub_a == params.pub_b {
+        return; // degenerate lock — seats indistinguishable
+    }
+    if attr.identity_a.is_some() && attr.identity_b.is_some() {
+        return; // both slots already attributed by the stronger claim
+    }
+    let pub_a_hex = hex::encode(params.pub_a);
+    let pub_b_hex = hex::encode(params.pub_b);
+    let mut slot_a: Option<Option<String>> = None;
+    let mut slot_b: Option<Option<String>> = None;
+    for h in hops {
+        if h.marker_valid != Some(true) {
+            continue; // unverified or unmeasured — refused
+        }
+        let pk = h.seat_settle_pubkey.to_ascii_lowercase();
+        let slot = if pk == pub_a_hex {
+            &mut slot_a
+        } else if pk == pub_b_hex {
+            &mut slot_b
+        } else {
+            continue; // key not committed in this pot's lock — refused
+        };
+        let id = h.identity.to_ascii_lowercase();
+        match slot {
+            None => *slot = Some(Some(id)),
+            Some(Some(existing)) if *existing == id => {} // idempotent replay
+            Some(_) => *slot = Some(None),                // conflicting — poison
+        }
+    }
+    if attr.identity_a.is_none() {
+        attr.identity_a = slot_a.flatten();
+    }
+    if attr.identity_b.is_none() {
+        attr.identity_b = slot_b.flatten();
+    }
+}
+
+/// Binds per pot for [`hop_seat_markers_sql`]: (pubA, pubB).
+pub const HOP_SEAT_BINDS_PER_POT: usize = 2;
+
+/// Fetch hop seat markers for `pots` pots, filtered to each pot's OWN
+/// COMMITTED settle keys — the same F2 shape [`seat_markers_sql`] uses, and
+/// for the same reason: the lock is the authority, so a row naming a key the
+/// pot never committed is never even loaded.
+///
+/// Filtering by the committed keys is also implicitly GAME-SCOPED: a seat
+/// settle key is derived per (seat, gameId), so it cannot collide across
+/// games — which is why this needs no gameId bind and works even for a pot
+/// whose potparty markers are entirely absent.
+pub fn hop_seat_markers_sql(pots: usize) -> String {
+    let mut sql = String::from(
+        "SELECT identity AS identity, seatSettlePubkey AS seatSettlePubkey, \
+                markerValid AS markerValid FROM hopparty_records WHERE ",
+    );
+    for i in 0..pots {
+        if i > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str("seatSettlePubkey IN (?, ?)");
+    }
+    sql
+}
+
 /// A committed-lock seat slot (`pubA` = A, `pubB` = B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeatLetter {
@@ -821,7 +938,27 @@ pub fn my_seat(
     identity_lc: &str,
     markers: &[SeatMarkerRow],
 ) -> Option<SeatLetter> {
-    let attr = attribute_seats(params, pot_txid_lc, pot_vout, markers);
+    my_seat_with_hops(params, pot_txid_lc, pot_vout, identity_lc, markers, &[])
+}
+
+/// [`my_seat`] with the HOP-marker fallback layered under it.
+///
+/// `/results` resolves a winner verdict through the CALLER's own seat proof,
+/// so a caller whose v2 potparty marker never landed reads `unresolved` even
+/// though the pot is spent, confirmed and paid — the 2026-08-13 `c9a4af3a…`
+/// row. The hop marker carries the same committed key, published at fund
+/// time; see [`fill_seats_from_hop_markers`] for why deferring to it keeps the
+/// chain as the authority.
+pub fn my_seat_with_hops(
+    params: &CovenantParams,
+    pot_txid_lc: &str,
+    pot_vout: u32,
+    identity_lc: &str,
+    markers: &[SeatMarkerRow],
+    hops: &[HopSeatRow],
+) -> Option<SeatLetter> {
+    let mut attr = attribute_seats(params, pot_txid_lc, pot_vout, markers);
+    fill_seats_from_hop_markers(&mut attr, params, hops);
     let a = attr.identity_a.as_deref() == Some(identity_lc);
     let b = attr.identity_b.as_deref() == Some(identity_lc);
     match (a, b) {
@@ -1608,6 +1745,10 @@ pub fn assemble_results(
     claims_by_game: &std::collections::HashMap<String, GameClaims>,
     seat_markers_by_pot: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
     params_by_pot: &std::collections::HashMap<(String, u32), CovenantParams>,
+    // HOP seat markers keyed by pot outpoint — the fund-time fallback when a
+    // seat's end-of-hand potparty marker never landed. Empty is the previous
+    // behaviour exactly.
+    hop_markers_by_pot: &std::collections::HashMap<(String, u32), Vec<HopSeatRow>>,
 ) -> Vec<ResultEntry> {
     // Keyed by pot OUTPOINT, never by gameId: `attribute_seats` re-checks the
     // outpoint and the committed key on every marker, so a marker naming a
@@ -1779,7 +1920,12 @@ pub fn assemble_results(
             // first, else the hash-verified funding bytes.
             if verdict.is_some() {
                 seat = row_params.and_then(|p| {
-                    my_seat(
+                    // …with the fund-time HOP fallback under it, so a seat
+                    // whose end-of-hand potparty marker never landed still
+                    // resolves. This is THE outcome-deciding seat: the sibling
+                    // call below only sets `potBinding`, so fixing that one
+                    // alone left the row `unresolved` with `potBinding:chain`.
+                    my_seat_with_hops(
                         p,
                         &pot_txid_lc,
                         r.pot_vout,
@@ -1788,6 +1934,9 @@ pub fn assemble_results(
                             .get(&(pot_txid_lc.clone(), r.pot_vout))
                             .map(Vec::as_slice)
                             .unwrap_or(&[]),
+                        hop_markers_by_pot
+                            .get(&(pot_txid_lc.clone(), r.pot_vout))
+                            .map_or(&[], Vec::as_slice),
                     )
                 });
             }
@@ -1807,9 +1956,21 @@ pub fn assemble_results(
         // gameId made ONE dust marker (fabricated gameId, earlier `createdAt`)
         // flip an honest row to `Unknown` permanently — Rule 19: dissolving
         // one attacker-writable input by depending on another.
+        let hops_for_pot: &[HopSeatRow] = hop_markers_by_pot
+            .get(&(pot_txid_lc.clone(), r.pot_vout))
+            .map_or(&[], Vec::as_slice);
         let pot_binding = PotBinding::from_proof(
             row_params
-                .and_then(|p| my_seat(p, &pot_txid_lc, r.pot_vout, identity_lc, markers_for_pot))
+                .and_then(|p| {
+                    my_seat_with_hops(
+                        p,
+                        &pot_txid_lc,
+                        r.pot_vout,
+                        identity_lc,
+                        markers_for_pot,
+                        hops_for_pot,
+                    )
+                })
                 .is_some(),
         );
         // DECORATION — the same predicate over the strictly narrower set of
@@ -2684,7 +2845,7 @@ mod tests {
         seat_markers: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
     ) -> Vec<ResultEntry> {
         let params_by_pot = covenant_params_by_pot(&rows);
-        assemble_results(identity_lc, rows, claims, seat_markers, &params_by_pot)
+        assemble_results(identity_lc, rows, claims, seat_markers, &params_by_pot, &Default::default())
     }
 
     fn ident(b: u8) -> String {
@@ -3043,6 +3204,115 @@ mod tests {
             None,
         );
         assert_eq!((o, src), (Outcome::Won, Some("chain+seatkey")));
+    }
+
+    // ── hop-marker seat fallback ───────────────────────────────────────────
+    //
+    // Fixtures are THE REAL 2026-08-13 beta hand that came back `unresolved`:
+    // pot `c9a4af3a…`, game `2628eddd…`, verdict `winner-b`, spent+confirmed
+    // and paid — with only 3 of 4 potparty rows, seat B's v2 marker missing.
+    // Its two hopparty rows carry exactly the pot's committed keys.
+
+    /// Pot's committed `pubA` — hop-published by identity `020d2811…`.
+    const REAL_PUB_A: &str = "035037394d2b4e7822b9008691edc28f0768e98a9f668657e885b8c239f3c14ca9";
+    /// Pot's committed `pubB` — hop-published by identity `030ab0a1…`.
+    const REAL_PUB_B: &str = "037dea4644468469ade8ffc35ed1c30651fbbc38292fc5e2d1ac6f7f44530ab7e8";
+    const REAL_ID_A: &str = "020d2811c5c949bab57b35facd753baabf697b1ba14a50469d416fdac0e37fc9b9";
+    const REAL_ID_B: &str = "030ab0a18b1b73fa264a7d27c7932fd5914ac036a18fc846dbf292f1780a9ef775";
+
+    fn hop(identity: &str, pk: &str, valid: Option<bool>) -> HopSeatRow {
+        HopSeatRow {
+            identity: identity.to_string(),
+            seat_settle_pubkey: pk.to_string(),
+            marker_valid: valid,
+        }
+    }
+
+    /// THE INCIDENT: seat B unattributed by pot markers, recovered from hops,
+    /// and the chain verdict `winner-b` now names a real identity.
+    #[test]
+    fn hop_markers_recover_the_seat_the_pot_marker_never_published() {
+        let params = params_with_keys(REAL_PUB_A, REAL_PUB_B);
+        // What the pot markers gave us: seat A only (3 of 4 rows).
+        let mut attr = SeatAttribution {
+            identity_a: Some(REAL_ID_A.to_string()),
+            identity_b: None,
+        };
+        assert_eq!(
+            attr.winner_for(PotVerdict::WinnerB),
+            None,
+            "precondition: this is the unresolved row"
+        );
+
+        fill_seats_from_hop_markers(
+            &mut attr,
+            &params,
+            &[
+                hop(REAL_ID_A, REAL_PUB_A, Some(true)),
+                hop(REAL_ID_B, REAL_PUB_B, Some(true)),
+            ],
+        );
+
+        assert_eq!(attr.identity_b.as_deref(), Some(REAL_ID_B));
+        assert_eq!(
+            attr.winner_for(PotVerdict::WinnerB),
+            Some(REAL_ID_B),
+            "the hand resolves to the identity the chain already paid"
+        );
+    }
+
+    /// FILL, never OVERRIDE — the pot marker binds the outpoint directly and
+    /// is the stronger claim; a hop row must not restate or replace it.
+    #[test]
+    fn hop_markers_never_override_a_pot_attributed_slot() {
+        let params = params_with_keys(REAL_PUB_A, REAL_PUB_B);
+        let mut attr = SeatAttribution {
+            identity_a: Some(REAL_ID_A.to_string()),
+            identity_b: Some(REAL_ID_B.to_string()),
+        };
+        // A hostile hop row claiming seat A with the WRONG identity.
+        fill_seats_from_hop_markers(&mut attr, &params, &[hop(REAL_ID_B, REAL_PUB_A, Some(true))]);
+        assert_eq!(attr.identity_a.as_deref(), Some(REAL_ID_A), "untouched");
+    }
+
+    /// The CHAIN stays the authority: a key the pot's lock never committed
+    /// attributes nothing, however well-formed the row is.
+    #[test]
+    fn a_hop_key_outside_the_committed_lock_attributes_nothing() {
+        let params = params_with_keys(REAL_PUB_A, REAL_PUB_B);
+        let mut attr = SeatAttribution::default();
+        let foreign = "02".to_string() + &"11".repeat(32);
+        fill_seats_from_hop_markers(&mut attr, &params, &[hop(REAL_ID_B, &foreign, Some(true))]);
+        assert_eq!(attr, SeatAttribution::default(), "foreign key attributes nothing");
+    }
+
+    /// Unverified and UNMEASURED rows are both refused — a legacy `None` is
+    /// never silently promoted (the `/hops-view` rule).
+    #[test]
+    fn only_a_latched_verified_hop_marker_attributes() {
+        let params = params_with_keys(REAL_PUB_A, REAL_PUB_B);
+        for latched in [Some(false), None] {
+            let mut attr = SeatAttribution::default();
+            fill_seats_from_hop_markers(&mut attr, &params, &[hop(REAL_ID_B, REAL_PUB_B, latched)]);
+            assert_eq!(attr, SeatAttribution::default(), "latched={latched:?} must not attribute");
+        }
+    }
+
+    /// Two identities claiming one committed key is ambiguous — poison the
+    /// slot rather than pick. `unresolved` is the honest answer.
+    #[test]
+    fn conflicting_hop_claims_poison_the_slot() {
+        let params = params_with_keys(REAL_PUB_A, REAL_PUB_B);
+        let mut attr = SeatAttribution::default();
+        fill_seats_from_hop_markers(
+            &mut attr,
+            &params,
+            &[
+                hop(REAL_ID_A, REAL_PUB_B, Some(true)),
+                hop(REAL_ID_B, REAL_PUB_B, Some(true)),
+            ],
+        );
+        assert_eq!(attr.identity_b, None, "conflict resolves to nobody");
     }
 
     #[test]

@@ -1560,10 +1560,12 @@ async fn seat_attributions(
             }
         }
     }
+    const NO_MARKERS: &[crate::results::SeatMarkerRow] = &[];
     for (pot, params) in params_by_pot {
-        let Some(markers) = markers_by_pot.get(pot) else {
-            continue;
-        };
+        // A pot with NO potparty rows is no longer skipped: the hop fallback
+        // below can still attribute it, and skipping here was why an entirely
+        // marker-less pot could never resolve.
+        let markers = markers_by_pot.get(pot).map_or(NO_MARKERS, Vec::as_slice);
         let attr = crate::results::attribute_seats(
             params,
             pot,
@@ -1574,7 +1576,79 @@ async fn seat_attributions(
             out.insert(pot.clone(), attr);
         }
     }
+
+    // ── HOP fallback (2026-08-14) ──────────────────────────────────────────
+    //
+    // The potparty v2 marker is published at the END of a hand and races
+    // teardown. On 2026-08-13 four 20k beta hands settled identically on
+    // chain and one (`c9a4af3a…`) came back `unresolved` on 3 of 4 rows — the
+    // pot was spent, confirmed, `winner-b`, and PAID; only the attribution was
+    // missing. The same binding exists in `hopparty_records`, written at FUND
+    // time seconds into the hand, and for that game BOTH seats were present
+    // and `markerValid` 8 seconds before the pot even existed.
+    //
+    // Fill-only, and the CHAIN stays the authority — see
+    // `fill_seats_from_hop_markers`. Best-effort like everything here: a fault
+    // leaves attribution exactly as the pot markers left it.
+    let needs_fallback: Vec<&String> = {
+        let mut v: Vec<&String> = params_by_pot
+            .keys()
+            .filter(|pot| {
+                out.get(*pot).is_none_or(|a| {
+                    a.identity_a.is_none() || a.identity_b.is_none()
+                })
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    for chunk in needs_fallback.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+        let sql = crate::results::hop_seat_markers_sql(chunk.len());
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(chunk.len() * crate::results::HOP_SEAT_BINDS_PER_POT);
+        for pot in chunk {
+            let p = &params_by_pot[*pot];
+            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+        }
+        let Ok(stmt) = db.prepare(&sql).bind(&binds) else {
+            continue;
+        };
+        match stmt.all().await.and_then(|r| r.results::<HopSeatRowD1>()) {
+            Ok(rows) => {
+                let hops: Vec<crate::results::HopSeatRow> = rows
+                    .into_iter()
+                    .map(|r| crate::results::HopSeatRow {
+                        identity: r.identity,
+                        seat_settle_pubkey: r.seat_settle_pubkey,
+                        marker_valid: r.marker_valid.map(|v| v != 0.0),
+                    })
+                    .collect();
+                for pot in chunk {
+                    let params = &params_by_pot[*pot];
+                    let mut attr = out.get(*pot).cloned().unwrap_or_default();
+                    crate::results::fill_seats_from_hop_markers(&mut attr, params, &hops);
+                    if attr != crate::results::SeatAttribution::default() {
+                        out.insert((*pot).clone(), attr);
+                    }
+                }
+            }
+            Err(e) => {
+                console_warn!("[leaderboard] hop seat fallback query failed (attribution unchanged): {e}");
+            }
+        }
+    }
     out
+}
+
+/// One `hopparty_records` row as D1 returns it for the seat fallback.
+#[derive(Deserialize)]
+struct HopSeatRowD1 {
+    identity: String,
+    #[serde(rename = "seatSettlePubkey")]
+    seat_settle_pubkey: String,
+    #[serde(rename = "markerValid")]
+    marker_valid: Option<f64>,
 }
 
 // ── /results — server-derived settle results (bsv-low #227) ─────────────────
@@ -1821,6 +1895,10 @@ async fn gather_result_entries(
     // and whose row set attacker-writable dust markers populate (#314 class).
     let params_by_pot = crate::results::covenant_params_by_pot(&rows);
     let seat_markers = results_seat_markers(db, &params_by_pot).await;
+    // The fund-time fallback: a seat whose end-of-hand potparty marker never
+    // landed still published the same committed key at hop time. Best-effort —
+    // an empty map is exactly the previous behaviour.
+    let hop_markers = results_hop_seat_markers(db, &params_by_pot).await;
 
     Ok(crate::results::assemble_results(
         identity_lc,
@@ -1828,7 +1906,62 @@ async fn gather_result_entries(
         &claims,
         &seat_markers,
         &params_by_pot,
+        &hop_markers,
     ))
+}
+
+/// HOP seat markers for the pots on this `/results` page, fetched under each
+/// pot's OWN committed lock keys — the same F2 bar `results_seat_markers` uses,
+/// so a row naming a key the pot never committed is filtered out IN SQL.
+///
+/// Exists because `/results` resolves a winner verdict through the CALLER's own
+/// seat proof, and that proof lived only in the potparty marker published at the
+/// END of a hand, which races teardown. See `fill_seats_from_hop_markers`.
+async fn results_hop_seat_markers(
+    db: &worker::D1Database,
+    params_by_pot: &std::collections::HashMap<(String, u32), crate::results::CovenantParams>,
+) -> std::collections::HashMap<(String, u32), Vec<crate::results::HopSeatRow>> {
+    let mut out: std::collections::HashMap<(String, u32), Vec<crate::results::HopSeatRow>> =
+        std::collections::HashMap::new();
+    if params_by_pot.is_empty() {
+        return out;
+    }
+    let mut keys: Vec<&(String, u32)> = params_by_pot.keys().collect();
+    keys.sort_unstable();
+    for chunk in keys.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+        let sql = crate::results::hop_seat_markers_sql(chunk.len());
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(chunk.len() * crate::results::HOP_SEAT_BINDS_PER_POT);
+        for k in chunk {
+            let p = &params_by_pot[*k];
+            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
+            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+        }
+        let Ok(stmt) = db.prepare(&sql).bind(&binds) else {
+            continue;
+        };
+        match stmt.all().await.and_then(|r| r.results::<HopSeatRowD1>()) {
+            Ok(rows) => {
+                let hops: Vec<crate::results::HopSeatRow> = rows
+                    .into_iter()
+                    .map(|r| crate::results::HopSeatRow {
+                        identity: r.identity,
+                        seat_settle_pubkey: r.seat_settle_pubkey,
+                        marker_valid: r.marker_valid.map(|v| v != 0.0),
+                    })
+                    .collect();
+                // Every pot in the chunk gets the chunk's rows; the committed-key
+                // match inside `fill_seats_from_hop_markers` decides which apply.
+                for k in chunk {
+                    out.entry((*k).clone()).or_default().extend(hops.iter().cloned());
+                }
+            }
+            Err(e) => {
+                console_warn!("[results] hop seat fallback query failed (binding unchanged): {e}");
+            }
+        }
+    }
+    out
 }
 
 /// #230/#281 — the caller's v2 seat markers for the pots on this `/results`
