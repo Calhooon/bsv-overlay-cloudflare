@@ -13,6 +13,7 @@
           "anchored": true,
           "cardsHex": null,
           "chainAttributedWinner": "02f9502d540ca7d5ab09ea89e83889fa4bcd0b27f7eec5752f4fa07b1b19160f3b",
+          "createdAt": 100,
           "gameId": "0303030303030303030303030303030303030303030303030303030303030303",
           "loser": "03dfeeef1881101f2cb11644f3a2afdfc2045e19919152923f367a1767c11cceda",
           "loserSigHex": "3044022015f8ee5b5232ae6f022b7674418b192f326f035eb1cf8c4aa2419d71e662f9ce022034421aa2a2f4e4eb5ee99cd624faafa052a6ee79e39a00095d940366bfbc536d",

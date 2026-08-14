@@ -1568,6 +1568,17 @@ pub struct LeaderboardEvidence {
     /// `ls_potparty byPot` serves the v2 marker, `/beef` the committed lock,
     /// and `serverVerdict` names the winning template.
     pub chain_attributed_winner: Option<String>,
+    /// When the overlay first admitted this result marker (unix seconds), from
+    /// `result_markers_v2.createdAt`. `None` when the index never recorded one.
+    ///
+    /// DISPLAY-ONLY, and the client treats it that way: it is the app-layer's
+    /// own admission stamp, not a chain fact and not a claim either seat
+    /// signed, so nothing counts or ranks on it. It exists because a played
+    /// hand without a date is a record nobody can place in time — the slow
+    /// `gatherBoard` path has always carried it (`HandRow.createdAt`), and the
+    /// fast path silently dropped it, so the same board rendered dated or
+    /// undated depending on which path served it.
+    pub created_at: Option<i64>,
 }
 
 /// One chain-counted win's on-chain ANCHOR (bsv-low #336/#337): the pot
@@ -1631,8 +1642,17 @@ pub struct LeaderboardHandRow {
     pub score: u32,
     pub cards_hex: String,
     pub winner: String,
+    /// The identity this hand was won AGAINST — the marker's `loser`. A hand
+    /// is a game between two people; the board showed only one of them.
+    /// Carried verbatim (lowercase hex) and, like `winner`, re-verifiable by
+    /// the client against the marker's own signatures.
+    pub loser: String,
     /// Always `true` for a hand row (only anchored + confirmed hands qualify).
     pub anchored: bool,
+    /// The marker's overlay admission stamp — see [`LeaderboardEvidence::created_at`].
+    /// Already computed here before this field existed: it was the hand list's
+    /// score-tie break, carried in a side tuple and then thrown away.
+    pub created_at: Option<i64>,
 }
 
 /// The assembled leaderboard, pre-JSON.
@@ -2035,6 +2055,7 @@ pub fn aggregate_leaderboard_attributed(
                         proof_txids,
                         server_verdict: verdict,
                         chain_attributed_winner: counted.get(&pot).map(|(o, _)| o.clone()),
+                        created_at: m.created_at,
                     }
                 })
                 .collect();
@@ -2071,7 +2092,9 @@ pub fn aggregate_leaderboard_attributed(
     // One per counted pot (the winner's own signed cards), never marker-
     // grouped — so a marker flood can only DENY a hand (undercount), never
     // fabricate or steal one.
-    let mut hands: Vec<(LeaderboardHandRow, Option<i64>)> = Vec::new();
+    // The score-tie break is the earliest claim — read off the row's own
+    // `created_at` now that it carries one (it used to ride in a side tuple).
+    let mut hands: Vec<LeaderboardHandRow> = Vec::new();
     for (pot_lc, &(i, _)) in &hand_marker {
         let m = &markers[i];
         // hand_marker is only populated for identity-keyed wins (the
@@ -2079,32 +2102,31 @@ pub fn aggregate_leaderboard_attributed(
         // identity — the hand names it.
         let winner_lc = &counted[pot_lc].0;
         let cards = leaderboard_cards_from_hex(m.cards_hex.as_ref().unwrap()).unwrap();
-        hands.push((
-            LeaderboardHandRow {
-                game_id: m.game_id.to_ascii_lowercase(),
-                score: hand_score(&cards),
-                cards_hex: m.cards_hex.as_ref().unwrap().to_ascii_lowercase(),
-                winner: winner_lc.clone(),
-                anchored: true,
-            },
-            m.created_at,
-        ));
+        hands.push(LeaderboardHandRow {
+            game_id: m.game_id.to_ascii_lowercase(),
+            score: hand_score(&cards),
+            cards_hex: m.cards_hex.as_ref().unwrap().to_ascii_lowercase(),
+            winner: winner_lc.clone(),
+            loser: m.loser.to_ascii_lowercase(),
+            anchored: true,
+            created_at: m.created_at,
+        });
     }
     // Score ascending; tie → earliest createdAt (None sorts LAST, == the
     // client's `?? Infinity`); final tie → gameId asc. The gameId tiebreak
     // (LOW-3) makes the order a TOTAL function of the data, so it depends on
     // NOTHING outside this function — no coupling to any window ORDER BY.
-    hands.sort_by(|(a, ac), (b, bc)| {
+    hands.sort_by(|a, b| {
         a.score
             .cmp(&b.score)
-            .then_with(|| ac.unwrap_or(i64::MAX).cmp(&bc.unwrap_or(i64::MAX)))
+            .then_with(|| {
+                a.created_at
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.created_at.unwrap_or(i64::MAX))
+            })
             .then_with(|| a.game_id.cmp(&b.game_id))
     });
-    let hands = hands
-        .into_iter()
-        .take(hands_limit)
-        .map(|(h, _)| h)
-        .collect();
+    let hands = hands.into_iter().take(hands_limit).collect();
 
     Leaderboard { board, hands }
 }
@@ -2160,6 +2182,12 @@ pub fn leaderboard_body(
                         // verdict (null when unattributed) — the falsifiable
                         // fact behind the row's `chainProven` tier.
                         "chainAttributedWinner": e.chain_attributed_winner,
+                        // The marker's overlay admission stamp (unix seconds,
+                        // null when unrecorded) — DISPLAY ONLY. Nothing counts,
+                        // ranks or verifies on it, so a garbled value costs a
+                        // date and nothing else; the client parses it as
+                        // optional and simply omits the date when it is absent.
+                        "createdAt": e.created_at,
                     })
                 })
                 .collect();
@@ -2207,7 +2235,12 @@ pub fn leaderboard_body(
                 "score": h.score,
                 "cardsHex": h.cards_hex,
                 "winner": h.winner,
+                // Who the hand was won against, and when — both display-only
+                // (see the evidence row's `createdAt`). A hand row that names
+                // only its winner cannot say who was across the table.
+                "loser": h.loser,
                 "anchored": h.anchored,
+                "createdAt": h.created_at,
             })
         })
         .collect();
@@ -4470,13 +4503,85 @@ mod tests {
         assert_eq!(ev[0]["proofTxid"], "px");
         assert_eq!(ev[0]["proofTxids"][0], "px");
         assert_eq!(ev[0]["cardsHex"], "000102030c");
+        assert_eq!(ev[0]["createdAt"], 100);
         let hands = v["hands"].as_array().unwrap();
         assert_eq!(hands.len(), 1);
         assert_eq!(hands[0]["gameId"], tx(1));
         assert_eq!(hands[0]["score"], 15);
         assert_eq!(hands[0]["cardsHex"], "000102030c");
         assert_eq!(hands[0]["winner"], a);
+        assert_eq!(hands[0]["loser"], b);
         assert_eq!(hands[0]["anchored"], true);
+        assert_eq!(hands[0]["createdAt"], 100);
+    }
+
+    /// The date and the opponent must SURVIVE to the wire — the fast path's
+    /// whole job is to serve the same facts the slow client-side `gatherBoard`
+    /// derives, and it silently dropped both: `createdAt` was computed here (it
+    /// is the hand-list tie-break) and thrown away, and `loser` never left the
+    /// evidence row, so a hand row could not name who was across the table.
+    ///
+    /// Both are DISPLAY-ONLY and therefore OPTIONAL on the wire: an unstamped
+    /// marker must serialize as an explicit `null`, not vanish, so the client
+    /// can tell "no date recorded" from "this server is too old to send one".
+    #[test]
+    fn an_unstamped_marker_serializes_a_null_date_not_an_absent_field() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let mut m = mk(1, &a, &b, 1, 2, true, Some("000102030c"), 100, 0);
+        m.created_at = None; // the index never recorded an admission time
+        let markers = vec![m];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b)]),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+        let ev = &v["board"][0]["evidence"][0];
+        assert!(ev["createdAt"].is_null(), "absent stamp must be null");
+        assert!(
+            ev.as_object().unwrap().contains_key("createdAt"),
+            "the field must be EMITTED even when null — absent means 'old server'"
+        );
+        let hand = &v["hands"][0];
+        assert!(hand["createdAt"].is_null());
+        assert!(hand.as_object().unwrap().contains_key("createdAt"));
+        // The opponent is not optional: every marker names one.
+        assert_eq!(hand["loser"], b);
+    }
+
+    /// The hand list's score-tie break is the EARLIEST claim. That ordering
+    /// used to ride in a side tuple; it now reads off the row's own
+    /// `created_at`, so pin that the move did not invert it.
+    #[test]
+    fn tied_hand_scores_still_break_to_the_earliest_claim() {
+        let a = ident(0xaa);
+        let b = ident(0xbb);
+        let c = ident(0xcc);
+        // Two different games, same five cards (same score), different stamps.
+        let markers = vec![
+            mk(1, &a, &b, 1, 2, true, Some("000102030c"), 900, 0), // later
+            mk(3, &c, &b, 3, 4, true, Some("000102030c"), 100, 0), // earlier
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8), (3u8, 4u8)]));
+        let lb = agg(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            &win_world(&[(1, &a, &b), (3, &c, &b)]),
+        );
+        assert_eq!(lb.hands.len(), 2);
+        assert_eq!(lb.hands[0].score, lb.hands[1].score);
+        assert_eq!(
+            lb.hands[0].created_at,
+            Some(100),
+            "earliest claim ranks first"
+        );
+        assert_eq!(lb.hands[0].winner, c);
+        assert_eq!(lb.hands[1].created_at, Some(900));
     }
 
     /// bsv-low #276 — an UNCONFIRMED (loser-quit / tower-adjudicated) v2 claim
