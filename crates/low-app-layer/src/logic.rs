@@ -158,7 +158,17 @@ pub struct OutpointStatus {
     /// `network_seen` witness for the recorded spender, and the spender's
     /// bytes-finality latch. `None` from every other producer (`/spent-any`,
     /// legacy constructors), which keeps those rows on the strict confirmed
-    /// bar. NOT serialized to any wire body — an in-process counting input.
+    /// bar.
+    ///
+    /// SERIALIZED to `/utxo-status` as `spenderSeen`/`spenderFinal` (2026-08-15,
+    /// for `low-monitor`'s theft-alarm spender-selection). `spenderSeen` IS
+    /// ARC/Arcade's `SEEN_ON_NETWORK` verdict (the overlay's broadcast-gate
+    /// latches `network_seen` only at that status — `broadcaster.rs`), so it is
+    /// the mempool-acceptance bar with double-spends excluded: the monitor
+    /// trusts a spender pointer only when `spenderSeen` or `spentConfirmed`,
+    /// which is exactly what a bare (un-broadcast) `historical-tx-no-spv` plant
+    /// can NEVER earn. `null` on any non-D1 producer is the strict-confirmed
+    /// fallback, never a positive.
     pub spender_seen: Option<bool>,
     pub spender_final: Option<bool>,
     /// WHY this answer is `known:false` — `None` on every `known:true` row
@@ -266,6 +276,15 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
                 "spent": e.spent,
                 "spendingTxid": e.spending_txid,
                 "spentConfirmed": e.spent_confirmed,
+                // #371 witness pair (2026-08-15): `spenderSeen` = ARC
+                // SEEN_ON_NETWORK (mempool-accepted, double-spends excluded);
+                // `spenderFinal` = the spender's bytes-finality latch. Present
+                // on the D1 batch path (null elsewhere = strict-confirmed
+                // fallback). low-monitor trusts a spender pointer only when
+                // `spenderSeen` OR `spentConfirmed` — a bare caller plant earns
+                // neither. Additive: existing consumers ignore unknown keys.
+                "spenderSeen": e.spender_seen,
+                "spenderFinal": e.spender_final,
                 // #323 defect 2 — present only when this surface could not
                 // verify an answer; null everywhere else (including every
                 // known:true row and the whole D1 /utxo-status path).
@@ -2447,25 +2466,40 @@ mod tests {
             vout: 1,
         };
         let entries = vec![
-            OutpointStatus::known(&op_a, true, Some("f0".repeat(32)), true),
+            // A network-SEEN spender (the #371 witness), via the D1 producer.
+            OutpointStatus::known_with_witness(
+                &op_a,
+                true,
+                Some("f0".repeat(32)),
+                false,
+                Some(true),  // spenderSeen — ARC SEEN_ON_NETWORK
+                Some(false), // spenderFinal
+            ),
             OutpointStatus::known(&op_a, false, None, false),
             OutpointStatus::unknown(&op_b),
         ];
         let v: serde_json::Value = serde_json::from_str(&utxo_status_body(&entries)).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 3);
-        // Spent row with landing proof.
+        // Spent row: a network-SEEN spender that is not yet confirmed — the
+        // monitor trusts it on `spenderSeen` alone (no confirmation wait).
         assert_eq!(arr[0]["txid"], txid_a());
         assert_eq!(arr[0]["vout"], 0);
         assert_eq!(arr[0]["known"], true);
         assert_eq!(arr[0]["spent"], true);
         assert_eq!(arr[0]["spendingTxid"], "f0".repeat(32));
-        assert_eq!(arr[0]["spentConfirmed"], true);
-        // Known-unspent row.
+        assert_eq!(arr[0]["spentConfirmed"], false);
+        assert_eq!(arr[0]["spenderSeen"], true, "the #371 network-seen witness reaches the wire");
+        assert_eq!(arr[0]["spenderFinal"], false);
+        // Known-unspent row: no witness (produced by `known`, not the D1 path).
         assert_eq!(arr[1]["known"], true);
         assert_eq!(arr[1]["spent"], false);
         assert!(arr[1]["spendingTxid"].is_null());
         assert_eq!(arr[1]["spentConfirmed"], false);
+        assert!(
+            arr[1]["spenderSeen"].is_null(),
+            "a non-D1 producer leaves the witness null — the strict-confirmed fallback, never a positive"
+        );
         // Unknown row: fail-safe nulls, never asserted unspent.
         assert_eq!(arr[2]["txid"], txid_b());
         assert_eq!(arr[2]["vout"], 1);
@@ -2473,6 +2507,7 @@ mod tests {
         assert!(arr[2]["spent"].is_null());
         assert!(arr[2]["spendingTxid"].is_null());
         assert!(arr[2]["spentConfirmed"].is_null());
+        assert!(arr[2]["spenderSeen"].is_null());
     }
 
     #[test]
