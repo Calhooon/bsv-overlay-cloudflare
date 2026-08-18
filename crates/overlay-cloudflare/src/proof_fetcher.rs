@@ -47,6 +47,9 @@ pub const DEFAULT_BITAILS_BASE: &str = "https://api.bitails.io";
 
 /// Default live Arcade V2 mainnet endpoint.
 pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech";
+/// BananaBlocks (GorillaPool's independent explorer, JungleBus-backed with a
+/// complete UTXO/spend index) — the spender-hint ladder's FIRST rung.
+pub const DEFAULT_BANANABLOCKS_BASE: &str = "https://bananablocks.com/api/v1";
 
 /// Per-tick fetch budget — bounds a single Worker invocation under the CF
 /// subrequest cap. Each proofless candidate costs a handful of subrequests
@@ -128,6 +131,7 @@ pub const PUSH_BACKSTOP_MIN_AGE_SECS: u64 = 30 * 60;
 /// bump is returned.
 pub struct ChainProofFetcher {
     arcade_url: String,
+    bananablocks_base: String,
     woc_base: String,
     bitails_base: String,
     woc_api_key: Option<String>,
@@ -146,6 +150,7 @@ impl ChainProofFetcher {
     pub fn new(tracker: Option<Rc<dyn ChainTracker>>) -> Self {
         Self {
             arcade_url: DEFAULT_ARCADE_URL.to_string(),
+            bananablocks_base: DEFAULT_BANANABLOCKS_BASE.to_string(),
             woc_base: DEFAULT_WOC_BASE.to_string(),
             bitails_base: DEFAULT_BITAILS_BASE.to_string(),
             woc_api_key: None,
@@ -345,48 +350,89 @@ impl ChainProofFetcher {
 }
 
 impl ChainProofFetcher {
-    /// The spender HINT for an outpoint, from WhatsOnChain's spent endpoint —
-    /// SERVER-side per the no-client-indexer rule.
+    /// The spender HINT for an outpoint — a three-rung provider LADDER in the
+    /// house order (owner, 2026-08-18: "should include bitails and
+    /// bananablocks"; WoC demoted to break-glass LAST):
     ///
-    /// WHY WoC when the house provider order is Arcade → Bitails → WoC
-    /// break-glass (owner, re-confirmed 2026-08-18): the order applies PER
-    /// CAPABILITY, and spend-of-outpoint is the one question only WoC can
-    /// answer today — Arcade has no outpoint query at all (`/tx/{txid}` is
-    /// tx-status + merklePath; ARC's data model), and Bitails'
-    /// `/tx/{txid}/output/{vout}/spent` 500s (live-probed 2026-08-18, both
-    /// URL shapes; matches low-app-layer routes.rs's standing comment). The
-    /// app-layer's proven `/spent-any` uses this same WoC route for the same
-    /// reason. Within THIS leg the other capabilities do follow the order:
-    /// proofs ladder Arcade-first, raw bytes Bitails-first. Steady-state call
-    /// volume is ~zero: hints fire only for rows stuck unconfirmed, ≤
-    /// `DISPLACE_CAP_PER_TICK` per tick, budget-charged. If Bitails ever
-    /// fixes its outpoint endpoint, ladder it first here and demote WoC to
-    /// break-glass.
+    ///   1. BananaBlocks `GET {base}/txo/{txid}/{vout}/spend` — GorillaPool's
+    ///      explorer (same family as the proof ladder's Arcade rung), a
+    ///      complete UTXO/spend index. Live-verified 2026-08-18 on the
+    ///      fixture: `{"spent":true,"spentTxid":"3ddda993…"}`.
+    ///   2. Bitails `GET {base}/tx/{txid}/output/{vout}/spent` — the house's
+    ///      second provider. Its outpoint endpoint 500s today (probed
+    ///      2026-08-18; matches low-app-layer's standing comment) — a 5xx is
+    ///      a FAULT that falls through, so the rung self-heals into service
+    ///      the day Bitails fixes it, and schema drift on a healthy answer
+    ///      self-announces as a fault (never a silent "no hint").
+    ///   3. WhatsOnChain `GET {base}/tx/{txid}/{vout}/spent` — break-glass,
+    ///      the same route the app-layer's proven `/spent-any` uses.
     ///
-    /// 404 = "not spent that this indexer can see" ⇒ `Ok(None)` — never an
-    /// assertion of unspentness. The hint's provider count is deliberately
-    /// ONE: it cannot lie its way past the binding + the chaintracks-verified
-    /// bump, so corroborating the HINT would add cost, not trust. BUDGETED:
-    /// draws one unit from the per-tick subrequest budget; exhausted ⇒ `Err`
-    /// (a local refusal the caller counts as a fault — never folded into "no
-    /// hint").
-    async fn woc_spender_of(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
-        let remaining = self.budget.get();
-        if remaining == 0 {
-            return Err("per-tick fetch budget exhausted (spender hint skipped)".into());
+    /// Precedence mirrors the #93/#94 reveal-scan doctrine: a FOUND spender
+    /// short-circuits (it is proof-gated downstream, so one provider's word
+    /// is enough to TRY); "no hint" requires walking every healthy rung; a
+    /// rung's fault falls through, and if NO rung yields a hint while ANY
+    /// rung faulted the whole resolve is a FAULT (the caller counts it —
+    /// "couldn't ask" must never read as "nobody spent it"). SERVER-side per
+    /// the no-client-indexer rule. Each rung draws one unit from the per-tick
+    /// budget BEFORE its HTTP; an exhausted budget is a fault, and with the
+    /// ladder running in phase 2 it can only spend what the primary chase
+    /// left. Steady-state volume is ~zero (hints fire only for rows stuck
+    /// unconfirmed, ≤ DISPLACE_CAP_PER_TICK per tick).
+    async fn spender_hint_ladder(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
+        let hdr_none: Option<(&str, &str)> = None;
+        let woc_hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
+        let mut faults: Vec<String> = Vec::new();
+        for (name, url, hdr, parse) in [
+            (
+                "bananablocks",
+                bananablocks_spend_url(&self.bananablocks_base, txid, vout),
+                hdr_none,
+                parse_bananablocks_spend_body as fn(u16, &str, &str) -> Result<Option<String>, String>,
+            ),
+            (
+                "bitails",
+                bitails_spent_url(&self.bitails_base, txid, vout),
+                hdr_none,
+                parse_bitails_spend_body as fn(u16, &str, &str) -> Result<Option<String>, String>,
+            ),
+            (
+                "woc",
+                woc_spent_url(&self.woc_base, txid, vout),
+                woc_hdr,
+                parse_woc_spend_body as fn(u16, &str, &str) -> Result<Option<String>, String>,
+            ),
+        ] {
+            let remaining = self.budget.get();
+            if remaining == 0 {
+                faults.push(format!("{name}: per-tick fetch budget exhausted"));
+                break;
+            }
+            self.budget.set(remaining - 1);
+            match http_get(&url, hdr).await {
+                Err(e) => faults.push(format!("{name}: {e}")),
+                Ok((status, body)) => match parse(status, &body, txid) {
+                    Ok(Some(spender)) => return Ok(Some(spender)),
+                    Ok(None) => {}
+                    Err(e) => faults.push(format!("{name}: {e}")),
+                },
+            }
         }
-        self.budget.set(remaining - 1);
-        let url = woc_spent_url(&self.woc_base, txid, vout);
-        let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        let (status, body) = http_get(&url, hdr).await.map_err(|e| format!("woc spent: {e}"))?;
-        parse_spent_hint_body(status, &body)
+        if faults.is_empty() {
+            Ok(None) // every healthy rung answered: nobody reports a spender
+        } else {
+            Err(format!(
+                "no rung yielded a hint and {} faulted ({})",
+                faults.len(),
+                faults.join("; ")
+            ))
+        }
     }
 }
 
 #[async_trait(?Send)]
 impl AncestorFetcher for ChainProofFetcher {
     async fn resolve_spender(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
-        self.woc_spender_of(txid, vout).await
+        self.spender_hint_ladder(txid, vout).await
     }
 
     async fn spender_binding_raw(
@@ -879,39 +925,124 @@ fn woc_spent_url(woc_base: &str, txid: &str, vout: u32) -> String {
     format!("{woc_base}/tx/{txid}/{vout}/spent")
 }
 
-/// Parse the spent-endpoint answer. 404 is the endpoint's SEMANTIC "no spend
-/// this indexer can see" ⇒ `Ok(None)`. A 2xx MUST carry a well-formed spender
-/// txid — a 2xx with a missing/garbled/non-hex `txid` is a FAULT (`Err`),
-/// never "no hint": schema drift must announce itself, not silently kill the
-/// reconcile (the unknown-must-not-read-as-fine rule). Any other status is a
-/// fault.
-fn parse_spent_hint_body(status: u16, body: &str) -> Result<Option<String>, String> {
+/// A well-formed 64-hex spender txid, lowercased — refusing the OUTPOINT's
+/// own txid (an indexer echoing the queried txid back must never become a
+/// self-hint; a tx cannot spend its own output in the same tx anyway, so a
+/// same-txid answer is provider noise by construction).
+fn well_formed_spender(candidate: Option<&str>, outpoint_txid: &str) -> Option<String> {
+    candidate
+        .map(str::to_lowercase)
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|t| !t.eq_ignore_ascii_case(outpoint_txid))
+}
+
+/// BananaBlocks `…/txo/{txid}/{vout}/spend` (live-verified 2026-08-18):
+/// 200 `{"spent":true,"spentTxid":"…"}` = hint; 200 `{"spent":false,…}` =
+/// no spender this indexer can see; 404 `Transaction not found` = it does not
+/// know the tx at all ⇒ no hint. A 2xx claiming spent WITHOUT a well-formed
+/// `spentTxid` is schema drift ⇒ FAULT (never "no hint"); any other status is
+/// a fault.
+fn parse_bananablocks_spend_body(
+    status: u16,
+    body: &str,
+    outpoint_txid: &str,
+) -> Result<Option<String>, String> {
     if status == 404 {
         return Ok(None);
     }
     if !(200..300).contains(&status) {
-        return Err(format!("woc spent: HTTP {status}"));
+        return Err(format!("HTTP {status}"));
     }
     let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("woc spent: bad json: {e}"))?;
-    let spender = v
-        .get("txid")
-        .and_then(|t| t.as_str())
-        .map(str::to_lowercase)
-        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()));
-    spender.map(Some).ok_or_else(|| {
-        // Char-boundary-safe truncation: a multibyte char straddling the cut
-        // must shorten the excerpt, never panic the whole scheduled tick on
-        // exactly the garbled-input path this formatter exists to survive.
-        let mut cut = body.len().min(120);
-        while !body.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!(
-            "woc spent: 2xx without a well-formed spender txid (schema drift?): {}",
-            &body[..cut]
+        serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    match v.get("spent").and_then(serde_json::Value::as_bool) {
+        Some(false) => Ok(None),
+        Some(true) => well_formed_spender(
+            v.get("spentTxid").and_then(|t| t.as_str()),
+            outpoint_txid,
         )
-    })
+        .map(Some)
+        .ok_or_else(|| excerpt("2xx spent:true without a well-formed spentTxid", body)),
+        None => Err(excerpt("2xx without a boolean `spent` (schema drift?)", body)),
+    }
+}
+
+/// Bitails `…/tx/{txid}/output/{vout}/spent`. The endpoint 500s at the time
+/// of writing (2026-08-18) — a 5xx is a plain FAULT so the rung self-heals
+/// when Bitails fixes it. Healthy-shape expectations follow the app-layer's
+/// `parse_bitails_unspent` (`{"spent": bool, …}`); the spender is accepted
+/// from `spentTxid` or `spentIn.txid`, and a spent:true answer carrying
+/// neither is drift ⇒ FAULT (self-announcing, per the finding-7 rule).
+fn parse_bitails_spend_body(
+    status: u16,
+    body: &str,
+    outpoint_txid: &str,
+) -> Result<Option<String>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    match v.get("spent").and_then(serde_json::Value::as_bool) {
+        Some(false) => Ok(None),
+        Some(true) => {
+            let candidate = v
+                .get("spentTxid")
+                .and_then(|t| t.as_str())
+                .or_else(|| v.get("spentIn").and_then(|s| s.get("txid")).and_then(|t| t.as_str()));
+            well_formed_spender(candidate, outpoint_txid)
+                .map(Some)
+                .ok_or_else(|| excerpt("2xx spent:true without a well-formed spender", body))
+        }
+        None => Err(excerpt("2xx without a boolean `spent` (schema drift?)", body)),
+    }
+}
+
+/// WhatsOnChain `…/tx/{txid}/{vout}/spent`: 404 is the endpoint's SEMANTIC
+/// "no spend this indexer can see" ⇒ no hint. A 2xx MUST carry a well-formed
+/// spender `txid` — a 2xx with a missing/garbled/non-hex value is a FAULT,
+/// never "no hint" (the unknown-must-not-read-as-fine rule). Any other
+/// status is a fault.
+fn parse_woc_spend_body(
+    status: u16,
+    body: &str,
+    outpoint_txid: &str,
+) -> Result<Option<String>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    well_formed_spender(v.get("txid").and_then(|t| t.as_str()), outpoint_txid)
+        .map(Some)
+        .ok_or_else(|| excerpt("2xx without a well-formed spender txid (schema drift?)", body))
+}
+
+/// Char-boundary-safe body excerpt for fault messages: a multibyte char
+/// straddling the cut must shorten the excerpt, never panic the tick.
+fn excerpt(prefix: &str, body: &str) -> String {
+    let mut cut = body.len().min(120);
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{prefix}: {}", &body[..cut])
+}
+
+/// BananaBlocks spend-lookup URL. PINNED BY TEST: `/txo/{txid}/{vout}/spend`
+/// (live-probed 2026-08-18; the `_`/`:`-joined outpoint forms 400).
+fn bananablocks_spend_url(base: &str, txid: &str, vout: u32) -> String {
+    format!("{base}/txo/{txid}/{vout}/spend")
+}
+
+/// Bitails outpoint-spend URL, the shape the app-layer already queries.
+fn bitails_spent_url(base: &str, txid: &str, vout: u32) -> String {
+    format!("{base}/tx/{txid}/output/{vout}/spent")
 }
 
 /// TRUE iff `raw_hex` parses to a tx with an input consuming exactly
@@ -2578,58 +2709,87 @@ mod tests {
     // ══ The reconcile's CONCRETE layer (gate findings 1/4/7: the ladder tests
     // above stub these; the URL/parse/walk are where the HIGH shipped) ══
 
-    /// FINDING-1 PIN: the spent route that EXISTS is `/tx/{txid}/{vout}/spent`
-    /// (the app-layer's proven reader shape). The plausible `/out/` variant is
-    /// a WoC router 404 — shipping it made every hint read as semantic
-    /// "not spent" and the whole leg died silently.
+    /// FINDING-1 PIN + ladder-order URL pins: every rung's route is the one
+    /// that EXISTS, live-probed 2026-08-18. WoC's plausible `/out/` variant is
+    /// a router miss; BananaBlocks' `_`/`:`-joined outpoint forms 400.
     #[test]
-    fn the_woc_spent_url_is_the_route_that_exists() {
-        let url = woc_spent_url("https://api.whatsonchain.com/v1/bsv/main", "aabb", 3);
-        assert_eq!(url, "https://api.whatsonchain.com/v1/bsv/main/tx/aabb/3/spent");
-        assert!(!url.contains("/out/"), "the /out/ shape is a router miss, not an API answer");
+    fn every_hint_rung_url_is_the_route_that_exists() {
+        let woc = woc_spent_url("https://api.whatsonchain.com/v1/bsv/main", "aabb", 3);
+        assert_eq!(woc, "https://api.whatsonchain.com/v1/bsv/main/tx/aabb/3/spent");
+        assert!(!woc.contains("/out/"), "the /out/ shape is a router miss, not an API answer");
+        assert_eq!(
+            bananablocks_spend_url("https://bananablocks.com/api/v1", "aabb", 3),
+            "https://bananablocks.com/api/v1/txo/aabb/3/spend"
+        );
+        assert_eq!(
+            bitails_spent_url("https://api.bitails.io", "aabb", 3),
+            "https://api.bitails.io/tx/aabb/output/3/spent"
+        );
+    }
+
+    const OUTPOINT_TX: &str =
+        "e450f6686efb27662a387fd7af0fb7d992648186d3e2e219ef9cd1af72c51d58";
+
+    #[test]
+    fn bananablocks_parse_matches_the_live_shapes() {
+        let spender = "3d".repeat(32);
+        let spent = format!("{{\"spent\":true,\"spentTxid\":\"{}\",\"txid\":\"{OUTPOINT_TX}\",\"vout\":0}}", spender.to_uppercase());
+        assert_eq!(
+            parse_bananablocks_spend_body(200, &spent, OUTPOINT_TX),
+            Ok(Some(spender))
+        );
+        let unspent = format!("{{\"spent\":false,\"txid\":\"{OUTPOINT_TX}\",\"vout\":0}}");
+        assert_eq!(parse_bananablocks_spend_body(200, &unspent, OUTPOINT_TX), Ok(None));
+        assert_eq!(
+            parse_bananablocks_spend_body(404, "{\"error\":\"Transaction not found\"}", OUTPOINT_TX),
+            Ok(None)
+        );
+        // Drift: spent:true without a usable spender = FAULT, never "no hint".
+        assert!(parse_bananablocks_spend_body(200, "{\"spent\":true}", OUTPOINT_TX).is_err());
+        assert!(parse_bananablocks_spend_body(200, "{}", OUTPOINT_TX).is_err());
+        assert!(parse_bananablocks_spend_body(500, "boom", OUTPOINT_TX).is_err());
+        // An indexer echoing the OUTPOINT's own txid is noise, and with no
+        // other candidate that makes the answer drift ⇒ fault.
+        let echo = format!("{{\"spent\":true,\"spentTxid\":\"{OUTPOINT_TX}\"}}");
+        assert!(parse_bananablocks_spend_body(200, &echo, OUTPOINT_TX).is_err());
     }
 
     #[test]
-    fn spent_hint_parse_semantic_404_is_no_hint() {
-        assert_eq!(parse_spent_hint_body(404, "404 page not found"), Ok(None));
-    }
-
-    #[test]
-    fn spent_hint_parse_valid_200_lowercases_the_spender() {
-        let want = "F3E60660".to_lowercase() + &"ab".repeat(28);
-        let body = format!("{{\"txid\":\"{}\",\"vin\":12,\"status\":\"confirmed\"}}", want.to_uppercase());
-        assert_eq!(parse_spent_hint_body(200, &body), Ok(Some(want)));
-    }
-
-    /// FINDING-7 PIN: a 2xx WITHOUT a well-formed spender is schema drift — a
-    /// FAULT the caller counts, never "no hint" (unknown must not read as fine).
-    #[test]
-    fn spent_hint_parse_garbled_200_is_a_fault_not_a_no() {
+    fn bitails_parse_faults_on_todays_500_and_reads_both_spender_spellings() {
+        // Today's live behavior: 500 Unhandled Error ⇒ FAULT (falls through).
+        assert!(parse_bitails_spend_body(500, "{\"statusCode\":500}", OUTPOINT_TX).is_err());
+        let spender = "3d".repeat(32);
         for body in [
-            "{}",
-            "{\"txid\":null}",
-            "{\"txid\":\"short\"}",
-            "{\"txid\":\"zz\"}",
-            "not json at all",
-            "{\"txid\":12}",
+            format!("{{\"spent\":true,\"spentTxid\":\"{spender}\"}}"),
+            format!("{{\"spent\":true,\"spentIn\":{{\"txid\":\"{spender}\"}}}}"),
         ] {
-            assert!(
-                parse_spent_hint_body(200, body).is_err(),
-                "2xx body {body:?} must be a fault"
+            assert_eq!(
+                parse_bitails_spend_body(200, &body, OUTPOINT_TX),
+                Ok(Some(spender.clone()))
             );
         }
-        let bad_len = format!("{{\"txid\":\"{}\"}}", "a".repeat(63));
-        assert!(parse_spent_hint_body(200, &bad_len).is_err());
+        assert_eq!(parse_bitails_spend_body(200, "{\"spent\":false}", OUTPOINT_TX), Ok(None));
+        assert_eq!(parse_bitails_spend_body(404, "nope", OUTPOINT_TX), Ok(None));
+        assert!(parse_bitails_spend_body(200, "{\"spent\":true}", OUTPOINT_TX).is_err());
+    }
+
+    /// FINDING-7 PIN (WoC rung): a 2xx without a well-formed txid is a FAULT,
+    /// never "no hint" — and the excerpt is char-boundary-safe.
+    #[test]
+    fn woc_parse_garbled_200_is_a_fault_not_a_no() {
+        let spender = "f3".repeat(32);
+        let ok = format!("{{\"txid\":\"{}\",\"vin\":12}}", spender.to_uppercase());
+        assert_eq!(parse_woc_spend_body(200, &ok, OUTPOINT_TX), Ok(Some(spender)));
+        assert_eq!(parse_woc_spend_body(404, "404 page not found", OUTPOINT_TX), Ok(None));
+        for body in ["{}", "{\"txid\":null}", "{\"txid\":\"short\"}", "not json", "{\"txid\":12}"] {
+            assert!(parse_woc_spend_body(200, body, OUTPOINT_TX).is_err(), "{body:?}");
+        }
+        assert!(parse_woc_spend_body(500, "boom", OUTPOINT_TX).is_err());
+        assert!(parse_woc_spend_body(429, "rate", OUTPOINT_TX).is_err());
         // A multibyte char straddling the 120-byte excerpt cut must yield an
         // Err, never a char-boundary panic that kills the whole tick.
         let straddle = format!("{{\"note\":\"{}\"}}", "é".repeat(80));
-        assert!(parse_spent_hint_body(200, &straddle).is_err());
-    }
-
-    #[test]
-    fn spent_hint_parse_5xx_is_a_fault() {
-        assert!(parse_spent_hint_body(500, "boom").is_err());
-        assert!(parse_spent_hint_body(429, "rate").is_err());
+        assert!(parse_woc_spend_body(200, &straddle, OUTPOINT_TX).is_err());
     }
 
     /// A REAL spender tx for the input-walk cells: one input consuming
