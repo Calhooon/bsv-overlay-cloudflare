@@ -344,8 +344,60 @@ impl ChainProofFetcher {
     }
 }
 
+impl ChainProofFetcher {
+    /// The spender HINT for an outpoint, from WhatsOnChain's spent endpoint
+    /// (the one indexer this workspace already queries with a spend surface;
+    /// SERVER-side per the no-client-indexer rule). 404 = "not spent that this
+    /// indexer can see" ⇒ `Ok(None)` — never an assertion of unspentness. The
+    /// hint's provider count is deliberately ONE: it cannot lie its way past
+    /// `spender_binds_outpoint` + the chaintracks-verified bump, so
+    /// corroborating the HINT would add cost, not trust.
+    async fn woc_spender_of(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
+        let url = format!("{}/tx/{}/out/{}/spent", self.woc_base, txid, vout);
+        let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
+        let (status, body) = http_get(&url, hdr).await.map_err(|e| format!("woc spent: {e}"))?;
+        if status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("woc spent: HTTP {status}"));
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("woc spent: bad json: {e}"))?;
+        let spender = v.get("txid").and_then(|t| t.as_str()).map(str::to_lowercase);
+        Ok(spender.filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())))
+    }
+}
+
 #[async_trait(?Send)]
 impl AncestorFetcher for ChainProofFetcher {
+    async fn resolve_spender(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
+        self.woc_spender_of(txid, vout).await
+    }
+
+    async fn spender_binds_outpoint(
+        &self,
+        spender: &str,
+        txid: &str,
+        vout: u32,
+    ) -> Result<bool, String> {
+        // CONTENT-ADDRESSED raw (fetch_raw_hex accepts bytes only if they hash
+        // to `spender`), then the input walk: the hint becomes a fact only if
+        // one of the spender's inputs consumes exactly `txid:vout`.
+        let raw = self
+            .fetch_raw_hex(spender)
+            .await
+            .map_err(|e| format!("spender raw: {e}"))?;
+        let tx = Transaction::from_hex(raw.trim()).map_err(|e| format!("spender parse: {e}"))?;
+        let want = txid.to_lowercase();
+        Ok(tx.inputs.iter().any(|i| {
+            i.source_output_index == vout
+                && i.source_txid
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&want))
+        }))
+    }
+
     async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
         // Per-tick budget guard — bound subrequests per Worker invocation.
         let remaining = self.budget.get();
@@ -842,6 +894,21 @@ pub struct SpendConfirmSummary {
     /// == 0 && cas_errors > 0`. Rows are retried next tick (still
     /// unconfirmed candidates), fail-safe.
     pub cas_errors: usize,
+    /// Rows DISPLACED this tick (the 2026-08-18 index reconcile): the recorded
+    /// spend pointer was a CLAIM that never verifiably mined (e.g. a parked
+    /// non-final refund a client re-submitted), while the chain's ACTUAL
+    /// spender — input-bound to the outpoint and chaintracks-verified mined —
+    /// was a different tx. The pointer now names the true spender with
+    /// `spentConfirmed = 1` (the existing last-confirmed-wins arm).
+    pub displaced: usize,
+    /// Reconcile pipelines ENTERED this tick — an `Ok(None)` row the chaser
+    /// asked the chain about, whatever the outcome. Bounded by
+    /// [`DISPLACE_CAP_PER_TICK`].
+    pub displace_attempts: usize,
+    /// Reconcile pipeline REFUSALS + READ FAULTS: hint/raw/proof transport
+    /// faults, plus hints that FAILED the content-addressed input binding (a
+    /// lying or garbled indexer answer — refused, logged, never written).
+    pub displace_faults: usize,
     /// OBSERVABILITY ONLY (bounded to 5): the spending txids actually sampled
     /// this tick. Lets an operator check the candidates against a block explorer
     /// to tell "the chaser is broken" from "this backlog is genuinely
@@ -901,6 +968,13 @@ pub struct SpendConfirmSummary {
 /// unconfirmed claims by design (`mark_spent` trait doc). The reorg-reset
 /// harm this closes (a silently reverted confirmed pointer that nothing
 /// re-visits) outweighs the one-tick confirm delay.
+/// Per-tick cap on reconcile pipelines entered from the chaser's `Ok(None)`
+/// arm (each entry costs up to 3 subrequests: spender hint + content-addressed
+/// raw + verified proof). Bounds the tick's subrequest spend when the
+/// unconfirmable backlog is large; candidates are RANDOM-sampled upstream, so
+/// a capped tick still converges across ticks.
+const DISPLACE_CAP_PER_TICK: usize = 4;
+
 pub async fn complete_spend_confirmations(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn AncestorFetcher,
@@ -994,6 +1068,134 @@ pub async fn complete_spend_confirmations(
             }
             Ok(None) => {
                 summary.still_unconfirmed += 1;
+
+                // ── THE RECONCILE LEG (2026-08-18 index regression) ──
+                // The recorded pointer is not verifiably mined — but that
+                // pointer is a CLAIM (any submitter's, including a parked
+                // NON-FINAL refund a client re-submitted under Rule 4b), and
+                // chasing only the claim forever is exactly how a MINED true
+                // spend stayed invisible behind it (pot e450f668…:0 —
+                // recorded 41f70310… refund intent, actual mined settle
+                // 3ddda993…). Ask the chain who ACTUALLY spent the outpoint,
+                // and displace ONLY on the full ladder:
+                //   1. `resolve_spender` — an indexer HINT, never a verdict;
+                //   2. `spender_binds_outpoint` — the hinted tx's
+                //      content-addressed raw bytes must consume exactly this
+                //      outpoint (a lying indexer is refused HERE);
+                //   3. `verified_proof_for_detailed` — the hinted spender
+                //      must be MINED under a PoW-verified root. An unmined
+                //      hint NEVER displaces: that would let one mempool
+                //      claim overwrite another; only chain truth displaces.
+                // The write is `mark_spent(confirmed = true)` — the existing
+                // last-confirmed-wins displacement arm. Verdict columns are
+                // NOT touched (the stale verdict stays keyed to the OLD txid
+                // and every reader guards `verdictTxid == spendingTxid`);
+                // `spenderFinal = true` is a fact of the proof (a mined tx's
+                // bytes are final by consensus).
+                if summary.displace_attempts >= DISPLACE_CAP_PER_TICK {
+                    continue;
+                }
+                summary.displace_attempts += 1;
+                let hinted = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
+                    Err(e) => {
+                        summary.displace_faults += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} spender-hint READ FAULT — reconcile \
+                             skipped this tick, NOT a chain verdict: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                        continue;
+                    }
+                    Ok(h) => h,
+                };
+                let Some(actual) = hinted else {
+                    // No hint — nothing to reconcile against; the ordinary
+                    // pointer chase keeps retrying next tick.
+                    continue;
+                };
+                if actual.eq_ignore_ascii_case(spending_txid) {
+                    // The chain names the recorded pointer itself — the spend
+                    // is genuinely just not mined yet. Ordinary chase.
+                    continue;
+                }
+                match fetcher
+                    .spender_binds_outpoint(&actual, &rec.txid, rec.output_index)
+                    .await
+                {
+                    Err(e) => {
+                        summary.displace_faults += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} binding read FAULT for hint {actual} — \
+                             reconcile skipped this tick: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                        continue;
+                    }
+                    Ok(false) => {
+                        summary.displace_faults += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} hint {actual} does NOT consume the \
+                             outpoint — indexer hint REFUSED (content-addressed input \
+                             binding failed); nothing written",
+                            rec.txid, rec.output_index
+                        ));
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                let bump_hex = match fetcher.verified_proof_for_detailed(&actual).await {
+                    Err(e) => {
+                        summary.displace_faults += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} proof/header READ FAULT for true-spender \
+                             candidate {actual} — reconcile skipped this tick: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                        continue;
+                    }
+                    Ok(None) => {
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} candidate {actual} binds the outpoint but \
+                             is not verifiably MINED — no displacement (only chain truth \
+                             displaces a claim)",
+                            rec.txid, rec.output_index
+                        ));
+                        continue;
+                    }
+                    Ok(Some(b)) => b,
+                };
+                let spent_height = MerklePath::from_hex(&bump_hex)
+                    .ok()
+                    .map(|mp| u64::from(mp.block_height));
+                match pot_storage
+                    .mark_spent(
+                        &rec.txid,
+                        rec.output_index,
+                        &actual,
+                        true,
+                        None,
+                        spent_height,
+                        Some(true),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        summary.displaced += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} DISPLACED {spending_txid} → {actual} \
+                             (input-bound + chaintracks-verified mined; the recorded claim \
+                             was never verifiably mined)",
+                            rec.txid, rec.output_index
+                        ));
+                    }
+                    Err(e) => {
+                        summary.cas_errors += 1;
+                        push_log(&format!(
+                            "[spend-confirm] {}:{} displace write failed: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1924,8 +2126,16 @@ mod tests {
     /// for the txids in `minable` — models the chaintracks-verified vs unmined
     /// outcome without hitting the network (the concrete ChainProofFetcher is
     /// network-only). `fetch_ancestor` is never called by the pass.
+    #[derive(Default)]
     struct MockProofFetcher {
         minable: std::collections::HashSet<String>,
+        /// `(txid, vout)` → the spender the chain HINT names (`resolve_spender`).
+        spender_hints: std::collections::HashMap<(String, u32), String>,
+        /// Spenders whose raw bytes bind the asked outpoint
+        /// (`spender_binds_outpoint` → true).
+        binding: std::collections::HashSet<String>,
+        /// When set, `resolve_spender` errors (the transport-fault path).
+        hint_fault: bool,
     }
 
     #[async_trait(?Send)]
@@ -1937,6 +2147,20 @@ mod tests {
         }
         async fn verified_proof_for(&self, txid: &str) -> Option<String> {
             self.minable.contains(txid).then(|| "beefbump".to_string())
+        }
+        async fn resolve_spender(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
+            if self.hint_fault {
+                return Err("mock: hint transport down".into());
+            }
+            Ok(self.spender_hints.get(&(txid.to_string(), vout)).cloned())
+        }
+        async fn spender_binds_outpoint(
+            &self,
+            spender: &str,
+            _txid: &str,
+            _vout: u32,
+        ) -> Result<bool, String> {
+            Ok(self.binding.contains(spender))
         }
     }
 
@@ -1973,6 +2197,7 @@ mod tests {
 
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
+            ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.scanned, 1);
@@ -1988,6 +2213,197 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A pot row spent-marked by an UNCONFIRMED claim `claimed` (the parked
+    /// non-final refund shape), stored and ready for the chaser.
+    async fn pot_with_parked_claim(store: &MemoryPotStorage, pot: &str, claimed: &str) {
+        store
+            .store_record(&PotRecord {
+                txid: pot.into(),
+                output_index: 0,
+                spent: false,
+                spending_txid: None,
+                spent_confirmed: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(pot, 0, claimed, false, None, None, Some(false))
+            .await
+            .unwrap();
+    }
+
+    /// THE LIVE REGRESSION (2026-08-18, pot e450f668…:0): the recorded pointer
+    /// is a parked non-final refund that will never mine; the actual settle
+    /// mined an hour earlier. Full ladder green (hint + binding + proof) ⇒
+    /// the pointer is DISPLACED to the true spender, spentConfirmed latched.
+    #[tokio::test]
+    async fn a_mined_true_spender_displaces_a_parked_claim() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        let fetcher = MockProofFetcher {
+            minable: ["settleA".to_string()].into_iter().collect(),
+            spender_hints: [(("potA".to_string(), 0u32), "settleA".to_string())]
+                .into_iter()
+                .collect(),
+            binding: ["settleA".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 1);
+        assert_eq!(s.displace_attempts, 1);
+        assert_eq!(s.displace_faults, 0);
+        assert_eq!(
+            s.still_unconfirmed, 1,
+            "the recorded claim itself was (correctly) not confirmable"
+        );
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("settleA"),
+            "the pointer must name the TRUE spender after displacement"
+        );
+        assert!(r.spent_confirmed, "displacement latches spentConfirmed");
+        // A displaced row drops out of the candidate set — the loop ends.
+        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
+    }
+
+    /// An unmined hint must NEVER displace: that would let one mempool claim
+    /// overwrite another. Binding green, proof absent ⇒ nothing written.
+    #[tokio::test]
+    async fn an_unmined_hint_never_displaces() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        let fetcher = MockProofFetcher {
+            spender_hints: [(("potA".to_string(), 0u32), "settleA".to_string())]
+                .into_iter()
+                .collect(),
+            binding: ["settleA".to_string()].into_iter().collect(),
+            ..Default::default() // minable EMPTY: the hint is not mined
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 0);
+        assert_eq!(s.displace_attempts, 1);
+        assert_eq!(s.displace_faults, 0, "unmined is a wait, not a fault");
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "pointer untouched");
+        assert!(!r.spent_confirmed);
+    }
+
+    /// A hint whose raw bytes do NOT consume the outpoint is a lying (or
+    /// garbled) indexer answer — REFUSED at the binding, counted as a fault,
+    /// never written, even though the liar's tx is "mined".
+    #[tokio::test]
+    async fn a_hint_that_fails_the_input_binding_is_refused() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        let fetcher = MockProofFetcher {
+            minable: ["liarTx".to_string()].into_iter().collect(),
+            spender_hints: [(("potA".to_string(), 0u32), "liarTx".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default() // binding EMPTY: the bytes do not bind
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 0);
+        assert_eq!(s.displace_faults, 1, "a non-binding hint is a counted refusal");
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "pointer untouched");
+        assert!(!r.spent_confirmed);
+    }
+
+    /// The hint naming the RECORDED pointer is the ordinary "not mined yet"
+    /// case — no displacement machinery beyond the equality check runs.
+    #[tokio::test]
+    async fn a_hint_agreeing_with_the_recorded_pointer_is_left_to_the_proof_chase() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        let fetcher = MockProofFetcher {
+            spender_hints: [(("potA".to_string(), 0u32), "refundA".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 0);
+        assert_eq!(s.displace_attempts, 1);
+        assert_eq!(s.displace_faults, 0);
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("refundA"));
+        assert!(!r.spent_confirmed);
+    }
+
+    /// No hint at all: nothing to reconcile against; the ordinary chase keeps
+    /// the row for next tick. Entered (counted) but neither fault nor write.
+    #[tokio::test]
+    async fn no_hint_leaves_the_row_to_the_ordinary_chase() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        let fetcher = MockProofFetcher::default();
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 0);
+        assert_eq!(s.displace_attempts, 1);
+        assert_eq!(s.displace_faults, 0);
+        assert!(!store
+            .get_spent_status("potA", 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .spent_confirmed);
+    }
+
+    /// A hint transport fault is COUNTED and skipped — never read as "no
+    /// spender" (unknown must not read as fine), never a write.
+    #[tokio::test]
+    async fn a_hint_transport_fault_is_counted_never_a_verdict() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        let fetcher = MockProofFetcher {
+            hint_fault: true,
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 0);
+        assert_eq!(s.displace_faults, 1);
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "pointer untouched");
+        assert!(!r.spent_confirmed);
+    }
+
+    /// The reconcile pipeline is BOUNDED per tick: with more displaceable rows
+    /// than the cap, exactly `DISPLACE_CAP_PER_TICK` are attempted; the rest
+    /// stay ordinary still-unconfirmed candidates for the next (random-sampled)
+    /// tick.
+    #[tokio::test]
+    async fn the_reconcile_pipeline_is_bounded_per_tick() {
+        let store = MemoryPotStorage::new();
+        let n = DISPLACE_CAP_PER_TICK + 2;
+        let mut hints = std::collections::HashMap::new();
+        let mut minable = std::collections::HashSet::new();
+        let mut binding = std::collections::HashSet::new();
+        for i in 0..n {
+            let pot = format!("pot{i}");
+            let claim = format!("refund{i}");
+            let truth = format!("settle{i}");
+            pot_with_parked_claim(&store, &pot, &claim).await;
+            hints.insert((pot, 0u32), truth.clone());
+            minable.insert(truth.clone());
+            binding.insert(truth);
+        }
+        let fetcher = MockProofFetcher {
+            minable,
+            spender_hints: hints,
+            binding,
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displace_attempts, DISPLACE_CAP_PER_TICK);
+        assert_eq!(s.displaced, DISPLACE_CAP_PER_TICK);
+        assert_eq!(s.still_unconfirmed, n, "every row was still ordinary-unconfirmable");
+        let remaining = store.find_spent_unconfirmed(20, 0).await.unwrap();
+        assert_eq!(remaining.len(), n - DISPLACE_CAP_PER_TICK);
     }
 
     #[tokio::test]
@@ -2012,6 +2428,7 @@ mod tests {
         // The spending tx is NOT verifiably mined → fail-closed, no upgrade.
         let fetcher = MockProofFetcher {
             minable: std::collections::HashSet::new(),
+            ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.scanned, 1);
@@ -2032,6 +2449,7 @@ mod tests {
         let store = MemoryPotStorage::new();
         let fetcher = MockProofFetcher {
             minable: std::collections::HashSet::new(),
+            ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s, SpendConfirmSummary::default());
@@ -2049,6 +2467,7 @@ mod tests {
         // Only settleA is mined.
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
+            ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.scanned, 2);
@@ -2868,6 +3287,7 @@ mod tests {
         // potC — and with an unminable fetcher it upgrades nothing.
         let fetcher = MockProofFetcher {
             minable: std::collections::HashSet::new(),
+            ..Default::default()
         };
         let chase = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(chase.scanned, 1, "pushed-latched rows are skipped entirely");
@@ -2910,6 +3330,7 @@ mod tests {
 
         let fetcher = MockProofFetcher {
             minable: [settle_txid.clone()].into_iter().collect(),
+            ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.confirmed, 1);
@@ -3197,6 +3618,7 @@ mod tests {
         // Poll chaser: the proof verifies, the CAS errors → counted.
         let fetcher = MockProofFetcher {
             minable: [SETTLE_A.to_string()].into_iter().collect(),
+            ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(
@@ -3378,6 +3800,7 @@ mod tests {
 
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
+            ..Default::default()
         };
         let min_age = PUSH_BACKSTOP_MIN_AGE_SECS;
 

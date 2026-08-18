@@ -269,6 +269,34 @@ pub trait AncestorFetcher {
     /// forged) must never be latched-proven and trimmed on (#192/#193). Default:
     /// fail-closed `false` — a fetcher with no header source can prove nothing.
     /// The production `ChainProofFetcher` overrides it against chaintracks.
+    /// Which txid spends `txid:vout`, per an EXTERNAL INDEXER — a HINT, never
+    /// a verdict (bsv-low 2026-08-18, the displaced-spender reconcile). The
+    /// caller must independently prove the hint before acting on it:
+    /// [`Self::spender_binds_outpoint`] (the bytes really spend the outpoint)
+    /// and [`Self::verified_proof_for_detailed`] (the spender is MINED, root
+    /// verified against our PoW-anchored headers). An indexer can therefore
+    /// only ever point at the REAL confirmed spender — pointing anywhere else
+    /// fails one of the two proofs and changes nothing.
+    ///
+    /// Default `Ok(None)` — unknown — so every existing implementation keeps
+    /// compiling AND keeps today's behavior (no resolution, fail-closed).
+    async fn resolve_spender(&self, _txid: &str, _vout: u32) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// TRUE iff `spender`'s raw bytes — fetched CONTENT-ADDRESSED (they must
+    /// hash to `spender`) — carry an input spending exactly `txid:vout`. This
+    /// is the binding that turns [`Self::resolve_spender`]'s hint into a fact.
+    /// Default `Ok(false)`: fail-closed, an unbindable hint is a dead hint.
+    async fn spender_binds_outpoint(
+        &self,
+        _spender: &str,
+        _txid: &str,
+        _vout: u32,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn verify_proof(&self, txid: &str, bump_hex: &str) -> bool {
         let _ = (txid, bump_hex);
         false
