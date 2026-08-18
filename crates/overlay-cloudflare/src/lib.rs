@@ -1278,7 +1278,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     .await;
     worker::console_log!(
         "Scheduled: spend-confirmation (pot_records) — scanned={} confirmed={} \
-         still_unconfirmed={} fetch_failed={} tracker_faults={} cas_missed={} cas_errors={}",
+         still_unconfirmed={} fetch_failed={} tracker_faults={} cas_missed={} cas_errors={} \
+         displaced={} displace_attempts={} displace_faults={}",
         spend_summary.scanned,
         spend_summary.confirmed,
         spend_summary.still_unconfirmed,
@@ -1286,6 +1287,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         spend_summary.tracker_faults,
         spend_summary.cas_missed,
         spend_summary.cas_errors,
+        spend_summary.displaced,
+        spend_summary.displace_attempts,
+        spend_summary.displace_faults,
     );
     worker::console_log!(
         "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} already_proven={} \
@@ -1417,7 +1421,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let proofs_completed = tx_completed + pot_summary.completed as u64;
     let fetch_failed = tx_fetch_failed + pot_summary.fetch_failed as u64;
     let pot_beefs_compacted = pot_summary.completed as u64;
-    let spends_confirmed = spend_summary.confirmed as u64;
+    // A displacement latches spentConfirmed the same as a confirm — the ops
+    // heartbeat counts both or displaced rows go invisible (2026-08-18).
+    let spends_confirmed = (spend_summary.confirmed + spend_summary.displaced) as u64;
     crate::ops::record_completion_tick(
         &ops_db,
         proofs_completed,
@@ -1728,7 +1734,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         proofs_completed,
         fetch_failed,
         ps.completed as u64,
-        ss.confirmed as u64,
+        // A displacement latches spentConfirmed the same as a confirm — the
+        // ops heartbeat counts both or displaced rows go invisible.
+        (ss.confirmed + ss.displaced) as u64,
     )
     .await;
     let flagged = crate::ops::refresh_proofless_watch(&ops_db).await;
@@ -1754,6 +1762,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         // distinct from a guard miss). A total failure of the RETURNING
         // statement self-announces as scanned>0 & confirmed=0 & this >0.
         "spends_cas_errors": ss.cas_errors,
+        // 2026-08-18 reconcile: rows whose never-mined claim was DISPLACED by
+        // the chaintracks-proven actual spender; attempts/faults make a dead
+        // or starved reconcile leg self-announce instead of reading as "the
+        // chain simply has no hint".
+        "spends_displaced": ss.displaced,
+        "spends_displace_attempts": ss.displace_attempts,
+        "spends_displace_faults": ss.displace_faults,
         // #284 decoded-params backfill counters.
         "params_scanned": bf.scanned,
         "params_decoded": bf.decoded,

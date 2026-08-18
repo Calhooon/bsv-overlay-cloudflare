@@ -1975,6 +1975,25 @@ pub fn verdict_cas_sql() -> &'static str {
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
 }
 
+/// The DISPLACEMENT CAS (bsv-low 2026-08-18 reconcile — see
+/// `PotStorage::displace_spend_for`): move the pointer from a recorded claim
+/// that never verifiably mined to the chaintracks-proven actual spender,
+/// latching `spentConfirmed`. Guarded on BOTH the from-pointer and
+/// still-unconfirmed, so a row that moved or was competing-confirmed inside
+/// the caller's verify window is a NO-OP re-evaluated next tick. The pointer
+/// changes by definition ⇒ `spentHeight`/`spenderFinal` are the incoming
+/// values (no COALESCE — a new spender never inherits the old one's facts).
+/// Verdict columns NEVER touched (stale verdict stays keyed to the old txid;
+/// readers guard `verdictTxid == spendingTxid`). `RETURNING txid` turns the
+/// hit into a row for the caller's hit/miss count.
+pub fn displace_spend_cas_sql() -> &'static str {
+    "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
+         spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
+         spentHeight = ?, spenderFinal = ? \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spentConfirmed = 0 \
+     RETURNING txid"
+}
+
 /// The #301 spend-confirmation CAS (the [`verdict_cas_sql`] sibling): the
 /// #186 chaser's confirmed latch, GUARDED on the spender the SPV proof was
 /// verified FOR. If the pointer moved between the chaser's candidate read
@@ -2148,6 +2167,34 @@ impl PotStorage for D1PotStorage {
             .execute(&self.db)
             .await
             .map_err(pot_err)
+    }
+
+    async fn displace_spend_for(
+        &self,
+        txid: &str,
+        output_index: u32,
+        from_spender: &str,
+        to_spender: &str,
+        spent_height: Option<u64>,
+        spender_final: Option<bool>,
+    ) -> Result<bool, PotStorageError> {
+        let hit: Option<serde_json::Value> = Query::new(displace_spend_cas_sql())
+            .bind(to_spender)
+            .bind(spent_height)
+            .bind(spender_final.map(|f| if f { 1i64 } else { 0i64 }))
+            .bind(txid)
+            .bind(output_index)
+            .bind(from_spender)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        // #2b: a displacement HIT is a confirm moment — retire the superseded
+        // siblings, same as the other two confirmed writers.
+        if hit.is_some() {
+            self.retire_superseded_best_effort(txid, output_index, to_spender)
+                .await;
+        }
+        Ok(hit.is_some())
     }
 
     async fn mark_confirmed_for_spender(
@@ -6071,6 +6118,68 @@ mod tests {
             ),
         }
         .expect("mark_spent_sql executes");
+    }
+
+    /// The DISPLACEMENT CAS against the REAL production schema (gate finding
+    /// 4): both guard arms are WHERE-clause behavior only SQLite can prove,
+    /// and the stale-verdict-untouched claim is a SET-clause absence.
+    #[test]
+    fn sql_displacement_cas_guards_and_preserves_the_stale_verdict_real_sqlite() {
+        let conn = production_schema_db();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) \
+             VALUES ('pot', 0, 1, 'refundA', 0)",
+            [],
+        )
+        .unwrap();
+        // A stale verdict keyed to the recorded claim, via the real writer.
+        exec_mark_spent_final(&conn, "pot", 0, "refundA", false, Some("refund"), None, Some(false));
+
+        let displace = |from: &str, to: &str, h: Option<i64>, f: Option<i64>| -> usize {
+            let mut stmt = conn.prepare(displace_spend_cas_sql()).unwrap();
+            stmt.query_map(rusqlite::params![to, h, f, "pot", 0u32, from], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+            .count()
+        };
+
+        // Guard 1: from-pointer mismatch ⇒ zero rows, nothing changes.
+        assert_eq!(displace("someoneElse", "settleA", Some(9), Some(1)), 0);
+        let (sp, conf): (String, i64) = conn
+            .query_row(
+                "SELECT spendingTxid, spentConfirmed FROM pot_records WHERE txid='pot'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((sp.as_str(), conf), ("refundA", 0));
+
+        // Happy: guarded displacement flips pointer + confirm + incoming facts,
+        // verdict columns UNTOUCHED (stale, keyed to the OLD txid — the reader
+        // guard verdictTxid == spendingTxid hides it).
+        assert_eq!(displace("refundA", "settleA", Some(9), Some(1)), 1);
+        let (sp, conf, h, fin, v, vt): (String, i64, Option<i64>, Option<i64>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT spendingTxid, spentConfirmed, spentHeight, spenderFinal, verdict, verdictTxid \
+                 FROM pot_records WHERE txid='pot'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(sp, "settleA");
+        assert_eq!(conf, 1);
+        assert_eq!(h, Some(9));
+        assert_eq!(fin, Some(1));
+        assert_eq!(v.as_deref(), Some("refund"), "verdict untouched");
+        assert_eq!(vt.as_deref(), Some("refundA"), "verdictTxid still the OLD spender");
+
+        // Guard 2: already-confirmed ⇒ zero rows (never displace chain truth).
+        assert_eq!(displace("settleA", "later", Some(10), None), 0);
+        let sp: String = conn
+            .query_row("SELECT spendingTxid FROM pot_records WHERE txid='pot'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sp, "settleA");
     }
 
     fn exec_mark_spent(

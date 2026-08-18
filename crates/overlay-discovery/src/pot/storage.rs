@@ -362,6 +362,35 @@ pub trait PotStorage {
         Ok(())
     }
 
+    /// The DISPLACEMENT CAS (bsv-low 2026-08-18 reconcile): move the spend
+    /// pointer from `from_spender` (a recorded claim that never verifiably
+    /// mined) to `to_spender` (input-bound to the outpoint and
+    /// chaintracks-verified MINED by the caller), latching `spentConfirmed`.
+    /// GUARDED on both the from-pointer and still-unconfirmed — if the row
+    /// moved or was competing-confirmed inside the caller's verify window the
+    /// write is a NO-OP (`Ok(false)`) and the next tick re-evaluates (never
+    /// trade a self-healing failure for a permanent one; the #301 discipline).
+    /// The pointer CHANGES by definition, so `spent_height`/`spender_final`
+    /// are the incoming values (a new spender never inherits the old one's);
+    /// verdict columns are NEVER touched (a stale verdict stays keyed to the
+    /// old txid and every reader guards `verdictTxid == spendingTxid`).
+    /// A hit is a confirm moment: superseded siblings are retired, same as
+    /// every other confirmed write.
+    ///
+    /// Default `Ok(false)` — fail-closed no-op — so implementations that do
+    /// not support displacement keep compiling and simply never displace.
+    async fn displace_spend_for(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+        _from_spender: &str,
+        _to_spender: &str,
+        _spent_height: Option<u64>,
+        _spender_final: Option<bool>,
+    ) -> Result<bool, PotStorageError> {
+        Ok(false)
+    }
+
     /// Latch `spent_confirmed` via GUARDED COMPARE-AND-SET (bsv-low #301,
     /// the [`mark_verdict_for_spender`](Self::mark_verdict_for_spender)
     /// sibling): sets `spent = true, spent_confirmed = true` (and
@@ -821,6 +850,43 @@ impl PotStorage for MemoryPotStorage {
             }
         }
         Ok(())
+    }
+
+    async fn displace_spend_for(
+        &self,
+        txid: &str,
+        output_index: u32,
+        from_spender: &str,
+        to_spender: &str,
+        spent_height: Option<u64>,
+        spender_final: Option<bool>,
+    ) -> Result<bool, PotStorageError> {
+        let mut hit = false;
+        {
+            let mut records = self.records.lock().unwrap();
+            for r in records.iter_mut() {
+                if r.txid == txid
+                    && r.output_index == output_index
+                    && !r.spent_confirmed
+                    && r.spending_txid.as_deref() == Some(from_spender)
+                {
+                    r.spent = true;
+                    r.spending_txid = Some(to_spender.to_string());
+                    r.spent_confirmed = true;
+                    // Pointer change by definition: incoming values, never
+                    // inherited (the mark_spent ELSE-branch doctrine).
+                    r.spent_height = spent_height;
+                    r.spender_final = spender_final;
+                    hit = true;
+                }
+            }
+        }
+        if hit {
+            // A confirmed write is a retirement moment (#2b), same as the
+            // other two confirmed writers.
+            self.retire_superseded_after_confirm(txid, output_index, to_spender);
+        }
+        Ok(hit)
     }
 
     async fn mark_confirmed_for_spender(

@@ -36,7 +36,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use async_trait::async_trait;
-use bsv_rs::transaction::{ChainTracker, MerklePath, MerklePathLeaf, Transaction};
+use bsv_rs::transaction::{Beef, ChainTracker, MerklePath, MerklePathLeaf, Transaction};
 use overlay_engine::gasp::{AncestorFetcher, FetchedAncestor, GASPError};
 
 /// WoC mainnet base URL (mainnet only).
@@ -350,22 +350,20 @@ impl ChainProofFetcher {
     /// SERVER-side per the no-client-indexer rule). 404 = "not spent that this
     /// indexer can see" ⇒ `Ok(None)` — never an assertion of unspentness. The
     /// hint's provider count is deliberately ONE: it cannot lie its way past
-    /// `spender_binds_outpoint` + the chaintracks-verified bump, so
-    /// corroborating the HINT would add cost, not trust.
+    /// the binding + the chaintracks-verified bump, so corroborating the HINT
+    /// would add cost, not trust. BUDGETED: draws one unit from the per-tick
+    /// subrequest budget; exhausted ⇒ `Err` (a local refusal the caller counts
+    /// as a fault — never folded into "no hint").
     async fn woc_spender_of(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
-        let url = format!("{}/tx/{}/out/{}/spent", self.woc_base, txid, vout);
+        let remaining = self.budget.get();
+        if remaining == 0 {
+            return Err("per-tick fetch budget exhausted (spender hint skipped)".into());
+        }
+        self.budget.set(remaining - 1);
+        let url = woc_spent_url(&self.woc_base, txid, vout);
         let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
         let (status, body) = http_get(&url, hdr).await.map_err(|e| format!("woc spent: {e}"))?;
-        if status == 404 {
-            return Ok(None);
-        }
-        if !(200..300).contains(&status) {
-            return Err(format!("woc spent: HTTP {status}"));
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("woc spent: bad json: {e}"))?;
-        let spender = v.get("txid").and_then(|t| t.as_str()).map(str::to_lowercase);
-        Ok(spender.filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())))
+        parse_spent_hint_body(status, &body)
     }
 }
 
@@ -375,27 +373,30 @@ impl AncestorFetcher for ChainProofFetcher {
         self.woc_spender_of(txid, vout).await
     }
 
-    async fn spender_binds_outpoint(
+    async fn spender_binding_raw(
         &self,
         spender: &str,
         txid: &str,
         vout: u32,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
+        // BUDGETED (one unit covers the ladder's up-to-two provider hits, the
+        // same coarse accounting as `fetch_ancestor`); exhausted ⇒ `Err`, a
+        // counted local refusal — this preserves the pinned budget-0 ⇒
+        // no-courier-traffic property for every caller of this fetcher.
+        let remaining = self.budget.get();
+        if remaining == 0 {
+            return Err("per-tick fetch budget exhausted (binding raw skipped)".into());
+        }
+        self.budget.set(remaining - 1);
         // CONTENT-ADDRESSED raw (fetch_raw_hex accepts bytes only if they hash
-        // to `spender`), then the input walk: the hint becomes a fact only if
-        // one of the spender's inputs consumes exactly `txid:vout`.
+        // to `spender`), then the pure input walk: the hint becomes a fact
+        // only if one of the spender's inputs consumes exactly `txid:vout`.
         let raw = self
             .fetch_raw_hex(spender)
             .await
             .map_err(|e| format!("spender raw: {e}"))?;
-        let tx = Transaction::from_hex(raw.trim()).map_err(|e| format!("spender parse: {e}"))?;
-        let want = txid.to_lowercase();
-        Ok(tx.inputs.iter().any(|i| {
-            i.source_output_index == vout
-                && i.source_txid
-                    .as_deref()
-                    .is_some_and(|t| t.eq_ignore_ascii_case(&want))
-        }))
+        let raw = raw.trim().to_string();
+        Ok(tx_consumes_outpoint(&raw, txid, vout)?.then_some(raw))
     }
 
     async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
@@ -852,6 +853,77 @@ fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> O
 // ============================================================================
 
 /// Tally of one pot-spend confirmation pass (logged by the cron / returned by
+/// The WoC spent-endpoint URL for an outpoint. PINNED BY TEST: the correct
+/// route is `/tx/{txid}/{vout}/spent` — the same shape the app-layer's proven
+/// reader uses (`low-app-layer routes.rs spent_any_resolve`). The plausible
+/// `/tx/{txid}/out/{vout}/spent` variant DOES NOT EXIST on WoC (router 404,
+/// live-probed 2026-08-18): shipping it made every hint read as the semantic
+/// "not spent" and the reconcile leg died silently — the reason this is a
+/// pure, unit-pinned function and not an inline format!.
+fn woc_spent_url(woc_base: &str, txid: &str, vout: u32) -> String {
+    format!("{woc_base}/tx/{txid}/{vout}/spent")
+}
+
+/// Parse the spent-endpoint answer. 404 is the endpoint's SEMANTIC "no spend
+/// this indexer can see" ⇒ `Ok(None)`. A 2xx MUST carry a well-formed spender
+/// txid — a 2xx with a missing/garbled/non-hex `txid` is a FAULT (`Err`),
+/// never "no hint": schema drift must announce itself, not silently kill the
+/// reconcile (the unknown-must-not-read-as-fine rule). Any other status is a
+/// fault.
+fn parse_spent_hint_body(status: u16, body: &str) -> Result<Option<String>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("woc spent: HTTP {status}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("woc spent: bad json: {e}"))?;
+    let spender = v
+        .get("txid")
+        .and_then(|t| t.as_str())
+        .map(str::to_lowercase)
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+    spender.map(Some).ok_or_else(|| {
+        format!(
+            "woc spent: 2xx without a well-formed spender txid (schema drift?): {}",
+            &body[..body.len().min(120)]
+        )
+    })
+}
+
+/// TRUE iff `raw_hex` parses to a tx with an input consuming exactly
+/// `txid:vout`. Pure so the conjunction (txid match AND vout match, txid
+/// case-insensitive, coinbase `source_txid: None` never matches) is
+/// unit-pinned against real bytes — the caller's content-addressing already
+/// guarantees WHOSE bytes these are; this decides only what they spend.
+fn tx_consumes_outpoint(raw_hex: &str, txid: &str, vout: u32) -> Result<bool, String> {
+    let tx = Transaction::from_hex(raw_hex).map_err(|e| format!("spender parse: {e}"))?;
+    let want = txid.to_lowercase();
+    Ok(tx.inputs.iter().any(|i| {
+        i.source_output_index == vout
+            && i.source_txid
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(&want))
+    }))
+}
+
+/// Assemble the ATOMIC BEEF for a displaced-in spender from the bytes the
+/// reconcile just proved (content-addressed raw + chaintracks-verified bump),
+/// so the store holds the same durable copy `output_spent` would have written
+/// had the true spender been submitted — without it the displaced spend is
+/// visible but its WIN stays unattributable (`/results`/leaderboard need
+/// `spender_beef_hex`). Pure; any failure is the caller's cue to log and
+/// proceed (the POINTER write is the money fix — this is enrichment).
+fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -> Result<Vec<u8>, String> {
+    let bump = MerklePath::from_hex(bump_hex).map_err(|e| format!("bump parse: {e}"))?;
+    let raw = hex::decode(raw_hex).map_err(|e| format!("raw decode: {e}"))?;
+    let mut beef = Beef::new();
+    let bump_index = beef.merge_bump(bump);
+    beef.merge_raw_tx(raw, Some(bump_index));
+    beef.to_binary_atomic(txid).map_err(|e| format!("beef serialize: {e}"))
+}
+
 /// the admin route).
 // NOTE: not `Copy` — `sample` is a Vec (observability only).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -917,6 +989,17 @@ pub struct SpendConfirmSummary {
     pub sample: Vec<String>,
 }
 
+/// Per-tick cap on reconcile pipelines entered from the chaser's `Ok(None)`
+/// arm. Honest worst-case subrequest accounting PER ENTRY: 1 hint + up to 2
+/// raw-provider hits + the proof leg's own budgeted ladder — every HTTP leg
+/// draws from the fetcher's shared per-tick budget (hint and raw each charge
+/// one unit; the proof leg charges as it always did), so a large
+/// unconfirmable backlog cannot turn the reconcile into a courier hammer and
+/// the pinned budget-0 ⇒ chaintracks-only property still holds. Candidates
+/// are RANDOM-sampled upstream, so a capped tick still converges across
+/// ticks.
+const DISPLACE_CAP_PER_TICK: usize = 4;
+
 /// Confirm 0-conf pot spends in the LOW `pot_records` landing-proof store
 /// (#186).
 ///
@@ -968,13 +1051,6 @@ pub struct SpendConfirmSummary {
 /// unconfirmed claims by design (`mark_spent` trait doc). The reorg-reset
 /// harm this closes (a silently reverted confirmed pointer that nothing
 /// re-visits) outweighs the one-tick confirm delay.
-/// Per-tick cap on reconcile pipelines entered from the chaser's `Ok(None)`
-/// arm (each entry costs up to 3 subrequests: spender hint + content-addressed
-/// raw + verified proof). Bounds the tick's subrequest spend when the
-/// unconfirmable backlog is large; candidates are RANDOM-sampled upstream, so
-/// a capped tick still converges across ticks.
-const DISPLACE_CAP_PER_TICK: usize = 4;
-
 pub async fn complete_spend_confirmations(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn AncestorFetcher,
@@ -995,6 +1071,12 @@ pub async fn complete_spend_confirmations(
     };
     summary.scanned = candidates.len();
 
+    // ── PHASE 1: the primary pointer chase (unchanged semantics). Rows whose
+    // recorded pointer is not verifiably mined are ALSO collected (up to the
+    // cap) for phase 2's reconcile — which runs strictly AFTER this loop so
+    // the reconcile can only spend budget the primary credit-anchor chase
+    // left over (the M-5 starvation ordering).
+    let mut displace_candidates: Vec<overlay_discovery::pot::storage::PotRecord> = Vec::new();
     for rec in candidates {
         // A spent row always carries a spending txid; skip defensively if not.
         let Some(spending_txid) = rec.spending_txid.as_deref() else {
@@ -1068,134 +1150,182 @@ pub async fn complete_spend_confirmations(
             }
             Ok(None) => {
                 summary.still_unconfirmed += 1;
+                if displace_candidates.len() < DISPLACE_CAP_PER_TICK {
+                    displace_candidates.push(rec);
+                }
+            }
+        }
+    }
 
-                // ── THE RECONCILE LEG (2026-08-18 index regression) ──
-                // The recorded pointer is not verifiably mined — but that
-                // pointer is a CLAIM (any submitter's, including a parked
-                // NON-FINAL refund a client re-submitted under Rule 4b), and
-                // chasing only the claim forever is exactly how a MINED true
-                // spend stayed invisible behind it (pot e450f668…:0 —
-                // recorded 41f70310… refund intent, actual mined settle
-                // 3ddda993…). Ask the chain who ACTUALLY spent the outpoint,
-                // and displace ONLY on the full ladder:
-                //   1. `resolve_spender` — an indexer HINT, never a verdict;
-                //   2. `spender_binds_outpoint` — the hinted tx's
-                //      content-addressed raw bytes must consume exactly this
-                //      outpoint (a lying indexer is refused HERE);
-                //   3. `verified_proof_for_detailed` — the hinted spender
-                //      must be MINED under a PoW-verified root. An unmined
-                //      hint NEVER displaces: that would let one mempool
-                //      claim overwrite another; only chain truth displaces.
-                // The write is `mark_spent(confirmed = true)` — the existing
-                // last-confirmed-wins displacement arm. Verdict columns are
-                // NOT touched (the stale verdict stays keyed to the OLD txid
-                // and every reader guards `verdictTxid == spendingTxid`);
-                // `spenderFinal = true` is a fact of the proof (a mined tx's
-                // bytes are final by consensus).
-                if summary.displace_attempts >= DISPLACE_CAP_PER_TICK {
-                    continue;
+    // ── PHASE 2: THE RECONCILE (2026-08-18 index regression). Each collected
+    // row's recorded pointer is a CLAIM that is not verifiably mined (any
+    // submitter's — including a parked NON-FINAL refund a client re-submitted
+    // under Rule 4b), and chasing only the claim forever is exactly how a
+    // MINED true spend stayed invisible behind it (pot e450f668…:0 — recorded
+    // 41f70310… refund intent, actual mined settle 3ddda993…). Ask the chain
+    // who ACTUALLY spent the outpoint; displace ONLY on the full ladder:
+    //   1. `resolve_spender` — an indexer HINT, never a verdict;
+    //   2. `spender_binding_raw` — the hinted tx's content-addressed raw
+    //      bytes must consume exactly this outpoint (a lying indexer is
+    //      refused HERE), and the proven bytes come back for fact
+    //      derivation;
+    //   3. `verified_proof_for_detailed` — the hinted spender must be MINED
+    //      under a PoW-verified root. An unmined hint NEVER displaces: that
+    //      would let one mempool claim overwrite another; only chain truth
+    //      displaces.
+    // The write is the GUARDED `displace_spend_for` CAS — conditional on the
+    // pointer still being the claim this pipeline started from, so a
+    // competing confirmed write inside the verify window makes this a no-op
+    // re-evaluated next tick (the #301 discipline; never trade self-healing
+    // for permanent). Verdict columns are NOT touched (the stale verdict
+    // stays keyed to the OLD txid and every reader guards
+    // `verdictTxid == spendingTxid`); `spenderFinal` is parsed from the
+    // PROVEN bytes with the same rule as `output_spent` (the #371 witness
+    // keeps one meaning); the proven raw + bump are persisted as the
+    // spender's atomic BEEF so the displaced-in win stays classifiable
+    // (enrichment — its failure never blocks the pointer fix).
+    for rec in displace_candidates {
+        let Some(recorded) = rec.spending_txid.as_deref() else {
+            continue;
+        };
+        summary.displace_attempts += 1;
+        let hinted = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
+            Err(e) => {
+                summary.displace_faults += 1;
+                push_log(&format!(
+                    "[spend-confirm] {}:{} spender-hint UNAVAILABLE (fault or budget) — \
+                     reconcile skipped this tick, NOT a chain verdict: {e}",
+                    rec.txid, rec.output_index
+                ));
+                continue;
+            }
+            Ok(h) => h,
+        };
+        let Some(actual) = hinted else {
+            // No hint — nothing to reconcile against; the ordinary pointer
+            // chase keeps retrying next tick.
+            continue;
+        };
+        if actual.eq_ignore_ascii_case(recorded) {
+            // The chain names the recorded pointer itself — the spend is
+            // genuinely just not mined yet. Ordinary chase.
+            continue;
+        }
+        let raw = match fetcher
+            .spender_binding_raw(&actual, &rec.txid, rec.output_index)
+            .await
+        {
+            Err(e) => {
+                summary.displace_faults += 1;
+                push_log(&format!(
+                    "[spend-confirm] {}:{} binding read UNAVAILABLE for hint {actual} \
+                     (fault or budget) — reconcile skipped this tick: {e}",
+                    rec.txid, rec.output_index
+                ));
+                continue;
+            }
+            Ok(None) => {
+                summary.displace_faults += 1;
+                push_log(&format!(
+                    "[spend-confirm] {}:{} hint {actual} does NOT consume the outpoint — \
+                     indexer hint REFUSED (content-addressed input binding failed); \
+                     nothing written",
+                    rec.txid, rec.output_index
+                ));
+                continue;
+            }
+            Ok(Some(raw)) => raw,
+        };
+        let bump_hex = match fetcher.verified_proof_for_detailed(&actual).await {
+            Err(e) => {
+                summary.displace_faults += 1;
+                push_log(&format!(
+                    "[spend-confirm] {}:{} proof/header READ FAULT for true-spender \
+                     candidate {actual} — reconcile skipped this tick: {e}",
+                    rec.txid, rec.output_index
+                ));
+                continue;
+            }
+            Ok(None) => {
+                push_log(&format!(
+                    "[spend-confirm] {}:{} candidate {actual} binds the outpoint but has \
+                     no verifiable proof THIS TICK (unmined, or the tick's proof budget \
+                     ran dry — see any preceding budget log) — no displacement (only \
+                     chain truth displaces a claim)",
+                    rec.txid, rec.output_index
+                ));
+                continue;
+            }
+            Ok(Some(b)) => b,
+        };
+        // Facts derived from the PROVEN bytes:
+        // — height from the verified bump;
+        // — bytes-finality with the EXACT `output_spent` rule (#371: the
+        //   column means one thing regardless of writer; parse failure ⇒
+        //   None = not parsed, never a guess).
+        let spent_height = MerklePath::from_hex(&bump_hex)
+            .ok()
+            .map(|mp| u64::from(mp.block_height));
+        let spender_final = Transaction::from_hex(&raw).ok().map(|tx| {
+            !(tx.lock_time > 0 && tx.inputs.iter().any(|i| i.sequence < 0xffff_ffff))
+        });
+        // Durably persist the spender's atomic BEEF BEFORE the pointer flips,
+        // so the classifier finds bytes the moment the row names this
+        // spender. Failure logs and proceeds — the pointer is the money fix.
+        match assemble_spender_beef(&raw, &bump_hex, &actual) {
+            Ok(beef) => {
+                if let Err(e) = pot_storage.store_beef(&actual, &beef).await {
+                    push_log(&format!(
+                        "[spend-confirm] {actual} displaced-spender beef store failed \
+                         (win may stay unattributed until a re-submit): {e}"
+                    ));
                 }
-                summary.displace_attempts += 1;
-                let hinted = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
-                    Err(e) => {
-                        summary.displace_faults += 1;
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} spender-hint READ FAULT — reconcile \
-                             skipped this tick, NOT a chain verdict: {e}",
-                            rec.txid, rec.output_index
-                        ));
-                        continue;
-                    }
-                    Ok(h) => h,
-                };
-                let Some(actual) = hinted else {
-                    // No hint — nothing to reconcile against; the ordinary
-                    // pointer chase keeps retrying next tick.
-                    continue;
-                };
-                if actual.eq_ignore_ascii_case(spending_txid) {
-                    // The chain names the recorded pointer itself — the spend
-                    // is genuinely just not mined yet. Ordinary chase.
-                    continue;
-                }
-                match fetcher
-                    .spender_binds_outpoint(&actual, &rec.txid, rec.output_index)
-                    .await
-                {
-                    Err(e) => {
-                        summary.displace_faults += 1;
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} binding read FAULT for hint {actual} — \
-                             reconcile skipped this tick: {e}",
-                            rec.txid, rec.output_index
-                        ));
-                        continue;
-                    }
-                    Ok(false) => {
-                        summary.displace_faults += 1;
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} hint {actual} does NOT consume the \
-                             outpoint — indexer hint REFUSED (content-addressed input \
-                             binding failed); nothing written",
-                            rec.txid, rec.output_index
-                        ));
-                        continue;
-                    }
-                    Ok(true) => {}
-                }
-                let bump_hex = match fetcher.verified_proof_for_detailed(&actual).await {
-                    Err(e) => {
-                        summary.displace_faults += 1;
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} proof/header READ FAULT for true-spender \
-                             candidate {actual} — reconcile skipped this tick: {e}",
-                            rec.txid, rec.output_index
-                        ));
-                        continue;
-                    }
-                    Ok(None) => {
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} candidate {actual} binds the outpoint but \
-                             is not verifiably MINED — no displacement (only chain truth \
-                             displaces a claim)",
-                            rec.txid, rec.output_index
-                        ));
-                        continue;
-                    }
-                    Ok(Some(b)) => b,
-                };
-                let spent_height = MerklePath::from_hex(&bump_hex)
-                    .ok()
-                    .map(|mp| u64::from(mp.block_height));
-                match pot_storage
-                    .mark_spent(
-                        &rec.txid,
-                        rec.output_index,
-                        &actual,
-                        true,
-                        None,
-                        spent_height,
-                        Some(true),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        summary.displaced += 1;
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} DISPLACED {spending_txid} → {actual} \
-                             (input-bound + chaintracks-verified mined; the recorded claim \
-                             was never verifiably mined)",
-                            rec.txid, rec.output_index
-                        ));
-                    }
-                    Err(e) => {
-                        summary.cas_errors += 1;
-                        push_log(&format!(
-                            "[spend-confirm] {}:{} displace write failed: {e}",
-                            rec.txid, rec.output_index
-                        ));
-                    }
-                }
+            }
+            Err(e) => {
+                push_log(&format!(
+                    "[spend-confirm] {actual} displaced-spender beef assembly failed \
+                     (win may stay unattributed until a re-submit): {e}"
+                ));
+            }
+        }
+        match pot_storage
+            .displace_spend_for(
+                &rec.txid,
+                rec.output_index,
+                recorded,
+                &actual,
+                spent_height,
+                spender_final,
+            )
+            .await
+        {
+            Ok(true) => {
+                summary.displaced += 1;
+                // The row ENDED this tick confirmed — it is not still
+                // unconfirmed, and ops reads must not double-count it.
+                summary.still_unconfirmed = summary.still_unconfirmed.saturating_sub(1);
+                push_log(&format!(
+                    "[spend-confirm] {}:{} DISPLACED {recorded} → {actual} (input-bound + \
+                     chaintracks-verified mined; the recorded claim was never verifiably \
+                     mined)",
+                    rec.txid, rec.output_index
+                ));
+            }
+            Ok(false) => {
+                summary.cas_missed += 1;
+                push_log(&format!(
+                    "[spend-confirm] {}:{} displacement CAS missed — the pointer moved off \
+                     {recorded} (or was competing-confirmed) inside the verify window; \
+                     wrote NOTHING, next tick re-evaluates",
+                    rec.txid, rec.output_index
+                ));
+            }
+            Err(e) => {
+                summary.cas_errors += 1;
+                push_log(&format!(
+                    "[spend-confirm] {}:{} displacement CAS failed: {e}",
+                    rec.txid, rec.output_index
+                ));
             }
         }
     }
@@ -2131,11 +2261,14 @@ mod tests {
         minable: std::collections::HashSet<String>,
         /// `(txid, vout)` → the spender the chain HINT names (`resolve_spender`).
         spender_hints: std::collections::HashMap<(String, u32), String>,
-        /// Spenders whose raw bytes bind the asked outpoint
-        /// (`spender_binds_outpoint` → true).
-        binding: std::collections::HashSet<String>,
+        /// spender → the raw hex `spender_binding_raw` hands back for it
+        /// (present = binds; absent = fetched-but-does-not-bind).
+        binding_raw: std::collections::HashMap<String, String>,
         /// When set, `resolve_spender` errors (the transport-fault path).
         hint_fault: bool,
+        /// txid → a REAL bump hex to serve instead of the opaque "beefbump"
+        /// (cells that exercise BEEF assembly / height parsing).
+        real_bumps: std::collections::HashMap<String, String>,
     }
 
     #[async_trait(?Send)]
@@ -2146,7 +2279,12 @@ mod tests {
             )))
         }
         async fn verified_proof_for(&self, txid: &str) -> Option<String> {
-            self.minable.contains(txid).then(|| "beefbump".to_string())
+            self.minable.contains(txid).then(|| {
+                self.real_bumps
+                    .get(txid)
+                    .cloned()
+                    .unwrap_or_else(|| "beefbump".to_string())
+            })
         }
         async fn resolve_spender(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
             if self.hint_fault {
@@ -2154,13 +2292,13 @@ mod tests {
             }
             Ok(self.spender_hints.get(&(txid.to_string(), vout)).cloned())
         }
-        async fn spender_binds_outpoint(
+        async fn spender_binding_raw(
             &self,
             spender: &str,
             _txid: &str,
             _vout: u32,
-        ) -> Result<bool, String> {
-            Ok(self.binding.contains(spender))
+        ) -> Result<Option<String>, String> {
+            Ok(self.binding_raw.get(spender).cloned())
         }
     }
 
@@ -2248,7 +2386,9 @@ mod tests {
             spender_hints: [(("potA".to_string(), 0u32), "settleA".to_string())]
                 .into_iter()
                 .collect(),
-            binding: ["settleA".to_string()].into_iter().collect(),
+            binding_raw: [("settleA".to_string(), "not-parseable-raw".to_string())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
@@ -2256,8 +2396,8 @@ mod tests {
         assert_eq!(s.displace_attempts, 1);
         assert_eq!(s.displace_faults, 0);
         assert_eq!(
-            s.still_unconfirmed, 1,
-            "the recorded claim itself was (correctly) not confirmable"
+            s.still_unconfirmed, 0,
+            "a displaced row ENDED the tick confirmed — it must not read as still-unconfirmed"
         );
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
         assert_eq!(
@@ -2280,7 +2420,9 @@ mod tests {
             spender_hints: [(("potA".to_string(), 0u32), "settleA".to_string())]
                 .into_iter()
                 .collect(),
-            binding: ["settleA".to_string()].into_iter().collect(),
+            binding_raw: [("settleA".to_string(), "not-parseable-raw".to_string())]
+                .into_iter()
+                .collect(),
             ..Default::default() // minable EMPTY: the hint is not mined
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
@@ -2304,7 +2446,7 @@ mod tests {
             spender_hints: [(("potA".to_string(), 0u32), "liarTx".to_string())]
                 .into_iter()
                 .collect(),
-            ..Default::default() // binding EMPTY: the bytes do not bind
+            ..Default::default() // binding_raw EMPTY: the bytes do not bind
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.displaced, 0);
@@ -2382,7 +2524,7 @@ mod tests {
         let n = DISPLACE_CAP_PER_TICK + 2;
         let mut hints = std::collections::HashMap::new();
         let mut minable = std::collections::HashSet::new();
-        let mut binding = std::collections::HashSet::new();
+        let mut binding_raw = std::collections::HashMap::new();
         for i in 0..n {
             let pot = format!("pot{i}");
             let claim = format!("refund{i}");
@@ -2390,20 +2532,312 @@ mod tests {
             pot_with_parked_claim(&store, &pot, &claim).await;
             hints.insert((pot, 0u32), truth.clone());
             minable.insert(truth.clone());
-            binding.insert(truth);
+            binding_raw.insert(truth, "not-parseable-raw".to_string());
         }
         let fetcher = MockProofFetcher {
             minable,
             spender_hints: hints,
-            binding,
+            binding_raw,
             ..Default::default()
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.displace_attempts, DISPLACE_CAP_PER_TICK);
         assert_eq!(s.displaced, DISPLACE_CAP_PER_TICK);
-        assert_eq!(s.still_unconfirmed, n, "every row was still ordinary-unconfirmable");
+        assert_eq!(
+            s.still_unconfirmed,
+            n - DISPLACE_CAP_PER_TICK,
+            "displaced rows ended confirmed; only the uncapped remainder is still unconfirmed"
+        );
         let remaining = store.find_spent_unconfirmed(20, 0).await.unwrap();
         assert_eq!(remaining.len(), n - DISPLACE_CAP_PER_TICK);
+    }
+
+    // ══ The reconcile's CONCRETE layer (gate findings 1/4/7: the ladder tests
+    // above stub these; the URL/parse/walk are where the HIGH shipped) ══
+
+    /// FINDING-1 PIN: the spent route that EXISTS is `/tx/{txid}/{vout}/spent`
+    /// (the app-layer's proven reader shape). The plausible `/out/` variant is
+    /// a WoC router 404 — shipping it made every hint read as semantic
+    /// "not spent" and the whole leg died silently.
+    #[test]
+    fn the_woc_spent_url_is_the_route_that_exists() {
+        let url = woc_spent_url("https://api.whatsonchain.com/v1/bsv/main", "aabb", 3);
+        assert_eq!(url, "https://api.whatsonchain.com/v1/bsv/main/tx/aabb/3/spent");
+        assert!(!url.contains("/out/"), "the /out/ shape is a router miss, not an API answer");
+    }
+
+    #[test]
+    fn spent_hint_parse_semantic_404_is_no_hint() {
+        assert_eq!(parse_spent_hint_body(404, "404 page not found"), Ok(None));
+    }
+
+    #[test]
+    fn spent_hint_parse_valid_200_lowercases_the_spender() {
+        let want = "F3E60660".to_lowercase() + &"ab".repeat(28);
+        let body = format!("{{\"txid\":\"{}\",\"vin\":12,\"status\":\"confirmed\"}}", want.to_uppercase());
+        assert_eq!(parse_spent_hint_body(200, &body), Ok(Some(want)));
+    }
+
+    /// FINDING-7 PIN: a 2xx WITHOUT a well-formed spender is schema drift — a
+    /// FAULT the caller counts, never "no hint" (unknown must not read as fine).
+    #[test]
+    fn spent_hint_parse_garbled_200_is_a_fault_not_a_no() {
+        for body in [
+            "{}",
+            "{\"txid\":null}",
+            "{\"txid\":\"short\"}",
+            "{\"txid\":\"zz\"}",
+            "not json at all",
+            "{\"txid\":12}",
+        ] {
+            assert!(
+                parse_spent_hint_body(200, body).is_err(),
+                "2xx body {body:?} must be a fault"
+            );
+        }
+        let bad_len = format!("{{\"txid\":\"{}\"}}", "a".repeat(63));
+        assert!(parse_spent_hint_body(200, &bad_len).is_err());
+    }
+
+    #[test]
+    fn spent_hint_parse_5xx_is_a_fault() {
+        assert!(parse_spent_hint_body(500, "boom").is_err());
+        assert!(parse_spent_hint_body(429, "rate").is_err());
+    }
+
+    /// A REAL spender tx for the input-walk cells: one input consuming
+    /// `pot_txid:vout`, one dust output (bytes serialize + reparse cleanly).
+    fn real_spender_raw(pot_txid: &str, vout: u32) -> String {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{TransactionInput, TransactionOutput};
+        let mut tx = Transaction::new();
+        tx.inputs.push(TransactionInput::new(pot_txid.to_string(), vout));
+        tx.outputs.push(TransactionOutput {
+            satoshis: Some(1),
+            locking_script: LockingScript::from_hex("51").unwrap(),
+            change: false,
+        });
+        tx.to_hex()
+    }
+
+    /// FINDING-4 PIN: the REAL input walk against real bytes — each conjunct
+    /// (txid equality, vout equality) falls to its own cell, so deleting
+    /// either breaks a test (the mutation the mock layer could never see).
+    #[test]
+    fn the_input_walk_binds_only_the_exact_outpoint() {
+        let pot = "ab".repeat(32);
+        let raw = real_spender_raw(&pot, 2);
+        assert_eq!(tx_consumes_outpoint(&raw, &pot, 2), Ok(true), "binds its outpoint");
+        assert_eq!(tx_consumes_outpoint(&raw, &pot, 3), Ok(false), "wrong vout must not bind");
+        let other = "cd".repeat(32);
+        assert_eq!(tx_consumes_outpoint(&raw, &other, 2), Ok(false), "wrong txid must not bind");
+        assert_eq!(
+            tx_consumes_outpoint(&raw, &pot.to_uppercase(), 2),
+            Ok(true),
+            "txid compare is case-insensitive"
+        );
+        assert!(tx_consumes_outpoint("zz-not-hex", &pot, 2).is_err(), "garbage is a fault");
+    }
+
+    /// The assembled displaced-spender BEEF is a REAL atomic beef: it parses,
+    /// carries the spender at its bump height, and garbage in either half is
+    /// an Err (the leg logs + proceeds — enrichment never blocks the pointer).
+    #[test]
+    fn assemble_spender_beef_round_trips_and_fails_closed() {
+        let pot = "ab".repeat(32);
+        let raw = real_spender_raw(&pot, 0);
+        let spender = Transaction::from_hex(&raw).unwrap().id();
+        let bump_hex = single_tx_bump(&spender, 901_000).to_hex();
+        let beef = assemble_spender_beef(&raw, &bump_hex, &spender).unwrap();
+        assert_eq!(stored_bump_height(&beef, &spender), Some(901_000));
+        assert!(assemble_spender_beef("zz", &bump_hex, &spender).is_err());
+        assert!(assemble_spender_beef(&raw, "zz", &spender).is_err());
+    }
+
+    /// End-to-end enrichment: a displacement whose binding raw + bump are REAL
+    /// leaves the spender's atomic BEEF in the store (classifiable win) and
+    /// stamps bytes-finality with the `output_spent` rule (final bytes ⇒ true).
+    #[tokio::test]
+    async fn displacement_persists_the_spender_beef_and_bytes_finality() {
+        let store = MemoryPotStorage::new();
+        let pot = "ab".repeat(32);
+        pot_with_parked_claim(&store, &pot, "refundA").await;
+        let raw = real_spender_raw(&pot, 0);
+        let spender = Transaction::from_hex(&raw).unwrap().id();
+        let fetcher = MockProofFetcher {
+            minable: [spender.clone()].into_iter().collect(),
+            spender_hints: [((pot.clone(), 0u32), spender.clone())].into_iter().collect(),
+            binding_raw: [(spender.clone(), raw)].into_iter().collect(),
+            real_bumps: [(spender.clone(), single_tx_bump(&spender, 901_000).to_hex())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 1);
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(
+            r.spender_final,
+            Some(true),
+            "lock_time 0 bytes are final by the output_spent rule"
+        );
+        assert!(
+            store.get_beef(&spender).await.unwrap().is_some(),
+            "the proven bytes must be durably stored so the win stays classifiable"
+        );
+    }
+
+    /// The leg maps a displacement-CAS MISS (pointer moved/competing-confirmed
+    /// inside the verify window) to cas_missed — wrote nothing, retried next
+    /// tick. Pinned through a store whose displace CAS always misses.
+    struct DisplaceMissStore {
+        inner: MemoryPotStorage,
+    }
+
+    #[async_trait(?Send)]
+    impl PotStorage for DisplaceMissStore {
+        async fn store_record(&self, r: &PotRecord) -> Result<(), PotStorageError> {
+            self.inner.store_record(r).await
+        }
+        async fn get_spent_status(
+            &self,
+            txid: &str,
+            output_index: u32,
+        ) -> Result<Option<PotRecord>, PotStorageError> {
+            self.inner.get_spent_status(txid, output_index).await
+        }
+        async fn find_spent_unconfirmed(
+            &self,
+            limit: u64,
+            min_age_secs: u64,
+        ) -> Result<Vec<PotRecord>, PotStorageError> {
+            self.inner.find_spent_unconfirmed(limit, min_age_secs).await
+        }
+        async fn mark_spent(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            confirmed: bool,
+            verdict: Option<&str>,
+            spent_height: Option<u64>,
+            spender_final: Option<bool>,
+        ) -> Result<(), PotStorageError> {
+            self.inner
+                .mark_spent(txid, output_index, spending_txid, confirmed, verdict, spent_height, spender_final)
+                .await
+        }
+        async fn mark_confirmed_for_spender(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            spent_height: Option<u64>,
+        ) -> Result<bool, PotStorageError> {
+            self.inner
+                .mark_confirmed_for_spender(txid, output_index, spending_txid, spent_height)
+                .await
+        }
+        async fn displace_spend_for(
+            &self,
+            _txid: &str,
+            _output_index: u32,
+            _from_spender: &str,
+            _to_spender: &str,
+            _spent_height: Option<u64>,
+            _spender_final: Option<bool>,
+        ) -> Result<bool, PotStorageError> {
+            Ok(false) // the guard missed: pointer moved inside the window
+        }
+        async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
+            self.inner.store_beef(txid, beef).await
+        }
+        async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+            self.inner.get_beef(txid).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_displacement_cas_miss_is_counted_and_writes_nothing() {
+        let store = DisplaceMissStore { inner: MemoryPotStorage::new() };
+        pot_with_parked_claim(&store.inner, "potA", "refundA").await;
+        let fetcher = MockProofFetcher {
+            minable: ["settleA".to_string()].into_iter().collect(),
+            spender_hints: [(("potA".to_string(), 0u32), "settleA".to_string())]
+                .into_iter()
+                .collect(),
+            binding_raw: [("settleA".to_string(), "not-parseable-raw".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 0);
+        assert_eq!(s.cas_missed, 1, "a guard miss is counted, never silently dropped");
+        assert_eq!(s.still_unconfirmed, 1, "the row stays a candidate for next tick");
+        let r = store.inner.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "nothing was written");
+        assert!(!r.spent_confirmed);
+    }
+
+    /// The Memory displacement CAS itself: both guard arms + the happy write
+    /// (pointer + confirm latch + incoming height/finality; verdict UNTOUCHED).
+    #[tokio::test]
+    async fn memory_displace_cas_guards_and_writes() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potA", "refundA").await;
+        // Stale verdict keyed to the OLD spender must survive displacement.
+        store
+            .mark_spent("potA", 0, "refundA", false, Some("refund"), None, Some(false))
+            .await
+            .unwrap();
+        // Guard 1: from-pointer mismatch ⇒ no-op.
+        assert!(!store
+            .displace_spend_for("potA", 0, "someoneElse", "settleA", Some(9), Some(true))
+            .await
+            .unwrap());
+        // Happy: guarded displacement writes pointer/confirm/height/finality.
+        assert!(store
+            .displace_spend_for("potA", 0, "refundA", "settleA", Some(9), Some(true))
+            .await
+            .unwrap());
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("settleA"));
+        assert!(r.spent_confirmed);
+        assert_eq!(r.spent_height, Some(9));
+        assert_eq!(r.spender_final, Some(true));
+        assert_eq!(r.verdict.as_deref(), Some("refund"), "verdict columns untouched");
+        assert_eq!(
+            r.verdict_txid.as_deref(),
+            Some("refundA"),
+            "stale verdict stays keyed to the OLD txid — the reader guard hides it"
+        );
+        // Guard 2: already-confirmed ⇒ no-op (never displace chain truth).
+        assert!(!store
+            .displace_spend_for("potA", 0, "settleA", "later", Some(10), None)
+            .await
+            .unwrap());
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some("settleA"));
+    }
+
+    /// FINDING-5 PIN: the hint and binding legs draw from the SAME per-tick
+    /// budget as every other courier read — at zero budget both REFUSE with a
+    /// counted fault BEFORE any HTTP, preserving the pinned budget-0 ⇒
+    /// no-courier-traffic property for the whole fetcher. (If the guard were
+    /// deleted, the native run would surface a transport error instead — the
+    /// "budget" text assert distinguishes the two.)
+    #[tokio::test]
+    async fn hint_and_binding_refuse_at_zero_budget_before_any_courier_traffic() {
+        let fetcher = ChainProofFetcher::new(None).with_budget(0);
+        let e = fetcher.resolve_spender(&"aa".repeat(32), 0).await.unwrap_err();
+        assert!(e.contains("budget"), "hint must refuse on budget, got: {e}");
+        let e = fetcher
+            .spender_binding_raw(&"bb".repeat(32), &"aa".repeat(32), 0)
+            .await
+            .unwrap_err();
+        assert!(e.contains("budget"), "binding must refuse on budget, got: {e}");
     }
 
     #[tokio::test]

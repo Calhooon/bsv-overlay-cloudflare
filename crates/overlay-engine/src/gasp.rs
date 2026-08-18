@@ -269,10 +269,15 @@ pub trait AncestorFetcher {
     /// forged) must never be latched-proven and trimmed on (#192/#193). Default:
     /// fail-closed `false` — a fetcher with no header source can prove nothing.
     /// The production `ChainProofFetcher` overrides it against chaintracks.
+    async fn verify_proof(&self, txid: &str, bump_hex: &str) -> bool {
+        let _ = (txid, bump_hex);
+        false
+    }
+
     /// Which txid spends `txid:vout`, per an EXTERNAL INDEXER — a HINT, never
     /// a verdict (bsv-low 2026-08-18, the displaced-spender reconcile). The
     /// caller must independently prove the hint before acting on it:
-    /// [`Self::spender_binds_outpoint`] (the bytes really spend the outpoint)
+    /// [`Self::spender_binding_raw`] (the bytes really spend the outpoint)
     /// and [`Self::verified_proof_for_detailed`] (the spender is MINED, root
     /// verified against our PoW-anchored headers). An indexer can therefore
     /// only ever point at the REAL confirmed spender — pointing anywhere else
@@ -284,23 +289,24 @@ pub trait AncestorFetcher {
         Ok(None)
     }
 
-    /// TRUE iff `spender`'s raw bytes — fetched CONTENT-ADDRESSED (they must
-    /// hash to `spender`) — carry an input spending exactly `txid:vout`. This
-    /// is the binding that turns [`Self::resolve_spender`]'s hint into a fact.
-    /// Default `Ok(false)`: fail-closed, an unbindable hint is a dead hint.
-    async fn spender_binds_outpoint(
+    /// `spender`'s raw tx hex — fetched CONTENT-ADDRESSED (the bytes must
+    /// hash to `spender`) — returned iff those bytes carry an input spending
+    /// exactly `txid:vout`. This is the binding that turns
+    /// [`Self::resolve_spender`]'s hint into a fact, and the caller gets the
+    /// PROVEN bytes back so it can derive further facts from them (bytes
+    /// finality, a durable BEEF) without a second fetch. `Ok(None)` = the
+    /// bytes were read and do NOT bind (a lying or garbled hint — refuse);
+    /// `Err` = could not read (a fault, never a verdict). Default `Ok(None)`:
+    /// fail-closed, an unbindable hint is a dead hint.
+    async fn spender_binding_raw(
         &self,
         _spender: &str,
         _txid: &str,
         _vout: u32,
-    ) -> Result<bool, String> {
-        Ok(false)
+    ) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
-    async fn verify_proof(&self, txid: &str, bump_hex: &str) -> bool {
-        let _ = (txid, bump_hex);
-        false
-    }
 }
 
 /// An ancestor transaction fetched from chain: its raw tx hex plus an optional
