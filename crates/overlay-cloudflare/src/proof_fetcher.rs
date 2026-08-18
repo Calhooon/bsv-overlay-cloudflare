@@ -345,15 +345,31 @@ impl ChainProofFetcher {
 }
 
 impl ChainProofFetcher {
-    /// The spender HINT for an outpoint, from WhatsOnChain's spent endpoint
-    /// (the one indexer this workspace already queries with a spend surface;
-    /// SERVER-side per the no-client-indexer rule). 404 = "not spent that this
-    /// indexer can see" ⇒ `Ok(None)` — never an assertion of unspentness. The
-    /// hint's provider count is deliberately ONE: it cannot lie its way past
-    /// the binding + the chaintracks-verified bump, so corroborating the HINT
-    /// would add cost, not trust. BUDGETED: draws one unit from the per-tick
-    /// subrequest budget; exhausted ⇒ `Err` (a local refusal the caller counts
-    /// as a fault — never folded into "no hint").
+    /// The spender HINT for an outpoint, from WhatsOnChain's spent endpoint —
+    /// SERVER-side per the no-client-indexer rule.
+    ///
+    /// WHY WoC when the house provider order is Arcade → Bitails → WoC
+    /// break-glass (owner, re-confirmed 2026-08-18): the order applies PER
+    /// CAPABILITY, and spend-of-outpoint is the one question only WoC can
+    /// answer today — Arcade has no outpoint query at all (`/tx/{txid}` is
+    /// tx-status + merklePath; ARC's data model), and Bitails'
+    /// `/tx/{txid}/output/{vout}/spent` 500s (live-probed 2026-08-18, both
+    /// URL shapes; matches low-app-layer routes.rs's standing comment). The
+    /// app-layer's proven `/spent-any` uses this same WoC route for the same
+    /// reason. Within THIS leg the other capabilities do follow the order:
+    /// proofs ladder Arcade-first, raw bytes Bitails-first. Steady-state call
+    /// volume is ~zero: hints fire only for rows stuck unconfirmed, ≤
+    /// `DISPLACE_CAP_PER_TICK` per tick, budget-charged. If Bitails ever
+    /// fixes its outpoint endpoint, ladder it first here and demote WoC to
+    /// break-glass.
+    ///
+    /// 404 = "not spent that this indexer can see" ⇒ `Ok(None)` — never an
+    /// assertion of unspentness. The hint's provider count is deliberately
+    /// ONE: it cannot lie its way past the binding + the chaintracks-verified
+    /// bump, so corroborating the HINT would add cost, not trust. BUDGETED:
+    /// draws one unit from the per-tick subrequest budget; exhausted ⇒ `Err`
+    /// (a local refusal the caller counts as a fault — never folded into "no
+    /// hint").
     async fn woc_spender_of(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
         let remaining = self.budget.get();
         if remaining == 0 {
