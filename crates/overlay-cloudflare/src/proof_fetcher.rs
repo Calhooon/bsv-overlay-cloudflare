@@ -852,7 +852,6 @@ fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> O
 // pot_records spend-confirmation chaser (#186)
 // ============================================================================
 
-/// Tally of one pot-spend confirmation pass (logged by the cron / returned by
 /// The WoC spent-endpoint URL for an outpoint. PINNED BY TEST: the correct
 /// route is `/tx/{txid}/{vout}/spent` — the same shape the app-layer's proven
 /// reader uses (`low-app-layer routes.rs spent_any_resolve`). The plausible
@@ -885,9 +884,16 @@ fn parse_spent_hint_body(status: u16, body: &str) -> Result<Option<String>, Stri
         .map(str::to_lowercase)
         .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()));
     spender.map(Some).ok_or_else(|| {
+        // Char-boundary-safe truncation: a multibyte char straddling the cut
+        // must shorten the excerpt, never panic the whole scheduled tick on
+        // exactly the garbled-input path this formatter exists to survive.
+        let mut cut = body.len().min(120);
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
         format!(
             "woc spent: 2xx without a well-formed spender txid (schema drift?): {}",
-            &body[..body.len().min(120)]
+            &body[..cut]
         )
     })
 }
@@ -924,6 +930,7 @@ fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -> Result<Ve
     beef.to_binary_atomic(txid).map_err(|e| format!("beef serialize: {e}"))
 }
 
+/// Tally of one pot-spend confirmation pass (logged by the cron / returned by
 /// the admin route).
 // NOTE: not `Copy` — `sample` is a Vec (observability only).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2597,6 +2604,10 @@ mod tests {
         }
         let bad_len = format!("{{\"txid\":\"{}\"}}", "a".repeat(63));
         assert!(parse_spent_hint_body(200, &bad_len).is_err());
+        // A multibyte char straddling the 120-byte excerpt cut must yield an
+        // Err, never a char-boundary panic that kills the whole tick.
+        let straddle = format!("{{\"note\":\"{}\"}}", "é".repeat(80));
+        assert!(parse_spent_hint_body(200, &straddle).is_err());
     }
 
     #[test]
