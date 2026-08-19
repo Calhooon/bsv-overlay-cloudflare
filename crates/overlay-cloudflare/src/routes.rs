@@ -816,6 +816,57 @@ pub async fn submit(
                     }
                 }
             }
+            Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) => {
+                // #397: sync-validated + queued by Arcade, tracker lagging,
+                // corroborator inconclusive, ancestry PROVEN (the broadcaster
+                // never pends an unproven-ancestry subject — #267). ADMIT —
+                // a lagging tracker must not read as a rejected tx — but do
+                // NOT latch `network_seen`: nothing witnessed it yet. Money
+                // views stay gated on the real witness; the background
+                // re-checks below latch it when the tracker catches up, and
+                // the reconcile ladder displaces the claim if the tx truly
+                // never propagates (the act-on-failure design, owner
+                // 2026-08-19).
+                worker::console_log!(
+                    "broadcast-gated(arcade): {subject_txid} admitted PENDING ({pending}) — sync-accepted, \
+                     SEEN unwitnessed (#397); scheduling background witness re-checks"
+                );
+                // Accepted residual (gate LOW-2): a stranger CAN park an
+                // inert pending row through this arm (valid script+fee,
+                // tracker quiet, corroborator down) — bounded by the subject
+                // EF byte cap, displaceable by the reconcile CAS, and
+                // excluded from every money view until witnessed. Writing
+                // inert rows is the D2 open-path status quo, not a new power.
+                if let Ok(seen_db) = env.d1("OVERLAY_DB") {
+                    let recheck_arcade = crate::broadcaster::ArcadeBroadcaster::new(
+                        arcade_url.clone().unwrap_or_default(),
+                    );
+                    let recheck_txid = subject_txid.clone();
+                    ctx.wait_until(async move {
+                        // Two witness re-checks inside the isolate's post-
+                        // response budget (+6 s, +8 s — gate LOW-1: stay well
+                        // under the ~30 s wait_until ceiling so eviction
+                        // cannot silently skip the latch). Longer lags
+                        // converge via the #371 corroboration on later
+                        // submits, the completion cron, and the reconcile
+                        // ladder.
+                        for delay_ms in [6_000u64, 8_000] {
+                            crate::broadcaster::sleep_ms(delay_ms).await;
+                            if recheck_arcade.network_witnessed(&recheck_txid).await {
+                                crate::ops::latch_network_seen(&seen_db, &recheck_txid).await;
+                                worker::console_log!(
+                                    "#397: background re-check witnessed {recheck_txid} SEEN — latched"
+                                );
+                                return;
+                            }
+                        }
+                        worker::console_log!(
+                            "#397: {recheck_txid} still unwitnessed after background re-checks — \
+                             the completion/reconcile passes own it now"
+                        );
+                    });
+                }
+            }
             Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
                 // DEFINITIVE refusal of the SUBJECT → admit NOTHING. (#214:
                 // this arm is now reachable only via a SYNCHRONOUS validation
@@ -2735,13 +2786,15 @@ mod tests {
         let needle = ["crate::ops::latch_net", "work_seen("].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            2,
-            "expected EXACTLY two latch calls — the gated Accepted arm and the \
-             ungated post-submit corroboration; a changed count means a \
-             producer was deleted, moved or duplicated. An unchanged count \
-             does NOT prove either call executes — that is the ci-route \
-             lane's job (ungated) and the deploy-runbook networkSeenTotal \
-             check (gated)"
+            3,
+            "expected EXACTLY three latch calls — the gated Accepted arm, the \
+             ungated post-submit corroboration, and the #397 AcceptedPending \
+             background witness re-check (which latches ONLY on a real \
+             network_witnessed answer — a pending admit itself must never \
+             latch); a changed count means a producer was deleted, moved or \
+             duplicated. An unchanged count does NOT prove any call executes \
+             — that is the ci-route lane's job (ungated) and the \
+             deploy-runbook networkSeenTotal check (gated)"
         );
         // The ungated corroboration must sit AFTER the engine submit (gate
         // MEDIUM-2) — assert on the construct: the corroboration flag is
@@ -2757,6 +2810,47 @@ mod tests {
             submit_at < flag_at,
             "the ungated corroboration must be scheduled AFTER engine.submit \
              (MEDIUM-2: no Arcade fan-out for subjects the engine refused)"
+        );
+    }
+
+    /// #397 (gate MEDIUM-1): the pending admit's MONEY-INERTNESS is now a
+    /// load-bearing boundary — the whole relaxation is sound only because an
+    /// `AcceptedPending` row never reads as SEEN until a genuine witness
+    /// speaks. The leaf halves are pinned elsewhere (broadcaster:
+    /// `unseen_fold_semantics` / `wiring_unseen_*` prove pending mints only
+    /// from proven-single-leg + inconclusive; low-app-layer:
+    /// `is_confirmed_landing*` tests prove unwitnessed spends are excluded
+    /// from every money view). THIS pins the routes link on the construct:
+    /// inside the AcceptedPending arm the latch producer appears exactly
+    /// once, backgrounded (`wait_until`), and strictly AFTER the
+    /// `network_witnessed` guard — a latch reachable before the witness
+    /// would mark an unwitnessed spend SEEN and unlock money views on it.
+    #[test]
+    fn pending_admit_latches_only_behind_a_real_witness() {
+        let src = code_only(include_str!("routes.rs"));
+        let arm_start = src
+            .find("ArcOutcome::AcceptedPending(pending)")
+            .expect("the pending arm exists");
+        let arm_end = arm_start
+            + src[arm_start..]
+                .find("ArcOutcome::Rejected")
+                .expect("the Rejected arm follows the pending arm");
+        let arm = &src[arm_start..arm_end];
+        let needle = ["crate::ops::latch_net", "work_seen("].concat();
+        assert_eq!(
+            arm.matches(&needle).count(),
+            1,
+            "exactly ONE latch producer inside the pending arm"
+        );
+        let wait_at = arm.find("wait_until").expect("the pending latch is backgrounded");
+        let witness_at = arm
+            .find("network_witnessed(")
+            .expect("the pending latch is witness-guarded");
+        let latch_at = arm.find(&needle).expect("counted above");
+        assert!(
+            wait_at < witness_at && witness_at < latch_at,
+            "the pending arm's latch must sit INSIDE wait_until and strictly AFTER \
+             the network_witnessed guard (wait@{wait_at} witness@{witness_at} latch@{latch_at})"
         );
     }
 

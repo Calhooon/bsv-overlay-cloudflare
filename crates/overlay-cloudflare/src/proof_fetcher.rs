@@ -1962,6 +1962,15 @@ pub async fn rebroadcast_absent_admitted(
                 ));
                 summary.rebroadcast += 1;
             }
+            Some(Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_))) => {
+                // #397: queued but UNWITNESSED — not a rescue yet. The next
+                // backstop pass either finds it on an indexer (done) or
+                // retries; never count RESCUED without a witness.
+                push_log(&format!(
+                    "[rebroadcast-backstop] {txid} rebroadcast sync-accepted but unwitnessed (#397) — retry later"
+                ));
+                summary.rebroadcast_failed += 1;
+            }
             Some(Ok(crate::broadcaster::ArcOutcome::Rejected(r))) => {
                 push_log(&format!(
                     "[rebroadcast-backstop] {txid} rebroadcast REJECTED ({r}) — retry later"

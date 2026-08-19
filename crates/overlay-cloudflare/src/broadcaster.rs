@@ -101,6 +101,17 @@ pub enum ArcOutcome {
     Accepted(String),
     /// Network definitively rejected the tx; carries the reason.
     Rejected(String),
+    /// bsv-low #397 — accepted SYNCHRONOUSLY by Arcade (validated + queued)
+    /// but not yet WITNESSED as seen: the status tracker was slow past the
+    /// grace window and the corroborator could not decide either way. Only
+    /// ever produced for a subject whose ancestry is PROVEN (single-leg —
+    /// `has_unproven_ancestry` false): a 0-conf-ancestry subject keeps the
+    /// #267 two-witness bar and refuses instead. The caller ADMITS (the
+    /// synchronous validation caught every genuine-invalidity class; the
+    /// tracker lagging must not read as the network refusing) but must NOT
+    /// latch `network_seen` — the SEEN witness arrives via the background
+    /// re-checks / #371 latch / reconcile, and money views stay gated on it.
+    AcceptedPending(String),
 }
 
 /// A hex run this long is a txid / script / BEEF blob, i.e. RANDOM DATA — not
@@ -537,9 +548,75 @@ fn corroborated_exhaustion(
         Ok(ArcOutcome::Rejected(r)) => Ok(ArcOutcome::Rejected(format!(
             "network did not accept {subject_txid}; retried; corroborated by second broadcaster: {r}"
         ))),
+        // Corroborators are ARC transports; they answer Accepted/Rejected or
+        // Err — a pending outcome cannot originate there. Honest Err if the
+        // impossible arrives (never an admit on a nonsense answer).
+        Ok(ArcOutcome::AcceptedPending(_)) => Err(format!(
+            "corroborator produced a pending outcome for {subject_txid} — impossible by construction; not admitting"
+        )),
         Err(t) => Err(format!(
             "Arcade did not accept {subject_txid} and the corroborating broadcaster was inconclusive — not admitting, not refusing: {t}"
         )),
+    }
+}
+
+/// PURE (#397): fold the corroborator's word into a SYNC-ACCEPTED subject the
+/// tracker never reported SEEN within the grace budget ([`GateStep::AcceptedUnseen`]).
+/// The evidence in hand: Arcade VALIDATED the bytes and queued them (every
+/// genuine-invalidity class fails synchronously or fatally — a silent tracker
+/// is a lagging tracker, not a network refusal). The missing piece is a
+/// network WITNESS, so ask the second broadcaster:
+///
+/// - Corroborator ACCEPTED → `Ok(Accepted)` — a real network-accept marker
+///   from an independent broadcaster (the same admit bar
+///   [`corroborated_exhaustion`] already uses, reached ~30 s sooner). The
+///   corroborator also actively propagates the EF — the durability belt the
+///   ghost-canary incident showed a single queued copy lacks.
+/// - Corroborator REJECTED → `Err` → 502, deliberately NOT a 422: Arcade
+///   validated the same EF the corroborator refused — the providers CONFLICT,
+///   and neither single-provider verdict is the network's
+///   ([`gate_accept_claim_with`]'s exact doctrine). Fail closed on admission,
+///   keep the refusal retryable.
+/// - Corroborator transport/inconclusive → the tiers split on ancestry:
+///     * UNPROVEN ancestry (`has_unproven_ancestry`) → `Err` → 502. The #267
+///       bar stands: a 0-conf-ancestry subject (the JOIN) never enters the
+///       index on one provider's unwitnessed word — that exact shape once
+///       played a hand on a phantom pot.
+///     * PROVEN ancestry (single-leg: settles/refunds/sweeps) →
+///       `Ok(AcceptedPending)` — admit on the synchronous validation and act
+///       on failure: the caller must NOT latch `network_seen` (money views
+///       stay gated on the real witness), the background re-checks latch it
+///       when the tracker catches up, and the reconcile ladder displaces the
+///       claim if the tx truly never propagates.
+fn corroborated_unseen(
+    corroborator: Result<ArcOutcome, String>,
+    efs_len: usize,
+    subject_txid: &str,
+) -> Result<ArcOutcome, String> {
+    match corroborator {
+        Ok(ArcOutcome::Accepted(_)) => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        Ok(ArcOutcome::Rejected(r)) => Err(format!(
+            "providers CONFLICT on {subject_txid}: Arcade accepted the EF synchronously but the \
+             corroborating broadcaster refused it ({r}) — not admitting, not refusing (#397/#214)"
+        )),
+        Ok(ArcOutcome::AcceptedPending(_)) => Err(format!(
+            "corroborator produced a pending outcome for {subject_txid} — impossible by construction; not admitting"
+        )),
+        Err(t) => {
+            if has_unproven_ancestry(efs_len) {
+                Err(format!(
+                    "Arcade sync-accepted {subject_txid} but never reported it SEEN, and the \
+                     corroborator was inconclusive ({t}) — subject rides UNPROVEN ancestry, so the \
+                     #267 two-witness bar refuses to admit (retryable)"
+                ))
+            } else {
+                gate_log(&format!(
+                    "[arcade] {subject_txid} sync-accepted, tracker lagging, corroborator inconclusive ({t}) — \
+                     PROVEN-ancestry subject admits PENDING (#397); network_seen stays unlatched until witnessed"
+                ));
+                Ok(ArcOutcome::AcceptedPending(subject_txid.to_string()))
+            }
+        }
     }
 }
 
@@ -579,6 +656,10 @@ fn corroborated_accept_claim(
 ) -> Result<ArcOutcome, String> {
     match corroborator {
         Ok(ArcOutcome::Accepted(_)) => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        // #397: corroborators are ARC transports and cannot pend — honest Err.
+        Ok(ArcOutcome::AcceptedPending(_)) => Err(format!(
+            "corroborator produced a pending outcome for {subject_txid} — impossible by construction; not admitting"
+        )),
         Ok(ArcOutcome::Rejected(r)) => Err(format!(
             "Arcade claims {subject_txid} accepted but the corroborating broadcaster rejected it ({r}) — conflicting single-provider verdicts; not admitting, not refusing"
         )),
@@ -614,6 +695,10 @@ fn corroborated_mined_claim(
 ) -> Result<ArcOutcome, String> {
     match corroborator {
         Ok(ArcOutcome::Accepted(_)) => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        // #397: corroborators are ARC transports and cannot pend — honest Err.
+        Ok(ArcOutcome::AcceptedPending(_)) => Err(format!(
+            "corroborator produced a pending outcome for {subject_txid} — impossible by construction; not admitting"
+        )),
         Ok(ArcOutcome::Rejected(r)) => Err(format!(
             "submitter claims {subject_txid} already mined (bump attached) but the corroborating broadcaster rejected it ({r}) — refusing to admit an unverified mined-claim (#268); not refusing definitively"
         )),
@@ -655,6 +740,11 @@ fn fold_refuse_bar(
             "one-provider rejection is not definitive (taal inconclusive: {a}; gorillapool rejected: {b})"
         )),
         (Err(a), Err(b)) => Err(format!("taal: {a}; gorillapool: {b}")),
+        // #397: `corroborator_verdict` never produces a pending outcome — an
+        // impossible arm reads as inconclusive, never as an admit or refusal.
+        (Ok(ArcOutcome::AcceptedPending(_)), _) | (_, Ok(ArcOutcome::AcceptedPending(_))) => Err(
+            "corroborator host produced a pending outcome — impossible by construction".to_string(),
+        ),
     }
 }
 
@@ -686,6 +776,8 @@ async fn corroborate_tx_hex(
             Ok(ArcOutcome::Rejected(r)) => format!("rejected: {r}"),
             Err(e) => format!("inconclusive: {e}"),
             Ok(ArcOutcome::Accepted(_)) => unreachable!("accept short-circuits"),
+            // #397: corroborator_verdict never pends.
+            Ok(ArcOutcome::AcceptedPending(_)) => unreachable!("corroborators never pend"),
         }
     );
     let gp = match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
@@ -807,6 +899,18 @@ const MAX_CORROBORATION_LEGS: usize = 32;
 ///   for unproven-parent subjects ([`corroborated_accept_claim`]); a
 ///   proven-parent (single-EF) subject keeps the uncorroborated fast path —
 ///   see the risk-class note in `gate_accept_claim`.
+/// #397: which corroborating broadcast answers an UNSEEN step — the same
+/// ancestry-primed selection the accept-claim leg uses (#216: a corroborator
+/// with a partial UTXO view can only validate a 0-conf-parent subject with
+/// the parents fed first).
+fn unseen_corroboration_kind(efs_len: usize) -> CorroborationKind {
+    if has_unproven_ancestry(efs_len) {
+        CorroborationKind::WithAncestry
+    } else {
+        CorroborationKind::SubjectOnly
+    }
+}
+
 fn has_unproven_ancestry(efs_len: usize) -> bool {
     efs_len > 1
 }
@@ -818,6 +922,9 @@ impl ArcBroadcaster for WorkerArcBroadcaster {
         match post_arc_tx(Self::ARC_URL, Some(&self.api_key), raw_tx_hex).await? {
             ArcOutcome::Accepted(txid) => Ok(txid),
             ArcOutcome::Rejected(reason) => Err(format!("ARC broadcast rejected: {reason}")),
+            // #397: `arc_verdict` never produces a pending outcome (that arm
+            // is minted only by the gated ladder's corroborated_unseen).
+            ArcOutcome::AcceptedPending(_) => Err("ARC verdict pended — impossible by construction".to_string()),
         }
     }
 }
@@ -869,7 +976,20 @@ const ARCADE_FATAL_STATUSES: &[&str] = &["REJECTED", "DOUBLE_SPEND_ATTEMPTED"];
 
 /// Give up waiting for propagation after this long — the tx was submitted but
 /// never became demonstrably SEEN, so the caller must NOT admit it (fail-closed).
+/// Since #397 this budget governs only the RESUBMIT rungs (attempt 2 / full
+/// batch, the async-REJECTED-flip retry paths); the FIRST attempt uses
+/// [`ARCADE_SEEN_GRACE_MS`] and routes a slow tracker to the corroborator
+/// instead of waiting this out.
 const ARCADE_WAIT_TIMEOUT_MS: u64 = 20_000;
+
+/// bsv-low #397 — the first-attempt SEEN grace. Measured SEEN latency on both
+/// stacks is ~2.2 s (one poll cycle; the canary's `GET /canary` window is the
+/// live baseline), so three cycles of grace cover the healthy case with slack.
+/// Past this the tracker is LAGGING, and a lagging tracker must not read as a
+/// rejected tx: the ladder asks the SECOND broadcaster instead of waiting —
+/// under lag a sit admits in ~8 s (grace + corroborate) rather than refusing
+/// at 20–40 s (the 2026-08-18 CEO-call class).
+const ARCADE_SEEN_GRACE_MS: u64 = 6_000;
 
 /// Poll `GET /tx/{txid}` at this cadence while gating.
 const ARCADE_POLL_INTERVAL_MS: u64 = 2_000;
@@ -1108,6 +1228,15 @@ enum GateStep {
     /// ancestry-primed corroboration). Never admits, never definitively
     /// rejects, on the orphan view alone.
     Orphan(String),
+    /// bsv-low #397: the submit was accepted SYNCHRONOUSLY (2xx — Arcade
+    /// validated the bytes and queued them) but the STATUS TRACKER never
+    /// reported SEEN within the poll budget and never reported anything
+    /// fatal either. Every genuine-invalidity class (fee, format, script,
+    /// mempool double-spend) surfaces synchronously or as a fatal status —
+    /// this shape is a LAGGING TRACKER, and a lagging tracker must not read
+    /// as a rejected tx. The ladder answers it by asking the SECOND
+    /// broadcaster instead of waiting the lag out.
+    AcceptedUnseen,
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
@@ -1187,6 +1316,10 @@ enum Ladder {
     /// to the ancestry rungs: the full-batch resubmit, then the
     /// ancestry-primed exhaustion corroboration.
     Ancestry,
+    /// #397: sync-accepted but the tracker never said SEEN in budget — ask
+    /// the second broadcaster NOW (`corroborated_unseen`) instead of burning
+    /// another poll window; a resubmit cannot make a lagging tracker faster.
+    Unseen,
 }
 
 /// How one classified submit outcome enters the gate (PURE — the real
@@ -1254,15 +1387,25 @@ fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
         // parents", so answer it with parents (the ancestry rungs). Never a
         // Return: an orphan view alone may neither admit nor reject.
         GateStep::Orphan(_) => Ladder::Ancestry,
+        // #397: sync-accepted, tracker never said SEEN in budget. Not a
+        // Return (nothing witnessed), not a Retry (a resubmit cannot speed a
+        // lagging tracker), not Ancestry (nothing says parents are missing) —
+        // ask the second broadcaster.
+        GateStep::AcceptedUnseen => Ladder::Unseen,
     }
 }
 
 /// Which rung of the gated ladder a submit serves ([`broadcast_efs_gated_with`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmitRung {
-    /// `POST /tx` of the subject's EF alone (attempts 1 and 2).
-    SubjectOnly,
-    /// `POST /txs` of the full ancestry batch (attempt 3).
+    /// `POST /tx` of the subject's EF alone (attempts 1 and 2). `graced`
+    /// (#397) selects the SEEN-poll budget: attempt 1 waits only
+    /// [`ARCADE_SEEN_GRACE_MS`] (a lagging tracker routes to the corroborator
+    /// instead of being waited out); the async-flip RETRY keeps the full
+    /// [`ARCADE_WAIT_TIMEOUT_MS`] (its wait is about Arcade re-validating,
+    /// not about the tracker).
+    SubjectOnly { graced: bool },
+    /// `POST /txs` of the full ancestry batch (attempt 3). Full budget.
     FullBatch,
 }
 
@@ -1331,6 +1474,10 @@ where
 {
     match outcome {
         ArcOutcome::Rejected(_) => Ok(outcome),
+        // #397: never produced by a ladder Return (AcceptedUnseen maps to
+        // Ladder::Unseen, whose corroboration is its own — corroborated_unseen);
+        // pass through defensively rather than double-corroborating.
+        ArcOutcome::AcceptedPending(_) => Ok(outcome),
         ArcOutcome::Accepted(_) => {
             let kind = if has_unproven_ancestry(efs_len) {
                 CorroborationKind::WithAncestry
@@ -1394,11 +1541,13 @@ where
     // the remaining subject-only rungs cannot supply the missing parents.
     let mut orphan_shortcut = false;
 
-    // ── Attempt 1: SUBJECT ONLY. Arcade sources unconfirmed parents itself.
+    // ── Attempt 1: SUBJECT ONLY, GRACED (#397). Arcade sources unconfirmed
+    // parents itself; the SEEN poll gets only the short grace — a lagging
+    // tracker routes to the corroborator instead of being waited out.
     gate_log(&format!(
-        "[arcade] submitting subject-only {subject_txid} → gating on {ARCADE_GATE_STATUS}"
+        "[arcade] submitting subject-only {subject_txid} → gating on {ARCADE_GATE_STATUS} (graced)"
     ));
-    let step = submit_gate(SubmitRung::SubjectOnly).await?;
+    let step = submit_gate(SubmitRung::SubjectOnly { graced: true }).await?;
     match ladder_step(step, subject_txid) {
         Ladder::Return(outcome) => {
             return gate_accept_claim_with(outcome, efs_len, subject_txid, &mut corroborate).await;
@@ -1408,6 +1557,13 @@ where
                 "[arcade] {subject_txid} held as ORPHAN — routing to ancestry rungs (#267)"
             ));
             orphan_shortcut = true;
+        }
+        // #397: sync-accepted, tracker silent past the grace — ask the second
+        // broadcaster now (ancestry-primed when the parents are unproven, the
+        // same #216 selection the accept-claim leg uses).
+        Ladder::Unseen => {
+            let corroborated = corroborate(unseen_corroboration_kind(efs_len)).await;
+            return corroborated_unseen(corroborated, efs_len, subject_txid);
         }
         Ladder::Retry => {}
     }
@@ -1420,7 +1576,7 @@ where
         gate_log(&format!(
             "[arcade] {subject_txid} not accepted — resubmitting subject-only"
         ));
-        let step = submit_gate(SubmitRung::SubjectOnly).await?;
+        let step = submit_gate(SubmitRung::SubjectOnly { graced: false }).await?;
         match ladder_step(step, subject_txid) {
             Ladder::Return(outcome) => {
                 return gate_accept_claim_with(outcome, efs_len, subject_txid, &mut corroborate)
@@ -1431,6 +1587,13 @@ where
                     "[arcade] {subject_txid} held as ORPHAN — routing to ancestry rungs (#267)"
                 ));
                 orphan_shortcut = true;
+            }
+            // #397: the RESUBMIT sync-accepted and then the tracker stayed
+            // silent for the full budget — same answer as attempt 1's grace:
+            // the second broadcaster decides.
+            Ladder::Unseen => {
+                let corroborated = corroborate(unseen_corroboration_kind(efs_len)).await;
+                return corroborated_unseen(corroborated, efs_len, subject_txid);
             }
             Ladder::Retry => {}
         }
@@ -1494,6 +1657,15 @@ where
     match ladder_step(step, subject_txid) {
         Ladder::Return(outcome) => {
             return gate_accept_claim_with(outcome, efs_len, subject_txid, &mut corroborate).await;
+        }
+        // #397: the batch sync-accepted and the tracker stayed silent.
+        // `corroborated_unseen` (not the exhaustion mapper) keeps the
+        // conflict doctrine exact: Arcade DID accept these bytes, so a
+        // corroborator rejection is a provider CONFLICT (Err/502), never the
+        // two-provider 422 the exhaustion arm means.
+        Ladder::Unseen => {
+            let corroborated = corroborate(unseen_corroboration_kind(efs_len)).await;
+            return corroborated_unseen(corroborated, efs_len, subject_txid);
         }
         // Retry (async-rejected) and Ancestry (still orphan) both fall
         // through to the exhaustion corroboration — the ladder has no
@@ -1796,12 +1968,13 @@ impl ArcadeBroadcaster {
                 let subject_ef = subject_ef
                     .ok_or_else(|| format!("subject {subject_txid} has no EF leg"))?;
                 match rung {
-                    SubmitRung::SubjectOnly => {
+                    SubmitRung::SubjectOnly { graced } => {
                         self.submit_once_and_gate(
                             &self.tx_endpoint(),
                             &subject_ef.ef,
                             subject_txid,
                             1,
+                            if graced { ARCADE_SEEN_GRACE_MS } else { ARCADE_WAIT_TIMEOUT_MS },
                         )
                         .await
                     }
@@ -1812,6 +1985,7 @@ impl ArcadeBroadcaster {
                             &concat,
                             subject_txid,
                             efs.len(),
+                            ARCADE_WAIT_TIMEOUT_MS,
                         )
                         .await
                     }
@@ -1852,6 +2026,7 @@ impl ArcadeBroadcaster {
         body: &[u8],
         subject_txid: &str,
         batch_len: usize,
+        poll_budget_ms: u64,
     ) -> Result<GateStep, String> {
         let submit_body = match submit_entry(self.submit_ef(endpoint, subject_txid, body).await) {
             SubmitEntry::Proceed(b) => b,
@@ -1899,7 +2074,7 @@ impl ArcadeBroadcaster {
             }
         }
 
-        self.poll_for_status(subject_txid).await
+        self.poll_for_status(subject_txid, poll_budget_ms).await
     }
 
     /// POST the EF body to `endpoint` (callback headers set) and CLASSIFY the
@@ -1968,9 +2143,13 @@ impl ArcadeBroadcaster {
 
     /// Poll `GET /tx/{txid}` until the subject reaches the gate (or better),
     /// hits a fatal status, surfaces an ORPHAN view (#267 — routed to the
-    /// ancestry rungs, not waited out), or the deadline elapses. Timeout →
-    /// `Err` (never admit a tx that never became SEEN).
-    async fn poll_for_status(&self, txid: &str) -> Result<GateStep, String> {
+    /// ancestry rungs, not waited out), or `budget_ms` elapses. Timeout →
+    /// [`GateStep::AcceptedUnseen`] (#397): the POST was accepted
+    /// synchronously (this poll only ever runs after
+    /// [`SubmitEntry::Proceed`]), so a silent tracker is a LAGGING tracker —
+    /// the ladder answers it with the second broadcaster, never with an
+    /// admit and never by waiting the lag out.
+    async fn poll_for_status(&self, txid: &str, budget_ms: u64) -> Result<GateStep, String> {
         let started = worker::js_sys::Date::now();
         // Accumulate this loop's wall-clock into `poll_ms` on EVERY exit —
         // scopeguard-free: the loop has 3 exits, each stamps before return.
@@ -2017,12 +2196,13 @@ impl ArcadeBroadcaster {
                     GateVerdict::Pending => {}
                 }
             }
-            if waited >= ARCADE_WAIT_TIMEOUT_MS {
+            if waited >= budget_ms {
                 stamp(&self.poll_ms);
-                return Err(format!(
-                    "Arcade {txid} never reached {ARCADE_GATE_STATUS} within {}s — do not admit",
-                    ARCADE_WAIT_TIMEOUT_MS / 1000
-                ));
+                worker::console_log!(
+                    "[arcade] {txid} sync-accepted but not {ARCADE_GATE_STATUS} within {}ms — tracker lagging (#397)",
+                    budget_ms
+                );
+                return Ok(GateStep::AcceptedUnseen);
             }
             sleep_ms(ARCADE_POLL_INTERVAL_MS).await;
             waited += ARCADE_POLL_INTERVAL_MS;
@@ -3257,7 +3437,7 @@ mod tests {
         assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
         assert_eq!(
             *rungs.borrow(),
-            vec![SubmitRung::SubjectOnly, SubmitRung::FullBatch],
+            vec![SubmitRung::SubjectOnly { graced: true }, SubmitRung::FullBatch],
             "orphan must skip the subject-only resubmit (attempt 2)"
         );
         assert_eq!(
@@ -3301,8 +3481,8 @@ mod tests {
         assert_eq!(
             *rungs.borrow(),
             vec![
-                SubmitRung::SubjectOnly,
-                SubmitRung::SubjectOnly,
+                SubmitRung::SubjectOnly { graced: true },
+                SubmitRung::SubjectOnly { graced: false },
                 SubmitRung::FullBatch,
             ]
         );
@@ -3313,6 +3493,122 @@ mod tests {
                 CorroborationKind::WithAncestry,
             ]
         );
+    }
+
+    // ── #397: sync-accepted + lagging tracker — the unseen ladder ──────────
+
+    #[test]
+    fn unseen_fold_semantics() {
+        let subject = "2c50a257da80421f8a31c98bedc728b19e437edff0e2e84b74278f4b20d82256";
+        // Corroborator ACCEPT → Accepted(subject) — the second witness admits.
+        assert_eq!(
+            corroborated_unseen(Ok(ArcOutcome::Accepted("echo".into())), 1, subject).unwrap(),
+            ArcOutcome::Accepted(subject.to_string())
+        );
+        // Corroborator REJECT while Arcade sync-accepted → provider CONFLICT:
+        // retryable Err, NEVER a 422-bound Rejected and NEVER an admit.
+        let err = corroborated_unseen(Ok(ArcOutcome::Rejected("unlock invalid".into())), 1, subject)
+            .expect_err("conflicting providers must not admit or mint a 422");
+        assert!(err.contains("CONFLICT"), "{err}");
+        // Inconclusive + UNPROVEN ancestry → the #267 two-witness bar refuses
+        // (a 0-conf-ancestry subject never enters the index unwitnessed).
+        let err = corroborated_unseen(Err("both corroborator hosts down".into()), 2, subject)
+            .expect_err("unproven ancestry must never pend");
+        assert!(err.contains("#267"), "{err}");
+        // Inconclusive + PROVEN single leg → AcceptedPending (#397): admit on
+        // the synchronous validation, act on failure later.
+        assert_eq!(
+            corroborated_unseen(Err("both corroborator hosts down".into()), 1, subject).unwrap(),
+            ArcOutcome::AcceptedPending(subject.to_string())
+        );
+    }
+
+    #[test]
+    fn ladder_routes_unseen_to_the_second_witness_never_terminal() {
+        // AcceptedUnseen may neither admit (nothing witnessed) nor retry (a
+        // resubmit cannot speed a lagging tracker) nor go to ancestry
+        // (nothing says parents are missing) — it must ask the corroborator.
+        assert!(matches!(
+            ladder_step(GateStep::AcceptedUnseen, "subject"),
+            Ladder::Unseen
+        ));
+    }
+
+    #[tokio::test]
+    async fn wiring_unseen_first_attempt_asks_corroborator_and_admits_on_its_accept() {
+        // Tracker lags on attempt 1 → NO second submit, NO batch: one graced
+        // rung, one subject-only corroborate, admit on the second witness.
+        let rungs = std::cell::RefCell::new(Vec::new());
+        let kinds = std::cell::RefCell::new(Vec::new());
+        let out = broadcast_efs_gated_with(
+            1,
+            "subject",
+            |rung| {
+                rungs.borrow_mut().push(rung);
+                async move { Ok(GateStep::AcceptedUnseen) }
+            },
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                async { Ok(ArcOutcome::Accepted("subject".into())) }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        assert_eq!(*rungs.borrow(), vec![SubmitRung::SubjectOnly { graced: true }]);
+        assert_eq!(*kinds.borrow(), vec![CorroborationKind::SubjectOnly]);
+    }
+
+    #[tokio::test]
+    async fn wiring_unseen_proven_single_leg_admits_pending_when_corroborator_is_down() {
+        // The #397 act-on-failure arm: sync-accept + lagging tracker + both
+        // corroborator hosts inconclusive, PROVEN ancestry → AcceptedPending.
+        let out = broadcast_efs_gated_with(
+            1,
+            "subject",
+            |_| async { Ok(GateStep::AcceptedUnseen) },
+            |_| async { Err("both corroborator hosts down".to_string()) },
+        )
+        .await;
+        assert_eq!(out.unwrap(), ArcOutcome::AcceptedPending("subject".into()));
+    }
+
+    #[tokio::test]
+    async fn wiring_unseen_unproven_ancestry_refuses_instead_of_pending() {
+        // The #267 bar survives #397: a 0-conf-ancestry subject (the JOIN)
+        // with a lagging tracker and a down corroborator REFUSES (retryable
+        // Err), never admits pending — and the corroborate leg it asked for
+        // was the ancestry-primed one (#216).
+        let kinds = std::cell::RefCell::new(Vec::new());
+        let out = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |_| async { Ok(GateStep::AcceptedUnseen) },
+            |kind| {
+                kinds.borrow_mut().push(kind);
+                async { Err("both corroborator hosts down".to_string()) }
+            },
+        )
+        .await;
+        let err = out.expect_err("unproven ancestry must never admit unwitnessed");
+        assert!(err.contains("#267"), "{err}");
+        assert_eq!(*kinds.borrow(), vec![CorroborationKind::WithAncestry]);
+    }
+
+    #[tokio::test]
+    async fn wiring_unseen_conflict_stays_retryable_never_422() {
+        // Arcade sync-accepted the EF; the corroborator rejects the same
+        // bytes → the providers CONFLICT. Err (502/retryable), never
+        // Ok(Rejected) — a 422 would terminally refuse a tx one provider
+        // already validated and queued.
+        let out = broadcast_efs_gated_with(
+            1,
+            "subject",
+            |_| async { Ok(GateStep::AcceptedUnseen) },
+            |_| async { Ok(ArcOutcome::Rejected("unlock invalid".to_string())) },
+        )
+        .await;
+        let err = out.expect_err("provider conflict must not mint a 422");
+        assert!(err.contains("CONFLICT"), "{err}");
     }
 
     // ── #267: SEEN_IN_ORPHAN_MEMPOOL short-circuits to the ancestry rungs ───
