@@ -373,12 +373,12 @@ fn mark_hop_spent(conn: &Connection, hop_txid: &str, spender: &str, confirmed: b
 /// Execute the SHIPPED `hops_view_sql(false)` and map rows exactly as the route
 /// does (same columns, same Option-ness).
 fn query_rows(conn: &Connection, identity: &str) -> Vec<HopsViewRow> {
-    query_rows_inner(conn, hops_view_sql(false, None), params![identity])
+    query_rows_inner(conn, hops_view_sql(false, None, 0), params![identity])
 }
 
 /// The `?gameId=`-scoped window — the escape hatch a truncated caller uses.
 fn query_rows_scoped(conn: &Connection, identity: &str, game_id: &str) -> Vec<HopsViewRow> {
-    query_rows_inner(conn, hops_view_sql(true, None), params![identity, game_id])
+    query_rows_inner(conn, hops_view_sql(true, None, 0), params![identity, game_id])
 }
 
 fn query_rows_inner<P: rusqlite::Params>(
@@ -491,7 +491,7 @@ fn junk_sig_marker_is_served_labeled_unverified_never_verified() {
         MarkerVerification::Unverified,
         "junk sigs NEVER become markerVerified: verified — even in a perfect container"
     );
-    let body = hops_view_body(&m.identity_hex, None, &entries, false);
+    let body = hops_view_body(&m.identity_hex, None, &entries, false, 0);
     assert!(body.contains("\"markerVerified\":\"unverified\""));
     assert!(!body.contains("\"markerVerified\":\"verified\""));
 }
@@ -902,7 +902,7 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
     assert!(rows.is_empty());
     let (entries, truncated) = assemble_hops_view(rows);
     let v: serde_json::Value =
-        serde_json::from_str(&hops_view_body(&stranger, None, &entries, truncated)).unwrap();
+        serde_json::from_str(&hops_view_body(&stranger, None, &entries, truncated, 0)).unwrap();
     assert_eq!(v["hops"], serde_json::json!([]));
     assert_eq!(v["truncated"], serde_json::json!(false));
 
@@ -921,7 +921,7 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
 fn pre_migration_schema_faults_the_query_the_routes_503_path() {
     let conn = Connection::open_in_memory().unwrap();
     assert!(
-        conn.prepare(&hops_view_sql(false, None)).is_err(),
+        conn.prepare(&hops_view_sql(false, None, 0)).is_err(),
         "missing tables must FAULT the query (the route answers 503), \
          never serve an empty-but-complete-looking page"
     );
@@ -1433,7 +1433,7 @@ fn a_legacy_row_is_served_labelled_unknown_and_ranks_between_the_two_verdicts() 
 
     // …and the wire says exactly that.
     let v: serde_json::Value =
-        serde_json::from_str(&hops_view_body(&good.identity_hex, None, &entries, false)).unwrap();
+        serde_json::from_str(&hops_view_body(&good.identity_hex, None, &entries, false, 0)).unwrap();
     assert_eq!(v["hops"][1]["markerVerified"], serde_json::json!("unknown"));
     assert_eq!(v["hops"][1]["hopTxid"], serde_json::json!(legacy_txid));
     assert_eq!(v["verifyBudgetExhausted"], serde_json::json!(false));
@@ -1491,7 +1491,7 @@ fn the_freshness_window_matches_the_overlay_sibling_windows() {
     );
     // …and the semantics, not just the number: freshness-gated, and slots
     // allocated OLDEST-first (a newest-first quota is attacker-jumpable).
-    let sql = hops_view_sql(false, None);
+    let sql = hops_view_sql(false, None, 0);
     assert!(sql.contains("freshUnknown = 1"));
     assert!(sql.contains("ORDER BY COALESCE(firstMarkerAt, 0) ASC"));
 }
@@ -1681,7 +1681,7 @@ fn hops_txids(
     scoped: Option<&str>,
     era: Option<i64>,
 ) -> Vec<String> {
-    let sql = hops_view_sql(scoped.is_some(), era);
+    let sql = hops_view_sql(scoped.is_some(), era, 0);
     let mut stmt = conn.prepare(&sql).unwrap_or_else(|e| {
         panic!(
             "hops_view_sql({:?}, {era:?}) did not PREPARE: {e}\n{sql}",

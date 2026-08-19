@@ -66,18 +66,18 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "recovery_view_sql(era)", &recovery_view_sql(ERA));
     assert_prepares(&conn, "refund_view_sql", &refund_view_sql(None));
     assert_prepares(&conn, "refund_view_sql(era)", &refund_view_sql(ERA));
-    assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false, None));
-    assert_prepares(&conn, "hops_view_sql(era)", &hops_view_sql(false, ERA));
+    assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false, None, 0));
+    assert_prepares(&conn, "hops_view_sql(era)", &hops_view_sql(false, ERA, 0));
     // Both arities of the gameId-scoped escape hatch must parse.
     assert_prepares(
         &conn,
         "hops_view_sql(scoped, None)",
-        &hops_view_sql(true, None),
+        &hops_view_sql(true, None, 0),
     );
     assert_prepares(
         &conn,
         "hops_view_sql(scoped, era)",
-        &hops_view_sql(true, ERA),
+        &hops_view_sql(true, ERA, 0),
     );
     assert_prepares(&conn, "live_view_sql", &live_view_sql(None));
     assert_prepares(&conn, "live_view_sql(era)", &live_view_sql(ERA));
@@ -113,10 +113,10 @@ fn fixed_queries_declare_the_parameter_count_per_era_arm() {
         ("live_view_sql(era)", live_view_sql(ERA), 2),
         ("results_sql(None)", results_sql(None), 1),
         ("results_sql(era)", results_sql(ERA), 2),
-        ("hops_view_sql(false, None)", hops_view_sql(false, None), 1),
-        ("hops_view_sql(false, era)", hops_view_sql(false, ERA), 2),
-        ("hops_view_sql(true, None)", hops_view_sql(true, None), 2),
-        ("hops_view_sql(true, era)", hops_view_sql(true, ERA), 3),
+        ("hops_view_sql(false, None, 0)", hops_view_sql(false, None, 0), 1),
+        ("hops_view_sql(false, era)", hops_view_sql(false, ERA, 0), 2),
+        ("hops_view_sql(true, None, 0)", hops_view_sql(true, None, 0), 2),
+        ("hops_view_sql(true, era)", hops_view_sql(true, ERA, 0), 3),
         (
             "leaderboard_markers_sql(None)",
             leaderboard_markers_sql(None),

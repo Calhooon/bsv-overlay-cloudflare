@@ -2338,7 +2338,7 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
 
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
-            crate::hops_view::hops_view_body(&identity_lc, None, &[], false),
+            crate::hops_view::hops_view_body(&identity_lc, None, &[], false, 0),
             200,
         );
     }
@@ -2362,6 +2362,17 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .map(|(_, v)| v.into_owned().to_ascii_lowercase())
         .filter(|g| g.len() == 64 && g.bytes().all(|b| b.is_ascii_hexdigit()));
 
+    // #398: the rank-window cursor. `after` slides the finalRank window so a
+    // >cap identity can WALK to its remaining outpoints (the /alerts-trim
+    // resolution applied here); clamped so a hostile value cannot format an
+    // absurd literal. Non-numeric/absent ⇒ 0 (page 1, byte-identical query).
+    let after: usize = url
+        .query_pairs()
+        .find(|(k, _)| k == "after")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .map(|a| a.min(crate::hops_view::HOPS_VIEW_AFTER_MAX))
+        .unwrap_or(0);
+
     // #375: the era cutoff is always the LAST numbered bind (`?2` unscoped,
     // `?3` scoped) iff configured.
     let era = written_off_before_ms(&ctx);
@@ -2373,7 +2384,7 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         binds.push(era_bind(ms));
     }
     let stmt = db
-        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some(), era))
+        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some(), era, after))
         .bind(&binds)?;
     let rows: Vec<crate::hops_view::HopsViewRow> =
         match stmt.all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
@@ -2388,7 +2399,7 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     // The tip AFTER the D1 facts (`null` on a fault — facts still serve).
     let tip = chaintracks_present_height(&ctx, "hops-view").await.ok();
     json_response(
-        crate::hops_view::hops_view_body(&identity_lc, tip, &entries, truncated),
+        crate::hops_view::hops_view_body(&identity_lc, tip, &entries, truncated, after),
         200,
     )
 }

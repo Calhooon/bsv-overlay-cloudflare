@@ -128,6 +128,42 @@
 //! per outpoint — which is what makes verification happen BEFORE paging,
 //! and is the thing the pre-#362 design structurally could not do (see
 //! [`assemble_hops_view`] for the re-priced residual it retires).
+//!
+//! ## bsv-low#398 — the rank-window cursor (`after`)
+//!
+//! Measured 2026-08-19: a long-lived identity's NEWEST stranded hop was
+//! ADMITTED (`/utxo-status` `known:true`) yet absent from the served
+//! 100-row `truncated:true` answer — past the cap it ranked below a
+//! week of fatter, earlier outpoints. The tempting fix — rank recency
+//! above sats/arrival so eviction favors the oldest — is WRONG here and
+//! a first attempt was caught by the adversarial pins: the orderings are
+//! defenses, not presentation. `hopSatsOnChain DESC` makes a paid-replay
+//! flood PAY per fake row (sats locked to the victim's own settle key);
+//! time ASC means a reactive flood minted AFTER a victim's rows can
+//! never evict them; the quota's oldest-first survived gate MEDIUM-5's
+//! ghost burst (a newest-first quota is attacker-jumpable). So the
+//! ordering stays, and #398 fixes REACHABILITY instead: `after` slides
+//! the `finalRank` window (`finalRank > after AND <= after + page+1`),
+//! the body carries `nextAfter` while `truncated` (null at the
+//! [`HOPS_VIEW_AFTER_MAX`] ceiling — a re-clamped step is a loop, not a
+//! walk), and a caller walks pages to completion — the /alerts-trim
+//! resolution (2026-08-17), applied to the money-recovery surface.
+//!
+//! For 1 rank = 1 outpoint (the walk's completeness), EVERY rank key must
+//! be constant per outpoint — `paidTier` is per-ROW, so the page rank uses
+//! the aggregated `outpointPaidTier` (`MIN` over the outpoint; gate
+//! MEDIUM-1: a spanning outpoint — two markers in one container tx with
+//! differing claims — occupied two ranks and under-filled a page into a
+//! false `truncated:false` end-of-walk).
+//!
+//! Residuals, stated: markers are append-only (no delete column), so a
+//! concurrent admission during a walk shifts ranks UP — at worst a
+//! duplicate across pages (callers dedupe), never a skip; an operator
+//! era-cutoff advance mid-walk can shrink the set (re-run heals — the
+//! walk is eventually consistent, never silently wrong twice). And the
+//! CLIENT half is tracked separately: `parseHopsView` consumers do not
+//! yet follow `nextAfter`, so the reachability win lands for them only
+//! with the walking client (#398's remaining leg).
 
 use serde_json::json;
 
@@ -139,6 +175,14 @@ pub use overlay_discovery::hopparty::storage::HOPSFOR_ROWS_PER_OUTPOINT as HOPS_
 /// Hard bound on `/hops-view` DISTINCT HOP OUTPOINTS per request — same cap
 /// + rationale as [`crate::refund_view::REFUND_VIEW_MAX_ROWS`].
 pub const HOPS_VIEW_MAX_OUTPOINTS: usize = 100;
+
+/// #398 (gate LOW-2): the `after` cursor's ceiling. The route clamps the
+/// parsed value here, and [`hops_view_body`] stops emitting `nextAfter` at
+/// the ceiling — otherwise a walker whose next step re-clamps to the same
+/// page would loop forever. ~1 M rank positions requires an attacker to
+/// mint ~1 M on-chain marker rows; an identity legitimately near it is not
+/// a shape this surface serves.
+pub const HOPS_VIEW_AFTER_MAX: usize = 1_000_000;
 
 /// How many of the newest hops ABSENT from `pot_records` are promoted into
 /// the main tier — same reservation + rationale as
@@ -297,7 +341,11 @@ const _: () = assert!(HOPS_VIEW_UNKNOWN_HOP_QUOTA < HOPS_VIEW_MAX_OUTPOINTS);
 /// uses NUMBERED binds, so the cutoff placeholder is `?2` unscoped / `?3`
 /// scoped — always the LAST bind. `None` ⇒ byte-identical to the pre-#375
 /// query.
-pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -> String {
+pub fn hops_view_sql(
+    scoped_to_game: bool,
+    written_off_before_ms: Option<i64>,
+    after_outpoints: usize,
+) -> String {
     let game_filter = if scoped_to_game {
         " AND hp.gameId = ?2"
     } else {
@@ -329,9 +377,9 @@ pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -
                     hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
                     spent, spendingTxid, spentConfirmed, spenderFinal, \
                     markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
-                    markerRank, outpointMarkerRank, paidTier, tier, \
+                    markerRank, outpointMarkerRank, outpointPaidTier, paidTier, tier, \
                     DENSE_RANK() OVER (ORDER BY outpointMarkerRank DESC, \
-                                                paidTier ASC, tier ASC, \
+                                                outpointPaidTier ASC, tier ASC, \
                                                 hopSatsOnChain DESC, \
                                                 COALESCE(potCreatedAt, firstMarkerAt) ASC, \
                                                 hopTxid ASC, hopVout ASC) AS finalRank \
@@ -340,7 +388,7 @@ pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -
                     hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
                     spent, spendingTxid, spentConfirmed, spenderFinal, \
                     markerCreatedAt, markerRowid, potCreatedAt, firstMarkerAt, \
-                    markerRank, outpointMarkerRank, paidTier, unknownHop, \
+                    markerRank, outpointMarkerRank, outpointPaidTier, paidTier, unknownHop, \
                     CASE WHEN unknownHop = 0 \
                          OR (freshUnknown = 1 AND hopRank <= {quota}) \
                          THEN 0 ELSE 1 END AS tier \
@@ -352,6 +400,8 @@ pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -
                       markerRank, paidTier, unknownHop, freshUnknown, \
                       MAX(markerRank) OVER (PARTITION BY hopTxid, hopVout) \
                           AS outpointMarkerRank, \
+                      MIN(paidTier) OVER (PARTITION BY hopTxid, hopVout) \
+                          AS outpointPaidTier, \
                       DENSE_RANK() OVER (PARTITION BY unknownHop, freshUnknown \
                                          ORDER BY COALESCE(firstMarkerAt, 0) ASC, \
                                                   hopTxid ASC, hopVout ASC) AS hopRank \
@@ -391,7 +441,7 @@ pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -
                         ON r.txid = hp.txid AND r.outputIndex = hp.hopVout \
                  WHERE hp.identity = ?1{game_filter}{era}) \
                WHERE rn <= {per_outpoint}))) \
-           WHERE finalRank <= {rank_cap} \
+           WHERE finalRank > {after} AND finalRank <= {after} + {rank_cap} \
            ORDER BY outpointMarkerRank DESC, paidTier ASC, tier ASC, hopSatsOnChain DESC, \
                     COALESCE(potCreatedAt, firstMarkerAt) ASC, \
                     hopTxid ASC, hopVout ASC, markerRank DESC, \
@@ -410,6 +460,7 @@ pub fn hops_view_sql(scoped_to_game: bool, written_off_before_ms: Option<i64>) -
         fresh_secs = HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS,
         per_outpoint = HOPS_VIEW_ROWS_PER_OUTPOINT,
         rank_cap = HOPS_VIEW_MAX_OUTPOINTS + 1,
+        after = after_outpoints,
         row_cap = (HOPS_VIEW_MAX_OUTPOINTS + 1) * HOPS_VIEW_ROWS_PER_OUTPOINT,
         game_filter = game_filter,
         // The SHARED rank expression — the column name and its three tiers
@@ -767,6 +818,7 @@ pub fn hops_view_body(
     tip: Option<u64>,
     entries: &[HopEntry],
     truncated: bool,
+    after: usize,
 ) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
@@ -795,6 +847,20 @@ pub fn hops_view_body(
         "identity": identity,
         "tip": tip,
         "truncated": truncated,
+        // #398: the rank-window cursor. `after` echoes the walked offset;
+        // `nextAfter` is present IFF this page trimmed — a caller walks
+        // `?after=nextAfter` until it vanishes, and no outpoint is ever
+        // silently unreachable. Additive + feature-detected on presence
+        // (deployed clients ignore unknown keys).
+        "after": after,
+        // Null once the ceiling is reached (gate LOW-2): a `nextAfter` the
+        // route would re-clamp to the SAME page is a forever-loop, not a
+        // walk. The trim stays visible via `truncated`.
+        "nextAfter": if truncated && after + HOPS_VIEW_MAX_OUTPOINTS < HOPS_VIEW_AFTER_MAX {
+            serde_json::json!(after + HOPS_VIEW_MAX_OUTPOINTS)
+        } else {
+            serde_json::Value::Null
+        },
         "verifyBudgetExhausted": VERIFY_BUDGET_EXHAUSTED_WIRE,
         "hops": arr,
     })
@@ -819,6 +885,252 @@ mod tests {
 
     fn h64(seed: u8) -> String {
         format!("{seed:02x}").repeat(32)
+    }
+
+    /// bsv-low#398 gate MEDIUM-1 — a SPANNING outpoint (two markers, one
+    /// container tx, differing hopSats claims) must occupy ONE rank. With
+    /// the per-row `paidTier` in the page rank it occupied TWO: its paid row
+    /// ranked early, its unpaid twin ranked INSIDE the window among an
+    /// unpaid-majority population, the page's distinct count under-filled to
+    /// exactly the cap, `truncated` read FALSE, and the cursor walk ended
+    /// with outpoints still unreached — the reviewer's empirical repro
+    /// (206 outpoints, 100 served, 106 silently unreachable). The
+    /// `MIN(paidTier) OVER (PARTITION BY outpoint)` aggregate collapses the
+    /// span; this cell seeds the exact hostile shape and walks to
+    /// completion.
+    #[test]
+    fn a_spanning_outpoint_cannot_underfill_a_page_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "{e}\n{sql}");
+            }
+        }
+        let identity = "03".repeat(33);
+        let insert = |txid: &str, output_index: i64, hop_sats: i64, on_chain: i64, created: i64| {
+            conn.execute(
+                "INSERT INTO hopparty_records (identity, opponentIdentity, gameId, hopVout, \
+                     hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                     hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt) \
+                 VALUES (?1, 'opp', ?2, 0, ?3, 'pk', 'ss', 'is', 'aa', ?4, 3, ?5, ?6, ?7)",
+                rusqlite::params![identity, txid, hop_sats, on_chain, txid, output_index, created],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO pot_records (txid, outputIndex, spent, createdAt) \
+                 VALUES (?1, 0, 0, ?2)",
+                rusqlite::params![txid, created],
+            )
+            .unwrap();
+        };
+
+        // 205 UNPAID-majority outpoints (claims mismatch their containers).
+        let bulk = 205usize;
+        for i in 0..bulk {
+            let txid = format!("{:02x}", i).repeat(32);
+            insert(&txid, 1, 5_000, 4_000, 1_000 + i as i64);
+        }
+        // The spanner: one PAID row + one UNPAID twin in the same container.
+        let spanner = "f7".repeat(32);
+        insert(&spanner, 1, 9_000, 9_000, 900); // paid — ranks first
+        insert(&spanner, 2, 8_999, 9_000, 900); // unpaid twin — inside the window pre-fix
+        let total = bulk + 1;
+
+        let page_of = |after: usize| -> (Vec<String>, bool) {
+            let sql = hops_view_sql(false, None, after);
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let served: Vec<String> = stmt
+                .query_map(rusqlite::params![identity], |r| r.get::<_, String>(2))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let mut distinct: Vec<String> = Vec::new();
+            for t in &served {
+                if !distinct.contains(t) {
+                    distinct.push(t.clone());
+                }
+            }
+            let truncated = distinct.len() > HOPS_VIEW_MAX_OUTPOINTS;
+            distinct.truncate(HOPS_VIEW_MAX_OUTPOINTS);
+            (distinct, truncated)
+        };
+
+        // Page 1 must be FULL and honestly trimmed — the pre-fix defect was
+        // exactly here: 100 distinct + truncated:false, walk over, 106
+        // outpoints unreachable.
+        let (page1, truncated1) = page_of(0);
+        assert_eq!(page1.len(), HOPS_VIEW_MAX_OUTPOINTS);
+        assert!(
+            truncated1,
+            "gate MEDIUM-1: the spanning twin must not under-fill the page into a false end-of-walk"
+        );
+
+        // Walk to completion; the union is every outpoint, exactly once.
+        let mut union: Vec<String> = page1;
+        let mut after = HOPS_VIEW_MAX_OUTPOINTS;
+        for _ in 0..5 {
+            let (page, truncated) = page_of(after);
+            for t in page {
+                if !union.contains(&t) {
+                    union.push(t);
+                }
+            }
+            if !truncated {
+                break;
+            }
+            after += HOPS_VIEW_MAX_OUTPOINTS;
+        }
+        assert_eq!(
+            union.len(),
+            total,
+            "#398: the walk serves EVERY outpoint — nothing silently unreachable"
+        );
+    }
+
+    /// bsv-low#398 — the rank-window cursor makes EVERY outpoint reachable
+    /// while the anti-flood page ordering stands. Executes the exact
+    /// production string under real SQLite on the production schema,
+    /// seeding MAX+2 fully-verified outpoints where the OLDEST are the
+    /// FATTEST (descending sats as time ascends — the measured 2026-08-19
+    /// shape, where a small fresh hop that `/utxo-status` answered
+    /// `known:true` for fell off the identity page). Pins BOTH halves:
+    ///
+    /// 1. Page 1 (`after=0`) still ranks big+old first — that ordering is a
+    ///    DEFENSE (a paid-replay flood pays per row; a reactive flood
+    ///    minted after a victim's rows can never evict them), so the
+    ///    newest outpoint is legitimately NOT on page 1 here;
+    /// 2. the `after` walk REACHES it — the union of pages is every
+    ///    outpoint, each page's trim is honest, and nothing is silently
+    ///    unreachable (the /alerts-trim resolution, money-surface edition).
+    #[test]
+    fn newest_outpoint_survives_the_cap_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+
+        let identity = "02".repeat(33);
+        let n = HOPS_VIEW_MAX_OUTPOINTS + 2;
+        for i in 0..n {
+            // txid per outpoint; OLDEST (i=0) is FATTEST — sats descend as
+            // createdAt ascends, so the old ordering (sats DESC first)
+            // would rank every old hop above the newest.
+            let txid = format!("{:02x}", i).repeat(32);
+            let sats = 10_000 - (i as i64) * 50;
+            let created = 1_000 + i as i64;
+            conn.execute(
+                "INSERT INTO hopparty_records (identity, opponentIdentity, gameId, hopVout, \
+                     hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                     hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt) \
+                 VALUES (?1, 'opp', ?2, 0, ?3, 'pk', 'ss', 'is', 'aa', ?3, 2, ?4, 1, ?5)",
+                rusqlite::params![identity, format!("{:02x}", i).repeat(32), sats, txid, created],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, ?2)",
+                rusqlite::params![txid, created],
+            )
+            .unwrap();
+        }
+
+        // One page in served order, as assemble_hops_view's page rule sees it.
+        let page_of = |after: usize| -> (Vec<String>, bool) {
+            let sql = hops_view_sql(false, None, after);
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let served: Vec<String> = stmt
+                .query_map(rusqlite::params![identity], |r| r.get::<_, String>(2))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let mut distinct: Vec<String> = Vec::new();
+            for t in &served {
+                if !distinct.contains(t) {
+                    distinct.push(t.clone());
+                }
+            }
+            let truncated = distinct.len() > HOPS_VIEW_MAX_OUTPOINTS;
+            distinct.truncate(HOPS_VIEW_MAX_OUTPOINTS);
+            (distinct, truncated)
+        };
+
+        // Gate MEDIUM-1's spanning shape: ONE outpoint carrying TWO markers
+        // (same txid+hopVout, different outputIndex) whose hopSats claims
+        // DIFFER — per-row paidTier would give this outpoint TWO ranks,
+        // under-filling a page's distinct count and ending the cursor walk
+        // early. The aggregated outpointPaidTier collapses it to one rank.
+        // Seeded mid-window (created between the fat old rows) so the span
+        // would land INSIDE page 1.
+        let spanner = "f7".repeat(32);
+        conn.execute(
+            "INSERT INTO hopparty_records (identity, opponentIdentity, gameId, hopVout, \
+                 hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                 hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt) \
+             VALUES (?1, 'opp', ?2, 0, 9000, 'pk', 'ss', 'is', 'aa', 9000, 3, ?3, 1, 1050)",
+            rusqlite::params![identity, "f7".repeat(32), spanner],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO hopparty_records (identity, opponentIdentity, gameId, hopVout, \
+                 hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
+                 hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt) \
+             VALUES (?1, 'opp', ?2, 0, 8999, 'pk', 'ss', 'is', 'aa', 9000, 3, ?3, 2, 1050)",
+            rusqlite::params![identity, "f7".repeat(32), spanner],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 1050)",
+            rusqlite::params![spanner],
+        )
+        .unwrap();
+        let n = n + 1; // the spanner is one more OUTPOINT (two rows)
+
+        let newest = format!("{:02x}", n - 2).repeat(32);
+        let oldest = "00".repeat(32);
+
+        // Page 1: the anti-flood ordering stands — big+old first, the small
+        // fresh hop NOT on this page, the trim honestly flagged, and the
+        // page EXACTLY full (a spanning outpoint must not under-fill it —
+        // gate MEDIUM-1's proven defect).
+        let (page1, truncated1) = page_of(0);
+        assert_eq!(
+            page1.len(),
+            HOPS_VIEW_MAX_OUTPOINTS,
+            "gate MEDIUM-1: a spanning outpoint must occupy ONE rank — an \
+             under-filled page ends the walk early with outpoints unreached"
+        );
+        assert!(truncated1, "beyond-cap identity must flag the trim");
+        assert!(
+            page1.contains(&oldest),
+            "the defense ordering keeps the earliest (un-evictable-by-flood) rows on page 1"
+        );
+        assert!(
+            !page1.contains(&newest),
+            "the small fresh hop is legitimately past page 1 under the defense ordering"
+        );
+
+        // Page 2 via the cursor: the newest outpoint is REACHED, the walk
+        // terminates, and the union covers every outpoint.
+        let (page2, truncated2) = page_of(HOPS_VIEW_MAX_OUTPOINTS);
+        assert!(
+            page2.contains(&newest),
+            "#398: the rank-window cursor must reach the newest stranded hop"
+        );
+        assert!(!truncated2, "two outpoints remain — the walk ends here");
+        let mut union: Vec<&String> = page1.iter().chain(page2.iter()).collect();
+        union.sort();
+        union.dedup();
+        assert_eq!(
+            union.len(),
+            n,
+            "#398: the page walk serves EVERY outpoint exactly once — nothing silently unreachable"
+        );
     }
 
     /// A served row carrying a latched verdict. The signature/pubkey fields
@@ -896,7 +1208,7 @@ mod tests {
         // Emitted on a populated body…
         let (entries, truncated) = assemble_hops_view(vec![row(0xaa, Some(true))]);
         let v: serde_json::Value =
-            serde_json::from_str(&hops_view_body("id", Some(1), &entries, truncated)).unwrap();
+            serde_json::from_str(&hops_view_body("id", Some(1), &entries, truncated, 0)).unwrap();
         assert_eq!(v["verifyBudgetExhausted"], json!(false));
         assert!(
             v["verifyBudgetExhausted"].is_boolean(),
@@ -905,7 +1217,7 @@ mod tests {
         // …and on the empty one, which is the fail-safe path the route takes
         // for an invalid identity.
         let v: serde_json::Value =
-            serde_json::from_str(&hops_view_body("nope", None, &[], false)).unwrap();
+            serde_json::from_str(&hops_view_body("nope", None, &[], false, 0)).unwrap();
         assert_eq!(v["verifyBudgetExhausted"], json!(false));
         assert!(v["verifyBudgetExhausted"].is_boolean());
     }
@@ -1064,7 +1376,7 @@ mod tests {
         junk.spent = None;
         junk.spent_confirmed = None;
         let (entries, truncated) = assemble_hops_view(vec![verified.clone(), junk]);
-        let body = hops_view_body(&verified.identity, Some(960_000), &entries, truncated);
+        let body = hops_view_body(&verified.identity, Some(960_000), &entries, truncated, 0);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["identity"], json!(verified.identity));
         assert_eq!(v["tip"], json!(960_000));
@@ -1096,7 +1408,7 @@ mod tests {
     #[test]
     fn empty_body_and_null_tip() {
         let v: serde_json::Value =
-            serde_json::from_str(&hops_view_body("nope", None, &[], false)).unwrap();
+            serde_json::from_str(&hops_view_body("nope", None, &[], false, 0)).unwrap();
         assert_eq!(v["identity"], json!("nope"));
         assert!(v["tip"].is_null());
         assert_eq!(v["hops"], json!([]));
@@ -1125,7 +1437,7 @@ mod tests {
 
     #[test]
     fn hops_view_sql_shape() {
-        let sql = hops_view_sql(false, None);
+        let sql = hops_view_sql(false, None, 0);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
         assert!(
             sql.contains("ROW_NUMBER() OVER (PARTITION BY hp.txid, hp.hopVout"),
@@ -1137,9 +1449,21 @@ mod tests {
         );
         assert!(sql.contains(&format!("hopRank <= {HOPS_VIEW_UNKNOWN_HOP_QUOTA}")));
         assert!(
-            sql.contains(&format!("finalRank <= {}", HOPS_VIEW_MAX_OUTPOINTS + 1)),
-            "one outpoint beyond the page — the honest truncated bit"
+            sql.contains(&format!(
+                "finalRank > 0 AND finalRank <= 0 + {}",
+                HOPS_VIEW_MAX_OUTPOINTS + 1
+            )),
+            "one outpoint beyond the page — the honest truncated bit (#398: the \
+             rank WINDOW, `after`-slid; page 1 formats after=0)"
         );
+        // …and the cursor genuinely slides the window.
+        let paged = hops_view_sql(false, None, HOPS_VIEW_MAX_OUTPOINTS);
+        assert!(paged.contains(&format!(
+            "finalRank > {} AND finalRank <= {} + {}",
+            HOPS_VIEW_MAX_OUTPOINTS,
+            HOPS_VIEW_MAX_OUTPOINTS,
+            HOPS_VIEW_MAX_OUTPOINTS + 1
+        )));
         // The verification facts are TYPED COLUMNS decoded at admission —
         // no `outputs` join, no topic dependency, no BLOB. POSITIVE counts,
         // so a rename or a dropped nesting level fails loudly rather than
@@ -1153,7 +1477,14 @@ mod tests {
         assert_eq!(sql.matches("containerOutputs").count(), 8);
         // The ranking leads on chain-settled facts, never on arrival.
         assert!(sql.contains("CASE WHEN hp.hopLockHex IS NOT NULL"));
-        // #283a semantics: freshness-gated, OLDEST-first promotion.
+        // #283a semantics: freshness-gated, OLDEST-first promotion — and
+        // #398 KEEPS every eviction ordering. They are adversarial defenses:
+        // the sats term prices a paid-replay flood, ASC time means a
+        // reactive flood minted AFTER a victim's rows can never evict them,
+        // and the quota's oldest-first survived gate MEDIUM-5's ghost burst.
+        // #398's fix is REACHABILITY (the rank-window cursor), never a
+        // weaker ordering — a first attempt flipped these to recency-DESC
+        // and the adversarial pins caught it reintroducing both vectors.
         assert!(sql.contains(&format!(
             "unixepoch() - {HOPS_VIEW_UNKNOWN_HOP_MAX_AGE_SECS}"
         )));
@@ -1188,8 +1519,8 @@ mod tests {
                 placeholder,
                 cutoff,
             );
-            let with = hops_view_sql(scoped, cutoff);
-            let without = hops_view_sql(scoped, None);
+            let with = hops_view_sql(scoped, cutoff, 0);
+            let without = hops_view_sql(scoped, None, 0);
             assert_eq!(
                 with.matches(&frag).count(),
                 1,
@@ -1236,7 +1567,7 @@ mod tests {
     #[test]
     fn the_latched_verdict_leads_every_order_and_filters_nothing() {
         for scoped in [false, true] {
-            let sql = hops_view_sql(scoped, None);
+            let sql = hops_view_sql(scoped, None, 0);
             // Built from the SHARED expression, not a local copy.
             assert!(
                 sql.contains(&overlay_discovery::hopparty::validity::marker_rank_expr(
@@ -1251,12 +1582,30 @@ mod tests {
                 1,
                 "the page-allocating rank leads on the latched verdict"
             );
-            // …and leading in BOTH unaliased orderings: the DENSE_RANK's own
-            // (counted above) and the LIMITed ORDER BY that fills the page.
+            // …and leading in BOTH unaliased orderings. The page-allocating
+            // DENSE_RANK uses the OUTPOINT-AGGREGATED paid tier (#398 gate
+            // MEDIUM-1: `paidTier` is per-ROW, so a spanning outpoint — two
+            // markers in one container tx, one paid one not — occupied TWO
+            // ranks, under-filling a page's distinct count and ending the
+            // cursor walk early with outpoints still unreached; every rank
+            // key must be constant per outpoint for 1 rank = 1 outpoint).
+            // The LIMITed fill ORDER BY keeps the per-row key (display-only,
+            // inside a settled page).
+            assert_eq!(
+                sql.matches("ORDER BY outpointMarkerRank DESC, outpointPaidTier ASC")
+                    .count(),
+                1,
+                "the page-allocating rank aggregates the paid tier per outpoint"
+            );
             assert_eq!(
                 sql.matches("ORDER BY outpointMarkerRank DESC, paidTier ASC")
                     .count(),
-                2
+                1
+            );
+            assert_eq!(
+                sql.matches("MIN(paidTier) OVER (PARTITION BY hopTxid, hopVout)")
+                    .count(),
+                1
             );
             assert_eq!(
                 sql.matches("ORDER BY w.outpointMarkerRank DESC, w.paidTier ASC")
@@ -1300,7 +1649,7 @@ mod tests {
             assert!(sql.contains("WHERE hp.identity = ?1"));
             assert!(sql.contains(&format!("WHERE rn <= {HOPS_VIEW_ROWS_PER_OUTPOINT}")));
             assert!(sql.contains(&format!(
-                "WHERE finalRank <= {}",
+                "WHERE finalRank > 0 AND finalRank <= 0 + {}",
                 HOPS_VIEW_MAX_OUTPOINTS + 1
             )));
             // The column is also SELECTED, so the reader can label the row
@@ -1313,8 +1662,8 @@ mod tests {
     /// become a second filter dimension by accident.
     #[test]
     fn the_game_scope_adds_one_bind_and_one_and() {
-        let unscoped = hops_view_sql(false, None);
-        let scoped = hops_view_sql(true, None);
+        let unscoped = hops_view_sql(false, None, 0);
+        let scoped = hops_view_sql(true, None, 0);
         assert_eq!(scoped.matches('?').count(), 2);
         assert!(scoped.contains("WHERE hp.identity = ?1 AND hp.gameId = ?2"));
         assert_eq!(
