@@ -1069,6 +1069,7 @@ fn file_honest_potparty(
         seat_settle_pubkey: settle_pub.to_string(),
         seat_sig_hex: seat_sig.clone(),
         identity_sig_hex: String::new(),
+    sig_valid: None, // fixture: the compute arm
     };
     let challenge = potparty_v2_challenge(&probe).unwrap();
     let id_sig = idw
@@ -1130,6 +1131,7 @@ fn attribution_from_db(
                         .to_ascii_lowercase(),
                     seat_sig_hex: r.get::<_, String>("seatSigHex")?.to_ascii_lowercase(),
                     identity_sig_hex: r.get::<_, String>("sigHex")?.to_ascii_lowercase(),
+                    sig_valid: r.get::<_, Option<i64>>("sigValid")?.map(|v| v != 0),
                 })
             },
         )
@@ -1470,4 +1472,99 @@ fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
     for pot in [&pre, &post, &unknown_pre, &unknown_post] {
         assert!(all.contains(pot), "{pot} missing from the None arm");
     }
+}
+
+/// Brain-cutover M1 — the seat-attribution dual-arm, both directions:
+/// `Some(true)` attributes a row WITHOUT touching its signatures (garbage
+/// sigs still attribute — proof the two ECDSA checks were skipped),
+/// `Some(false)` refuses a row whose signatures WOULD verify (the latch is
+/// authoritative; the relatch sweep repairs a wrong one and its `demoted`
+/// count is the alarm), and `None` computes both checks exactly as before
+/// (the garbage row is refused — the arm the rest of this suite pins).
+#[test]
+fn the_sig_valid_latch_arm_short_circuits_attribute_seats_and_a_zero_latch_refuses() {
+    let (_key_a, pub_a) = settle_key(0x41);
+    let (_key_b, pub_b) = settle_key(0x42);
+    let params = params_with_keys(&pub_a, &pub_b);
+    let pot = h64(0xd1);
+    let game = h64(0x0b);
+
+    // Garbage sigs, latched TRUE → attributed (the latch arm, no ECDSA).
+    let garbage_latched_true = SeatMarkerRow {
+        identity: identity(0x11),
+        opponent_identity: identity(0x22),
+        game_id: game.clone(),
+        pot_txid: pot.clone(),
+        pot_vout: 0,
+        recovery_height: 900_000,
+        seat_settle_pubkey: pub_a.clone(),
+        seat_sig_hex: "3045abababab".into(),
+        identity_sig_hex: "3044cdcdcd".into(),
+        sig_valid: Some(true),
+    };
+    let attr = attribute_seats(&params, &pot, 0, std::slice::from_ref(&garbage_latched_true));
+    assert_eq!(
+        attr.identity_a,
+        Some(identity(0x11).to_ascii_lowercase()),
+        "a latched-true row attributes without any signature computation"
+    );
+
+    // The same garbage row with NO latch → the compute arm refuses it.
+    let mut garbage_unlatched = garbage_latched_true.clone();
+    garbage_unlatched.sig_valid = None;
+    let attr = attribute_seats(&params, &pot, 0, std::slice::from_ref(&garbage_unlatched));
+    assert_eq!(attr.identity_a, None, "the compute arm still refuses junk");
+
+    // An HONEST marker (real seatSig under the committed key + real identity
+    // sig) latched FALSE → refused: the latch is authoritative when present.
+    let (key_a2, pub_a2) = settle_key(0x43);
+    let params2 = params_with_keys(&pub_a2, &pub_b);
+    let idw = wallet(0x33);
+    let id_hex = identity(0x33);
+    let preimage = seatsig_preimage(&game, &pot, 0, &id_hex).unwrap();
+    let seat_sig = hex::encode(
+        key_a2
+            .sign(&bsv_rs::primitives::hash::sha256(&preimage))
+            .unwrap()
+            .to_der(),
+    );
+    let mut honest = SeatMarkerRow {
+        identity: id_hex.clone(),
+        opponent_identity: identity(0x22),
+        game_id: game.clone(),
+        pot_txid: pot.clone(),
+        pot_vout: 0,
+        recovery_height: 900_000,
+        seat_settle_pubkey: pub_a2.clone(),
+        seat_sig_hex: seat_sig,
+        identity_sig_hex: String::new(),
+        sig_valid: None,
+    };
+    let challenge = potparty_v2_challenge(&honest).unwrap();
+    let id_sig = idw
+        .create_signature(CreateSignatureArgs {
+            data: Some(challenge),
+            hash_to_directly_sign: None,
+            protocol_id: bsv_rs::wallet::Protocol::new(
+                bsv_rs::wallet::SecurityLevel::App,
+                "low potparty",
+            ),
+            key_id: game.clone(),
+            counterparty: Some(Counterparty::Anyone),
+        })
+        .unwrap()
+        .signature;
+    honest.identity_sig_hex = hex::encode(id_sig);
+    let attr = attribute_seats(&params2, &pot, 0, std::slice::from_ref(&honest));
+    assert_eq!(
+        attr.identity_a,
+        Some(id_hex.to_ascii_lowercase()),
+        "sanity: the honest marker attributes on the compute arm"
+    );
+    honest.sig_valid = Some(false);
+    let attr = attribute_seats(&params2, &pot, 0, std::slice::from_ref(&honest));
+    assert_eq!(
+        attr.identity_a, None,
+        "a latched 0 is authoritative — the relatch sweep repairs, the serve path never second-guesses"
+    );
 }

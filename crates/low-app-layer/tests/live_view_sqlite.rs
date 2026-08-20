@@ -338,6 +338,7 @@ fn file_party_v2_real(
         seat_settle_pubkey: settle_pub.clone(),
         seat_sig_hex: seat_sig_hex.clone(),
         identity_sig_hex: String::new(),
+    sig_valid: None, // fixture: the compute arm
     };
     let challenge = potparty_v2_challenge(&m).expect("challenge");
     let id_sig = identity_wallet
@@ -466,6 +467,7 @@ fn fetch_candidates(conn: &Connection, identity: &str, rows: &[LiveViewRow]) -> 
                         .get::<_, Option<String>>("sigHex")?
                         .unwrap_or_default()
                         .to_ascii_lowercase(),
+                    sig_valid: r.get::<_, Option<i64>>("sigValid")?.map(|v| v != 0),
                 })
             })
             .expect("candidate query")

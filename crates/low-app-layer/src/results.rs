@@ -356,6 +356,14 @@ pub struct SeatMarkerRow {
     /// preimage embedding any identity), landing the victim in BOTH slots
     /// and erasing the victim's `my_seat` — the 2026-07-28 gate's F1.
     pub identity_sig_hex: String,
+    /// The overlay's admission-latched `sigValid` verdict for this row
+    /// (brain-cutover M1). For a v2 row it covers EXACTLY the two checks
+    /// `attribute_seats` runs — the seat sig AND the identity binding
+    /// (`marker_sig_valid`'s v2 arm) — so `Some(true)` replaces both,
+    /// `Some(false)` refuses as a failed check does today, and `None` (a row
+    /// from a source that does not select the column, or one admitted before
+    /// the latch) computes both as before.
+    pub sig_valid: Option<bool>,
 }
 
 /// The EXACT cross-repo seatSig preimage (bsv-low #230; the client's
@@ -531,11 +539,18 @@ pub fn attribute_seats(
         } else {
             continue; // key not committed in this pot's lock — refused
         };
-        if !verify_seat_marker(m) {
-            continue; // seat signature does not verify — refused
-        }
-        if !verify_identity_binding(m) {
-            continue; // identity signature does not verify — refused (F1)
+        // ── THE LATCH ARM (brain-cutover M1): `sigValid` was computed at
+        // admission by the overlay's `marker_sig_valid` — for a v2 row,
+        // exactly the seat sig + identity binding below — and is repaired
+        // by the relatch sweep. `Some(true)` deletes two ECDSA verifies per
+        // candidate per request; `Some(false)` refuses as a failed check
+        // does; `None` computes as before (never a silent drop).
+        let verified = match m.sig_valid {
+            Some(v) => v,
+            None => verify_seat_marker(m) && verify_identity_binding(m),
+        };
+        if !verified {
+            continue; // signatures do not verify (latched or computed) — refused
         }
         let id = m.identity.to_ascii_lowercase();
         match slot {
@@ -1803,6 +1818,7 @@ pub fn assemble_results(
                 seat_settle_pubkey: pk.to_ascii_lowercase(),
                 seat_sig_hex: seat_sig.to_ascii_lowercase(),
                 identity_sig_hex: id_sig.to_ascii_lowercase(),
+                sig_valid: None, // additive candidate from a non-latch source — compute
             };
             let slot = seat_markers.entry(key).or_default();
             if !slot.contains(&m) {
@@ -2615,9 +2631,9 @@ pub fn seat_markers_sql(n: usize, cap: usize) -> String {
         vec!["(potTxid = ? AND potVout = ? AND seatSettlePubkey IN (?, ?))"; n].join(" OR ");
     format!(
         "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
-                recoveryHeight, seatSettlePubkey, seatSigHex, sigHex \
+                recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, sigValid \
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
-                      recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
+                      recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, sigValid, \
                       ROW_NUMBER() OVER (PARTITION BY potTxid, potVout, seatSettlePubkey \
                                          ORDER BY {rank} DESC, \
                                                   createdAt ASC, rowid ASC) AS rn \
@@ -3083,6 +3099,7 @@ mod tests {
             seat_settle_pubkey: settle_pub_hex.to_string(),
             seat_sig_hex: hex::encode(seat_sig.to_der()),
             identity_sig_hex: String::new(),
+        sig_valid: None, // fixture: the compute arm
         };
         let challenge = potparty_v2_challenge(&m).unwrap();
         m.identity_sig_hex = sign_potparty_identity(identity_wallet, game_id, &challenge);
@@ -3207,6 +3224,7 @@ mod tests {
                 hex::encode(kb.sign(&hash).unwrap().to_der())
             },
             identity_sig_hex: String::new(),
+        sig_valid: None, // fixture: the compute arm
         };
         let challenge = potparty_v2_challenge(&forged).unwrap();
         forged.identity_sig_hex = sign_potparty_identity(&w_loser, &gid, &challenge);
@@ -3463,6 +3481,7 @@ mod tests {
             seat_settle_pubkey: hex::encode(m.seat_settle_pubkey.as_ref().unwrap()),
             seat_sig_hex: hex::encode(m.seat_sig.as_ref().unwrap()),
             identity_sig_hex: hex::encode(&m.sig),
+        sig_valid: None, // fixture: the compute arm
         };
         assert!(
             verify_seat_marker(&row),
@@ -3712,6 +3731,7 @@ mod tests {
                 )
             },
             identity_sig_hex: String::new(),
+        sig_valid: None, // fixture: the compute arm
         };
         forged.identity_sig_hex =
             sign_potparty_identity(&w_loser, &gid, &potparty_v2_challenge(&forged).unwrap());

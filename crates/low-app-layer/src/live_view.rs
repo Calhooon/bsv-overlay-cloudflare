@@ -493,9 +493,9 @@ pub fn keyless_candidates_sql(n: usize) -> String {
     let per_pot = vec!["(potTxid = ? AND potVout = ?)"; n].join(" OR ");
     format!(
         "SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
-                recoveryHeight, seatSettlePubkey, seatSigHex, sigHex \
+                recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, sigValid \
          FROM (SELECT identity, opponentIdentity, gameId, potTxid, potVout, \
-                      recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, \
+                      recoveryHeight, seatSettlePubkey, seatSigHex, sigHex, sigValid, \
                       ROW_NUMBER() OVER (PARTITION BY potTxid, potVout \
                                          ORDER BY {rank} DESC, \
                                                   createdAt ASC, rowid ASC) AS rn \
@@ -587,6 +587,7 @@ impl LiveViewRow {
             seat_settle_pubkey: pk.to_ascii_lowercase(),
             seat_sig_hex: seat_sig.to_ascii_lowercase(),
             identity_sig_hex: id_sig.to_ascii_lowercase(),
+            sig_valid: None, // additive candidate from a non-latch source — compute
         })
     }
 }
@@ -1551,6 +1552,7 @@ mod tests {
             seat_settle_pubkey: settle_pub,
             seat_sig_hex: hex::encode(seat_sig.to_der()),
             identity_sig_hex: String::new(),
+        sig_valid: None, // fixture: the compute arm
         };
         let challenge = crate::results::potparty_v2_challenge(&m).unwrap();
         let sig = w
@@ -1589,6 +1591,7 @@ mod tests {
             seat_settle_pubkey: pk,
             seat_sig_hex: hex::encode(sig.to_der()),
             identity_sig_hex: hex::encode(sig.to_der()), // well-formed DER, wrong signer
+            sig_valid: None,                             // fixture: the compute arm
         }
     }
 

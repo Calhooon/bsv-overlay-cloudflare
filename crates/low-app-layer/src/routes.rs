@@ -1474,6 +1474,10 @@ struct SeatMarkerRowD1 {
     /// The marker's IDENTITY signature — required by the F1 binding check.
     #[serde(rename = "sigHex")]
     sig_hex: Option<String>,
+    /// The admission-latched verdict (brain-cutover M1). `None` = legacy row
+    /// (or a read racing the additive migration — `default` tolerates it).
+    #[serde(rename = "sigValid", default)]
+    sig_valid: Option<f64>,
 }
 
 /// #230: build the pot → [`crate::results::SeatAttribution`] map for the
@@ -1553,6 +1557,7 @@ async fn seat_attributions(
                             seat_settle_pubkey: pk.to_ascii_lowercase(),
                             seat_sig_hex: seat_sig.to_ascii_lowercase(),
                             identity_sig_hex: id_sig.to_ascii_lowercase(),
+                            sig_valid: r.sig_valid.map(|v| v != 0.0),
                         });
                 }
             }
@@ -2034,6 +2039,7 @@ async fn results_seat_markers(
                             seat_settle_pubkey: pk.to_ascii_lowercase(),
                             seat_sig_hex: seat_sig.to_ascii_lowercase(),
                             identity_sig_hex: id_sig.to_ascii_lowercase(),
+                            sig_valid: r.sig_valid.map(|v| v != 0.0),
                         });
                 }
             }
@@ -2695,6 +2701,7 @@ async fn live_view_candidates(
                     seat_settle_pubkey: pk.to_ascii_lowercase(),
                     seat_sig_hex: seat_sig.to_ascii_lowercase(),
                     identity_sig_hex: id_sig.to_ascii_lowercase(),
+                    sig_valid: r.sig_valid.map(|v| v != 0.0),
                 });
         }
     };
