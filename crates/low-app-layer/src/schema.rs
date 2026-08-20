@@ -117,6 +117,19 @@ pub const FIRST_SPENT_AT_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN first
 /// (epoch Rule 24).
 pub const SPENDER_FINAL_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spenderFinal INTEGER";
 
+/// The brain-cutover M1 result-claim TIER latch, same Rule-24 contract:
+/// `/results` and `/leaderboard` read `claimValid` in the dual-arm
+/// `verified_claim` (latch when present, compute when NULL), so a cold
+/// app-layer isolate against an unwarmed schema fails to PREPARE without it.
+/// NULL = unswept (compute-at-serve), 0 = invalid, 1 = winner-valid, 2 =
+/// countersigned — the tier the overlay's `result::validity::claim_tier`
+/// latches at admission and the relatch sweep repairs.
+pub const CLAIM_VALID_ALTER: &str = "ALTER TABLE result_markers_v2 ADD COLUMN claimValid INTEGER";
+
+/// The brain-cutover M1 hand-marker latch, same contract — read by the M2
+/// `/results` hands join (`hand::validity::row_valid`'s verdict).
+pub const ROW_VALID_ALTER: &str = "ALTER TABLE hand_markers ADD COLUMN rowValid INTEGER";
+
 /// Every ALTER this module issues, in no significant order — each is
 /// independently idempotent, so arrival order cannot matter.
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
@@ -124,6 +137,8 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     MARKER_VALID_ALTER,
     FIRST_SPENT_AT_ALTER,
     SPENDER_FINAL_ALTER,
+    CLAIM_VALID_ALTER,
+    ROW_VALID_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -160,9 +175,32 @@ pub const COLLECTED_MARKERS_V2_CREATE: &str = "CREATE TABLE IF NOT EXISTS collec
         PRIMARY KEY (txid, outputIndex)
     )";
 
+/// The #382 `hand_markers` catch-up (brain-cutover M1) — the owning overlay
+/// migration's comment predicted this exact statement: "if /results later
+/// joins this table, the app-layer must issue this same statement". The M2
+/// hands join names it, and [`ROW_VALID_ALTER`] above adds its latch column
+/// (order-independent: the ALTER's duplicate-column outcome is benign and a
+/// CREATE against an existing table is `IF NOT EXISTS`-idempotent).
+/// Byte-identical to the overlay migration, pinned below.
+pub const HAND_MARKERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS hand_markers (
+        gameId TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        potTxid TEXT NOT NULL,
+        cardsHex TEXT NOT NULL,
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        sigHex TEXT,
+        createdAt INTEGER,
+        PRIMARY KEY (txid, outputIndex)
+    )";
+
 /// Every CREATE-class catch-up this module issues. `IF NOT EXISTS` makes
 /// success the only benign outcome — any error is real and defers the latch.
-pub const CREATE_TABLE_CATCHUPS: &[&str] = &[NETWORK_SEEN_CREATE, COLLECTED_MARKERS_V2_CREATE];
+pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
+    NETWORK_SEEN_CREATE,
+    COLLECTED_MARKERS_V2_CREATE,
+    HAND_MARKERS_CREATE,
+];
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
 ///
@@ -286,8 +324,9 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            4,
-            "sigValid (#283), markerValid (#362), firstSpentAt (#217), spenderFinal (#371)"
+            6,
+            "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
+             spenderFinal (#371), claimValid + rowValid (brain-cutover M1)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt
@@ -346,8 +385,9 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            2,
-            "network_seen (#371), collected_markers_v2 (#252 stage A)"
+            3,
+            "network_seen (#371), collected_markers_v2 (#252 stage A), \
+             hand_markers (#382, mirrored for the brain-cutover M2 join)"
         );
         for stmt in CREATE_TABLE_CATCHUPS {
             assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");

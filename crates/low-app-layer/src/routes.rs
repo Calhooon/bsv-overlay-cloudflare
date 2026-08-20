@@ -919,6 +919,8 @@ struct ResultRowD1 {
     txid: String,
     #[serde(rename = "createdAt")]
     created_at: Option<f64>,
+    #[serde(rename = "claimValid")]
+    claim_valid: Option<f64>,
 }
 
 impl ResultRowD1 {
@@ -936,6 +938,7 @@ impl ResultRowD1 {
             cards_hex: self.cards_hex,
             txid: self.txid,
             created_at: self.created_at.map(|v| v as i64),
+            claim_valid: self.claim_valid.map(|v| v as i64),
         })
     }
 }

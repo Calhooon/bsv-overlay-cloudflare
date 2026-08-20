@@ -1341,7 +1341,7 @@ pub const LEADERBOARD_PROOF_PAIRS_CAP: usize = 512;
 /// not one — do not assume this view's stronger property elsewhere.
 pub fn leaderboard_markers_sql(written_off_before_ms: Option<i64>) -> String {
     const COLS: &str = "gameId, winner, loser, potTxid, settleTxid, \
-         winnerSigHex, loserSigHex, cardsHex, txid, createdAt";
+         winnerSigHex, loserSigHex, cardsHex, txid, createdAt, claimValid";
     let fresh = format!(
         "CASE WHEN unknownPot = 1 AND COALESCE(potFirstMarkerAt, 0) >= \
               unixepoch() - {LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS} \
@@ -1370,6 +1370,7 @@ pub fn leaderboard_markers_sql(written_off_before_ms: Option<i64>) -> String {
                                     rm.loserSigHex AS loserSigHex, \
                                     rm.cardsHex AS cardsHex, \
                                     rm.txid AS txid, rm.createdAt AS createdAt, \
+                                    rm.claimValid AS claimValid, \
                                     rm.rowid AS markerRowid, \
                                     r.potCreatedAt AS potCreatedAt, \
                                     MIN(rm.createdAt) OVER (PARTITION BY rm.potTxid) \
@@ -1476,6 +1477,11 @@ pub struct ResultMarkerRow {
     /// The marker OP_RETURN txid (half its outpoint) — carried for reference.
     pub txid: String,
     pub created_at: Option<i64>,
+    /// The admission-latched claim TIER (brain-cutover M1): `None` = admitted
+    /// before the latch (the compute-at-serve arm), `Some(0)` invalid,
+    /// `Some(1)` winner-valid, `Some(2)` countersigned. `verified_claim`
+    /// consults this FIRST and only computes on `None`.
+    pub claim_valid: Option<i64>,
 }
 
 /// The distinct pot outpoints (`potTxid:0`) to spent-status-join, in
@@ -3759,6 +3765,7 @@ mod tests {
             cards_hex: cards.map(str::to_string),
             txid: format!("{game:02x}{seq:02x}").repeat(16),
             created_at: Some(created),
+            claim_valid: None, // legacy tier — exercises the compute arm
         }
     }
 
@@ -3789,6 +3796,7 @@ mod tests {
             cards_hex: cards.map(str::to_string),
             txid: format!("{game:02x}{seq:02x}").repeat(16),
             created_at: Some(created),
+            claim_valid: None, // legacy tier — the compute arm must refute it
         }
     }
 

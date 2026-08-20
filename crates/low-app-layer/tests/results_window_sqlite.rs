@@ -1973,6 +1973,7 @@ fn fetch_claims(
                     cards_hex: r.get("cardsHex")?,
                     txid: r.get("txid")?,
                     created_at: r.get("createdAt")?,
+                    claim_valid: r.get("claimValid")?,
                 })
             })
             .unwrap()

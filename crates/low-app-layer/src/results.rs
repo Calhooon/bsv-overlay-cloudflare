@@ -1237,6 +1237,35 @@ pub fn verified_claim(m: &ResultMarkerRow) -> Option<ClaimFact> {
     if winner_lc == loser_lc {
         return None; // self-paired claims are invalid (client parity)
     }
+    // ── THE LATCH ARM (brain-cutover M1) ────────────────────────────────
+    // `claimValid` was computed ONCE at admission by the overlay's
+    // `result::validity::claim_tier` — the byte-identical recipe of the
+    // compute arm below (pinned by the SIGNED cross-repo goldens) — and is
+    // repaired by the relatch fixpoint sweep. Consulting it here deletes
+    // two ECDSA verifies per row per request from `/results` and
+    // `/leaderboard`. `None` = admitted before the latch → the compute arm
+    // (never a silent drop of an unswept row); a demoted-wrong latch has
+    // exactly the client's own #335 failure shape (a verify failure drops
+    // the row) and the relatch `demoted` alarm is its detector.
+    match m.claim_valid {
+        Some(0) => return None, // latched invalid — as if never published
+        Some(tier @ (1 | 2)) => {
+            // The cards still need canonicalizing for downstream display —
+            // hashing-free string work, no EC. A malformed field cannot
+            // coexist with tier ≥ 1 (the challenge would not have built at
+            // admission), but re-canonicalize defensively as the compute
+            // arm does.
+            let cards_hex = m.cards_hex.as_deref().and_then(canonical_cards_hex);
+            return Some(ClaimFact {
+                winner: winner_lc,
+                loser: loser_lc,
+                settle_txid: m.settle_txid.to_ascii_lowercase(),
+                loser_sig_verified: tier == 2,
+                cards_hex,
+            });
+        }
+        Some(_) | None => {} // unknown tier value or unswept row → compute
+    }
     let game_lc = m.game_id.to_ascii_lowercase();
     let challenge = result_challenge_bytes(
         &game_lc,
@@ -2654,7 +2683,7 @@ pub fn claims_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(",");
     format!(
         "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
-         loserSigHex, cardsHex, txid, createdAt FROM result_markers_v2 \
+         loserSigHex, cardsHex, txid, createdAt, claimValid FROM result_markers_v2 \
          WHERE gameId IN ({placeholders}) ORDER BY createdAt DESC, rowid DESC LIMIT 1000"
     )
 }
@@ -5027,12 +5056,76 @@ mod tests {
             cards_hex: cards_hex.map(str::to_string),
             txid: tx(0x04),
             created_at: Some(1),
+            claim_valid: None, // legacy tier — exercises the compute arm
         }
     }
 
     /// A plausibly-shaped but FABRICATED DER sig (valid hex, garbage bytes).
     fn garbage_sig() -> String {
         format!("3045{}", "ab".repeat(69))
+    }
+
+    /// Brain-cutover M1 — the dual-arm contract, both directions:
+    /// the LATCH arm serves a tier ≥ 1 row WITHOUT touching its signatures
+    /// (garbage sigs + tier 2 still yield a countersigned fact — proof the
+    /// ECDSA was skipped), and a latched 0 drops a row whose signatures
+    /// would verify (the latch is authoritative when present; the relatch
+    /// sweep is what repairs a wrong one). `None` falls through to the
+    /// compute arm, which the rest of this suite pins exhaustively.
+    #[test]
+    fn the_claim_valid_latch_arm_short_circuits_and_the_zero_latch_drops() {
+        let (ww, lw) = (wallet_of(1), wallet_of(2));
+        let (wid, lid) = (identity_of(&ww), identity_of(&lw));
+        // Tier-2 latch + GARBAGE sigs: served countersigned — proof the
+        // ECDSA was skipped.
+        let mut latched = marker(
+            &tx(0x01),
+            &wid,
+            &lid,
+            &tx(0x02),
+            &tx(0x03),
+            None,
+            garbage_sig(),
+            Some(garbage_sig()),
+        );
+        latched.claim_valid = Some(2);
+        let fact = verified_claim(&latched).expect("the latch arm serves the row");
+        assert!(fact.loser_sig_verified, "tier 2 = countersigned");
+        latched.claim_valid = Some(1);
+        let fact = verified_claim(&latched).expect("tier 1 serves too");
+        assert!(!fact.loser_sig_verified, "tier 1 = winner-only");
+        // Tier-0 latch + a sig that WOULD verify: dropped (latch wins).
+        let game_lc = tx(0x01);
+        let challenge = result_challenge_bytes(
+            &game_lc,
+            &wid.to_ascii_lowercase(),
+            &lid.to_ascii_lowercase(),
+            &tx(0x02),
+            &tx(0x03),
+            None,
+        )
+        .unwrap();
+        let mut honest = marker(
+            &tx(0x01),
+            &wid,
+            &lid,
+            &tx(0x02),
+            &tx(0x03),
+            None,
+            sign_result(&ww, &game_lc, &challenge),
+            None,
+        );
+        assert!(verified_claim(&honest).is_some(), "compute arm accepts it");
+        honest.claim_valid = Some(0);
+        assert!(
+            verified_claim(&honest).is_none(),
+            "a latched 0 is authoritative — the relatch sweep repairs, the serve path never second-guesses"
+        );
+        // Self-paired stays invalid on EVERY arm.
+        let mut selfp = latched.clone();
+        selfp.loser = selfp.winner.clone();
+        selfp.claim_valid = Some(2);
+        assert!(verified_claim(&selfp).is_none());
     }
 
     #[test]

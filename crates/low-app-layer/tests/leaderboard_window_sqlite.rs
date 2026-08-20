@@ -298,6 +298,7 @@ fn query_window(conn: &Connection, limit: usize) -> (Vec<ResultMarkerRow>, bool)
                         cards_hex: r.get("cardsHex")?,
                         txid: r.get("txid")?,
                         created_at: r.get("createdAt")?,
+                        claim_valid: r.get("claimValid")?,
                     },
                 ))
             },
