@@ -166,6 +166,14 @@ pub trait RelatchTable {
     /// The row shape the scan yields.
     type Row;
 
+    /// The verdict the table's column stores. `bool` for the original two
+    /// arms (`sigValid`, `markerValid`); `i64` for TIERED latches
+    /// (`claimValid` 0/1/2 — brain-cutover M1). `Ord` is load-bearing: the
+    /// pass classifies a change as `promoted` (toward more-verified) or
+    /// `demoted` (the alarm) by comparison, which for `bool` is exactly the
+    /// old false<true behaviour.
+    type Verdict: Copy + Ord + std::fmt::Debug;
+
     /// The table's name — the cursor key and the log label.
     fn table(&self) -> &'static str;
 
@@ -173,7 +181,7 @@ pub trait RelatchTable {
     fn rowid(row: &Self::Row) -> i64;
 
     /// This row's stored verdict: `None` = the legacy `NULL` tier.
-    fn stored(row: &Self::Row) -> Option<bool>;
+    fn stored(row: &Self::Row) -> Option<Self::Verdict>;
 
     /// Rows STRICTLY after `after_rowid`, `rowid` ascending, at most `limit`.
     /// Never filtered on the verdict column — see the module doc.
@@ -192,7 +200,7 @@ pub trait RelatchTable {
     /// The verdict is still DERIVED by the write and never handed to it
     /// (epoch Rule 15): implementations build their capability-typed UPDATE
     /// first and read the verdict off it.
-    async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String>;
+    async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<Self::Verdict>, String>;
 
     /// `(rows after `after_rowid`, rows whose verdict is NULL table-wide)`.
     async fn census(&self, after_rowid: i64) -> Result<RelatchCensus, String>;
@@ -266,8 +274,8 @@ pub async fn relatch_pass<T: RelatchTable, C: RelatchCursorStore>(
                 );
                 match stored {
                     None => summary.latched += 1,
-                    Some(false) => summary.promoted += 1,
-                    Some(true) => {
+                    Some(prev) if written > prev => summary.promoted += 1,
+                    Some(_) => {
                         // THE alarm (epoch Rule 13): logged per row, because a
                         // handful is a bug report and a page of them is a
                         // cross-language predicate regression in progress.
@@ -444,6 +452,7 @@ mod tests {
     #[async_trait(?Send)]
     impl RelatchTable for FakeTable {
         type Row = (i64, Option<bool>, bool);
+        type Verdict = bool;
         fn table(&self) -> &'static str {
             "fake_records"
         }

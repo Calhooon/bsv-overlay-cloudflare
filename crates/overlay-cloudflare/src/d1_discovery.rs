@@ -4320,6 +4320,7 @@ struct RelatchCensusRow {
 #[async_trait(?Send)]
 impl crate::relatch::RelatchTable for D1PotpartyStorage {
     type Row = PotpartyRelatchRow;
+    type Verdict = bool;
 
     fn table(&self) -> &'static str {
         POTPARTY_TABLE
@@ -5138,6 +5139,7 @@ impl HoppartyRelatchDbRow {
 #[async_trait(?Send)]
 impl crate::relatch::RelatchTable for D1HoppartyStorage {
     type Row = HoppartyRelatchRow;
+    type Verdict = bool;
 
     fn table(&self) -> &'static str {
         HOPPARTY_TABLE
@@ -8751,6 +8753,7 @@ mod tests {
     #[async_trait(?Send)]
     impl crate::relatch::RelatchTable for SqliteRelatchPotparty<'_> {
         type Row = PotpartyRelatchRow;
+        type Verdict = bool;
         fn table(&self) -> &'static str {
             POTPARTY_TABLE
         }
@@ -8800,6 +8803,7 @@ mod tests {
     #[async_trait(?Send)]
     impl crate::relatch::RelatchTable for SqliteRelatchHopparty<'_> {
         type Row = HoppartyRelatchRow;
+        type Verdict = bool;
         fn table(&self) -> &'static str {
             HOPPARTY_TABLE
         }

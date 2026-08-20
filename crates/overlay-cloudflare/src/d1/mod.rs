@@ -317,11 +317,14 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// superseded pre-signed refund, ~64% of refunds per bsv-low #369).
 /// Overlay-internal — the app-layer reads `pot_beefs` only through explicit
 /// `hex(beef)` joins, so epoch Rule 24 does NOT bite (no schema catch-up).
+/// 109 → 111 for brain-cutover M1: `claimValid` (tiered result-claim
+/// verdict latch) + `rowValid` (hand-marker verdict latch) — see the
+/// migration comments.
 /// 107 → 109 for bsv-low #382: `hand_markers` (per-seat showdown-hand marker
 /// index, outpoint-keyed from birth per the #327 S8 lesson) + its
 /// gameId/createdAt read index. Overlay-internal (clients read via /lookup
 /// ls_hand); display-only — no money path and no app-layer join reads it.
-pub const OVERLAY_MIGRATION_COUNT: usize = 109;
+pub const OVERLAY_MIGRATION_COUNT: usize = 111;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1255,6 +1258,21 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // per-game window.
     "CREATE INDEX IF NOT EXISTS idx_hand_markers_gameId_created \
      ON hand_markers(gameId, createdAt)",
+    // 109 → 111, brain-cutover M1 (bsv-low docs/PLAN-BRAIN-CUTOVER-2026-08.md):
+    // the #283/#362 verdict-latch family grows two members, computed ONCE at
+    // admission by the D1 writer and repaired by the relatch fixpoint sweep.
+    //
+    // `claimValid` is a TIER, not a bool: NULL = admitted before the latch
+    // (compute-at-serve until the sweep retires it), 0 = invalid (as if never
+    // published), 1 = winner-sig-valid (the client's 'unconfirmed'),
+    // 2 = countersigned ('confirmed'). `rowValid` is the boolean hand-marker
+    // latch (verifyHandRow's recipe). BOTH are read by the app-layer
+    // (/results, /leaderboard, the M2 hands join) — epoch Rule 24 bites:
+    // the byte-identical statements live in low_app_layer::schema, and the
+    // hand_markers CREATE above is mirrored there too (the migration comment
+    // on it said "if /results later joins this table" — it now does).
+    "ALTER TABLE result_markers_v2 ADD COLUMN claimValid INTEGER",
+    "ALTER TABLE hand_markers ADD COLUMN rowValid INTEGER",
 ];
 
 // =============================================================================
