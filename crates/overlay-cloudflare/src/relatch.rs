@@ -394,16 +394,19 @@ impl RelatchCursorStore for D1RelatchCursors {
 /// share a cursor pattern, a bound and a summary shape, and a caller that could
 /// run one and forget the other is a caller that will (the hopparty tier is the
 /// one with no other repair path at all).
-pub async fn run_relatch(
-    db: std::rc::Rc<worker::D1Database>,
-    limit: u64,
-) -> (RelatchSummary, RelatchSummary) {
+pub async fn run_relatch(db: std::rc::Rc<worker::D1Database>, limit: u64) -> Vec<RelatchSummary> {
     let cursors = D1RelatchCursors::new(db.clone());
     let potparty = crate::d1_discovery::D1PotpartyStorage::new(db.clone());
-    let hopparty = crate::d1_discovery::D1HoppartyStorage::new(db);
-    let pp = relatch_pass(&potparty, &cursors, limit).await;
-    let hp = relatch_pass(&hopparty, &cursors, limit).await;
-    (pp, hp)
+    let hopparty = crate::d1_discovery::D1HoppartyStorage::new(db.clone());
+    let result = crate::d1_discovery::D1ResultStorage::new(db.clone());
+    let hand = crate::d1_discovery::D1HandStorage::new(db);
+    vec![
+        relatch_pass(&potparty, &cursors, limit).await,
+        relatch_pass(&hopparty, &cursors, limit).await,
+        // brain-cutover M1: the claimValid tier + rowValid latches.
+        relatch_pass(&result, &cursors, limit).await,
+        relatch_pass(&hand, &cursors, limit).await,
+    ]
 }
 
 /// Log one table's tick in the shape the other scheduled passes use.

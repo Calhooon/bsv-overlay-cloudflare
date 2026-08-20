@@ -39,11 +39,11 @@ use overlay_discovery::collected::lookup_service::CollectedLookupService;
 use overlay_discovery::collected::storage::CollectedStorage;
 use overlay_discovery::collected::topic_manager::CollectedTopicManager;
 use overlay_discovery::dm_delegation::lookup_service::DmDelegationLookupService;
+use overlay_discovery::dm_delegation::storage::DmDelegationStorage;
+use overlay_discovery::dm_delegation::topic_manager::DmDelegationTopicManager;
 use overlay_discovery::hand::lookup_service::HandLookupService;
 use overlay_discovery::hand::storage::HandStorage;
 use overlay_discovery::hand::topic_manager::HandTopicManager;
-use overlay_discovery::dm_delegation::storage::DmDelegationStorage;
-use overlay_discovery::dm_delegation::topic_manager::DmDelegationTopicManager;
 use overlay_discovery::hopparty::lookup_service::HoppartyLookupService;
 use overlay_discovery::hopparty::storage::HoppartyStorage;
 use overlay_discovery::hopparty::topic_manager::HoppartyTopicManager;
@@ -87,8 +87,8 @@ use crate::chain_tracker::WorkerChainTracker;
 use crate::d1::ensure_overlay_migrations;
 use crate::d1_discovery::{
     D1AgentStorage, D1CollectedStorage, D1DmDelegationStorage, D1HandStorage, D1HoppartyStorage,
-    D1LowStorage, D1PotStorage, D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage, D1ResultStorage,
-    D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
+    D1LowStorage, D1PotStorage, D1PotpartyStorage, D1PotrefundStorage, D1ProofStorage,
+    D1ResultStorage, D1RevealStorage, D1SHIPStorage, D1SLAPStorage, D1UHRPStorage,
 };
 use crate::d1_storage::D1Storage;
 use crate::health_checker::WorkerHealthChecker;
@@ -1329,10 +1329,11 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     //     chain, so no republish can ever re-latch it, and a row a transient
     //     predicate fault latched 0 sorts below even the legacy tier forever.
     //     `changed`/`demoted` in the log lines are the regression detector.
-    let (pp_relatch, hp_relatch) =
-        crate::relatch::run_relatch(ops_db.clone(), crate::relatch::RELATCH_PAGE_LIMIT).await;
-    crate::relatch::log_relatch_summary(&pp_relatch);
-    crate::relatch::log_relatch_summary(&hp_relatch);
+    for summary in
+        crate::relatch::run_relatch(ops_db.clone(), crate::relatch::RELATCH_PAGE_LIMIT).await
+    {
+        crate::relatch::log_relatch_summary(&summary);
+    }
 
     // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
     //    #267 item c). The passes above only help txs the network HOLDS; an
@@ -1681,14 +1682,17 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
     )
     .await;
-    // 4b. the #355/#367 RE-LATCH fixpoint over both verdict columns — same
-    //     bounds as the scheduled tick; pokeable so a predicate change can be
-    //     converged without waiting out the cron (the cron-poker doctrine).
-    let (pp_relatch, hp_relatch) =
+    // 4b. the #355/#367 RE-LATCH fixpoint over the verdict columns (four
+    //     arms since brain-cutover M1: sigValid, markerValid, claimValid,
+    //     rowValid) — same bounds as the scheduled tick; pokeable so a
+    //     predicate change can be converged without waiting out the cron
+    //     (the cron-poker doctrine).
+    let relatch_summaries =
         crate::relatch::run_relatch(db.clone(), crate::relatch::RELATCH_PAGE_LIMIT).await;
-    crate::relatch::log_relatch_summary(&pp_relatch);
-    crate::relatch::log_relatch_summary(&hp_relatch);
-    let relatch_json: Vec<serde_json::Value> = [&pp_relatch, &hp_relatch]
+    for summary in &relatch_summaries {
+        crate::relatch::log_relatch_summary(summary);
+    }
+    let relatch_json: Vec<serde_json::Value> = relatch_summaries
         .iter()
         .map(|s| {
             serde_json::json!({

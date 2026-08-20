@@ -2765,12 +2765,127 @@ pub fn hand_records_batch_sql(n: usize) -> String {
 /// outpoint-keyed, `INSERT OR IGNORE`, rows never deleted (a revealed hand is
 /// a permanent fact; the lookup service's spend/eviction hooks are no-ops).
 pub struct D1HandStorage {
-    db: Rc<D1Database>,
+    db: hand_write::HandDb,
 }
 
 impl D1HandStorage {
     pub fn new(db: Rc<D1Database>) -> Self {
-        Self { db }
+        Self {
+            db: hand_write::HandDb::new(db),
+        }
+    }
+}
+
+/// The hand-marker write path as a CAPABILITY (brain-cutover M1) — the
+/// `potparty_write` shape (see its module doc for the three gate rounds that
+/// forged it), third instance. `rowValid` is `hand::validity::row_valid`
+/// (the client's `verifyHandRow` recipe, pinned by the SIGNED cross-repo
+/// golden), computed ONCE here and bound on the insert; the relatch sweep is
+/// the only other statement that may touch the column.
+pub mod hand_write {
+    use super::potparty_write::is_select_only;
+    use super::{HandRecord, Query};
+    use serde::de::DeserializeOwned;
+    use std::rc::Rc;
+    use worker::D1Database;
+
+    /// What [`HandDb::fetch_all`] answers when handed a write.
+    pub const NON_SELECT_ON_READ_PATH: &str = "hand read path accepts SELECT only";
+
+    /// A hand-marker INSERT that PROVABLY carries the `rowValid` latch.
+    pub struct LatchedHandInsert {
+        query: Query,
+        row_valid: bool,
+    }
+
+    impl LatchedHandInsert {
+        /// The verdict this insert BINDS — one evaluation, carried (the
+        /// #283 gate's LOW-2 rule).
+        pub fn row_valid(&self) -> bool {
+            self.row_valid
+        }
+        /// Read-only view for the replay pin.
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    /// THE hand admission WRITE, as a pure value. `INSERT OR IGNORE` on the
+    /// outpoint key; a 0-latched row is STORED and served (the latch is a
+    /// serving verdict, never an admission decision — `tm_hand` admits
+    /// exactly what it admitted before).
+    pub fn hand_insert_query(record: &HandRecord, created_at: i64) -> LatchedHandInsert {
+        let row_valid = overlay_discovery::hand::validity::row_valid(record);
+        LatchedHandInsert {
+            query: Query::new(
+                "INSERT OR IGNORE INTO hand_markers \
+                 (gameId, identity, potTxid, cardsHex, txid, outputIndex, \
+                  sigHex, createdAt, rowValid) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(record.game_id.as_str())
+            .bind(record.identity.as_str())
+            .bind(record.pot_txid.as_str())
+            .bind(record.cards_hex.as_str())
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(record.sig_hex.as_deref())
+            .bind(created_at)
+            .bind(i64::from(row_valid)),
+            row_valid,
+        }
+    }
+
+    /// THE hand RE-LATCH write — `UPDATE` of exactly one column, addressed
+    /// by the outpoint primary key, verdict re-derived HERE (epoch Rule 15).
+    pub struct LatchedHandRelatch {
+        query: Query,
+        row_valid: bool,
+    }
+
+    impl LatchedHandRelatch {
+        pub fn row_valid(&self) -> bool {
+            self.row_valid
+        }
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    pub fn hand_relatch_query(record: &HandRecord) -> LatchedHandRelatch {
+        let row_valid = overlay_discovery::hand::validity::row_valid(record);
+        LatchedHandRelatch {
+            query: Query::new(
+                "UPDATE hand_markers SET rowValid = ? WHERE txid = ? AND outputIndex = ?",
+            )
+            .bind(i64::from(row_valid))
+            .bind(record.txid.as_str())
+            .bind(record.output_index),
+            row_valid,
+        }
+    }
+
+    /// The ONLY database handle [`super::D1HandStorage`] holds — reads are
+    /// SELECT-guarded by the SHARED [`is_select_only`] bar; the two writes
+    /// accept only this module's capability values.
+    pub struct HandDb(Rc<D1Database>);
+
+    impl HandDb {
+        pub fn new(db: Rc<D1Database>) -> Self {
+            Self(db)
+        }
+        pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
+            if !is_select_only(q.sql()) {
+                return Err(NON_SELECT_ON_READ_PATH.to_string());
+            }
+            q.fetch_all(&self.0).await
+        }
+        pub async fn insert(&self, insert: LatchedHandInsert) -> Result<(), String> {
+            insert.query.execute(&self.0).await
+        }
+        pub async fn relatch(&self, update: LatchedHandRelatch) -> Result<(), String> {
+            update.query.execute(&self.0).await
+        }
     }
 }
 
@@ -2783,23 +2898,22 @@ impl HandStorage for D1HandStorage {
     async fn store_record(&self, record: &HandRecord) -> Result<(), HandStorageError> {
         // INSERT OR IGNORE on the (txid, outputIndex) primary key: a replayed
         // submit of the same output is a no-op; a marker for the same
-        // (gameId, identity) from another tx is a NEW row.
-        Query::new(
-            "INSERT OR IGNORE INTO hand_markers \
-             (gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(record.game_id.as_str())
-        .bind(record.identity.as_str())
-        .bind(record.pot_txid.as_str())
-        .bind(record.cards_hex.as_str())
-        .bind(record.txid.as_str())
-        .bind(record.output_index)
-        .bind(record.sig_hex.as_deref())
-        .bind(current_unix_seconds_i64())
-        .execute(&self.db)
-        .await
-        .map_err(hand_err)
+        // (gameId, identity) from another tx is a NEW row. The `rowValid`
+        // latch rides the insert (hand_write — the #283 capability shape).
+        let insert = hand_write::hand_insert_query(record, current_unix_seconds_i64());
+        // TELEMETRY, not a decision — the potparty RATE-detector doctrine:
+        // a 0-latch is normal under a junk flood and abnormal on a quiet
+        // topic; a sustained stream with no flood means predicate drift
+        // (compare against the SIGNED golden first).
+        if !insert.row_valid() {
+            worker::console_log!(
+                "[hand:siginvalid] txid={} vout={} identity={}",
+                record.txid,
+                record.output_index,
+                record.identity
+            );
+        }
+        self.db.insert(insert).await.map_err(hand_err)
     }
 
     async fn get_records_for_game(
@@ -2810,9 +2924,9 @@ impl HandStorage for D1HandStorage {
         // two reads of one store must not disagree — a plain per-game LIMIT
         // here would reopen the exact eviction the batch SQL closes). Reuse
         // the shipped batch string with n = 1 so there is ONE window spelling.
-        let rows: Vec<HandRow> = Query::new(hand_records_batch_sql(1))
-            .bind(game_id)
-            .fetch_all(&self.db)
+        let rows: Vec<HandRow> = self
+            .db
+            .fetch_all(Query::new(hand_records_batch_sql(1)).bind(game_id))
             .await
             .map_err(hand_err)?;
         Ok(rows.into_iter().map(HandRow::into_record).collect())
@@ -2838,7 +2952,7 @@ impl HandStorage for D1HandStorage {
             for game_id in chunk {
                 q = q.bind(game_id.as_str());
             }
-            let rows: Vec<HandRow> = q.fetch_all(&self.db).await.map_err(hand_err)?;
+            let rows: Vec<HandRow> = self.db.fetch_all(q).await.map_err(hand_err)?;
             for row in rows {
                 let record = row.into_record();
                 by_game
@@ -2918,12 +3032,127 @@ impl ResultRow {
 /// and drives the newest-first list ordering; `rowid DESC` breaks
 /// same-second ties in insertion order.
 pub struct D1ResultStorage {
-    db: Rc<D1Database>,
+    db: result_write::ResultDb,
 }
 
 impl D1ResultStorage {
     pub fn new(db: Rc<D1Database>) -> Self {
-        Self { db }
+        Self {
+            db: result_write::ResultDb::new(db),
+        }
+    }
+}
+
+/// The result-claim write path as a CAPABILITY (brain-cutover M1) — the
+/// `potparty_write` shape (see its module doc), fourth instance, and the
+/// first TIERED one: `claimValid` is `result::validity::claim_tier`
+/// (0 invalid / 1 winner-valid / 2 countersigned — recipe-identical to the
+/// app-layer's `verified_claim`, pinned by the SIGNED cross-repo goldens),
+/// computed ONCE here and bound on the insert; the relatch sweep is the only
+/// other statement that may touch the column.
+pub mod result_write {
+    use super::potparty_write::is_select_only;
+    use super::{Query, ResultRecord};
+    use serde::de::DeserializeOwned;
+    use std::rc::Rc;
+    use worker::D1Database;
+
+    /// What [`ResultDb::fetch_all`] answers when handed a write.
+    pub const NON_SELECT_ON_READ_PATH: &str = "result read path accepts SELECT only";
+
+    /// A result INSERT that PROVABLY carries the `claimValid` tier.
+    pub struct LatchedResultInsert {
+        query: Query,
+        claim_tier: i64,
+    }
+
+    impl LatchedResultInsert {
+        /// The tier this insert BINDS — one evaluation, carried.
+        pub fn claim_tier(&self) -> i64 {
+            self.claim_tier
+        }
+        /// Read-only view for the replay pin.
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    /// THE result admission WRITE, as a pure value. `INSERT OR IGNORE` on
+    /// the outpoint key; a 0-tiered row is STORED (never refused — the
+    /// tm_result censorship rule is untouched), it just serves as invalid.
+    pub fn result_insert_query(record: &ResultRecord, created_at: i64) -> LatchedResultInsert {
+        let claim_tier = overlay_discovery::result::validity::claim_tier(record);
+        LatchedResultInsert {
+            query: Query::new(
+                "INSERT OR IGNORE INTO result_markers_v2 \
+                 (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+                  loserSigHex, cardsHex, txid, outputIndex, createdAt, claimValid) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(record.game_id.as_str())
+            .bind(record.winner.as_str())
+            .bind(record.loser.as_str())
+            .bind(record.pot_txid.as_str())
+            .bind(record.settle_txid.as_str())
+            .bind(record.winner_sig_hex.as_str())
+            .bind(record.loser_sig_hex.as_deref())
+            .bind(record.cards_hex.as_deref())
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(created_at)
+            .bind(claim_tier),
+            claim_tier,
+        }
+    }
+
+    /// THE result RE-LATCH write — `UPDATE` of exactly one column, addressed
+    /// by the outpoint primary key, tier re-derived HERE (epoch Rule 15).
+    pub struct LatchedResultRelatch {
+        query: Query,
+        claim_tier: i64,
+    }
+
+    impl LatchedResultRelatch {
+        pub fn claim_tier(&self) -> i64 {
+            self.claim_tier
+        }
+        pub fn query(&self) -> &Query {
+            &self.query
+        }
+    }
+
+    pub fn result_relatch_query(record: &ResultRecord) -> LatchedResultRelatch {
+        let claim_tier = overlay_discovery::result::validity::claim_tier(record);
+        LatchedResultRelatch {
+            query: Query::new(
+                "UPDATE result_markers_v2 SET claimValid = ? WHERE txid = ? AND outputIndex = ?",
+            )
+            .bind(claim_tier)
+            .bind(record.txid.as_str())
+            .bind(record.output_index),
+            claim_tier,
+        }
+    }
+
+    /// The ONLY database handle [`super::D1ResultStorage`] holds.
+    pub struct ResultDb(Rc<D1Database>);
+
+    impl ResultDb {
+        pub fn new(db: Rc<D1Database>) -> Self {
+            Self(db)
+        }
+        pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
+            if !is_select_only(q.sql()) {
+                return Err(NON_SELECT_ON_READ_PATH.to_string());
+            }
+            q.fetch_all(&self.0).await
+        }
+        pub async fn insert(&self, insert: LatchedResultInsert) -> Result<(), String> {
+            insert.query.execute(&self.0).await
+        }
+        pub async fn relatch(&self, update: LatchedResultRelatch) -> Result<(), String> {
+            update.query.execute(&self.0).await
+        }
     }
 }
 
@@ -3035,27 +3264,19 @@ impl ResultStorage for D1ResultStorage {
         // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
         // replayed submit of the same output is a no-op; markers for the
         // same (gameId, winner) from different txs are ALL kept; never
-        // overwrite, never delete.
-        Query::new(
-            "INSERT OR IGNORE INTO result_markers_v2 \
-             (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
-              loserSigHex, cardsHex, txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(record.game_id.as_str())
-        .bind(record.winner.as_str())
-        .bind(record.loser.as_str())
-        .bind(record.pot_txid.as_str())
-        .bind(record.settle_txid.as_str())
-        .bind(record.winner_sig_hex.as_str())
-        .bind(record.loser_sig_hex.as_deref())
-        .bind(record.cards_hex.as_deref())
-        .bind(record.txid.as_str())
-        .bind(record.output_index)
-        .bind(current_unix_seconds_i64())
-        .execute(&self.db)
-        .await
-        .map_err(result_err)
+        // overwrite, never delete. The `claimValid` tier rides the insert
+        // (result_write — the #283 capability shape).
+        let insert = result_write::result_insert_query(record, current_unix_seconds_i64());
+        // TELEMETRY, not a decision — the potparty RATE-detector doctrine.
+        if insert.claim_tier() == 0 {
+            worker::console_log!(
+                "[result:claiminvalid] txid={} vout={} winner={}",
+                record.txid,
+                record.output_index,
+                record.winner
+            );
+        }
+        self.db.insert(insert).await.map_err(result_err)
     }
 
     async fn list_for_winner(
@@ -3065,26 +3286,224 @@ impl ResultStorage for D1ResultStorage {
     ) -> Result<Vec<ResultRecord>, ResultStorageError> {
         // Per-pot superset window — see `result_window_sql` (bsv-low #282;
         // the flat newest-first window was dust-displaceable).
-        let rows: Vec<ResultRow> = Query::new(result_window_sql(true))
-            .bind(winner)
-            .bind(limit as u32)
-            .bind(unknown_pot_quota(limit) as u32)
-            .bind(result_window_row_cap(limit) as u32)
-            .fetch_all(&self.db)
+        let rows: Vec<ResultRow> = self
+            .db
+            .fetch_all(
+                Query::new(result_window_sql(true))
+                    .bind(winner)
+                    .bind(limit as u32)
+                    .bind(unknown_pot_quota(limit) as u32)
+                    .bind(result_window_row_cap(limit) as u32),
+            )
             .await
             .map_err(result_err)?;
         Ok(rows.into_iter().map(ResultRow::into_record).collect())
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<ResultRecord>, ResultStorageError> {
-        let rows: Vec<ResultRow> = Query::new(result_window_sql(false))
-            .bind(limit as u32)
-            .bind(unknown_pot_quota(limit) as u32)
-            .bind(result_window_row_cap(limit) as u32)
-            .fetch_all(&self.db)
+        let rows: Vec<ResultRow> = self
+            .db
+            .fetch_all(
+                Query::new(result_window_sql(false))
+                    .bind(limit as u32)
+                    .bind(unknown_pot_quota(limit) as u32)
+                    .bind(result_window_row_cap(limit) as u32),
+            )
             .await
             .map_err(result_err)?;
         Ok(rows.into_iter().map(ResultRow::into_record).collect())
+    }
+}
+
+// ── brain-cutover M1: relatch arms for the claimValid / rowValid latches ──
+// (the #355 fixpoint shape — see `relatch.rs`; scan yields the record + its
+// STORED verdict, the write re-derives the verdict itself.)
+
+/// The shipped result relatch scan — every wire column + rowid + the stored
+/// tier, rowid-ascending.
+fn result_relatch_scan_sql() -> String {
+    "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+            loserSigHex, cardsHex, txid, outputIndex, createdAt, rowid, claimValid \
+     FROM result_markers_v2 WHERE rowid > ? ORDER BY rowid ASC LIMIT ?"
+        .to_string()
+}
+
+fn result_relatch_census_sql() -> String {
+    "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
+            COALESCE(SUM(CASE WHEN claimValid IS NULL THEN 1 ELSE 0 END), 0) AS stillNull \
+     FROM result_markers_v2"
+        .to_string()
+}
+
+/// A scanned result row: the record, its `rowid`, and its STORED tier.
+#[derive(Deserialize)]
+struct ResultRelatchDbRow {
+    #[serde(flatten)]
+    row: ResultRow,
+    rowid: f64,
+    #[serde(rename = "claimValid")]
+    claim_valid: Option<f64>,
+}
+
+pub struct ResultRelatchRow {
+    rowid: i64,
+    stored: Option<i64>,
+    record: ResultRecord,
+}
+
+impl ResultRelatchDbRow {
+    fn into_row(self) -> ResultRelatchRow {
+        ResultRelatchRow {
+            rowid: self.rowid as i64,
+            stored: self.claim_valid.map(|v| v as i64),
+            record: self.row.into_record(),
+        }
+    }
+}
+
+const RESULT_TABLE: &str = "result_markers_v2";
+
+#[async_trait(?Send)]
+impl crate::relatch::RelatchTable for D1ResultStorage {
+    type Row = ResultRelatchRow;
+    type Verdict = i64;
+
+    fn table(&self) -> &'static str {
+        RESULT_TABLE
+    }
+    fn rowid(row: &Self::Row) -> i64 {
+        row.rowid
+    }
+    fn stored(row: &Self::Row) -> Option<i64> {
+        row.stored
+    }
+
+    async fn scan(&self, after_rowid: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+        let rows: Vec<ResultRelatchDbRow> = self
+            .db
+            .fetch_all(
+                Query::new(result_relatch_scan_sql())
+                    .bind(after_rowid)
+                    .bind(limit as u32),
+            )
+            .await?;
+        Ok(rows.into_iter().map(ResultRelatchDbRow::into_row).collect())
+    }
+
+    async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<i64>, String> {
+        // ONE evaluation, inside the capability-typed UPDATE (LOW-2 rule).
+        let update = result_write::result_relatch_query(&row.record);
+        let verdict = update.claim_tier();
+        if row.stored == Some(verdict) {
+            return Ok(None);
+        }
+        self.db.relatch(update).await?;
+        Ok(Some(verdict))
+    }
+
+    async fn census(&self, after_rowid: i64) -> Result<crate::relatch::RelatchCensus, String> {
+        let rows: Vec<RelatchCensusRow> = self
+            .db
+            .fetch_all(Query::new(result_relatch_census_sql()).bind(after_rowid))
+            .await?;
+        let r = rows.into_iter().next().ok_or("census returned no row")?;
+        Ok(crate::relatch::RelatchCensus {
+            remaining: r.remaining as u64,
+            still_null: r.still_null as u64,
+        })
+    }
+}
+
+/// The shipped hand relatch scan.
+fn hand_relatch_scan_sql() -> String {
+    "SELECT gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, \
+            createdAt, rowid, rowValid \
+     FROM hand_markers WHERE rowid > ? ORDER BY rowid ASC LIMIT ?"
+        .to_string()
+}
+
+fn hand_relatch_census_sql() -> String {
+    "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
+            COALESCE(SUM(CASE WHEN rowValid IS NULL THEN 1 ELSE 0 END), 0) AS stillNull \
+     FROM hand_markers"
+        .to_string()
+}
+
+/// A scanned hand row: the record, its `rowid`, and its STORED verdict.
+#[derive(Deserialize)]
+struct HandRelatchDbRow {
+    #[serde(flatten)]
+    row: HandRow,
+    rowid: f64,
+    #[serde(rename = "rowValid")]
+    row_valid: Option<f64>,
+}
+
+pub struct HandRelatchRow {
+    rowid: i64,
+    stored: Option<bool>,
+    record: HandRecord,
+}
+
+impl HandRelatchDbRow {
+    fn into_row(self) -> HandRelatchRow {
+        HandRelatchRow {
+            rowid: self.rowid as i64,
+            stored: self.row_valid.map(|v| v != 0.0),
+            record: self.row.into_record(),
+        }
+    }
+}
+
+const HAND_TABLE: &str = "hand_markers";
+
+#[async_trait(?Send)]
+impl crate::relatch::RelatchTable for D1HandStorage {
+    type Row = HandRelatchRow;
+    type Verdict = bool;
+
+    fn table(&self) -> &'static str {
+        HAND_TABLE
+    }
+    fn rowid(row: &Self::Row) -> i64 {
+        row.rowid
+    }
+    fn stored(row: &Self::Row) -> Option<bool> {
+        row.stored
+    }
+
+    async fn scan(&self, after_rowid: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+        let rows: Vec<HandRelatchDbRow> = self
+            .db
+            .fetch_all(
+                Query::new(hand_relatch_scan_sql())
+                    .bind(after_rowid)
+                    .bind(limit as u32),
+            )
+            .await?;
+        Ok(rows.into_iter().map(HandRelatchDbRow::into_row).collect())
+    }
+
+    async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+        let update = hand_write::hand_relatch_query(&row.record);
+        let verdict = update.row_valid();
+        if row.stored == Some(verdict) {
+            return Ok(None);
+        }
+        self.db.relatch(update).await?;
+        Ok(Some(verdict))
+    }
+
+    async fn census(&self, after_rowid: i64) -> Result<crate::relatch::RelatchCensus, String> {
+        let rows: Vec<RelatchCensusRow> = self
+            .db
+            .fetch_all(Query::new(hand_relatch_census_sql()).bind(after_rowid))
+            .await?;
+        let r = rows.into_iter().next().ok_or("census returned no row")?;
+        Ok(crate::relatch::RelatchCensus {
+            remaining: r.remaining as u64,
+            still_null: r.still_null as u64,
+        })
     }
 }
 
@@ -6135,7 +6554,16 @@ mod tests {
         )
         .unwrap();
         // A stale verdict keyed to the recorded claim, via the real writer.
-        exec_mark_spent_final(&conn, "pot", 0, "refundA", false, Some("refund"), None, Some(false));
+        exec_mark_spent_final(
+            &conn,
+            "pot",
+            0,
+            "refundA",
+            false,
+            Some("refund"),
+            None,
+            Some(false),
+        );
 
         let displace = |from: &str, to: &str, h: Option<i64>, f: Option<i64>| -> usize {
             let mut stmt = conn.prepare(displace_spend_cas_sql()).unwrap();
@@ -6174,12 +6602,20 @@ mod tests {
         assert_eq!(h, Some(9));
         assert_eq!(fin, Some(1));
         assert_eq!(v.as_deref(), Some("refund"), "verdict untouched");
-        assert_eq!(vt.as_deref(), Some("refundA"), "verdictTxid still the OLD spender");
+        assert_eq!(
+            vt.as_deref(),
+            Some("refundA"),
+            "verdictTxid still the OLD spender"
+        );
 
         // Guard 2: already-confirmed ⇒ zero rows (never displace chain truth).
         assert_eq!(displace("settleA", "later", Some(10), None), 0);
         let sp: String = conn
-            .query_row("SELECT spendingTxid FROM pot_records WHERE txid='pot'", [], |r| r.get(0))
+            .query_row(
+                "SELECT spendingTxid FROM pot_records WHERE txid='pot'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(sp, "settleA");
     }
@@ -7751,7 +8187,9 @@ mod tests {
     fn hand_rows(conn: &rusqlite::Connection, game: &str) -> Vec<(String, String, String)> {
         // (identity, txid, cardsHex) via the SHIPPED batch SQL (n = 1).
         let sql = hand_records_batch_sql(1);
-        let mut stmt = conn.prepare(&sql).expect("shipped hand batch SQL must parse");
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("shipped hand batch SQL must parse");
         stmt.query_map(rusqlite::params![game], |row| {
             Ok((
                 row.get::<_, String>(1)?,
@@ -7796,13 +8234,22 @@ mod tests {
         // lenient admission default.
         for i in 0..40u8 {
             let junk_id = format!("02{i:02x}{}", "cc".repeat(31));
-            insert_hand(&conn, &game, &junk_id, &h64(0xa0 ^ i), 0, 100 + i as i64, "0001020304");
+            insert_hand(
+                &conn,
+                &game,
+                &junk_id,
+                &h64(0xa0 ^ i),
+                0,
+                100 + i as i64,
+                "0001020304",
+            );
         }
         let rows = hand_rows(&conn, &game);
         // Seat A's genuine row is STILL present (its own partition was never
         // touched) — the feature is not censorable by a stranger.
         assert!(
-            rows.iter().any(|(id, txid, _)| *id == seat_a && *txid == h64(0x01)),
+            rows.iter()
+                .any(|(id, txid, _)| *id == seat_a && *txid == h64(0x01)),
             "the genuine seat's hand survives an identity-spray: {} rows",
             rows.len()
         );
@@ -7820,7 +8267,15 @@ mod tests {
         // The squatter pre-files a FULL per-seat window naming the VICTIM's
         // identity at deal time (t=1..HAND_ROWS_PER_SEAT), all junk cards.
         for i in 0..HAND_ROWS_PER_SEAT as u8 {
-            insert_hand(&conn, &game, &victim, &h64(0xa0 + i), i as u32, 1 + i as i64, "0001020304");
+            insert_hand(
+                &conn,
+                &game,
+                &victim,
+                &h64(0xa0 + i),
+                i as u32,
+                1 + i as i64,
+                "0001020304",
+            );
         }
         // The victim's GENUINE hand lands afterwards (t=99), a different tx.
         insert_hand(&conn, &game, &victim, &h64(0xbb), 0, 99, "000c1a2733");
@@ -7831,7 +8286,8 @@ mod tests {
             "the per-(game, identity) window bounds an unbounded mint"
         );
         assert!(
-            rows.iter().any(|(_, txid, cards)| *txid == h64(0xbb) && cards == "000c1a2733"),
+            rows.iter()
+                .any(|(_, txid, cards)| *txid == h64(0xbb) && cards == "000c1a2733"),
             "a pre-filed squat must not evict the victim's later genuine hand: {rows:?}"
         );
     }
@@ -8846,6 +9302,327 @@ mod tests {
         }
     }
 
+    // ── brain-cutover M1: the claimValid / rowValid latches, proven against
+    // real SQLite with the SHIPPED statements and the SIGNED cross-repo
+    // goldens (frozen artifacts of the real client producer — the same hex
+    // the validity suites pin; duplicated here as constants because a frozen
+    // contract is data, not code to share).
+
+    const M1_GOLDEN_RESULT_V2_CONFIRMED: &str = "006a0d4c4f572f726573756c742f7632201111111111111111111111111111111111111111111111111111111111111111210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5202222222222222222222222222222222222222222222222222222222222222222203333333333333333333333333333333333333333333333333333333333333333050001020304473045022100f5169865c38b686b863c6932e4f5a0460a2633140e742fbac7b3db00aaf0eaf902201a07ac5e713340128fc61356eeb65618fd16067898fad85a25f0b684e6cff846473045022100fe7f746e3d1d8e72701263a9910eb59b58cd4afbc628329c7f33eb0e4cf1697b0220779757d2f1bebd6fcf269180b53a9d307dc55aa3e1e020a937d06e0a48a5fb55";
+    const M1_GOLDEN_HAND_SIGNED: &str = "006a0b4c4f572f68616e642f7631201111111111111111111111111111111111111111111111111111111111111111210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820222222222222222222222222222222222222222222222222222222222222222205000102030446304402200d1a1461fc2ae2190466e3cfc6f1a042d8ccf379af035e5b7d8281a835a84fc9022034fc67ce95220b0ad2eb172899cfbceac10bee61da2816e3cc98cf237eb15b42";
+
+    fn m1_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        conn
+    }
+
+    /// Golden script hex → the stored record, THROUGH the production parser
+    /// and the production writer field mapping.
+    fn m1_result_record(hex_str: &str, txid: &str) -> ResultRecord {
+        let script = hex::decode(hex_str).expect("golden decodes");
+        let m = overlay_discovery::result::parse_result_marker(&script).expect("golden parses");
+        ResultRecord {
+            game_id: hex::encode(m.game_id),
+            winner: hex::encode(&m.winner),
+            loser: hex::encode(&m.loser),
+            pot_txid: hex::encode(m.pot_txid),
+            settle_txid: hex::encode(m.settle_txid),
+            winner_sig_hex: hex::encode(&m.winner_sig),
+            loser_sig_hex: m.loser_sig.as_deref().map(hex::encode),
+            cards_hex: m.cards.map(hex::encode),
+            txid: txid.to_string(),
+            output_index: 0,
+            created_at: 0,
+        }
+    }
+
+    fn m1_hand_record(txid: &str) -> HandRecord {
+        let script = hex::decode(M1_GOLDEN_HAND_SIGNED).expect("golden decodes");
+        let m = overlay_discovery::hand::parse_hand_marker(&script).expect("golden parses");
+        HandRecord {
+            game_id: hex::encode(m.game_id),
+            identity: hex::encode(&m.identity_key),
+            pot_txid: hex::encode(m.pot_txid),
+            cards_hex: hex::encode(m.cards),
+            txid: txid.to_string(),
+            output_index: 0,
+            sig_hex: Some(hex::encode(&m.sig)),
+        }
+    }
+
+    /// The admission write BINDS the tier the predicate produced — replayed
+    /// through the shipped INSERT against the production schema, column read
+    /// back. A forged row is STORED at tier 0 (a latch is never a gate).
+    #[test]
+    fn the_result_admission_write_latches_claim_tier_through_the_real_writer() {
+        let conn = m1_conn();
+        let honest = m1_result_record(M1_GOLDEN_RESULT_V2_CONFIRMED, &"aa".repeat(32));
+        let insert = result_write::result_insert_query(&honest, 1);
+        assert_eq!(insert.claim_tier(), 2, "the countersigned golden tiers 2");
+        exec_query(&conn, insert.query());
+
+        let mut forged = m1_result_record(M1_GOLDEN_RESULT_V2_CONFIRMED, &"bb".repeat(32));
+        forged.settle_txid = "44".repeat(32); // breaks the winner sig
+        let insert = result_write::result_insert_query(&forged, 2);
+        assert_eq!(insert.claim_tier(), 0);
+        exec_query(&conn, insert.query());
+
+        let tiers: Vec<(String, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT txid, claimValid FROM result_markers_v2 ORDER BY txid")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows
+        };
+        assert_eq!(
+            tiers,
+            vec![("aa".repeat(32), Some(2)), ("bb".repeat(32), Some(0)),],
+            "both rows STORED, each carrying its own tier"
+        );
+    }
+
+    #[test]
+    fn the_hand_admission_write_latches_row_valid_through_the_real_writer() {
+        let conn = m1_conn();
+        let honest = m1_hand_record(&"aa".repeat(32));
+        let insert = hand_write::hand_insert_query(&honest, 1);
+        assert!(insert.row_valid(), "the signed golden latches 1");
+        exec_query(&conn, insert.query());
+
+        let mut forged = m1_hand_record(&"bb".repeat(32));
+        forged.pot_txid = "44".repeat(32); // breaks the identity sig binding
+        let insert = hand_write::hand_insert_query(&forged, 2);
+        assert!(!insert.row_valid());
+        exec_query(&conn, insert.query());
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hand_markers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "a 0-latched marker is STORED, never refused");
+        let forged_latched: Option<i64> = conn
+            .query_row(
+                "SELECT rowValid FROM hand_markers WHERE txid = ?",
+                ["bb".repeat(32)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(forged_latched, Some(0));
+    }
+
+    /// `result_markers_v2` as a RelatchTable over real SQLite — the shipped
+    /// scan/census/UPDATE statements + the shipped row structs (the tiered
+    /// Verdict = i64 arm).
+    struct SqliteRelatchResult<'a>(&'a rusqlite::Connection);
+
+    #[async_trait(?Send)]
+    impl crate::relatch::RelatchTable for SqliteRelatchResult<'_> {
+        type Row = ResultRelatchRow;
+        type Verdict = i64;
+        fn table(&self) -> &'static str {
+            RESULT_TABLE
+        }
+        fn rowid(row: &Self::Row) -> i64 {
+            row.rowid
+        }
+        fn stored(row: &Self::Row) -> Option<i64> {
+            row.stored
+        }
+        async fn scan(&self, after: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+            Ok(
+                select_json(self.0, &result_relatch_scan_sql(), &[after, limit as i64])
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::from_value::<ResultRelatchDbRow>(v)
+                            .expect("the shipped SELECT list feeds the shipped row struct")
+                            .into_row()
+                    })
+                    .collect(),
+            )
+        }
+        async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<i64>, String> {
+            let update = result_write::result_relatch_query(&row.record);
+            let verdict = update.claim_tier();
+            if row.stored == Some(verdict) {
+                return Ok(None);
+            }
+            exec_query(self.0, update.query());
+            Ok(Some(verdict))
+        }
+        async fn census(&self, after: i64) -> Result<crate::relatch::RelatchCensus, String> {
+            let rows = select_json(self.0, &result_relatch_census_sql(), &[after]);
+            let r: RelatchCensusRow =
+                serde_json::from_value(rows.into_iter().next().expect("one aggregate row"))
+                    .expect("the census SELECT feeds the census row struct");
+            Ok(crate::relatch::RelatchCensus {
+                remaining: r.remaining as u64,
+                still_null: r.still_null as u64,
+            })
+        }
+    }
+
+    /// `hand_markers` as a RelatchTable — same shape, bool arm.
+    struct SqliteRelatchHand<'a>(&'a rusqlite::Connection);
+
+    #[async_trait(?Send)]
+    impl crate::relatch::RelatchTable for SqliteRelatchHand<'_> {
+        type Row = HandRelatchRow;
+        type Verdict = bool;
+        fn table(&self) -> &'static str {
+            HAND_TABLE
+        }
+        fn rowid(row: &Self::Row) -> i64 {
+            row.rowid
+        }
+        fn stored(row: &Self::Row) -> Option<bool> {
+            row.stored
+        }
+        async fn scan(&self, after: i64, limit: u64) -> Result<Vec<Self::Row>, String> {
+            Ok(
+                select_json(self.0, &hand_relatch_scan_sql(), &[after, limit as i64])
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::from_value::<HandRelatchDbRow>(v)
+                            .expect("the shipped SELECT list feeds the shipped row struct")
+                            .into_row()
+                    })
+                    .collect(),
+            )
+        }
+        async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+            let update = hand_write::hand_relatch_query(&row.record);
+            let verdict = update.row_valid();
+            if row.stored == Some(verdict) {
+                return Ok(None);
+            }
+            exec_query(self.0, update.query());
+            Ok(Some(verdict))
+        }
+        async fn census(&self, after: i64) -> Result<crate::relatch::RelatchCensus, String> {
+            let rows = select_json(self.0, &hand_relatch_census_sql(), &[after]);
+            let r: RelatchCensusRow =
+                serde_json::from_value(rows.into_iter().next().expect("one aggregate row"))
+                    .expect("the census SELECT feeds the census row struct");
+            Ok(crate::relatch::RelatchCensus {
+                remaining: r.remaining as u64,
+                still_null: r.still_null as u64,
+            })
+        }
+    }
+
+    /// The tiered fixpoint: NULL (legacy), a corrupted 0, a corrupted 1 and a
+    /// correct 2 all converge to the predicate's tier in one sweep; a second
+    /// sweep writes nothing; the 1→2 repair counts as PROMOTED and the
+    /// planted 2→0 corruption of a forged row as... nothing, because a forged
+    /// row RE-DERIVES to 0 (the pass repairs toward truth, whichever
+    /// direction that is — a wrongly-2 forged row is the DEMOTED alarm).
+    #[tokio::test]
+    async fn the_result_relatch_pass_reaches_the_fixpoint_over_tiers() {
+        let conn = m1_conn();
+        // Row 1: honest countersigned golden, latch CORRUPTED to NULL.
+        let honest = m1_result_record(M1_GOLDEN_RESULT_V2_CONFIRMED, &"aa".repeat(32));
+        exec_query(&conn, result_write::result_insert_query(&honest, 1).query());
+        conn.execute("UPDATE result_markers_v2 SET claimValid = NULL", [])
+            .unwrap();
+        // Row 2: honest golden again (new outpoint), latch corrupted to 0.
+        let honest2 = m1_result_record(M1_GOLDEN_RESULT_V2_CONFIRMED, &"bb".repeat(32));
+        exec_query(
+            &conn,
+            result_write::result_insert_query(&honest2, 2).query(),
+        );
+        conn.execute(
+            "UPDATE result_markers_v2 SET claimValid = 0 WHERE txid = ?",
+            ["bb".repeat(32)],
+        )
+        .unwrap();
+        // Row 3: forged (broken winner sig), latch corrupted to 2.
+        let mut forged = m1_result_record(M1_GOLDEN_RESULT_V2_CONFIRMED, &"cc".repeat(32));
+        forged.settle_txid = "44".repeat(32);
+        exec_query(&conn, result_write::result_insert_query(&forged, 3).query());
+        conn.execute(
+            "UPDATE result_markers_v2 SET claimValid = 2 WHERE txid = ?",
+            ["cc".repeat(32)],
+        )
+        .unwrap();
+
+        let table = SqliteRelatchResult(&conn);
+        let cursors = MemCursorsHere::default();
+        let s = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!(s.scanned, 3);
+        assert_eq!(s.latched, 1, "the NULL row latched");
+        assert_eq!(s.promoted, 1, "the 0-corrupted honest row repaired to 2");
+        assert_eq!(
+            s.demoted, 1,
+            "the 2-corrupted forged row demoted to 0 — the alarm"
+        );
+        assert_eq!(s.still_null, 0);
+
+        let s2 = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!(s2.changed(), 0, "the second sweep is a no-op: fixpoint");
+
+        let tiers: Vec<Option<i64>> = {
+            let mut stmt = conn
+                .prepare("SELECT claimValid FROM result_markers_v2 ORDER BY txid")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(tiers, vec![Some(2), Some(2), Some(0)]);
+    }
+
+    #[tokio::test]
+    async fn the_hand_relatch_pass_reaches_the_fixpoint() {
+        let conn = m1_conn();
+        let honest = m1_hand_record(&"aa".repeat(32));
+        exec_query(&conn, hand_write::hand_insert_query(&honest, 1).query());
+        conn.execute("UPDATE hand_markers SET rowValid = NULL", [])
+            .unwrap();
+
+        let table = SqliteRelatchHand(&conn);
+        let cursors = MemCursorsHere::default();
+        let s = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!((s.scanned, s.latched, s.demoted), (1, 1, 0));
+        let s2 = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!(s2.changed(), 0, "fixpoint");
+    }
+
+    /// A tiny in-memory cursor store for the new arms' cells (the existing
+    /// SqliteCursors uses the production statements; these cells exercise the
+    /// TABLE arms, and the cursor store is already covered there).
+    #[derive(Default)]
+    struct MemCursorsHere(
+        std::cell::RefCell<std::collections::HashMap<String, crate::relatch::RelatchCursor>>,
+    );
+
+    #[async_trait(?Send)]
+    impl crate::relatch::RelatchCursorStore for MemCursorsHere {
+        async fn load(&self, table: &str) -> Result<crate::relatch::RelatchCursor, String> {
+            Ok(self.0.borrow().get(table).copied().unwrap_or_default())
+        }
+        async fn store(
+            &self,
+            table: &str,
+            cursor: crate::relatch::RelatchCursor,
+        ) -> Result<(), String> {
+            self.0.borrow_mut().insert(table.to_string(), cursor);
+            Ok(())
+        }
+    }
+
     /// The cursor store, running the SHIPPED `relatch_cursors` statements
     /// against the production schema.
     struct SqliteCursors<'a>(&'a rusqlite::Connection);
@@ -9462,23 +10239,24 @@ mod tests {
         // guard EXPRESSION rather than a region (epoch Rule 9, fourth failure
         // mode), so `&& false` or a swapped argument changes the needle.
         //
-        // TWO since #362: `potparty_write::PotpartyDb` and
-        // `hopparty_write::HoppartyDb` share ONE bar rather than each growing
-        // a copy (epoch Rule 10 — the durable fix for "these must agree" is
-        // one predicate, not two plus a test).
+        // TWO since #362, FOUR since brain-cutover M1:
+        // `potparty_write::PotpartyDb`, `hopparty_write::HoppartyDb`,
+        // `result_write::ResultDb` and `hand_write::HandDb` share ONE bar
+        // rather than each growing a copy (epoch Rule 10 — the durable fix
+        // for "these must agree" is one predicate, not four plus a test).
         assert_eq!(
             prod.matches(&["if !is_select", "_only(q.sql()) {"].concat())
                 .count(),
-            2,
-            "both read paths guard on the shared read bar, in exactly that \
-             form — this is the door the round-3 gate walked through"
+            4,
+            "all four read paths guard on the shared read bar, in exactly \
+             that form — this is the door the round-3 gate walked through"
         );
         assert_eq!(
             prod.matches(&["is_select", "_only("].concat()).count(),
-            3,
-            "the read bar is DEFINED once and CALLED twice (the import names \
-             it without parentheses) — a smaller number means a `fetch_all` \
-             stopped consulting it"
+            5,
+            "the read bar is DEFINED once and CALLED four times (the imports \
+             name it without parentheses) — a smaller number means a \
+             `fetch_all` stopped consulting it"
         );
     }
 

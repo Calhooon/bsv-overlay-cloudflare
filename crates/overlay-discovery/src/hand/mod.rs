@@ -66,8 +66,8 @@
 
 pub mod lookup_service;
 pub mod storage;
-pub mod validity;
 pub mod topic_manager;
+pub mod validity;
 
 /// The domain tag the app stamps (`HAND_TAG` in `app/src/lib/handMarker.ts`).
 /// v1 = `(tag, gameId, identityKey, potTxid, cards, sig)`. 11 bytes of
