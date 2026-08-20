@@ -66,6 +66,7 @@
 
 pub mod lookup_service;
 pub mod storage;
+pub mod validity;
 pub mod topic_manager;
 
 /// The domain tag the app stamps (`HAND_TAG` in `app/src/lib/handMarker.ts`).

@@ -110,6 +110,7 @@
 
 pub mod lookup_service;
 pub mod storage;
+pub mod validity;
 pub mod topic_manager;
 
 /// The domain tag the app stamps. v1 = `(tag, gameId, winnerIdentity,
