@@ -1,6 +1,23 @@
-//! The lazy RE-LATCH pass for the two admission-latched verdict columns —
-//! `potparty_records.sigValid` (bsv-low#355) and `hopparty_records.markerValid`
-//! (bsv-low#367) — as ONE pass over two tables.
+//! The lazy RE-LATCH pass for the admission-latched verdict columns —
+//! `potparty_records.sigValid` (bsv-low#355), `hopparty_records.markerValid`
+//! (bsv-low#367), and since brain-cutover M1 `result_markers_v2.claimValid`
+//! (tiered) and `hand_markers.rowValid` — one pass, four arms.
+//!
+//! # TWO CONTRACT CLASSES, not one (gate F3)
+//!
+//! - **Sort-key arms** (`sigValid` as consumed by the potparty windows,
+//!   `markerValid`): the column orders candidates; consumers that draw a
+//!   conclusion re-verify. A wrong verdict mis-orders.
+//! - **Serving-verdict arms** (`claimValid`, `rowValid`, and `sigValid` as
+//!   consumed by the `attribute_seats`/live-view DUAL-ARM): the latch is
+//!   AUTHORITATIVE when present — a wrong `0` HIDES a claim from money-visible
+//!   views by design (the owner ruling 2026-08-20: the app-layer is the brain
+//!   and clients stop re-verifying). That is the client's own #335 drop
+//!   relocated server-side, and THIS PASS plus the `demoted` alarm are what
+//!   bound it: `NULL` is never a verdict (consumers compute), the fixpoint
+//!   re-derives every stored verdict, and a demotion stream is the drift
+//!   detector. The "worst case is mis-ordering" sentence below is true ONLY
+//!   for the sort-key class.
 //!
 //! # Why a pass exists at all
 //!
@@ -125,10 +142,11 @@ pub struct RelatchSummary {
     pub scanned: usize,
     /// Rows whose stored verdict was `NULL` and now carries one.
     pub latched: usize,
-    /// Rows REPAIRED: stored `0`, recomputed `1`.
+    /// Rows REPAIRED: recomputed verdict ABOVE the stored one (bool `0`→`1`;
+    /// tiers e.g. `0`→`2`, `1`→`2`).
     pub promoted: usize,
-    /// Rows DEMOTED: stored `1`, recomputed `0`. **The alarm** — see the
-    /// module doc.
+    /// Rows DEMOTED: recomputed verdict BELOW the stored one. **The alarm** —
+    /// see the module doc.
     pub demoted: usize,
     /// Rows still ahead of the cursor in this sweep.
     pub remaining: u64,
@@ -388,7 +406,7 @@ impl RelatchCursorStore for D1RelatchCursors {
     }
 }
 
-/// ONE tick of the re-latch fixpoint over BOTH latched tables (#355 + #367).
+/// ONE tick of the re-latch fixpoint over ALL latched tables (#355 + #367).
 ///
 /// Deliberately one entry point rather than two call sites: the two tables
 /// share a cursor pattern, a bound and a summary shape, and a caller that could

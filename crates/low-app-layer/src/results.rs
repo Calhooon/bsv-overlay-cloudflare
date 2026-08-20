@@ -1151,93 +1151,18 @@ pub struct ClaimFact {
 // `overlay-discovery`'s Rust topic manager verifies with this same
 // `ProtoWallet::anyone()` pattern).
 
-/// The BRC-43 protocol result claims are signed under —
-/// `result.ts::RESULT_PROTOCOL` = `[1, 'low result']`.
-///
-/// `pub` (#332) so producer-parity fixtures — the leaderboard attack cells
-/// and the `leaderboard_window_sqlite` integration harness — can SIGN real
-/// markers with the exact protocol the verifier checks, instead of
-/// re-deriving the tuple by convention (a duplicated format string is a
-/// boundary with no pin by construction).
-pub fn result_protocol() -> bsv_rs::wallet::Protocol {
-    bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low result")
-}
-
-/// Canonicalize a v2 cards push: 10 hex chars → five DISTINCT ordinals
-/// 0..=51, sorted ascending, re-encoded lowercase — `result.ts::cardsToHex ∘
-/// cardsFromHex`. `None` = malformed (an unverifiable claim: the sigs bind
-/// the canonical cards, so we must be able to reconstruct them).
-fn canonical_cards_hex(cards_hex: &str) -> Option<String> {
-    let mut cards = hex::decode(cards_hex).ok()?;
-    if cards.len() != 5 || cards.iter().any(|&c| c > 51) {
-        return None;
-    }
-    cards.sort_unstable();
-    if cards.windows(2).any(|w| w[0] == w[1]) {
-        return None;
-    }
-    Some(hex::encode(cards))
-}
-
-/// The canonical signed challenge — byte-identical to
-/// `result.ts::resultChallenge` (all fields lowercased; v2 binds the
-/// canonical sorted cards). Inputs must already be lowercase.
-///
-/// `pub` (#332) for the same producer-parity reason as [`result_protocol`]:
-/// fixtures that must mint REAL verifiable markers build the challenge here,
-/// never from a copied format string.
-pub fn result_challenge_bytes(
-    game_id_lc: &str,
-    winner_lc: &str,
-    loser_lc: &str,
-    pot_lc: &str,
-    settle_lc: &str,
-    cards_hex: Option<&str>,
-) -> Option<Vec<u8>> {
-    let base = format!(
-        "gid={game_id_lc}\nwinner={winner_lc}\nloser={loser_lc}\npot={pot_lc}\nsettle={settle_lc}"
-    );
-    let s = match cards_hex {
-        Some(ch) => {
-            let cards = canonical_cards_hex(ch)?;
-            format!("LOW-result\nv2\n{base}\ncards={cards}")
-        }
-        None => format!("LOW-result\nv1\n{base}"),
-    };
-    Some(s.into_bytes())
-}
-
-/// Verify one DER signature under `signer_identity_hex` over `challenge`
-/// with the public 'anyone' verifier — the mirror of the client's
-/// `anyoneVerifier.verifySignature({counterparty: signer, forSelf: false})`.
-/// Any malformed key/sig/derivation failure is simply `false` (fail-safe:
-/// an unverifiable signature never corroborates).
-pub(crate) fn anyone_sig_verifies(
-    signer_identity_hex: &str,
-    key_id: &str,
-    challenge: &[u8],
-    sig_hex: &str,
-    protocol: bsv_rs::wallet::Protocol,
-) -> bool {
-    let Ok(signer) = bsv_rs::primitives::ec::PublicKey::from_hex(signer_identity_hex) else {
-        return false;
-    };
-    let Ok(sig) = hex::decode(sig_hex) else {
-        return false;
-    };
-    bsv_rs::wallet::ProtoWallet::anyone()
-        .verify_signature(bsv_rs::wallet::VerifySignatureArgs {
-            data: Some(challenge.to_vec()),
-            hash_to_directly_verify: None,
-            signature: sig,
-            protocol_id: protocol,
-            key_id: key_id.to_string(),
-            counterparty: Some(bsv_rs::wallet::Counterparty::Other(signer)),
-            for_self: Some(false),
-        })
-        .map(|r| r.valid)
-        .unwrap_or(false)
-}
+/// The result-claim crypto recipe — DELEGATED to
+/// `overlay_discovery::result::validity`, the single shared artifact the
+/// admission latch (`claim_tier`), the relatch sweep, and this serve-time
+/// compute arm all execute (gate F1, brain-cutover M1: two hand-maintained
+/// copies of a recipe with no cross-crate pin is exactly the drift class the
+/// dual-arm contract cannot survive — the potparty family already delegates,
+/// results now does too). `result_protocol` stays `pub` (#332) so
+/// producer-parity fixtures sign real markers with the verifier's own tuple;
+/// `result_challenge_bytes` likewise. The SIGNED cross-repo goldens pin the
+/// shared recipe in `overlay_discovery::result::validity::tests`.
+pub use overlay_discovery::result::validity::{result_challenge_bytes, result_protocol};
+pub(crate) use overlay_discovery::result::validity::{anyone_sig_verifies, canonical_cards_hex};
 
 /// Verify one raw `result_markers_v2` row into a [`ClaimFact`], or `None`
 /// when it must contribute nothing: self-paired, malformed cards, or a
@@ -1267,9 +1192,12 @@ pub fn verified_claim(m: &ResultMarkerRow) -> Option<ClaimFact> {
         Some(tier @ (1 | 2)) => {
             // The cards still need canonicalizing for downstream display —
             // hashing-free string work, no EC. A malformed field cannot
-            // coexist with tier ≥ 1 (the challenge would not have built at
-            // admission), but re-canonicalize defensively as the compute
-            // arm does.
+            // coexist with tier ≥ 1 under ONE predicate version — but the
+            // overlay (which latches) and this worker (which serves) deploy
+            // separately (gate F6): a future `claim_tier` accepting a new
+            // cards form would latch 1 while this older arm serves the claim
+            // CARDLESS (`cards_hex: None`) rather than hiding it. Safe
+            // direction (less info, never forged info), named on purpose.
             let cards_hex = m.cards_hex.as_deref().and_then(canonical_cards_hex);
             return Some(ClaimFact {
                 winner: winner_lc,

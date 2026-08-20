@@ -833,7 +833,19 @@ pub fn corroborate_rows(
                 continue;
             };
             out.attempts += 1;
-            if crate::results::verify_seat_marker(m) && crate::results::verify_identity_binding(m) {
+            // Dual-arm (gate F2, brain-cutover M1): the admission latch
+            // covers exactly these two checks for a v2 row — consult it
+            // first (same contract as `attribute_seats`), compute on `None`.
+            // Keeps this surface's verdict consistent with `/results`'
+            // attribution for the same row.
+            let verified = match m.sig_valid {
+                Some(v) => v,
+                None => {
+                    crate::results::verify_seat_marker(m)
+                        && crate::results::verify_identity_binding(m)
+                }
+            };
+            if verified {
                 claim_by_pot[p] = Some(VerifiedClaim {
                     game_id: m.game_id.to_ascii_lowercase(),
                     opponent_identity: m.opponent_identity.to_ascii_lowercase(),

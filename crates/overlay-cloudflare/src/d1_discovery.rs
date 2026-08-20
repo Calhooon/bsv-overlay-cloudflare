@@ -9881,6 +9881,12 @@ mod tests {
                 hopparty_relatch_scan_sql(),
                 overlay_discovery::hopparty::validity::MARKER_VALID_COLUMN,
             ),
+            // Brain-cutover M1 arms (gate F4): serving-verdict latches — the
+            // never-a-WHERE rule matters MORE here, not less (a filtered scan
+            // would skip exactly the wrongly-0 rows the sweep exists to
+            // repair, and for these arms a wrong 0 HIDES a claim).
+            (result_relatch_scan_sql(), "claimValid"),
+            (hand_relatch_scan_sql(), "rowValid"),
         ] {
             assert_eq!(
                 sql.matches(col).count(),
@@ -9926,9 +9932,34 @@ mod tests {
         assert_eq!(hup.query().params().len(), 3);
         assert!(hup.marker_valid());
 
+        // Brain-cutover M1 arms (gate F4): same shape, tier + bool.
+        let rup = result_write::result_relatch_query(&m1_result_record(
+            M1_GOLDEN_RESULT_V2_CONFIRMED,
+            &"dd".repeat(32),
+        ));
+        assert_eq!(
+            rup.query().sql(),
+            "UPDATE result_markers_v2 SET claimValid = ? WHERE txid = ? AND outputIndex = ?"
+        );
+        assert_eq!(rup.query().params().len(), 3);
+        assert_eq!(rup.claim_tier(), 2, "the golden's tier rides the update");
+
+        let hup2 = hand_write::hand_relatch_query(&m1_hand_record(&"dd".repeat(32)));
+        assert_eq!(
+            hup2.query().sql(),
+            "UPDATE hand_markers SET rowValid = ? WHERE txid = ? AND outputIndex = ?"
+        );
+        assert_eq!(hup2.query().params().len(), 3);
+        assert!(hup2.row_valid());
+
         // Addressed by the OUTPOINT PRIMARY KEY, so a stale cursor can never
         // splash a second row.
-        for sql in [up.query().sql(), hup.query().sql()] {
+        for sql in [
+            up.query().sql(),
+            hup.query().sql(),
+            rup.query().sql(),
+            hup2.query().sql(),
+        ] {
             assert!(sql.contains("WHERE txid = ? AND outputIndex = ?"), "{sql}");
             assert!(!sql.contains("INSERT") && !sql.contains("REPLACE"), "{sql}");
         }

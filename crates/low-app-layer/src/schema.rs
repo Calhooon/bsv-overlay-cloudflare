@@ -44,9 +44,10 @@
 //! only DDL here and D1 migrations in this project are append-only.
 //!
 //! **Scope, stated so it does not creep:** this is not a migration runner and
-//! must not become one. It is ONE STATEMENT PER COLUMN this worker READS and
-//! cannot serve without — three today ([`SIG_VALID_ALTER`],
-//! [`MARKER_VALID_ALTER`], [`FIRST_SPENT_AT_ALTER`]) — and nothing else.
+//! must not become one. It is ONE STATEMENT PER COLUMN (or table) this worker
+//! READS and cannot serve without — the [`LATCH_COLUMN_ALTERS`] and
+//! [`CREATE_TABLE_CATCHUPS`] lists, six ALTERs + three CREATEs as of
+//! brain-cutover M1 — and nothing else.
 //!
 //! The membership test is "does a shipped query in this crate NAME the
 //! column", not "is it a verdict latch": #217's `firstSpentAt` is a plain
@@ -130,8 +131,10 @@ pub const CLAIM_VALID_ALTER: &str = "ALTER TABLE result_markers_v2 ADD COLUMN cl
 /// `/results` hands join (`hand::validity::row_valid`'s verdict).
 pub const ROW_VALID_ALTER: &str = "ALTER TABLE hand_markers ADD COLUMN rowValid INTEGER";
 
-/// Every ALTER this module issues, in no significant order — each is
-/// independently idempotent, so arrival order cannot matter.
+/// Every ALTER this module issues. Each is independently idempotent; the ONE
+/// ordering rule is module-level (gate F5): the CREATE catch-ups run first,
+/// because `ROW_VALID_ALTER` targets a table `HAND_MARKERS_CREATE` may be
+/// creating on the same cold isolate.
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SIG_VALID_ALTER,
     MARKER_VALID_ALTER,
@@ -179,7 +182,7 @@ pub const COLLECTED_MARKERS_V2_CREATE: &str = "CREATE TABLE IF NOT EXISTS collec
 /// migration's comment predicted this exact statement: "if /results later
 /// joins this table, the app-layer must issue this same statement". The M2
 /// hands join names it, and [`ROW_VALID_ALTER`] above adds its latch column
-/// (order-independent: the ALTER's duplicate-column outcome is benign and a
+/// (CREATE-before-ALTER ordered by `apply` (gate F5): the ALTER's duplicate-column outcome is benign and a
 /// CREATE against an existing table is `IF NOT EXISTS`-idempotent).
 /// Byte-identical to the overlay migration, pinned below.
 pub const HAND_MARKERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS hand_markers (
@@ -275,6 +278,18 @@ pub async fn ensure_latch_columns(env: &worker::Env) -> LatchColumnsEnsured {
 /// is why the predicates are pinned to agree rather than assumed to.
 async fn apply(db: &worker::D1Database) {
     let mut all_ok = true;
+    // CREATEs FIRST (gate F5): `ROW_VALID_ALTER` targets `hand_markers`,
+    // which `HAND_MARKERS_CREATE` may be the first to create on this D1 — an
+    // ALTER against a missing table fails not-benign ("no such table"), which
+    // self-heals on the next request but is one avoidable deferred cycle.
+    // This is the module's first in-list dependency; the per-statement
+    // idempotence claims below are per-statement, not cross-statement.
+    for stmt in CREATE_TABLE_CATCHUPS {
+        if let Err(e) = db.prepare(*stmt).run().await {
+            all_ok = false;
+            worker::console_log!("[schema] CREATE deferred: {stmt} — {e}");
+        }
+    }
     for stmt in LATCH_COLUMN_ALTERS {
         match db.prepare(*stmt).run().await {
             Ok(_) => {}
@@ -290,16 +305,6 @@ async fn apply(db: &worker::D1Database) {
                     worker::console_log!("[schema] ALTER deferred: {stmt} — {msg}");
                 }
             }
-        }
-    }
-    // The CREATE-class catch-ups (#371 network_seen, #252 collected_markers_v2).
-    // `IF NOT EXISTS` makes success the only benign outcome — any error is
-    // real, so it defers the latch and the next request retries, exactly like
-    // a non-benign ALTER failure above.
-    for stmt in CREATE_TABLE_CATCHUPS {
-        if let Err(e) = db.prepare(*stmt).run().await {
-            all_ok = false;
-            worker::console_log!("[schema] CREATE deferred: {stmt} — {e}");
         }
     }
     if all_ok {
