@@ -68,8 +68,8 @@ fn every_fixed_query_prepares_against_the_production_schema() {
         "recovery_view_sql(era, 0)",
         &recovery_view_sql(ERA, 0),
     );
-    assert_prepares(&conn, "refund_view_sql", &refund_view_sql(None));
-    assert_prepares(&conn, "refund_view_sql(era)", &refund_view_sql(ERA));
+    assert_prepares(&conn, "refund_view_sql", &refund_view_sql(None, 0));
+    assert_prepares(&conn, "refund_view_sql(era, 0)", &refund_view_sql(ERA, 0));
     assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false, None, 0));
     assert_prepares(&conn, "hops_view_sql(era)", &hops_view_sql(false, ERA, 0));
     // Both arities of the gameId-scoped escape hatch must parse.
@@ -83,10 +83,10 @@ fn every_fixed_query_prepares_against_the_production_schema() {
         "hops_view_sql(scoped, era)",
         &hops_view_sql(true, ERA, 0),
     );
-    assert_prepares(&conn, "live_view_sql", &live_view_sql(None));
-    assert_prepares(&conn, "live_view_sql(era)", &live_view_sql(ERA));
-    assert_prepares(&conn, "results_sql", &results_sql(None));
-    assert_prepares(&conn, "results_sql(era)", &results_sql(ERA));
+    assert_prepares(&conn, "live_view_sql", &live_view_sql(None, 0));
+    assert_prepares(&conn, "live_view_sql(era, 0)", &live_view_sql(ERA, 0));
+    assert_prepares(&conn, "results_sql", &results_sql(None, 0));
+    assert_prepares(&conn, "results_sql(era)", &results_sql(ERA, 0));
     // #332 — the /leaderboard anti-flood marker window.
     assert_prepares(
         &conn,
@@ -111,12 +111,12 @@ fn fixed_queries_declare_the_parameter_count_per_era_arm() {
     for (name, sql, expected) in [
         ("recovery_view_sql(None, 0)", recovery_view_sql(None, 0), 1),
         ("recovery_view_sql(era, 0)", recovery_view_sql(ERA, 0), 2),
-        ("refund_view_sql(None)", refund_view_sql(None), 1),
-        ("refund_view_sql(era)", refund_view_sql(ERA), 2),
-        ("live_view_sql(None)", live_view_sql(None), 1),
-        ("live_view_sql(era)", live_view_sql(ERA), 2),
-        ("results_sql(None)", results_sql(None), 1),
-        ("results_sql(era)", results_sql(ERA), 2),
+        ("refund_view_sql(None, 0)", refund_view_sql(None, 0), 1),
+        ("refund_view_sql(era, 0)", refund_view_sql(ERA, 0), 2),
+        ("live_view_sql(None, 0)", live_view_sql(None, 0), 1),
+        ("live_view_sql(era, 0)", live_view_sql(ERA, 0), 2),
+        ("results_sql(None, 0)", results_sql(None, 0), 1),
+        ("results_sql(era)", results_sql(ERA, 0), 2),
         (
             "hops_view_sql(false, None, 0)",
             hops_view_sql(false, None, 0),

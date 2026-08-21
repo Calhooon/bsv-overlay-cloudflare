@@ -833,8 +833,12 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
     } else {
         // #375: the same cutoff — the reused /results derivation must not
         // resurrect a written-off pot through the outcome fold.
-        match gather_result_entries(&db, &identity.to_ascii_lowercase(), era).await {
-            Ok(v) => Some(v),
+        // The paging round: the outcome fold follows THIS page's cursor —
+        // /results and /recovery-view share the window ordering and the
+        // 100-pot cap by design (see RECOVERY_VIEW_MAX_ROWS' doc), so page N
+        // of one is page N of the other.
+        match gather_result_entries(&db, &identity.to_ascii_lowercase(), era, after).await {
+            Ok((v, _)) => Some(v),
             Err(e) => {
                 console_warn!(
                     "[recovery-view] results derivation unavailable (outcome served null): {e}"
@@ -1915,8 +1919,25 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         ViewIdentity::Refuse(resp) => return resp,
     };
 
+    // The paging cursor (2026-08-21; the /recovery-view #398 contract):
+    // absent/garbage `after` is 0 — the unchanged first page — and the value
+    // clamps at the ceiling so a walker can never be handed a loop.
+    let after = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "after")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        .min(crate::results::RESULTS_VIEW_AFTER_MAX);
+
     if !crate::logic::valid_identity(&identity_lc) {
-        return json_response(crate::results::results_body(&identity_lc, &[]), 200);
+        return json_response(
+            crate::results::results_body(&identity_lc, &[], false, after),
+            200,
+        );
     }
 
     let db = match ctx.env.d1("OVERLAY_DB") {
@@ -1927,15 +1948,18 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
 
-    let entries = match gather_result_entries(&db, &identity_lc, written_off_before_ms(&ctx)).await
-    {
-        Ok(entries) => entries,
-        Err(e) => {
-            console_warn!("[results] {e}");
-            return json_error("database query failed", 503);
-        }
-    };
-    json_response(crate::results::results_body(&identity_lc, &entries), 200)
+    let (entries, truncated) =
+        match gather_result_entries(&db, &identity_lc, written_off_before_ms(&ctx), after).await {
+            Ok(v) => v,
+            Err(e) => {
+                console_warn!("[results] {e}");
+                return json_error("database query failed", 503);
+            }
+        };
+    json_response(
+        crate::results::results_body(&identity_lc, &entries, truncated, after),
+        200,
+    )
 }
 
 /// The whole `/results` derivation for one identity — rows, claims, seat
@@ -1949,7 +1973,8 @@ async fn gather_result_entries(
     db: &worker::D1Database,
     identity_lc: &str,
     written_off_before_ms: Option<i64>,
-) -> std::result::Result<Vec<crate::results::ResultEntry>, String> {
+    after: usize,
+) -> std::result::Result<(Vec<crate::results::ResultEntry>, bool), String> {
     // #375: the SPINE filter — the claims/seat legs below are keyed to this
     // page's games/pots, so they inherit the write-off without a clause.
     let mut binds: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
@@ -1957,14 +1982,21 @@ async fn gather_result_entries(
         binds.push(era_bind(ms));
     }
     let stmt = db
-        .prepare(crate::results::results_sql(written_off_before_ms))
+        .prepare(crate::results::results_sql(written_off_before_ms, after))
         .bind(&binds)
         .map_err(|e| format!("results bind failed: {e}"))?;
-    let rows: Vec<crate::results::ResultsRow> =
+    let mut rows: Vec<crate::results::ResultsRow> =
         match stmt.all().await.and_then(|r| r.results::<ResultsRowD1>()) {
             Ok(rows) => rows.into_iter().map(ResultsRowD1::into_row).collect(),
             Err(e) => return Err(format!("potparty join query failed: {e}")),
         };
+    // Truncation is decided by what the QUERY returned (the #399 gate-S2
+    // lesson: never by downstream consumption): the window probes
+    // RESULTS_MAX_ROWS + 1, so an extra row means MORE pots exist past this
+    // page. The probe row is dropped BEFORE the claims/seat/hand legs so no
+    // leg is keyed to a pot the page does not serve.
+    let truncated = rows.len() > crate::results::RESULTS_MAX_ROWS;
+    rows.truncate(crate::results::RESULTS_MAX_ROWS);
 
     // Claims (won/lost attribution) — BEST-EFFORT: a fault here only leaves
     // winner-verdict games `unresolved`, never a hard failure (the
@@ -2024,14 +2056,17 @@ async fn gather_result_entries(
     // a money path (display-only index).
     let hand_facts = results_hand_markers(db, &game_ids).await;
 
-    Ok(crate::results::assemble_results(
-        identity_lc,
-        rows,
-        &claims,
-        &seat_markers,
-        &params_by_pot,
-        &hop_markers,
-        &hand_facts,
+    Ok((
+        crate::results::assemble_results(
+            identity_lc,
+            rows,
+            &claims,
+            &seat_markers,
+            &params_by_pot,
+            &hop_markers,
+            &hand_facts,
+        ),
+        truncated,
     ))
 }
 
@@ -2355,9 +2390,22 @@ pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         ViewIdentity::Refuse(resp) => return resp,
     };
 
+    // The paging cursor (2026-08-21; the #398 contract): absent/garbage
+    // `after` is 0 — the unchanged first page — clamped at the ceiling.
+    let after = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "after")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        .min(crate::refund_view::REFUND_VIEW_AFTER_MAX);
+
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
-            crate::refund_view::refund_view_body(&identity_lc, None, &[]),
+            crate::refund_view::refund_view_body(&identity_lc, None, &[], false, after),
             200,
         );
     }
@@ -2377,9 +2425,9 @@ pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         binds.push(era_bind(ms));
     }
     let stmt = db
-        .prepare(crate::refund_view::refund_view_sql(era))
+        .prepare(crate::refund_view::refund_view_sql(era, after))
         .bind(&binds)?;
-    let rows: Vec<crate::refund_view::RefundViewRow> = match stmt
+    let mut rows: Vec<crate::refund_view::RefundViewRow> = match stmt
         .all()
         .await
         .and_then(|r| r.results::<RefundViewRowD1>())
@@ -2390,13 +2438,18 @@ pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             return json_error("database query failed", 503);
         }
     };
+    // Truncation is decided by what the QUERY returned (the #399 gate-S2
+    // lesson): the window probes MAX + 1; the probe row is dropped before
+    // assembly.
+    let truncated = rows.len() > crate::refund_view::REFUND_VIEW_MAX_ROWS;
+    rows.truncate(crate::refund_view::REFUND_VIEW_MAX_ROWS);
 
     // The tip AFTER the D1 facts (the gate math needs it; `null` on a fault
     // — gate fields degrade to null/false, statuses stay fail-safe).
     let tip = chaintracks_present_height(&ctx, "refund-view").await.ok();
     let entries = crate::refund_view::assemble_refund_view(rows, tip);
     json_response(
-        crate::refund_view::refund_view_body(&identity_lc, tip, &entries),
+        crate::refund_view::refund_view_body(&identity_lc, tip, &entries, truncated, after),
         200,
     )
 }
@@ -3004,9 +3057,22 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         ViewIdentity::Refuse(resp) => return resp,
     };
 
+    // The paging cursor (2026-08-21; the #398 contract): absent/garbage
+    // `after` is 0 — the unchanged first page — clamped at the ceiling.
+    let after = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "after")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        .min(crate::live_view::LIVE_VIEW_AFTER_MAX);
+
     if !crate::logic::valid_identity(&identity_lc) {
         return json_response(
-            crate::live_view::live_view_body(&identity_lc, None, &[]),
+            crate::live_view::live_view_body(&identity_lc, None, &[], false, after),
             200,
         );
     }
@@ -3027,7 +3093,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         binds.push(era_bind(ms));
     }
     let stmt = match db
-        .prepare(crate::live_view::live_view_sql(era))
+        .prepare(crate::live_view::live_view_sql(era, after))
         .bind(&binds)
     {
         Ok(stmt) => stmt,
@@ -3036,7 +3102,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             return json_error("database query failed", 503);
         }
     };
-    let rows: Vec<crate::live_view::LiveViewRow> =
+    let mut rows: Vec<crate::live_view::LiveViewRow> =
         match stmt.all().await.and_then(|r| r.results::<LiveViewRowD1>()) {
             Ok(rows) => rows.into_iter().map(LiveViewRowD1::into_row).collect(),
             Err(e) => {
@@ -3044,6 +3110,12 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
                 return json_error("database query failed", 503);
             }
         };
+    // Truncation decided by what the QUERY returned (the #399 gate-S2
+    // lesson): the window probes MAX + 1; drop the probe row before any
+    // downstream leg (the case fan-out must not chase a pot this page does
+    // not serve).
+    let truncated = rows.len() > crate::live_view::LIVE_VIEW_MAX_ROWS;
+    rows.truncate(crate::live_view::LIVE_VIEW_MAX_ROWS);
 
     // LOW-6: the tip hop is BOUNDED (same with_timeout idiom as the case
     // fetches — an untimed await here would let a wedged chaintracks stall
@@ -3126,7 +3198,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     crate::live_view::apply_cases(&mut entries, &targets, &fetched);
 
     json_response(
-        crate::live_view::live_view_body(&identity_lc, tip, &entries),
+        crate::live_view::live_view_body(&identity_lc, tip, &entries, truncated, after),
         200,
     )
 }

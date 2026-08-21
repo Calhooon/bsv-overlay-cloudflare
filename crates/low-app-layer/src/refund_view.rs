@@ -171,6 +171,10 @@ use crate::results::{PotVerdict, LOCKTIME_THRESHOLD};
 /// window is per-pot-outpoint).
 pub const REFUND_VIEW_MAX_ROWS: usize = 100;
 
+/// The `/refund-view` cursor's ceiling (the paging round, 2026-08-21) — same
+/// bound + rationale as [`crate::results::RESULTS_VIEW_AFTER_MAX`].
+pub const REFUND_VIEW_AFTER_MAX: usize = 1_000_000;
+
 /// How many of the newest pots ABSENT from `pot_records` are promoted into
 /// the main tier — same reservation + rationale as
 /// [`crate::results::RESULTS_UNKNOWN_POT_QUOTA`] (a fresh pot whose `tm_pot`
@@ -204,7 +208,7 @@ const _: () = assert!(REFUND_VIEW_UNKNOWN_POT_QUOTA < REFUND_VIEW_MAX_ROWS);
 /// pre-dates the cutoff, before the dedupe/quota windows run. ONE extra bind
 /// (the cutoff, after the identity). `None` ⇒ byte-identical to the
 /// pre-#375 query.
-pub fn refund_view_sql(written_off_before_ms: Option<i64>) -> String {
+pub fn refund_view_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     format!(
         "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, \
                 w.recoveryHeight AS recoveryHeight, \
@@ -223,6 +227,18 @@ pub fn refund_view_sql(written_off_before_ms: Option<i64>) -> String {
                 w.spenderFinal AS spenderFinal, \
                 ns.txid IS NOT NULL AS spenderSeen \
          FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                  spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
+                  firstSpentAt, spenderFinal, \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier \
+           FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                    spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
+                    firstSpentAt, spenderFinal, \
+                    markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier, \
+                    DENSE_RANK() OVER (ORDER BY potBestSigRank DESC, tier ASC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                                markerCreatedAt DESC, markerRowid DESC) \
+                        AS finalRank \
+           FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
                   spent, spendingTxid, spentConfirmed, verdict, verdictTxid, spentHeight, \
                   firstSpentAt, spenderFinal, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
@@ -257,11 +273,12 @@ pub fn refund_view_sql(written_off_before_ms: Option<i64>) -> String {
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ?{era}) \
-             WHERE rn = 1) \
+             WHERE rn = 1))) \
+           WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
            ORDER BY potBestSigRank DESC, tier ASC, \
                     COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
-           LIMIT {rows}) w \
+           LIMIT {probe}) w \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND sb.txid = lower(w.spendingTxid) \
          LEFT JOIN network_seen ns ON w.spendingTxid IS NOT NULL \
@@ -270,7 +287,8 @@ pub fn refund_view_sql(written_off_before_ms: Option<i64>) -> String {
                   COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = REFUND_VIEW_UNKNOWN_POT_QUOTA,
-        rows = REFUND_VIEW_MAX_ROWS,
+        probe = REFUND_VIEW_MAX_ROWS + 1,
+        after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
         era = crate::logic::era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
@@ -628,7 +646,13 @@ pub fn assemble_refund_view(rows: Vec<RefundViewRow>, tip: Option<u64>) -> Vec<R
 /// AUDIT-ONLY and gates nothing.
 /// `tip` mirrors `/recovery-view` (`null` on a chaintracks fault — the D1
 /// facts still serve; the gate fields then degrade to `null`/`false`).
-pub fn refund_view_body(identity: &str, tip: Option<u64>, entries: &[RefundEntry]) -> String {
+pub fn refund_view_body(
+    identity: &str,
+    tip: Option<u64>,
+    entries: &[RefundEntry],
+    truncated: bool,
+    after: usize,
+) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -657,7 +681,22 @@ pub fn refund_view_body(identity: &str, tip: Option<u64>, entries: &[RefundEntry
             })
         })
         .collect();
-    json!({ "identity": identity, "tip": tip, "refunds": arr }).to_string()
+    // The paging round (2026-08-21) — the /recovery-view #398 contract:
+    // `truncated` is the honest incompleteness bit, `nextAfter` the cursor
+    // (absent on the last page and at the ceiling). Additive.
+    let next_after = if truncated && after < REFUND_VIEW_AFTER_MAX {
+        Some(after + REFUND_VIEW_MAX_ROWS)
+    } else {
+        None
+    };
+    json!({
+        "identity": identity,
+        "tip": tip,
+        "refunds": arr,
+        "truncated": truncated,
+        "nextAfter": next_after,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -822,7 +861,7 @@ mod tests {
     /// widened rule is inoperative in production (the producer-level check).
     #[test]
     fn refund_view_sql_fetches_the_spender_proof_latch() {
-        let sql = refund_view_sql(None);
+        let sql = refund_view_sql(None, 0);
         assert!(
             sql.contains("sb.proof_verified AS spenderProofVerified"),
             "the proof latch must be SELECTed: {sql}"
@@ -1060,7 +1099,8 @@ mod tests {
         let me = format!("02{}", "a1".repeat(32));
         let entries = assemble_refund_view(vec![r], Some(900_168));
         let v: serde_json::Value =
-            serde_json::from_str(&refund_view_body(&me, Some(900_168), &entries)).unwrap();
+            serde_json::from_str(&refund_view_body(&me, Some(900_168), &entries, false, 0))
+                .unwrap();
         assert_eq!(v["identity"], serde_json::json!(me));
         assert_eq!(v["tip"], serde_json::json!(900_168));
         let e = &v["refunds"][0];
@@ -1079,13 +1119,13 @@ mod tests {
         assert_eq!(e["status"], serde_json::json!("landed"));
         assert_eq!(e["statusSource"], serde_json::json!("chain"));
         // Display-only: the raw refund bytes are NEVER in this body.
-        assert!(!refund_view_body(&me, None, &entries).contains("refundRawHex"));
+        assert!(!refund_view_body(&me, None, &entries, false, 0).contains("refundRawHex"));
     }
 
     #[test]
     fn refund_view_body_empty_and_null_tip() {
         let v: serde_json::Value =
-            serde_json::from_str(&refund_view_body("nope", None, &[])).unwrap();
+            serde_json::from_str(&refund_view_body("nope", None, &[], false, 0)).unwrap();
         assert_eq!(v["identity"], serde_json::json!("nope"));
         assert!(v["tip"].is_null());
         assert_eq!(v["refunds"], serde_json::json!([]));
@@ -1095,9 +1135,13 @@ mod tests {
 
     #[test]
     fn refund_view_sql_shape() {
-        let sql = refund_view_sql(None);
+        let sql = refund_view_sql(None, 0);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
-        assert!(sql.contains(&format!("LIMIT {REFUND_VIEW_MAX_ROWS}")));
+        // The paging round: the window PROBES one past the page (truncation is
+        // decided by what the query returned) and the cursor bounds the page.
+        let probe = REFUND_VIEW_MAX_ROWS + 1;
+        assert!(sql.contains(&format!("LIMIT {probe}")));
+        assert!(sql.contains("finalRank > 0 AND finalRank <= 0 + 101"));
         assert!(sql.contains("PARTITION BY pp.potTxid, pp.potVout"));
         assert!(sql.contains(&format!("potRank <= {REFUND_VIEW_UNKNOWN_POT_QUOTA}")));
         assert!(sql.contains("EXISTS(SELECT 1 FROM potrefund_records"));
@@ -1116,8 +1160,8 @@ mod tests {
     fn refund_view_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
         let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
-        let with = refund_view_sql(cutoff);
-        let without = refund_view_sql(None);
+        let with = refund_view_sql(cutoff, 0);
+        let without = refund_view_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
             with.matches(&format!("WHERE pp.identity = ?{frag})"))

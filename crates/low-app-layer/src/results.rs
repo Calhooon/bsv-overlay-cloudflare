@@ -2110,7 +2110,12 @@ pub fn claims_by_game(
 /// covenant pot committing `recoveryHeight: 1` serves `covRecoveryHeight: 1`,
 /// and it is `potBinding` — not the range — that keeps that pot out of the
 /// caller's money word.
-pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
+pub fn results_body(
+    identity: &str,
+    entries: &[ResultEntry],
+    truncated: bool,
+    after: usize,
+) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -2194,7 +2199,24 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
             })
         })
         .collect();
-    json!({ "identity": identity, "results": arr }).to_string()
+    // The paging round (2026-08-21) — the same contract as `/recovery-view`
+    // (#398): `truncated` is the honest incompleteness bit (this answer is a
+    // PAGE, not the whole record — the pre-cursor shape silently dropped
+    // everything past the 100th pot), and `nextAfter` is the cursor for the
+    // next page, ABSENT on the last page and at the ceiling. Both additive:
+    // a deployed client ignores them and sees exactly the old first page.
+    let next_after = if truncated && after < RESULTS_VIEW_AFTER_MAX {
+        Some(after + RESULTS_MAX_ROWS)
+    } else {
+        None
+    };
+    json!({
+        "identity": identity,
+        "results": arr,
+        "truncated": truncated,
+        "nextAfter": next_after,
+    })
+    .to_string()
 }
 
 /// The `/results` potparty join SQL: the caller's marker rows JOINed to the
@@ -2312,7 +2334,7 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
 /// inherits the write-off without its own clause. ONE extra bind (the
 /// cutoff, after the identity). `None` ⇒ byte-identical to the pre-#375
 /// query.
-pub fn results_sql(written_off_before_ms: Option<i64>) -> String {
+pub fn results_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     // The #284 decoded pot_records columns, threaded verbatim through every
     // window level (pot_records.recoveryHeight is aliased covRecoveryHeight
     // — the potparty marker owns the bare `recoveryHeight` name).
@@ -2362,6 +2384,18 @@ pub fn results_sql(written_off_before_ms: Option<i64>) -> String {
          FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
                   opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
                   spent, spendingTxid, spentConfirmed, {DECODED}, \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier \
+           FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
+                    opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
+                    spent, spendingTxid, spentConfirmed, {DECODED}, \
+                    markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier, \
+                    DENSE_RANK() OVER (ORDER BY potBestSigRank DESC, tier ASC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                                markerCreatedAt DESC, markerRowid DESC) \
+                        AS finalRank \
+           FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
+                  opponentIdentity, seatSettlePubkey, seatSigHex, sigHex, \
+                  spent, spendingTxid, spentConfirmed, {DECODED}, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
                   CASE WHEN unknownPot = 0 OR potRank <= {quota} THEN 0 ELSE 1 END AS tier \
            FROM (SELECT identity, gameId, potTxid, potVout, recoveryHeight, \
@@ -2402,11 +2436,12 @@ pub fn results_sql(written_off_before_ms: Option<i64>) -> String {
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ?{era}) \
-             WHERE rn = 1) \
+             WHERE rn = 1))) \
+           WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
            ORDER BY potBestSigRank DESC, tier ASC, \
                     COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
-           LIMIT {rows}) w \
+           LIMIT {probe}) w \
          LEFT JOIN pot_beefs fb ON w.pubA IS NULL AND fb.txid = lower(w.potTxid) \
          LEFT JOIN pot_beefs sb ON w.spendingTxid IS NOT NULL \
               AND (w.verdict IS NULL OR w.verdictTxid IS NULL \
@@ -2418,7 +2453,8 @@ pub fn results_sql(written_off_before_ms: Option<i64>) -> String {
                   COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = RESULTS_UNKNOWN_POT_QUOTA,
-        rows = RESULTS_MAX_ROWS,
+        probe = RESULTS_MAX_ROWS + 1,
+        after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
         era = crate::logic::era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
@@ -2451,6 +2487,13 @@ pub fn decoded_pots_sql(n: usize) -> String {
 /// this is a cap on DISTINCT POTS — and, one row per pot, still the same
 /// ≤100-row BLOB-weight bound it always was.
 pub const RESULTS_MAX_ROWS: usize = 100;
+
+/// The `/results` cursor's ceiling (the board's paging round, 2026-08-21) —
+/// same bound + rationale as [`crate::logic::RECOVERY_VIEW_AFTER_MAX`]: the
+/// route clamps the parsed `after` here and [`results_body`] stops emitting
+/// `nextAfter` at the ceiling, because a walker whose next step re-clamps to
+/// the same page loops forever rather than walking.
+pub const RESULTS_VIEW_AFTER_MAX: usize = 1_000_000;
 
 /// How many of the newest pots ABSENT from `pot_records` are promoted into
 /// the main `/results` tier instead of being demoted behind every indexed
@@ -4354,7 +4397,8 @@ mod tests {
         );
 
         // …and it survives the real serializer, in both states.
-        let body: serde_json::Value = serde_json::from_str(&results_body(&me, &entries)).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &entries, false, 0)).unwrap();
         assert_eq!(
             body["results"][0]["committedKeys"]["payPkhA"],
             json!("aa".repeat(20))
@@ -4753,7 +4797,8 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: Some(k.clone()),
         };
-        let results: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let results: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
         let from_results = results["results"][0]["committedKeys"].clone();
 
         let recovery: serde_json::Value = serde_json::from_str(&crate::logic::recovery_view_body(
@@ -4860,7 +4905,8 @@ mod tests {
                 .count(),
             1
         );
-        let pretty: serde_json::Value = serde_json::from_str(&results_body(&me, &entries)).unwrap();
+        let pretty: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &entries, false, 0)).unwrap();
         let mut got = serde_json::to_string_pretty(&pretty).unwrap();
         got.push('\n');
         let fixture = include_str!("fixtures/results_committed_keys.fixture.json");
@@ -4896,7 +4942,8 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
         };
-        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
         assert_eq!(v["identity"], me);
         let r = &v["results"][0];
         assert_eq!(r["gameId"], tx(0x01));
@@ -4943,7 +4990,8 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
         };
-        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
         let r = &v["results"][0];
         assert_eq!(r["recoveryHeight"], 1, "the hint serves unchanged");
         assert!(
@@ -5029,7 +5077,8 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
         };
-        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
         let obj = v["results"][0].as_object().unwrap();
         // `hand` is pre-change too but is asserted by its own cell above; it
         // is listed here only so the key-set equality is exhaustive.
@@ -5060,9 +5109,13 @@ mod tests {
         assert_eq!(obj["outcome"], json!("won"));
         assert_eq!(obj["outcomeSource"], json!("chain+seatkey"));
         assert_eq!(obj["at"], json!({ "height": 958_900 }));
-        // The top-level envelope is unchanged too.
-        assert_eq!(v.as_object().unwrap().len(), 2);
+        // The top-level envelope grew by exactly the two paging keys
+        // (2026-08-21): `truncated` + `nextAfter` — additive, ignored by
+        // deployed clients.
+        assert_eq!(v.as_object().unwrap().len(), 4);
         assert_eq!(v["identity"], me);
+        assert_eq!(v["truncated"], json!(false));
+        assert_eq!(v["nextAfter"], serde_json::Value::Null);
     }
 
     /// A winner ResultEntry carrying a showdown hand serializes the full
@@ -5095,7 +5148,8 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
         };
-        let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
         let h = &v["results"][0]["hand"];
         assert_eq!(h["winnerIdentity"], me);
         assert_eq!(h["winnerCardsHex"], "000102030c");
@@ -5739,9 +5793,16 @@ mod tests {
     fn results_and_claims_sql_are_bounded() {
         // The results query is single-bind and bounded (the over-50-outpoint
         // 503 lesson: bound every D1 statement).
-        let sql = results_sql(None);
+        let sql = results_sql(None, 0);
         assert_eq!(sql.matches('?').count(), 1);
-        assert!(sql.contains(&format!("LIMIT {RESULTS_MAX_ROWS}")));
+        // The paging round: the window PROBES one past the page so truncation
+        // is decided by what the query returned (never a second COUNT), and
+        // the cursor bounds the page — the pre-cursor flat `LIMIT 100`
+        // silently dropped everything past the 100th pot.
+        let probe = RESULTS_MAX_ROWS + 1;
+        assert!(sql.contains(&format!("LIMIT {probe}")));
+        assert!(sql.contains("finalRank > 0 AND finalRank <= 0 + 101"));
+        assert!(results_sql(None, 200).contains("finalRank > 200 AND finalRank <= 200 + 101"));
         // #281 F7: the BEEF joins run on the OUTER select, against the ≤100
         // survivors — never inside the window, where every dust replay naming
         // the victim's real pot would have dragged the real BLOBs along.
@@ -5777,11 +5838,12 @@ mod tests {
              filter once LIMIT binds (F3)"
         );
         // An explicit ORDER BY at EVERY level (the gate flagged unordered
-        // windows): the per-pot window, the pot ranking, the page, and the
-        // post-join projection.
+        // windows): the per-pot window, the pot ranking, the cursor rank
+        // (DENSE_RANK — the paging round), the page, and the post-join
+        // projection.
         assert_eq!(
             sql.matches("ORDER BY").count(),
-            4,
+            5,
             "deterministic at every level"
         );
         // The seat proof does NOT ride on this query any more (F1) — it has
@@ -5811,8 +5873,8 @@ mod tests {
     fn results_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
         let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
-        let with = results_sql(cutoff);
-        let without = results_sql(None);
+        let with = results_sql(cutoff, 0);
+        let without = results_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
             with.matches(&format!("WHERE pp.identity = ?{frag})"))

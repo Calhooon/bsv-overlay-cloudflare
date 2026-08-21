@@ -1,5 +1,6 @@
 {
   "identity": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "nextAfter": null,
   "results": [
     {
       "at": {
@@ -58,5 +59,6 @@
       "spentConfirmed": null,
       "verdict": null
     }
-  ]
+  ],
+  "truncated": false
 }

@@ -272,6 +272,10 @@ use crate::results::{SeatMarkerBind, SeatMarkerRow};
 /// since the window is per-pot-outpoint).
 pub const LIVE_VIEW_MAX_ROWS: usize = 100;
 
+/// The `/live-view` cursor's ceiling (the paging round, 2026-08-21) — same
+/// bound + rationale as [`crate::results::RESULTS_VIEW_AFTER_MAX`].
+pub const LIVE_VIEW_AFTER_MAX: usize = 1_000_000;
+
 /// How many of the newest pots ABSENT from `pot_records` are PROMOTED into
 /// the main tier — same reservation + rationale as
 /// [`crate::refund_view::REFUND_VIEW_UNKNOWN_POT_QUOTA`] (a fresh pot whose
@@ -386,7 +390,7 @@ pub const CASE_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// never a LIVE hand, however its liveness columns read. ONE extra bind
 /// (the cutoff, after the identity). `None` ⇒ byte-identical to the
 /// pre-#375 query.
-pub fn live_view_sql(written_off_before_ms: Option<i64>) -> String {
+pub fn live_view_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     format!(
         "SELECT w.identity AS identity, w.gameId AS gameId, \
                 w.potTxid AS potTxid, w.potVout AS potVout, \
@@ -399,6 +403,18 @@ pub fn live_view_sql(written_off_before_ms: Option<i64>) -> String {
                 w.spent AS spent, w.spendingTxid AS spendingTxid, \
                 w.spentConfirmed AS spentConfirmed \
          FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
+                  covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+                  covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
+                  markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier \
+           FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
+                    covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
+                    covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
+                    markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier, \
+                    DENSE_RANK() OVER (ORDER BY potBestSigRank DESC, tier ASC, \
+                                                COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                                markerCreatedAt DESC, markerRowid DESC) \
+                        AS finalRank \
+           FROM (SELECT identity, gameId, potTxid, potVout, opponentIdentity, recoveryHeight, \
                   covRecoveryHeight, sigHex, seatSettlePubkey, seatSigHex, \
                   covPubA, covPubB, spent, spendingTxid, spentConfirmed, \
                   markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
@@ -434,16 +450,18 @@ pub fn live_view_sql(written_off_before_ms: Option<i64>) -> String {
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
                WHERE pp.identity = ? \
                  AND (COALESCE(r.spent, 0) = 0 OR COALESCE(r.spentConfirmed, 0) = 0){era}) \
-             WHERE rn = 1) \
+             WHERE rn = 1))) \
+           WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
            ORDER BY potBestSigRank DESC, tier ASC, \
                     COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                     markerCreatedAt DESC, markerRowid DESC \
-           LIMIT {rows}) w \
+           LIMIT {probe}) w \
          ORDER BY w.potBestSigRank DESC, w.tier ASC, \
                   COALESCE(w.potCreatedAt, w.markerCreatedAt) DESC, \
                   w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = LIVE_VIEW_UNKNOWN_POT_QUOTA,
-        rows = LIVE_VIEW_MAX_ROWS,
+        probe = LIVE_VIEW_MAX_ROWS + 1,
+        after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
         era = crate::logic::era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
@@ -1397,7 +1415,13 @@ pub fn assemble_live_view(
 /// ALWAYS one of the four [`CaseProvenance`] strings. `tip` mirrors
 /// `/refund-view` (`null` on a chaintracks fault — the D1 facts still
 /// serve; the gate fields then degrade to `null`/`false`).
-pub fn live_view_body(identity: &str, tip: Option<u64>, entries: &[LiveEntry]) -> String {
+pub fn live_view_body(
+    identity: &str,
+    tip: Option<u64>,
+    entries: &[LiveEntry],
+    truncated: bool,
+    after: usize,
+) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -1428,7 +1452,21 @@ pub fn live_view_body(identity: &str, tip: Option<u64>, entries: &[LiveEntry]) -
             })
         })
         .collect();
-    json!({ "identity": identity, "tip": tip, "live": arr }).to_string()
+    // The paging round (2026-08-21) — the /recovery-view #398 contract:
+    // `truncated` + `nextAfter` (absent on the last page / at the ceiling).
+    let next_after = if truncated && after < LIVE_VIEW_AFTER_MAX {
+        Some(after + LIVE_VIEW_MAX_ROWS)
+    } else {
+        None
+    };
+    json!({
+        "identity": identity,
+        "tip": tip,
+        "live": arr,
+        "truncated": truncated,
+        "nextAfter": next_after,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -2076,8 +2114,14 @@ mod tests {
         assert_eq!(e.blocks_to_gate, Some(45));
         assert_eq!(e.spent, Some(false));
         assert!(e.case.is_none(), "case:null still means UNKNOWN");
-        let v: serde_json::Value =
-            serde_json::from_str(&live_view_body(&h66(0xa1), Some(900_078), &entries)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&live_view_body(
+            &h66(0xa1),
+            Some(900_078),
+            &entries,
+            false,
+            0,
+        ))
+        .unwrap();
         assert_eq!(
             v["live"][0]["markerSource"],
             serde_json::json!("corroboration-unavailable")
@@ -2699,7 +2743,7 @@ mod tests {
         let mut entries = assemble_live_view(vec![row], &corr_of(vec![claim]), Some(900_078));
         apply_cases(&mut entries, &[], &std::collections::HashMap::new());
         let v: serde_json::Value =
-            serde_json::from_str(&live_view_body(&me, Some(900_078), &entries)).unwrap();
+            serde_json::from_str(&live_view_body(&me, Some(900_078), &entries, false, 0)).unwrap();
         assert_eq!(v["identity"], serde_json::json!(me));
         assert_eq!(v["tip"], serde_json::json!(900_078));
         let e = &v["live"][0];
@@ -2732,7 +2776,7 @@ mod tests {
         let fetched = [(h64(0x11), cv)].into();
         apply_cases(&mut entries, &targets, &fetched);
         let v: serde_json::Value =
-            serde_json::from_str(&live_view_body(&me, Some(900_078), &entries)).unwrap();
+            serde_json::from_str(&live_view_body(&me, Some(900_078), &entries, false, 0)).unwrap();
         let c = &v["live"][0]["case"];
         assert_eq!(c["status"], serde_json::json!("pending"));
         assert_eq!(c["epoch"], serde_json::json!(1));
@@ -2751,7 +2795,7 @@ mod tests {
         let mut entries = assemble_live_view(vec![base_row()], &corr_of(vec![None]), None);
         apply_cases(&mut entries, &[], &std::collections::HashMap::new());
         let v: serde_json::Value =
-            serde_json::from_str(&live_view_body(&me, None, &entries)).unwrap();
+            serde_json::from_str(&live_view_body(&me, None, &entries, false, 0)).unwrap();
         assert_eq!(
             v["live"][0]["caseSource"],
             serde_json::json!("marker-unverified")
@@ -2769,7 +2813,7 @@ mod tests {
     #[test]
     fn live_view_body_empty_and_null_tip() {
         let v: serde_json::Value =
-            serde_json::from_str(&live_view_body("nope", None, &[])).unwrap();
+            serde_json::from_str(&live_view_body("nope", None, &[], false, 0)).unwrap();
         assert_eq!(v["identity"], serde_json::json!("nope"));
         assert!(v["tip"].is_null());
         assert_eq!(v["live"], serde_json::json!([]));
@@ -2779,9 +2823,13 @@ mod tests {
 
     #[test]
     fn live_view_sql_shape() {
-        let sql = live_view_sql(None);
+        let sql = live_view_sql(None, 0);
         assert_eq!(sql.matches('?').count(), 1, "one identity bind");
-        assert!(sql.contains(&format!("LIMIT {LIVE_VIEW_MAX_ROWS}")));
+        // The paging round: the window PROBES one past the page (truncation is
+        // decided by what the query returned) and the cursor bounds the page.
+        let probe = LIVE_VIEW_MAX_ROWS + 1;
+        assert!(sql.contains(&format!("LIMIT {probe}")));
+        assert!(sql.contains("finalRank > 0 AND finalRank <= 0 + 101"));
         assert!(sql.contains("PARTITION BY pp.potTxid, pp.potVout"));
         assert!(sql.contains(&format!("potRank <= {LIVE_VIEW_UNKNOWN_POT_QUOTA}")));
         // The NULL-safe liveness predicate — COALESCE on BOTH columns, so a
@@ -2814,8 +2862,8 @@ mod tests {
     fn live_view_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
         let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
-        let with = live_view_sql(cutoff);
-        let without = live_view_sql(None);
+        let with = live_view_sql(cutoff, 0);
+        let without = live_view_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
             with.matches(&format!(

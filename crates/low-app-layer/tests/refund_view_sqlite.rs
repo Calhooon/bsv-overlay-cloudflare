@@ -259,7 +259,7 @@ fn file_refund_backup(conn: &Connection, identity: &str, pot_txid: &str, marker_
 /// Execute the SHIPPED `refund_view_sql()` and map rows exactly as the route
 /// does (same columns, same Option-ness).
 fn query_rows(conn: &Connection, identity: &str) -> Vec<RefundViewRow> {
-    let sql = refund_view_sql(None);
+    let sql = refund_view_sql(None, 0);
     let mut stmt = conn.prepare(&sql).expect("prepare refund_view_sql");
     stmt.query_map(params![identity], |r| {
         Ok(RefundViewRow {
@@ -581,7 +581,7 @@ fn both_seats_backups_never_multiply_rows_and_bytes_never_leak() {
 
     // Display-only contract: the stored refund bytes NEVER reach the wire.
     let entries = assemble_refund_view(rows, Some(900_078));
-    let body = refund_view_body(&me, Some(900_078), &entries);
+    let body = refund_view_body(&me, Some(900_078), &entries, false, 0);
     assert!(
         !body.contains("0100de"),
         "refundRawHex bytes leaked into the body"
@@ -604,6 +604,8 @@ fn unknown_identity_is_a_well_formed_empty_answer() {
         &stranger,
         None,
         &assemble_refund_view(rows, None),
+        false,
+        0,
     ))
     .unwrap();
     assert_eq!(v["refunds"], serde_json::json!([]));
@@ -682,7 +684,16 @@ fn unknown_pot_quota_bounds_ghost_promotion_and_the_real_pot_survives() {
         );
     }
 
-    let rows = query_rows(&conn, &me);
+    // Paging: the raw window PROBES one past the page; the route truncates
+    // to the cap (the extra row = `truncated`). Emulated here to keep
+    // pinning the SERVED page.
+    let mut rows = query_rows(&conn, &me);
+    assert_eq!(
+        rows.len(),
+        REFUND_VIEW_MAX_ROWS + 1,
+        "the probe row is present"
+    );
+    rows.truncate(REFUND_VIEW_MAX_ROWS);
     assert_eq!(rows.len(), REFUND_VIEW_MAX_ROWS, "page full");
     let pots: Vec<&String> = rows.iter().map(|r| &r.pot_txid).collect();
     assert_eq!(
@@ -807,7 +818,16 @@ fn row_cap_bounds_the_page_and_a_full_book_survives() {
             1_000 + i as i64,
         );
     }
-    let rows = query_rows(&conn, &me);
+    // Paging: the raw window PROBES one past the page; the route truncates
+    // to the cap (the extra row = `truncated`). Emulated here to keep
+    // pinning the SERVED page.
+    let mut rows = query_rows(&conn, &me);
+    assert_eq!(
+        rows.len(),
+        REFUND_VIEW_MAX_ROWS + 1,
+        "the probe row is present"
+    );
+    rows.truncate(REFUND_VIEW_MAX_ROWS);
     assert_eq!(rows.len(), REFUND_VIEW_MAX_ROWS, "hard cap");
     let unique: std::collections::HashSet<&String> = rows.iter().map(|r| &r.pot_txid).collect();
     assert_eq!(unique.len(), REFUND_VIEW_MAX_ROWS, "one row per pot");
@@ -941,7 +961,7 @@ fn the_served_hand_end_stamp_survives_the_whole_spend_lifecycle() {
         "the #228 age anchor moved ({moved}) while the durable one held"
     );
     assert!(
-        !refund_view_sql(None).contains("spentAt AS"),
+        !refund_view_sql(None, 0).contains("spentAt AS"),
         "`spentAt` is a MOVING age gate and must never be projected as an \
          audit stamp — `firstSpentAt` is the served one"
     );
@@ -1003,7 +1023,8 @@ fn the_timeline_wire_block_is_the_documented_shape() {
 
     let entries = assemble_refund_view(query_rows(&conn, &me), Some(900_200));
     let v: serde_json::Value =
-        serde_json::from_str(&refund_view_body(&me, Some(900_200), &entries)).expect("json");
+        serde_json::from_str(&refund_view_body(&me, Some(900_200), &entries, false, 0))
+            .expect("json");
     let row = &v["refunds"][0];
     let t = &row["timeline"];
 
@@ -1040,7 +1061,8 @@ fn the_timeline_wire_block_is_the_documented_shape() {
     file_party(&conn, &me, &ghost, GATE, "txGHOST", 2_222);
     let entries = assemble_refund_view(query_rows(&conn, &me), Some(900_200));
     let v: serde_json::Value =
-        serde_json::from_str(&refund_view_body(&me, Some(900_200), &entries)).expect("json");
+        serde_json::from_str(&refund_view_body(&me, Some(900_200), &entries, false, 0))
+            .expect("json");
     let g = v["refunds"]
         .as_array()
         .expect("rows")
@@ -1060,7 +1082,7 @@ fn the_timeline_wire_block_is_the_documented_shape() {
 
 /// The pot-txid page served by the SHIPPED SQL under an era cutoff.
 fn refund_pot_txids(conn: &Connection, identity: &str, era: Option<i64>) -> Vec<String> {
-    let sql = refund_view_sql(era);
+    let sql = refund_view_sql(era, 0);
     let mut stmt = conn
         .prepare(&sql)
         .unwrap_or_else(|e| panic!("refund_view_sql({era:?}) did not PREPARE: {e}\n{sql}"));
@@ -1120,4 +1142,54 @@ fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
     for pot in [&pre, &post, &unknown_pre, &unknown_post] {
         assert!(all.contains(pot), "{pot} missing from the None arm");
     }
+}
+
+/// The paging round (2026-08-21; the /recovery-view #398 model): the cursor
+/// walk reaches EVERY pot — 150 pots at the 100-pot cap = two pages, all
+/// distinct, terminating. The pre-cursor flat LIMIT silently dropped pots
+/// 101..150 with no probe, no flag, no cursor.
+#[test]
+fn the_cursor_walk_reaches_every_pot_and_terminates() {
+    let conn = production_schema_db();
+    let me = h66(0xa1);
+    for i in 0..150u32 {
+        let pot = format!("{:064x}", 0x0000_3000_u64 + u64::from(i));
+        file_party(
+            &conn,
+            &me,
+            &pot,
+            GATE,
+            &format!("txWLK{i:03}"),
+            1_000 + i64::from(i),
+        );
+    }
+    let pots_at = |after: usize| -> Vec<String> {
+        let sql = refund_view_sql(None, after);
+        let mut stmt = conn.prepare(&sql).expect("prepare");
+        stmt.query_map(params![me], |r| r.get::<_, String>("potTxid"))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect()
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut after = 0usize;
+    let mut pages = 0;
+    loop {
+        let rows = pots_at(after);
+        pages += 1;
+        let truncated = rows.len() > REFUND_VIEW_MAX_ROWS;
+        seen.extend(rows.into_iter().take(REFUND_VIEW_MAX_ROWS));
+        if !truncated || pages > 10 {
+            break;
+        }
+        after += REFUND_VIEW_MAX_ROWS;
+    }
+    assert_eq!(pages, 2, "150 pots at cap 100 = exactly two pages");
+    assert_eq!(
+        seen.len(),
+        150,
+        "every pot reached — nothing silently dropped"
+    );
+    let unique: std::collections::HashSet<&String> = seen.iter().collect();
+    assert_eq!(unique.len(), 150, "no pot served twice across pages");
 }
