@@ -1593,6 +1593,19 @@ pub struct LeaderboardEvidence {
     /// `ls_potparty byPot` serves the v2 marker, `/beef` the committed lock,
     /// and `serverVerdict` names the winning template.
     pub chain_attributed_winner: Option<String>,
+    /// The ADMISSION-LATCHED claim tier for this row (brain-cutover M2b):
+    /// `Some(2)` countersigned, `Some(1)` winner-sig-valid, `Some(0)`
+    /// invalid, `None` = a row the relatch sweep has not reached (the client
+    /// computes that one itself, exactly as it computed every row before).
+    ///
+    /// This is the same verdict `verified_claim` serves `/results` from, and
+    /// the same recipe the client's `verifyBoardEvidence` runs — carried onto
+    /// the wire so the Leaderboard stops re-running an ECDSA per counted row
+    /// per render (#401: 721 ms of blocked main thread on a lived-in
+    /// identity). The signature fields stay on the row, so a client that
+    /// wants to falsify the server still can (the "verify on chain" escape
+    /// hatch is unchanged) — it simply no longer does it by default.
+    pub claim_tier: Option<i64>,
     /// When the overlay first admitted this result marker (unix seconds), from
     /// `result_markers_v2.createdAt`. `None` when the index never recorded one.
     ///
@@ -2080,6 +2093,7 @@ pub fn aggregate_leaderboard_attributed(
                         proof_txids,
                         server_verdict: verdict,
                         chain_attributed_winner: counted.get(&pot).map(|(o, _)| o.clone()),
+                        claim_tier: m.claim_valid,
                         created_at: m.created_at,
                     }
                 })
@@ -2207,6 +2221,14 @@ pub fn leaderboard_body(
                         // verdict (null when unattributed) — the falsifiable
                         // fact behind the row's `chainProven` tier.
                         "chainAttributedWinner": e.chain_attributed_winner,
+                        // Brain-cutover M2b (ADDITIVE): the admission-latched
+                        // claim tier — 2 countersigned, 1 winner-sig-valid,
+                        // 0 invalid, null = not yet swept (the client
+                        // computes that row itself). Lets the client skip the
+                        // per-row ECDSA it used to run on every render; the
+                        // signature fields remain so falsification stays
+                        // possible. An older client ignores the key.
+                        "claimTier": e.claim_tier,
                         // The marker's overlay admission stamp (unix seconds,
                         // null when unrecorded) — DISPLAY ONLY. Nothing counts,
                         // ranks or verifies on it, so a garbled value costs a
