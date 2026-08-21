@@ -924,7 +924,9 @@ impl ArcBroadcaster for WorkerArcBroadcaster {
             ArcOutcome::Rejected(reason) => Err(format!("ARC broadcast rejected: {reason}")),
             // #397: `arc_verdict` never produces a pending outcome (that arm
             // is minted only by the gated ladder's corroborated_unseen).
-            ArcOutcome::AcceptedPending(_) => Err("ARC verdict pended — impossible by construction".to_string()),
+            ArcOutcome::AcceptedPending(_) => {
+                Err("ARC verdict pended — impossible by construction".to_string())
+            }
         }
     }
 }
@@ -3437,7 +3439,10 @@ mod tests {
         assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
         assert_eq!(
             *rungs.borrow(),
-            vec![SubmitRung::SubjectOnly { graced: true }, SubmitRung::FullBatch],
+            vec![
+                SubmitRung::SubjectOnly { graced: true },
+                SubmitRung::FullBatch
+            ],
             "orphan must skip the subject-only resubmit (attempt 2)"
         );
         assert_eq!(
@@ -3507,8 +3512,12 @@ mod tests {
         );
         // Corroborator REJECT while Arcade sync-accepted → provider CONFLICT:
         // retryable Err, NEVER a 422-bound Rejected and NEVER an admit.
-        let err = corroborated_unseen(Ok(ArcOutcome::Rejected("unlock invalid".into())), 1, subject)
-            .expect_err("conflicting providers must not admit or mint a 422");
+        let err = corroborated_unseen(
+            Ok(ArcOutcome::Rejected("unlock invalid".into())),
+            1,
+            subject,
+        )
+        .expect_err("conflicting providers must not admit or mint a 422");
         assert!(err.contains("CONFLICT"), "{err}");
         // Inconclusive + UNPROVEN ancestry → the #267 two-witness bar refuses
         // (a 0-conf-ancestry subject never enters the index unwitnessed).
@@ -3554,7 +3563,10 @@ mod tests {
         )
         .await;
         assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
-        assert_eq!(*rungs.borrow(), vec![SubmitRung::SubjectOnly { graced: true }]);
+        assert_eq!(
+            *rungs.borrow(),
+            vec![SubmitRung::SubjectOnly { graced: true }]
+        );
         assert_eq!(*kinds.borrow(), vec![CorroborationKind::SubjectOnly]);
     }
 

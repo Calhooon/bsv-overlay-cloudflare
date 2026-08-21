@@ -298,11 +298,7 @@ mod tests {
     #[tokio::test]
     async fn absent_game_contributes_no_rows() {
         let (svc, _) = make_service_with_storage();
-        let rows = answer_rows(
-            svc.lookup(&question(vec!["44".repeat(32)]))
-                .await
-                .unwrap(),
-        );
+        let rows = answer_rows(svc.lookup(&question(vec!["44".repeat(32)])).await.unwrap());
         assert!(rows.is_empty(), "silence is the fail-safe, never a guess");
     }
 
@@ -387,7 +383,11 @@ mod tests {
             .unwrap();
         let gid = hex::encode(golden_game_id());
         let rows = answer_rows(svc.lookup(&question(vec![gid.clone(), gid])).await.unwrap());
-        assert_eq!(rows.len(), 1, "a repeated gameId must not duplicate its rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a repeated gameId must not duplicate its rows"
+        );
     }
 
     #[tokio::test]

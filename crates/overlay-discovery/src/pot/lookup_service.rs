@@ -477,17 +477,32 @@ impl LookupService for PotLookupService {
             // Fail-safe: an outpoint we never admitted is `known:false` with
             // null spent/spendingTxid/spentConfirmed — never assert
             // "unspent" for an output we never saw.
-            let (known, spent, spending_txid, spent_confirmed) = match record {
+            let (known, spent, spending_txid, spent_confirmed, settle_signers) = match record {
                 Some(r) => (
                     true,
                     serde_json::Value::Bool(r.spent),
                     r.spending_txid
+                        .clone()
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
                     serde_json::Value::Bool(r.spent_confirmed),
+                    // bsv-low #406: the signer classification, served ONLY
+                    // while it shares the CURRENT pointer's lineage (the
+                    // verdict-group guard `verdictTxid == spendingTxid`) —
+                    // a stale group is a fact about a displaced spender.
+                    // 'unresolved' is a storage sentinel, not an answer.
+                    match (&r.verdict_txid, &r.spending_txid, &r.settle_signers) {
+                        (Some(vt), Some(st), Some(sig))
+                            if vt.eq_ignore_ascii_case(st) && sig != "unresolved" =>
+                        {
+                            serde_json::Value::String(sig.clone())
+                        }
+                        _ => serde_json::Value::Null,
+                    },
                 ),
                 None => (
                     false,
+                    serde_json::Value::Null,
                     serde_json::Value::Null,
                     serde_json::Value::Null,
                     serde_json::Value::Null,
@@ -501,6 +516,9 @@ impl LookupService for PotLookupService {
                 "spent": spent,
                 "spendingTxid": spending_txid,
                 "spentConfirmed": spent_confirmed,
+                // #406 (ADDITIVE): who signed the recorded spend — 'coop' /
+                // 'tower-a' / 'tower-b', null = not established.
+                "settleSigners": settle_signers,
             }));
         }
 
@@ -739,6 +757,101 @@ mod tests {
         assert_eq!(e["spendingTxid"], settle.id());
         // No tracker configured → the spend is an UNCONFIRMED hint.
         assert_eq!(e["spentConfirmed"], false);
+    }
+
+    /// bsv-low #406: the spentStatus answer serves the signer classification
+    /// under the verdict-group guard — current-pointer lineage only, and the
+    /// 'unresolved' storage sentinel never reaches the wire.
+    #[tokio::test]
+    async fn spent_status_serves_settle_signers_under_the_verdict_guard() {
+        use crate::pot::storage::VerdictWrite;
+        let (svc, storage) = make_service_with_storage();
+        let funding = funding_tx(1);
+        let pot_txid = funding.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        let settle = settle_tx(&pot_txid, 0);
+        svc.output_spent(&spent(&pot_txid, 0, beef_of(&settle)))
+            .await
+            .unwrap();
+        // The synthetic settle carries no signatures → the live latch stored
+        // nothing → null on the wire.
+        let arr = spent_status(&svc, serde_json::json!([{"txid": pot_txid, "vout": 0}])).await;
+        assert!(
+            arr[0]["settleSigners"].is_null(),
+            "no classification = null"
+        );
+
+        // The backfill attaches the group for the CURRENT pointer → served.
+        storage
+            .mark_verdict_for_spender(
+                &pot_txid,
+                0,
+                &settle.id(),
+                VerdictWrite {
+                    verdict: "winner-b",
+                    settle_signers: Some("tower-b"),
+                },
+            )
+            .await
+            .unwrap();
+        let arr = spent_status(&svc, serde_json::json!([{"txid": pot_txid, "vout": 0}])).await;
+        assert_eq!(arr[0]["settleSigners"], "tower-b");
+
+        // 'unresolved' is a storage sentinel, never an answer.
+        storage
+            .mark_verdict_for_spender(
+                &pot_txid,
+                0,
+                &settle.id(),
+                VerdictWrite {
+                    verdict: "winner-b",
+                    settle_signers: Some("unresolved"),
+                },
+            )
+            .await
+            .unwrap();
+        let arr = spent_status(&svc, serde_json::json!([{"txid": pot_txid, "vout": 0}])).await;
+        assert!(
+            arr[0]["settleSigners"].is_null(),
+            "'unresolved' never narrates"
+        );
+
+        // A DISPLACED pointer strands the group → the guard nulls it.
+        storage
+            .mark_verdict_for_spender(
+                &pot_txid,
+                0,
+                &settle.id(),
+                VerdictWrite {
+                    verdict: "winner-b",
+                    settle_signers: Some("coop"),
+                },
+            )
+            .await
+            .unwrap();
+        let displacing = settle_tx(&pot_txid, 0);
+        // A different spender claims the outpoint (unconfirmed overwrite) —
+        // same tx shape, but mark_spent with a foreign txid moves the pointer.
+        storage
+            .mark_spent(
+                &pot_txid,
+                0,
+                "ff".repeat(32).as_str(),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = displacing;
+        let arr = spent_status(&svc, serde_json::json!([{"txid": pot_txid, "vout": 0}])).await;
+        assert!(
+            arr[0]["settleSigners"].is_null(),
+            "a stale verdict group is a fact about a displaced spender — never served"
+        );
     }
 
     #[tokio::test]

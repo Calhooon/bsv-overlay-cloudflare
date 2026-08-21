@@ -306,7 +306,6 @@ pub trait AncestorFetcher {
     ) -> Result<Option<String>, String> {
         Ok(None)
     }
-
 }
 
 /// An ancestor transaction fetched from chain: its raw tx hex plus an optional

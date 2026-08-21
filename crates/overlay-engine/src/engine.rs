@@ -1098,8 +1098,8 @@ impl Engine {
             // survive, and so does any ancestry that arrived inside the submitted
             // bytes but was never admitted as an output of its own (a foreign
             // parent), which the `outputs_consumed` walk below cannot see.
-            let mut acc =
-                Beef::from_binary(beef_data).map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+            let mut acc = Beef::from_binary(beef_data)
+                .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
 
             // For each consumed output, recursively hydrate and embed as source transaction
             for consumed in &output.outputs_consumed {

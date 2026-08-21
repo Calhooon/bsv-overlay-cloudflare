@@ -1865,9 +1865,10 @@ fn pot_err(e: String) -> PotStorageError {
 ///
 /// # #284 verdict atomicity (`with_verdict`)
 ///
-/// `with_verdict = true` adds `verdict = ?, verdictTxid = ?` to the SAME
-/// statement — verdictTxid is bound to the spending txid, so the verdict can
-/// never point at a different spender than the pointer it rode in with, and
+/// `with_verdict = true` adds `verdict = ?, verdictTxid = ?, settleSigners = ?`
+/// to the SAME statement — verdictTxid is bound to the spending txid, so the
+/// verdict group can never point at a different spender than the pointer it
+/// rode in with, and
 /// the unconfirmed guard covers it identically (an unconfirmed writer can
 /// never displace a confirmed pointer's verdict). `with_verdict = false`
 /// leaves BOTH columns entirely out of the SET (explicitly UNCHANGED — a
@@ -1991,8 +1992,8 @@ pub fn pot_spent_statuses_sql(n: usize) -> String {
 /// `spentAt` age anchor, and never attach a verdict to a spender it was not
 /// computed from (verdictTxid is bound to the same guarded pointer).
 ///
-/// Bind order: `verdict, spendingTxid (verdictTxid), txid, outputIndex,
-/// spendingTxid (guard)`.
+/// Bind order: `verdict, spendingTxid (verdictTxid), settleSigners, txid,
+/// outputIndex, spendingTxid (guard)`.
 pub fn verdict_cas_sql() -> &'static str {
     "UPDATE pot_records SET verdict = ?, verdictTxid = ?, settleSigners = ? \
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"

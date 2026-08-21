@@ -36,6 +36,20 @@
 //! against a lock key over the network's own digest is a signature that key
 //! produced — re-encoding it proves nothing about who signed.)
 //!
+//! ── STATED RESIDUALS (gate 2026-08-21; both SSOT-identical, so changing them
+//! here alone would be a silent divergence) ───────────────────────────────────
+//! 1. PAIR PRECEDENCE: the scan tries `[A,B]` before the tower pairs, so a
+//!    tower-enforced spend to which the LOSING seat voluntarily appends its
+//!    own signature over the same digest classifies 'coop'. Narration-only
+//!    (the money outcome is identical, and the seat ENDORSED the spend), and
+//!    it grants no alarm evasion: making a tower-key spend read as coop
+//!    requires BOTH seat keys — with which a thief needs no tower key at all.
+//! 2. LEADING NON-PUSH OPCODES: `read_pushes` stops at the first non-push
+//!    byte, so a malleator-prepended opcode (or an OP_1 CHECKMULTISIG dummy —
+//!    BSV has no NULLDUMMY rule) hides every signature and the answer
+//!    degrades to "not established" (the backfill latches 'unresolved').
+//!    Never a wrong value — a forced abstention on a hand-malleated spend.
+//!
 //! ── TRUST POSTURE ────────────────────────────────────────────────────────────
 //! Chain bytes in, chain facts out: the keys come from the covenant params
 //! decoded at admission (hash-bound to the funding tx), the digest is the
@@ -51,6 +65,18 @@ use bsv_rs::primitives::bsv::sighash::{
 use bsv_rs::primitives::ec::{PublicKey, Signature};
 
 use super::covenant::CovenantParams;
+
+/// Cap on signature CANDIDATES the pair-scan will consider (gate MED-1,
+/// 2026-08-21): `classify_spend_signers` runs INLINE in the spend hook, and
+/// the unlock's push count is attacker-controlled — an uncapped scan over a
+/// junk-padded unlock is a cheap CPU burn on the submit path (~72-byte valid
+/// junk at 100 sat/KB). An honest unlock carries ≤3 pushes and the SSOT's
+/// motivating malleation prepends a handful; 16 is far above both, and
+/// over-cap degrades to `None` = "not established" — the contract's safe
+/// direction, never a wrong value. (Junk fails its FIRST verify against a
+/// lock key, so the capped worst case is ~a few hundred ECDSA ops, not
+/// tens of thousands.)
+pub const MAX_SIG_CANDIDATES: usize = 16;
 
 /// Which pair of the three lock keys signed a pot spend, as stored in
 /// `pot_records.settleSigners` and served to the client.
@@ -211,6 +237,7 @@ pub fn classify_spend_signers(
                 Some(p)
             }
         })
+        .take(MAX_SIG_CANDIDATES) // gate MED-1: bound the submit-path scan
         .collect();
     if ders.len() < 2 {
         return None;
@@ -408,6 +435,39 @@ mod tests {
             classify_spend_signers(&p, LOCK, POT_SATS, &raw, 0),
             Some(SettleSigners::TowerA)
         );
+    }
+
+    #[test]
+    fn the_candidate_cap_bounds_the_scan_and_fails_safe(// gate MED-1
+    ) {
+        let keys = [key(1), key(2), key(3)];
+        let p = params_with(&keys);
+        let skeleton = spender_raw(&[]);
+        let s1 = wire_sig(&keys[0], &skeleton);
+        let s2 = wire_sig(&keys[1], &skeleton);
+        let build = |junk_count: usize| {
+            let mut unlock = vec![0x00];
+            for _ in 0..junk_count {
+                unlock.push(2);
+                unlock.extend_from_slice(&[0xde, 0xad]);
+            }
+            unlock.push(s1.len() as u8);
+            unlock.extend_from_slice(&s1);
+            unlock.push(s2.len() as u8);
+            unlock.extend_from_slice(&s2);
+            spender_raw(&unlock)
+        };
+        // Junk within the cap: the real pair is still found.
+        let within = build(MAX_SIG_CANDIDATES - 2);
+        assert_eq!(
+            classify_spend_signers(&p, LOCK, POT_SATS, &within, 0),
+            Some(SettleSigners::Coop)
+        );
+        // A flood pushing the real pair PAST the cap degrades to None — the
+        // safe direction ("not established"), never a wrong value, and the
+        // submit-path scan stays bounded.
+        let beyond = build(MAX_SIG_CANDIDATES);
+        assert_eq!(classify_spend_signers(&p, LOCK, POT_SATS, &beyond, 0), None);
     }
 
     #[test]

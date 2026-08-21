@@ -264,7 +264,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.record_count(), 1);
         let rows = store.get_records_for_game(&gid).await.unwrap();
-        assert_eq!(rows[0].cards_hex, "000c1a2733", "same outpoint never overwrites");
+        assert_eq!(
+            rows[0].cards_hex, "000c1a2733",
+            "same outpoint never overwrites"
+        );
     }
 
     #[tokio::test]
@@ -278,7 +281,10 @@ mod tests {
             .unwrap();
         let out = store.get_records(&[g1.clone(), g2.clone()]).await.unwrap();
         assert_eq!(out.len(), 2);
-        assert!(out[0].is_empty(), "absent game answers EMPTY, never omitted");
+        assert!(
+            out[0].is_empty(),
+            "absent game answers EMPTY, never omitted"
+        );
         assert_eq!(out[1].len(), 1);
     }
 

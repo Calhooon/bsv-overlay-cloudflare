@@ -2636,14 +2636,32 @@ mod tests {
     #[test]
     fn caller_errors_are_4xx_and_our_errors_are_5xx() {
         // Caller's fault.
-        assert_eq!(engine_error_status(&EngineError::InvalidQuery("bad gameId".into())), 400);
-        assert_eq!(engine_error_status(&EngineError::UnsupportedTopic("tm_nope".into())), 400);
-        assert_eq!(engine_error_status(&EngineError::LookupServiceNotFound("ls_nope".into())), 400);
+        assert_eq!(
+            engine_error_status(&EngineError::InvalidQuery("bad gameId".into())),
+            400
+        );
+        assert_eq!(
+            engine_error_status(&EngineError::UnsupportedTopic("tm_nope".into())),
+            400
+        );
+        assert_eq!(
+            engine_error_status(&EngineError::LookupServiceNotFound("ls_nope".into())),
+            400
+        );
         // Ours.
-        assert_eq!(engine_error_status(&EngineError::LookupFailed("db exploded".into())), 500);
-        assert_eq!(engine_error_status(&EngineError::StorageError("d1 down".into())), 500);
+        assert_eq!(
+            engine_error_status(&EngineError::LookupFailed("db exploded".into())),
+            500
+        );
+        assert_eq!(
+            engine_error_status(&EngineError::StorageError("d1 down".into())),
+            500
+        );
         // Upstream's.
-        assert_eq!(engine_error_status(&EngineError::BroadcastError("arc 503".into())), 502);
+        assert_eq!(
+            engine_error_status(&EngineError::BroadcastError("arc 503".into())),
+            502
+        );
     }
 
     // ── #347 Rule 22: can anything observe the seam being IGNORED? ────────
@@ -2842,7 +2860,9 @@ mod tests {
             1,
             "exactly ONE latch producer inside the pending arm"
         );
-        let wait_at = arm.find("wait_until").expect("the pending latch is backgrounded");
+        let wait_at = arm
+            .find("wait_until")
+            .expect("the pending latch is backgrounded");
         let witness_at = arm
             .find("network_witnessed(")
             .expect("the pending latch is witness-guarded");
