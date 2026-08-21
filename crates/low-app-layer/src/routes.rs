@@ -1907,6 +1907,12 @@ async fn gather_result_entries(
     // landed still published the same committed key at hop time. Best-effort —
     // an empty map is exactly the previous behaviour.
     let hop_markers = results_hop_seat_markers(db, &params_by_pot).await;
+    // Brain-cutover M2: the published hand markers for this page's games —
+    // the read the CLIENT used to make against `ls_hand` (plus an ECDSA per
+    // row on its main thread, #401). BEST-EFFORT with the same discipline as
+    // claims: a fault omits hands from the drill-down, never a 5xx and never
+    // a money path (display-only index).
+    let hand_facts = results_hand_markers(db, &game_ids).await;
 
     Ok(crate::results::assemble_results(
         identity_lc,
@@ -1915,7 +1921,76 @@ async fn gather_result_entries(
         &seat_markers,
         &params_by_pot,
         &hop_markers,
+        &hand_facts,
     ))
+}
+
+/// `hand_markers` row as D1 returns it (brain-cutover M2).
+#[derive(Deserialize)]
+struct HandMarkerRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    identity: String,
+    #[serde(rename = "potTxid")]
+    pot_txid: String,
+    #[serde(rename = "cardsHex")]
+    cards_hex: String,
+    #[serde(rename = "sigHex", default)]
+    sig_hex: Option<String>,
+    /// The admission latch. `None` = a row the sweep has not reached — the
+    /// resolver computes it rather than dropping the hand.
+    #[serde(rename = "rowValid", default)]
+    row_valid: Option<f64>,
+}
+
+/// Published hand markers for the games on this `/results` page, keyed by
+/// gameId, windowed exactly as `ls_hand` windows them (the SHARED
+/// `HAND_ROWS_PER_SEAT`). Verification happens in `resolve_marker_hands`, per
+/// seat, against the caller's own row — this only fetches.
+async fn results_hand_markers(
+    db: &worker::D1Database,
+    game_ids: &[String],
+) -> std::collections::HashMap<String, Vec<crate::results::HandMarkerFact>> {
+    let mut out: std::collections::HashMap<String, Vec<crate::results::HandMarkerFact>> =
+        std::collections::HashMap::new();
+    if game_ids.is_empty() {
+        return out;
+    }
+    for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|g| JsValue::from_str(g)).collect();
+        let stmt = match db
+            .prepare(crate::results::hand_markers_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[results] hand-marker bind failed (chunk omitted): {e}");
+                continue;
+            }
+        };
+        match stmt.all().await.and_then(|r| r.results::<HandMarkerRowD1>()) {
+            Ok(fetched) => {
+                for r in fetched {
+                    out.entry(r.game_id.to_ascii_lowercase())
+                        .or_default()
+                        .push(crate::results::HandMarkerFact {
+                            game_id: r.game_id.to_ascii_lowercase(),
+                            identity: r.identity.to_ascii_lowercase(),
+                            pot_txid: r.pot_txid.to_ascii_lowercase(),
+                            cards_hex: r.cards_hex.to_ascii_lowercase(),
+                            sig_hex: r.sig_hex,
+                            row_valid: r.row_valid.map(|v| v != 0.0),
+                        });
+                }
+            }
+            Err(e) => {
+                // A racing pre-migration schema (no rowValid column yet) or
+                // any D1 fault: hands are simply absent this pass.
+                console_warn!("[results] hand-marker query failed (hands omitted): {e}");
+            }
+        }
+    }
+    out
 }
 
 /// HOP seat markers for the pots on this `/results` page, fetched under each

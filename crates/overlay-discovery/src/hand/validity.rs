@@ -44,18 +44,54 @@ pub fn hand_challenge_bytes(
 /// and never an error that could fail the admission (the client's
 /// `verifyHandRow` returns exactly `false` for a `null` sig).
 pub fn row_valid(r: &HandRecord) -> bool {
-    let Some(sig_hex) = r.sig_hex.as_deref() else {
+    row_valid_parts(
+        &r.game_id,
+        &r.identity,
+        &r.pot_txid,
+        &r.cards_hex,
+        r.sig_hex.as_deref(),
+    )
+}
+
+/// [`row_valid`] over the FIELDS, for consumers that hold a row shape without
+/// an outpoint (the app-layer's `/results` hands join computes the dual-arm
+/// fallback from a served row). One recipe, two call shapes — never a second
+/// copy, and never a fabricated outpoint to satisfy a struct.
+pub fn row_valid_parts(
+    game_id: &str,
+    identity: &str,
+    pot_txid: &str,
+    cards_hex: &str,
+    sig_hex: Option<&str>,
+) -> bool {
+    let Some(sig_hex) = sig_hex else {
         return false;
     };
-    let game_lc = r.game_id.to_ascii_lowercase();
-    let identity_lc = r.identity.to_ascii_lowercase();
+    let game_lc = game_id.to_ascii_lowercase();
+    let identity_lc = identity.to_ascii_lowercase();
     let challenge = hand_challenge_bytes(
         &game_lc,
         &identity_lc,
-        &r.pot_txid.to_ascii_lowercase(),
-        &r.cards_hex.to_ascii_lowercase(),
+        &pot_txid.to_ascii_lowercase(),
+        &cards_hex.to_ascii_lowercase(),
     );
     anyone_sig_verifies(&identity_lc, &game_lc, &challenge, sig_hex, hand_protocol())
+}
+
+/// Is this a well-formed hand cards push — 10 hex chars, five DISTINCT
+/// ordinals 0..=51? Mirrors the client's `cardsFromHex` + `validCardOrdinals`.
+/// NB order is PRESERVED (wire order): unlike the result challenge, the hand
+/// challenge binds the cards VERBATIM, so sorting here would break parity.
+pub fn valid_hand_cards_hex(cards_hex: &str) -> bool {
+    let Ok(cards) = hex::decode(cards_hex) else {
+        return false;
+    };
+    if cards.len() != 5 || cards.iter().any(|&c| c > 51) {
+        return false;
+    }
+    let mut sorted = cards.clone();
+    sorted.sort_unstable();
+    !sorted.windows(2).any(|w| w[0] == w[1])
 }
 
 #[cfg(test)]

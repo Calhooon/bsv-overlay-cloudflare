@@ -1412,6 +1412,11 @@ pub struct ResultEntry {
     /// unresolved winner). Only the winner's hand is on-chain — the loser's is
     /// never fabricated. See [`resolve_winner_hand`].
     pub winner_hand: Option<WinnerHand>,
+    /// Both seats' PUBLISHED hand markers (brain-cutover M2), server-verified
+    /// via the `rowValid` latch — what the client used to fetch from
+    /// `ls_hand` and verify per row on its main thread (#401). Absent slots
+    /// mean "no verified marker", never "not checked".
+    pub marker_hands: MarkerHands,
     /// The pot's COMMITTED covenant keys (bsv-low #343), or `None` when the
     /// pot is absent from the index, is not a covenant lock, or its stored
     /// params are malformed. See [`CommittedKeys`] — in particular, a
@@ -1721,6 +1726,10 @@ pub fn assemble_results(
     // seat's end-of-hand potparty marker never landed. Empty is the previous
     // behaviour exactly.
     hop_markers_by_pot: &std::collections::HashMap<(String, u32), Vec<HopSeatRow>>,
+    // Brain-cutover M2: published hand markers keyed by gameId, server-verified
+    // here via the rowValid latch. Empty is the previous behaviour exactly
+    // (every entry serves an empty MarkerHands).
+    hand_facts_by_game: &std::collections::HashMap<String, Vec<HandMarkerFact>>,
 ) -> Vec<ResultEntry> {
     // Keyed by pot OUTPOINT, never by gameId: `attribute_seats` re-checks the
     // outpoint and the committed key on every marker, so a marker naming a
@@ -1980,6 +1989,15 @@ pub fn assemble_results(
             settle_lc.as_deref(),
             game_claims,
         );
+        // Brain-cutover M2: both seats' PUBLISHED hands, verified HERE (the
+        // rowValid dual-arm) so the client stops fetching `ls_hand` and
+        // running ECDSA per row on its main thread (#401). Scoped to THIS
+        // row's two seats — a stranger's marker on the same gameId occupies
+        // neither slot.
+        let marker_hands = hand_facts_by_game
+            .get(&game_lc)
+            .map(|facts| resolve_marker_hands(identity_lc, &opponent_lc, facts))
+            .unwrap_or_default();
         out.push(ResultEntry {
             game_id: game_lc,
             pot_txid: r.pot_txid.to_ascii_lowercase(),
@@ -2008,6 +2026,7 @@ pub fn assemble_results(
             outcome_source,
             at_height,
             winner_hand,
+            marker_hands,
             // #343: the pot's own committed keys, from the params the caller
             // already resolved for this outpoint (decoded columns first, else
             // the hash-verified funding bytes) — LOOKED UP, never re-derived
@@ -2158,6 +2177,17 @@ pub fn results_body(identity: &str, entries: &[ResultEntry]) -> String {
                          loser's hand is not (do not fabricate it)"
                     },
                 })),
+                // Brain-cutover M2 (ADDITIVE — deployed clients ignore it and
+                // keep their own ls_hand path until they update; the new
+                // client feature-detects on presence, never a version bump):
+                // both seats' PUBLISHED hand markers, each already verified
+                // server-side. A null slot means "no VERIFIED marker", never
+                // "not checked" — the client renders it as unknown exactly as
+                // it did for a row that failed its own verify.
+                "markerHands": json!({
+                    "mine": e.marker_hands.mine,
+                    "theirs": e.marker_hands.theirs,
+                }),
             })
         })
         .collect();
@@ -2620,6 +2650,101 @@ pub fn seat_marker_chunks(
         .collect()
 }
 
+/// One `hand_markers` row as `/results` reads it (brain-cutover M2): the
+/// publishing seat, its cards, and the admission-LATCHED verdict.
+#[derive(Debug, Clone)]
+pub struct HandMarkerFact {
+    pub game_id: String,
+    pub identity: String,
+    pub pot_txid: String,
+    pub cards_hex: String,
+    pub sig_hex: Option<String>,
+    /// The latched `rowValid` (brain-cutover M1). `None` = a row the sweep has
+    /// not reached — computed on the spot, never silently dropped.
+    pub row_valid: Option<bool>,
+}
+
+/// Both seats' PUBLISHED showdown hands for one game, as `/results` serves
+/// them — the caller's own and the opponent's, each `None` when no VERIFIED
+/// row exists. Cards stay in WIRE ORDER (the hand challenge binds them
+/// verbatim).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkerHands {
+    pub mine: Option<String>,
+    pub theirs: Option<String>,
+}
+
+/// The `hand_markers` query for a chunk of gameIds — the SAME per-(game,
+/// identity) window `ls_hand` serves (`hand_records_batch_sql`), so the two
+/// reads of one store cannot disagree (epoch Rule 16), plus the `rowValid`
+/// latch. Newest-first within a seat; the resolver takes the first row that
+/// verifies.
+pub fn hand_markers_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT gameId, identity, potTxid, cardsHex, sigHex, rowValid FROM \
+           (SELECT gameId, identity, potTxid, cardsHex, sigHex, rowValid, \
+                   ROW_NUMBER() OVER (PARTITION BY gameId, identity \
+                                      ORDER BY createdAt DESC, txid DESC, \
+                                               outputIndex DESC) AS rn \
+            FROM hand_markers \
+            WHERE gameId IN ({placeholders})) \
+         WHERE rn <= {per_seat} \
+         ORDER BY gameId ASC, identity ASC, rn ASC",
+        per_seat = overlay_discovery::hand::storage::HAND_ROWS_PER_SEAT,
+    )
+}
+
+/// Which published hands this identity may SEE for one game.
+///
+/// The dual-arm (brain-cutover M1/M2): `row_valid` is consulted first —
+/// `Some(true)` serves with ZERO ECDSA, `Some(false)` refuses exactly as a
+/// failed verify does, `None` computes the client's own `verifyHandRow`
+/// recipe through the SHARED predicate. A row whose cards are malformed is
+/// refused whatever its verdict says (the client applied the same bar before
+/// rendering). Rows naming neither seat of this row are ignored by the
+/// caller's identity/opponent filter — a stranger's marker on someone else's
+/// gameId can never occupy either slot.
+pub fn resolve_marker_hands(
+    identity_lc: &str,
+    opponent_lc: &str,
+    facts: &[HandMarkerFact],
+) -> MarkerHands {
+    let mut out = MarkerHands::default();
+    for f in facts {
+        let who = f.identity.to_ascii_lowercase();
+        let slot = if who == identity_lc {
+            &mut out.mine
+        } else if who == opponent_lc {
+            &mut out.theirs
+        } else {
+            continue; // neither seat of this row — never rendered
+        };
+        if slot.is_some() {
+            continue; // newest verified row per seat wins (window order)
+        }
+        let cards = f.cards_hex.to_ascii_lowercase();
+        if !overlay_discovery::hand::validity::valid_hand_cards_hex(&cards) {
+            continue;
+        }
+        let verified = match f.row_valid {
+            Some(v) => v,
+            None => overlay_discovery::hand::validity::row_valid_parts(
+                &f.game_id,
+                &f.identity,
+                &f.pot_txid,
+                &f.cards_hex,
+                f.sig_hex.as_deref(),
+            ),
+        };
+        if verified {
+            *slot = Some(cards);
+        }
+    }
+    out
+}
+
 /// The claims query for a chunk of gameIds (1 bind each — chunk at
 /// [`crate::logic::D1_CHUNK_OUTPOINTS`] to stay far under D1's 100-param cap).
 pub fn claims_sql(n: usize) -> String {
@@ -2818,7 +2943,15 @@ mod tests {
         seat_markers: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
     ) -> Vec<ResultEntry> {
         let params_by_pot = covenant_params_by_pot(&rows);
-        assemble_results(identity_lc, rows, claims, seat_markers, &params_by_pot, &Default::default())
+        assemble_results(
+            identity_lc,
+            rows,
+            claims,
+            seat_markers,
+            &params_by_pot,
+            &Default::default(),
+            &Default::default(),
+        )
     }
 
     fn ident(b: u8) -> String {
@@ -4602,6 +4735,7 @@ mod tests {
             outcome_source: None,
             at_height: None,
             winner_hand: None,
+            marker_hands: Default::default(),
             committed_keys: Some(k.clone()),
         };
         let results: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
@@ -4683,11 +4817,13 @@ mod tests {
             outcome_source: None,
             at_height: None,
             winner_hand: None,
+            marker_hands: Default::default(),
             committed_keys: Some(keys_fixture()),
         };
         let cannot_say = ResultEntry {
             game_id: tx(0x03),
             pot_txid: tx(0x04),
+            marker_hands: Default::default(),
             committed_keys: None,
             ..base.clone()
         };
@@ -4741,6 +4877,7 @@ mod tests {
             outcome_source: Some("chain"),
             at_height: Some(958_900),
             winner_hand: None,
+            marker_hands: Default::default(),
             committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
@@ -4787,6 +4924,7 @@ mod tests {
             outcome_source: None,
             at_height: None,
             winner_hand: None,
+            marker_hands: Default::default(),
             committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
@@ -4832,7 +4970,7 @@ mod tests {
             "outcomeSource",
             "at",
         ];
-        const ADDED_KEYS: [&str; 5] = [
+        const ADDED_KEYS: [&str; 6] = [
             "covRecoveryHeight",
             "potBinding",
             "potBindingSource",
@@ -4842,6 +4980,12 @@ mod tests {
             // classification. Additive: no existing key changed name, type
             // or value, which is what the rest of this cell measures.
             "committedKeys",
+            // Brain-cutover M2 — both seats' PUBLISHED hand markers, verified
+            // server-side via the rowValid latch, so the client stops calling
+            // ls_hand + running an ECDSA per row on its main thread (#401).
+            // Additive by the same bar: a deployed client that has never heard
+            // of this key keeps its own path untouched.
+            "markerHands",
         ];
         let me = ident(0xaa);
         let e = ResultEntry {
@@ -4866,6 +5010,7 @@ mod tests {
                 score: 15,
                 is_tie: false,
             }),
+            marker_hands: Default::default(),
             committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
@@ -4931,6 +5076,7 @@ mod tests {
                 score: 15,
                 is_tie: false,
             }),
+            marker_hands: Default::default(),
             committed_keys: None,
         };
         let v: serde_json::Value = serde_json::from_str(&results_body(&me, &[e])).unwrap();
@@ -5020,6 +5166,57 @@ mod tests {
     /// would verify (the latch is authoritative when present; the relatch
     /// sweep is what repairs a wrong one). `None` falls through to the
     /// compute arm, which the rest of this suite pins exhaustively.
+    /// Brain-cutover M2 — `/results` serves both seats' hands, and the
+    /// resolver is what the CLIENT used to do per row on its main thread.
+    /// Pins: the latch arm short-circuits (garbage sig + rowValid=true still
+    /// serves — proof no ECDSA ran), a latched 0 refuses a row whose sig
+    /// would verify, `None` computes the real recipe, malformed cards are
+    /// refused whatever the latch says, and a STRANGER's marker on the same
+    /// gameId occupies NEITHER slot.
+    #[test]
+    fn marker_hands_resolve_per_seat_with_the_dual_arm_and_ignore_strangers() {
+        let me = ident(0xaa);
+        let opp = ident(0xbb);
+        let stranger = ident(0xcc);
+        let fact = |identity: &str, cards: &str, row_valid: Option<bool>| HandMarkerFact {
+            game_id: tx(0x01),
+            identity: identity.to_string(),
+            pot_txid: tx(0x02),
+            cards_hex: cards.to_string(),
+            sig_hex: Some(format!("3045{}", "ab".repeat(69))), // garbage
+            row_valid,
+        };
+
+        // Latch arm: garbage sigs, latched true → both seats served.
+        let hands = resolve_marker_hands(
+            &me,
+            &opp,
+            &[
+                fact(&me, "0001020304", Some(true)),
+                fact(&opp, "05060708090", Some(true)), // malformed (11 chars)
+                fact(&stranger, "0102030405", Some(true)),
+            ],
+        );
+        assert_eq!(hands.mine.as_deref(), Some("0001020304"));
+        assert_eq!(
+            hands.theirs, None,
+            "malformed cards are refused whatever the latch says"
+        );
+
+        // A stranger's row can never occupy a slot, even latched true.
+        let hands = resolve_marker_hands(&me, &opp, &[fact(&stranger, "0102030405", Some(true))]);
+        assert_eq!((hands.mine, hands.theirs), (None, None));
+
+        // Latched 0 refuses; None computes (garbage sig → refused).
+        let hands = resolve_marker_hands(&me, &opp, &[fact(&me, "0001020304", Some(false))]);
+        assert_eq!(hands.mine, None, "a latched 0 is authoritative");
+        let hands = resolve_marker_hands(&me, &opp, &[fact(&me, "0001020304", None)]);
+        assert_eq!(
+            hands.mine, None,
+            "the compute arm runs the real recipe — a garbage sig is refused"
+        );
+    }
+
     #[test]
     fn the_claim_valid_latch_arm_short_circuits_and_the_zero_latch_drops() {
         let (ww, lw) = (wallet_of(1), wallet_of(2));

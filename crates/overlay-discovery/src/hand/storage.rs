@@ -60,6 +60,23 @@ pub enum HandQuery {
     },
 }
 
+/// Rows kept per (game, identity) by every hand-marker read window.
+///
+/// The honest population per (game, seat) is ONE row; 4 leaves headroom for a
+/// republish without unbounded growth. The RESIDUAL an identity-spray leaves —
+/// K distinct junk identities → up to K×4 rows returned for the game — is
+/// verify-rejected NOISE (dropped by `hand::validity::row_valid`, latched at
+/// admission since brain-cutover M1); the two genuine seats' rows are ALWAYS
+/// returned (their partitions are never evicted), so the feature never breaks.
+/// Eviction is FAIL-SAFE regardless: a pushed-out row only omits a hand from
+/// the drill-down (display-only, no money path reads this index).
+///
+/// SHARED (brain-cutover M2): the overlay's `ls_hand` window and the
+/// app-layer's `/results` hands join must be the SAME window, or two reads of
+/// one store disagree (epoch Rule 16) — so the constant lives here rather
+/// than as a literal in each.
+pub const HAND_ROWS_PER_SEAT: usize = 4;
+
 /// Backend-agnostic storage for hand-marker records.
 #[async_trait(?Send)]
 pub trait HandStorage {

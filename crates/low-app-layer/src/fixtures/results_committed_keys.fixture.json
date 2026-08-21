@@ -15,6 +15,10 @@
       "gameId": "0101010101010101010101010101010101010101010101010101010101010101",
       "gameIdBinding": "unknown",
       "hand": null,
+      "markerHands": {
+        "mine": null,
+        "theirs": null
+      },
       "opponentIdentity": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "outcome": "unresolved",
       "outcomeSource": null,
@@ -37,6 +41,10 @@
       "gameId": "0303030303030303030303030303030303030303030303030303030303030303",
       "gameIdBinding": "unknown",
       "hand": null,
+      "markerHands": {
+        "mine": null,
+        "theirs": null
+      },
       "opponentIdentity": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "outcome": "unresolved",
       "outcomeSource": null,

@@ -844,6 +844,7 @@ fn the_outcome_word_is_the_results_derivation_reused_not_respelled() {
         outcome_source: Some("chain+seatkey"),
         at_height: Some(958_700),
         winner_hand: None,
+        marker_hands: Default::default(),
         committed_keys: None,
     };
 

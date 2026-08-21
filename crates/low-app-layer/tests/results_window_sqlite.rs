@@ -52,7 +52,15 @@ fn assemble_like_the_route(
     seat_markers: &std::collections::HashMap<(String, u32), Vec<SeatMarkerRow>>,
 ) -> Vec<low_app_layer::results::ResultEntry> {
     let params_by_pot = covenant_params_by_pot(&rows);
-    assemble_results(identity_lc, rows, claims, seat_markers, &params_by_pot, &Default::default())
+    assemble_results(
+        identity_lc,
+        rows,
+        claims,
+        seat_markers,
+        &params_by_pot,
+        &Default::default(),
+        &Default::default(),
+    )
 }
 
 /// A fresh in-memory SQLite carrying the REAL production schema.
@@ -1994,7 +2002,15 @@ fn results_wire(conn: &Connection, identity_lc: &str) -> serde_json::Value {
     let params_by_pot = covenant_params_by_pot(&rows);
     let seat_markers = fetch_seat_markers(conn, &params_by_pot);
     let claims = fetch_claims(conn, &rows);
-    let entries = assemble_results(identity_lc, rows, &claims, &seat_markers, &params_by_pot, &Default::default());
+    let entries = assemble_results(
+        identity_lc,
+        rows,
+        &claims,
+        &seat_markers,
+        &params_by_pot,
+        &Default::default(),
+        &Default::default(),
+    );
     serde_json::from_str(&results_body(identity_lc, &entries)).unwrap()
 }
 

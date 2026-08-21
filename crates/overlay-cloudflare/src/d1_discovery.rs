@@ -2728,16 +2728,13 @@ impl HandRow {
 /// seat's own partition costs a real fee-bearing tx per row once
 /// `SUBMIT_ENFORCE=true` (the collected post-hoc story, verbatim).
 ///
-/// The honest population per (game, seat) is ONE row; 4 leaves headroom for a
-/// republish without unbounded growth. The RESIDUAL an identity-spray leaves —
-/// K distinct junk identities → up to K×4 rows returned for the game — is
-/// verify-rejected NOISE the client drops row by row; the two genuine seats'
-/// rows are ALWAYS returned (their partitions are never evicted), so the
-/// feature never breaks. Eviction is FAIL-SAFE regardless: a pushed-out row
-/// only omits a hand from the drill-down (display-only, no money path reads
-/// this index). The spray's response size is bounded the same way collected's
-/// is — by the `SUBMIT_ENFORCE` fee flip, not by this window.
-const HAND_ROWS_PER_SEAT: usize = 4;
+/// The spray's response size is bounded the same way collected's is — by the
+/// `SUBMIT_ENFORCE` fee flip, not by this window.
+///
+/// MOVED to `overlay_discovery::hand::storage` (brain-cutover M2) so the
+/// app-layer's `/results` hands join windows identically — see that const's
+/// doc for the full rationale.
+use overlay_discovery::hand::storage::HAND_ROWS_PER_SEAT;
 
 /// SQL for one batched hand-marker chunk: one `gameId IN (…)` query replacing
 /// `n` round trips, windowed to [`HAND_ROWS_PER_SEAT`] per (game, identity)
