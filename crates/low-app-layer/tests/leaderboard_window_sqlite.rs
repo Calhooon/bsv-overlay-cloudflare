@@ -1573,3 +1573,132 @@ fn the_sig_valid_latch_arm_short_circuits_attribute_seats_and_a_zero_latch_refus
         "a latched 0 is authoritative — the relatch sweep repairs, the serve path never second-guesses"
     );
 }
+
+/// #399 (OWNER RULED 2026-08-21) — a claim-less chain win is LISTED.
+///
+/// The counting spine has minted from chain facts alone since #332 v3; what
+/// this pins is the NEW candidate source feeding it: `chain_win_pots_sql`
+/// returns a classified winner pot with ZERO result markers, and the
+/// aggregate then counts it — the exact shape of the 2026-08-13 beta hand
+/// that settled, confirmed, classified winner-b, paid… and vanished from the
+/// board because one marker publish raced teardown.
+///
+/// The window's guards are pinned in the same cell, each with its own pot:
+///  - a pot whose stored verdict is STALE (`verdictTxid` ≠ the current
+///    spender — the documented reader-side guard) is NOT a candidate;
+///  - an UNSPENT pot with a leftover verdict is NOT a candidate;
+///  - a tie/refund verdict is NOT a candidate (it attributes nobody).
+#[test]
+fn a_claimless_chain_win_is_a_candidate_and_counts() {
+    let conn = production_schema_db();
+    let (_key_a, pub_a) = settle_key(0x61);
+    let (_key_b, pub_b) = settle_key(0x62);
+
+    // THE win: classified, confirmed, params decoded, NO markers anywhere.
+    let pot = h64(0xe1);
+    let settle = h64(0xe2);
+    admit_pot(&conn, &pot, 1_000);
+    mark_spent_confirmed(&conn, &pot, &settle);
+    conn.execute(
+        "UPDATE pot_records SET verdict = 'winner-a', verdictTxid = ?1, \
+         paramsDecoded = 1, pubA = ?2, pubB = ?3 WHERE txid = ?4",
+        params![settle, pub_a, pub_b, pot],
+    )
+    .unwrap();
+
+    // Guard 1: stale verdict — verdictTxid names a DIFFERENT (superseded) spender.
+    let stale = h64(0xe3);
+    admit_pot(&conn, &stale, 1_001);
+    mark_spent_confirmed(&conn, &stale, &h64(0xe4));
+    conn.execute(
+        "UPDATE pot_records SET verdict = 'winner-a', verdictTxid = ?1, \
+         paramsDecoded = 1, pubA = ?2, pubB = ?3 WHERE txid = ?4",
+        params![h64(0xe5), pub_a, pub_b, stale],
+    )
+    .unwrap();
+
+    // Guard 2: unspent pot carrying a leftover verdict.
+    let unspent = h64(0xe6);
+    admit_pot(&conn, &unspent, 1_002);
+    conn.execute(
+        "UPDATE pot_records SET verdict = 'winner-a', verdictTxid = ?1, \
+         paramsDecoded = 1, pubA = ?2, pubB = ?3 WHERE txid = ?4",
+        params![h64(0xe7), pub_a, pub_b, unspent],
+    )
+    .unwrap();
+
+    // Guard 3: a refund verdict.
+    let refund = h64(0xe8);
+    admit_pot(&conn, &refund, 1_003);
+    mark_spent_confirmed(&conn, &refund, &h64(0xe9));
+    conn.execute(
+        "UPDATE pot_records SET verdict = 'refund', verdictTxid = ?1, \
+         paramsDecoded = 1, pubA = ?2, pubB = ?3 WHERE txid = ?4",
+        params![h64(0xe9), pub_a, pub_b, refund],
+    )
+    .unwrap();
+
+    // The SHIPPED window: exactly the one candidate.
+    let sql = low_app_layer::logic::chain_win_pots_sql(None);
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("chain_win_pots_sql did not PREPARE: {e}\n{sql}"));
+    let candidates: Vec<String> = stmt
+        .query_map(params![10i64], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        candidates,
+        vec![pot.clone()],
+        "the claim-less win is the ONLY candidate; stale/unspent/refund are refused"
+    );
+
+    // …and the spine counts it with ZERO markers, keyed by the winner's
+    // identity when attribution resolves (win_world supplies the verified
+    // attribution exactly as `seat_attributions` would).
+    let winner = identity(0x11);
+    let statuses = assemble_statuses(
+        &[low_app_layer::logic::Outpoint {
+            txid: pot.clone(),
+            vout: 0,
+        }],
+        &query_pot_rows(&conn, &pot),
+    );
+    let world = win_world(&[(&pot, &winner, &identity(0x22))]);
+    let lb = agg_world(&[], &statuses, &world);
+    let row = lb
+        .board
+        .iter()
+        .find(|b| b.identity == winner)
+        .expect("the claim-less winner is ON the board");
+    assert_eq!(row.wins, 1);
+    assert_eq!(row.chain_wins.len(), 1);
+    assert_eq!(row.chain_wins[0].pot_txid, pot);
+    assert!(
+        row.evidence.is_empty(),
+        "no marker ⇒ no evidence row — the win counts anyway (that is #399)"
+    );
+}
+
+/// The window's rows drive `assemble_statuses` exactly like the marker-window
+/// rows do (shared shape) — a tiny helper so the cell above reads the pot
+/// back through the SHIPPED batch reader rather than hand-building a status.
+fn query_pot_rows(conn: &Connection, pot: &str) -> Vec<PotRecordRow> {
+    let sql = low_app_layer::logic::batch_where_sql(1);
+    let mut stmt = conn.prepare(&sql).expect("batch_where_sql prepares");
+    stmt.query_map(params![pot, 0i64], |r| {
+        Ok(PotRecordRow {
+            txid: r.get("txid")?,
+            vout: r.get::<_, i64>("outputIndex")? as u32,
+            spent: r.get::<_, Option<i64>>("spent")?.unwrap_or(0) != 0,
+            spending_txid: r.get("spendingTxid")?,
+            spent_confirmed: r.get::<_, Option<i64>>("spentConfirmed")?.unwrap_or(0) != 0,
+            spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
+            spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
+        })
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}

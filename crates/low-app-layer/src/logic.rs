@@ -1179,6 +1179,73 @@ pub fn clamp_future_cutoff(cutoff_ms: Option<i64>, now_ms: i64) -> Option<i64> {
 ///   client-half epoch wipe removes the old-era records that could be
 ///   republished. Never re-claim the closed form the first draft of these
 ///   comments claimed (Rule 10).
+/// #399 (OWNER RULED 2026-08-21: "the chain arm counts alone") — the CHAIN
+/// candidate window for `/leaderboard`.
+///
+/// The counting spine (`aggregate_leaderboard_attributed`) has minted wins
+/// from CHAIN FACTS ONLY since #332 v3 — verdict + committed winning key +
+/// confirmed landing, "whether or not any marker exists". But the CANDIDATE
+/// SET was still seeded exclusively from the `result_markers_v2` window, so
+/// a pot whose winner never published a claim marker never reached the
+/// spine at all, and a real win VANISHED from the board (the 2026-08-13
+/// beta case: settled, confirmed, verdict=winner-b, paid — and unlisted
+/// because ONE marker publish raced teardown). This window closes that gap:
+/// classified winner pots straight from `pot_records`, no marker required.
+///
+/// TRUST SHAPE, stated (gate S1 corrected the first draft, which claimed a
+/// recompute that does not run for these rows — a stated defense that is not
+/// the operative one misleads the next gate):
+/// - The OPERATIVE defense is WRITE-PATH PROVENANCE. `pot_records.verdict`
+///   is written only by the overlay's own spend classification
+///   (`classify_covenant` over the ENGINE-PARSED spender bytes, riding the
+///   same `mark_spent_sql` statement as the spend pointer; `verdict_cas_sql`
+///   is pointer-guarded; `store_record_sql`'s upsert never touches verdict
+///   columns). No caller-supplied verdict path exists. Freshness is the
+///   `verdictTxid = spendingTxid` guard — a later spend-pointer overwrite
+///   leaves a stale verdict on purpose, and the equality check is the
+///   documented reader-side bar.
+/// - `classify_spent_pots` tier 1 RE-SERVES the stored verdict for exactly
+///   the rows this WHERE selects (decodable column params + matching
+///   pointer) — there is deliberately no recompute to disagree with. The
+///   COUNT bar is the aggregate's own: confirmed landing + recorded spender,
+///   re-checked at the spine, and a fabricated never-on-chain "pot" cannot
+///   clear it (`spentConfirmed` unearnable, `network_seen` unearnable).
+/// - The lenient-window residual, stated (#347/#366): while `SUBMIT_ENFORCE`
+///   is unset a stranger can file structural template-matching pot rows for
+///   free and DISPLACE real claimless wins out of this newest-first window —
+///   eviction pressure on a display window with the honesty bit set, never a
+///   minted win. Symmetric with the marker window's existing posture; the
+///   enforce flip is the shared remedy.
+/// - Failure direction: a pot MISSING from this window (NULL verdict, an
+///   unconfirmed spend, undecoded params) loses nothing that exists today —
+///   the marker window still carries every claim-seeded pot. Additive both
+///   ways.
+/// - `paramsDecoded = 1`: only covenant pots with stored committed keys can
+///   be attributed or key-counted; `outputIndex = 0` because every consumer
+///   (statuses, attribution, the spine's `LEADERBOARD_POT_VOUT` filter)
+///   speaks vout 0 — a vout≠0 covenant row could never count and would only
+///   waste window slots (gate S3).
+/// - Era-filtered on the pot's own admission stamp (`p.createdAt` — the
+///   server-written anchor, #375), newest-first, `?1 = limit + 1` probe so
+///   truncation of THIS window is detectable and ORed into the body's bit.
+pub fn chain_win_pots_sql(written_off_before_ms: Option<i64>) -> String {
+    format!(
+        "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
+                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen \
+         FROM pot_records p \
+         LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
+              AND ns.txid = lower(p.spendingTxid) \
+         WHERE p.verdict IN ('winner-a', 'winner-b') \
+           AND p.verdictTxid = p.spendingTxid \
+           AND p.spent = 1 \
+           AND p.outputIndex = 0 \
+           AND p.paramsDecoded = 1{era} \
+         ORDER BY p.createdAt DESC, p.rowid DESC \
+         LIMIT ?1",
+        era = era_filter_sql("p.createdAt", "?2", written_off_before_ms),
+    )
+}
+
 pub fn era_filter_sql(anchor_expr_secs: &str, placeholder: &str, cutoff_ms: Option<i64>) -> String {
     match cutoff_ms {
         Some(_) => format!(" AND ({anchor_expr_secs} * 1000 >= {placeholder})"),

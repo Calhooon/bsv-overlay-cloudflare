@@ -1044,7 +1044,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         }
     };
     let pot_keys: Vec<Option<String>> = raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
-    let (cut, truncated) = crate::logic::leaderboard_window_cut(&pot_keys, limit);
+    let (cut, mut truncated) = crate::logic::leaderboard_window_cut(&pot_keys, limit);
     let markers: Vec<ResultMarkerRow> = raw_rows
         .into_iter()
         .take(cut)
@@ -1055,7 +1055,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     // same discipline as /utxo-status. FAIL-SAFE: a chunk's D1 error is the
     // SAME 503 the client handles and serves no body (never a fabricated
     // all-unknown board that would silently zero every win).
-    let outpoints = leaderboard_pot_outpoints(&markers);
+    let mut outpoints = leaderboard_pot_outpoints(&markers);
     let mut pot_rows: Vec<PotRecordRow> = Vec::with_capacity(outpoints.len());
     for chunk in chunk_outpoints(&outpoints) {
         let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
@@ -1070,6 +1070,71 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
                 console_warn!("[leaderboard] pot_records batch query failed: {e}");
                 return json_error("database query failed", 503);
             }
+        }
+    }
+    // 2b) #399 (OWNER RULED 2026-08-21): the CHAIN candidate window — a
+    // marker was never required to WIN, it must not be required to be
+    // LISTED. Classified winner pots join the candidate set straight from
+    // `pot_records`, so the spine (which has counted from chain facts alone
+    // since #332 v3) finally SEES the pots whose claim marker never landed.
+    // The stored verdict is TRUSTED here by write-path provenance (only the
+    // overlay's own spend classification writes it; `verdictTxid =
+    // spendingTxid` is the freshness bar — see `chain_win_pots_sql`'s doc,
+    // gate S1); the COUNT bar stays the aggregate's confirmed-landing +
+    // spender re-check. BEST-EFFORT: a fault here only narrows the candidate
+    // set back to the marker window — exactly yesterday's board, never a 5xx.
+    {
+        let mut cbinds: Vec<JsValue> = vec![JsValue::from_f64((limit + 1) as f64)];
+        if let Some(ms) = era {
+            cbinds.push(era_bind(ms));
+        }
+        match db
+            .prepare(crate::logic::chain_win_pots_sql(era))
+            .bind(&cbinds)
+        {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
+                Ok(rows) => {
+                    // Gate S2: the honesty bit is decided by what the QUERY
+                    // returned, not by how the loop consumed it. The first
+                    // draft flagged truncation only when `fresh` filled the
+                    // budget — but marker-carried dups are skipped without
+                    // counting, so a probe page containing dups could be
+                    // consumed to the end with candidates beyond the SQL
+                    // LIMIT silently invisible: a complete-looking partial
+                    // board, the one lie this route may never tell.
+                    // Over-flagging on the exact-boundary case is the honest
+                    // direction.
+                    if rows.len() > limit {
+                        truncated = true;
+                    }
+                    let seen: std::collections::HashSet<(String, u32)> = outpoints
+                        .iter()
+                        .map(|o| (o.txid.to_ascii_lowercase(), o.vout))
+                        .collect();
+                    let mut fresh = 0usize;
+                    for row in rows.into_iter().map(PotRowD1::into_row) {
+                        if fresh >= limit {
+                            break; // budget spent (bit already set above)
+                        }
+                        let key = (row.txid.to_ascii_lowercase(), row.vout);
+                        if seen.contains(&key) {
+                            continue; // already carried by the marker window
+                        }
+                        fresh += 1;
+                        outpoints.push(crate::logic::Outpoint {
+                            txid: row.txid.clone(),
+                            vout: row.vout,
+                        });
+                        pot_rows.push(row);
+                    }
+                }
+                Err(e) => console_warn!(
+                    "[leaderboard] chain-win candidate query failed (marker window only): {e}"
+                ),
+            },
+            Err(e) => console_warn!(
+                "[leaderboard] chain-win candidate bind failed (marker window only): {e}"
+            ),
         }
     }
     let statuses = assemble_statuses(&outpoints, &pot_rows);
@@ -1382,6 +1447,9 @@ async fn classify_spent_pots(
     // window (1) + `pot_records` status chunks (≈12) + proof-pointer chunks
     // (≈12) + decoded-pots chunks (≈12) + `pot_beefs` chunks (≈23) + seat-
     // marker chunks (≈21) ≈ **~81 D1 statements**, single-digit MB transient.
+    // (#399 gate S5: the chain candidate window can add up to limit+1 more
+    // pots when fully disjoint from the marker window, roughly doubling that
+    // worst case — still bounded by the same window arithmetic.)
     // Every one of those pots is a REAL admitted `tm_pot` row (an on-chain
     // LOW-template funding tx — not a dust marker), so the fan-out is priced
     // in real funding, and the whole tier-2 partition shrinks to zero as the
