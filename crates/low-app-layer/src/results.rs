@@ -1151,6 +1151,7 @@ pub struct ClaimFact {
 // `overlay-discovery`'s Rust topic manager verifies with this same
 // `ProtoWallet::anyone()` pattern).
 
+pub(crate) use overlay_discovery::result::validity::{anyone_sig_verifies, canonical_cards_hex};
 /// The result-claim crypto recipe — DELEGATED to
 /// `overlay_discovery::result::validity`, the single shared artifact the
 /// admission latch (`claim_tier`), the relatch sweep, and this serve-time
@@ -1162,7 +1163,6 @@ pub struct ClaimFact {
 /// `result_challenge_bytes` likewise. The SIGNED cross-repo goldens pin the
 /// shared recipe in `overlay_discovery::result::validity::tests`.
 pub use overlay_discovery::result::validity::{result_challenge_bytes, result_protocol};
-pub(crate) use overlay_discovery::result::validity::{anyone_sig_verifies, canonical_cards_hex};
 
 /// Verify one raw `result_markers_v2` row into a [`ClaimFact`], or `None`
 /// when it must contribute nothing: self-paired, malformed cards, or a
@@ -3160,7 +3160,7 @@ mod tests {
             seat_settle_pubkey: settle_pub_hex.to_string(),
             seat_sig_hex: hex::encode(seat_sig.to_der()),
             identity_sig_hex: String::new(),
-        sig_valid: None, // fixture: the compute arm
+            sig_valid: None, // fixture: the compute arm
         };
         let challenge = potparty_v2_challenge(&m).unwrap();
         m.identity_sig_hex = sign_potparty_identity(identity_wallet, game_id, &challenge);
@@ -3285,7 +3285,7 @@ mod tests {
                 hex::encode(kb.sign(&hash).unwrap().to_der())
             },
             identity_sig_hex: String::new(),
-        sig_valid: None, // fixture: the compute arm
+            sig_valid: None, // fixture: the compute arm
         };
         let challenge = potparty_v2_challenge(&forged).unwrap();
         forged.identity_sig_hex = sign_potparty_identity(&w_loser, &gid, &challenge);
@@ -3379,7 +3379,11 @@ mod tests {
             identity_b: Some(REAL_ID_B.to_string()),
         };
         // A hostile hop row claiming seat A with the WRONG identity.
-        fill_seats_from_hop_markers(&mut attr, &params, &[hop(REAL_ID_B, REAL_PUB_A, Some(true))]);
+        fill_seats_from_hop_markers(
+            &mut attr,
+            &params,
+            &[hop(REAL_ID_B, REAL_PUB_A, Some(true))],
+        );
         assert_eq!(attr.identity_a.as_deref(), Some(REAL_ID_A), "untouched");
     }
 
@@ -3391,7 +3395,11 @@ mod tests {
         let mut attr = SeatAttribution::default();
         let foreign = "02".to_string() + &"11".repeat(32);
         fill_seats_from_hop_markers(&mut attr, &params, &[hop(REAL_ID_B, &foreign, Some(true))]);
-        assert_eq!(attr, SeatAttribution::default(), "foreign key attributes nothing");
+        assert_eq!(
+            attr,
+            SeatAttribution::default(),
+            "foreign key attributes nothing"
+        );
     }
 
     /// Unverified and UNMEASURED rows are both refused — a legacy `None` is
@@ -3402,7 +3410,11 @@ mod tests {
         for latched in [Some(false), None] {
             let mut attr = SeatAttribution::default();
             fill_seats_from_hop_markers(&mut attr, &params, &[hop(REAL_ID_B, REAL_PUB_B, latched)]);
-            assert_eq!(attr, SeatAttribution::default(), "latched={latched:?} must not attribute");
+            assert_eq!(
+                attr,
+                SeatAttribution::default(),
+                "latched={latched:?} must not attribute"
+            );
         }
     }
 
@@ -3542,7 +3554,7 @@ mod tests {
             seat_settle_pubkey: hex::encode(m.seat_settle_pubkey.as_ref().unwrap()),
             seat_sig_hex: hex::encode(m.seat_sig.as_ref().unwrap()),
             identity_sig_hex: hex::encode(&m.sig),
-        sig_valid: None, // fixture: the compute arm
+            sig_valid: None, // fixture: the compute arm
         };
         assert!(
             verify_seat_marker(&row),
@@ -3792,7 +3804,7 @@ mod tests {
                 )
             },
             identity_sig_hex: String::new(),
-        sig_valid: None, // fixture: the compute arm
+            sig_valid: None, // fixture: the compute arm
         };
         forged.identity_sig_hex =
             sign_potparty_identity(&w_loser, &gid, &potparty_v2_challenge(&forged).unwrap());
@@ -4763,6 +4775,7 @@ mod tests {
             ),
             None,
             false,
+            0,
         ))
         .unwrap();
         let from_recovery = recovery["entries"][0]["committedKeys"].clone();

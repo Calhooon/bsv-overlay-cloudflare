@@ -1069,7 +1069,7 @@ fn file_honest_potparty(
         seat_settle_pubkey: settle_pub.to_string(),
         seat_sig_hex: seat_sig.clone(),
         identity_sig_hex: String::new(),
-    sig_valid: None, // fixture: the compute arm
+        sig_valid: None, // fixture: the compute arm
     };
     let challenge = potparty_v2_challenge(&probe).unwrap();
     let id_sig = idw
@@ -1502,7 +1502,12 @@ fn the_sig_valid_latch_arm_short_circuits_attribute_seats_and_a_zero_latch_refus
         identity_sig_hex: "3044cdcdcd".into(),
         sig_valid: Some(true),
     };
-    let attr = attribute_seats(&params, &pot, 0, std::slice::from_ref(&garbage_latched_true));
+    let attr = attribute_seats(
+        &params,
+        &pot,
+        0,
+        std::slice::from_ref(&garbage_latched_true),
+    );
     assert_eq!(
         attr.identity_a,
         Some(identity(0x11).to_ascii_lowercase()),

@@ -282,7 +282,10 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 /// Factored out of `beef` so `/credit-beef` cannot drift from it: an assembled
 /// ancestry that trusted different bytes than the single-txid route would be a
 /// second source of truth for the same question.
-async fn load_stored_beef(db: &worker::D1Database, txid: &str) -> std::result::Result<Option<Vec<u8>>, ()> {
+async fn load_stored_beef(
+    db: &worker::D1Database,
+    txid: &str,
+) -> std::result::Result<Option<Vec<u8>>, ()> {
     let key = txid.to_ascii_lowercase();
     let mut faulted = false;
     for (table, sql, legacy_sql) in [
@@ -768,6 +771,7 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
                 &crate::logic::apply_recovery_extras(Vec::new(), None, None),
                 None,
                 false,
+                0,
             ),
             200,
         );
@@ -789,7 +793,21 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
     if let Some(ms) = era {
         binds.push(era_bind(ms));
     }
-    let stmt = db.prepare(recovery_view_sql(era)).bind(&binds)?;
+    // #398's cursor on the recovery surface (brain-cutover M2c): `after`
+    // slides the rank window so a caller can WALK a truncated set to
+    // completion. Clamped to the ceiling; a malformed value is 0 (the first
+    // page), never an error — this is a recovery surface.
+    let after: usize = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "after")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+        })
+        .map(|a| a.min(crate::logic::RECOVERY_VIEW_AFTER_MAX))
+        .unwrap_or(0);
+    let stmt = db.prepare(recovery_view_sql(era, after)).bind(&binds)?;
     let rows: Vec<RecoveryRow> = match stmt.all().await.and_then(|r| r.results::<RecoveryRowD1>()) {
         Ok(rows) => rows.into_iter().map(RecoveryRowD1::into_row).collect(),
         Err(e) => {
@@ -838,7 +856,7 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
     );
 
     let tip = chaintracks_present_height(&ctx, "recovery-view").await.ok();
-    json_response(recovery_view_body(&entries, tip, truncated), 200)
+    json_response(recovery_view_body(&entries, tip, truncated, after), 200)
 }
 
 /// #252 stage A — which of these games carry a `collected_markers_v2` row for
@@ -1602,9 +1620,8 @@ async fn seat_attributions(
         let mut v: Vec<&String> = params_by_pot
             .keys()
             .filter(|pot| {
-                out.get(*pot).is_none_or(|a| {
-                    a.identity_a.is_none() || a.identity_b.is_none()
-                })
+                out.get(*pot)
+                    .is_none_or(|a| a.identity_a.is_none() || a.identity_b.is_none())
             })
             .collect();
         v.sort_unstable();
@@ -1642,7 +1659,9 @@ async fn seat_attributions(
                 }
             }
             Err(e) => {
-                console_warn!("[leaderboard] hop seat fallback query failed (attribution unchanged): {e}");
+                console_warn!(
+                    "[leaderboard] hop seat fallback query failed (attribution unchanged): {e}"
+                );
             }
         }
     }
@@ -1968,19 +1987,23 @@ async fn results_hand_markers(
                 continue;
             }
         };
-        match stmt.all().await.and_then(|r| r.results::<HandMarkerRowD1>()) {
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<HandMarkerRowD1>())
+        {
             Ok(fetched) => {
                 for r in fetched {
-                    out.entry(r.game_id.to_ascii_lowercase())
-                        .or_default()
-                        .push(crate::results::HandMarkerFact {
+                    out.entry(r.game_id.to_ascii_lowercase()).or_default().push(
+                        crate::results::HandMarkerFact {
                             game_id: r.game_id.to_ascii_lowercase(),
                             identity: r.identity.to_ascii_lowercase(),
                             pot_txid: r.pot_txid.to_ascii_lowercase(),
                             cards_hex: r.cards_hex.to_ascii_lowercase(),
                             sig_hex: r.sig_hex,
                             row_valid: r.row_valid.map(|v| v != 0.0),
-                        });
+                        },
+                    );
                 }
             }
             Err(e) => {
@@ -2036,7 +2059,9 @@ async fn results_hop_seat_markers(
                 // Every pot in the chunk gets the chunk's rows; the committed-key
                 // match inside `fill_seats_from_hop_markers` decides which apply.
                 for k in chunk {
-                    out.entry((*k).clone()).or_default().extend(hops.iter().cloned());
+                    out.entry((*k).clone())
+                        .or_default()
+                        .extend(hops.iter().cloned());
                 }
             }
             Err(e) => {
@@ -2468,7 +2493,11 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         binds.push(era_bind(ms));
     }
     let stmt = db
-        .prepare(crate::hops_view::hops_view_sql(game_id_lc.is_some(), era, after))
+        .prepare(crate::hops_view::hops_view_sql(
+            game_id_lc.is_some(),
+            era,
+            after,
+        ))
         .bind(&binds)?;
     let rows: Vec<crate::hops_view::HopsViewRow> =
         match stmt.all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
@@ -2608,7 +2637,9 @@ pub(crate) fn tower_case_url(game_id: &str, pot_txid: &str, pot_vout: u32) -> Op
     if !valid_txid(game_id) || !valid_txid(pot_txid) {
         return None;
     }
-    Some(format!("https://tower/case/{game_id}/{pot_txid}/{pot_vout}"))
+    Some(format!(
+        "https://tower/case/{game_id}/{pot_txid}/{pot_vout}"
+    ))
 }
 
 async fn tower_case_fetch(

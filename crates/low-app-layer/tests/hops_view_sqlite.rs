@@ -378,7 +378,11 @@ fn query_rows(conn: &Connection, identity: &str) -> Vec<HopsViewRow> {
 
 /// The `?gameId=`-scoped window — the escape hatch a truncated caller uses.
 fn query_rows_scoped(conn: &Connection, identity: &str, game_id: &str) -> Vec<HopsViewRow> {
-    query_rows_inner(conn, hops_view_sql(true, None, 0), params![identity, game_id])
+    query_rows_inner(
+        conn,
+        hops_view_sql(true, None, 0),
+        params![identity, game_id],
+    )
 }
 
 fn query_rows_inner<P: rusqlite::Params>(
@@ -1432,8 +1436,14 @@ fn a_legacy_row_is_served_labelled_unknown_and_ranks_between_the_two_verdicts() 
     );
 
     // …and the wire says exactly that.
-    let v: serde_json::Value =
-        serde_json::from_str(&hops_view_body(&good.identity_hex, None, &entries, false, 0)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&hops_view_body(
+        &good.identity_hex,
+        None,
+        &entries,
+        false,
+        0,
+    ))
+    .unwrap();
     assert_eq!(v["hops"][1]["markerVerified"], serde_json::json!("unknown"));
     assert_eq!(v["hops"][1]["hopTxid"], serde_json::json!(legacy_txid));
     assert_eq!(v["verifyBudgetExhausted"], serde_json::json!(false));

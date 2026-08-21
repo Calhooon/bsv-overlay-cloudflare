@@ -1564,7 +1564,7 @@ mod tests {
             seat_settle_pubkey: settle_pub,
             seat_sig_hex: hex::encode(seat_sig.to_der()),
             identity_sig_hex: String::new(),
-        sig_valid: None, // fixture: the compute arm
+            sig_valid: None, // fixture: the compute arm
         };
         let challenge = crate::results::potparty_v2_challenge(&m).unwrap();
         let sig = w

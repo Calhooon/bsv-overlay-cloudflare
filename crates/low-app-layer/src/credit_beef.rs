@@ -289,7 +289,10 @@ mod tests {
         );
 
         let walk = drive(SPLIT_SUBJECT_BEEF, &store);
-        assert!(walk.is_complete(), "the walk must finish once the parent lands");
+        assert!(
+            walk.is_complete(),
+            "the walk must finish once the parent lands"
+        );
         assert_eq!(walk.fetches(), 1, "exactly one parent was needed");
 
         let beef = walk.into_beef();
@@ -314,7 +317,10 @@ mod tests {
     fn an_absent_parent_ends_the_walk_incomplete() {
         let store = std::collections::HashMap::new(); // hold nothing
         let walk = drive(SPLIT_SUBJECT_BEEF, &store);
-        assert!(!walk.is_complete(), "must not claim completeness it does not have");
+        assert!(
+            !walk.is_complete(),
+            "must not claim completeness it does not have"
+        );
         assert_eq!(walk.fetches(), 1, "one attempt, then stop — never a spin");
     }
 
@@ -328,7 +334,11 @@ mod tests {
         let before = acc.txs.len();
 
         assert!(!merge_parent(&mut acc, &[0xde, 0xad, 0xbe, 0xef]));
-        assert_eq!(acc.txs.len(), before, "corrupt bytes changed the accumulator");
+        assert_eq!(
+            acc.txs.len(),
+            before,
+            "corrupt bytes changed the accumulator"
+        );
         assert!(
             !wanted_parents(&acc).complete,
             "a skipped parent must leave the walk incomplete, never complete"

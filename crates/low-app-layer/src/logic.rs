@@ -575,7 +575,7 @@ pub fn decode_beef_hex(hex_str: &str) -> Option<Vec<u8>> {
 /// `era_filter_sql`). ONE extra bind (the
 /// cutoff, after the identity). `None` ⇒ byte-identical to the pre-#375
 /// query.
-pub fn recovery_view_sql(written_off_before_ms: Option<i64>) -> String {
+pub fn recovery_view_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     // NOTE: any change here must keep the `w.`-qualified outer ORDER BY —
     // SQLite does not guarantee ordering survives a join otherwise.
     //
@@ -592,6 +592,18 @@ pub fn recovery_view_sql(written_off_before_ms: Option<i64>) -> String {
             w.spentConfirmed AS spentConfirmed, \
             hex(b.beef) AS spenderBeef \
      FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+              covPubA, covPubB, covPayPkhA, covPayPkhB, \
+              opponentIdentity, spent, spendingTxid, spentConfirmed, \
+              markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier \
+       FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
+                covPubA, covPubB, covPayPkhA, covPayPkhB, \
+                opponentIdentity, spent, spendingTxid, spentConfirmed, \
+                markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, tier, \
+                DENSE_RANK() OVER (ORDER BY potBestSigRank DESC, tier ASC, \
+                                            COALESCE(potCreatedAt, markerCreatedAt) DESC, \
+                                            markerCreatedAt DESC, markerRowid DESC) \
+                    AS finalRank \
+       FROM (SELECT gameId, potTxid, potVout, recoveryHeight, covRecoveryHeight, \
               covPubA, covPubB, covPayPkhA, covPayPkhB, \
               opponentIdentity, spent, spendingTxid, spentConfirmed, \
               markerCreatedAt, markerRowid, potCreatedAt, potBestSigRank, \
@@ -625,7 +637,8 @@ pub fn recovery_view_sql(written_off_before_ms: Option<i64>) -> String {
            LEFT JOIN pot_records r \
                   ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
            WHERE pp.identity = ?{era}) \
-         WHERE rn = 1) \
+         WHERE rn = 1))) \
+       WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
        ORDER BY potBestSigRank DESC, tier ASC, \
                 COALESCE(potCreatedAt, markerCreatedAt) DESC, \
                 markerCreatedAt DESC, markerRowid DESC \
@@ -636,6 +649,7 @@ pub fn recovery_view_sql(written_off_before_ms: Option<i64>) -> String {
               w.markerCreatedAt DESC, w.markerRowid DESC",
         quota = RECOVERY_VIEW_UNKNOWN_QUOTA,
         probe = RECOVERY_VIEW_MAX_ROWS + 1,
+        after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
         era = era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
@@ -654,6 +668,13 @@ pub fn recovery_view_sql(written_off_before_ms: Option<i64>) -> String {
 /// caller whose `/results` page is complete has a complete `/recovery-view`
 /// page too.
 pub const RECOVERY_VIEW_MAX_ROWS: usize = 100;
+
+/// The `after` cursor's ceiling (brain-cutover M2c) — same bound + rationale
+/// as [`crate::hops_view::HOPS_VIEW_AFTER_MAX`]: the route clamps the parsed
+/// value here and [`recovery_view_body`] stops emitting `nextAfter` at the
+/// ceiling, because a walker whose next step re-clamps to the same page loops
+/// forever rather than walking.
+pub const RECOVERY_VIEW_AFTER_MAX: usize = 1_000_000;
 
 /// How many of the newest pots ABSENT from `pot_records` are promoted into
 /// the main `/recovery-view` tier instead of being demoted behind every
@@ -943,6 +964,8 @@ pub fn recovery_view_body(
     entries: &RecoveryEntriesReady,
     tip: Option<u64>,
     truncated: bool,
+    // The cursor position this page was served from (brain-cutover M2c).
+    after: usize,
 ) -> String {
     let arr: Vec<serde_json::Value> = entries
         .entries()
@@ -997,7 +1020,30 @@ pub fn recovery_view_body(
     // is attacker-writable (byte-format admission, no signature), so a caller
     // seeing `truncated: true` must treat the page as INCOMPLETE rather than
     // as "these are all my pots".
-    json!({ "tip": tip, "entries": arr, "truncated": truncated }).to_string()
+    // #398's cursor, applied to the recovery surface (brain-cutover M2c).
+    // `nextAfter` is present IFF this page trimmed AND a further step is
+    // representable — so a walker knows the set is REACHABLE rather than
+    // merely knowing it is incomplete. `truncated` keeps its exact meaning
+    // (this page is not the whole set), so a deployed client that ignores
+    // `nextAfter` behaves byte-identically to before.
+    //
+    // Why this matters beyond paging: the CLIENT's `creditSweep.seedFromServer`
+    // unions this view with an `ls_potparty partyFor` read precisely BECAUSE a
+    // truncated page could hide a pot (bsv-low #347's denial-of-recovery). A
+    // walkable view removes that justification — the union's remaining value
+    // is rank-cap divergence, which a complete walk subsumes.
+    let next_after = if truncated && after < RECOVERY_VIEW_AFTER_MAX {
+        Some(after + entries.entries().len())
+    } else {
+        None
+    };
+    json!({
+        "tip": tip,
+        "entries": arr,
+        "truncated": truncated,
+        "nextAfter": next_after,
+    })
+    .to_string()
 }
 
 /// Assemble the `/beef/:txid` wire body: `{"txid","beef":[<bytes>]}` (bytes
@@ -2517,7 +2563,10 @@ mod tests {
         assert_eq!(arr[0]["spent"], true);
         assert_eq!(arr[0]["spendingTxid"], "f0".repeat(32));
         assert_eq!(arr[0]["spentConfirmed"], false);
-        assert_eq!(arr[0]["spenderSeen"], true, "the #371 network-seen witness reaches the wire");
+        assert_eq!(
+            arr[0]["spenderSeen"], true,
+            "the #371 network-seen witness reaches the wire"
+        );
         assert_eq!(arr[0]["spenderFinal"], false);
         // Known-unspent row: no witness (produced by `known`, not the D1 path).
         assert_eq!(arr[1]["known"], true);
@@ -3100,6 +3149,7 @@ mod tests {
             &apply_recovery_extras(out, None, None),
             Some(958_800),
             false,
+            0,
         ))
         .unwrap();
         assert!(
@@ -3112,7 +3162,7 @@ mod tests {
     /// inoperative in production (producer-level check).
     #[test]
     fn recovery_view_sql_fetches_the_covenant_height() {
-        let sql = recovery_view_sql(None);
+        let sql = recovery_view_sql(None, 0);
         assert!(
             sql.contains("r.recoveryHeight AS covRecoveryHeight"),
             "covenant height must be SELECTed from pot_records: {sql}"
@@ -3128,8 +3178,8 @@ mod tests {
     fn recovery_view_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
         let frag = era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
-        let with = recovery_view_sql(cutoff);
-        let without = recovery_view_sql(None);
+        let with = recovery_view_sql(cutoff, 0);
+        let without = recovery_view_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
             with.matches(&format!("WHERE pp.identity = ?{frag})"))
@@ -3367,7 +3417,7 @@ mod tests {
 
     #[test]
     fn recovery_view_sql_shape() {
-        let sql = recovery_view_sql(None);
+        let sql = recovery_view_sql(None, 0);
         // JOINs the pot outpoint for spend status; the BEEF join now sits
         // OUTSIDE the window, on survivors only, so a marker flood can never
         // drag real BLOBs along with it (#323 HIGH-1).
@@ -3645,6 +3695,7 @@ mod tests {
             &apply_recovery_extras(entries.clone(), None, None),
             Some(958_800),
             false,
+            0,
         ))
         .unwrap();
         assert_eq!(v["tip"], 958_800);
@@ -3670,6 +3721,7 @@ mod tests {
             &apply_recovery_extras(entries, None, None),
             None,
             false,
+            0,
         ))
         .unwrap();
         assert!(v2["tip"].is_null());
@@ -3679,6 +3731,7 @@ mod tests {
             &apply_recovery_extras(Vec::new(), None, None),
             None,
             false,
+            0,
         ))
         .unwrap();
         assert!(v3["tip"].is_null());

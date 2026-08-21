@@ -146,10 +146,21 @@ fn file_party(
     .expect("insert potparty_records");
 }
 
+/// [`query_recovery_rows`] at a cursor position (brain-cutover M2c): the
+/// SHIPPED SQL with a non-zero `after`, so a walk is driven the way the route
+/// drives it.
+fn query_recovery_rows_after(conn: &Connection, identity: &str, after: usize) -> Vec<RecoveryRow> {
+    query_recovery_rows_inner(conn, identity, after)
+}
+
 /// EXECUTE the shipped `recovery_view_sql()` and map rows exactly as the
 /// worker's `RecoveryRowD1` does.
 fn query_recovery_rows(conn: &Connection, identity: &str) -> Vec<RecoveryRow> {
-    let sql = recovery_view_sql(None);
+    query_recovery_rows_inner(conn, identity, 0)
+}
+
+fn query_recovery_rows_inner(conn: &Connection, identity: &str, after: usize) -> Vec<RecoveryRow> {
+    let sql = recovery_view_sql(None, after);
     let mut stmt = conn
         .prepare(&sql)
         .unwrap_or_else(|e| panic!("recovery_view_sql did not PREPARE: {e}\n{sql}"));
@@ -190,7 +201,7 @@ fn query_recovery_rows(conn: &Connection, identity: &str) -> Vec<RecoveryRow> {
 #[test]
 fn recovery_view_sql_prepares_against_the_production_schema() {
     let conn = production_schema_db();
-    let sql = recovery_view_sql(None);
+    let sql = recovery_view_sql(None, 0);
     conn.prepare(&sql)
         .unwrap_or_else(|e| panic!("recovery_view_sql is not valid SQL: {e}\n{sql}"));
 }
@@ -271,6 +282,7 @@ fn the_committed_covenant_keys_survive_every_projection_tier_and_reach_the_wire(
         &apply_recovery_extras(entries, None, None),
         Some(900_000),
         false,
+        0,
     ))
     .unwrap();
     let ck = &body["entries"][0]["committedKeys"];
@@ -314,6 +326,7 @@ fn a_pot_without_decoded_params_serves_null_committed_keys() {
         &apply_recovery_extras(entries, None, None),
         None,
         false,
+        0,
     ))
     .unwrap();
     assert!(
@@ -762,7 +775,7 @@ fn the_extras_reach_the_wire_and_absent_stays_null() {
     );
     let folded = apply_recovery_extras(entries, None, Some(&set));
     let body: serde_json::Value =
-        serde_json::from_str(&recovery_view_body(&folded, None, false)).unwrap();
+        serde_json::from_str(&recovery_view_body(&folded, None, false, 0)).unwrap();
 
     let by_game = |g: &str| -> serde_json::Value {
         body["entries"]
@@ -799,6 +812,7 @@ fn the_extras_reach_the_wire_and_absent_stays_null() {
         ),
         None,
         false,
+        0,
     ))
     .unwrap();
     assert!(unfolded["entries"][0]["collected"].is_null());
@@ -851,7 +865,7 @@ fn the_outcome_word_is_the_results_derivation_reused_not_respelled() {
     // Matching outpoint: the word + source pass through verbatim.
     let folded = apply_recovery_extras(entries.clone(), Some(&[mk(0)]), None);
     let body: serde_json::Value =
-        serde_json::from_str(&recovery_view_body(&folded, None, false)).unwrap();
+        serde_json::from_str(&recovery_view_body(&folded, None, false, 0)).unwrap();
     assert_eq!(body["entries"][0]["outcome"], serde_json::json!("won"));
     assert_eq!(
         body["entries"][0]["outcomeSource"],
@@ -861,7 +875,7 @@ fn the_outcome_word_is_the_results_derivation_reused_not_respelled() {
     // Near-miss (different vout): absence, never a guess.
     let folded2 = apply_recovery_extras(entries, Some(&[mk(1)]), None);
     let body2: serde_json::Value =
-        serde_json::from_str(&recovery_view_body(&folded2, None, false)).unwrap();
+        serde_json::from_str(&recovery_view_body(&folded2, None, false, 0)).unwrap();
     assert!(body2["entries"][0]["outcome"].is_null());
 }
 
@@ -887,7 +901,7 @@ fn the_rule24_catchup_alone_makes_the_presence_query_preparable() {
 
 /// The pot-txid page served by the SHIPPED SQL under an era cutoff.
 fn recovery_pot_txids(conn: &Connection, identity: &str, era: Option<i64>) -> Vec<String> {
-    let sql = recovery_view_sql(era);
+    let sql = recovery_view_sql(era, 0);
     let mut stmt = conn
         .prepare(&sql)
         .unwrap_or_else(|e| panic!("recovery_view_sql({era:?}) did not PREPARE: {e}\n{sql}"));
@@ -985,4 +999,109 @@ fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
     for pot in [&pre, &post, &unknown_pre, &unknown_post] {
         assert!(all.contains(pot), "{pot} missing from the None arm");
     }
+}
+
+/// Brain-cutover M2c — THE WALK: a >cap identity's pots are all REACHABLE by
+/// stepping `after`, and the walk TERMINATES.
+///
+/// This is the property the client's recovery union exists to compensate for
+/// (bsv-low #347's denial-of-recovery: a truncated page could hide a pot, so
+/// `creditSweep.seedFromServer` unions the view with an `ls_potparty` read).
+/// A walkable view removes that justification.
+///
+/// The trap #398 hit and this cell guards: EVERY rank key must be constant
+/// per PARTITION UNIT or a page under-fills and the walk ends early on a
+/// false `truncated:false`. Here the unit is the POT (the SQL collapses
+/// `rn = 1` per outpoint before ranking), so the cell proves it by walking a
+/// set with more pots than the cap and asserting the union of pages is the
+/// WHOLE set, with no duplicates and no gaps.
+#[test]
+fn the_cursor_walk_reaches_every_pot_and_terminates() {
+    let conn = production_schema_db();
+    let me = h66(0xaa);
+    // 150 pots > RECOVERY_VIEW_MAX_ROWS (100): a single page cannot hold them.
+    const N: usize = 150;
+    for i in 0..N {
+        let pot = format!("{:02x}", i).repeat(32);
+        let game = format!("{:02x}", 0x80 + i).repeat(32);
+        admit_pot(&conn, &pot, 1_000 + i as i64, Some(958_800));
+        file_party(
+            &conn,
+            &me,
+            &game,
+            &pot,
+            958_800,
+            &format!("{:02x}", 0x40 + i).repeat(32),
+            2_000 + i as i64,
+        );
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut after = 0usize;
+    let mut pages = 0;
+    loop {
+        let rows = query_recovery_rows_after(&conn, &me, after);
+        // The route trims the probe row before serving; mirror that here so
+        // the walk arithmetic is the SERVED one.
+        let truncated = rows.len() > low_app_layer::logic::RECOVERY_VIEW_MAX_ROWS;
+        let served = if truncated {
+            &rows[..low_app_layer::logic::RECOVERY_VIEW_MAX_ROWS]
+        } else {
+            &rows[..]
+        };
+        seen.extend(served.iter().map(|r| r.pot_txid.clone()));
+        pages += 1;
+        assert!(pages <= 5, "the walk must terminate, not loop");
+        if !truncated {
+            break;
+        }
+        after += served.len();
+    }
+
+    assert_eq!(pages, 2, "150 pots at a 100 cap is exactly two pages");
+    let mut uniq = seen.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(
+        uniq.len(),
+        N,
+        "every pot is REACHABLE by walking (the union of pages is the whole set)"
+    );
+    assert_eq!(
+        seen.len(),
+        N,
+        "and no pot is served twice across the walk (1 rank = 1 pot)"
+    );
+}
+
+/// The cursor is a WINDOW, not an offset-into-a-reordered-set: page 1 and the
+/// walk's first page are byte-identical, so a deployed client that never
+/// sends `after` sees exactly what it saw before (Rule 14, read-both/write-new).
+#[test]
+fn after_zero_is_the_unchanged_first_page() {
+    let conn = production_schema_db();
+    let me = h66(0xaa);
+    for i in 0..5 {
+        let pot = format!("{:02x}", i).repeat(32);
+        admit_pot(&conn, &pot, 1_000 + i as i64, Some(958_800));
+        file_party(
+            &conn,
+            &me,
+            &format!("{:02x}", 0x80 + i).repeat(32),
+            &pot,
+            958_800,
+            &format!("{:02x}", 0x40 + i).repeat(32),
+            2_000 + i as i64,
+        );
+    }
+    let plain: Vec<String> = query_recovery_rows(&conn, &me)
+        .into_iter()
+        .map(|r| r.pot_txid)
+        .collect();
+    let at_zero: Vec<String> = query_recovery_rows_after(&conn, &me, 0)
+        .into_iter()
+        .map(|r| r.pot_txid)
+        .collect();
+    assert_eq!(plain, at_zero);
+    assert_eq!(plain.len(), 5);
 }

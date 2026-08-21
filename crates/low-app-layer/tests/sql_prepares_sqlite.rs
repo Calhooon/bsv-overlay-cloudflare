@@ -3,7 +3,7 @@
 //!
 //! # Why
 //!
-//! `recovery_view_sql()` shipped syntactically invalid — a column carried
+//! `recovery_view_sql(, 0)` shipped syntactically invalid — a column carried
 //! through three of four projection tiers and dropped by the middle one — and
 //! took `/recovery-view` down for every request with a valid identity. It
 //! passed the whole suite because the only pins on it were
@@ -62,8 +62,12 @@ fn assert_prepares(conn: &Connection, name: &str, sql: &str) {
 fn every_fixed_query_prepares_against_the_production_schema() {
     let conn = production_schema_db();
     const ERA: Option<i64> = Some(1_754_500_000_000);
-    assert_prepares(&conn, "recovery_view_sql", &recovery_view_sql(None));
-    assert_prepares(&conn, "recovery_view_sql(era)", &recovery_view_sql(ERA));
+    assert_prepares(&conn, "recovery_view_sql", &recovery_view_sql(None, 0));
+    assert_prepares(
+        &conn,
+        "recovery_view_sql(era, 0)",
+        &recovery_view_sql(ERA, 0),
+    );
     assert_prepares(&conn, "refund_view_sql", &refund_view_sql(None));
     assert_prepares(&conn, "refund_view_sql(era)", &refund_view_sql(ERA));
     assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false, None, 0));
@@ -105,17 +109,25 @@ fn fixed_queries_declare_the_parameter_count_per_era_arm() {
     let conn = production_schema_db();
     const ERA: Option<i64> = Some(1_754_500_000_000);
     for (name, sql, expected) in [
-        ("recovery_view_sql(None)", recovery_view_sql(None), 1),
-        ("recovery_view_sql(era)", recovery_view_sql(ERA), 2),
+        ("recovery_view_sql(None, 0)", recovery_view_sql(None, 0), 1),
+        ("recovery_view_sql(era, 0)", recovery_view_sql(ERA, 0), 2),
         ("refund_view_sql(None)", refund_view_sql(None), 1),
         ("refund_view_sql(era)", refund_view_sql(ERA), 2),
         ("live_view_sql(None)", live_view_sql(None), 1),
         ("live_view_sql(era)", live_view_sql(ERA), 2),
         ("results_sql(None)", results_sql(None), 1),
         ("results_sql(era)", results_sql(ERA), 2),
-        ("hops_view_sql(false, None, 0)", hops_view_sql(false, None, 0), 1),
+        (
+            "hops_view_sql(false, None, 0)",
+            hops_view_sql(false, None, 0),
+            1,
+        ),
         ("hops_view_sql(false, era)", hops_view_sql(false, ERA, 0), 2),
-        ("hops_view_sql(true, None, 0)", hops_view_sql(true, None, 0), 2),
+        (
+            "hops_view_sql(true, None, 0)",
+            hops_view_sql(true, None, 0),
+            2,
+        ),
         ("hops_view_sql(true, era)", hops_view_sql(true, ERA, 0), 3),
         (
             "leaderboard_markers_sql(None)",

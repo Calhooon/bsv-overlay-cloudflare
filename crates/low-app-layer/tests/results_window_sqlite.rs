@@ -1711,7 +1711,7 @@ fn file_real_v2_marker(
         seat_settle_pubkey: settle_pub_hex.to_string(),
         seat_sig_hex: hex::encode(seat_sig.to_der()),
         identity_sig_hex: String::new(),
-    sig_valid: None, // fixture: the compute arm
+        sig_valid: None, // fixture: the compute arm
     };
     let challenge = potparty_v2_challenge(&m).unwrap();
     let sig = identity_wallet
@@ -2817,7 +2817,7 @@ fn der_padding_is_refused_canonical_strict() {
         seat_settle_pubkey: pa.clone(),
         seat_sig_hex: hex::encode(&der),
         identity_sig_hex: String::new(),
-    sig_valid: None, // fixture: the compute arm
+        sig_valid: None, // fixture: the compute arm
     };
     // POSITIVE CONTROL — without this the refusals below prove nothing.
     assert!(

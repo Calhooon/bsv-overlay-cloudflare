@@ -338,7 +338,7 @@ fn file_party_v2_real(
         seat_settle_pubkey: settle_pub.clone(),
         seat_sig_hex: seat_sig_hex.clone(),
         identity_sig_hex: String::new(),
-    sig_valid: None, // fixture: the compute arm
+        sig_valid: None, // fixture: the compute arm
     };
     let challenge = potparty_v2_challenge(&m).expect("challenge");
     let id_sig = identity_wallet

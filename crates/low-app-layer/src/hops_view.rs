@@ -914,7 +914,15 @@ mod tests {
                      hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
                      hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt) \
                  VALUES (?1, 'opp', ?2, 0, ?3, 'pk', 'ss', 'is', 'aa', ?4, 3, ?5, ?6, ?7)",
-                rusqlite::params![identity, txid, hop_sats, on_chain, txid, output_index, created],
+                rusqlite::params![
+                    identity,
+                    txid,
+                    hop_sats,
+                    on_chain,
+                    txid,
+                    output_index,
+                    created
+                ],
             )
             .unwrap();
             conn.execute(
@@ -1030,7 +1038,13 @@ mod tests {
                      hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
                      hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt) \
                  VALUES (?1, 'opp', ?2, 0, ?3, 'pk', 'ss', 'is', 'aa', ?3, 2, ?4, 1, ?5)",
-                rusqlite::params![identity, format!("{:02x}", i).repeat(32), sats, txid, created],
+                rusqlite::params![
+                    identity,
+                    format!("{:02x}", i).repeat(32),
+                    sats,
+                    txid,
+                    created
+                ],
             )
             .unwrap();
             conn.execute(
