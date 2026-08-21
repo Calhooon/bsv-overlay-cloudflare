@@ -336,33 +336,51 @@ impl LookupService for PotLookupService {
         // stakeA + stakeB` in-script, so a funding value that disagrees is
         // not the pot the params describe → no verdict.
         let verdict = match self.storage.get_spent_status(txid, output_index).await {
-            Ok(Some(record)) => record
-                .decoded_covenant_params()
-                .and_then(|params| {
-                    let pot_sats = record.pot_sats?;
-                    if params.stake_a.checked_add(params.stake_b)? != pot_sats {
-                        return None; // conservation failed — never classify
-                    }
-                    // The spend notification names the spent outpoint; find
-                    // the spending tx's OWN input for it (its sequence feeds
-                    // the refund height-gate check).
-                    let pot_input_sequence = spending_tx.inputs.iter().find_map(|i| {
+            Ok(Some(record)) => record.decoded_covenant_params().and_then(|params| {
+                let pot_sats = record.pot_sats?;
+                if params.stake_a.checked_add(params.stake_b)? != pot_sats {
+                    return None; // conservation failed — never classify
+                }
+                // The spend notification names the spent outpoint; find
+                // the spending tx's OWN input for it (the index feeds the
+                // #406 sighash, the sequence the refund height-gate).
+                let (pot_input_index, pot_input_sequence) =
+                    spending_tx.inputs.iter().enumerate().find_map(|(n, i)| {
                         (i.source_txid
                             .as_deref()
                             .is_some_and(|t| t.eq_ignore_ascii_case(txid))
                             && i.source_output_index == output_index)
-                            .then_some(i.sequence)
+                            .then_some((n, i.sequence))
                     })?;
-                    let spender = crate::pot::RawTx::from_transaction(&spending_tx)?;
-                    crate::pot::classify_covenant(&params, &spender, pot_input_sequence)
-                })
-                .map(|v| v.as_str()),
+                let spender = crate::pot::RawTx::from_transaction(&spending_tx)?;
+                let v = crate::pot::classify_covenant(&params, &spender, pot_input_sequence)?;
+                // #406: WHO SIGNED — the spend's signatures verified
+                // against the committed key triple over the network's own
+                // BIP-143 digest (the lock is rebuilt from the committed
+                // params; a rebuild that drifts can only fail to verify,
+                // never mis-attribute). `None` = not established — the
+                // group still writes, and the backfill retries once from
+                // the durable spender BEEF.
+                let signers = crate::pot::settle_signers_for_spend(
+                    &params,
+                    pot_sats,
+                    &spending_tx.to_binary(),
+                    pot_input_index,
+                );
+                Some((v, signers))
+            }),
             Ok(None) => None, // never admitted — mark_spent is a no-op anyway
             Err(e) => {
                 debug!("POT: record read for verdict classification failed — no verdict: {e}");
                 None
             }
         };
+        // The #284 verdict + #406 signers travel as ONE group (typed so the
+        // signers can never be written without the verdict they ride with).
+        let verdict_write = verdict.map(|(v, s)| crate::pot::storage::VerdictWrite {
+            verdict: v.as_str(),
+            settle_signers: s.map(crate::pot::SettleSigners::as_str),
+        });
 
         // bsv-low #371: latch the spender's BYTES-FINALITY once, at record
         // time, from the tx we already parsed (epoch Rule 25 — never re-parse
@@ -385,7 +403,7 @@ impl LookupService for PotLookupService {
                 output_index,
                 &spending_txid,
                 confirmed,
-                verdict,
+                verdict_write,
                 spent_height,
                 spender_final,
             )
@@ -1072,7 +1090,10 @@ mod tests {
         // is filed as a hop with its committed params thrown away.
         assert_eq!(r.lock_kind.as_deref(), Some("covenant"));
         assert!(r.params_decoded);
-        assert_eq!(r.pub_tower.as_deref(), Some(hex::encode(p.pub_tower).as_str()));
+        assert_eq!(
+            r.pub_tower.as_deref(),
+            Some(hex::encode(p.pub_tower).as_str())
+        );
         assert_eq!(r.stake_a, Some(p.stake_a));
     }
 

@@ -121,6 +121,9 @@ pub use overlay_discovery::pot::covenant::{
     p2pkh_lock, CovenantParams, PotVerdict, RawInput, RawTx, LOCKTIME_THRESHOLD,
     TEMPLATE_RAKE_DIVISOR,
 };
+// bsv-low #406: the settle-signer classification's wire enum (serves the
+// column; the app-layer never runs the ECDSA itself).
+pub use overlay_discovery::pot::spend_signers::SettleSigners;
 
 /// Parse raw tx bytes via `bsv_rs` and require the bytes HASH to
 /// `expected_txid` — a garbled or substituted store row must degrade to
@@ -2438,7 +2441,7 @@ pub fn decoded_pots_sql(n: usize) -> String {
         "SELECT txid, outputIndex, spendingTxid, lockKind, pubA, pubB, pubTower, \
                 payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, \
                 recoveryHeight AS covRecoveryHeight, potSats, \
-                verdict, verdictTxid, spentHeight \
+                verdict, verdictTxid, settleSigners, spentHeight \
          FROM pot_records WHERE {clause}"
     )
 }

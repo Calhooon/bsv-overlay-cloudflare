@@ -23,7 +23,9 @@ use overlay_discovery::low::storage::{
     LowRecord, LowRecordType, LowStorage, LowStorageError, LOW_BY_KEY_RESULT_CAP,
     OPEN_TABLES_PER_HOST_CAP, OPEN_TABLES_RESULT_CAP,
 };
-use overlay_discovery::pot::storage::{pot_beef_has_proof, PotRecord, PotStorage, PotStorageError};
+use overlay_discovery::pot::storage::{
+    pot_beef_has_proof, PotRecord, PotStorage, PotStorageError, VerdictWrite,
+};
 use overlay_discovery::potparty::storage::{PotpartyRecord, PotpartyStorage, PotpartyStorageError};
 use overlay_discovery::potrefund::storage::{
     PotrefundRecord, PotrefundStorage, PotrefundStorageError,
@@ -1451,6 +1453,10 @@ struct PotRow {
     /// `spenderFinal` migration.
     #[serde(rename = "spenderFinal", default)]
     spender_final: Option<f64>,
+    /// bsv-low #406 — `serde(default)` tolerates a read racing the additive
+    /// migration, exactly like `spenderFinal`.
+    #[serde(rename = "settleSigners", default)]
+    settle_signers: Option<String>,
 }
 
 impl PotRow {
@@ -1478,6 +1484,7 @@ impl PotRow {
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
             spender_final: self.spender_final.map(|v| v != 0.0),
+            settle_signers: self.settle_signers,
         }
     }
 }
@@ -1487,7 +1494,7 @@ impl PotRow {
 const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentConfirmed, \
      lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
      stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
-     verdict, verdictTxid, spentHeight, spenderFinal";
+     verdict, verdictTxid, spentHeight, spenderFinal, settleSigners";
 
 /// Row for the `pot_beefs` length + verified-latch probe
 /// (`length(beef) AS len, proof_verified`). D1 returns numbers as f64;
@@ -1868,7 +1875,7 @@ fn pot_err(e: String) -> PotStorageError {
 /// a pointer change under `false` deliberately leaves a stale verdict
 /// behind, neutralized by the reader's `verdictTxid == spendingTxid` check.
 ///
-/// Bind order: `spendingTxid, [verdict, verdictTxid,] [confirmed only:
+/// Bind order: `spendingTxid, [verdict, verdictTxid, settleSigners,] [confirmed only:
 /// spendingTxid, spentHeight, spentHeight,] txid, outputIndex`.
 ///
 /// Both branches stamp `spentAt = unixepoch()` (#228 backstop age anchor):
@@ -1912,7 +1919,7 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
         (true, true) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1, \
                  spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
-                 verdict = ?, verdictTxid = ?, \
+                 verdict = ?, verdictTxid = ?, settleSigners = ?, \
                  spentHeight = CASE WHEN spendingTxid = ? \
                                THEN COALESCE(?, spentHeight) ELSE ? END, \
                  spenderFinal = CASE WHEN spendingTxid = ? \
@@ -1931,7 +1938,7 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
         (false, true) => {
             "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentAt = unixepoch(), \
                  firstSpentAt = COALESCE(firstSpentAt, unixepoch()), \
-                 verdict = ?, verdictTxid = ?, \
+                 verdict = ?, verdictTxid = ?, settleSigners = ?, \
                  spenderFinal = CASE WHEN spendingTxid = ? \
                                THEN COALESCE(?, spenderFinal) ELSE ? END \
              WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
@@ -1944,6 +1951,22 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
              WHERE txid = ? AND outputIndex = ? AND spentConfirmed = 0"
         }
     }
+}
+
+/// The bsv-low #406 signers-backfill candidate scan: rows holding a CURRENT
+/// verdict group (verdict present, keyed to the live pointer) with no signer
+/// classification. `settleSigners IS NULL` naturally excludes the
+/// 'unresolved' latch (attempted from durable bytes, no pair verified), so a
+/// never-verifying row leaves the set permanently. RANDOM-sampled — the
+/// anti-starvation idiom of the #284 scan. A const-shaped helper so the
+/// real-SQLite pin executes the production string.
+pub(crate) fn settle_signers_candidates_sql(limit: u64) -> String {
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE verdict IS NOT NULL AND verdictTxid = spendingTxid \
+           AND settleSigners IS NULL \
+         ORDER BY RANDOM() LIMIT {limit}"
+    )
 }
 
 /// SQL for one batched spent-status chunk (bsv-low #289): a single
@@ -1971,7 +1994,7 @@ pub fn pot_spent_statuses_sql(n: usize) -> String {
 /// Bind order: `verdict, spendingTxid (verdictTxid), txid, outputIndex,
 /// spendingTxid (guard)`.
 pub fn verdict_cas_sql() -> &'static str {
-    "UPDATE pot_records SET verdict = ?, verdictTxid = ? \
+    "UPDATE pot_records SET verdict = ?, verdictTxid = ?, settleSigners = ? \
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
 }
 
@@ -2096,7 +2119,7 @@ impl PotStorage for D1PotStorage {
         output_index: u32,
         spending_txid: &str,
         confirmed: bool,
-        verdict: Option<&str>,
+        verdict: Option<VerdictWrite<'_>>,
         spent_height: Option<u64>,
         spender_final: Option<bool>,
     ) -> Result<(), PotStorageError> {
@@ -2111,14 +2134,15 @@ impl PotStorage for D1PotStorage {
         //   unconfirmed claims is preserved); spentConfirmed untouched.
         //
         // #284: a Some(verdict) rides the SAME statement as the pointer
-        // (verdictTxid bound to the spending txid — atomic); None leaves
-        // verdict/verdictTxid entirely out of the SET. spentHeight (the
-        // confirmed branch only) RIDES THE POINTER: same-pointer re-confirm
-        // keeps-or-updates (COALESCE), a pointer change resets it to the
-        // incoming value (gate LOW-1) — see mark_spent_sql for the CASE.
+        // (verdictTxid bound to the spending txid — atomic); None leaves the
+        // whole verdict GROUP (verdict/verdictTxid/#406 settleSigners) out of
+        // the SET. spentHeight (the confirmed branch only) RIDES THE POINTER:
+        // same-pointer re-confirm keeps-or-updates (COALESCE), a pointer
+        // change resets it to the incoming value (gate LOW-1) — see
+        // mark_spent_sql for the CASE.
         let mut q = Query::new(mark_spent_sql(confirmed, verdict.is_some())).bind(spending_txid);
         if let Some(v) = verdict {
-            q = q.bind(v).bind(spending_txid);
+            q = q.bind(v.verdict).bind(spending_txid).bind(v.settle_signers);
         }
         if confirmed {
             // CASE binds: the same-pointer probe, the COALESCE height, the
@@ -2153,14 +2177,16 @@ impl PotStorage for D1PotStorage {
         txid: &str,
         output_index: u32,
         spending_txid: &str,
-        verdict: &str,
+        verdict: VerdictWrite<'_>,
     ) -> Result<(), PotStorageError> {
-        // The backfill's CAS verdict write (gate MEDIUM-2): verdict +
-        // verdictTxid only, guarded on the pointer it was computed for. A
-        // moved pointer ⇒ WHERE misses ⇒ no-op (see `verdict_cas_sql`).
+        // The backfill's CAS verdict-group write (gate MEDIUM-2): verdict +
+        // verdictTxid + #406 settleSigners only, guarded on the pointer it
+        // was computed for. A moved pointer ⇒ WHERE misses ⇒ no-op (see
+        // `verdict_cas_sql`).
         Query::new(verdict_cas_sql())
-            .bind(verdict)
+            .bind(verdict.verdict)
             .bind(spending_txid)
+            .bind(verdict.settle_signers)
             .bind(txid)
             .bind(output_index)
             .bind(spending_txid)
@@ -2285,6 +2311,19 @@ impl PotStorage for D1PotStorage {
              WHERE paramsDecoded = 0 ORDER BY RANDOM() LIMIT {limit}"
         );
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_settle_signers_unlatched(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // bsv-low #406 backfill candidates — see
+        // `settle_signers_candidates_sql` (pinned against real SQLite).
+        let rows: Vec<PotRow> = Query::new(settle_signers_candidates_sql(limit))
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
     }
 
@@ -6468,7 +6507,7 @@ mod tests {
     }
 
     /// Execute the shipped `mark_spent_sql(...)` with the D1 impl's exact
-    /// bind order (spendingTxid, [verdict, verdictTxid,] [confirmed only:
+    /// bind order (spendingTxid, [verdict, verdictTxid, settleSigners,] [confirmed only:
     /// spendingTxid, spentHeight, spentHeight,] #371 finality CASE:
     /// spendingTxid, spenderFinal, spenderFinal, then txid, outputIndex).
     /// Callers that predate #371 use the `exec_mark_spent` wrapper (finality
@@ -6493,6 +6532,7 @@ mod tests {
                     spending_txid,
                     v,
                     spending_txid,
+                    Option::<String>::None, // settleSigners (#406) — the plain helper writes NULL
                     spending_txid,
                     spent_height,
                     spent_height,
@@ -6523,6 +6563,7 @@ mod tests {
                     spending_txid,
                     v,
                     spending_txid,
+                    Option::<String>::None, // settleSigners (#406)
                     spending_txid,
                     fin,
                     fin,
@@ -6649,9 +6690,172 @@ mod tests {
     ) {
         conn.execute(
             verdict_cas_sql(),
-            rusqlite::params![verdict, spending_txid, txid, vout, spending_txid],
+            rusqlite::params![
+                verdict,
+                spending_txid,
+                Option::<String>::None, // settleSigners (#406) — the plain helper writes NULL
+                txid,
+                vout,
+                spending_txid
+            ],
         )
         .expect("verdict_cas_sql executes");
+    }
+
+    /// bsv-low #406 — the verdict GROUP carries `settleSigners` atomically,
+    /// with the exact production strings against real SQLite: the with_verdict
+    /// writers set it, the verdict-less writers and the displacement CAS never
+    /// touch it, the backfill CAS is pointer-guarded, and the candidate scan's
+    /// bar (NULL only — 'unresolved' is latched OUT) is WHERE-clause behavior.
+    #[test]
+    fn sql_the_verdict_group_carries_settle_signers() {
+        let conn = production_schema_db();
+        exec_store(&conn, "potA", 0, 1_000, None, None, None, None, 0);
+
+        // The live writer (unconfirmed + verdict): the group lands whole.
+        conn.execute(
+            mark_spent_sql(false, true),
+            rusqlite::params![
+                "settle1",
+                "winner-a",
+                "settle1",
+                Some("coop"),
+                "settle1",
+                Option::<i64>::None,
+                Option::<i64>::None,
+                "potA",
+                0u32
+            ],
+        )
+        .expect("mark_spent_sql(false, true) executes with the signers bind");
+        let read = |col: &str| -> Option<String> {
+            conn.query_row(
+                &format!("SELECT {col} FROM pot_records WHERE txid='potA'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(read("verdict").as_deref(), Some("winner-a"));
+        assert_eq!(read("settleSigners").as_deref(), Some("coop"));
+
+        // A verdict-less confirm leaves the whole group untouched.
+        exec_mark_spent_final(
+            &conn,
+            "potA",
+            0,
+            "settle1",
+            true,
+            None,
+            Some(800_000),
+            Some(true),
+        );
+        assert_eq!(
+            read("settleSigners").as_deref(),
+            Some("coop"),
+            "confirm-only never nulls"
+        );
+
+        // The backfill CAS: stale pointer ⇒ no-op; current pointer ⇒ rewrite.
+        conn.execute(
+            verdict_cas_sql(),
+            rusqlite::params![
+                "winner-b",
+                "ghostSpender",
+                Some("tower-a"),
+                "potA",
+                0u32,
+                "ghostSpender"
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read("settleSigners").as_deref(),
+            Some("coop"),
+            "stale CAS changes nothing"
+        );
+        conn.execute(
+            verdict_cas_sql(),
+            rusqlite::params![
+                "winner-a",
+                "settle1",
+                Some("tower-a"),
+                "potA",
+                0u32,
+                "settle1"
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read("settleSigners").as_deref(),
+            Some("tower-a"),
+            "current CAS rewrites the group"
+        );
+
+        // The candidate scan's bar: a latched row (real value OR 'unresolved')
+        // is out; only a NULL-signers current-verdict row is in.
+        let candidates = |limit: u64| -> usize {
+            conn.prepare(&settle_signers_candidates_sql(limit))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(candidates(10), 0, "a latched row is not a candidate");
+        exec_store(&conn, "potB", 0, 1_000, None, None, None, None, 0);
+        exec_mark_spent(&conn, "potB", 0, "settleB", false, Some("tie"), None);
+        assert_eq!(
+            candidates(10),
+            1,
+            "verdict present + signers NULL = a candidate"
+        );
+        conn.execute(
+            verdict_cas_sql(),
+            rusqlite::params![
+                "tie",
+                "settleB",
+                Some("unresolved"),
+                "potB",
+                0u32,
+                "settleB"
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            candidates(10),
+            0,
+            "'unresolved' latches the row OUT of the set"
+        );
+
+        // The displacement CAS never touches the group (existing contract —
+        // re-asserted here for the new column).
+        conn.prepare(displace_spend_cas_sql())
+            .unwrap()
+            .query_map(
+                rusqlite::params![
+                    "settleC",
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    "potB",
+                    0u32,
+                    "settleB"
+                ],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+            .count();
+        let sig: Option<String> = conn
+            .query_row(
+                "SELECT settleSigners FROM pot_records WHERE txid='potB'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sig.as_deref(),
+            Some("unresolved"),
+            "displacement leaves the stale group"
+        );
     }
 
     #[test]

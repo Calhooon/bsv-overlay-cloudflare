@@ -1212,7 +1212,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     // (the D1 param-cap discipline); any fault only omits classifications
     // (counting falls back to the claim rules) — never a 5xx, never a
     // fabricated verdict.
-    let (verdicts, params_by_pot) = classify_spent_pots(&db, &statuses).await;
+    let (verdicts, params_by_pot, signers_by_pot) = classify_spent_pots(&db, &statuses).await;
 
     // 5) #230 seat attribution — the DISPLAY identity mapping only (#332 v3:
     // the WIN is counted from the verdict + committed key in the aggregate,
@@ -1239,6 +1239,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         &verdicts,
         &attributions,
         &params_by_pot,
+        &signers_by_pot,
     );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
     json_response(
@@ -1287,6 +1288,11 @@ struct DecodedPotRowD1 {
     verdict: Option<String>,
     #[serde(rename = "verdictTxid", default)]
     verdict_txid: Option<String>,
+    /// bsv-low #406: who signed the recorded spend — rides the verdict group,
+    /// so the SAME freshness guard (`verdictTxid == spendingTxid == spender`)
+    /// covers it. `serde(default)` tolerates a pre-migration read.
+    #[serde(rename = "settleSigners", default)]
+    settle_signers: Option<String>,
 }
 
 impl DecodedPotRowD1 {
@@ -1336,9 +1342,16 @@ async fn classify_spent_pots(
 ) -> (
     std::collections::HashMap<String, crate::results::PotVerdict>,
     std::collections::HashMap<String, crate::results::CovenantParams>,
+    std::collections::HashMap<String, String>,
 ) {
     let mut verdicts = std::collections::HashMap::new();
     let mut params_by_pot = std::collections::HashMap::new();
+    // bsv-low #406: who signed each pot's settle — COLUMN-TIER ONLY (the
+    // latch + backfill write it; this read path never runs ECDSA). A pot the
+    // sweep has not reached serves nothing and the client says "not
+    // established" — self-draining, exactly the claimValid pattern.
+    let mut signers_by_pot: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // ALL spent pots with a recorded spender, deduped, in WINDOW RANK order
     // (#332: `statuses` follows the marker window, whose pot order is the
@@ -1362,7 +1375,7 @@ async fn classify_spent_pots(
         }
     }
     if all_pairs.is_empty() {
-        return (verdicts, params_by_pot);
+        return (verdicts, params_by_pot, signers_by_pot);
     }
 
     // ── Tier 1: the decoded-column partition (no BLOB fetch, NO CAP) ──────
@@ -1423,6 +1436,16 @@ async fn classify_spent_pots(
                     };
                     verdicts.insert(pot.clone(), v);
                     params_by_pot.insert(pot.clone(), params);
+                    // #406: the signer classification rides the verdict
+                    // group, so `fresh` above IS its guard; `from_wire`
+                    // drops 'unresolved'/garbage (→ not established).
+                    if let Some(sig) = row
+                        .settle_signers
+                        .as_deref()
+                        .and_then(crate::results::SettleSigners::from_wire)
+                    {
+                        signers_by_pot.insert(pot.clone(), sig.as_str().to_string());
+                    }
                     column_resolved.insert(pot.clone());
                 }
             }
@@ -1462,7 +1485,7 @@ async fn classify_spent_pots(
         .filter(|(pot, _)| !column_resolved.contains(pot))
         .collect();
     if pairs.is_empty() {
-        return (verdicts, params_by_pot);
+        return (verdicts, params_by_pot, signers_by_pot);
     }
 
     // One IN-query per ≤45-key chunk over the DISTINCT txids (funding +
@@ -1484,7 +1507,7 @@ async fn classify_spent_pots(
             Ok(s) => s,
             Err(e) => {
                 console_warn!("[leaderboard] pot_beefs bind failed (classification omitted): {e}");
-                return (verdicts, params_by_pot);
+                return (verdicts, params_by_pot, signers_by_pot);
             }
         };
         match stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
@@ -1536,7 +1559,7 @@ async fn classify_spent_pots(
             }
         }
     }
-    (verdicts, params_by_pot)
+    (verdicts, params_by_pot, signers_by_pot)
 }
 
 /// `potparty_records` v2 row for the #230 attribution join.

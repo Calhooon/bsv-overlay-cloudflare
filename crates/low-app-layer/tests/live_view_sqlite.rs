@@ -123,6 +123,7 @@ fn mark_spent(
                 spender,
                 v,
                 spender,
+                Option::<String>::None, // settleSigners (#406) — plain helper writes NULL
                 spender,
                 spent_height,
                 spent_height,
@@ -149,7 +150,17 @@ fn mark_spent(
         ),
         (false, Some(v)) => conn.execute(
             sql,
-            params![spender, v, spender, spender, fin, fin, pot_txid, 0i64],
+            params![
+                spender,
+                v,
+                spender,
+                Option::<String>::None, // settleSigners (#406)
+                spender,
+                fin,
+                fin,
+                pot_txid,
+                0i64
+            ],
         ),
         (false, None) => conn.execute(sql, params![spender, spender, fin, fin, pot_txid, 0i64]),
     }

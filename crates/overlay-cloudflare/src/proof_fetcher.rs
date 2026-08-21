@@ -387,7 +387,8 @@ impl ChainProofFetcher {
                 "bananablocks",
                 bananablocks_spend_url(&self.bananablocks_base, txid, vout),
                 hdr_none,
-                parse_bananablocks_spend_body as fn(u16, &str, &str) -> Result<Option<String>, String>,
+                parse_bananablocks_spend_body
+                    as fn(u16, &str, &str) -> Result<Option<String>, String>,
             ),
             (
                 "bitails",
@@ -953,17 +954,18 @@ fn parse_bananablocks_spend_body(
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status}"));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
     match v.get("spent").and_then(serde_json::Value::as_bool) {
         Some(false) => Ok(None),
-        Some(true) => well_formed_spender(
-            v.get("spentTxid").and_then(|t| t.as_str()),
-            outpoint_txid,
-        )
-        .map(Some)
-        .ok_or_else(|| excerpt("2xx spent:true without a well-formed spentTxid", body)),
-        None => Err(excerpt("2xx without a boolean `spent` (schema drift?)", body)),
+        Some(true) => {
+            well_formed_spender(v.get("spentTxid").and_then(|t| t.as_str()), outpoint_txid)
+                .map(Some)
+                .ok_or_else(|| excerpt("2xx spent:true without a well-formed spentTxid", body))
+        }
+        None => Err(excerpt(
+            "2xx without a boolean `spent` (schema drift?)",
+            body,
+        )),
     }
 }
 
@@ -984,20 +986,23 @@ fn parse_bitails_spend_body(
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status}"));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
     match v.get("spent").and_then(serde_json::Value::as_bool) {
         Some(false) => Ok(None),
         Some(true) => {
-            let candidate = v
-                .get("spentTxid")
-                .and_then(|t| t.as_str())
-                .or_else(|| v.get("spentIn").and_then(|s| s.get("txid")).and_then(|t| t.as_str()));
+            let candidate = v.get("spentTxid").and_then(|t| t.as_str()).or_else(|| {
+                v.get("spentIn")
+                    .and_then(|s| s.get("txid"))
+                    .and_then(|t| t.as_str())
+            });
             well_formed_spender(candidate, outpoint_txid)
                 .map(Some)
                 .ok_or_else(|| excerpt("2xx spent:true without a well-formed spender", body))
         }
-        None => Err(excerpt("2xx without a boolean `spent` (schema drift?)", body)),
+        None => Err(excerpt(
+            "2xx without a boolean `spent` (schema drift?)",
+            body,
+        )),
     }
 }
 
@@ -1017,11 +1022,15 @@ fn parse_woc_spend_body(
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status}"));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
     well_formed_spender(v.get("txid").and_then(|t| t.as_str()), outpoint_txid)
         .map(Some)
-        .ok_or_else(|| excerpt("2xx without a well-formed spender txid (schema drift?)", body))
+        .ok_or_else(|| {
+            excerpt(
+                "2xx without a well-formed spender txid (schema drift?)",
+                body,
+            )
+        })
 }
 
 /// Char-boundary-safe body excerpt for fault messages: a multibyte char
@@ -1074,7 +1083,8 @@ fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -> Result<Ve
     let mut beef = Beef::new();
     let bump_index = beef.merge_bump(bump);
     beef.merge_raw_tx(raw, Some(bump_index));
-    beef.to_binary_atomic(txid).map_err(|e| format!("beef serialize: {e}"))
+    beef.to_binary_atomic(txid)
+        .map_err(|e| format!("beef serialize: {e}"))
 }
 
 /// Tally of one pot-spend confirmation pass (logged by the cron / returned by
@@ -1420,9 +1430,9 @@ pub async fn complete_spend_confirmations(
         let spent_height = MerklePath::from_hex(&bump_hex)
             .ok()
             .map(|mp| u64::from(mp.block_height));
-        let spender_final = Transaction::from_hex(&raw).ok().map(|tx| {
-            !(tx.lock_time > 0 && tx.inputs.iter().any(|i| i.sequence < 0xffff_ffff))
-        });
+        let spender_final = Transaction::from_hex(&raw)
+            .ok()
+            .map(|tx| !(tx.lock_time > 0 && tx.inputs.iter().any(|i| i.sequence < 0xffff_ffff)));
         // Durably persist the spender's atomic BEEF BEFORE the pointer flips,
         // so the classifier finds bytes the moment the row names this
         // spender. Failure logs and proceeds — the pointer is the money fix.
@@ -1545,8 +1555,10 @@ pub async fn backfill_decoded_params(
     limit: u64,
 ) -> ParamsBackfillSummary {
     use overlay_discovery::pot::storage::PotRecord;
+    use overlay_discovery::pot::storage::VerdictWrite;
     use overlay_discovery::pot::{
-        classify_covenant, extract_covenant_params, is_bare_2of3_lock, is_p2pkh_script, RawTx,
+        classify_covenant, extract_covenant_params, is_bare_2of3_lock, is_p2pkh_script,
+        settle_signers_for_spend, RawTx, SettleSigners,
     };
 
     let mut summary = ParamsBackfillSummary::default();
@@ -1652,13 +1664,15 @@ pub async fn backfill_decoded_params(
         let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
             continue;
         };
-        let Some(pot_input_sequence) = spending_tx.inputs.iter().find_map(|i| {
-            (i.source_txid
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case(&row.txid))
-                && i.source_output_index == row.output_index)
-                .then_some(i.sequence)
-        }) else {
+        let Some((pot_input_index, pot_input_sequence)) =
+            spending_tx.inputs.iter().enumerate().find_map(|(n, i)| {
+                (i.source_txid
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&row.txid))
+                    && i.source_output_index == row.output_index)
+                    .then_some((n, i.sequence))
+            })
+        else {
             continue; // the recorded spender does not spend this outpoint
         };
         let Some(spender) = RawTx::from_transaction(&spending_tx) else {
@@ -1667,6 +1681,14 @@ pub async fn backfill_decoded_params(
         let Some(verdict) = classify_covenant(&params, &spender, pot_input_sequence) else {
             continue; // non-template spend — honestly unresolved
         };
+        // bsv-low #406: WHO SIGNED, from the durable spender bytes. This pass
+        // holds the bytes by construction, so a no-pair answer latches
+        // 'unresolved' (re-derived and concluded — never re-scanned), while a
+        // verifying pair latches the wire value. Both ride the verdict CAS.
+        let signers =
+            settle_signers_for_spend(&params, pot_sats, &spending_tx.to_binary(), pot_input_index)
+                .map(SettleSigners::as_str)
+                .unwrap_or("unresolved");
         // GUARDED CAS write (gate MEDIUM-2, 2026-07-28): the candidate read
         // and this write are separated by several awaits, so the pointer may
         // have MOVED (e.g. a reorg-confirmed S2 landed). A plain mark_spent
@@ -1681,7 +1703,15 @@ pub async fn backfill_decoded_params(
         // a moved pointer makes it a no-op and the read-path fallback (or a
         // later tick, if this row re-enters via its spender) covers it.
         if let Err(e) = pot_storage
-            .mark_verdict_for_spender(&row.txid, row.output_index, spending_txid, verdict.as_str())
+            .mark_verdict_for_spender(
+                &row.txid,
+                row.output_index,
+                spending_txid,
+                VerdictWrite {
+                    verdict: verdict.as_str(),
+                    settle_signers: Some(signers),
+                },
+            )
             .await
         {
             push_log(&format!(
@@ -1690,6 +1720,189 @@ pub async fn backfill_decoded_params(
             ));
         } else {
             summary.verdicts += 1;
+        }
+    }
+
+    summary
+}
+
+// ============================================================================
+// settleSigners historic backfill (bsv-low #406)
+// ============================================================================
+
+/// Per-tick candidate bound for [`backfill_settle_signers`] — same figure as
+/// the #284 pass (each candidate costs one spender-BEEF read + at most a few
+/// ECDSA verifies, all local).
+pub const SETTLE_SIGNERS_BACKFILL_LIMIT: u64 = 16;
+
+/// Tally of one settle-signers backfill pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SettleSignersBackfillSummary {
+    /// Candidate rows scanned this tick.
+    pub scanned: usize,
+    /// Rows latched with a REAL signer value ('coop'/'tower-a'/'tower-b').
+    pub latched: usize,
+    /// Rows latched 'unresolved' — re-derived from the durable bytes and no
+    /// pair verified (or a data anomaly made the row unclassifiable forever).
+    /// Latching removes them from the candidate set; readers show "not
+    /// established".
+    pub unresolved: usize,
+    /// Rows skipped because the spender BEEF is missing/unparseable — they
+    /// STAY candidates (the bytes can still arrive via a later submit).
+    pub missing_beef: usize,
+}
+
+/// Backfill `pot_records.settleSigners` for rows classified BEFORE #406
+/// shipped (verdict present + current, signers NULL) from the durable
+/// spender BEEF — the historic sibling of the live classify in
+/// `pot::lookup_service::output_spent`.
+///
+/// Per candidate row:
+/// 1. rebuild the committed params + pot value from the row's own decoded
+///    columns (a verdict-holding covenant row has them by construction; a
+///    row that doesn\'t is a data anomaly and latches 'unresolved' rather
+///    than re-entering forever);
+/// 2. read the SPENDER\'s durable BEEF (`get_beef(spendingTxid)`); missing →
+///    stays a candidate (bounded per tick, RANDOM-sampled);
+/// 3. hash-bound parse, locate the pot input, and classify WHO SIGNED
+///    ([`overlay_discovery::pot::settle_signers_for_spend`] — signatures
+///    verified against the committed triple over the network\'s own BIP-143
+///    digest). No pair verifying latches 'unresolved';
+/// 4. re-derive the verdict from the same bytes and CAS the whole group via
+///    [`PotStorage::mark_verdict_for_spender`] (pointer-guarded — a moved
+///    pointer makes it a no-op). The re-derived verdict equals the stored
+///    one for any row the same classifier wrote (deterministic function of
+///    bytes); if the re-derivation comes up empty the STORED verdict string
+///    is echoed unchanged so the write stays a pure signers-attach.
+pub async fn backfill_settle_signers(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    limit: u64,
+) -> SettleSignersBackfillSummary {
+    use overlay_discovery::pot::storage::VerdictWrite;
+    use overlay_discovery::pot::{
+        classify_covenant, settle_signers_for_spend, RawTx, SettleSigners,
+    };
+
+    let mut summary = SettleSignersBackfillSummary::default();
+    let candidates = match pot_storage.find_settle_signers_unlatched(limit).await {
+        Ok(c) => c,
+        Err(e) => {
+            push_log(&format!("[signers-backfill] candidate scan failed: {e}"));
+            return summary;
+        }
+    };
+    summary.scanned = candidates.len();
+
+    for row in candidates {
+        // The candidate query guarantees a current verdict group.
+        let (Some(stored_verdict), Some(spending_txid)) =
+            (row.verdict.as_deref(), row.spending_txid.as_deref())
+        else {
+            continue; // cannot happen per the query; leave it alone
+        };
+        // A latch that concludes "unclassifiable forever" — used for every
+        // durable-bytes conclusion AND for data anomalies (a candidate that
+        // cannot ever classify must not re-enter every tick).
+        fn latch_unresolved(verdict: &str) -> VerdictWrite<'_> {
+            VerdictWrite {
+                verdict,
+                settle_signers: Some("unresolved"),
+            }
+        }
+
+        // 1. Params + value from the row\'s own decoded columns.
+        let (Some(params), Some(pot_sats)) = (row.decoded_covenant_params(), row.pot_sats) else {
+            if let Err(e) = pot_storage
+                .mark_verdict_for_spender(
+                    &row.txid,
+                    row.output_index,
+                    spending_txid,
+                    latch_unresolved(stored_verdict),
+                )
+                .await
+            {
+                push_log(&format!(
+                    "[signers-backfill] {} anomaly latch failed: {e}",
+                    row.txid
+                ));
+            } else {
+                summary.unresolved += 1;
+            }
+            continue;
+        };
+        if params.stake_a.checked_add(params.stake_b) != Some(pot_sats) {
+            // Conservation broken on a verdict-holding row: an anomaly (the
+            // classifier refuses this before writing a verdict) — latch out.
+            if pot_storage
+                .mark_verdict_for_spender(
+                    &row.txid,
+                    row.output_index,
+                    spending_txid,
+                    latch_unresolved(stored_verdict),
+                )
+                .await
+                .is_ok()
+            {
+                summary.unresolved += 1;
+            }
+            continue;
+        }
+
+        // 2. The spender\'s durable bytes.
+        let Ok(Some(spender_beef)) = pot_storage.get_beef(spending_txid).await else {
+            summary.missing_beef += 1;
+            continue; // stays a candidate — the bytes can still arrive
+        };
+        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+            summary.missing_beef += 1;
+            continue; // unparseable stored bytes — stays a candidate (longer-wins may repair)
+        };
+        let Some((pot_input_index, pot_input_sequence)) =
+            spending_tx.inputs.iter().enumerate().find_map(|(n, i)| {
+                (i.source_txid
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&row.txid))
+                    && i.source_output_index == row.output_index)
+                    .then_some((n, i.sequence))
+            })
+        else {
+            // The recorded spender does not spend this outpoint: an anomaly
+            // for a verdict-holding row — latch out.
+            if pot_storage
+                .mark_verdict_for_spender(
+                    &row.txid,
+                    row.output_index,
+                    spending_txid,
+                    latch_unresolved(stored_verdict),
+                )
+                .await
+                .is_ok()
+            {
+                summary.unresolved += 1;
+            }
+            continue;
+        };
+
+        // 3+4. Classify signers; re-derive the verdict; CAS the group.
+        let signers =
+            settle_signers_for_spend(&params, pot_sats, &spending_tx.to_binary(), pot_input_index);
+        let rederived = RawTx::from_transaction(&spending_tx)
+            .and_then(|spender| classify_covenant(&params, &spender, pot_input_sequence));
+        let verdict_str = rederived.map(|v| v.as_str()).unwrap_or(stored_verdict);
+        let group = VerdictWrite {
+            verdict: verdict_str,
+            settle_signers: Some(signers.map(SettleSigners::as_str).unwrap_or("unresolved")),
+        };
+        match pot_storage
+            .mark_verdict_for_spender(&row.txid, row.output_index, spending_txid, group)
+            .await
+        {
+            Err(e) => push_log(&format!(
+                "[signers-backfill] {} write failed: {e}",
+                row.txid
+            )),
+            Ok(()) if signers.is_some() => summary.latched += 1,
+            Ok(()) => summary.unresolved += 1,
         }
     }
 
@@ -2412,7 +2625,7 @@ mod tests {
     // ── 5. spend-confirmation chaser pass (#186) ─────────────────────────────
 
     use overlay_discovery::pot::storage::{
-        MemoryPotStorage, PotRecord, PotStorage, PotStorageError,
+        MemoryPotStorage, PotRecord, PotStorage, PotStorageError, VerdictWrite,
     };
 
     /// A fetcher whose `verified_proof_for` returns a (dummy) verified bump ONLY
@@ -2570,7 +2783,11 @@ mod tests {
         );
         assert!(r.spent_confirmed, "displacement latches spentConfirmed");
         // A displaced row drops out of the candidate set — the loop ends.
-        assert!(store.find_spent_unconfirmed(10, 0).await.unwrap().is_empty());
+        assert!(store
+            .find_spent_unconfirmed(10, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// An unmined hint must NEVER displace: that would let one mempool claim
@@ -2593,7 +2810,11 @@ mod tests {
         assert_eq!(s.displace_attempts, 1);
         assert_eq!(s.displace_faults, 0, "unmined is a wait, not a fault");
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
-        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "pointer untouched");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("refundA"),
+            "pointer untouched"
+        );
         assert!(!r.spent_confirmed);
     }
 
@@ -2613,9 +2834,16 @@ mod tests {
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.displaced, 0);
-        assert_eq!(s.displace_faults, 1, "a non-binding hint is a counted refusal");
+        assert_eq!(
+            s.displace_faults, 1,
+            "a non-binding hint is a counted refusal"
+        );
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
-        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "pointer untouched");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("refundA"),
+            "pointer untouched"
+        );
         assert!(!r.spent_confirmed);
     }
 
@@ -2651,12 +2879,14 @@ mod tests {
         assert_eq!(s.displaced, 0);
         assert_eq!(s.displace_attempts, 1);
         assert_eq!(s.displace_faults, 0);
-        assert!(!store
-            .get_spent_status("potA", 0)
-            .await
-            .unwrap()
-            .unwrap()
-            .spent_confirmed);
+        assert!(
+            !store
+                .get_spent_status("potA", 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
     }
 
     /// A hint transport fault is COUNTED and skipped — never read as "no
@@ -2673,7 +2903,11 @@ mod tests {
         assert_eq!(s.displaced, 0);
         assert_eq!(s.displace_faults, 1);
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
-        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "pointer untouched");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("refundA"),
+            "pointer untouched"
+        );
         assert!(!r.spent_confirmed);
     }
 
@@ -2724,8 +2958,14 @@ mod tests {
     #[test]
     fn every_hint_rung_url_is_the_route_that_exists() {
         let woc = woc_spent_url("https://api.whatsonchain.com/v1/bsv/main", "aabb", 3);
-        assert_eq!(woc, "https://api.whatsonchain.com/v1/bsv/main/tx/aabb/3/spent");
-        assert!(!woc.contains("/out/"), "the /out/ shape is a router miss, not an API answer");
+        assert_eq!(
+            woc,
+            "https://api.whatsonchain.com/v1/bsv/main/tx/aabb/3/spent"
+        );
+        assert!(
+            !woc.contains("/out/"),
+            "the /out/ shape is a router miss, not an API answer"
+        );
         assert_eq!(
             bananablocks_spend_url("https://bananablocks.com/api/v1", "aabb", 3),
             "https://bananablocks.com/api/v1/txo/aabb/3/spend"
@@ -2736,21 +2976,30 @@ mod tests {
         );
     }
 
-    const OUTPOINT_TX: &str =
-        "e450f6686efb27662a387fd7af0fb7d992648186d3e2e219ef9cd1af72c51d58";
+    const OUTPOINT_TX: &str = "e450f6686efb27662a387fd7af0fb7d992648186d3e2e219ef9cd1af72c51d58";
 
     #[test]
     fn bananablocks_parse_matches_the_live_shapes() {
         let spender = "3d".repeat(32);
-        let spent = format!("{{\"spent\":true,\"spentTxid\":\"{}\",\"txid\":\"{OUTPOINT_TX}\",\"vout\":0}}", spender.to_uppercase());
+        let spent = format!(
+            "{{\"spent\":true,\"spentTxid\":\"{}\",\"txid\":\"{OUTPOINT_TX}\",\"vout\":0}}",
+            spender.to_uppercase()
+        );
         assert_eq!(
             parse_bananablocks_spend_body(200, &spent, OUTPOINT_TX),
             Ok(Some(spender))
         );
         let unspent = format!("{{\"spent\":false,\"txid\":\"{OUTPOINT_TX}\",\"vout\":0}}");
-        assert_eq!(parse_bananablocks_spend_body(200, &unspent, OUTPOINT_TX), Ok(None));
         assert_eq!(
-            parse_bananablocks_spend_body(404, "{\"error\":\"Transaction not found\"}", OUTPOINT_TX),
+            parse_bananablocks_spend_body(200, &unspent, OUTPOINT_TX),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_bananablocks_spend_body(
+                404,
+                "{\"error\":\"Transaction not found\"}",
+                OUTPOINT_TX
+            ),
             Ok(None)
         );
         // Drift: spent:true without a usable spender = FAULT, never "no hint".
@@ -2777,7 +3026,10 @@ mod tests {
                 Ok(Some(spender.clone()))
             );
         }
-        assert_eq!(parse_bitails_spend_body(200, "{\"spent\":false}", OUTPOINT_TX), Ok(None));
+        assert_eq!(
+            parse_bitails_spend_body(200, "{\"spent\":false}", OUTPOINT_TX),
+            Ok(None)
+        );
         assert_eq!(parse_bitails_spend_body(404, "nope", OUTPOINT_TX), Ok(None));
         assert!(parse_bitails_spend_body(200, "{\"spent\":true}", OUTPOINT_TX).is_err());
     }
@@ -2788,10 +3040,25 @@ mod tests {
     fn woc_parse_garbled_200_is_a_fault_not_a_no() {
         let spender = "f3".repeat(32);
         let ok = format!("{{\"txid\":\"{}\",\"vin\":12}}", spender.to_uppercase());
-        assert_eq!(parse_woc_spend_body(200, &ok, OUTPOINT_TX), Ok(Some(spender)));
-        assert_eq!(parse_woc_spend_body(404, "404 page not found", OUTPOINT_TX), Ok(None));
-        for body in ["{}", "{\"txid\":null}", "{\"txid\":\"short\"}", "not json", "{\"txid\":12}"] {
-            assert!(parse_woc_spend_body(200, body, OUTPOINT_TX).is_err(), "{body:?}");
+        assert_eq!(
+            parse_woc_spend_body(200, &ok, OUTPOINT_TX),
+            Ok(Some(spender))
+        );
+        assert_eq!(
+            parse_woc_spend_body(404, "404 page not found", OUTPOINT_TX),
+            Ok(None)
+        );
+        for body in [
+            "{}",
+            "{\"txid\":null}",
+            "{\"txid\":\"short\"}",
+            "not json",
+            "{\"txid\":12}",
+        ] {
+            assert!(
+                parse_woc_spend_body(200, body, OUTPOINT_TX).is_err(),
+                "{body:?}"
+            );
         }
         assert!(parse_woc_spend_body(500, "boom", OUTPOINT_TX).is_err());
         assert!(parse_woc_spend_body(429, "rate", OUTPOINT_TX).is_err());
@@ -2807,7 +3074,8 @@ mod tests {
         use bsv_rs::script::LockingScript;
         use bsv_rs::transaction::{TransactionInput, TransactionOutput};
         let mut tx = Transaction::new();
-        tx.inputs.push(TransactionInput::new(pot_txid.to_string(), vout));
+        tx.inputs
+            .push(TransactionInput::new(pot_txid.to_string(), vout));
         tx.outputs.push(TransactionOutput {
             satoshis: Some(1),
             locking_script: LockingScript::from_hex("51").unwrap(),
@@ -2823,16 +3091,31 @@ mod tests {
     fn the_input_walk_binds_only_the_exact_outpoint() {
         let pot = "ab".repeat(32);
         let raw = real_spender_raw(&pot, 2);
-        assert_eq!(tx_consumes_outpoint(&raw, &pot, 2), Ok(true), "binds its outpoint");
-        assert_eq!(tx_consumes_outpoint(&raw, &pot, 3), Ok(false), "wrong vout must not bind");
+        assert_eq!(
+            tx_consumes_outpoint(&raw, &pot, 2),
+            Ok(true),
+            "binds its outpoint"
+        );
+        assert_eq!(
+            tx_consumes_outpoint(&raw, &pot, 3),
+            Ok(false),
+            "wrong vout must not bind"
+        );
         let other = "cd".repeat(32);
-        assert_eq!(tx_consumes_outpoint(&raw, &other, 2), Ok(false), "wrong txid must not bind");
+        assert_eq!(
+            tx_consumes_outpoint(&raw, &other, 2),
+            Ok(false),
+            "wrong txid must not bind"
+        );
         assert_eq!(
             tx_consumes_outpoint(&raw, &pot.to_uppercase(), 2),
             Ok(true),
             "txid compare is case-insensitive"
         );
-        assert!(tx_consumes_outpoint("zz-not-hex", &pot, 2).is_err(), "garbage is a fault");
+        assert!(
+            tx_consumes_outpoint("zz-not-hex", &pot, 2).is_err(),
+            "garbage is a fault"
+        );
     }
 
     /// The assembled displaced-spender BEEF is a REAL atomic beef: it parses,
@@ -2862,7 +3145,9 @@ mod tests {
         let spender = Transaction::from_hex(&raw).unwrap().id();
         let fetcher = MockProofFetcher {
             minable: [spender.clone()].into_iter().collect(),
-            spender_hints: [((pot.clone(), 0u32), spender.clone())].into_iter().collect(),
+            spender_hints: [((pot.clone(), 0u32), spender.clone())]
+                .into_iter()
+                .collect(),
             binding_raw: [(spender.clone(), raw)].into_iter().collect(),
             real_bumps: [(spender.clone(), single_tx_bump(&spender, 901_000).to_hex())]
                 .into_iter()
@@ -2916,12 +3201,20 @@ mod tests {
             output_index: u32,
             spending_txid: &str,
             confirmed: bool,
-            verdict: Option<&str>,
+            verdict: Option<VerdictWrite<'_>>,
             spent_height: Option<u64>,
             spender_final: Option<bool>,
         ) -> Result<(), PotStorageError> {
             self.inner
-                .mark_spent(txid, output_index, spending_txid, confirmed, verdict, spent_height, spender_final)
+                .mark_spent(
+                    txid,
+                    output_index,
+                    spending_txid,
+                    confirmed,
+                    verdict,
+                    spent_height,
+                    spender_final,
+                )
                 .await
         }
         async fn mark_confirmed_for_spender(
@@ -2956,7 +3249,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_displacement_cas_miss_is_counted_and_writes_nothing() {
-        let store = DisplaceMissStore { inner: MemoryPotStorage::new() };
+        let store = DisplaceMissStore {
+            inner: MemoryPotStorage::new(),
+        };
         pot_with_parked_claim(&store.inner, "potA", "refundA").await;
         let fetcher = MockProofFetcher {
             minable: ["settleA".to_string()].into_iter().collect(),
@@ -2970,10 +3265,25 @@ mod tests {
         };
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.displaced, 0);
-        assert_eq!(s.cas_missed, 1, "a guard miss is counted, never silently dropped");
-        assert_eq!(s.still_unconfirmed, 1, "the row stays a candidate for next tick");
-        let r = store.inner.get_spent_status("potA", 0).await.unwrap().unwrap();
-        assert_eq!(r.spending_txid.as_deref(), Some("refundA"), "nothing was written");
+        assert_eq!(
+            s.cas_missed, 1,
+            "a guard miss is counted, never silently dropped"
+        );
+        assert_eq!(
+            s.still_unconfirmed, 1,
+            "the row stays a candidate for next tick"
+        );
+        let r = store
+            .inner
+            .get_spent_status("potA", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("refundA"),
+            "nothing was written"
+        );
         assert!(!r.spent_confirmed);
     }
 
@@ -2985,7 +3295,15 @@ mod tests {
         pot_with_parked_claim(&store, "potA", "refundA").await;
         // Stale verdict keyed to the OLD spender must survive displacement.
         store
-            .mark_spent("potA", 0, "refundA", false, Some("refund"), None, Some(false))
+            .mark_spent(
+                "potA",
+                0,
+                "refundA",
+                false,
+                Some(VerdictWrite::bare("refund")),
+                None,
+                Some(false),
+            )
             .await
             .unwrap();
         // Guard 1: from-pointer mismatch ⇒ no-op.
@@ -3003,7 +3321,11 @@ mod tests {
         assert!(r.spent_confirmed);
         assert_eq!(r.spent_height, Some(9));
         assert_eq!(r.spender_final, Some(true));
-        assert_eq!(r.verdict.as_deref(), Some("refund"), "verdict columns untouched");
+        assert_eq!(
+            r.verdict.as_deref(),
+            Some("refund"),
+            "verdict columns untouched"
+        );
         assert_eq!(
             r.verdict_txid.as_deref(),
             Some("refundA"),
@@ -3027,13 +3349,19 @@ mod tests {
     #[tokio::test]
     async fn hint_and_binding_refuse_at_zero_budget_before_any_courier_traffic() {
         let fetcher = ChainProofFetcher::new(None).with_budget(0);
-        let e = fetcher.resolve_spender(&"aa".repeat(32), 0).await.unwrap_err();
+        let e = fetcher
+            .resolve_spender(&"aa".repeat(32), 0)
+            .await
+            .unwrap_err();
         assert!(e.contains("budget"), "hint must refuse on budget, got: {e}");
         let e = fetcher
             .spender_binding_raw(&"bb".repeat(32), &"aa".repeat(32), 0)
             .await
             .unwrap_err();
-        assert!(e.contains("budget"), "binding must refuse on budget, got: {e}");
+        assert!(
+            e.contains("budget"),
+            "binding must refuse on budget, got: {e}"
+        );
     }
 
     #[tokio::test]
@@ -3828,6 +4156,10 @@ mod tests {
         assert_eq!(r.verdict.as_deref(), Some("winner-b"));
         assert_eq!(r.verdict_txid.as_deref(), Some(settle_txid.as_str()));
         assert_eq!(r.spent_height, None, "this pass verifies no height");
+        // #406: this synthetic spender carries no signatures, and the pass
+        // held its durable bytes — so the signer question is CONCLUDED, not
+        // deferred: 'unresolved' rides the same verdict write.
+        assert_eq!(r.settle_signers.as_deref(), Some("unresolved"));
 
         // A spent BARE row never gets a verdict from the backfill.
         let mut bare = vec![0x52];
@@ -3864,6 +4196,234 @@ mod tests {
             .unwrap();
         assert_eq!(r.lock_kind.as_deref(), Some("bare"));
         assert_eq!(r.verdict, None);
+    }
+
+    // ── bsv-low #406: the settleSigners HISTORIC backfill ────────────────────
+
+    /// A decoded covenant row carrying a pre-#406 verdict (no signers) —
+    /// exactly what the old writer left behind.
+    fn pre406_row(txid: &str, p: &CovenantParams, pot_sats: u64) -> PotRecord {
+        PotRecord {
+            txid: txid.into(),
+            output_index: 0,
+            params_decoded: true,
+            lock_kind: Some("covenant".into()),
+            pub_a: Some(hex::encode(p.pub_a)),
+            pub_b: Some(hex::encode(p.pub_b)),
+            pub_tower: Some(hex::encode(p.pub_tower)),
+            pay_pkh_a: Some(hex::encode(p.pay_pkh_a)),
+            pay_pkh_b: Some(hex::encode(p.pay_pkh_b)),
+            rake_pkh: Some(hex::encode(p.rake_pkh)),
+            stake_a: Some(p.stake_a),
+            stake_b: Some(p.stake_b),
+            fee_sats: Some(p.fee_sats),
+            recovery_height: Some(p.recovery_height),
+            pot_sats: Some(pot_sats),
+            ..Default::default()
+        }
+    }
+
+    /// Params whose key triple is REAL (deterministic scalars 1/2/3), so a
+    /// signed spend can actually verify.
+    fn real_key_params() -> ([bsv_rs::primitives::ec::PrivateKey; 3], CovenantParams) {
+        let key = |scalar: u8| {
+            let mut b = [0u8; 32];
+            b[31] = scalar;
+            bsv_rs::primitives::ec::PrivateKey::from_bytes(&b).unwrap()
+        };
+        let keys = [key(1), key(2), key(3)];
+        let p = CovenantParams {
+            pub_a: keys[0].public_key().to_compressed(),
+            pub_b: keys[1].public_key().to_compressed(),
+            pub_tower: keys[2].public_key().to_compressed(),
+            pay_pkh_a: [0xAA; 20],
+            pay_pkh_b: [0xBB; 20],
+            rake_pkh: [0xCC; 20],
+            stake_a: 1250,
+            stake_b: 1250,
+            fee_sats: 100,
+            recovery_height: 900_000,
+        };
+        (keys, p)
+    }
+
+    /// A spender of `pot_txid:0` SIGNED by `signers` against the pot's real
+    /// covenant lock digest (SIGHASH_ALL|FORKID) — the shape the network
+    /// actually validated. Returns `(beef, txid)`.
+    fn signed_spender_beef(
+        pot_txid: &str,
+        p: &CovenantParams,
+        pot_sats: u64,
+        signers: &[&bsv_rs::primitives::ec::PrivateKey],
+        outs: &[(u64, Vec<u8>)],
+    ) -> (Vec<u8>, String) {
+        use bsv_rs::primitives::bsv::sighash::{
+            compute_sighash_for_signing, parse_transaction, SighashParams, SIGHASH_ALL,
+            SIGHASH_FORKID,
+        };
+        use bsv_rs::script::{LockingScript, UnlockingScript};
+        use bsv_rs::transaction::{Beef, TransactionInput, TransactionOutput};
+        let lock = covenant_lock(p);
+        // Build twice rather than mutate: `Transaction::to_binary` CACHES its
+        // serialization, so an unlock spliced in after a digest read would be
+        // silently dropped from every later serialization (found the hard
+        // way — the beef carried the unsigned skeleton).
+        let build = |unlock: Option<&[u8]>| {
+            let mut tx = Transaction::new();
+            let mut input = TransactionInput::new(pot_txid.to_string(), 0);
+            if let Some(u) = unlock {
+                input.unlocking_script = Some(UnlockingScript::from_binary(u).unwrap());
+            }
+            tx.add_input(input).unwrap();
+            for (sats, out_lock) in outs {
+                tx.add_output(TransactionOutput {
+                    satoshis: Some(*sats),
+                    locking_script: LockingScript::from_binary(out_lock).unwrap(),
+                    change: false,
+                })
+                .unwrap();
+            }
+            tx
+        };
+        // The digest does not commit the input script (BIP-143), so sign over
+        // the skeleton's bytes.
+        let raw = build(None).to_binary();
+        let parsed = parse_transaction(&raw).unwrap();
+        let digest = compute_sighash_for_signing(&SighashParams {
+            version: parsed.version,
+            inputs: &parsed.inputs,
+            outputs: &parsed.outputs,
+            locktime: parsed.locktime,
+            input_index: 0,
+            subscript: &lock,
+            satoshis: pot_sats,
+            scope: SIGHASH_ALL | SIGHASH_FORKID,
+        });
+        let mut unlock = vec![0x00]; // CHECKMULTISIG null dummy
+        for sk in signers {
+            let mut der = sk.sign(&digest).unwrap().to_der();
+            der.push((SIGHASH_ALL | SIGHASH_FORKID) as u8);
+            unlock.push(der.len() as u8);
+            unlock.extend_from_slice(&der);
+        }
+        let tx = build(Some(&unlock));
+        let txid = tx.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        (beef.to_binary(), txid)
+    }
+
+    #[tokio::test]
+    async fn signers_backfill_latches_who_signed_from_the_durable_bytes() {
+        let store = MemoryPotStorage::new();
+        let (keys, p) = real_key_params();
+        let pot_txid = hex::encode([0x11u8; 32]);
+        // Signed by seat B + the TOWER — the enforced family.
+        let (settle_bytes, settle_txid) = signed_spender_beef(
+            &pot_txid,
+            &p,
+            2500,
+            &[&keys[1], &keys[2]],
+            &[(2375, p2pkh_script(&p.pay_pkh_b))],
+        );
+        store
+            .store_record(&pre406_row(&pot_txid, &p, 2500))
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                &pot_txid,
+                0,
+                &settle_txid,
+                false,
+                Some(VerdictWrite::bare("winner-b")), // the pre-#406 writer's shape
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store.store_beef(&settle_txid, &settle_bytes).await.unwrap();
+
+        let s = backfill_settle_signers(&store, 20).await;
+        assert_eq!(
+            (s.scanned, s.latched, s.unresolved, s.missing_beef),
+            (1, 1, 0, 0)
+        );
+        let r = store.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert_eq!(r.settle_signers.as_deref(), Some("tower-b"));
+        // The stored verdict is preserved (the outputs match no template, so
+        // the re-derivation came up empty and the pass ECHOED the stored
+        // string — a pure signers-attach).
+        assert_eq!(r.verdict.as_deref(), Some("winner-b"));
+        assert_eq!(r.verdict_txid.as_deref(), Some(settle_txid.as_str()));
+
+        // TERMINATION: latched rows leave the candidate set.
+        let s2 = backfill_settle_signers(&store, 20).await;
+        assert_eq!(s2.scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn signers_backfill_missing_spender_beef_stays_a_candidate() {
+        let store = MemoryPotStorage::new();
+        let (_, p) = real_key_params();
+        let pot_txid = hex::encode([0x22u8; 32]);
+        store
+            .store_record(&pre406_row(&pot_txid, &p, 2500))
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                &pot_txid,
+                0,
+                "deadbeef",
+                false,
+                Some(VerdictWrite::bare("winner-a")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let s = backfill_settle_signers(&store, 20).await;
+        assert_eq!((s.scanned, s.latched, s.missing_beef), (1, 0, 1));
+        // Retried next tick — the spender bytes can still arrive.
+        let s2 = backfill_settle_signers(&store, 20).await;
+        assert_eq!(s2.scanned, 1);
+        let r = store.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert_eq!(r.settle_signers, None, "nothing concluded without bytes");
+    }
+
+    #[tokio::test]
+    async fn signers_backfill_concludes_unresolved_for_an_unsigned_spender() {
+        let store = MemoryPotStorage::new();
+        let (_, p) = real_key_params();
+        let pot_txid = hex::encode([0x33u8; 32]);
+        // Durable spender bytes with NO signatures at all.
+        let (settle_bytes, settle_txid) =
+            spender_beef(&pot_txid, &[(2375, p2pkh_script(&p.pay_pkh_a))]);
+        store
+            .store_record(&pre406_row(&pot_txid, &p, 2500))
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                &pot_txid,
+                0,
+                &settle_txid,
+                false,
+                Some(VerdictWrite::bare("winner-a")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store.store_beef(&settle_txid, &settle_bytes).await.unwrap();
+        let s = backfill_settle_signers(&store, 20).await;
+        assert_eq!((s.scanned, s.latched, s.unresolved), (1, 0, 1));
+        let r = store.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert_eq!(r.settle_signers.as_deref(), Some("unresolved"));
+        // TERMINATION: 'unresolved' leaves the candidate set — no tick-loop.
+        let s2 = backfill_settle_signers(&store, 20).await;
+        assert_eq!(s2.scanned, 0);
     }
 
     #[tokio::test]
@@ -4051,7 +4611,7 @@ mod tests {
             output_index: u32,
             spending_txid: &str,
             confirmed: bool,
-            verdict: Option<&str>,
+            verdict: Option<VerdictWrite<'_>>,
             spent_height: Option<u64>,
             spender_final: Option<bool>,
         ) -> Result<(), PotStorageError> {
@@ -4179,7 +4739,7 @@ mod tests {
             output_index: u32,
             spending_txid: &str,
             confirmed: bool,
-            verdict: Option<&str>,
+            verdict: Option<VerdictWrite<'_>>,
             spent_height: Option<u64>,
             spender_final: Option<bool>,
         ) -> Result<(), PotStorageError> {

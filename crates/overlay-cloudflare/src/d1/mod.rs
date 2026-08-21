@@ -317,6 +317,9 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// superseded pre-signed refund, ~64% of refunds per bsv-low #369).
 /// Overlay-internal — the app-layer reads `pot_beefs` only through explicit
 /// `hex(beef)` joins, so epoch Rule 24 does NOT bite (no schema catch-up).
+/// 111 → 112 for bsv-low #406: `pot_records.settleSigners` (who signed the
+/// recorded spend — the verdict group's third member; display-tier ending
+/// narration). See the migration comment.
 /// 109 → 111 for brain-cutover M1: `claimValid` (tiered result-claim
 /// verdict latch) + `rowValid` (hand-marker verdict latch) — see the
 /// migration comments.
@@ -324,7 +327,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// index, outpoint-keyed from birth per the #327 S8 lesson) + its
 /// gameId/createdAt read index. Overlay-internal (clients read via /lookup
 /// ls_hand); display-only — no money path and no app-layer join reads it.
-pub const OVERLAY_MIGRATION_COUNT: usize = 111;
+pub const OVERLAY_MIGRATION_COUNT: usize = 112;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1273,6 +1276,21 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // on it said "if /results later joins this table" — it now does).
     "ALTER TABLE result_markers_v2 ADD COLUMN claimValid INTEGER",
     "ALTER TABLE hand_markers ADD COLUMN rowValid INTEGER",
+    // 111 → 112, bsv-low #406: `pot_records.settleSigners` — WHO SIGNED the
+    // recorded spend ('coop' = the two seats, 'tower-a'/'tower-b' = the tower
+    // + that seat, 'unresolved' = re-derived from durable bytes and no pair
+    // verified, NULL = not yet established). Derived by verifying the spend's
+    // own signatures against the committed key triple over the network's
+    // BIP-143 digest (`overlay_discovery::pot::settle_signers_for_spend` —
+    // the missing_j discriminator's server-side mirror). Part of the #284
+    // VERDICT GROUP: written only alongside verdict/verdictTxid (same
+    // statement / same CAS), so it shares the pointer lineage and readers
+    // guard `verdictTxid == spendingTxid` exactly as for the verdict.
+    // DISPLAY-TIER by contract: feeds the client's ending narration; it must
+    // never become a COUNT/rank/WHERE bar without its own gate. Read by the
+    // app-layer (/leaderboard, /results) — epoch Rule 24: the byte-identical
+    // statement lives in low_app_layer::schema.
+    "ALTER TABLE pot_records ADD COLUMN settleSigners TEXT",
 ];
 
 // =============================================================================

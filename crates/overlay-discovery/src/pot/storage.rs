@@ -136,6 +136,41 @@ pub struct PotRecord {
     /// is `Some(false)` and keeps the #323 confirmed-only bar verbatim.
     #[serde(rename = "spenderFinal", default)]
     pub spender_final: Option<bool>,
+    /// bsv-low #406: WHO SIGNED the recorded spend — wire strings of
+    /// [`crate::pot::SettleSigners`] (`'coop'` = the two seats, `'tower-a'` /
+    /// `'tower-b'` = the tower + that seat), derived by verifying the spend's
+    /// signatures against the committed key triple over the network's own
+    /// BIP-143 digest. Part of the VERDICT GROUP: written only alongside
+    /// `verdict` (same statement / same CAS), so it shares `verdict_txid`'s
+    /// lineage and is meaningful ONLY when `verdict_txid == spending_txid`.
+    /// `None` = not established (pre-#406 row awaiting backfill, or no pair
+    /// verified) — readers must degrade to "not established", never guess.
+    /// DISPLAY-TIER: feeds ending narration, never a count/rank/credit.
+    #[serde(rename = "settleSigners", default)]
+    pub settle_signers: Option<String>,
+}
+
+/// The #284 verdict group as ONE write value (bsv-low #406): the verdict
+/// string plus the optional #406 signer classification. A signers value
+/// cannot exist WITHOUT a verdict by construction — both ride the same
+/// statement and share `verdict_txid`'s pointer lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerdictWrite<'a> {
+    /// [`crate::pot::PotVerdict::as_str`] wire string.
+    pub verdict: &'a str,
+    /// [`crate::pot::SettleSigners::as_str`] wire string, or `None` when no
+    /// signature pair verified (stored NULL — "not established").
+    pub settle_signers: Option<&'a str>,
+}
+
+impl<'a> VerdictWrite<'a> {
+    /// A verdict with no signer classification ("not established").
+    pub fn bare(verdict: &'a str) -> Self {
+        VerdictWrite {
+            verdict,
+            settle_signers: None,
+        }
+    }
 }
 
 impl PotRecord {
@@ -220,14 +255,16 @@ pub trait PotStorage {
     ///
     /// # #284 verdict + height (atomic with the pointer)
     ///
-    /// - `verdict = Some(v)` writes `verdict = v, verdict_txid =
-    ///   spending_txid` IN THE SAME statement as the spend pointer — the
-    ///   verdict can never point at a different spender than the pointer it
-    ///   rode in with. `verdict = None` leaves BOTH columns UNCHANGED
-    ///   (a confirm-only caller with no spender raw must not null a stored
-    ///   verdict); if the pointer changes under `None`, the stale verdict
-    ///   deliberately remains and is neutralized by the reader's
-    ///   `verdict_txid == spending_txid` equality check.
+    /// - `verdict = Some(v)` writes `verdict = v.verdict, verdict_txid =
+    ///   spending_txid, settle_signers = v.settle_signers` IN THE SAME
+    ///   statement as the spend pointer — the verdict group can never point
+    ///   at a different spender than the pointer it rode in with (#406: the
+    ///   signer classification is part of the group, typed so it cannot be
+    ///   written without a verdict). `verdict = None` leaves ALL THREE
+    ///   columns UNCHANGED (a confirm-only caller with no spender raw must
+    ///   not null a stored verdict); if the pointer changes under `None`,
+    ///   the stale group deliberately remains and is neutralized by the
+    ///   reader's `verdict_txid == spending_txid` equality check.
     /// - `spent_height` is honored ONLY on the `confirmed = true` branch (a
     ///   height is a fact of the verified BUMP), and it RIDES THE POINTER
     ///   exactly like the verdict does (gate finding LOW-1, 2026-07-28):
@@ -252,7 +289,7 @@ pub trait PotStorage {
         output_index: u32,
         spending_txid: &str,
         confirmed: bool,
-        verdict: Option<&str>,
+        verdict: Option<VerdictWrite<'_>>,
         spent_height: Option<u64>,
         spender_final: Option<bool>,
     ) -> Result<(), PotStorageError>;
@@ -340,23 +377,23 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
-    /// Attach a #284 verdict to a row via GUARDED COMPARE-AND-SET (gate
+    /// Attach a #284 verdict group to a row via GUARDED COMPARE-AND-SET (gate
     /// finding MEDIUM-2, 2026-07-28): sets `verdict` + `verdict_txid =
-    /// spending_txid` ONLY when the row's CURRENT spend pointer still equals
-    /// `spending_txid` — and touches NOTHING else (never the pointer, never
-    /// `spent_confirmed`, never the #228 `spent_at` age anchor, never
-    /// `spent_height`). This is the backfill's write: its candidate read and
-    /// its write are separated by awaits, so a reorg-confirmed S2 landing in
-    /// the window must make the write a NO-OP, never get displaced back to
-    /// the stale S1 the verdict was computed for. Backends that can't
-    /// enumerate may keep this default no-op — the read-path fallback still
-    /// classifies.
+    /// spending_txid` + `settle_signers` (#406 — the group rides as one) ONLY
+    /// when the row's CURRENT spend pointer still equals `spending_txid` —
+    /// and touches NOTHING else (never the pointer, never `spent_confirmed`,
+    /// never the #228 `spent_at` age anchor, never `spent_height`). This is
+    /// the backfill's write: its candidate read and its write are separated
+    /// by awaits, so a reorg-confirmed S2 landing in the window must make the
+    /// write a NO-OP, never get displaced back to the stale S1 the verdict
+    /// was computed for. Backends that can't enumerate may keep this default
+    /// no-op — the read-path fallback still classifies.
     async fn mark_verdict_for_spender(
         &self,
         txid: &str,
         output_index: u32,
         spending_txid: &str,
-        verdict: &str,
+        verdict: VerdictWrite<'_>,
     ) -> Result<(), PotStorageError> {
         let _ = (txid, output_index, spending_txid, verdict);
         Ok(())
@@ -438,6 +475,26 @@ pub trait PotStorage {
     /// Backends that can't enumerate return an empty `Vec` via this default
     /// → the backfill is a no-op.
     async fn find_params_undecoded(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
+    /// bsv-low #406 backfill candidates: DECODED covenant rows whose CURRENT
+    /// verdict group lacks the signer classification (`verdict IS NOT NULL
+    /// AND verdict_txid = spending_txid AND settle_signers IS NULL`). These
+    /// are the rows written before #406 shipped (or whose live classify had
+    /// no spender raw); `proof_fetcher::backfill_settle_signers` re-derives
+    /// the signers from the STORED spender BEEF and re-attaches the whole
+    /// group via [`mark_verdict_for_spender`](Self::mark_verdict_for_spender)
+    /// (idempotent: same bytes ⇒ same verdict). RANDOM order per tick, same
+    /// starvation rationale as [`find_params_undecoded`]. A row whose
+    /// signatures never verify would re-enter forever — the backfill caller
+    /// bounds that by latching the row out of the candidate set explicitly
+    /// (see its docs). Backends that can't enumerate return empty → no-op.
+    async fn find_settle_signers_unlatched(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
         let _ = limit;
         Ok(Vec::new())
     }
@@ -742,7 +799,7 @@ impl PotStorage for MemoryPotStorage {
         output_index: u32,
         spending_txid: &str,
         confirmed: bool,
-        verdict: Option<&str>,
+        verdict: Option<VerdictWrite<'_>>,
         spent_height: Option<u64>,
         spender_final: Option<bool>,
     ) -> Result<(), PotStorageError> {
@@ -798,13 +855,16 @@ impl PotStorage for MemoryPotStorage {
                     } else {
                         r.spender_final = spender_final;
                     }
-                    // Verdict rides the SAME accepted write as the pointer
-                    // (atomic): Some sets both columns; None leaves both
-                    // UNCHANGED (a stale verdict is neutralized by the
-                    // reader's verdict_txid == spending_txid check).
+                    // The verdict GROUP rides the SAME accepted write as the
+                    // pointer (atomic): Some sets all three columns (#406:
+                    // the signer classification is part of the group); None
+                    // leaves all three UNCHANGED (a stale group is
+                    // neutralized by the reader's verdict_txid ==
+                    // spending_txid check).
                     if let Some(v) = verdict {
-                        r.verdict = Some(v.to_string());
+                        r.verdict = Some(v.verdict.to_string());
                         r.verdict_txid = Some(spending_txid.to_string());
+                        r.settle_signers = v.settle_signers.map(str::to_string);
                     }
                     // Stamp the spend-record time on every accepted write
                     // (#228 backstop age anchor): a NEW spend pointer resets
@@ -834,19 +894,21 @@ impl PotStorage for MemoryPotStorage {
         txid: &str,
         output_index: u32,
         spending_txid: &str,
-        verdict: &str,
+        verdict: VerdictWrite<'_>,
     ) -> Result<(), PotStorageError> {
-        // Guarded CAS (gate MEDIUM-2): verdict + verdict_txid only, and only
-        // while the row's CURRENT pointer still equals the one the verdict
-        // was computed for. A moved pointer ⇒ no-op. Nothing else touched.
+        // Guarded CAS (gate MEDIUM-2): the verdict group only (verdict +
+        // verdict_txid + #406 settle_signers), and only while the row's
+        // CURRENT pointer still equals the one the group was computed for.
+        // A moved pointer ⇒ no-op. Nothing else touched.
         let mut records = self.records.lock().unwrap();
         for r in records.iter_mut() {
             if r.txid == txid
                 && r.output_index == output_index
                 && r.spending_txid.as_deref() == Some(spending_txid)
             {
-                r.verdict = Some(verdict.to_string());
+                r.verdict = Some(verdict.verdict.to_string());
                 r.verdict_txid = Some(spending_txid.to_string());
+                r.settle_signers = verdict.settle_signers.map(str::to_string);
             }
         }
         Ok(())
@@ -934,6 +996,30 @@ impl PotStorage for MemoryPotStorage {
             .unwrap()
             .iter()
             .filter(|r| !r.params_decoded)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn find_settle_signers_unlatched(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // The #406 candidate bar, mirrored from the D1 query: a CURRENT
+        // verdict group (verdict present, keyed to the live pointer) with no
+        // signer classification yet. `'unresolved'` rows are latched OUT of
+        // the set (attempted with bytes in hand, no pair verified).
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.verdict.is_some()
+                    && r.verdict_txid.is_some()
+                    && r.verdict_txid == r.spending_txid
+                    && r.settle_signers.is_none()
+            })
             .take(limit as usize)
             .cloned()
             .collect())
@@ -1888,7 +1974,7 @@ mod tests {
                 0,
                 "settleTx",
                 true,
-                Some("winner-a"),
+                Some(VerdictWrite::bare("winner-a")),
                 Some(800_000),
                 None,
             )
@@ -1929,7 +2015,15 @@ mod tests {
 
         // Verdict Some rides the accepted write; verdict_txid = the pointer.
         store
-            .mark_spent("potA", 0, "settle1", false, Some("winner-a"), None, None)
+            .mark_spent(
+                "potA",
+                0,
+                "settle1",
+                false,
+                Some(VerdictWrite::bare("winner-a")),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -1962,7 +2056,7 @@ mod tests {
                 0,
                 "realSettle",
                 true,
-                Some("winner-a"),
+                Some(VerdictWrite::bare("winner-a")),
                 Some(800_000),
                 None,
             )
@@ -1975,7 +2069,7 @@ mod tests {
                 0,
                 "forgedSpend",
                 false,
-                Some("winner-b"),
+                Some(VerdictWrite::bare("winner-b")),
                 Some(999_999),
                 None,
             )
@@ -1997,7 +2091,15 @@ mod tests {
         let store = MemoryPotStorage::new();
         store.store_record(&pot_record("potA", 0)).await.unwrap();
         store
-            .mark_spent("potA", 0, "settle1", false, Some("tie"), None, None)
+            .mark_spent(
+                "potA",
+                0,
+                "settle1",
+                false,
+                Some(VerdictWrite::bare("tie")),
+                None,
+                None,
+            )
             .await
             .unwrap();
         store
@@ -2032,7 +2134,7 @@ mod tests {
         let before = store.get_spent_status("potA", 0).await.unwrap().unwrap();
 
         store
-            .mark_verdict_for_spender("potA", 0, "settleS1", "winner-a")
+            .mark_verdict_for_spender("potA", 0, "settleS1", VerdictWrite::bare("winner-a"))
             .await
             .unwrap();
         let after = store.get_spent_status("potA", 0).await.unwrap().unwrap();
@@ -2041,7 +2143,7 @@ mod tests {
 
         // The current-pointer write lands, touching only the verdict pair.
         store
-            .mark_verdict_for_spender("potA", 0, "settleS2", "winner-b")
+            .mark_verdict_for_spender("potA", 0, "settleS2", VerdictWrite::bare("winner-b"))
             .await
             .unwrap();
         let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();

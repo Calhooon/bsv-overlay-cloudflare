@@ -96,6 +96,7 @@ use std::sync::OnceLock;
 pub mod covenant;
 pub mod lookup_service;
 pub mod lowfund_topic_manager;
+pub mod spend_signers;
 pub mod storage;
 pub mod topic_manager;
 
@@ -107,6 +108,7 @@ pub use covenant::{
     extract_covenant_params, is_bare_2of3_lock, p2pkh_lock, CovenantParams, PotVerdict, RawInput,
     RawTx, LOCKTIME_THRESHOLD, TEMPLATE_RAKE_DIVISOR,
 };
+pub use spend_signers::{classify_spend_signers, settle_signers_for_spend, SettleSigners};
 
 /// The compiled `Poc5TemplatePot` covenant template, copied byte-for-byte
 /// from the canonical source
@@ -180,6 +182,29 @@ pub fn pot_covenant_param_region(s: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&s[head_bytes().len()..s.len() - tail_bytes().len()])
+}
+
+/// REBUILD the full `Poc5TemplatePot` locking script from committed params:
+/// fixed HEAD ‖ [`encode_covenant_param_pushes`] ‖ fixed TAIL.
+///
+/// Byte-exact for every builder-made lock: `encode_covenant_param_pushes` is
+/// the proven inverse of the extractor over the frozen template
+/// (`encode_extract_roundtrip_is_identity`), so
+/// `covenant_lock_of(&extract_covenant_params(lock)) == lock` for any lock
+/// the client's builder emitted. A HAND-BUILT lock using non-canonical (but
+/// parseable) param encodings reconstructs differently — safe for every
+/// current caller (the #406 signer classifier), where a wrong scriptCode
+/// only shifts the BIP-143 digest so no signature verifies and the answer
+/// degrades to "not established", never to a wrong classification.
+pub fn covenant_lock_of(p: &CovenantParams) -> Vec<u8> {
+    let head = head_bytes();
+    let tail = tail_bytes();
+    let mid = encode_covenant_param_pushes(p);
+    let mut s = Vec::with_capacity(head.len() + mid.len() + tail.len());
+    s.extend_from_slice(head);
+    s.extend(mid);
+    s.extend_from_slice(tail);
+    s
 }
 
 /// True iff `s` is a standard P2PKH locking script — the LOW hop lock shape

@@ -1321,6 +1321,24 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         backfill_summary.missing_beef,
     );
 
+    // 4a. bsv-low #406: settleSigners historic backfill — attach WHO SIGNED
+    //     to rows classified before #406 shipped, from the durable spender
+    //     bytes. Pure local re-reads + ECDSA verifies; bounded, RANDOM-
+    //     sampled; converges to zero candidates and stays there.
+    let signers_summary = crate::proof_fetcher::backfill_settle_signers(
+        pot_storage.as_ref(),
+        crate::proof_fetcher::SETTLE_SIGNERS_BACKFILL_LIMIT,
+    )
+    .await;
+    worker::console_log!(
+        "Scheduled: signers-backfill (pot_records) — scanned={} latched={} unresolved={} \
+         missing_beef={}",
+        signers_summary.scanned,
+        signers_summary.latched,
+        signers_summary.unresolved,
+        signers_summary.missing_beef,
+    );
+
     // 4b. The RE-LATCH fixpoint over the two admission-latched verdict columns
     //     (bsv-low #355 potparty.sigValid + #367 hopparty.markerValid). Pure
     //     re-reads of our own rows — no courier, no tracker, no BEEF parse —
@@ -1682,6 +1700,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
     )
     .await;
+    // 4a. bsv-low #406: settleSigners historic backfill (see the scheduled
+    //     tick) — pokeable so the beta census can be converged on demand.
+    let signers_bf = crate::proof_fetcher::backfill_settle_signers(
+        pot_storage.as_ref(),
+        crate::proof_fetcher::SETTLE_SIGNERS_BACKFILL_LIMIT,
+    )
+    .await;
     // 4b. the #355/#367 RE-LATCH fixpoint over the verdict columns (four
     //     arms since brain-cutover M1: sigValid, markerValid, claimValid,
     //     rowValid) — same bounds as the scheduled tick; pokeable so a
@@ -1778,6 +1803,11 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "params_decoded": bf.decoded,
         "params_verdicts": bf.verdicts,
         "params_missing_beef": bf.missing_beef,
+        // bsv-low #406 settleSigners backfill counters.
+        "signers_scanned": signers_bf.scanned,
+        "signers_latched": signers_bf.latched,
+        "signers_unresolved": signers_bf.unresolved,
+        "signers_missing_beef": signers_bf.missing_beef,
         // #355/#367 re-latch counters, per table. `changed` is the fixpoint's
         // progress AND the predicate-regression detector; `demoted` is the
         // alarm (rows the predicate now refuses that it previously accepted);

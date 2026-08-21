@@ -131,6 +131,16 @@ pub const CLAIM_VALID_ALTER: &str = "ALTER TABLE result_markers_v2 ADD COLUMN cl
 /// `/results` hands join (`hand::validity::row_valid`'s verdict).
 pub const ROW_VALID_ALTER: &str = "ALTER TABLE hand_markers ADD COLUMN rowValid INTEGER";
 
+/// The bsv-low #406 settle-signer classification, same Rule-24 contract:
+/// `/leaderboard`'s decoded-pots read (`decoded_pots_sql`) names
+/// `settleSigners`, so a cold app-layer isolate against an unwarmed schema
+/// fails to PREPARE without it. Values are the verdict group's third member
+/// ('coop' / 'tower-a' / 'tower-b' / 'unresolved', NULL = not established),
+/// written only by the overlay's spend classifier + backfill and served
+/// under the verdict's own `verdictTxid == spendingTxid` freshness guard.
+/// DISPLAY-TIER by contract — never a COUNT/rank/WHERE bar without a gate.
+pub const SETTLE_SIGNERS_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN settleSigners TEXT";
+
 /// Every ALTER this module issues. Each is independently idempotent; the ONE
 /// ordering rule is module-level (gate F5): the CREATE catch-ups run first,
 /// because `ROW_VALID_ALTER` targets a table `HAND_MARKERS_CREATE` may be
@@ -142,6 +152,7 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SPENDER_FINAL_ALTER,
     CLAIM_VALID_ALTER,
     ROW_VALID_ALTER,
+    SETTLE_SIGNERS_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -329,9 +340,10 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            6,
+            7,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
-             spenderFinal (#371), claimValid + rowValid (brain-cutover M1)"
+             spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
+             settleSigners (#406)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt

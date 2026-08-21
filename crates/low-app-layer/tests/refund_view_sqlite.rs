@@ -121,6 +121,7 @@ fn mark_spent_final(
                 spender,
                 v,
                 spender,
+                Option::<String>::None, // settleSigners (#406) — plain helper writes NULL
                 spender,
                 spent_height,
                 spent_height,
@@ -151,6 +152,7 @@ fn mark_spent_final(
                 spender,
                 v,
                 spender,
+                Option::<String>::None, // settleSigners (#406)
                 spender,
                 spender_final,
                 spender_final,

@@ -1706,6 +1706,15 @@ pub struct LeaderboardEvidence {
     /// `ls_potparty byPot` serves the v2 marker, `/beef` the committed lock,
     /// and `serverVerdict` names the winning template.
     pub chain_attributed_winner: Option<String>,
+    /// bsv-low #406: WHO SIGNED this pot's recorded spend, from the overlay's
+    /// admission-latched classification (`'coop'` = both seats signed the
+    /// settlement itself; `'tower-a'`/`'tower-b'` = the tower co-signed with
+    /// that seat — the enforced family). `None` = not established (pre-#406
+    /// row awaiting backfill, no verifying pair, non-covenant). Served under
+    /// the SAME freshness guard as `server_verdict` (the verdict group
+    /// shares `verdictTxid`'s lineage). DISPLAY-TIER by contract: the client
+    /// picks its ending narration from it; nothing counts or ranks on it.
+    pub settle_signers: Option<String>,
     /// The ADMISSION-LATCHED claim tier for this row (brain-cutover M2b):
     /// `Some(2)` countersigned, `Some(1)` winner-sig-valid, `Some(0)`
     /// invalid, `None` = a row the relatch sweep has not reached (the client
@@ -1744,6 +1753,9 @@ pub struct LeaderboardEvidence {
 pub struct ChainWinAnchor {
     pub pot_txid: String,
     pub settle_txid: String,
+    /// bsv-low #406: who signed this settle (see
+    /// `LeaderboardEvidence::settle_signers` — same source, same guard).
+    pub settle_signers: Option<String>,
 }
 
 /// One `board[i]` row — an identity's wins + its evidence.
@@ -1969,6 +1981,7 @@ pub fn aggregate_leaderboard_with_verdicts(
         verdict_by_pot,
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -1999,6 +2012,7 @@ pub fn aggregate_leaderboard_attributed(
     verdict_by_pot: &std::collections::HashMap<String, crate::results::PotVerdict>,
     attr_by_pot: &std::collections::HashMap<String, crate::results::SeatAttribution>,
     params_by_pot: &std::collections::HashMap<String, crate::results::CovenantParams>,
+    signers_by_pot: &std::collections::HashMap<String, String>,
 ) -> Leaderboard {
     use std::collections::{HashMap, HashSet};
 
@@ -2093,6 +2107,7 @@ pub fn aggregate_leaderboard_attributed(
             .push(ChainWinAnchor {
                 pot_txid: pot_lc.clone(),
                 settle_txid: settle.to_ascii_lowercase(),
+                settle_signers: signers_by_pot.get(pot_lc).cloned(),
             });
     }
     for anchors in chain_wins_by_owner.values_mut() {
@@ -2206,6 +2221,7 @@ pub fn aggregate_leaderboard_attributed(
                         proof_txids,
                         server_verdict: verdict,
                         chain_attributed_winner: counted.get(&pot).map(|(o, _)| o.clone()),
+                        settle_signers: signers_by_pot.get(&pot).cloned(),
                         claim_tier: m.claim_valid,
                         created_at: m.created_at,
                     }
@@ -2334,6 +2350,12 @@ pub fn leaderboard_body(
                         // verdict (null when unattributed) — the falsifiable
                         // fact behind the row's `chainProven` tier.
                         "chainAttributedWinner": e.chain_attributed_winner,
+                        // bsv-low #406 (ADDITIVE): who signed the settle —
+                        // 'coop' (both seats signed the payout itself) or
+                        // 'tower-a'/'tower-b' (the enforced family), null =
+                        // not established. Picks the client's ending
+                        // narration; display-tier, nothing counts on it.
+                        "settleSigners": e.settle_signers,
                         // Brain-cutover M2b (ADDITIVE): the admission-latched
                         // claim tier — 2 countersigned, 1 winner-sig-valid,
                         // 0 invalid, null = not yet swept (the client
@@ -2360,6 +2382,8 @@ pub fn leaderboard_body(
                     json!({
                         "potTxid": c.pot_txid,
                         "settleTxid": c.settle_txid,
+                        // #406 (ADDITIVE): see the evidence row's field.
+                        "settleSigners": c.settle_signers,
                     })
                 })
                 .collect();
@@ -4124,7 +4148,14 @@ mod tests {
         world: &World,
     ) -> Leaderboard {
         aggregate_leaderboard_attributed(
-            markers, statuses, proofs, 200, &world.0, &world.1, &world.2,
+            markers,
+            statuses,
+            proofs,
+            200,
+            &world.0,
+            &world.1,
+            &world.2,
+            &std::collections::HashMap::new(),
         )
     }
 
@@ -4441,6 +4472,7 @@ mod tests {
             &HashMap::new(),
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert!(lb.board.is_empty(), "no verdict ⇒ unranked");
 
@@ -4454,6 +4486,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board[0].wins, 1);
         assert_eq!(lb.hands.len(), 1);
@@ -4472,6 +4505,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert!(lb.board.is_empty(), "a refund is never a win");
         assert!(lb.hands.is_empty());
@@ -4486,6 +4520,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert!(lb.board.is_empty(), "a tie is never a win");
         assert!(lb.hands.is_empty());
@@ -4519,6 +4554,74 @@ mod tests {
     /// (`app/src/lib/fixtures/leaderboard_chain_wins.fixture.json`) and read
     /// back by the real client PARSER + `gatherBoardFast`, so the producer's
     /// output is proven acceptable to the consumer across the language boundary.
+    /// bsv-low #406: the served settle-signer classification rides both the
+    /// evidence row and the chain-win anchor when the route resolved it, and
+    /// stays null when it did not — the client's ending narration must never
+    /// see a value the freshness-guarded column read did not produce.
+    #[test]
+    fn evidence_and_anchors_carry_settle_signers_when_resolved() {
+        use crate::results::PotVerdict;
+        let w = ident(0xaa);
+        let l = ident(0xbb);
+        let key_a = ident(0x5a);
+        let key_b = ident(0x5b);
+        let markers = vec![
+            mk(1, &w, &l, 1, 2, true, None, 100, 0),
+            mk(3, &w, &l, 3, 4, true, None, 100, 0),
+        ];
+        let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8), (3u8, 4u8)]));
+        let verdicts = verdicts_of(&[(1, PotVerdict::WinnerA), (3, PotVerdict::WinnerA)]);
+        let attrs = attrs_of(&[(3, Some(&w), Some(&l))]);
+        let params = params_of(&[(1, &key_a, &key_b)]);
+        // Only pot 3 has a resolved signer classification.
+        let pot3 = hex::encode([3u8; 32]);
+        let signers = HashMap::from([(pot3, "coop".to_string())]);
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &attrs,
+            &params,
+            &signers,
+        );
+        let with_ev = lb
+            .board
+            .iter()
+            .find(|r| !r.evidence.is_empty())
+            .expect("the identity row");
+        assert_eq!(with_ev.evidence[0].settle_signers.as_deref(), Some("coop"));
+        assert_eq!(
+            with_ev.chain_wins[0].settle_signers.as_deref(),
+            Some("coop")
+        );
+        let key_row = lb
+            .board
+            .iter()
+            .find(|r| r.identity_is_key)
+            .expect("the key row (pot 1 — unresolved)");
+        assert_eq!(
+            key_row.chain_wins[0].settle_signers, None,
+            "unresolved stays null"
+        );
+        // …and the body emits exactly that.
+        let body = leaderboard_body(&lb, 1, 2, false);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = v["board"].as_array().unwrap();
+        let ev_row = rows
+            .iter()
+            .find(|r| !r["evidence"].as_array().unwrap().is_empty())
+            .unwrap();
+        assert_eq!(ev_row["evidence"][0]["settleSigners"], "coop");
+        assert_eq!(ev_row["chainWins"][0]["settleSigners"], "coop");
+        let k_row = rows.iter().find(|r| r["identityIsKey"] == true).unwrap();
+        assert_eq!(
+            k_row["chainWins"][0]["settleSigners"],
+            serde_json::Value::Null
+        );
+    }
+
     /// A serializer field-name/shape drift on this side goes RED here; a
     /// parser drift on the client side goes red there; and the two copies are
     /// byte-compared on the client so they can never diverge silently.
@@ -4545,6 +4648,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         // Loud-count guard: exactly two board rows, one of each new shape.
         assert_eq!(
@@ -4892,6 +4996,7 @@ mod tests {
             &verdicts,
             &attrs,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board[0].identity, w);
         assert_eq!(
@@ -4925,6 +5030,7 @@ mod tests {
             &verdicts,
             &attrs,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board[0].wins, 1);
         assert!(lb.board[0].proven);
@@ -4957,6 +5063,7 @@ mod tests {
             &verdicts,
             &HashMap::new(),
             &params,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board.len(), 1, "the win is NOT erased");
         assert_eq!(
@@ -4979,6 +5086,7 @@ mod tests {
             &verdicts_b,
             &HashMap::new(),
             &params,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board[0].identity, key_b);
         // With the attribution PRESENT, the same pot counts under the identity.
@@ -4991,6 +5099,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board[0].identity, w);
         assert!(!lb.board[0].identity_is_key);
@@ -5025,6 +5134,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(lb.board.len(), 1);
         assert_eq!(lb.board[0].chain_wins.len(), 1);
@@ -5047,6 +5157,7 @@ mod tests {
             &verdicts,
             &attrs,
             &params,
+            &std::collections::HashMap::new(),
         );
         assert!(
             lb.board.is_empty(),
@@ -5084,6 +5195,7 @@ mod tests {
             &verdicts,
             &attrs,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         let row_of = |id: &str| lb.board.iter().find(|r| r.identity == id);
         assert!(
@@ -5109,6 +5221,7 @@ mod tests {
             &verdicts,
             &attrs,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         let h = row_of2(&lb, &honest).expect("the chain win stands without a marker");
         assert_eq!(h.wins, 1);
@@ -5130,6 +5243,7 @@ mod tests {
             &verdicts,
             &attrs,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         assert!(lb.board.is_empty());
 
@@ -5146,6 +5260,7 @@ mod tests {
             &HashMap::new(),
             &attrs3,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         assert!(lb.board.is_empty(), "no verdict ⇒ unranked");
     }
@@ -5374,6 +5489,7 @@ mod tests {
             &verdicts,
             &attrs,
             &no_params(),
+            &std::collections::HashMap::new(),
         );
         let honest = lb
             .board

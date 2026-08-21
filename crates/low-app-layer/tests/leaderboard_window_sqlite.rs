@@ -92,6 +92,7 @@ fn agg_world(
         &world.0,
         &world.1,
         &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -1235,6 +1236,7 @@ fn potparty_flood_evicts_the_identity_but_never_the_chain_win() {
         &verdicts,
         &attrs,
         &params_map,
+        &std::collections::HashMap::new(),
     );
     // #332 v3: the win SURVIVES the eviction, under the committed settle key.
     let row = lb
@@ -1327,6 +1329,7 @@ fn a_realistic_flood_still_attributes_to_the_honest_identity() {
         &verdicts,
         &attrs,
         &params_map,
+        &std::collections::HashMap::new(),
     );
     let row = lb
         .board
