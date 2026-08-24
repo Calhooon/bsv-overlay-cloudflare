@@ -161,6 +161,29 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_hand,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
 LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_hand,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
 ENABLE_EXTENSIONS = "true"
+# ── #347 STRICT ON BETA (bsv-low #407, 2026-08-24) ────────────────────────
+# The Rule 6c lenient window is CLOSED here: an unauthenticated submit on any
+# UNBARRED path (every mode except `broadcast-gated`) is refused 401.
+#
+# The criterion's leg (1) is met — bsv-low #407 moved every client producer
+# onto `broadcast-gated`, so `app/src` now contains exactly two `x-submit-mode`
+# sites and both are the barred one; the last script we own migrated with it.
+# Leg (2) was already met: the watchtower carries SUBMIT_OPERATOR_TOKEN (its
+# index leg shows up in the census as `operator`, and operator-authed ungated
+# submits stay allowed).
+#
+# PROVEN before flipping, on beta with real sats: four cooperative hands, ZERO
+# ungated CLIENT submits in the census delta (was 16/hand), every marker still
+# indexed — the potparty + potrefund rows for pot 3c4b024b… read back out of
+# the index with the refund bytes intact.
+#
+# PROD IS NOT FLIPPED. Its client still predates #407, and flipping it would
+# 401 the recovery-enumeration writes silently (every caller is
+# fire-and-forget) — the exact money path #347 exists to close. Prod's flip
+# rides the promotion, after its client carries #407.
+#
+# Rollback is this line: set it back to "false" (or delete it) and redeploy.
+SUBMIT_ENFORCE = "true"
 
 [[env.beta.d1_databases]]
 binding = "OVERLAY_DB"
