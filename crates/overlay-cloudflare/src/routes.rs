@@ -958,9 +958,24 @@ pub async fn submit(
                 .ok()
                 .and_then(|mut b| {
                     b.sort_txs();
-                    b.txs.last().map(|t| t.txid())
+                    b.txs.last().and_then(|t| t.tx().map(|tx| (t.txid(), tx.clone())))
                 });
-            if let (Some(subject_txid), Ok(db)) = (subject, env.d1("OVERLAY_DB")) {
+            // Belt v3 (attempt 11 live finding): the refusal additionally
+            // requires the subject to CARRY a covenant-admissible output —
+            // the true anomaly is "a funding shape tm_pot would admit,
+            // admitted 0". A recovery re-seed / spend of a pot the index
+            // doesn't hold consumes nothing-known and admits 0 LEGITIMATELY
+            // (best-effort, non-fatal by the client's own contract) and was
+            // 502-churning under the first cut. Same inline-revalidation
+            // precedent as the tm_uhrp diag block below.
+            let funding_shaped = subject.as_ref().is_some_and(|(_, tx)| {
+                tx.outputs
+                    .iter()
+                    .any(|o| overlay_discovery::pot::is_pot_covenant_script(&o.locking_script.to_binary()))
+            });
+            if let (true, Some((subject_txid, _)), Ok(db)) =
+                (funding_shaped, subject, env.d1("OVERLAY_DB"))
+            {
                 #[derive(serde::Deserialize)]
                 struct OneRow {
                     #[allow(dead_code)]
