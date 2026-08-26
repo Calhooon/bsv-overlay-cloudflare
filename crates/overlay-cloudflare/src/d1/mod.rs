@@ -281,9 +281,99 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
     if OVERLAY_MIGRATIONS_APPLIED.load(Ordering::Acquire) {
         return Ok(());
     }
+    // #411 (2026-08-26): VERSION GATE. The per-isolate atomic above only
+    // helps a WARM isolate — a 16-pair run's launch scales up many fresh
+    // isolates at once, and each replayed all 114 idempotent statements into
+    // ONE D1 (the #255 class as a per-scale-up burst; measured live: submits
+    // in that window answered "0 output(s) admitted" and lookups failed).
+    // Now a cold start costs ONE read: if the persisted count matches the
+    // built-in count, the list is current and the full replay is skipped.
+    // The counter row lives in ops_counters, which is itself CREATED by a
+    // migration — so any read failure (first boot, pre-gate database) falls
+    // through to the full run, exactly as before. Fail-open by construction:
+    // a wrong/missing counter can only cause the OLD behavior (full replay),
+    // never a skipped migration — the counter is written ONLY after
+    // run_migrations returns Ok.
+    if migration_state_current(db).await {
+        OVERLAY_MIGRATIONS_APPLIED.store(true, Ordering::Release);
+        return Ok(());
+    }
     run_migrations(db, OVERLAY_MIGRATIONS).await?;
+    // Review MEDIUM-4: a swallowed certify-write leaves the gate permanently
+    // inert (the burst returns on every scale-up, invisibly) — log it.
+    if let Err(e) = Query::new(MIGRATION_CERTIFY_SQL)
+        .bind(OVERLAY_MIGRATION_COUNT as f64)
+        .bind(migration_list_fingerprint() as f64)
+        .execute(db)
+        .await
+    {
+        worker::console_log!(
+            "[#411] migration certify-write FAILED (gate inert until it lands): {e}"
+        );
+    }
     OVERLAY_MIGRATIONS_APPLIED.store(true, Ordering::Release);
     Ok(())
+}
+
+/// True IFF the persisted `overlay_migration_count` equals
+/// [`OVERLAY_MIGRATION_COUNT`]. Any read error (missing table on first boot,
+/// D1 fault) or mismatch answers `false` — the caller then runs the full
+/// idempotent list, the pre-gate behavior. Extracted for the comparison test.
+async fn migration_state_current(db: &D1Database) -> bool {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        value: f64,
+    }
+    let count_ok = match Query::new("SELECT value FROM ops_counters WHERE name = 'overlay_migration_count'")
+        .fetch_optional::<CountRow>(db)
+        .await
+    {
+        Ok(Some(row)) => migration_count_matches(row.value),
+        _ => false,
+    };
+    if !count_ok {
+        return false;
+    }
+    match Query::new("SELECT value FROM ops_counters WHERE name = 'overlay_migration_fp'")
+        .fetch_optional::<CountRow>(db)
+        .await
+    {
+        Ok(Some(row)) => row.value == migration_list_fingerprint() as f64,
+        _ => false,
+    }
+}
+
+/// PURE: does a persisted counter value certify the CURRENT migration list?
+/// Exact equality only — an older count (upgrade pending) and a NEWER count
+/// (a rollback to an older worker; its shorter list must still re-run so its
+/// own tail statements exist) both answer false.
+pub fn migration_count_matches(persisted: f64) -> bool {
+    persisted == OVERLAY_MIGRATION_COUNT as f64
+}
+
+/// The certify upsert — two rows in one statement (count + content
+/// fingerprint). Factored so a pin can assert the SHIPPED string's shape.
+pub const MIGRATION_CERTIFY_SQL: &str =
+    "INSERT INTO ops_counters (name, value) VALUES ('overlay_migration_count', ?1), \
+     ('overlay_migration_fp', ?2) \
+     ON CONFLICT(name) DO UPDATE SET value = excluded.value";
+
+/// Review HIGH-2: certify CONTENT, not just count — an in-place edit of a
+/// shipped statement keeps the list length unchanged and would otherwise
+/// never apply anywhere again (a self-healing failure traded for a permanent
+/// one). FNV-1a per statement, order-sensitive wrapping sum, folded to u32
+/// (exactly representable in the ops_counters REAL).
+pub fn migration_list_fingerprint() -> u32 {
+    let mut acc: u32 = 0;
+    for sql in OVERLAY_MIGRATIONS {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in sql.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        acc = acc.wrapping_add(h);
+    }
+    acc
 }
 
 /// Number of overlay migration statements.
@@ -1360,6 +1450,27 @@ mod tests {
             .build();
         assert_eq!(clause, " WHERE topic = ? AND spent = ? AND score >= ?");
         assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn migration_fingerprint_moves_on_content_and_certify_sql_is_two_row() {
+        let fp = super::migration_list_fingerprint();
+        assert_eq!(fp, super::migration_list_fingerprint(), "deterministic");
+        assert_ne!(fp, 0, "a zero fingerprint would look like a missing row");
+        assert!(super::MIGRATION_CERTIFY_SQL.contains("overlay_migration_count"));
+        assert!(super::MIGRATION_CERTIFY_SQL.contains("overlay_migration_fp"));
+        assert!(super::MIGRATION_CERTIFY_SQL.contains("ON CONFLICT(name)"));
+    }
+
+    #[test]
+    fn migration_count_gate_is_exact_equality() {
+        // #411 version gate: equal certifies; older (upgrade pending) and
+        // NEWER (a rolled-back worker whose shorter list must still re-run)
+        // both fall through to the full idempotent replay.
+        assert!(super::migration_count_matches(super::OVERLAY_MIGRATION_COUNT as f64));
+        assert!(!super::migration_count_matches((super::OVERLAY_MIGRATION_COUNT - 1) as f64));
+        assert!(!super::migration_count_matches((super::OVERLAY_MIGRATION_COUNT + 1) as f64));
+        assert!(!super::migration_count_matches(0.0));
     }
 
     #[test]

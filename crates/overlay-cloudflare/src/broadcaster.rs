@@ -2085,10 +2085,34 @@ impl ArcadeBroadcaster {
     /// transport. Genuine transport failures (5xx, auth, misroute, 429,
     /// timeouts, connection errors) stay [`SubmitOutcome::Transport`].
     async fn submit_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> SubmitOutcome {
-        match self.post_ef_raw(endpoint, token, body).await {
-            Ok((status, text)) => classify_submit_response(status, &text),
-            Err(transport) => SubmitOutcome::Transport(transport),
-        }
+        // #413 instrumentation (2026-08-26): the phantom forensics found an
+        // arcade POST answering in 34 ms with no record ever created, and the
+        // leg's status/latency was invisible in every log. One line per POST:
+        // cheap, and the next anomaly names itself.
+        let t0 = worker::js_sys::Date::now();
+        let out = match self.post_ef_raw(endpoint, token, body).await {
+            Ok((status, text)) => {
+                gate_log(&format!(
+                    "[arcade] POST {} → HTTP {status} in {:.0}ms ({} bytes sent, body head: {})",
+                    endpoint,
+                    worker::js_sys::Date::now() - t0,
+                    body.len(),
+                    &text.chars().take(80).collect::<String>()
+                ));
+                classify_submit_response(status, &text)
+            }
+            Err(transport) => {
+                gate_log(&format!(
+                    "[arcade] POST {} TRANSPORT-FAILED in {:.0}ms ({} bytes sent): {}",
+                    endpoint,
+                    worker::js_sys::Date::now() - t0,
+                    body.len(),
+                    &transport.chars().take(120).collect::<String>()
+                ));
+                SubmitOutcome::Transport(transport)
+            }
+        };
+        out
     }
 
     /// POST the EF body to `endpoint`, registering the callback headers, and

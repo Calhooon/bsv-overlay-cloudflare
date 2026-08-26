@@ -923,6 +923,67 @@ pub async fn submit(
             "WARNING: /submit returned 200 but 0 outputs were admitted — \
              check topic manager validation (signature verification, field count, protocol tag)"
         );
+        // #413 delivery-integrity hardening (2026-08-26, owner call): on the
+        // BROADCAST-GATED money path, 0 admitted must not read as ok — it is
+        // exactly the phantom's front door (measured: cold-start migration
+        // bursts made topic managers admit 0 while the evidence gate ok'd,
+        // the client believed the network held its JOIN, and the tx was
+        // never stored anywhere). One nuance keeps the belt alive: a
+        // RE-PRESENT of an already-admitted tx also admits 0 (duplicate) —
+        // so the refusal additionally requires the subject to be ABSENT from
+        // the transactions store (its first admit stored the bytes; one PK
+        // read discriminates). Absent + 0 admitted + gated ⇒ 502 retryable:
+        // the client ladder re-presents after the burst window instead of
+        // sailing on a false ok. Fail-open: any parse/read fault falls
+        // through to the pre-hardening 200 (never a manufactured refusal).
+        // Review CRITICAL-1 (2026-08-26): a CONSUME-ONLY spend subject
+        // (settle/refund/close) admits 0 outputs BY DESIGN and never gets a
+        // `transactions` row — the belt must pass it, or every hand-end 502s
+        // forever. The spend evidence is already in the steak: consuming
+        // previously-admitted coins fills coins_to_retain/coins_removed. The
+        // phantom consumes nothing known and admits nothing — only THAT
+        // shape may refuse.
+        let total_consumed: usize = steak
+            .values()
+            .map(|a| a.coins_to_retain.len() + a.coins_removed.as_ref().map_or(0, |v| v.len()))
+            .sum();
+        if total_consumed == 0
+            && matches!(action, crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_))
+        {
+            // Review MEDIUM-3: the SAME subject derivation as the gated arm —
+            // beef_to_ef_batch sorts first and takes the sorted last; a raw
+            // `.txs.last()` here would key a different txid for any body
+            // whose raw order differs (the #351 sorted-last contract).
+            let subject = bsv_rs::transaction::beef::Beef::from_binary(&tagged_beef.beef)
+                .ok()
+                .and_then(|mut b| {
+                    b.sort_txs();
+                    b.txs.last().map(|t| t.txid())
+                });
+            if let (Some(subject_txid), Ok(db)) = (subject, env.d1("OVERLAY_DB")) {
+                #[derive(serde::Deserialize)]
+                struct OneRow {
+                    #[allow(dead_code)]
+                    one: f64,
+                }
+                let stored = crate::d1::Query::new(
+                    "SELECT 1 AS one FROM transactions WHERE txid = lower(?)",
+                )
+                .bind(subject_txid.as_str())
+                .fetch_optional::<OneRow>(&db)
+                .await;
+                if matches!(stored, Ok(None)) {
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated) -> 502 ({subject_txid}: 0 outputs admitted and \
+                         nothing stored — refusing the false ok; the client ladder re-presents (#413)"
+                    );
+                    return json_error(
+                        "broadcast-gated submit admitted nothing and stored nothing — retry",
+                        502,
+                    );
+                }
+            }
+        }
         // Re-parse the BEEF and re-run tm_uhrp's validator inline, so any
         // tm_uhrp rejection reason surfaces in the CF log stream (the
         // `tracing::debug!` calls inside `identify_admissible_outputs` are
@@ -2756,9 +2817,11 @@ mod tests {
         let needle = ["SubmitAction::ProceedWithNetwork", "Gate(_)"].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            2,
-            "expected EXACTLY two references to the gated action — the match arm \
-             and the branch that runs the broadcast; a changed count means the \
+            3,
+            "expected EXACTLY three references to the gated action — the match \
+             arm, the branch that runs the broadcast, and the #413 0-admit \
+             refusal (which READS the same derived action — a third READ, \
+             never a second derivation); a changed count means the \
              only public admission bar MOVED, was RENAMED or was DELETED. An \
              unchanged count does NOT mean the bar is live: an added conjunct \
              leaves this at 2 (see this test's stated boundary) — that shape, \
