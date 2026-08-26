@@ -1170,10 +1170,25 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
                 .filter_map(ResultRowD1::into_marker)
                 .collect();
             // The request just paid the window scan anyway — leave the spine
-            // converged behind it. FAIL-OPEN (warn only).
-            match db.prepare(crate::logic::lb_backfill_sql()).run().await {
-                Ok(_) => {}
-                Err(e) => console_warn!("[leaderboard] lb spine backfill failed: {e}"),
+            // converged behind it. AT MOST ONCE PER ISOLATE: a board whose
+            // request limit exceeds its distinct pots (e.g. the default 200
+            // on a young board) takes this fallback on EVERY miss by design
+            // (zero-lie), and re-running the backfill scan each time DOUBLED
+            // the miss cost (measured 6.8-13.3s spikes vs the old 3-10s,
+            // 2026-08-26). One run per isolate converges everything that
+            // existed at isolate birth; the companion writers carry the rest.
+            // FAIL-OPEN (warn only), and a failed run may retry once more on
+            // the next fallback in this isolate (the flag latches only after
+            // a successful run — a lost backfill self-heals).
+            static BACKFILLED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !BACKFILLED.load(std::sync::atomic::Ordering::Relaxed) {
+                match db.prepare(crate::logic::lb_backfill_sql()).run().await {
+                    Ok(_) => {
+                        BACKFILLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => console_warn!("[leaderboard] lb spine backfill failed: {e}"),
+                }
             }
             (markers, truncated)
         }
