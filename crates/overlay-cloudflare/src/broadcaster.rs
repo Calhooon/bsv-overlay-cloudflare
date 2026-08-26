@@ -759,7 +759,7 @@ fn fold_refuse_bar(
 /// corroborator proves network acceptance by the same means the client's
 /// direct-ARC fallback would, and a re-broadcast of an already-accepted tx
 /// is idempotent (already-known = accept).
-async fn corroborate_tx_hex(
+pub(crate) async fn corroborate_tx_hex(
     taal_api_key: Option<&str>,
     tx_hex: &str,
 ) -> Result<ArcOutcome, String> {

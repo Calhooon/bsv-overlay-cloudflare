@@ -1276,10 +1276,15 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // merkle proofs arrive later and gate nothing).
     //
     // `network_seen`: one row per txid THIS OVERLAY ITSELF witnessed accepted
-    // by the network — written only (a) by the broadcast-gated submit arm on
-    // Arcade's SEEN_ON_NETWORK verdict, and (b) by the ungated arm's
-    // backgrounded Arcade corroboration (`GET /tx/{txid}` reaching
-    // SEEN_ON_NETWORK-or-better, orphan excluded per #267). NEVER written from
+    // by the network — WRITER CENSUS (review 2026-08-26; keep in lockstep
+    // with the routes latch pin, count 4): (a) the broadcast-gated submit arm
+    // on Arcade's SEEN_ON_NETWORK verdict, (b) the ungated arm's backgrounded
+    // Arcade corroboration (`GET /tx/{txid}` reaching SEEN-or-better, orphan
+    // excluded per #267), (c) the #397 AcceptedPending background re-check —
+    // latching only on a real network_witnessed answer, and (d) the #413
+    // dual-broadcast delivery latch — only on the corroborator's >=SEEN
+    // verdict of OUR OWN TAAL/GP broadcast. All four are broadcaster verdicts
+    // of overlay-performed broadcasts. NEVER written from
     // a caller's claim: a stranger's /submit cannot mint a row for a tx the
     // network has not seen, which is exactly why the app-layer may trust it
     // (epoch Rule 21: an attacker-planted spend pointer carries no seen-latch

@@ -751,6 +751,48 @@ pub async fn submit(
         } else {
             None
         };
+        // #413 DUAL-BROADCAST AT FIRST SEND (owner decision 2026-08-26): the
+        // ARC-tracker indictment proved Arcade/ARC acceptance is not delivery
+        // (SEEN-for-14h-never-held one way, mined-but-still-SEEN/0 the other),
+        // while every direct TAAL push delivered without exception. So the
+        // TAAL leg is no longer only the exhausted-ladder second opinion — it
+        // fires on EVERY gated submit, post-response (ctx.wait_until: zero
+        // added latency), and its strict ≥SEEN verdict (corroborator_verdict's
+        // bar — RECEIVED/STORED rank below) latches `network_seen` as a REAL
+        // witness. Idempotent with the ladder's own corroborate and with the
+        // client belts; best-effort by construction. Accepted residuals
+        // (review 2026-08-26): during the #347 lenient window an unauthed
+        // structural-pass body gets a keyed TAAL relay (owner-accepted cost,
+        // 256KB-capped, no amplification loop); a hung socket can eat the
+        // wait_until budget silently — convergence rides the #397 re-checks
+        // and the backstop, by design.
+        {
+            let subject_ef_hex = efs
+                .iter()
+                .find(|e| e.txid == subject_txid)
+                .map(|e| hex::encode(&e.ef));
+            if let (Some(hex_body), Ok(dual_db)) = (subject_ef_hex, env.d1("OVERLAY_DB")) {
+                let dual_key = taal_api_key.clone();
+                let dual_txid = subject_txid.clone();
+                ctx.wait_until(async move {
+                    match crate::broadcaster::corroborate_tx_hex(dual_key.as_deref(), &hex_body).await {
+                        Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => {
+                            crate::ops::latch_network_seen(&dual_db, &dual_txid).await;
+                            worker::console_log!(
+                                "[#413] dual-broadcast delivered {dual_txid} (TAAL >=SEEN) — network_seen latched"
+                            );
+                        }
+                        Ok(other) => worker::console_log!(
+                            "[#413] dual-broadcast for {dual_txid}: non-accept ({other:?}) — no latch"
+                        ),
+                        Err(e) => worker::console_log!(
+                            "[#413] dual-broadcast for {dual_txid} inconclusive: {} — no latch",
+                            e.chars().take(80).collect::<String>()
+                        ),
+                    }
+                });
+            }
+        }
         let arcade_started = js_sys::Date::now();
         let arcade_outcome = arcade
             .broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref())
@@ -2860,9 +2902,12 @@ mod tests {
     }
 
     /// #371 (gate MEDIUM-1): the `network_seen` latch must be CALLED from
-    /// exactly two places — the gated Accepted arm (synchronous) and the
-    /// post-`engine.submit` ungated corroboration closure. Positive count,
-    /// split needle, comments stripped (Rule 9).
+    /// exactly FOUR places — the gated Accepted arm (synchronous), the
+    /// post-`engine.submit` ungated corroboration closure, the #397
+    /// AcceptedPending background witness re-check, and the #413
+    /// dual-broadcast delivery latch (writer census mirrored in the
+    /// `network_seen` migration comment — keep both in lockstep). Positive
+    /// count, split needle, comments stripped (Rule 9).
     ///
     /// **Stated boundary (Rule 22): this pins the SPELLING, not the effect.**
     /// The UNGATED producer's effect is behaviorally driven by the ci-route
@@ -2875,22 +2920,22 @@ mod tests {
     /// `/health/invariants.networkSeenTotal` MUST move on the first real
     /// gated settle after deploy.
     #[test]
-    fn routes_call_the_network_seen_latch_from_both_arms() {
+    fn routes_call_the_network_seen_latch_from_all_four_arms() {
         let src = code_only(include_str!("routes.rs"));
         // Split mid-token so the needle never matches itself (Rule 9, third
         // failure mode).
         let needle = ["crate::ops::latch_net", "work_seen("].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            3,
-            "expected EXACTLY three latch calls — the gated Accepted arm, the \
-             ungated post-submit corroboration, and the #397 AcceptedPending \
+            4,
+            "expected EXACTLY four latch calls — the gated Accepted arm, the \
+             ungated post-submit corroboration, the #413 dual-broadcast \
+             delivery latch (fires only on the corroborator's >=SEEN verdict \
+             of OUR OWN TAAL/GP broadcast), and the #397 AcceptedPending \
              background witness re-check (which latches ONLY on a real \
              network_witnessed answer — a pending admit itself must never \
              latch); a changed count means a producer was deleted, moved or \
-             duplicated. An unchanged count does NOT prove any call executes \
-             — that is the ci-route lane's job (ungated) and the \
-             deploy-runbook networkSeenTotal check (gated)"
+             added unaccounted"
         );
         // The ungated corroboration must sit AFTER the engine submit (gate
         // MEDIUM-2) — assert on the construct: the corroboration flag is
