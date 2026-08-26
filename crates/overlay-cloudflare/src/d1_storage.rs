@@ -219,7 +219,7 @@ impl D1Storage {
                AND created_at IS NOT NULL \
                AND created_at <= unixepoch() - {min_age_secs} \
                AND created_at >= unixepoch() - {max_age_secs} \
-             ORDER BY RANDOM() LIMIT {limit}"
+             ORDER BY created_at DESC LIMIT {limit}"
         )
     }
 

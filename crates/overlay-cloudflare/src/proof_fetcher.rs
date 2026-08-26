@@ -1926,7 +1926,16 @@ pub const REBROADCAST_BACKSTOP_LIMIT: u64 = 16;
 /// rationale: ≥95% of healthy txs have mined (and left the proofless set)
 /// by then, so what remains is either slow-mine (probe answers "present",
 /// one GET wasted) or the incident class this backstop exists for.
-pub const REBROADCAST_MIN_AGE_SECS: u64 = PUSH_BACKSTOP_MIN_AGE_SECS;
+pub const REBROADCAST_MIN_AGE_SECS: u64 = 5 * 60;
+// ^ #413 (2026-08-26): was PUSH_BACKSTOP_MIN_AGE_SECS (30 min) — but the
+// phantom class (admitted, never delivered) is rescuable the moment the
+// indexers' mempool-ingestion lag has passed. 5 min beats both that lag and
+// the reconcile's displacement clock; a false "absent" on a young healthy
+// row costs one idempotent rebroadcast. Candidacy now orders newest-first
+// (rescued rows leave the set next tick, so the aged tail still drains)
+// instead of RANDOM — under a 14-day junk backlog the RANDOM 16 almost
+// never drew the fresh rescuable rows (measured live: phantoms sat hours
+// while the pass ran every 15 min).
 
 /// Maximum age for backstop CANDIDACY (bsv-low#273, gate LOW-1): a proofless
 /// admitted row older than this stops being presence-probed/rebroadcast —
