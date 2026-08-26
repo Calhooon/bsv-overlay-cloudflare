@@ -1050,7 +1050,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     // #411: serve from the in-worker Cache API when fresh. The edge does NOT
     // zone-cache *.workers.dev responses, so the Cache-Control header alone
     // did nothing (measured 12-24 s under burst with 32 pollers); an explicit
-    // cache.put honors the same max-age=5. Global view only - the answer
+    // cache.put honors the same max-age=15. Global view only - the answer
     // carries no identity. The durable fix (write-time decoded leaderboard
     // table) is tracked on #411.
     let cache_key = req.url()?.to_string();
@@ -1180,14 +1180,34 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             // FAIL-OPEN (warn only), and a failed run may retry once more on
             // the next fallback in this isolate (the flag latches only after
             // a successful run — a lost backfill self-heals).
+            // …and GAP-GATED (2026-08-26, the D1-overload lesson): under
+            // load CF churns isolates, and a bare once-per-isolate latch let
+            // EVERY fresh isolate re-run the full history scan — dozens of
+            // concurrent backfills fed the overload that was churning the
+            // isolates. Two O(1) MAX() index seeks prove whether the spine
+            // is actually behind; no gap ⇒ no scan, any isolate.
             static BACKFILLED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !BACKFILLED.load(std::sync::atomic::Ordering::Relaxed) {
-                match db.prepare(crate::logic::lb_backfill_sql()).run().await {
-                    Ok(_) => {
-                        BACKFILLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                let gap: Option<bool> = match db
+                    .prepare(
+                        "SELECT (SELECT COALESCE(MAX(createdAt), 0) FROM lb_marker_rows) <                                 (SELECT COALESCE(MAX(createdAt), 0) FROM result_markers_v2) AS behind",
+                    )
+                    .first::<serde_json::Value>(None)
+                    .await
+                {
+                    Ok(Some(v)) => v.get("behind").and_then(|b| b.as_f64()).map(|b| b != 0.0),
+                    _ => None, // unreadable probe: attempt the backfill (fail-open)
+                };
+                if gap != Some(false) {
+                    match db.prepare(crate::logic::lb_backfill_sql()).run().await {
+                        Ok(_) => {
+                            BACKFILLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => console_warn!("[leaderboard] lb spine backfill failed: {e}"),
                     }
-                    Err(e) => console_warn!("[leaderboard] lb spine backfill failed: {e}"),
+                } else {
+                    BACKFILLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             (markers, truncated)
@@ -1389,7 +1409,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         let mut resp = json_response_cached(
             leaderboard_body(&lb, computed_at, markers.len(), truncated),
             200,
-            5,
+            15,
         )?;
         let for_cache = resp.cloned()?;
         let _ = cache.put(&cache_key, for_cache).await;
