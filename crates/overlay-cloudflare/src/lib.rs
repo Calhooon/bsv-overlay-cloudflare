@@ -1328,7 +1328,6 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     let signers_summary = crate::proof_fetcher::backfill_settle_signers(
         pot_storage.as_ref(),
         crate::proof_fetcher::SETTLE_SIGNERS_BACKFILL_LIMIT,
-        crate::proof_fetcher::SIGNERS_CHAIN_FETCH_BUDGET,
     )
     .await;
     worker::console_log!(
@@ -1706,7 +1705,6 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     let signers_bf = crate::proof_fetcher::backfill_settle_signers(
         pot_storage.as_ref(),
         crate::proof_fetcher::SETTLE_SIGNERS_BACKFILL_LIMIT,
-        crate::proof_fetcher::SIGNERS_CHAIN_FETCH_BUDGET,
     )
     .await;
     // 4b. the #355/#367 RE-LATCH fixpoint over the verdict columns (four

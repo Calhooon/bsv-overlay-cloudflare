@@ -1774,37 +1774,17 @@ pub struct SettleSignersBackfillSummary {
 ///    one for any row the same classifier wrote (deterministic function of
 ///    bytes); if the re-derivation comes up empty the STORED verdict string
 ///    is echoed unchanged so the write stays a pure signers-attach.
-/// H2 (bsv-low 2026-08-26) — bounded raw-tx fallback for signers
-/// classification when no durable BEEF was ever stored. A tower-enforced
-/// settle is broadcast by the TOWER straight to ARC — no client /submit ever
-/// hands the overlay its bytes — so before this fallback such rows sat in
-/// the missing_beef set forever and the #406 narration (which REQUIRES
-/// 'tower-*') never resolved: the persistent enforcedWithheldReplay red
-/// across attempts 13-15. WoC raw-hex GET (break-glass tier, ≤ the per-tick
-/// budget), HASH-BOUND parse — a hostile courier can only fail the parse,
-/// never substitute bytes. The classification WRITE is the durable outcome,
-/// so no beef storage is needed and a classified row leaves the candidate
-/// set (no repeat fetches).
-async fn fetch_spender_tx_for_signers(txid: &str) -> Option<Transaction> {
-    let url = format!("{DEFAULT_WOC_BASE}/tx/{txid}/hex");
-    match http_get(&url, None).await {
-        Ok((200, body)) => {
-            let tx = Transaction::from_hex(body.trim()).ok()?;
-            tx.id().eq_ignore_ascii_case(txid).then_some(tx)
-        }
-        _ => None,
-    }
-}
-
-/// Per-tick chain-fetch budget for the signers backfill.
-pub const SIGNERS_CHAIN_FETCH_BUDGET: u32 = 3;
+/// (2026-08-26, OWNER RULING: NO WoC anywhere.) A briefly-shipped WoC
+/// chain-fetch fallback here was reverted the same evening. A spend whose
+/// bytes never reached our store stays a `missing_beef` candidate; the
+/// DURABLE fix is FIRST-PARTY delivery — the tower already submits its pot
+/// spends with ancestry (`broadcast_via_overlay` #193, `submit_tm_pot` #36
+/// with per-tick retries), so this set converges without any indexer read.
 
 pub async fn backfill_settle_signers(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     limit: u64,
-    chain_fetch_budget: u32,
 ) -> SettleSignersBackfillSummary {
-    let mut chain_fetch_budget = chain_fetch_budget;
     use overlay_discovery::pot::storage::VerdictWrite;
     use overlay_discovery::pot::{
         classify_covenant, settle_signers_for_spend, RawTx, SettleSigners,
@@ -1875,33 +1855,15 @@ pub async fn backfill_settle_signers(
             continue;
         }
 
-        // 2. The spender\'s durable bytes — or the H2 budgeted chain fetch
-        // (see `fetch_spender_tx_for_signers`): a spend whose bytes never
-        // reached our store (tower-broadcast settles) must still classify.
-        let spending_tx = match pot_storage.get_beef(spending_txid).await {
-            Ok(Some(spender_beef)) => {
-                match Transaction::from_beef(&spender_beef, Some(spending_txid)) {
-                    Ok(tx) => tx,
-                    Err(_) => {
-                        summary.missing_beef += 1;
-                        continue; // unparseable stored bytes — longer-wins may repair
-                    }
-                }
-            }
-            _ => {
-                if chain_fetch_budget == 0 {
-                    summary.missing_beef += 1;
-                    continue; // stays a candidate — bytes (or budget) can still arrive
-                }
-                chain_fetch_budget -= 1;
-                match fetch_spender_tx_for_signers(spending_txid).await {
-                    Some(tx) => tx,
-                    None => {
-                        summary.missing_beef += 1;
-                        continue; // network miss — stays a candidate
-                    }
-                }
-            }
+        // 2. The spender's durable bytes (first-party only — see the note
+        // above `backfill_settle_signers`).
+        let Ok(Some(spender_beef)) = pot_storage.get_beef(spending_txid).await else {
+            summary.missing_beef += 1;
+            continue; // stays a candidate — the bytes can still arrive
+        };
+        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+            summary.missing_beef += 1;
+            continue; // unparseable stored bytes — longer-wins may repair
         };
         let Some((pot_input_index, pot_input_sequence)) =
             spending_tx.inputs.iter().enumerate().find_map(|(n, i)| {
@@ -4399,7 +4361,7 @@ mod tests {
             .unwrap();
         store.store_beef(&settle_txid, &settle_bytes).await.unwrap();
 
-        let s = backfill_settle_signers(&store, 20, 0).await;
+        let s = backfill_settle_signers(&store, 20).await;
         assert_eq!(
             (s.scanned, s.latched, s.unresolved, s.missing_beef),
             (1, 1, 0, 0)
@@ -4413,7 +4375,7 @@ mod tests {
         assert_eq!(r.verdict_txid.as_deref(), Some(settle_txid.as_str()));
 
         // TERMINATION: latched rows leave the candidate set.
-        let s2 = backfill_settle_signers(&store, 20, 0).await;
+        let s2 = backfill_settle_signers(&store, 20).await;
         assert_eq!(s2.scanned, 0);
     }
 
@@ -4438,10 +4400,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let s = backfill_settle_signers(&store, 20, 0).await;
+        let s = backfill_settle_signers(&store, 20).await;
         assert_eq!((s.scanned, s.latched, s.missing_beef), (1, 0, 1));
         // Retried next tick — the spender bytes can still arrive.
-        let s2 = backfill_settle_signers(&store, 20, 0).await;
+        let s2 = backfill_settle_signers(&store, 20).await;
         assert_eq!(s2.scanned, 1);
         let r = store.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
         assert_eq!(r.settle_signers, None, "nothing concluded without bytes");
@@ -4472,12 +4434,12 @@ mod tests {
             .await
             .unwrap();
         store.store_beef(&settle_txid, &settle_bytes).await.unwrap();
-        let s = backfill_settle_signers(&store, 20, 0).await;
+        let s = backfill_settle_signers(&store, 20).await;
         assert_eq!((s.scanned, s.latched, s.unresolved), (1, 0, 1));
         let r = store.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
         assert_eq!(r.settle_signers.as_deref(), Some("unresolved"));
         // TERMINATION: 'unresolved' leaves the candidate set — no tick-loop.
-        let s2 = backfill_settle_signers(&store, 20, 0).await;
+        let s2 = backfill_settle_signers(&store, 20).await;
         assert_eq!(s2.scanned, 0);
     }
 
