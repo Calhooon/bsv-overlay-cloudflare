@@ -1705,3 +1705,263 @@ fn query_pot_rows(conn: &Connection, pot: &str) -> Vec<PotRecordRow> {
     .collect::<Result<Vec<_>, _>>()
     .unwrap()
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #411 round 2 — the WRITE-TIME spine (`lb_marker_rows`), proven against the
+// stage-1 window it replaces, through the SHIPPED strings only.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Execute the SHIPPED companion write (`lb_row_insert_sql`) with the same
+/// values a `file_result` seeded — the write-time half of the spine.
+#[allow(clippy::too_many_arguments)]
+fn lb_companion(
+    conn: &Connection,
+    game: &str,
+    winner: &str,
+    loser: &str,
+    pot: &str,
+    settle: &str,
+    winner_sig: &str,
+    loser_sig: Option<&str>,
+    marker_txid: &str,
+    at: i64,
+) {
+    let per_pot = low_app_layer::logic::LEADERBOARD_RESULT_ROWS_PER_POT as i64;
+    conn.execute(
+        bsv_overlay_cloudflare::d1_discovery::result_write::lb_row_insert_sql(),
+        params![
+            marker_txid,
+            0i64,
+            game,
+            winner,
+            loser,
+            pot,
+            settle,
+            winner_sig,
+            loser_sig,
+            Option::<String>::None, // cardsHex (mirrors file_result)
+            at,
+            Option::<i64>::None, // claimValid NULL (mirrors file_result's legacy shape)
+            pot,
+            pot,
+            pot,
+            at,
+            pot,
+            pot,
+            at,
+            pot,
+            pot,
+            per_pot
+        ],
+    )
+    .expect("lb companion insert");
+}
+
+/// Read the spine pages through the SHIPPED `lb_page_sql` strings and run
+/// the route's own combiner — the fast path exactly as `/leaderboard` runs it.
+fn lb_pages(conn: &Connection, limit: usize, now: i64) -> (Vec<ResultMarkerRow>, bool, usize) {
+    let per_pot = low_app_layer::logic::LEADERBOARD_RESULT_ROWS_PER_POT;
+    let read = |unknown: bool, cap: usize| -> Vec<low_app_layer::logic::LbPageRow> {
+        let sql = low_app_layer::logic::lb_page_sql(unknown, None);
+        let mut stmt = conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("lb_page_sql did not PREPARE: {e}\n{sql}"));
+        stmt.query_map(params![cap as i64], |r| {
+            let pot: Option<String> = r.get("potTxid")?;
+            Ok(low_app_layer::logic::LbPageRow {
+                marker: ResultMarkerRow {
+                    game_id: r.get("gameId")?,
+                    winner: r.get("winner")?,
+                    loser: r.get("loser")?,
+                    pot_txid: pot.unwrap_or_default(),
+                    settle_txid: r.get::<_, Option<String>>("settleTxid")?.unwrap_or_default(),
+                    winner_sig_hex: r
+                        .get::<_, Option<String>>("winnerSigHex")?
+                        .unwrap_or_default(),
+                    loser_sig_hex: r.get("loserSigHex")?,
+                    cards_hex: r.get("cardsHex")?,
+                    txid: r.get("txid")?,
+                    created_at: r.get("createdAt")?,
+                    claim_valid: r.get("claimValid")?,
+                },
+                marker_rowid: r.get("markerRowid")?,
+                pot_first_marker_at: r.get("potFirstMarkerAt")?,
+                order_at: r.get("orderAt")?,
+                unknown_pot: r.get::<_, i64>("unknownPot")? != 0,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    let known = read(false, (limit + 1) * per_pot);
+    let unknown = read(true, low_app_layer::logic::LB_UNKNOWN_PAGE_ROWS);
+    low_app_layer::logic::lb_window_from_pages(
+        known,
+        unknown,
+        limit,
+        leaderboard_unknown_pot_quota(limit),
+        now,
+    )
+}
+
+/// Shared world: 4 known pots seeded pot-first (writer A sees the pot), one
+/// known pot seeded markers-first + the SHIPPED flip (writer B), one
+/// unknown-FRESH pot, one unknown-STALE pot, and one pot with 5 markers
+/// (the rn ≤ 4 cap). `with_companions` decides whether the write-time half
+/// runs (T1) or the spine starts empty (T2's backfill subject).
+fn seed_spine_world(conn: &Connection, now: i64, with_companions: bool) {
+    let mut file = |game: &str, pot: &str, m: &str, at: i64| {
+        let (w, l) = (h64(0xaa), h64(0xbb));
+        let settle = h64(0x77);
+        let ws = junk_sig();
+        file_result(conn, game, &w, &l, pot, &settle, &ws, None, m, at);
+        if with_companions {
+            lb_companion(conn, game, &w, &l, pot, &settle, &ws, None, m, at);
+        }
+    };
+    // 4 known pots, pot admitted BEFORE its markers.
+    for i in 0..4u8 {
+        let pot = h64(0x30 + i);
+        admit_pot(conn, &pot, now - 5_000 + i as i64 * 100);
+        file(&h64(0x40 + i), &pot, &h64(0x50 + i), now - 4_000 + i as i64 * 100);
+    }
+    // 1 known pot, markers FIRST (unknown at write), pot admitted after +
+    // the SHIPPED flip — exactly what the pot-admission writer runs.
+    let late_pot = h64(0x38);
+    file(&h64(0x48), &late_pot, &h64(0x58), now - 3_000);
+    admit_pot(conn, &late_pot, now - 2_900);
+    if with_companions {
+        conn.execute(
+            bsv_overlay_cloudflare::d1_discovery::lb_pot_flip_sql(),
+            params![late_pot, late_pot, late_pot],
+        )
+        .expect("shipped flip");
+    }
+    // The rn cap subject: 5 markers on one known pot — the spine must hold 4.
+    let fat_pot = h64(0x39);
+    admit_pot(conn, &fat_pot, now - 2_500);
+    for j in 0..5u8 {
+        file(&h64(0x49), &fat_pot, &h64(0x60 + j), now - 2_400 + j as i64);
+    }
+    // Unknown pots: one FRESH (inside the quota hour), one STALE.
+    file(&h64(0x4a), &h64(0x3a), &h64(0x6a), now - 100);
+    file(&h64(0x4b), &h64(0x3b), &h64(0x6b), now - 90_000);
+}
+
+fn assert_windows_equal(
+    fast: &(Vec<ResultMarkerRow>, bool, usize),
+    old: &(Vec<ResultMarkerRow>, bool),
+) {
+    let fast_seq: Vec<(String, String)> = fast
+        .0
+        .iter()
+        .map(|m| (m.txid.clone(), m.pot_txid.clone()))
+        .collect();
+    let old_seq: Vec<(String, String)> = old
+        .0
+        .iter()
+        .map(|m| (m.txid.clone(), m.pot_txid.clone()))
+        .collect();
+    assert_eq!(fast_seq, old_seq, "spine window rows/order diverge from stage-1");
+    assert_eq!(fast.1, old.1, "truncated bit diverges from stage-1");
+}
+
+/// T1 — a PROVEN-OVERFULL board: the write-time spine (both shipped writers)
+/// serves the SAME rows, order and truncated bit as the stage-1 window.
+#[test]
+fn spine_fast_path_matches_stage1_on_proven_overfull_board() {
+    let conn = production_schema_db();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64; // REAL clock: stage-1's freshness CASE uses SQL unixepoch()
+    seed_spine_world(&conn, now, true);
+    let limit = 3usize;
+    let fast = lb_pages(&conn, limit, now);
+    assert!(
+        fast.2 >= limit + 1,
+        "world must prove over-full (distinct {} < {})",
+        fast.2,
+        limit + 1
+    );
+    let old = query_window(&conn, limit);
+    assert_windows_equal(&fast, &old);
+    // The rn cap held: the 5-marker pot materialized exactly 4 spine rows.
+    let fat: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM lb_marker_rows WHERE potTxid = ?1",
+            params![h64(0x39)],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fat, 4, "rn cap must hold at RESULT_ROWS_PER_POT");
+}
+
+/// T2 — SELF-HEAL: an empty spine refuses the fast path (the zero-lie rule),
+/// the shipped BULK backfill converges it, and the healed spine matches
+/// stage-1 exactly.
+#[test]
+fn spine_backfill_converges_and_then_matches_stage1() {
+    let conn = production_schema_db();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64; // REAL clock: stage-1's freshness CASE uses SQL unixepoch()
+    seed_spine_world(&conn, now, false); // no companions — the spine is empty
+    let limit = 3usize;
+    let before = lb_pages(&conn, limit, now);
+    assert!(
+        before.2 < limit + 1,
+        "an empty spine must REFUSE the fast path, never serve a sparse page"
+    );
+    conn.execute(&low_app_layer::logic::lb_backfill_sql(), [])
+        .expect("shipped backfill");
+    let after = lb_pages(&conn, limit, now);
+    assert!(after.2 >= limit + 1, "backfill must converge the spine");
+    let old = query_window(&conn, limit);
+    assert_windows_equal(&after, &old);
+}
+
+/// T3 — the unknown→known FLIP: a marker admitted before its pot rides
+/// unknown-tiered; the pot admission's shipped flip moves it to tier 0 and
+/// stamps potCreatedAt/orderAt from the pot's own admission stamp.
+#[test]
+fn spine_pot_flip_moves_unknown_to_known() {
+    let conn = production_schema_db();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64; // REAL clock: stage-1's freshness CASE uses SQL unixepoch()
+    let pot = h64(0x71);
+    let (w, l) = (h64(0xaa), h64(0xbb));
+    let ws = junk_sig();
+    file_result(&conn, &h64(0x72), &w, &l, &pot, &h64(0x77), &ws, None, &h64(0x73), now - 50);
+    lb_companion(&conn, &h64(0x72), &w, &l, &pot, &h64(0x77), &ws, None, &h64(0x73), now - 50);
+    let (unk, created): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT unknownPot, potCreatedAt FROM lb_marker_rows WHERE potTxid = ?1",
+            params![pot],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(unk, 1, "pre-pot marker must ride unknown");
+    assert_eq!(created, None);
+    admit_pot(&conn, &pot, now - 40);
+    conn.execute(
+        bsv_overlay_cloudflare::d1_discovery::lb_pot_flip_sql(),
+        params![pot, pot, pot],
+    )
+    .expect("shipped flip");
+    let (unk2, created2, order2): (i64, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT unknownPot, potCreatedAt, orderAt FROM lb_marker_rows WHERE potTxid = ?1",
+            params![pot],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(unk2, 0, "flip must move the row to the known tier");
+    assert_eq!(created2, order2, "orderAt must adopt the pot admission stamp");
+    assert!(created2.is_some());
+}

@@ -1601,6 +1601,152 @@ pub struct ResultMarkerRow {
 /// first-seen marker order (many markers can share a pot — one funding tx,
 /// one settle). The route chunks these at [`D1_CHUNK_OUTPOINTS`] exactly like
 /// `/utxo-status`, so a large result set never trips D1's 100-bound-param cap.
+/// #411 round 2 — the WRITE-TIME spine read (`lb_marker_rows`). One page per
+/// tier, PLAIN-indexed (`idx_lb_marker_rows_page`), no window functions: the
+/// stage-1 derivations (rn cap, potCreatedAt, potFirstMarkerAt, unknownPot,
+/// the COALESCE order/era anchor as `orderAt`) were stamped at WRITE by
+/// `lb_row_insert_query` / the pot-admission flip. Era filters on `orderAt`,
+/// the same anchor stage-1 filters on.
+pub fn lb_page_sql(unknown: bool, written_off_before_ms: Option<i64>) -> String {
+    format!(
+        "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+                loserSigHex, cardsHex, txid, createdAt, claimValid, \
+                rowid AS markerRowid, potCreatedAt, potFirstMarkerAt, orderAt, \
+                unknownPot \
+         FROM lb_marker_rows \
+         WHERE unknownPot = {tier}{era} \
+         ORDER BY orderAt DESC, potTxid ASC, markerRowid ASC \
+         LIMIT ?1",
+        tier = if unknown { 1 } else { 0 },
+        era = era_filter_sql("orderAt", "?2", written_off_before_ms),
+    )
+}
+
+/// The unknown-tier page bound. Stage-1 ranks fresh-unknown pots over the
+/// WHOLE history; this page is bounded, ordered `orderAt DESC` — fresh
+/// unknowns (potFirstMarkerAt within the hour) are by construction the
+/// newest, so they front-load the page. A flood beyond this bound narrows
+/// the quota's candidate set (the honest direction: fewer unknowns listed,
+/// never a minted row), and any board this page cannot PROVE over-full is
+/// served by the fallback path anyway.
+pub const LB_UNKNOWN_PAGE_ROWS: usize = 400;
+
+/// One `lb_marker_rows` page row: the marker plus the write-time stamps the
+/// tier/quota combiner needs.
+pub struct LbPageRow {
+    pub marker: ResultMarkerRow,
+    pub marker_rowid: i64,
+    pub pot_first_marker_at: Option<i64>,
+    pub order_at: Option<i64>,
+    pub unknown_pot: bool,
+}
+
+/// PURE stage-1 replacement over the two pages: replicate the tier system
+/// (known pots tier 0; FRESH unknown pots — oldest-first, ≤ `quota` — join
+/// tier 0; every other unknown is tier 1), the final order
+/// (tier ASC, orderAt DESC, potTxid ASC, markerRowid ASC) and the
+/// distinct-pot probe cut ([`leaderboard_window_cut`]).
+///
+/// Returns `(markers, truncated, distinct_pots_seen)`. THE ZERO-LIE RULE:
+/// the route serves this result ONLY when `distinct_pots_seen >= limit + 1`
+/// (the page PROVED the board over-full, so `truncated` is honestly true and
+/// no deeper row the page missed could have made the window). Every other
+/// board takes the fallback (the old windowed query), so a bounded page can
+/// never silently narrow a sparse board.
+pub fn lb_window_from_pages(
+    known: Vec<LbPageRow>,
+    unknown: Vec<LbPageRow>,
+    limit: usize,
+    quota: usize,
+    now: i64,
+) -> (Vec<ResultMarkerRow>, bool, usize) {
+    let fresh_floor = now - LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS as i64;
+    // Fresh-unknown pots, ranked oldest-first (stage-1's potRank: the
+    // anti-flood order — a NEWEST flood cannot displace the quota).
+    let mut fresh_pots: Vec<(i64, String)> = Vec::new();
+    let mut seen_fresh = std::collections::HashSet::new();
+    for r in &unknown {
+        let fresh = r.pot_first_marker_at.map(|t| t >= fresh_floor).unwrap_or(false);
+        if !fresh {
+            continue;
+        }
+        let key = r.marker.pot_txid.to_ascii_lowercase();
+        if seen_fresh.insert(key.clone()) {
+            fresh_pots.push((r.pot_first_marker_at.unwrap_or(0), key));
+        }
+    }
+    fresh_pots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let tier0_unknown: std::collections::HashSet<String> =
+        fresh_pots.into_iter().take(quota).map(|(_, k)| k).collect();
+
+    let mut tier0: Vec<LbPageRow> = known;
+    let mut tier1: Vec<LbPageRow> = Vec::new();
+    for r in unknown {
+        if tier0_unknown.contains(&r.marker.pot_txid.to_ascii_lowercase()) {
+            tier0.push(r);
+        } else {
+            tier1.push(r);
+        }
+    }
+    let order = |a: &LbPageRow, b: &LbPageRow| {
+        b.order_at
+            .unwrap_or(0)
+            .cmp(&a.order_at.unwrap_or(0))
+            .then_with(|| a.marker.pot_txid.cmp(&b.marker.pot_txid))
+            .then_with(|| a.marker_rowid.cmp(&b.marker_rowid))
+    };
+    tier0.sort_by(order);
+    tier1.sort_by(order);
+    tier0.extend(tier1);
+
+    let keys: Vec<Option<String>> = tier0.iter().map(|r| Some(r.marker.pot_txid.clone())).collect();
+    let distinct = {
+        let mut s = std::collections::HashSet::new();
+        for k in &keys {
+            s.insert(k.as_deref().unwrap_or("").to_ascii_lowercase());
+        }
+        s.len()
+    };
+    let (cut, truncated) = leaderboard_window_cut(&keys, limit);
+    (
+        tier0.into_iter().take(cut).map(|r| r.marker).collect(),
+        truncated,
+        distinct,
+    )
+}
+
+/// #411 round 2 — the fallback path's BULK materialization: the whole
+/// stage-1 inner derivation as ONE `INSERT OR IGNORE ... SELECT`, so a
+/// fallback request (the only kind that still pays the window scan) leaves
+/// the spine converged behind it. Idempotent on the (txid, outputIndex) key;
+/// costs one stage-1-shaped scan, exactly what the request just paid anyway.
+pub fn lb_backfill_sql() -> String {
+    format!(
+        "INSERT OR IGNORE INTO lb_marker_rows \
+         (txid, outputIndex, gameId, winner, loser, potTxid, settleTxid, \
+          winnerSigHex, loserSigHex, cardsHex, createdAt, claimValid, rn, \
+          potCreatedAt, potFirstMarkerAt, orderAt, unknownPot) \
+         SELECT txid, outputIndex, gameId, winner, loser, potTxid, settleTxid, \
+                winnerSigHex, loserSigHex, cardsHex, createdAt, claimValid, rn, \
+                potCreatedAt, potFirstMarkerAt, \
+                COALESCE(potCreatedAt, potFirstMarkerAt), unknownPot \
+         FROM (SELECT rm.txid, rm.outputIndex, rm.gameId, rm.winner, rm.loser, \
+                      rm.potTxid, rm.settleTxid, rm.winnerSigHex, rm.loserSigHex, \
+                      rm.cardsHex, rm.createdAt, rm.claimValid, \
+                      ROW_NUMBER() OVER (PARTITION BY rm.potTxid \
+                                         ORDER BY rm.createdAt ASC, rm.rowid ASC) AS rn, \
+                      r.potCreatedAt AS potCreatedAt, \
+                      MIN(rm.createdAt) OVER (PARTITION BY rm.potTxid) AS potFirstMarkerAt, \
+                      CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot \
+               FROM result_markers_v2 rm \
+               LEFT JOIN (SELECT txid, MIN(createdAt) AS potCreatedAt \
+                          FROM pot_records GROUP BY txid) r \
+                      ON r.txid = rm.potTxid) \
+         WHERE rn <= {per_pot}",
+        per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
+    )
+}
+
 pub fn leaderboard_pot_outpoints(markers: &[ResultMarkerRow]) -> Vec<Outpoint> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();

@@ -1915,6 +1915,18 @@ fn pot_err(e: String) -> PotStorageError {
 /// spender never inherits the old spender's finality). The CASE's
 /// `spendingTxid` probe reads the PRE-update value (SQLite UPDATE
 /// semantics), same as the height CASE.
+/// #411 round 2 — the pot-admission side of the write-time leaderboard
+/// spine: markers admitted BEFORE their pot flip unknown→known (the live
+/// half of stage-1's LEFT JOIN). Pub for the REAL-SQLite harness.
+pub fn lb_pot_flip_sql() -> &'static str {
+    "UPDATE lb_marker_rows SET unknownPot = 0, \
+         potCreatedAt = COALESCE(potCreatedAt, \
+             (SELECT MIN(createdAt) FROM pot_records WHERE txid = ?)), \
+         orderAt = COALESCE( \
+             (SELECT MIN(createdAt) FROM pot_records WHERE txid = ?), orderAt) \
+     WHERE potTxid = ? AND unknownPot = 1"
+}
+
 pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     match (confirmed, with_verdict) {
         (true, true) => {
@@ -2110,7 +2122,23 @@ impl PotStorage for D1PotStorage {
             .bind(if record.params_decoded { 1u32 } else { 0u32 })
             .execute(&self.db)
             .await
-            .map_err(pot_err)
+            .map_err(pot_err)?;
+        // #411 write-time spine: markers admitted BEFORE their pot flip
+        // unknown→known here (the live half of stage-1's LEFT JOIN).
+        // FAIL-OPEN: a missed flip leaves rows unknown-tiered until the
+        // read-path fallback re-materializes them — never fails admission.
+        if let Err(e) = Query::new(lb_pot_flip_sql())
+        .bind(record.txid.as_str())
+        .bind(record.txid.as_str())
+        .bind(record.txid.as_str())
+        .execute(&self.db)
+        .await
+        {
+            worker::console_warn!(
+                "[pot:lb-spine] unknown->known flip failed (self-heals via fallback): {e}"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)] // the write is atomic by design: every field rides the pointer
@@ -3117,6 +3145,60 @@ pub mod result_write {
     /// THE result admission WRITE, as a pure value. `INSERT OR IGNORE` on
     /// the outpoint key; a 0-tiered row is STORED (never refused — the
     /// tm_result censorship rule is untouched), it just serves as invalid.
+    /// #411 — the write-time `lb_marker_rows` companion of
+    /// [`result_insert_query`]: the SAME marker, stamped with the stage-1
+    /// inner-row derivations (rn / potCreatedAt / potFirstMarkerAt /
+    /// unknownPot / orderAt) so `/leaderboard` reads a flat indexed page
+    /// instead of window-scanning history. `INSERT OR IGNORE` on the same
+    /// (txid, outputIndex) key; the rn ≤ RESULT_ROWS_PER_POT cap is the
+    /// WHERE guard (rows beyond the per-pot window are never materialized —
+    /// exactly the rows stage-1 would drop). rn is arrival-ordered, which
+    /// equals createdAt order because createdAt IS the admission stamp.
+    /// The SQL behind [`lb_row_insert_query`] — pub so the REAL-SQLite
+    /// harness executes the shipped string (the #323 lesson: a `contains`
+    /// pin is not an execution pin).
+    pub fn lb_row_insert_sql() -> &'static str {
+        "INSERT OR IGNORE INTO lb_marker_rows \
+             (txid, outputIndex, gameId, winner, loser, potTxid, settleTxid, \
+              winnerSigHex, loserSigHex, cardsHex, createdAt, claimValid, rn, \
+              potCreatedAt, potFirstMarkerAt, orderAt, unknownPot) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                    (SELECT COUNT(*) + 1 FROM lb_marker_rows WHERE potTxid = ?), \
+                    (SELECT MIN(createdAt) FROM pot_records WHERE txid = ?), \
+                    COALESCE((SELECT MIN(potFirstMarkerAt) FROM lb_marker_rows WHERE potTxid = ?), ?), \
+                    COALESCE((SELECT MIN(createdAt) FROM pot_records WHERE txid = ?), \
+                             (SELECT MIN(potFirstMarkerAt) FROM lb_marker_rows WHERE potTxid = ?), ?), \
+                    CASE WHEN EXISTS (SELECT 1 FROM pot_records WHERE txid = ?) THEN 0 ELSE 1 END \
+             WHERE (SELECT COUNT(*) FROM lb_marker_rows WHERE potTxid = ?) < ?"
+    }
+
+    pub fn lb_row_insert_query(record: &ResultRecord, created_at: i64) -> Query {
+        let pot = record.pot_txid.as_str();
+        Query::new(lb_row_insert_sql())
+        .bind(record.txid.as_str())
+        .bind(record.output_index)
+        .bind(record.game_id.as_str())
+        .bind(record.winner.as_str())
+        .bind(record.loser.as_str())
+        .bind(pot)
+        .bind(record.settle_txid.as_str())
+        .bind(record.winner_sig_hex.as_str())
+        .bind(record.loser_sig_hex.as_deref())
+        .bind(record.cards_hex.as_deref())
+        .bind(created_at)
+        .bind(overlay_discovery::result::validity::claim_tier(record))
+        .bind(pot)
+        .bind(pot)
+        .bind(pot)
+        .bind(created_at)
+        .bind(pot)
+        .bind(pot)
+        .bind(created_at)
+        .bind(pot)
+        .bind(pot)
+        .bind(overlay_discovery::result::storage::RESULT_ROWS_PER_POT as i64)
+    }
+
     pub fn result_insert_query(record: &ResultRecord, created_at: i64) -> LatchedResultInsert {
         let claim_tier = overlay_discovery::result::validity::claim_tier(record);
         LatchedResultInsert {
@@ -3186,6 +3268,12 @@ pub mod result_write {
         }
         pub async fn insert(&self, insert: LatchedResultInsert) -> Result<(), String> {
             insert.query.execute(&self.0).await
+        }
+        /// #411 write-time leaderboard spine — FAIL-OPEN companion write (a
+        /// lost row only under-fills the read page, which falls back to the
+        /// windowed query and re-materializes it; never a lie).
+        pub async fn lb_insert(&self, q: Query) -> Result<(), String> {
+            q.execute(&self.0).await
         }
         pub async fn relatch(&self, update: LatchedResultRelatch) -> Result<(), String> {
             update.query.execute(&self.0).await
@@ -3303,7 +3391,8 @@ impl ResultStorage for D1ResultStorage {
         // same (gameId, winner) from different txs are ALL kept; never
         // overwrite, never delete. The `claimValid` tier rides the insert
         // (result_write — the #283 capability shape).
-        let insert = result_write::result_insert_query(record, current_unix_seconds_i64());
+        let now = current_unix_seconds_i64();
+        let insert = result_write::result_insert_query(record, now);
         // TELEMETRY, not a decision — the potparty RATE-detector doctrine.
         if insert.claim_tier() == 0 {
             worker::console_log!(
@@ -3313,7 +3402,20 @@ impl ResultStorage for D1ResultStorage {
                 record.winner
             );
         }
-        self.db.insert(insert).await.map_err(result_err)
+        self.db.insert(insert).await.map_err(result_err)?;
+        // #411 write-time spine companion — FAIL-OPEN: a lost lb row only
+        // under-fills the read page, which falls back to the windowed query
+        // and re-materializes it. Never fails the admission.
+        if let Err(e) = self
+            .db
+            .lb_insert(result_write::lb_row_insert_query(record, now))
+            .await
+        {
+            worker::console_warn!(
+                "[result:lb-spine] companion write failed (self-heals via fallback): {e}"
+            );
+        }
+        Ok(())
     }
 
     async fn list_for_winner(

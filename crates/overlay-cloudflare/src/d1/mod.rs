@@ -417,7 +417,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// index, outpoint-keyed from birth per the #327 S8 lesson) + its
 /// gameId/createdAt read index. Overlay-internal (clients read via /lookup
 /// ls_hand); display-only — no money path and no app-layer join reads it.
-pub const OVERLAY_MIGRATION_COUNT: usize = 114;
+pub const OVERLAY_MIGRATION_COUNT: usize = 117;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1396,6 +1396,41 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // shape. Additive + idempotent (IF NOT EXISTS) per the M9 rerun rule.
     "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_potTxid_createdAt      ON result_markers_v2(potTxid, createdAt)",
     "CREATE INDEX IF NOT EXISTS idx_pot_records_txid_createdAt      ON pot_records(txid, createdAt)",
+    // #411 round 2 (2026-08-26): the indexes above lowered constants but the
+    // window-fn spine still MATERIALIZES all of result_markers_v2 per request
+    // (DENSE_RANK cannot be cut by LIMIT), measured 3-10s per cache miss
+    // under 16-pair burst. `lb_marker_rows` is the WRITE-TIME spine: one row
+    // per marker (rn ≤ 4 per pot, the stage-1 inner-row shape), stamped at
+    // result-marker admission (`lb_row_insert_query`) and flipped
+    // unknown→known at pot admission (`lb_pot_flip_sql`). `orderAt` is the
+    // era/order anchor (COALESCE(potCreatedAt, potFirstMarkerAt)) stored so a
+    // PLAIN index serves the read. The read path keeps the old windowed query
+    // as a permanent fallback-and-backfill (an under-full page re-runs it and
+    // materializes what it found), so a missed write SELF-HEALS and the board
+    // never undercounts — the display window's trust model is unchanged (the
+    // counting bars still re-check pot_records/network_seen at read).
+    "CREATE TABLE IF NOT EXISTS lb_marker_rows (
+        txid TEXT NOT NULL,
+        outputIndex INTEGER NOT NULL,
+        gameId TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        loser TEXT NOT NULL,
+        potTxid TEXT,
+        settleTxid TEXT,
+        winnerSigHex TEXT,
+        loserSigHex TEXT,
+        cardsHex TEXT,
+        createdAt INTEGER,
+        claimValid INTEGER,
+        rn INTEGER NOT NULL,
+        potCreatedAt INTEGER,
+        potFirstMarkerAt INTEGER,
+        orderAt INTEGER,
+        unknownPot INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (txid, outputIndex)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_lb_marker_rows_page ON lb_marker_rows(unknownPot, orderAt DESC, potTxid)",
+    "CREATE INDEX IF NOT EXISTS idx_lb_marker_rows_pot ON lb_marker_rows(potTxid)",
 ];
 
 // =============================================================================

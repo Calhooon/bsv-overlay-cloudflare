@@ -351,9 +351,15 @@ mod tests {
                 .next()
                 .and_then(|t| t.split_whitespace().next())
                 .expect("every statement is an ADD COLUMN");
+            // OWNERSHIP is the ALTER that ADDS the column — a later
+            // migration may legitimately REUSE the name as a column of its
+            // own table (#411 round 2: `lb_marker_rows` mirrors the marker
+            // columns, claimValid included). A bare `contains(column)` would
+            // count that reuse as a second owner.
+            let owner_shape = format!("ADD COLUMN {column}");
             let hits: Vec<&&str> = bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
-                .filter(|m| m.contains(column))
+                .filter(|m| m.contains(&owner_shape))
                 .collect();
             assert_eq!(hits.len(), 1, "exactly one migration owns {column}");
             assert_eq!(

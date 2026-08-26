@@ -981,6 +981,37 @@ impl ResultRowD1 {
     }
 }
 
+/// #411 round 2 — one `lb_marker_rows` page row (the write-time spine).
+#[derive(Deserialize)]
+struct LbRowD1 {
+    #[serde(flatten)]
+    marker: ResultRowD1,
+    #[serde(rename = "markerRowid")]
+    marker_rowid: Option<f64>,
+    #[serde(rename = "potFirstMarkerAt")]
+    pot_first_marker_at: Option<f64>,
+    #[serde(rename = "orderAt")]
+    order_at: Option<f64>,
+    #[serde(rename = "unknownPot")]
+    unknown_pot: Option<f64>,
+}
+
+impl LbRowD1 {
+    fn into_page_row(self) -> Option<crate::logic::LbPageRow> {
+        let marker_rowid = self.marker_rowid.map(|v| v as i64).unwrap_or(0);
+        let pot_first_marker_at = self.pot_first_marker_at.map(|v| v as i64);
+        let order_at = self.order_at.map(|v| v as i64);
+        let unknown_pot = self.unknown_pot.map(|v| v as i64 != 0).unwrap_or(true);
+        Some(crate::logic::LbPageRow {
+            marker: self.marker.into_marker()?,
+            marker_rowid,
+            pot_first_marker_at,
+            order_at,
+            unknown_pot,
+        })
+    }
+}
+
 /// `proof_markers` pointer row — only the (gameId, winner) key and the marker
 /// txid; the ~10-15 KB transcript `bundle` is never read here (the CLIENT
 /// fetches + verifies it — this surface only points at where it lives).
@@ -1063,24 +1094,90 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     if let Some(ms) = era {
         binds.push(era_bind(ms));
     }
-    let stmt = db
-        .prepare(crate::logic::leaderboard_markers_sql(era))
-        .bind(&binds)?;
-    let raw_rows: Vec<ResultRowD1> = match stmt.all().await.and_then(|r| r.results::<ResultRowD1>())
+    // #411 round 2 — FAST PATH first: two PLAIN-indexed pages over the
+    // write-time spine (`lb_marker_rows`), tier/quota/rank replayed in Rust
+    // (`lb_window_from_pages`). THE ZERO-LIE RULE: this result is served
+    // ONLY when the pages PROVE the board over-full (≥ limit+1 distinct
+    // pots) — every sparse, un-converged or doubtful board takes the old
+    // windowed query below, which also BULK-MATERIALIZES the spine behind
+    // it (`lb_backfill_sql`), so a missed companion write self-heals and the
+    // fast path only ever replaces answers it can prove. A fast-path D1
+    // fault falls through to the old path — never a 503 from this block.
+    let mut fast: Option<(Vec<ResultMarkerRow>, bool)> = None;
     {
-        Ok(rows) => rows,
-        Err(e) => {
-            console_warn!("[leaderboard] result_markers_v2 window query failed: {e}");
-            return json_error("database query failed", 503);
+        let mut kb: Vec<JsValue> = vec![JsValue::from_f64(row_cap as f64)];
+        if let Some(ms) = era {
+            kb.push(era_bind(ms));
+        }
+        let mut ub: Vec<JsValue> =
+            vec![JsValue::from_f64(crate::logic::LB_UNKNOWN_PAGE_ROWS as f64)];
+        if let Some(ms) = era {
+            ub.push(era_bind(ms));
+        }
+        let known_q = db
+            .prepare(crate::logic::lb_page_sql(false, era))
+            .bind(&kb);
+        let unknown_q = db
+            .prepare(crate::logic::lb_page_sql(true, era))
+            .bind(&ub);
+        if let (Ok(kq), Ok(uq)) = (known_q, unknown_q) {
+            let known = kq.all().await.and_then(|r| r.results::<LbRowD1>());
+            let unknown = uq.all().await.and_then(|r| r.results::<LbRowD1>());
+            match (known, unknown) {
+                (Ok(krows), Ok(urows)) => {
+                    let now = (worker::Date::now().as_millis() / 1000) as i64;
+                    let (m, t, distinct) = crate::logic::lb_window_from_pages(
+                        krows.into_iter().filter_map(LbRowD1::into_page_row).collect(),
+                        urows.into_iter().filter_map(LbRowD1::into_page_row).collect(),
+                        limit,
+                        quota,
+                        now,
+                    );
+                    if distinct >= limit + 1 {
+                        fast = Some((m, t));
+                    }
+                }
+                (k, u) => {
+                    if let Err(e) = k {
+                        console_warn!("[leaderboard] lb spine known-page failed (fallback): {e}");
+                    }
+                    if let Err(e) = u {
+                        console_warn!("[leaderboard] lb spine unknown-page failed (fallback): {e}");
+                    }
+                }
+            }
+        }
+    }
+    let (markers, mut truncated): (Vec<ResultMarkerRow>, bool) = match fast {
+        Some(f) => f,
+        None => {
+            let stmt = db
+                .prepare(crate::logic::leaderboard_markers_sql(era))
+                .bind(&binds)?;
+            let raw_rows: Vec<ResultRowD1> =
+                match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        console_warn!("[leaderboard] result_markers_v2 window query failed: {e}");
+                        return json_error("database query failed", 503);
+                    }
+                };
+            let pot_keys: Vec<Option<String>> = raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
+            let (cut, truncated) = crate::logic::leaderboard_window_cut(&pot_keys, limit);
+            let markers: Vec<ResultMarkerRow> = raw_rows
+                .into_iter()
+                .take(cut)
+                .filter_map(ResultRowD1::into_marker)
+                .collect();
+            // The request just paid the window scan anyway — leave the spine
+            // converged behind it. FAIL-OPEN (warn only).
+            match db.prepare(crate::logic::lb_backfill_sql()).run().await {
+                Ok(_) => {}
+                Err(e) => console_warn!("[leaderboard] lb spine backfill failed: {e}"),
+            }
+            (markers, truncated)
         }
     };
-    let pot_keys: Vec<Option<String>> = raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
-    let (cut, mut truncated) = crate::logic::leaderboard_window_cut(&pot_keys, limit);
-    let markers: Vec<ResultMarkerRow> = raw_rows
-        .into_iter()
-        .take(cut)
-        .filter_map(ResultRowD1::into_marker)
-        .collect();
 
     // 2) Pot spend-status join (potTxid:0), CHUNKED at D1_CHUNK_OUTPOINTS —
     // same discipline as /utxo-status. FAIL-SAFE: a chunk's D1 error is the
