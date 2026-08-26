@@ -1975,10 +1975,16 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
 /// real-SQLite pin executes the production string.
 pub(crate) fn settle_signers_candidates_sql(limit: u64) -> String {
     format!(
+        // Recency band first (bsv-low 2026-08-26: a fresh settle waiting on
+        // pure RANDOM sampling under a 15-min cron could sit unclassified for
+        // many cycles while display polls timed out at 240 s) — rows spent
+        // within the last hour outrank the elders, RANDOM within each band
+        // keeps the #284 anti-starvation property for the backlog.
         "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
          WHERE verdict IS NOT NULL AND verdictTxid = spendingTxid \
            AND settleSigners IS NULL \
-         ORDER BY RANDOM() LIMIT {limit}"
+         ORDER BY CASE WHEN COALESCE(spentAt, 0) >= unixepoch() - 3600 \
+                       THEN 0 ELSE 1 END, RANDOM() LIMIT {limit}"
     )
 }
 
