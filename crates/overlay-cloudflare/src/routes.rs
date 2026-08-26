@@ -767,15 +767,31 @@ pub async fn submit(
         // wait_until budget silently — convergence rides the #397 re-checks
         // and the backstop, by design.
         {
-            let subject_ef_hex = efs
+            // Ancestry-ordered (2026-08-26, first live fire): subject-only
+            // dual-pushes came back "orphan view" — TAAL holds a fresh
+            // two-leg money tx in its ORPHAN POOL because the hop parent
+            // never reached it. `efs` is already dependency-ordered
+            // (parents before subject), so push EVERY leg in order — the
+            // parent fills TAAL's mempool and the subject validates. Latch
+            // only on the SUBJECT's accept.
+            let dual_legs: Vec<(String, String)> = efs
                 .iter()
-                .find(|e| e.txid == subject_txid)
-                .map(|e| hex::encode(&e.ef));
-            if let (Some(hex_body), Ok(dual_db)) = (subject_ef_hex, env.d1("OVERLAY_DB")) {
+                .map(|e| (e.txid.clone(), hex::encode(&e.ef)))
+                .collect();
+            if let (false, Ok(dual_db)) = (dual_legs.is_empty(), env.d1("OVERLAY_DB")) {
                 let dual_key = taal_api_key.clone();
                 let dual_txid = subject_txid.clone();
                 ctx.wait_until(async move {
-                    match crate::broadcaster::corroborate_tx_hex(dual_key.as_deref(), &hex_body).await {
+                    let mut subject_outcome: Result<crate::broadcaster::ArcOutcome, String> =
+                        Err("subject leg never pushed".to_string());
+                    for (leg_txid, hex_body) in &dual_legs {
+                        let res =
+                            crate::broadcaster::corroborate_tx_hex(dual_key.as_deref(), hex_body).await;
+                        if *leg_txid == dual_txid {
+                            subject_outcome = res;
+                        }
+                    }
+                    match subject_outcome {
                         Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => {
                             crate::ops::latch_network_seen(&dual_db, &dual_txid).await;
                             worker::console_log!(
