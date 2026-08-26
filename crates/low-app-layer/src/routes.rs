@@ -51,6 +51,22 @@ fn json_error(msg: &str, status: u16) -> Result<Response> {
     json_response(serde_json::json!({ "error": msg }).to_string(), status)
 }
 
+/// #411: JSON response the edge MAY cache briefly — for GLOBAL display-tier
+/// views whose answer is identical for every caller (no identity in the
+/// query). Under a 16-pair burst, 32 clients polling `/leaderboard` each paid
+/// the full whole-history window (9-13 s measured live, 2026-08-26); a 5 s
+/// shared edge cache collapses that to ~1 D1 hit per window. Money views and
+/// anything identity-scoped keep `json_response`'s `no-store` — display
+/// freshness is the ONLY thing traded, and the SEEN-bar gates stay
+/// server-side.
+fn json_response_cached(body: String, status: u16, max_age_secs: u32) -> Result<Response> {
+    let mut resp = Response::ok(body)?.with_status(status);
+    resp.headers_mut().set("Content-Type", "application/json")?;
+    resp.headers_mut()
+        .set("Cache-Control", &format!("public, max-age={max_age_secs}, s-maxage={max_age_secs}"))?;
+    Ok(resp)
+}
+
 /// The resolved view identity for an identity-scoped route, or the refusal
 /// response to return instead.
 pub(crate) enum ViewIdentity {
@@ -1000,6 +1016,17 @@ struct ProofPointerRowD1 {
 /// never a count and never a 5xx. An over-full window is reported via the
 /// body's `truncated` bit — never a complete-looking partial answer.
 pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    // #411: serve from the in-worker Cache API when fresh. The edge does NOT
+    // zone-cache *.workers.dev responses, so the Cache-Control header alone
+    // did nothing (measured 12-24 s under burst with 32 pollers); an explicit
+    // cache.put honors the same max-age=5. Global view only - the answer
+    // carries no identity. The durable fix (write-time decoded leaderboard
+    // table) is tracked on #411.
+    let cache_key = req.url()?.to_string();
+    let cache = worker::Cache::default();
+    if let Ok(Some(hit)) = cache.get(&cache_key, false).await {
+        return Ok(hit);
+    }
     let url = req.url()?;
     let limit_raw = url
         .query_pairs()
@@ -1246,10 +1273,16 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         &signers_by_pot,
     );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
-    json_response(
-        leaderboard_body(&lb, computed_at, markers.len(), truncated),
-        200,
-    )
+    {
+        let mut resp = json_response_cached(
+            leaderboard_body(&lb, computed_at, markers.len(), truncated),
+            200,
+            5,
+        )?;
+        let for_cache = resp.cloned()?;
+        let _ = cache.put(&cache_key, for_cache).await;
+        Ok(resp)
+    }
 }
 
 /// `pot_beefs` row for the classification fold: txid + `hex(beef)`.

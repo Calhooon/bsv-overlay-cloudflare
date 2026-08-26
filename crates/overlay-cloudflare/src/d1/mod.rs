@@ -327,7 +327,7 @@ pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
 /// index, outpoint-keyed from birth per the #327 S8 lesson) + its
 /// gameId/createdAt read index. Overlay-internal (clients read via /lookup
 /// ls_hand); display-only — no money path and no app-layer join reads it.
-pub const OVERLAY_MIGRATION_COUNT: usize = 112;
+pub const OVERLAY_MIGRATION_COUNT: usize = 114;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1291,6 +1291,16 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // app-layer (/leaderboard, /results) — epoch Rule 24: the byte-identical
     // statement lives in low_app_layer::schema.
     "ALTER TABLE pot_records ADD COLUMN settleSigners TEXT",
+    // #411 (2026-08-26): the two hottest app-layer read views measured 7.5s /
+    // 3.6s wallTime under 16-pair burst (wrangler tail, attempt 7d live load).
+    // /leaderboard's inner subquery aggregates pot_records per REQUEST
+    // (GROUP BY txid -> MIN(createdAt)) and its window PARTITIONs
+    // result_markers_v2 by potTxid; neither had a covering index, so both
+    // were full scans growing with all history. Reference pattern
+    // (ts-stack 2025-11-11-001-utxo-lookup-index.ts): one index per query
+    // shape. Additive + idempotent (IF NOT EXISTS) per the M9 rerun rule.
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_potTxid_createdAt      ON result_markers_v2(potTxid, createdAt)",
+    "CREATE INDEX IF NOT EXISTS idx_pot_records_txid_createdAt      ON pot_records(txid, createdAt)",
 ];
 
 // =============================================================================
