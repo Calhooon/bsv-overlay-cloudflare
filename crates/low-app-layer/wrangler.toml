@@ -158,13 +158,18 @@ AUTH_ENFORCE = "false"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.
 STORAGE_EPOCH = "beta-2026-08-12-1"
-# DELIBERATELY EMPTY (= inert), unlike prod. The #375 era write-off exists to
-# retire a pre-launch era of real player records; the beta database starts at
-# zero rows, so there is no old era to write off. Wiping beta is a DELETE
-# against the beta D1, not a cutoff. If beta ever needs to rehearse the
-# launch-eve bump, set both together (ms + height) exactly as prod does.
-WRITTEN_OFF_BEFORE_MS = ""
-WRITTEN_OFF_BEFORE_HEIGHT = ""
+# 2026-08-27 — SET (the rehearsal the note below anticipated): beta's own
+# campaign history crossed the 500-pot leaderboard window (BOARD_CLAIM_LIMIT),
+# so every board page returned truncated:true and every client fell back to
+# the slow gather (layer 10 of the enforced-board onion; decision log
+# addendum 21). Cutoff = 2026-08-27 00:00 UTC / first block past midnight
+# (964063 @ 00:12:31Z) — retires the pre-today era from every view while the
+# day's live cells keep serving. Bump forward the same way whenever beta's
+# window re-fills; the durable fix is board paging (#403 item 4).
+# (Original stance, kept for the why of the mechanism: the #375 era write-off
+# retires a pre-launch era; wiping beta wholesale is a DELETE, not a cutoff.)
+WRITTEN_OFF_BEFORE_MS = "1787788800000"
+WRITTEN_OFF_BEFORE_HEIGHT = "964063"
 
 # Beta's OWN session store. AUTH_SESSIONS and SERVER_PRIVATE_KEY are all-or-
 # nothing: the front door computes `configured = key AND kv`, and an
