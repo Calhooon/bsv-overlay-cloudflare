@@ -49,6 +49,23 @@ impl DurableObject for BoardView {
 
     async fn fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
+        // S3 second iteration: ONE actor class, two view kinds. `/results`
+        // instances are NAMED `results:<identity>` (the route resolves the
+        // identity at the #318 seam and the name pins the scope); the board
+        // instance stays `board:v1`. Same SWR/serve semantics for both.
+        if req.path() == "/results" {
+            let identity = url
+                .query_pairs()
+                .find(|(k, _)| k == "identity")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            let after = url
+                .query_pairs()
+                .find(|(k, _)| k == "after")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            return self.serve_results(&identity, after).await;
+        }
         let limit_raw = url
             .query_pairs()
             .find(|(k, _)| k == "limit")
@@ -94,6 +111,42 @@ impl DurableObject for BoardView {
 }
 
 impl BoardView {
+    /// S3 — per-identity `/results` with the same SWR contract as the board
+    /// (fresh ≤10 s from memory; stale serves instantly while one arrival
+    /// refreshes; failed refresh serves held). Keyed by `after` page.
+    async fn serve_results(&self, identity: &str, after: usize) -> Result<Response> {
+        let key = 1_000_000u32 + after as u32; // page-keyed, disjoint from board keys
+        let now = Date::now().as_millis();
+        let held = self.cache.borrow().get(&key).cloned();
+        match held {
+            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => body_response(body, false),
+            Some((body, _)) => {
+                if self.refreshing.borrow().contains(&key) {
+                    return body_response(body, true);
+                }
+                self.refreshing.borrow_mut().insert(key);
+                let out =
+                    crate::routes::compute_results_body_string(&self.env, identity, after).await;
+                self.refreshing.borrow_mut().remove(&key);
+                match out {
+                    Ok((200, new_body)) => {
+                        self.cache.borrow_mut().insert(key, (new_body.clone(), now));
+                        body_response(new_body, false)
+                    }
+                    _ => body_response(body, true),
+                }
+            }
+            None => {
+                let (status, body) =
+                    crate::routes::compute_results_body_string(&self.env, identity, after).await?;
+                if status == 200 {
+                    self.cache.borrow_mut().insert(key, (body.clone(), now));
+                }
+                crate::routes::json_response_cached(body, status, 5)
+            }
+        }
+    }
+
     /// S3b — tell subscribed clients the board CHANGED (they refetch once,
     /// hitting this actor's warm copy). Fire-and-forget POST to OUR relay's
     /// bearer-gated /broadcast; a lost push costs one safety-poll interval,

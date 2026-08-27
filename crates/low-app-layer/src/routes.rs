@@ -2115,33 +2115,69 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         .unwrap_or(0)
         .min(crate::results::RESULTS_VIEW_AFTER_MAX);
 
-    if !crate::logic::valid_identity(&identity_lc) {
-        return json_response(
-            crate::results::results_body(&identity_lc, &[], false, after),
+    // S3 second iteration (2026-08-27): forward to the PER-IDENTITY view
+    // actor. The #318 auth seam is untouched — identity resolves HERE (the
+    // one seam), and the actor instance is NAMED by the resolved identity,
+    // so it can only ever serve its own view. Any actor fault falls back to
+    // direct compute (no new failure mode).
+    if let Ok(ns) = ctx.env.durable_object("BOARD_VIEW") {
+        if let Ok(stub) = ns
+            .id_from_name(&format!("results:{identity_lc}"))
+            .and_then(|id| id.get_stub())
+        {
+            let target =
+                format!("https://board-view/results?identity={identity_lc}&after={after}");
+            match stub.fetch_with_str(&target).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => console_warn!("[results] view actor unreachable ({e}) — direct compute"),
+            }
+        }
+    }
+    let (status, body) = compute_results_body_string(&ctx.env, &identity_lc, after).await?;
+    json_response_cached(body, status, 5)
+}
+
+/// S3 — the whole `/results` pipeline as a callable (auth already resolved
+/// by the caller; see the seam note above). The view actor and the route's
+/// direct fallback both serve EXACTLY this.
+pub async fn compute_results_body_string(
+    env: &worker::Env,
+    identity_lc: &str,
+    after: usize,
+) -> Result<(u16, String)> {
+    if !crate::logic::valid_identity(identity_lc) {
+        return Ok((
             200,
-        );
+            crate::results::results_body(identity_lc, &[], false, after),
+        ));
     }
 
-    let db = match ctx.env.d1("OVERLAY_DB") {
+    let db = match env.d1("OVERLAY_DB") {
         Ok(db) => db,
         Err(e) => {
             console_warn!("[results] OVERLAY_DB binding unavailable: {e}");
-            return json_error("database unavailable", 503);
+            return Ok((503, "{\"error\":\"database unavailable\"}".to_string()));
         }
     };
 
-    let (entries, truncated) =
-        match gather_result_entries(&db, &identity_lc, written_off_before_ms(&ctx), after).await {
-            Ok(v) => v,
-            Err(e) => {
-                console_warn!("[results] {e}");
-                return json_error("database query failed", 503);
-            }
-        };
-    json_response(
-        crate::results::results_body(&identity_lc, &entries, truncated, after),
-        200,
+    let (entries, truncated) = match gather_result_entries(
+        &db,
+        identity_lc,
+        written_off_before_ms_env(env),
+        after,
     )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            console_warn!("[results] {e}");
+            return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
+        }
+    };
+    Ok((
+        200,
+        crate::results::results_body(identity_lc, &entries, truncated, after),
+    ))
 }
 
 /// The whole `/results` derivation for one identity — rows, claims, seat
