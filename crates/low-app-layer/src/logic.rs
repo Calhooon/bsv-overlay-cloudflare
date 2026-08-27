@@ -1666,7 +1666,10 @@ pub fn lb_window_from_pages(
     let mut fresh_pots: Vec<(i64, String)> = Vec::new();
     let mut seen_fresh = std::collections::HashSet::new();
     for r in &unknown {
-        let fresh = r.pot_first_marker_at.map(|t| t >= fresh_floor).unwrap_or(false);
+        let fresh = r
+            .pot_first_marker_at
+            .map(|t| t >= fresh_floor)
+            .unwrap_or(false);
         if !fresh {
             continue;
         }
@@ -1699,7 +1702,10 @@ pub fn lb_window_from_pages(
     tier1.sort_by(order);
     tier0.extend(tier1);
 
-    let keys: Vec<Option<String>> = tier0.iter().map(|r| Some(r.marker.pot_txid.clone())).collect();
+    let keys: Vec<Option<String>> = tier0
+        .iter()
+        .map(|r| Some(r.marker.pot_txid.clone()))
+        .collect();
     let distinct = {
         let mut s = std::collections::HashSet::new();
         for k in &keys {

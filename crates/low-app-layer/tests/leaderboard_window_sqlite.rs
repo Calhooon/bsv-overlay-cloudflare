@@ -1706,7 +1706,6 @@ fn query_pot_rows(conn: &Connection, pot: &str) -> Vec<PotRecordRow> {
     .unwrap()
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 // #411 round 2 — the WRITE-TIME spine (`lb_marker_rows`), proven against the
 // stage-1 window it replaces, through the SHIPPED strings only.
@@ -1775,7 +1774,9 @@ fn lb_pages(conn: &Connection, limit: usize, now: i64) -> (Vec<ResultMarkerRow>,
                     winner: r.get("winner")?,
                     loser: r.get("loser")?,
                     pot_txid: pot.unwrap_or_default(),
-                    settle_txid: r.get::<_, Option<String>>("settleTxid")?.unwrap_or_default(),
+                    settle_txid: r
+                        .get::<_, Option<String>>("settleTxid")?
+                        .unwrap_or_default(),
                     winner_sig_hex: r
                         .get::<_, Option<String>>("winnerSigHex")?
                         .unwrap_or_default(),
@@ -1825,7 +1826,12 @@ fn seed_spine_world(conn: &Connection, now: i64, with_companions: bool) {
     for i in 0..4u8 {
         let pot = h64(0x30 + i);
         admit_pot(conn, &pot, now - 5_000 + i as i64 * 100);
-        file(&h64(0x40 + i), &pot, &h64(0x50 + i), now - 4_000 + i as i64 * 100);
+        file(
+            &h64(0x40 + i),
+            &pot,
+            &h64(0x50 + i),
+            now - 4_000 + i as i64 * 100,
+        );
     }
     // 1 known pot, markers FIRST (unknown at write), pot admitted after +
     // the SHIPPED flip — exactly what the pot-admission writer runs.
@@ -1864,7 +1870,10 @@ fn assert_windows_equal(
         .iter()
         .map(|m| (m.txid.clone(), m.pot_txid.clone()))
         .collect();
-    assert_eq!(fast_seq, old_seq, "spine window rows/order diverge from stage-1");
+    assert_eq!(
+        fast_seq, old_seq,
+        "spine window rows/order diverge from stage-1"
+    );
     assert_eq!(fast.1, old.1, "truncated bit diverges from stage-1");
 }
 
@@ -1937,8 +1946,30 @@ fn spine_pot_flip_moves_unknown_to_known() {
     let pot = h64(0x71);
     let (w, l) = (h64(0xaa), h64(0xbb));
     let ws = junk_sig();
-    file_result(&conn, &h64(0x72), &w, &l, &pot, &h64(0x77), &ws, None, &h64(0x73), now - 50);
-    lb_companion(&conn, &h64(0x72), &w, &l, &pot, &h64(0x77), &ws, None, &h64(0x73), now - 50);
+    file_result(
+        &conn,
+        &h64(0x72),
+        &w,
+        &l,
+        &pot,
+        &h64(0x77),
+        &ws,
+        None,
+        &h64(0x73),
+        now - 50,
+    );
+    lb_companion(
+        &conn,
+        &h64(0x72),
+        &w,
+        &l,
+        &pot,
+        &h64(0x77),
+        &ws,
+        None,
+        &h64(0x73),
+        now - 50,
+    );
     let (unk, created): (i64, Option<i64>) = conn
         .query_row(
             "SELECT unknownPot, potCreatedAt FROM lb_marker_rows WHERE potTxid = ?1",
@@ -1962,6 +1993,9 @@ fn spine_pot_flip_moves_unknown_to_known() {
         )
         .unwrap();
     assert_eq!(unk2, 0, "flip must move the row to the known tier");
-    assert_eq!(created2, order2, "orderAt must adopt the pot admission stamp");
+    assert_eq!(
+        created2, order2,
+        "orderAt must adopt the pot admission stamp"
+    );
     assert!(created2.is_some());
 }
