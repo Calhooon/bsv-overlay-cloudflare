@@ -818,6 +818,11 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             pot_sats: r.get::<_, Option<i64>>("potSats")?.map(|v| v as u64),
             verdict: r.get("verdict")?,
             verdict_txid: r.get("verdictTxid")?,
+            // #406 — NOT selected by results_sql (the const is byte-pinned;
+            // adding a column empties the page — see the results.rs comment).
+            // Production fills this via the separate page-batched overlay
+            // read in gather_result_entries; through the REAL SQL it is None.
+            settle_signers: None,
             spent_height: r.get::<_, Option<i64>>("spentHeight")?.map(|v| v as u64),
             spender_proof_verified: r
                 .get::<_, Option<i64>>("spenderProofVerified")?

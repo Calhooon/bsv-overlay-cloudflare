@@ -59,11 +59,37 @@ fn json_error(msg: &str, status: u16) -> Result<Response> {
 /// anything identity-scoped keep `json_response`'s `no-store` — display
 /// freshness is the ONLY thing traded, and the SEEN-bar gates stay
 /// server-side.
-pub(crate) fn json_response_cached(body: String, status: u16, max_age_secs: u32) -> Result<Response> {
+/// Rebuild a Durable-Object-forwarded response into one with MUTABLE headers.
+///
+/// A `Response` that came out of `stub.fetch_with_str` wraps an immutable JS
+/// `Headers` object — every later `headers_mut().set(...)` fails, and the
+/// worker-level `cors::add_cors_headers` swallows those failures by design
+/// (`let _ =`). Returning such a response verbatim therefore ships WITHOUT
+/// `Access-Control-Allow-Origin`, and every BROWSER caller loses the route
+/// while curl/node keep working — exactly the 2026-08-27 regression that
+/// blanked the board for every client after the BoardView fronting landed
+/// (the page fell back to the degraded client gather; the harness saw
+/// "0 wins / all unconfirmed" with a PERFECT served payload). Reading the
+/// body and re-wrapping it costs one copy and restores header mutability;
+/// the DO's own cache header is re-applied here (5 s — the actor's SWR
+/// freshness), and CORS attaches at the single worker-level site.
+async fn rebuild_do_response(resp: &mut Response) -> Result<Response> {
+    let status = resp.status_code();
+    let body = resp.text().await?;
+    json_response_cached(body, status, 5)
+}
+
+pub(crate) fn json_response_cached(
+    body: String,
+    status: u16,
+    max_age_secs: u32,
+) -> Result<Response> {
     let mut resp = Response::ok(body)?.with_status(status);
     resp.headers_mut().set("Content-Type", "application/json")?;
-    resp.headers_mut()
-        .set("Cache-Control", &format!("public, max-age={max_age_secs}, s-maxage={max_age_secs}"))?;
+    resp.headers_mut().set(
+        "Cache-Control",
+        &format!("public, max-age={max_age_secs}, s-maxage={max_age_secs}"),
+    )?;
     Ok(resp)
 }
 
@@ -144,9 +170,7 @@ fn written_off_before_ms(ctx: &RouteContext<AuthState>) -> Option<i64> {
 /// Env-taking twin (S3a): the BoardView actor computes outside any route ctx.
 pub(crate) fn written_off_before_ms_env(env: &worker::Env) -> Option<i64> {
     let raw = crate::logic::normalize_written_off_before_ms(
-        env.var("WRITTEN_OFF_BEFORE_MS")
-            .ok()
-            .map(|v| v.to_string()),
+        env.var("WRITTEN_OFF_BEFORE_MS").ok().map(|v| v.to_string()),
     );
     // Review MED-2 — the future-cutoff belt (`clamp_future_cutoff` docs): a
     // well-formed WRONG value (extra digit, pasted future instant) must
@@ -1069,8 +1093,13 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
                 .fetch_with_str(&format!("https://board-view/leaderboard{q}"))
                 .await
             {
-                Ok(resp) => return Ok(resp),
-                Err(e) => console_warn!("[leaderboard] BoardView unreachable ({e}) — direct compute"),
+                // NEVER return the DO response verbatim — its headers are
+                // immutable and CORS would silently fail to attach (see
+                // `rebuild_do_response`).
+                Ok(mut resp) => return rebuild_do_response(&mut resp).await,
+                Err(e) => {
+                    console_warn!("[leaderboard] BoardView unreachable ({e}) — direct compute")
+                }
             }
         }
     }
@@ -1137,12 +1166,8 @@ pub async fn compute_leaderboard_body_string(
         if let Some(ms) = era {
             ub.push(era_bind(ms));
         }
-        let known_q = db
-            .prepare(crate::logic::lb_page_sql(false, era))
-            .bind(&kb);
-        let unknown_q = db
-            .prepare(crate::logic::lb_page_sql(true, era))
-            .bind(&ub);
+        let known_q = db.prepare(crate::logic::lb_page_sql(false, era)).bind(&kb);
+        let unknown_q = db.prepare(crate::logic::lb_page_sql(true, era)).bind(&ub);
         if let (Ok(kq), Ok(uq)) = (known_q, unknown_q) {
             let known = kq.all().await.and_then(|r| r.results::<LbRowD1>());
             let unknown = uq.all().await.and_then(|r| r.results::<LbRowD1>());
@@ -1150,8 +1175,14 @@ pub async fn compute_leaderboard_body_string(
                 (Ok(krows), Ok(urows)) => {
                     let now = (worker::Date::now().as_millis() / 1000) as i64;
                     let (m, t, distinct) = crate::logic::lb_window_from_pages(
-                        krows.into_iter().filter_map(LbRowD1::into_page_row).collect(),
-                        urows.into_iter().filter_map(LbRowD1::into_page_row).collect(),
+                        krows
+                            .into_iter()
+                            .filter_map(LbRowD1::into_page_row)
+                            .collect(),
+                        urows
+                            .into_iter()
+                            .filter_map(LbRowD1::into_page_row)
+                            .collect(),
                         limit,
                         quota,
                         now,
@@ -1185,7 +1216,8 @@ pub async fn compute_leaderboard_body_string(
                         return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
                     }
                 };
-            let pot_keys: Vec<Option<String>> = raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
+            let pot_keys: Vec<Option<String>> =
+                raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
             let (cut, truncated) = crate::logic::leaderboard_window_cut(&pot_keys, limit);
             let markers: Vec<ResultMarkerRow> = raw_rows
                 .into_iter()
@@ -1428,7 +1460,10 @@ pub async fn compute_leaderboard_body_string(
         &signers_by_pot,
     );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
-    Ok((200, leaderboard_body(&lb, computed_at, markers.len(), truncated)))
+    Ok((
+        200,
+        leaderboard_body(&lb, computed_at, markers.len(), truncated),
+    ))
 }
 
 /// `pot_beefs` row for the classification fold: txid + `hex(beef)`.
@@ -2125,10 +2160,10 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
             .id_from_name(&format!("results:{identity_lc}"))
             .and_then(|id| id.get_stub())
         {
-            let target =
-                format!("https://board-view/results?identity={identity_lc}&after={after}");
+            let target = format!("https://board-view/results?identity={identity_lc}&after={after}");
             match stub.fetch_with_str(&target).await {
-                Ok(resp) => return Ok(resp),
+                // Same immutable-headers hazard as the board forward above.
+                Ok(mut resp) => return rebuild_do_response(&mut resp).await,
                 Err(e) => console_warn!("[results] view actor unreachable ({e}) — direct compute"),
             }
         }
@@ -2234,9 +2269,8 @@ async fn gather_result_entries(
             std::collections::HashMap::new();
         for chunk in ops.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
             let clause = vec!["(txid = ? AND outputIndex = ?)"; chunk.len()].join(" OR ");
-            let sql = format!(
-                "SELECT txid, outputIndex, settleSigners FROM pot_records WHERE {clause}"
-            );
+            let sql =
+                format!("SELECT txid, outputIndex, settleSigners FROM pot_records WHERE {clause}");
             let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
             for (t, v) in chunk {
                 binds.push(JsValue::from_str(t));
