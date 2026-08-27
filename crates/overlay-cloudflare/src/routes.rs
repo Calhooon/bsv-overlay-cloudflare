@@ -1005,6 +1005,29 @@ pub async fn submit(
             .values()
             .map(|a| a.coins_to_retain.len() + a.coins_removed.as_ref().map_or(0, |v| v.len()))
             .sum();
+        // SIGNERS SELF-HEAL (2026-08-26 — the enforcedWithheldReplay residual):
+        // a consuming submit (settle/refund) can leave its pot row's verdict
+        // group WITHOUT signers when the inline classify's record read hiccups
+        // under D1 pressure — bytes and verdict land, and the narration then
+        // waits on the */15 cron. Two delayed passes of the SAME tested
+        // pipeline (`backfill_settle_signers`, recency-banded so a just-spent
+        // pot is the top candidate) close that gap in seconds. FAIL-OPEN and
+        // off the request path (wait_until); bounded (limit 4, two passes); a
+        // clean state scans zero candidates and stops immediately.
+        if total_consumed > 0 {
+            if let Ok(heal_db) = env.d1("OVERLAY_DB") {
+                ctx.wait_until(async move {
+                    let storage = crate::d1_discovery::D1PotStorage::new(std::rc::Rc::new(heal_db));
+                    for delay_ms in [3_000u64, 9_000] {
+                        worker::Delay::from(std::time::Duration::from_millis(delay_ms)).await;
+                        let s = crate::proof_fetcher::backfill_settle_signers(&storage, 4).await;
+                        if s.scanned == 0 {
+                            break; // nothing unclassified — done
+                        }
+                    }
+                });
+            }
+        }
         if total_consumed == 0
             && matches!(action, crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_))
         {
