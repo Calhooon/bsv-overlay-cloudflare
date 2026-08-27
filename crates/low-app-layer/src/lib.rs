@@ -113,6 +113,9 @@
 //! for a whole batch of outpoints — not a cache. Every response is
 //! `no-store`.
 
+
+pub mod board_view;
+pub use board_view::BoardView;
 pub mod auth;
 pub mod compaction;
 pub mod cors;

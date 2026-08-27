@@ -142,6 +142,13 @@ service = "low-watchtower"
 # worker reads is redeclared here on purpose.
 # ══════════════════════════════════════════════════════════════════════════
 
+[durable_objects]
+bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]
+
+[[migrations]]
+tag = "v2-boardview"
+new_classes = ["BoardView"]
+
 [env.beta]
 name = "low-app-layer-beta"
 
@@ -182,3 +189,6 @@ service = "rust-chaintracks"
 [[env.beta.services]]
 binding = "TOWER"
 service = "low-watchtower-beta"
+
+[env.beta.durable_objects]
+bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]

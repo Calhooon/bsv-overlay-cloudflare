@@ -59,7 +59,7 @@ fn json_error(msg: &str, status: u16) -> Result<Response> {
 /// anything identity-scoped keep `json_response`'s `no-store` — display
 /// freshness is the ONLY thing traded, and the SEEN-bar gates stay
 /// server-side.
-fn json_response_cached(body: String, status: u16, max_age_secs: u32) -> Result<Response> {
+pub(crate) fn json_response_cached(body: String, status: u16, max_age_secs: u32) -> Result<Response> {
     let mut resp = Response::ok(body)?.with_status(status);
     resp.headers_mut().set("Content-Type", "application/json")?;
     resp.headers_mut()
@@ -138,9 +138,13 @@ pub(crate) fn view_identity(req: &Request, ctx: &RouteContext<AuthState>) -> Vie
 /// append the cutoff as ONE extra bind iff `Some`, matching the exactly-one
 /// placeholder [`crate::logic::era_filter_sql`] emits.
 fn written_off_before_ms(ctx: &RouteContext<AuthState>) -> Option<i64> {
+    written_off_before_ms_env(&ctx.env)
+}
+
+/// Env-taking twin (S3a): the BoardView actor computes outside any route ctx.
+pub(crate) fn written_off_before_ms_env(env: &worker::Env) -> Option<i64> {
     let raw = crate::logic::normalize_written_off_before_ms(
-        ctx.env
-            .var("WRITTEN_OFF_BEFORE_MS")
+        env.var("WRITTEN_OFF_BEFORE_MS")
             .ok()
             .map(|v| v.to_string()),
     );
@@ -1047,29 +1051,48 @@ struct ProofPointerRowD1 {
 /// never a count and never a 5xx. An over-full window is reported via the
 /// body's `truncated` bit — never a complete-looking partial answer.
 pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
-    // #411: serve from the in-worker Cache API when fresh. The edge does NOT
-    // zone-cache *.workers.dev responses, so the Cache-Control header alone
-    // did nothing (measured 12-24 s under burst with 32 pollers); an explicit
-    // cache.put honors the same max-age=15. Global view only - the answer
-    // carries no identity. The durable fix (write-time decoded leaderboard
-    // table) is tracked on #411.
-    let cache_key = req.url()?.to_string();
-    let cache = worker::Cache::default();
-    if let Ok(Some(hit)) = cache.get(&cache_key, false).await {
-        return Ok(hit);
-    }
+    // S3a (ARCHITECTURE v2): forward to the BoardView ACTOR — one warm copy
+    // serves every poller from memory (single-flight by construction), D1
+    // stays the durable truth underneath. The worker-Cache layer this
+    // replaces is DELETED (a superseded mechanism is a re-derivation). On
+    // ANY actor fault the route falls back to direct compute — never a new
+    // failure mode.
     let url = req.url()?;
     let limit_raw = url
         .query_pairs()
         .find(|(k, _)| k == "limit")
         .and_then(|(_, v)| v.parse::<u32>().ok());
+    if let Ok(ns) = ctx.env.durable_object("BOARD_VIEW") {
+        if let Ok(stub) = ns.id_from_name("board:v1").and_then(|id| id.get_stub()) {
+            let q = limit_raw.map(|l| format!("?limit={l}")).unwrap_or_default();
+            match stub
+                .fetch_with_str(&format!("https://board-view/leaderboard{q}"))
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => console_warn!("[leaderboard] BoardView unreachable ({e}) — direct compute"),
+            }
+        }
+    }
+    let (status, body) = compute_leaderboard_body_string(&ctx.env, limit_raw).await?;
+    json_response_cached(body, status, 15)
+}
+
+/// S3a — the WHOLE leaderboard pipeline (spine fast path, zero-lie fallback,
+/// status/proof joins, counting bars — trust model unchanged) as a callable:
+/// the BoardView actor and the route's direct fallback both serve EXACTLY
+/// this. Returns (status, body-json).
+pub async fn compute_leaderboard_body_string(
+    env: &worker::Env,
+    limit_raw: Option<u32>,
+) -> Result<(u16, String)> {
     let limit = clamp_leaderboard_limit(limit_raw);
 
-    let db = match ctx.env.d1("OVERLAY_DB") {
+    let db = match env.d1("OVERLAY_DB") {
         Ok(db) => db,
         Err(e) => {
             console_warn!("[leaderboard] OVERLAY_DB binding unavailable: {e}");
-            return json_error("database unavailable", 503);
+            return Ok((503, "{\"error\":\"database unavailable\"}".to_string()));
         }
     };
 
@@ -1085,7 +1108,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     // #375: the era cutoff rides as `?4` iff configured — the board counts
     // from this spine, so every derived leg (statuses, classification,
     // attribution, proof pointers) inherits the write-off.
-    let era = written_off_before_ms(&ctx);
+    let era = written_off_before_ms_env(env);
     let mut binds: Vec<JsValue> = vec![
         JsValue::from_f64((limit + 1) as f64),
         JsValue::from_f64(quota as f64),
@@ -1159,7 +1182,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
                     Ok(rows) => rows,
                     Err(e) => {
                         console_warn!("[leaderboard] result_markers_v2 window query failed: {e}");
-                        return json_error("database query failed", 503);
+                        return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
                     }
                 };
             let pot_keys: Vec<Option<String>> = raw_rows.iter().map(|r| r.pot_txid.clone()).collect();
@@ -1231,7 +1254,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             Ok(chunk_rows) => pot_rows.extend(chunk_rows.into_iter().map(PotRowD1::into_row)),
             Err(e) => {
                 console_warn!("[leaderboard] pot_records batch query failed: {e}");
-                return json_error("database query failed", 503);
+                return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
             }
         }
     }
@@ -1405,16 +1428,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         &signers_by_pot,
     );
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
-    {
-        let mut resp = json_response_cached(
-            leaderboard_body(&lb, computed_at, markers.len(), truncated),
-            200,
-            15,
-        )?;
-        let for_cache = resp.cloned()?;
-        let _ = cache.put(&cache_key, for_cache).await;
-        Ok(resp)
-    }
+    Ok((200, leaderboard_body(&lb, computed_at, markers.len(), truncated)))
 }
 
 /// `pot_beefs` row for the classification fold: txid + `hex(beef)`.
