@@ -153,6 +153,7 @@ new_classes = ["BoardView"]
 name = "low-app-layer-beta"
 
 [env.beta.vars]
+RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
 AUTH_ENFORCE = "false"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.

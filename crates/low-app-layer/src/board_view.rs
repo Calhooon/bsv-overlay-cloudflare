@@ -70,7 +70,11 @@ impl DurableObject for BoardView {
                 self.refreshing.borrow_mut().remove(&key);
                 match out {
                     Ok((200, new_body)) => {
+                        let changed = new_body != body;
                         self.cache.borrow_mut().insert(key, (new_body.clone(), now));
+                        if changed {
+                            self.push_board_changed().await;
+                        }
                         body_response(new_body, false)
                     }
                     _ => body_response(body, true),
@@ -81,9 +85,45 @@ impl DurableObject for BoardView {
                     crate::routes::compute_leaderboard_body_string(&self.env, limit_raw).await?;
                 if status == 200 {
                     self.cache.borrow_mut().insert(key, (body.clone(), now));
+                    self.push_board_changed().await;
                 }
                 crate::routes::json_response_cached(body, status, 5)
             }
+        }
+    }
+}
+
+impl BoardView {
+    /// S3b — tell subscribed clients the board CHANGED (they refetch once,
+    /// hitting this actor's warm copy). Fire-and-forget POST to OUR relay's
+    /// bearer-gated /broadcast; a lost push costs one safety-poll interval,
+    /// never correctness. Paid only by the one refresh that found a change.
+    async fn push_board_changed(&self) {
+        let (Ok(relay), Ok(token)) = (
+            self.env.var("RELAY_URL").map(|v| v.to_string()),
+            self.env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
+        ) else {
+            return; // unconfigured deploy — S4 wires prod
+        };
+        let body = serde_json::json!({
+            "room": "broadcast-low-board",
+            "body": { "kind": "board-changed", "at": Date::now().as_millis() },
+        })
+        .to_string();
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        let headers = Headers::new();
+        let _ = headers.set("Authorization", &format!("Bearer {token}"));
+        let _ = headers.set("content-type", "application/json");
+        init.with_headers(headers);
+        init.with_body(Some(body.into()));
+        let Ok(req) = Request::new_with_init(&format!("{relay}/broadcast"), &init) else {
+            return;
+        };
+        match Fetch::Request(req).send().await {
+            Ok(r) if r.status_code() == 200 => {}
+            Ok(r) => console_log!("[board-view] broadcast push HTTP {}", r.status_code()),
+            Err(e) => console_log!("[board-view] broadcast push failed: {e}"),
         }
     }
 }
