@@ -1073,6 +1073,8 @@ pub struct ResultsRow {
     /// ignored and the BEEF fallback classifies instead).
     pub verdict: Option<String>,
     pub verdict_txid: Option<String>,
+    /// #406 — who signed; rides the verdict group (same pointer guard).
+    pub settle_signers: Option<String>,
     /// Block height of the SPV-verified spend confirm (at.height source).
     pub spent_height: Option<u64>,
     /// bsv-low#304: the spender `pot_beefs` row's VERIFIED proof latch
@@ -1401,6 +1403,14 @@ pub struct ResultEntry {
     /// The chain-truth template classification (`winner-a`/`winner-b`/`tie`/
     /// `refund`), `None` = not classified.
     pub verdict: Option<PotVerdict>,
+    /// bsv-low #406 — WHO SIGNED the recorded spend (`coop` / `tower-a` /
+    /// `tower-b` / `unresolved`), served under the SAME pointer guard as
+    /// `verdict` (`verdictTxid == spendingTxid`). The enforced-ending
+    /// narration REQUIRES `tower-*` from this served row; until 2026-08-27
+    /// the field existed in D1 and the SELECT but was never EMITTED here —
+    /// the enforcedWithheldReplay cell was structurally red for exactly
+    /// that (six-layer diagnosis, decision log addendum 15).
+    pub settle_signers: Option<String>,
     /// The per-identity outcome (see [`derive_outcome`]).
     pub outcome: Outcome,
     /// How `outcome` was derived: `"chain"` (seat-symmetric verdict),
@@ -1790,6 +1800,7 @@ pub fn assemble_results(
         // precisely the state a "recoverable" money word is rendered in.
         let row_params = params_by_pot.get(&(pot_txid_lc.clone(), r.pot_vout));
         let mut verdict = None;
+        let mut settle_signers: Option<String> = None;
         let mut at_height = None;
         let mut seat = None;
         // #323 defect 1 — the spend must be CONFIRMED before any verdict,
@@ -1835,6 +1846,10 @@ pub fn assemble_results(
             if let (Some(v), Some(vt)) = (r.verdict.as_deref(), r.verdict_txid.as_deref()) {
                 if vt.eq_ignore_ascii_case(settle) {
                     verdict = PotVerdict::from_wire(v);
+                    // #406 — signers ride the verdict GROUP: same write, same
+                    // pointer guard, so this branch is the ONLY place they may
+                    // be served from.
+                    settle_signers = r.settle_signers.clone();
                 }
             }
             // 2. Decoded params + spender BEEF (stored verdict stale/absent
@@ -2025,6 +2040,7 @@ pub fn assemble_results(
             pot_binding,
             game_id_binding,
             verdict,
+            settle_signers,
             outcome,
             outcome_source,
             at_height,
@@ -2148,6 +2164,8 @@ pub fn results_body(
                 "spent": e.spent,
                 "spentConfirmed": e.spent_confirmed,
                 "verdict": e.verdict.map(PotVerdict::as_str),
+                // #406 — see the entity field doc: same guard as verdict.
+                "settleSigners": e.settle_signers,
                 "outcome": e.outcome.as_str(),
                 "outcomeSource": e.outcome_source,
                 "at": { "height": e.at_height },
@@ -2340,7 +2358,7 @@ pub fn results_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     // — the potparty marker owns the bare `recoveryHeight` name).
     const DECODED: &str = "lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
          stakeA, stakeB, feeSats, covRecoveryHeight, potSats, \
-         verdict, verdictTxid, spentHeight, spenderFinal";
+         verdict, verdictTxid, settleSigners AS settle_signers, spentHeight, spenderFinal";
     format!(
         // L4 — BEEF join, on the ≤{rows} survivors only (never inside the
         // window, where each dust replay would drag the real BLOBs along).
@@ -4778,6 +4796,7 @@ mod tests {
         let me = ident(0xaa);
         let k = keys_fixture();
         let e = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -4862,6 +4881,7 @@ mod tests {
     fn committed_keys_body_matches_cross_repo_fixture() {
         let me = ident(0xaa);
         let base = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -4882,6 +4902,7 @@ mod tests {
             committed_keys: Some(keys_fixture()),
         };
         let cannot_say = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x03),
             pot_txid: tx(0x04),
             marker_hands: Default::default(),
@@ -4923,6 +4944,7 @@ mod tests {
     fn results_body_shape() {
         let me = ident(0xaa);
         let e = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -4971,6 +4993,7 @@ mod tests {
     fn results_body_serializes_unknown_as_a_first_class_answer() {
         let me = ident(0xaa);
         let e = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5034,7 +5057,11 @@ mod tests {
             "outcomeSource",
             "at",
         ];
-        const ADDED_KEYS: [&str; 6] = [
+        const ADDED_KEYS: [&str; 7] = [
+            // #406 (2026-08-27) — who signed the recorded spend, served
+            // under the verdict group's pointer guard (the enforced-ending
+            // narration's missing boundary; additive, null when ungated).
+            "settleSigners",
             "covRecoveryHeight",
             "potBinding",
             "potBindingSource",
@@ -5053,6 +5080,7 @@ mod tests {
         ];
         let me = ident(0xaa);
         let e = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5124,6 +5152,7 @@ mod tests {
     fn results_body_carries_the_winner_hand() {
         let me = ident(0xaa);
         let e = ResultEntry {
+            settle_signers: None,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,

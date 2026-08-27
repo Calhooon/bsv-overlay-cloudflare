@@ -2017,6 +2017,8 @@ struct ResultsRowD1 {
     verdict: Option<String>,
     #[serde(rename = "verdictTxid", default)]
     verdict_txid: Option<String>,
+    #[serde(rename = "settleSigners", default)]
+    settle_signers: Option<String>,
     #[serde(rename = "spentHeight", default)]
     spent_height: Option<f64>,
     /// bsv-low#304: the spender pot_beefs row's VERIFIED proof latch
@@ -2037,6 +2039,7 @@ struct ResultsRowD1 {
 impl ResultsRowD1 {
     fn into_row(self) -> crate::results::ResultsRow {
         crate::results::ResultsRow {
+            settle_signers: self.settle_signers,
             identity: self.identity,
             game_id: self.game_id,
             pot_txid: self.pot_txid,
