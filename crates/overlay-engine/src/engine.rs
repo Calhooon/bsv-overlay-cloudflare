@@ -2569,6 +2569,90 @@ mod tests {
 
     // ── Tests ──────────────────────────────────────────────────────────
 
+    /// bsv-low#289 parse-once + zanaadu#284 subject discipline: the tx handed
+    /// to every topic manager must be the ATOMIC SUBJECT of the submitted
+    /// BEEF, not whatever sits last in wire order. bsv-rs < 0.3.20's
+    /// `from_beef(_, None)` picked `txs.last()`; wallet serializers do not all
+    /// place the subject last, so a TM could be handed a PARENT to validate.
+    /// This pins the engine on the fixed rule (`txid ?? atomicTxid ?? last`).
+    #[tokio::test]
+    async fn parse_once_hands_tms_the_atomic_subject_not_wire_order() {
+        use bsv_rs::transaction::beef_tx::ATOMIC_BEEF;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // Rebuild the fixture chain SUBJECT-FIRST via to_writer (to_binary
+        // re-sorts parents-first and would hide the trigger).
+        let parsed = Beef::from_binary(&test_beef()).unwrap();
+        let parent = parsed.txs[0].tx().unwrap().clone();
+        let child = parsed.txs[1].tx().unwrap().clone();
+        let child_id = child.id();
+        let parent_id = parent.id();
+        let mut beef = Beef::new();
+        beef.merge_transaction(child);
+        beef.merge_transaction(parent);
+        let mut w = bsv_rs::primitives::encoding::Writer::new();
+        w.write_u32_le(ATOMIC_BEEF);
+        let mut le = hex::decode(&child_id).unwrap();
+        le.reverse();
+        w.write_bytes(&le);
+        beef.to_writer(&mut w);
+        let atomic_wire_order = w.into_bytes();
+
+        // A TM that records the txid it is handed.
+        struct RecordingTm(Rc<RefCell<Option<String>>>);
+        #[async_trait(?Send)]
+        impl TopicManagerTrait for RecordingTm {
+            async fn identify_admissible_outputs(
+                &self,
+                tx: &Transaction,
+                _previous_coins: &[u8],
+                _off_chain_values: Option<&[u8]>,
+                _mode: SubmitMode,
+            ) -> Result<AdmittanceInstructions, TopicManagerError> {
+                *self.0.borrow_mut() = Some(tx.id());
+                Ok(AdmittanceInstructions {
+                    outputs_to_admit: vec![0],
+                    coins_to_retain: vec![],
+                    coins_removed: None,
+                })
+            }
+            async fn get_documentation(&self) -> String {
+                String::new()
+            }
+            async fn get_metadata(&self) -> ServiceMetadata {
+                ServiceMetadata {
+                    name: "tm_test".to_string(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        let seen: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let mut managers: HashMap<String, Box<dyn TopicManagerTrait>> = HashMap::new();
+        managers.insert(
+            "tm_test".to_string(),
+            Box::new(RecordingTm(Rc::clone(&seen))),
+        );
+        let engine = Engine::new(
+            managers,
+            HashMap::new(),
+            Box::new(MemoryStorage::new()),
+            None,
+            EngineConfig::default(),
+        );
+
+        let tagged = TaggedBEEF::new(atomic_wire_order, vec!["tm_test".to_string()]);
+        let _ = engine.submit(&tagged, SubmitMode::CurrentTx).await.unwrap();
+
+        let handed = seen.borrow().clone().expect("TM was not invoked");
+        assert_eq!(
+            handed, child_id,
+            "TM must be handed the atomic subject, got the wire-order pick"
+        );
+        assert_ne!(handed, parent_id);
+    }
+
     /// #4 REGRESSION: history hydration must never DOWNGRADE provenance.
     ///
     /// `get_utxo_history` used to `Transaction::from_beef(beef, None)` and then
@@ -4997,7 +5081,7 @@ mod tests {
         let out = Engine::stitch_proof_into_stored_beef(&stored, &child_id, &proof)
             .expect("stitch must succeed on a beef that contains the txid");
 
-        let mut after = Beef::from_binary(&out).unwrap();
+        let after = Beef::from_binary(&out).unwrap();
         assert!(
             after.find_txid(&child_id).is_some(),
             "the SUBJECT must survive its own proof-completion"
