@@ -1405,19 +1405,15 @@ impl Engine {
         };
 
         for output in &outputs {
-            // Update BEEF with merkle proof if we have both BEEF and proof
+            // Stitch the proof into the STORED BEEF (#284) — never rebuild it
+            // around a re-picked subject; see stitch_proof_into_stored_beef.
             if let (Some(ref beef_data), Some(ref proof)) = (&output.beef, &proof) {
-                if let Ok(mut tx) = Transaction::from_beef(beef_data, None) {
-                    // Set merkle path on the transaction (or its ancestors)
-                    Self::update_input_proofs(&mut tx, txid, proof);
-
-                    // Serialize updated BEEF back to storage
-                    if let Ok(new_beef) = tx.to_beef(true) {
-                        let _ = self
-                            .storage
-                            .update_transaction_beef(&output.txid, &new_beef)
-                            .await;
-                    }
+                if let Some(new_beef) = Self::stitch_proof_into_stored_beef(beef_data, txid, proof)
+                {
+                    let _ = self
+                        .storage
+                        .update_transaction_beef(&output.txid, &new_beef)
+                        .await;
                 }
             }
 
@@ -1442,18 +1438,21 @@ impl Engine {
                     .await
                 {
                     for consumed_output in &consumed_outputs {
-                        // Update BEEF for consuming outputs (they reference this tx as an ancestor)
+                        // The consuming row's BEEF carries this tx as an
+                        // ancestor — stitch the same bump in there too, again
+                        // without rebuilding the tx set (#284: this branch is
+                        // the one that was observed replacing a head-spend's
+                        // stored BEEF with parent ancestry only).
                         if let (Some(ref beef_data), Some(ref proof)) =
                             (&consumed_output.beef, &proof)
                         {
-                            if let Ok(mut consumed_tx) = Transaction::from_beef(beef_data, None) {
-                                Self::update_input_proofs(&mut consumed_tx, txid, proof);
-                                if let Ok(new_beef) = consumed_tx.to_beef(true) {
-                                    let _ = self
-                                        .storage
-                                        .update_transaction_beef(&consumed_output.txid, &new_beef)
-                                        .await;
-                                }
+                            if let Some(new_beef) =
+                                Self::stitch_proof_into_stored_beef(beef_data, txid, proof)
+                            {
+                                let _ = self
+                                    .storage
+                                    .update_transaction_beef(&consumed_output.txid, &new_beef)
+                                    .await;
                             }
                         }
                     }
@@ -1612,25 +1611,40 @@ impl Engine {
     ///
     /// If the transaction's id matches txid, set its merkle_path.
     /// Otherwise, recurse into sourceTransactions of each input.
-    fn update_input_proofs(
-        tx: &mut Transaction,
+    /// Stitch a verified BUMP for `txid` into a STORED BEEF, preserving every
+    /// transaction and every other proof in it (#284).
+    ///
+    /// The old path round-tripped the stored bytes through
+    /// `Transaction::from_beef(bytes, None)` -> `to_beef(true)`, and
+    /// `from_beef(_, None)` picks **`txs.last()`** — it ignores the atomic
+    /// subject pointer entirely. Whenever the subject was not the last tx in
+    /// wire order, a PARENT was picked, `to_beef(true)` then serialized that
+    /// parent's world, and the rewrite dropped the subject transaction from its
+    /// own stored BEEF — observed live on every pf head-spend (list / reprice /
+    /// delist / buy) the moment it mined, breaking the NEXT spend on that name
+    /// (zanaadu#284). `update_input_proofs`' "already has a proof — update it"
+    /// arm could even stamp the child's bump onto that mis-picked parent.
+    /// This is the same destroy-the-stored-BEEF class the #4 fix note above
+    /// (`hydrate_utxo_history`) already documents for lookup hydration.
+    ///
+    /// Operating on [`Beef`] directly has none of those failure modes:
+    /// `merge_bump` dedupes against existing bumps by (height, root) and
+    /// assigns the bump ONLY to transactions that appear as flagged txid
+    /// leaves, so stitching tx X's proof can never mislabel tx Y, and the tx
+    /// set is never rebuilt at all.
+    ///
+    /// Returns `None` when the bytes do not parse or `txid` is not in this
+    /// BEEF (nothing to stitch — e.g. a consuming row whose ancestry got
+    /// trimmed), so callers skip the write instead of writing garbage.
+    fn stitch_proof_into_stored_beef(
+        stored: &[u8],
         txid: &str,
         proof: &bsv_rs::transaction::MerklePath,
-    ) {
-        if tx.merkle_path.is_some() {
-            // Already has a proof — update it (handles reorgs)
-            tx.merkle_path = Some(proof.clone());
-            return;
-        }
-        if tx.id() == txid {
-            tx.merkle_path = Some(proof.clone());
-        } else {
-            for input in &mut tx.inputs {
-                if let Some(ref mut source_tx) = input.source_transaction {
-                    Self::update_input_proofs(source_tx, txid, proof);
-                }
-            }
-        }
+    ) -> Option<Vec<u8>> {
+        let mut beef = bsv_rs::transaction::Beef::from_binary(stored).ok()?;
+        beef.find_txid(txid)?;
+        beef.merge_bump(proof.clone());
+        Some(beef.to_binary())
     }
 
     // ========================================================================
@@ -4936,6 +4950,104 @@ mod tests {
         let mut beef = Beef::new();
         beef.merge_transaction(tx);
         (beef.to_binary(), txid)
+    }
+
+    // ── #284: stitching a proof must never rebuild the stored BEEF ─────────
+
+    /// The corruption shape observed live on rust-beta: a stored BEEF whose
+    /// SUBJECT is not the last tx in wire order. The old rewrite went through
+    /// `Transaction::from_beef(bytes, None)`, whose None arm picks
+    /// `txs.last()` — the PARENT here — and `to_beef(true)` then serialized the
+    /// parent's world, dropping the subject from its own row. TEST_BEEF_HEX is
+    /// exactly a two-tx chain (parent + child spending it), so re-encoding it
+    /// child-first reproduces the trigger byte-for-byte.
+    fn subject_not_last_beef() -> (Vec<u8>, String, String) {
+        use bsv_rs::transaction::Beef;
+        let parsed = Beef::from_binary(&test_beef()).unwrap();
+        let parent = parsed.txs[0].tx().unwrap().clone();
+        let child = parsed.txs[1].tx().unwrap().clone();
+        let (parent_id, child_id) = (parent.id(), child.id());
+        assert_ne!(parent_id, child_id);
+
+        // Serialize via to_writer, NOT to_binary: to_binary re-sorts
+        // parents-first (subject last), which is precisely why bsv_rs's own
+        // output never triggers the bug. The corrupt rows held WALLET
+        // serialized bytes stored verbatim at admit time, whose wire order is
+        // whatever the wallet emitted — model that by writing the child first.
+        let mut beef = Beef::new();
+        beef.merge_transaction(child); // subject FIRST — the trigger
+        beef.merge_transaction(parent);
+        let mut w = bsv_rs::primitives::encoding::Writer::new();
+        beef.to_writer(&mut w);
+        let bytes = w.into_bytes();
+
+        // The premise the whole test rests on: wire order preserved, subject
+        // genuinely not last.
+        let reread = Beef::from_binary(&bytes).unwrap();
+        assert_eq!(reread.txs.last().unwrap().txid(), parent_id);
+        (bytes, child_id, parent_id)
+    }
+
+    #[test]
+    fn stitch_preserves_the_subject_when_it_is_not_last() {
+        use bsv_rs::transaction::{Beef, MerklePath};
+        let (stored, child_id, parent_id) = subject_not_last_beef();
+        let proof = MerklePath::from_hex(&single_leaf_bump_hex(&child_id, 900_000)).unwrap();
+
+        let out = Engine::stitch_proof_into_stored_beef(&stored, &child_id, &proof)
+            .expect("stitch must succeed on a beef that contains the txid");
+
+        let mut after = Beef::from_binary(&out).unwrap();
+        assert!(
+            after.find_txid(&child_id).is_some(),
+            "the SUBJECT must survive its own proof-completion"
+        );
+        assert!(
+            after.find_txid(&parent_id).is_some(),
+            "the ancestry must survive too"
+        );
+        assert!(
+            after.find_bump(&child_id).is_some(),
+            "the stitched bump must prove the subject"
+        );
+        assert!(
+            after.find_bump(&parent_id).is_none(),
+            "the parent must NOT be claimed by the child's bump"
+        );
+    }
+
+    /// The old path, reproduced against the same input, to pin WHY the new one
+    /// exists: it demonstrably drops the subject. If bsv_rs ever changes
+    /// `from_beef(_, None)` to honor the subject, this starts failing and the
+    /// comment trail can be revisited — until then it documents the hazard.
+    #[test]
+    fn the_old_round_trip_demonstrably_dropped_the_subject() {
+        use bsv_rs::transaction::{Beef, Transaction};
+        let (stored, child_id, _parent_id) = subject_not_last_beef();
+        let tx = Transaction::from_beef(&stored, None).unwrap();
+        assert_ne!(
+            tx.id(),
+            child_id,
+            "from_beef(None) picks txs.last(), not the subject — the trigger"
+        );
+        let rebuilt = tx.to_beef(true).unwrap();
+        let reparsed = Beef::from_binary(&rebuilt).unwrap();
+        assert!(
+            reparsed.find_txid(&child_id).is_none(),
+            "the rebuild loses the subject — exactly the #284 artifact"
+        );
+    }
+
+    #[test]
+    fn stitch_refuses_a_beef_that_lacks_the_txid() {
+        use bsv_rs::transaction::MerklePath;
+        let (stored, _c, _p) = subject_not_last_beef();
+        let foreign = "aa".repeat(32);
+        let proof = MerklePath::from_hex(&single_leaf_bump_hex(&foreign, 900_000)).unwrap();
+        assert!(
+            Engine::stitch_proof_into_stored_beef(&stored, &foreign, &proof).is_none(),
+            "no txid in the beef -> no write, never garbage"
+        );
     }
 
     /// A minimal valid single-leaf BUMP hex proving `txid` at `height`.
