@@ -2358,7 +2358,7 @@ pub fn results_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     // — the potparty marker owns the bare `recoveryHeight` name).
     const DECODED: &str = "lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
          stakeA, stakeB, feeSats, covRecoveryHeight, potSats, \
-         verdict, verdictTxid, settleSigners AS settle_signers, spentHeight, spenderFinal";
+         verdict, verdictTxid, settleSigners, spentHeight, spenderFinal";
     format!(
         // L4 — BEEF join, on the ≤{rows} survivors only (never inside the
         // window, where each dust replay would drag the real BLOBs along).
