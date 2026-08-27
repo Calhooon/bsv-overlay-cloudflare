@@ -2216,6 +2216,62 @@ async fn gather_result_entries(
     let truncated = rows.len() > crate::results::RESULTS_MAX_ROWS;
     rows.truncate(crate::results::RESULTS_MAX_ROWS);
 
+    // #406 (2026-08-27) — settleSigners OVERLAY, page-batched. The nested
+    // window query is left byte-identical (adding the column inside it
+    // emptied the page — see the decision log); instead ONE PK-indexed
+    // batched read over this page's ≤100 outpoints fills the field, and the
+    // fold's existing pointer guard (verdictTxid == spendingTxid) remains
+    // the ONLY serving bar. BEST-EFFORT: a fault leaves signers null (the
+    // narration then simply doesn't claim an ending kind), never a 503.
+    {
+        let mut ops: Vec<(String, u32)> = rows
+            .iter()
+            .map(|r| (r.pot_txid.to_ascii_lowercase(), r.pot_vout))
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+        let mut signers_by_op: std::collections::HashMap<(String, u32), String> =
+            std::collections::HashMap::new();
+        for chunk in ops.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let clause = vec!["(txid = ? AND outputIndex = ?)"; chunk.len()].join(" OR ");
+            let sql = format!(
+                "SELECT txid, outputIndex, settleSigners FROM pot_records WHERE {clause}"
+            );
+            let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+            for (t, v) in chunk {
+                binds.push(JsValue::from_str(t));
+                binds.push(JsValue::from_f64(f64::from(*v)));
+            }
+            #[derive(serde::Deserialize)]
+            struct SignersRowD1 {
+                txid: String,
+                #[serde(rename = "outputIndex")]
+                output_index: u32,
+                #[serde(rename = "settleSigners", default)]
+                settle_signers: Option<String>,
+            }
+            match db.prepare(&sql).bind(&binds) {
+                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<SignersRowD1>()) {
+                    Ok(srows) => {
+                        for sr in srows {
+                            if let Some(sig) = sr.settle_signers {
+                                signers_by_op
+                                    .insert((sr.txid.to_ascii_lowercase(), sr.output_index), sig);
+                            }
+                        }
+                    }
+                    Err(e) => console_warn!("[results] signers overlay chunk failed: {e}"),
+                },
+                Err(e) => console_warn!("[results] signers overlay bind failed: {e}"),
+            }
+        }
+        for r in rows.iter_mut() {
+            r.settle_signers = signers_by_op
+                .get(&(r.pot_txid.to_ascii_lowercase(), r.pot_vout))
+                .cloned();
+        }
+    }
+
     // Claims (won/lost attribution) — BEST-EFFORT: a fault here only leaves
     // winner-verdict games `unresolved`, never a hard failure (the
     // chain-truth tie/refund outcomes and the verdict field still serve).
