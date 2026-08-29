@@ -106,6 +106,12 @@ binding = "MUTATION_QUEUE"
 queue = "low-overlay-mutations"
 max_batch_size = 1
 max_retries = 3
+# S2 (2026-08-29): a replay that still faults after max_retries must LAND
+# somewhere an operator can see — never a silent drop. Create the queue
+# BEFORE deploying: `wrangler queues create low-overlay-mutations-dlq`
+# (wrangler refuses a deploy naming a queue that does not exist — loud, by
+# design).
+dead_letter_queue = "low-overlay-mutations-dlq"
 
 [triggers]
 crons = ["*/15 * * * *"]
@@ -205,6 +211,9 @@ binding = "MUTATION_QUEUE"
 queue = "low-overlay-mutations-beta"
 max_batch_size = 1
 max_retries = 3
+# S2: `wrangler queues create low-overlay-mutations-beta-dlq` before the
+# beta deploy (see the prod consumer's note).
+dead_letter_queue = "low-overlay-mutations-beta-dlq"
 
 [env.beta.triggers]
 crons = ["*/15 * * * *"]

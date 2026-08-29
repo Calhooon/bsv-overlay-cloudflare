@@ -1828,14 +1828,21 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     }))
 }
 
-/// Queue consumer for the onSteakReady pattern.
+/// Queue consumer for the onSteakReady pattern — and the S2 replay
+/// (queue-durable admission, bsv-low 2026-08-29).
 ///
 /// Processes mutation messages enqueued by /submit. Each message contains a
-/// BEEF + topics + mode. The consumer builds an Engine and calls full
-/// `engine.submit()` which includes Phase 3 mutations.
+/// BEEF + topics + mode. The consumer builds an Engine and calls
+/// `engine.submit_with_report()` under the REPLAY mode
+/// (`queue::replay_submit_mode` — never a re-broadcast), which includes
+/// Phase 3 mutations, and acks ONLY a durable report: a replay that still
+/// faults is handed back (`retry`) for the platform's backoff and
+/// dead-letters after `max_retries` — never silently dropped.
 ///
 /// Dedup safety: `applied_transactions` in D1 ensures at-least-once delivery
-/// is safe — duplicate messages are detected and skipped in Phase 1.
+/// is safe — a topic whose every write landed is detected and skipped in
+/// Phase 1, and a topic that faulted is never recorded as applied, so its
+/// replay is re-validated and re-written (idempotent backend writes).
 #[event(queue)]
 async fn queue_handler(
     batch: worker::MessageBatch<crate::queue::MutationMessage>,
@@ -1876,19 +1883,41 @@ async fn queue_handler(
             off_chain_values: None,
         };
 
-        let mode = match body.mode.as_str() {
-            "historical-tx" => SubmitMode::HistoricalTx,
-            "historical-tx-no-spv" => SubmitMode::HistoricalTxNoSpv,
-            _ => SubmitMode::CurrentTx,
-        };
+        let mode: SubmitMode = crate::queue::replay_submit_mode(&body.mode);
+        let counters = env.d1("OVERLAY_DB").ok();
 
-        match engine.submit(&tagged_beef, mode).await {
-            Ok(_steak) => {
-                worker::console_log!("Queue: mutation applied for {} topic(s)", body.topics.len());
+        match engine.submit_with_report(&tagged_beef, mode).await {
+            Ok((_steak, report)) if report.is_durable() => {
+                worker::console_log!(
+                    "Queue: mutation applied for {} topic(s) (reason={:?}, applied={:?})",
+                    body.topics.len(),
+                    body.reason,
+                    report.applied_topics
+                );
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
+                        .await;
+                }
                 msg.ack();
             }
+            Ok((_steak, report)) => {
+                worker::console_log!(
+                    "Queue: mutation replay still NOT durable ({} fault(s): {}) — retrying",
+                    report.faults.len(),
+                    report.summary()
+                );
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
+                        .await;
+                }
+                msg.retry();
+            }
             Err(e) => {
-                worker::console_log!("Queue: mutation failed: {}", e);
+                worker::console_log!("Queue: mutation failed: {} — retrying", e);
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
+                        .await;
+                }
                 msg.retry();
             }
         }

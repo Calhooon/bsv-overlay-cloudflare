@@ -37,6 +37,23 @@ pub const COUNTER_SPENDS_CONFIRMED: &str = "spends_confirmed_total";
 /// primary proof source). Compare against `proofs_completed_total` (the poll
 /// backstop) to see the push/poll split. Name-keyed → additive.
 pub const COUNTER_ARC_INGEST_PUSHED: &str = "arc_ingest_pushed_total";
+
+// ── S2 queue-durable admission (bsv-low 2026-08-29) ──────────────────────
+/// `/submit` admissions whose Phase-3 writes did NOT all land (the engine's
+/// `MutationReport` carried ≥1 fault). Every one of these was, pre-S2, an
+/// ack over a dropped write.
+pub const COUNTER_SUBMIT_MUTATION_FAULT: &str = "submit_mutation_fault_total";
+/// …of which the replay was QUEUED before the ack (the durable-ack path).
+pub const COUNTER_SUBMIT_MUTATION_QUEUED: &str = "submit_mutation_queued_total";
+/// …of which the replay could NOT be queued and the submit was REFUSED
+/// (502 retryable). Sustained non-zero = the queue itself is unhealthy.
+pub const COUNTER_SUBMIT_MUTATION_REFUSED: &str = "submit_mutation_refused_total";
+/// Queue consumer: replays whose every write landed (acked).
+pub const COUNTER_QUEUE_MUTATION_APPLIED: &str = "queue_mutation_applied_total";
+/// Queue consumer: replays that still faulted (or errored) and were handed
+/// back for the platform's retry/backoff. After `max_retries` the message
+/// dead-letters — a growing DLQ is an operator page, never a silent drop.
+pub const COUNTER_QUEUE_MUTATION_RETRIED: &str = "queue_mutation_retried_total";
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
 /// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
 /// operation, not an error — it proves the webhook stream is alive.

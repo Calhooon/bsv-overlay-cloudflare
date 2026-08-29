@@ -212,6 +212,80 @@ struct TopicValidation {
     previous_outputs: Vec<Output>,
     admittance: AdmittanceInstructions,
     failed: bool,
+    /// The FIRST storage read fault hit while scanning this topic's
+    /// previous outputs (S2, bsv-low 2026-08-29). A faulted read makes a
+    /// spend look like it consumes nothing — the settle's spend pointer is
+    /// then never written — so it is carried into the [`MutationReport`]
+    /// and blocks the `applied_transactions` record for this topic: a
+    /// replay re-reads instead of being deduplicated away.
+    read_fault: Option<String>,
+}
+
+/// One Phase-3 write — or the validation read it depends on — that FAILED
+/// during a submit (S2 queue-durable admission, bsv-low 2026-08-29).
+///
+/// Before this existed every such failure was `error!`-logged and swallowed
+/// while `submit` returned `Ok(steak)`: under a D1-overload storm the
+/// overlay ACKED admissions whose writes never landed (the 2026-08-26
+/// phantom class — `c4d2ed06…`/`62c2a9b3…` absent from the engine store,
+/// beta D1 queried directly). A fault is now a VALUE the caller can act on
+/// (re-queue for an idempotent replay) instead of a log line nobody reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationFault {
+    /// The topic whose mutation faulted.
+    pub topic: String,
+    /// The write (or read) that failed: `insert_output`,
+    /// `mark_utxo_as_spent`, `update_consumed_by`, `delete_utxo_deep`,
+    /// `insert_applied_transaction`, `find_output` (validation read),
+    /// `lookup_service.output_spent`, `lookup_service.output_admitted_by_topic`.
+    pub site: &'static str,
+    /// The backend's own error text.
+    pub error: String,
+}
+
+/// What Phase 3 actually landed for a submit — the durability report.
+///
+/// `applied_topics` are the topics whose EVERY write (and lookup-service
+/// notification) succeeded and were therefore recorded in
+/// `applied_transactions`. A topic with any fault is deliberately NOT
+/// recorded: the dedup in Phase 1 would otherwise turn a replay into a
+/// no-op and make the loss permanent (the ordering was already
+/// write-then-record; the record is now conditional on the writes).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MutationReport {
+    pub faults: Vec<MutationFault>,
+    pub applied_topics: Vec<String>,
+}
+
+impl MutationReport {
+    fn fault(&mut self, topic: &str, site: &'static str, error: String) {
+        self.faults.push(MutationFault {
+            topic: topic.to_string(),
+            site,
+            error,
+        });
+    }
+
+    /// True when every mutation this submit needed landed (nothing to
+    /// replay). A dupe-only submit is durable (there was nothing to write).
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.faults.is_empty()
+    }
+
+    /// One log line naming every fault (`topic/site: error`), each error
+    /// clipped so a D1 stack dump cannot flood the log stream.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        self.faults
+            .iter()
+            .map(|f| {
+                let err: String = f.error.chars().take(120).collect();
+                format!("{}/{}: {}", f.topic, f.site, err)
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 impl Engine {
@@ -425,12 +499,49 @@ impl Engine {
     /// 3. **MUTATE** — mark spent, delete stale, insert new outputs, notify lookup services
     ///
     /// Returns a STEAK mapping each topic to its admittance instructions.
+    ///
+    /// Phase-3 faults are reported through [`Engine::submit_with_report`];
+    /// this convenience keeps the historical signature and only LOGS the
+    /// report's summary. A caller that must not ack an admission whose
+    /// writes did not land (the `/submit` route — S2) uses the report form.
     pub async fn submit(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<Steak, EngineError> {
+        let (steak, report) = self.submit_with_report(tagged_beef, mode).await?;
+        if !report.is_durable() {
+            warn!(
+                "submit: {} mutation fault(s) — not durable: {}",
+                report.faults.len(),
+                report.summary()
+            );
+        }
+        Ok(steak)
+    }
+
+    /// [`Engine::submit`] plus the Phase-3 durability report (S2
+    /// queue-durable admission, bsv-low 2026-08-29).
+    ///
+    /// The STEAK is the admission DECISION; the report says whether the
+    /// decision was DURABLY WRITTEN. They are returned together because
+    /// they are answered by different things: Phase 1+2 decide, Phase 3
+    /// lands, and only the caller knows whether an undurable landing may
+    /// be acked (never, on the money path — re-queue it instead).
+    ///
+    /// Every write failure is still logged AND still non-fatal to the
+    /// other topics (a faulted topic does not un-admit its siblings); what
+    /// changed is that the failure is also VISIBLE, and that the faulted
+    /// topic is not recorded as applied — so a replay of the same bytes is
+    /// re-validated and re-written (every backend write is idempotent:
+    /// `INSERT OR IGNORE` / `OR REPLACE` / `UPDATE`).
+    pub async fn submit_with_report(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+    ) -> Result<(Steak, MutationReport), EngineError> {
         let (validations, mut steak, tx, txid) = self.run_validation(tagged_beef, mode).await?;
+        let mut report = MutationReport::default();
 
         // =================================================================
         // PHASE 3: MUTATE STORAGE
@@ -442,6 +553,10 @@ impl Engine {
 
             let topic = &v.topic;
             let admittance = &v.admittance;
+            let faults_before = report.faults.len();
+            if let Some(err) = &v.read_fault {
+                report.fault(topic, "find_output", err.clone());
+            }
 
             // ── Mark previous outputs as spent + notify lookup services ──
             for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
@@ -451,6 +566,7 @@ impl Engine {
                     .await
                 {
                     error!("Error marking UTXO as spent: {e}");
+                    report.fault(topic, "mark_utxo_as_spent", e.to_string());
                     continue;
                 }
 
@@ -500,6 +616,7 @@ impl Engine {
                     };
                     if let Err(e) = ls.output_spent(&payload).await {
                         error!("Error notifying lookup service of spent output: {e}");
+                        report.fault(topic, "lookup_service.output_spent", e.to_string());
                     }
                 }
             }
@@ -522,12 +639,22 @@ impl Engine {
 
             // Delete stale outputs recursively
             for stale in &stale_coins {
-                if let Ok(Some(stale_output)) = self
+                match self
                     .storage
                     .find_output(&stale.txid, stale.output_index, Some(topic), None, false)
                     .await
                 {
-                    let _ = self.delete_utxo_deep(&stale_output).await;
+                    Ok(Some(stale_output)) => {
+                        if let Err(e) = self.delete_utxo_deep(&stale_output).await {
+                            error!("Error deleting stale output for topic {topic}: {e}");
+                            report.fault(topic, "delete_utxo_deep", e.to_string());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Error reading stale output for topic {topic}: {e}");
+                        report.fault(topic, "find_output", e.to_string());
+                    }
                 }
             }
 
@@ -575,6 +702,7 @@ impl Engine {
 
                 if let Err(e) = self.storage.insert_output(&output).await {
                     error!("Error inserting output for topic {topic}: {e}");
+                    report.fault(topic, "insert_output", e.to_string());
                 }
 
                 new_utxos.push(Outpoint::new(&txid, output_index));
@@ -607,13 +735,18 @@ impl Engine {
 
                     if let Err(e) = ls.output_admitted_by_topic(&payload).await {
                         error!("Error notifying lookup service: {e}");
+                        report.fault(
+                            topic,
+                            "lookup_service.output_admitted_by_topic",
+                            e.to_string(),
+                        );
                     }
                 }
             }
 
             // ── Update consumedBy on retained previous outputs ──
             for consumed_outpoint in &outputs_consumed {
-                if let Ok(Some(consumed_output)) = self
+                let consumed_output = match self
                     .storage
                     .find_output(
                         &consumed_outpoint.txid,
@@ -623,6 +756,15 @@ impl Engine {
                         false,
                     )
                     .await
+                {
+                    Ok(Some(o)) => o,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        error!("Error reading consumed output for topic {topic}: {e}");
+                        report.fault(topic, "find_output", e.to_string());
+                        continue;
+                    }
+                };
                 {
                     let mut new_consumed_by = consumed_output.consumed_by.clone();
                     for new_utxo in &new_utxos {
@@ -643,21 +785,36 @@ impl Engine {
                         .await
                     {
                         error!("Error updating consumedBy: {e}");
+                        report.fault(topic, "update_consumed_by", e.to_string());
                     }
                 }
             }
 
-            // Record applied transaction
+            // Record applied transaction — ONLY when every write above
+            // landed. A faulted topic stays unrecorded so the Phase-1 dedup
+            // cannot turn its replay into a no-op (S2).
+            if report.faults.len() > faults_before {
+                warn!(
+                    "topic {topic}: {} mutation fault(s) — applied_transactions NOT recorded; \
+                     a replay of these bytes re-applies",
+                    report.faults.len() - faults_before
+                );
+                continue;
+            }
             let tx_record = AppliedTransaction {
                 txid: txid.clone(),
                 topic: topic.clone(),
             };
-            if let Err(e) = self.storage.insert_applied_transaction(&tx_record).await {
-                error!("Error inserting applied transaction for topic {topic}: {e}");
+            match self.storage.insert_applied_transaction(&tx_record).await {
+                Ok(()) => report.applied_topics.push(topic.clone()),
+                Err(e) => {
+                    error!("Error inserting applied transaction for topic {topic}: {e}");
+                    report.fault(topic, "insert_applied_transaction", e.to_string());
+                }
             }
         }
 
-        Ok(steak)
+        Ok((steak, report))
     }
 
     /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
@@ -737,19 +894,21 @@ impl Engine {
                     previous_outputs: vec![],
                     admittance: AdmittanceInstructions::default(),
                     failed: false,
+                    read_fault: None,
                 });
                 continue;
             }
 
             let mut previous_coins: Vec<u32> = Vec::new();
             let mut previous_outputs: Vec<Output> = Vec::new();
+            let mut read_fault: Option<String> = None;
 
             for (input_idx, input) in tx.inputs.iter().enumerate() {
                 let source_txid = input.get_source_txid().unwrap_or_default();
                 if source_txid.is_empty() {
                     continue;
                 }
-                if let Ok(Some(prev_output)) = self
+                match self
                     .storage
                     .find_output(
                         &source_txid,
@@ -760,8 +919,25 @@ impl Engine {
                     )
                     .await
                 {
-                    previous_coins.push(input_idx as u32);
-                    previous_outputs.push(prev_output);
+                    Ok(Some(prev_output)) => {
+                        previous_coins.push(input_idx as u32);
+                        previous_outputs.push(prev_output);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // A faulted read is NOT "no previous coin": the
+                        // spend may consume an admitted output we simply
+                        // could not read. Validation proceeds (the topic
+                        // manager decides on what it can see) but the fault
+                        // rides the report and blocks the applied record.
+                        error!(
+                            "Error reading previous output {source_txid}:{} for topic {topic}: {e}",
+                            input.source_output_index
+                        );
+                        if read_fault.is_none() {
+                            read_fault = Some(e.to_string());
+                        }
+                    }
                 }
             }
 
@@ -789,6 +965,7 @@ impl Engine {
                         previous_outputs,
                         admittance,
                         failed: false,
+                        read_fault: read_fault.clone(),
                     });
                 }
                 Err(e) => {
@@ -800,6 +977,7 @@ impl Engine {
                         previous_outputs: vec![],
                         admittance: AdmittanceInstructions::default(),
                         failed: true,
+                        read_fault,
                     });
                 }
             }
@@ -5641,6 +5819,330 @@ mod tests {
                 .map(bsv_rs::transaction::BeefTx::has_proof),
             Some(true),
             "the old proofless tx now carries its proof"
+        );
+    }
+
+    // ── S2 queue-durable admission (bsv-low 2026-08-29): Phase-3 faults ──
+    //
+    // The phantom class: under a D1 storm `submit` returned Ok(steak) while
+    // its writes failed — the ack outlived the admission. These pins hold
+    // the new contract: a fault is REPORTED, the faulted topic is NOT
+    // recorded as applied, and a replay of the same bytes re-applies.
+
+    use crate::storage::StorageError;
+    use std::rc::Rc;
+
+    /// `MemoryStorage` behind two fault switches. Every method delegates;
+    /// the two the tests flip model a D1 write fault (`insert_output`) and
+    /// a D1 read fault (`find_output` — the validation's previous-coin scan
+    /// AND Phase 3's stale/consumed lookups).
+    struct FaultingStorage {
+        inner: MemoryStorage,
+        fail_insert_output: Cell<bool>,
+        fail_find_output: Cell<bool>,
+    }
+
+    impl FaultingStorage {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                inner: MemoryStorage::new(),
+                fail_insert_output: Cell::new(false),
+                fail_find_output: Cell::new(false),
+            })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Storage for FaultingStorage {
+        async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+            if self.fail_insert_output.get() {
+                return Err(StorageError::Database("D1_ERROR: storage overloaded".into()));
+            }
+            self.inner.insert_output(output).await
+        }
+        async fn delete_output(
+            &self,
+            txid: &str,
+            output_index: u32,
+            topic: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_output(txid, output_index, topic).await
+        }
+        async fn mark_utxo_as_spent(
+            &self,
+            txid: &str,
+            output_index: u32,
+            topic: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.mark_utxo_as_spent(txid, output_index, topic).await
+        }
+        async fn update_consumed_by(
+            &self,
+            txid: &str,
+            output_index: u32,
+            topic: &str,
+            consumed_by: &[Outpoint],
+        ) -> Result<(), StorageError> {
+            self.inner
+                .update_consumed_by(txid, output_index, topic, consumed_by)
+                .await
+        }
+        async fn update_transaction_beef(
+            &self,
+            txid: &str,
+            beef: &[u8],
+        ) -> Result<(), StorageError> {
+            self.inner.update_transaction_beef(txid, beef).await
+        }
+        async fn insert_applied_transaction(
+            &self,
+            tx: &AppliedTransaction,
+        ) -> Result<(), StorageError> {
+            self.inner.insert_applied_transaction(tx).await
+        }
+        async fn does_applied_transaction_exist(
+            &self,
+            tx: &AppliedTransaction,
+        ) -> Result<bool, StorageError> {
+            self.inner.does_applied_transaction_exist(tx).await
+        }
+        async fn find_output(
+            &self,
+            txid: &str,
+            output_index: u32,
+            topic: Option<&str>,
+            spent: Option<bool>,
+            include_beef: bool,
+        ) -> Result<Option<Output>, StorageError> {
+            if self.fail_find_output.get() {
+                return Err(StorageError::Database("D1_ERROR: read timed out".into()));
+            }
+            self.inner
+                .find_output(txid, output_index, topic, spent, include_beef)
+                .await
+        }
+        async fn find_outputs_for_transaction(
+            &self,
+            txid: &str,
+            include_beef: bool,
+        ) -> Result<Vec<Output>, StorageError> {
+            self.inner
+                .find_outputs_for_transaction(txid, include_beef)
+                .await
+        }
+        async fn find_utxos_for_topic(
+            &self,
+            topic: &str,
+            since: Option<f64>,
+            limit: Option<u64>,
+            include_beef: bool,
+        ) -> Result<Vec<Output>, StorageError> {
+            self.inner
+                .find_utxos_for_topic(topic, since, limit, include_beef)
+                .await
+        }
+        async fn update_last_interaction(
+            &self,
+            host: &str,
+            topic: &str,
+            since: u64,
+        ) -> Result<(), StorageError> {
+            self.inner.update_last_interaction(host, topic, since).await
+        }
+        async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError> {
+            self.inner.get_last_interaction(host, topic).await
+        }
+    }
+
+    fn make_faulting_engine(admit_indices: Vec<u32>) -> (Engine, Rc<FaultingStorage>) {
+        let storage = FaultingStorage::new();
+        let mut managers: HashMap<String, Box<dyn TopicManagerTrait>> = HashMap::new();
+        managers.insert(
+            "tm_test".to_string(),
+            Box::new(MockTopicManager::admitting(admit_indices)),
+        );
+        let mut lookup_services: HashMap<String, Box<dyn LookupServiceTrait>> = HashMap::new();
+        lookup_services.insert("ls_test".to_string(), Box::new(MockLookupService::new()));
+        let engine = Engine::new(
+            managers,
+            lookup_services,
+            Box::new(Rc::clone(&storage)),
+            None,
+            EngineConfig::default(),
+        );
+        (engine, storage)
+    }
+
+    async fn applied(storage: &FaultingStorage) -> bool {
+        storage
+            .does_applied_transaction_exist(&AppliedTransaction {
+                txid: TEST_TXID.to_string(),
+                topic: "tm_test".to_string(),
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The old behaviour, pinned: a clean submit is durable, records the
+    /// topic as applied, and the output is in storage.
+    #[tokio::test]
+    async fn clean_submit_is_durable_and_records_applied() {
+        let (engine, storage) = make_faulting_engine(vec![0]);
+        let (steak, report) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert_eq!(steak["tm_test"].outputs_to_admit, vec![0]);
+        assert!(report.is_durable(), "{}", report.summary());
+        assert_eq!(report.applied_topics, vec!["tm_test".to_string()]);
+        assert!(applied(&storage).await);
+        assert!(storage
+            .find_output(TEST_TXID, 0, Some("tm_test"), None, false)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// THE PHANTOM, red→green: the insert fails, the steak still says
+    /// "admitted" (the decision stands), but the report says NOT DURABLE and
+    /// names the site — and the topic is NOT recorded as applied, so nothing
+    /// downstream can treat the loss as final.
+    #[tokio::test]
+    async fn phase3_write_fault_is_reported_and_blocks_the_applied_record() {
+        let (engine, storage) = make_faulting_engine(vec![0]);
+        storage.fail_insert_output.set(true);
+        let (steak, report) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert_eq!(
+            steak["tm_test"].outputs_to_admit,
+            vec![0],
+            "the admission DECISION is unchanged by a write fault"
+        );
+        assert!(!report.is_durable());
+        assert_eq!(report.faults.len(), 1, "{}", report.summary());
+        assert_eq!(report.faults[0].topic, "tm_test");
+        assert_eq!(report.faults[0].site, "insert_output");
+        assert!(report.faults[0].error.contains("D1_ERROR"));
+        assert!(report.applied_topics.is_empty());
+        assert!(
+            !applied(&storage).await,
+            "a faulted topic must not be recorded as applied — the replay would be a dupe"
+        );
+        assert!(storage
+            .find_output(TEST_TXID, 0, Some("tm_test"), None, false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The replay: same bytes, storage healthy again → re-validated (not a
+    /// dupe), re-written, recorded. A THIRD submit is then the dupe it
+    /// should be: nothing admitted, nothing to write, durable.
+    #[tokio::test]
+    async fn replay_after_a_fault_reapplies_and_records_applied() {
+        let (engine, storage) = make_faulting_engine(vec![0]);
+        storage.fail_insert_output.set(true);
+        let (_, first) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert!(!first.is_durable());
+
+        storage.fail_insert_output.set(false);
+        let (steak, replay) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert_eq!(steak["tm_test"].outputs_to_admit, vec![0], "re-validated, not deduped");
+        assert!(replay.is_durable(), "{}", replay.summary());
+        assert_eq!(replay.applied_topics, vec!["tm_test".to_string()]);
+        assert!(applied(&storage).await);
+        assert!(storage
+            .find_output(TEST_TXID, 0, Some("tm_test"), None, false)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (steak, third) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert!(
+            steak["tm_test"].outputs_to_admit.is_empty(),
+            "now a genuine dupe: nothing admitted"
+        );
+        assert!(third.is_durable() && third.applied_topics.is_empty());
+    }
+
+    /// The SPEND half of the phantom: a `find_output` fault during
+    /// validation made a settle look like it consumed nothing, so the spend
+    /// pointer was never written and the ack stood. Now the read fault is
+    /// reported, the topic stays unrecorded, the previously-admitted coin
+    /// is untouched — and the healthy replay consumes it.
+    #[tokio::test]
+    async fn validation_read_fault_is_reported_and_the_replay_consumes_the_coin() {
+        let (engine, storage) = make_faulting_engine(vec![0]);
+        // The subject's own input: seed the coin it spends as a previously
+        // admitted tm_test output.
+        let tx = Transaction::from_beef(&test_beef(), None).unwrap();
+        let source_txid = tx.inputs[0].get_source_txid().unwrap();
+        let source_vout = tx.inputs[0].source_output_index;
+        storage
+            .insert_output(&Output {
+                txid: source_txid.clone(),
+                output_index: source_vout,
+                output_script: vec![0x51],
+                satoshis: 1,
+                topic: "tm_test".to_string(),
+                spent: false,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: None,
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+
+        storage.fail_find_output.set(true);
+        let (_, faulted) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert!(!faulted.is_durable());
+        assert!(
+            faulted.faults.iter().any(|f| f.site == "find_output"),
+            "{}",
+            faulted.summary()
+        );
+        assert!(!applied(&storage).await, "unrecorded: the replay must re-read");
+        storage.fail_find_output.set(false);
+        assert!(
+            storage
+                .find_output(&source_txid, source_vout, Some("tm_test"), None, false)
+                .await
+                .unwrap()
+                .is_some(),
+            "the coin the faulted pass could not see is still there, untouched"
+        );
+
+        let (_, replay) = engine
+            .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert!(replay.is_durable(), "{}", replay.summary());
+        assert!(applied(&storage).await);
+        // The mock manager retains no coins, so the consumed coin is stale
+        // and deleted — the observable proof the spend was PROCESSED.
+        assert!(
+            storage
+                .find_output(&source_txid, source_vout, Some("tm_test"), None, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "the healthy replay consumed the coin the faulted pass missed"
         );
     }
 }

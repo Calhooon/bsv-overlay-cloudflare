@@ -950,8 +950,8 @@ pub async fn submit(
     // Admitted outputs are written to D1 before the response is sent,
     // so subsequent /lookup queries on this instance see them immediately.
     let engine_started = js_sys::Date::now();
-    let steak = match engine.submit(&tagged_beef, mode).await {
-        Ok(s) => s,
+    let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {
+        Ok(v) => v,
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /submit -> {} (submit failed)", status);
@@ -959,6 +959,66 @@ pub async fn submit(
         }
     };
     let engine_submit_ms = js_sys::Date::now() - engine_started;
+
+    // ── S2 QUEUE-DURABLE ADMISSION (ARCHITECTURE v2 principle 1, bsv-low
+    // 2026-08-29): AN ACK IS DURABLE. The write-through above is the fast
+    // path; the engine now REPORTS every Phase-3 write (or validation read)
+    // that faulted instead of swallowing it. If anything faulted, the same
+    // bytes are ENQUEUED for an idempotent replay BEFORE the ack — and if
+    // the queue cannot take them, the submit is REFUSED (502, retryable)
+    // rather than acked over a write we do not hold. This is the exact
+    // mechanism behind the 2026-08-26 phantom class (admissions acked under
+    // a D1 storm whose rows never existed; addendum 7): a dropped write is
+    // now redelivered, never vanished. The decision is derived ONCE
+    // (`mutation_ack`) and consumed as an enum.
+    let enqueue_outcome = if mutation_report.is_durable() {
+        None
+    } else {
+        worker::console_log!(
+            "POST /submit: Phase-3 NOT DURABLE for {} — {} fault(s): {} — enqueueing an idempotent replay (S2)",
+            tagged_beef.topics.join(","),
+            mutation_report.faults.len(),
+            mutation_report.summary()
+        );
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            ctx.wait_until(async move {
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1).await;
+            });
+        }
+        Some(crate::queue::enqueue_replay(env, &tagged_beef.beef, &tagged_beef.topics, mode).await)
+    };
+    let mutation_queued = match crate::queue::mutation_ack(mutation_report.is_durable(), enqueue_outcome)
+    {
+        crate::queue::MutationAck::Durable => false,
+        crate::queue::MutationAck::Queued => {
+            worker::console_log!(
+                "POST /submit: replay QUEUED for {} (S2) — acking; the queue is the guarantee",
+                tagged_beef.topics.join(",")
+            );
+            if let Ok(db) = env.d1("OVERLAY_DB") {
+                ctx.wait_until(async move {
+                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1)
+                        .await;
+                });
+            }
+            true
+        }
+        crate::queue::MutationAck::Refused(reason) => {
+            worker::console_log!(
+                "POST /submit -> 502 (admission NOT durable and the replay could not be queued: {reason})"
+            );
+            if let Ok(db) = env.d1("OVERLAY_DB") {
+                ctx.wait_until(async move {
+                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_REFUSED, 1)
+                        .await;
+                });
+            }
+            return json_error_retryable(
+                &format!("admission not durable ({reason}) — retry"),
+                502,
+            );
+        }
+    };
 
     // Diagnostic logging: show admitted output counts per topic
     let total_admitted: usize = steak.values().map(|a| a.outputs_to_admit.len()).sum();
@@ -1028,7 +1088,12 @@ pub async fn submit(
                 });
             }
         }
+        // S2: a QUEUED replay supersedes this belt for the request — the
+        // rows it probes for may legitimately not exist yet, and the queue
+        // (not a re-present) is the guarantee. Refusing here would 502 an
+        // admission that is already durably held.
         if total_consumed == 0
+            && !mutation_queued
             && matches!(action, crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_))
         {
             // Review MEDIUM-3: the SAME subject derivation as the gated arm —
@@ -1223,7 +1288,20 @@ pub async fn submit(
     let server_timing = format!(
         "arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
     );
-    Ok(with_server_timing(json_ok(&steak)?, &server_timing))
+    let mut resp = with_server_timing(json_ok(&steak)?, &server_timing);
+    if mutation_queued {
+        // S2: tell the caller (and the harness) this admission is held by
+        // the queue, not yet by D1 — a lookup on this instance may lag by
+        // one consumer delivery. Exposed for browser reads alongside
+        // Server-Timing.
+        let h = resp.headers_mut();
+        let _ = h.set("X-Overlay-Mutation", "queued");
+        let _ = h.set(
+            "Access-Control-Expose-Headers",
+            "Server-Timing, X-Overlay-Mutation",
+        );
+    }
+    Ok(resp)
 }
 
 /// #195: attach a `Server-Timing` header (+ its CORS expose) to a response.
@@ -2982,8 +3060,15 @@ mod tests {
         // that consumption in source order.
         let flag_use = ["if corroborate_seen_", "after_submit {"].concat();
         assert_eq!(src.matches(&flag_use).count(), 1, "one consumption site");
+        // S2 (2026-08-29): the route submits through `submit_with_report`
+        // (the Phase-3 durability report) — the SAME call site, renamed.
+        // Split needle so this literal never matches itself (the pre-S2
+        // needle was an unsplit literal and, once the real call was renamed,
+        // the first match became THIS test's own string — after the flag).
+        let submit_call = ["engine.submit_with_", "report(&tagged_beef, mode)"].concat();
+        assert_eq!(src.matches(&submit_call).count(), 1, "one engine submit call site");
         let submit_at = src
-            .find("engine.submit(&tagged_beef, mode)")
+            .find(&submit_call)
             .expect("the engine submit call exists");
         let flag_at = src.find(&flag_use).expect("checked above");
         assert!(
