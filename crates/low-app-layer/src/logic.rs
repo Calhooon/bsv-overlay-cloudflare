@@ -575,6 +575,74 @@ pub fn decode_beef_hex(hex_str: &str) -> Option<Vec<u8>> {
 /// `era_filter_sql`). ONE extra bind (the
 /// cutoff, after the identity). `None` ⇒ byte-identical to the pre-#375
 /// query.
+/// PARTY CANDIDATES (bsv-low 2026-08-29, the run-A "invisible own refund"):
+/// the candidate set every IDENTITY-KEYED view (`/results`, `/recovery-view`,
+/// `/refund-view`) enumerates, as ONE subquery aliased `pp` with the
+/// `potparty_records` column shape the three windows already consume
+/// (`identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight,
+/// seatSettlePubkey, seatSigHex, sigHex, createdAt, markerRowid, sigValid`).
+///
+/// THE GAP. The views keyed pot ownership on the seat's `LOW/potparty/v2`
+/// marker alone. That marker is published at the END of a hand; a seat
+/// killed right after funding (towerDeadManArm / refundLandedArm: both
+/// clients die post-fund by design) never publishes it, so its OWN refunded
+/// pot was invisible to its own views — `/hops-view` served the hop with
+/// `spendingTxid` = the JOIN, `/utxo-status` served the pot spent by the
+/// refund with 8 confirmations, and `/results?identity` carried no row. The
+/// refund never became a Collect card (the credit-on-return cells:
+/// refundLandedVerify, stageFByteDropDrill, homeKeyRecovery).
+///
+/// THE PROOF ALREADY IN HAND. The seat's `LOW/hopparty` marker is published
+/// at FUND time, admission-latched (`markerValid`), carries the seat's
+/// committed settle key, and its hop output is spent by exactly one tx —
+/// the JOIN, which IS the pot funding tx (the covenant pot sits at vout
+/// `LEADERBOARD_POT_VOUT`). A pot whose decoded lock commits that seat key
+/// is therefore this identity's pot by chain construction: the same
+/// decoded-owner spine the leaderboard's #403 fold and
+/// `fill_seats_from_hop_markers` already trust. No party marker is needed
+/// to LIST the pot; the party marker, when it exists, still wins (the hop
+/// arm is suppressed for any pot the identity already has a party row
+/// for — one pot, one candidate source, no double rows).
+///
+/// Bars kept: `markerValid = 1` only (the latched verdict; an unlatched or
+/// failed hop marker attributes nothing — the `attribute_seats` rule), the
+/// hop must be SPENT with a recorded spender, the pot must be DECODED
+/// (`paramsDecoded`) with a `recoveryHeight`, and the marker's seat key must
+/// be one of the pot's committed keys. Everything is read from columns the
+/// overlay wrote at admission; the read path runs no ECDSA.
+///
+/// BINDS: `?1` = the identity (lowercase), used by BOTH arms — the routes
+/// still bind exactly [identity, era?]; the views number their era slot
+/// `?2` for the same reason. `rowid` is exposed as `markerRowid` (a
+/// compound subquery has no implicit rowid).
+pub fn party_candidates_sql() -> String {
+    format!(
+        "(SELECT identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
+                 seatSettlePubkey, seatSigHex, sigHex, createdAt, rowid AS markerRowid, sigValid \
+            FROM potparty_records WHERE identity = ?1 \
+          UNION ALL \
+          SELECT hp.identity AS identity, hp.opponentIdentity AS opponentIdentity, \
+                 hp.gameId AS gameId, pot.txid AS potTxid, pot.outputIndex AS potVout, \
+                 pot.recoveryHeight AS recoveryHeight, \
+                 hp.seatSettlePubkey AS seatSettlePubkey, hp.seatSigHex AS seatSigHex, \
+                 hp.identitySigHex AS sigHex, hp.createdAt AS createdAt, \
+                 hp.rowid AS markerRowid, hp.markerValid AS sigValid \
+            FROM hopparty_records hp \
+            JOIN pot_records hop ON hop.txid = hp.txid AND hop.outputIndex = hp.hopVout \
+            JOIN pot_records pot ON pot.txid = lower(hop.spendingTxid) \
+                 AND pot.outputIndex = {vout} \
+           WHERE hp.identity = ?1 AND hp.markerValid = 1 \
+             AND hop.spent = 1 AND hop.spendingTxid IS NOT NULL \
+             AND pot.paramsDecoded = 1 AND pot.recoveryHeight IS NOT NULL \
+             AND pot.pubA IS NOT NULL AND pot.pubB IS NOT NULL \
+             AND lower(hp.seatSettlePubkey) IN (lower(pot.pubA), lower(pot.pubB)) \
+             AND NOT EXISTS (SELECT 1 FROM potparty_records x \
+                              WHERE x.identity = hp.identity \
+                                AND x.potTxid = pot.txid AND x.potVout = pot.outputIndex))",
+        vout = LEADERBOARD_POT_VOUT,
+    )
+}
+
 pub fn recovery_view_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
     // NOTE: any change here must keep the `w.`-qualified outer ORDER BY —
     // SQLite does not guarantee ordering survives a join otherwise.
@@ -625,18 +693,18 @@ pub fn recovery_view_sql(written_off_before_ms: Option<i64>, after: usize) -> St
                   pp.opponentIdentity AS opponentIdentity, \
                   r.spent AS spent, r.spendingTxid AS spendingTxid, \
                   r.spentConfirmed AS spentConfirmed, \
-                  pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
+                  pp.createdAt AS markerCreatedAt, pp.markerRowid AS markerRowid, \
                   r.createdAt AS potCreatedAt, \
                   CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
                   MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
                       AS potBestSigRank, \
                   ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
                                      ORDER BY {rank} DESC, \
-                                              pp.createdAt ASC, pp.rowid ASC) AS rn \
-           FROM potparty_records pp \
+                                              pp.createdAt ASC, pp.markerRowid ASC) AS rn \
+           FROM {party} pp \
            LEFT JOIN pot_records r \
                   ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-           WHERE pp.identity = ?{era}) \
+           WHERE pp.identity = ?1{era}) \
          WHERE rn = 1))) \
        WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
        ORDER BY potBestSigRank DESC, tier ASC, \
@@ -651,9 +719,10 @@ pub fn recovery_view_sql(written_off_before_ms: Option<i64>, after: usize) -> St
         probe = RECOVERY_VIEW_MAX_ROWS + 1,
         after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        party = party_candidates_sql(),
         era = era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
-            "?",
+            "?2",
             written_off_before_ms
         ),
     )
@@ -3755,12 +3824,14 @@ mod tests {
     #[test]
     fn recovery_view_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
-        let frag = era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        // 2026-08-29 party-candidates: identity is `?1` (reused by the
+        // subquery's two arms), the cutoff `?2` — still [identity, era].
+        let frag = era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?2", cutoff);
         let with = recovery_view_sql(cutoff, 0);
         let without = recovery_view_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
-            with.matches(&format!("WHERE pp.identity = ?{frag})"))
+            with.matches(&format!("WHERE pp.identity = ?1{frag})"))
                 .count(),
             1,
             "the era filter rides the innermost identity scan"
@@ -4005,10 +4076,19 @@ mod tests {
         ));
         assert!(sql.contains("LEFT JOIN pot_beefs b ON b.txid = lower(w.spendingTxid)"));
         assert!(sql.contains("hex(b.beef) AS spenderBeef"));
-        // Keyed by ONE identity.
-        assert!(sql.contains("WHERE pp.identity = ?"));
-        // Exactly one bind placeholder (single-identity query, not batched).
-        assert_eq!(sql.matches('?').count(), 1);
+        // Keyed by ONE identity — since 2026-08-29 through the PARTY-CANDIDATES
+        // subquery (party rows UNION hop-proven rows), whose two arms reuse
+        // the numbered identity bind: one BIND, three `?1` placeholders.
+        assert!(sql.contains("WHERE pp.identity = ?1"));
+        assert!(
+            sql.contains("FROM hopparty_records hp"),
+            "the hop-proven arm is present"
+        );
+        assert_eq!(sql.matches("?1").count(), 3, "identity bind reused thrice");
+        assert!(
+            !sql.contains("?2"),
+            "no cutoff placeholder without a cutoff"
+        );
 
         // #323 HIGH-1 — the three anti-flood properties, asserted
         // individually so losing any ONE of them fails loudly. A marker
@@ -4023,7 +4103,7 @@ mod tests {
             sql.contains(&format!(
                 "ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
                                      ORDER BY {rank} DESC, \
-                                              pp.createdAt ASC, pp.rowid ASC) AS rn",
+                                              pp.createdAt ASC, pp.markerRowid ASC) AS rn",
                 rank = overlay_discovery::potparty::validity::sig_rank_expr("pp.")
             )),
             "per-pot dedupe window missing: {sql}"

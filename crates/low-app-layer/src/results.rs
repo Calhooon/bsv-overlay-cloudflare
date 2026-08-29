@@ -2442,18 +2442,18 @@ pub fn results_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
                       r.potSats AS potSats, r.verdict AS verdict, \
                       r.verdictTxid AS verdictTxid, r.spentHeight AS spentHeight, \
                       r.spenderFinal AS spenderFinal, \
-                      pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
+                      pp.createdAt AS markerCreatedAt, pp.markerRowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
                       MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
                           AS potBestSigRank, \
                       ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
                                          ORDER BY {rank} DESC, \
-                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
-               FROM potparty_records pp \
+                                                  pp.createdAt ASC, pp.markerRowid ASC) AS rn \
+               FROM {party} pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-               WHERE pp.identity = ?{era}) \
+               WHERE pp.identity = ?1{era}) \
              WHERE rn = 1))) \
            WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
            ORDER BY potBestSigRank DESC, tier ASC, \
@@ -2474,9 +2474,10 @@ pub fn results_sql(written_off_before_ms: Option<i64>, after: usize) -> String {
         probe = RESULTS_MAX_ROWS + 1,
         after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        party = crate::logic::party_candidates_sql(),
         era = crate::logic::era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
-            "?",
+            "?2",
             written_off_before_ms
         ),
     )
@@ -5823,7 +5824,16 @@ mod tests {
         // The results query is single-bind and bounded (the over-50-outpoint
         // 503 lesson: bound every D1 statement).
         let sql = results_sql(None, 0);
-        assert_eq!(sql.matches('?').count(), 1);
+        // 2026-08-29: ONE identity bind, THREE placeholders — `?1` in the
+        // party arm, the hop arm and the outer scan of the party-candidates
+        // subquery (a numbered parameter binds once; the route binds
+        // exactly [identity]). A bare `?` count no longer equals the bind
+        // count, and that is the point being pinned.
+        assert_eq!(sql.matches("?1").count(), 3, "identity bind reused thrice");
+        assert!(
+            !sql.contains("?2"),
+            "no cutoff placeholder without a cutoff"
+        );
         // The paging round: the window PROBES one past the page so truncation
         // is decided by what the query returned (never a second COUNT), and
         // the cursor bounds the page — the pre-cursor flat `LIMIT 100`
@@ -5901,12 +5911,16 @@ mod tests {
     #[test]
     fn results_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
-        let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        // 2026-08-29 party-candidates: the identity bind is NUMBERED (`?1`,
+        // reused by the candidate subquery's two arms) and the cutoff is `?2`
+        // — still exactly [identity, era] at the route.
+        let frag =
+            crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?2", cutoff);
         let with = results_sql(cutoff, 0);
         let without = results_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
-            with.matches(&format!("WHERE pp.identity = ?{frag})"))
+            with.matches(&format!("WHERE pp.identity = ?1{frag})"))
                 .count(),
             1,
             "the era filter rides the innermost identity scan"

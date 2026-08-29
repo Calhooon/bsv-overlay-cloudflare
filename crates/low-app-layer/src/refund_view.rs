@@ -261,18 +261,18 @@ pub fn refund_view_sql(written_off_before_ms: Option<i64>, after: usize) -> Stri
                       r.spentHeight AS spentHeight, \
                       r.firstSpentAt AS firstSpentAt, \
                       r.spenderFinal AS spenderFinal, \
-                      pp.createdAt AS markerCreatedAt, pp.rowid AS markerRowid, \
+                      pp.createdAt AS markerCreatedAt, pp.markerRowid AS markerRowid, \
                       r.createdAt AS potCreatedAt, \
                       CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
                       MAX({rank}) OVER (PARTITION BY pp.potTxid, pp.potVout) \
                           AS potBestSigRank, \
                       ROW_NUMBER() OVER (PARTITION BY pp.potTxid, pp.potVout \
                                          ORDER BY {rank} DESC, \
-                                                  pp.createdAt ASC, pp.rowid ASC) AS rn \
-               FROM potparty_records pp \
+                                                  pp.createdAt ASC, pp.markerRowid ASC) AS rn \
+               FROM {party} pp \
                LEFT JOIN pot_records r \
                       ON r.txid = pp.potTxid AND r.outputIndex = pp.potVout \
-               WHERE pp.identity = ?{era}) \
+               WHERE pp.identity = ?1{era}) \
              WHERE rn = 1))) \
            WHERE finalRank > {after} AND finalRank <= {after} + {probe} \
            ORDER BY potBestSigRank DESC, tier ASC, \
@@ -290,9 +290,10 @@ pub fn refund_view_sql(written_off_before_ms: Option<i64>, after: usize) -> Stri
         probe = REFUND_VIEW_MAX_ROWS + 1,
         after = after,
         rank = overlay_discovery::potparty::validity::sig_rank_expr("pp."),
+        party = crate::logic::party_candidates_sql(),
         era = crate::logic::era_filter_sql(
             "COALESCE(r.createdAt, pp.createdAt)",
-            "?",
+            "?2",
             written_off_before_ms
         ),
     )
@@ -1136,7 +1137,13 @@ mod tests {
     #[test]
     fn refund_view_sql_shape() {
         let sql = refund_view_sql(None, 0);
-        assert_eq!(sql.matches('?').count(), 1, "one identity bind");
+        // 2026-08-29 party-candidates: ONE identity bind (`?1`), reused by
+        // the subquery's two arms and the outer scan — three placeholders.
+        assert_eq!(sql.matches("?1").count(), 3, "identity bind reused thrice");
+        assert!(
+            !sql.contains("?2"),
+            "no cutoff placeholder without a cutoff"
+        );
         // The paging round: the window PROBES one past the page (truncation is
         // decided by what the query returned) and the cursor bounds the page.
         let probe = REFUND_VIEW_MAX_ROWS + 1;
@@ -1159,17 +1166,21 @@ mod tests {
     #[test]
     fn refund_view_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
-        let frag = crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?", cutoff);
+        let frag =
+            crate::logic::era_filter_sql("COALESCE(r.createdAt, pp.createdAt)", "?2", cutoff);
         let with = refund_view_sql(cutoff, 0);
         let without = refund_view_sql(None, 0);
         assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
         assert_eq!(
-            with.matches(&format!("WHERE pp.identity = ?{frag})"))
+            with.matches(&format!("WHERE pp.identity = ?1{frag})"))
                 .count(),
             1,
             "the era filter rides the innermost identity scan"
         );
-        assert_eq!(with.matches('?').count(), 2, "identity + cutoff binds");
+        // identity (`?1` ×3 across the party-candidates subquery + outer scan)
+        // + cutoff (`?2` ×1) — two BINDS at the route.
+        assert_eq!(with.matches("?1").count(), 3, "identity bind reused thrice");
+        assert_eq!(with.matches("?2").count(), 1, "one cutoff placeholder");
         assert_eq!(
             with.replace(&frag, ""),
             without,
