@@ -290,6 +290,14 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARC_INGEST_STATUS_IGNORED: 0,
         COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: 0,
         COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: 0,
+        // S2 (2026-08-29): seeded so a never-bumped counter reads an explicit
+        // 0 on the surface — an ABSENT key is an unknown, and an unknown must
+        // not read as fine.
+        COUNTER_SUBMIT_MUTATION_FAULT: 0,
+        COUNTER_SUBMIT_MUTATION_QUEUED: 0,
+        COUNTER_SUBMIT_MUTATION_REFUSED: 0,
+        COUNTER_QUEUE_MUTATION_APPLIED: 0,
+        COUNTER_QUEUE_MUTATION_RETRIED: 0,
     });
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);
