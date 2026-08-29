@@ -903,7 +903,7 @@ fn truncation_is_reported_only_when_the_page_is_short() {
     let lb = agg_world(&all, &statuses, &w);
     assert_eq!(lb.board[0].wins, 5, "five distinct pots, five wins");
     let v: serde_json::Value =
-        serde_json::from_str(&leaderboard_body(&lb, 1, all.len(), truncated)).unwrap();
+        serde_json::from_str(&leaderboard_body(&lb, 1, all.len(), truncated, None)).unwrap();
     assert_eq!(v["truncated"], false);
 
     let (page, truncated) = query_window(&conn, 2);
@@ -911,7 +911,7 @@ fn truncation_is_reported_only_when_the_page_is_short() {
     let pots: std::collections::HashSet<&str> = page.iter().map(|m| m.pot_txid.as_str()).collect();
     assert_eq!(pots.len(), 2, "the cut lands exactly on the limit-th pot");
     let v: serde_json::Value =
-        serde_json::from_str(&leaderboard_body(&lb, 1, page.len(), truncated)).unwrap();
+        serde_json::from_str(&leaderboard_body(&lb, 1, page.len(), truncated, None)).unwrap();
     assert_eq!(v["truncated"], true);
 }
 

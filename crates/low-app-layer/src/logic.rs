@@ -2456,6 +2456,328 @@ pub fn aggregate_leaderboard_attributed(
     Leaderboard { board, hands }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #403 BOARD PAGING (2026-08-29) — the whole-era CHAIN-WINS SPINE
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// THE CLIFF. `/leaderboard` counted wins over a MARKER WINDOW of at most
+// `LEADERBOARD_MAX_LIMIT` (500) distinct pots. The moment an era held more
+// pots than the window, every page came back `truncated:true` and the
+// client — correctly refusing a complete-looking partial board — fell back
+// to the slow whole-history gather (layer 10 of the 2026-08-27 onion). The
+// stopgap was the #375 era cutoff bumped forward on beta every time its
+// window re-filled. The window was the wrong unit: it bounded the COUNTING
+// SPINE by a display cap.
+//
+// THE FIX. Counting no longer walks markers at all. Every fact a win needs
+// is LATCHED AT WRITE TIME by the overlay and sits in indexed columns:
+//   - the verdict + its freshness (`pot_records.verdict`, `verdictTxid =
+//     spendingTxid`, written by the spend classifier's CAS — no caller path),
+//   - the committed winning settle key (`pubA`/`pubB`, `paramsDecoded`),
+//   - the confirmed landing (`spent`/`spentConfirmed`, or the overlay's own
+//     `network_seen` witness + `spenderFinal` — exactly `is_confirmed_landing`),
+//   - the identity holding that key (`potparty_records.seatSettlePubkey` +
+//     the admission-latched `sigValid = 1`, the brain-cutover M1 latch that
+//     `attribute_seats` consults; a conflicting pair of verified identities
+//     for one slot poisons it to the key, as `attribute_seats` does).
+// So the spine is ONE aggregate over `pot_records` for the whole era,
+// grouped by owner, ranked `wins DESC, owner ASC`, and PAGED by rank
+// (`?limit` owners per page, `?after` rank offset, a `+1` probe for the
+// honest `truncated` bit + `nextAfter`). The marker tables only DECORATE
+// the owners on the page (evidence rows, the countersigned `proven` badge,
+// the hands board) — bounded by the page, never by the history. Rows that
+// predate the M1 latch (`sigValid IS NULL`) count under the settle key
+// until the relatch sweep latches them (`identityIsKey`, the honest
+// direction: a win is never dropped, never mis-awarded — see
+// `attribute_seats`); the read path runs no ECDSA.
+//
+// The existing fold (`aggregate_leaderboard_attributed`) is UNCHANGED and
+// still runs over the page's pots: verdict + committed key + confirmed
+// landing mint the win, the winner's own verified marker decorates it. The
+// SQL below is pinned against the fold's own predicates by the executing
+// harness (`tests/leaderboard_paging_sqlite.rs`, production migrations).
+
+/// Default owners per `/leaderboard` page.
+pub const LEADERBOARD_PAGE_DEFAULT: usize = 50;
+/// Hard cap on owners per page — bounds the per-request decoration joins
+/// (each owner's counted pots → statuses / classification / markers /
+/// proof pointers, all chunked at `D1_CHUNK_OUTPOINTS`).
+pub const LEADERBOARD_PAGE_MAX: usize = 200;
+/// The `?after` ceiling (same rationale as [`RECOVERY_VIEW_AFTER_MAX`]: a
+/// walker whose next step re-clamps to the same page loops forever, so
+/// `nextAfter` stops being emitted at the ceiling).
+pub const LEADERBOARD_AFTER_MAX: usize = 1_000_000;
+
+/// Clamp `?limit` to `1..=LEADERBOARD_PAGE_MAX` owners; absent ⇒ default.
+/// NOTE: the pre-#403 client sends `limit=500` (the old distinct-POT
+/// cap) — it clamps to `LEADERBOARD_PAGE_MAX` owners, a strictly larger
+/// board than the old window could ever hold.
+pub fn clamp_leaderboard_page(raw: Option<u32>) -> usize {
+    match raw {
+        Some(n) => (n as usize).clamp(1, LEADERBOARD_PAGE_MAX),
+        None => LEADERBOARD_PAGE_DEFAULT,
+    }
+}
+
+/// Clamp `?after` (rank offset) to `0..=LEADERBOARD_AFTER_MAX`.
+pub fn clamp_leaderboard_after(raw: Option<u32>) -> usize {
+    (raw.unwrap_or(0) as usize).min(LEADERBOARD_AFTER_MAX)
+}
+
+/// The cursor for the NEXT page, or `None` when this page is the last one
+/// (not truncated) or the walk has hit the ceiling.
+pub fn leaderboard_next_after(after: usize, page: usize, truncated: bool) -> Option<usize> {
+    if truncated && after + page < LEADERBOARD_AFTER_MAX {
+        Some(after + page)
+    } else {
+        None
+    }
+}
+
+/// The shared CTE every paging query is built on — ONE derivation of "a
+/// counted win and who owns it", so the owner page, the owners' pots and
+/// the hands board can never disagree on the population.
+///
+/// `wins`: every era pot whose CONFIRMED-LANDED spend paid a winner
+/// template, the verdict FRESH for the recorded spender, with decoded
+/// committed keys; plus the latched identity holding each seat key
+/// (`identityA`/`identityB`: exactly one distinct `sigValid = 1` identity
+/// for that key on that pot, else NULL — the `attribute_seats` slot rule).
+/// `owned`: the winning side resolved — `winnerIdentity` (NULL when the
+/// lock is degenerate `pubA == pubB`, the slot is unlatched, or poisoned)
+/// and `winKey` (the committed winning settle key); `identityA`/`identityB`
+/// are the per-slot resolutions with the SAME degenerate-lock rule applied
+/// (a `pubA == pubB` lock attributes nobody — `attribute_seats`), so the
+/// fold's attribution input and the page's owner can never disagree.
+///
+/// `era_placeholder` is the bind slot for the #375 cutoff when set (the
+/// caller numbers it; see each query). Filtered on the pot's own admission
+/// stamp (`p.createdAt`), the server-written anchor.
+pub fn chain_wins_cte(era_placeholder: &str, written_off_before_ms: Option<i64>) -> String {
+    let era = era_filter_sql("p.createdAt", era_placeholder, written_off_before_ms);
+    format!(
+        "WITH wins AS ( \
+           SELECT p.txid AS potTxid, lower(p.spendingTxid) AS settleTxid, \
+                  p.verdict AS verdict, lower(p.pubA) AS pubA, lower(p.pubB) AS pubB, \
+                  p.settleSigners AS settleSigners, p.createdAt AS potCreatedAt, \
+                  (SELECT CASE WHEN COUNT(DISTINCT lower(q.identity)) = 1 \
+                               THEN MIN(lower(q.identity)) END \
+                     FROM potparty_records q \
+                    WHERE q.potTxid = p.txid AND q.potVout = p.outputIndex \
+                      AND q.sigValid = 1 \
+                      AND lower(q.seatSettlePubkey) = lower(p.pubA)) AS slotA, \
+                  (SELECT CASE WHEN COUNT(DISTINCT lower(q.identity)) = 1 \
+                               THEN MIN(lower(q.identity)) END \
+                     FROM potparty_records q \
+                    WHERE q.potTxid = p.txid AND q.potVout = p.outputIndex \
+                      AND q.sigValid = 1 \
+                      AND lower(q.seatSettlePubkey) = lower(p.pubB)) AS slotB \
+             FROM pot_records p \
+             LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
+                  AND ns.txid = lower(p.spendingTxid) \
+            WHERE p.outputIndex = {vout} \
+              AND p.paramsDecoded = 1 \
+              AND p.pubA IS NOT NULL AND p.pubB IS NOT NULL \
+              AND p.verdict IN ('winner-a', 'winner-b') \
+              AND p.spendingTxid IS NOT NULL \
+              AND p.verdictTxid = p.spendingTxid \
+              AND p.spent = 1 \
+              AND (p.spentConfirmed = 1 OR (ns.txid IS NOT NULL AND p.spenderFinal = 1)){era} \
+         ), \
+         owned AS ( \
+           SELECT w.potTxid, w.settleTxid, w.verdict, w.pubA, w.pubB, w.settleSigners, \
+                  w.potCreatedAt, \
+                  CASE WHEN w.pubA = w.pubB THEN NULL ELSE w.slotA END AS identityA, \
+                  CASE WHEN w.pubA = w.pubB THEN NULL ELSE w.slotB END AS identityB, \
+                  CASE WHEN w.pubA = w.pubB THEN NULL \
+                       WHEN w.verdict = 'winner-a' THEN w.slotA \
+                       ELSE w.slotB END AS winnerIdentity, \
+                  CASE WHEN w.verdict = 'winner-a' THEN w.pubA ELSE w.pubB END AS winKey \
+             FROM wins w \
+         ) ",
+        vout = LEADERBOARD_POT_VOUT,
+    )
+}
+
+/// The OWNER PAGE: `(owner, identityIsKey, wins)` ranked `wins DESC, owner
+/// ASC`. BINDS: `?1` = page + 1 (the truncation probe), `?2` = `after`
+/// (rank offset), `?3` = the era cutoff (ms) iff configured.
+pub fn chain_wins_spine_sql(written_off_before_ms: Option<i64>) -> String {
+    format!(
+        "{cte} \
+         SELECT COALESCE(winnerIdentity, winKey) AS owner, \
+                MAX(CASE WHEN winnerIdentity IS NULL THEN 1 ELSE 0 END) AS identityIsKey, \
+                COUNT(*) AS wins \
+           FROM owned \
+          GROUP BY COALESCE(winnerIdentity, winKey) \
+          ORDER BY wins DESC, owner ASC \
+          LIMIT ?1 OFFSET ?2",
+        cte = chain_wins_cte("?3", written_off_before_ms),
+    )
+}
+
+/// The counted pots of `n` owners (the page): one row per win with the
+/// facts the fold's inputs are built from. BINDS: `?1` = the era cutoff
+/// iff configured (a no-op slot otherwise — bind it anyway, see
+/// [`chain_wins_owner_binds_era_first`]), then the `n` owners as `?2..`.
+pub fn chain_wins_owners_sql(n: usize, written_off_before_ms: Option<i64>) -> String {
+    debug_assert!((1..=D1_CHUNK_OUTPOINTS).contains(&n));
+    let owners = (0..n)
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{cte} \
+         SELECT COALESCE(winnerIdentity, winKey) AS owner, \
+                CASE WHEN winnerIdentity IS NULL THEN 1 ELSE 0 END AS identityIsKey, \
+                potTxid, settleTxid, verdict, pubA, pubB, settleSigners, \
+                identityA, identityB \
+           FROM owned \
+          WHERE COALESCE(winnerIdentity, winKey) IN ({owners}) \
+          ORDER BY owner ASC, potCreatedAt DESC, potTxid ASC",
+        cte = chain_wins_cte("?1", written_off_before_ms),
+    )
+}
+
+/// The owners query numbers the era slot `?1` unconditionally so the owner
+/// binds are stable at `?2..`; when no cutoff is configured the slot is
+/// unreferenced by the SQL and the bound value is ignored. `true` always —
+/// exists so the route's bind order is a pinned fact, not a convention.
+pub const fn chain_wins_owner_binds_era_first() -> bool {
+    true
+}
+
+/// The DECORATION markers for `n` pots: each pot's oldest
+/// `RESULT_ROWS_PER_POT` `result_markers_v2` rows (the same per-pot
+/// superset rule the old window used — oldest-first because oldest is the
+/// one order later spam cannot improve on; verification happens in the
+/// fold, never in SQL). BINDS: the `n` pot txids as `?1..`.
+pub fn pot_markers_sql(n: usize) -> String {
+    debug_assert!((1..=D1_CHUNK_OUTPOINTS).contains(&n));
+    let pots = (0..n)
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, loserSigHex, \
+                cardsHex, txid, createdAt, claimValid \
+           FROM (SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
+                        loserSigHex, cardsHex, txid, createdAt, claimValid, \
+                        ROW_NUMBER() OVER (PARTITION BY potTxid \
+                                           ORDER BY createdAt ASC, rowid ASC) AS rn \
+                   FROM result_markers_v2 \
+                  WHERE potTxid IN ({pots})) \
+          WHERE rn <= {per_pot} \
+          ORDER BY potTxid ASC, rn ASC",
+        per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
+    )
+}
+
+/// The LOW hand score of a 10-hex-char `cardsHex` column, in pure SQL —
+/// byte-identical to [`hand_score`] (pinned by the harness over every
+/// card): rank = card % 13 (0='2' … 12='A'); A=1, J/Q/K=10, else rank+2.
+/// Each card is also bounded `<= 51` (a malformed byte scores 0 here and
+/// the fold, which re-decodes, drops the marker — a bad row can only lose
+/// its own hand, never rank above an honest one: it would need a LOWER
+/// score than honest cards, and a 0 contribution is exactly what a
+/// too-high byte gets, so the `<= 51` guard keeps the order honest).
+pub fn sql_hand_score_expr(col: &str) -> String {
+    let nib =
+        |pos: usize| format!("(instr('0123456789abcdef', substr(lower({col}), {pos}, 1)) - 1)");
+    (1..=5)
+        .map(|i| {
+            let card = format!("({} * 16 + {})", nib(2 * i - 1), nib(2 * i));
+            format!(
+                "(CASE WHEN {card} > 51 THEN 0 \
+                       WHEN ({card} % 13) = 12 THEN 1 \
+                       WHEN ({card} % 13) >= 9 THEN 10 \
+                       ELSE ({card} % 13) + 2 END)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// The ERA-WIDE LOWEST HANDS: the winner's own earliest card-bearing
+/// verified claim (`claimValid IN (1, 2)`, anchored on the recorded settle)
+/// of every counted pot whose winner resolved to an IDENTITY, ordered by
+/// the SQL hand score (`sql_hand_score_expr`), then earliest claim, then
+/// gameId — the fold's own total order. BINDS: `?1` = hands limit, `?2` =
+/// the era cutoff iff configured.
+pub fn era_hands_sql(written_off_before_ms: Option<i64>) -> String {
+    format!(
+        "{cte} \
+         SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, loserSigHex, \
+                cardsHex, txid, createdAt, claimValid \
+           FROM (SELECT m.gameId, m.winner, m.loser, m.potTxid, m.settleTxid, \
+                        m.winnerSigHex, m.loserSigHex, m.cardsHex, m.txid, \
+                        m.createdAt, m.claimValid, \
+                        ROW_NUMBER() OVER (PARTITION BY m.potTxid \
+                                           ORDER BY m.createdAt ASC, m.rowid ASC) AS rn \
+                   FROM owned o \
+                   JOIN result_markers_v2 m ON m.potTxid = o.potTxid \
+                  WHERE o.winnerIdentity IS NOT NULL \
+                    AND lower(m.winner) = o.winnerIdentity \
+                    AND lower(m.settleTxid) = o.settleTxid \
+                    AND m.claimValid IN (1, 2) \
+                    AND m.cardsHex IS NOT NULL AND length(m.cardsHex) = 10) \
+          WHERE rn = 1 \
+          ORDER BY ({score}) ASC, createdAt ASC, gameId ASC \
+          LIMIT ?1",
+        cte = chain_wins_cte("?2", written_off_before_ms),
+        score = sql_hand_score_expr("cardsHex"),
+    )
+}
+
+/// One row of [`chain_wins_owners_sql`] — a counted win with its owner and
+/// the latched seat identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainWinPotRow {
+    pub owner: String,
+    pub identity_is_key: bool,
+    pub pot_txid: String,
+    pub settle_txid: String,
+    pub verdict: String,
+    pub pub_a: String,
+    pub pub_b: String,
+    pub settle_signers: Option<String>,
+    pub identity_a: Option<String>,
+    pub identity_b: Option<String>,
+}
+
+/// The fold's `attr_by_pot` input, built from the SAME latched resolution
+/// the spine grouped by — so the fold can never attribute a pot to an
+/// identity the page ranked under a key (or vice versa).
+pub fn attributions_from_pot_rows(
+    rows: &[ChainWinPotRow],
+) -> std::collections::HashMap<String, crate::results::SeatAttribution> {
+    rows.iter()
+        .map(|r| {
+            (
+                r.pot_txid.to_ascii_lowercase(),
+                crate::results::SeatAttribution {
+                    identity_a: r.identity_a.as_ref().map(|s| s.to_ascii_lowercase()),
+                    identity_b: r.identity_b.as_ref().map(|s| s.to_ascii_lowercase()),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Keep only the page's owners' rows (the fold also sees the hands-board
+/// pots, whose owners may lie beyond the page) and order them by the
+/// spine's rank: `wins DESC, owner ASC`.
+pub fn retain_page_owners(lb: &mut Leaderboard, owners: &[String]) {
+    let set: std::collections::HashSet<String> =
+        owners.iter().map(|o| o.to_ascii_lowercase()).collect();
+    lb.board.retain(|r| set.contains(&r.identity));
+    lb.board.sort_by(|a, b| {
+        b.wins
+            .cmp(&a.wins)
+            .then_with(|| a.identity.cmp(&b.identity))
+    });
+}
+
 /// Assemble the `/leaderboard` wire body (the endpoint CONTRACT):
 /// `{"board":[…],"hands":[…],"computedAt":<unix>,"resultCount":<int>,
 /// "truncated":<bool>}`.
@@ -2467,11 +2789,18 @@ pub fn aggregate_leaderboard_attributed(
 /// `resultCount == limit` and the wrong answer looked complete. Same
 /// contract as `/recovery-view`'s bit: additive, and a caller that ignores
 /// it sees exactly the old shape.
+///
+/// `nextAfter` (#403, 2026-08-29): the rank cursor for the next page of
+/// OWNERS, `null` when this page is the last (or the walk hit
+/// `LEADERBOARD_AFTER_MAX`). Since #403 `truncated` means "more owners
+/// beyond this page" — a walkable page, never a reason to gather the whole
+/// history client-side.
 pub fn leaderboard_body(
     lb: &Leaderboard,
     computed_at: i64,
     result_count: usize,
     truncated: bool,
+    next_after: Option<usize>,
 ) -> String {
     let board: Vec<serde_json::Value> = lb
         .board
@@ -2591,6 +2920,7 @@ pub fn leaderboard_body(
         "computedAt": computed_at,
         "resultCount": result_count,
         "truncated": truncated,
+        "nextAfter": next_after,
     })
     .to_string()
 }
@@ -4696,7 +5026,7 @@ mod tests {
         let _ = PotVerdict::WinnerA;
         let lb = agg(&markers, &statuses, &no_proofs(), &world);
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false, None)).unwrap();
         assert_eq!(v["board"][0]["evidence"][0]["serverVerdict"], "winner-a");
     }
 
@@ -4763,7 +5093,7 @@ mod tests {
             "unresolved stays null"
         );
         // …and the body emits exactly that.
-        let body = leaderboard_body(&lb, 1, 2, false);
+        let body = leaderboard_body(&lb, 1, 2, false, None);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let rows = v["board"].as_array().unwrap();
         let ev_row = rows
@@ -4825,7 +5155,7 @@ mod tests {
                 .any(|r| !r.identity_is_key && !r.evidence.is_empty() && r.chain_wins.len() == 1),
             "an identity row with evidence + a chain-win anchor (#336 coexistence)"
         );
-        let body = leaderboard_body(&lb, 1_700_000_000, 2, false);
+        let body = leaderboard_body(&lb, 1_700_000_000, 2, false, None);
         let pretty: serde_json::Value = serde_json::from_str(&body).unwrap();
         let mut got = serde_json::to_string_pretty(&pretty).unwrap();
         got.push('\n');
@@ -4928,7 +5258,7 @@ mod tests {
         let proofs = HashMap::from([((tx(1), a.clone()), vec!["px".to_string()])]);
         let lb = agg(&markers, &statuses, &proofs, &win_world(&[(1, &a, &b)]));
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false, None)).unwrap();
         assert_eq!(v["computedAt"], 1_700_000_000_i64);
         assert_eq!(v["resultCount"], 1);
         let board = v["board"].as_array().unwrap();
@@ -4985,7 +5315,7 @@ mod tests {
             &win_world(&[(1, &a, &b)]),
         );
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false, None)).unwrap();
         let ev = &v["board"][0]["evidence"][0];
         assert!(ev["createdAt"].is_null(), "absent stamp must be null");
         assert!(
@@ -5058,7 +5388,7 @@ mod tests {
             "the v2 cards the winner's signature binds must survive aggregation"
         );
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false, None)).unwrap();
         let ev = &v["board"][0]["evidence"][0];
         assert_eq!(
             ev["loserSigHex"],
@@ -5078,7 +5408,7 @@ mod tests {
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         let lb = agg(&markers, &statuses, &no_proofs(), &world);
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false, None)).unwrap();
         let ev = v["board"][0]["evidence"][0].as_object().unwrap();
         assert!(ev.contains_key("cardsHex"), "the key is always present");
         assert_eq!(ev["cardsHex"], serde_json::Value::Null);
@@ -5170,7 +5500,7 @@ mod tests {
         );
         // The wire body carries both tier flags + the falsifiable attribution.
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1_700_000_000, 1, false, None)).unwrap();
         assert_eq!(v["board"][0]["wins"], 1);
         assert_eq!(v["board"][0]["proven"], false);
         assert_eq!(v["board"][0]["chainProven"], true);
@@ -5689,10 +6019,10 @@ mod tests {
             hands: vec![],
         };
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1, 0, true)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1, 0, true, None)).unwrap();
         assert_eq!(v["truncated"], true);
         let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1, 0, false)).unwrap();
+            serde_json::from_str(&leaderboard_body(&lb, 1, 0, false, None)).unwrap();
         assert_eq!(v["truncated"], false);
     }
     #[test]

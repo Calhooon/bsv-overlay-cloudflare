@@ -417,7 +417,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// index, outpoint-keyed from birth per the #327 S8 lesson) + its
 /// gameId/createdAt read index. Overlay-internal (clients read via /lookup
 /// ls_hand); display-only — no money path and no app-layer join reads it.
-pub const OVERLAY_MIGRATION_COUNT: usize = 117;
+/// 117 → 118 for bsv-low #403 board paging (2026-08-29):
+/// `idx_pot_records_chain_wins` — the whole-era chain-wins spine's scan
+/// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
+pub const OVERLAY_MIGRATION_COUNT: usize = 118;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1431,6 +1434,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_lb_marker_rows_page ON lb_marker_rows(unknownPot, orderAt DESC, potTxid)",
     "CREATE INDEX IF NOT EXISTS idx_lb_marker_rows_pot ON lb_marker_rows(potTxid)",
+    // bsv-low #403 board paging (2026-08-29): the whole-era CHAIN-WINS SPINE
+    // (`low-app-layer logic::chain_wins_cte`) aggregates `pot_records` by
+    // verdict + landing + era stamp for EVERY page; one composite index
+    // serves the scan. The potparty attribution subquery rides the existing
+    // `idx_potparty_pot (potTxid, potVout)`. Additive + idempotent.
+    "CREATE INDEX IF NOT EXISTS idx_pot_records_chain_wins ON pot_records(outputIndex, verdict, spent, createdAt)",
 ];
 
 // =============================================================================

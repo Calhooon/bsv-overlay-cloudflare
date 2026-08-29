@@ -52,6 +52,7 @@
   ],
   "computedAt": 1700000000,
   "hands": [],
+  "nextAfter": null,
   "resultCount": 2,
   "truncated": false
 }

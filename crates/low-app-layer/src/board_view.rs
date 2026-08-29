@@ -75,11 +75,20 @@ impl DurableObject for BoardView {
             .query_pairs()
             .find(|(k, _)| k == "limit")
             .and_then(|(_, v)| v.parse::<u32>().ok());
-        let key = limit_raw.unwrap_or(0);
+        // #403: the owners-page cursor. Cache key = (after, limit) folded
+        // below the results-page key space (1_000_000+): after ≤ 999 pages
+        // × 1000 + limit ≤ 999.
+        let after_raw = url
+            .query_pairs()
+            .find(|(k, _)| k == "after")
+            .and_then(|(_, v)| v.parse::<u32>().ok());
+        let key = after_raw.unwrap_or(0).min(999) * 1000 + limit_raw.unwrap_or(0).min(999);
         let env = self.env.clone();
         self.serve_view(key, move || {
             let env = env.clone();
-            async move { crate::routes::compute_leaderboard_body_string(&env, limit_raw).await }
+            async move {
+                crate::routes::compute_leaderboard_body_string(&env, limit_raw, after_raw).await
+            }
         })
         .await
     }
