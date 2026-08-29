@@ -1774,13 +1774,13 @@ pub struct SettleSignersBackfillSummary {
 ///    one for any row the same classifier wrote (deterministic function of
 ///    bytes); if the re-derivation comes up empty the STORED verdict string
 ///    is echoed unchanged so the write stays a pure signers-attach.
+///
 /// (2026-08-26, OWNER RULING: NO WoC anywhere.) A briefly-shipped WoC
 /// chain-fetch fallback here was reverted the same evening. A spend whose
 /// bytes never reached our store stays a `missing_beef` candidate; the
 /// DURABLE fix is FIRST-PARTY delivery — the tower already submits its pot
 /// spends with ancestry (`broadcast_via_overlay` #193, `submit_tm_pot` #36
 /// with per-tick retries), so this set converges without any indexer read.
-
 pub async fn backfill_settle_signers(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     limit: u64,

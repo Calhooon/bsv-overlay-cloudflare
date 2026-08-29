@@ -899,6 +899,7 @@ const MAX_CORROBORATION_LEGS: usize = 32;
 ///   for unproven-parent subjects ([`corroborated_accept_claim`]); a
 ///   proven-parent (single-EF) subject keeps the uncorroborated fast path —
 ///   see the risk-class note in `gate_accept_claim`.
+///
 /// #397: which corroborating broadcast answers an UNSEEN step — the same
 /// ancestry-primed selection the accept-claim leg uses (#216: a corroborator
 /// with a partial UTXO view can only validate a 0-conf-parent subject with

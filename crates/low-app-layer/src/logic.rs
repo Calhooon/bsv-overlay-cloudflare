@@ -1179,6 +1179,7 @@ pub fn clamp_future_cutoff(cutoff_ms: Option<i64>, now_ms: i64) -> Option<i64> {
 ///   client-half epoch wipe removes the old-era records that could be
 ///   republished. Never re-claim the closed form the first draft of these
 ///   comments claimed (Rule 10).
+///
 /// #399 (OWNER RULED 2026-08-21: "the chain arm counts alone") — the CHAIN
 /// candidate window for `/leaderboard`.
 ///
@@ -2156,6 +2157,10 @@ pub fn aggregate_leaderboard_with_verdicts(
 /// - the winner's OWN verified, anchored result marker DECORATES the win:
 ///   `proven` iff it carries a verified loser countersig, the hands board from
 ///   its revealed cards, and the evidence row. Eviction costs only that.
+// Eight inputs = the eight independent fact sources the fold joins (markers,
+// statuses, proof pointers, hands cap, verdicts, attributions, params,
+// signers); bundling them would only hide the join.
+#[allow(clippy::too_many_arguments)]
 pub fn aggregate_leaderboard_attributed(
     markers: &[ResultMarkerRow],
     statuses: &[OutpointStatus],

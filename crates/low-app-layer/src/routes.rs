@@ -1187,7 +1187,8 @@ pub async fn compute_leaderboard_body_string(
                         quota,
                         now,
                     );
-                    if distinct >= limit + 1 {
+                    // ≥ limit + 1 distinct pots: the page PROVED over-full.
+                    if distinct > limit {
                         fast = Some((m, t));
                     }
                 }

@@ -1813,7 +1813,7 @@ fn lb_pages(conn: &Connection, limit: usize, now: i64) -> (Vec<ResultMarkerRow>,
 /// (the rn ≤ 4 cap). `with_companions` decides whether the write-time half
 /// runs (T1) or the spine starts empty (T2's backfill subject).
 fn seed_spine_world(conn: &Connection, now: i64, with_companions: bool) {
-    let mut file = |game: &str, pot: &str, m: &str, at: i64| {
+    let file = |game: &str, pot: &str, m: &str, at: i64| {
         let (w, l) = (h64(0xaa), h64(0xbb));
         let settle = h64(0x77);
         let ws = junk_sig();
@@ -1890,7 +1890,7 @@ fn spine_fast_path_matches_stage1_on_proven_overfull_board() {
     let limit = 3usize;
     let fast = lb_pages(&conn, limit, now);
     assert!(
-        fast.2 >= limit + 1,
+        fast.2 > limit,
         "world must prove over-full (distinct {} < {})",
         fast.2,
         limit + 1
@@ -1928,7 +1928,7 @@ fn spine_backfill_converges_and_then_matches_stage1() {
     conn.execute(&low_app_layer::logic::lb_backfill_sql(), [])
         .expect("shipped backfill");
     let after = lb_pages(&conn, limit, now);
-    assert!(after.2 >= limit + 1, "backfill must converge the spine");
+    assert!(after.2 > limit, "backfill must converge the spine");
     let old = query_window(&conn, limit);
     assert_windows_equal(&after, &old);
 }
