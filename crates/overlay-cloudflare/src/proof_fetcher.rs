@@ -695,9 +695,16 @@ pub(crate) async fn http_get(
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
     init.with_redirect(worker::RequestRedirect::Manual);
-    if let Some((name, value)) = header {
+    {
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: identify ourselves on every
+        // courier GET — Arcade's edge began 403-ing bare/default agents on
+        // incident day, and a blinded courier degrades silently (every rung
+        // reads "no proof here" and retries forever).
         let headers = worker::Headers::new();
-        let _ = headers.set(name, value);
+        let _ = headers.set("User-Agent", crate::broadcaster::OVERLAY_USER_AGENT);
+        if let Some((name, value)) = header {
+            let _ = headers.set(name, value);
+        }
         init.with_headers(headers);
     }
     let request =
@@ -2003,8 +2010,15 @@ pub fn classify_presence(bitails: Option<bool>, woc: Option<bool>) -> NetworkPre
 
 /// Tally of one rebroadcast-backstop pass (logged by the cron / returned by
 /// the admin route).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RebroadcastSummary {
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — every candidate whose legs
+    /// were actually POSTed this pass, with the subject outcome kind
+    /// (`rescued` / `accepted-unwitnessed` / `rejected` / `transport` /
+    /// `no-subject-leg`). The caller records each into `rebroadcast_state`
+    /// so the attempt cap binds; probe-only candidates (present /
+    /// inconclusive / budget-skipped / no-bytes) are NOT attempts.
+    pub attempted: Vec<(String, &'static str)>,
     /// Proofless admitted rows old enough to probe this tick.
     pub scanned: usize,
     /// Rows an indexer still holds (healthy — no action).
@@ -2191,6 +2205,7 @@ pub async fn rebroadcast_absent_admitted(
                     legs.len()
                 ));
                 summary.rebroadcast += 1;
+                summary.attempted.push((txid.clone(), "rescued"));
             }
             Some(Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_))) => {
                 // #397: queued but UNWITNESSED — not a rescue yet. The next
@@ -2200,27 +2215,409 @@ pub async fn rebroadcast_absent_admitted(
                     "[rebroadcast-backstop] {txid} rebroadcast sync-accepted but unwitnessed (#397) — retry later"
                 ));
                 summary.rebroadcast_failed += 1;
+                summary
+                    .attempted
+                    .push((txid.clone(), "accepted-unwitnessed"));
             }
             Some(Ok(crate::broadcaster::ArcOutcome::Rejected(r))) => {
+                // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: no longer "retry
+                // later" as if it were a transport blip — the attempt is
+                // RECORDED (cap 3) and the retire classifier owns the
+                // terminal question with corroborated evidence.
                 push_log(&format!(
-                    "[rebroadcast-backstop] {txid} rebroadcast REJECTED ({r}) — retry later"
+                    "[rebroadcast-backstop] {txid} rebroadcast REJECTED ({r}) — attempt recorded; retire classifier owns terminal"
                 ));
                 summary.rebroadcast_failed += 1;
+                summary.attempted.push((txid.clone(), "rejected"));
             }
             Some(Err(e)) => {
                 push_log(&format!(
-                    "[rebroadcast-backstop] {txid} rebroadcast transport failed ({e}) — retry later"
+                    "[rebroadcast-backstop] {txid} rebroadcast transport failed ({e}) — attempt recorded"
                 ));
                 summary.rebroadcast_failed += 1;
+                summary.attempted.push((txid.clone(), "transport"));
             }
             None => {
                 // Subject leg absent from the batch — beef_to_ef_batch
                 // guarantees it, so this is defensive only.
                 summary.rebroadcast_failed += 1;
+                summary.attempted.push((txid.clone(), "no-subject-leg"));
             }
         }
     }
 
+    summary
+}
+
+// ============================================================================
+// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — bounded attempts + terminal retire
+// ============================================================================
+//
+// The incident's architecture smell, named by the owner: RETRY-FOREVER. A
+// definitively network-dead tx (a fleet double-spend, UTXO_SPENT) was
+// indistinguishable from a transport blip at every layer — the REJECTED
+// webhook was counted-and-discarded, the presence probe read "absent" as
+// "rescue harder", and the only exit was a 14-day age-out. The two pieces
+// here close that: every rebroadcast attempt is RECORDED and CAPPED
+// (`rebroadcast_eligible`), and a corroborated-dead row is RETIRED
+// (`run_retire_pass`) — out of every retry pool, never deleted, still served.
+
+/// Lifetime rebroadcast attempts per txid (owner ruling, incident doc §6:
+/// "if the broadcast fails or is invalid we should NEVER try again… at max
+/// 2-3 attempts"). After the cap the row is dead-lettered from the backstop
+/// (logged once); the retire classifier and the 14-day bracket own the rest.
+pub const REBROADCAST_MAX_ATTEMPTS: i64 = 3;
+
+/// Spacing before attempt 2 (1 h) and attempt 3 (6 h). Failure never speeds
+/// retries (the incident's 20 s pull-forward anti-pattern, inverted).
+pub const REBROADCAST_SPACING_MS: [i64; 2] = [3_600_000, 21_600_000];
+
+/// PURE: may this candidate be rebroadcast now, given its attempt ledger?
+/// `attempts == 0` → yes (first attempt). Past the cap → never. Otherwise
+/// the per-attempt spacing must have elapsed since `last_ms`.
+pub fn rebroadcast_eligible(attempts: i64, last_ms: i64, now_ms: i64) -> bool {
+    if attempts <= 0 {
+        return true;
+    }
+    if attempts >= REBROADCAST_MAX_ATTEMPTS {
+        return false;
+    }
+    let idx = usize::try_from(attempts - 1).unwrap_or(usize::MAX);
+    let spacing = REBROADCAST_SPACING_MS
+        .get(idx)
+        .copied()
+        .unwrap_or(i64::MAX);
+    now_ms.saturating_sub(last_ms) >= spacing
+}
+
+/// The #273 backstop, attempt-bounded (INCIDENT D1-CALLBACK-FLOOD
+/// 2026-09-01): fetch an over-full candidate page (the SQL lists candidacy;
+/// THIS gate decides eligibility), filter by the attempt ledger, run the
+/// presence-probe/rebroadcast pass, then record every actual attempt. Both
+/// cron twins (the scheduled tick and `/admin/complete-proofs`) call this
+/// one wrapper so the bound cannot be bypassed by one of them drifting.
+pub async fn run_rebroadcast_backstop(
+    storage: &crate::d1_storage::D1Storage,
+    taal_api_key: Option<&str>,
+    woc_api_key: Option<&str>,
+) -> RebroadcastSummary {
+    let now = js_sys::Date::now() as i64;
+    let page = match storage
+        .find_rebroadcast_candidates(
+            REBROADCAST_BACKSTOP_LIMIT * 4,
+            REBROADCAST_MIN_AGE_SECS,
+            REBROADCAST_MAX_CANDIDATE_AGE_SECS,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            worker::console_log!("[rebroadcast-backstop] candidate scan failed: {e}");
+            return RebroadcastSummary::default();
+        }
+    };
+    let mut capped = 0usize;
+    let mut cooling = 0usize;
+    let mut eligible = Vec::new();
+    for c in page {
+        if !rebroadcast_eligible(c.attempts, c.last_ms, now) {
+            if c.attempts >= REBROADCAST_MAX_ATTEMPTS {
+                capped += 1;
+            } else {
+                cooling += 1;
+            }
+            continue;
+        }
+        eligible.push(c);
+        if eligible.len() as u64 >= REBROADCAST_BACKSTOP_LIMIT {
+            break;
+        }
+    }
+    if capped > 0 || cooling > 0 {
+        worker::console_log!(
+            "[rebroadcast-backstop] {capped} candidate(s) at the attempt cap (dead-lettered), {cooling} cooling down"
+        );
+    }
+    let attempts_by_txid: std::collections::HashMap<String, i64> = eligible
+        .iter()
+        .map(|c| (c.tx.txid.clone(), c.attempts))
+        .collect();
+    let summary = rebroadcast_absent_admitted(
+        eligible.into_iter().map(|c| c.tx).collect(),
+        taal_api_key,
+        woc_api_key,
+    )
+    .await;
+    for (txid, outcome) in &summary.attempted {
+        storage.record_rebroadcast_attempt(txid, outcome).await;
+        let prior = attempts_by_txid.get(txid).copied().unwrap_or(0);
+        if prior + 1 >= REBROADCAST_MAX_ATTEMPTS {
+            worker::console_log!(
+                "[rebroadcast-backstop] dead-letter: {txid} reached the lifetime attempt cap ({REBROADCAST_MAX_ATTEMPTS}) — no further rebroadcasts; retire classifier / proof passes own it"
+            );
+        }
+    }
+    summary
+}
+
+/// What Arcade's `GET /tx/{txid}` said about a retire candidate (PURE input
+/// to [`retire_verdict`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArcadeLook {
+    /// A terminal status (`ARCADE_FATAL_STATUSES`), with the reason text.
+    Fatal(String, String),
+    /// Arcade does not know the txid (definitive 404).
+    Missing,
+    /// Any live/mined status — the ordinary proof machinery owns it.
+    Present,
+    /// Transport/HTTP fault — no verdict.
+    Fault,
+}
+
+/// Minimum proofless age before a row is even CONSIDERED for retirement.
+pub const RETIRE_MIN_AGE_SECS: i64 = 3_600;
+/// A row retired purely on ABSENCE (Arcade 404 + both indexers 404) needs
+/// this much age — a fresh registration gap must never read as death.
+pub const RETIRE_ABSENT_MIN_AGE_SECS: i64 = 48 * 3_600;
+/// Candidates examined per store per tick (each costs ≤3 courier GETs).
+pub const RETIRE_SCAN_LIMIT: u64 = 8;
+
+/// PURE — the retirement decision for one proofless row. `Some(reason)` =
+/// retire; `None` = keep (fail-safe: every uncertainty keeps).
+///
+/// The bar is the #212/#213/#214 doctrine made mechanical: a NEGATIVE never
+/// rests on one provider. Arcade's terminal word alone retires nothing — it
+/// must be corroborated by BOTH indexers' definitive 404 (`classify_presence`
+/// == Absent). Absence alone retires only past
+/// [`RETIRE_ABSENT_MIN_AGE_SECS`], and an Arcade fault never retires.
+pub fn retire_verdict(
+    arcade: &ArcadeLook,
+    bitails: Option<bool>,
+    woc: Option<bool>,
+    age_secs: i64,
+) -> Option<String> {
+    if age_secs < RETIRE_MIN_AGE_SECS {
+        return None;
+    }
+    if matches!(arcade, ArcadeLook::Present) {
+        return None;
+    }
+    if classify_presence(bitails, woc) != NetworkPresence::Absent {
+        return None;
+    }
+    match arcade {
+        ArcadeLook::Fatal(status, extra) => {
+            let head: String = extra.chars().take(120).collect();
+            Some(format!("arcade {status}: {head}"))
+        }
+        ArcadeLook::Missing if age_secs >= RETIRE_ABSENT_MIN_AGE_SECS => Some(format!(
+            "network-absent {age_secs}s: arcade 404 + both indexers 404"
+        )),
+        _ => None,
+    }
+}
+
+/// Ask Arcade about a retire candidate — the LIVE answer is authoritative.
+///
+/// Webhook-recorded evidence (an `arc_terminal` row) is only a FALLBACK for
+/// when Arcade is unreachable. It can never override a live answer: the
+/// `/arc-ingest` bearer token is the subject txid itself (public), so a
+/// stranger can plant a REJECTED row for any txid; letting that plant skip
+/// the live GET would let it suppress Arcade's own Present and trip the 1 h
+/// fatal arm for a tx that is merely absent from the indexers (review
+/// finding MEDIUM, 2026-09-01). With the live GET first, a plant changes
+/// nothing while Arcade answers, and behind an Arcade outage the
+/// both-indexer absence bar still stands between it and a retire.
+async fn arcade_look(
+    arcade_base: &str,
+    txid: &str,
+    webhook_evidence: Option<(String, String)>,
+) -> ArcadeLook {
+    let url = format!("{}/tx/{}", arcade_base.trim_end_matches('/'), txid);
+    let live = match http_get(&url, None).await {
+        Ok((status, body)) if (200..300).contains(&status) => {
+            #[derive(serde::Deserialize)]
+            struct Look {
+                #[serde(rename = "txStatus", default)]
+                tx_status: String,
+                #[serde(rename = "extraInfo", default)]
+                extra_info: String,
+            }
+            match serde_json::from_str::<Look>(&body) {
+                Ok(l)
+                    if crate::broadcaster::ARCADE_FATAL_STATUSES
+                        .contains(&l.tx_status.to_ascii_uppercase().as_str()) =>
+                {
+                    ArcadeLook::Fatal(l.tx_status.to_ascii_uppercase(), l.extra_info)
+                }
+                Ok(l) if !l.tx_status.is_empty() => ArcadeLook::Present,
+                _ => ArcadeLook::Fault,
+            }
+        }
+        Ok((404, _)) => ArcadeLook::Missing,
+        _ => ArcadeLook::Fault,
+    };
+    fold_arcade_look(live, webhook_evidence)
+}
+
+/// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT.
+pub fn fold_arcade_look(
+    live: ArcadeLook,
+    webhook_evidence: Option<(String, String)>,
+) -> ArcadeLook {
+    match (live, webhook_evidence) {
+        (ArcadeLook::Fault, Some((status, extra))) => ArcadeLook::Fatal(status, extra),
+        (live, _) => live,
+    }
+}
+
+/// Tally of one retire pass (logged by the cron twins).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetireSummary {
+    pub scanned: usize,
+    pub retired: usize,
+    pub kept_present: usize,
+    pub kept_uncertain: usize,
+}
+
+/// Shipped candidate SQL for the retire pass — the proofless_watch ledger IS
+/// the canonical "how long has this been proofless" clock (ms first-seen),
+/// so both stores ride it. `?1` = now_ms. Factored consts so the
+/// real-SQLite tier executes the production strings.
+pub(crate) const RETIRE_CANDIDATES_TRANSACTIONS_SQL: &str = "SELECT w.txid AS txid, \
+        (?1 - w.first_seen_ms) / 1000 AS age_secs, \
+        a.status AS term_status, a.extra AS term_extra \
+     FROM proofless_watch w \
+     JOIN transactions t ON t.txid = w.txid \
+     LEFT JOIN arc_terminal a ON a.txid = w.txid \
+     WHERE t.has_proof = 0 AND t.retired_ms IS NULL \
+       AND w.first_seen_ms <= ?1 - 3600000 \
+     ORDER BY w.first_seen_ms ASC LIMIT 8";
+pub(crate) const RETIRE_CANDIDATES_POT_BEEFS_SQL: &str = "SELECT w.txid AS txid, \
+        (?1 - w.first_seen_ms) / 1000 AS age_secs, \
+        a.status AS term_status, a.extra AS term_extra \
+     FROM proofless_watch w \
+     JOIN pot_beefs p ON p.txid = w.txid \
+     LEFT JOIN arc_terminal a ON a.txid = w.txid \
+     WHERE p.has_proof = 0 AND p.structurally_unprovable IS NOT 1 \
+       AND w.first_seen_ms <= ?1 - 3600000 \
+     ORDER BY w.first_seen_ms ASC LIMIT 8";
+/// The retire writers. `has_proof = 0` guard: a proof that landed mid-pass
+/// WINS (confirm beats the latch — the #2b doctrine, kept).
+pub(crate) const RETIRE_TRANSACTIONS_SQL: &str =
+    "UPDATE transactions SET retired_ms = ?1, retired_reason = ?2 \
+     WHERE txid = ?3 AND has_proof = 0 AND retired_ms IS NULL";
+pub(crate) const RETIRE_POT_BEEFS_SQL: &str =
+    "UPDATE pot_beefs SET structurally_unprovable = 1 \
+     WHERE txid = ?1 AND has_proof = 0";
+
+#[derive(serde::Deserialize)]
+struct RetireCandidateRow {
+    txid: String,
+    age_secs: f64,
+    term_status: Option<String>,
+    term_extra: Option<String>,
+}
+
+/// One retire pass over both proofless stores. Every decision funnels
+/// through the pure [`retire_verdict`]; a retirement writes the store latch,
+/// records the evidence into `arc_terminal` (when it came from the live
+/// poll), and logs a dead-letter line. The watch GC then drops the row from
+/// `proofless_watch` on its next tick.
+pub async fn run_retire_pass(
+    db: &worker::D1Database,
+    arcade_base: &str,
+    woc_api_key: Option<&str>,
+) -> RetireSummary {
+    use crate::d1::Query;
+    let mut summary = RetireSummary::default();
+    let now = js_sys::Date::now() as i64;
+    for (candidates_sql, store) in [
+        (RETIRE_CANDIDATES_TRANSACTIONS_SQL, "transactions"),
+        (RETIRE_CANDIDATES_POT_BEEFS_SQL, "pot_beefs"),
+    ] {
+        let rows: Vec<RetireCandidateRow> = match Query::new(candidates_sql)
+            .bind(now)
+            .fetch_all(db)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                worker::console_log!("[retire] candidate scan ({store}) failed: {e}");
+                continue;
+            }
+        };
+        for row in rows {
+            summary.scanned += 1;
+            let webhook_evidence = row
+                .term_status
+                .clone()
+                .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
+            let look = arcade_look(arcade_base, &row.txid, webhook_evidence).await;
+            if matches!(look, ArcadeLook::Present) {
+                summary.kept_present += 1;
+                continue;
+            }
+            // Corroboration probes (the same courier hosts as the backstop).
+            let bitails = bitails_presence(DEFAULT_BITAILS_BASE, &row.txid).await;
+            let woc = if bitails == Some(true) {
+                Some(true)
+            } else {
+                woc_presence(DEFAULT_WOC_BASE, woc_api_key, &row.txid).await
+            };
+            match retire_verdict(&look, bitails, woc, row.age_secs as i64) {
+                Some(reason) => {
+                    let write = match store {
+                        "transactions" => {
+                            Query::new(RETIRE_TRANSACTIONS_SQL)
+                                .bind(now)
+                                .bind(reason.as_str())
+                                .bind(row.txid.as_str())
+                                .execute(db)
+                                .await
+                        }
+                        _ => {
+                            Query::new(RETIRE_POT_BEEFS_SQL)
+                                .bind(row.txid.as_str())
+                                .execute(db)
+                                .await
+                        }
+                    };
+                    match write {
+                        Ok(()) => {
+                            summary.retired += 1;
+                            // Evidence on record (write-once — a webhook row
+                            // already present makes this a no-op).
+                            if let ArcadeLook::Fatal(status, extra) = &look {
+                                crate::ops::record_arc_terminal(
+                                    db,
+                                    &row.txid,
+                                    status,
+                                    Some(&format!("polled: {extra}")),
+                                )
+                                .await;
+                            }
+                            worker::console_log!(
+                                "[retire] dead-letter: {} ({store}) retired — {reason}",
+                                row.txid
+                            );
+                        }
+                        Err(e) => {
+                            worker::console_log!(
+                                "[retire] latch failed for {} ({store}): {e}",
+                                row.txid
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // Present already `continue`d above; everything else
+                    // that keeps is uncertainty, kept fail-safe.
+                    summary.kept_uncertain += 1;
+                }
+            }
+        }
+    }
     summary
 }
 
@@ -2418,6 +2815,72 @@ mod tests {
 
     const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEIGHT: u32 = 830_000;
+
+    // ── INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the three pure decisions ──
+
+    /// The attempt cap: first attempt always; then the per-attempt spacing
+    /// must elapse; at the cap never again. Failure never SPEEDS a retry.
+    #[test]
+    fn rebroadcast_eligible_caps_and_spaces() {
+        let now = 10_000_000_000i64;
+        assert!(rebroadcast_eligible(0, 0, now), "first attempt is free");
+        assert!(rebroadcast_eligible(0, now, now), "attempts=0 ignores last_ms");
+        // Attempt 2 needs 1 h since the first.
+        assert!(!rebroadcast_eligible(1, now - 3_599_000, now));
+        assert!(rebroadcast_eligible(1, now - 3_600_000, now));
+        // Attempt 3 needs 6 h since the second.
+        assert!(!rebroadcast_eligible(2, now - 21_599_000, now));
+        assert!(rebroadcast_eligible(2, now - 21_600_000, now));
+        // The lifetime cap: never again, however old the last attempt.
+        assert!(!rebroadcast_eligible(REBROADCAST_MAX_ATTEMPTS, 0, now));
+        assert!(!rebroadcast_eligible(REBROADCAST_MAX_ATTEMPTS + 50, 0, now));
+        // Clock skew (last_ms in the future) never panics and never spins.
+        assert!(!rebroadcast_eligible(1, now + 60_000, now));
+    }
+
+    /// The retire fold: every uncertain arm KEEPS; only a corroborated
+    /// terminal verdict (or 48 h+ absence everywhere) retires.
+    #[test]
+    fn retire_verdict_fails_safe_on_every_uncertain_arm() {
+        let fatal = ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT (70): x".into());
+        let old = RETIRE_MIN_AGE_SECS;
+        let ancient = RETIRE_ABSENT_MIN_AGE_SECS;
+        // Corroborated terminal → retire, reason names the verdict.
+        let r = retire_verdict(&fatal, Some(false), Some(false), old).expect("retire");
+        assert!(r.starts_with("arcade REJECTED: UTXO_SPENT"), "{r}");
+        // Too young → keep, even with a full terminal + absence bar.
+        assert_eq!(retire_verdict(&fatal, Some(false), Some(false), old - 1), None);
+        // Arcade Present → keep, whatever the indexers say.
+        assert_eq!(retire_verdict(&ArcadeLook::Present, Some(false), Some(false), ancient), None);
+        // Any indexer holding it → keep; one-sided 404 / fault → keep.
+        assert_eq!(retire_verdict(&fatal, Some(true), Some(false), ancient), None);
+        assert_eq!(retire_verdict(&fatal, Some(false), None, ancient), None);
+        assert_eq!(retire_verdict(&fatal, None, Some(false), ancient), None);
+        // Arcade FAULT never retires, however absent and old.
+        assert_eq!(retire_verdict(&ArcadeLook::Fault, Some(false), Some(false), ancient), None);
+        // Arcade 404 + both indexers 404: only past the 48 h bar.
+        assert_eq!(retire_verdict(&ArcadeLook::Missing, Some(false), Some(false), ancient - 1), None);
+        let r = retire_verdict(&ArcadeLook::Missing, Some(false), Some(false), ancient).expect("retire");
+        assert!(r.starts_with("network-absent"), "{r}");
+    }
+
+    /// Review finding MEDIUM (2026-09-01): a planted `arc_terminal` row (the
+    /// webhook token is the public txid) must never override a LIVE Arcade
+    /// answer — it only fills a fault.
+    #[test]
+    fn fold_arcade_look_live_answer_wins_over_webhook_evidence() {
+        let plant = Some(("REJECTED".to_string(), "planted".to_string()));
+        assert_eq!(fold_arcade_look(ArcadeLook::Present, plant.clone()), ArcadeLook::Present);
+        assert_eq!(fold_arcade_look(ArcadeLook::Missing, plant.clone()), ArcadeLook::Missing);
+        let live_fatal = ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "live".into());
+        assert_eq!(fold_arcade_look(live_fatal.clone(), plant.clone()), live_fatal);
+        // Only an unreachable Arcade lets the recorded evidence speak.
+        assert_eq!(
+            fold_arcade_look(ArcadeLook::Fault, plant),
+            ArcadeLook::Fatal("REJECTED".into(), "planted".into())
+        );
+        assert_eq!(fold_arcade_look(ArcadeLook::Fault, None), ArcadeLook::Fault);
+    }
 
     /// A minimal valid single-tx-block BUMP proving `txid` as the sole tx —
     /// whose merkle root IS `txid`. Mirrors the proven lookup_service fixture.

@@ -129,6 +129,54 @@ struct TxBeefRow {
     beef: Option<String>,
 }
 
+/// The two `transactions` upsert statements, factored so the real-SQLite
+/// tier executes the SHIPPED strings (a transcribed copy could drift).
+///
+/// INSERT OR REPLACE deletes-and-reinserts, so every column not listed
+/// silently NULLs — `created_at` preserve-or-stamps (#228, the backstop age
+/// anchor) and `retired_ms`/`retired_reason` PRESERVE (INCIDENT
+/// D1-CALLBACK-FLOOD 2026-09-01: a re-present of a retired tx must not
+/// un-retire it and re-open the retry loops; a genuine revival heals via a
+/// verified proof, and has_proof=1 outranks the latch at every consumer).
+///
+/// `INSERT_OUTPUT_TX_SQL` binds: ?1 txid, ?2 beef (admit path — forces
+/// has_proof = 0, see the call-site doc). `UPDATE_TX_BEEF_SQL` binds: ?1
+/// txid, ?2 beef, ?3 has_proof (the verified-stitch path) — and CONFIRM
+/// BEATS THE LATCH: a stitch that lands has_proof = 1 clears the retire
+/// columns (the pot_beefs #2b rule, mirrored) so a false retire self-heals.
+pub(crate) const INSERT_OUTPUT_TX_SQL: &str =
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason) \
+     VALUES (?1, ?2, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
+             (SELECT retired_ms FROM transactions WHERE txid = ?1), \
+             (SELECT retired_reason FROM transactions WHERE txid = ?1))";
+pub(crate) const UPDATE_TX_BEEF_SQL: &str =
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason) \
+     VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
+             CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_ms FROM transactions WHERE txid = ?1) END, \
+             CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_reason FROM transactions WHERE txid = ?1) END)";
+
+/// Rebroadcast-backstop candidate row: TxBeefRow + the `rebroadcast_state`
+/// attempt ledger (LEFT JOIN — NULL = never attempted). D1 returns numeric
+/// columns as f64 (codebase convention).
+#[derive(Deserialize)]
+struct RebroadcastCandidateRow {
+    txid: String,
+    beef: Option<String>,
+    attempts: Option<f64>,
+    last_ms: Option<f64>,
+}
+
+/// One rebroadcast-backstop candidate with its attempt history (INCIDENT
+/// D1-CALLBACK-FLOOD 2026-09-01: candidacy is now attempt-bounded — see
+/// `proof_fetcher::rebroadcast_eligible`).
+pub struct RebroadcastCandidate {
+    pub tx: TransactionBeef,
+    /// Prior recorded attempts (0 = never attempted).
+    pub attempts: i64,
+    /// Wall-clock ms of the last recorded attempt (0 = never).
+    pub last_ms: i64,
+}
+
 // =============================================================================
 // SQL fragments
 // =============================================================================
@@ -195,16 +243,21 @@ impl D1Storage {
         limit: u64,
         min_age_secs: u64,
         max_age_secs: u64,
-    ) -> Result<Vec<TransactionBeef>, StorageError> {
+    ) -> Result<Vec<RebroadcastCandidate>, StorageError> {
         let sql = Self::rebroadcast_candidates_sql(limit, min_age_secs, max_age_secs);
-        let rows: Vec<TxBeefRow> = Query::new(sql).fetch_all(&self.db).await.map_err(d1_err)?;
+        let rows: Vec<RebroadcastCandidateRow> =
+            Query::new(sql).fetch_all(&self.db).await.map_err(d1_err)?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
                 r.beef
                     .and_then(|h| hex::decode(h).ok())
                     .filter(|b| !b.is_empty())
-                    .map(|beef| TransactionBeef { txid: r.txid, beef })
+                    .map(|beef| RebroadcastCandidate {
+                        tx: TransactionBeef { txid: r.txid, beef },
+                        attempts: r.attempts.unwrap_or(0.0) as i64,
+                        last_ms: r.last_ms.unwrap_or(0.0) as i64,
+                    })
             })
             .collect())
     }
@@ -212,15 +265,47 @@ impl D1Storage {
     /// The shipped SQL behind [`Self::find_rebroadcast_candidates`] —
     /// factored out so the real-SQLite test executes the SHIPPED string
     /// against the production schema.
+    ///
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01: two additions. (1) RETIRED rows
+    /// (`retired_ms` latched on corroborated network-death) leave candidacy —
+    /// the 11 UTXO_SPENT double-spends were re-presented every 15 min for up
+    /// to 14 days because nothing could ever say "dead". (2) The
+    /// `rebroadcast_state` attempt ledger rides along so the caller can gate
+    /// on attempts + spacing (`rebroadcast_eligible`) — retry-forever was the
+    /// incident's architecture smell, and the bound lives with the candidacy.
     fn rebroadcast_candidates_sql(limit: u64, min_age_secs: u64, max_age_secs: u64) -> String {
         format!(
-            "SELECT txid, hex(beef) as beef FROM transactions \
-             WHERE has_proof = 0 \
-               AND created_at IS NOT NULL \
-               AND created_at <= unixepoch() - {min_age_secs} \
-               AND created_at >= unixepoch() - {max_age_secs} \
-             ORDER BY created_at DESC LIMIT {limit}"
+            "SELECT t.txid, hex(t.beef) as beef, rs.attempts AS attempts, rs.last_ms AS last_ms \
+             FROM transactions t \
+             LEFT JOIN rebroadcast_state rs ON rs.txid = t.txid \
+             WHERE t.has_proof = 0 \
+               AND t.retired_ms IS NULL \
+               AND t.created_at IS NOT NULL \
+               AND t.created_at <= unixepoch() - {min_age_secs} \
+               AND t.created_at >= unixepoch() - {max_age_secs} \
+             ORDER BY t.created_at DESC LIMIT {limit}"
         )
+    }
+
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — record one rebroadcast attempt
+    /// for `txid` (upsert: attempts increments, last_ms/last_outcome move).
+    /// Best-effort: a lost write costs one extra future attempt, and the
+    /// attempt cap still holds on the next recorded one.
+    pub async fn record_rebroadcast_attempt(&self, txid: &str, outcome: &str) {
+        let q = Query::new(
+            "INSERT INTO rebroadcast_state (txid, attempts, last_ms, last_outcome) \
+             VALUES (?, 1, ?, ?) \
+             ON CONFLICT(txid) DO UPDATE SET \
+                 attempts = rebroadcast_state.attempts + 1, \
+                 last_ms = excluded.last_ms, \
+                 last_outcome = excluded.last_outcome",
+        )
+        .bind(txid)
+        .bind(js_sys::Date::now())
+        .bind(outcome);
+        if let Err(e) = q.execute(&self.db).await {
+            worker::console_log!("[rebroadcast-backstop] attempt record failed for {txid}: {e}");
+        }
     }
 
     /// Parse a serialized BEEF and report whether it carries a merkle proof for
@@ -298,16 +383,19 @@ impl Storage for D1Storage {
                 // created_at is preserve-or-stamp (#228 backstop age anchor):
                 // a REPLACE keeps the original first-store time so the
                 // push-primary backstop's age gate measures real age.
-                Query::new(
-                    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at) \
-                     VALUES (?, ?, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?), unixepoch()))",
-                )
-                .bind(&*output.txid)
-                .bind(beef.as_slice())
-                .bind(&*output.txid)
-                .execute(&self.db)
-                .await
-                .map_err(d1_err)?;
+                // retired_ms/-reason preserve too (INCIDENT D1-CALLBACK-FLOOD
+                // 2026-09-01): INSERT OR REPLACE deletes-and-reinserts, so an
+                // unlisted column silently NULLs — a RE-PRESENT of a retired
+                // tx would un-retire it and re-open the retry loops the latch
+                // exists to close. A re-present is not proof of life; a
+                // genuine revival heals through the verified proof push
+                // (has_proof=1 outranks the latch at every consumer).
+                Query::new(INSERT_OUTPUT_TX_SQL)
+                    .bind(&*output.txid)
+                    .bind(beef.as_slice())
+                    .execute(&self.db)
+                    .await
+                    .map_err(d1_err)?;
             }
         }
 
@@ -401,17 +489,18 @@ impl Storage for D1Storage {
         // INSERT OR REPLACE — txid is PRIMARY KEY, so this upserts.
         // created_at is preserve-or-stamp (#228): the stitch keeps the row's
         // original first-store time (age stays real for the backstop gate).
-        Query::new(
-            "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at) \
-             VALUES (?, ?, ?, COALESCE((SELECT created_at FROM transactions WHERE txid = ?), unixepoch()))",
-        )
-        .bind(txid)
-        .bind(beef)
-        .bind(has_proof)
-        .bind(txid)
-        .execute(&self.db)
-        .await
-        .map_err(d1_err)
+        // retired_ms/-reason preserve too (INCIDENT D1-CALLBACK-FLOOD
+        // 2026-09-01: REPLACE deletes-and-reinserts — see `insert_output`).
+        // A verified stitch that lands has_proof=1 makes the kept latch
+        // irrelevant at every consumer (has_proof outranks it), so
+        // preserving is safe even on the revival path.
+        Query::new(UPDATE_TX_BEEF_SQL)
+            .bind(txid)
+            .bind(beef)
+            .bind(has_proof)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
     }
 
     async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
@@ -423,7 +512,13 @@ impl Storage for D1Storage {
         // find_transactions_for_proof_check every tick and skipped, clogging the
         // LIMIT-n candidate window. Idempotent: re-running on a proven row is a
         // no-op.
-        Query::new("UPDATE transactions SET has_proof = 1 WHERE txid = ?")
+        // Confirm beats the retire latch (INCIDENT D1-CALLBACK-FLOOD
+        // 2026-09-01 — the pot_beefs #2b rule, mirrored): a verified proof
+        // clears `retired_ms` so a false retire self-heals here too.
+        Query::new(
+            "UPDATE transactions SET has_proof = 1, retired_ms = NULL, retired_reason = NULL \
+             WHERE txid = ?",
+        )
             .bind(txid)
             .execute(&self.db)
             .await
@@ -714,9 +809,13 @@ impl Storage for D1Storage {
         // min_age_secs are excluded — their proof is expected via /arc-ingest.
         // NULL created_at (pre-migration) is treated as OLD/eligible
         // (fail-safe: poll more, never starve a row of its backstop).
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: retired rows (corroborated
+        // network-dead) leave the poll pool too — polling a proven double-
+        // spend's proof is a courier GET burned every tick, forever.
         let sql = format!(
             "SELECT txid, hex(beef) as beef FROM transactions \
              WHERE has_proof = 0 \
+               AND retired_ms IS NULL \
                AND (created_at IS NULL OR created_at <= unixepoch() - {min_age_secs}) \
              ORDER BY RANDOM() LIMIT {limit}"
         );
@@ -777,17 +876,45 @@ mod tests {
         insert("agedout", Some(now - 15 * 24 * 3600), 0); // > max age
         insert("nullstamp", None, 0); // pre-migration ⇒ ancient
         insert("proven", Some(now - 3600), 1); // already proven
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: an in-bracket row RETIRED on
+        // corroborated network-death leaves candidacy (it used to be
+        // re-presented every 15 min for the whole 14-day bracket).
+        insert("deadretired", Some(now - 3600), 0);
+        conn.execute(
+            "UPDATE transactions SET retired_ms = 1, retired_reason = 'test' \
+             WHERE txid = 'deadretired'",
+            [],
+        )
+        .unwrap();
+        // …and the attempt ledger rides along (LEFT JOIN — the CALLER gates
+        // on it via `rebroadcast_eligible`; candidacy itself still lists).
+        conn.execute(
+            "INSERT INTO rebroadcast_state (txid, attempts, last_ms, last_outcome) \
+             VALUES ('inbracket', 2, 5, 'rejected')",
+            [],
+        )
+        .unwrap();
 
         let sql = D1Storage::rebroadcast_candidates_sql(16, 30 * 60, 14 * 24 * 3600);
         let mut stmt = conn.prepare(&sql).expect("shipped SQL must parse");
-        let got: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+        let got: Vec<(String, Option<f64>, Option<f64>)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<f64>>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                ))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(got, vec!["inbracket".to_string()]);
-        // …and the aged-out / NULL rows remain proof-pass candidates (the
-        // completion window this bracket deliberately does not touch).
+        assert_eq!(got.len(), 1, "retired row must not be a candidate: {got:?}");
+        assert_eq!(got[0].0, "inbracket");
+        assert_eq!(got[0].1, Some(2.0), "attempt ledger joins onto candidacy");
+        assert_eq!(got[0].2, Some(5.0));
+        // …and the aged-out / NULL / retired rows remain STORED (nothing is
+        // deleted by leaving candidacy; the proof-pass pool excludes only the
+        // retired row, via its own `retired_ms IS NULL` arm).
         let all_proofless: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM transactions WHERE has_proof = 0",
@@ -796,9 +923,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            all_proofless, 4,
-            "nothing was deleted or proven by aging out"
+            all_proofless, 5,
+            "nothing was deleted or proven by aging out or retiring"
         );
+    }
+
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the SHIPPED transactions
+    /// upserts PRESERVE the retire latch across INSERT OR REPLACE — a
+    /// re-present (admit path) and a re-stitch both keep `retired_ms` /
+    /// `retired_reason` and the original `created_at`; without the listed
+    /// columns REPLACE would NULL them and un-retire a dead tx.
+    #[test]
+    fn transactions_upserts_preserve_retire_latch_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let admit = |txid: &str| {
+            conn.execute(
+                INSERT_OUTPUT_TX_SQL,
+                rusqlite::params![txid, vec![0xbeu8, 0xef]],
+            )
+            .unwrap();
+        };
+        admit("tx1");
+        let created0: i64 = conn
+            .query_row(
+                "SELECT created_at FROM transactions WHERE txid = 'tx1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE transactions SET retired_ms = 77, retired_reason = 'dead', \
+             created_at = created_at - 500 WHERE txid = 'tx1'",
+            [],
+        )
+        .unwrap();
+        // The RE-PRESENT: the latch and the (backdated) first-store time survive.
+        admit("tx1");
+        let (retired, reason, created): (Option<i64>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT retired_ms, retired_reason, created_at FROM transactions WHERE txid = 'tx1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retired, Some(77), "a re-present must not un-retire");
+        assert_eq!(reason.as_deref(), Some("dead"));
+        assert_eq!(created, created0 - 500, "created_at preserve-or-stamp holds");
+        // The verified-stitch upsert preserves the latch while still
+        // proofless (a re-stitch of unproven bytes is not proof of life)…
+        conn.execute(
+            UPDATE_TX_BEEF_SQL,
+            rusqlite::params!["tx1", vec![0xbeu8, 0xef, 0x01], 0i64],
+        )
+        .unwrap();
+        let retired_still: Option<i64> = conn
+            .query_row(
+                "SELECT retired_ms FROM transactions WHERE txid = 'tx1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired_still, Some(77), "an unproven re-stitch keeps the latch");
+        // …and CONFIRM BEATS THE LATCH: a stitch landing has_proof = 1 clears
+        // it (the pot_beefs #2b rule mirrored) — as does `mark_transaction_proven`.
+        conn.execute(
+            UPDATE_TX_BEEF_SQL,
+            rusqlite::params!["tx1", vec![0xbeu8, 0xef, 0x02], 1i64],
+        )
+        .unwrap();
+        let (retired2, reason2, proof): (Option<i64>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT retired_ms, retired_reason, has_proof FROM transactions WHERE txid = 'tx1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retired2, None, "a verified proof clears the retire latch");
+        assert_eq!(reason2, None);
+        assert_eq!(proof, 1);
     }
 
     /// bsv-low#302: the SHIPPED peer-health upsert + select on the

@@ -1353,6 +1353,27 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
         crate::relatch::log_relatch_summary(&summary);
     }
 
+    // 4b. Terminal-retire classifier (INCIDENT D1-CALLBACK-FLOOD 2026-09-01).
+    //    Runs BEFORE the rebroadcast backstop on purpose: a row it retires
+    //    this tick (corroborated network-dead — Arcade terminal verdict or
+    //    48h+ absence, PLUS both indexers' definitive 404) must not be
+    //    re-presented by the very next step. Bounded: ≤8 candidates per
+    //    store, ≤3 courier GETs each; every uncertainty keeps (fail-safe).
+    let arcade_base = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
+    let retire = crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, None).await;
+    worker::console_log!(
+        "Scheduled: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={}",
+        retire.scanned,
+        retire.retired,
+        retire.kept_present,
+        retire.kept_uncertain,
+    );
+
     // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
     //    #267 item c). The passes above only help txs the network HOLDS; an
     //    admitted tx the network never accepted (the #267 incident class)
@@ -1360,32 +1381,24 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     //    (Bitails + WoC) and rebroadcasts the stored BEEF ancestry-first
     //    when BOTH indexers definitively 404 it. Runs LAST, own bounds
     //    (16 candidates / 48 POSTs, 30min–14d candidacy bracket — gate
-    //    LOW-1), so it can never starve proof completion.
+    //    LOW-1), so it can never starve proof completion. Since the incident
+    //    fix the attempts are RECORDED AND CAPPED (`run_rebroadcast_backstop`
+    //    — 3 lifetime attempts, spacing 1h/6h, dead-letter log at the cap).
     let tx_storage = D1Storage::new(ops_db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-    let rb_candidates = tx_storage
-        .find_rebroadcast_candidates(
-            crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
-            crate::proof_fetcher::REBROADCAST_MIN_AGE_SECS,
-            crate::proof_fetcher::REBROADCAST_MAX_CANDIDATE_AGE_SECS,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            worker::console_log!("Scheduled: rebroadcast-backstop candidate scan failed: {e}");
-            Vec::new()
-        });
     let rb =
-        crate::proof_fetcher::rebroadcast_absent_admitted(rb_candidates, taal_key.as_deref(), None)
+        crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
             .await;
     worker::console_log!(
         "Scheduled: rebroadcast-backstop (transactions) — scanned={} present={} \
-         inconclusive={} rebroadcast={} failed={} budget_skipped={}",
+         inconclusive={} rebroadcast={} failed={} budget_skipped={} attempted={}",
         rb.scanned,
         rb.present,
         rb.inconclusive,
         rb.rebroadcast,
         rb.rebroadcast_failed,
         rb.budget_skipped,
+        rb.attempted.len(),
     );
 
     // 6. LOW advert lifecycle (bsv-low#309): reap expired-but-unspent lobby
@@ -1736,24 +1749,30 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
             })
         })
         .collect();
+    // 4b. terminal-retire classifier (INCIDENT D1-CALLBACK-FLOOD 2026-09-01)
+    //     — BEFORE the backstop, same as the scheduled twin: a row retired
+    //     this pass must not be re-presented by the next step.
+    let arcade_base = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
+    let retire = crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, None).await;
+    worker::console_log!(
+        "complete-proofs: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={}",
+        retire.scanned,
+        retire.retired,
+        retire.kept_present,
+        retire.kept_uncertain,
+    );
     // 4c. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
-    //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1);
-    //     see the scheduled block's note.
+    //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1) +
+    //     the incident's attempt cap; see the scheduled block's note.
     let tx_storage = D1Storage::new(db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-    let rb_candidates = tx_storage
-        .find_rebroadcast_candidates(
-            crate::proof_fetcher::REBROADCAST_BACKSTOP_LIMIT,
-            crate::proof_fetcher::REBROADCAST_MIN_AGE_SECS,
-            crate::proof_fetcher::REBROADCAST_MAX_CANDIDATE_AGE_SECS,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            worker::console_log!("complete-proofs: rebroadcast candidate scan failed: {e}");
-            Vec::new()
-        });
     let rb =
-        crate::proof_fetcher::rebroadcast_absent_admitted(rb_candidates, taal_key.as_deref(), None)
+        crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
             .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
@@ -1820,6 +1839,12 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "rebroadcast_rescued": rb.rebroadcast,
         "rebroadcast_failed": rb.rebroadcast_failed,
         "rebroadcast_budget_skipped": rb.budget_skipped,
+        "rebroadcast_attempted": rb.attempted.len(),
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — the retire pass's tick.
+        "retire_scanned": retire.scanned,
+        "retire_retired": retire.retired,
+        "retire_kept_present": retire.kept_present,
+        "retire_kept_uncertain": retire.kept_uncertain,
         // Observability only (≤5): which spending txids were sampled, so an
         // operator can check them on a block explorer and distinguish a broken
         // chaser from a genuinely unconfirmable backlog.

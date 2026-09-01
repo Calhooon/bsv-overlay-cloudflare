@@ -995,8 +995,22 @@ impl Engine {
             // ── ARC network broadcast ──────────────────────────────────
             // Broadcast to miners via ARC, matching the TS Engine pattern.
             // Skip if the tx already has a merkle path (already mined).
+            //
+            // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: also skip when EVERY
+            // topic classified the tx as a dupe (already applied) — the
+            // exact `!v.is_dupe` filter the SHIP arm below has always had,
+            // ten lines away. Without it, every RE-PRESENT of an
+            // already-applied tx (cron ad-sync, peer crawl, a client
+            // retrying a default-mode /submit) re-POSTed to Arcade and
+            // re-registered the status callback, and registrations
+            // accumulate per POST on Arcade's side — the flood's fuel. A
+            // genuinely new tx (any topic non-dupe) broadcasts exactly as
+            // before.
+            let all_topics_dupe = !validations.is_empty() && validations.iter().all(|v| v.is_dupe);
             if let Some(ref arc) = self.arc_broadcaster {
-                if tx.merkle_path.is_none() {
+                if all_topics_dupe {
+                    info!("Skipping ARC broadcast — tx already applied to every topic (re-present)");
+                } else if tx.merkle_path.is_none() {
                     let raw_tx_hex = tx.to_hex();
                     match arc.broadcast(&raw_tx_hex).await {
                         Ok(arc_txid) => {

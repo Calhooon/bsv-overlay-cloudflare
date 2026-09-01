@@ -956,6 +956,14 @@ use crate::ef::{beef_to_ef_batch, EfTx};
 /// Default live Arcade V2 mainnet endpoint (overridable via `ARCADE_URL`).
 pub const ARCADE_DEFAULT_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech";
 
+/// Explicit service identity on every Arcade call (INCIDENT D1-CALLBACK-FLOOD
+/// 2026-09-01): on incident day Arcade's edge began 403-ing bare/default
+/// user agents, which would silently blind the SEEN gate, the status probes
+/// and the proof couriers (every one degrades toward refuse/retry, so the
+/// failure shape is invisible-but-expensive). We identify honestly — this is
+/// our traffic, and BSVA should be able to attribute it.
+pub(crate) const OVERLAY_USER_AGENT: &str = "low-overlay/1.0 (+https://bsvarcade.com)";
+
 /// Gate admission on this status (or better). `SEEN_ON_NETWORK` lands ~3s after
 /// submit and is reliable; `SEEN_MULTIPLE_NODES` is erratic so we do NOT gate on
 /// it (btc-relay-rs arcade-v2-integration.md §4).
@@ -975,7 +983,10 @@ const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 /// completion for such txs rides the Bitails/WoC couriers (`proof_fetcher.rs`
 /// ladder, which treats a non-MINED Arcade answer as merely "no proof here",
 /// never as terminal).
-const ARCADE_FATAL_STATUSES: &[&str] = &["REJECTED", "DOUBLE_SPEND_ATTEMPTED"];
+/// pub(crate) since INCIDENT D1-CALLBACK-FLOOD 2026-09-01: `/arc-ingest`
+/// matches webhook statuses against this same set to RECORD terminal verdicts
+/// (evidence intake only — the corroboration bar above is unchanged).
+pub(crate) const ARCADE_FATAL_STATUSES: &[&str] = &["REJECTED", "DOUBLE_SPEND_ATTEMPTED"];
 
 /// Give up waiting for propagation after this long — the tx was submitted but
 /// never became demonstrably SEEN, so the caller must NOT admit it (fail-closed).
@@ -1964,6 +1975,25 @@ impl ArcadeBroadcaster {
             return Err(format!("subject {subject_txid} not present in EF batch"));
         }
 
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — pre-flight status probe: a
+        // RE-PRESENT of a subject Arcade already witnessed ≥SEEN skips the
+        // whole ladder. Every skipped rung is one fewer POST and, decisively,
+        // one fewer CALLBACK REGISTRATION — the incident's flood was Arcade
+        // fanning status flips to thousands of registrations accumulated by
+        // ladder re-presents of the same subjects (client retry ladders, the
+        // tower's 5-min sweep). The bar is IDENTICAL to the ladder's own
+        // accept (`network_witnessed` = the #371 one-GET ≥SEEN witness, gated
+        // on the echoed txid), so this is the same verdict cheaper, not a
+        // weaker one. A probe miss (unknown/orphan/fatal/transport) changes
+        // nothing — the ladder runs exactly as before.
+        if self.network_witnessed(subject_txid).await {
+            gate_log(&format!(
+                "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe) — ladder + callback re-registration skipped"
+            ));
+            // Payload contract: `Accepted` carries the txid.
+            return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+        }
+
         broadcast_efs_gated_with(
             efs.len(),
             subject_txid,
@@ -2130,11 +2160,21 @@ impl ArcadeBroadcaster {
 
         let headers = worker::Headers::new();
         let _ = headers.set("Content-Type", "application/octet-stream");
+        let _ = headers.set("User-Agent", OVERLAY_USER_AGENT);
         // Subject txid doubles as the callback token — scopes the status stream
         // and (P2.5) authenticates the MINED webhook to /arc-ingest.
         let _ = headers.set("X-CallbackToken", token);
-        // REQUIRED to receive the non-terminal SEEN_ON_NETWORK.
-        let _ = headers.set("X-FullStatusUpdates", "true");
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: `X-FullStatusUpdates: true`
+        // is GONE. It subscribed every registration to every lifecycle flip,
+        // and nothing consumed those: the SEEN gate POLLS `GET /tx/{txid}`
+        // (never the webhook), and `/arc-ingest` discards non-MINED bodies.
+        // Meanwhile Arcade's retry engine, wedged on ~51 network-invalid txs
+        // (retryCount 1,483 and climbing on a tx whose extraInfo already said
+        // "giving up"), fanned EVERY flip to EVERY registration accumulated
+        // by re-presents — ~370 webhooks/s, 32M/day, ~$37/day. Default
+        // registrations still deliver the two statuses we act on: MINED
+        // (the merklePath push) and the terminal verdicts `/arc-ingest` now
+        // records. Never reintroduce full-status without a consumer.
         if let Some(ref cb) = self.callback_url {
             let _ = headers.set("X-CallbackUrl", cb);
         }
@@ -2264,8 +2304,11 @@ impl ArcadeBroadcaster {
     /// text — see the [`ArcadeStatusResponse`] stale-extraInfo trap note.
     async fn tx_status(&self, txid: &str) -> Option<ArcadeStatusResponse> {
         let url = self.status_endpoint(txid);
+        let headers = worker::Headers::new();
+        let _ = headers.set("User-Agent", OVERLAY_USER_AGENT);
         let mut init = worker::RequestInit::new();
         init.with_method(worker::Method::Get);
+        init.with_headers(headers);
         let request = worker::Request::new_with_init(&url, &init).ok()?;
         let mut response = worker::Fetch::Request(request).send().await.ok()?;
         if !(200..300).contains(&response.status_code()) {

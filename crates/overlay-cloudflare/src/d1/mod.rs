@@ -420,7 +420,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 117 → 118 for bsv-low #403 board paging (2026-08-29):
 /// `idx_pot_records_chain_wins` — the whole-era chain-wins spine's scan
 /// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
-pub const OVERLAY_MIGRATION_COUNT: usize = 118;
+pub const OVERLAY_MIGRATION_COUNT: usize = 122;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1440,6 +1440,45 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // serves the scan. The potparty attribution subquery rides the existing
     // `idx_potparty_pot (potTxid, potVout)`. Additive + idempotent.
     "CREATE INDEX IF NOT EXISTS idx_pot_records_chain_wins ON pot_records(outputIndex, verdict, spent, createdAt)",
+    // ── INCIDENT D1-CALLBACK-FLOOD 2026-09-01 (docs/INCIDENT-D1-CALLBACK-FLOOD
+    // -2026-09-01.md in bsv-low): terminal broadcast verdicts become STATE.
+    //
+    // `arc_terminal`: one row per txid whose broadcaster reported a TERMINAL
+    // status (REJECTED / DOUBLE_SPEND_ATTEMPTED — `ARCADE_FATAL_STATUSES`).
+    // Written by `/arc-ingest` (the webhook already DELIVERED this verdict
+    // ~99M times while the handler counted-and-discarded it) and by the
+    // retire classifier's own poll. EVIDENCE, not a verdict: a row here never
+    // retires anything by itself — retirement additionally requires the
+    // multi-source absence bar (#212/#213/#214: one provider's word is never
+    // a negative). Write-once per txid (INSERT OR IGNORE — first verdict
+    // wins; `extra` keeps the reason text, e.g. the UTXO_SPENT competitor).
+    "CREATE TABLE IF NOT EXISTS arc_terminal (
+        txid TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        extra TEXT,
+        first_ms INTEGER NOT NULL
+    )",
+    // `transactions.retired_ms/-reason`: the `transactions`-store twin of
+    // pot_beefs.structurally_unprovable (#2b above) — a row PROVEN network-dead
+    // (corroborated terminal verdict + both-indexer definitive 404) leaves
+    // every retry pool (proof poll, rebroadcast backstop, proofless watch)
+    // but is NEVER deleted: bytes stay stored and served. NULL = live (the
+    // fail-safe direction: poll more). Additive ALTERs — the runner ignores
+    // the re-run "duplicate column" error (`migration_error_is_benign`).
+    "ALTER TABLE transactions ADD COLUMN retired_ms INTEGER",
+    "ALTER TABLE transactions ADD COLUMN retired_reason TEXT",
+    // `rebroadcast_state`: per-txid attempt ledger for the #273 rebroadcast
+    // backstop. The incident's smell was RETRY-FOREVER (a definitively
+    // REJECTED subject was re-presented every 15 min for 14 days, identical
+    // to a transport blip); every attempt now lands here and candidacy is
+    // gated on attempts + spacing (`rebroadcast_eligible`). Rows are state,
+    // not history — one per txid, upserted per attempt.
+    "CREATE TABLE IF NOT EXISTS rebroadcast_state (
+        txid TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_ms INTEGER NOT NULL,
+        last_outcome TEXT
+    )",
 ];
 
 // =============================================================================

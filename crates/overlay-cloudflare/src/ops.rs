@@ -181,6 +181,90 @@ pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
     }
 }
 
+/// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — how many status-ignored callbacks
+/// accumulate per isolate before one billed counter write flushes them.
+///
+/// The per-callback `bump_counter` was the billing site: every webhook did one
+/// D1 UPSERT on the same `ops_counters` row (~370/s sustained ≈ $28/day of
+/// rows-written for a CHATTER counter whose whole job is "the stream is
+/// alive"). Batching trades exactness for cost: up to `BATCH-1` events per
+/// isolate are uncounted at eviction, which the counter's consumers
+/// (`arc_ingest_push_health`, an operator eyeballing deltas) never needed.
+/// The first [`STATUS_IGNORED_EXACT_HEAD`] events per isolate still flush
+/// IMMEDIATELY — the route tier pins "an authorized callback visibly counts"
+/// (Rule 13: accepted and silently-dropped must never look alike), and at
+/// trickle volume (the normal state) exactness is what an operator actually
+/// reads. Batching engages only once one isolate has seen flood-scale
+/// volume, which is precisely when per-event exactness stops meaning
+/// anything and starts costing $28/day. The 401 counters and
+/// `arc_ingest_pushed_total` stay EXACT — they are rare and diagnostic.
+pub const STATUS_IGNORED_FLUSH_BATCH: u32 = 256;
+/// Events per isolate counted exactly (one write each) before batching.
+pub const STATUS_IGNORED_EXACT_HEAD: u32 = 8;
+
+thread_local! {
+    /// Workers isolates are single-threaded. `(seen, pending)`: `seen` =
+    /// lifetime events in this isolate (saturating), `pending` = events not
+    /// yet flushed.
+    static STATUS_IGNORED_STATE: std::cell::Cell<(u32, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// PURE fold for one ignored-status event: `(seen, pending)` before →
+/// `((seen, pending) after, rows_to_flush_now)`. The first
+/// [`STATUS_IGNORED_EXACT_HEAD`] events each flush 1 (exact); past the head
+/// every [`STATUS_IGNORED_FLUSH_BATCH`]th accumulated event flushes the
+/// accumulation.
+pub fn status_ignored_step(state: (u32, u32)) -> ((u32, u32), u64) {
+    let (seen, pending) = state;
+    let seen = seen.saturating_add(1);
+    if seen <= STATUS_IGNORED_EXACT_HEAD {
+        return ((seen, pending), 1);
+    }
+    let p = pending + 1;
+    if p >= STATUS_IGNORED_FLUSH_BATCH {
+        ((seen, 0), u64::from(p))
+    } else {
+        ((seen, p), 0)
+    }
+}
+
+/// Count one ignored status callback (see [`STATUS_IGNORED_FLUSH_BATCH`]):
+/// exact for the first [`STATUS_IGNORED_EXACT_HEAD`] events per isolate,
+/// batched past that.
+pub async fn bump_status_ignored_batched(db: &D1Database) {
+    let flush = STATUS_IGNORED_STATE.with(|c| {
+        let (next, flush) = status_ignored_step(c.get());
+        c.set(next);
+        flush
+    });
+    if flush > 0 {
+        bump_counter(db, COUNTER_ARC_INGEST_STATUS_IGNORED, flush).await;
+    }
+}
+
+/// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — record a courier-delivered TERMINAL
+/// broadcast verdict (REJECTED / DOUBLE_SPEND_ATTEMPTED) as evidence.
+///
+/// Write-once per txid (INSERT OR IGNORE: the first verdict wins, and the
+/// ~7/s repeat deliveries for a wedged txid write ZERO rows — an ignored
+/// insert is not a billed row write). This is EVIDENCE for the retire
+/// classifier, never a verdict by itself: #214 stands — an async REJECTED is
+/// authoritative only once corroborated (both-indexer definitive absence,
+/// `proof_fetcher::retire_verdict`).
+pub async fn record_arc_terminal(db: &D1Database, txid: &str, status: &str, extra: Option<&str>) {
+    let q = Query::new(
+        "INSERT OR IGNORE INTO arc_terminal (txid, status, extra, first_ms) VALUES (?, ?, ?, ?)",
+    )
+    .bind(txid)
+    .bind(status)
+    .bind(extra.unwrap_or(""))
+    .bind(now_ms());
+    if let Err(e) = q.execute(db).await {
+        worker::console_log!("[ops] arc_terminal record failed for {txid}: {e}");
+    }
+}
+
 /// Refresh the proofless first-seen ledger and return the count of txids
 /// flagged (proofless > 24h). Best-effort throughout.
 ///
@@ -232,13 +316,14 @@ pub async fn refresh_proofless_watch(db: &D1Database) -> u64 {
 /// (`IS NOT 1` — NULL/pre-migration rows still enrol, fail-safe toward
 /// watching MORE): a retired row is RESIDUE, not backlog, and enrolling it
 /// would keep `prooflessOver24h` unable to tell the two apart. The
-/// `transactions` store has no such column (a pot settle/refund admits no
-/// outputs, so the superseded class never reaches that table).
+/// `transactions` page excludes `retired_ms`-latched rows for the same
+/// reason (INCIDENT D1-CALLBACK-FLOOD 2026-09-01: that store's retirement
+/// twin — corroborated network-dead, e.g. a UTXO_SPENT double-spend).
 pub(crate) fn proofless_watch_enrol_sql(table: &str) -> String {
     let unprovable_clause = if table == "pot_beefs" {
         " AND structurally_unprovable IS NOT 1"
     } else {
-        ""
+        " AND retired_ms IS NULL"
     };
     format!(
         "INSERT OR IGNORE INTO proofless_watch (txid, first_seen_ms) \
@@ -248,12 +333,21 @@ pub(crate) fn proofless_watch_enrol_sql(table: &str) -> String {
 }
 
 /// SHIPPED proofless-watch GC: drop txids that have since PROVEN in either
-/// store, or were RETIRED structurally unprovable (#2b) — both are "no
-/// longer genuine backlog", which is the only thing the 24h flag may count.
+/// store, or were RETIRED (structurally unprovable in `pot_beefs` — #2b —
+/// or corroborated network-dead in `transactions` — INCIDENT
+/// D1-CALLBACK-FLOOD 2026-09-01), or are ORPHANS — rows with NO backing row
+/// in EITHER store. The orphan arm closes the incident's zombie class: 9 of
+/// beta's 27 flagged rows pointed at store rows that displacement/cleanup
+/// had deleted, and the old GC (proven-only) could never release them, so
+/// `prooflessOver24h` counted ghosts forever. All four arms are "no longer
+/// genuine backlog", which is the only thing the 24h flag may count.
 pub(crate) const PROOFLESS_WATCH_GC_SQL: &str = "DELETE FROM proofless_watch WHERE \
      txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1) OR \
      txid IN (SELECT txid FROM transactions WHERE has_proof = 1) OR \
-     txid IN (SELECT txid FROM pot_beefs WHERE structurally_unprovable = 1)";
+     txid IN (SELECT txid FROM pot_beefs WHERE structurally_unprovable = 1) OR \
+     txid IN (SELECT txid FROM transactions WHERE retired_ms IS NOT NULL) OR \
+     (txid NOT IN (SELECT txid FROM pot_beefs) AND \
+      txid NOT IN (SELECT txid FROM transactions))";
 
 /// Count proofless_watch rows first seen before `cutoff_ms`.
 async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
@@ -499,6 +593,25 @@ pub async fn health_invariants(
             .ok()
             .flatten()
             .map_or(-1, |r| r.c.max(0.0) as i64);
+    // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the two new Rule-13 surfaces.
+    // `arcTerminalTotal` = distinct txids with a courier-delivered terminal
+    // verdict on record (evidence intake is ALIVE); `txRetiredTotal` = the
+    // `transactions` rows retired on corroborated evidence (where the
+    // incident's retry-forever population went). -1 = table unreadable
+    // (pre-migration isolate), distinct from a real 0.
+    let arc_terminal_total: i64 = Query::new("SELECT COUNT(*) AS c FROM arc_terminal")
+        .fetch_optional::<CountRow>(db)
+        .await
+        .ok()
+        .flatten()
+        .map_or(-1, |r| r.c.max(0.0) as i64);
+    let tx_retired_total: i64 =
+        Query::new("SELECT COUNT(*) AS c FROM transactions WHERE retired_ms IS NOT NULL")
+            .fetch_optional::<CountRow>(db)
+            .await
+            .ok()
+            .flatten()
+            .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
     let body = json!({
@@ -525,6 +638,9 @@ pub async fn health_invariants(
         "prooflessOver24h": flagged,
         // #2b: where the residue went (live count; -1 = table unreadable).
         "retiredUnprovableTotal": retired_unprovable_total,
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 (both -1 = unreadable):
+        "arcTerminalTotal": arc_terminal_total,
+        "txRetiredTotal": tx_retired_total,
         // #371: lifetime network_seen latch count (-1 = table unreadable).
         "networkSeenTotal": network_seen_total,
         // #347 soak signal (Rule 6c closure criterion 3): `unauthenticatedUngated`
@@ -643,6 +759,87 @@ mod tests {
         conn.execute(PROOFLESS_WATCH_GC_SQL, []).unwrap();
         assert!(!watched("backlog"), "the GC drops retired rows");
         assert!(watched("enginetx"), "genuine backlog survives the GC");
+
+        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — the two new arms.
+        //
+        // (1) A `transactions` row retired on corroborated network-death
+        // (`retired_ms`) stops enrolling AND is dropped if already watched —
+        // the 11 UTXO_SPENT double-spends sat flagged for weeks.
+        conn.execute(
+            "UPDATE transactions SET retired_ms = 1, retired_reason = 'test' \
+             WHERE txid = 'enginetx'",
+            [],
+        )
+        .unwrap();
+        conn.execute(PROOFLESS_WATCH_GC_SQL, []).unwrap();
+        assert!(
+            !watched("enginetx"),
+            "a retired transactions row is residue, not backlog"
+        );
+        conn.execute(
+            &proofless_watch_enrol_sql("transactions"),
+            rusqlite::params![2_000i64],
+        )
+        .unwrap();
+        assert!(
+            !watched("enginetx"),
+            "a retired transactions row never re-enrols"
+        );
+        // (2) ORPHANS: a watch row whose store row was deleted (displacement
+        // / cleanup) could NEVER leave under the proven-only GC — 9 of beta's
+        // 27 flagged rows were exactly this zombie class. The orphan arm
+        // drops it; rows with a live store row are untouched.
+        conn.execute_batch(
+            "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES ('ghost', 1); \
+             INSERT INTO pot_beefs (txid, beef, has_proof) VALUES ('alive', x'beef', 0); \
+             INSERT INTO proofless_watch (txid, first_seen_ms) VALUES ('alive', 1);",
+        )
+        .unwrap();
+        conn.execute(PROOFLESS_WATCH_GC_SQL, []).unwrap();
+        assert!(!watched("ghost"), "an orphan watch row is GC'd");
+        assert!(watched("alive"), "a store-backed row survives the orphan arm");
+    }
+
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the status-ignored counter's
+    /// exact-head-then-batch fold — the first [`STATUS_IGNORED_EXACT_HEAD`]
+    /// events each write (the route tier's Rule-13 pin: an authorized
+    /// callback visibly counts), then writes happen once per
+    /// [`STATUS_IGNORED_FLUSH_BATCH`] with no events lost between flushes.
+    #[test]
+    fn status_ignored_fold_exact_head_then_batch() {
+        let mut state = (0u32, 0u32);
+        let mut written = 0u64;
+        // Head: every event flushes exactly 1.
+        for i in 1..=STATUS_IGNORED_EXACT_HEAD {
+            let (next, flush) = status_ignored_step(state);
+            state = next;
+            assert_eq!(flush, 1, "head event {i} must count exactly");
+            written += flush;
+        }
+        assert_eq!(written, u64::from(STATUS_IGNORED_EXACT_HEAD));
+        // Past the head: silence until the batch fills, then one flush of the
+        // full accumulation — nothing lost.
+        let mut post_head_events = 0u64;
+        let mut flushed_after_head = 0u64;
+        loop {
+            let (next, flush) = status_ignored_step(state);
+            state = next;
+            post_head_events += 1;
+            flushed_after_head += flush;
+            if flush > 0 {
+                assert_eq!(
+                    flush,
+                    u64::from(STATUS_IGNORED_FLUSH_BATCH),
+                    "the batch flush carries the whole accumulation"
+                );
+                break;
+            }
+        }
+        assert_eq!(post_head_events, u64::from(STATUS_IGNORED_FLUSH_BATCH));
+        assert_eq!(flushed_after_head, post_head_events, "no event is lost");
+        // Saturation safety at absurd lifetimes.
+        let (_, flush) = status_ignored_step((u32::MAX, 0));
+        assert_eq!(flush, 0);
     }
 
     #[test]

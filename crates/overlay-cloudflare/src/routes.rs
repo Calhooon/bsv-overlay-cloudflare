@@ -1595,10 +1595,18 @@ pub(crate) enum ArcIngestBody {
         merkle_path: String,
         block_height: Option<u32>,
     },
-    /// A non-MINED lifecycle callback (`X-FullStatusUpdates: true` — e.g.
-    /// SEEN_ON_NETWORK) — carries NO merklePath. Acknowledged and ignored
-    /// (2xx, counted), never a parse error.
-    StatusOnly { txid: String, tx_status: String },
+    /// A non-MINED lifecycle callback — carries NO merklePath. Acknowledged
+    /// (2xx, counted), never a parse error. A TERMINAL status (REJECTED /
+    /// DOUBLE_SPEND_ATTEMPTED) is additionally RECORDED as evidence with its
+    /// `extraInfo` reason text (INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the
+    /// webhook delivered the terminal verdict ~99M times while this handler
+    /// counted-and-discarded it, so nothing downstream could ever stop
+    /// retrying the dead tx).
+    StatusOnly {
+        txid: String,
+        tx_status: String,
+        extra_info: Option<String>,
+    },
 }
 
 /// Parse + classify an `/arc-ingest` body (#228). A missing/empty/whitespace
@@ -1616,6 +1624,8 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
         block_height: Option<u32>,
         #[serde(rename = "txStatus", default)]
         tx_status: Option<String>,
+        #[serde(rename = "extraInfo", default)]
+        extra_info: Option<String>,
     }
 
     let body: Body = serde_json::from_str(raw).map_err(|e| e.to_string())?;
@@ -1628,6 +1638,7 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
         _ => Ok(ArcIngestBody::StatusOnly {
             txid: body.txid,
             tx_status: body.tx_status.unwrap_or_default(),
+            extra_info: body.extra_info,
         }),
     }
 }
@@ -1713,17 +1724,41 @@ pub async fn arc_ingest(
     }
 
     let (merkle_path, block_height) = match body {
-        // #228 fix: a non-MINED lifecycle callback is NORMAL webhook traffic
-        // (we register X-FullStatusUpdates:true), not an error. Acknowledge
-        // (2xx), count, ignore — no proof means nothing to verify or stitch.
-        ArcIngestBody::StatusOnly { tx_status, .. } => {
+        // #228 fix: a non-MINED lifecycle callback is NORMAL webhook traffic,
+        // not an error. Acknowledge (2xx), count, and — INCIDENT
+        // D1-CALLBACK-FLOOD 2026-09-01 — CONSUME a terminal verdict instead of
+        // discarding it: REJECTED / DOUBLE_SPEND_ATTEMPTED is recorded once
+        // per txid into `arc_terminal` (evidence for the retire classifier —
+        // #214 still requires corroboration before anything acts on it). The
+        // ignored-counter write is exact for the first
+        // `STATUS_IGNORED_EXACT_HEAD` events per isolate, then BATCHED
+        // (`STATUS_IGNORED_FLUSH_BATCH`): the old per-callback UPSERT was
+        // the incident's billing site
+        // (~370 webhooks/s × one hot-row D1 write each ≈ $28/day). Always
+        // 200 — a non-2xx would make the courier RE-deliver, amplifying the
+        // very flood this fixes.
+        ArcIngestBody::StatusOnly {
+            tx_status,
+            extra_info,
+            ..
+        } => {
             worker::console_log!(
                 "POST /arc-ingest txid={txid} status-only ({}) -> 200 (acknowledged, no merklePath)",
                 if tx_status.is_empty() { "?" } else { &tx_status }
             );
             if let Some(db) = ops_db {
-                crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_STATUS_IGNORED, 1)
+                let status_upper = tx_status.to_ascii_uppercase();
+                if crate::broadcaster::ARCADE_FATAL_STATUSES.contains(&status_upper.as_str()) {
+                    crate::ops::record_arc_terminal(
+                        db,
+                        &txid,
+                        &status_upper,
+                        extra_info.as_deref(),
+                    )
                     .await;
+                } else {
+                    crate::ops::bump_status_ignored_batched(db).await;
+                }
             }
             return json_ok(&SuccessBody {
                 status: "success",
@@ -3411,12 +3446,55 @@ mod tests {
             format!(r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK","merklePath":"  "}}"#),
         ] {
             match classify_arc_ingest_body(&body).unwrap() {
-                ArcIngestBody::StatusOnly { txid, tx_status } => {
+                ArcIngestBody::StatusOnly {
+                    txid, tx_status, ..
+                } => {
                     assert_eq!(txid, CB_TXID);
                     assert!(!tx_status.is_empty(), "{body}");
                 }
                 other => panic!("status callback must be StatusOnly, got {other:?} for {body}"),
             }
+        }
+    }
+
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01: a terminal-status callback
+    /// carries its `extraInfo` reason through classification (the handler
+    /// records it as evidence — e.g. the UTXO_SPENT competitor txid) and its
+    /// status matches the broadcaster's fatal set case-insensitively.
+    #[test]
+    fn arc_ingest_terminal_status_carries_extra_info_and_matches_fatal_set() {
+        let body = format!(
+            r#"{{"txid":"{CB_TXID}","txStatus":"REJECTED","extraInfo":"UTXO_SPENT (70): spent by deadbeef"}}"#
+        );
+        match classify_arc_ingest_body(&body).unwrap() {
+            ArcIngestBody::StatusOnly {
+                txid,
+                tx_status,
+                extra_info,
+            } => {
+                assert_eq!(txid, CB_TXID);
+                assert!(crate::broadcaster::ARCADE_FATAL_STATUSES
+                    .contains(&tx_status.to_ascii_uppercase().as_str()));
+                assert_eq!(
+                    extra_info.as_deref(),
+                    Some("UTXO_SPENT (70): spent by deadbeef")
+                );
+            }
+            other => panic!("terminal status must be StatusOnly, got {other:?}"),
+        }
+        // …and a non-terminal status carries None without becoming fatal.
+        let seen = format!(r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK"}}"#);
+        match classify_arc_ingest_body(&seen).unwrap() {
+            ArcIngestBody::StatusOnly {
+                tx_status,
+                extra_info,
+                ..
+            } => {
+                assert!(!crate::broadcaster::ARCADE_FATAL_STATUSES
+                    .contains(&tx_status.to_ascii_uppercase().as_str()));
+                assert_eq!(extra_info, None);
+            }
+            other => panic!("got {other:?}"),
         }
     }
 
