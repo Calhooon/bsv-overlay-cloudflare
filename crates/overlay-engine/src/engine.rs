@@ -1009,7 +1009,9 @@ impl Engine {
             let all_topics_dupe = !validations.is_empty() && validations.iter().all(|v| v.is_dupe);
             if let Some(ref arc) = self.arc_broadcaster {
                 if all_topics_dupe {
-                    info!("Skipping ARC broadcast — tx already applied to every topic (re-present)");
+                    info!(
+                        "Skipping ARC broadcast — tx already applied to every topic (re-present)"
+                    );
                 } else if tx.merkle_path.is_none() {
                     let raw_tx_hex = tx.to_hex();
                     match arc.broadcast(&raw_tx_hex).await {
@@ -5870,7 +5872,9 @@ mod tests {
     impl Storage for FaultingStorage {
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
             if self.fail_insert_output.get() {
-                return Err(StorageError::Database("D1_ERROR: storage overloaded".into()));
+                return Err(StorageError::Database(
+                    "D1_ERROR: storage overloaded".into(),
+                ));
             }
             self.inner.insert_output(output).await
         }
@@ -5888,7 +5892,9 @@ mod tests {
             output_index: u32,
             topic: &str,
         ) -> Result<(), StorageError> {
-            self.inner.mark_utxo_as_spent(txid, output_index, topic).await
+            self.inner
+                .mark_utxo_as_spent(txid, output_index, topic)
+                .await
         }
         async fn update_consumed_by(
             &self,
@@ -6069,7 +6075,11 @@ mod tests {
             .submit_with_report(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
             .await
             .unwrap();
-        assert_eq!(steak["tm_test"].outputs_to_admit, vec![0], "re-validated, not deduped");
+        assert_eq!(
+            steak["tm_test"].outputs_to_admit,
+            vec![0],
+            "re-validated, not deduped"
+        );
         assert!(replay.is_durable(), "{}", replay.summary());
         assert_eq!(replay.applied_topics, vec!["tm_test".to_string()]);
         assert!(applied(&storage).await);
@@ -6131,7 +6141,10 @@ mod tests {
             "{}",
             faulted.summary()
         );
-        assert!(!applied(&storage).await, "unrecorded: the replay must re-read");
+        assert!(
+            !applied(&storage).await,
+            "unrecorded: the replay must re-read"
+        );
         storage.fail_find_output.set(false);
         assert!(
             storage

@@ -1386,9 +1386,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     //    — 3 lifetime attempts, spacing 1h/6h, dead-letter log at the cap).
     let tx_storage = D1Storage::new(ops_db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-    let rb =
-        crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
-            .await;
+    let rb = crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
+        .await;
     worker::console_log!(
         "Scheduled: rebroadcast-backstop (transactions) — scanned={} present={} \
          inconclusive={} rebroadcast={} failed={} budget_skipped={} attempted={}",
@@ -1771,9 +1770,8 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     //     the incident's attempt cap; see the scheduled block's note.
     let tx_storage = D1Storage::new(db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-    let rb =
-        crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
-            .await;
+    let rb = crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
+        .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;

@@ -519,10 +519,10 @@ impl Storage for D1Storage {
             "UPDATE transactions SET has_proof = 1, retired_ms = NULL, retired_reason = NULL \
              WHERE txid = ?",
         )
-            .bind(txid)
-            .execute(&self.db)
-            .await
-            .map_err(d1_err)
+        .bind(txid)
+        .execute(&self.db)
+        .await
+        .map_err(d1_err)
     }
 
     async fn update_output_block_height(
@@ -876,9 +876,9 @@ mod tests {
         insert("agedout", Some(now - 15 * 24 * 3600), 0); // > max age
         insert("nullstamp", None, 0); // pre-migration ⇒ ancient
         insert("proven", Some(now - 3600), 1); // already proven
-        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: an in-bracket row RETIRED on
-        // corroborated network-death leaves candidacy (it used to be
-        // re-presented every 15 min for the whole 14-day bracket).
+                                               // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: an in-bracket row RETIRED on
+                                               // corroborated network-death leaves candidacy (it used to be
+                                               // re-presented every 15 min for the whole 14-day bracket).
         insert("deadretired", Some(now - 3600), 0);
         conn.execute(
             "UPDATE transactions SET retired_ms = 1, retired_reason = 'test' \
@@ -977,7 +977,11 @@ mod tests {
             .unwrap();
         assert_eq!(retired, Some(77), "a re-present must not un-retire");
         assert_eq!(reason.as_deref(), Some("dead"));
-        assert_eq!(created, created0 - 500, "created_at preserve-or-stamp holds");
+        assert_eq!(
+            created,
+            created0 - 500,
+            "created_at preserve-or-stamp holds"
+        );
         // The verified-stitch upsert preserves the latch while still
         // proofless (a re-stitch of unproven bytes is not proof of life)…
         conn.execute(
@@ -992,7 +996,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(retired_still, Some(77), "an unproven re-stitch keeps the latch");
+        assert_eq!(
+            retired_still,
+            Some(77),
+            "an unproven re-stitch keeps the latch"
+        );
         // …and CONFIRM BEATS THE LATCH: a stitch landing has_proof = 1 clears
         // it (the pot_beefs #2b rule mirrored) — as does `mark_transaction_proven`.
         conn.execute(

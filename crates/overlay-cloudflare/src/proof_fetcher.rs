@@ -2283,10 +2283,7 @@ pub fn rebroadcast_eligible(attempts: i64, last_ms: i64, now_ms: i64) -> bool {
         return false;
     }
     let idx = usize::try_from(attempts - 1).unwrap_or(usize::MAX);
-    let spacing = REBROADCAST_SPACING_MS
-        .get(idx)
-        .copied()
-        .unwrap_or(i64::MAX);
+    let spacing = REBROADCAST_SPACING_MS.get(idx).copied().unwrap_or(i64::MAX);
     now_ms.saturating_sub(last_ms) >= spacing
 }
 
@@ -2507,8 +2504,7 @@ pub(crate) const RETIRE_CANDIDATES_POT_BEEFS_SQL: &str = "SELECT w.txid AS txid,
 pub(crate) const RETIRE_TRANSACTIONS_SQL: &str =
     "UPDATE transactions SET retired_ms = ?1, retired_reason = ?2 \
      WHERE txid = ?3 AND has_proof = 0 AND retired_ms IS NULL";
-pub(crate) const RETIRE_POT_BEEFS_SQL: &str =
-    "UPDATE pot_beefs SET structurally_unprovable = 1 \
+pub(crate) const RETIRE_POT_BEEFS_SQL: &str = "UPDATE pot_beefs SET structurally_unprovable = 1 \
      WHERE txid = ?1 AND has_proof = 0";
 
 #[derive(serde::Deserialize)]
@@ -2536,17 +2532,14 @@ pub async fn run_retire_pass(
         (RETIRE_CANDIDATES_TRANSACTIONS_SQL, "transactions"),
         (RETIRE_CANDIDATES_POT_BEEFS_SQL, "pot_beefs"),
     ] {
-        let rows: Vec<RetireCandidateRow> = match Query::new(candidates_sql)
-            .bind(now)
-            .fetch_all(db)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                worker::console_log!("[retire] candidate scan ({store}) failed: {e}");
-                continue;
-            }
-        };
+        let rows: Vec<RetireCandidateRow> =
+            match Query::new(candidates_sql).bind(now).fetch_all(db).await {
+                Ok(r) => r,
+                Err(e) => {
+                    worker::console_log!("[retire] candidate scan ({store}) failed: {e}");
+                    continue;
+                }
+            };
         for row in rows {
             summary.scanned += 1;
             let webhook_evidence = row
@@ -2824,7 +2817,10 @@ mod tests {
     fn rebroadcast_eligible_caps_and_spaces() {
         let now = 10_000_000_000i64;
         assert!(rebroadcast_eligible(0, 0, now), "first attempt is free");
-        assert!(rebroadcast_eligible(0, now, now), "attempts=0 ignores last_ms");
+        assert!(
+            rebroadcast_eligible(0, now, now),
+            "attempts=0 ignores last_ms"
+        );
         // Attempt 2 needs 1 h since the first.
         assert!(!rebroadcast_eligible(1, now - 3_599_000, now));
         assert!(rebroadcast_eligible(1, now - 3_600_000, now));
@@ -2849,18 +2845,34 @@ mod tests {
         let r = retire_verdict(&fatal, Some(false), Some(false), old).expect("retire");
         assert!(r.starts_with("arcade REJECTED: UTXO_SPENT"), "{r}");
         // Too young → keep, even with a full terminal + absence bar.
-        assert_eq!(retire_verdict(&fatal, Some(false), Some(false), old - 1), None);
+        assert_eq!(
+            retire_verdict(&fatal, Some(false), Some(false), old - 1),
+            None
+        );
         // Arcade Present → keep, whatever the indexers say.
-        assert_eq!(retire_verdict(&ArcadeLook::Present, Some(false), Some(false), ancient), None);
+        assert_eq!(
+            retire_verdict(&ArcadeLook::Present, Some(false), Some(false), ancient),
+            None
+        );
         // Any indexer holding it → keep; one-sided 404 / fault → keep.
-        assert_eq!(retire_verdict(&fatal, Some(true), Some(false), ancient), None);
+        assert_eq!(
+            retire_verdict(&fatal, Some(true), Some(false), ancient),
+            None
+        );
         assert_eq!(retire_verdict(&fatal, Some(false), None, ancient), None);
         assert_eq!(retire_verdict(&fatal, None, Some(false), ancient), None);
         // Arcade FAULT never retires, however absent and old.
-        assert_eq!(retire_verdict(&ArcadeLook::Fault, Some(false), Some(false), ancient), None);
+        assert_eq!(
+            retire_verdict(&ArcadeLook::Fault, Some(false), Some(false), ancient),
+            None
+        );
         // Arcade 404 + both indexers 404: only past the 48 h bar.
-        assert_eq!(retire_verdict(&ArcadeLook::Missing, Some(false), Some(false), ancient - 1), None);
-        let r = retire_verdict(&ArcadeLook::Missing, Some(false), Some(false), ancient).expect("retire");
+        assert_eq!(
+            retire_verdict(&ArcadeLook::Missing, Some(false), Some(false), ancient - 1),
+            None
+        );
+        let r = retire_verdict(&ArcadeLook::Missing, Some(false), Some(false), ancient)
+            .expect("retire");
         assert!(r.starts_with("network-absent"), "{r}");
     }
 
@@ -2870,10 +2882,19 @@ mod tests {
     #[test]
     fn fold_arcade_look_live_answer_wins_over_webhook_evidence() {
         let plant = Some(("REJECTED".to_string(), "planted".to_string()));
-        assert_eq!(fold_arcade_look(ArcadeLook::Present, plant.clone()), ArcadeLook::Present);
-        assert_eq!(fold_arcade_look(ArcadeLook::Missing, plant.clone()), ArcadeLook::Missing);
+        assert_eq!(
+            fold_arcade_look(ArcadeLook::Present, plant.clone()),
+            ArcadeLook::Present
+        );
+        assert_eq!(
+            fold_arcade_look(ArcadeLook::Missing, plant.clone()),
+            ArcadeLook::Missing
+        );
         let live_fatal = ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "live".into());
-        assert_eq!(fold_arcade_look(live_fatal.clone(), plant.clone()), live_fatal);
+        assert_eq!(
+            fold_arcade_look(live_fatal.clone(), plant.clone()),
+            live_fatal
+        );
         // Only an unreachable Arcade lets the recorded evidence speak.
         assert_eq!(
             fold_arcade_look(ArcadeLook::Fault, plant),

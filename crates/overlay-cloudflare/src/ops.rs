@@ -797,7 +797,10 @@ mod tests {
         .unwrap();
         conn.execute(PROOFLESS_WATCH_GC_SQL, []).unwrap();
         assert!(!watched("ghost"), "an orphan watch row is GC'd");
-        assert!(watched("alive"), "a store-backed row survives the orphan arm");
+        assert!(
+            watched("alive"),
+            "a store-backed row survives the orphan arm"
+        );
     }
 
     /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the status-ignored counter's

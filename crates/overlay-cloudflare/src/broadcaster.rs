@@ -1986,12 +1986,34 @@ impl ArcadeBroadcaster {
         // on the echoed txid), so this is the same verdict cheaper, not a
         // weaker one. A probe miss (unknown/orphan/fatal/transport) changes
         // nothing — the ladder runs exactly as before.
-        if self.network_witnessed(subject_txid).await {
+        let probe = self.tx_status(subject_txid).await;
+        let probe_is_subject = probe
+            .as_ref()
+            .is_some_and(|r| r.txid.eq_ignore_ascii_case(subject_txid));
+        let probe_status = probe.as_ref().map(|r| r.tx_status.as_str()).unwrap_or("");
+        if probe_is_subject
+            && matches!(
+                classify_arcade_status(probe_status, ARCADE_GATE_STATUS),
+                GateVerdict::Reached
+            )
+        {
             gate_log(&format!(
                 "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe) — ladder + callback re-registration skipped"
             ));
             // Payload contract: `Accepted` carries the txid.
             return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+        }
+        // REGISTER ONCE PER TXID: a subject Arcade already holds (pending,
+        // orphan, or terminal) has its callback registered from its first
+        // presentation, and Arcade accumulates a fresh registration per POST
+        // — the incident's fuel. Only a subject Arcade does not know gets the
+        // callback headers on this ladder. The ladder itself still runs (a
+        // re-present with ancestry can turn an orphan into an accept).
+        let register_callback = !probe_is_subject;
+        if !register_callback {
+            gate_log(&format!(
+                "[arcade] {subject_txid} already known to Arcade — re-presenting WITHOUT callback re-registration"
+            ));
         }
 
         broadcast_efs_gated_with(
@@ -2008,6 +2030,7 @@ impl ArcadeBroadcaster {
                             subject_txid,
                             1,
                             if graced { ARCADE_SEEN_GRACE_MS } else { ARCADE_WAIT_TIMEOUT_MS },
+                            register_callback,
                         )
                         .await
                     }
@@ -2019,6 +2042,7 @@ impl ArcadeBroadcaster {
                             subject_txid,
                             efs.len(),
                             ARCADE_WAIT_TIMEOUT_MS,
+                            register_callback,
                         )
                         .await
                     }
@@ -2060,8 +2084,12 @@ impl ArcadeBroadcaster {
         subject_txid: &str,
         batch_len: usize,
         poll_budget_ms: u64,
+        register_callback: bool,
     ) -> Result<GateStep, String> {
-        let submit_body = match submit_entry(self.submit_ef(endpoint, subject_txid, body).await) {
+        let submit_body = match submit_entry(
+            self.submit_ef(endpoint, subject_txid, body, register_callback)
+                .await,
+        ) {
             SubmitEntry::Proceed(b) => b,
             SubmitEntry::Step(step) => return Ok(step),
             SubmitEntry::Transport(e) => return Err(e),
@@ -2115,13 +2143,22 @@ impl ArcadeBroadcaster {
     /// definitive per-tx rejection ([`SubmitOutcome::SyncRejected`]), NOT
     /// transport. Genuine transport failures (5xx, auth, misroute, 429,
     /// timeouts, connection errors) stay [`SubmitOutcome::Transport`].
-    async fn submit_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> SubmitOutcome {
+    async fn submit_ef(
+        &self,
+        endpoint: &str,
+        token: &str,
+        body: &[u8],
+        register_callback: bool,
+    ) -> SubmitOutcome {
         // #413 instrumentation (2026-08-26): the phantom forensics found an
         // arcade POST answering in 34 ms with no record ever created, and the
         // leg's status/latency was invisible in every log. One line per POST:
         // cheap, and the next anomaly names itself.
         let t0 = worker::js_sys::Date::now();
-        let out = match self.post_ef_raw(endpoint, token, body).await {
+        let out = match self
+            .post_ef_raw(endpoint, token, body, register_callback)
+            .await
+        {
             Ok((status, text)) => {
                 gate_log(&format!(
                     "[arcade] POST {} → HTTP {status} in {:.0}ms ({} bytes sent, body head: {})",
@@ -2155,6 +2192,7 @@ impl ArcadeBroadcaster {
         endpoint: &str,
         token: &str,
         body: &[u8],
+        register_callback: bool,
     ) -> Result<(u16, String), String> {
         use worker::js_sys::Uint8Array;
 
@@ -2163,20 +2201,26 @@ impl ArcadeBroadcaster {
         let _ = headers.set("User-Agent", OVERLAY_USER_AGENT);
         // Subject txid doubles as the callback token — scopes the status stream
         // and (P2.5) authenticates the MINED webhook to /arc-ingest.
-        let _ = headers.set("X-CallbackToken", token);
-        // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: `X-FullStatusUpdates: true`
-        // is GONE. It subscribed every registration to every lifecycle flip,
-        // and nothing consumed those: the SEEN gate POLLS `GET /tx/{txid}`
-        // (never the webhook), and `/arc-ingest` discards non-MINED bodies.
-        // Meanwhile Arcade's retry engine, wedged on ~51 network-invalid txs
-        // (retryCount 1,483 and climbing on a tx whose extraInfo already said
-        // "giving up"), fanned EVERY flip to EVERY registration accumulated
-        // by re-presents — ~370 webhooks/s, 32M/day, ~$37/day. Default
-        // registrations still deliver the two statuses we act on: MINED
-        // (the merklePath push) and the terminal verdicts `/arc-ingest` now
-        // records. Never reintroduce full-status without a consumer.
-        if let Some(ref cb) = self.callback_url {
-            let _ = headers.set("X-CallbackUrl", cb);
+        // `register_callback == false` (INCIDENT D1-CALLBACK-FLOOD 2026-09-01:
+        // a re-present of a subject Arcade already holds) sends NEITHER
+        // callback header: Arcade accumulates one registration per POST, and
+        // the first presentation already registered this txid.
+        if register_callback {
+            let _ = headers.set("X-CallbackToken", token);
+            // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: `X-FullStatusUpdates: true`
+            // is GONE. It subscribed every registration to every lifecycle flip,
+            // and nothing consumed those: the SEEN gate POLLS `GET /tx/{txid}`
+            // (never the webhook), and `/arc-ingest` discards non-MINED bodies.
+            // Meanwhile Arcade's retry engine, wedged on ~51 network-invalid txs
+            // (retryCount 1,483 and climbing on a tx whose extraInfo already said
+            // "giving up"), fanned EVERY flip to EVERY registration accumulated
+            // by re-presents — ~370 webhooks/s, 32M/day, ~$37/day. Default
+            // registrations still deliver the two statuses we act on: MINED
+            // (the merklePath push) and the terminal verdicts `/arc-ingest` now
+            // records. Never reintroduce full-status without a consumer.
+            if let Some(ref cb) = self.callback_url {
+                let _ = headers.set("X-CallbackUrl", cb);
+            }
         }
 
         let mut init = worker::RequestInit::new();
@@ -2201,7 +2245,9 @@ impl ArcadeBroadcaster {
     /// (the engine treats it as non-fatal). The money path uses
     /// [`submit_once_and_gate`](Self::submit_once_and_gate).
     async fn post_ef(&self, endpoint: &str, token: &str, body: &[u8]) -> Result<String, String> {
-        let (status, text) = self.post_ef_raw(endpoint, token, body).await?;
+        // The engine slot only fires for a tx not yet applied (the all-dupe
+        // skip), i.e. a first presentation — register.
+        let (status, text) = self.post_ef_raw(endpoint, token, body, true).await?;
         if !(200..300).contains(&status) {
             return Err(format!("Arcade submit HTTP {status}: {text}"));
         }

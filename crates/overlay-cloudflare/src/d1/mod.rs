@@ -324,13 +324,14 @@ async fn migration_state_current(db: &D1Database) -> bool {
     struct CountRow {
         value: f64,
     }
-    let count_ok = match Query::new("SELECT value FROM ops_counters WHERE name = 'overlay_migration_count'")
-        .fetch_optional::<CountRow>(db)
-        .await
-    {
-        Ok(Some(row)) => migration_count_matches(row.value),
-        _ => false,
-    };
+    let count_ok =
+        match Query::new("SELECT value FROM ops_counters WHERE name = 'overlay_migration_count'")
+            .fetch_optional::<CountRow>(db)
+            .await
+        {
+            Ok(Some(row)) => migration_count_matches(row.value),
+            _ => false,
+        };
     if !count_ok {
         return false;
     }
@@ -1555,9 +1556,15 @@ mod tests {
         // #411 version gate: equal certifies; older (upgrade pending) and
         // NEWER (a rolled-back worker whose shorter list must still re-run)
         // both fall through to the full idempotent replay.
-        assert!(super::migration_count_matches(super::OVERLAY_MIGRATION_COUNT as f64));
-        assert!(!super::migration_count_matches((super::OVERLAY_MIGRATION_COUNT - 1) as f64));
-        assert!(!super::migration_count_matches((super::OVERLAY_MIGRATION_COUNT + 1) as f64));
+        assert!(super::migration_count_matches(
+            super::OVERLAY_MIGRATION_COUNT as f64
+        ));
+        assert!(!super::migration_count_matches(
+            (super::OVERLAY_MIGRATION_COUNT - 1) as f64
+        ));
+        assert!(!super::migration_count_matches(
+            (super::OVERLAY_MIGRATION_COUNT + 1) as f64
+        ));
         assert!(!super::migration_count_matches(0.0));
     }
 

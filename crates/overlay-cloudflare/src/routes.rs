@@ -987,8 +987,10 @@ pub async fn submit(
         }
         Some(crate::queue::enqueue_replay(env, &tagged_beef.beef, &tagged_beef.topics, mode).await)
     };
-    let mutation_queued = match crate::queue::mutation_ack(mutation_report.is_durable(), enqueue_outcome)
-    {
+    let mutation_queued = match crate::queue::mutation_ack(
+        mutation_report.is_durable(),
+        enqueue_outcome,
+    ) {
         crate::queue::MutationAck::Durable => false,
         crate::queue::MutationAck::Queued => {
             worker::console_log!(
@@ -1013,10 +1015,7 @@ pub async fn submit(
                         .await;
                 });
             }
-            return json_error_retryable(
-                &format!("admission not durable ({reason}) — retry"),
-                502,
-            );
+            return json_error_retryable(&format!("admission not durable ({reason}) — retry"), 502);
         }
     };
 
@@ -1094,7 +1093,10 @@ pub async fn submit(
         // admission that is already durably held.
         if total_consumed == 0
             && !mutation_queued
-            && matches!(action, crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_))
+            && matches!(
+                action,
+                crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_)
+            )
         {
             // Review MEDIUM-3: the SAME subject derivation as the gated arm —
             // beef_to_ef_batch sorts first and takes the sorted last; a raw
@@ -1104,7 +1106,9 @@ pub async fn submit(
                 .ok()
                 .and_then(|mut b| {
                     b.sort_txs();
-                    b.txs.last().and_then(|t| t.tx().map(|tx| (t.txid(), tx.clone())))
+                    b.txs
+                        .last()
+                        .and_then(|t| t.tx().map(|tx| (t.txid(), tx.clone())))
                 });
             // Belt v3 (attempt 11 live finding): the refusal additionally
             // requires the subject to CARRY a covenant-admissible output —
@@ -1115,9 +1119,9 @@ pub async fn submit(
             // 502-churning under the first cut. Same inline-revalidation
             // precedent as the tm_uhrp diag block below.
             let funding_shaped = subject.as_ref().is_some_and(|(_, tx)| {
-                tx.outputs
-                    .iter()
-                    .any(|o| overlay_discovery::pot::is_pot_covenant_script(&o.locking_script.to_binary()))
+                tx.outputs.iter().any(|o| {
+                    overlay_discovery::pot::is_pot_covenant_script(&o.locking_script.to_binary())
+                })
             });
             if let (true, Some((subject_txid, _)), Ok(db)) =
                 (funding_shaped, subject, env.d1("OVERLAY_DB"))
@@ -3101,7 +3105,11 @@ mod tests {
         // needle was an unsplit literal and, once the real call was renamed,
         // the first match became THIS test's own string — after the flag).
         let submit_call = ["engine.submit_with_", "report(&tagged_beef, mode)"].concat();
-        assert_eq!(src.matches(&submit_call).count(), 1, "one engine submit call site");
+        assert_eq!(
+            src.matches(&submit_call).count(),
+            1,
+            "one engine submit call site"
+        );
         let submit_at = src
             .find(&submit_call)
             .expect("the engine submit call exists");
