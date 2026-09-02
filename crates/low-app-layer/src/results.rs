@@ -1639,6 +1639,10 @@ pub struct ResultEntry {
     /// `ls_hand` and verify per row on its main thread (#401). Absent slots
     /// mean "no verified marker", never "not checked".
     pub marker_hands: MarkerHands,
+    /// bsv-low P1.1 part b: where `marker_hands` came from — `"proof"` (the
+    /// winner's replayed bundle, both hands re-derived), `"marker"` (the
+    /// seats' self-published hand markers only), `None` (nothing served).
+    pub hands_source: Option<&'static str>,
     /// The pot's COMMITTED covenant keys (bsv-low #343), or `None` when the
     /// pot is absent from the index, is not a covenant lock, or its stored
     /// params are malformed. See [`CommittedKeys`] — in particular, a
@@ -1941,6 +1945,7 @@ pub fn covenant_params_from_funding_raw(
 /// 100-legacy-pot page is attacker-CONSTRUCTIBLE — that doubling was a
 /// free 2× on an attacker-directed route. Taking the map as an argument makes
 /// double resolution unrepresentable rather than merely absent (Rule 15).
+#[allow(clippy::too_many_arguments)] // every input is a resolved, page-scoped map — see the doc above
 pub fn assemble_results(
     identity_lc: &str,
     rows: Vec<ResultsRow>,
@@ -1955,6 +1960,10 @@ pub fn assemble_results(
     // here via the rowValid latch. Empty is the previous behaviour exactly
     // (every entry serves an empty MarkerHands).
     hand_facts_by_game: &std::collections::HashMap<String, Vec<HandMarkerFact>>,
+    // bsv-low P1.1 part b: replayed proof bundles keyed by gameId — both hands
+    // re-derived server-side; takes a slot over a self-published marker. Empty
+    // is the marker-only behaviour exactly.
+    proof_hands_by_game: &std::collections::HashMap<String, Vec<ProofHandsFact>>,
 ) -> Vec<ResultEntry> {
     // Keyed by pot OUTPOINT, never by gameId: `attribute_seats` re-checks the
     // outpoint and the committed key on every marker, so a marker naming a
@@ -2224,10 +2233,16 @@ pub fn assemble_results(
         // running ECDSA per row on its main thread (#401). Scoped to THIS
         // row's two seats — a stranger's marker on the same gameId occupies
         // neither slot.
-        let marker_hands = hand_facts_by_game
-            .get(&game_lc)
-            .map(|facts| resolve_marker_hands(identity_lc, &opponent_lc, facts))
-            .unwrap_or_default();
+        let (marker_hands, hands_source) = resolve_hands(
+            identity_lc,
+            &opponent_lc,
+            hand_facts_by_game
+                .get(&game_lc)
+                .map_or(&[][..], Vec::as_slice),
+            proof_hands_by_game
+                .get(&game_lc)
+                .map_or(&[][..], Vec::as_slice),
+        );
         out.push(ResultEntry {
             game_id: game_lc,
             pot_txid: r.pot_txid.to_ascii_lowercase(),
@@ -2258,6 +2273,7 @@ pub fn assemble_results(
             at_height,
             winner_hand,
             marker_hands,
+            hands_source,
             money: money_facts(&r, row_params, hops_for_pot),
             // #343: the pot's own committed keys, from the params the caller
             // already resolved for this outpoint (decoded columns first, else
@@ -2426,6 +2442,10 @@ pub fn results_body(
                 "markerHands": json!({
                     "mine": e.marker_hands.mine,
                     "theirs": e.marker_hands.theirs,
+                    // bsv-low P1.1 part b (ADDITIVE): "proof" = both hands
+                    // re-derived from the winner's replayed bundle, "marker" =
+                    // the seats' own hand markers, null = nothing served.
+                    "source": e.hands_source,
                 }),
                 // bsv-low P4 slice 2 (ADDITIVE, display tier): the money
                 // facts a single device cannot hold — the funding tx's size
@@ -2997,6 +3017,133 @@ pub fn hand_markers_sql(n: usize) -> String {
     )
 }
 
+/// bsv-low P1.1 part b (2026-09-02): one REPLAYED proof bundle for a game —
+/// the winner's identity (the marker push, F1-signed) and both hands the
+/// overlay's `proof::replay` re-derived from the signed transcript material
+/// (never the bundle's own words). The loser's is `None` when the bundle
+/// carried no provable loser half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofHandsFact {
+    pub game_id: String,
+    pub winner: String,
+    pub winner_cards_hex: String,
+    pub loser_cards_hex: Option<String>,
+}
+
+/// Newest-first cap per game for [`proof_hands_sql`] (a game normally has one
+/// bundle; a re-published one is the second).
+pub const PROOF_HANDS_PER_GAME: usize = 2;
+
+/// Rows admitted BEFORE the overlay replayed at admission (`bundleValid IS
+/// NULL`) are replayed at read time from their retained bytes, at most this
+/// many per request — bounded CPU on an attacker-directed route.
+pub const PROOF_REPLAYS_PER_REQUEST: usize = 4;
+
+/// The proof-hands fetch for a chunk of gameIds (1 bind each): the replayed
+/// columns plus, for a not-yet-replayed row, its rowid (the bytes are fetched
+/// separately, bounded — see [`proof_bundle_bytes_sql`]). Refused rows
+/// (`bundleValid = 0`) are never loaded. Pub for the REAL-SQLite harness.
+pub fn proof_hands_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT gameId, winner, bundleValid, winnerCardsHex, loserCardsHex, markerRowid FROM \
+           (SELECT gameId, winner, bundleValid, winnerCardsHex, loserCardsHex, \
+                   rowid AS markerRowid, \
+                   ROW_NUMBER() OVER (PARTITION BY gameId \
+                                      ORDER BY createdAt DESC, rowid DESC) AS rn \
+            FROM proof_markers \
+            WHERE gameId IN ({placeholders}) AND (bundleValid = 1 OR bundleValid IS NULL)) \
+         WHERE rn <= {per_game} \
+         ORDER BY gameId ASC, rn ASC",
+        per_game = PROOF_HANDS_PER_GAME,
+    )
+}
+
+/// The retained bundle bytes of up to `n` not-yet-replayed rows, by rowid
+/// (1 bind each) — the read-time replay's input, bounded by
+/// [`PROOF_REPLAYS_PER_REQUEST`]. Pub for the REAL-SQLite harness.
+pub fn proof_bundle_bytes_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!("SELECT rowid AS markerRowid, gameId, winner, hex(bundle) AS bundleHex FROM proof_markers WHERE rowid IN ({placeholders})")
+}
+
+/// Replay one not-yet-replayed row's retained bytes at read time (the same
+/// verifier the overlay runs at admission). `None` = refused or malformed.
+pub fn replay_proof_row(
+    game_id_hex: &str,
+    winner_hex: &str,
+    bundle_hex: &str,
+) -> Option<ProofHandsFact> {
+    let game: [u8; 32] = hex::decode(game_id_hex).ok()?.try_into().ok()?;
+    let winner: [u8; 33] = hex::decode(winner_hex).ok()?.try_into().ok()?;
+    let bytes = hex::decode(bundle_hex).ok()?;
+    let proved = overlay_discovery::proof::replay::prove_bundle(&bytes, &game, &winner)?;
+    Some(ProofHandsFact {
+        game_id: game_id_hex.to_ascii_lowercase(),
+        winner: winner_hex.to_ascii_lowercase(),
+        winner_cards_hex: overlay_discovery::proof::replay::ProvedHands::cards_hex(
+            &proved.winner_cards,
+        ),
+        loser_cards_hex: proved
+            .loser_cards
+            .map(|c| overlay_discovery::proof::replay::ProvedHands::cards_hex(&c)),
+    })
+}
+
+/// Which hands this identity may SEE for one game, from BOTH sources:
+///
+/// - the replayed proof bundle (P1.1 part b) — the winner's five AND the
+///   loser's five, each re-derived from two scalars that opened seat- and
+///   position-bound blind commitments under wire-verified envelopes. It
+///   names the winner by IDENTITY (the F1-signed marker push), so a bundle
+///   whose winner is neither seat of this row occupies nothing;
+/// - the self-published hand markers ([`resolve_marker_hands`]) fill any slot
+///   the proof left empty (an old game, a winner-only bundle, a loser that
+///   never revealed).
+///
+/// The proof wins a slot both claim: a self-signed marker says what a seat
+/// CHOSE to publish, the replay says what the transcript PROVES. `source` is
+/// `"proof"` when any slot came from a bundle, `"marker"` when only markers
+/// served, `None` when nothing did.
+pub fn resolve_hands(
+    identity_lc: &str,
+    opponent_lc: &str,
+    hand_facts: &[HandMarkerFact],
+    proofs: &[ProofHandsFact],
+) -> (MarkerHands, Option<&'static str>) {
+    let mut out = resolve_marker_hands(identity_lc, opponent_lc, hand_facts);
+    let mut source = if out.mine.is_some() || out.theirs.is_some() {
+        Some("marker")
+    } else {
+        None
+    };
+    for p in proofs {
+        let winner = p.winner.to_ascii_lowercase();
+        let (winner_slot, loser_slot) = if winner == identity_lc {
+            (&mut out.mine, &mut out.theirs)
+        } else if winner == opponent_lc {
+            (&mut out.theirs, &mut out.mine)
+        } else {
+            continue; // a bundle for someone else's win — never rendered here
+        };
+        let wc = p.winner_cards_hex.to_ascii_lowercase();
+        if !overlay_discovery::hand::validity::valid_hand_cards_hex(&wc) {
+            continue;
+        }
+        *winner_slot = Some(wc);
+        source = Some("proof");
+        if let Some(lc) = p.loser_cards_hex.as_ref().map(|c| c.to_ascii_lowercase()) {
+            if overlay_discovery::hand::validity::valid_hand_cards_hex(&lc) {
+                *loser_slot = Some(lc);
+            }
+        }
+        break; // newest valid bundle decides
+    }
+    (out, source)
+}
+
 /// Which published hands this identity may SEE for one game.
 ///
 /// The dual-arm (brain-cutover M1/M2): `row_valid` is consulted first —
@@ -3250,6 +3397,7 @@ mod tests {
             claims,
             seat_markers,
             &params_by_pot,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -3640,6 +3788,91 @@ mod tests {
             size_bytes: None,
             fee_sats: None,
         }
+    }
+
+    /// bsv-low P1.1 part b: the replayed bundle takes both slots over the
+    /// seats' own markers; a bundle for someone else's win occupies nothing;
+    /// a winner-only bundle leaves the loser slot to the marker path.
+    #[test]
+    fn proof_hands_take_precedence_and_fill_the_loser_slot() {
+        let me = REAL_ID_A.to_string();
+        let opp = REAL_ID_B.to_string();
+        let marker = |identity: &str, cards: &str| HandMarkerFact {
+            game_id: "11".repeat(32),
+            identity: identity.to_string(),
+            pot_txid: "22".repeat(32),
+            cards_hex: cards.to_string(),
+            sig_hex: None,
+            row_valid: Some(true),
+        };
+        let proof = |winner: &str, loser: Option<&str>| ProofHandsFact {
+            game_id: "11".repeat(32),
+            winner: winner.to_string(),
+            winner_cards_hex: "011f232733".into(),
+            loser_cards_hex: loser.map(str::to_string),
+        };
+        // Nothing but markers: the marker path, source "marker".
+        let (h, src) = resolve_hands(&me, &opp, &[marker(&me, "0102030405")], &[]);
+        assert_eq!(
+            (h.mine.as_deref(), h.theirs.as_deref(), src),
+            (Some("0102030405"), None, Some("marker"))
+        );
+        // The opponent's replayed bundle: THEIR winner five, MY loser five —
+        // and mine came from the bundle even though my marker said otherwise
+        // (the transcript proves, a marker only claims).
+        let (h, src) = resolve_hands(
+            &me,
+            &opp,
+            &[marker(&me, "0102030405")],
+            &[proof(&opp, Some("151c1d2d31"))],
+        );
+        assert_eq!(
+            (h.mine.as_deref(), h.theirs.as_deref(), src),
+            (Some("151c1d2d31"), Some("011f232733"), Some("proof"))
+        );
+        // A winner-only bundle: the winner slot from the bundle, the loser slot
+        // from the loser's own marker when present, else empty.
+        let (h, _) = resolve_hands(
+            &me,
+            &opp,
+            &[marker(&me, "0102030405")],
+            &[proof(&opp, None)],
+        );
+        assert_eq!(
+            (h.mine.as_deref(), h.theirs.as_deref()),
+            (Some("0102030405"), Some("011f232733"))
+        );
+        let (h, src) = resolve_hands(&me, &opp, &[], &[proof(&opp, None)]);
+        assert_eq!(
+            (h.mine, h.theirs.as_deref(), src),
+            (None, Some("011f232733"), Some("proof"))
+        );
+        // A stranger's bundle occupies nothing.
+        let (h, src) = resolve_hands(&me, &opp, &[], &[proof("02cc", Some("151c1d2d31"))]);
+        assert_eq!((h.mine, h.theirs, src), (None, None, None));
+        // Malformed served cards never render.
+        let mut bad = proof(&opp, Some("zz"));
+        bad.winner_cards_hex = "nope".into();
+        let (h, src) = resolve_hands(&me, &opp, &[], &[bad]);
+        assert_eq!((h.mine, h.theirs, src), (None, None, None));
+    }
+
+    /// The read-time replay of a row admitted before the overlay replayed at
+    /// admission: the REAL beta bundle re-derives both hands here too.
+    #[test]
+    fn read_time_replay_of_a_pre_replay_row_derives_both_hands() {
+        const REAL: &[u8] =
+            include_bytes!("../../overlay-discovery/src/proof/fixtures/bundle-a1081773.bin");
+        let f = replay_proof_row(
+            "a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523",
+            "03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0",
+            &hex::encode(REAL),
+        )
+        .expect("the real bundle replays");
+        assert_eq!(f.winner_cards_hex, "011f232733");
+        assert_eq!(f.loser_cards_hex.as_deref(), Some("151c1d2d31"));
+        assert!(replay_proof_row("00", "02", &hex::encode(REAL)).is_none());
+        assert!(replay_proof_row(&f.game_id, &f.winner, "zz").is_none());
     }
 
     /// bsv-low P4 slice 2: the served money facts — funding when named,
@@ -5137,6 +5370,7 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: Some(k.clone()),
             money: MoneyFacts::default(),
+            hands_source: None,
         };
         let results: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5223,6 +5457,7 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: Some(keys_fixture()),
             money: MoneyFacts::default(),
+            hands_source: None,
         };
         let cannot_say = ResultEntry {
             settle_signers: None,
@@ -5287,6 +5522,7 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
             money: MoneyFacts::default(),
+            hands_source: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5337,6 +5573,7 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
             money: MoneyFacts::default(),
+            hands_source: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5431,6 +5668,7 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
             money: MoneyFacts::default(),
+            hands_source: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5504,6 +5742,7 @@ mod tests {
             marker_hands: Default::default(),
             committed_keys: None,
             money: MoneyFacts::default(),
+            hands_source: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();

@@ -2266,6 +2266,11 @@ async fn gather_result_entries(
     // claims: a fault omits hands from the drill-down, never a 5xx and never
     // a money path (display-only index).
     let hand_facts = results_hand_markers(db, &game_ids).await;
+    // bsv-low P1.1 part b: the winner's replayed proof bundle — both hands
+    // re-derived at admission (or, for a row admitted before that shipped,
+    // replayed here from its retained bytes, bounded). BEST-EFFORT, same
+    // discipline as hand markers: a fault leaves the marker path in charge.
+    let proof_hands = results_proof_hands(db, &game_ids).await;
 
     Ok((
         crate::results::assemble_results(
@@ -2276,9 +2281,128 @@ async fn gather_result_entries(
             &params_by_pot,
             &hop_markers,
             &hand_facts,
+            &proof_hands,
         ),
         truncated,
     ))
+}
+
+/// `proof_markers` row as D1 returns it for the proof-hands fetch.
+#[derive(Deserialize)]
+struct ProofHandsRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    #[serde(rename = "bundleValid", default)]
+    bundle_valid: Option<f64>,
+    #[serde(rename = "winnerCardsHex", default)]
+    winner_cards_hex: Option<String>,
+    #[serde(rename = "loserCardsHex", default)]
+    loser_cards_hex: Option<String>,
+    #[serde(rename = "markerRowid")]
+    marker_rowid: f64,
+}
+
+#[derive(Deserialize)]
+struct ProofBytesRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    #[serde(rename = "bundleHex")]
+    bundle_hex: String,
+}
+
+/// Replayed proof bundles for this page's games (bsv-low P1.1 part b): the
+/// admission-time columns first; rows the overlay admitted before the replay
+/// shipped (`bundleValid IS NULL`) are replayed HERE from their retained
+/// bytes, at most `PROOF_REPLAYS_PER_REQUEST` per request. Refused rows are
+/// never loaded (the SQL filters them).
+async fn results_proof_hands(
+    db: &worker::D1Database,
+    game_ids: &[String],
+) -> std::collections::HashMap<String, Vec<crate::results::ProofHandsFact>> {
+    let mut out: std::collections::HashMap<String, Vec<crate::results::ProofHandsFact>> =
+        std::collections::HashMap::new();
+    if game_ids.is_empty() {
+        return out;
+    }
+    let mut pending: Vec<f64> = Vec::new();
+    for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|g| JsValue::from_str(g)).collect();
+        let stmt = match db
+            .prepare(crate::results::proof_hands_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[results] proof-hands bind failed (chunk omitted): {e}");
+                continue;
+            }
+        };
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<ProofHandsRowD1>())
+        {
+            Ok(fetched) => {
+                for r in fetched {
+                    match (r.bundle_valid, r.winner_cards_hex) {
+                        (Some(v), Some(wc)) if v != 0.0 => {
+                            out.entry(r.game_id.to_ascii_lowercase()).or_default().push(
+                                crate::results::ProofHandsFact {
+                                    game_id: r.game_id.to_ascii_lowercase(),
+                                    winner: r.winner.to_ascii_lowercase(),
+                                    winner_cards_hex: wc.to_ascii_lowercase(),
+                                    loser_cards_hex: r
+                                        .loser_cards_hex
+                                        .map(|c| c.to_ascii_lowercase()),
+                                },
+                            );
+                        }
+                        (None, _) if pending.len() < crate::results::PROOF_REPLAYS_PER_REQUEST => {
+                            pending.push(r.marker_rowid);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                // A racing pre-migration schema or any D1 fault: proof hands
+                // are simply absent this pass (markers still serve).
+                console_warn!("[results] proof-hands query failed (proof hands omitted): {e}");
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let binds: Vec<JsValue> = pending.iter().map(|r| JsValue::from_f64(*r)).collect();
+        match db
+            .prepare(crate::results::proof_bundle_bytes_sql(pending.len()))
+            .bind(&binds)
+        {
+            Ok(stmt) => match stmt
+                .all()
+                .await
+                .and_then(|r| r.results::<ProofBytesRowD1>())
+            {
+                Ok(rows) => {
+                    for r in rows {
+                        if let Some(f) =
+                            crate::results::replay_proof_row(&r.game_id, &r.winner, &r.bundle_hex)
+                        {
+                            out.entry(f.game_id.clone()).or_default().push(f);
+                        }
+                    }
+                }
+                Err(e) => console_warn!(
+                    "[results] proof-bytes query failed (read-time replay skipped): {e}"
+                ),
+            },
+            Err(e) => {
+                console_warn!("[results] proof-bytes bind failed (read-time replay skipped): {e}")
+            }
+        }
+    }
+    out
 }
 
 /// `hand_markers` row as D1 returns it (brain-cutover M2).

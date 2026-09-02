@@ -60,6 +60,7 @@ fn assemble_like_the_route(
         &params_by_pot,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
 }
 
@@ -2114,6 +2115,7 @@ fn results_wire(conn: &Connection, identity_lc: &str) -> serde_json::Value {
         &params_by_pot,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     );
     serde_json::from_str(&results_body(identity_lc, &entries, false, 0)).unwrap()
 }
@@ -3892,6 +3894,7 @@ fn the_money_facts_serve_through_the_real_producers_under_their_guards() {
         &params_by_pot,
         &hop_markers_by_pot,
         &Default::default(),
+        &Default::default(),
     );
     let m = &entries[0].money;
     assert_eq!(
@@ -3942,6 +3945,7 @@ fn the_money_facts_serve_through_the_real_producers_under_their_guards() {
         &params_by_pot,
         &hop_markers_by_pot,
         &Default::default(),
+        &Default::default(),
     );
     assert!(
         entries2[0].money.settle.is_none(),
@@ -3950,5 +3954,213 @@ fn the_money_facts_serve_through_the_real_producers_under_their_guards() {
     assert!(
         entries2[0].money.funding.is_some(),
         "the funding facts are pointer-independent"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// bsv-low P1.1 part b — both hands from the winner's replayed bundle
+// ════════════════════════════════════════════════════════════════════════
+
+/// Mirror of `routes::results_proof_hands` over real SQLite: the shipped
+/// `proof_hands_sql` (replayed columns), then `proof_bundle_bytes_sql` +
+/// `replay_proof_row` for rows the overlay admitted before it replayed at
+/// admission, bounded by `PROOF_REPLAYS_PER_REQUEST`.
+fn proof_hands_like_the_route(
+    conn: &Connection,
+    game_ids: &[String],
+) -> std::collections::HashMap<String, Vec<low_app_layer::results::ProofHandsFact>> {
+    use low_app_layer::results::{
+        proof_bundle_bytes_sql, proof_hands_sql, replay_proof_row, ProofHandsFact,
+        PROOF_REPLAYS_PER_REQUEST,
+    };
+    let mut out: std::collections::HashMap<String, Vec<ProofHandsFact>> =
+        std::collections::HashMap::new();
+    let mut pending: Vec<i64> = Vec::new();
+    let mut stmt = conn.prepare(&proof_hands_sql(game_ids.len())).unwrap();
+    let rows: Vec<(
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        i64,
+    )> = stmt
+        .query_map(rusqlite::params_from_iter(game_ids.iter()), |r| {
+            Ok((
+                r.get("gameId")?,
+                r.get("winner")?,
+                r.get("bundleValid")?,
+                r.get("winnerCardsHex")?,
+                r.get("loserCardsHex")?,
+                r.get("markerRowid")?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (gid, winner, valid, wc, lc, rowid) in rows {
+        match (valid, wc) {
+            (Some(1), Some(wc)) => out.entry(gid.clone()).or_default().push(ProofHandsFact {
+                game_id: gid,
+                winner,
+                winner_cards_hex: wc,
+                loser_cards_hex: lc,
+            }),
+            (None, _) if pending.len() < PROOF_REPLAYS_PER_REQUEST => pending.push(rowid),
+            _ => {}
+        }
+    }
+    if !pending.is_empty() {
+        let mut stmt = conn
+            .prepare(&proof_bundle_bytes_sql(pending.len()))
+            .unwrap();
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map(rusqlite::params_from_iter(pending.iter()), |r| {
+                Ok((r.get("gameId")?, r.get("winner")?, r.get("bundleHex")?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (gid, winner, bundle_hex) in rows {
+            if let Some(f) = replay_proof_row(&gid, &winner, &bundle_hex) {
+                out.entry(f.game_id.clone()).or_default().push(f);
+            }
+        }
+    }
+    out
+}
+
+/// The winner's bundle serves BOTH hands on `/results` — through the real
+/// admission write (`PROOF_ADMIT_WRITE_SQL`, replayed columns) for a new
+/// row, and through the read-time replay of the REAL beta bundle for a row
+/// admitted before the replay shipped. A refused row serves nothing.
+#[test]
+fn both_hands_serve_from_the_winners_replayed_bundle() {
+    use bsv_overlay_cloudflare::d1_discovery::PROOF_ADMIT_WRITE_SQL;
+    const REAL: &[u8] =
+        include_bytes!("../../overlay-discovery/src/proof/fixtures/bundle-a1081773.bin");
+    let conn = production_schema_db();
+    let winner = "03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0".to_string();
+    // Game 1: a row the overlay replayed at admission (columns present).
+    let g1 = h64(0x51);
+    insert_pot(&conn, &h64(0xa1), 1_000, true);
+    file_marker(&conn, &winner, &h64(0xa1), &h64(0xe1), 1_000);
+    conn.execute(
+        PROOF_ADMIT_WRITE_SQL,
+        params![
+            g1.as_str(),
+            winner.as_str(),
+            "3045",
+            vec![1u8],
+            "AQ==",
+            "txP1",
+            0i64,
+            1_000i64,
+            1i64,
+            0i64,
+            Option::<String>::None,
+            Option::<String>::None,
+            "011f232733",
+            "151c1d2d31"
+        ],
+    )
+    .unwrap();
+    // Game 2: the REAL bundle, admitted before the replay shipped (NULL verdict).
+    let g2 = "a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523".to_string();
+    conn.execute(
+        PROOF_ADMIT_WRITE_SQL,
+        params![
+            g2.as_str(),
+            winner.as_str(),
+            "3045",
+            REAL,
+            Option::<String>::None,
+            "txP2",
+            0i64,
+            1_001i64,
+            Option::<i64>::None,
+            Option::<i64>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None
+        ],
+    )
+    .unwrap();
+    // Game 3: a REFUSED row — never loaded.
+    let g3 = h64(0x53);
+    conn.execute(
+        PROOF_ADMIT_WRITE_SQL,
+        params![
+            g3.as_str(),
+            winner.as_str(),
+            "3045",
+            vec![9u8],
+            "CQ==",
+            "txP3",
+            0i64,
+            1_002i64,
+            0i64,
+            Option::<i64>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None
+        ],
+    )
+    .unwrap();
+
+    let proofs = proof_hands_like_the_route(&conn, &[g1.clone(), g2.clone(), g3.clone()]);
+    assert_eq!(
+        proofs.get(&g1).map(|v| v.len()),
+        Some(1),
+        "the admission-replayed row serves"
+    );
+    assert_eq!(
+        proofs.get(&g2).map(|v| (
+            v[0].winner_cards_hex.as_str(),
+            v[0].loser_cards_hex.as_deref()
+        )),
+        Some(("011f232733", Some("151c1d2d31"))),
+        "the pre-replay row is replayed at read time from its retained bytes"
+    );
+    assert!(proofs.get(&g3).is_none(), "a refused row serves nothing");
+
+    // Through the assembler: the viewer is the winner → mine = the winner's
+    // five, theirs = the loser's five, source "proof" — with NO hand marker
+    // from either seat in the index.
+    let mut rows = query_results_rows(&conn, &winner);
+    apply_page_overlay_like_the_route(&conn, &mut rows);
+    // The potparty row names game g1's txid pattern; point it at g1 for the fold.
+    for r in rows.iter_mut() {
+        r.game_id = g1.clone();
+    }
+    let params_by_pot = covenant_params_by_pot(&rows);
+    let entries = assemble_results(
+        &winner,
+        rows,
+        &Default::default(),
+        &Default::default(),
+        &params_by_pot,
+        &Default::default(),
+        &Default::default(),
+        &proofs,
+    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].marker_hands.mine.as_deref(), Some("011f232733"));
+    assert_eq!(
+        entries[0].marker_hands.theirs.as_deref(),
+        Some("151c1d2d31")
+    );
+    assert_eq!(entries[0].hands_source, Some("proof"));
+    let v: serde_json::Value =
+        serde_json::from_str(&results_body(&winner, &entries, false, 0)).unwrap();
+    assert_eq!(
+        v["results"][0]["markerHands"]["source"],
+        serde_json::json!("proof")
+    );
+    assert_eq!(
+        v["results"][0]["markerHands"]["theirs"],
+        serde_json::json!("151c1d2d31")
     );
 }

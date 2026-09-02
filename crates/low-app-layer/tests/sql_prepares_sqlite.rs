@@ -31,8 +31,8 @@ use low_app_layer::logic::{
 };
 use low_app_layer::refund_view::refund_view_sql;
 use low_app_layer::results::{
-    claims_sql, decoded_pots_sql, hop_seat_markers_sql, page_overlay_sql, results_sql,
-    seat_markers_sql,
+    claims_sql, decoded_pots_sql, hop_seat_markers_sql, page_overlay_sql, proof_bundle_bytes_sql,
+    proof_hands_sql, results_sql, seat_markers_sql,
 };
 use rusqlite::Connection;
 
@@ -176,6 +176,13 @@ fn every_batched_query_prepares_at_representative_arities() {
             &format!("hop_seat_markers_sql({n})"),
             &hop_seat_markers_sql(n),
         );
+        // bsv-low P1.1 part b: the replayed proof hands + the bounded bytes fetch.
+        assert_prepares(&conn, &format!("proof_hands_sql({n})"), &proof_hands_sql(n));
+        assert_prepares(
+            &conn,
+            &format!("proof_bundle_bytes_sql({n})"),
+            &proof_bundle_bytes_sql(n),
+        );
         assert_prepares(
             &conn,
             &format!("proof_pointers_sql({n})"),
@@ -218,6 +225,8 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
             // P4 slice 2: one outpoint pair per page row; two committed keys per pot.
             ("page_overlay_sql", page_overlay_sql(n), n * 2),
             ("hop_seat_markers_sql", hop_seat_markers_sql(n), n * 2),
+            ("proof_hands_sql", proof_hands_sql(n), n),
+            ("proof_bundle_bytes_sql", proof_bundle_bytes_sql(n), n),
         ] {
             let stmt = conn
                 .prepare(&sql)
