@@ -40,7 +40,7 @@ use bsv_rs::wallet::{
     Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
 };
 use low_app_layer::hops_view::{
-    assemble_hops_view, expected_hop_lock_hex, hops_view_body, hops_view_sql, HopStatus,
+    apply_chain_probes, assemble_hops_view, expected_hop_lock_hex, hops_view_body, hops_view_sql, ChainSpendProbe, HopStatus,
     HopsViewRow, MarkerVerification, HOPS_VIEW_MAX_OUTPOINTS,
 };
 use low_app_layer::logic::valid_identity;
@@ -465,7 +465,7 @@ fn real_marker_in_its_production_container_is_verified_and_unspent() {
     assert!(!truncated);
     let e = &entries[0];
     assert_eq!(e.status, HopStatus::Unspent);
-    assert_eq!(e.status_source, Some("chain"));
+    assert_eq!(e.status_source, Some("index"), "B2.1: the index's non-observation is labelled index, never chain");
     assert_eq!(
         e.marker_verified,
         MarkerVerification::Verified,
@@ -1762,4 +1762,38 @@ fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
             scope.is_some()
         );
     }
+}
+
+/// bsv-low B2.1 (filed 2026-09-02): a hop the index never saw spent — swept
+/// DIRECT to ARC, no overlay submit, so `pot_records.spent` stayed 0 — must
+/// never be served `unspent`/`chain`. The executing SQL yields the index's
+/// word (`unspent`/`index`); the route's bounded chain probe (here: the
+/// rung's answer, stubbed) reports the confirmed spender ⇒ the view says
+/// `spent`/`chain` and names it.
+#[test]
+fn b21_a_hop_swept_outside_the_overlay_is_served_spent_once_the_chain_rung_says_so() {
+    let conn = production_schema_db();
+    let m = build_marker(0xb2, GAME, 0, 20_190, true);
+    let txid = admit_marker(&conn, &m, 20_190, 0x02, 1_001);
+    admit_hop(&conn, &txid, 20_190, 1_000);
+    // NO mark_hop_spent: the overlay never saw the sweep.
+
+    let rows = query_rows(&conn, &m.identity_hex);
+    let (entries, _) = assemble_hops_view(rows);
+    assert_eq!(entries[0].status, HopStatus::Unspent);
+    assert_eq!(entries[0].status_source, Some("index"), "the index's word is labelled index");
+
+    let spender = "3d".repeat(32);
+    let probes = vec![(
+        txid.clone(),
+        0u32,
+        ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.clone()), spent_confirmed: Some(true) },
+    )];
+    let served = apply_chain_probes(entries, &probes);
+    assert_eq!(served[0].status, HopStatus::Spent, "the chain rung's confirmed spender wins");
+    assert_eq!(served[0].status_source, Some("chain"));
+    assert_eq!(served[0].spending_txid.as_deref(), Some(spender.as_str()));
+    let body = hops_view_body(&m.identity_hex, Some(961_000), &served, false, 0);
+    assert!(body.contains("\"status\":\"spent\""), "the wire says spent: {body}");
+    assert!(!body.contains("\"status\":\"unspent\""));
 }

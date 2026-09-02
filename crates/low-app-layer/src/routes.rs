@@ -2851,6 +2851,25 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         };
 
     let (entries, truncated) = crate::hops_view::assemble_hops_view(rows);
+    // B2.1 (bsv-low, 2026-09-02): the index's `unspent` is a non-observation;
+    // re-check a bounded number of them against the chain rung (the same
+    // corroborated WoC + Bitails read `/spent-any` serves, cached) so a hop
+    // swept outside our overlay is never served as recoverable.
+    let mut probes: Vec<(String, u32, crate::hops_view::ChainSpendProbe)> = Vec::new();
+    for (txid, vout) in crate::hops_view::chain_probe_targets(&entries) {
+        let st = spent_any_resolve(&txid, vout).await;
+        probes.push((
+            txid,
+            vout,
+            crate::hops_view::ChainSpendProbe {
+                known: st.known,
+                spent: st.spent,
+                spending_txid: st.spending_txid.clone(),
+                spent_confirmed: st.spent_confirmed,
+            },
+        ));
+    }
+    let entries = crate::hops_view::apply_chain_probes(entries, &probes);
     // The tip AFTER the D1 facts (`null` on a fault — facts still serve).
     let tip = chaintracks_present_height(&ctx, "hops-view").await.ok();
     json_response(

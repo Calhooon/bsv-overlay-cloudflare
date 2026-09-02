@@ -27,7 +27,9 @@
 //!
 //! | facts                                                   | status    | source |
 //! |---------------------------------------------------------|-----------|--------|
-//! | `pot_records` row, spent = 0                            | `unspent` | chain  |
+//! | `pot_records` row, spent = 0, NOT re-checked            | `unspent` | index  |
+//! | row, spent = 0, chain rung corroborates UNSPENT (B2.1)  | `unspent` | chain  |
+//! | row, spent = 0, chain rung reports a CONFIRMED spender  | `spent`   | chain  |
 //! | row, spend recorded + confirmed (shared #323 bar)       | `spent`   | chain  |
 //! | row, spend recorded but UNCONFIRMED (displaceable)      | `unknown` | null   |
 //! | NO `pot_records` row (hop never indexed)                | `unknown` | null   |
@@ -35,7 +37,14 @@
 //! An absent `pot_records` row is `unknown`, NEVER asserted-unspent — the
 //! overlay may simply never have seen the hop tx. `spent = 0` is likewise
 //! the overlay's NON-observation of a spend on an indexed outpoint, not a
-//! UTXO existence proof (the raw facts ride alongside either way). The
+//! UTXO existence proof (the raw facts ride alongside either way) — so it is
+//! labelled `index`, never `chain` (bsv-low B2.1, 2026-09-02: a hop swept
+//! DIRECT to ARC four days earlier was served `unspent`/`chain` because no
+//! index row ever recorded the spend). The route then re-checks a BOUNDED
+//! number of index-unspent hops against the chain rung (`/spent-any`'s own
+//! corroborated WoC + Bitails read, cached) and folds the answer in
+//! (`apply_chain_probes`): a corroborated spender displaces the stale word,
+//! a corroborated unspent earns `chain`, an unknown probe leaves `index`. The
 //! confirmation bar is the ONE shared bar
 //! (`logic::is_confirmed_landing_with_proof` — `spentConfirmed` OR a
 //! chaintracks-verified spender proof), so this view can never disagree
@@ -646,8 +655,9 @@ pub fn derive_hop_status(
     spender_final: Option<bool>,
 ) -> (HopStatus, Option<&'static str>) {
     match spent {
-        // Non-observation of a spend on an INDEXED hop (module docs).
-        Some(false) => (HopStatus::Unspent, Some("chain")),
+        // Non-observation of a spend on an INDEXED hop (module docs): the
+        // INDEX's word, until the chain rung re-checks it (B2.1).
+        Some(false) => (HopStatus::Unspent, Some("index")),
         Some(true) => {
             if crate::logic::is_confirmed_landing_with_proof(
                 spent_confirmed,
@@ -664,6 +674,84 @@ pub fn derive_hop_status(
         // No pot_records row: genuinely unknown, never asserted unspent.
         None => (HopStatus::Unknown, None),
     }
+}
+
+/// B2.1 — what the chain rung says about ONE outpoint: the app-layer's own
+/// corroborated `/spent-any` read (WoC + Bitails, cached), never the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSpendProbe {
+    /// False = the providers could not answer (fault / disagreement) — the
+    /// index's word stands, labelled `index`.
+    pub known: bool,
+    pub spent: Option<bool>,
+    pub spending_txid: Option<String>,
+    pub spent_confirmed: Option<bool>,
+}
+
+/// How many index-unspent hops ONE `/hops-view` request re-checks against
+/// the chain rung. An identity's hops in flight are few; the rung's cache
+/// bounds provider traffic; anything past the bound stays `index` (honest,
+/// never `chain`).
+pub const HOPS_VIEW_CHAIN_PROBES_MAX: usize = 8;
+
+/// The outpoints the route should re-check: the index-unspent entries, in
+/// served order, bounded.
+pub fn chain_probe_targets(entries: &[HopEntry]) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for e in entries {
+        if e.status == HopStatus::Unspent && e.status_source == Some("index") {
+            let key = (e.hop_txid.to_ascii_lowercase(), e.hop_vout);
+            if !out.contains(&key) {
+                out.push(key);
+            }
+            if out.len() >= HOPS_VIEW_CHAIN_PROBES_MAX {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// B2.1 — fold the chain rung's answers into the assembled entries. Only an
+/// index-unspent entry can change; the fold never downgrades a recorded
+/// spend and never invents one from an unknown probe:
+///  - a CONFIRMED spender ⇒ `spent` / `chain`, the spender named;
+///  - an UNCONFIRMED spender ⇒ `unknown` (a displaceable intent — the same
+///    bar the index applies to its own recorded-but-unconfirmed spends);
+///  - a corroborated UNSPENT ⇒ `unspent` / `chain`;
+///  - unknown ⇒ unchanged (`unspent` / `index`).
+pub fn apply_chain_probes(mut entries: Vec<HopEntry>, probes: &[(String, u32, ChainSpendProbe)]) -> Vec<HopEntry> {
+    for e in entries.iter_mut() {
+        if !(e.status == HopStatus::Unspent && e.status_source == Some("index")) {
+            continue;
+        }
+        let key = (e.hop_txid.to_ascii_lowercase(), e.hop_vout);
+        let Some((_, _, probe)) = probes.iter().find(|(t, v, _)| (t.to_ascii_lowercase(), *v) == key) else {
+            continue;
+        };
+        if !probe.known {
+            continue;
+        }
+        match probe.spent {
+            Some(true) => {
+                e.spent = Some(true);
+                e.spending_txid = probe.spending_txid.clone();
+                e.spent_confirmed = probe.spent_confirmed;
+                if probe.spent_confirmed == Some(true) {
+                    e.status = HopStatus::Spent;
+                    e.status_source = Some("chain");
+                } else {
+                    e.status = HopStatus::Unknown;
+                    e.status_source = None;
+                }
+            }
+            Some(false) => {
+                e.status_source = Some("chain");
+            }
+            None => {}
+        }
+    }
+    entries
 }
 
 /// One `/hops-view` response entry, pre-JSON.
@@ -1334,10 +1422,11 @@ mod tests {
 
     #[test]
     fn hop_status_table() {
-        // Indexed, unspent.
+        // Indexed, unspent: the INDEX's non-observation — never `chain` until
+        // the chain rung re-checks it (B2.1).
         assert_eq!(
             derive_hop_status(Some(false), Some(false), None, None, None),
-            (HopStatus::Unspent, Some("chain"))
+            (HopStatus::Unspent, Some("index"))
         );
         // Confirmed spend (flag).
         assert_eq!(
@@ -1401,7 +1490,7 @@ mod tests {
         assert_eq!(e0["hopVout"], json!(0));
         assert_eq!(e0["hopSats"], json!(80_800));
         assert_eq!(e0["status"], json!("unspent"));
-        assert_eq!(e0["statusSource"], json!("chain"));
+        assert_eq!(e0["statusSource"], json!("index")); // B2.1: un-probed = the index's word
         assert_eq!(e0["markerVerified"], json!("verified"));
         assert_eq!(e0["seatSettlePubkey"], json!(verified.seat_settle_pubkey));
         assert_eq!(
@@ -1685,5 +1774,90 @@ mod tests {
             " AND hp.gameId = ?2".len(),
             "the scope is exactly that clause and nothing else"
         );
+    }
+    fn index_unspent(txid: &str, vout: u32) -> HopEntry {
+        HopEntry {
+            game_id: "aa".repeat(32),
+            hop_txid: txid.to_string(),
+            hop_vout: vout,
+            hop_sats: 20_190,
+            opponent_identity: "03".to_string() + &"cd".repeat(32),
+            seat_settle_pubkey: "02".to_string() + &"ab".repeat(32),
+            seat_sig_hex: "3044".to_string(),
+            identity_sig_hex: "3044".to_string(),
+            marker_txid: txid.to_string(),
+            marker_vout: 1,
+            spent: Some(false),
+            spending_txid: None,
+            spent_confirmed: Some(false),
+            status: HopStatus::Unspent,
+            status_source: Some("index"),
+            marker_verified: MarkerVerification::Verified,
+        }
+    }
+
+    #[test]
+    fn b21_a_confirmed_chain_spender_displaces_the_stale_index_word() {
+        let hop = "81".repeat(32);
+        let spender = "3d".repeat(32);
+        let probes = vec![(
+            hop.clone(),
+            0,
+            ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.clone()), spent_confirmed: Some(true) },
+        )];
+        let out = apply_chain_probes(vec![index_unspent(&hop, 0)], &probes);
+        assert_eq!(out[0].status, HopStatus::Spent);
+        assert_eq!(out[0].status_source, Some("chain"));
+        assert_eq!(out[0].spent, Some(true));
+        assert_eq!(out[0].spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(out[0].spent_confirmed, Some(true));
+    }
+
+    #[test]
+    fn b21_an_unconfirmed_chain_spender_is_a_displaceable_intent_never_a_landing() {
+        let hop = "81".repeat(32);
+        let probes = vec![(
+            hop.clone(),
+            0,
+            ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some("3d".repeat(32)), spent_confirmed: Some(false) },
+        )];
+        let out = apply_chain_probes(vec![index_unspent(&hop, 0)], &probes);
+        assert_eq!(out[0].status, HopStatus::Unknown);
+        assert_eq!(out[0].status_source, None);
+        assert_eq!(out[0].spent, Some(true));
+    }
+
+    #[test]
+    fn b21_a_corroborated_unspent_earns_chain_and_an_unknown_probe_leaves_index() {
+        let a = "81".repeat(32);
+        let b = "82".repeat(32);
+        let probes = vec![
+            (a.clone(), 0, ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None }),
+            (b.clone(), 0, ChainSpendProbe { known: false, spent: None, spending_txid: None, spent_confirmed: None }),
+        ];
+        let out = apply_chain_probes(vec![index_unspent(&a, 0), index_unspent(&b, 0)], &probes);
+        assert_eq!((out[0].status, out[0].status_source), (HopStatus::Unspent, Some("chain")));
+        assert_eq!((out[1].status, out[1].status_source), (HopStatus::Unspent, Some("index")));
+    }
+
+    #[test]
+    fn b21_only_index_unspent_entries_are_targets_and_the_bound_holds() {
+        let mut entries: Vec<HopEntry> = (0..(HOPS_VIEW_CHAIN_PROBES_MAX + 3) as u8)
+            .map(|i| index_unspent(&format!("{:02x}", 0x90 + i).repeat(32), 0))
+            .collect();
+        // a recorded confirmed spend is never a target
+        entries[1].status = HopStatus::Spent;
+        entries[1].status_source = Some("chain");
+        let targets = chain_probe_targets(&entries);
+        assert_eq!(targets.len(), HOPS_VIEW_CHAIN_PROBES_MAX);
+        assert!(!targets.iter().any(|(t, _)| *t == entries[1].hop_txid));
+        // a probe naming a recorded-spent entry cannot touch it
+        let probes = vec![(
+            entries[1].hop_txid.clone(),
+            0,
+            ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None },
+        )];
+        let out = apply_chain_probes(entries.clone(), &probes);
+        assert_eq!(out[1].status, HopStatus::Spent);
     }
 }
