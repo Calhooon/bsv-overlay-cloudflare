@@ -169,7 +169,15 @@ fn file_potparty(
          (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
           sigHex, seatSettlePubkey, seatSigHex, txid, outputIndex, createdAt, sigValid) \
          VALUES (?1, ?2, ?3, ?4, 0, 900000, 'idsig', ?5, 'seatsig', ?6, 0, 1, ?7)",
-        params![identity, identity, h64(7), pot, seat_pub, marker_txid, sig_valid],
+        params![
+            identity,
+            identity,
+            h64(7),
+            pot,
+            seat_pub,
+            marker_txid,
+            sig_valid
+        ],
     )
     .expect("insert potparty_records");
 }
@@ -193,7 +201,17 @@ fn file_result(
          (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, loserSigHex, cardsHex, \
           txid, outputIndex, createdAt, claimValid) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'wsig', NULL, ?6, ?7, 0, ?8, ?9)",
-        params![game, winner, loser, pot, settle, cards_hex, marker_txid, at, claim_valid],
+        params![
+            game,
+            winner,
+            loser,
+            pot,
+            settle,
+            cards_hex,
+            marker_txid,
+            at,
+            claim_valid
+        ],
     )
     .expect("insert result_markers_v2");
 }
@@ -213,19 +231,37 @@ fn counted_win(
     let spender = h64(20_000 + seed);
     admit_pot(conn, &pot, created_at);
     mark_spent_confirmed(conn, &pot, &spender);
-    set_verdict(conn, &pot, &spender, "winner-a", winner_key, &key(999), Some("coop"));
+    set_verdict(
+        conn,
+        &pot,
+        &spender,
+        "winner-a",
+        winner_key,
+        &key(999),
+        Some("coop"),
+    );
     if latched.is_some() || latched.is_none() {
-        file_potparty(conn, winner_identity, &pot, winner_key, latched, &h64(30_000 + seed));
+        file_potparty(
+            conn,
+            winner_identity,
+            &pot,
+            winner_key,
+            latched,
+            &h64(30_000 + seed),
+        );
     }
     (pot, spender)
 }
 
-fn page(conn: &Connection, era: Option<i64>, limit: usize, after: usize) -> (Vec<(String, bool, i64)>, bool) {
+fn page(
+    conn: &Connection,
+    era: Option<i64>,
+    limit: usize,
+    after: usize,
+) -> (Vec<(String, bool, i64)>, bool) {
     let mut stmt = conn.prepare(&chain_wins_spine_sql(era)).unwrap();
-    let mut binds: Vec<rusqlite::types::Value> = vec![
-        ((limit + 1) as i64).into(),
-        (after as i64).into(),
-    ];
+    let mut binds: Vec<rusqlite::types::Value> =
+        vec![((limit + 1) as i64).into(), (after as i64).into()];
     if let Some(ms) = era {
         binds.push(ms.into());
     }
@@ -279,7 +315,10 @@ fn hands(conn: &Connection, era: Option<i64>, limit: usize) -> Vec<(String, Stri
         binds.push(ms.into());
     }
     stmt.query_map(params_from_iter(binds), |r| {
-        Ok((r.get::<_, String>("gameId")?, r.get::<_, String>("cardsHex")?))
+        Ok((
+            r.get::<_, String>("gameId")?,
+            r.get::<_, String>("cardsHex")?,
+        ))
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
@@ -291,7 +330,8 @@ fn the_paging_queries_prepare_against_the_production_schema() {
     let conn = production_schema_db();
     for era in [None, Some(1_700_000_000_000i64)] {
         conn.prepare(&chain_wins_spine_sql(era)).expect("spine");
-        conn.prepare(&chain_wins_owners_sql(3, era)).expect("owners");
+        conn.prepare(&chain_wins_owners_sql(3, era))
+            .expect("owners");
         conn.prepare(&era_hands_sql(era)).expect("hands");
     }
     conn.prepare(&pot_markers_sql(5)).expect("markers");
@@ -324,10 +364,20 @@ fn the_whole_era_spine_counts_past_the_old_window_on_one_page() {
     let keys = [key(1), key(2), key(3)];
     for i in 0..total {
         let w = i % 3;
-        counted_win(&conn, i as u32, &ids[w], &keys[w], 1_000 + i as i64, Some(1));
+        counted_win(
+            &conn,
+            i as u32,
+            &ids[w],
+            &keys[w],
+            1_000 + i as i64,
+            Some(1),
+        );
     }
     let (rows, truncated) = page(&conn, None, 50, 0);
-    assert!(!truncated, "three owners fit one page whatever the pot count");
+    assert!(
+        !truncated,
+        "three owners fit one page whatever the pot count"
+    );
     assert_eq!(
         rows,
         vec![
@@ -353,7 +403,14 @@ fn pages_walk_owners_in_rank_order_without_overlap() {
     let mut seed = 0u32;
     for k in 1..=7u32 {
         for _ in 0..k {
-            counted_win(&conn, seed, &identity(k), &key(k), 1_000 + seed as i64, Some(1));
+            counted_win(
+                &conn,
+                seed,
+                &identity(k),
+                &key(k),
+                1_000 + seed as i64,
+                Some(1),
+            );
             seed += 1;
         }
     }
@@ -372,7 +429,10 @@ fn pages_walk_owners_in_rank_order_without_overlap() {
         .rev()
         .map(|k| (identity(k), i64::from(k)))
         .collect();
-    assert_eq!(walked, expected, "rank order, no overlap, no gap, three pages");
+    assert_eq!(
+        walked, expected,
+        "rank order, no overlap, no gap, three pages"
+    );
     assert_eq!(after, 6, "two truncated pages then the last");
 }
 
@@ -518,7 +578,12 @@ fn attribution_in_sql_matches_attribute_seats_slot_rule() {
         identity_sig_hex: "idsig".into(),
         sig_valid: Some(true),
     };
-    let via_fold = attribute_seats(&params(&k_win, &key(999)), &pa, 0, &[marker(&honest, &pa, &k_win)]);
+    let via_fold = attribute_seats(
+        &params(&k_win, &key(999)),
+        &pa,
+        0,
+        &[marker(&honest, &pa, &k_win)],
+    );
     assert_eq!(attr[&pa].identity_a, via_fold.identity_a);
     assert_eq!(attr[&pa].identity_a.as_deref(), Some(honest.as_str()));
     let via_fold = attribute_seats(
@@ -528,11 +593,25 @@ fn attribution_in_sql_matches_attribute_seats_slot_rule() {
         &[marker(&honest, &pc, &k_win), marker(&rival, &pc, &k_win)],
     );
     assert_eq!(attr[&pc].identity_a, via_fold.identity_a);
-    assert_eq!(attr[&pc].identity_a, None, "conflict poisons the slot both ways");
-    let via_fold = attribute_seats(&params(&k_win, &k_win), &pe, 0, &[marker(&honest, &pe, &k_win)]);
+    assert_eq!(
+        attr[&pc].identity_a, None,
+        "conflict poisons the slot both ways"
+    );
+    let via_fold = attribute_seats(
+        &params(&k_win, &k_win),
+        &pe,
+        0,
+        &[marker(&honest, &pe, &k_win)],
+    );
     assert_eq!(attr[&pe].identity_a, via_fold.identity_a);
-    assert_eq!(attr[&pe].identity_a, None, "degenerate lock attributes nobody");
-    assert_eq!(attr[&pb].identity_a, None, "unlatched row: the key, until the relatch sweep");
+    assert_eq!(
+        attr[&pe].identity_a, None,
+        "degenerate lock attributes nobody"
+    );
+    assert_eq!(
+        attr[&pb].identity_a, None,
+        "unlatched row: the key, until the relatch sweep"
+    );
 }
 
 fn hex33(h: &str) -> [u8; 33] {
@@ -551,7 +630,8 @@ fn sql_hand_score_matches_hand_score() {
     let mut stmt = conn.prepare(&sql).unwrap();
     let mut score = |cards: &[u8; 5]| -> i64 {
         let hexs = hex::encode(cards);
-        stmt.query_row(params![hexs], |r| r.get::<_, i64>("s")).unwrap()
+        stmt.query_row(params![hexs], |r| r.get::<_, i64>("s"))
+            .unwrap()
     };
     for c in 0u8..52 {
         let hand = [c; 5];
@@ -594,28 +674,108 @@ fn hands_are_the_era_wide_lowest_verified_winner_claims() {
     let k = key(1);
     // Scores: cards 0..4 → 20; 0,1,2,3,12 → 15; 8..12 → 41.
     let (p20, s20) = counted_win(&conn, 1, &id, &k, 1_001, Some(1));
-    file_result(&conn, &h64(51), &id, &identity(9), &p20, &s20, Some("0001020304"), Some(2), &h64(61), 10);
+    file_result(
+        &conn,
+        &h64(51),
+        &id,
+        &identity(9),
+        &p20,
+        &s20,
+        Some("0001020304"),
+        Some(2),
+        &h64(61),
+        10,
+    );
     let (p15, s15) = counted_win(&conn, 2, &id, &k, 1_002, Some(1));
-    file_result(&conn, &h64(52), &id, &identity(9), &p15, &s15, Some("000102030c"), Some(1), &h64(62), 11);
+    file_result(
+        &conn,
+        &h64(52),
+        &id,
+        &identity(9),
+        &p15,
+        &s15,
+        Some("000102030c"),
+        Some(1),
+        &h64(62),
+        11,
+    );
     let (p41, s41) = counted_win(&conn, 3, &id, &k, 1_003, Some(1));
-    file_result(&conn, &h64(53), &id, &identity(9), &p41, &s41, Some("08090a0b0c"), Some(2), &h64(63), 12);
+    file_result(
+        &conn,
+        &h64(53),
+        &id,
+        &identity(9),
+        &p41,
+        &s41,
+        Some("08090a0b0c"),
+        Some(2),
+        &h64(63),
+        12,
+    );
     // A LOWER hand that must never rank: claimValid 0 (latched invalid).
     let (pbad, sbad) = counted_win(&conn, 4, &id, &k, 1_004, Some(1));
-    file_result(&conn, &h64(54), &id, &identity(9), &pbad, &sbad, Some("0c0d1a2733"), Some(0), &h64(64), 13);
+    file_result(
+        &conn,
+        &h64(54),
+        &id,
+        &identity(9),
+        &pbad,
+        &sbad,
+        Some("0c0d1a2733"),
+        Some(0),
+        &h64(64),
+        13,
+    );
     // A low hand on a KEY-keyed win (unlatched potparty) → never ranks.
     let (pkey, skey) = counted_win(&conn, 5, &id, &k, 1_005, None);
-    file_result(&conn, &h64(55), &id, &identity(9), &pkey, &skey, Some("0c0d1a2733"), Some(2), &h64(65), 14);
+    file_result(
+        &conn,
+        &h64(55),
+        &id,
+        &identity(9),
+        &pkey,
+        &skey,
+        Some("0c0d1a2733"),
+        Some(2),
+        &h64(65),
+        14,
+    );
     // A low hand whose settle does not match the recorded spend → never.
     let (pun, _sun) = counted_win(&conn, 6, &id, &k, 1_006, Some(1));
-    file_result(&conn, &h64(56), &id, &identity(9), &pun, &h64(777), Some("0c0d1a2733"), Some(2), &h64(66), 15);
+    file_result(
+        &conn,
+        &h64(56),
+        &id,
+        &identity(9),
+        &pun,
+        &h64(777),
+        Some("0c0d1a2733"),
+        Some(2),
+        &h64(66),
+        15,
+    );
     // A cardless claim → never.
     let (pnc, snc) = counted_win(&conn, 7, &id, &k, 1_007, Some(1));
-    file_result(&conn, &h64(57), &id, &identity(9), &pnc, &snc, None, Some(2), &h64(67), 16);
+    file_result(
+        &conn,
+        &h64(57),
+        &id,
+        &identity(9),
+        &pnc,
+        &snc,
+        None,
+        Some(2),
+        &h64(67),
+        16,
+    );
 
     let got = hands(&conn, None, 2);
     assert_eq!(
         got,
-        vec![(h64(52), "000102030c".to_string()), (h64(51), "0001020304".to_string())],
+        vec![
+            (h64(52), "000102030c".to_string()),
+            (h64(51), "0001020304".to_string())
+        ],
         "15 then 20; 41 cut by the limit; the four decoys never rank"
     );
     let all = hands(&conn, None, 10);
@@ -630,9 +790,31 @@ fn the_era_cutoff_filters_the_spine_and_the_hands() {
     let id = identity(1);
     let k = key(1);
     let (old_pot, old_s) = counted_win(&conn, 1, &id, &k, 1_000, Some(1));
-    file_result(&conn, &h64(51), &id, &identity(9), &old_pot, &old_s, Some("0001020304"), Some(2), &h64(61), 10);
+    file_result(
+        &conn,
+        &h64(51),
+        &id,
+        &identity(9),
+        &old_pot,
+        &old_s,
+        Some("0001020304"),
+        Some(2),
+        &h64(61),
+        10,
+    );
     let (new_pot, new_s) = counted_win(&conn, 2, &id, &k, 5_000, Some(1));
-    file_result(&conn, &h64(52), &id, &identity(9), &new_pot, &new_s, Some("08090a0b0c"), Some(2), &h64(62), 11);
+    file_result(
+        &conn,
+        &h64(52),
+        &id,
+        &identity(9),
+        &new_pot,
+        &new_s,
+        Some("08090a0b0c"),
+        Some(2),
+        &h64(62),
+        11,
+    );
     let cutoff_ms = Some(3_000i64 * 1000);
     let (rows, _) = page(&conn, cutoff_ms, 10, 0);
     assert_eq!(rows, vec![(id.clone(), false, 1)]);
@@ -640,7 +822,11 @@ fn the_era_cutoff_filters_the_spine_and_the_hands() {
     assert_eq!(pots.len(), 1);
     assert_eq!(pots[0].pot_txid, new_pot);
     let h = hands(&conn, cutoff_ms, 10);
-    assert_eq!(h, vec![(h64(52), "08090a0b0c".to_string())], "the old-era 20 is gone; only the new-era 41 remains");
+    assert_eq!(
+        h,
+        vec![(h64(52), "08090a0b0c".to_string())],
+        "the old-era 20 is gone; only the new-era 41 remains"
+    );
     let (rows, _) = page(&conn, None, 10, 0);
     assert_eq!(rows, vec![(id, false, 2)], "no cutoff ⇒ both");
 }
@@ -653,17 +839,45 @@ fn pot_markers_are_bounded_per_pot_oldest_first() {
     let pot = h64(1);
     let per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT;
     for i in 0..(per_pot as u32 + 3) {
-        file_result(&conn, &h64(100 + i), &identity(1), &identity(2), &pot, &h64(9), None, Some(1), &h64(200 + i), 1_000 + i64::from(i));
+        file_result(
+            &conn,
+            &h64(100 + i),
+            &identity(1),
+            &identity(2),
+            &pot,
+            &h64(9),
+            None,
+            Some(1),
+            &h64(200 + i),
+            1_000 + i64::from(i),
+        );
     }
     // A marker for ANOTHER pot never rides.
-    file_result(&conn, &h64(999), &identity(1), &identity(2), &h64(2), &h64(9), None, Some(1), &h64(998), 1);
+    file_result(
+        &conn,
+        &h64(999),
+        &identity(1),
+        &identity(2),
+        &h64(2),
+        &h64(9),
+        None,
+        Some(1),
+        &h64(998),
+        1,
+    );
     let mut stmt = conn.prepare(&pot_markers_sql(1)).unwrap();
     let rows: Vec<(String, i64)> = stmt
-        .query_map(params![pot], |r| Ok((r.get("gameId")?, r.get("createdAt")?)))
+        .query_map(params![pot], |r| {
+            Ok((r.get("gameId")?, r.get("createdAt")?))
+        })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(rows.len(), per_pot);
     let ats: Vec<i64> = rows.iter().map(|r| r.1).collect();
-    assert_eq!(ats, (0..per_pot as i64).map(|i| 1_000 + i).collect::<Vec<_>>(), "oldest first, later spam cut");
+    assert_eq!(
+        ats,
+        (0..per_pot as i64).map(|i| 1_000 + i).collect::<Vec<_>>(),
+        "oldest first, later spam cut"
+    );
 }

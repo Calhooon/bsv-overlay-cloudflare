@@ -2134,11 +2134,11 @@ impl PotStorage for D1PotStorage {
         // FAIL-OPEN: a missed flip leaves rows unknown-tiered until the
         // read-path fallback re-materializes them — never fails admission.
         if let Err(e) = Query::new(lb_pot_flip_sql())
-        .bind(record.txid.as_str())
-        .bind(record.txid.as_str())
-        .bind(record.txid.as_str())
-        .execute(&self.db)
-        .await
+            .bind(record.txid.as_str())
+            .bind(record.txid.as_str())
+            .bind(record.txid.as_str())
+            .execute(&self.db)
+            .await
         {
             worker::console_warn!(
                 "[pot:lb-spine] unknown->known flip failed (self-heals via fallback): {e}"
@@ -3181,28 +3181,28 @@ pub mod result_write {
     pub fn lb_row_insert_query(record: &ResultRecord, created_at: i64) -> Query {
         let pot = record.pot_txid.as_str();
         Query::new(lb_row_insert_sql())
-        .bind(record.txid.as_str())
-        .bind(record.output_index)
-        .bind(record.game_id.as_str())
-        .bind(record.winner.as_str())
-        .bind(record.loser.as_str())
-        .bind(pot)
-        .bind(record.settle_txid.as_str())
-        .bind(record.winner_sig_hex.as_str())
-        .bind(record.loser_sig_hex.as_deref())
-        .bind(record.cards_hex.as_deref())
-        .bind(created_at)
-        .bind(overlay_discovery::result::validity::claim_tier(record))
-        .bind(pot)
-        .bind(pot)
-        .bind(pot)
-        .bind(created_at)
-        .bind(pot)
-        .bind(pot)
-        .bind(created_at)
-        .bind(pot)
-        .bind(pot)
-        .bind(overlay_discovery::result::storage::RESULT_ROWS_PER_POT as i64)
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(record.game_id.as_str())
+            .bind(record.winner.as_str())
+            .bind(record.loser.as_str())
+            .bind(pot)
+            .bind(record.settle_txid.as_str())
+            .bind(record.winner_sig_hex.as_str())
+            .bind(record.loser_sig_hex.as_deref())
+            .bind(record.cards_hex.as_deref())
+            .bind(created_at)
+            .bind(overlay_discovery::result::validity::claim_tier(record))
+            .bind(pot)
+            .bind(pot)
+            .bind(pot)
+            .bind(created_at)
+            .bind(pot)
+            .bind(pot)
+            .bind(created_at)
+            .bind(pot)
+            .bind(pot)
+            .bind(overlay_discovery::result::storage::RESULT_ROWS_PER_POT as i64)
     }
 
     pub fn result_insert_query(record: &ResultRecord, created_at: i64) -> LatchedResultInsert {

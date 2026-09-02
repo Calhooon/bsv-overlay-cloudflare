@@ -170,7 +170,10 @@ mod tests {
         // historical-tx (SPV kept, broadcast skipped); the historical modes
         // pass through; junk defaults to the broadcast-free mode.
         assert_eq!(replay_submit_mode("current-tx"), SubmitMode::HistoricalTx);
-        assert_eq!(replay_submit_mode("historical-tx"), SubmitMode::HistoricalTx);
+        assert_eq!(
+            replay_submit_mode("historical-tx"),
+            SubmitMode::HistoricalTx
+        );
         assert_eq!(
             replay_submit_mode("historical-tx-no-spv"),
             SubmitMode::HistoricalTxNoSpv
@@ -194,8 +197,13 @@ mod tests {
     fn replay_message_carries_bytes_topics_mode_reason_and_refuses_oversize() {
         let topics = vec!["tm_pot".to_string(), "tm_lowfund".to_string()];
         let beef = vec![0xbeu8; 10];
-        let msg = replay_message(&beef, &topics, SubmitMode::HistoricalTxNoSpv, "phase3-fault")
-            .expect("KB-scale BEEF rides the queue");
+        let msg = replay_message(
+            &beef,
+            &topics,
+            SubmitMode::HistoricalTxNoSpv,
+            "phase3-fault",
+        )
+        .expect("KB-scale BEEF rides the queue");
         assert_eq!(msg.topics, topics);
         assert_eq!(msg.mode, "historical-tx-no-spv");
         assert_eq!(msg.reason, "phase3-fault");
@@ -216,7 +224,10 @@ mod tests {
     fn mutation_ack_is_durable_queued_or_refused_never_a_silent_ok() {
         assert_eq!(mutation_ack(true, None), MutationAck::Durable);
         // Durable wins even if a caller (wrongly) attempted an enqueue.
-        assert_eq!(mutation_ack(true, Some(Err("x".into()))), MutationAck::Durable);
+        assert_eq!(
+            mutation_ack(true, Some(Err("x".into()))),
+            MutationAck::Durable
+        );
         assert_eq!(mutation_ack(false, Some(Ok(()))), MutationAck::Queued);
         assert_eq!(
             mutation_ack(false, Some(Err("queue send failed".into()))),
