@@ -20,8 +20,9 @@ use bsv_overlay_cloudflare::d1_discovery::{mark_spent_sql, store_record_sql, ver
 use low_app_layer::logic::{
     attributions_from_pot_rows, chain_wins_owners_sql, chain_wins_spine_sql,
     clamp_leaderboard_after, clamp_leaderboard_page, era_hands_sql, hand_score,
-    leaderboard_next_after, pot_markers_sql, sql_hand_score_expr, ChainWinPotRow,
+    leaderboard_next_after, pot_markers_sql, proof_pointers_sql, sql_hand_score_expr, ChainWinPotRow,
     LEADERBOARD_AFTER_MAX, LEADERBOARD_MAX_LIMIT, LEADERBOARD_PAGE_DEFAULT, LEADERBOARD_PAGE_MAX,
+    PROOF_POINTERS_PER_KEY,
 };
 use low_app_layer::results::{attribute_seats, CovenantParams, SeatMarkerRow};
 use rusqlite::{params, params_from_iter, Connection};
@@ -879,5 +880,101 @@ fn pot_markers_are_bounded_per_pot_oldest_first() {
         ats,
         (0..per_pot as i64).map(|i| 1_000 + i).collect::<Vec<_>>(),
         "oldest first, later spam cut"
+    );
+}
+
+// ── the proof-pointer drill-down (LIVE: routes.rs `proof_pointers_sql`) ──────
+// Ported from the retired marker-window harness (E7b, 2026-09-02): the SQL is
+// the live drill-down's; the two attack cells keep executing against the
+// production schema.
+
+fn file_proof(conn: &Connection, game: &str, winner: &str, marker_txid: &str, at: i64) {
+    conn.execute(
+        "INSERT OR IGNORE INTO proof_markers \
+         (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
+         VALUES (?1, ?2, '3045ab', X'7B7D', 'e30=', ?3, 0, ?4)",
+        params![game, winner, marker_txid, at],
+    )
+    .expect("insert proof_markers");
+}
+
+fn query_proof_pointers(
+    conn: &Connection,
+    pairs: &[(String, String)],
+) -> std::collections::HashMap<(String, String), Vec<String>> {
+    let sql = proof_pointers_sql(pairs.len());
+    let mut stmt = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("proof_pointers_sql did not PREPARE: {e}\n{sql}"));
+    let binds: Vec<String> = pairs
+        .iter()
+        .flat_map(|(g, w)| [g.clone(), w.clone()])
+        .collect();
+    let mut out: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    let rows = stmt
+        .query_map(params_from_iter(binds), |r| {
+            Ok((
+                r.get::<_, String>("gameId")?,
+                r.get::<_, String>("winner")?,
+                r.get::<_, String>("txid")?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (g, w, txid) in rows {
+        out.entry((g.to_ascii_lowercase(), w.to_ascii_lowercase()))
+            .or_default()
+            .push(txid);
+    }
+    out
+}
+
+#[test]
+fn proof_pointers_are_key_bound_and_return_a_superset() {
+    let conn = production_schema_db();
+    let game = h64(0x05);
+    let winner = identity(0x11);
+    file_proof(&conn, &game, &winner, "txHONEST", 5_000);
+    file_proof(&conn, &game, &winner, "txREPOINT", 9_000);
+    for i in 0..3_000u32 {
+        file_proof(
+            &conn,
+            &format!("{:064x}", 0xd000 + i),
+            &identity(0xcc),
+            &format!("txJUNK{i:05}"),
+            8_000 + i64::from(i),
+        );
+    }
+    let map = query_proof_pointers(&conn, &[(game.clone(), winner.clone())]);
+    let set = map
+        .get(&(game.clone(), winner.clone()))
+        .expect("the requested key returns its superset");
+    assert!(
+        set.contains(&"txHONEST".to_string()),
+        "the honest pointer is IN the superset the client will verify"
+    );
+    assert!(
+        set.len() <= PROOF_POINTERS_PER_KEY,
+        "the superset is bounded to PROOF_POINTERS_PER_KEY"
+    );
+    assert_eq!(map.len(), 1, "only the requested key is returned");
+    let none = query_proof_pointers(&conn, &[(h64(0x06), winner)]);
+    assert!(none.is_empty());
+}
+
+#[test]
+fn a_prefiled_junk_pointer_cannot_own_a_victims_drilldown() {
+    let conn = production_schema_db();
+    let game = h64(0x08);
+    let winner = identity(0x11);
+    file_proof(&conn, &game, &winner, "txSQUAT", 1);
+    file_proof(&conn, &game, &winner, "txHONEST", 9_999);
+    let map = query_proof_pointers(&conn, &[(game.clone(), winner.clone())]);
+    let set = &map[&(game, winner)];
+    assert!(
+        set.contains(&"txHONEST".to_string()),
+        "the honest pointer is served despite the earlier squat (no exclusive slot)"
     );
 }

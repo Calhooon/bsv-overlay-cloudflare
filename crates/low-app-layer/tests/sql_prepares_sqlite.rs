@@ -27,7 +27,7 @@ use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::hops_view::hops_view_sql;
 use low_app_layer::live_view::{keyless_candidates_sql, live_view_sql};
 use low_app_layer::logic::{
-    batch_where_sql, leaderboard_markers_sql, pots_view_join_sql, proof_pointers_sql,
+    batch_where_sql, pots_view_join_sql, proof_pointers_sql,
     recovery_view_sql,
 };
 use low_app_layer::refund_view::refund_view_sql;
@@ -87,17 +87,6 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "live_view_sql(era, 0)", &live_view_sql(ERA, 0));
     assert_prepares(&conn, "results_sql", &results_sql(None, 0));
     assert_prepares(&conn, "results_sql(era)", &results_sql(ERA, 0));
-    // #332 — the /leaderboard anti-flood marker window.
-    assert_prepares(
-        &conn,
-        "leaderboard_markers_sql",
-        &leaderboard_markers_sql(None),
-    );
-    assert_prepares(
-        &conn,
-        "leaderboard_markers_sql(era)",
-        &leaderboard_markers_sql(ERA),
-    );
 }
 
 /// #375 — the FIXED queries' bind arity, both era arms: the cutoff is
@@ -129,16 +118,6 @@ fn fixed_queries_declare_the_parameter_count_per_era_arm() {
             2,
         ),
         ("hops_view_sql(true, era)", hops_view_sql(true, ERA, 0), 3),
-        (
-            "leaderboard_markers_sql(None)",
-            leaderboard_markers_sql(None),
-            3,
-        ),
-        (
-            "leaderboard_markers_sql(era)",
-            leaderboard_markers_sql(ERA),
-            4,
-        ),
     ] {
         let stmt = conn
             .prepare(&sql)

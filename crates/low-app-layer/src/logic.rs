@@ -1209,113 +1209,6 @@ pub fn clamp_future_cutoff(cutoff_ms: Option<i64>, now_ms: i64) -> Option<i64> {
     cutoff_ms.filter(|&ms| ms < now_ms)
 }
 
-/// THE ONE era predicate (#375) — the single place the write-off WHERE
-/// fragment (and its seconds→ms conversion) is spelled; every money-listing
-/// view builder consumes this, never a hand-copied clause (six copies would
-/// drift).
-///
-/// * `anchor_expr_secs` is a SQL expression in unix SECONDS — every
-///   `createdAt` this crate anchors on is written by the overlay's
-///   `current_unix_seconds_i64()` (pinned by the unit test in
-///   `tests/era_cutoff_sqlite.rs`). The `* 1000` here is the ONE conversion
-///   to the cutoff's ms unit; i64 seconds × 1000 cannot overflow SQLite's
-///   64-bit integer for any real clock.
-/// * The anchor must be a SERVER-OBSERVED admission stamp (`pot_records
-///   .createdAt`, or the marker table's own admission `createdAt` when no
-///   pot row exists) — NEVER caller-supplied content: a caller-supplied
-///   timestamp is attacker-owned.
-/// * `placeholder` is the bind marker for the cutoff (plain `?`, or `?N`
-///   for the numbered-bind queries) — emitted EXACTLY ONCE, so the caller
-///   appends exactly one bind iff the cutoff is `Some`.
-/// * `None` ⇒ empty string: the enclosing SQL is byte-identical to the
-///   pre-#375 query (pinned per view).
-/// * A NULL anchor is DROPPED when the cutoff is set (`NULL * 1000 >= ?` is
-///   NULL, i.e. not kept): every production write stamps `createdAt`, so a
-///   stampless row cannot be shown to post-date the cutoff — and the cutoff
-///   pre-dates launch, so nothing an honest player owns is behind it.
-/// * RESIDUAL, STATED (review MED-1): the anchor is ADMISSION time, not game
-///   era. A written-off pot whose `pot_records` row SURVIVES cannot be
-///   resurfaced by a marker republish (the COALESCE prefers the pot's
-///   pre-cutoff stamp) — but a pot with NO surviving row (never indexed, or
-///   gone in the 2026-08-06 D1 wipe) can be RE-ADMITTED by re-submitting its
-///   mined funding tx, which stamps a fresh post-cutoff anchor; a marker
-///   republish then resurfaces the game on the marker-fallback views. The
-///   leaderboard's per-pot MIN(createdAt) anchor resists the republish arm
-///   but not re-admission. Deliberately accepted as display-tier: re-added
-///   rows can only ADD (the filter sits under every quota/rank window, so
-///   they can never evict or out-rank a current player's row), money exits
-///   stay landing-proof-gated client-side, and the class starves once the
-///   client-half epoch wipe removes the old-era records that could be
-///   republished. Never re-claim the closed form the first draft of these
-///   comments claimed (Rule 10).
-///
-/// #399 (OWNER RULED 2026-08-21: "the chain arm counts alone") — the CHAIN
-/// candidate window for `/leaderboard`.
-///
-/// The counting spine (`aggregate_leaderboard_attributed`) has minted wins
-/// from CHAIN FACTS ONLY since #332 v3 — verdict + committed winning key +
-/// confirmed landing, "whether or not any marker exists". But the CANDIDATE
-/// SET was still seeded exclusively from the `result_markers_v2` window, so
-/// a pot whose winner never published a claim marker never reached the
-/// spine at all, and a real win VANISHED from the board (the 2026-08-13
-/// beta case: settled, confirmed, verdict=winner-b, paid — and unlisted
-/// because ONE marker publish raced teardown). This window closes that gap:
-/// classified winner pots straight from `pot_records`, no marker required.
-///
-/// TRUST SHAPE, stated (gate S1 corrected the first draft, which claimed a
-/// recompute that does not run for these rows — a stated defense that is not
-/// the operative one misleads the next gate):
-/// - The OPERATIVE defense is WRITE-PATH PROVENANCE. `pot_records.verdict`
-///   is written only by the overlay's own spend classification
-///   (`classify_covenant` over the ENGINE-PARSED spender bytes, riding the
-///   same `mark_spent_sql` statement as the spend pointer; `verdict_cas_sql`
-///   is pointer-guarded; `store_record_sql`'s upsert never touches verdict
-///   columns). No caller-supplied verdict path exists. Freshness is the
-///   `verdictTxid = spendingTxid` guard — a later spend-pointer overwrite
-///   leaves a stale verdict on purpose, and the equality check is the
-///   documented reader-side bar.
-/// - `classify_spent_pots` tier 1 RE-SERVES the stored verdict for exactly
-///   the rows this WHERE selects (decodable column params + matching
-///   pointer) — there is deliberately no recompute to disagree with. The
-///   COUNT bar is the aggregate's own: confirmed landing + recorded spender,
-///   re-checked at the spine, and a fabricated never-on-chain "pot" cannot
-///   clear it (`spentConfirmed` unearnable, `network_seen` unearnable).
-/// - The lenient-window residual, stated (#347/#366): while `SUBMIT_ENFORCE`
-///   is unset a stranger can file structural template-matching pot rows for
-///   free and DISPLACE real claimless wins out of this newest-first window —
-///   eviction pressure on a display window with the honesty bit set, never a
-///   minted win. Symmetric with the marker window's existing posture; the
-///   enforce flip is the shared remedy.
-/// - Failure direction: a pot MISSING from this window (NULL verdict, an
-///   unconfirmed spend, undecoded params) loses nothing that exists today —
-///   the marker window still carries every claim-seeded pot. Additive both
-///   ways.
-/// - `paramsDecoded = 1`: only covenant pots with stored committed keys can
-///   be attributed or key-counted; `outputIndex = 0` because every consumer
-///   (statuses, attribution, the spine's `LEADERBOARD_POT_VOUT` filter)
-///   speaks vout 0 — a vout≠0 covenant row could never count and would only
-///   waste window slots (gate S3).
-/// - Era-filtered on the pot's own admission stamp (`p.createdAt` — the
-///   server-written anchor, #375), newest-first, `?1 = limit + 1` probe so
-///   truncation of THIS window is detectable and ORed into the body's bit.
-pub fn chain_win_pots_sql(written_off_before_ms: Option<i64>) -> String {
-    format!(
-        "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
-                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen \
-         FROM pot_records p \
-         LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
-              AND ns.txid = lower(p.spendingTxid) \
-         WHERE p.verdict IN ('winner-a', 'winner-b') \
-           AND p.verdictTxid = p.spendingTxid \
-           AND p.spent = 1 \
-           AND p.outputIndex = 0 \
-           AND p.paramsDecoded = 1{era} \
-         ORDER BY p.createdAt DESC, p.rowid DESC \
-         LIMIT ?1",
-        era = era_filter_sql("p.createdAt", "?2", written_off_before_ms),
-    )
-}
-
 pub fn era_filter_sql(anchor_expr_secs: &str, placeholder: &str, cutoff_ms: Option<i64>) -> String {
     match cutoff_ms {
         Some(_) => format!(" AND ({anchor_expr_secs} * 1000 >= {placeholder})"),
@@ -1460,148 +1353,6 @@ pub fn leaderboard_unknown_pot_quota(limit: usize) -> usize {
 /// `proofTxid` display hint for the overflow pairs — never a count.
 pub const LEADERBOARD_PROOF_PAIRS_CAP: usize = 512;
 
-/// The `/leaderboard` recent-marker WINDOW (#332 / bsv-low#335 item 2) — the
-/// `/recovery-view` + `ls_result` (#282) anti-flood treatment applied to the
-/// query this route previously ran as a flat
-/// `ORDER BY createdAt DESC LIMIT ?`:
-///
-/// `result_markers_v2` admission is BYTE-FORMAT-ONLY, so the flat window was
-/// a flood-to-evict primitive — `limit` fresh dust markers displaced every
-/// honest result while the response still looked complete (no `truncated`
-/// bit existed). This mirrors the overlay's own hardened
-/// `result_window_sql` (#282) shape:
-///
-///  1. **Per-POT superset** — `ROW_NUMBER() OVER (PARTITION BY rm.potTxid
-///     ORDER BY rm.createdAt ASC, rm.rowid ASC) <= RESULT_ROWS_PER_POT`
-///     (the constant is IMPORTED from `overlay-discovery`, the same one the
-///     overlay window uses). One pot can never consume the window; the
-///     oldest rows are kept because oldest is the one order later spam
-///     cannot improve on. SQL never picks "the real row" — verification
-///     happens in `aggregate_leaderboard_attributed` (verification before
-///     collapse).
-///  2. **Pot-existence tier with the age-bounded quota** (`?2`): markers
-///     naming pots absent from `pot_records` are demoted behind every
-///     indexed pot, except the oldest-first quota of FRESH unknowns
-///     (younger than [`LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS`]) — a
-///     just-settled pot whose `tm_pot` admission is in flight must not be
-///     filtered, while every ghost ages out of the promoted set.
-///     LOW-4: a promoted unknown pot (no `pot_records` row) ranks by
-///     `COALESCE(potCreatedAt, potFirstMarkerAt)`, so with no pot row it
-///     falls back to the marker stamp and can display AHEAD of an older
-///     indexed pot. Inherited from the overlay's #283a window and MOOT for
-///     the spine: a promoted pot has no `pot_records` row, so it is
-///     unconfirmed → never a chain-counted win, only a transient
-///     display-order artifact until its admission lands (or it ages out).
-///  3. **Pots ranked by the pot's own admission stamp**
-///     (`pot_records.createdAt`, which an attacker cannot move by filing
-///     markers), newest first; `DENSE_RANK` bounds the answer to `?1`
-///     DISTINCT POTS (the route binds `limit + 1` as a truncation probe —
-///     see [`leaderboard_window_cut`]).
-///
-/// BINDS: `?1` pot limit (probe), `?2` unknown-pot quota, `?3` row cap
-/// (`?1 × RESULT_ROWS_PER_POT` — a belt, never the truncation signal), and
-/// — #375, only when `written_off_before_ms` is set — `?4` the write-off
-/// cutoff (ms). EXECUTED (not string-pinned) by
-/// `tests/leaderboard_window_sqlite.rs` against the production migrations
-/// (#323: a `contains` assertion on a query must never be the only thing
-/// standing behind it).
-///
-/// #375 placement: the era filter rides the `rn <= per_pot` level, where
-/// the per-pot anchor columns exist and are CONSTANT per pot — so a
-/// written-off pot drops ATOMICALLY (every marker row at once) before the
-/// existence tier / quota / `DENSE_RANK` windows run, and the board (the
-/// leaderboard counts from this spine) can never rank it. Anchor:
-/// `COALESCE(potCreatedAt, potFirstMarkerAt)` — the pot's own admission
-/// stamp when indexed, else the pot's OLDEST marker admission stamp (both
-/// server-written, per-pot MIN so later spam cannot move it forward).
-/// #375 anchor asymmetry, stated (review LOW-2): THIS view era-filters at
-/// the per-pot level on `COALESCE(potCreatedAt, potFirstMarkerAt)` where
-/// `potFirstMarkerAt` is the per-pot MIN over markers — so a post-cutoff
-/// marker REPUBLISH can never resurface a written-off pot here (the oldest
-/// stamp survives as the anchor). The four potparty-family views anchor on
-/// the PER-ROW `pp.createdAt` fallback instead and do not get that
-/// resistance (their residual is stated at `era_filter_sql`). Two rules,
-/// not one — do not assume this view's stronger property elsewhere.
-pub fn leaderboard_markers_sql(written_off_before_ms: Option<i64>) -> String {
-    const COLS: &str = "gameId, winner, loser, potTxid, settleTxid, \
-         winnerSigHex, loserSigHex, cardsHex, txid, createdAt, claimValid";
-    let fresh = format!(
-        "CASE WHEN unknownPot = 1 AND COALESCE(potFirstMarkerAt, 0) >= \
-              unixepoch() - {LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS} \
-         THEN 1 ELSE 0 END"
-    );
-    format!(
-        "SELECT {COLS} \
-     FROM (SELECT {COLS}, markerRowid, potCreatedAt, potFirstMarkerAt, tier, \
-                  DENSE_RANK() OVER (ORDER BY tier ASC, \
-                                              COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
-                                              potTxid ASC) AS finalRank \
-           FROM (SELECT {COLS}, markerRowid, potCreatedAt, potFirstMarkerAt, \
-                        CASE WHEN unknownPot = 0 \
-                             OR (freshUnknown = 1 AND potRank <= ?2) \
-                             THEN 0 ELSE 1 END AS tier \
-                 FROM (SELECT {COLS}, markerRowid, potCreatedAt, potFirstMarkerAt, \
-                              unknownPot, \
-                              {fresh} AS freshUnknown, \
-                              DENSE_RANK() OVER (PARTITION BY unknownPot, {fresh} \
-                                                 ORDER BY COALESCE(potFirstMarkerAt, 0) ASC, \
-                                                          potTxid ASC) AS potRank \
-                       FROM (SELECT rm.gameId AS gameId, rm.winner AS winner, \
-                                    rm.loser AS loser, rm.potTxid AS potTxid, \
-                                    rm.settleTxid AS settleTxid, \
-                                    rm.winnerSigHex AS winnerSigHex, \
-                                    rm.loserSigHex AS loserSigHex, \
-                                    rm.cardsHex AS cardsHex, \
-                                    rm.txid AS txid, rm.createdAt AS createdAt, \
-                                    rm.claimValid AS claimValid, \
-                                    rm.rowid AS markerRowid, \
-                                    r.potCreatedAt AS potCreatedAt, \
-                                    MIN(rm.createdAt) OVER (PARTITION BY rm.potTxid) \
-                                        AS potFirstMarkerAt, \
-                                    CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot, \
-                                    ROW_NUMBER() OVER (PARTITION BY rm.potTxid \
-                                                       ORDER BY rm.createdAt ASC, \
-                                                                rm.rowid ASC) AS rn \
-                             FROM result_markers_v2 rm \
-                             LEFT JOIN (SELECT txid, MIN(createdAt) AS potCreatedAt \
-                                        FROM pot_records GROUP BY txid) r \
-                                    ON r.txid = rm.potTxid) \
-                       WHERE rn <= {per_pot}{era}))) \
-     WHERE finalRank <= ?1 \
-     ORDER BY tier ASC, COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
-              potTxid ASC, markerRowid ASC \
-     LIMIT ?3",
-        per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
-        era = era_filter_sql(
-            "COALESCE(potCreatedAt, potFirstMarkerAt)",
-            "?4",
-            written_off_before_ms
-        ),
-    )
-}
-
-/// Cut the window at the `limit`-th DISTINCT pot and report whether MORE
-/// pots existed — the honest `truncated` bit (#335 item 2). The SQL binds
-/// `limit + 1` pots as a probe, so an over-full page here means the answer
-/// is INCOMPLETE and the route must say so rather than serve a
-/// complete-looking board (the fail mode the #317 audit called out: under a
-/// flood `resultCount == limit` and the wrong answer looks whole).
-///
-/// `pot_keys` are the rows' `potTxid` values IN WINDOW ORDER (the SQL ranks
-/// pots and returns each pot's rows contiguously); `None` (a malformed
-/// NULL-pot row) groups as one key, exactly as the SQL's
-/// `PARTITION BY rm.potTxid` groups NULLs.
-pub fn leaderboard_window_cut(pot_keys: &[Option<String>], limit: usize) -> (usize, bool) {
-    let mut seen = std::collections::HashSet::new();
-    for (i, k) in pot_keys.iter().enumerate() {
-        let key = k.as_deref().unwrap_or("").to_ascii_lowercase();
-        if seen.insert(key) && seen.len() > limit {
-            return (i, true);
-        }
-    }
-    (pot_keys.len(), false)
-}
-
 /// How many `proof_markers` pointers the fetch returns PER `(gameId, winner)`
 /// key (#332 HIGH-1). `gameId` and `winner` are BOTH public, claimable names,
 /// and `tm_proof` admission is byte-format-only — so any single-winner slot
@@ -1667,31 +1418,6 @@ pub struct ResultMarkerRow {
     pub claim_valid: Option<i64>,
 }
 
-/// The distinct pot outpoints (`potTxid:0`) to spent-status-join, in
-/// first-seen marker order (many markers can share a pot — one funding tx,
-/// one settle). The route chunks these at [`D1_CHUNK_OUTPOINTS`] exactly like
-/// `/utxo-status`, so a large result set never trips D1's 100-bound-param cap.
-/// #411 round 2 — the WRITE-TIME spine read (`lb_marker_rows`). One page per
-/// tier, PLAIN-indexed (`idx_lb_marker_rows_page`), no window functions: the
-/// stage-1 derivations (rn cap, potCreatedAt, potFirstMarkerAt, unknownPot,
-/// the COALESCE order/era anchor as `orderAt`) were stamped at WRITE by
-/// `lb_row_insert_query` / the pot-admission flip. Era filters on `orderAt`,
-/// the same anchor stage-1 filters on.
-pub fn lb_page_sql(unknown: bool, written_off_before_ms: Option<i64>) -> String {
-    format!(
-        "SELECT gameId, winner, loser, potTxid, settleTxid, winnerSigHex, \
-                loserSigHex, cardsHex, txid, createdAt, claimValid, \
-                rowid AS markerRowid, potCreatedAt, potFirstMarkerAt, orderAt, \
-                unknownPot \
-         FROM lb_marker_rows \
-         WHERE unknownPot = {tier}{era} \
-         ORDER BY orderAt DESC, potTxid ASC, markerRowid ASC \
-         LIMIT ?1",
-        tier = if unknown { 1 } else { 0 },
-        era = era_filter_sql("orderAt", "?2", written_off_before_ms),
-    )
-}
-
 /// The unknown-tier page bound. Stage-1 ranks fresh-unknown pots over the
 /// WHOLE history; this page is bounded, ordered `orderAt DESC` — fresh
 /// unknowns (potFirstMarkerAt within the hour) are by construction the
@@ -1709,118 +1435,6 @@ pub struct LbPageRow {
     pub pot_first_marker_at: Option<i64>,
     pub order_at: Option<i64>,
     pub unknown_pot: bool,
-}
-
-/// PURE stage-1 replacement over the two pages: replicate the tier system
-/// (known pots tier 0; FRESH unknown pots — oldest-first, ≤ `quota` — join
-/// tier 0; every other unknown is tier 1), the final order
-/// (tier ASC, orderAt DESC, potTxid ASC, markerRowid ASC) and the
-/// distinct-pot probe cut ([`leaderboard_window_cut`]).
-///
-/// Returns `(markers, truncated, distinct_pots_seen)`. THE ZERO-LIE RULE:
-/// the route serves this result ONLY when `distinct_pots_seen >= limit + 1`
-/// (the page PROVED the board over-full, so `truncated` is honestly true and
-/// no deeper row the page missed could have made the window). Every other
-/// board takes the fallback (the old windowed query), so a bounded page can
-/// never silently narrow a sparse board.
-pub fn lb_window_from_pages(
-    known: Vec<LbPageRow>,
-    unknown: Vec<LbPageRow>,
-    limit: usize,
-    quota: usize,
-    now: i64,
-) -> (Vec<ResultMarkerRow>, bool, usize) {
-    let fresh_floor = now - LEADERBOARD_UNKNOWN_POT_MAX_AGE_SECS as i64;
-    // Fresh-unknown pots, ranked oldest-first (stage-1's potRank: the
-    // anti-flood order — a NEWEST flood cannot displace the quota).
-    let mut fresh_pots: Vec<(i64, String)> = Vec::new();
-    let mut seen_fresh = std::collections::HashSet::new();
-    for r in &unknown {
-        let fresh = r
-            .pot_first_marker_at
-            .map(|t| t >= fresh_floor)
-            .unwrap_or(false);
-        if !fresh {
-            continue;
-        }
-        let key = r.marker.pot_txid.to_ascii_lowercase();
-        if seen_fresh.insert(key.clone()) {
-            fresh_pots.push((r.pot_first_marker_at.unwrap_or(0), key));
-        }
-    }
-    fresh_pots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let tier0_unknown: std::collections::HashSet<String> =
-        fresh_pots.into_iter().take(quota).map(|(_, k)| k).collect();
-
-    let mut tier0: Vec<LbPageRow> = known;
-    let mut tier1: Vec<LbPageRow> = Vec::new();
-    for r in unknown {
-        if tier0_unknown.contains(&r.marker.pot_txid.to_ascii_lowercase()) {
-            tier0.push(r);
-        } else {
-            tier1.push(r);
-        }
-    }
-    let order = |a: &LbPageRow, b: &LbPageRow| {
-        b.order_at
-            .unwrap_or(0)
-            .cmp(&a.order_at.unwrap_or(0))
-            .then_with(|| a.marker.pot_txid.cmp(&b.marker.pot_txid))
-            .then_with(|| a.marker_rowid.cmp(&b.marker_rowid))
-    };
-    tier0.sort_by(order);
-    tier1.sort_by(order);
-    tier0.extend(tier1);
-
-    let keys: Vec<Option<String>> = tier0
-        .iter()
-        .map(|r| Some(r.marker.pot_txid.clone()))
-        .collect();
-    let distinct = {
-        let mut s = std::collections::HashSet::new();
-        for k in &keys {
-            s.insert(k.as_deref().unwrap_or("").to_ascii_lowercase());
-        }
-        s.len()
-    };
-    let (cut, truncated) = leaderboard_window_cut(&keys, limit);
-    (
-        tier0.into_iter().take(cut).map(|r| r.marker).collect(),
-        truncated,
-        distinct,
-    )
-}
-
-/// #411 round 2 — the fallback path's BULK materialization: the whole
-/// stage-1 inner derivation as ONE `INSERT OR IGNORE ... SELECT`, so a
-/// fallback request (the only kind that still pays the window scan) leaves
-/// the spine converged behind it. Idempotent on the (txid, outputIndex) key;
-/// costs one stage-1-shaped scan, exactly what the request just paid anyway.
-pub fn lb_backfill_sql() -> String {
-    format!(
-        "INSERT OR IGNORE INTO lb_marker_rows \
-         (txid, outputIndex, gameId, winner, loser, potTxid, settleTxid, \
-          winnerSigHex, loserSigHex, cardsHex, createdAt, claimValid, rn, \
-          potCreatedAt, potFirstMarkerAt, orderAt, unknownPot) \
-         SELECT txid, outputIndex, gameId, winner, loser, potTxid, settleTxid, \
-                winnerSigHex, loserSigHex, cardsHex, createdAt, claimValid, rn, \
-                potCreatedAt, potFirstMarkerAt, \
-                COALESCE(potCreatedAt, potFirstMarkerAt), unknownPot \
-         FROM (SELECT rm.txid, rm.outputIndex, rm.gameId, rm.winner, rm.loser, \
-                      rm.potTxid, rm.settleTxid, rm.winnerSigHex, rm.loserSigHex, \
-                      rm.cardsHex, rm.createdAt, rm.claimValid, \
-                      ROW_NUMBER() OVER (PARTITION BY rm.potTxid \
-                                         ORDER BY rm.createdAt ASC, rm.rowid ASC) AS rn, \
-                      r.potCreatedAt AS potCreatedAt, \
-                      MIN(rm.createdAt) OVER (PARTITION BY rm.potTxid) AS potFirstMarkerAt, \
-                      CASE WHEN r.txid IS NULL THEN 1 ELSE 0 END AS unknownPot \
-               FROM result_markers_v2 rm \
-               LEFT JOIN (SELECT txid, MIN(createdAt) AS potCreatedAt \
-                          FROM pot_records GROUP BY txid) r \
-                      ON r.txid = rm.potTxid) \
-         WHERE rn <= {per_pot}",
-        per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT,
-    )
 }
 
 pub fn leaderboard_pot_outpoints(markers: &[ResultMarkerRow]) -> Vec<Outpoint> {
@@ -2159,52 +1773,6 @@ fn marker_anchored(
         }
         None => false,
     }
-}
-
-/// Aggregate + rank the leaderboard server-side. Since #332 v2 the COUNTING
-/// SPINE is chain facts (verdict + verified attribution + confirmed spend),
-/// so this no-verdict / no-attribution entry point can COUNT NOTHING — it
-/// returns an empty board (evidence needs a counted pot to attach to) and is
-/// kept only for the pre-#230 call shape and for tests that assert the
-/// unattributed case is unranked. `statuses` come from the chunked
-/// `pot_records` join (vout 0); `proof_by_game_winner` maps (gameId_lc,
-/// winner_lc) → a `proof_markers` txid hint (empty when the join was
-/// unavailable — never a count).
-pub fn aggregate_leaderboard(
-    markers: &[ResultMarkerRow],
-    statuses: &[OutpointStatus],
-    proof_by_game_winner: &std::collections::HashMap<(String, String), Vec<String>>,
-    hands_limit: usize,
-) -> Leaderboard {
-    aggregate_leaderboard_with_verdicts(
-        markers,
-        statuses,
-        proof_by_game_winner,
-        hands_limit,
-        &std::collections::HashMap::new(),
-    )
-}
-
-/// [`aggregate_leaderboard_attributed`] without seat attributions OR committed
-/// params — counts nothing (no verdict + committed key ⇒ unranked), kept for
-/// callers/tests without the classification join.
-pub fn aggregate_leaderboard_with_verdicts(
-    markers: &[ResultMarkerRow],
-    statuses: &[OutpointStatus],
-    proof_by_game_winner: &std::collections::HashMap<(String, String), Vec<String>>,
-    hands_limit: usize,
-    verdict_by_pot: &std::collections::HashMap<String, crate::results::PotVerdict>,
-) -> Leaderboard {
-    aggregate_leaderboard_attributed(
-        markers,
-        statuses,
-        proof_by_game_winner,
-        hands_limit,
-        verdict_by_pot,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-    )
 }
 
 /// The CHAIN-SPINE leaderboard fold (#332 v3 — see the module note for the
@@ -3849,29 +3417,6 @@ mod tests {
     /// constant per pot (a written-off pot drops atomically, before the
     /// tier/quota/DENSE_RANK windows); stripping it restores the `None`
     /// arm byte-for-byte.
-    #[test]
-    fn leaderboard_markers_sql_era_filter_shape_and_none_identity() {
-        let cutoff = Some(1_754_500_000_000i64);
-        let frag = era_filter_sql("COALESCE(potCreatedAt, potFirstMarkerAt)", "?4", cutoff);
-        let with = leaderboard_markers_sql(cutoff);
-        let without = leaderboard_markers_sql(None);
-        assert_eq!(with.matches(&frag).count(), 1, "exactly one era fragment");
-        assert_eq!(
-            with.matches(&format!(
-                "WHERE rn <= {per_pot}{frag}",
-                per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT
-            ))
-            .count(),
-            1,
-            "the era filter rides the per-pot window level"
-        );
-        assert_eq!(
-            with.replace(&frag, ""),
-            without,
-            "None must stay byte-identical to the pre-#375 query"
-        );
-    }
-
     /// #323 MEDIUM-5 — the confirmed-landing predicate, pinned where it
     /// lives rather than inside `routes.rs`.
     /// #323 — the ONE bar both money views use. Because `/results` and
@@ -4780,7 +4325,9 @@ mod tests {
         let b = ident(0xbb);
         let markers = vec![mk(1, &a, &b, 1, 2, true, None, 100, 0)];
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
-        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        // E7b: the non-attributed aggregator is gone — an EMPTY attribution
+        // world through the live spine says the same thing.
+        let lb = agg(&markers, &statuses, &no_proofs(), &World::default());
         assert!(
             lb.board.is_empty(),
             "no attribution ⇒ unranked, never a marker-only win"
@@ -5547,8 +5094,18 @@ mod tests {
         let attrs = attrs_of(&[(1, Some(&w), Some(&l))]);
 
         // WITHOUT the attribution: a verdict alone is UNRANKED (no row).
-        let lb =
-            aggregate_leaderboard_with_verdicts(&markers, &statuses, &no_proofs(), 200, &verdicts);
+        // E7b: the non-attributed aggregator is gone — the live spine with an
+        // EMPTY attribution map says the same thing.
+        let lb = aggregate_leaderboard_attributed(
+            &markers,
+            &statuses,
+            &no_proofs(),
+            200,
+            &verdicts,
+            &HashMap::new(),
+            &no_params(),
+            &std::collections::HashMap::new(),
+        );
         assert!(
             lb.board.is_empty(),
             "verdict without attribution ⇒ unranked"
@@ -5978,7 +5535,7 @@ mod tests {
             .collect();
         let statuses = statuses_for(&markers, &HashMap::from([(1u8, 2u8)]));
         // NO verdict, NO attribution — a bare/legacy pot.
-        let lb = aggregate_leaderboard(&markers, &statuses, &no_proofs(), 200);
+        let lb = agg(&markers, &statuses, &no_proofs(), &World::default());
         assert!(
             lb.board.is_empty(),
             "an unattributed pot is UNRANKED — no wrong-winner, no win at all"
@@ -6076,35 +5633,6 @@ mod tests {
     }
 
     /// #335 item 2 — the truncation cut + the honest wire bit.
-    #[test]
-    fn window_cut_and_truncated_bit_are_honest() {
-        // Rows arrive pot-grouped in rank order; the cut lands on the first
-        // row of the (limit+1)-th DISTINCT pot.
-        let keys: Vec<Option<String>> = vec![Some(tx(1)), Some(tx(1)), Some(tx(2)), Some(tx(3))];
-        assert_eq!(leaderboard_window_cut(&keys, 2), (3, true));
-        assert_eq!(leaderboard_window_cut(&keys, 3), (4, false));
-        // NULL-pot rows group as ONE key, exactly as the SQL's
-        // `PARTITION BY rm.potTxid` groups NULLs — a malformed flood is one
-        // pot, not many.
-        let keys2: Vec<Option<String>> = vec![None, None, Some(tx(1))];
-        assert_eq!(leaderboard_window_cut(&keys2, 1), (2, true));
-        assert_eq!(leaderboard_window_cut(&keys2, 2), (3, false));
-        // Case-insensitive pot keys collapse (pot txids are hex).
-        let keys3: Vec<Option<String>> = vec![Some(tx(1).to_uppercase()), Some(tx(1))];
-        assert_eq!(leaderboard_window_cut(&keys3, 1), (2, false));
-
-        // The body carries the bit — additive, both values.
-        let lb = Leaderboard {
-            board: vec![],
-            hands: vec![],
-        };
-        let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1, 0, true, None)).unwrap();
-        assert_eq!(v["truncated"], true);
-        let v: serde_json::Value =
-            serde_json::from_str(&leaderboard_body(&lb, 1, 0, false, None)).unwrap();
-        assert_eq!(v["truncated"], false);
-    }
     #[test]
     fn clamp_limit_defaults_and_bounds() {
         assert_eq!(clamp_leaderboard_limit(None), LEADERBOARD_DEFAULT_LIMIT);
