@@ -200,6 +200,84 @@ pub fn proof_posts_hands_sql(n: usize) -> String {
 /// `POST /proof?identity=<poster>` — the seam resolves the caller exactly as
 /// the identity views do (a VERIFIED session must be the poster; anonymous
 /// lenient posts are bound by the signature alone). Answers the replay verdict.
+/// The `(gameId, winner)` pairs among `n` that hold a VALID posted bundle —
+/// the leaderboard's `proofPosted` hint (display; the client re-verifies the
+/// bundle it fetches through `GET /proof` before it renders a badge).
+pub fn proof_posted_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let pairs = vec!["(gameId = ? AND winner = ?)"; n].join(" OR ");
+    format!("SELECT gameId, winner FROM proof_posts WHERE bundleValid = 1 AND ({pairs})")
+}
+
+/// One posted bundle, bytes verbatim (hex-projected: D1 hands BLOBs back as
+/// arrays; `hex()` keeps the row a plain string row).
+pub const PROOF_POST_READ_SQL: &str =
+    "SELECT gameId, winner, sigHex, hex(bundle) AS bundleHex, createdAt \
+     FROM proof_posts WHERE gameId = ? AND winner = ? AND bundleValid = 1 LIMIT 1";
+
+#[derive(serde::Deserialize)]
+struct ProofPostReadRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    #[serde(rename = "sigHex")]
+    sig_hex: String,
+    #[serde(rename = "bundleHex")]
+    bundle_hex: String,
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<f64>,
+}
+
+/// `GET /proof?gameId=<hex64>&winner=<pub33>` — the posted proof for one
+/// `(game, winner)` in EXACTLY the overlay's `ls_proof` `proofsFor` row shape
+/// (`gameId/winner/sigHex/bundleBase64/txid/createdAt`, `txid` null: nothing
+/// was mined for it), so the client's existing verifier (`verifyClaimProof`
+/// → `verifiedRowReplay`) replays it unchanged. Public read; `{"result": []}`
+/// when nothing valid is posted. Anyone can fetch + re-derive the hand: the
+/// winner's signature over the bundle hash is inside the row.
+pub async fn proof_get(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    let url = req.url()?;
+    let q = |k: &str| -> Option<String> {
+        url.query_pairs()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.trim().to_ascii_lowercase())
+    };
+    let (Some(game_id), Some(winner)) = (q("gameId"), q("winner")) else {
+        return crate::routes::json_error("gameId and winner are required", 400);
+    };
+    if !is_hex_len(&game_id, 64) {
+        return crate::routes::json_error("gameId must be 64 hex", 400);
+    }
+    if !is_hex_len(&winner, 66) || !(winner.starts_with("02") || winner.starts_with("03")) {
+        return crate::routes::json_error("winner must be a 33-byte compressed pubkey hex", 400);
+    }
+    let db = ctx.env.d1("OVERLAY_DB")?;
+    let rows = db
+        .prepare(PROOF_POST_READ_SQL)
+        .bind(&[game_id.as_str().into(), winner.as_str().into()])?
+        .all()
+        .await?
+        .results::<ProofPostReadRowD1>()?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let bytes = hex::decode(&r.bundle_hex).ok()?;
+            Some(serde_json::json!({
+                "gameId": r.game_id,
+                "winner": r.winner,
+                "sigHex": r.sig_hex,
+                "bundleBase64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                "txid": serde_json::Value::Null,
+                "createdAt": r.created_at.map(|c| c as i64),
+            }))
+        })
+        .collect();
+    crate::routes::json_response(
+        serde_json::json!({ "type": "proof", "result": result }).to_string(),
+        200,
+    )
+}
+
 pub async fn proof_post(mut req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let identity = match crate::routes::view_identity(&req, &ctx) {
         crate::routes::ViewIdentity::Identity(id) => id,

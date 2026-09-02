@@ -1013,6 +1013,13 @@ impl ResultRowD1 {
 /// txid; the ~10-15 KB transcript `bundle` is never read here (the CLIENT
 /// fetches + verifies it — this surface only points at where it lives).
 #[derive(Deserialize)]
+struct ProofPostedRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+}
+
+#[derive(Deserialize)]
 struct ProofPointerRowD1 {
     #[serde(rename = "gameId")]
     game_id: String,
@@ -1458,6 +1465,45 @@ pub async fn compute_leaderboard_body_string(
     }
 
     // 5) The fold — unchanged — then cut to the page in rank order.
+    // Proof-in-DB (2026-09-02): the posted-bundle set over the same pairs —
+    // stamped onto the evidence AFTER aggregation (a posted proof is not a
+    // marker; the aggregator has nothing to count).
+    let mut posted: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for chunk in pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        for (g, w) in chunk {
+            b.push(JsValue::from_str(&g.to_ascii_lowercase()));
+            b.push(JsValue::from_str(&w.to_ascii_lowercase()));
+        }
+        let stmt = match db
+            .prepare(crate::proof_post::proof_posted_sql(chunk.len()))
+            .bind(&b)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[leaderboard] proof_posts bind failed (proofPosted omitted): {e}");
+                continue;
+            }
+        };
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<ProofPostedRowD1>())
+        {
+            Ok(rows) => {
+                for pr in rows {
+                    posted.insert((
+                        pr.game_id.to_ascii_lowercase(),
+                        pr.winner.to_ascii_lowercase(),
+                    ));
+                }
+            }
+            Err(e) => {
+                console_warn!("[leaderboard] proof_posts query failed (proofPosted omitted): {e}")
+            }
+        }
+    }
+
     let mut lb = crate::logic::aggregate_leaderboard_attributed(
         &markers,
         &statuses,
@@ -1468,6 +1514,13 @@ pub async fn compute_leaderboard_body_string(
         &params_by_pot,
         &signers_by_pot,
     );
+    if !posted.is_empty() {
+        for row in lb.board.iter_mut() {
+            for e in row.evidence.iter_mut() {
+                e.proof_posted = posted.contains(&(e.game_id.clone(), e.winner.clone()));
+            }
+        }
+    }
     crate::logic::retain_page_owners(&mut lb, &owners);
     Ok((
         200,

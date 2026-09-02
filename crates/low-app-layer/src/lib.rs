@@ -220,6 +220,7 @@ fn router(
         .get_async("/results", routes::results)
         // bsv-low P1.1 proof-in-DB (owner GO 2026-09-02): the winner posts the
         // transcript proof bundle here instead of spending it on chain.
+        .get_async("/proof", proof_post::proof_get)
         .post_async("/proof", proof_post::proof_post)
         .get_async("/refund-view", routes::refund_view)
         .get_async("/hops-view", routes::hops_view)

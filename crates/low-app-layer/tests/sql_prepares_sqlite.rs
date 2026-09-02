@@ -196,6 +196,16 @@ fn every_batched_query_prepares_at_representative_arities() {
         );
         assert_prepares(
             &conn,
+            &format!("proof_posted_sql({n})"),
+            &low_app_layer::proof_post::proof_posted_sql(n),
+        );
+        assert_prepares(
+            &conn,
+            "PROOF_POST_READ_SQL",
+            low_app_layer::proof_post::PROOF_POST_READ_SQL,
+        );
+        assert_prepares(
+            &conn,
             &format!("keyless_candidates_sql({n})"),
             &keyless_candidates_sql(n),
         );
@@ -237,6 +247,11 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
                 "proof_posts_hands_sql",
                 low_app_layer::proof_post::proof_posts_hands_sql(n),
                 n,
+            ),
+            (
+                "proof_posted_sql",
+                low_app_layer::proof_post::proof_posted_sql(n),
+                n * 2,
             ),
         ] {
             let stmt = conn

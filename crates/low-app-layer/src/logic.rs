@@ -1528,6 +1528,12 @@ pub struct LeaderboardEvidence {
     /// set the CLIENT filters by transcript validity, never a server pick).
     /// Empty when none indexed.
     pub proof_txids: Vec<String>,
+    /// A VALID `LOW/proof/v1` bundle is POSTED for this (game, winner) —
+    /// proof-in-DB (2026-09-02): the winner files the bundle with the
+    /// app-layer instead of buying an on-chain marker. Stamped by the route
+    /// from `proof_posts` (never by the aggregator: no marker carries it).
+    /// Display hint only — the client fetches + replays the bundle itself.
+    pub proof_posted: bool,
     /// The server-derived CHAIN classification of this pot's recorded spend
     /// (bsv-low #227): which mandated covenant template the settle paid.
     /// `None` = not classified (legacy bare pot, missing bytes, or ambiguous
@@ -2013,6 +2019,7 @@ pub fn aggregate_leaderboard_attributed(
                         cards_hex: m.cards_hex.as_ref().map(|s| s.to_ascii_lowercase()),
                         anchored: anchored[i],
                         proof_txids,
+                        proof_posted: false,
                         server_verdict: verdict,
                         chain_attributed_winner: counted.get(&pot).map(|(o, _)| o.clone()),
                         settle_signers: signers_by_pot.get(&pot).cloned(),
@@ -2467,6 +2474,7 @@ pub fn leaderboard_body(
                         // singular field; `proofTxids` is the authoritative set.
                         "proofTxid": e.proof_txids.first(),
                         "proofTxids": e.proof_txids,
+                        "proofPosted": e.proof_posted,
                         "serverVerdict": e.server_verdict.map(crate::results::PotVerdict::as_str),
                         // bsv-low #230: the identity attributed as this pot's
                         // winner via the verified seat-binding marker + chain
@@ -4905,6 +4913,10 @@ mod tests {
         assert_eq!(ev[0]["anchored"], true);
         assert_eq!(ev[0]["proofTxid"], "px");
         assert_eq!(ev[0]["proofTxids"][0], "px");
+        assert_eq!(
+            ev[0]["proofPosted"], false,
+            "the aggregator never stamps a posted proof; the route does"
+        );
         assert_eq!(ev[0]["cardsHex"], "000102030c");
         assert_eq!(ev[0]["createdAt"], 100);
         let hands = v["hands"].as_array().unwrap();
