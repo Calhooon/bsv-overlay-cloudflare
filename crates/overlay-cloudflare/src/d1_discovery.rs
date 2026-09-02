@@ -5890,6 +5890,20 @@ struct ProofRow {
     output_index: f64,
     #[serde(rename = "createdAt")]
     created_at: Option<f64>,
+    /// bsv-low P1.1 part b replay columns — `default` tolerates a read
+    /// racing the additive migrations (absent = not replayed yet).
+    #[serde(rename = "bundleValid", default)]
+    bundle_valid: Option<f64>,
+    #[serde(rename = "winnerSeat", default)]
+    winner_seat: Option<f64>,
+    #[serde(rename = "seatA", default)]
+    seat_a: Option<String>,
+    #[serde(rename = "seatB", default)]
+    seat_b: Option<String>,
+    #[serde(rename = "winnerCardsHex", default)]
+    winner_cards_hex: Option<String>,
+    #[serde(rename = "loserCardsHex", default)]
+    loser_cards_hex: Option<String>,
 }
 
 impl ProofRow {
@@ -5910,6 +5924,12 @@ impl ProofRow {
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
+            bundle_valid: self.bundle_valid.map(|v| v != 0.0),
+            winner_seat: self.winner_seat.map(|v| v as u8),
+            seat_a: self.seat_a,
+            seat_b: self.seat_b,
+            winner_cards_hex: self.winner_cards_hex,
+            loser_cards_hex: self.loser_cards_hex,
         }
     }
 }
@@ -5932,10 +5952,21 @@ impl ProofRow {
 pub fn proof_list_for_game_winner_sql() -> &'static str {
     "SELECT gameId, winner, sigHex, bundleB64, \
             CASE WHEN bundleB64 IS NULL THEN hex(bundle) ELSE '' END AS bundle, \
-            txid, outputIndex, createdAt \
+            txid, outputIndex, createdAt, \
+            bundleValid, winnerSeat, seatA, seatB, winnerCardsHex, loserCardsHex \
      FROM proof_markers WHERE gameId = ? AND winner = ? \
      ORDER BY createdAt ASC, rowid ASC LIMIT ?"
 }
+
+/// SHIPPED proof-admission write (bsv-low P1.1 part b, 2026-09-02): the
+/// marker's pushes + the admission-time replay verdict and both re-derived
+/// hands (NULL when the replay refused or the half is not provable). 14
+/// binds. `INSERT OR IGNORE` on the outpoint PK — never overwrite, never
+/// delete. Pub for the REAL-SQLite pin.
+pub const PROOF_ADMIT_WRITE_SQL: &str = "INSERT OR IGNORE INTO proof_markers \
+     (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt, \
+      bundleValid, winnerSeat, seatA, seatB, winnerCardsHex, loserCardsHex) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 /// Cloudflare D1 implementation of the ProofStorage trait
 /// (tm_proof / ls_proof, bsv-low leaderboard rung 3).
@@ -5971,24 +6002,27 @@ impl ProofStorage for D1ProofStorage {
         // replayed submit of the same output is a no-op; bundles for the
         // same (gameId, winner) from different txs are ALL kept; never
         // overwrite, never delete.
-        Query::new(
-            "INSERT OR IGNORE INTO proof_markers \
-             (gameId, winner, sigHex, bundle, bundleB64, txid, outputIndex, createdAt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(record.game_id.as_str())
-        .bind(record.winner.as_str())
-        .bind(record.sig_hex.as_str())
-        .bind(record.bundle.clone()) // BLOB bind, like pot_beefs
-        // bsv-low #289: the admission-time base64 (the admit path always
-        // sets it; a defensive None binds NULL → the read-time fallback).
-        .bind(record.bundle_b64.as_deref())
-        .bind(record.txid.as_str())
-        .bind(record.output_index)
-        .bind(current_unix_seconds_i64())
-        .execute(&self.db)
-        .await
-        .map_err(proof_err)
+        Query::new(PROOF_ADMIT_WRITE_SQL)
+            .bind(record.game_id.as_str())
+            .bind(record.winner.as_str())
+            .bind(record.sig_hex.as_str())
+            .bind(record.bundle.clone()) // BLOB bind, like pot_beefs
+            // bsv-low #289: the admission-time base64 (the admit path always
+            // sets it; a defensive None binds NULL → the read-time fallback).
+            .bind(record.bundle_b64.as_deref())
+            .bind(record.txid.as_str())
+            .bind(record.output_index)
+            .bind(current_unix_seconds_i64())
+            // bsv-low P1.1 part b: the admission-time replay verdict + hands.
+            .bind(record.bundle_valid.map(i64::from))
+            .bind(record.winner_seat.map(i64::from))
+            .bind(record.seat_a.as_deref())
+            .bind(record.seat_b.as_deref())
+            .bind(record.winner_cards_hex.as_deref())
+            .bind(record.loser_cards_hex.as_deref())
+            .execute(&self.db)
+            .await
+            .map_err(proof_err)
     }
 
     async fn list_for_game_winner(
@@ -6419,6 +6453,12 @@ mod tests {
             txid: "tx1".into(),
             output_index: 2.0,
             created_at: Some(1_234.0),
+            bundle_valid: None,
+            winner_seat: None,
+            seat_a: None,
+            seat_b: None,
+            winner_cards_hex: None,
+            loser_cards_hex: None,
         };
         let r = row.into_record();
         assert_eq!(r.bundle, b"{\"v\":1}");
@@ -10525,6 +10565,84 @@ mod tests {
             (Some("s2".into()), Some(400), None),
             "a new spender RESETS the pair — fee None is not inherited"
         );
+    }
+
+    /// bsv-low P1.1 part b: the proof-admission write lands the replay
+    /// verdict and both hands through the SHIPPED statement against the
+    /// production schema — a dropped bind would shift every column silently.
+    #[test]
+    fn the_proof_admission_write_lands_the_replay_columns() {
+        let conn = production_schema_db();
+        assert_eq!(
+            PROOF_ADMIT_WRITE_SQL.matches('?').count(),
+            14,
+            "14 placeholders"
+        );
+        conn.execute(
+            PROOF_ADMIT_WRITE_SQL,
+            rusqlite::params![
+                "aa".repeat(32),
+                format!("02{}", "bb".repeat(32)),
+                "3045",
+                vec![1u8, 2, 3],
+                "AQID",
+                "txPROOF",
+                0i64,
+                1_000i64,
+                1i64,
+                0i64,
+                format!("03{}", "0a".repeat(32)),
+                format!("02{}", "0b".repeat(32)),
+                "011f232733",
+                "151c1d2d31",
+            ],
+        )
+        .expect("the shipped write executes");
+        let (valid, seat, a, w, l): (Option<i64>, Option<i64>, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT bundleValid, winnerSeat, seatA, winnerCardsHex, loserCardsHex FROM proof_markers WHERE txid = 'txPROOF'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("row");
+        assert_eq!((valid, seat), (Some(1), Some(0)));
+        assert_eq!(
+            a.as_deref(),
+            Some(format!("03{}", "0a".repeat(32)).as_str())
+        );
+        assert_eq!(
+            (w.as_deref(), l.as_deref()),
+            (Some("011f232733"), Some("151c1d2d31"))
+        );
+        // A refused replay stores 0 with NULL hands; the row still exists.
+        conn.execute(
+            PROOF_ADMIT_WRITE_SQL,
+            rusqlite::params![
+                "aa".repeat(32),
+                format!("02{}", "bb".repeat(32)),
+                "3045",
+                vec![9u8],
+                "CQ==",
+                "txREFUSED",
+                0i64,
+                1_001i64,
+                0i64,
+                Option::<i64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+            ],
+        )
+        .expect("refused write executes");
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT bundleValid FROM proof_markers WHERE txid = 'txREFUSED'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
+        assert_eq!(v, Some(0));
     }
 
     /// The hopparty writer's bind list and its SQL must agree in COUNT — a

@@ -73,6 +73,7 @@
 //! Clients verify each bundle and use the one that proves.
 
 pub mod lookup_service;
+pub mod replay;
 pub mod storage;
 pub mod topic_manager;
 

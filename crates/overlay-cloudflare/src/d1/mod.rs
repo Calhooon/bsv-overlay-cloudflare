@@ -421,7 +421,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 117 → 118 for bsv-low #403 board paging (2026-08-29):
 /// `idx_pot_records_chain_wins` — the whole-era chain-wins spine's scan
 /// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
-pub const OVERLAY_MIGRATION_COUNT: usize = 129;
+pub const OVERLAY_MIGRATION_COUNT: usize = 135;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1498,6 +1498,16 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE pot_records ADD COLUMN spenderFactsTxid TEXT",
     "ALTER TABLE pot_records ADD COLUMN spenderSizeBytes INTEGER",
     "ALTER TABLE pot_records ADD COLUMN spenderFeeSats INTEGER",
+    // bsv-low P1.1 part b (2026-09-02): the proof bundle's admission-time
+    // REPLAY verdict and both re-derived hands (`proof::replay`). Additive,
+    // NULLable (NULL = admitted before the replay shipped — a reader decodes
+    // the retained bundle bytes instead). Display tier: the receipt's showdown.
+    "ALTER TABLE proof_markers ADD COLUMN bundleValid INTEGER",
+    "ALTER TABLE proof_markers ADD COLUMN winnerSeat INTEGER",
+    "ALTER TABLE proof_markers ADD COLUMN seatA TEXT",
+    "ALTER TABLE proof_markers ADD COLUMN seatB TEXT",
+    "ALTER TABLE proof_markers ADD COLUMN winnerCardsHex TEXT",
+    "ALTER TABLE proof_markers ADD COLUMN loserCardsHex TEXT",
 ];
 
 // =============================================================================

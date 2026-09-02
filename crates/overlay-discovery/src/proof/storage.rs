@@ -68,6 +68,27 @@ pub struct ProofRecord {
     /// passed to `store_record` is ignored); recency ordering rides on it.
     #[serde(rename = "createdAt")]
     pub created_at: i64,
+    /// bsv-low P1.1 part b (2026-09-02): the admission-time REPLAY verdict
+    /// ([`crate::proof::replay::prove_bundle`]) and what it re-derived.
+    /// `None` = recorded before the replay shipped (a reader decodes from the
+    /// retained bytes); `Some(false)` = refused (nothing derived, the row
+    /// still exists — admission is byte-format-only); `Some(true)` = both
+    /// hands below are the replay's OWN derivation, never the bundle's words.
+    #[serde(rename = "bundleValid", default)]
+    pub bundle_valid: Option<bool>,
+    #[serde(rename = "winnerSeat", default)]
+    pub winner_seat: Option<u8>,
+    /// The two wire seat keys, positional (66-hex lowercase).
+    #[serde(rename = "seatA", default)]
+    pub seat_a: Option<String>,
+    #[serde(rename = "seatB", default)]
+    pub seat_b: Option<String>,
+    /// Canonical (sorted) 10-hex card sets; the loser's is `None` when the
+    /// bundle carried no provable loser half.
+    #[serde(rename = "winnerCardsHex", default)]
+    pub winner_cards_hex: Option<String>,
+    #[serde(rename = "loserCardsHex", default)]
+    pub loser_cards_hex: Option<String>,
 }
 
 /// `ls_proof` query shapes — tagged JSON, e.g.
@@ -201,6 +222,12 @@ mod tests {
             txid: txid.into(),
             output_index: 0,
             created_at: 0, // ignored — storage assigns
+            bundle_valid: None,
+            winner_seat: None,
+            seat_a: None,
+            seat_b: None,
+            winner_cards_hex: None,
+            loser_cards_hex: None,
         }
     }
 

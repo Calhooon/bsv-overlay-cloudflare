@@ -102,6 +102,13 @@ impl LookupService for ProofLookupService {
             return Ok(());
         };
 
+        // bsv-low P1.1 part b: replay ONCE at admission (decode-once, the #284
+        // pattern) — the verdict and both re-derived hands ride the record.
+        // Admission itself stays byte-format-only: a refused replay is stored
+        // as `bundleValid = 0`, never a rejected marker.
+        let proved = <[u8; 33]>::try_from(marker.winner.as_slice())
+            .ok()
+            .and_then(|w| crate::proof::replay::prove_bundle(&marker.bundle, &marker.game_id, &w));
         let record = ProofRecord {
             game_id: hex::encode(marker.game_id),
             winner: hex::encode(&marker.winner),
@@ -115,6 +122,17 @@ impl LookupService for ProofLookupService {
             txid: txid.to_string(),
             output_index,
             created_at: 0, // assigned by the storage layer at insert
+            bundle_valid: Some(proved.is_some()),
+            winner_seat: proved.as_ref().map(|p| p.winner_seat),
+            seat_a: proved.as_ref().map(|p| hex::encode(p.seats[0])),
+            seat_b: proved.as_ref().map(|p| hex::encode(p.seats[1])),
+            winner_cards_hex: proved
+                .as_ref()
+                .map(|p| crate::proof::replay::ProvedHands::cards_hex(&p.winner_cards)),
+            loser_cards_hex: proved.as_ref().and_then(|p| {
+                p.loser_cards
+                    .map(|c| crate::proof::replay::ProvedHands::cards_hex(&c))
+            }),
         };
 
         // Keyed by the OUTPOINT: a replayed submit of the same output is a
@@ -313,6 +331,62 @@ mod tests {
 
     // ── Admission + lookup (the golden vector end-to-end) ────────────────
 
+    /// bsv-low P1.1 part b: admission replays the bundle ONCE and stores the
+    /// verdict + both re-derived hands; a bundle the replay refuses is still
+    /// admitted (byte-format admission) with `bundleValid = Some(false)`.
+    #[tokio::test]
+    async fn admission_replays_the_bundle_and_stores_both_hands() {
+        const REAL: &[u8] = include_bytes!("fixtures/bundle-a1081773.bin");
+        let game: [u8; 32] =
+            hex::decode("a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let winner =
+            hex::decode("03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0")
+                .unwrap();
+        let (svc, storage) = make_service_with_storage();
+        let script = super::super::tests::marker_script(&game, &winner, &golden_sig(), REAL);
+        svc.output_admitted_by_topic(&admit("txREAL", 0, script))
+            .await
+            .unwrap();
+        let rows = storage
+            .list_for_game_winner(&hex::encode(game), &hex::encode(&winner), 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.bundle_valid, Some(true));
+        assert_eq!(r.winner_seat, Some(0));
+        assert_eq!(
+            r.seat_a.as_deref(),
+            Some("032f0bceeaf001f7d16871c9eba014004a17489c8a39aec9d4e9cccf626fe66e8d")
+        );
+        assert_eq!(r.winner_cards_hex.as_deref(), Some("011f232733"));
+        assert_eq!(r.loser_cards_hex.as_deref(), Some("151c1d2d31"));
+        assert_eq!(r.bundle, REAL, "the bytes are still retained verbatim");
+
+        // The golden (format-only) marker: admitted, refused by the replay.
+        svc.output_admitted_by_topic(&admit(
+            "txGOLDEN",
+            0,
+            hex::decode(GOLDEN_PROOF_HEX).unwrap(),
+        ))
+        .await
+        .unwrap();
+        let g = storage
+            .list_for_game_winner(
+                &hex::encode([0x11u8; 32]),
+                &hex::encode(golden_winner()),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].bundle_valid, Some(false));
+        assert!(g[0].winner_cards_hex.is_none() && g[0].loser_cards_hex.is_none());
+    }
+
     #[tokio::test]
     async fn golden_marker_admitted_and_found() {
         let (svc, storage) = make_service_with_storage();
@@ -358,6 +432,12 @@ mod tests {
                 txid: "legacyTx".into(),
                 output_index: 0,
                 created_at: 0,
+                bundle_valid: None,
+                winner_seat: None,
+                seat_a: None,
+                seat_b: None,
+                winner_cards_hex: None,
+                loser_cards_hex: None,
             })
             .await
             .unwrap();

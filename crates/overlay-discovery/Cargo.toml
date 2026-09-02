@@ -19,6 +19,17 @@ async-trait.workspace = true
 # ls_proof answers carry the raw proof-bundle bytes base64-encoded
 # (bundleBase64). Same version as overlay-cloudflare's existing dep.
 base64 = "0.22"
+# bsv-low P1.1 part b (2026-09-02): the server-side replay of a
+# `LOW/proof/v1` bundle — the SAME pure crates the client's wasm wraps
+# (`low-core` mental/discard math, `low-wire` signed envelopes; native +
+# wasm32, no I/O, no RNG). Cross-repo PATH deps (the sister checkout at
+# ../bsv-low, the same shape bsv-wallet-cli uses for its toolbox); the
+# fields they inherit (`version.workspace`) resolve against THEIR workspace.
+low-core = { path = "../../../bsv-low/crates/low-core" }
+low-wire = { path = "../../../bsv-low/crates/low-wire" }
+# Bundles are gzip-compressed by the client past a size threshold; the pure
+# Rust backend builds on wasm32-unknown-unknown.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `std::time::SystemTime::now()` panics on wasm32-unknown-unknown — route
