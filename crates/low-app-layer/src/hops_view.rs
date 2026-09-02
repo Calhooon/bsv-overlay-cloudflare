@@ -720,13 +720,19 @@ pub fn chain_probe_targets(entries: &[HopEntry]) -> Vec<(String, u32)> {
 ///    bar the index applies to its own recorded-but-unconfirmed spends);
 ///  - a corroborated UNSPENT ⇒ `unspent` / `chain`;
 ///  - unknown ⇒ unchanged (`unspent` / `index`).
-pub fn apply_chain_probes(mut entries: Vec<HopEntry>, probes: &[(String, u32, ChainSpendProbe)]) -> Vec<HopEntry> {
+pub fn apply_chain_probes(
+    mut entries: Vec<HopEntry>,
+    probes: &[(String, u32, ChainSpendProbe)],
+) -> Vec<HopEntry> {
     for e in entries.iter_mut() {
         if !(e.status == HopStatus::Unspent && e.status_source == Some("index")) {
             continue;
         }
         let key = (e.hop_txid.to_ascii_lowercase(), e.hop_vout);
-        let Some((_, _, probe)) = probes.iter().find(|(t, v, _)| (t.to_ascii_lowercase(), *v) == key) else {
+        let Some((_, _, probe)) = probes
+            .iter()
+            .find(|(t, v, _)| (t.to_ascii_lowercase(), *v) == key)
+        else {
             continue;
         };
         if !probe.known {
@@ -1803,7 +1809,12 @@ mod tests {
         let probes = vec![(
             hop.clone(),
             0,
-            ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.clone()), spent_confirmed: Some(true) },
+            ChainSpendProbe {
+                known: true,
+                spent: Some(true),
+                spending_txid: Some(spender.clone()),
+                spent_confirmed: Some(true),
+            },
         )];
         let out = apply_chain_probes(vec![index_unspent(&hop, 0)], &probes);
         assert_eq!(out[0].status, HopStatus::Spent);
@@ -1819,7 +1830,12 @@ mod tests {
         let probes = vec![(
             hop.clone(),
             0,
-            ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some("3d".repeat(32)), spent_confirmed: Some(false) },
+            ChainSpendProbe {
+                known: true,
+                spent: Some(true),
+                spending_txid: Some("3d".repeat(32)),
+                spent_confirmed: Some(false),
+            },
         )];
         let out = apply_chain_probes(vec![index_unspent(&hop, 0)], &probes);
         assert_eq!(out[0].status, HopStatus::Unknown);
@@ -1832,12 +1848,36 @@ mod tests {
         let a = "81".repeat(32);
         let b = "82".repeat(32);
         let probes = vec![
-            (a.clone(), 0, ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None }),
-            (b.clone(), 0, ChainSpendProbe { known: false, spent: None, spending_txid: None, spent_confirmed: None }),
+            (
+                a.clone(),
+                0,
+                ChainSpendProbe {
+                    known: true,
+                    spent: Some(false),
+                    spending_txid: None,
+                    spent_confirmed: None,
+                },
+            ),
+            (
+                b.clone(),
+                0,
+                ChainSpendProbe {
+                    known: false,
+                    spent: None,
+                    spending_txid: None,
+                    spent_confirmed: None,
+                },
+            ),
         ];
         let out = apply_chain_probes(vec![index_unspent(&a, 0), index_unspent(&b, 0)], &probes);
-        assert_eq!((out[0].status, out[0].status_source), (HopStatus::Unspent, Some("chain")));
-        assert_eq!((out[1].status, out[1].status_source), (HopStatus::Unspent, Some("index")));
+        assert_eq!(
+            (out[0].status, out[0].status_source),
+            (HopStatus::Unspent, Some("chain"))
+        );
+        assert_eq!(
+            (out[1].status, out[1].status_source),
+            (HopStatus::Unspent, Some("index"))
+        );
     }
 
     #[test]
@@ -1855,7 +1895,12 @@ mod tests {
         let probes = vec![(
             entries[1].hop_txid.clone(),
             0,
-            ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None },
+            ChainSpendProbe {
+                known: true,
+                spent: Some(false),
+                spending_txid: None,
+                spent_confirmed: None,
+            },
         )];
         let out = apply_chain_probes(entries.clone(), &probes);
         assert_eq!(out[1].status, HopStatus::Spent);
