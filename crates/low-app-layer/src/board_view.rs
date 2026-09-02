@@ -202,32 +202,12 @@ impl BoardView {
 /// Free function so the DETACHED compute task can call it after its
 /// spawning request is gone.
 async fn push_board_changed(env: &Env) {
-    let (Ok(relay), Ok(token)) = (
-        env.var("RELAY_URL").map(|v| v.to_string()),
-        env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
-    ) else {
-        return; // unconfigured deploy — S4 wires prod
-    };
-    let body = serde_json::json!({
-        "room": "broadcast-low-board",
-        "body": { "kind": "board-changed", "at": Date::now().as_millis() },
-    })
-    .to_string();
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post);
-    let headers = Headers::new();
-    let _ = headers.set("Authorization", &format!("Bearer {token}"));
-    let _ = headers.set("content-type", "application/json");
-    init.with_headers(headers);
-    init.with_body(Some(body.into()));
-    let Ok(req) = Request::new_with_init(&format!("{relay}/broadcast"), &init) else {
-        return;
-    };
-    match Fetch::Request(req).send().await {
-        Ok(r) if r.status_code() == 200 => {}
-        Ok(r) => console_log!("[board-view] broadcast push HTTP {}", r.status_code()),
-        Err(e) => console_log!("[board-view] broadcast push failed: {e}"),
-    }
+    crate::internal_events::push_broadcast(
+        env,
+        "broadcast-low-board",
+        serde_json::json!({ "kind": "board-changed", "at": Date::now().as_millis() }),
+    )
+    .await
 }
 
 fn body_response(body: String, stale: bool) -> Result<Response> {

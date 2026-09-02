@@ -120,6 +120,7 @@ pub mod compaction;
 pub mod cors;
 pub mod credit_beef;
 pub mod hops_view;
+pub mod internal_events;
 pub mod live_view;
 pub mod logic;
 pub mod proof_post;
@@ -164,6 +165,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // deleting this line, or wrapping it in `if false`, is a BUILD failure —
     // there is no other way to obtain a `LatchColumnsEnsured`.
     let schema_ready = schema::ensure_latch_columns(&env).await;
+
+    // W2-P4: first-party internal webhooks (bearer INTERNAL_TOKEN) — served
+    // BEFORE the BRC-103 front door, exactly like the relay's /broadcast:
+    // the callers are our workers, not identities with a wallet.
+    if req.method() == Method::Post && req.path() == "/internal/tip-changed" {
+        return internal_events::tip_changed(req, &env).await;
+    }
 
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
     // middleware refusals return here; otherwise the request proceeds with
