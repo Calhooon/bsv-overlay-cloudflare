@@ -10517,7 +10517,8 @@ mod tests {
             [],
         )
         .expect("point at s1");
-        let read = |conn: &rusqlite::Connection| -> (Option<String>, Option<i64>, Option<i64>) {
+        type FactsRow = (Option<String>, Option<i64>, Option<i64>);
+        let read = |conn: &rusqlite::Connection| -> FactsRow {
             conn.query_row(
                 "SELECT spenderFactsTxid, spenderSizeBytes, spenderFeeSats FROM pot_records WHERE txid = 'potS'",
                 [],

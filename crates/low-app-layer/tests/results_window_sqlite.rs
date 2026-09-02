@@ -3977,14 +3977,15 @@ fn proof_hands_like_the_route(
         std::collections::HashMap::new();
     let mut pending: Vec<i64> = Vec::new();
     let mut stmt = conn.prepare(&proof_hands_sql(game_ids.len())).unwrap();
-    let rows: Vec<(
+    type ProofRow = (
         String,
         String,
         Option<i64>,
         Option<String>,
         Option<String>,
         i64,
-    )> = stmt
+    );
+    let rows: Vec<ProofRow> = stmt
         .query_map(rusqlite::params_from_iter(game_ids.iter()), |r| {
             Ok((
                 r.get("gameId")?,
@@ -4124,7 +4125,7 @@ fn both_hands_serve_from_the_winners_replayed_bundle() {
         Some(("011f232733", Some("151c1d2d31"))),
         "the pre-replay row is replayed at read time from its retained bytes"
     );
-    assert!(proofs.get(&g3).is_none(), "a refused row serves nothing");
+    assert!(!proofs.contains_key(&g3), "a refused row serves nothing");
 
     // Through the assembler: the viewer is the winner → mine = the winner's
     // five, theirs = the loser's five, source "proof" — with NO hand marker
