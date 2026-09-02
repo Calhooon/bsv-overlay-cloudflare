@@ -1875,6 +1875,18 @@ struct HopSeatRowD1 {
     seat_settle_pubkey: String,
     #[serde(rename = "markerValid")]
     marker_valid: Option<f64>,
+    /// bsv-low P4 slice 2: the container tx + hop outpoint + money facts
+    /// (`default` tolerates a read racing the additive migrations).
+    #[serde(default)]
+    txid: String,
+    #[serde(rename = "hopVout", default)]
+    hop_vout: Option<f64>,
+    #[serde(rename = "hopSats", default)]
+    hop_sats: Option<f64>,
+    #[serde(rename = "sizeBytes", default)]
+    size_bytes: Option<f64>,
+    #[serde(rename = "feeSats", default)]
+    fee_sats: Option<f64>,
 }
 
 // ── /results — server-derived settle results (bsv-low #227) ─────────────────
@@ -1959,6 +1971,18 @@ struct ResultsRowD1 {
     spender_seen: Option<f64>,
     #[serde(rename = "spenderFinal", default)]
     spender_final: Option<f64>,
+    /// bsv-low P4 slice 2 money facts (display tier) — `default` tolerates a
+    /// read racing the overlay's additive migrations (absent = not named).
+    #[serde(rename = "fundingSizeBytes", default)]
+    funding_size_bytes: Option<f64>,
+    #[serde(rename = "fundingFeeSats", default)]
+    funding_fee_sats: Option<f64>,
+    #[serde(rename = "spenderFactsTxid", default)]
+    spender_facts_txid: Option<String>,
+    #[serde(rename = "spenderSizeBytes", default)]
+    spender_size_bytes: Option<f64>,
+    #[serde(rename = "spenderFeeSats", default)]
+    spender_fee_sats: Option<f64>,
 }
 
 impl ResultsRowD1 {
@@ -1997,6 +2021,11 @@ impl ResultsRowD1 {
             spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
             spender_seen: self.spender_seen.map(|v| v != 0.0),
             spender_final: self.spender_final.map(|v| v != 0.0),
+            funding_size_bytes: self.funding_size_bytes.map(|v| v as u64),
+            funding_fee_sats: self.funding_fee_sats.map(|v| v as u64),
+            spender_facts_txid: self.spender_facts_txid,
+            spender_size_bytes: self.spender_size_bytes.map(|v| v as u64),
+            spender_fee_sats: self.spender_fee_sats.map(|v| v as u64),
         }
     }
 }
@@ -2141,13 +2170,15 @@ async fn gather_result_entries(
     let truncated = rows.len() > crate::results::RESULTS_MAX_ROWS;
     rows.truncate(crate::results::RESULTS_MAX_ROWS);
 
-    // #406 (2026-08-27) — settleSigners OVERLAY, page-batched. The nested
-    // window query is left byte-identical (adding the column inside it
+    // #406 (2026-08-27) — the PAGE OVERLAY, page-batched. The nested
+    // window query is left byte-identical (adding a column inside it
     // emptied the page — see the decision log); instead ONE PK-indexed
-    // batched read over this page's ≤100 outpoints fills the field, and the
-    // fold's existing pointer guard (verdictTxid == spendingTxid) remains
-    // the ONLY serving bar. BEST-EFFORT: a fault leaves signers null (the
-    // narration then simply doesn't claim an ending kind), never a 503.
+    // batched read over this page's ≤100 outpoints fills `settleSigners`
+    // and (bsv-low P4 slice 2) the money facts, and each value keeps its
+    // own serving bar in the fold (the verdict pointer guard for signers,
+    // `spenderFactsTxid == spendingTxid` for the spender facts). BEST-
+    // EFFORT: a fault leaves the fields null (the narration then simply
+    // doesn't claim an ending kind; the receipt names the gap), never a 503.
     {
         let mut ops: Vec<(String, u32)> = rows
             .iter()
@@ -2155,45 +2186,27 @@ async fn gather_result_entries(
             .collect();
         ops.sort_unstable();
         ops.dedup();
-        let mut signers_by_op: std::collections::HashMap<(String, u32), String> =
-            std::collections::HashMap::new();
+        let mut overlay: Vec<crate::results::PageOverlay> = Vec::with_capacity(ops.len());
         for chunk in ops.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-            let clause = vec!["(txid = ? AND outputIndex = ?)"; chunk.len()].join(" OR ");
-            let sql =
-                format!("SELECT txid, outputIndex, settleSigners FROM pot_records WHERE {clause}");
+            let sql = crate::results::page_overlay_sql(chunk.len());
             let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
             for (t, v) in chunk {
                 binds.push(JsValue::from_str(t));
                 binds.push(JsValue::from_f64(f64::from(*v)));
             }
-            #[derive(serde::Deserialize)]
-            struct SignersRowD1 {
-                txid: String,
-                #[serde(rename = "outputIndex")]
-                output_index: u32,
-                #[serde(rename = "settleSigners", default)]
-                settle_signers: Option<String>,
-            }
             match db.prepare(&sql).bind(&binds) {
-                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<SignersRowD1>()) {
-                    Ok(srows) => {
-                        for sr in srows {
-                            if let Some(sig) = sr.settle_signers {
-                                signers_by_op
-                                    .insert((sr.txid.to_ascii_lowercase(), sr.output_index), sig);
-                            }
-                        }
-                    }
-                    Err(e) => console_warn!("[results] signers overlay chunk failed: {e}"),
+                Ok(stmt) => match stmt
+                    .all()
+                    .await
+                    .and_then(|r| r.results::<crate::results::PageOverlay>())
+                {
+                    Ok(orows) => overlay.extend(orows),
+                    Err(e) => console_warn!("[results] page overlay chunk failed: {e}"),
                 },
-                Err(e) => console_warn!("[results] signers overlay bind failed: {e}"),
+                Err(e) => console_warn!("[results] page overlay bind failed: {e}"),
             }
         }
-        for r in rows.iter_mut() {
-            r.settle_signers = signers_by_op
-                .get(&(r.pot_txid.to_ascii_lowercase(), r.pot_vout))
-                .cloned();
-        }
+        crate::results::apply_page_overlay(&mut rows, &overlay);
     }
 
     // Claims (won/lost attribution) — BEST-EFFORT: a fault here only leaves
@@ -2378,6 +2391,11 @@ async fn results_hop_seat_markers(
                         identity: r.identity,
                         seat_settle_pubkey: r.seat_settle_pubkey,
                         marker_valid: r.marker_valid.map(|v| v != 0.0),
+                        txid: r.txid,
+                        hop_vout: r.hop_vout.map_or(0, |v| v as u32),
+                        hop_sats: r.hop_sats.map(|v| v as u64),
+                        size_bytes: r.size_bytes.map(|v| v as u64),
+                        fee_sats: r.fee_sats.map(|v| v as u64),
                     })
                     .collect();
                 // Every pot in the chunk gets the chunk's rows; the committed-key

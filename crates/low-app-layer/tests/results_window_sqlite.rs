@@ -830,11 +830,64 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             // #371 — the third-arm inputs, read through the REAL SQL.
             spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
             spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
+            // bsv-low P4 slice 2 — NOT selected by results_sql either (same
+            // byte-identical rule); filled by the PAGE OVERLAY below exactly
+            // as the route fills them.
+            funding_size_bytes: None,
+            funding_fee_sats: None,
+            spender_facts_txid: None,
+            spender_size_bytes: None,
+            spender_fee_sats: None,
         })
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
     .unwrap()
+}
+
+/// The route's PAGE OVERLAY driven through the REAL statement
+/// (`page_overlay_sql`) and the REAL fold (`apply_page_overlay`): one
+/// PK-indexed read over the page's outpoints fills `settleSigners` and the
+/// P4 money facts onto the rows — Rule 6b, the cell drives the producer.
+fn apply_page_overlay_like_the_route(conn: &Connection, rows: &mut [ResultsRow]) {
+    use low_app_layer::results::{apply_page_overlay, page_overlay_sql, PageOverlay};
+    let mut ops: Vec<(String, u32)> = rows
+        .iter()
+        .map(|r| (r.pot_txid.to_ascii_lowercase(), r.pot_vout))
+        .collect();
+    ops.sort_unstable();
+    ops.dedup();
+    if ops.is_empty() {
+        return;
+    }
+    let sql = page_overlay_sql(ops.len());
+    let mut binds: Vec<rusqlite::types::Value> = Vec::with_capacity(ops.len() * 2);
+    for (t, v) in &ops {
+        binds.push(rusqlite::types::Value::Text(t.clone()));
+        binds.push(rusqlite::types::Value::Integer(i64::from(*v)));
+    }
+    let mut stmt = conn.prepare(&sql).expect("page overlay prepares");
+    let overlay: Vec<PageOverlay> = stmt
+        .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok(PageOverlay {
+                txid: r.get("txid")?,
+                output_index: r.get::<_, i64>("outputIndex")? as u32,
+                settle_signers: r.get("settleSigners")?,
+                funding_size_bytes: r
+                    .get::<_, Option<i64>>("fundingSizeBytes")?
+                    .map(|v| v as f64),
+                funding_fee_sats: r.get::<_, Option<i64>>("fundingFeeSats")?.map(|v| v as f64),
+                spender_facts_txid: r.get("spenderFactsTxid")?,
+                spender_size_bytes: r
+                    .get::<_, Option<i64>>("spenderSizeBytes")?
+                    .map(|v| v as f64),
+                spender_fee_sats: r.get::<_, Option<i64>>("spenderFeeSats")?.map(|v| v as f64),
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    apply_page_overlay(rows, &overlay);
 }
 
 /// The gated joins surface "no BLOB fetched" the same way a missing
@@ -3676,4 +3729,226 @@ fn the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert() {
     for pot in [&pre, &post, &unknown_pre, &unknown_post] {
         assert!(all.contains(pot), "{pot} missing from the None arm");
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// bsv-low P4 slice 2 — the served MONEY facts, through the real producers
+// ════════════════════════════════════════════════════════════════════════
+
+/// The receipt's money section needs what one device cannot hold: the
+/// opponent's stake tx, the exact JOIN fee, the settle's size/fee after a
+/// wipe. This drives the REAL chain end to end against the PRODUCTION
+/// schema — the overlay's own fact writers (`pot_funding_facts_fill_sql`,
+/// `spender_facts_cas_sql`), `results_sql` (byte-identical, no new column),
+/// the PAGE OVERLAY (`page_overlay_sql` → `apply_page_overlay`), the hop
+/// fetch under the pot's OWN committed keys (`hop_seat_markers_sql`),
+/// `assemble_results` → `results_body` — and asserts on the WIRE BODY.
+#[test]
+fn the_money_facts_serve_through_the_real_producers_under_their_guards() {
+    use bsv_overlay_cloudflare::d1_discovery::{pot_funding_facts_fill_sql, spender_facts_cas_sql};
+    use low_app_layer::results::{hop_seat_markers_sql, HopSeatRow};
+    let conn = production_schema_db();
+    let identity = format!("02{}", "a1".repeat(32));
+    let (_ka, pub_a) = real_key(0x31);
+    let (_kb, pub_b) = real_key(0x32);
+    let p = params_committing(&pub_a, &pub_b, 958_846);
+    let pot = h64(0xc1);
+    let spender = h64(0xd1);
+    insert_decoded_pot(
+        &conn,
+        &pot,
+        Some(&spender),
+        &p,
+        4_000,
+        Some("winner-a"),
+        Some(&spender),
+        Some(961_000),
+        true,
+    );
+    file_marker(&conn, &identity, &pot, &h64(0xe1), 1_000);
+    // The overlay's fact writers, verbatim: funding at admission, the spender
+    // under the live pointer.
+    conn.execute(
+        pot_funding_facts_fill_sql(),
+        params![991i64, 101i64, pot.as_str(), 0i64],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.execute(
+            spender_facts_cas_sql(),
+            params![
+                spender.as_str(),
+                3_577i64,
+                3_577i64,
+                spender.as_str(),
+                400i64,
+                400i64,
+                spender.as_str(),
+                pot.as_str(),
+                0i64,
+                spender.as_str()
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    // Seat A's hop container (verified at admission: markerValid = 1) plus
+    // junk: an UNVERIFIED row under pubA and a verified row under a key the
+    // pot never committed — neither may serve.
+    let hop_insert = "INSERT OR IGNORE INTO hopparty_records \
+         (identity, opponentIdentity, gameId, hopVout, hopSats, seatSettlePubkey, seatSigHex, \
+          identitySigHex, hopLockHex, hopSatsOnChain, containerOutputs, txid, outputIndex, \
+          createdAt, sizeBytes, feeSats, markerValid) \
+         VALUES (?1, ?2, ?3, 0, 2_190, ?4, '30', '30', '76a9', 2_190, 2, ?5, 1, ?6, ?7, ?8, ?9)";
+    let hop_a = h64(0xf1);
+    conn.execute(
+        hop_insert,
+        params![
+            identity.as_str(),
+            h64(0xbb),
+            h64(0x11),
+            pub_a.as_str(),
+            hop_a.as_str(),
+            900i64,
+            580i64,
+            58i64,
+            1i64
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        hop_insert,
+        params![
+            h64(0xbb),
+            identity.as_str(),
+            h64(0x11),
+            pub_a.as_str(),
+            h64(0xf2),
+            901i64,
+            999i64,
+            99i64,
+            0i64
+        ],
+    )
+    .unwrap();
+    let (_kx, foreign) = real_key(0x33);
+    conn.execute(
+        hop_insert,
+        params![
+            h64(0xcc),
+            identity.as_str(),
+            h64(0x11),
+            foreign.as_str(),
+            h64(0xf3),
+            902i64,
+            1i64,
+            1i64,
+            1i64
+        ],
+    )
+    .unwrap();
+
+    // The route's chain.
+    let mut rows = query_results_rows(&conn, &identity);
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].funding_size_bytes.is_none(),
+        "results_sql itself carries no money column (byte-identical)"
+    );
+    apply_page_overlay_like_the_route(&conn, &mut rows);
+    let params_by_pot = covenant_params_by_pot(&rows);
+    let pp = params_by_pot
+        .get(&(pot.clone(), 0))
+        .expect("decoded params");
+    let mut stmt = conn.prepare(&hop_seat_markers_sql(1)).unwrap();
+    let hops: Vec<HopSeatRow> = stmt
+        .query_map(params![hex::encode(pp.pub_a), hex::encode(pp.pub_b)], |r| {
+            Ok(HopSeatRow {
+                identity: r.get("identity")?,
+                seat_settle_pubkey: r.get("seatSettlePubkey")?,
+                marker_valid: r.get::<_, Option<i64>>("markerValid")?.map(|v| v != 0),
+                txid: r.get("txid")?,
+                hop_vout: r.get::<_, i64>("hopVout")? as u32,
+                hop_sats: r.get::<_, Option<i64>>("hopSats")?.map(|v| v as u64),
+                size_bytes: r.get::<_, Option<i64>>("sizeBytes")?.map(|v| v as u64),
+                fee_sats: r.get::<_, Option<i64>>("feeSats")?.map(|v| v as u64),
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        hops.len(),
+        2,
+        "the foreign-key row is filtered IN SQL; the unverified one is refused in the fold"
+    );
+    let mut hop_markers_by_pot = std::collections::HashMap::new();
+    hop_markers_by_pot.insert((pot.clone(), 0u32), hops);
+    let entries = assemble_results(
+        &identity,
+        rows,
+        &Default::default(),
+        &Default::default(),
+        &params_by_pot,
+        &hop_markers_by_pot,
+        &Default::default(),
+    );
+    let m = &entries[0].money;
+    assert_eq!(
+        m.funding.as_ref().map(|f| (f.size_bytes, f.fee_sats)),
+        Some((Some(991), Some(101)))
+    );
+    assert_eq!(
+        m.settle
+            .as_ref()
+            .map(|f| (f.txid.as_str(), f.size_bytes, f.fee_sats)),
+        Some((spender.as_str(), Some(3_577), Some(400)))
+    );
+    assert_eq!(m.hops.len(), 1);
+    assert_eq!(
+        (
+            m.hops[0].txid.as_str(),
+            m.hops[0].size_bytes,
+            m.hops[0].fee_sats,
+            m.hops[0].hop_sats
+        ),
+        (hop_a.as_str(), Some(580), Some(58), Some(2_190))
+    );
+    // The WIRE body — what the client reads.
+    let v: serde_json::Value =
+        serde_json::from_str(&results_body(&identity, &entries, false, 0)).unwrap();
+    let money = &v["results"][0]["money"];
+    assert_eq!(money["funding"]["sizeBytes"], serde_json::json!(991));
+    assert_eq!(money["funding"]["feeSats"], serde_json::json!(101));
+    assert_eq!(money["settle"]["txid"], serde_json::json!(spender));
+    assert_eq!(money["settle"]["feeSats"], serde_json::json!(400));
+    assert_eq!(money["hops"][0]["seat"], serde_json::json!("A"));
+    assert_eq!(money["hops"][0]["txid"], serde_json::json!(hop_a));
+    assert_eq!(money["hops"][0]["identity"], serde_json::json!(identity));
+
+    // The pointer moves under the described spender: the pair is NOT served.
+    conn.execute(
+        "UPDATE pot_records SET spendingTxid = ?1, verdictTxid = ?1 WHERE txid = ?2",
+        params![h64(0xd2), pot.as_str()],
+    )
+    .unwrap();
+    let mut rows2 = query_results_rows(&conn, &identity);
+    apply_page_overlay_like_the_route(&conn, &mut rows2);
+    let entries2 = assemble_results(
+        &identity,
+        rows2,
+        &Default::default(),
+        &Default::default(),
+        &params_by_pot,
+        &hop_markers_by_pot,
+        &Default::default(),
+    );
+    assert!(
+        entries2[0].money.settle.is_none(),
+        "stale spender facts never serve under a moved pointer"
+    );
+    assert!(
+        entries2[0].money.funding.is_some(),
+        "the funding facts are pointer-independent"
+    );
 }

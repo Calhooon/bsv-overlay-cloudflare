@@ -27,11 +27,13 @@ use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::hops_view::hops_view_sql;
 use low_app_layer::live_view::{keyless_candidates_sql, live_view_sql};
 use low_app_layer::logic::{
-    batch_where_sql, pots_view_join_sql, proof_pointers_sql,
-    recovery_view_sql,
+    batch_where_sql, pots_view_join_sql, proof_pointers_sql, recovery_view_sql,
 };
 use low_app_layer::refund_view::refund_view_sql;
-use low_app_layer::results::{claims_sql, decoded_pots_sql, results_sql, seat_markers_sql};
+use low_app_layer::results::{
+    claims_sql, decoded_pots_sql, hop_seat_markers_sql, page_overlay_sql, results_sql,
+    seat_markers_sql,
+};
 use rusqlite::Connection;
 
 /// A fresh in-memory SQLite carrying the REAL production schema.
@@ -161,6 +163,19 @@ fn every_batched_query_prepares_at_representative_arities() {
             &seat_markers_sql(n, low_app_layer::results::SEAT_MARKERS_PER_KEY),
         );
         assert_prepares(&conn, &format!("claims_sql({n})"), &claims_sql(n));
+        // bsv-low P4 slice 2: the /results page overlay (settleSigners + the
+        // money facts) and the hop seat/money fetch, against the schema that
+        // now carries sizeBytes/feeSats/fundingSizeBytes/… columns.
+        assert_prepares(
+            &conn,
+            &format!("page_overlay_sql({n})"),
+            &page_overlay_sql(n),
+        );
+        assert_prepares(
+            &conn,
+            &format!("hop_seat_markers_sql({n})"),
+            &hop_seat_markers_sql(n),
+        );
         assert_prepares(
             &conn,
             &format!("proof_pointers_sql({n})"),
@@ -200,6 +215,9 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
             ),
             // #332: one (gameId, winner) PAIR per key.
             ("proof_pointers_sql", proof_pointers_sql(n), n * 2),
+            // P4 slice 2: one outpoint pair per page row; two committed keys per pot.
+            ("page_overlay_sql", page_overlay_sql(n), n * 2),
+            ("hop_seat_markers_sql", hop_seat_markers_sql(n), n * 2),
         ] {
             let stmt = conn
                 .prepare(&sql)

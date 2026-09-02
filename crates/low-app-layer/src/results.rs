@@ -577,6 +577,17 @@ pub struct HopSeatRow {
     /// The latched `markerValid` column. `None` = a legacy row nobody
     /// measured — never treated as verified (`/hops-view`'s own rule).
     pub marker_valid: Option<bool>,
+    /// bsv-low P4 slice 2: the hop CONTAINER tx (the seat's stake tx) — its
+    /// txid, the hop output's index and marker-claimed value, and the
+    /// container's own size + exact fee read at admission
+    /// (`hopparty_records.txid/hopVout/hopSats/sizeBytes/feeSats`). Served
+    /// by [`money_facts`] ONLY for a `markerValid` row under a key THIS pot's
+    /// lock committed — the same bar seat attribution applies.
+    pub txid: String,
+    pub hop_vout: u32,
+    pub hop_sats: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub fee_sats: Option<u64>,
 }
 
 /// FILL seat slots the pot markers left empty, from the HOP markers.
@@ -673,7 +684,9 @@ pub const HOP_SEAT_BINDS_PER_POT: usize = 2;
 pub fn hop_seat_markers_sql(pots: usize) -> String {
     let mut sql = String::from(
         "SELECT identity AS identity, seatSettlePubkey AS seatSettlePubkey, \
-                markerValid AS markerValid FROM hopparty_records WHERE ",
+                markerValid AS markerValid, txid AS txid, hopVout AS hopVout, \
+                hopSats AS hopSats, sizeBytes AS sizeBytes, feeSats AS feeSats \
+         FROM hopparty_records WHERE ",
     );
     for i in 0..pots {
         if i > 0 {
@@ -682,6 +695,188 @@ pub fn hop_seat_markers_sql(pots: usize) -> String {
         sql.push_str("seatSettlePubkey IN (?, ?)");
     }
     sql
+}
+
+/// bsv-low P4 slice 2: one tx's money facts as served — size and exact fee,
+/// each `None` when the index could not name it (never an estimate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxMoneyFacts {
+    pub txid: String,
+    pub size_bytes: Option<u64>,
+    pub fee_sats: Option<u64>,
+}
+
+/// A seat's STAKE tx (the hop container) as served: which committed seat it
+/// funded, the hop outpoint, the marker-claimed hop value, and the
+/// container's own size + fee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopMoneyFacts {
+    pub identity: String,
+    pub seat: SeatLetter,
+    pub txid: String,
+    pub vout: u32,
+    pub hop_sats: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub fee_sats: Option<u64>,
+}
+
+/// The `/results` row's served money facts (bsv-low P4 slice 2): what the
+/// receipt's money section needs that a single device cannot hold — the
+/// OPPONENT's stake tx, the exact JOIN (funding) fee, and the settle's size
+/// and fee after a wipe. DISPLAY-TIER by contract: nothing here is a count,
+/// a rank, a credit or a gate; every value is a decoded re-presentation of
+/// bytes the overlay admitted, and absence is `None`, never a guess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MoneyFacts {
+    pub funding: Option<TxMoneyFacts>,
+    pub settle: Option<TxMoneyFacts>,
+    pub hops: Vec<HopMoneyFacts>,
+}
+
+/// Derive the served money facts for one row.
+///
+/// - `funding`: the pot funding tx, when admission named its size or fee.
+/// - `settle`: the recorded spender, ONLY when the stored pair was computed
+///   for the LIVE pointer (`spender_facts_txid == spending_txid`) — a stale
+///   pair left behind by a pointer overwrite is dropped, exactly as a stale
+///   verdict is (the `verdict_txid` guard).
+/// - `hops`: each `markerValid` hop row whose seat key THIS pot's lock
+///   committed (`pubA` → seat A, `pubB` → seat B) — the same bar
+///   [`fill_seats_from_hop_markers`] applies; no committed params ⇒ no hops
+///   (a hop cannot be bound to the pot without the lock). Deduplicated by
+///   hop outpoint; ordered A before B, then by txid, so the answer is
+///   deterministic. Two containers under one key (a re-stake) both serve —
+///   the client picks its own by txid and shows the rest as the other seat's.
+pub fn money_facts(
+    r: &ResultsRow,
+    params: Option<&CovenantParams>,
+    hops: &[HopSeatRow],
+) -> MoneyFacts {
+    let pot_txid_lc = r.pot_txid.to_ascii_lowercase();
+    let funding =
+        (r.funding_size_bytes.is_some() || r.funding_fee_sats.is_some()).then_some(TxMoneyFacts {
+            txid: pot_txid_lc,
+            size_bytes: r.funding_size_bytes,
+            fee_sats: r.funding_fee_sats,
+        });
+    let settle = match (r.spending_txid.as_deref(), r.spender_facts_txid.as_deref()) {
+        (Some(live), Some(described))
+            if live.eq_ignore_ascii_case(described)
+                && (r.spender_size_bytes.is_some() || r.spender_fee_sats.is_some()) =>
+        {
+            Some(TxMoneyFacts {
+                txid: live.to_ascii_lowercase(),
+                size_bytes: r.spender_size_bytes,
+                fee_sats: r.spender_fee_sats,
+            })
+        }
+        _ => None,
+    };
+    let mut out: Vec<HopMoneyFacts> = Vec::new();
+    if let Some(p) = params {
+        if p.pub_a != p.pub_b {
+            let pub_a_hex = hex::encode(p.pub_a);
+            let pub_b_hex = hex::encode(p.pub_b);
+            for h in hops {
+                if h.marker_valid != Some(true) {
+                    continue; // unverified or unmeasured — refused
+                }
+                let pk = h.seat_settle_pubkey.to_ascii_lowercase();
+                let seat = if pk == pub_a_hex {
+                    SeatLetter::A
+                } else if pk == pub_b_hex {
+                    SeatLetter::B
+                } else {
+                    continue; // a key this pot never committed — refused
+                };
+                let txid = h.txid.to_ascii_lowercase();
+                if out.iter().any(|o| o.txid == txid && o.vout == h.hop_vout) {
+                    continue; // duplicate row for one outpoint (junk coexists)
+                }
+                out.push(HopMoneyFacts {
+                    identity: h.identity.to_ascii_lowercase(),
+                    seat,
+                    txid,
+                    vout: h.hop_vout,
+                    hop_sats: h.hop_sats,
+                    size_bytes: h.size_bytes,
+                    fee_sats: h.fee_sats,
+                });
+            }
+        }
+    }
+    out.sort_by(|x, y| {
+        let sx = matches!(x.seat, SeatLetter::B);
+        let sy = matches!(y.seat, SeatLetter::B);
+        sx.cmp(&sy)
+            .then_with(|| x.txid.cmp(&y.txid))
+            .then_with(|| x.vout.cmp(&y.vout))
+    });
+    MoneyFacts {
+        funding,
+        settle,
+        hops: out,
+    }
+}
+
+/// The `/results` PAGE OVERLAY (bsv-low #406, extended by P4 slice 2): the
+/// per-outpoint `pot_records` columns that must NOT ride the nested window
+/// query (adding one inside it emptied the page — empirically bisected
+/// 2026-08-27, decision log addendum 15; `results_sql` stays byte-identical
+/// forever). ONE PK-indexed batched read over the page's ≤100 outpoints fills
+/// these onto the rows; every value keeps its own serving bar (`settleSigners`
+/// under the verdict pointer guard, the spender facts under
+/// `spenderFactsTxid == spendingTxid` in [`money_facts`]). BEST-EFFORT at the
+/// route: a fault leaves the fields `None`, never a 503.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct PageOverlay {
+    pub txid: String,
+    #[serde(rename = "outputIndex")]
+    pub output_index: u32,
+    #[serde(rename = "settleSigners", default)]
+    pub settle_signers: Option<String>,
+    #[serde(rename = "fundingSizeBytes", default)]
+    pub funding_size_bytes: Option<f64>,
+    #[serde(rename = "fundingFeeSats", default)]
+    pub funding_fee_sats: Option<f64>,
+    #[serde(rename = "spenderFactsTxid", default)]
+    pub spender_facts_txid: Option<String>,
+    #[serde(rename = "spenderSizeBytes", default)]
+    pub spender_size_bytes: Option<f64>,
+    #[serde(rename = "spenderFeeSats", default)]
+    pub spender_fee_sats: Option<f64>,
+}
+
+/// The overlay's SQL for `n` outpoints (2 binds each: txid, outputIndex) —
+/// a plain PK-indexed read, no window. Pub for the REAL-SQLite harness, which
+/// drives the same statement the route does (Rule 6b).
+pub fn page_overlay_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let clause = vec!["(txid = ? AND outputIndex = ?)"; n].join(" OR ");
+    format!(
+        "SELECT txid, outputIndex, settleSigners, fundingSizeBytes, fundingFeeSats, \
+                spenderFactsTxid, spenderSizeBytes, spenderFeeSats \
+         FROM pot_records WHERE {clause}"
+    )
+}
+
+/// Apply the fetched overlay rows onto the page rows, keyed by outpoint. A
+/// row with no overlay (or a NULL column) reads `None` — exactly what the
+/// pre-P4 fill produced for `settle_signers`.
+pub fn apply_page_overlay(rows: &mut [ResultsRow], overlay: &[PageOverlay]) {
+    let by_op: std::collections::HashMap<(String, u32), &PageOverlay> = overlay
+        .iter()
+        .map(|o| ((o.txid.to_ascii_lowercase(), o.output_index), o))
+        .collect();
+    for r in rows.iter_mut() {
+        let o = by_op.get(&(r.pot_txid.to_ascii_lowercase(), r.pot_vout));
+        r.settle_signers = o.and_then(|o| o.settle_signers.clone());
+        r.funding_size_bytes = o.and_then(|o| o.funding_size_bytes.map(|v| v as u64));
+        r.funding_fee_sats = o.and_then(|o| o.funding_fee_sats.map(|v| v as u64));
+        r.spender_facts_txid = o.and_then(|o| o.spender_facts_txid.clone());
+        r.spender_size_bytes = o.and_then(|o| o.spender_size_bytes.map(|v| v as u64));
+        r.spender_fee_sats = o.and_then(|o| o.spender_fee_sats.map(|v| v as u64));
+    }
 }
 
 /// A committed-lock seat slot (`pubA` = A, `pubB` = B).
@@ -1090,6 +1285,20 @@ pub struct ResultsRow {
     /// arms.
     pub spender_seen: Option<bool>,
     pub spender_final: Option<bool>,
+    /// bsv-low P4 slice 2 (2026-09-02): the pot FUNDING tx's own size + exact
+    /// fee, decoded once at admission from the admitted BEEF
+    /// (`pot_records.fundingSizeBytes/fundingFeeSats`). DISPLAY-TIER — the
+    /// receipt's money section; never a count, rank, credit or gate.
+    pub funding_size_bytes: Option<u64>,
+    pub funding_fee_sats: Option<u64>,
+    /// The recorded SPENDER's size + fee, keyed by the pointer they describe
+    /// (`spenderFactsTxid`): served ONLY when it equals the live
+    /// `spending_txid` — the `verdict_txid` guard, applied in
+    /// [`money_facts`]. A stale pair left behind by a pointer overwrite is
+    /// never served.
+    pub spender_facts_txid: Option<String>,
+    pub spender_size_bytes: Option<u64>,
+    pub spender_fee_sats: Option<u64>,
 }
 
 impl ResultsRow {
@@ -1435,6 +1644,9 @@ pub struct ResultEntry {
     /// params are malformed. See [`CommittedKeys`] — in particular, a
     /// consumer must read `None` and a MISMATCH alike as cannot-say.
     pub committed_keys: Option<CommittedKeys>,
+    /// bsv-low P4 slice 2: the served money facts (funding / settle / both
+    /// seats' stake txs with size + fee). See [`money_facts`]. DISPLAY-TIER.
+    pub money: MoneyFacts,
 }
 
 /// The per-identity outcome enum (wire strings match bsv-low #227's spec).
@@ -2046,6 +2258,7 @@ pub fn assemble_results(
             at_height,
             winner_hand,
             marker_hands,
+            money: money_facts(&r, row_params, hops_for_pot),
             // #343: the pot's own committed keys, from the params the caller
             // already resolved for this outpoint (decoded columns first, else
             // the hash-verified funding bytes) — LOOKED UP, never re-derived
@@ -2213,6 +2426,29 @@ pub fn results_body(
                 "markerHands": json!({
                     "mine": e.marker_hands.mine,
                     "theirs": e.marker_hands.theirs,
+                }),
+                // bsv-low P4 slice 2 (ADDITIVE, display tier): the money
+                // facts a single device cannot hold — the funding tx's size
+                // and exact fee, the settle's (under the pointer guard), and
+                // BOTH seats' stake txs. `null` / absent = the index could
+                // not name it — never an estimate. A deployed client ignores
+                // it; the new one feature-detects on presence.
+                "money": json!({
+                    "funding": e.money.funding.as_ref().map(|f| json!({
+                        "txid": f.txid, "sizeBytes": f.size_bytes, "feeSats": f.fee_sats,
+                    })),
+                    "settle": e.money.settle.as_ref().map(|f| json!({
+                        "txid": f.txid, "sizeBytes": f.size_bytes, "feeSats": f.fee_sats,
+                    })),
+                    "hops": e.money.hops.iter().map(|h| json!({
+                        "identity": h.identity,
+                        "seat": match h.seat { SeatLetter::A => "A", SeatLetter::B => "B" },
+                        "txid": h.txid,
+                        "vout": h.vout,
+                        "hopSats": h.hop_sats,
+                        "sizeBytes": h.size_bytes,
+                        "feeSats": h.fee_sats,
+                    })).collect::<Vec<_>>(),
                 }),
             })
         })
@@ -3398,7 +3634,91 @@ mod tests {
             identity: identity.to_string(),
             seat_settle_pubkey: pk.to_string(),
             marker_valid: valid,
+            txid: format!("hop-{}", identity.get(..8).unwrap_or(identity)),
+            hop_vout: 0,
+            hop_sats: Some(20_190),
+            size_bytes: None,
+            fee_sats: None,
         }
+    }
+
+    /// bsv-low P4 slice 2: the served money facts — funding when named,
+    /// settle ONLY under the pointer guard, hops ONLY for verified rows under
+    /// a key THIS pot committed, deduplicated and A-before-B.
+    #[test]
+    fn money_facts_guard_the_pointer_and_the_committed_keys() {
+        let params = params_with_keys(REAL_PUB_A, REAL_PUB_B);
+        let mut r = ResultsRow {
+            pot_txid: "AA".repeat(32),
+            spending_txid: Some("S1".repeat(32)),
+            funding_size_bytes: Some(991),
+            funding_fee_sats: None,
+            spender_facts_txid: Some("s1".repeat(32)), // same pointer, other case
+            spender_size_bytes: Some(3_577),
+            spender_fee_sats: Some(400),
+            ..Default::default()
+        };
+        let mut hop_a = hop(REAL_ID_A, REAL_PUB_A, Some(true));
+        hop_a.size_bytes = Some(580);
+        hop_a.fee_sats = Some(58);
+        let mut hop_b = hop(REAL_ID_B, REAL_PUB_B, Some(true));
+        hop_b.txid = "hop-b-container".into();
+        let dup_b = hop_b.clone(); // the same outpoint filed twice (junk coexists)
+        let unverified = hop("02cc", REAL_PUB_A, None);
+        let refuted = hop("02dd", REAL_PUB_A, Some(false));
+        let foreign = hop("02ee", "02".repeat(33).as_str(), Some(true));
+        let hops = vec![
+            hop_b.clone(),
+            foreign,
+            unverified,
+            refuted,
+            hop_a.clone(),
+            dup_b,
+        ];
+        let m = money_facts(&r, Some(&params), &hops);
+        assert_eq!(
+            m.funding
+                .as_ref()
+                .map(|f| (f.txid.as_str(), f.size_bytes, f.fee_sats)),
+            Some(("aa".repeat(32).as_str(), Some(991), None))
+        );
+        assert_eq!(
+            m.settle
+                .as_ref()
+                .map(|f| (f.txid.as_str(), f.size_bytes, f.fee_sats)),
+            Some(("s1".repeat(32).as_str(), Some(3_577), Some(400)))
+        );
+        assert_eq!(
+            m.hops.len(),
+            2,
+            "verified + committed only, deduplicated: {:?}",
+            m.hops
+        );
+        assert_eq!(m.hops[0].seat, SeatLetter::A);
+        assert_eq!(
+            (
+                m.hops[0].identity.as_str(),
+                m.hops[0].size_bytes,
+                m.hops[0].fee_sats
+            ),
+            (REAL_ID_A, Some(580), Some(58))
+        );
+        assert_eq!(
+            (m.hops[1].seat, m.hops[1].txid.as_str()),
+            (SeatLetter::B, "hop-b-container")
+        );
+        // The pointer moved: the stale spender pair is NOT served.
+        r.spending_txid = Some("S2".repeat(32));
+        let m2 = money_facts(&r, Some(&params), &hops);
+        assert!(
+            m2.settle.is_none(),
+            "a pair described for another spender never serves"
+        );
+        // No committed params: hops cannot be bound to the pot → none served.
+        assert!(money_facts(&r, None, &hops).hops.is_empty());
+        // Nothing named at admission: funding is None, never zeros.
+        r.funding_size_bytes = None;
+        assert!(money_facts(&r, Some(&params), &[]).funding.is_none());
     }
 
     /// THE INCIDENT: seat B unattributed by pot markers, recovered from hops,
@@ -4816,6 +5136,7 @@ mod tests {
             winner_hand: None,
             marker_hands: Default::default(),
             committed_keys: Some(k.clone()),
+            money: MoneyFacts::default(),
         };
         let results: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -4901,6 +5222,7 @@ mod tests {
             winner_hand: None,
             marker_hands: Default::default(),
             committed_keys: Some(keys_fixture()),
+            money: MoneyFacts::default(),
         };
         let cannot_say = ResultEntry {
             settle_signers: None,
@@ -4964,6 +5286,7 @@ mod tests {
             winner_hand: None,
             marker_hands: Default::default(),
             committed_keys: None,
+            money: MoneyFacts::default(),
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5013,6 +5336,7 @@ mod tests {
             winner_hand: None,
             marker_hands: Default::default(),
             committed_keys: None,
+            money: MoneyFacts::default(),
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5058,7 +5382,7 @@ mod tests {
             "outcomeSource",
             "at",
         ];
-        const ADDED_KEYS: [&str; 7] = [
+        const ADDED_KEYS: [&str; 8] = [
             // #406 (2026-08-27) — who signed the recorded spend, served
             // under the verdict group's pointer guard (the enforced-ending
             // narration's missing boundary; additive, null when ungated).
@@ -5078,6 +5402,7 @@ mod tests {
             // Additive by the same bar: a deployed client that has never heard
             // of this key keeps its own path untouched.
             "markerHands",
+            "money",
         ];
         let me = ident(0xaa);
         let e = ResultEntry {
@@ -5105,6 +5430,7 @@ mod tests {
             }),
             marker_hands: Default::default(),
             committed_keys: None,
+            money: MoneyFacts::default(),
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5177,6 +5503,7 @@ mod tests {
             }),
             marker_hands: Default::default(),
             committed_keys: None,
+            money: MoneyFacts::default(),
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();

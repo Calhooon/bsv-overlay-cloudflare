@@ -861,6 +861,7 @@ fn the_outcome_word_is_the_results_derivation_reused_not_respelled() {
         winner_hand: None,
         marker_hands: Default::default(),
         committed_keys: None,
+        money: Default::default(),
     };
 
     // Matching outpoint: the word + source pass through verbatim.

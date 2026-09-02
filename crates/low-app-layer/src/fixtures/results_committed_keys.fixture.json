@@ -20,6 +20,11 @@
         "mine": null,
         "theirs": null
       },
+      "money": {
+        "funding": null,
+        "hops": [],
+        "settle": null
+      },
       "opponentIdentity": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "outcome": "unresolved",
       "outcomeSource": null,
@@ -46,6 +51,11 @@
       "markerHands": {
         "mine": null,
         "theirs": null
+      },
+      "money": {
+        "funding": null,
+        "hops": [],
+        "settle": null
       },
       "opponentIdentity": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "outcome": "unresolved",
