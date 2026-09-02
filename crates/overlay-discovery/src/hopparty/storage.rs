@@ -106,6 +106,14 @@ pub struct HoppartyRecord {
     /// about (the unknown-vs-refuted distinction the reader depends on).
     #[serde(rename = "containerOutputs")]
     pub container_outputs: u32,
+    // ── P4 slice 2 (2026-09-02): the container's OWN size + exact fee, read
+    // once at admission from the admitted BEEF (`tx_facts`). Display tier —
+    // the money views list them; nothing money-gating reads them. `None` on
+    // pre-slice-2 rows and when the BEEF lacked an input's source tx.
+    #[serde(rename = "sizeBytes", default)]
+    pub size_bytes: Option<u64>,
+    #[serde(rename = "feeSats", default)]
+    pub fee_sats: Option<u64>,
     /// The txid carrying the marker OP_RETURN — half of the primary key,
     /// and (since the 2026-08-04 revision) the HOP TXID itself: the marker
     /// rides the hop transaction, so one txid names both.
@@ -338,6 +346,8 @@ mod tests {
             hop_lock_hex: Some(format!("76a914{}88ac", "d4".repeat(20))),
             hop_sats_on_chain: Some(80_800),
             container_outputs: 2,
+            size_bytes: None,
+            fee_sats: None,
             txid: txid.into(),
             output_index: 0,
             created_at: 0, // ignored — storage assigns

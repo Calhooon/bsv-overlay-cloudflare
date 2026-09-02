@@ -613,6 +613,8 @@ mod tests {
             hop_lock_hex: lock,
             hop_sats_on_chain: sats,
             container_outputs: 2,
+            size_bytes: None,
+            fee_sats: None,
             txid: "aa".repeat(32),
             output_index: 1,
             created_at: 0,

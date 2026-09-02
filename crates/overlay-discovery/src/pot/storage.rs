@@ -148,6 +148,33 @@ pub struct PotRecord {
     /// DISPLAY-TIER: feeds ending narration, never a count/rank/credit.
     #[serde(rename = "settleSigners", default)]
     pub settle_signers: Option<String>,
+    /// bsv-low P4 slice 2 (2026-09-02): the FUNDING tx's own serialized size
+    /// and exact fee (Σ inputs − Σ outputs), read once at admission from the
+    /// admitted BEEF by [`crate::tx_facts::facts_from_atomic_beef`]. The fee
+    /// is `None` when the BEEF does not carry every parent output (never an
+    /// estimate); the size is `None` only when the BEEF did not name the
+    /// subject at all. DISPLAY-TIER (the receipt's money section) — never a
+    /// count, rank, credit or WHERE. Stored-wins on re-admission like every
+    /// other decoded column.
+    #[serde(rename = "fundingSizeBytes", default)]
+    pub funding_size_bytes: Option<u64>,
+    #[serde(rename = "fundingFeeSats", default)]
+    pub funding_fee_sats: Option<u64>,
+    /// bsv-low P4 slice 2: the recorded SPENDER's own size + exact fee,
+    /// read at spend-record time from the spending BEEF (the fee falls back
+    /// to `potSats − Σ outputs` for a single-input pot spend — the pot value
+    /// is the admitted funding output's, never a caller claim). Keyed by
+    /// `spender_facts_txid` and written under a CAS on the live pointer
+    /// ([`PotStorage::store_spender_facts`]), so the pair is meaningful ONLY
+    /// when `spender_facts_txid == spending_txid` — a later pointer overwrite
+    /// leaves a stale pair behind on purpose (the reader's equality check
+    /// guards, exactly like `verdict_txid`). DISPLAY-TIER.
+    #[serde(rename = "spenderFactsTxid", default)]
+    pub spender_facts_txid: Option<String>,
+    #[serde(rename = "spenderSizeBytes", default)]
+    pub spender_size_bytes: Option<u64>,
+    #[serde(rename = "spenderFeeSats", default)]
+    pub spender_fee_sats: Option<u64>,
 }
 
 /// The #284 verdict group as ONE write value (bsv-low #406): the verdict
@@ -293,6 +320,28 @@ pub trait PotStorage {
         spent_height: Option<u64>,
         spender_final: Option<bool>,
     ) -> Result<(), PotStorageError>;
+
+    /// bsv-low P4 slice 2: record the SPENDER's own size + fee under a CAS on
+    /// the pointer they were computed for (`spending_txid` must be the LIVE
+    /// pointer, else no-op — the `mark_verdict_for_spender` idiom). Same
+    /// pointer already keyed ⇒ stored-wins per value; a different
+    /// `spender_facts_txid` ⇒ the whole pair is RESET to the incoming values
+    /// (a new spender never inherits the old spender's facts). DISPLAY-TIER,
+    /// best-effort at the call site: a failure here never fails the spend
+    /// record it follows. The default refuses so a real store cannot forget
+    /// it silently; the in-memory and D1 stores implement it.
+    async fn store_spender_facts(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        facts: crate::tx_facts::TxFacts,
+    ) -> Result<(), PotStorageError> {
+        let _ = (txid, output_index, spending_txid, facts);
+        Err(PotStorageError::Other(
+            "store_spender_facts is not implemented by this store".into(),
+        ))
+    }
 
     /// The record for an outpoint, or `None` if we never admitted it.
     async fn get_spent_status(
@@ -784,6 +833,8 @@ impl PotStorage for MemoryPotStorage {
                 fill(&mut existing.fee_sats, &record.fee_sats);
                 fill(&mut existing.recovery_height, &record.recovery_height);
                 fill(&mut existing.pot_sats, &record.pot_sats);
+                fill(&mut existing.funding_size_bytes, &record.funding_size_bytes);
+                fill(&mut existing.funding_fee_sats, &record.funding_fee_sats);
                 existing.params_decoded |= record.params_decoded;
                 // spent / spending_txid / spent_confirmed / verdict /
                 // verdict_txid / spent_height: NEVER touched here.
@@ -1023,6 +1074,39 @@ impl PotStorage for MemoryPotStorage {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    async fn store_spender_facts(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        facts: crate::tx_facts::TxFacts,
+    ) -> Result<(), PotStorageError> {
+        let mut records = self.records.lock().unwrap();
+        let Some(r) = records
+            .iter_mut()
+            .find(|r| r.txid == txid && r.output_index == output_index)
+        else {
+            return Ok(()); // never admitted — nothing to describe
+        };
+        if r.spending_txid.as_deref() != Some(spending_txid) {
+            return Ok(()); // CAS miss: the pointer moved under us
+        }
+        if r.spender_facts_txid.as_deref() == Some(spending_txid) {
+            // same spender already described — stored-wins per value
+            if r.spender_size_bytes.is_none() {
+                r.spender_size_bytes = Some(facts.size_bytes);
+            }
+            if r.spender_fee_sats.is_none() {
+                r.spender_fee_sats = facts.fee_sats;
+            }
+        } else {
+            r.spender_facts_txid = Some(spending_txid.to_string());
+            r.spender_size_bytes = Some(facts.size_bytes);
+            r.spender_fee_sats = facts.fee_sats;
+        }
+        Ok(())
     }
 
     async fn get_spent_status(
@@ -1303,6 +1387,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.record_count(), 0);
+        assert!(store.get_spent_status("ghost", 0).await.unwrap().is_none());
+    }
+
+    /// bsv-low P4 slice 2: the spender facts land ONLY under the live
+    /// pointer, are stored-wins for the same spender, and RESET when the
+    /// pointer moves (a new spender never inherits the old one's facts).
+    #[tokio::test]
+    async fn spender_facts_are_cas_on_the_pointer_stored_wins_and_reset_on_move() {
+        use crate::tx_facts::TxFacts;
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("potA", 0)).await.unwrap();
+        store
+            .mark_spent("potA", 0, "claim1", false, None, None, None)
+            .await
+            .unwrap();
+        // CAS miss: describing a spender that is NOT the live pointer is a no-op.
+        store
+            .store_spender_facts(
+                "potA",
+                0,
+                "claim2",
+                TxFacts {
+                    size_bytes: 300,
+                    fee_sats: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                r.spender_facts_txid.as_deref(),
+                r.spender_size_bytes,
+                r.spender_fee_sats
+            ),
+            (None, None, None)
+        );
+        // Live pointer: lands.
+        store
+            .store_spender_facts(
+                "potA",
+                0,
+                "claim1",
+                TxFacts {
+                    size_bytes: 300,
+                    fee_sats: None,
+                },
+            )
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                r.spender_facts_txid.as_deref(),
+                r.spender_size_bytes,
+                r.spender_fee_sats
+            ),
+            (Some("claim1"), Some(300), None)
+        );
+        // Same spender again: stored-wins per value — the absent fee FILLS, the size does not move.
+        store
+            .store_spender_facts(
+                "potA",
+                0,
+                "claim1",
+                TxFacts {
+                    size_bytes: 999,
+                    fee_sats: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(
+            (r.spender_size_bytes, r.spender_fee_sats),
+            (Some(300), Some(10))
+        );
+        // The pointer moves: the new spender's facts RESET the pair (fee None stays None).
+        store
+            .mark_spent("potA", 0, "claim2", false, None, None, None)
+            .await
+            .unwrap();
+        store
+            .store_spender_facts(
+                "potA",
+                0,
+                "claim2",
+                TxFacts {
+                    size_bytes: 400,
+                    fee_sats: None,
+                },
+            )
+            .await
+            .unwrap();
+        let r = store.get_spent_status("potA", 0).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                r.spender_facts_txid.as_deref(),
+                r.spender_size_bytes,
+                r.spender_fee_sats
+            ),
+            (Some("claim2"), Some(400), None)
+        );
+        // A never-admitted outpoint: no-op, no phantom row.
+        store
+            .store_spender_facts(
+                "ghost",
+                0,
+                "x",
+                TxFacts {
+                    size_bytes: 1,
+                    fee_sats: None,
+                },
+            )
+            .await
+            .unwrap();
         assert!(store.get_spent_status("ghost", 0).await.unwrap().is_none());
     }
 

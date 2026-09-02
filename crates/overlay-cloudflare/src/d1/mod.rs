@@ -421,7 +421,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 117 → 118 for bsv-low #403 board paging (2026-08-29):
 /// `idx_pot_records_chain_wins` — the whole-era chain-wins spine's scan
 /// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
-pub const OVERLAY_MIGRATION_COUNT: usize = 122;
+pub const OVERLAY_MIGRATION_COUNT: usize = 129;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1480,6 +1480,24 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         last_ms INTEGER NOT NULL,
         last_outcome TEXT
     )",
+    // P4 slice 2 (bsv-low, 2026-09-02): the hop container's OWN size + exact
+    // fee, read once at admission from the admitted BEEF (`tx_facts`) so the
+    // money views can list every tx's size/fee — the opponent's included.
+    // Additive; NULL on pre-slice-2 rows; display tier.
+    "ALTER TABLE hopparty_records ADD COLUMN sizeBytes INTEGER",
+    "ALTER TABLE hopparty_records ADD COLUMN feeSats INTEGER",
+    // bsv-low P4 slice 2 (2026-09-02): the pot FUNDING tx's own size + exact
+    // fee, read at admission from the admitted BEEF (display tier, NULLable,
+    // stored-wins). Additive; the runner ignores the re-run duplicate-column
+    // error.
+    "ALTER TABLE pot_records ADD COLUMN fundingSizeBytes INTEGER",
+    "ALTER TABLE pot_records ADD COLUMN fundingFeeSats INTEGER",
+    // …and the recorded SPENDER's, keyed by the pointer it describes
+    // (`spenderFactsTxid == spendingTxid` is the reader's guard — the
+    // `verdictTxid` idiom). Display tier, NULLable, CAS-written.
+    "ALTER TABLE pot_records ADD COLUMN spenderFactsTxid TEXT",
+    "ALTER TABLE pot_records ADD COLUMN spenderSizeBytes INTEGER",
+    "ALTER TABLE pot_records ADD COLUMN spenderFeeSats INTEGER",
 ];
 
 // =============================================================================
@@ -1691,9 +1709,16 @@ mod tests {
             .iter()
             .filter(|sql| sql.trim_start().starts_with("ALTER TABLE hopparty_records"))
             .collect();
+        // P4 slice 2 (bsv-low, 2026-09-02): two more additive, NULLABLE
+        // columns — the container's own size and exact fee, read at admission
+        // (`tx_facts`), display tier. Still no wire field is re-typed.
         assert_eq!(
             alters,
-            vec![&"ALTER TABLE hopparty_records ADD COLUMN markerValid INTEGER"],
+            vec![
+                &"ALTER TABLE hopparty_records ADD COLUMN markerValid INTEGER",
+                &"ALTER TABLE hopparty_records ADD COLUMN sizeBytes INTEGER",
+                &"ALTER TABLE hopparty_records ADD COLUMN feeSats INTEGER",
+            ],
             "hopparty_records takes exactly ONE ALTER — the #362 markerValid \
              latch, additive and NULLABLE (a pre-migration NULL must stay \
              observable: it means 'never evaluated', not 'refuted')"

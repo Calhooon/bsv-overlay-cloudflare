@@ -41,6 +41,7 @@ use overlay_discovery::ship::storage::{
 use overlay_discovery::slap::storage::{
     SLAPDiscoveryRecord, SLAPQuery, SLAPStorage, SLAPStorageError,
 };
+use overlay_discovery::tx_facts::TxFacts;
 use overlay_discovery::uhrp::storage::{
     current_unix_seconds_i64, UHRPDiscoveryRecord, UHRPQuery, UHRPSortOrder, UHRPStorage,
     UHRPStorageError,
@@ -1457,6 +1458,16 @@ struct PotRow {
     /// migration, exactly like `spenderFinal`.
     #[serde(rename = "settleSigners", default)]
     settle_signers: Option<String>,
+    #[serde(rename = "fundingSizeBytes", default)]
+    funding_size_bytes: Option<f64>,
+    #[serde(rename = "fundingFeeSats", default)]
+    funding_fee_sats: Option<f64>,
+    #[serde(rename = "spenderFactsTxid", default)]
+    spender_facts_txid: Option<String>,
+    #[serde(rename = "spenderSizeBytes", default)]
+    spender_size_bytes: Option<f64>,
+    #[serde(rename = "spenderFeeSats", default)]
+    spender_fee_sats: Option<f64>,
 }
 
 impl PotRow {
@@ -1485,6 +1496,11 @@ impl PotRow {
             spent_height: self.spent_height.map(|v| v as u64),
             spender_final: self.spender_final.map(|v| v != 0.0),
             settle_signers: self.settle_signers,
+            funding_size_bytes: self.funding_size_bytes.map(|v| v as u64),
+            funding_fee_sats: self.funding_fee_sats.map(|v| v as u64),
+            spender_facts_txid: self.spender_facts_txid,
+            spender_size_bytes: self.spender_size_bytes.map(|v| v as u64),
+            spender_fee_sats: self.spender_fee_sats.map(|v| v as u64),
         }
     }
 }
@@ -1494,7 +1510,8 @@ impl PotRow {
 const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentConfirmed, \
      lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
      stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
-     verdict, verdictTxid, spentHeight, spenderFinal, settleSigners";
+     verdict, verdictTxid, spentHeight, spenderFinal, settleSigners, \
+     fundingSizeBytes, fundingFeeSats, spenderFactsTxid, spenderSizeBytes, spenderFeeSats";
 
 /// Row for the `pot_beefs` length + verified-latch probe
 /// (`length(beef) AS len, proof_verified`). D1 returns numbers as f64;
@@ -2100,8 +2117,63 @@ pub fn store_record_sql() -> &'static str {
          paramsDecoded = CASE WHEN excluded.paramsDecoded = 1 THEN 1 ELSE paramsDecoded END"
 }
 
+/// bsv-low P4 slice 2: the funding tx's own size/fee, filled STORED-WINS
+/// beside the #284 upsert (a separate statement so `store_record_sql()`'s
+/// 19-bind contract — executed verbatim by the real-SQLite harnesses —
+/// stays byte-identical). Same COALESCE argument order as the decoded
+/// columns: an incoming value only ever fills an absent stored one. Pub for
+/// the REAL-SQLite harness.
+pub fn pot_funding_facts_fill_sql() -> &'static str {
+    "UPDATE pot_records SET \
+         fundingSizeBytes = COALESCE(fundingSizeBytes, ?), \
+         fundingFeeSats = COALESCE(fundingFeeSats, ?) \
+     WHERE txid = ? AND outputIndex = ?"
+}
+
+/// bsv-low P4 slice 2: the SPENDER facts CAS — lands ONLY under the live
+/// pointer (`spendingTxid = ?`, the `verdict_cas_sql` idiom). Same
+/// `spenderFactsTxid` ⇒ stored-wins per value (COALESCE); a different one ⇒
+/// the pair RESETS to the incoming values (a new spender never inherits the
+/// old spender's size or fee). The SET's `spenderFactsTxid` probes read the
+/// PRE-update value (SQLite UPDATE semantics), like the height CASE. Binds:
+/// (spender, spender, size, size, spender, fee, fee, txid, vout, spender).
+/// Pub for the REAL-SQLite harness.
+pub fn spender_facts_cas_sql() -> &'static str {
+    "UPDATE pot_records SET \
+         spenderSizeBytes = CASE WHEN spenderFactsTxid = ? \
+                            THEN COALESCE(spenderSizeBytes, ?) ELSE ? END, \
+         spenderFeeSats = CASE WHEN spenderFactsTxid = ? \
+                          THEN COALESCE(spenderFeeSats, ?) ELSE ? END, \
+         spenderFactsTxid = ? \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
+}
+
 #[async_trait(?Send)]
 impl PotStorage for D1PotStorage {
+    async fn store_spender_facts(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        facts: TxFacts,
+    ) -> Result<(), PotStorageError> {
+        let size = facts.size_bytes;
+        Query::new(spender_facts_cas_sql())
+            .bind(spending_txid)
+            .bind(size)
+            .bind(size)
+            .bind(spending_txid)
+            .bind(facts.fee_sats)
+            .bind(facts.fee_sats)
+            .bind(spending_txid)
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
+    }
+
     async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
         // #284 upsert: insert-if-absent for SPEND state, COALESCE backfill
         // for the decoded columns (see `store_record_sql` for the contract:
@@ -2129,6 +2201,26 @@ impl PotStorage for D1PotStorage {
             .execute(&self.db)
             .await
             .map_err(pot_err)?;
+        // P4 slice 2: the funding facts ride a separate stored-wins fill, and
+        // only when the admission BEEF named them (a NULL fill is a no-op).
+        // BEST-EFFORT (display tier): a failed fill never fails the money
+        // record it follows — the row simply carries no facts.
+        if record.funding_size_bytes.is_some() || record.funding_fee_sats.is_some() {
+            if let Err(e) = Query::new(pot_funding_facts_fill_sql())
+                .bind(record.funding_size_bytes)
+                .bind(record.funding_fee_sats)
+                .bind(record.txid.as_str())
+                .bind(record.output_index)
+                .execute(&self.db)
+                .await
+            {
+                let msg = format!("[pot] funding facts fill skipped (display tier): {e}");
+                #[cfg(target_arch = "wasm32")]
+                worker::console_warn!("{msg}");
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("{msg}");
+            }
+        }
         // #411 write-time spine: markers admitted BEFORE their pot flip
         // unknown→known here (the live half of stage-1's LEFT JOIN).
         // FAIL-OPEN: a missed flip leaves rows unknown-tiered until the
@@ -5112,6 +5204,11 @@ struct HoppartyRow {
     hop_sats_on_chain: Option<f64>,
     #[serde(rename = "containerOutputs")]
     container_outputs: f64,
+    // P4 slice 2: NULL on pre-slice-2 rows.
+    #[serde(rename = "sizeBytes", default)]
+    size_bytes: Option<f64>,
+    #[serde(rename = "feeSats", default)]
+    fee_sats: Option<f64>,
     txid: String,
     #[serde(rename = "outputIndex")]
     output_index: f64,
@@ -5133,6 +5230,8 @@ impl HoppartyRow {
             hop_lock_hex: self.hop_lock_hex,
             hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
             container_outputs: self.container_outputs as u32,
+            size_bytes: self.size_bytes.map(|v| v as u64),
+            fee_sats: self.fee_sats.map(|v| v as u64),
             txid: self.txid,
             output_index: self.output_index as u32,
             created_at: self.created_at.unwrap_or(0.0) as i64,
@@ -5252,9 +5351,9 @@ pub mod hopparty_write {
                 "INSERT OR IGNORE INTO hopparty_records \
                  (identity, opponentIdentity, gameId, hopVout, hopSats, \
                   seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
-                  hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+                  hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats, \
                   markerValid) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(record.identity.as_str())
             .bind(record.opponent_identity.as_str())
@@ -5270,6 +5369,8 @@ pub mod hopparty_write {
             .bind(record.txid.as_str())
             .bind(record.output_index)
             .bind(created_at)
+            .bind(record.size_bytes)
+            .bind(record.fee_sats)
             .bind(i64::from(marker_valid)),
             marker_valid,
         }
@@ -5384,7 +5485,7 @@ fn hopparty_err(e: String) -> HoppartyStorageError {
 
 const HOPPARTY_SELECT: &str = "SELECT identity, opponentIdentity, gameId, hopVout, \
      hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
-     containerOutputs, txid, outputIndex, createdAt \
+     containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats \
      FROM hopparty_records";
 
 /// `ls_hopparty hopsFor` — the identity-scoped hops-in-flight window: the
@@ -5426,17 +5527,17 @@ pub fn hopparty_list_for_identity_sql() -> String {
     format!(
         "SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
             seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
-            containerOutputs, txid, outputIndex, createdAt \
+            containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats \
      FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
                   seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, \
-                  containerOutputs, txid, outputIndex, createdAt, markerRowid, \
+                  containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats, markerRowid, \
                   potCreatedAt, potFirstMarkerAt, markerRank, outpointMarkerRank, tier, \
                   DENSE_RANK() OVER (ORDER BY outpointMarkerRank DESC, tier ASC, \
                                               COALESCE(potCreatedAt, potFirstMarkerAt) DESC, \
                                               txid ASC, hopVout ASC) AS finalRank \
            FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
                         seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
-                        hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+                        hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats, \
                         markerRowid, potCreatedAt, potFirstMarkerAt, \
                         markerRank, outpointMarkerRank, \
                         CASE WHEN unknownPot = 0 \
@@ -5444,7 +5545,7 @@ pub fn hopparty_list_for_identity_sql() -> String {
                              THEN 0 ELSE 1 END AS tier \
                  FROM (SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
                               seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
-                              hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+                              hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats, \
                               markerRowid, potCreatedAt, potFirstMarkerAt, unknownPot, \
                               markerRank, \
                               MAX(markerRank) OVER (PARTITION BY txid, hopVout) \
@@ -5464,7 +5565,7 @@ pub fn hopparty_list_for_identity_sql() -> String {
                                     hp.hopSatsOnChain AS hopSatsOnChain, \
                                     hp.containerOutputs AS containerOutputs, \
                                     hp.txid AS txid, hp.outputIndex AS outputIndex, \
-                                    hp.createdAt AS createdAt, hp.rowid AS markerRowid, \
+                                    hp.createdAt AS createdAt, hp.sizeBytes AS sizeBytes, hp.feeSats AS feeSats, hp.rowid AS markerRowid, \
                                     {marker_rank} AS markerRank, \
                                     r.createdAt AS potCreatedAt, \
                                     MIN(hp.createdAt) OVER (PARTITION BY hp.txid, \
@@ -5616,7 +5717,7 @@ fn hopparty_relatch_scan_sql() -> String {
     format!(
         "SELECT identity, opponentIdentity, gameId, hopVout, hopSats, \
             seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, \
-            hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, \
+            hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, sizeBytes, feeSats, \
             rowid, {MARKER_VALID_COLUMN} \
          FROM hopparty_records WHERE rowid > ? ORDER BY rowid ASC LIMIT ?"
     )
@@ -5658,6 +5759,11 @@ struct HoppartyRelatchDbRow {
     hop_sats_on_chain: Option<f64>,
     #[serde(rename = "containerOutputs")]
     container_outputs: f64,
+    // P4 slice 2: NULL on pre-slice-2 rows.
+    #[serde(rename = "sizeBytes", default)]
+    size_bytes: Option<f64>,
+    #[serde(rename = "feeSats", default)]
+    fee_sats: Option<f64>,
     txid: String,
     #[serde(rename = "outputIndex")]
     output_index: f64,
@@ -5692,6 +5798,8 @@ impl HoppartyRelatchDbRow {
                 hop_lock_hex: self.hop_lock_hex,
                 hop_sats_on_chain: self.hop_sats_on_chain.map(|v| v as u64),
                 container_outputs: self.container_outputs as u32,
+                size_bytes: self.size_bytes.map(|v| v as u64),
+                fee_sats: self.fee_sats.map(|v| v as u64),
                 txid: self.txid,
                 output_index: self.output_index as u32,
                 created_at: self.created_at.unwrap_or(0.0) as i64,
@@ -9388,6 +9496,8 @@ mod tests {
             hop_lock_hex: if pays { lock } else { None },
             hop_sats_on_chain: if pays { Some(m.hop_sats) } else { None },
             container_outputs: 2,
+            size_bytes: None,
+            fee_sats: None,
             txid: marker_txid.to_string(),
             output_index: 1,
             created_at: 0,
@@ -10275,27 +10385,182 @@ mod tests {
         }
     }
 
+    /// bsv-low P4 slice 2: the funding-facts fill is STORED-WINS and a NULL
+    /// fill is a no-op — executed verbatim against the production schema.
+    #[test]
+    fn the_funding_facts_fill_is_stored_wins_and_null_is_a_noop() {
+        let conn = production_schema_db();
+        exec_store(
+            &conn,
+            "potF",
+            0,
+            1_000,
+            Some("covenant"),
+            None,
+            None,
+            Some(40_000),
+            1,
+        );
+        let read = |conn: &rusqlite::Connection| -> (Option<i64>, Option<i64>) {
+            conn.query_row(
+                "SELECT fundingSizeBytes, fundingFeeSats FROM pot_records WHERE txid = 'potF'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row")
+        };
+        assert_eq!(
+            read(&conn),
+            (None, None),
+            "admission alone carries no facts"
+        );
+        conn.execute(
+            pot_funding_facts_fill_sql(),
+            rusqlite::params![991i64, Option::<i64>::None, "potF", 0i64],
+        )
+        .expect("fill");
+        assert_eq!(read(&conn), (Some(991), None));
+        conn.execute(
+            pot_funding_facts_fill_sql(),
+            rusqlite::params![5i64, 101i64, "potF", 0i64],
+        )
+        .expect("fill again");
+        assert_eq!(
+            read(&conn),
+            (Some(991), Some(101)),
+            "size is stored-wins; the absent fee FILLS"
+        );
+        conn.execute(
+            pot_funding_facts_fill_sql(),
+            rusqlite::params![Option::<i64>::None, Option::<i64>::None, "potF", 0i64],
+        )
+        .expect("null fill");
+        assert_eq!(
+            read(&conn),
+            (Some(991), Some(101)),
+            "a NULL fill is a no-op"
+        );
+        // The #284 upsert re-admission never touches the facts either.
+        exec_store(
+            &conn,
+            "potF",
+            0,
+            2_000,
+            Some("covenant"),
+            None,
+            None,
+            Some(40_000),
+            1,
+        );
+        assert_eq!(read(&conn), (Some(991), Some(101)));
+    }
+
+    /// bsv-low P4 slice 2: the spender-facts CAS lands ONLY under the live
+    /// pointer, is stored-wins for the same spender, and RESETS the pair
+    /// when the pointer names a new spender — executed verbatim.
+    #[test]
+    fn the_spender_facts_cas_only_lands_under_the_live_pointer() {
+        let conn = production_schema_db();
+        exec_store(
+            &conn,
+            "potS",
+            0,
+            1_000,
+            Some("covenant"),
+            None,
+            None,
+            Some(40_000),
+            1,
+        );
+        conn.execute(
+            "UPDATE pot_records SET spent = 1, spendingTxid = 's1' WHERE txid = 'potS' AND outputIndex = 0",
+            [],
+        )
+        .expect("point at s1");
+        let read = |conn: &rusqlite::Connection| -> (Option<String>, Option<i64>, Option<i64>) {
+            conn.query_row(
+                "SELECT spenderFactsTxid, spenderSizeBytes, spenderFeeSats FROM pot_records WHERE txid = 'potS'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row")
+        };
+        let cas =
+            |conn: &rusqlite::Connection, spender: &str, size: i64, fee: Option<i64>| -> usize {
+                conn.execute(
+                    spender_facts_cas_sql(),
+                    rusqlite::params![
+                        spender, size, size, spender, fee, fee, spender, "potS", 0i64, spender
+                    ],
+                )
+                .expect("cas")
+            };
+        assert_eq!(
+            cas(&conn, "s2", 300, Some(10)),
+            0,
+            "not the live pointer → no row touched"
+        );
+        assert_eq!(read(&conn), (None, None, None));
+        assert_eq!(cas(&conn, "s1", 300, None), 1);
+        assert_eq!(read(&conn), (Some("s1".into()), Some(300), None));
+        cas(&conn, "s1", 999, Some(10));
+        assert_eq!(
+            read(&conn),
+            (Some("s1".into()), Some(300), Some(10)),
+            "same spender: stored-wins per value"
+        );
+        conn.execute(
+            "UPDATE pot_records SET spendingTxid = 's2' WHERE txid = 'potS' AND outputIndex = 0",
+            [],
+        )
+        .expect("pointer moves");
+        assert_eq!(
+            read(&conn).0.as_deref(),
+            Some("s1"),
+            "the stale pair stays behind (reader guards by equality)"
+        );
+        cas(&conn, "s2", 400, None);
+        assert_eq!(
+            read(&conn),
+            (Some("s2".into()), Some(400), None),
+            "a new spender RESETS the pair — fee None is not inherited"
+        );
+    }
+
     /// The hopparty writer's bind list and its SQL must agree in COUNT — a
     /// dropped bind shifts every column silently (epoch Rule 9).
     #[test]
     fn the_hopparty_admission_write_binds_every_placeholder() {
         let insert = hopparty_insert_query(&golden_hopparty_record("txN", true), 0);
         let q = insert.query();
-        assert_eq!(q.sql().matches('?').count(), 15, "15 placeholders");
-        assert_eq!(q.params().len(), 15, "15 binds");
+        assert_eq!(
+            q.sql().matches('?').count(),
+            17,
+            "17 placeholders (P4 slice 2: + sizeBytes, feeSats)"
+        );
+        assert_eq!(q.params().len(), 17, "17 binds");
         assert_eq!(
             q.sql().matches(',').count(),
-            14 + 14,
-            "15 columns + 15 values = 28 separating commas"
+            16 + 16,
+            "17 columns + 17 values = 32 separating commas"
         );
         assert!(
             q.sql().contains("markerValid"),
             "the latch column is written"
         );
         assert!(
-            matches!(q.params()[14], crate::d1::QVal::Int(1)),
+            matches!(q.params()[16], crate::d1::QVal::Int(1)),
             "the LAST bind is the latch verdict for the golden: {:?}",
-            q.params()[14]
+            q.params()[16]
+        );
+        // P4 slice 2: the two facts ride just before the latch, NULL when the
+        // admission BEEF could not name them (never a guessed number).
+        assert!(
+            matches!(q.params()[14], crate::d1::QVal::Null)
+                && matches!(q.params()[15], crate::d1::QVal::Null),
+            "the golden carries no facts: {:?} {:?}",
+            q.params()[14],
+            q.params()[15]
         );
         assert!(
             insert.marker_valid(),
@@ -11774,6 +12039,8 @@ mod tests {
                     hop_lock_hex: on_chain_sats.map(|_| format!("76a914{}88ac", "d4".repeat(20))),
                     hop_sats_on_chain: on_chain_sats,
                     container_outputs: 2,
+                    size_bytes: None,
+                    fee_sats: None,
                     txid: container_txid.to_string(),
                     output_index: marker_vout,
                     created_at: 0, // ignored by the writer — the stamp wins

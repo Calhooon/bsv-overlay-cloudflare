@@ -216,6 +216,9 @@ impl LookupService for PotLookupService {
         // The funding txid comes from the parsed tx (whole-tx payloads carry
         // no txid field).
         let txid = tx.id();
+        // P4 slice 2: the funding tx's own size + exact fee from the admitted
+        // BEEF (None when it cannot be named — never an estimate).
+        let facts = crate::tx_facts::facts_from_atomic_beef(atomic_beef, &txid);
 
         // #284: decode ONCE at admission. Everything stored is a pure
         // re-presentation of the admitted bytes: the lock's committed param
@@ -232,6 +235,8 @@ impl LookupService for PotLookupService {
             spent_confirmed: false,
             pot_sats: output.satoshis,
             params_decoded: true,
+            funding_size_bytes: facts.as_ref().map(|f| f.size_bytes),
+            funding_fee_sats: facts.as_ref().and_then(|f| f.fee_sats),
             ..Default::default()
         };
         // Same classification as the shape gate above — the two MUST agree, or
@@ -335,8 +340,15 @@ impl LookupService for PotLookupService {
         // `classify_pot_spend`: the covenant asserts `ctx.utxo.value ==
         // stakeA + stakeB` in-script, so a funding value that disagrees is
         // not the pot the params describe → no verdict.
-        let verdict = match self.storage.get_spent_status(txid, output_index).await {
-            Ok(Some(record)) => record.decoded_covenant_params().and_then(|params| {
+        let admitted = match self.storage.get_spent_status(txid, output_index).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("POT: record read for verdict classification failed — no verdict: {e}");
+                None
+            }
+        };
+        let verdict = match admitted.as_ref() {
+            Some(record) => record.decoded_covenant_params().and_then(|params| {
                 let pot_sats = record.pot_sats?;
                 if params.stake_a.checked_add(params.stake_b)? != pot_sats {
                     return None; // conservation failed — never classify
@@ -369,11 +381,7 @@ impl LookupService for PotLookupService {
                 );
                 Some((v, signers))
             }),
-            Ok(None) => None, // never admitted — mark_spent is a no-op anyway
-            Err(e) => {
-                debug!("POT: record read for verdict classification failed — no verdict: {e}");
-                None
-            }
+            None => None, // never admitted — mark_spent is a no-op anyway
         };
         // The #284 verdict + #406 signers travel as ONE group (typed so the
         // signers can never be written without the verdict they ride with).
@@ -409,6 +417,33 @@ impl LookupService for PotLookupService {
             )
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+
+        // bsv-low P4 slice 2: the spender's OWN size + exact fee, described
+        // under the pointer just written (CAS — a moved pointer is a no-op).
+        // The fee comes from the BEEF's parents when it carries them, else
+        // from the ADMITTED pot value for a single-input pot spend (the only
+        // input is the pot, so fee = potSats − Σ outputs — never a caller
+        // claim). Display-tier and BEST-EFFORT: a failure here never fails
+        // the landing proof above.
+        if let Some(record) = admitted.as_ref() {
+            let mut facts =
+                crate::tx_facts::facts_from_atomic_beef(spending_atomic_beef, &spending_txid);
+            if let Some(f) = facts.as_mut() {
+                if f.fee_sats.is_none() {
+                    f.fee_sats =
+                        single_input_pot_fee(&spending_tx, txid, output_index, record.pot_sats);
+                }
+            }
+            if let Some(f) = facts {
+                if let Err(e) = self
+                    .storage
+                    .store_spender_facts(txid, output_index, &spending_txid, f)
+                    .await
+                {
+                    debug!("POT: spender facts not recorded (display tier, best-effort): {e}");
+                }
+            }
+        }
 
         // Durably persist the SETTLE/refund beef under the SPENDER's txid —
         // the settle admits no outputs, so the engine's `transactions` table
@@ -547,6 +582,36 @@ impl LookupService for PotLookupService {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// bsv-low P4 slice 2: the exact fee of a SINGLE-input spend of the admitted
+/// pot outpoint, from the ADMITTED funding value: `pot_sats − Σ outputs`.
+/// `None` unless the tx's only input is exactly `(pot_txid, pot_vout)`, every
+/// output value is present and the subtraction does not underflow — never an
+/// estimate, never a multi-input guess (other inputs' values are unknown).
+pub(crate) fn single_input_pot_fee(
+    spending_tx: &Transaction,
+    pot_txid: &str,
+    pot_vout: u32,
+    pot_sats: Option<u64>,
+) -> Option<u64> {
+    let pot_sats = pot_sats?;
+    let [only] = spending_tx.inputs.as_slice() else {
+        return None;
+    };
+    let sources_pot = only
+        .source_txid
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(pot_txid))
+        && only.source_output_index == pot_vout;
+    if !sources_pot {
+        return None;
+    }
+    let mut out_sum: u64 = 0;
+    for o in &spending_tx.outputs {
+        out_sum = out_sum.checked_add(o.satoshis?)?;
+    }
+    pot_sats.checked_sub(out_sum)
+}
 
 #[cfg(test)]
 mod tests {
@@ -713,6 +778,133 @@ mod tests {
         assert_eq!(e["spent"], false);
         assert!(e["spendingTxid"].is_null());
         assert_eq!(e["spentConfirmed"], false);
+    }
+
+    /// A parent tx paying `value` sats to a P2PKH — attached as the SOURCE of
+    /// a funding input so the BEEF carries it (exact fee derivable).
+    fn parent_tx(value: u64, salt: u8) -> Tx {
+        let mut p = Tx::new();
+        p.add_input(TransactionInput::new(hex::encode([salt; 32]), 1))
+            .unwrap();
+        let mut o = p2pkh_output();
+        o.satoshis = Some(value);
+        p.add_output(o).unwrap();
+        p
+    }
+
+    /// bsv-low P4 slice 2: the funding tx's OWN size + exact fee are read from
+    /// the admitted BEEF (fee only when the parent rides along) and stored on
+    /// the record — never estimated.
+    #[tokio::test]
+    async fn admit_records_the_funding_size_and_fee_from_the_beef() {
+        let (svc, storage) = make_service_with_storage();
+        // Exact: the BEEF carries the parent (100_000 in, 2_500 pot out).
+        let parent = parent_tx(100_000, 0x51);
+        let mut funding = Tx::new();
+        funding
+            .add_input(TransactionInput::with_source_transaction(parent.clone(), 0))
+            .unwrap();
+        funding
+            .add_output(make_covenant_output(&dummy_params()))
+            .unwrap();
+        let ftx = funding.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        let r = storage
+            .get_spent_status(&ftx, 0)
+            .await
+            .unwrap()
+            .expect("admitted");
+        let pot_sats = r.pot_sats.expect("pot value from the admitted output");
+        assert_eq!(r.funding_size_bytes, Some(funding.to_binary().len() as u64));
+        assert_eq!(r.funding_fee_sats, Some(100_000 - pot_sats));
+        // Partial BEEF (no parent): size only, fee None — never a guess.
+        let lone = funding_tx(0x52);
+        svc.output_admitted_by_topic(&admit(beef_of(&lone), 0))
+            .await
+            .unwrap();
+        let r2 = storage
+            .get_spent_status(&lone.id(), 0)
+            .await
+            .unwrap()
+            .expect("admitted");
+        assert_eq!(r2.funding_size_bytes, Some(lone.to_binary().len() as u64));
+        assert_eq!(r2.funding_fee_sats, None);
+    }
+
+    /// bsv-low P4 slice 2: the SPENDER's facts ride the pointer — exact fee
+    /// from the ADMITTED pot value for a single-input pot spend even when the
+    /// spending BEEF is partial, keyed by `spenderFactsTxid`.
+    #[tokio::test]
+    async fn spend_records_the_spender_size_and_fee_under_the_pointer() {
+        let (svc, storage) = make_service_with_storage();
+        let funding = funding_tx(0x61);
+        let ftx = funding.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&funding), 0))
+            .await
+            .unwrap();
+        let pot_sats = storage
+            .get_spent_status(&ftx, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .pot_sats
+            .expect("pot value");
+        let settle = settle_tx(&ftx, 0); // one input (the pot), one 546-sat P2PKH output
+        let stx = settle.id();
+        svc.output_spent(&spent(&ftx, 0, beef_of(&settle)))
+            .await
+            .unwrap();
+        let r = storage.get_spent_status(&ftx, 0).await.unwrap().unwrap();
+        assert_eq!(r.spending_txid.as_deref(), Some(stx.as_str()));
+        assert_eq!(r.spender_facts_txid.as_deref(), Some(stx.as_str()));
+        assert_eq!(r.spender_size_bytes, Some(settle.to_binary().len() as u64));
+        assert_eq!(r.spender_fee_sats, Some(pot_sats - 546));
+    }
+
+    #[test]
+    fn single_input_pot_fee_refuses_multi_input_foreign_input_and_underflow() {
+        let pot = "ab".repeat(32);
+        let mut one = Tx::new();
+        one.add_input(TransactionInput::new(pot.clone(), 0))
+            .unwrap();
+        one.add_output(p2pkh_output()).unwrap(); // 546 out
+        assert_eq!(
+            single_input_pot_fee(&one, &pot, 0, Some(2_500)),
+            Some(2_500 - 546)
+        );
+        assert_eq!(
+            single_input_pot_fee(&one, &pot, 0, None),
+            None,
+            "no admitted value → no fee"
+        );
+        assert_eq!(
+            single_input_pot_fee(&one, &pot, 1, Some(2_500)),
+            None,
+            "wrong vout → not the pot"
+        );
+        assert_eq!(
+            single_input_pot_fee(&one, &"cd".repeat(32), 0, Some(2_500)),
+            None,
+            "wrong txid"
+        );
+        assert_eq!(
+            single_input_pot_fee(&one, &pot, 0, Some(100)),
+            None,
+            "outputs exceed the pot → underflow refused"
+        );
+        let mut two = Tx::new();
+        two.add_input(TransactionInput::new(pot.clone(), 0))
+            .unwrap();
+        two.add_input(TransactionInput::new("ef".repeat(32), 0))
+            .unwrap();
+        two.add_output(p2pkh_output()).unwrap();
+        assert_eq!(
+            single_input_pot_fee(&two, &pot, 0, Some(2_500)),
+            None,
+            "a second input's value is unknown"
+        );
     }
 
     #[tokio::test]

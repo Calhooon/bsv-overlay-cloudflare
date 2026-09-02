@@ -123,6 +123,8 @@ impl LookupService for HoppartyLookupService {
         // makes that absence PROVEN rather than ambiguous. No refusal here —
         // the reader labels.
         let container_outputs = tx.outputs.len() as u32;
+        // P4 slice 2: the container's size + exact fee, from the same bytes.
+        let facts = crate::tx_facts::facts_from_atomic_beef(atomic_beef, &txid);
         let hop_output = tx.outputs.get(marker.hop_vout as usize);
         let hop_lock_hex = hop_output.map(|o| hex::encode(o.locking_script.to_binary()));
         let hop_sats_on_chain = hop_output.and_then(|o| o.satoshis);
@@ -139,6 +141,8 @@ impl LookupService for HoppartyLookupService {
             hop_lock_hex,
             hop_sats_on_chain,
             container_outputs,
+            size_bytes: facts.map(|f| f.size_bytes),
+            fee_sats: facts.and_then(|f| f.fee_sats),
             txid,
             output_index,
             created_at: 0, // assigned by the storage layer at insert

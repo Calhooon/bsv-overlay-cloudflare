@@ -14,6 +14,7 @@ pub mod result;
 pub mod reveal;
 pub mod ship;
 pub mod slap;
+pub mod tx_facts;
 pub mod uhrp;
 pub mod validation;
 

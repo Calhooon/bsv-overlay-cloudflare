@@ -40,8 +40,8 @@ use bsv_rs::wallet::{
     Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
 };
 use low_app_layer::hops_view::{
-    apply_chain_probes, assemble_hops_view, expected_hop_lock_hex, hops_view_body, hops_view_sql, ChainSpendProbe, HopStatus,
-    HopsViewRow, MarkerVerification, HOPS_VIEW_MAX_OUTPOINTS,
+    apply_chain_probes, assemble_hops_view, expected_hop_lock_hex, hops_view_body, hops_view_sql,
+    ChainSpendProbe, HopStatus, HopsViewRow, MarkerVerification, HOPS_VIEW_MAX_OUTPOINTS,
 };
 use low_app_layer::logic::valid_identity;
 use overlay_discovery::hopparty::storage::HoppartyRecord;
@@ -261,6 +261,8 @@ fn admit_container(conn: &Connection, beef: &[u8], marker_vout: u32, at: i64) ->
             hop_lock_hex,
             hop_sats_on_chain,
             container_outputs,
+            size_bytes: None,
+            fee_sats: None,
             txid: txid.clone(),
             output_index: marker_vout,
             created_at: 0, // ignored by the writer — the stamp below wins
@@ -465,7 +467,11 @@ fn real_marker_in_its_production_container_is_verified_and_unspent() {
     assert!(!truncated);
     let e = &entries[0];
     assert_eq!(e.status, HopStatus::Unspent);
-    assert_eq!(e.status_source, Some("index"), "B2.1: the index's non-observation is labelled index, never chain");
+    assert_eq!(
+        e.status_source,
+        Some("index"),
+        "B2.1: the index's non-observation is labelled index, never chain"
+    );
     assert_eq!(
         e.marker_verified,
         MarkerVerification::Verified,
@@ -1781,19 +1787,35 @@ fn b21_a_hop_swept_outside_the_overlay_is_served_spent_once_the_chain_rung_says_
     let rows = query_rows(&conn, &m.identity_hex);
     let (entries, _) = assemble_hops_view(rows);
     assert_eq!(entries[0].status, HopStatus::Unspent);
-    assert_eq!(entries[0].status_source, Some("index"), "the index's word is labelled index");
+    assert_eq!(
+        entries[0].status_source,
+        Some("index"),
+        "the index's word is labelled index"
+    );
 
     let spender = "3d".repeat(32);
     let probes = vec![(
         txid.clone(),
         0u32,
-        ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.clone()), spent_confirmed: Some(true) },
+        ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(spender.clone()),
+            spent_confirmed: Some(true),
+        },
     )];
     let served = apply_chain_probes(entries, &probes);
-    assert_eq!(served[0].status, HopStatus::Spent, "the chain rung's confirmed spender wins");
+    assert_eq!(
+        served[0].status,
+        HopStatus::Spent,
+        "the chain rung's confirmed spender wins"
+    );
     assert_eq!(served[0].status_source, Some("chain"));
     assert_eq!(served[0].spending_txid.as_deref(), Some(spender.as_str()));
     let body = hops_view_body(&m.identity_hex, Some(961_000), &served, false, 0);
-    assert!(body.contains("\"status\":\"spent\""), "the wire says spent: {body}");
+    assert!(
+        body.contains("\"status\":\"spent\""),
+        "the wire says spent: {body}"
+    );
     assert!(!body.contains("\"status\":\"unspent\""));
 }
