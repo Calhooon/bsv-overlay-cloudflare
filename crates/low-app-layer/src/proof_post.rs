@@ -283,7 +283,16 @@ pub async fn proof_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resul
         crate::routes::ViewIdentity::Identity(id) => id,
         crate::routes::ViewIdentity::Refuse(resp) => return resp,
     };
-    let body: ProofPostBody = match req.json().await {
+    // The authed lane's body was CONSUMED by the BRC-104 middleware (it signs
+    // over it) and rides `ctx.data.body`; the plain lane's is still on `req`.
+    let raw: Vec<u8> = match ctx.data.body.clone() {
+        Some(b) => b,
+        None => match req.bytes().await {
+            Ok(b) => b,
+            Err(e) => return crate::routes::json_error(&format!("body unreadable: {e}"), 400),
+        },
+    };
+    let body: ProofPostBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return crate::routes::json_error(&format!("body is not a proof post: {e}"), 400),
     };

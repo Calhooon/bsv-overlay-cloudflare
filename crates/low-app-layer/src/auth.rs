@@ -422,6 +422,15 @@ pub struct AuthState {
     /// Present iff the caller authenticated — used to sign the JSON reply so
     /// `AuthFetch` clients verify the server (the tower's posture).
     pub session: Option<AuthSession>,
+    /// The request body the BRC-104 middleware CONSUMED while verifying the
+    /// caller's signature over it (`AuthResult::Authenticated.body`), on the
+    /// authenticated lane; `None` on the plain lane, where the request's own
+    /// body is untouched. A POST handler must read THIS before falling back
+    /// to `req.bytes()` — the first real proof-in-DB hand (beta, 2026-09-02,
+    /// game `f1cad298…`) was refused 400 "body has already been read"
+    /// because the app-layer's first POST route read the request after the
+    /// middleware had.
+    pub body: Option<Vec<u8>>,
 }
 
 /// Front-door outcome: either proceed to the router with resolved state, or
@@ -495,6 +504,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     caller: CallerAuth::Anonymous,
                     auth_configured,
                     session: None,
+                    body: None,
                 },
             ))
         }
@@ -548,9 +558,10 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     context,
                     request,
                     session,
-                    // GET reads carry no body; the BRC-104 signature covered
-                    // whatever bytes were there.
-                    body: _,
+                    // The signature covered these bytes; a POST handler reads
+                    // them from `AuthState.body` (the request's own body is
+                    // spent).
+                    body,
                 } => match session {
                     Some(session) => {
                         count_authenticated_served();
@@ -564,6 +575,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                                 caller: CallerAuth::verified(&context.identity_key),
                                 auth_configured,
                                 session: Some(session),
+                                body: Some(body),
                             },
                         ))
                     }
