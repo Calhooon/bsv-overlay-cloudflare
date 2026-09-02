@@ -169,7 +169,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // W2-P4: first-party internal webhooks (bearer INTERNAL_TOKEN) — served
     // BEFORE the BRC-103 front door, exactly like the relay's /broadcast:
     // the callers are our workers, not identities with a wallet.
-    if req.method() == Method::Post && req.path() == "/internal/tip-changed" {
+    if req.method() == worker::Method::Post && req.path() == "/internal/tip-changed" {
         return internal_events::tip_changed(req, &env).await;
     }
 
