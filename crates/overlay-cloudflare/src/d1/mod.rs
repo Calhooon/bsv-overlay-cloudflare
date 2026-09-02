@@ -421,7 +421,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 117 → 118 for bsv-low #403 board paging (2026-08-29):
 /// `idx_pot_records_chain_wins` — the whole-era chain-wins spine's scan
 /// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
-pub const OVERLAY_MIGRATION_COUNT: usize = 135;
+pub const OVERLAY_MIGRATION_COUNT: usize = 136;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1508,6 +1508,26 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE proof_markers ADD COLUMN seatB TEXT",
     "ALTER TABLE proof_markers ADD COLUMN winnerCardsHex TEXT",
     "ALTER TABLE proof_markers ADD COLUMN loserCardsHex TEXT",
+    // bsv-low P1.1 PROOF-IN-DB (owner GO 2026-09-02): the winner's transcript
+    // proof bundle POSTED to the app-layer (`POST /proof`) instead of spent on
+    // chain — one row per (game, poster), replaced by a later post from the
+    // same poster; bytes verbatim (poster-signed), replay verdict + both hands
+    // at write. Owned here (the overlay is the schema authority for this D1);
+    // the app-layer's catch-up CREATE is byte-identical, pinned there.
+    "CREATE TABLE IF NOT EXISTS proof_posts (
+        gameId TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        sigHex TEXT NOT NULL,
+        bundle BLOB NOT NULL,
+        createdAt INTEGER NOT NULL,
+        bundleValid INTEGER NOT NULL,
+        winnerSeat INTEGER,
+        seatA TEXT,
+        seatB TEXT,
+        winnerCardsHex TEXT,
+        loserCardsHex TEXT,
+        PRIMARY KEY (gameId, winner)
+    )",
 ];
 
 // =============================================================================

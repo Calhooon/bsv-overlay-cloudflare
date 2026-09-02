@@ -208,12 +208,36 @@ pub const HAND_MARKERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS hand_markers (
         PRIMARY KEY (txid, outputIndex)
     )";
 
+/// bsv-low P1.1 proof-in-DB (owner GO 2026-09-02): the winner's transcript
+/// proof bundle POSTED to this app-layer instead of spent on chain — one row
+/// per (game, poster), REPLACED by a later post from the same poster (a newer
+/// winner-signed bundle supersedes; nothing else may touch it). The bytes are
+/// stored verbatim (the poster's identity signature over their sha256 binds
+/// them, exactly as the on-chain marker's does), and the admission-time REPLAY
+/// verdict + both re-derived hands ride the row (`proof::replay`). Ties post
+/// from the revealed side: `winner` is the POSTER, not a claim of victory.
+pub const PROOF_POSTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS proof_posts (
+        gameId TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        sigHex TEXT NOT NULL,
+        bundle BLOB NOT NULL,
+        createdAt INTEGER NOT NULL,
+        bundleValid INTEGER NOT NULL,
+        winnerSeat INTEGER,
+        seatA TEXT,
+        seatB TEXT,
+        winnerCardsHex TEXT,
+        loserCardsHex TEXT,
+        PRIMARY KEY (gameId, winner)
+    )";
+
 /// Every CREATE-class catch-up this module issues. `IF NOT EXISTS` makes
 /// success the only benign outcome — any error is real and defers the latch.
 pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     NETWORK_SEEN_CREATE,
     COLLECTED_MARKERS_V2_CREATE,
     HAND_MARKERS_CREATE,
+    PROOF_POSTS_CREATE,
 ];
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
@@ -408,9 +432,10 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            3,
+            4,
             "network_seen (#371), collected_markers_v2 (#252 stage A), \
-             hand_markers (#382, mirrored for the brain-cutover M2 join)"
+             hand_markers (#382, mirrored for the brain-cutover M2 join), \
+             proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02)"
         );
         for stmt in CREATE_TABLE_CATCHUPS {
             assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");

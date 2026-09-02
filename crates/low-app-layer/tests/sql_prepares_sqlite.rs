@@ -183,6 +183,12 @@ fn every_batched_query_prepares_at_representative_arities() {
             &format!("proof_bundle_bytes_sql({n})"),
             &proof_bundle_bytes_sql(n),
         );
+        // bsv-low P1.1 proof-in-DB: the posted-bundle read.
+        assert_prepares(
+            &conn,
+            &format!("proof_posts_hands_sql({n})"),
+            &low_app_layer::proof_post::proof_posts_hands_sql(n),
+        );
         assert_prepares(
             &conn,
             &format!("proof_pointers_sql({n})"),
@@ -227,6 +233,11 @@ fn batched_queries_declare_the_parameter_count_they_emit() {
             ("hop_seat_markers_sql", hop_seat_markers_sql(n), n * 2),
             ("proof_hands_sql", proof_hands_sql(n), n),
             ("proof_bundle_bytes_sql", proof_bundle_bytes_sql(n), n),
+            (
+                "proof_posts_hands_sql",
+                low_app_layer::proof_post::proof_posts_hands_sql(n),
+                n,
+            ),
         ] {
             let stmt = conn
                 .prepare(&sql)

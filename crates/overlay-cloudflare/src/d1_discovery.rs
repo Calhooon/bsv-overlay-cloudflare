@@ -10599,7 +10599,14 @@ mod tests {
             ],
         )
         .expect("the shipped write executes");
-        let (valid, seat, a, w, l): (Option<i64>, Option<i64>, Option<String>, Option<String>, Option<String>) = conn
+        type ReplayCols = (
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let (valid, seat, a, w, l): ReplayCols = conn
             .query_row(
                 "SELECT bundleValid, winnerSeat, seatA, winnerCardsHex, loserCardsHex FROM proof_markers WHERE txid = 'txPROOF'",
                 [],

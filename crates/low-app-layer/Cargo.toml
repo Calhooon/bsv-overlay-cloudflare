@@ -37,6 +37,8 @@ bsv-middleware-cloudflare = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
+# bsv-low P1.1 proof-in-DB (2026-09-02): the posted bundle travels base64 (same crate/version as the overlay).
+base64 = "0.22"
 # BEEF parsing for /pots-view's spenderRawHex extraction (the same crate the
 # sibling overlay worker uses; `overlay` feature only — no net/tokio on wasm32).
 bsv-rs.workspace = true

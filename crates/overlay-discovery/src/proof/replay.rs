@@ -237,13 +237,16 @@ fn parse_reveal(body: &[u8]) -> Option<RevealView> {
     })
 }
 
+/// (`deal_keys` scalars, optional `draw_keys` scalars) as released by a seat.
+type ReleasedKeys = (Vec<[u8; 32]>, Option<Vec<[u8; 32]>>);
+
 /// The released scalars covering the OTHER seat's positions: exactly one
 /// `deal_keys` (five), at most one `draw_keys` (≤5, bounded before parse).
 fn parse_released_keys(
     wires: Option<&Value>,
     game_id: &[u8; 32],
     seat: &[u8; 33],
-) -> Option<(Vec<[u8; 32]>, Option<Vec<[u8; 32]>>)> {
+) -> Option<ReleasedKeys> {
     let arr = wires?.as_array()?;
     if arr.is_empty() || arr.len() > 2 {
         return None;

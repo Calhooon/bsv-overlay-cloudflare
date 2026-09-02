@@ -4011,6 +4011,36 @@ fn proof_hands_like_the_route(
             _ => {}
         }
     }
+    // bsv-low P1.1 proof-in-DB: posted bundles serve exactly like on-chain ones.
+    {
+        use low_app_layer::proof_post::proof_posts_hands_sql;
+        let mut stmt = conn
+            .prepare(&proof_posts_hands_sql(game_ids.len()))
+            .unwrap();
+        type PostRow = (String, String, Option<String>, Option<String>);
+        let rows: Vec<PostRow> = stmt
+            .query_map(rusqlite::params_from_iter(game_ids.iter()), |r| {
+                Ok((
+                    r.get("gameId")?,
+                    r.get("winner")?,
+                    r.get("winnerCardsHex")?,
+                    r.get("loserCardsHex")?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (gid, winner, wc, lc) in rows {
+            if let Some(wc) = wc {
+                out.entry(gid.clone()).or_default().push(ProofHandsFact {
+                    game_id: gid,
+                    winner,
+                    winner_cards_hex: wc,
+                    loser_cards_hex: lc,
+                });
+            }
+        }
+    }
     if !pending.is_empty() {
         let mut stmt = conn
             .prepare(&proof_bundle_bytes_sql(pending.len()))
@@ -4164,4 +4194,85 @@ fn both_hands_serve_from_the_winners_replayed_bundle() {
         v["results"][0]["markerHands"]["theirs"],
         serde_json::json!("151c1d2d31")
     );
+}
+
+/// bsv-low P1.1 proof-in-DB (owner GO 2026-09-02): a bundle POSTED to the
+/// app-layer — created by the (overlay-owned, app-layer-mirrored) statement,
+/// written by the shipped 11-bind write — serves both hands on `/results`
+/// exactly like an on-chain one, with NO hand marker and NO proof marker in
+/// the index; a later post by the same poster REPLACES.
+#[test]
+fn a_posted_proof_serves_both_hands_with_no_marker_on_chain() {
+    use low_app_layer::proof_post::PROOF_POST_WRITE_SQL;
+    let conn = production_schema_db(); // the overlay migration list already carries proof_posts
+    let poster = "03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0".to_string();
+    let g = h64(0x61);
+    insert_pot(&conn, &h64(0xa6), 1_000, true);
+    file_marker(&conn, &poster, &h64(0xa6), &h64(0xe6), 1_000);
+    conn.execute(
+        PROOF_POST_WRITE_SQL,
+        params![
+            g.as_str(),
+            poster.as_str(),
+            "3045",
+            vec![1u8, 2, 3],
+            1_000i64,
+            1i64,
+            0i64,
+            Option::<String>::None,
+            Option::<String>::None,
+            "011f232733",
+            "151c1d2d31"
+        ],
+    )
+    .expect("the shipped write executes");
+    conn.execute(
+        PROOF_POST_WRITE_SQL,
+        params![
+            g.as_str(),
+            poster.as_str(),
+            "3046",
+            vec![9u8],
+            1_001i64,
+            1i64,
+            0i64,
+            Option::<String>::None,
+            Option::<String>::None,
+            "011f232733",
+            "151c1d2d31"
+        ],
+    )
+    .unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM proof_posts WHERE gameId = ?1",
+            params![g.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "one row per (game, poster) — a later post replaces");
+    let proofs = proof_hands_like_the_route(&conn, std::slice::from_ref(&g));
+    assert_eq!(proofs.get(&g).map(|v| v.len()), Some(1));
+    let mut rows = query_results_rows(&conn, &poster);
+    apply_page_overlay_like_the_route(&conn, &mut rows);
+    for r in rows.iter_mut() {
+        r.game_id = g.clone();
+    }
+    let params_by_pot = covenant_params_by_pot(&rows);
+    let entries = assemble_results(
+        &poster,
+        rows,
+        &Default::default(),
+        &Default::default(),
+        &params_by_pot,
+        &Default::default(),
+        &Default::default(),
+        &proofs,
+    );
+    assert_eq!(entries[0].marker_hands.mine.as_deref(), Some("011f232733"));
+    assert_eq!(
+        entries[0].marker_hands.theirs.as_deref(),
+        Some("151c1d2d31")
+    );
+    assert_eq!(entries[0].hands_source, Some("proof"));
 }

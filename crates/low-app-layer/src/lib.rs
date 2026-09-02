@@ -122,6 +122,7 @@ pub mod credit_beef;
 pub mod hops_view;
 pub mod live_view;
 pub mod logic;
+pub mod proof_post;
 pub mod refund_view;
 pub mod results;
 mod routes;
@@ -217,6 +218,9 @@ fn router(
         .get_async("/recovery-view", routes::recovery_view)
         .get_async("/leaderboard", routes::leaderboard)
         .get_async("/results", routes::results)
+        // bsv-low P1.1 proof-in-DB (owner GO 2026-09-02): the winner posts the
+        // transcript proof bundle here instead of spending it on chain.
+        .post_async("/proof", proof_post::proof_post)
         .get_async("/refund-view", routes::refund_view)
         .get_async("/hops-view", routes::hops_view)
         .get_async("/live-view", routes::live_view)

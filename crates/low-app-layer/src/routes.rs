@@ -39,7 +39,7 @@ use crate::logic::{
 const CHAINTRACKS_TIP_URL: &str = "https://chaintracks/getPresentHeight";
 
 /// Build a JSON response (always `no-store` — see the module note).
-fn json_response(body: String, status: u16) -> Result<Response> {
+pub(crate) fn json_response(body: String, status: u16) -> Result<Response> {
     let mut resp = Response::ok(body)?.with_status(status);
     resp.headers_mut().set("Content-Type", "application/json")?;
     resp.headers_mut().set("Cache-Control", "no-store")?;
@@ -47,7 +47,7 @@ fn json_response(body: String, status: u16) -> Result<Response> {
 }
 
 /// JSON error.
-fn json_error(msg: &str, status: u16) -> Result<Response> {
+pub(crate) fn json_error(msg: &str, status: u16) -> Result<Response> {
     json_response(serde_json::json!({ "error": msg }).to_string(), status)
 }
 
@@ -2304,6 +2304,17 @@ struct ProofHandsRowD1 {
 }
 
 #[derive(Deserialize)]
+struct ProofPostHandsRowD1 {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    winner: String,
+    #[serde(rename = "winnerCardsHex", default)]
+    winner_cards_hex: Option<String>,
+    #[serde(rename = "loserCardsHex", default)]
+    loser_cards_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ProofBytesRowD1 {
     #[serde(rename = "gameId")]
     game_id: String,
@@ -2370,6 +2381,45 @@ async fn results_proof_hands(
                 // A racing pre-migration schema or any D1 fault: proof hands
                 // are simply absent this pass (markers still serve).
                 console_warn!("[results] proof-hands query failed (proof hands omitted): {e}");
+            }
+        }
+    }
+    // bsv-low P1.1 proof-in-DB: bundles POSTED to this app-layer (replayed on
+    // write) serve exactly like on-chain ones. Same chunking, same shape.
+    for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|g| JsValue::from_str(g)).collect();
+        let stmt = match db
+            .prepare(crate::proof_post::proof_posts_hands_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                console_warn!("[results] proof-posts bind failed (chunk omitted): {e}");
+                continue;
+            }
+        };
+        match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<ProofPostHandsRowD1>())
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let Some(wc) = r.winner_cards_hex else {
+                        continue;
+                    };
+                    out.entry(r.game_id.to_ascii_lowercase()).or_default().push(
+                        crate::results::ProofHandsFact {
+                            game_id: r.game_id.to_ascii_lowercase(),
+                            winner: r.winner.to_ascii_lowercase(),
+                            winner_cards_hex: wc.to_ascii_lowercase(),
+                            loser_cards_hex: r.loser_cards_hex.map(|c| c.to_ascii_lowercase()),
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                console_warn!("[results] proof-posts query failed (posted proofs omitted): {e}")
             }
         }
     }

@@ -1313,6 +1313,7 @@ name = "low-app-layer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bsv-middleware-cloudflare",
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
