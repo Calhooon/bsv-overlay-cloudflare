@@ -150,6 +150,8 @@ crons = ["*/15 * * * *"]
 name = "low-overlay-beta"
 
 [env.beta.vars]
+# W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN).
+APP_LAYER_URL = "https://low-app-layer-beta.dev-a3e.workers.dev"
 ENVIRONMENT = "production"
 # The per-environment topic namespace. MUST match the client's
 # VITE_OVERLAY_TOPIC_SUFFIX (app/.env.beta) — a mismatch means every submit

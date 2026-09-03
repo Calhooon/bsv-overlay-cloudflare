@@ -2171,7 +2171,9 @@ impl PotStorage for D1PotStorage {
             .bind(spending_txid)
             .execute(&self.db)
             .await
-            .map_err(pot_err)
+            .map_err(pot_err)?;
+        crate::pot_changes::note(txid, output_index);
+        Ok(())
     }
 
     async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
@@ -2236,6 +2238,7 @@ impl PotStorage for D1PotStorage {
                 "[pot:lb-spine] unknown->known flip failed (self-heals via fallback): {e}"
             );
         }
+        crate::pot_changes::note(&record.txid, record.output_index);
         Ok(())
     }
 
@@ -2296,6 +2299,7 @@ impl PotStorage for D1PotStorage {
             self.retire_superseded_best_effort(txid, output_index, spending_txid)
                 .await;
         }
+        crate::pot_changes::note(txid, output_index);
         Ok(())
     }
 
@@ -2319,7 +2323,9 @@ impl PotStorage for D1PotStorage {
             .bind(spending_txid)
             .execute(&self.db)
             .await
-            .map_err(pot_err)
+            .map_err(pot_err)?;
+        crate::pot_changes::note(txid, output_index);
+        Ok(())
     }
 
     async fn displace_spend_for(
@@ -2346,6 +2352,9 @@ impl PotStorage for D1PotStorage {
         if hit.is_some() {
             self.retire_superseded_best_effort(txid, output_index, to_spender)
                 .await;
+        }
+        if hit.is_some() {
+            crate::pot_changes::note(txid, output_index);
         }
         Ok(hit.is_some())
     }
@@ -2375,6 +2384,9 @@ impl PotStorage for D1PotStorage {
         if hit.is_some() {
             self.retire_superseded_best_effort(txid, output_index, spending_txid)
                 .await;
+        }
+        if hit.is_some() {
+            crate::pot_changes::note(txid, output_index);
         }
         Ok(hit.is_some())
     }

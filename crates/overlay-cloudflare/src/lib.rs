@@ -23,6 +23,7 @@ pub mod ops;
 pub mod peer_crawler;
 pub mod proof_fetcher;
 pub mod queue;
+pub mod pot_changes;
 pub mod relatch;
 pub mod routes;
 pub mod submit_census;
@@ -1035,7 +1036,7 @@ const ADVERT_LIFECYCLE_BUDGET_MS: u64 = 60_000;
 const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
 
 #[event(scheduled)]
-async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
+async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     worker::console_log!("Scheduled event triggered");
 
     // Initialize D1 and run migrations
@@ -1509,6 +1510,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     }
 
     worker::console_log!("Scheduled tasks completed");
+    // W2-P4: ship the pot rows this run changed (off the critical path).
+    crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
 }
 
 /// POST /admin/complete-proofs (#192/#193) — run the BEEF proof-completion passes
@@ -1870,7 +1873,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
 async fn queue_handler(
     batch: worker::MessageBatch<crate::queue::MutationMessage>,
     env: Env,
-    _ctx: worker::Context,
+    ctx: worker::Context,
 ) -> worker::Result<()> {
     use base64::{engine::general_purpose::STANDARD, Engine as B64Engine};
     use overlay_engine::types::{SubmitMode, TaggedBEEF};
@@ -1946,6 +1949,8 @@ async fn queue_handler(
         }
     }
 
+    // W2-P4: ship the pot rows this batch changed (off the critical path).
+    crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
     Ok(())
 }
 
