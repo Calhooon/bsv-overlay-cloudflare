@@ -48,6 +48,10 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 # flipping it back; no code change. Full closure criteria: `src/auth.rs` docs.
 [vars]
 AUTH_ENFORCE = "false"
+# The relay this worker pushes events to (its /broadcast rooms + /push boxes),
+# reached through the RELAY service binding; the URL names the path/host the
+# relay sees. Pushes no-op without the BROADCAST_TOKEN secret.
+RELAY_URL = "https://low-relay.dev-a3e.workers.dev"
 
 # Storage epoch (bsv-low THE ORDER item 2, owner-ruled 2026-08-06): served
 # verbatim by `GET /epoch` as {"storageEpoch": "<value>"}. BUMPING THIS VALUE
@@ -118,6 +122,15 @@ service = "rust-chaintracks"
 [[services]]
 binding = "TOWER"
 service = "low-watchtower"
+
+# Service binding to the LOW relay (same account) for `/broadcast` (the lobby /
+# leaderboard / tip rooms) and `/push` (per-seat `low_events` boxes). REQUIRED:
+# Cloudflare refuses a plain fetch between two Workers on one zone (error 1042
+# behind a 404), and every *.workers.dev host of an account is ONE zone —
+# proven on beta 2026-09-03. `service` is a worker name, not a secret.
+[[services]]
+binding = "RELAY"
+service = "low-relay"
 
 # ══════════════════════════════════════════════════════════════════════════
 # beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
@@ -195,6 +208,11 @@ service = "rust-chaintracks"
 [[env.beta.services]]
 binding = "TOWER"
 service = "low-watchtower-beta"
+
+# The BETA relay (see the prod RELAY binding for the why).
+[[env.beta.services]]
+binding = "RELAY"
+service = "low-relay-beta"
 
 [env.beta.durable_objects]
 bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]

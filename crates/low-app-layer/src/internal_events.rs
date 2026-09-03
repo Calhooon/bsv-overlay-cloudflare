@@ -35,6 +35,12 @@ pub fn internal_bearer_ok(req: &Request, env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+/// The first 200 chars of a refusal body on one line — enough to tell WHO
+/// answered (an edge 404 page vs the relay's own refusal), never a secret.
+pub fn excerpt(body: &str) -> String {
+    body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ")
+}
+
 /// `{ "height": <u64> }` — the only field the tip webhook carries.
 pub fn parse_tip_changed(raw: &[u8]) -> Option<u64> {
     let v: Value = serde_json::from_slice(raw).ok()?;
@@ -48,6 +54,29 @@ pub fn tip_event_body(height: u64, at_ms: u64) -> Value {
     json!({ "kind": "tip", "height": height, "at": at_ms })
 }
 
+/// One bearer-gated JSON POST to the relay at `path`. Rides the `RELAY`
+/// SERVICE BINDING when the deploy declares one: the relay is a Worker on
+/// this account, and Cloudflare refuses a plain fetch between two Workers on
+/// one zone (error 1042 behind a 404; every `*.workers.dev` host of an
+/// account is ONE zone — proven on beta 2026-09-03, the tip broadcast's
+/// `[broadcast] … HTTP 404 (server=cloudflare) error code: 1042`). Without a
+/// binding it is a public fetch, which is only right for a relay on another
+/// zone.
+async fn relay_post(env: &Env, relay: &str, path: &str, token: &str, payload: String) -> Result<Response> {
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let headers = Headers::new();
+    headers.set("Authorization", &format!("Bearer {token}"))?;
+    headers.set("content-type", "application/json")?;
+    init.with_headers(headers);
+    init.with_body(Some(payload.into()));
+    let req = Request::new_with_init(&format!("{}{path}", relay.trim_end_matches('/')), &init)?;
+    match env.service("RELAY") {
+        Ok(svc) => svc.fetch_request(req).await,
+        Err(_) => Fetch::Request(req).send().await,
+    }
+}
+
 /// Fan one event out through the relay's `/broadcast` (bearer `BROADCAST_TOKEN`).
 /// Best-effort and logged; an unconfigured deploy no-ops.
 pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
@@ -59,19 +88,14 @@ pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
         return;
     };
     let payload = json!({ "room": room, "body": body }).to_string();
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post);
-    let headers = Headers::new();
-    let _ = headers.set("Authorization", &format!("Bearer {token}"));
-    let _ = headers.set("content-type", "application/json");
-    init.with_headers(headers);
-    init.with_body(Some(payload.into()));
-    let Ok(req) = Request::new_with_init(&format!("{}/broadcast", relay.trim_end_matches('/')), &init) else {
-        return;
-    };
-    match Fetch::Request(req).send().await {
+    match relay_post(env, &relay, "/broadcast", &token, payload).await {
         Ok(r) if r.status_code() == 200 => {}
-        Ok(r) => console_log!("[broadcast] {room} push HTTP {}", r.status_code()),
+        Ok(mut r) => {
+            let status = r.status_code();
+            let server = r.headers().get("server").ok().flatten().unwrap_or_default();
+            let body = r.text().await.unwrap_or_default();
+            console_log!("[broadcast] {room} push HTTP {status} (server={server}) {}", excerpt(&body));
+        }
         Err(e) => console_log!("[broadcast] {room} push failed: {e}"),
     }
 }
@@ -107,19 +131,18 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
         "body": body,
     })
     .to_string();
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post);
-    let headers = Headers::new();
-    let _ = headers.set("Authorization", &format!("Bearer {token}"));
-    let _ = headers.set("content-type", "application/json");
-    init.with_headers(headers);
-    init.with_body(Some(payload.into()));
-    let Ok(req) = Request::new_with_init(&format!("{}/push", relay.trim_end_matches('/')), &init) else {
-        return;
-    };
-    match Fetch::Request(req).send().await {
+    match relay_post(env, &relay, "/push", &token, payload).await {
         Ok(r) if (200..300).contains(&r.status_code()) => {}
-        Ok(r) => console_log!("[push] → {}… HTTP {}", &recipient[..12.min(recipient.len())], r.status_code()),
+        Ok(mut r) => {
+            let status = r.status_code();
+            let server = r.headers().get("server").ok().flatten().unwrap_or_default();
+            let body = r.text().await.unwrap_or_default();
+            console_log!(
+                "[push] → {}… HTTP {status} (server={server}) {}",
+                &recipient[..12.min(recipient.len())],
+                excerpt(&body)
+            );
+        }
         Err(e) => console_log!("[push] → {}… failed: {e}", &recipient[..12.min(recipient.len())]),
     }
 }

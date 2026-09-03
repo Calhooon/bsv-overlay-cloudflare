@@ -31,6 +31,9 @@ database_name = "low-overlay-db"
 database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
 
 [vars]
+# W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN),
+# reached through the APP_LAYER service binding; no-ops without the secret.
+APP_LAYER_URL = "https://low-app-layer.dev-a3e.workers.dev"
 ENVIRONMENT = "production"
 CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
 HOSTING_URL = "https://low-overlay.dev-a3e.workers.dev"
@@ -97,6 +100,15 @@ ENABLE_EXTENSIONS = "true"
 [[services]]
 binding = "CHAINTRACKS"
 service = "rust-chaintracks"
+
+# Service binding to the LOW app-layer (same account) for the W2-P4
+# `/internal/pot-changed` note. REQUIRED: Cloudflare refuses a plain fetch
+# between two Workers on one zone (1042 behind a 404), and every *.workers.dev
+# host of an account is ONE zone — proven on beta 2026-09-03. `service` is a
+# worker name, not a secret.
+[[services]]
+binding = "APP_LAYER"
+service = "low-app-layer"
 
 [[queues.producers]]
 queue = "low-overlay-mutations"
@@ -204,6 +216,11 @@ database_id = "49d4ecb7-5f4d-4ba5-b149-2939ca7262c3"
 [[env.beta.services]]
 binding = "CHAINTRACKS"
 service = "rust-chaintracks"
+
+# The BETA app-layer (see the prod APP_LAYER binding for the why).
+[[env.beta.services]]
+binding = "APP_LAYER"
+service = "low-app-layer-beta"
 
 [[env.beta.queues.producers]]
 queue = "low-overlay-mutations-beta"

@@ -66,11 +66,25 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>) {
     let Ok(req) = Request::new_with_init(&format!("{}/internal/pot-changed", url.trim_end_matches('/')), &init) else {
         return;
     };
-    match Fetch::Request(req).send().await {
+    // The app-layer is a Worker on this account: the POST rides the
+    // APP_LAYER service binding (Cloudflare refuses a plain fetch between two
+    // Workers on one zone — 1042 behind a 404 — and every *.workers.dev host
+    // of an account is one zone). A deploy without the binding falls back to
+    // a public fetch, which is only right for an app-layer on another zone.
+    let sent = match env.service("APP_LAYER") {
+        Ok(svc) => svc.fetch_request(req).await,
+        Err(_) => Fetch::Request(req).send().await,
+    };
+    match sent {
         Ok(r) if (200..300).contains(&r.status_code()) => {
             console_log!("[pot-changes] notified {} outpoint(s)", outpoints.len())
         }
-        Ok(r) => console_log!("[pot-changes] app-layer HTTP {}", r.status_code()),
+        Ok(mut r) => {
+            let status = r.status_code();
+            let body = r.text().await.unwrap_or_default();
+            let excerpt: String = body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ");
+            console_log!("[pot-changes] app-layer HTTP {status} {excerpt}")
+        }
         Err(e) => console_log!("[pot-changes] notify failed: {e}"),
     }
 }
