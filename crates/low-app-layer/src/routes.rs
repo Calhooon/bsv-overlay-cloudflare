@@ -2215,6 +2215,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
     let db = env.d1("OVERLAY_DB")?;
     let era = written_off_before_ms_env(env);
     let mut filed: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
     for (txid, vout) in outpoints {
         // (1) committed params for the outpoint (the decoded columns).
         let stmt = db
@@ -2224,11 +2225,17 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
             Ok(r) => r,
             Err(e) => {
                 console_warn!("[pot-changed] decoded-pots read failed for {txid}:{vout}: {e}");
+
+                skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] decoded-pots read failed for {txid}:{vout}: {e}") }));
+
                 continue;
             }
         };
         let Some(params) = rows.first().and_then(|r| r.covenant_params()) else {
             worker::console_log!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file");
+
+            skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file") }));
+
             continue;
         };
         let key = (txid.clone(), vout);
@@ -2249,6 +2256,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
             .collect();
         if identities.is_empty() {
             worker::console_log!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file");
+
+            skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file") }));
+
             continue;
         }
         // (3) each seat's own served entry → its box.
@@ -2257,6 +2267,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                 Ok((entries, _)) => entries,
                 Err(e) => {
                     console_warn!("[pot-changed] gather for {}… failed: {e}", &id[..12.min(id.len())]);
+
+                    skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] gather for {}… failed: {e}", &id[..12.min(id.len())]) }));
+
                     continue;
                 }
             };
@@ -2265,6 +2278,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                 .find(|e| e.pot_txid.eq_ignore_ascii_case(&txid) && e.pot_vout == vout)
             else {
                 worker::console_log!("[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file", &id[..12.min(id.len())]);
+
+                skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file", &id[..12.min(id.len())]) }));
+
                 continue;
             };
             let body = crate::results::results_body(&id, std::slice::from_ref(entry), false, 0);
@@ -2272,10 +2288,14 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                 Ok(v) => v,
                 Err(e) => {
                     console_warn!("[pot-changed] serializer output is not JSON: {e}");
+
+                    skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] serializer output is not JSON: {e}") }));
+
                     continue;
                 }
             };
             let Some(one) = served.get("entries").and_then(|a| a.as_array()).and_then(|a| a.first()).cloned() else {
+                skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": "serializer produced no entry" }));
                 continue;
             };
             let event = crate::internal_events::pot_event_body(&txid, vout, one, worker::Date::now().as_millis());
@@ -2283,7 +2303,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
             filed.push(serde_json::json!({ "txid": txid, "vout": vout, "identity": id }));
         }
     }
-    json_response(serde_json::json!({ "ok": true, "filed": filed }).to_string(), 200)
+    json_response(serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped }).to_string(), 200)
 }
 
 async fn gather_result_entries(
