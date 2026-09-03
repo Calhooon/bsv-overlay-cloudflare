@@ -3009,6 +3009,60 @@ pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     )
 }
 
+/// `GET /refund-backups?identity=<66-hex>` — the per-identity REFUND-BACKUP
+/// BYTES view (bsv-low W2 client batch B(a); owner ruling 2026-09-03: batched
+/// decoded reads live on the app-layer). For every pot the identity is a
+/// party to, the indexed `potrefund_records` rows WITH `refundRawHex`, newest
+/// first, ≤ `REFUND_BACKUPS_ROWS_PER_POT` per pot, ≤ `REFUND_BACKUPS_MAX_ROWS`
+/// in all (`truncated` when the cap was hit). The reader verifies every raw
+/// exactly as before (module docs: `refund_backups`). Fail-safe shape mirrors
+/// `/refund-view`: an invalid identity is an EMPTY 200; a D1 fault is a 503.
+pub async fn refund_backups(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    let identity_lc = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id,
+        ViewIdentity::Refuse(resp) => return resp,
+    };
+    if !crate::logic::valid_identity(&identity_lc) {
+        return json_response(
+            crate::refund_backups::refund_backups_body(&identity_lc, &[], false),
+            200,
+        );
+    }
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[refund-backups] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        }
+    };
+    let era = written_off_before_ms(&ctx);
+    let mut binds: Vec<JsValue> = vec![JsValue::from_str(&identity_lc)];
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
+    let stmt = db
+        .prepare(crate::refund_backups::refund_backups_sql(era))
+        .bind(&binds)?;
+    let mut rows: Vec<crate::refund_backups::RefundBackupRow> = match stmt
+        .all()
+        .await
+        .and_then(|r| r.results::<crate::refund_backups::RefundBackupRowD1>())
+    {
+        Ok(rows) => rows.into_iter().map(|r| r.into_row()).collect(),
+        Err(e) => {
+            console_warn!("[refund-backups] query failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
+    let truncated = rows.len() > crate::refund_backups::REFUND_BACKUPS_MAX_ROWS;
+    rows.truncate(crate::refund_backups::REFUND_BACKUPS_MAX_ROWS);
+    let backups = crate::refund_backups::assemble_refund_backups(rows);
+    json_response(
+        crate::refund_backups::refund_backups_body(&identity_lc, &backups, truncated),
+        200,
+    )
+}
+
 // ── /hops-view — per-identity hops-in-flight view (bsv-low #315, stage 2b) ──
 
 /// `/hops-view` joined row as D1 returns it (the `hops_view_sql` shape):

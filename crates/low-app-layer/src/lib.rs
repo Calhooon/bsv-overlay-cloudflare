@@ -71,6 +71,12 @@
 //!   and the chain-truth exit status (`armed`/`gate-open`/`landed`/
 //!   `superseded`/`unknown`) with a `/results`-style `status`/`statusSource`
 //!   honesty pair. See the `refund_view` module docs.
+//! - `GET /refund-backups?identity=<66-hex>` — the per-identity REFUND-BACKUP
+//!   BYTES view (bsv-low W2 batch B(a), 2026-09-03): every indexed
+//!   `potrefund_records` row for the identity's pots, `refundRawHex`
+//!   INCLUDED, bounded per pot and in all — the wiped-device seeding pass's
+//!   ONE batched read (it used to ask the overlay once per pot). The reader
+//!   still verifies every raw; see the `refund_backups` module docs.
 //! - `GET /live-view?identity=<66-hex>` — the per-identity LIVE-HAND view
 //!   (bsv-low #252 stage 2a step 3): every pot the identity is a party to
 //!   with NO confirmed spend (unspent / unconfirmed-spend / never-indexed —
@@ -124,6 +130,7 @@ pub mod internal_events;
 pub mod live_view;
 pub mod logic;
 pub mod proof_post;
+pub mod refund_backups;
 pub mod refund_view;
 pub mod results;
 mod routes;
@@ -237,6 +244,10 @@ fn router(
         .get_async("/proof", proof_post::proof_get)
         .post_async("/proof", proof_post::proof_post)
         .get_async("/refund-view", routes::refund_view)
+        // bsv-low W2 batch B(a) (owner ruling 2026-09-03): the wiped-device
+        // seeding pass reads every refund backup in ONE batched call here
+        // instead of one overlay lookup per pot.
+        .get_async("/refund-backups", routes::refund_backups)
         .get_async("/hops-view", routes::hops_view)
         .get_async("/live-view", routes::live_view)
         .get_async("/spent-any", routes::spent_any)
