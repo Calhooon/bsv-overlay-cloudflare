@@ -1186,7 +1186,13 @@ impl LowStorage for D1LowStorage {
         .bind(record.expiry_height.map(|h| h as i64))
         .execute(&self.db)
         .await
-        .map_err(low_err)
+        .map_err(low_err)?;
+        // W2-P6: a TABLE advert admitted ⇒ the lobby changed (noted here, shipped
+        // once per unit of work by `lobby_changes::flush`).
+        if record.record_type.as_str() == "table" {
+            crate::lobby_changes::note_admitted(&record.txid, record.output_index);
+        }
+        Ok(())
     }
 
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), LowStorageError> {
@@ -1195,7 +1201,11 @@ impl LowStorage for D1LowStorage {
             .bind(output_index)
             .execute(&self.db)
             .await
-            .map_err(low_err)
+            .map_err(low_err)?;
+        // W2-P6: an advert row gone (spent / reaped / refused) ⇒ the lobby
+        // changed. Every low_records delete is lobby-relevant.
+        crate::lobby_changes::note_evicted(txid, output_index);
+        Ok(())
     }
 
     async fn find_open_tables(

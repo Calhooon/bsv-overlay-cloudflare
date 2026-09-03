@@ -175,6 +175,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Post && req.path() == "/internal/pot-changed" {
         return routes::internal_pot_changed(req, &env).await;
     }
+    if req.method() == worker::Method::Post && req.path() == "/internal/lobby-changed" {
+        return internal_events::lobby_changed(req, &env).await;
+    }
 
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
     // middleware refusals return here; otherwise the request proceeds with

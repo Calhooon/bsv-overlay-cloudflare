@@ -191,6 +191,65 @@ pub fn pot_event_body(txid: &str, vout: u32, entry: Value, at_ms: u64) -> Value 
     })
 }
 
+pub const LOBBY_ROOM: &str = "broadcast-low-lobby";
+
+/// `{"changes":[{"txid","vout","kind"},…]}` — the lobby-changed webhook body
+/// (the overlay's TABLE-advert storage notes admissions and evictions).
+/// Validated + deduped + capped; the client only ever REFETCHES on the event.
+pub fn parse_lobby_changed(raw: &[u8]) -> Vec<(String, u32, String)> {
+    let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("changes").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u32, String)> = Vec::new();
+    for o in arr {
+        let txid = o.get("txid").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+        let vout = o.get("vout").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+        let kind = o.get("kind").and_then(Value::as_str).unwrap_or("");
+        if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let (Some(vout), true) = (vout, matches!(kind, "admitted" | "evicted")) else {
+            continue;
+        };
+        if !out.iter().any(|(t, v, k)| t == &txid && *v == vout && k == kind) {
+            out.push((txid, vout, kind.to_string()));
+        }
+        if out.len() >= POT_CHANGED_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// The broadcast body clients receive in `broadcast-low-lobby`: a SIGNAL to
+/// refetch the open-tables list once (never the list itself — the served
+/// list is the truth, this is a carrier), plus what moved, for a log line.
+pub fn lobby_event_body(changes: &[(String, u32, String)], at_ms: u64) -> Value {
+    let arr: Vec<Value> = changes
+        .iter()
+        .map(|(t, v, k)| json!({ "txid": t, "vout": v, "kind": k }))
+        .collect();
+    json!({ "kind": "lobby", "at": at_ms, "changes": arr })
+}
+
+/// `POST /internal/lobby-changed` (bearer `INTERNAL_TOKEN`): the overlay's
+/// advert storage changed ⇒ fan a `lobby` event into `broadcast-low-lobby`.
+pub async fn lobby_changed(mut req: Request, env: &Env) -> Result<Response> {
+    if !internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let changes = parse_lobby_changed(&raw);
+    if changes.is_empty() {
+        return Response::error("body must be {\"changes\":[{\"txid\",\"vout\",\"kind\"}]}", 400);
+    }
+    push_broadcast(env, LOBBY_ROOM, lobby_event_body(&changes, Date::now().as_millis())).await;
+    Response::from_json(&json!({ "ok": true, "room": LOBBY_ROOM, "changes": changes.len() }))
+}
+
 /// `POST /internal/tip-changed` (bearer `INTERNAL_TOKEN`, body `{height}`):
 /// chaintracks' cron calls it once per synced tip; we broadcast the tip.
 pub async fn tip_changed(mut req: Request, env: &Env) -> Result<Response> {
@@ -227,6 +286,23 @@ mod tests {
             Some("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
         );
         assert!(sender_pubkey_hex("zz").is_none());
+    }
+
+    #[test]
+    fn parse_lobby_changed_validates_dedupes_and_keeps_the_kind() {
+        let t = "ab".repeat(32);
+        let raw = format!(
+            r#"{{"changes":[{{"txid":"{t}","vout":0,"kind":"admitted"}},{{"txid":"{T}","vout":0,"kind":"admitted"}},{{"txid":"{t}","vout":0,"kind":"evicted"}},{{"txid":"zz","vout":0,"kind":"admitted"}},{{"txid":"{t}","vout":1,"kind":"nope"}}]}}"#,
+            T = t.to_ascii_uppercase()
+        );
+        let got = parse_lobby_changed(raw.as_bytes());
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (t.clone(), 0, "admitted".to_string()));
+        assert_eq!(got[1], (t, 0, "evicted".to_string()));
+        assert!(parse_lobby_changed(b"{}").is_empty());
+        let body = lobby_event_body(&got, 7);
+        assert_eq!(body["kind"], "lobby");
+        assert_eq!(body["changes"].as_array().unwrap().len(), 2);
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod ops;
 pub mod peer_crawler;
 pub mod proof_fetcher;
 pub mod queue;
+pub mod lobby_changes;
 pub mod pot_changes;
 pub mod relatch;
 pub mod routes;
@@ -1512,6 +1513,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     worker::console_log!("Scheduled tasks completed");
     // W2-P4: ship the pot rows this run changed (off the critical path).
     crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
+    crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut));
 }
 
 /// POST /admin/complete-proofs (#192/#193) — run the BEEF proof-completion passes
@@ -1951,6 +1953,7 @@ async fn queue_handler(
 
     // W2-P4: ship the pot rows this batch changed (off the critical path).
     crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
+    crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut));
     Ok(())
 }
 
