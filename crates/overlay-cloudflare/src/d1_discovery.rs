@@ -1191,6 +1191,7 @@ impl LowStorage for D1LowStorage {
         // once per unit of work by `lobby_changes::flush`).
         if record.record_type.as_str() == "table" {
             crate::lobby_changes::note_admitted(&record.txid, record.output_index);
+            worker::console_log!("[lobby-changes] noted admitted {}:{}", &record.txid[..12.min(record.txid.len())], record.output_index);
         }
         Ok(())
     }
@@ -1205,6 +1206,7 @@ impl LowStorage for D1LowStorage {
         // W2-P6: an advert row gone (spent / reaped / refused) ⇒ the lobby
         // changed. Every low_records delete is lobby-relevant.
         crate::lobby_changes::note_evicted(txid, output_index);
+        worker::console_log!("[lobby-changes] noted evicted {}:{}", &txid[..12.min(txid.len())], output_index);
         Ok(())
     }
 
