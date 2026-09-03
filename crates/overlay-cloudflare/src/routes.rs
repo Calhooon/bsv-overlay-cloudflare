@@ -425,7 +425,36 @@ pub async fn get_doc_for_lookup_service(
 /// `engine.submit()` (Phase 1+2+3) write-through so that admitted outputs are
 /// immediately available for `/lookup` queries. GASP cross-instance sync
 /// remains async via the scheduled task.
+/// W2-P4/P6 (2026-09-03): every exit of `submit_inner` — the broadcast-gated
+/// success returns included — ships the pot and lobby notes this request's
+/// storage writes took. The flush used to sit on ONE path near the end of the
+/// handler; a gated `tm_low` advert admitted and returned before it, so the
+/// note was logged and never shipped (the lobby cell, 10:54Z).
 pub async fn submit(
+    engine: &Engine,
+    mut req: Request,
+    hosting_url: Option<&str>,
+    // Arcade V2 endpoint override for the broadcast-gated mode (None → default
+    // endpoint). Arcade is keyless, so broadcast-gated is always available.
+    arcade_url: Option<String>,
+    // TAAL key for the #214 corroborating broadcaster (exhausted-ladder second
+    // opinion). None still corroborates — TAAL keyless, then GorillaPool.
+    taal_api_key: Option<String>,
+    // Worker context — used only to background the mainnet SHIP fan-out.
+    ctx: &Context,
+    // #347: the submit-gate needs the env for ENABLE_EXTENSIONS (kill switch),
+    // SUBMIT_ENFORCE (the Rule 6c rollout flag) and SUBMIT_OPERATOR_TOKEN
+    // (deliberately NOT ADMIN_TOKEN — see `check_submit_operator_auth`).
+    // #366 also derives the census counters' D1 handle (`OVERLAY_DB`) from it.
+    env: &Env,
+) -> worker::Result<Response> {
+    let out = submit_inner(engine, req, hosting_url, arcade_url, taal_api_key, ctx, env).await;
+    crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
+    crate::lobby_changes::flush(env, |fut| ctx.wait_until(fut));
+    out
+}
+
+async fn submit_inner(
     engine: &Engine,
     mut req: Request,
     hosting_url: Option<&str>,
