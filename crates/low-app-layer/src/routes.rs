@@ -2294,7 +2294,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                     continue;
                 }
             };
-            let Some(one) = served.get("entries").and_then(|a| a.as_array()).and_then(|a| a.first()).cloned() else {
+            let Some(one) = crate::internal_events::first_served_result(&served) else {
                 skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": "serializer produced no entry" }));
                 continue;
             };

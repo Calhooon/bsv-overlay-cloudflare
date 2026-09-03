@@ -41,6 +41,14 @@ pub fn excerpt(body: &str) -> String {
     body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ")
 }
 
+/// The first entry of a served `/results` body (`results::results_body`):
+/// the array is keyed `results` — the pot-changed handler read `entries`
+/// for a night and filed nothing (every real pot answered "serializer
+/// produced no entry"). Pinned by a test against the serializer itself.
+pub fn first_served_result(served: &Value) -> Option<Value> {
+    served.get("results").and_then(Value::as_array).and_then(|a| a.first()).cloned()
+}
+
 /// `{ "height": <u64> }` — the only field the tip webhook carries.
 pub fn parse_tip_changed(raw: &[u8]) -> Option<u64> {
     let v: Value = serde_json::from_slice(raw).ok()?;
@@ -286,6 +294,17 @@ mod tests {
             Some("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
         );
         assert!(sender_pubkey_hex("zz").is_none());
+    }
+
+    #[test]
+    fn first_served_result_reads_the_key_the_results_serializer_writes() {
+        // An empty page still carries the array under the SAME key: the two
+        // functions agree on the name, or this fails before a deploy does.
+        let served: Value = serde_json::from_str(&crate::results::results_body("02aa", &[], false, 0)).unwrap();
+        assert!(served.get("results").map(Value::is_array).unwrap_or(false), "results_body must serve `results`");
+        assert!(first_served_result(&served).is_none());
+        let one: Value = serde_json::json!({ "results": [{ "potTxid": "ab" }], "truncated": false });
+        assert_eq!(first_served_result(&one).unwrap()["potTxid"], "ab");
     }
 
     #[test]
