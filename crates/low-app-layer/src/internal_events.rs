@@ -76,6 +76,98 @@ pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
     }
 }
 
+/// The compressed pubkey hex the relay stores as `sender` for our pushes —
+/// this worker's BRC-103 identity (`SERVER_PRIVATE_KEY`).
+pub fn sender_pubkey_hex(server_private_key_hex: &str) -> Option<String> {
+    let sk = bsv_rs::primitives::ec::PrivateKey::from_hex(server_private_key_hex.trim()).ok()?;
+    let hex = sk.public_key().to_hex();
+    (hex.len() == 66).then_some(hex.to_ascii_lowercase())
+}
+
+/// File one DURABLE event into ONE seat's `low_events` box through the
+/// relay's first-party `POST /push` (bearer `BROADCAST_TOKEN`; stored,
+/// live-bridged, acknowledged by the client, replayed on reload). Best-effort.
+pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
+    let (Ok(relay), Ok(token), Ok(sk)) = (
+        env.var("RELAY_URL").map(|v| v.to_string()),
+        env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
+        env.secret("SERVER_PRIVATE_KEY").map(|v| v.to_string()),
+    ) else {
+        console_log!("[push] not configured (RELAY_URL / BROADCAST_TOKEN / SERVER_PRIVATE_KEY) — event dropped");
+        return;
+    };
+    let Some(sender) = sender_pubkey_hex(&sk) else {
+        console_log!("[push] SERVER_PRIVATE_KEY does not derive a pubkey — event dropped");
+        return;
+    };
+    let payload = json!({
+        "sender": sender,
+        "recipient": recipient.to_ascii_lowercase(),
+        "messageBox": "low_events",
+        "body": body,
+    })
+    .to_string();
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let headers = Headers::new();
+    let _ = headers.set("Authorization", &format!("Bearer {token}"));
+    let _ = headers.set("content-type", "application/json");
+    init.with_headers(headers);
+    init.with_body(Some(payload.into()));
+    let Ok(req) = Request::new_with_init(&format!("{}/push", relay.trim_end_matches('/')), &init) else {
+        return;
+    };
+    match Fetch::Request(req).send().await {
+        Ok(r) if (200..300).contains(&r.status_code()) => {}
+        Ok(r) => console_log!("[push] → {}… HTTP {}", &recipient[..12.min(recipient.len())], r.status_code()),
+        Err(e) => console_log!("[push] → {}… failed: {e}", &recipient[..12.min(recipient.len())]),
+    }
+}
+
+/// `{"outpoints":[{"txid","vout"},…]}` — the pot-changed webhook body. Capped
+/// (a flood is an operator problem, never a fan-out storm).
+pub const POT_CHANGED_MAX: usize = 8;
+
+pub fn parse_pot_changed(raw: &[u8]) -> Vec<(String, u32)> {
+    let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("outpoints").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for o in arr {
+        let txid = o.get("txid").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+        let vout = o.get("vout").and_then(Value::as_u64);
+        if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Some(vout) = vout.and_then(|v| u32::try_from(v).ok()) else {
+            continue;
+        };
+        if !out.iter().any(|(t, v)| t == &txid && *v == vout) {
+            out.push((txid, vout));
+        }
+        if out.len() >= POT_CHANGED_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// The `pot` event body: the seat's exact served `/results` entry, wrapped
+/// with the routing keys (a SNAPSHOT — the client parses `entry` with the
+/// same parser it uses for `/results`).
+pub fn pot_event_body(txid: &str, vout: u32, entry: Value, at_ms: u64) -> Value {
+    json!({
+        "v": 1,
+        "kind": "pot",
+        "potOutpoint": { "txid": txid, "vout": vout },
+        "at": at_ms,
+        "entry": entry,
+    })
+}
+
 /// `POST /internal/tip-changed` (bearer `INTERNAL_TOKEN`, body `{height}`):
 /// chaintracks' cron calls it once per synced tip; we broadcast the tip.
 pub async fn tip_changed(mut req: Request, env: &Env) -> Result<Response> {
@@ -102,6 +194,40 @@ mod tests {
         assert_eq!(parse_tip_changed(br#"{"height": "965051"}"#), None);
         assert_eq!(parse_tip_changed(br#"{}"#), None);
         assert_eq!(parse_tip_changed(b"nope"), None);
+    }
+
+    #[test]
+    fn sender_pubkey_hex_derives_compressed_g_for_key_one() {
+        let one = "0000000000000000000000000000000000000000000000000000000000000001";
+        assert_eq!(
+            sender_pubkey_hex(one).as_deref(),
+            Some("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+        );
+        assert!(sender_pubkey_hex("zz").is_none());
+    }
+
+    #[test]
+    fn parse_pot_changed_validates_dedupes_and_caps() {
+        let t = "ab".repeat(32);
+        let raw = format!(
+            r#"{{"outpoints":[{{"txid":"{t}","vout":0}},{{"txid":"{T}","vout":0}},{{"txid":"zz","vout":0}},{{"txid":"{t}","vout":"1"}},{{"txid":"{t}","vout":1}}]}}"#,
+            T = t.to_ascii_uppercase()
+        );
+        assert_eq!(parse_pot_changed(raw.as_bytes()), vec![(t.clone(), 0), (t.clone(), 1)]);
+        assert!(parse_pot_changed(b"nope").is_empty());
+        assert!(parse_pot_changed(br#"{"outpoints":"x"}"#).is_empty());
+        let many: Vec<String> = (0..20).map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32))).collect();
+        let raw = format!(r#"{{"outpoints":[{}]}}"#, many.join(","));
+        assert_eq!(parse_pot_changed(raw.as_bytes()).len(), POT_CHANGED_MAX);
+    }
+
+    #[test]
+    fn pot_event_body_wraps_the_served_entry_as_a_snapshot() {
+        let b = pot_event_body("ab", 0, json!({ "outcome": "won" }), 5);
+        assert_eq!(b["v"], 1);
+        assert_eq!(b["kind"], "pot");
+        assert_eq!(b["potOutpoint"]["txid"], "ab");
+        assert_eq!(b["entry"]["outcome"], "won");
     }
 
     #[test]

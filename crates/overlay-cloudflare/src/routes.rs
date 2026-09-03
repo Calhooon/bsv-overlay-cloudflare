@@ -1092,7 +1092,7 @@ pub async fn submit(
         // (not a re-present) is the guarantee. Refusing here would 502 an
         // admission that is already durably held.
         // W2-P4: ship the pot rows this submit changed (off the critical path).
-        crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
+        crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
         if total_consumed == 0
             && !mutation_queued
             && matches!(

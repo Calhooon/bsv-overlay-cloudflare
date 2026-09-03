@@ -2194,6 +2194,98 @@ pub async fn compute_results_body_string(
 /// results query failed (each caller keeps its own posture: `/results`
 /// answers 503, `/recovery-view` serves null outcomes — best-effort). The
 /// claims/seat legs stay BEST-EFFORT inside, exactly as before.
+/// W2-P4 — `POST /internal/pot-changed` (bearer `INTERNAL_TOKEN`; the
+/// overlay's pot storage notes every changed outpoint and ships this once per
+/// unit of work). For each outpoint: decode the committed params, attribute
+/// the two seat IDENTITIES from their verified seat markers, assemble each
+/// seat's OWN served `/results` entry (the same gather + serializer the route
+/// uses — never a second shape) and file it into that seat's `low_events`
+/// box as a `pot` event. Best-effort per outpoint; the answer names what
+/// was filed. Nothing here is money truth — the client still verifies
+/// landings before any credit.
+pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let outpoints = crate::internal_events::parse_pot_changed(&raw);
+    if outpoints.is_empty() {
+        return Response::error("body must be {\"outpoints\":[{\"txid\",\"vout\"}]}", 400);
+    }
+    let db = env.d1("OVERLAY_DB")?;
+    let era = written_off_before_ms_env(env);
+    let mut filed: Vec<serde_json::Value> = Vec::new();
+    for (txid, vout) in outpoints {
+        // (1) committed params for the outpoint (the decoded columns).
+        let stmt = db
+            .prepare(crate::results::decoded_pots_sql(1))
+            .bind(&[JsValue::from_str(&txid), JsValue::from_f64(f64::from(vout))])?;
+        let rows = match stmt.all().await.and_then(|r| r.results::<DecodedPotRowD1>()) {
+            Ok(r) => r,
+            Err(e) => {
+                console_warn!("[pot-changed] decoded-pots read failed for {txid}:{vout}: {e}");
+                continue;
+            }
+        };
+        let Some(params) = rows.first().and_then(|r| r.covenant_params()) else {
+            worker::console_log!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file");
+            continue;
+        };
+        let key = (txid.clone(), vout);
+        let mut params_by_pot = std::collections::HashMap::new();
+        params_by_pot.insert(key.clone(), params.clone());
+        // (2) the two identities from their verified seat markers.
+        let markers = results_seat_markers(&db, &params_by_pot).await;
+        let attr = crate::results::attribute_seats(
+            &params,
+            &txid,
+            vout,
+            markers.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+        );
+        let identities: Vec<String> = [attr.identity_a.clone(), attr.identity_b.clone()]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        if identities.is_empty() {
+            worker::console_log!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file");
+            continue;
+        }
+        // (3) each seat's own served entry → its box.
+        for id in identities {
+            let entries = match gather_result_entries(&db, &id, era, 0).await {
+                Ok((entries, _)) => entries,
+                Err(e) => {
+                    console_warn!("[pot-changed] gather for {}… failed: {e}", &id[..12.min(id.len())]);
+                    continue;
+                }
+            };
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.pot_txid.eq_ignore_ascii_case(&txid) && e.pot_vout == vout)
+            else {
+                worker::console_log!("[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file", &id[..12.min(id.len())]);
+                continue;
+            };
+            let body = crate::results::results_body(&id, std::slice::from_ref(entry), false, 0);
+            let served: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    console_warn!("[pot-changed] serializer output is not JSON: {e}");
+                    continue;
+                }
+            };
+            let Some(one) = served.get("entries").and_then(|a| a.as_array()).and_then(|a| a.first()).cloned() else {
+                continue;
+            };
+            let event = crate::internal_events::pot_event_body(&txid, vout, one, worker::Date::now().as_millis());
+            crate::internal_events::first_party_push(env, &id, event).await;
+            filed.push(serde_json::json!({ "txid": txid, "vout": vout, "identity": id }));
+        }
+    }
+    json_response(serde_json::json!({ "ok": true, "filed": filed }).to_string(), 200)
+}
+
 async fn gather_result_entries(
     db: &worker::D1Database,
     identity_lc: &str,
