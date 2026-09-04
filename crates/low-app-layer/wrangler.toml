@@ -162,6 +162,11 @@ bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]
 tag = "v2-boardview"
 new_classes = ["BoardView"]
 
+# Workers Logs (2026-09-03): persistent, queryable invocation logs for the fleet.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [env.beta]
 name = "low-app-layer-beta"
 

@@ -158,6 +158,11 @@ crons = ["*/15 * * * *"]
 #   npx wrangler d1 execute low-overlay-db-beta --remote --command "DELETE FROM …"
 # ══════════════════════════════════════════════════════════════════════════
 
+# Workers Logs (2026-09-03): persistent, queryable invocation logs for the fleet.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [env.beta]
 name = "low-overlay-beta"
 
