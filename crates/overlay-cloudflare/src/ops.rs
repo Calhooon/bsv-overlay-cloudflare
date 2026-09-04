@@ -71,6 +71,15 @@ pub const COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: &str = "arc_ingest_unauthorized_no
 /// `/arc-ingest` callbacks REFUSED 401 because a token WAS presented and did
 /// not equal the subject txid. Diagnosis: a stale registration, or a prober.
 pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_bad_token_total";
+/// bsv-low (2026-09-04) — the missing-spend DISCOVERY pass (`proof_fetcher::
+/// discover_missing_spends`), lifetime totals: candidates scanned, spends
+/// discovered (an unconfirmed pointer written), courier-ladder faults, and
+/// discoveries on NEW-era rows (admitted after the pointer heal shipped — a
+/// growing value is the page: a live pot's re-present never reached us).
+pub const COUNTER_MISSING_SPEND_SCANNED: &str = "missing_spend_scanned_total";
+pub const COUNTER_MISSING_SPEND_DISCOVERED: &str = "missing_spend_discovered_total";
+pub const COUNTER_MISSING_SPEND_FAULTS: &str = "missing_spend_faults_total";
+pub const COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: &str = "missing_spend_discovered_new_era_total";
 
 /// Default staleness budget for `/health/invariants?strict=1`: 6 hours. The
 /// completion cron runs every 15 min (`wrangler.toml crons`), so 6h ≈ 24 dead
@@ -140,6 +149,64 @@ pub async fn record_completion_tick(
         (COUNTER_SPENDS_CONFIRMED, spends_confirmed),
     ] {
         bump_counter(db, name, delta).await;
+    }
+}
+
+/// bsv-low (2026-09-04): one discovery pass's totals → the lifetime counters.
+pub async fn record_missing_spend_pass(
+    db: &D1Database,
+    scanned: u64,
+    discovered: u64,
+    faults: u64,
+    discovered_new_era: u64,
+) {
+    for (name, delta) in [
+        (COUNTER_MISSING_SPEND_SCANNED, scanned),
+        (COUNTER_MISSING_SPEND_DISCOVERED, discovered),
+        (COUNTER_MISSING_SPEND_FAULTS, faults),
+        (COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA, discovered_new_era),
+    ] {
+        if delta > 0 {
+            bump_counter(db, name, delta).await;
+        }
+    }
+}
+
+/// bsv-low (2026-09-04): the index janitor's live backlog, by row kind —
+/// `spent = 0` rows at least an hour old (the discovery pass's own candidate
+/// rule). `covenant` = real pots (the money), `p2pkh` = `tm_lowfund` hop /
+/// change rows (indexed for the hop's landing proof, never a pot), `other` =
+/// bare / undecoded. -1 = table unreadable (a pre-migration isolate).
+#[derive(serde::Deserialize)]
+struct KindCountRow {
+    #[serde(rename = "lockKind")]
+    lock_kind: Option<String>,
+    c: f64,
+}
+
+pub async fn index_janitor_backlog(db: &D1Database) -> serde_json::Value {
+    let rows: Result<Vec<KindCountRow>, _> = Query::new(
+        "SELECT lockKind, COUNT(*) AS c FROM pot_records \
+         WHERE spent = 0 AND (createdAt IS NULL OR createdAt <= unixepoch() - 3600) \
+         GROUP BY lockKind",
+    )
+    .fetch_all(db)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let (mut covenant, mut p2pkh, mut other) = (0u64, 0u64, 0u64);
+            for r in rows {
+                let n = r.c.max(0.0) as u64;
+                match r.lock_kind.as_deref() {
+                    Some("covenant") => covenant += n,
+                    Some("p2pkh") => p2pkh += n,
+                    _ => other += n,
+                }
+            }
+            json!({ "staleCovenant": covenant, "staleP2pkh": p2pkh, "staleOther": other,
+                    "note": "spent = 0 rows ≥ 1 h old; the discovery pass drains covenant (pot) rows first, ≤ 20 per 15-min tick; staleCovenant is the number that matters" })
+        }
+        Err(_) => json!({ "staleCovenant": -1, "staleP2pkh": -1, "staleOther": -1 }),
     }
 }
 
@@ -392,6 +459,11 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_MUTATION_REFUSED: 0,
         COUNTER_QUEUE_MUTATION_APPLIED: 0,
         COUNTER_QUEUE_MUTATION_RETRIED: 0,
+        // 2026-09-04: the discovery pass — seeded to 0 for the same reason.
+        COUNTER_MISSING_SPEND_SCANNED: 0,
+        COUNTER_MISSING_SPEND_DISCOVERED: 0,
+        COUNTER_MISSING_SPEND_FAULTS: 0,
+        COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: 0,
     });
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);
@@ -614,11 +686,15 @@ pub async fn health_invariants(
             .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
+    let index_janitor = index_janitor_backlog(db).await;
     let body = json!({
         "ok": !dead,
         "service": "low-overlay",
         "check": "proof-completion",
         "strict": strict,
+        // bsv-low (2026-09-04): the index janitor — the live backlog by row
+        // kind; its pass totals are the `missing_spend_*` counters below.
+        "indexJanitor": index_janitor,
         "completionPass": {
             "dead": dead,
             "neverRan": never_ran,

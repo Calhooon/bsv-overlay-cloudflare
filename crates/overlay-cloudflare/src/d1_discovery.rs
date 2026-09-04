@@ -1440,6 +1440,10 @@ struct PotRow {
     spent_confirmed: f64,
     #[serde(rename = "lockKind", default)]
     lock_kind: Option<String>,
+    /// unix SECONDS (the pot insert's own clock); only the age-aware stale
+    /// query selects it, every other SELECT leaves it `None`.
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<f64>,
     #[serde(rename = "pubA", default)]
     pub_a: Option<String>,
     #[serde(rename = "pubB", default)]
@@ -1631,13 +1635,17 @@ pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
 /// bsv-low W4 (2026-09-04): the stale-UNSPENT candidate set for
 /// `discover_missing_spends` — rows the index still marks `spent = 0`, at
 /// least `min_age_secs` old (`createdAt` is unix SECONDS, the same clock as
-/// `spentAt`), OLDEST first so the long-forgotten pre-heal rows drain first.
+/// `spentAt`). POTS FIRST, then oldest first: the `tm_lowfund` hop index
+/// shares this table (`lockKind = 'p2pkh'`, every P2PKH output of a submitted
+/// hop tx, change included) and on beta 3,571 of 3,670 stale rows were hop
+/// rows standing in front of 99 real pots — the pass had chewed 08-14 change
+/// for a day while the pots waited. A hop row still drains, after the pots.
 pub(crate) fn pot_unspent_stale_sql(limit: u64, min_age_secs: u64) -> String {
     format!(
-        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
+        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, createdAt FROM pot_records \
          WHERE spent = 0 \
            AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
-         ORDER BY createdAt ASC LIMIT {limit}"
+         ORDER BY CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END ASC, createdAt ASC LIMIT {limit}"
     )
 }
 
@@ -2528,6 +2536,22 @@ impl PotStorage for D1PotStorage {
         let sql = pot_unspent_stale_sql(limit, min_age_secs);
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_unspent_stale_with_age(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<Vec<(PotRecord, Option<u64>)>, PotStorageError> {
+        let sql = pot_unspent_stale_sql(limit, min_age_secs);
+        let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let created = r.created_at.filter(|v| *v > 0.0).map(|v| v as u64);
+                (r.into_record(), created)
+            })
+            .collect())
     }
 
     async fn find_unconfirmed_by_spending_txid(
@@ -6598,16 +6622,22 @@ mod tests {
     // ── mark_spent SQL (prefer-confirmed / never-clobber-with-unconfirmed) ──
 
     #[test]
-    fn unspent_stale_sql_selects_old_unspent_rows_oldest_first() {
+    fn unspent_stale_sql_selects_old_unspent_rows_pots_first_then_oldest() {
         let sql = pot_unspent_stale_sql(20, 3600);
         assert!(sql.contains("WHERE spent = 0"));
         assert!(
             sql.contains("createdAt IS NULL OR createdAt <= unixepoch() - 3600"),
             "seconds, like spentAt"
         );
+        // 2026-09-04: pots before hop rows (the tm_lowfund P2PKH index shares
+        // the table and outnumbered the pots 36:1 on beta), then oldest first.
         assert!(
-            sql.contains("ORDER BY createdAt ASC LIMIT 20"),
-            "oldest first, bounded"
+            sql.contains("ORDER BY CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END ASC, createdAt ASC LIMIT 20"),
+            "pots first, then oldest first, bounded"
+        );
+        assert!(
+            sql.contains("lockKind, createdAt FROM pot_records"),
+            "the age-aware pass reads the stamp and the kind"
         );
     }
 

@@ -906,6 +906,15 @@ pub struct MissingSpendSummary {
     pub unbound: usize,
     pub faults: usize,
     pub write_errors: usize,
+    /// Of `scanned`, how many were hop/change rows (`lockKind = p2pkh`, the
+    /// `tm_lowfund` index) — the pass takes pots first, so a non-zero here
+    /// means the pot backlog is empty and the hop backlog is draining.
+    pub hop_rows: usize,
+    /// Discoveries on rows admitted AFTER `MISSING_SPEND_NEW_ERA_CUTOFF_SECS`
+    /// — a NEW-era pot whose spend nobody submitted is the pointer-heal
+    /// regression signal (the legacy backlog never counts here). The monitor
+    /// pages when its lifetime counter grows.
+    pub discovered_new_era: usize,
 }
 
 /// Per tick: at most this many stale unspent pots, none younger than an hour
@@ -915,6 +924,11 @@ pub const MISSING_SPEND_MIN_AGE_SECS: u64 = 3600;
 /// The discovery pass's own per-tick courier budget: 20 candidates × up to 4
 /// calls (three hint rungs + the binding raw).
 pub const MISSING_SPEND_FETCH_BUDGET: u32 = 80;
+/// 2026-09-04T00:00:00Z (unix seconds) — the day the pointer-heal + discovery
+/// shipped. A pot admitted after this whose spend the pass had to DISCOVER is
+/// a pot whose seat/tower re-present never reached the overlay: page-worthy.
+/// Rows before it are the legacy backlog (the 08-12…08-29 eras), never paged.
+pub const MISSING_SPEND_NEW_ERA_CUTOFF_SECS: u64 = 1_788_480_000;
 
 pub async fn discover_missing_spends(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
@@ -923,15 +937,22 @@ pub async fn discover_missing_spends(
     min_age_secs: u64,
 ) -> MissingSpendSummary {
     let mut summary = MissingSpendSummary::default();
-    let candidates = match pot_storage.find_unspent_stale(limit, min_age_secs).await {
+    let candidates = match pot_storage
+        .find_unspent_stale_with_age(limit, min_age_secs)
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => {
             dlog!("discover_missing_spends: candidate query failed: {e}");
             return summary;
         }
     };
-    for rec in candidates {
+    for (rec, created_at_secs) in candidates {
         summary.scanned += 1;
+        if overlay_discovery::pot::storage::is_hop_row(&rec) {
+            summary.hop_rows += 1;
+        }
+        let new_era = created_at_secs.is_some_and(|t| t >= MISSING_SPEND_NEW_ERA_CUTOFF_SECS);
         let spender = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
             Ok(Some(s)) => s,
             Ok(None) => {
@@ -981,10 +1002,14 @@ pub async fn discover_missing_spends(
         {
             Ok(()) => {
                 summary.discovered += 1;
+                if new_era {
+                    summary.discovered_new_era += 1;
+                }
                 dlog!(
-                    "discover_missing_spends: {}:{} ← {spender} (unconfirmed pointer; the confirmation pass proves it)",
+                    "discover_missing_spends: {}:{} ← {spender} (unconfirmed pointer; the confirmation pass proves it{})",
                     rec.txid,
-                    rec.output_index
+                    rec.output_index,
+                    if new_era { "; NEW-ERA row — its re-present never reached us" } else { "" }
                 );
             }
             Err(e) => {
@@ -5686,6 +5711,88 @@ mod tests {
     /// bsv-low W4 (2026-09-04): a stale UNSPENT pot gets its spender from the
     /// hint ladder, bound by the spender's raw, and recorded UNCONFIRMED; a
     /// hint that does not bind is ignored; a ladder fault is counted, never a write.
+    #[tokio::test]
+    async fn discover_missing_spends_pots_first_and_new_era_counted() {
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        // Two rows: a hop/change row (`p2pkh`, the tm_lowfund index) that is
+        // lexically FIRST, and a covenant pot admitted after the new-era
+        // cutoff. With limit 1 the pass must take the POT, not the hop row —
+        // and its discovery must count as new-era.
+        let hop = "aa".repeat(32);
+        let pot = "bb".repeat(32);
+        let store = MemoryPotStorage::default().with_created_at(
+            &pot,
+            0,
+            MISSING_SPEND_NEW_ERA_CUTOFF_SECS + 60,
+        );
+        store
+            .store_record(&PotRecord {
+                txid: hop.clone(),
+                output_index: 2,
+                lock_kind: Some("p2pkh".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .store_record(&PotRecord {
+                txid: pot.clone(),
+                output_index: 0,
+                lock_kind: Some("covenant".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let spender = "11".repeat(32);
+        let mut hints = std::collections::HashMap::new();
+        hints.insert((pot.clone(), 0), spender.clone());
+        hints.insert((hop.clone(), 2), spender.clone());
+        let mut binding = std::collections::HashMap::new();
+        binding.insert(spender.clone(), "00".to_string());
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: hints,
+            binding_raw: binding,
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        let s = discover_missing_spends(&store, &fetcher, 1, 0).await;
+        assert_eq!(s.scanned, 1);
+        assert_eq!(s.hop_rows, 0, "the pot goes first; the hop row waits");
+        assert_eq!(s.discovered, 1);
+        assert_eq!(
+            s.discovered_new_era, 1,
+            "a post-cutoff pot the pass had to discover is the page"
+        );
+        assert!(
+            store
+                .get_spent_status(&pot, 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        assert!(
+            !store
+                .get_spent_status(&hop, 2)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        // The next pass takes the hop row: counted as a hop row, never new-era (no stamp).
+        let s2 = discover_missing_spends(&store, &fetcher, 1, 0).await;
+        assert_eq!(
+            (
+                s2.scanned,
+                s2.hop_rows,
+                s2.discovered,
+                s2.discovered_new_era
+            ),
+            (1, 1, 1, 0)
+        );
+    }
+
     #[tokio::test]
     async fn discover_missing_spends_records_bound_hints_unconfirmed() {
         use overlay_discovery::pot::storage::MemoryPotStorage;

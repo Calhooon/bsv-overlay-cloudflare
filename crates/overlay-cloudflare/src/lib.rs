@@ -1317,14 +1317,28 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     )
     .await;
     worker::console_log!(
-        "Scheduled: missing-spend discovery (pot_records) — scanned={} discovered={} no_hint={} unbound={} faults={} write_errors={}",
+        "Scheduled: missing-spend discovery (pot_records) — scanned={} discovered={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={}",
         missing.scanned,
         missing.discovered,
         missing.no_hint,
         missing.unbound,
         missing.faults,
-        missing.write_errors
+        missing.write_errors,
+        missing.hop_rows,
+        missing.discovered_new_era
     );
+    // 2026-09-04: the pass's lifetime counters ride `/health/invariants`
+    // (`counters.missing_spend_*`) so the backlog's drain, the couriers'
+    // faults and — the paged one — NEW-era discoveries are observable without
+    // a laptop tail. Additive upserts; a never-run counter reads 0 there.
+    crate::ops::record_missing_spend_pass(
+        &ops_db,
+        missing.scanned as u64,
+        missing.discovered as u64,
+        missing.faults as u64,
+        missing.discovered_new_era as u64,
+    )
+    .await;
     worker::console_log!(
         "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} already_proven={} \
          still_unconfirmed={} fetch_failed={} stitch_failed={}",

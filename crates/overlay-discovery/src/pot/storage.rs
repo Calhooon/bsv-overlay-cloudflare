@@ -425,6 +425,23 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
+    /// bsv-low (2026-09-04): the same candidates WITH each row's `createdAt`
+    /// (unix seconds, `None` when the backend has no stamp), so the discovery
+    /// pass can tell a NEW-era pot (admitted after the pointer-heal shipped)
+    /// from the legacy backlog. Default: the age-less query, every stamp `None`.
+    async fn find_unspent_stale_with_age(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<Vec<(PotRecord, Option<u64>)>, PotStorageError> {
+        Ok(self
+            .find_unspent_stale(limit, min_age_secs)
+            .await?
+            .into_iter()
+            .map(|r| (r, None))
+            .collect())
+    }
+
     /// Spent-but-UNCONFIRMED pot records whose recorded spender is
     /// `spending_txid` — the PUSH consumer's lookup (bsv-low #228): when
     /// `/arc-ingest` receives (and chaintracks-verifies) the merkle proof for
@@ -701,6 +718,10 @@ pub enum PotStorageError {
 /// In-memory POT storage for testing.
 #[derive(Debug, Default)]
 pub struct MemoryPotStorage {
+    /// TEST HOOK (2026-09-04): unix-second creation stamps for rows the age-aware
+    /// stale query should report (`with_created_at`); rows without one read `None`,
+    /// exactly like a D1 row whose `createdAt` is NULL.
+    pub created_at_secs: std::sync::Mutex<std::collections::HashMap<(String, u32), u64>>,
     records: std::sync::Mutex<Vec<PotRecord>>,
     beefs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     /// Deterministic logical clock (seconds) for the push-primary backstop
@@ -734,6 +755,15 @@ pub struct MemoryPotStorage {
 }
 
 impl MemoryPotStorage {
+    /// TEST HOOK: stamp a row's creation time (unix seconds) for `find_unspent_stale_with_age`.
+    pub fn with_created_at(self, txid: &str, output_index: u32, secs: u64) -> Self {
+        self.created_at_secs
+            .lock()
+            .unwrap()
+            .insert((txid.to_string(), output_index), secs);
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -824,14 +854,40 @@ impl PotStorage for MemoryPotStorage {
         _min_age_secs: u64,
     ) -> Result<Vec<PotRecord>, PotStorageError> {
         // The memory store carries no createdAt: every unspent row is eligible.
+        // POTS FIRST (2026-09-04): a `tm_lowfund` hop/change row (`lock_kind`
+        // p2pkh) sorts after every pot — on beta 3,571 hop rows stood in front
+        // of 99 pots and starved the discovery pass for a day.
         let all = self
             .records
             .lock()
             .map_err(|_| PotStorageError::Other("lock".into()))?;
         let mut out: Vec<PotRecord> = all.iter().filter(|r| !r.spent).cloned().collect();
-        out.sort_by(|a, b| (&a.txid, a.output_index).cmp(&(&b.txid, b.output_index)));
+        out.sort_by(|a, b| {
+            (is_hop_row(a), &a.txid, a.output_index).cmp(&(is_hop_row(b), &b.txid, b.output_index))
+        });
         out.truncate(limit as usize);
         Ok(out)
+    }
+
+    async fn find_unspent_stale_with_age(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<Vec<(PotRecord, Option<u64>)>, PotStorageError> {
+        let stamps = self
+            .created_at_secs
+            .lock()
+            .map_err(|_| PotStorageError::Other("lock".into()))?
+            .clone();
+        Ok(self
+            .find_unspent_stale(limit, min_age_secs)
+            .await?
+            .into_iter()
+            .map(|r| {
+                let stamp = stamps.get(&(r.txid.clone(), r.output_index)).copied();
+                (r, stamp)
+            })
+            .collect())
     }
 
     async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
@@ -2769,4 +2825,11 @@ mod tests {
             "clearing the latch re-admits the pointed-at row"
         );
     }
+}
+
+/// A `tm_lowfund` hop / change row (`lock_kind = "p2pkh"`) — indexed for the
+/// hop's landing proof, never a pot. The janitor's candidate order puts these
+/// LAST (`find_unspent_stale`): the money is in the covenant rows.
+pub fn is_hop_row(r: &PotRecord) -> bool {
+    r.lock_kind.as_deref() == Some("p2pkh")
 }
