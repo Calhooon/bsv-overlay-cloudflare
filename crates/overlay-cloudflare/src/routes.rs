@@ -1104,6 +1104,7 @@ async fn submit_inner(
         // clean state scans zero candidates and stops immediately.
         if total_consumed > 0 {
             if let Ok(heal_db) = env.d1("OVERLAY_DB") {
+                let heal_env = env.clone();
                 ctx.wait_until(async move {
                     let storage = crate::d1_discovery::D1PotStorage::new(std::rc::Rc::new(heal_db));
                     for delay_ms in [3_000u64, 9_000] {
@@ -1113,6 +1114,12 @@ async fn submit_inner(
                             break; // nothing unclassified — done
                         }
                     }
+                    // 2026-09-04: this task runs AFTER the request's flush below,
+                    // so the signers it writes would otherwise strand their pot
+                    // notes in the isolate-global set until the next request on
+                    // this isolate (or vanish with it) — the felt's ending
+                    // narration rides that event. Ship them from HERE, awaited.
+                    crate::pot_changes::flush_inline(heal_env).await;
                 });
             }
         }

@@ -96,8 +96,26 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>) {
     }
 }
 
+/// Drain and ship INSIDE a detached task, awaited there (2026-09-04).
+///
+/// THE STRANDED-NOTE HOLE (found the same day in a sibling overlay by the
+/// wallet terminal): a pot write made from a `wait_until` task that runs
+/// AFTER the request's [`flush`] queues its note into this isolate-global set
+/// — nothing drains it until the NEXT request on this isolate flushes, and it
+/// is lost when the isolate goes first. Every detached task that writes pot
+/// rows (the post-submit signers self-heal, `routes.rs`) must end with
+/// `flush_inline(env.clone()).await` so its own notes ride its own task.
+pub async fn flush_inline(env: Env) {
+    let changed = drain();
+    if changed.is_empty() {
+        return;
+    }
+    ship(env, changed).await;
+}
+
 /// Drain and ship under the given `wait_until` (a request, queue or cron
-/// context). One call per unit of work.
+/// context). One call per unit of work. NOT sufficient for notes queued by a
+/// task that runs after this call — see [`flush_inline`].
 pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(
     env: &Env,
     wait_until: F,
@@ -122,6 +140,25 @@ mod tests {
         let d = drain();
         assert_eq!(d, vec![("aa".to_string(), 0), ("bb".to_string(), 1)]);
         assert!(drain().is_empty());
+    }
+
+    /// SOURCE PIN (2026-09-04): every detached pot-writing task in routes.rs
+    /// ships its own notes. The signers self-heal is the one such task today;
+    /// a second `backfill_settle_signers(&storage` under `wait_until` without
+    /// a matching `flush_inline` re-opens the stranded-note hole.
+    #[test]
+    fn every_detached_pot_writing_task_ships_its_own_notes() {
+        let routes = include_str!("routes.rs");
+        let heals = routes.matches("backfill_settle_signers(&storage").count();
+        let inline = routes.matches("pot_changes::flush_inline(").count();
+        assert!(
+            heals >= 1,
+            "the signers self-heal task moved — re-point this pin"
+        );
+        assert_eq!(
+            heals, inline,
+            "a detached task writes pot rows without shipping its own notes (see flush_inline)"
+        );
     }
 
     #[test]
