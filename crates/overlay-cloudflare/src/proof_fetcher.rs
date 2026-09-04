@@ -912,6 +912,9 @@ pub struct MissingSpendSummary {
 /// (a live pot's spend arrives by submission; the couriers are for the forgotten).
 pub const MISSING_SPEND_PASS_LIMIT: u64 = 20;
 pub const MISSING_SPEND_MIN_AGE_SECS: u64 = 3600;
+/// The discovery pass's own per-tick courier budget: 20 candidates × up to 4
+/// calls (three hint rungs + the binding raw).
+pub const MISSING_SPEND_FETCH_BUDGET: u32 = 80;
 
 pub async fn discover_missing_spends(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,

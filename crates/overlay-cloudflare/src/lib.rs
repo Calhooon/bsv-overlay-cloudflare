@@ -1293,10 +1293,25 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         spend_summary.displace_attempts,
         spend_summary.displace_faults,
     );
-    // bsv-low W4 (2026-09-04): spends the index never saw — bounded, oldest first.
+    // bsv-low W4 (2026-09-04): spends the index never saw — bounded, oldest
+    // first, on a fetcher of its OWN (the first tick on beta shared the
+    // confirmation pass's 20-call budget and faulted 11 of 20 candidates on
+    // "budget exhausted"): up to 4 courier calls per candidate, never a call
+    // taken from the money-relevant confirmation pass.
+    let mut discovery_fetcher =
+        crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(&env))
+            .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        discovery_fetcher = discovery_fetcher.with_arcade_url(u);
+    }
     let missing = crate::proof_fetcher::discover_missing_spends(
         pot_storage.as_ref(),
-        &spend_fetcher,
+        &discovery_fetcher,
         crate::proof_fetcher::MISSING_SPEND_PASS_LIMIT,
         crate::proof_fetcher::MISSING_SPEND_MIN_AGE_SECS,
     )
