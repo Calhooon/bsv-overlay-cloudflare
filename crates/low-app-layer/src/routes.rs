@@ -3995,6 +3995,20 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
                     }
                 }
             };
+            // 2026-09-04: the third raw source — BananaBlocks' WoC-compatible
+            // `/tx/{txid}/hex` (probed live: the bytes hash to the spender).
+            // `spender_raw_verifies` content-addresses whatever came back.
+            let raw = match raw {
+                Some(r) => Some(r),
+                None => {
+                    match provider_get(&format!("{BANANABLOCKS_BASE}/tx/{spender}/hex")).await {
+                        Some((200, body)) => std::str::from_utf8(&body)
+                            .ok()
+                            .and_then(|h| hex::decode(h.trim()).ok()),
+                        _ => None,
+                    }
+                }
+            };
             if let Some(raw) = raw {
                 spender_raw_ok = spender_raw_verifies(&raw, spender, txid_lc, vout);
             }

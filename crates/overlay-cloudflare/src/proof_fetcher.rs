@@ -406,14 +406,22 @@ impl ChainProofFetcher {
         if let Some(raw) = self.raw_hex_content_addressed(txid, &bitails, None).await {
             return Ok(raw);
         }
-        // 2. WoC break-glass (last resort).
+        // 2. WoC (api key when installed).
         let woc = format!("{}/tx/{}/hex", self.woc_base, txid);
         let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
         if let Some(raw) = self.raw_hex_content_addressed(txid, &woc, hdr).await {
             return Ok(raw);
         }
+        // 3. BananaBlocks (2026-09-04, owner ruling "all three, fallbacks for
+        //    each other"): a WoC-compatible `/tx/{txid}/hex` — probed live,
+        //    the bytes hash to the txid. Content-addressed like the others, so
+        //    a wrong body can never inject an ancestor.
+        let banana = bananablocks_tx_hex_url(&self.bananablocks_base, txid);
+        if let Some(raw) = self.raw_hex_content_addressed(txid, &banana, None).await {
+            return Ok(raw);
+        }
         Err(GASPError::NodeNotFound(format!(
-            "no raw tx for {txid} (bitails + woc exhausted)"
+            "no raw tx for {txid} (bitails + woc + bananablocks exhausted)"
         )))
     }
 
@@ -1588,6 +1596,12 @@ fn bananablocks_spend_url(base: &str, txid: &str, vout: u32) -> String {
 #[allow(dead_code)]
 fn bitails_spent_url(base: &str, txid: &str, vout: u32) -> String {
     format!("{base}/tx/{txid}/output/{vout}/spent")
+}
+
+/// BananaBlocks' WoC-compatible raw endpoint (`/tx/{txid}/hex`) — the third
+/// content-addressed raw source (`fetch_raw_hex`).
+fn bananablocks_tx_hex_url(base: &str, txid: &str) -> String {
+    format!("{base}/tx/{txid}/hex")
 }
 
 fn bitails_tx_url(base: &str, txid: &str) -> String {
@@ -6336,6 +6350,35 @@ mod tests {
         let e = ladder_verdict(1, vec!["woc: HTTP 500".into()]).unwrap_err();
         assert!(e.contains("1 clean negative(s) (need 2)") && e.contains("woc: HTTP 500"));
         assert!(ladder_verdict(0, vec!["a".into()]).is_err());
+    }
+
+    #[test]
+    fn courier_url_builders_hit_the_probed_endpoints() {
+        // Every URL a rung hits, pinned to the shape probed live on 2026-09-04.
+        assert_eq!(
+            bananablocks_spend_url("https://bananablocks.com/api/v1", "aa", 2),
+            "https://bananablocks.com/api/v1/txo/aa/2/spend"
+        );
+        assert_eq!(
+            bananablocks_tx_hex_url("https://bananablocks.com/api/v1", "aa"),
+            "https://bananablocks.com/api/v1/tx/aa/hex"
+        );
+        assert_eq!(
+            bitails_tx_url("https://api.bitails.io", "aa"),
+            "https://api.bitails.io/tx/aa"
+        );
+        assert_eq!(
+            bitails_script_history_url("https://api.bitails.io", "ff"),
+            "https://api.bitails.io/scripthash/ff/history"
+        );
+        assert_eq!(
+            woc_script_history_url("https://api.whatsonchain.com/v1/bsv/main", "ff"),
+            "https://api.whatsonchain.com/v1/bsv/main/script/ff/history"
+        );
+        assert_eq!(
+            woc_spent_url("https://api.whatsonchain.com/v1/bsv/main", "aa", 3),
+            "https://api.whatsonchain.com/v1/bsv/main/tx/aa/3/spent"
+        );
     }
 
     #[test]
