@@ -121,6 +121,7 @@
 
 pub mod board_view;
 pub use board_view::BoardView;
+pub mod armed_pots;
 pub mod auth;
 pub mod compaction;
 pub mod cors;
@@ -184,6 +185,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/lobby-changed" {
         return internal_events::lobby_changed(req, &env).await;
+    }
+    // bsv-low W4 (2026-09-03): the tower watchdog's population — unspent pots
+    // with an admitted refund-backup marker, bearer-gated like the webhooks.
+    if req.method() == worker::Method::Get && req.path() == "/internal/armed-pots" {
+        return armed_pots::armed_pots(req, &env).await;
     }
 
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
