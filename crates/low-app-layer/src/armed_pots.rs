@@ -26,8 +26,11 @@ use worker::*;
 pub const ARMED_POTS_DEFAULT_SINCE_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 pub const ARMED_POTS_MAX_ROWS: usize = 400;
 
-/// UNSPENT pots with a refund-backup marker since `?1` (ms), newest first,
-/// `?2` rows at most. The LEFT JOIN keeps a pot the index has not marked yet
+/// UNSPENT pots with a refund-backup marker since `?1` (UNIX SECONDS — the
+/// overlay stamps `potrefund_records.createdAt` with
+/// `current_unix_seconds_i64()`; the first cut compared milliseconds and
+/// listed nothing, caught by the empty live answer), newest first, `?2` rows
+/// at most. The LEFT JOIN keeps a pot the index has not marked yet
 /// (`spent IS NULL`) — an unknown spend is not a spend.
 pub fn armed_pots_sql() -> &'static str {
     "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, \
@@ -73,7 +76,8 @@ impl ArmedPotRowD1 {
             pot_txid: txid,
             pot_vout: self.pot_vout as u32,
             game_id: self.game_id.trim().to_ascii_lowercase(),
-            created_at_ms: self.created_at.map_or(0, |v| v as i64),
+            // Stored in seconds; served in milliseconds like every other stamp.
+            created_at_ms: self.created_at.map_or(0, |v| (v as i64).saturating_mul(1000)),
         })
     }
 }
@@ -103,6 +107,12 @@ pub fn parse_armed_pots_query(query: Option<&str>, now_ms: i64) -> (i64, usize) 
         }
     }
     (since, limit)
+}
+
+/// The stored stamp is seconds; the API speaks milliseconds.
+#[must_use]
+pub fn since_seconds(since_ms: i64) -> i64 {
+    (since_ms / 1000).max(0)
 }
 
 /// The body: `{ pots: [{potTxid, potVout, gameId, createdAt}], truncated, sinceMs }`.
@@ -135,7 +145,7 @@ pub async fn armed_pots(req: Request, env: &Env) -> Result<Response> {
     };
     // One row past the limit tells the caller the page is cut.
     let stmt = db.prepare(armed_pots_sql()).bind(&[
-        wasm_bindgen::JsValue::from_f64(since_ms as f64),
+        wasm_bindgen::JsValue::from_f64(since_seconds(since_ms) as f64),
         wasm_bindgen::JsValue::from_f64((limit + 1) as f64),
     ])?;
     let rows: Vec<ArmedPotRowD1> = match stmt.all().await.and_then(|r| r.results::<ArmedPotRowD1>()) {
@@ -180,7 +190,9 @@ mod tests {
         let ok = ArmedPotRowD1 { pot_txid: "AB".repeat(32), pot_vout: 0.0, game_id: "G1".into(), created_at: Some(5.0) }.into_pot().unwrap();
         assert_eq!(ok.pot_txid, "ab".repeat(32));
         assert_eq!(ok.game_id, "g1");
-        assert_eq!(ok.created_at_ms, 5);
+        assert_eq!(ok.created_at_ms, 5_000, "seconds in the row, milliseconds out");
+        assert_eq!(since_seconds(1_788_470_000_123), 1_788_470_000);
+        assert_eq!(since_seconds(-5), 0);
         assert!(ArmedPotRowD1 { pot_txid: "zz".repeat(32), pot_vout: 0.0, game_id: "g".into(), created_at: None }.into_pot().is_none());
         assert!(ArmedPotRowD1 { pot_txid: "ab".repeat(32), pot_vout: -1.0, game_id: "g".into(), created_at: None }.into_pot().is_none());
         let body = armed_pots_body(&[ok], true, 7);
