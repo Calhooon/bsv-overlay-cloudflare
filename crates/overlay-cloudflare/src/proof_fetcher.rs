@@ -514,6 +514,7 @@ impl ChainProofFetcher {
         let start = self.rung_rotation.get();
         self.rung_rotation.set(start.wrapping_add(1));
         let mut faults: Vec<String> = Vec::new();
+        let mut clean_negatives = 0usize;
         for i in rotate_order(rungs.len(), start) {
             let (name, url, hdr, parse) = &rungs[i];
             match self
@@ -521,7 +522,7 @@ impl ChainProofFetcher {
                 .await
             {
                 RungCall::Answer(Some(spender)) => return Ok(Some(spender)),
-                RungCall::Answer(None) => {}
+                RungCall::Answer(None) => clean_negatives += 1,
                 RungCall::Fault(e) => faults.push(e),
                 RungCall::BudgetExhausted(e) => {
                     faults.push(e);
@@ -529,15 +530,7 @@ impl ChainProofFetcher {
                 }
             }
         }
-        if faults.is_empty() {
-            Ok(None) // every healthy rung answered: nobody reports a spender
-        } else {
-            Err(format!(
-                "no rung yielded a hint and {} faulted ({})",
-                faults.len(),
-                faults.join("; ")
-            ))
-        }
+        ladder_verdict(clean_negatives, faults)
     }
 
     /// 2026-09-04: an OUTPUT'S LOCKING SCRIPT by outpoint from BananaBlocks
@@ -651,6 +644,31 @@ impl ChainProofFetcher {
                 }
             },
         }
+    }
+}
+
+/// A clean "no spender" needs this many INDEPENDENT indexes to say so — the
+/// same bar as the app-layer's `/spent-any` negative (one provider's "unspent"
+/// can be a stale index). With the bar met, a further rung's fault (or an
+/// open circuit) no longer downgrades the answer: the providers are each
+/// other's fallbacks, not a unanimity vote (owner ruling 2026-09-04; the
+/// first tick on the new ladder counted 16 candidates two providers had
+/// cleanly called unspent as faults because a third rung was skipped).
+pub const MIN_CLEAN_NEGATIVES: usize = 2;
+
+/// PURE: the per-outpoint ladder's verdict when no rung named a spender.
+pub fn ladder_verdict(
+    clean_negatives: usize,
+    faults: Vec<String>,
+) -> Result<Option<String>, String> {
+    if faults.is_empty() || clean_negatives >= MIN_CLEAN_NEGATIVES {
+        Ok(None)
+    } else {
+        Err(format!(
+            "no rung yielded a hint, {clean_negatives} clean negative(s) (need {MIN_CLEAN_NEGATIVES}) and {} faulted ({})",
+            faults.len(),
+            faults.join("; ")
+        ))
     }
 }
 
@@ -6300,6 +6318,26 @@ mod tests {
     /// bsv-low W4 (2026-09-04): a stale UNSPENT pot gets its spender from the
     /// hint ladder, bound by the spender's raw, and recorded UNCONFIRMED; a
     /// hint that does not bind is ignored; a ladder fault is counted, never a write.
+    #[test]
+    fn ladder_verdict_two_clean_negatives_beat_a_faulted_third_rung() {
+        assert_eq!(
+            ladder_verdict(0, vec![]).unwrap(),
+            None,
+            "every rung answered: no spender"
+        );
+        assert_eq!(
+            ladder_verdict(2, vec!["bitails_tx: circuit open".into()]).unwrap(),
+            None
+        );
+        assert_eq!(
+            ladder_verdict(3, vec!["x".into(), "y".into()]).unwrap(),
+            None
+        );
+        let e = ladder_verdict(1, vec!["woc: HTTP 500".into()]).unwrap_err();
+        assert!(e.contains("1 clean negative(s) (need 2)") && e.contains("woc: HTTP 500"));
+        assert!(ladder_verdict(0, vec!["a".into()]).is_err());
+    }
+
     #[test]
     fn rotate_order_visits_every_rung_once_from_a_moving_start() {
         assert_eq!(rotate_order(3, 0), vec![0, 1, 2]);
