@@ -72,7 +72,10 @@ pub async fn ship(env: Env, changes: Vec<(String, u32, &'static str)>) {
     let _ = headers.set("content-type", "application/json");
     init.with_headers(headers);
     init.with_body(Some(body.into()));
-    let Ok(req) = Request::new_with_init(&format!("{}/internal/lobby-changed", url.trim_end_matches('/')), &init) else {
+    let Ok(req) = Request::new_with_init(
+        &format!("{}/internal/lobby-changed", url.trim_end_matches('/')),
+        &init,
+    ) else {
         return;
     };
     let sent = match env.service("APP_LAYER") {
@@ -86,7 +89,11 @@ pub async fn ship(env: Env, changes: Vec<(String, u32, &'static str)>) {
         Ok(mut r) => {
             let status = r.status_code();
             let body = r.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ");
+            let excerpt: String = body
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .replace(['\n', '\r'], " ");
             console_log!("[lobby-changes] app-layer HTTP {status} {excerpt}")
         }
         Err(e) => console_log!("[lobby-changes] notify failed: {e}"),
@@ -94,7 +101,10 @@ pub async fn ship(env: Env, changes: Vec<(String, u32, &'static str)>) {
 }
 
 /// Drain and ship under the given `wait_until`. One call per unit of work.
-pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(env: &Env, wait_until: F) {
+pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(
+    env: &Env,
+    wait_until: F,
+) {
     let changed = drain();
     if changed.is_empty() {
         return;
@@ -122,7 +132,10 @@ mod tests {
 
     #[test]
     fn body_json_is_the_changes_shape() {
-        let b = body_json(&[("ab".repeat(32), 0, "admitted"), ("cd".repeat(32), 2, "evicted")]);
+        let b = body_json(&[
+            ("ab".repeat(32), 0, "admitted"),
+            ("cd".repeat(32), 2, "evicted"),
+        ]);
         let v: serde_json::Value = serde_json::from_str(&b).unwrap();
         assert_eq!(v["changes"].as_array().unwrap().len(), 2);
         assert_eq!(v["changes"][1]["kind"], "evicted");

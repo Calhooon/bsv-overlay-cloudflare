@@ -38,7 +38,10 @@ pub fn internal_bearer_ok(req: &Request, env: &Env) -> bool {
 /// The first 200 chars of a refusal body on one line — enough to tell WHO
 /// answered (an edge 404 page vs the relay's own refusal), never a secret.
 pub fn excerpt(body: &str) -> String {
-    body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ")
+    body.chars()
+        .take(200)
+        .collect::<String>()
+        .replace(['\n', '\r'], " ")
 }
 
 /// The first entry of a served `/results` body (`results::results_body`):
@@ -46,7 +49,11 @@ pub fn excerpt(body: &str) -> String {
 /// for a night and filed nothing (every real pot answered "serializer
 /// produced no entry"). Pinned by a test against the serializer itself.
 pub fn first_served_result(served: &Value) -> Option<Value> {
-    served.get("results").and_then(Value::as_array).and_then(|a| a.first()).cloned()
+    served
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .cloned()
 }
 
 /// `{ "height": <u64> }` — the only field the tip webhook carries.
@@ -70,7 +77,13 @@ pub fn tip_event_body(height: u64, at_ms: u64) -> Value {
 /// `[broadcast] … HTTP 404 (server=cloudflare) error code: 1042`). Without a
 /// binding it is a public fetch, which is only right for a relay on another
 /// zone.
-async fn relay_post(env: &Env, relay: &str, path: &str, token: &str, payload: String) -> Result<Response> {
+async fn relay_post(
+    env: &Env,
+    relay: &str,
+    path: &str,
+    token: &str,
+    payload: String,
+) -> Result<Response> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     let headers = Headers::new();
@@ -92,7 +105,9 @@ pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
         env.var("RELAY_URL").map(|v| v.to_string()),
         env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
     ) else {
-        console_log!("[broadcast] not configured (RELAY_URL / BROADCAST_TOKEN) — {room} event dropped");
+        console_log!(
+            "[broadcast] not configured (RELAY_URL / BROADCAST_TOKEN) — {room} event dropped"
+        );
         return;
     };
     let payload = json!({ "room": room, "body": body }).to_string();
@@ -102,7 +117,10 @@ pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
             let status = r.status_code();
             let server = r.headers().get("server").ok().flatten().unwrap_or_default();
             let body = r.text().await.unwrap_or_default();
-            console_log!("[broadcast] {room} push HTTP {status} (server={server}) {}", excerpt(&body));
+            console_log!(
+                "[broadcast] {room} push HTTP {status} (server={server}) {}",
+                excerpt(&body)
+            );
         }
         Err(e) => console_log!("[broadcast] {room} push failed: {e}"),
     }
@@ -151,7 +169,10 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
                 excerpt(&body)
             );
         }
-        Err(e) => console_log!("[push] → {}… failed: {e}", &recipient[..12.min(recipient.len())]),
+        Err(e) => console_log!(
+            "[push] → {}… failed: {e}",
+            &recipient[..12.min(recipient.len())]
+        ),
     }
 }
 
@@ -168,7 +189,11 @@ pub fn parse_pot_changed(raw: &[u8]) -> Vec<(String, u32)> {
     };
     let mut out: Vec<(String, u32)> = Vec::new();
     for o in arr {
-        let txid = o.get("txid").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+        let txid = o
+            .get("txid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let vout = o.get("vout").and_then(Value::as_u64);
         if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
@@ -213,8 +238,15 @@ pub fn parse_lobby_changed(raw: &[u8]) -> Vec<(String, u32, String)> {
     };
     let mut out: Vec<(String, u32, String)> = Vec::new();
     for o in arr {
-        let txid = o.get("txid").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
-        let vout = o.get("vout").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+        let txid = o
+            .get("txid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let vout = o
+            .get("vout")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok());
         let kind = o.get("kind").and_then(Value::as_str).unwrap_or("");
         if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
@@ -222,7 +254,10 @@ pub fn parse_lobby_changed(raw: &[u8]) -> Vec<(String, u32, String)> {
         let (Some(vout), true) = (vout, matches!(kind, "admitted" | "evicted")) else {
             continue;
         };
-        if !out.iter().any(|(t, v, k)| t == &txid && *v == vout && k == kind) {
+        if !out
+            .iter()
+            .any(|(t, v, k)| t == &txid && *v == vout && k == kind)
+        {
             out.push((txid, vout, kind.to_string()));
         }
         if out.len() >= POT_CHANGED_MAX {
@@ -252,9 +287,17 @@ pub async fn lobby_changed(mut req: Request, env: &Env) -> Result<Response> {
     let raw = req.bytes().await?;
     let changes = parse_lobby_changed(&raw);
     if changes.is_empty() {
-        return Response::error("body must be {\"changes\":[{\"txid\",\"vout\",\"kind\"}]}", 400);
+        return Response::error(
+            "body must be {\"changes\":[{\"txid\",\"vout\",\"kind\"}]}",
+            400,
+        );
     }
-    push_broadcast(env, LOBBY_ROOM, lobby_event_body(&changes, Date::now().as_millis())).await;
+    push_broadcast(
+        env,
+        LOBBY_ROOM,
+        lobby_event_body(&changes, Date::now().as_millis()),
+    )
+    .await;
     Response::from_json(&json!({ "ok": true, "room": LOBBY_ROOM, "changes": changes.len() }))
 }
 
@@ -268,7 +311,12 @@ pub async fn tip_changed(mut req: Request, env: &Env) -> Result<Response> {
     let Some(height) = parse_tip_changed(&raw) else {
         return Response::error("body must be {\"height\": <positive integer>}", 400);
     };
-    push_broadcast(env, TIP_ROOM, tip_event_body(height, Date::now().as_millis())).await;
+    push_broadcast(
+        env,
+        TIP_ROOM,
+        tip_event_body(height, Date::now().as_millis()),
+    )
+    .await;
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
 
@@ -300,10 +348,15 @@ mod tests {
     fn first_served_result_reads_the_key_the_results_serializer_writes() {
         // An empty page still carries the array under the SAME key: the two
         // functions agree on the name, or this fails before a deploy does.
-        let served: Value = serde_json::from_str(&crate::results::results_body("02aa", &[], false, 0)).unwrap();
-        assert!(served.get("results").map(Value::is_array).unwrap_or(false), "results_body must serve `results`");
+        let served: Value =
+            serde_json::from_str(&crate::results::results_body("02aa", &[], false, 0)).unwrap();
+        assert!(
+            served.get("results").map(Value::is_array).unwrap_or(false),
+            "results_body must serve `results`"
+        );
         assert!(first_served_result(&served).is_none());
-        let one: Value = serde_json::json!({ "results": [{ "potTxid": "ab" }], "truncated": false });
+        let one: Value =
+            serde_json::json!({ "results": [{ "potTxid": "ab" }], "truncated": false });
         assert_eq!(first_served_result(&one).unwrap()["potTxid"], "ab");
     }
 
@@ -331,10 +384,15 @@ mod tests {
             r#"{{"outpoints":[{{"txid":"{t}","vout":0}},{{"txid":"{T}","vout":0}},{{"txid":"zz","vout":0}},{{"txid":"{t}","vout":"1"}},{{"txid":"{t}","vout":1}}]}}"#,
             T = t.to_ascii_uppercase()
         );
-        assert_eq!(parse_pot_changed(raw.as_bytes()), vec![(t.clone(), 0), (t.clone(), 1)]);
+        assert_eq!(
+            parse_pot_changed(raw.as_bytes()),
+            vec![(t.clone(), 0), (t.clone(), 1)]
+        );
         assert!(parse_pot_changed(b"nope").is_empty());
         assert!(parse_pot_changed(br#"{"outpoints":"x"}"#).is_empty());
-        let many: Vec<String> = (0..20).map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32))).collect();
+        let many: Vec<String> = (0..20)
+            .map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32)))
+            .collect();
         let raw = format!(r#"{{"outpoints":[{}]}}"#, many.join(","));
         assert_eq!(parse_pot_changed(raw.as_bytes()).len(), POT_CHANGED_MAX);
     }

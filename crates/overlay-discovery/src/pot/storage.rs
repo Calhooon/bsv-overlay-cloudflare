@@ -410,6 +410,21 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
+    /// bsv-low W4 (2026-09-04): pots the index still marks UNSPENT that are at
+    /// least `min_age_secs` old, OLDEST first, at most `limit`. The candidate
+    /// set of [`discover_missing_spends`]: eight pre-heal-era rows on beta sat
+    /// `spent = 0` while `/spent-any` proved them spent with known spenders —
+    /// nothing ever asked the couriers about a pot nobody submitted a spend
+    /// for. Backends that can't enumerate return an empty `Vec` (no-op).
+    async fn find_unspent_stale(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = (limit, min_age_secs);
+        Ok(Vec::new())
+    }
+
     /// Spent-but-UNCONFIRMED pot records whose recorded spender is
     /// `spending_txid` — the PUSH consumer's lookup (bsv-low #228): when
     /// `/arc-ingest` receives (and chaintracks-verifies) the merkle proof for
@@ -803,6 +818,22 @@ impl MemoryPotStorage {
 
 #[async_trait(?Send)]
 impl PotStorage for MemoryPotStorage {
+    async fn find_unspent_stale(
+        &self,
+        limit: u64,
+        _min_age_secs: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // The memory store carries no createdAt: every unspent row is eligible.
+        let all = self
+            .records
+            .lock()
+            .map_err(|_| PotStorageError::Other("lock".into()))?;
+        let mut out: Vec<PotRecord> = all.iter().filter(|r| !r.spent).cloned().collect();
+        out.sort_by(|a, b| (&a.txid, a.output_index).cmp(&(&b.txid, b.output_index)));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
     async fn store_record(&self, record: &PotRecord) -> Result<(), PotStorageError> {
         let mut records = self.records.lock().unwrap();
         // Insert-if-absent for SPEND state; decoded-column upsert for the

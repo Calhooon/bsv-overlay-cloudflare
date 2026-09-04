@@ -197,11 +197,23 @@ mod tests {
     fn sql_is_the_party_window_over_potrefund_records_with_one_identity_bind() {
         let sql = refund_backups_sql(None);
         assert!(sql.contains("FROM potrefund_records pr"));
-        assert!(sql.contains("potparty_records"), "the caller's party window bounds the read");
+        assert!(
+            sql.contains("potparty_records"),
+            "the caller's party window bounds the read"
+        );
         assert!(sql.contains("pp.identity = ?1"));
-        assert!(sql.contains("pr.refundRawHex AS refundRawHex"), "this read SERVES the bytes");
-        assert!(sql.contains(&format!("LIMIT {}", REFUND_BACKUPS_MAX_ROWS + 1)), "one probe row past the cap");
-        assert!(!sql.contains("?2"), "no era bind when no cutoff is configured");
+        assert!(
+            sql.contains("pr.refundRawHex AS refundRawHex"),
+            "this read SERVES the bytes"
+        );
+        assert!(
+            sql.contains(&format!("LIMIT {}", REFUND_BACKUPS_MAX_ROWS + 1)),
+            "one probe row past the cap"
+        );
+        assert!(
+            !sql.contains("?2"),
+            "no era bind when no cutoff is configured"
+        );
     }
 
     #[test]
@@ -229,7 +241,11 @@ mod tests {
         assert_eq!(out[0].pot_txid, "aa".repeat(32)); // first seen = newest pot
         assert_eq!(out[0].rows.len(), REFUND_BACKUPS_ROWS_PER_POT); // capped, byteless row skipped
         assert_eq!(
-            out[0].rows.iter().map(|r| r.refund_raw_hex.clone().unwrap()).collect::<Vec<_>>(),
+            out[0]
+                .rows
+                .iter()
+                .map(|r| r.refund_raw_hex.clone().unwrap())
+                .collect::<Vec<_>>(),
             vec!["01", "03", "04", "05"]
         );
         assert_eq!(out[1].pot_vout, 1);
@@ -249,7 +265,8 @@ mod tests {
         assert_eq!(p["rows"][0]["refundRawHex"], "beef");
         assert_eq!(p["rows"][0]["createdAt"], 7);
         // An identity with nothing: the empty, honest body.
-        let empty: serde_json::Value = serde_json::from_str(&refund_backups_body("", &[], false)).unwrap();
+        let empty: serde_json::Value =
+            serde_json::from_str(&refund_backups_body("", &[], false)).unwrap();
         assert_eq!(empty["backups"].as_array().unwrap().len(), 0);
         assert_eq!(empty["truncated"], false);
     }

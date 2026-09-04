@@ -18,13 +18,13 @@ pub mod error;
 pub mod gasp_remote;
 pub mod health_checker;
 pub mod janitor;
+pub mod lobby_changes;
 pub mod mainnet_fanout;
 pub mod ops;
 pub mod peer_crawler;
+pub mod pot_changes;
 pub mod proof_fetcher;
 pub mod queue;
-pub mod lobby_changes;
-pub mod pot_changes;
 pub mod relatch;
 pub mod routes;
 pub mod submit_census;
@@ -1292,6 +1292,23 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         spend_summary.displaced,
         spend_summary.displace_attempts,
         spend_summary.displace_faults,
+    );
+    // bsv-low W4 (2026-09-04): spends the index never saw — bounded, oldest first.
+    let missing = crate::proof_fetcher::discover_missing_spends(
+        pot_storage.as_ref(),
+        &spend_fetcher,
+        crate::proof_fetcher::MISSING_SPEND_PASS_LIMIT,
+        crate::proof_fetcher::MISSING_SPEND_MIN_AGE_SECS,
+    )
+    .await;
+    worker::console_log!(
+        "Scheduled: missing-spend discovery (pot_records) — scanned={} discovered={} no_hint={} unbound={} faults={} write_errors={}",
+        missing.scanned,
+        missing.discovered,
+        missing.no_hint,
+        missing.unbound,
+        missing.faults,
+        missing.write_errors
     );
     worker::console_log!(
         "Scheduled: proof-completion (pot_beefs) — scanned={} completed={} already_proven={} \

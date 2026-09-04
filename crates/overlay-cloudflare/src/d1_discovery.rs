@@ -1191,7 +1191,11 @@ impl LowStorage for D1LowStorage {
         // once per unit of work by `lobby_changes::flush`).
         if record.record_type.as_str() == "table" {
             crate::lobby_changes::note_admitted(&record.txid, record.output_index);
-            worker::console_log!("[lobby-changes] noted admitted {}:{}", &record.txid[..12.min(record.txid.len())], record.output_index);
+            worker::console_log!(
+                "[lobby-changes] noted admitted {}:{}",
+                &record.txid[..12.min(record.txid.len())],
+                record.output_index
+            );
         }
         Ok(())
     }
@@ -1206,7 +1210,11 @@ impl LowStorage for D1LowStorage {
         // W2-P6: an advert row gone (spent / reaped / refused) ⇒ the lobby
         // changed. Every low_records delete is lobby-relevant.
         crate::lobby_changes::note_evicted(txid, output_index);
-        worker::console_log!("[lobby-changes] noted evicted {}:{}", &txid[..12.min(txid.len())], output_index);
+        worker::console_log!(
+            "[lobby-changes] noted evicted {}:{}",
+            &txid[..12.min(txid.len())],
+            output_index
+        );
         Ok(())
     }
 
@@ -1620,6 +1628,19 @@ pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
 /// or a NULL latch keeps the row a full candidate (fail-safe: chase MORE).
 /// Rule 6 holds: if the latched pointer ever really proves (reorg), the
 /// push path clears the latch and the row re-enters this pool.
+/// bsv-low W4 (2026-09-04): the stale-UNSPENT candidate set for
+/// `discover_missing_spends` — rows the index still marks `spent = 0`, at
+/// least `min_age_secs` old (`createdAt` is unix SECONDS, the same clock as
+/// `spentAt`), OLDEST first so the long-forgotten pre-heal rows drain first.
+pub(crate) fn pot_unspent_stale_sql(limit: u64, min_age_secs: u64) -> String {
+    format!(
+        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
+         WHERE spent = 0 \
+           AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
+         ORDER BY createdAt ASC LIMIT {limit}"
+    )
+}
+
 pub(crate) fn pot_spent_unconfirmed_sql(limit: u64, min_age_secs: u64) -> String {
     format!(
         "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
@@ -2495,6 +2516,16 @@ impl PotStorage for D1PotStorage {
         // #2b: rows pointed at a LATCHED structurally-unprovable spender are
         // excluded — see `pot_spent_unconfirmed_sql` (the shipped string).
         let sql = pot_spent_unconfirmed_sql(limit, min_age_secs);
+        let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_unspent_stale(
+        &self,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let sql = pot_unspent_stale_sql(limit, min_age_secs);
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
     }
@@ -6565,6 +6596,20 @@ mod tests {
     }
 
     // ── mark_spent SQL (prefer-confirmed / never-clobber-with-unconfirmed) ──
+
+    #[test]
+    fn unspent_stale_sql_selects_old_unspent_rows_oldest_first() {
+        let sql = pot_unspent_stale_sql(20, 3600);
+        assert!(sql.contains("WHERE spent = 0"));
+        assert!(
+            sql.contains("createdAt IS NULL OR createdAt <= unixepoch() - 3600"),
+            "seconds, like spentAt"
+        );
+        assert!(
+            sql.contains("ORDER BY createdAt ASC LIMIT 20"),
+            "oldest first, bounded"
+        );
+    }
 
     #[test]
     fn mark_spent_sql_confirmed_always_writes_and_latches_flag() {

@@ -63,7 +63,10 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>) {
     let _ = headers.set("content-type", "application/json");
     init.with_headers(headers);
     init.with_body(Some(body.into()));
-    let Ok(req) = Request::new_with_init(&format!("{}/internal/pot-changed", url.trim_end_matches('/')), &init) else {
+    let Ok(req) = Request::new_with_init(
+        &format!("{}/internal/pot-changed", url.trim_end_matches('/')),
+        &init,
+    ) else {
         return;
     };
     // The app-layer is a Worker on this account: the POST rides the
@@ -82,7 +85,11 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>) {
         Ok(mut r) => {
             let status = r.status_code();
             let body = r.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ");
+            let excerpt: String = body
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .replace(['\n', '\r'], " ");
             console_log!("[pot-changes] app-layer HTTP {status} {excerpt}")
         }
         Err(e) => console_log!("[pot-changes] notify failed: {e}"),
@@ -91,7 +98,10 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>) {
 
 /// Drain and ship under the given `wait_until` (a request, queue or cron
 /// context). One call per unit of work.
-pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(env: &Env, wait_until: F) {
+pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(
+    env: &Env,
+    wait_until: F,
+) {
     let changed = drain();
     if changed.is_empty() {
         return;
@@ -116,7 +126,8 @@ mod tests {
 
     #[test]
     fn body_json_is_the_outpoint_list() {
-        let v: serde_json::Value = serde_json::from_str(&body_json(&[("aa".into(), 0), ("bb".into(), 2)])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&body_json(&[("aa".into(), 0), ("bb".into(), 2)])).unwrap();
         assert_eq!(v["outpoints"][0]["txid"], "aa");
         assert_eq!(v["outpoints"][1]["vout"], 2);
     }

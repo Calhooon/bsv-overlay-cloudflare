@@ -2221,7 +2221,11 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
         let stmt = db
             .prepare(crate::results::decoded_pots_sql(1))
             .bind(&[JsValue::from_str(&txid), JsValue::from_f64(f64::from(vout))])?;
-        let rows = match stmt.all().await.and_then(|r| r.results::<DecodedPotRowD1>()) {
+        let rows = match stmt
+            .all()
+            .await
+            .and_then(|r| r.results::<DecodedPotRowD1>())
+        {
             Ok(r) => r,
             Err(e) => {
                 console_warn!("[pot-changed] decoded-pots read failed for {txid}:{vout}: {e}");
@@ -2232,7 +2236,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
             }
         };
         let Some(params) = rows.first().and_then(|r| r.covenant_params()) else {
-            worker::console_log!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file");
+            worker::console_log!(
+                "[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file"
+            );
 
             skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file") }));
 
@@ -2255,7 +2261,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
             .map(|s| s.to_ascii_lowercase())
             .collect();
         if identities.is_empty() {
-            worker::console_log!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file");
+            worker::console_log!(
+                "[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file"
+            );
 
             skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file") }));
 
@@ -2266,7 +2274,10 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
             let entries = match gather_result_entries(&db, &id, era, 0).await {
                 Ok((entries, _)) => entries,
                 Err(e) => {
-                    console_warn!("[pot-changed] gather for {}… failed: {e}", &id[..12.min(id.len())]);
+                    console_warn!(
+                        "[pot-changed] gather for {}… failed: {e}",
+                        &id[..12.min(id.len())]
+                    );
 
                     skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] gather for {}… failed: {e}", &id[..12.min(id.len())]) }));
 
@@ -2277,7 +2288,10 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                 .iter()
                 .find(|e| e.pot_txid.eq_ignore_ascii_case(&txid) && e.pot_vout == vout)
             else {
-                worker::console_log!("[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file", &id[..12.min(id.len())]);
+                worker::console_log!(
+                    "[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file",
+                    &id[..12.min(id.len())]
+                );
 
                 skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file", &id[..12.min(id.len())]) }));
 
@@ -2298,12 +2312,20 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                 skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": "serializer produced no entry" }));
                 continue;
             };
-            let event = crate::internal_events::pot_event_body(&txid, vout, one, worker::Date::now().as_millis());
+            let event = crate::internal_events::pot_event_body(
+                &txid,
+                vout,
+                one,
+                worker::Date::now().as_millis(),
+            );
             crate::internal_events::first_party_push(env, &id, event).await;
             filed.push(serde_json::json!({ "txid": txid, "vout": vout, "identity": id }));
         }
     }
-    json_response(serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped }).to_string(), 200)
+    json_response(
+        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped }).to_string(),
+        200,
+    )
 }
 
 async fn gather_result_entries(

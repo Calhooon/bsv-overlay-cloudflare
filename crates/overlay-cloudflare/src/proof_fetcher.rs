@@ -869,6 +869,134 @@ pub async fn complete_pot_beef_proofs(
 /// delay). BOTH entry points (the scheduled tick and
 /// `/admin/complete-proofs`) call THIS function, so the order cannot drift
 /// apart. Each pass keeps its own fetcher (own budget cell).
+/// Host-test-safe logging for the discovery pass: `console_log!` reaches
+/// wasm-bindgen and panics off-wasm, so the line is compiled away there.
+macro_rules! dlog {
+    ($($t:tt)*) => {{
+        #[cfg(target_arch = "wasm32")]
+        {
+            worker::console_log!($($t)*);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = format_args!($($t)*);
+        }
+    }};
+}
+
+/// bsv-low W4 (2026-09-04) — DISCOVER spends the index never saw.
+///
+/// `complete_spend_confirmations` proves pointers that exist; nothing looked
+/// for a spend on a pot the index still marks UNSPENT, so a pot whose spend
+/// nobody submitted (a tower-broadcast refund from the pre-heal era) sat
+/// `spent = 0` forever — beta carried eight, all spent on chain with known
+/// spenders. This pass asks the courier ladder (`resolve_spender`:
+/// BananaBlocks → Bitails → WoC break-glass) WHO spent each stale unspent
+/// pot, BINDS the answer by fetching the spender's raw and checking it really
+/// consumes the outpoint (`spender_binding_raw`, content-addressed), and
+/// records it as an UNCONFIRMED pointer through the prefer-confirmed,
+/// never-clobber `mark_spent` — the confirmation pass then proves it against
+/// chaintracks on a later tick. Steady state: the candidate set is empty and
+/// no courier is called.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MissingSpendSummary {
+    pub scanned: usize,
+    pub discovered: usize,
+    pub no_hint: usize,
+    pub unbound: usize,
+    pub faults: usize,
+    pub write_errors: usize,
+}
+
+/// Per tick: at most this many stale unspent pots, none younger than an hour
+/// (a live pot's spend arrives by submission; the couriers are for the forgotten).
+pub const MISSING_SPEND_PASS_LIMIT: u64 = 20;
+pub const MISSING_SPEND_MIN_AGE_SECS: u64 = 3600;
+
+pub async fn discover_missing_spends(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    limit: u64,
+    min_age_secs: u64,
+) -> MissingSpendSummary {
+    let mut summary = MissingSpendSummary::default();
+    let candidates = match pot_storage.find_unspent_stale(limit, min_age_secs).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            dlog!("discover_missing_spends: candidate query failed: {e}");
+            return summary;
+        }
+    };
+    for rec in candidates {
+        summary.scanned += 1;
+        let spender = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                summary.no_hint += 1;
+                continue;
+            }
+            Err(e) => {
+                summary.faults += 1;
+                dlog!(
+                    "discover_missing_spends: {}:{} hint ladder faulted: {e}",
+                    rec.txid,
+                    rec.output_index
+                );
+                continue;
+            }
+        };
+        match fetcher
+            .spender_binding_raw(&spender, &rec.txid, rec.output_index)
+            .await
+        {
+            Ok(Some(_raw)) => {}
+            Ok(None) => {
+                summary.unbound += 1;
+                continue;
+            }
+            Err(e) => {
+                summary.faults += 1;
+                dlog!(
+                    "discover_missing_spends: {}:{} spender {spender} raw fault: {e}",
+                    rec.txid,
+                    rec.output_index
+                );
+                continue;
+            }
+        }
+        match pot_storage
+            .mark_spent(
+                &rec.txid,
+                rec.output_index,
+                &spender,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(()) => {
+                summary.discovered += 1;
+                dlog!(
+                    "discover_missing_spends: {}:{} ← {spender} (unconfirmed pointer; the confirmation pass proves it)",
+                    rec.txid,
+                    rec.output_index
+                );
+            }
+            Err(e) => {
+                summary.write_errors += 1;
+                dlog!(
+                    "discover_missing_spends: {}:{} mark_spent failed: {e}",
+                    rec.txid,
+                    rec.output_index
+                );
+            }
+        }
+    }
+    summary
+}
+
 pub async fn run_pot_maintenance(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     spend_fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
@@ -5550,5 +5678,69 @@ mod tests {
             .unwrap();
         assert_eq!(cands.len(), 1, "past the window the backstop takes over");
         assert_eq!(cands[0].0, txid);
+    }
+
+    /// bsv-low W4 (2026-09-04): a stale UNSPENT pot gets its spender from the
+    /// hint ladder, bound by the spender's raw, and recorded UNCONFIRMED; a
+    /// hint that does not bind is ignored; a ladder fault is counted, never a write.
+    #[tokio::test]
+    async fn discover_missing_spends_records_bound_hints_unconfirmed() {
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        let store = MemoryPotStorage::default();
+        let pot_a = "aa".repeat(32);
+        let pot_b = "bb".repeat(32);
+        let pot_c = "cc".repeat(32);
+        for p in [&pot_a, &pot_b, &pot_c] {
+            store
+                .store_record(&PotRecord {
+                    txid: p.clone(),
+                    output_index: 0,
+                    spent: false,
+                    spending_txid: None,
+                    spent_confirmed: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let spender_a = "11".repeat(32);
+        let spender_b = "22".repeat(32);
+        let mut hints = std::collections::HashMap::new();
+        hints.insert((pot_a.clone(), 0), spender_a.clone());
+        hints.insert((pot_b.clone(), 0), spender_b.clone());
+        let mut binding = std::collections::HashMap::new();
+        binding.insert(spender_a.clone(), "00".to_string()); // a binds
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: hints,
+            binding_raw: binding,
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        let s = discover_missing_spends(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.scanned, 3);
+        assert_eq!(s.discovered, 1, "only the bound hint is recorded");
+        assert_eq!(s.unbound, 1, "b's hint did not bind → ignored");
+        assert_eq!(s.no_hint, 1, "c: nobody reports a spender");
+        let a = store.get_spent_status(&pot_a, 0).await.unwrap().unwrap();
+        assert!(
+            a.spent && a.spending_txid.as_deref() == Some(spender_a.as_str()) && !a.spent_confirmed
+        );
+        let b = store.get_spent_status(&pot_b, 0).await.unwrap().unwrap();
+        assert!(!b.spent);
+        // a ladder fault is counted and writes nothing
+        let faulty = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: Default::default(),
+            binding_raw: Default::default(),
+            hint_fault: true,
+            real_bumps: Default::default(),
+        };
+        let s2 = discover_missing_spends(&store, &faulty, 20, 0).await;
+        assert_eq!(
+            s2.faults, 2,
+            "b and c are still unspent candidates; both faulted"
+        );
+        assert_eq!(s2.discovered, 0);
     }
 }

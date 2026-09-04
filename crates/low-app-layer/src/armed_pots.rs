@@ -81,7 +81,9 @@ impl ArmedPotRowD1 {
             pot_vout: self.pot_vout as u32,
             game_id: self.game_id.trim().to_ascii_lowercase(),
             // Stored in seconds; served in milliseconds like every other stamp.
-            created_at_ms: self.created_at.map_or(0, |v| (v as i64).saturating_mul(1000)),
+            created_at_ms: self
+                .created_at
+                .map_or(0, |v| (v as i64).saturating_mul(1000)),
         })
     }
 }
@@ -152,14 +154,18 @@ pub async fn armed_pots(req: Request, env: &Env) -> Result<Response> {
         wasm_bindgen::JsValue::from_f64(since_seconds(since_ms) as f64),
         wasm_bindgen::JsValue::from_f64((limit + 1) as f64),
     ])?;
-    let rows: Vec<ArmedPotRowD1> = match stmt.all().await.and_then(|r| r.results::<ArmedPotRowD1>()) {
+    let rows: Vec<ArmedPotRowD1> = match stmt.all().await.and_then(|r| r.results::<ArmedPotRowD1>())
+    {
         Ok(rows) => rows,
         Err(e) => {
             console_warn!("[armed-pots] query failed: {e}");
             return Response::error("database query failed", 503);
         }
     };
-    let mut pots: Vec<ArmedPot> = rows.into_iter().filter_map(ArmedPotRowD1::into_pot).collect();
+    let mut pots: Vec<ArmedPot> = rows
+        .into_iter()
+        .filter_map(ArmedPotRowD1::into_pot)
+        .collect();
     let truncated = pots.len() > limit;
     pots.truncate(limit);
     Response::from_json(&armed_pots_body(&pots, truncated, since_ms))
@@ -172,18 +178,33 @@ mod tests {
     #[test]
     fn the_query_is_bounded_and_defaults_to_three_days() {
         let now = 1_000_000_000_000i64;
-        assert_eq!(parse_armed_pots_query(None, now), (now - ARMED_POTS_DEFAULT_SINCE_MS, ARMED_POTS_MAX_ROWS));
-        assert_eq!(parse_armed_pots_query(Some("since_ms=5&limit=10"), now), (5, 10));
-        assert_eq!(parse_armed_pots_query(Some("limit=9999"), now).1, ARMED_POTS_MAX_ROWS);
+        assert_eq!(
+            parse_armed_pots_query(None, now),
+            (now - ARMED_POTS_DEFAULT_SINCE_MS, ARMED_POTS_MAX_ROWS)
+        );
+        assert_eq!(
+            parse_armed_pots_query(Some("since_ms=5&limit=10"), now),
+            (5, 10)
+        );
+        assert_eq!(
+            parse_armed_pots_query(Some("limit=9999"), now).1,
+            ARMED_POTS_MAX_ROWS
+        );
         assert_eq!(parse_armed_pots_query(Some("limit=0"), now).1, 1);
         assert_eq!(parse_armed_pots_query(Some("since_ms=-7"), now).0, 0);
-        assert_eq!(parse_armed_pots_query(Some("since_ms=x&limit=y"), now), (now - ARMED_POTS_DEFAULT_SINCE_MS, ARMED_POTS_MAX_ROWS));
+        assert_eq!(
+            parse_armed_pots_query(Some("since_ms=x&limit=y"), now),
+            (now - ARMED_POTS_DEFAULT_SINCE_MS, ARMED_POTS_MAX_ROWS)
+        );
     }
 
     #[test]
     fn the_sql_lists_only_admitted_unspent_pots() {
         let sql = armed_pots_sql();
-        assert!(sql.contains("JOIN pot_records") && !sql.contains("LEFT JOIN"), "a pot the index never admitted (a phantom funding) is not a watchdog concern");
+        assert!(
+            sql.contains("JOIN pot_records") && !sql.contains("LEFT JOIN"),
+            "a pot the index never admitted (a phantom funding) is not a watchdog concern"
+        );
         assert!(sql.contains("p.spent = 0"));
         assert!(sql.contains("ORDER BY createdAt DESC"));
         assert!(sql.contains("LIMIT ?2"));
@@ -191,14 +212,38 @@ mod tests {
 
     #[test]
     fn rows_are_validated_and_lowercased() {
-        let ok = ArmedPotRowD1 { pot_txid: "AB".repeat(32), pot_vout: 0.0, game_id: "G1".into(), created_at: Some(5.0) }.into_pot().unwrap();
+        let ok = ArmedPotRowD1 {
+            pot_txid: "AB".repeat(32),
+            pot_vout: 0.0,
+            game_id: "G1".into(),
+            created_at: Some(5.0),
+        }
+        .into_pot()
+        .unwrap();
         assert_eq!(ok.pot_txid, "ab".repeat(32));
         assert_eq!(ok.game_id, "g1");
-        assert_eq!(ok.created_at_ms, 5_000, "seconds in the row, milliseconds out");
+        assert_eq!(
+            ok.created_at_ms, 5_000,
+            "seconds in the row, milliseconds out"
+        );
         assert_eq!(since_seconds(1_788_470_000_123), 1_788_470_000);
         assert_eq!(since_seconds(-5), 0);
-        assert!(ArmedPotRowD1 { pot_txid: "zz".repeat(32), pot_vout: 0.0, game_id: "g".into(), created_at: None }.into_pot().is_none());
-        assert!(ArmedPotRowD1 { pot_txid: "ab".repeat(32), pot_vout: -1.0, game_id: "g".into(), created_at: None }.into_pot().is_none());
+        assert!(ArmedPotRowD1 {
+            pot_txid: "zz".repeat(32),
+            pot_vout: 0.0,
+            game_id: "g".into(),
+            created_at: None
+        }
+        .into_pot()
+        .is_none());
+        assert!(ArmedPotRowD1 {
+            pot_txid: "ab".repeat(32),
+            pot_vout: -1.0,
+            game_id: "g".into(),
+            created_at: None
+        }
+        .into_pot()
+        .is_none());
         let body = armed_pots_body(&[ok], true, 7);
         assert_eq!(body["count"], 1);
         assert_eq!(body["truncated"], true);
