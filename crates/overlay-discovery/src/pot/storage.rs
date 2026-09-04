@@ -442,6 +442,20 @@ pub trait PotStorage {
             .collect())
     }
 
+    /// bsv-low (2026-09-04): stamp a stale-UNSPENT row as just EXAMINED by
+    /// the discovery pass, whatever the outcome, so a row a dead courier rung
+    /// faults on is not re-examined every tick ahead of everything else —
+    /// `find_unspent_stale` backs such rows off for an hour. Beta 2026-09-04:
+    /// Bitails retired its per-output spend data and the pass spun on the
+    /// same 20 rows for four ticks. Default: no-op (oldest-first stays).
+    async fn note_spend_discovery_attempt(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+    ) -> Result<(), PotStorageError> {
+        Ok(())
+    }
+
     /// Spent-but-UNCONFIRMED pot records whose recorded spender is
     /// `spending_txid` — the PUSH consumer's lookup (bsv-low #228): when
     /// `/arc-ingest` receives (and chaintracks-verifies) the merkle proof for
@@ -722,6 +736,9 @@ pub struct MemoryPotStorage {
     /// stale query should report (`with_created_at`); rows without one read `None`,
     /// exactly like a D1 row whose `createdAt` is NULL.
     pub created_at_secs: std::sync::Mutex<std::collections::HashMap<(String, u32), u64>>,
+    /// TEST HOOK (2026-09-04): rows the discovery pass has EXAMINED (`note_spend_discovery_attempt`);
+    /// the memory store orders them after never-examined rows — the rotation analog of D1's backoff.
+    pub discovery_examined: std::sync::Mutex<std::collections::HashSet<(String, u32)>>,
     records: std::sync::Mutex<Vec<PotRecord>>,
     beefs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     /// Deterministic logical clock (seconds) for the push-primary backstop
@@ -862,11 +879,34 @@ impl PotStorage for MemoryPotStorage {
             .lock()
             .map_err(|_| PotStorageError::Other("lock".into()))?;
         let mut out: Vec<PotRecord> = all.iter().filter(|r| !r.spent).cloned().collect();
+        let examined = self
+            .discovery_examined
+            .lock()
+            .map_err(|_| PotStorageError::Other("lock".into()))?
+            .clone();
+        let seen = |r: &PotRecord| examined.contains(&(r.txid.clone(), r.output_index));
         out.sort_by(|a, b| {
-            (is_hop_row(a), &a.txid, a.output_index).cmp(&(is_hop_row(b), &b.txid, b.output_index))
+            (is_hop_row(a), seen(a), &a.txid, a.output_index).cmp(&(
+                is_hop_row(b),
+                seen(b),
+                &b.txid,
+                b.output_index,
+            ))
         });
         out.truncate(limit as usize);
         Ok(out)
+    }
+
+    async fn note_spend_discovery_attempt(
+        &self,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<(), PotStorageError> {
+        self.discovery_examined
+            .lock()
+            .map_err(|_| PotStorageError::Other("lock".into()))?
+            .insert((txid.to_string(), output_index));
+        Ok(())
     }
 
     async fn find_unspent_stale_with_age(

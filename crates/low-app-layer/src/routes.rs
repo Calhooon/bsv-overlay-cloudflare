@@ -3878,10 +3878,35 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Fetch a URL, returning `(status, body_bytes)`. Faults map to `None`.
+thread_local! {
+    /// 2026-09-04: the WoC api key (`WOC_API_KEY` secret), set once per
+    /// isolate by [`set_woc_api_key`] at request entry; every WoC read here
+    /// sends it as `woc-api-key` (lifts WoC's free-tier rate limit — the
+    /// repo's most-documented outage class). Absent = the free tier, as before.
+    static WOC_API_KEY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install the WoC api key for this isolate (idempotent; `None` clears).
+pub fn set_woc_api_key(key: Option<String>) {
+    WOC_API_KEY.with(|k| *k.borrow_mut() = key.filter(|k| !k.trim().is_empty()));
+}
+
+fn woc_api_key() -> Option<String> {
+    WOC_API_KEY.with(|k| k.borrow().clone())
+}
+
+/// Fetch a URL, returning `(status, body_bytes)`. Faults map to `None`. A
+/// WoC URL carries the api key when one is installed.
 async fn provider_get(url: &str) -> Option<(u16, Vec<u8>)> {
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
+    if url.starts_with(WOC_BASE) {
+        if let Some(key) = woc_api_key() {
+            let headers = Headers::new();
+            let _ = headers.set("woc-api-key", &key);
+            init.with_headers(headers);
+        }
+    }
     let request = worker::Request::new_with_init(url, &init).ok()?;
     let mut response = worker::Fetch::Request(request).send().await.ok()?;
     let status = response.status_code();
@@ -3891,6 +3916,12 @@ async fn provider_get(url: &str) -> Option<(u16, Vec<u8>)> {
 
 const WOC_BASE: &str = "https://api.whatsonchain.com/v1/bsv/main";
 const BITAILS_BASE: &str = "https://api.bitails.io";
+/// 2026-09-04: the negative corroborator. Bitails runs in pruned mode and
+/// removed its per-output spend data (its `/output/{vout}/spent` answers 500
+/// on every outpoint), so every "unspent" here had become an honest unknown.
+/// BananaBlocks' `/txo/{txid}/{vout}/spend` answers `{"spent":false}` /
+/// `{"spent":true,"spentTxid"}` (60 req/min; a 429 is a fault, never a verdict).
+const BANANABLOCKS_BASE: &str = "https://bananablocks.com/api/v1";
 
 /// Resolve ONE outpoint against the upstream providers, per the
 /// proof-source-order doctrine (see `results.rs`'s `/spent-any` section):
@@ -3899,11 +3930,16 @@ const BITAILS_BASE: &str = "https://api.bitails.io";
 /// honest unknown.
 async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
     use crate::results::{
-        parse_bitails_unspent, parse_woc_spent_body, spender_raw_verifies, SpentObservation,
+        parse_bananablocks_unspent, parse_woc_spent_body, spender_raw_verifies, SpentObservation,
         UnspentCorroboration,
     };
 
-    let woc = match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
+    // Owner ruling 2026-09-04 ("use all three, fallbacks being each other"):
+    // the PRIMARY observation is the first provider that can LOOK — WoC,
+    // then BananaBlocks, then Bitails' tx body — a fault falls through, a
+    // real answer (spent OR not) stops the ladder. Every positive still
+    // passes the same raw-verification bar below, whoever named it.
+    let mut woc = match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => parse_woc_spent_body(&v),
             Err(_) => SpentObservation::Fault,
@@ -3915,6 +3951,27 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
         Some((s, _)) => crate::results::woc_spent_status_observation(s),
         None => SpentObservation::Fault,
     };
+    let mut primary = "woc";
+    if matches!(woc, SpentObservation::Fault) {
+        woc = match provider_get(&format!("{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend")).await {
+            Some((status, body)) => {
+                let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                crate::results::parse_bananablocks_spent(status, v.as_ref())
+            }
+            None => SpentObservation::Fault,
+        };
+        primary = "bananablocks";
+    }
+    if matches!(woc, SpentObservation::Fault) {
+        woc = match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+            Some((status, body)) => {
+                let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                crate::results::parse_bitails_tx_spent(status, v.as_ref(), vout)
+            }
+            None => SpentObservation::Fault,
+        };
+        primary = "bitails_tx";
+    }
 
     let mut spender_raw_ok = false;
     let mut bitails = UnspentCorroboration::Unknown;
@@ -3943,19 +4000,58 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             }
         }
         SpentObservation::NotSpent => {
-            // Negative corroboration (never WoC-only). Bitails' outpoint
-            // endpoint 500s at the time of writing — parse_bitails_unspent is
-            // strict, so that fault surfaces as known:false (fail-safe).
-            bitails =
-                match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}/output/{vout}/spent"))
+            // Negative corroboration: a SECOND provider must cleanly say
+            // unspent (never a single-provider negative). 2026-09-04: the
+            // corroborators are the providers that did NOT give the primary
+            // answer, in order — BananaBlocks, then Bitails' tx body, then
+            // WoC — the first clean "unspent" corroborates; a contradiction
+            // ("spent" where the primary said not) or a fault is an honest
+            // unknown, never a verdict. Bitails retired its per-output
+            // endpoint; its tx body reports an unspent output as `spent: ""`,
+            // which is unknown here, never corroboration.
+            for corroborator in ["bananablocks", "bitails_tx", "woc"] {
+                if corroborator == primary {
+                    continue;
+                }
+                let got = match corroborator {
+                    "bananablocks" => match provider_get(&format!(
+                        "{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend"
+                    ))
                     .await
-                {
-                    Some((status, body)) => {
-                        let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
-                        parse_bitails_unspent(status, v.as_ref())
+                    {
+                        Some((status, body)) => {
+                            let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                            parse_bananablocks_unspent(status, v.as_ref())
+                        }
+                        None => UnspentCorroboration::Unknown,
+                    },
+                    "bitails_tx" => {
+                        match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+                            Some((status, body)) => {
+                                let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                                crate::results::bitails_tx_unspent(status, v.as_ref(), vout)
+                            }
+                            None => UnspentCorroboration::Unknown,
+                        }
                     }
-                    None => UnspentCorroboration::Unknown,
+                    _ => match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await
+                    {
+                        Some((s, _))
+                            if matches!(
+                                crate::results::woc_spent_status_observation(s),
+                                SpentObservation::NotSpent
+                            ) =>
+                        {
+                            UnspentCorroboration::ConfirmedUnspent
+                        }
+                        _ => UnspentCorroboration::Unknown,
+                    },
                 };
+                if got == UnspentCorroboration::ConfirmedUnspent {
+                    bitails = got;
+                    break;
+                }
+            }
         }
         SpentObservation::Fault => {}
     }

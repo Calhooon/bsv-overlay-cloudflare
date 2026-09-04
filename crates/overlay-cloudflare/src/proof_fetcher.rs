@@ -32,7 +32,8 @@
 //! / `tokio` — so this stays `wasm32-unknown-unknown`-clean. bsv-rs is used only
 //! for the wasm-clean `transaction` surface.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use async_trait::async_trait;
@@ -141,6 +142,58 @@ pub struct ChainProofFetcher {
     tracker: Option<Rc<dyn ChainTracker>>,
     /// Per-tick fetch budget (remaining).
     budget: Cell<u32>,
+    /// 2026-09-04: per-rung tallies this tick (`rung_stats`) — the lifetime
+    /// `courier_<rung>_*_total` counters and the health surface's `couriers`
+    /// view are built from these.
+    rung_stats: RefCell<BTreeMap<&'static str, RungTally>>,
+    /// Consecutive transport/5xx/429 faults per rung this tick; at
+    /// [`RUNG_CIRCUIT_TRIP`] the rung is SKIPPED for the rest of the tick
+    /// (counted, never silent) so a dead provider stops burning the budget
+    /// and the healthy rungs' rate limits.
+    rung_consecutive_faults: RefCell<BTreeMap<&'static str, u32>>,
+    /// Owner ruling 2026-09-04 ("use all three, fallbacks being each other —
+    /// they all rate-limit"): the per-outpoint ladder STARTS at a different
+    /// rung each call and wraps, so no single provider carries every first
+    /// call (BananaBlocks allows 60/min); the other two are its fallbacks.
+    rung_rotation: Cell<usize>,
+}
+
+/// One courier rung's tally for the current tick.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RungTally {
+    /// answered (2xx / a clean 404)
+    pub ok: u32,
+    /// transport / 5xx / 429 / a malformed body
+    pub fault: u32,
+    /// not called: the rung's circuit was open
+    pub skipped: u32,
+}
+
+/// Consecutive faults that open a rung's circuit for the rest of the tick.
+pub const RUNG_CIRCUIT_TRIP: u32 = 3;
+
+/// PURE: is a rung's circuit open after `consecutive` faults?
+pub fn circuit_open(consecutive: u32) -> bool {
+    consecutive >= RUNG_CIRCUIT_TRIP
+}
+
+/// The courier rungs, in the order the health surface lists them.
+pub const COURIER_RUNGS: [&str; 6] = [
+    "bananablocks",
+    "woc",
+    "bitails_tx",
+    "woc_history",
+    "bitails_history",
+    "bananablocks_txo",
+];
+
+/// PURE: the call order for `n` rungs when this call's rotation index is
+/// `start` — every rung once, wrapping. `rotate_order(3, 4)` = `[1, 2, 0]`.
+pub fn rotate_order(n: usize, start: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    (0..n).map(|i| (start + i) % n).collect()
 }
 
 impl ChainProofFetcher {
@@ -156,7 +209,47 @@ impl ChainProofFetcher {
             woc_api_key: None,
             tracker,
             budget: Cell::new(DEFAULT_FETCH_BUDGET),
+            rung_stats: RefCell::new(BTreeMap::new()),
+            rung_consecutive_faults: RefCell::new(BTreeMap::new()),
+            rung_rotation: Cell::new(0),
         }
+    }
+
+    /// This tick's per-rung tallies (name → ok/fault/skipped).
+    pub fn rung_stats(&self) -> BTreeMap<&'static str, RungTally> {
+        self.rung_stats.borrow().clone()
+    }
+
+    fn rung_is_open(&self, name: &'static str) -> bool {
+        circuit_open(
+            *self
+                .rung_consecutive_faults
+                .borrow()
+                .get(name)
+                .unwrap_or(&0),
+        )
+    }
+
+    fn rung_ok(&self, name: &'static str) {
+        self.rung_stats.borrow_mut().entry(name).or_default().ok += 1;
+        self.rung_consecutive_faults.borrow_mut().insert(name, 0);
+    }
+
+    fn rung_fault(&self, name: &'static str) {
+        self.rung_stats.borrow_mut().entry(name).or_default().fault += 1;
+        *self
+            .rung_consecutive_faults
+            .borrow_mut()
+            .entry(name)
+            .or_insert(0) += 1;
+    }
+
+    fn rung_skipped(&self, name: &'static str) {
+        self.rung_stats
+            .borrow_mut()
+            .entry(name)
+            .or_default()
+            .skipped += 1;
     }
 
     /// Override the Arcade endpoint (default `arcade-v2-us-1.bsvblockchain.tech`).
@@ -381,41 +474,59 @@ impl ChainProofFetcher {
     async fn spender_hint_ladder(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
         let hdr_none: Option<(&str, &str)> = None;
         let woc_hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        let mut faults: Vec<String> = Vec::new();
-        for (name, url, hdr, parse) in [
+        // Owner ruling 2026-09-04: ALL THREE providers, each the others'
+        // fallback, because every one of them rate-limits — so the ladder
+        // starts at a different rung each call (`rotate_order`) and wraps.
+        //   bananablocks  `GET /txo/{txid}/{vout}/spend`   {spent, spentTxid}     60 req/min
+        //   woc           `GET /tx/{txid}/{vout}/spent`    {txid, status}         3 req/s free (api key lifts it)
+        //   bitails_tx    `GET /tx/{txid}`                 outputs[vout].{spent, spentIn}
+        //                 — Bitails runs in PRUNED mode and retired its
+        //                 per-output endpoint (`/output/{vout}/spent` answers
+        //                 500 on every outpoint); the tx body still names a
+        //                 spender for a SPENT output, and reports an unspent
+        //                 output as `spent: ""` — which parses as "could not
+        //                 look" (a fault), never as "unspent".
+        let rungs: [(
+            &'static str,
+            String,
+            Option<(&str, &str)>,
+            Box<dyn Fn(u16, &str) -> Result<Option<String>, String>>,
+        ); 3] = [
             (
                 "bananablocks",
                 bananablocks_spend_url(&self.bananablocks_base, txid, vout),
                 hdr_none,
-                parse_bananablocks_spend_body
-                    as fn(u16, &str, &str) -> Result<Option<String>, String>,
-            ),
-            (
-                "bitails",
-                bitails_spent_url(&self.bitails_base, txid, vout),
-                hdr_none,
-                parse_bitails_spend_body as fn(u16, &str, &str) -> Result<Option<String>, String>,
+                Box::new(move |st, body| parse_bananablocks_spend_body(st, body, txid)),
             ),
             (
                 "woc",
                 woc_spent_url(&self.woc_base, txid, vout),
                 woc_hdr,
-                parse_woc_spend_body as fn(u16, &str, &str) -> Result<Option<String>, String>,
+                Box::new(move |st, body| parse_woc_spend_body(st, body, txid)),
             ),
-        ] {
-            let remaining = self.budget.get();
-            if remaining == 0 {
-                faults.push(format!("{name}: per-tick fetch budget exhausted"));
-                break;
-            }
-            self.budget.set(remaining - 1);
-            match http_get(&url, hdr).await {
-                Err(e) => faults.push(format!("{name}: {e}")),
-                Ok((status, body)) => match parse(status, &body, txid) {
-                    Ok(Some(spender)) => return Ok(Some(spender)),
-                    Ok(None) => {}
-                    Err(e) => faults.push(format!("{name}: {e}")),
-                },
+            (
+                "bitails_tx",
+                bitails_tx_url(&self.bitails_base, txid),
+                hdr_none,
+                Box::new(move |st, body| parse_bitails_tx_spend_body(st, body, txid, vout)),
+            ),
+        ];
+        let start = self.rung_rotation.get();
+        self.rung_rotation.set(start.wrapping_add(1));
+        let mut faults: Vec<String> = Vec::new();
+        for i in rotate_order(rungs.len(), start) {
+            let (name, url, hdr, parse) = &rungs[i];
+            match self
+                .call_rung(name, url, *hdr, |st, body| parse(st, body))
+                .await
+            {
+                RungCall::Answer(Some(spender)) => return Ok(Some(spender)),
+                RungCall::Answer(None) => {}
+                RungCall::Fault(e) => faults.push(e),
+                RungCall::BudgetExhausted(e) => {
+                    faults.push(e);
+                    break;
+                }
             }
         }
         if faults.is_empty() {
@@ -428,12 +539,149 @@ impl ChainProofFetcher {
             ))
         }
     }
+
+    /// 2026-09-04: an OUTPUT'S LOCKING SCRIPT by outpoint from BananaBlocks
+    /// (`GET /txo/{txid}/{vout}` → `script_pubkey` hex) — the scripthash
+    /// rung's script source when the pot store holds no BEEF for the row.
+    async fn output_script_from_courier(
+        &self,
+        txid: &str,
+        vout: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/txo/{txid}/{vout}", self.bananablocks_base);
+        match self
+            .call_rung("bananablocks_txo", &url, None, |st, body| {
+                parse_bananablocks_txo_script(st, body)
+            })
+            .await
+        {
+            RungCall::Answer(script) => Ok(script),
+            RungCall::Fault(e) | RungCall::BudgetExhausted(e) => Err(e),
+        }
+    }
+
+    /// 2026-09-04 — the SCRIPTHASH-HISTORY ladder (`resolve_spender_by_script`):
+    /// WoC `/script/{h}/history` first, Bitails `/scripthash/{h}/history`
+    /// second (both proven live on a mined pot the day Bitails retired its
+    /// per-output endpoint). The first rung that ANSWERS decides: its
+    /// history minus the funding txid, newest first, at most
+    /// [`SCRIPT_HISTORY_MAX_CANDIDATES`]; an empty answer is a real "no other
+    /// tx" (no fall-through — a second index would only add a correlated
+    /// negative). Every rung faulting is `Err`.
+    async fn scripthash_history_ladder(
+        &self,
+        scripthash_le_hex: &str,
+        funding_txid: &str,
+    ) -> Result<Vec<String>, String> {
+        let hdr_none: Option<(&str, &str)> = None;
+        let woc_hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
+        let mut faults: Vec<String> = Vec::new();
+        for (name, url, hdr, parse) in [
+            (
+                "woc_history",
+                woc_script_history_url(&self.woc_base, scripthash_le_hex),
+                woc_hdr,
+                parse_woc_script_history
+                    as fn(u16, &str, &str) -> Result<Option<Vec<String>>, String>,
+            ),
+            (
+                "bitails_history",
+                bitails_script_history_url(&self.bitails_base, scripthash_le_hex),
+                hdr_none,
+                parse_bitails_script_history
+                    as fn(u16, &str, &str) -> Result<Option<Vec<String>>, String>,
+            ),
+        ] {
+            match self
+                .call_rung(name, &url, hdr, |status, body| {
+                    parse(status, body, funding_txid)
+                })
+                .await
+            {
+                RungCall::Answer(Some(candidates)) => return Ok(candidates),
+                RungCall::Answer(None) => return Ok(Vec::new()),
+                RungCall::Fault(e) => faults.push(e),
+                RungCall::BudgetExhausted(e) => {
+                    faults.push(e);
+                    break;
+                }
+            }
+        }
+        Err(format!(
+            "no history rung answered and {} faulted ({})",
+            faults.len(),
+            faults.join("; ")
+        ))
+    }
+
+    /// One courier call with the per-tick budget, the circuit breaker and
+    /// the tallies applied. `parse` turns (status, body) into the rung's
+    /// answer (`Ok(None)` = a clean negative).
+    async fn call_rung<T>(
+        &self,
+        name: &'static str,
+        url: &str,
+        hdr: Option<(&str, &str)>,
+        parse: impl Fn(u16, &str) -> Result<Option<T>, String>,
+    ) -> RungCall<T> {
+        if self.rung_is_open(name) {
+            self.rung_skipped(name);
+            return RungCall::Fault(format!(
+                "{name}: circuit open ({RUNG_CIRCUIT_TRIP} consecutive faults this tick)"
+            ));
+        }
+        let remaining = self.budget.get();
+        if remaining == 0 {
+            return RungCall::BudgetExhausted(format!("{name}: per-tick fetch budget exhausted"));
+        }
+        self.budget.set(remaining - 1);
+        match http_get(url, hdr).await {
+            Err(e) => {
+                self.rung_fault(name);
+                RungCall::Fault(format!("{name}: {e}"))
+            }
+            Ok((status, body)) => match parse(status, &body) {
+                Ok(answer) => {
+                    self.rung_ok(name);
+                    RungCall::Answer(answer)
+                }
+                Err(e) => {
+                    self.rung_fault(name);
+                    RungCall::Fault(format!("{name}: {e}"))
+                }
+            },
+        }
+    }
+}
+
+/// The outcome of one courier rung call.
+enum RungCall<T> {
+    /// The rung answered (`None` = a clean negative).
+    Answer(Option<T>),
+    /// Transport / 5xx / 429 / malformed body / circuit open — counted, and
+    /// the ladder moves on.
+    Fault(String),
+    /// The per-tick budget is gone — the ladder stops.
+    BudgetExhausted(String),
 }
 
 #[async_trait(?Send)]
 impl AncestorFetcher for ChainProofFetcher {
     async fn resolve_spender(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
         self.spender_hint_ladder(txid, vout).await
+    }
+
+    async fn resolve_spender_by_script(
+        &self,
+        scripthash_le_hex: &str,
+        funding_txid: &str,
+    ) -> Result<Vec<String>, String> {
+        self.scripthash_history_ladder(scripthash_le_hex, funding_txid)
+            .await
+    }
+
+    async fn output_script_hint(&self, txid: &str, vout: u32) -> Result<Option<Vec<u8>>, String> {
+        self.output_script_from_courier(txid, vout).await
     }
 
     async fn spender_binding_raw(
@@ -910,6 +1158,9 @@ pub struct MissingSpendSummary {
     /// `tm_lowfund` index) — the pass takes pots first, so a non-zero here
     /// means the pot backlog is empty and the hop backlog is draining.
     pub hop_rows: usize,
+    /// Of `discovered`, how many the SCRIPTHASH-HISTORY rung resolved after
+    /// the per-outpoint rungs could not (2026-09-04).
+    pub by_script: usize,
     /// Discoveries on rows admitted AFTER `MISSING_SPEND_NEW_ERA_CUTOFF_SECS`
     /// — a NEW-era pot whose spend nobody submitted is the pointer-heal
     /// regression signal (the legacy backlog never counts here). The monitor
@@ -949,43 +1200,140 @@ pub async fn discover_missing_spends(
     };
     for (rec, created_at_secs) in candidates {
         summary.scanned += 1;
-        if overlay_discovery::pot::storage::is_hop_row(&rec) {
+        // Examined — whatever happens next (the backoff that keeps a dead
+        // rung from pinning the pass on these same rows next tick).
+        if let Err(e) = pot_storage
+            .note_spend_discovery_attempt(&rec.txid, rec.output_index)
+            .await
+        {
+            dlog!(
+                "discover_missing_spends: {}:{} stamp failed: {e}",
+                rec.txid,
+                rec.output_index
+            );
+        }
+        let is_hop = overlay_discovery::pot::storage::is_hop_row(&rec);
+        if is_hop {
             summary.hop_rows += 1;
         }
         let new_era = created_at_secs.is_some_and(|t| t >= MISSING_SPEND_NEW_ERA_CUTOFF_SECS);
+        let mut via_script = false;
         let spender = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
             Ok(Some(s)) => s,
-            Ok(None) => {
-                summary.no_hint += 1;
-                continue;
-            }
-            Err(e) => {
-                summary.faults += 1;
-                dlog!(
-                    "discover_missing_spends: {}:{} hint ladder faulted: {e}",
-                    rec.txid,
-                    rec.output_index
-                );
-                continue;
+            outpoint_answer => {
+                // The per-outpoint rungs did not name a spender (a clean "no
+                // hint" or a fault). A POT's covenant script is unique to it,
+                // so a script-history index answers where an outpoint index
+                // cannot — the rung that survives a provider retiring its
+                // per-output data. Never for a hop row: an address script's
+                // history is long and shared.
+                let script_candidates = if is_hop {
+                    None
+                } else {
+                    let from_store = match pot_storage.get_beef(&rec.txid).await {
+                        Ok(Some(bytes)) => {
+                            funding_output_script(&bytes, &rec.txid, rec.output_index)
+                        }
+                        _ => None,
+                    };
+                    let script = match from_store {
+                        Some(s) => Some(s),
+                        // No stored BEEF (a pre-store-era row): the courier's
+                        // own output index serves the script (BananaBlocks).
+                        None => fetcher
+                            .output_script_hint(&rec.txid, rec.output_index)
+                            .await
+                            .ok()
+                            .flatten(),
+                    };
+                    script
+                        .filter(|s| !is_p2pkh_script(s))
+                        .map(|s| scripthash_le_hex(&s))
+                };
+                let mut found: Option<String> = None;
+                let mut script_fault: Option<String> = None;
+                if let Some(sh) = script_candidates {
+                    match fetcher.resolve_spender_by_script(&sh, &rec.txid).await {
+                        Ok(cands) => {
+                            for cand in cands {
+                                match fetcher
+                                    .spender_binding_raw(&cand, &rec.txid, rec.output_index)
+                                    .await
+                                {
+                                    Ok(Some(_raw)) => {
+                                        found = Some(cand);
+                                        break;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        script_fault =
+                                            Some(format!("candidate {cand} raw fault: {e}"));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => script_fault = Some(e),
+                    }
+                }
+                match (found, outpoint_answer, script_fault) {
+                    (Some(s), _, _) => {
+                        via_script = true;
+                        s
+                    }
+                    (None, Ok(None), None) => {
+                        summary.no_hint += 1;
+                        continue;
+                    }
+                    (None, Ok(None), Some(e)) => {
+                        summary.faults += 1;
+                        dlog!(
+                            "discover_missing_spends: {}:{} script rung faulted: {e}",
+                            rec.txid,
+                            rec.output_index
+                        );
+                        continue;
+                    }
+                    (None, Err(e), script) => {
+                        summary.faults += 1;
+                        dlog!(
+                            "discover_missing_spends: {}:{} hint ladder faulted: {e}{}",
+                            rec.txid,
+                            rec.output_index,
+                            script
+                                .map(|s| format!("; script rung: {s}"))
+                                .unwrap_or_default()
+                        );
+                        continue;
+                    }
+                    (None, Ok(Some(_)), _) => unreachable!("a named spender is handled above"),
+                }
             }
         };
-        match fetcher
-            .spender_binding_raw(&spender, &rec.txid, rec.output_index)
-            .await
-        {
-            Ok(Some(_raw)) => {}
-            Ok(None) => {
-                summary.unbound += 1;
-                continue;
-            }
-            Err(e) => {
-                summary.faults += 1;
-                dlog!(
-                    "discover_missing_spends: {}:{} spender {spender} raw fault: {e}",
-                    rec.txid,
-                    rec.output_index
-                );
-                continue;
+        if via_script {
+            // The script rung's candidate is already bound (the loop above
+            // fetched its raw and checked the input); skip the second binding
+            // fetch — the budget is the scarce thing.
+        }
+        if !via_script {
+            match fetcher
+                .spender_binding_raw(&spender, &rec.txid, rec.output_index)
+                .await
+            {
+                Ok(Some(_raw)) => {}
+                Ok(None) => {
+                    summary.unbound += 1;
+                    continue;
+                }
+                Err(e) => {
+                    summary.faults += 1;
+                    dlog!(
+                        "discover_missing_spends: {}:{} spender {spender} raw fault: {e}",
+                        rec.txid,
+                        rec.output_index
+                    );
+                    continue;
+                }
             }
         }
         match pot_storage
@@ -1002,6 +1350,9 @@ pub async fn discover_missing_spends(
         {
             Ok(()) => {
                 summary.discovered += 1;
+                if via_script {
+                    summary.by_script += 1;
+                }
                 if new_era {
                     summary.discovered_new_era += 1;
                 }
@@ -1138,6 +1489,7 @@ fn parse_bananablocks_spend_body(
 /// `parse_bitails_unspent` (`{"spent": bool, …}`); the spender is accepted
 /// from `spentTxid` or `spentIn.txid`, and a spent:true answer carrying
 /// neither is drift ⇒ FAULT (self-announcing, per the finding-7 rule).
+#[allow(dead_code)] // RETIRED rung (2026-09-04, Bitails pruned mode) — kept for its pins
 fn parse_bitails_spend_body(
     status: u16,
     body: &str,
@@ -1213,8 +1565,226 @@ fn bananablocks_spend_url(base: &str, txid: &str, vout: u32) -> String {
 }
 
 /// Bitails outpoint-spend URL, the shape the app-layer already queries.
+/// RETIRED rung (2026-09-04): Bitails removed per-output spend data (pruned
+/// mode); this endpoint answers 500 on every outpoint. Kept for its pin only.
+#[allow(dead_code)]
 fn bitails_spent_url(base: &str, txid: &str, vout: u32) -> String {
     format!("{base}/tx/{txid}/output/{vout}/spent")
+}
+
+fn bitails_tx_url(base: &str, txid: &str) -> String {
+    format!("{base}/tx/{txid}")
+}
+
+/// Bitails `GET /tx/{txid}` → `outputs[vout]`: `spent: true` + a well-formed
+/// `spentIn.txid` names the spender; `spent: false` is a clean negative;
+/// anything else (`spent: ""` — pruned/unknown — a missing output, no
+/// `outputs`) is "could not look" (a fault). Never "unspent" by absence.
+fn parse_bitails_tx_spend_body(
+    status: u16,
+    body: &str,
+    outpoint_txid: &str,
+    vout: u32,
+) -> Result<Option<String>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let out = v
+        .get("outputs")
+        .and_then(|o| o.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|o| o.get("index").and_then(|i| i.as_u64()) == Some(u64::from(vout)))
+        })
+        .ok_or_else(|| format!("tx body without output {vout}"))?;
+    match out.get("spent").and_then(serde_json::Value::as_bool) {
+        Some(false) => Ok(None),
+        Some(true) => well_formed_spender(
+            out.get("spentIn")
+                .and_then(|s| s.get("txid"))
+                .and_then(|t| t.as_str()),
+            outpoint_txid,
+        )
+        .map(Some)
+        .ok_or_else(|| {
+            excerpt(
+                "spent:true without a well-formed spentIn.txid (pruned?)",
+                body,
+            )
+        }),
+        None => Err("no spend data for the output (Bitails pruned mode)".to_string()),
+    }
+}
+
+/// BananaBlocks `GET /txo/{txid}/{vout}` → `script_pubkey` hex (the output's
+/// locking script). A 404 = the index never saw the outpoint.
+fn parse_bananablocks_txo_script(status: u16, body: &str) -> Result<Option<Vec<u8>>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let hex_script = v
+        .get("script_pubkey")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| excerpt("2xx without script_pubkey (schema drift?)", body))?;
+    let bytes = hex::decode(hex_script).map_err(|e| format!("script_pubkey hex: {e}"))?;
+    if bytes.is_empty() {
+        return Err("empty script_pubkey".to_string());
+    }
+    Ok(Some(bytes))
+}
+
+fn woc_script_history_url(woc_base: &str, scripthash_le_hex: &str) -> String {
+    format!("{woc_base}/script/{scripthash_le_hex}/history")
+}
+
+fn bitails_script_history_url(base: &str, scripthash_le_hex: &str) -> String {
+    format!("{base}/scripthash/{scripthash_le_hex}/history")
+}
+
+/// At most this many spender candidates from a script history (a pot's
+/// history is `[funding, spender]`; more than a few means a reused script,
+/// which this rung is not for).
+pub const SCRIPT_HISTORY_MAX_CANDIDATES: usize = 3;
+
+/// The scripthash a courier's script-history index is keyed by: sha256 of
+/// the locking script, byte-reversed, lowercase hex (the Electrum
+/// convention WoC and Bitails share).
+pub fn scripthash_le_hex(locking_script: &[u8]) -> String {
+    let mut h = bsv_rs::primitives::hash::sha256(locking_script);
+    h.reverse();
+    hex::encode(h)
+}
+
+/// A standard P2PKH locking script (`OP_DUP OP_HASH160 <20> OP_EQUALVERIFY
+/// OP_CHECKSIG`) — a reused ADDRESS script whose history is long and shared;
+/// the scripthash rung is for unique pot scripts, never for these.
+pub fn is_p2pkh_script(script: &[u8]) -> bool {
+    script.len() == 25
+        && script[0] == 0x76
+        && script[1] == 0xa9
+        && script[2] == 0x14
+        && script[23] == 0x88
+        && script[24] == 0xac
+}
+
+/// The locking script of `txid`'s output `vout` from stored bytes — a BEEF
+/// (the pot-beef store's shape) or a raw transaction — verified to be that
+/// txid's; `None` when the bytes do not parse, name another tx, or lack the
+/// output.
+pub fn funding_output_script(bytes: &[u8], txid: &str, vout: u32) -> Option<Vec<u8>> {
+    let tx = Transaction::from_beef(bytes, Some(txid))
+        .or_else(|_| Transaction::from_binary(bytes))
+        .ok()?;
+    if !tx.id().eq_ignore_ascii_case(txid) {
+        return None;
+    }
+    Some(tx.outputs.get(vout as usize)?.locking_script.to_binary())
+}
+
+/// PURE: the spender candidates a script history names — every txid other
+/// than the funding tx, newest first, deduped, capped — from a list of
+/// (txid, height-or-0) rows. `None` when the history is exactly the funding
+/// tx (a clean "no other tx").
+pub fn script_history_candidates(
+    rows: &[(String, u64)],
+    funding_txid: &str,
+) -> Option<Vec<String>> {
+    let mut out: Vec<(u64, String)> = Vec::new();
+    for (txid, height) in rows {
+        let t = txid.to_lowercase();
+        if t.len() != 64
+            || !t.bytes().all(|b| b.is_ascii_hexdigit())
+            || t.eq_ignore_ascii_case(funding_txid)
+        {
+            continue;
+        }
+        if !out.iter().any(|(_, x)| *x == t) {
+            out.push((*height, t));
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    Some(
+        out.into_iter()
+            .map(|(_, t)| t)
+            .take(SCRIPT_HISTORY_MAX_CANDIDATES)
+            .collect(),
+    )
+}
+
+/// WoC `GET /script/{h}/history` → `[{"tx_hash","height"},…]` (an empty list
+/// is a script the index never saw = no other tx).
+fn parse_woc_script_history(
+    status: u16,
+    body: &str,
+    funding_txid: &str,
+) -> Result<Option<Vec<String>>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let arr = v
+        .as_array()
+        .or_else(|| v.get("result").and_then(|r| r.as_array()))
+        .ok_or_else(|| excerpt("2xx without a history list (schema drift?)", body))?;
+    let rows: Vec<(String, u64)> = arr
+        .iter()
+        .filter_map(|e| {
+            let t = e.get("tx_hash").or_else(|| e.get("txid"))?.as_str()?;
+            let h = e
+                .get("height")
+                .and_then(|h| h.as_i64())
+                .map_or(0, |h| h.max(0) as u64);
+            Some((t.to_string(), h))
+        })
+        .collect();
+    Ok(script_history_candidates(&rows, funding_txid))
+}
+
+/// Bitails `GET /scripthash/{h}/history` → `{"scripthash","history":[{"txid",
+/// "blockheight"?,…}]}`.
+fn parse_bitails_script_history(
+    status: u16,
+    body: &str,
+    funding_txid: &str,
+) -> Result<Option<Vec<String>>, String> {
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let arr = v
+        .get("history")
+        .and_then(|h| h.as_array())
+        .ok_or_else(|| excerpt("2xx without a history list (schema drift?)", body))?;
+    let rows: Vec<(String, u64)> = arr
+        .iter()
+        .filter_map(|e| {
+            let t = e.get("txid")?.as_str()?;
+            let h = e
+                .get("blockheight")
+                .or_else(|| e.get("height"))
+                .and_then(|h| h.as_i64())
+                .map_or(0, |h| h.max(0) as u64);
+            Some((t.to_string(), h))
+        })
+        .collect();
+    Ok(script_history_candidates(&rows, funding_txid))
 }
 
 /// TRUE iff `raw_hex` parses to a tx with an input consuming exactly
@@ -3324,6 +3894,25 @@ mod tests {
                 return Err("mock: hint transport down".into());
             }
             Ok(self.spender_hints.get(&(txid.to_string(), vout)).cloned())
+        }
+
+        /// The script rung's answer rides `spender_hints` under the key
+        /// `("script:<scripthash>", 0)` → one candidate (no new field, so
+        /// every existing literal construction of the mock still compiles).
+        async fn resolve_spender_by_script(
+            &self,
+            scripthash_le_hex: &str,
+            _funding_txid: &str,
+        ) -> Result<Vec<String>, String> {
+            if self.hint_fault {
+                return Err("mock: history transport down".into());
+            }
+            Ok(self
+                .spender_hints
+                .get(&(format!("script:{scripthash_le_hex}"), 0))
+                .cloned()
+                .into_iter()
+                .collect())
         }
         async fn spender_binding_raw(
             &self,
@@ -5711,6 +6300,163 @@ mod tests {
     /// bsv-low W4 (2026-09-04): a stale UNSPENT pot gets its spender from the
     /// hint ladder, bound by the spender's raw, and recorded UNCONFIRMED; a
     /// hint that does not bind is ignored; a ladder fault is counted, never a write.
+    #[test]
+    fn rotate_order_visits_every_rung_once_from_a_moving_start() {
+        assert_eq!(rotate_order(3, 0), vec![0, 1, 2]);
+        assert_eq!(rotate_order(3, 4), vec![1, 2, 0]);
+        assert_eq!(rotate_order(0, 7), Vec::<usize>::new());
+        assert!(!circuit_open(RUNG_CIRCUIT_TRIP - 1));
+        assert!(circuit_open(RUNG_CIRCUIT_TRIP));
+    }
+
+    #[test]
+    fn bitails_tx_body_names_a_spender_and_never_reads_pruned_as_unspent() {
+        let t = "aa".repeat(32);
+        let spent = format!(
+            r#"{{"txid":"{t}","outputs":[{{"index":0,"spent":true,"spentIn":{{"txid":"{}"}}}},{{"index":1,"spent":false}}]}}"#,
+            "bb".repeat(32)
+        );
+        assert_eq!(
+            parse_bitails_tx_spend_body(200, &spent, &t, 0).unwrap(),
+            Some("bb".repeat(32))
+        );
+        assert_eq!(
+            parse_bitails_tx_spend_body(200, &spent, &t, 1).unwrap(),
+            None
+        );
+        // pruned: `spent: ""` is "could not look", never unspent
+        let pruned = format!(r#"{{"txid":"{t}","outputs":[{{"index":0,"spent":""}}]}}"#);
+        assert!(parse_bitails_tx_spend_body(200, &pruned, &t, 0).is_err());
+        assert!(
+            parse_bitails_tx_spend_body(200, &spent, &t, 5).is_err(),
+            "no such output"
+        );
+        assert_eq!(parse_bitails_tx_spend_body(404, "", &t, 0).unwrap(), None);
+        assert!(parse_bitails_tx_spend_body(500, "", &t, 0).is_err());
+    }
+
+    #[test]
+    fn script_history_parsers_name_every_other_tx_newest_first_and_capped() {
+        let f = "aa".repeat(32);
+        let s1 = "bb".repeat(32);
+        let s2 = "cc".repeat(32);
+        let woc = format!(
+            r#"[{{"tx_hash":"{f}","height":10}},{{"tx_hash":"{s1}","height":10}},{{"tx_hash":"{s2}","height":12}}]"#
+        );
+        assert_eq!(
+            parse_woc_script_history(200, &woc, &f).unwrap(),
+            Some(vec![s2.clone(), s1.clone()])
+        );
+        let only = format!(r#"[{{"tx_hash":"{f}","height":10}}]"#);
+        assert_eq!(
+            parse_woc_script_history(200, &only, &f).unwrap(),
+            None,
+            "the funding tx alone = no other tx"
+        );
+        let bit = format!(
+            r#"{{"scripthash":"x","history":[{{"txid":"{s1}","blockheight":10}},{{"txid":"{f}","blockheight":10}}]}}"#
+        );
+        assert_eq!(
+            parse_bitails_script_history(200, &bit, &f).unwrap(),
+            Some(vec![s1.clone()])
+        );
+        assert!(parse_woc_script_history(429, "", &f).is_err());
+        let rows: Vec<(String, u64)> = (0..6).map(|i| (format!("{:0>64x}", i + 1), i)).collect();
+        assert_eq!(
+            script_history_candidates(&rows, "zz").unwrap().len(),
+            SCRIPT_HISTORY_MAX_CANDIDATES
+        );
+    }
+
+    #[test]
+    fn scripthash_and_script_helpers() {
+        // sha256("") reversed, the Electrum scripthash of an empty script
+        assert_eq!(
+            scripthash_le_hex(&[]),
+            "55b852781b9995a44c939b64e441ae2724b96f99c8f4fb9a141cfc9842c4b0e3"
+        );
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend([0u8; 20]);
+        p2pkh.extend([0x88, 0xac]);
+        assert!(is_p2pkh_script(&p2pkh));
+        assert!(!is_p2pkh_script(&[0x51]));
+        // the funding output script from a raw tx (a synthetic one-output tx)
+        let mut tx = Transaction::new();
+        tx.add_output(bsv_rs::transaction::TransactionOutput {
+            satoshis: Some(1000),
+            locking_script: bsv_rs::script::LockingScript::from_binary(&[0x51, 0x52]).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let raw = tx.to_binary();
+        let id = tx.id();
+        assert_eq!(funding_output_script(&raw, &id, 0), Some(vec![0x51, 0x52]));
+        assert_eq!(funding_output_script(&raw, &id, 1), None);
+        assert_eq!(
+            funding_output_script(&raw, &"00".repeat(32), 0),
+            None,
+            "another tx's id"
+        );
+        let bb = format!(r#"{{"value":1000,"index":0,"script_pubkey":"5152"}}"#);
+        assert_eq!(
+            parse_bananablocks_txo_script(200, &bb).unwrap(),
+            Some(vec![0x51, 0x52])
+        );
+        assert_eq!(parse_bananablocks_txo_script(404, "").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn discover_missing_spends_resolves_a_pot_through_the_script_rung_when_outpoint_rungs_cannot(
+    ) {
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        // A pot whose funding raw is in the store; no outpoint hint at all
+        // (the shape Bitails' retirement leaves behind) — the script rung
+        // names the spender, the binding raw proves it, the pass records it.
+        let mut tx = Transaction::new();
+        tx.add_output(bsv_rs::transaction::TransactionOutput {
+            satoshis: Some(1000),
+            locking_script: bsv_rs::script::LockingScript::from_binary(&[0x51, 0x52, 0x53])
+                .unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let pot = tx.id();
+        let sh = scripthash_le_hex(&[0x51, 0x52, 0x53]);
+        let store = MemoryPotStorage::default();
+        store
+            .store_record(&PotRecord {
+                txid: pot.clone(),
+                output_index: 0,
+                lock_kind: Some("covenant".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store.store_beef(&pot, &tx.to_binary()).await.unwrap();
+        let spender = "11".repeat(32);
+        let mut hints = std::collections::HashMap::new();
+        hints.insert((format!("script:{sh}"), 0), spender.clone());
+        let mut binding = std::collections::HashMap::new();
+        binding.insert(spender.clone(), "00".to_string());
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: hints,
+            binding_raw: binding,
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        let s = discover_missing_spends(&store, &fetcher, 5, 0).await;
+        assert_eq!(
+            (s.scanned, s.discovered, s.by_script, s.no_hint, s.faults),
+            (1, 1, 1, 0, 0)
+        );
+        let rec = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(rec.spent && rec.spending_txid.as_deref() == Some(spender.as_str()));
+        // examined rows are stamped: a second pass with the same store finds no candidate
+        let s2 = discover_missing_spends(&store, &fetcher, 5, 0).await;
+        assert_eq!(s2.scanned, 0);
+    }
+
     #[tokio::test]
     async fn discover_missing_spends_pots_first_and_new_era_counted() {
         use overlay_discovery::pot::storage::MemoryPotStorage;

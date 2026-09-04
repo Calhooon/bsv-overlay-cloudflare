@@ -1640,14 +1640,26 @@ pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
 /// hop tx, change included) and on beta 3,571 of 3,670 stale rows were hop
 /// rows standing in front of 99 real pots — the pass had chewed 08-14 change
 /// for a day while the pots waited. A hop row still drains, after the pots.
+/// bsv-low (2026-09-04): a row the discovery pass examined (any outcome) is
+/// not a candidate again for this long — a dead courier rung must never pin
+/// the pass on the same rows (beta: four ticks on the same 20 under Bitails'
+/// retired endpoint). Stamped by `note_spend_discovery_attempt`.
+pub(crate) const SPEND_DISCOVERY_BACKOFF_SECS: u64 = 3600;
+
 pub(crate) fn pot_unspent_stale_sql(limit: u64, min_age_secs: u64) -> String {
     format!(
         "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, createdAt FROM pot_records \
          WHERE spent = 0 \
            AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
+           AND (spendDiscoveryAt IS NULL OR spendDiscoveryAt <= unixepoch() - {SPEND_DISCOVERY_BACKOFF_SECS}) \
          ORDER BY CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END ASC, createdAt ASC LIMIT {limit}"
     )
 }
+
+/// The examine stamp (`note_spend_discovery_attempt`): a const so the
+/// real-SQLite tier runs the shipped string against the shipped schema.
+pub(crate) const POT_SPEND_DISCOVERY_STAMP_SQL: &str =
+    "UPDATE pot_records SET spendDiscoveryAt = unixepoch() WHERE txid = ? AND outputIndex = ?";
 
 pub(crate) fn pot_spent_unconfirmed_sql(limit: u64, min_age_secs: u64) -> String {
     format!(
@@ -2536,6 +2548,20 @@ impl PotStorage for D1PotStorage {
         let sql = pot_unspent_stale_sql(limit, min_age_secs);
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn note_spend_discovery_attempt(
+        &self,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<(), PotStorageError> {
+        Query::new(POT_SPEND_DISCOVERY_STAMP_SQL)
+            .bind(txid.to_lowercase())
+            .bind(output_index as f64)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(())
     }
 
     async fn find_unspent_stale_with_age(
@@ -6639,6 +6665,13 @@ mod tests {
             sql.contains("lockKind, createdAt FROM pot_records"),
             "the age-aware pass reads the stamp and the kind"
         );
+        // 2026-09-04: a row examined within the backoff is not a candidate —
+        // a dead courier rung cannot pin the pass on the same rows.
+        assert!(
+            sql.contains("spendDiscoveryAt IS NULL OR spendDiscoveryAt <= unixepoch() - 3600"),
+            "examined rows back off for an hour"
+        );
+        assert!(POT_SPEND_DISCOVERY_STAMP_SQL.contains("SET spendDiscoveryAt = unixepoch()"));
     }
 
     #[test]

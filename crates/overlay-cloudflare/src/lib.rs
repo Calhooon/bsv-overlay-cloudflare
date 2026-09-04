@@ -424,6 +424,26 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
 /// works only if ChainTracks is off-account; with no tracker at all each
 /// consumer fails open/safe (ls_low: no expiry filter; ls_pot: spends record
 /// as unconfirmed hints).
+/// 2026-09-04: EVERY courier fetcher this worker builds — the Arcade URL from
+/// the var and the WoC api key from the `WOC_API_KEY` secret (the plumbing
+/// existed; nothing wired the secret, so every WoC read ran on the free tier
+/// that 429s under load — the repo's most-documented outage class).
+fn courier_fetcher(
+    env: &Env,
+    tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>>,
+) -> crate::proof_fetcher::ChainProofFetcher {
+    let mut f = crate::proof_fetcher::ChainProofFetcher::new(tracker);
+    if let Some(u) = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        f = f.with_arcade_url(u);
+    }
+    f.with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()))
+}
+
 fn lookup_service_chain_tracker(env: &Env) -> Option<Rc<dyn bsv_rs::transaction::ChainTracker>> {
     let ct_url = env
         .var("CHAIN_TRACKER_URL")
@@ -974,15 +994,7 @@ fn build_engine_with_storage(
     // Without a chain tracker it degrades to a pure retry (no proof can ever be
     // verified — fail-closed).
     let proof_tracker = lookup_service_chain_tracker(env);
-    let mut proof_fetcher = crate::proof_fetcher::ChainProofFetcher::new(proof_tracker);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        proof_fetcher = proof_fetcher.with_arcade_url(u);
-    }
+    let proof_fetcher = courier_fetcher(&env, proof_tracker);
     engine.set_ancestor_fetcher(std::rc::Rc::new(proof_fetcher));
 
     engine
@@ -1248,27 +1260,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     //    not-yet-verified pot BEEF; its candidate page is
     //    POT_PROOF_PASS_LIMIT (drain + op math at the const), courier
     //    traffic independently bounded by its fetcher budget.
-    let mut spend_fetcher =
-        crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(&env))
-            .with_budget(20);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        spend_fetcher = spend_fetcher.with_arcade_url(u);
-    }
+    let spend_fetcher = courier_fetcher(&env, lookup_service_chain_tracker(&env)).with_budget(20);
     let pot_tracker = lookup_service_chain_tracker(&env);
-    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        pot_fetcher = pot_fetcher.with_arcade_url(u);
-    }
+    let pot_fetcher = courier_fetcher(&env, pot_tracker);
     let (spend_summary, pot_summary) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,
@@ -1298,17 +1292,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // confirmation pass's 20-call budget and faulted 11 of 20 candidates on
     // "budget exhausted"): up to 4 courier calls per candidate, never a call
     // taken from the money-relevant confirmation pass.
-    let mut discovery_fetcher =
-        crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(&env))
-            .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        discovery_fetcher = discovery_fetcher.with_arcade_url(u);
-    }
+    let discovery_fetcher = courier_fetcher(&env, lookup_service_chain_tracker(&env))
+        .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET);
     let missing = crate::proof_fetcher::discover_missing_spends(
         pot_storage.as_ref(),
         &discovery_fetcher,
@@ -1317,16 +1302,21 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     )
     .await;
     worker::console_log!(
-        "Scheduled: missing-spend discovery (pot_records) — scanned={} discovered={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={}",
+        "Scheduled: missing-spend discovery (pot_records) — scanned={} discovered={} by_script={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={} couriers={:?}",
         missing.scanned,
         missing.discovered,
+        missing.by_script,
         missing.no_hint,
         missing.unbound,
         missing.faults,
         missing.write_errors,
         missing.hop_rows,
-        missing.discovered_new_era
+        missing.discovered_new_era,
+        discovery_fetcher.rung_stats()
     );
+    // 2026-09-04: each rung's ok/fault/skipped this tick → the lifetime
+    // `courier_<rung>_*_total` counters (`/health/invariants`, the monitor).
+    crate::ops::record_courier_tallies(&ops_db, &discovery_fetcher.rung_stats()).await;
     // 2026-09-04: the pass's lifetime counters ride `/health/invariants`
     // (`counters.missing_spend_*`) so the backlog's drain, the couriers'
     // faults and — the paged one — NEW-era discoveries are observable without
@@ -1726,27 +1716,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
     //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
     //    order as the scheduled tick). Own fetchers, own budget cells.
-    let mut spend_fetcher =
-        crate::proof_fetcher::ChainProofFetcher::new(lookup_service_chain_tracker(env))
-            .with_budget(20);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        spend_fetcher = spend_fetcher.with_arcade_url(u);
-    }
+    let spend_fetcher = courier_fetcher(&env, lookup_service_chain_tracker(env)).with_budget(20);
     let pot_tracker = lookup_service_chain_tracker(env);
-    let mut pot_fetcher = crate::proof_fetcher::ChainProofFetcher::new(pot_tracker);
-    if let Some(u) = env
-        .var("ARCADE_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-    {
-        pot_fetcher = pot_fetcher.with_arcade_url(u);
-    }
+    let pot_fetcher = courier_fetcher(&env, pot_tracker);
     let (ss, ps) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,

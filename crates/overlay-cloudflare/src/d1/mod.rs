@@ -421,7 +421,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 117 → 118 for bsv-low #403 board paging (2026-08-29):
 /// `idx_pot_records_chain_wins` — the whole-era chain-wins spine's scan
 /// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
-pub const OVERLAY_MIGRATION_COUNT: usize = 136;
+/// 136 → 137 (2026-09-04): `pot_records.spendDiscoveryAt` — the discovery
+/// pass's examine stamp (its candidate query backs examined rows off an hour).
+pub const OVERLAY_MIGRATION_COUNT: usize = 137;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1528,6 +1530,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         loserCardsHex TEXT,
         PRIMARY KEY (gameId, winner)
     )",
+    // 2026-09-04: the discovery pass's examine stamp (unix seconds); NULL = never examined.
+    "ALTER TABLE pot_records ADD COLUMN spendDiscoveryAt INTEGER",
 ];
 
 // =============================================================================

@@ -154,6 +154,8 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 /// instead of an opaque network error.
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // 2026-09-04: the WoC api key for this isolate's provider reads (see routes::provider_get).
+    routes::set_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()));
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
     console_error_panic_hook::set_once();
 

@@ -289,6 +289,33 @@ pub trait AncestorFetcher {
         Ok(None)
     }
 
+    /// bsv-low (2026-09-04) — the SCRIPTHASH-HISTORY rung: the txids a
+    /// courier's script-history index lists for `scripthash_le_hex` OTHER
+    /// than `funding_txid` (newest first, a few at most). A pot's covenant
+    /// script is unique to that pot, so its history is exactly
+    /// `[funding, spender]` and the answer is the spender CANDIDATE; the
+    /// caller BINDS it with [`spender_binding_raw`] before believing it. This
+    /// rung survives a provider retiring its per-output spend endpoint
+    /// (Bitails, pruned mode, 2026-09). `Err` = every rung faulted; an empty
+    /// `Ok` = the indexes answered and list no other tx. Default: no index.
+    ///
+    /// [`spender_binding_raw`]: AncestorFetcher::spender_binding_raw
+    async fn resolve_spender_by_script(
+        &self,
+        _scripthash_le_hex: &str,
+        _funding_txid: &str,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// bsv-low (2026-09-04): an output's LOCKING SCRIPT by outpoint from a
+    /// courier's output index (BananaBlocks `/txo/{txid}/{vout}`) — the
+    /// scripthash rung's script source when no BEEF is stored for the row.
+    /// `Ok(None)` = the index never saw it. Default: no such index.
+    async fn output_script_hint(&self, _txid: &str, _vout: u32) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+
     /// `spender`'s raw tx hex — fetched CONTENT-ADDRESSED (the bytes must
     /// hash to `spender`) — returned iff those bytes carry an input spending
     /// exactly `txid:vout`. This is the binding that turns

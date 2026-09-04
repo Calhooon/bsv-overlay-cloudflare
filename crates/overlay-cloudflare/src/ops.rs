@@ -80,6 +80,13 @@ pub const COUNTER_MISSING_SPEND_SCANNED: &str = "missing_spend_scanned_total";
 pub const COUNTER_MISSING_SPEND_DISCOVERED: &str = "missing_spend_discovered_total";
 pub const COUNTER_MISSING_SPEND_FAULTS: &str = "missing_spend_faults_total";
 pub const COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: &str = "missing_spend_discovered_new_era_total";
+/// bsv-low (2026-09-04): per-courier-rung lifetime tallies —
+/// `courier_<rung>_{ok,fault,skipped}_total` for every rung in
+/// [`crate::proof_fetcher::COURIER_RUNGS`] ("skipped" = the rung's circuit
+/// was open). The health surface folds them into `indexJanitor.couriers`.
+pub fn courier_counter_name(rung: &str, kind: &str) -> String {
+    format!("courier_{rung}_{kind}_total")
+}
 
 /// Default staleness budget for `/health/invariants?strict=1`: 6 hours. The
 /// completion cron runs every 15 min (`wrangler.toml crons`), so 6h ≈ 24 dead
@@ -170,6 +177,39 @@ pub async fn record_missing_spend_pass(
             bump_counter(db, name, delta).await;
         }
     }
+}
+
+/// bsv-low (2026-09-04): one tick's courier tallies → the lifetime counters.
+pub async fn record_courier_tallies(
+    db: &D1Database,
+    stats: &std::collections::BTreeMap<&'static str, crate::proof_fetcher::RungTally>,
+) {
+    for (rung, t) in stats {
+        for (kind, delta) in [("ok", t.ok), ("fault", t.fault), ("skipped", t.skipped)] {
+            if delta > 0 {
+                bump_counter(db, &courier_counter_name(rung, kind), u64::from(delta)).await;
+            }
+        }
+    }
+}
+
+/// PURE: the health surface's `couriers` view — `{rung: {ok, fault,
+/// skipped}}` from the flat counters object (absent = 0).
+pub fn couriers_view(counters: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for rung in crate::proof_fetcher::COURIER_RUNGS {
+        let get = |kind: &str| {
+            counters
+                .get(courier_counter_name(rung, kind))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        out.insert(
+            rung.to_string(),
+            json!({ "ok": get("ok"), "fault": get("fault"), "skipped": get("skipped") }),
+        );
+    }
+    serde_json::Value::Object(out)
 }
 
 /// bsv-low (2026-09-04): the index janitor's live backlog, by row kind —
@@ -465,6 +505,12 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_MISSING_SPEND_FAULTS: 0,
         COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: 0,
     });
+    // 2026-09-04: every courier rung reads an explicit 0 until it is called.
+    for rung in crate::proof_fetcher::COURIER_RUNGS {
+        for kind in ["ok", "fault", "skipped"] {
+            obj[courier_counter_name(rung, kind)] = json!(0);
+        }
+    }
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);
     }
@@ -686,7 +732,9 @@ pub async fn health_invariants(
             .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
-    let index_janitor = index_janitor_backlog(db).await;
+    let mut index_janitor = index_janitor_backlog(db).await;
+    // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
+    index_janitor["couriers"] = couriers_view(&counters);
     let body = json!({
         "ok": !dead,
         "service": "low-overlay",
@@ -753,6 +801,23 @@ mod tests {
             COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: no_token,
             COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: bad_token,
         })
+    }
+
+    #[test]
+    fn couriers_view_folds_the_flat_counters_per_rung_with_explicit_zeroes() {
+        let c = json!({ "courier_woc_ok_total": 7, "courier_woc_fault_total": 2, "courier_bitails_tx_skipped_total": 1 });
+        let v = couriers_view(&c);
+        assert_eq!(v["woc"]["ok"], 7);
+        assert_eq!(v["woc"]["fault"], 2);
+        assert_eq!(v["bitails_tx"]["skipped"], 1);
+        assert_eq!(
+            v["bananablocks"]["ok"], 0,
+            "never called reads an explicit 0"
+        );
+        assert_eq!(
+            courier_counter_name("woc_history", "fault"),
+            "courier_woc_history_fault_total"
+        );
     }
 
     #[test]

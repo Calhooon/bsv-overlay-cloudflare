@@ -3362,6 +3362,109 @@ pub fn parse_woc_spent_body(v: &serde_json::Value) -> SpentObservation {
 /// STRICT: only an explicit, well-formed `{"spent": false}` counts as a
 /// clean unspent signal; everything else (their current 500 fault, unknown
 /// shapes, `spent:true` — which would CONTRADICT WoC's negative) is Unknown.
+/// 2026-09-04: BananaBlocks' corroboration of an UNSPENT claim — the
+/// negative corroborator since Bitails retired its per-output spend data.
+/// ONLY a 200 `{"spent": false}` corroborates; a 200 `{"spent": true}`
+/// contradicts WoC and is an honest unknown; 404 / 429 / 5xx / malformed =
+/// unknown ("could not look" never reads as "nothing there").
+pub fn parse_bananablocks_unspent(
+    status: u16,
+    v: Option<&serde_json::Value>,
+) -> UnspentCorroboration {
+    if status == 200 {
+        if let Some(val) = v {
+            if val.get("spent").and_then(serde_json::Value::as_bool) == Some(false) {
+                return UnspentCorroboration::ConfirmedUnspent;
+            }
+        }
+    }
+    UnspentCorroboration::Unknown
+}
+
+/// 2026-09-04: BananaBlocks `GET /txo/{txid}/{vout}/spend` as a PRIMARY
+/// observation — `{"spent":true,"spentTxid"}` names a spender, `{"spent":
+/// false}` is NotSpent, everything else (404 = never indexed, 429, 5xx,
+/// malformed) is Fault ("could not look").
+pub fn parse_bananablocks_spent(status: u16, v: Option<&serde_json::Value>) -> SpentObservation {
+    if status != 200 {
+        return SpentObservation::Fault;
+    }
+    let Some(val) = v else {
+        return SpentObservation::Fault;
+    };
+    match val.get("spent").and_then(serde_json::Value::as_bool) {
+        Some(false) => SpentObservation::NotSpent,
+        Some(true) => match val.get("spentTxid").and_then(|t| t.as_str()) {
+            Some(t) if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                SpentObservation::Spent {
+                    txid: t.to_ascii_lowercase(),
+                    // BananaBlocks does not say whether the spend is mined; the
+                    // raw-verification + the caller's confirmation reads decide.
+                    confirmed: false,
+                }
+            }
+            _ => SpentObservation::Fault,
+        },
+        None => SpentObservation::Fault,
+    }
+}
+
+/// 2026-09-04: Bitails `GET /tx/{txid}` as a PRIMARY observation for output
+/// `vout` — `outputs[vout].spent: true` + `spentIn.txid` names a spender,
+/// `spent: false` is NotSpent, `spent: ""` (pruned mode) / a missing output
+/// is Fault.
+pub fn parse_bitails_tx_spent(
+    status: u16,
+    v: Option<&serde_json::Value>,
+    vout: u32,
+) -> SpentObservation {
+    if status != 200 {
+        return SpentObservation::Fault;
+    }
+    let Some(out) = v
+        .and_then(|val| val.get("outputs"))
+        .and_then(|o| o.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|o| o.get("index").and_then(|i| i.as_u64()) == Some(u64::from(vout)))
+        })
+    else {
+        return SpentObservation::Fault;
+    };
+    match out.get("spent").and_then(serde_json::Value::as_bool) {
+        Some(false) => SpentObservation::NotSpent,
+        Some(true) => match out
+            .get("spentIn")
+            .and_then(|s| s.get("txid"))
+            .and_then(|t| t.as_str())
+        {
+            Some(t) if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                SpentObservation::Spent {
+                    txid: t.to_ascii_lowercase(),
+                    confirmed: false,
+                }
+            }
+            _ => SpentObservation::Fault,
+        },
+        None => SpentObservation::Fault,
+    }
+}
+
+/// 2026-09-04: Bitails' tx body as a NEGATIVE corroborator — only an explicit
+/// `outputs[vout].spent: false` corroborates; `""` (pruned) is unknown.
+pub fn bitails_tx_unspent(
+    status: u16,
+    v: Option<&serde_json::Value>,
+    vout: u32,
+) -> UnspentCorroboration {
+    match parse_bitails_tx_spent(status, v, vout) {
+        SpentObservation::NotSpent => UnspentCorroboration::ConfirmedUnspent,
+        _ => UnspentCorroboration::Unknown,
+    }
+}
+
+/// RETIRED corroborator (2026-09-04): Bitails removed per-output spend data
+/// (pruned mode); kept for its pins.
 pub fn parse_bitails_unspent(status: u16, v: Option<&serde_json::Value>) -> UnspentCorroboration {
     if status == 200 {
         if let Some(val) = v {
@@ -6504,6 +6607,93 @@ mod tests {
                 .matches('?')
                 .count(),
             2 * SEAT_MARKERS_BINDS_PER_POT
+        );
+    }
+}
+
+#[cfg(test)]
+mod courier_ladder_2026_09_04 {
+    use super::*;
+
+    #[test]
+    fn bananablocks_primary_observation_three_states() {
+        let spent = serde_json::json!({ "spent": true, "spentTxid": "ab".repeat(32) });
+        assert!(matches!(
+            parse_bananablocks_spent(200, Some(&spent)),
+            SpentObservation::Spent { .. }
+        ));
+        let not = serde_json::json!({ "spent": false });
+        assert!(matches!(
+            parse_bananablocks_spent(200, Some(&not)),
+            SpentObservation::NotSpent
+        ));
+        assert!(
+            matches!(
+                parse_bananablocks_spent(429, Some(&not)),
+                SpentObservation::Fault
+            ),
+            "a rate limit is not an answer"
+        );
+        assert!(
+            matches!(parse_bananablocks_spent(404, None), SpentObservation::Fault),
+            "never indexed = could not look"
+        );
+        let bad = serde_json::json!({ "spent": true, "spentTxid": "nope" });
+        assert!(matches!(
+            parse_bananablocks_spent(200, Some(&bad)),
+            SpentObservation::Fault
+        ));
+        assert_eq!(
+            parse_bananablocks_unspent(200, Some(&not)),
+            UnspentCorroboration::ConfirmedUnspent
+        );
+        assert_eq!(
+            parse_bananablocks_unspent(200, Some(&spent)),
+            UnspentCorroboration::Unknown,
+            "a contradiction is unknown"
+        );
+    }
+
+    #[test]
+    fn bitails_tx_body_never_reads_pruned_as_unspent() {
+        let body = serde_json::json!({ "outputs": [
+            { "index": 0, "spent": true, "spentIn": { "txid": "cd".repeat(32) } },
+            { "index": 1, "spent": false },
+            { "index": 2, "spent": "" }
+        ]});
+        assert!(matches!(
+            parse_bitails_tx_spent(200, Some(&body), 0),
+            SpentObservation::Spent { .. }
+        ));
+        assert!(matches!(
+            parse_bitails_tx_spent(200, Some(&body), 1),
+            SpentObservation::NotSpent
+        ));
+        assert!(
+            matches!(
+                parse_bitails_tx_spent(200, Some(&body), 2),
+                SpentObservation::Fault
+            ),
+            "pruned = could not look"
+        );
+        assert!(
+            matches!(
+                parse_bitails_tx_spent(200, Some(&body), 9),
+                SpentObservation::Fault
+            ),
+            "no such output"
+        );
+        assert!(matches!(
+            parse_bitails_tx_spent(500, Some(&body), 0),
+            SpentObservation::Fault
+        ));
+        assert_eq!(
+            bitails_tx_unspent(200, Some(&body), 1),
+            UnspentCorroboration::ConfirmedUnspent
+        );
+        assert_eq!(
+            bitails_tx_unspent(200, Some(&body), 2),
+            UnspentCorroboration::Unknown
         );
     }
 }
