@@ -30,14 +30,18 @@ pub const ARMED_POTS_MAX_ROWS: usize = 400;
 /// overlay stamps `potrefund_records.createdAt` with
 /// `current_unix_seconds_i64()`; the first cut compared milliseconds and
 /// listed nothing, caught by the empty live answer), newest first, `?2` rows
-/// at most. The LEFT JOIN keeps a pot the index has not marked yet
-/// (`spent IS NULL`) — an unknown spend is not a spend.
+/// at most. INNER JOIN on the pot index: the refund-backup marker is filed by
+/// the client at ARM time and exists for pots whose funding never landed (the
+/// 2026-08-29 phantom era left eight of them on beta: `known:false` on
+/// `/utxo-status`); only a pot the overlay ADMITTED as a funding (network-
+/// accept gated, chain-corroborated) is a watchdog concern, and only while
+/// `spent = 0`.
 pub fn armed_pots_sql() -> &'static str {
     "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, \
             MAX(pr.createdAt) AS createdAt \
      FROM potrefund_records pr \
-     LEFT JOIN pot_records p ON p.txid = pr.potTxid AND p.outputIndex = pr.potVout \
-     WHERE (p.spent IS NULL OR p.spent = 0) AND pr.createdAt >= ?1 \
+     JOIN pot_records p ON p.txid = pr.potTxid AND p.outputIndex = pr.potVout \
+     WHERE p.spent = 0 AND pr.createdAt >= ?1 \
      GROUP BY pr.potTxid, pr.potVout, pr.gameId \
      ORDER BY createdAt DESC \
      LIMIT ?2"
@@ -177,10 +181,10 @@ mod tests {
     }
 
     #[test]
-    fn the_sql_keeps_unmarked_pots_and_drops_spent_ones() {
+    fn the_sql_lists_only_admitted_unspent_pots() {
         let sql = armed_pots_sql();
-        assert!(sql.contains("LEFT JOIN pot_records"), "an unknown spend is not a spend");
-        assert!(sql.contains("p.spent IS NULL OR p.spent = 0"));
+        assert!(sql.contains("JOIN pot_records") && !sql.contains("LEFT JOIN"), "a pot the index never admitted (a phantom funding) is not a watchdog concern");
+        assert!(sql.contains("p.spent = 0"));
         assert!(sql.contains("ORDER BY createdAt DESC"));
         assert!(sql.contains("LIMIT ?2"));
     }
