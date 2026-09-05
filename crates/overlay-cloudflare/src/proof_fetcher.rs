@@ -283,7 +283,7 @@ impl ChainProofFetcher {
     /// candidate bump (bsv-low#304 gate M-5 — one failing header read will
     /// fail for every rung, so it propagates immediately as retryable);
     /// courier fetch failures stay `Ok(None)`-shaped (honest unknown).
-    async fn fetch_verified_proof(&self, txid: &str) -> Result<Option<String>, String> {
+    pub(crate) async fn fetch_verified_proof(&self, txid: &str) -> Result<Option<String>, String> {
         let tracker = self.tracker.as_deref();
 
         // 1. Arcade — our own broadcaster's free BUMP (MINED status merklePath).
@@ -400,7 +400,7 @@ impl ChainProofFetcher {
     /// must never sit on the hot path). Used ONLY by the GASP-sync trait path
     /// ([`AncestorFetcher::fetch_ancestor`]) where the raw genuinely is needed;
     /// the proof-completion passes take the raw-free [`Self::verified_proof_for`].
-    async fn fetch_raw_hex(&self, txid: &str) -> Result<String, GASPError> {
+    pub(crate) async fn fetch_raw_hex(&self, txid: &str) -> Result<String, GASPError> {
         // 1. Bitails raw download (non-WoC primary).
         let bitails = format!("{}/download/tx/{}/hex", self.bitails_base, txid);
         if let Some(raw) = self.raw_hex_content_addressed(txid, &bitails, None).await {
@@ -1843,7 +1843,7 @@ fn tx_consumes_outpoint(raw_hex: &str, txid: &str, vout: u32) -> Result<bool, St
 /// visible but its WIN stays unattributable (`/results`/leaderboard need
 /// `spender_beef_hex`). Pure; any failure is the caller's cue to log and
 /// proceed (the POINTER write is the money fix — this is enrichment).
-fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -> Result<Vec<u8>, String> {
     let bump = MerklePath::from_hex(bump_hex).map_err(|e| format!("bump parse: {e}"))?;
     let raw = hex::decode(raw_hex).map_err(|e| format!("raw decode: {e}"))?;
     let mut beef = Beef::new();

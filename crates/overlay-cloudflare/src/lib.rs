@@ -136,6 +136,10 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
             "/health" => return health(&env).await,
             "/health/live" => return health_live(&env).await,
             "/health/ready" => return health_ready(&env).await,
+            // Loop-2 hardening (2026-09-05): an on-demand, courier-backed, chaintracks-
+            // verified BEEF for a MINED txid the index never admitted — the credit
+            // path's proof source when `/beef` has nothing to serve.
+            p if p.starts_with("/beef-any/") => return routes::beef_any(&env, p).await,
             _ => {}
         }
     }
@@ -428,7 +432,7 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
 /// the var and the WoC api key from the `WOC_API_KEY` secret (the plumbing
 /// existed; nothing wired the secret, so every WoC read ran on the free tier
 /// that 429s under load — the repo's most-documented outage class).
-fn courier_fetcher(
+pub(crate) fn courier_fetcher(
     env: &Env,
     tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>>,
 ) -> crate::proof_fetcher::ChainProofFetcher {
@@ -444,7 +448,7 @@ fn courier_fetcher(
     f.with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()))
 }
 
-fn lookup_service_chain_tracker(env: &Env) -> Option<Rc<dyn bsv_rs::transaction::ChainTracker>> {
+pub(crate) fn lookup_service_chain_tracker(env: &Env) -> Option<Rc<dyn bsv_rs::transaction::ChainTracker>> {
     let ct_url = env
         .var("CHAIN_TRACKER_URL")
         .map(|v| v.to_string())

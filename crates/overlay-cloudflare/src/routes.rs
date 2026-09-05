@@ -115,6 +115,72 @@ pub(crate) fn false_ok_refusal_applies(funding_shaped: bool, tx_row_stored: bool
     funding_shaped && !tx_row_stored && !pot_known
 }
 
+/// PURE (pinned): the txid of a `/beef-any/<txid>` path — 64 lowercase hex or
+/// nothing (a malformed id is the caller's fault, never a courier call).
+pub(crate) fn beef_any_txid(path: &str) -> Option<String> {
+    let id = path.strip_prefix("/beef-any/")?.trim_end_matches('/');
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(id.to_ascii_lowercase())
+}
+
+#[derive(Serialize)]
+struct BeefAnyBody<'a> {
+    txid: &'a str,
+    beef: Vec<u8>,
+    source: &'static str,
+}
+
+/// `GET /beef-any/:txid` — loop-2 hardening (2026-09-05, the fleet's
+/// refund→credit red): a wallet credit needs an ANCHORED ancestry, and the
+/// client's proof frontier is served only from the index's `/beef` — so a pot
+/// the overlay never admitted (its hop refused by a lagging corroborator, its
+/// JOIN failing EF conversion, the JOIN mined via direct ARC anyway) left the
+/// refund 'retry' → 'unprovable' while the chain held the proof all along.
+/// This route answers from the NETWORK: the raw through the courier ladder
+/// (content-addressed) and the merkle proof through the same ladder, VERIFIED
+/// against chaintracks (`fetch_verified_proof` — an unverifiable or forged
+/// proof is `None`, never a served byte), assembled as an atomic BEEF exactly
+/// like the reconcile's displaced-spender copy. Unmined / unproven / unknown
+/// → 404 (the client keeps its honest 'retry'). One txid per call; the client
+/// asks only on a conclusive `/beef` miss for a tx `/tx-any` says is
+/// confirmed. Reads no D1; writes nothing.
+pub async fn beef_any(env: &worker::Env, path: &str) -> worker::Result<Response> {
+    let Some(txid) = beef_any_txid(path) else {
+        return json_error("malformed txid (expect /beef-any/<64-hex>)", 400);
+    };
+    let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env));
+    let raw_hex = match fetcher.fetch_raw_hex(&txid).await {
+        Ok(h) => h,
+        Err(e) => {
+            worker::console_log!("[beef-any] {txid}: raw unavailable via the couriers ({e})");
+            return json_error("raw tx not available from any courier", 404);
+        }
+    };
+    let bump_hex = match fetcher.fetch_verified_proof(&txid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            worker::console_log!("[beef-any] {txid}: no chaintracks-verified proof (unmined or unprovable)");
+            return json_error("no verified merkle proof for this txid (unmined or unprovable)", 404);
+        }
+        Err(e) => {
+            worker::console_log!("[beef-any] {txid}: chaintracks read fault while verifying ({e})");
+            return json_error_retryable("chaintracks read fault while verifying the proof — retry", 503);
+        }
+    };
+    match crate::proof_fetcher::assemble_spender_beef(&raw_hex, &bump_hex, &txid) {
+        Ok(beef) => {
+            worker::console_log!("[beef-any] {txid}: served a courier-backed verified BEEF ({} bytes)", beef.len());
+            json_ok(&BeefAnyBody { txid: &txid, beef, source: "courier" })
+        }
+        Err(e) => {
+            worker::console_log!("[beef-any] {txid}: assembly failed ({e})");
+            json_error("could not assemble the BEEF", 500)
+        }
+    }
+}
+
 fn json_error(message: &str, status: u16) -> worker::Result<Response> {
     json_response(
         &ErrorBody {
@@ -2980,6 +3046,7 @@ pub fn not_found() -> worker::Result<Response> {
 mod tests {
     use super::engine_error_status;
     use super::false_ok_refusal_applies;
+    use super::beef_any_txid;
 
     /// Loop-1 hardening (2026-09-05): a KNOWN pot re-presented after the
     /// refund/settle consumed its last output must NOT trip the #413 false-ok
@@ -2987,6 +3054,19 @@ mod tests {
     /// `pot_records` row is the durable "we know this pot" fact. The refusal
     /// still fires for a funding-shaped subject the index never held, and
     /// never for a non-funding subject (a spend legitimately admits 0).
+    /// Loop-2 hardening: `/beef-any/<txid>` takes exactly one 64-hex id (case-
+    /// folded); anything else is a 400 before any courier is asked.
+    #[test]
+    fn beef_any_path_parses_only_a_64_hex_txid() {
+        let id = "67877CAE0f1b444111f467a3ebb076409542b498456f853bb950e98538f90039";
+        assert_eq!(beef_any_txid(&format!("/beef-any/{id}")).as_deref(), Some(id.to_ascii_lowercase().as_str()));
+        assert_eq!(beef_any_txid(&format!("/beef-any/{id}/")).as_deref(), Some(id.to_ascii_lowercase().as_str()));
+        assert!(beef_any_txid("/beef-any/").is_none());
+        assert!(beef_any_txid("/beef-any/abc").is_none());
+        assert!(beef_any_txid(&format!("/beef-any/{}zz", &id[..62])).is_none());
+        assert!(beef_any_txid("/beef/abc").is_none());
+    }
+
     #[test]
     fn known_consumed_pot_is_an_idempotent_no_op_not_a_false_ok() {
         // the probe's shape: funding-shaped, tx row deleted, pot record present → 200
