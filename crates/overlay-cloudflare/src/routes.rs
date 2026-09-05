@@ -104,6 +104,17 @@ fn json_ok<T: Serialize>(body: &T) -> worker::Result<Response> {
     json_response(body, 200)
 }
 
+/// PURE: the #413 false-ok refusal on a broadcast-gated submit that admitted
+/// nothing. It fires ONLY for a funding-shaped subject the index has never
+/// held: neither a `transactions` row (the engine deletes that row once the
+/// last output is consumed) nor a `pot_records` row (which outlives the
+/// spend). A known pot re-presented after its outputs were consumed is an
+/// idempotent no-op — refusing it 502-churned the client's readmit sweep
+/// forever (loop-1 hardening, 2026-09-05).
+pub(crate) fn false_ok_refusal_applies(funding_shaped: bool, tx_row_stored: bool, pot_known: bool) -> bool {
+    funding_shaped && !tx_row_stored && !pot_known
+}
+
 fn json_error(message: &str, status: u16) -> worker::Result<Response> {
     json_response(
         &ErrorBody {
@@ -1176,7 +1187,30 @@ async fn submit_inner(
                 .bind(subject_txid.as_str())
                 .fetch_optional::<OneRow>(&db)
                 .await;
-                if matches!(stored, Ok(None)) {
+                // Loop-1 hardening (2026-09-05, the fleet's refund→credit
+                // cells): the engine's `delete_output` drops a tx's
+                // `transactions` row once its LAST output is consumed
+                // (reference storage semantics), so a pot whose vout-0 the
+                // refund/settle already spent reads as "nothing stored" —
+                // and the client's readmit sweep re-presented it every pass
+                // against this 502 (retry-forever, the owner's smell). A
+                // KNOWN pot — a `pot_records` row for the subject, spent or
+                // not — is an idempotent no-op, never a false ok: answer
+                // 200 with the empty STEAK.
+                let pot_known = if matches!(stored, Ok(None)) {
+                    matches!(
+                        crate::d1::Query::new(
+                            "SELECT 1 AS one FROM pot_records WHERE txid = lower(?) LIMIT 1",
+                        )
+                        .bind(subject_txid.as_str())
+                        .fetch_optional::<OneRow>(&db)
+                        .await,
+                        Ok(Some(_))
+                    )
+                } else {
+                    false
+                };
+                if false_ok_refusal_applies(funding_shaped, !matches!(stored, Ok(None)), pot_known) {
                     worker::console_log!(
                         "POST /submit(broadcast-gated) -> 502 ({subject_txid}: 0 outputs admitted and \
                          nothing stored — refusing the false ok; the client ladder re-presents (#413)"
@@ -1184,6 +1218,12 @@ async fn submit_inner(
                     return json_error(
                         "broadcast-gated submit admitted nothing and stored nothing — retry",
                         502,
+                    );
+                }
+                if pot_known {
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated) -> 200 ({subject_txid}: a KNOWN pot re-presented \
+                         after its outputs were consumed — idempotent no-op, not a false ok)"
                     );
                 }
             }
@@ -2939,6 +2979,26 @@ pub fn not_found() -> worker::Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::engine_error_status;
+    use super::false_ok_refusal_applies;
+
+    /// Loop-1 hardening (2026-09-05): a KNOWN pot re-presented after the
+    /// refund/settle consumed its last output must NOT trip the #413 false-ok
+    /// refusal — the `transactions` row is gone by design (delete_output), the
+    /// `pot_records` row is the durable "we know this pot" fact. The refusal
+    /// still fires for a funding-shaped subject the index never held, and
+    /// never for a non-funding subject (a spend legitimately admits 0).
+    #[test]
+    fn known_consumed_pot_is_an_idempotent_no_op_not_a_false_ok() {
+        // the probe's shape: funding-shaped, tx row deleted, pot record present → 200
+        assert!(!false_ok_refusal_applies(true, false, true));
+        // never held at all → the refusal stands
+        assert!(false_ok_refusal_applies(true, false, false));
+        // still stored (its outputs live) → a plain 0-admitted 200, no refusal
+        assert!(!false_ok_refusal_applies(true, true, false));
+        // a spend / non-funding subject admits 0 legitimately
+        assert!(!false_ok_refusal_applies(false, false, false));
+        assert!(!false_ok_refusal_applies(false, false, true));
+    }
     use overlay_engine::engine::EngineError;
 
     /// WHOSE fault was it? A malformed query is the CALLER's and must answer
