@@ -117,6 +117,70 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
     Ok((efs, subject_txid))
 }
 
+/// PURE (loop-2 hardening, 2026-09-05 — F-D): the SUBJECT's input source
+/// txids that the BEEF does NOT carry as full transactions (absent, or
+/// txid-only entries). The reference engine admits a tx whose sources the
+/// store lacks (`previousCoins` lists only the held inputs); our broadcast
+/// gate needs every source's bytes for EF conversion, so a JOIN carrying a
+/// txid-only hop was refused 400 while the hop was on the network — this is
+/// the list the route completes from the courier ladder before converting.
+pub fn missing_source_txids(beef_bytes: &[u8]) -> Vec<String> {
+    let Ok(mut beef) = Beef::from_binary(beef_bytes) else {
+        return Vec::new();
+    };
+    beef.sort_txs();
+    let held: std::collections::HashSet<String> = beef
+        .txs
+        .iter()
+        .filter(|b| b.tx().is_some())
+        .map(|b| b.txid())
+        .collect();
+    let Some(subject) = beef.txs.last().and_then(|b| b.tx().cloned()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for input in &subject.inputs {
+        if input.source_transaction.is_some() {
+            continue;
+        }
+        if let Some(src) = input.source_txid.clone() {
+            if !held.contains(&src) && !out.contains(&src) {
+                out.push(src);
+            }
+        }
+    }
+    out
+}
+
+/// PURE (F-D): merge courier-served raw transactions into the BEEF as
+/// proofless ancestors, each VERIFIED by hash against the txid it was fetched
+/// for (a courier byte that does not hash to its txid is dropped, never
+/// merged). Returns the re-serialized BEEF; a BEEF that does not parse, or a
+/// batch with nothing verified, comes back byte-identical.
+pub fn merge_raw_sources(beef_bytes: &[u8], raws: &[(String, String)]) -> Vec<u8> {
+    let Ok(mut beef) = Beef::from_binary(beef_bytes) else {
+        return beef_bytes.to_vec();
+    };
+    let mut merged = 0usize;
+    for (txid, raw_hex) in raws {
+        let Ok(tx) = Transaction::from_hex(raw_hex) else {
+            continue;
+        };
+        if !tx.id().to_string().eq_ignore_ascii_case(txid) {
+            continue;
+        }
+        let Ok(raw) = hex::decode(raw_hex) else {
+            continue;
+        };
+        beef.merge_raw_tx(raw, None);
+        merged += 1;
+    }
+    if merged == 0 {
+        return beef_bytes.to_vec();
+    }
+    beef.to_binary()
+}
+
 /// Strip the SUBJECT's (submitter-supplied, NEVER-validated) bump from a
 /// BEEF before storage — bsv-low#268 gate finding M1.
 ///
@@ -199,6 +263,41 @@ pub fn proven_subject_raw(beef_bytes: &[u8]) -> Option<Vec<u8>> {
 )]
 mod tests {
     use super::*;
+
+    /// F-D (2026-09-05): a subject whose parents are only NAMED in the BEEF
+    /// lists them as missing; merging a parent's courier-served raw (hash-
+    /// verified) removes it from the list; a raw that does not hash to its
+    /// txid is dropped and the BEEF stays byte-identical. Real fixtures: the
+    /// subject `e98cdd1f…` and its parent `a7d76588…`.
+    #[test]
+    fn missing_sources_are_named_and_completed_by_verified_raws_only() {
+        let subject = Transaction::from_hex(SUBJECT_RAW_HEX.trim()).expect("subject raw");
+        let mut only_subject = Beef::new();
+        only_subject.merge_raw_tx(subject.to_binary(), None);
+        let bytes = only_subject.to_binary();
+        let missing = missing_source_txids(&bytes);
+        assert!(!missing.is_empty(), "the lone subject names its parents as missing");
+        assert!(missing.iter().all(|t| t.len() == 64));
+        let parent_beef = Beef::from_binary(&hex::decode(PARENT_BEEF_HEX.trim()).expect("parent beef hex")).expect("parent beef");
+        let (parent_txid, parent_raw_hex) = parent_beef
+            .txs
+            .iter()
+            .filter_map(|b| b.tx().map(|t| (b.txid(), t.to_hex())))
+            .find(|(id, _)| missing.contains(id))
+            .expect("the parent fixture covers one of the missing sources");
+        // an impostor raw under the parent's txid is dropped: byte-identical, still missing
+        let untouched = merge_raw_sources(&bytes, &[(parent_txid.clone(), subject.to_hex())]);
+        assert_eq!(untouched, bytes);
+        assert!(missing_source_txids(&untouched).contains(&parent_txid));
+        // the real raw completes that parent
+        let completed = merge_raw_sources(&bytes, &[(parent_txid.clone(), parent_raw_hex)]);
+        assert!(completed.len() > bytes.len());
+        assert!(!missing_source_txids(&completed).contains(&parent_txid));
+        // a garbage BEEF lists nothing and merges nothing
+        assert!(missing_source_txids(b"nope").is_empty());
+        assert_eq!(merge_raw_sources(b"nope", &[]), b"nope".to_vec());
+    }
+
 
     // Real mainnet transaction pair (subject + funding parent), committed raw
     // so the EF round-trip runs offline (fixtures shared with zanaadu's suite):

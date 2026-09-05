@@ -808,7 +808,39 @@ async fn submit_inner(
         // to its own direct broadcast). Arcade also carries X-CallbackUrl
         // (→ /arc-ingest) so a later MINED status pushes the free merkle path
         // for proof completion.
-        let (efs, subject_txid) = match crate::ef::beef_to_ef_batch(&tagged_beef.beef) {
+        // F-D (loop-2 hardening, 2026-09-05): the reference engine admits a tx
+        // whose sources the store lacks; our gate needs their bytes for EF.
+        // Complete the SUBJECT's missing sources from the courier ladder
+        // (content-addressed, hash-verified in `merge_raw_sources`, bounded)
+        // before converting — a JOIN carrying a txid-only hop that is already
+        // on the network is admitted instead of refused 400.
+        const MAX_COMPLETED_SOURCES: usize = 4;
+        let gated_beef: Vec<u8> = {
+            let missing = crate::ef::missing_source_txids(&tagged_beef.beef);
+            if missing.is_empty() {
+                tagged_beef.beef.clone()
+            } else if missing.len() > MAX_COMPLETED_SOURCES {
+                worker::console_log!(
+                    "broadcast-gated: {} missing source(s) exceed the completion bound ({MAX_COMPLETED_SOURCES}) — converting as submitted",
+                    missing.len()
+                );
+                tagged_beef.beef.clone()
+            } else {
+                let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env));
+                let mut raws: Vec<(String, String)> = Vec::new();
+                for txid in &missing {
+                    match fetcher.fetch_raw_hex(txid).await {
+                        Ok(raw) => {
+                            worker::console_log!("broadcast-gated: completed missing source {txid} from the couriers (F-D)");
+                            raws.push((txid.clone(), raw));
+                        }
+                        Err(e) => worker::console_log!("broadcast-gated: missing source {txid} not served by any courier ({e})"),
+                    }
+                }
+                crate::ef::merge_raw_sources(&tagged_beef.beef, &raws)
+            }
+        };
+        let (efs, subject_txid) = match crate::ef::beef_to_ef_batch(&gated_beef) {
             Ok(v) => v,
             Err(e) => {
                 worker::console_log!("POST /submit(broadcast-gated) -> 400 (EF: {e})");
