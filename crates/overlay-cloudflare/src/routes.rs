@@ -443,7 +443,7 @@ pub async fn get_doc_for_lookup_service(
 /// note was logged and never shipped (the lobby cell, 10:54Z).
 pub async fn submit(
     engine: &Engine,
-    mut req: Request,
+    req: Request,
     hosting_url: Option<&str>,
     // Arcade V2 endpoint override for the broadcast-gated mode (None → default
     // endpoint). Arcade is keyless, so broadcast-gated is always available.

@@ -994,7 +994,7 @@ fn build_engine_with_storage(
     // Without a chain tracker it degrades to a pure retry (no proof can ever be
     // verified — fail-closed).
     let proof_tracker = lookup_service_chain_tracker(env);
-    let proof_fetcher = courier_fetcher(&env, proof_tracker);
+    let proof_fetcher = courier_fetcher(env, proof_tracker);
     engine.set_ancestor_fetcher(std::rc::Rc::new(proof_fetcher));
 
     engine
@@ -1716,9 +1716,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
     //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
     //    order as the scheduled tick). Own fetchers, own budget cells.
-    let spend_fetcher = courier_fetcher(&env, lookup_service_chain_tracker(env)).with_budget(20);
+    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20);
     let pot_tracker = lookup_service_chain_tracker(env);
-    let pot_fetcher = courier_fetcher(&env, pot_tracker);
+    let pot_fetcher = courier_fetcher(env, pot_tracker);
     let (ss, ps) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,

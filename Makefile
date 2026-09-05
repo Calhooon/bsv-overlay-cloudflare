@@ -18,7 +18,7 @@ help:
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test --workspace with memory-storage feature"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
-	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs :8791-:8794)"
+	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs six free ports from LANE_BASE, default :8791-:8796)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
@@ -204,6 +204,7 @@ ROUTE_UP_TRIES ?= 60
 ROUTE_UP_SLEEP ?= 3
 ci-route:
 	@set -e; \
+	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); \
 	strict_log=/tmp/lane347-route-strict.log; \
 	kill_log=/tmp/lane347-route-kill.log; \
 	lenient_log=/tmp/lane366-route-lenient.log; \
@@ -245,13 +246,13 @@ ci-route:
 	  fi; \
 	  return 0; \
 	}; \
-	preflight 8791; \
-	preflight 8792; \
-	preflight 8793; \
-	preflight 8794; \
-	preflight 8795; \
-	preflight 8796; \
-	owned_ports="8791 8792 8793 8794 8795 8796"; \
+	preflight $$P1; \
+	preflight $$P2; \
+	preflight $$P3; \
+	preflight $$P4; \
+	preflight $$P5; \
+	preflight $$P6; \
+	owned_ports="$$P1 $$P2 $$P3 $$P4 $$P5 $$P6"; \
 	wait_up() { \
 	  _port=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -269,35 +270,35 @@ ci-route:
 	  echo "  ────────────────────────"; \
 	  return 1; \
 	}; \
-	echo "→ starting wrangler dev :8791 (strict)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8791 --ip 127.0.0.1 \
+	echo "→ starting wrangler dev :$$P1 (strict)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P1 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
 	) > "$$strict_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
-	wait_up 8791 "$$strict_log" strict; \
-	echo "→ starting wrangler dev :8792 (kill switch)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8792 --ip 127.0.0.1 \
+	wait_up $$P1 "$$strict_log" strict; \
+	echo "→ starting wrangler dev :$$P2 (kill switch)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P2 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:false \
 	) > "$$kill_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
-	wait_up 8792 "$$kill_log" "kill switch"; \
-	echo "→ starting wrangler dev :8793 (lenient — #366 census client-population leg)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8793 --ip 127.0.0.1 \
+	wait_up $$P2 "$$kill_log" "kill switch"; \
+	echo "→ starting wrangler dev :$$P3 (lenient — #366 census client-population leg)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P3 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
 	    --var ENABLE_EXTENSIONS:true \
 	) > "$$lenient_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
-	wait_up 8793 "$$lenient_log" "lenient"; \
-	echo "→ starting wrangler dev :8794 (arc-ingest — TAAL_API_KEY set, the only place the route is mounted)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8794 --ip 127.0.0.1 \
+	wait_up $$P3 "$$lenient_log" "lenient"; \
+	echo "→ starting wrangler dev :$$P4 (arc-ingest — TAAL_API_KEY set, the only place the route is mounted)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P4 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
@@ -305,25 +306,25 @@ ci-route:
 	    --var TAAL_API_KEY:ci-arc-ingest-route-tier \
 	) > "$$arc_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
-	wait_up 8794 "$$arc_log" "arc-ingest"; \
-	echo "→ starting wrangler dev :8796 (network_seen — ARCADE_URL points at the lane-371 fixture on :8795)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port 8796 --ip 127.0.0.1 \
+	wait_up $$P4 "$$arc_log" "arc-ingest"; \
+	echo "→ starting wrangler dev :$$P6 (network_seen — ARCADE_URL points at the lane-371 fixture on :$$P5)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P6 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
 	    --var ENABLE_EXTENSIONS:true \
-	    --var ARCADE_URL:http://127.0.0.1:8795 \
+	    --var ARCADE_URL:http://127.0.0.1:$$P5 \
 	) > "$$seen_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
-	wait_up 8796 "$$seen_log" "network_seen"; \
+	wait_up $$P6 "$$seen_log" "network_seen"; \
 	echo "→ all five up"; \
-	KILL_SWITCH_BASE=http://127.0.0.1:8792 \
-	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:8791; \
-	CENSUS_LENIENT_BASE=http://127.0.0.1:8793 \
-	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:8791; \
-	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:8794; \
-	FIXTURE_PORT=8795 \
-	  node tools/lane-371/network_seen_route_ci.mjs http://127.0.0.1:8796
+	KILL_SWITCH_BASE=http://127.0.0.1:$$P2 \
+	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:$$P1; \
+	CENSUS_LENIENT_BASE=http://127.0.0.1:$$P3 \
+	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:$$P1; \
+	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:$$P4; \
+	FIXTURE_PORT=$$P5 \
+	  node tools/lane-371/network_seen_route_ci.mjs http://127.0.0.1:$$P6
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

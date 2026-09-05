@@ -1420,6 +1420,13 @@ impl PotStorage for MemoryPotStorage {
 // Tests
 // ============================================================================
 
+/// A `tm_lowfund` hop / change row (`lock_kind = "p2pkh"`) — indexed for the
+/// hop's landing proof, never a pot. The janitor's candidate order puts these
+/// LAST (`find_unspent_stale`): the money is in the covenant rows.
+pub fn is_hop_row(r: &PotRecord) -> bool {
+    r.lock_kind.as_deref() == Some("p2pkh")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2865,11 +2872,4 @@ mod tests {
             "clearing the latch re-admits the pointed-at row"
         );
     }
-}
-
-/// A `tm_lowfund` hop / change row (`lock_kind = "p2pkh"`) — indexed for the
-/// hop's landing proof, never a pot. The janitor's candidate order puts these
-/// LAST (`find_unspent_stale`): the money is in the covenant rows.
-pub fn is_hop_row(r: &PotRecord) -> bool {
-    r.lock_kind.as_deref() == Some("p2pkh")
 }

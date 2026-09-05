@@ -494,6 +494,7 @@ impl ChainProofFetcher {
         //                 spender for a SPENT output, and reports an unspent
         //                 output as `spent: ""` — which parses as "could not
         //                 look" (a fault), never as "unspent".
+        #[allow(clippy::type_complexity)] // a local courier-rung tuple; an alias would only relocate the shape
         let rungs: [(
             &'static str,
             String,
@@ -1745,7 +1746,7 @@ pub fn script_history_candidates(
     if out.is_empty() {
         return None;
     }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|x| std::cmp::Reverse(x.0));
     Some(
         out.into_iter()
             .map(|(_, t)| t)
@@ -6478,7 +6479,7 @@ mod tests {
             None,
             "another tx's id"
         );
-        let bb = format!(r#"{{"value":1000,"index":0,"script_pubkey":"5152"}}"#);
+        let bb = r#"{"value":1000,"index":0,"script_pubkey":"5152"}"#.to_string();
         assert_eq!(
             parse_bananablocks_txo_script(200, &bb).unwrap(),
             Some(vec![0x51, 0x52])
