@@ -1656,6 +1656,23 @@ pub(crate) fn pot_unspent_stale_sql(limit: u64, min_age_secs: u64) -> String {
     )
 }
 
+/// bsv-low §H4 (2026-09-06): the discovery candidates for NAMED outpoints
+/// (`find_unspent_by_outpoints`) — the same columns as the stale query, keyed
+/// by `(txid, outputIndex)` row values, no age floor, no examine backoff.
+/// `n` ≥ 1 pairs, bound txid-then-vout in order. Pub for the real-SQLite tier.
+pub(crate) fn pot_unspent_by_outpoints_sql(n: usize) -> String {
+    let marks = std::iter::repeat_n("(?, ?)", n.max(1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, createdAt FROM pot_records \
+         WHERE spent = 0 AND (txid, outputIndex) IN (VALUES {marks})"
+    )
+}
+
+/// `find_unspent_by_outpoints` binds at most this many pairs (one readmit names one tx's outputs).
+pub(crate) const POT_UNSPENT_BY_OUTPOINTS_MAX: usize = 20;
+
 /// The examine stamp (`note_spend_discovery_attempt`): a const so the
 /// real-SQLite tier runs the shipped string against the shipped schema.
 pub(crate) const POT_SPEND_DISCOVERY_STAMP_SQL: &str =
@@ -2571,6 +2588,28 @@ impl PotStorage for D1PotStorage {
     ) -> Result<Vec<(PotRecord, Option<u64>)>, PotStorageError> {
         let sql = pot_unspent_stale_sql(limit, min_age_secs);
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let created = r.created_at.filter(|v| *v > 0.0).map(|v| v as u64);
+                (r.into_record(), created)
+            })
+            .collect())
+    }
+
+    async fn find_unspent_by_outpoints(
+        &self,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<(PotRecord, Option<u64>)>, PotStorageError> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let take: Vec<&(String, u32)> = outpoints.iter().take(POT_UNSPENT_BY_OUTPOINTS_MAX).collect();
+        let mut q = Query::new(pot_unspent_by_outpoints_sql(take.len()));
+        for (txid, vout) in &take {
+            q = q.bind(txid.to_ascii_lowercase()).bind(*vout);
+        }
+        let rows: Vec<PotRow> = q.fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -8917,6 +8956,63 @@ mod tests {
     }
 
     #[allow(dead_code)]
+    /// bsv-low §H4 (2026-09-06): the RED premise of the by-outpoints discovery
+    /// — the SHIPPED stale-candidate SQL skips a row admitted NOW (its hour
+    /// floor), while the SHIPPED by-outpoints SQL returns exactly the named
+    /// unspent rows, binds in (txid, vout) order, and never a spent one.
+    #[test]
+    fn pot_unspent_by_outpoints_sql_ignores_the_age_floor_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let fresh = h64(0xa1);
+        let spent = h64(0xa2);
+        let old_row = h64(0xa3);
+        insert_pot_with(&conn, &fresh, 0, now, false, false); // admitted now, unspent
+        insert_pot_with(&conn, &spent, 0, now, true, true); // admitted now, spent
+        insert_pot_with(&conn, &old_row, 1, now - 7200, false, false); // two hours old, unspent
+        let stale: Vec<String> = conn
+            .prepare(&pot_unspent_stale_sql(16, 3600))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stale, vec![old_row.clone()], "the hour floor skips the row admitted now");
+        let by_outpoints: Vec<(String, i64)> = conn
+            .prepare(&pot_unspent_by_outpoints_sql(3))
+            .unwrap()
+            .query_map(
+                rusqlite::params![fresh, 0u32, spent, 0u32, old_row, 1u32],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut got = by_outpoints.clone();
+        got.sort();
+        let mut want = vec![(fresh.clone(), 0i64), (old_row.clone(), 1i64)];
+        want.sort();
+        assert_eq!(got, want, "named UNSPENT rows only — the age floor does not apply, the spent row is out");
+        // a vout that does not match is not a row (the pair is keyed, not the txid alone)
+        let miss: Vec<String> = conn
+            .prepare(&pot_unspent_by_outpoints_sql(1))
+            .unwrap()
+            .query_map(rusqlite::params![fresh, 1u32], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(miss.is_empty());
+    }
+
     fn insert_pot_with(
         conn: &rusqlite::Connection,
         txid: &str,

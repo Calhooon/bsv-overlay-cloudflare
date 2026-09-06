@@ -2402,8 +2402,9 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
         }
     };
     if renotified.outputs > 0 {
+        let discovery = readmit_spend_discovery(env, &txid, &renotified.vouts).await;
         worker::console_log!(
-            "POST /admin/readmit -> 200 renotified outputs={} notified={} faults={}",
+            "POST /admin/readmit -> 200 renotified outputs={} notified={} faults={} discovery={discovery}",
             renotified.outputs,
             renotified.notified,
             renotified.faults.len()
@@ -2411,6 +2412,7 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
         return json_ok(&serde_json::json!({
             "status": "success", "mode": "renotified", "txid": txid, "topic": topic,
             "outputs": renotified.outputs, "notified": renotified.notified, "faults": renotified.faults,
+            "spendDiscovery": discovery,
         }));
     }
 
@@ -2467,14 +2469,15 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
                 .get(&topic)
                 .map(|a| a.outputs_to_admit.clone())
                 .unwrap_or_default();
+            let discovery = readmit_spend_discovery(env, &txid, &admitted).await;
             worker::console_log!(
-                "POST /admin/readmit -> 200 resubmitted admitted={admitted:?} deduped={:?} faults={}",
+                "POST /admin/readmit -> 200 resubmitted admitted={admitted:?} deduped={:?} faults={} discovery={discovery}",
                 report.deduped_topics,
                 report.faults.len()
             );
             json_ok(&serde_json::json!({
                 "status": "success", "mode": "resubmitted", "txid": txid, "topic": topic,
-                "phantomAppliedForgotten": forgot,
+                "phantomAppliedForgotten": forgot, "spendDiscovery": discovery,
                 "steak": steak, "deduped": report.deduped_topics,
                 "faults": report.faults.iter().map(|f| format!("{}:{}: {}", f.topic, f.site, f.error)).collect::<Vec<_>>(),
             }))
@@ -2485,6 +2488,31 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
             json_error(&e.to_string(), status)
         }
     }
+}
+
+/// §H4: right after an admission the index knows the pot but not its spend —
+/// and the scheduled discovery pass ignores rows younger than an hour. Run
+/// the SAME pass for exactly the outputs just admitted (its own courier
+/// budget; unconfirmed pointer now, the confirmation pass proves it on its
+/// tick). Fail-open: a storage/binding fault is reported, never a refusal —
+/// the admission already stands.
+async fn readmit_spend_discovery(env: &worker::Env, txid: &str, vouts: &[u32]) -> serde_json::Value {
+    if vouts.is_empty() {
+        return serde_json::json!({ "scanned": 0, "note": "nothing admitted" });
+    }
+    let db = match env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => return serde_json::json!({ "scanned": 0, "fault": format!("OVERLAY_DB: {e}") }),
+    };
+    let storage = crate::d1_discovery::D1PotStorage::new(std::rc::Rc::new(db));
+    let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env))
+        .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET);
+    let outpoints: Vec<(String, u32)> = vouts.iter().map(|v| (txid.to_string(), *v)).collect();
+    let s = crate::proof_fetcher::discover_spends_for_outpoints(&storage, &fetcher, &outpoints).await;
+    serde_json::json!({
+        "scanned": s.scanned, "discovered": s.discovered, "byScript": s.by_script, "noHint": s.no_hint,
+        "unbound": s.unbound, "faults": s.faults, "writeErrors": s.write_errors,
+    })
 }
 
 /// POST /admin/crawlPeers — manually trigger a one-shot non-GASP peer

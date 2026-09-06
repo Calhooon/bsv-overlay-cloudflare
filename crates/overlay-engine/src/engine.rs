@@ -271,6 +271,8 @@ pub struct RenotifyReport {
     pub notified: u32,
     /// notifications that failed — `<service>: <error>`; the others still ran
     pub faults: Vec<String>,
+    /// the output indexes re-notified (the caller's spend discovery keys on them)
+    pub vouts: Vec<u32>,
 }
 
 impl MutationReport {
@@ -2152,6 +2154,7 @@ impl Engine {
         let mut report = RenotifyReport::default();
         for output in outputs.iter().filter(|o| o.topic == topic) {
             report.outputs += 1;
+            report.vouts.push(output.output_index);
             // the body every WholeTx service receives NAMES the subject (BRC-95
             // atomic prefix) — the same rule as the live submit path
             let subject_named: Option<Vec<u8>> = output.beef.as_ref().map(|beef| {
@@ -6458,6 +6461,7 @@ mod tests {
         // the verb: told again from the stored outputs, the WholeTx body naming the subject
         let r = engine.renotify_admitted(&txid, "tm_test").await.unwrap();
         assert_eq!((r.outputs, r.notified, r.faults.len()), (1, 2, 0));
+        assert_eq!(r.vouts, vec![vout]);
         assert_eq!(seen.borrow().len(), 4);
         assert!(seen.borrow()[2..]
             .iter()

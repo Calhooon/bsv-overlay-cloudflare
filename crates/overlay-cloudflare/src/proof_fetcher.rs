@@ -1226,181 +1226,221 @@ pub async fn discover_missing_spends(
         }
     };
     for (rec, created_at_secs) in candidates {
-        summary.scanned += 1;
-        // Examined — whatever happens next (the backoff that keeps a dead
-        // rung from pinning the pass on these same rows next tick).
-        if let Err(e) = pot_storage
-            .note_spend_discovery_attempt(&rec.txid, rec.output_index)
+        discover_spend_for_row(pot_storage, fetcher, rec, created_at_secs, &mut summary).await;
+    }
+    summary
+}
+
+/// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): the discovery pass for NAMED
+/// outpoints — the rows `/admin/readmit` just admitted. A re-admitted row's
+/// `createdAt` is NOW, a full hour under the pass's age floor, so the index
+/// would answer `known:true, spent:false` for that hour and the app layer's
+/// served History row would say "Recover this game" for a pot that settled
+/// (p36 on beta, 17:26Z). Same rungs, same binding proof, same write; the
+/// era stamp is not read (an operator action is never page-worthy).
+pub async fn discover_spends_for_outpoints(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    outpoints: &[(String, u32)],
+) -> MissingSpendSummary {
+    let mut summary = MissingSpendSummary::default();
+    let candidates = match pot_storage.find_unspent_by_outpoints(outpoints).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            dlog!("discover_spends_for_outpoints: candidate query failed: {e}");
+            return summary;
+        }
+    };
+    for (rec, _created) in candidates {
+        discover_spend_for_row(pot_storage, fetcher, rec, None, &mut summary).await;
+    }
+    summary
+}
+
+/// ONE candidate of the discovery pass (shared by the scheduled pass and the
+/// §H4 by-outpoints pass): examine-stamp, the hint ladder, the script rung
+/// for a pot row, the binding raw, then `mark_spent` as an UNCONFIRMED
+/// pointer the confirmation pass proves.
+async fn discover_spend_for_row(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    rec: overlay_discovery::pot::storage::PotRecord,
+    created_at_secs: Option<u64>,
+    summary: &mut MissingSpendSummary,
+) {
+    summary.scanned += 1;
+    // Examined — whatever happens next (the backoff that keeps a dead
+    // rung from pinning the pass on these same rows next tick).
+    if let Err(e) = pot_storage
+        .note_spend_discovery_attempt(&rec.txid, rec.output_index)
+        .await
+    {
+        dlog!(
+            "discover_missing_spends: {}:{} stamp failed: {e}",
+            rec.txid,
+            rec.output_index
+        );
+    }
+    let is_hop = overlay_discovery::pot::storage::is_hop_row(&rec);
+    if is_hop {
+        summary.hop_rows += 1;
+    }
+    let new_era = created_at_secs.is_some_and(|t| t >= MISSING_SPEND_NEW_ERA_CUTOFF_SECS);
+    let mut via_script = false;
+    let spender = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
+        Ok(Some(s)) => s,
+        outpoint_answer => {
+            // The per-outpoint rungs did not name a spender (a clean "no
+            // hint" or a fault). A POT's covenant script is unique to it,
+            // so a script-history index answers where an outpoint index
+            // cannot — the rung that survives a provider retiring its
+            // per-output data. Never for a hop row: an address script's
+            // history is long and shared.
+            let script_candidates = if is_hop {
+                None
+            } else {
+                let from_store = match pot_storage.get_beef(&rec.txid).await {
+                    Ok(Some(bytes)) => {
+                        funding_output_script(&bytes, &rec.txid, rec.output_index)
+                    }
+                    _ => None,
+                };
+                let script = match from_store {
+                    Some(s) => Some(s),
+                    // No stored BEEF (a pre-store-era row): the courier's
+                    // own output index serves the script (BananaBlocks).
+                    None => fetcher
+                        .output_script_hint(&rec.txid, rec.output_index)
+                        .await
+                        .ok()
+                        .flatten(),
+                };
+                script
+                    .filter(|s| !is_p2pkh_script(s))
+                    .map(|s| scripthash_le_hex(&s))
+            };
+            let mut found: Option<String> = None;
+            let mut script_fault: Option<String> = None;
+            if let Some(sh) = script_candidates {
+                match fetcher.resolve_spender_by_script(&sh, &rec.txid).await {
+                    Ok(cands) => {
+                        for cand in cands {
+                            match fetcher
+                                .spender_binding_raw(&cand, &rec.txid, rec.output_index)
+                                .await
+                            {
+                                Ok(Some(_raw)) => {
+                                    found = Some(cand);
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    script_fault =
+                                        Some(format!("candidate {cand} raw fault: {e}"));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => script_fault = Some(e),
+                }
+            }
+            match (found, outpoint_answer, script_fault) {
+                (Some(s), _, _) => {
+                    via_script = true;
+                    s
+                }
+                (None, Ok(None), None) => {
+                    summary.no_hint += 1;
+                    return;
+                }
+                (None, Ok(None), Some(e)) => {
+                    summary.faults += 1;
+                    dlog!(
+                        "discover_missing_spends: {}:{} script rung faulted: {e}",
+                        rec.txid,
+                        rec.output_index
+                    );
+                    return;
+                }
+                (None, Err(e), script) => {
+                    summary.faults += 1;
+                    dlog!(
+                        "discover_missing_spends: {}:{} hint ladder faulted: {e}{}",
+                        rec.txid,
+                        rec.output_index,
+                        script
+                            .map(|s| format!("; script rung: {s}"))
+                            .unwrap_or_default()
+                    );
+                    return;
+                }
+                (None, Ok(Some(_)), _) => unreachable!("a named spender is handled above"),
+            }
+        }
+    };
+    if via_script {
+        // The script rung's candidate is already bound (the loop above
+        // fetched its raw and checked the input); skip the second binding
+        // fetch — the budget is the scarce thing.
+    }
+    if !via_script {
+        match fetcher
+            .spender_binding_raw(&spender, &rec.txid, rec.output_index)
             .await
         {
+            Ok(Some(_raw)) => {}
+            Ok(None) => {
+                summary.unbound += 1;
+                return;
+            }
+            Err(e) => {
+                summary.faults += 1;
+                dlog!(
+                    "discover_missing_spends: {}:{} spender {spender} raw fault: {e}",
+                    rec.txid,
+                    rec.output_index
+                );
+                return;
+            }
+        }
+    }
+    match pot_storage
+        .mark_spent(
+            &rec.txid,
+            rec.output_index,
+            &spender,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(()) => {
+            summary.discovered += 1;
+            if via_script {
+                summary.by_script += 1;
+            }
+            if new_era {
+                summary.discovered_new_era += 1;
+            }
             dlog!(
-                "discover_missing_spends: {}:{} stamp failed: {e}",
+                "discover_missing_spends: {}:{} ← {spender} (unconfirmed pointer; the confirmation pass proves it{})",
+                rec.txid,
+                rec.output_index,
+                if new_era { "; NEW-ERA row — its re-present never reached us" } else { "" }
+            );
+        }
+        Err(e) => {
+            summary.write_errors += 1;
+            dlog!(
+                "discover_missing_spends: {}:{} mark_spent failed: {e}",
                 rec.txid,
                 rec.output_index
             );
         }
-        let is_hop = overlay_discovery::pot::storage::is_hop_row(&rec);
-        if is_hop {
-            summary.hop_rows += 1;
-        }
-        let new_era = created_at_secs.is_some_and(|t| t >= MISSING_SPEND_NEW_ERA_CUTOFF_SECS);
-        let mut via_script = false;
-        let spender = match fetcher.resolve_spender(&rec.txid, rec.output_index).await {
-            Ok(Some(s)) => s,
-            outpoint_answer => {
-                // The per-outpoint rungs did not name a spender (a clean "no
-                // hint" or a fault). A POT's covenant script is unique to it,
-                // so a script-history index answers where an outpoint index
-                // cannot — the rung that survives a provider retiring its
-                // per-output data. Never for a hop row: an address script's
-                // history is long and shared.
-                let script_candidates = if is_hop {
-                    None
-                } else {
-                    let from_store = match pot_storage.get_beef(&rec.txid).await {
-                        Ok(Some(bytes)) => {
-                            funding_output_script(&bytes, &rec.txid, rec.output_index)
-                        }
-                        _ => None,
-                    };
-                    let script = match from_store {
-                        Some(s) => Some(s),
-                        // No stored BEEF (a pre-store-era row): the courier's
-                        // own output index serves the script (BananaBlocks).
-                        None => fetcher
-                            .output_script_hint(&rec.txid, rec.output_index)
-                            .await
-                            .ok()
-                            .flatten(),
-                    };
-                    script
-                        .filter(|s| !is_p2pkh_script(s))
-                        .map(|s| scripthash_le_hex(&s))
-                };
-                let mut found: Option<String> = None;
-                let mut script_fault: Option<String> = None;
-                if let Some(sh) = script_candidates {
-                    match fetcher.resolve_spender_by_script(&sh, &rec.txid).await {
-                        Ok(cands) => {
-                            for cand in cands {
-                                match fetcher
-                                    .spender_binding_raw(&cand, &rec.txid, rec.output_index)
-                                    .await
-                                {
-                                    Ok(Some(_raw)) => {
-                                        found = Some(cand);
-                                        break;
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        script_fault =
-                                            Some(format!("candidate {cand} raw fault: {e}"));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => script_fault = Some(e),
-                    }
-                }
-                match (found, outpoint_answer, script_fault) {
-                    (Some(s), _, _) => {
-                        via_script = true;
-                        s
-                    }
-                    (None, Ok(None), None) => {
-                        summary.no_hint += 1;
-                        continue;
-                    }
-                    (None, Ok(None), Some(e)) => {
-                        summary.faults += 1;
-                        dlog!(
-                            "discover_missing_spends: {}:{} script rung faulted: {e}",
-                            rec.txid,
-                            rec.output_index
-                        );
-                        continue;
-                    }
-                    (None, Err(e), script) => {
-                        summary.faults += 1;
-                        dlog!(
-                            "discover_missing_spends: {}:{} hint ladder faulted: {e}{}",
-                            rec.txid,
-                            rec.output_index,
-                            script
-                                .map(|s| format!("; script rung: {s}"))
-                                .unwrap_or_default()
-                        );
-                        continue;
-                    }
-                    (None, Ok(Some(_)), _) => unreachable!("a named spender is handled above"),
-                }
-            }
-        };
-        if via_script {
-            // The script rung's candidate is already bound (the loop above
-            // fetched its raw and checked the input); skip the second binding
-            // fetch — the budget is the scarce thing.
-        }
-        if !via_script {
-            match fetcher
-                .spender_binding_raw(&spender, &rec.txid, rec.output_index)
-                .await
-            {
-                Ok(Some(_raw)) => {}
-                Ok(None) => {
-                    summary.unbound += 1;
-                    continue;
-                }
-                Err(e) => {
-                    summary.faults += 1;
-                    dlog!(
-                        "discover_missing_spends: {}:{} spender {spender} raw fault: {e}",
-                        rec.txid,
-                        rec.output_index
-                    );
-                    continue;
-                }
-            }
-        }
-        match pot_storage
-            .mark_spent(
-                &rec.txid,
-                rec.output_index,
-                &spender,
-                false,
-                None,
-                None,
-                None,
-            )
-            .await
-        {
-            Ok(()) => {
-                summary.discovered += 1;
-                if via_script {
-                    summary.by_script += 1;
-                }
-                if new_era {
-                    summary.discovered_new_era += 1;
-                }
-                dlog!(
-                    "discover_missing_spends: {}:{} ← {spender} (unconfirmed pointer; the confirmation pass proves it{})",
-                    rec.txid,
-                    rec.output_index,
-                    if new_era { "; NEW-ERA row — its re-present never reached us" } else { "" }
-                );
-            }
-            Err(e) => {
-                summary.write_errors += 1;
-                dlog!(
-                    "discover_missing_spends: {}:{} mark_spent failed: {e}",
-                    rec.txid,
-                    rec.output_index
-                );
-            }
-        }
     }
-    summary
 }
 
 pub async fn run_pot_maintenance(
@@ -6638,6 +6678,53 @@ mod tests {
         assert!(rec.spent && rec.spending_txid.as_deref() == Some(spender.as_str()));
         // examined rows are stamped: a second pass with the same store finds no candidate
         let s2 = discover_missing_spends(&store, &fetcher, 5, 0).await;
+        assert_eq!(s2.scanned, 0);
+    }
+
+    /// bsv-low §H4 (2026-09-06): the by-outpoints pass discovers a NAMED row at
+    /// once with the same rungs and the same write as the scheduled pass; an
+    /// outpoint the store does not know, or already spent, is simply not a
+    /// candidate.
+    #[tokio::test]
+    async fn discover_spends_for_outpoints_ignores_the_age_floor() {
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        let pot = "ab".repeat(32);
+        let store = MemoryPotStorage::default();
+        store
+            .store_record(&PotRecord {
+                txid: pot.clone(),
+                output_index: 0,
+                lock_kind: Some("covenant".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store.created_at_secs.lock().unwrap().insert((pot.clone(), 0), now);
+        let spender = "22".repeat(32);
+        let mut hints = std::collections::HashMap::new();
+        hints.insert((pot.clone(), 0), spender.clone());
+        let mut binding = std::collections::HashMap::new();
+        binding.insert(spender.clone(), "00".to_string());
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: hints,
+            binding_raw: binding,
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        // (the age floor itself is a D1 SQL clause — its RED premise is pinned in the
+        // real-SQLite tier: `pot_unspent_by_outpoints_sql_ignores_the_age_floor_real_sqlite`)
+        // the by-outpoints pass: discovered at once, the unknown outpoint ignored
+        let s = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0), ("cd".repeat(32), 0)]).await;
+        assert_eq!((s.scanned, s.discovered, s.no_hint, s.faults), (1, 1, 0, 0));
+        let rec = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(rec.spent && rec.spending_txid.as_deref() == Some(spender.as_str()));
+        // now spent: no longer a candidate
+        let s2 = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0)]).await;
         assert_eq!(s2.scanned, 0);
     }
 

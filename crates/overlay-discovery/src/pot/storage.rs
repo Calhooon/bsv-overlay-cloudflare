@@ -442,6 +442,29 @@ pub trait PotStorage {
             .collect())
     }
 
+    /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): the SAME candidate shape for
+    /// NAMED outpoints — the rows `/admin/readmit` just admitted. No age
+    /// floor, no examine backoff, no limit game: the window between an
+    /// admission and its spend closes NOW, not an hour later (a re-admitted
+    /// row's `createdAt` is now, a full hour under the pass's floor; p36's
+    /// pot would have read "Recover this game" for that hour). Spent and
+    /// unknown outpoints are omitted. Default: the age-less query, filtered
+    /// (the memory backend); D1 overrides with a keyed query.
+    async fn find_unspent_by_outpoints(
+        &self,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<(PotRecord, Option<u64>)>, PotStorageError> {
+        let all = self.find_unspent_stale_with_age(u64::MAX, 0).await?;
+        Ok(all
+            .into_iter()
+            .filter(|(r, _)| {
+                outpoints
+                    .iter()
+                    .any(|(t, v)| t.eq_ignore_ascii_case(&r.txid) && *v == r.output_index)
+            })
+            .collect())
+    }
+
     /// bsv-low (2026-09-04): stamp a stale-UNSPENT row as just EXAMINED by
     /// the discovery pass, whatever the outcome, so a row a dead courier rung
     /// faults on is not re-examined every tick ahead of everything else —
