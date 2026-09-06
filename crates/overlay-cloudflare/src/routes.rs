@@ -1124,6 +1124,7 @@ async fn submit_inner(
     // a D1 storm whose rows never existed; addendum 7): a dropped write is
     // now redelivered, never vanished. The decision is derived ONCE
     // (`mutation_ack`) and consumed as an enum.
+    let applied_before: Vec<String> = mutation_report.deduped_topics.clone();
     let enqueue_outcome = if mutation_report.is_durable() {
         None
     } else {
@@ -1493,16 +1494,25 @@ async fn submit_inner(
         "arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
     );
     let mut resp = with_server_timing(json_ok(&steak)?, &server_timing);
-    if mutation_queued {
-        // S2: tell the caller (and the harness) this admission is held by
-        // the queue, not yet by D1 — a lookup on this instance may lag by
-        // one consumer delivery. Exposed for browser reads alongside
-        // Server-Timing.
+    {
         let h = resp.headers_mut();
-        let _ = h.set("X-Overlay-Mutation", "queued");
+        if mutation_queued {
+            // S2: tell the caller (and the harness) this admission is held by
+            // the queue, not yet by D1 — a lookup on this instance may lag by
+            // one consumer delivery. Exposed for browser reads alongside
+            // Server-Timing.
+            let _ = h.set("X-Overlay-Mutation", "queued");
+        }
+        if !applied_before.is_empty() {
+            // Loop-3 (2026-09-06): a RE-PRESENT of a tx this index already
+            // applied under a topic gets an EMPTY STEAK entry for it — name
+            // that, so a client reading "admitted nothing and consumed
+            // nothing" can tell "already held" from "judged another tx".
+            let _ = h.set("X-Overlay-Applied-Before", &applied_before.join(","));
+        }
         let _ = h.set(
             "Access-Control-Expose-Headers",
-            "Server-Timing, X-Overlay-Mutation",
+            "Server-Timing, X-Overlay-Mutation, X-Overlay-Applied-Before",
         );
     }
     Ok(resp)

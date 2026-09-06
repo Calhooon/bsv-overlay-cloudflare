@@ -255,6 +255,11 @@ pub struct MutationFault {
 pub struct MutationReport {
     pub faults: Vec<MutationFault>,
     pub applied_topics: Vec<String>,
+    /// Topics this (txid, topic) pair had ALREADY been applied under — the
+    /// Phase-1 dedup skipped them, so their STEAK entry is an empty default
+    /// that means "nothing new", never "judged another tx" (loop-3 client
+    /// belt re-presents read the empty STEAK as index-pending).
+    pub deduped_topics: Vec<String>,
 }
 
 impl MutationReport {
@@ -560,7 +565,11 @@ impl Engine {
         // PHASE 3: MUTATE STORAGE
         // =================================================================
         for v in &validations {
-            if v.is_dupe || v.failed {
+            if v.is_dupe {
+                report.deduped_topics.push(v.topic.clone());
+                continue;
+            }
+            if v.failed {
                 continue;
             }
 
