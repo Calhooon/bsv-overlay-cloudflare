@@ -262,6 +262,17 @@ pub struct MutationReport {
     pub deduped_topics: Vec<String>,
 }
 
+/// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): what [`Engine::renotify_admitted`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RenotifyReport {
+    /// stored outputs of (txid, topic) the engine had ALREADY admitted
+    pub outputs: u32,
+    /// lookup-service notifications that returned Ok (outputs × services)
+    pub notified: u32,
+    /// notifications that failed — `<service>: <error>`; the others still ran
+    pub faults: Vec<String>,
+}
+
 impl MutationReport {
     fn fault(&mut self, topic: &str, site: &'static str, error: String) {
         self.faults.push(MutationFault {
@@ -2110,6 +2121,80 @@ impl Engine {
     /// matching outputIndex across every topic.
     ///
     /// Matches TS OverlayExpress `/admin/evictOutpoint` (lines 974-1004).
+    /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): RE-NOTIFY every lookup service
+    /// of the outputs the engine ALREADY admitted for (`txid`, `topic`).
+    ///
+    /// Phase-1 dedup means a (txid, topic) once recorded in
+    /// `applied_transactions` never re-enters through `/submit`, so a lookup
+    /// service that missed — or mis-parsed — its admit notification could
+    /// never be told again (the loop-2 subject trap: the pot index's admit
+    /// hook shape-checked a wire-last hop and wrote no record while the engine
+    /// had admitted the pot). This replays `output_admitted_by_topic` from the
+    /// engine's OWN stored outputs (with their BEEF) and the subject-NAMED body
+    /// exactly as `submit_with_report` sends it. It validates nothing anew
+    /// (the topic manager judged these outputs at admit), writes none of the
+    /// engine's tables, and is idempotent for every lookup service whose
+    /// writes are (the pot index's `store_record` is insert-if-absent for the
+    /// spend fields — re-admission never regresses spend state).
+    /// `outputs == 0` means the engine never admitted this txid on this topic:
+    /// nothing to re-notify — the caller re-SUBMITS instead.
+    pub async fn renotify_admitted(
+        &self,
+        txid: &str,
+        topic: &str,
+    ) -> Result<RenotifyReport, EngineError> {
+        let txid = txid.to_ascii_lowercase();
+        let outputs = self
+            .storage
+            .find_outputs_for_transaction(&txid, true)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
+        let mut report = RenotifyReport::default();
+        for output in outputs.iter().filter(|o| o.topic == topic) {
+            report.outputs += 1;
+            // the body every WholeTx service receives NAMES the subject (BRC-95
+            // atomic prefix) — the same rule as the live submit path
+            let subject_named: Option<Vec<u8>> = output.beef.as_ref().map(|beef| {
+                bsv_rs::transaction::Beef::from_binary(beef)
+                    .ok()
+                    .and_then(|mut b| b.to_binary_atomic(&txid).ok())
+                    .unwrap_or_else(|| beef.clone())
+            });
+            for (name, ls) in &self.lookup_services {
+                let payload = match ls.admission_mode() {
+                    AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
+                        txid: txid.clone(),
+                        output_index: output.output_index,
+                        topic: topic.to_string(),
+                        satoshis: output.satoshis,
+                        locking_script: output.output_script.clone(),
+                        off_chain_values: None,
+                    },
+                    AdmissionMode::WholeTx => {
+                        let Some(atomic_beef) = subject_named.as_ref() else {
+                            report.faults.push(format!(
+                                "{name}: {txid}:{} is stored without its BEEF — a WholeTx service cannot be re-notified",
+                                output.output_index
+                            ));
+                            continue;
+                        };
+                        OutputAdmittedByTopic::WholeTx {
+                            atomic_beef: atomic_beef.clone(),
+                            output_index: output.output_index,
+                            topic: topic.to_string(),
+                            off_chain_values: None,
+                        }
+                    }
+                };
+                match ls.output_admitted_by_topic(&payload).await {
+                    Ok(()) => report.notified += 1,
+                    Err(e) => report.faults.push(format!("{name}: {e}")),
+                }
+            }
+        }
+        Ok(report)
+    }
+
     pub async fn evict_output(
         &self,
         txid: &str,
@@ -6213,5 +6298,130 @@ mod tests {
                 .is_none(),
             "the healthy replay consumed the coin the faulted pass missed"
         );
+    }
+
+    /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): a lookup service that missed
+    /// its admit notification is told AGAIN from the engine's own stored
+    /// outputs — one call per admitted output per service, the WholeTx body
+    /// naming the subject — while `/submit` of the same bytes is deduped and
+    /// tells nobody (the premise, RED-verified in the same test); a topic the
+    /// engine never admitted this txid on yields 0 (the caller re-submits).
+    #[tokio::test]
+    async fn renotify_admitted_replays_the_admit_from_stored_outputs() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct CountingLs(Rc<RefCell<Vec<(String, u32, String)>>>, AdmissionMode);
+        #[async_trait(?Send)]
+        impl LookupServiceTrait for CountingLs {
+            fn admission_mode(&self) -> AdmissionMode {
+                self.1
+            }
+            fn spend_notification_mode(&self) -> SpendNotificationMode {
+                SpendNotificationMode::None
+            }
+            async fn output_admitted_by_topic(
+                &self,
+                payload: &OutputAdmittedByTopic,
+            ) -> Result<(), LookupServiceError> {
+                let rec = match payload {
+                    OutputAdmittedByTopic::LockingScript {
+                        txid,
+                        output_index,
+                        topic,
+                        ..
+                    } => (txid.clone(), *output_index, topic.clone()),
+                    OutputAdmittedByTopic::WholeTx {
+                        atomic_beef,
+                        output_index,
+                        topic,
+                        ..
+                    } => {
+                        let beef = Beef::from_binary(atomic_beef).expect("the WholeTx body parses");
+                        (
+                            beef.atomic_txid.clone().expect("the WholeTx body NAMES its subject"),
+                            *output_index,
+                            topic.clone(),
+                        )
+                    }
+                };
+                self.0.borrow_mut().push(rec);
+                Ok(())
+            }
+            async fn output_evicted(
+                &self,
+                _txid: &str,
+                _output_index: u32,
+            ) -> Result<(), LookupServiceError> {
+                Ok(())
+            }
+            async fn lookup(
+                &self,
+                _question: &LookupQuestion,
+            ) -> Result<LookupResult, LookupServiceError> {
+                Ok(LookupResult::OutputList(Vec::new()))
+            }
+            async fn get_documentation(&self) -> String {
+                "counting".to_string()
+            }
+            async fn get_metadata(&self) -> ServiceMetadata {
+                ServiceMetadata {
+                    name: "counting-ls".to_string(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        let mut managers: HashMap<String, Box<dyn TopicManagerTrait>> = HashMap::new();
+        managers.insert(
+            "tm_test".to_string(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut lookup_services: HashMap<String, Box<dyn LookupServiceTrait>> = HashMap::new();
+        lookup_services.insert(
+            "ls_whole".to_string(),
+            Box::new(CountingLs(seen.clone(), AdmissionMode::WholeTx)),
+        );
+        lookup_services.insert(
+            "ls_script".to_string(),
+            Box::new(CountingLs(seen.clone(), AdmissionMode::LockingScript)),
+        );
+        let engine = Engine::new(
+            managers,
+            lookup_services,
+            Box::new(MemoryStorage::new()),
+            None,
+            EngineConfig::default(),
+        );
+
+        let tagged = test_tagged_beef(vec!["tm_test"]);
+        engine.submit(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert_eq!(seen.borrow().len(), 2, "one admit per service");
+        let (txid, vout, _) = seen.borrow()[0].clone();
+        assert_eq!(txid, TEST_TXID);
+
+        // the premise, RED-verified: the same bytes again are DEDUPED — /submit can never re-notify
+        let (_, report) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert_eq!(report.deduped_topics, vec!["tm_test".to_string()]);
+        assert_eq!(seen.borrow().len(), 2, "dedup told nobody");
+
+        // the verb: told again from the stored outputs, the WholeTx body naming the subject
+        let r = engine.renotify_admitted(&txid, "tm_test").await.unwrap();
+        assert_eq!((r.outputs, r.notified, r.faults.len()), (1, 2, 0));
+        assert_eq!(seen.borrow().len(), 4);
+        assert!(seen.borrow()[2..]
+            .iter()
+            .all(|(t, v, topic)| *t == txid && *v == vout && topic == "tm_test"));
+
+        // a topic the engine never admitted this txid on: nothing to re-notify (re-submit instead)
+        let r0 = engine.renotify_admitted(&txid, "tm_other").await.unwrap();
+        assert_eq!((r0.outputs, r0.notified), (0, 0));
+        assert_eq!(seen.borrow().len(), 4);
+
+        // idempotent: a second re-notify tells everyone again, faults nothing
+        let r2 = engine.renotify_admitted(&txid.to_ascii_uppercase(), "tm_test").await.unwrap();
+        assert_eq!((r2.outputs, r2.notified, r2.faults.len()), (1, 2, 0));
+        assert_eq!(seen.borrow().len(), 6);
     }
 }

@@ -337,6 +337,8 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 "/admin/syncAdvertisements" => admin_sync_advertisements(&engine).await,
                 "/admin/startGASPSync" => admin_start_gasp_sync(&engine).await,
                 "/admin/evictOutpoint" => admin_evict_outpoint(&engine, req).await,
+                // bsv-low PLAN-PRE-LOOP4 §H4: re-notify (or re-submit, subject-named) a txid the index never came to know
+                "/admin/readmit" => admin_readmit(&engine, &env, req).await,
                 "/admin/remove-token" => admin_remove_token(&engine, req).await,
                 "/admin/crawlPeers" => admin_crawl_peers(&engine, &non_gasp_peers()).await,
                 "/admin/janitor" => {

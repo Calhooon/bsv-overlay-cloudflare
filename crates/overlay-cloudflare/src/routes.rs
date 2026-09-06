@@ -7,7 +7,7 @@ use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::slap::storage::SLAPStorage;
 use overlay_engine::engine::{Engine, EngineError};
 use overlay_engine::health_checker::JanitorConfig;
-use overlay_engine::types::{GASPInitialRequest, LookupAnswer, LookupQuestion, TaggedBEEF};
+use overlay_engine::types::{GASPInitialRequest, LookupAnswer, LookupQuestion, SubmitMode, TaggedBEEF};
 use serde::Deserialize;
 use serde::Serialize;
 use worker::{Context, Env, Request, Response};
@@ -2349,6 +2349,124 @@ pub async fn admin_evict_outpoint(engine: &Engine, mut req: Request) -> worker::
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /admin/evictOutpoint -> {}", status);
+            json_error(&e.to_string(), status)
+        }
+    }
+}
+
+/// POST /admin/readmit — bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): make the
+/// index KNOW a txid it already saw. Body `{txid, topic}`. Two arms, in order:
+///
+///   1. RE-NOTIFY — the engine had admitted outputs of (txid, topic): every
+///      lookup service is told again from the stored outputs with the
+///      subject-named body (`Engine::renotify_admitted`); nothing is
+///      re-validated, nothing new is trusted, no engine table is written.
+///   2. RE-SUBMIT — the engine admitted nothing on this topic (the loop-2
+///      subject trap: the pot was never judged while its hop was): the txid's
+///      MINED bytes come back through the couriers with a chaintracks-verified
+///      bump (the `/beef-any` recipe), are wrapped as an ATOMIC body naming
+///      the txid, and go through `submit_with_report` in `historical-tx` mode
+///      (SPV-verified, never broadcast) — the same validation every submit
+///      gets; Phase-1 dedup does not apply because no applied row exists. An
+///      unmined txid is refused 409: the live submit path owns it.
+///
+/// Bearer-gated at the dispatch like every admin POST. Idempotent: a second
+/// call re-notifies (the pot index's upsert never regresses spend state).
+pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request) -> worker::Result<Response> {
+    #[derive(Deserialize)]
+    struct Body {
+        txid: String,
+        topic: String,
+    }
+    let body: Body = match req.json().await {
+        Ok(b) => b,
+        Err(e) => return json_error(&format!("Invalid readmit body: {e}"), 400),
+    };
+    let txid = body.txid.trim().to_ascii_lowercase();
+    if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return json_error("txid must be 64 hex", 400);
+    }
+    let topic = body.topic.trim().to_string();
+    if topic.is_empty() {
+        return json_error("topic required", 400);
+    }
+    worker::console_log!("POST /admin/readmit txid={txid} topic={topic}");
+
+    // ── arm 1: re-notify what the engine already admitted ──
+    let renotified = match engine.renotify_admitted(&txid, &topic).await {
+        Ok(r) => r,
+        Err(e) => {
+            let status = engine_error_status(&e);
+            worker::console_log!("POST /admin/readmit -> {status} (renotify: {e})");
+            return json_error(&e.to_string(), status);
+        }
+    };
+    if renotified.outputs > 0 {
+        worker::console_log!(
+            "POST /admin/readmit -> 200 renotified outputs={} notified={} faults={}",
+            renotified.outputs,
+            renotified.notified,
+            renotified.faults.len()
+        );
+        return json_ok(&serde_json::json!({
+            "status": "success", "mode": "renotified", "txid": txid, "topic": topic,
+            "outputs": renotified.outputs, "notified": renotified.notified, "faults": renotified.faults,
+        }));
+    }
+
+    // ── arm 2: the engine never judged it on this topic — re-submit its MINED bytes, subject-named ──
+    let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env));
+    let raw_hex = match fetcher.fetch_raw_hex(&txid).await {
+        Ok(h) => h,
+        Err(e) => {
+            worker::console_log!("POST /admin/readmit -> 404 ({txid}: raw unavailable via the couriers: {e})");
+            return json_error(&format!("raw tx not available from any courier: {e}"), 404);
+        }
+    };
+    let bump_hex = match fetcher.fetch_verified_proof(&txid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            worker::console_log!("POST /admin/readmit -> 409 ({txid}: unmined)");
+            return json_error("unmined — nothing to re-admit yet (the live submit path owns an unmined tx)", 409);
+        }
+        Err(e) => {
+            worker::console_log!("POST /admin/readmit -> 503 ({txid}: chaintracks read fault: {e})");
+            return json_error_retryable("chaintracks read fault while verifying the proof — retry", 503);
+        }
+    };
+    let beef = match crate::proof_fetcher::assemble_spender_beef(&raw_hex, &bump_hex, &txid) {
+        Ok(b) => b,
+        Err(e) => {
+            worker::console_log!("POST /admin/readmit -> 500 ({txid}: assembly failed: {e})");
+            return json_error(&format!("could not assemble the BEEF: {e}"), 500);
+        }
+    };
+    // NAME the subject (BRC-95 atomic prefix): the engine's rule is atomic ?? unique tip ?? sorted-last — never leave it to the sort
+    let atomic = bsv_rs::transaction::Beef::from_binary(&beef)
+        .ok()
+        .and_then(|mut b| b.to_binary_atomic(&txid).ok())
+        .unwrap_or(beef);
+    let tagged = TaggedBEEF::new(atomic, vec![topic.clone()]);
+    match engine.submit_with_report(&tagged, SubmitMode::HistoricalTx).await {
+        Ok((steak, report)) => {
+            let admitted = steak
+                .get(&topic)
+                .map(|a| a.outputs_to_admit.clone())
+                .unwrap_or_default();
+            worker::console_log!(
+                "POST /admin/readmit -> 200 resubmitted admitted={admitted:?} deduped={:?} faults={}",
+                report.deduped_topics,
+                report.faults.len()
+            );
+            json_ok(&serde_json::json!({
+                "status": "success", "mode": "resubmitted", "txid": txid, "topic": topic,
+                "steak": steak, "deduped": report.deduped_topics,
+                "faults": report.faults.iter().map(|f| format!("{}:{}: {}", f.topic, f.site, f.error)).collect::<Vec<_>>(),
+            }))
+        }
+        Err(e) => {
+            let status = engine_error_status(&e);
+            worker::console_log!("POST /admin/readmit -> {status} (resubmit: {e})");
             json_error(&e.to_string(), status)
         }
     }
