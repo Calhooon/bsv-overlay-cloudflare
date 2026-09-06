@@ -1853,6 +1853,107 @@ pub(crate) fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -
         .map_err(|e| format!("beef serialize: {e}"))
 }
 
+/// PURE: the source txids of a raw transaction (hex) — the next frontier of a
+/// service-backed ancestry walk. Malformed raw → Err.
+pub(crate) fn raw_input_txids(raw_hex: &str) -> Result<Vec<String>, String> {
+    let tx = Transaction::from_hex(raw_hex).map_err(|e| format!("raw parse: {e}"))?;
+    let mut out = Vec::new();
+    for input in &tx.inputs {
+        if let Some(src) = input.source_txid.as_deref() {
+            let src = src.to_ascii_lowercase();
+            if !out.contains(&src) {
+                out.push(src);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One resolved ancestry entry: the tx's raw hex and, when it is MINED, its
+/// chaintracks-verified bump (hex). An unmined entry carries `None` and every
+/// one of its inputs must appear as another entry (BRC-62).
+pub(crate) type AncestryEntry = (String, String, Option<String>);
+
+/// PURE: assemble an atomic BEEF for `subject` from resolved ancestry entries
+/// — the server-side twin of the reference toolbox's `getBeefForTransaction`
+/// (wallet-toolbox: proven → raw + bump, else raw + recurse into inputs, else
+/// services). Refuses (Err) any set that is not BRC-62 VALID: an unmined entry
+/// whose input is absent, a bump that does not cover its tx — a partial BEEF
+/// is never served (the client's fallback rung would trust it as complete).
+pub(crate) fn assemble_ancestry_beef(subject: &str, entries: &[AncestryEntry]) -> Result<Vec<u8>, String> {
+    let mut beef = Beef::new();
+    for (txid, raw_hex, bump_hex) in entries {
+        let raw = hex::decode(raw_hex).map_err(|e| format!("{txid}: raw decode: {e}"))?;
+        let bump_index = match bump_hex {
+            Some(b) => {
+                let bump = MerklePath::from_hex(b).map_err(|e| format!("{txid}: bump parse: {e}"))?;
+                Some(beef.merge_bump(bump))
+            }
+            None => None,
+        };
+        beef.merge_raw_tx(raw, bump_index);
+    }
+    if beef.find_txid(subject).is_none() {
+        return Err(format!("subject {subject} not among the resolved entries"));
+    }
+    if !beef.is_valid(false) {
+        return Err("resolved ancestry is not a valid BEEF (an unmined entry lacks a source, or a bump does not cover its tx)".to_string());
+    }
+    beef.to_binary_atomic(subject).map_err(|e| format!("beef serialize: {e}"))
+}
+
+/// Bounds for the unmined-ancestry walk: a JOIN under a deep no-block stretch
+/// carried 17 unproven legs in the loop-2 fleet; a walk past this is a
+/// courier-cost problem, not a serving problem — refuse, never serve partial.
+pub(crate) const ANCESTRY_MAX_TXS: usize = 24;
+pub(crate) const ANCESTRY_MAX_DEPTH: usize = 8;
+
+impl ChainProofFetcher {
+    /// `/beef-any` for an UNMINED txid (loop-3 hardening, 2026-09-06): the raw
+    /// through the couriers, then its inputs — each mined source closes its
+    /// branch with a chaintracks-verified bump, each unmined source is walked
+    /// in turn — bounded by [`ANCESTRY_MAX_TXS`] / [`ANCESTRY_MAX_DEPTH`],
+    /// assembled and VALIDATED by [`assemble_ancestry_beef`]. Err names the
+    /// first thing the couriers could not serve; nothing partial is returned.
+    pub(crate) async fn assemble_unmined_beef(&self, txid: &str) -> Result<Vec<u8>, String> {
+        let subject = txid.to_ascii_lowercase();
+        let mut entries: Vec<AncestryEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier: std::collections::VecDeque<(String, usize)> = std::collections::VecDeque::new();
+        frontier.push_back((subject.clone(), 0));
+        while let Some((id, depth)) = frontier.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if entries.len() >= ANCESTRY_MAX_TXS {
+                return Err(format!("ancestry budget exceeded ({ANCESTRY_MAX_TXS} txs) at {id}"));
+            }
+            if depth > ANCESTRY_MAX_DEPTH {
+                return Err(format!("ancestry depth exceeded ({ANCESTRY_MAX_DEPTH}) at {id}"));
+            }
+            let raw_hex = self
+                .fetch_raw_hex(&id)
+                .await
+                .map_err(|e| format!("{id}: raw unavailable via the couriers ({e:?})"))?;
+            let bump = if id == subject {
+                None // the caller established the subject is unmined
+            } else {
+                self.fetch_verified_proof(&id).await.map_err(|e| format!("{id}: proof read fault ({e})"))?
+            };
+            let closes_branch = bump.is_some();
+            entries.push((id.clone(), raw_hex.clone(), bump));
+            if !closes_branch {
+                for src in raw_input_txids(&raw_hex)? {
+                    if !seen.contains(&src) {
+                        frontier.push_back((src, depth + 1));
+                    }
+                }
+            }
+        }
+        assemble_ancestry_beef(&subject, &entries)
+    }
+}
+
 /// Tally of one pot-spend confirmation pass (logged by the cron / returned by
 /// the admin route).
 // NOTE: not `Copy` — `sample` is a Vec (observability only).
@@ -3719,6 +3820,7 @@ mod tests {
     /// The all-proven fixture BEEF (subject a7d76588… + its bump — the
     /// mined-claim shape; shared with ef.rs's suite).
     const PARENT_BEEF_HEX: &str = include_str!("../tests/fixtures/ef/parent_a7d76588_beef.hex");
+    const SUBJECT_RAW_HEX: &str = include_str!("../tests/fixtures/ef/subject_e98cdd1f.rawhex");
 
     #[test]
     fn stripped_beef_row_rescues_via_the_subject_raw() {
@@ -6680,5 +6782,35 @@ mod tests {
             "b and c are still unspent candidates; both faulted"
         );
         assert_eq!(s2.discovered, 0);
+    }
+    /// Loop-3 hardening: the service-backed ancestry walk's pure halves.
+    #[test]
+    fn ancestry_assembly_validates_and_names_the_subject() {
+        // proven parent (from its real BEEF) + the unmined subject that spends it
+        let pb = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+        let parent = pb.txs.last().unwrap();
+        let parent_txid = parent.txid();
+        let parent_raw = parent.tx().unwrap().to_hex();
+        let parent_bump = pb.bumps[parent.bump_index().unwrap()].to_hex();
+        let subject_raw = SUBJECT_RAW_HEX.trim().to_string();
+        let subject_txid = Transaction::from_hex(&subject_raw).unwrap().id();
+        assert_eq!(raw_input_txids(&subject_raw).unwrap(), vec![parent_txid.clone()]);
+
+        let entries: Vec<AncestryEntry> = vec![
+            (parent_txid.clone(), parent_raw.clone(), Some(parent_bump.clone())),
+            (subject_txid.clone(), subject_raw.clone(), None),
+        ];
+        let bytes = assemble_ancestry_beef(&subject_txid, &entries).expect("valid ancestry assembles");
+        let mut parsed = Beef::from_binary(&bytes).unwrap();
+        assert_eq!(parsed.atomic_txid.as_deref(), Some(subject_txid.as_str()));
+        assert!(parsed.is_valid(false));
+        assert_eq!(parsed.txs.len(), 2);
+
+        // an unmined subject whose parent is ABSENT is refused — never a partial serve
+        let partial: Vec<AncestryEntry> = vec![(subject_txid.clone(), subject_raw.clone(), None)];
+        assert!(assemble_ancestry_beef(&subject_txid, &partial).is_err());
+        // an unknown subject is refused
+        assert!(assemble_ancestry_beef(&"00".repeat(32), &entries).is_err());
+        assert!(raw_input_txids("zz").is_err());
     }
 }

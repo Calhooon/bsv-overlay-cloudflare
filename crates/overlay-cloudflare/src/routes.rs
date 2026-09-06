@@ -161,8 +161,21 @@ pub async fn beef_any(env: &worker::Env, path: &str) -> worker::Result<Response>
     let bump_hex = match fetcher.fetch_verified_proof(&txid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            worker::console_log!("[beef-any] {txid}: no chaintracks-verified proof (unmined or unprovable)");
-            return json_error("no verified merkle proof for this txid (unmined or unprovable)", 404);
+            // UNMINED (loop-3 hardening, 2026-09-06): serve the reference's
+            // service-backed ancestry — raw + every source walked to a
+            // chaintracks-verified bump — so a peer whose hop the index never
+            // admitted still funds its JOIN with a COMPLETE BEEF (the loop-2
+            // subject trap began with a subject-only hop on the wire).
+            match fetcher.assemble_unmined_beef(&txid).await {
+                Ok(beef) => {
+                    worker::console_log!("[beef-any] {txid}: unmined — ancestry assembled from the couriers");
+                    return json_ok(&serde_json::json!({ "txid": txid, "beef": beef, "source": "courier", "mined": false }));
+                }
+                Err(e) => {
+                    worker::console_log!("[beef-any] {txid}: unmined and the ancestry could not be resolved ({e})");
+                    return json_error(&format!("unmined; ancestry not resolvable via the couriers: {e}"), 404);
+                }
+            }
         }
         Err(e) => {
             worker::console_log!("[beef-any] {txid}: chaintracks read fault while verifying ({e})");
