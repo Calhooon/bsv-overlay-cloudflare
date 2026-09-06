@@ -840,6 +840,21 @@ async fn submit_inner(
                 crate::ef::merge_raw_sources(&tagged_beef.beef, &raws)
             }
         };
+        // Loop-2 hardening (2026-09-05): name the subject rule's work when it
+        // disagrees with the old sorted-last — the log line a mis-targeted
+        // admission would have needed (pair-17's JOIN admitted a HOP for 200).
+        if let Ok(mut named) = bsv_rs::transaction::beef::Beef::from_binary(&gated_beef) {
+            let tip = crate::ef::subject_txid_of(&mut named);
+            let last = crate::ef::sorted_last_txid_of(&named);
+            if tip.is_some() && tip != last {
+                worker::console_log!(
+                    "broadcast-gated: subject {} by the {} rule — sorted-last was {} (an incomplete ancestry; loop-2 class)",
+                    tip.as_deref().unwrap_or("?"),
+                    if named.is_atomic() { "atomic" } else { "unique-tip" },
+                    last.as_deref().unwrap_or("?")
+                );
+            }
+        }
         let (efs, subject_txid) = match crate::ef::beef_to_ef_batch(&gated_beef) {
             Ok(v) => v,
             Err(e) => {
@@ -1247,15 +1262,17 @@ async fn submit_inner(
             )
         {
             // Review MEDIUM-3: the SAME subject derivation as the gated arm —
-            // beef_to_ef_batch sorts first and takes the sorted last; a raw
-            // `.txs.last()` here would key a different txid for any body
-            // whose raw order differs (the #351 sorted-last contract).
+            // `ef::subject_txid_of` (atomic name → unique tip → the
+            // reference's sorted-last; loop-2 hardening 2026-09-05: the
+            // sorted-last alone named a HOP the subject of an incomplete JOIN
+            // BEEF and this belt then saw "not funding-shaped").
             let subject = bsv_rs::transaction::beef::Beef::from_binary(&tagged_beef.beef)
                 .ok()
                 .and_then(|mut b| {
-                    b.sort_txs();
+                    let subject_txid = crate::ef::subject_txid_of(&mut b)?;
                     b.txs
-                        .last()
+                        .iter()
+                        .find(|t| t.txid().eq_ignore_ascii_case(&subject_txid))
                         .and_then(|t| t.tx().map(|tx| (t.txid(), tx.clone())))
                 });
             // Belt v3 (attempt 11 live finding): the refusal additionally
@@ -1440,7 +1457,13 @@ async fn submit_inner(
             let seen_arcade =
                 crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
             ctx.wait_until(async move {
-                let subject = bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, None)
+                // The same subject rule as the gate (loop-2 hardening): a
+                // bare `from_beef(_, None)` takes the wire-last tx, which an
+                // SDK-sorted incomplete BEEF fills with a fully-sourced HOP.
+                let named = bsv_rs::transaction::beef::Beef::from_binary(&beef_for_seen)
+                    .ok()
+                    .and_then(|mut b| crate::ef::subject_txid_of(&mut b));
+                let subject = bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, named.as_deref())
                     .map(|t| t.id());
                 if let Ok(subject) = subject {
                     if seen_arcade.network_witnessed(&subject).await {

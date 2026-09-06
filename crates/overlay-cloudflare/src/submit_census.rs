@@ -600,10 +600,9 @@ mod tests {
 
     /// The fixture-found false green, reproduced natively: a body whose REAL
     /// subject has a missing input sorts that subject into the front group,
-    /// leaving a complete ANCESTOR as `last()`. The census must answer with
-    /// the THIRD state — never a green (the first implementation said
-    /// `GatedReady` here), and never a fail it cannot establish (the gated
-    /// fate is the network's verdict on the wrong tx).
+    /// leaving a complete ANCESTOR as `last()`. Pre-loop-2 the census answered
+    /// the THIRD state here (subject ambiguous); since the tip rule the gate
+    /// names the real subject and its structural refusal is the answer.
     #[test]
     fn a_poisoned_subject_sort_is_uneval_never_a_green() {
         // A COMPLETE in-BEEF parent (no inputs of its own to be missing —
@@ -644,9 +643,18 @@ mod tests {
             parent_txid,
             "fixture drift: the mis-sort this cell exists for is not happening"
         );
+        // LOOP-2 HARDENING (2026-09-05): the route no longer takes the
+        // sorted-last as the subject — `ef::subject_txid_of` names the UNIQUE
+        // TIP (the real subject: nothing spends it), so the trap can no longer
+        // spring the census into the third state. The real subject's absent
+        // source makes the EF conversion fail, and THAT is the honest, mapped
+        // answer: the route would refuse 400 (`SubjectEf`), never broadcast
+        // the ancestor. (The fleet found this exact shape live on pair-17 —
+        // a JOIN admitted as a HOP for 200 — and the fix moved from
+        // "uneval" here to "right subject" in the gate.)
         assert_eq!(
             census_verdict(&beef.to_binary()),
-            CensusVerdict::CouldNotEvaluate(UnevalWhy::SubjectAmbiguous)
+            CensusVerdict::WouldHaveFailed(WouldFailWhy::SubjectEf)
         );
     }
 

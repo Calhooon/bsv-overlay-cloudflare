@@ -41,6 +41,67 @@ pub struct EfTx {
 /// Convert BEEF bytes into Extended Format (BRC-30) binaries for ARC.
 ///
 /// # Returns
+/// The submitted BEEF's SUBJECT — the reference rule of `Transaction.fromBEEF`
+/// (`txid ?? beef.atomicTxid ?? lastTx`, mirrored by bsv-rs `from_beef`) with
+/// ONE hardening rung between the atomic name and the last-tx fallback: the
+/// UNIQUE TIP, the one transaction no other transaction in the BEEF spends.
+///
+/// LOOP-2 FLEET FINDING (2026-09-05, pair-17 DEFINITIVE + the mini's refund
+/// red — `docs/FLEET-LOOP-2026-09-05.md`): a JOIN whose ancestry lacked ONE
+/// source (a hop's parent the wallet had not BEEF'd) is `notValid` to
+/// `sort_txs`, which files it FIRST behind the with-missing-inputs group and
+/// the fully-sourced HOP LAST — so "sorted last" named the HOP the subject,
+/// the pre-flight probe found the hop already SEEN, `tm_pot` judged a hop (no
+/// covenant output → admitted nothing) and the route answered 200: the pot
+/// never entered the index while its JOIN mined (`5ad2764c…`, block 965500).
+/// The SDK's `toBinary()` writes the same order, so the reference's `lastTx`
+/// makes the same choice on an incomplete BEEF; only the atomic name and the
+/// tip are ORDER-INDEPENDENT. Two tips (a malformed multi-subject body) fall
+/// back to the reference's sorted-last so an old client is never refused for
+/// a shape it always sent. `None` only for a BEEF with no transaction data.
+pub fn subject_txid_of(beef: &mut Beef) -> Option<String> {
+    if let Some(atomic) = beef.atomic_txid.clone() {
+        if beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(&atomic)) {
+            return Some(atomic.to_ascii_lowercase());
+        }
+    }
+    let mut spent: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for b in &beef.txs {
+        if let Some(tx) = b.tx() {
+            for input in &tx.inputs {
+                let src = input
+                    .source_txid
+                    .clone()
+                    .or_else(|| input.source_transaction.as_ref().map(|t| t.id()));
+                if let Some(src) = src {
+                    spent.insert(src.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    let tips: Vec<String> = beef
+        .txs
+        .iter()
+        .filter(|b| b.tx().is_some())
+        .map(|b| b.txid().to_ascii_lowercase())
+        .filter(|t| !spent.contains(t))
+        .collect();
+    if tips.len() == 1 {
+        return tips.into_iter().next();
+    }
+    beef.sort_txs();
+    beef.txs.last().filter(|b| b.tx().is_some()).map(|b| b.txid().to_ascii_lowercase())
+}
+
+/// The sorted-last txid — the pre-loop-2 subject rule, kept ONLY so callers
+/// and pins can name the disagreement with [`subject_txid_of`] (a log line,
+/// never a decision).
+pub fn sorted_last_txid_of(beef: &Beef) -> Option<String> {
+    let mut sorted = beef.clone();
+    sorted.sort_txs();
+    sorted.txs.last().map(|b| b.txid().to_ascii_lowercase())
+}
+
 /// `(efs, subject_txid)` — EF entries for **unproven** transactions in
 /// dependency order, plus the txid of the BEEF's subject (last) transaction.
 /// `efs` is empty when every transaction already carries a merkle proof
@@ -56,6 +117,9 @@ pub struct EfTx {
 /// Only the SUBJECT failing to convert is an error.
 pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfError> {
     let mut beef = Beef::from_binary(beef_bytes).map_err(|e| EfError::Parse(e.to_string()))?;
+    // The subject is order-independent (atomic name → unique tip → the
+    // reference's sorted-last); the sort below only orders the EF legs.
+    let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();
     beef.sort_txs();
 
     // txid → parsed transaction, for linking input sources one level deep.
@@ -65,7 +129,6 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
             tx_map.insert(btx.txid(), tx.clone());
         }
     }
-    let subject_txid = beef.txs.last().map(|b| b.txid()).unwrap_or_default();
 
     let mut efs = Vec::new();
 
@@ -128,14 +191,19 @@ pub fn missing_source_txids(beef_bytes: &[u8]) -> Vec<String> {
     let Ok(mut beef) = Beef::from_binary(beef_bytes) else {
         return Vec::new();
     };
-    beef.sort_txs();
+    let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();
     let held: std::collections::HashSet<String> = beef
         .txs
         .iter()
         .filter(|b| b.tx().is_some())
         .map(|b| b.txid())
         .collect();
-    let Some(subject) = beef.txs.last().and_then(|b| b.tx().cloned()) else {
+    let Some(subject) = beef
+        .txs
+        .iter()
+        .find(|b| b.txid().eq_ignore_ascii_case(&subject_txid))
+        .and_then(|b| b.tx().cloned())
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -248,8 +316,11 @@ pub fn strip_subject_bump(beef_bytes: &[u8], subject_txid: &str) -> Option<Vec<u
 /// (fail-closed: an unverifiable claim never admits).
 pub fn proven_subject_raw(beef_bytes: &[u8]) -> Option<Vec<u8>> {
     let mut beef = Beef::from_binary(beef_bytes).ok()?;
-    beef.sort_txs();
-    let subject = beef.txs.last()?;
+    let subject_txid = subject_txid_of(&mut beef)?;
+    let subject = beef
+        .txs
+        .iter()
+        .find(|b| b.txid().eq_ignore_ascii_case(&subject_txid))?;
     let tx = subject.tx()?;
     Some(tx.to_binary())
 }
@@ -470,5 +541,129 @@ mod tests {
         assert_eq!(subject_txid, SUBJECT_TXID);
         assert_eq!(efs.len(), 1, "the unconvertible ancestor is skipped");
         assert_eq!(efs[0].txid, SUBJECT_TXID);
+    }
+    /// LOOP-2 FLEET PIN (2026-09-05, pair-17 DEFINITIVE; the real bytes p2's
+    /// felt POSTed at 23:45:57.885Z — 23 txs, 57,100 B): the JOIN
+    /// `5ad2764c…` spends the two hops; p1's hop `a347ed36…` spends
+    /// `294fced3…:1`, a source the BEEF does NOT carry. `sort_txs` files the
+    /// JOIN as not-valid and p2's hop LAST; the pre-loop-2 rule named the hop
+    /// the subject and the pot never entered the index. The subject is the
+    /// unique tip, order be damned; the EF batch carries the JOIN's own leg
+    /// (its direct sources are present) and the true subject's missing
+    /// sources are NONE (the gap is a grandparent — F-D's completion is not
+    /// what this shape needed, the subject rule was).
+    const LOOP2_INCOMPLETE_JOIN_BEEF: &[u8] =
+        include_bytes!("../tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef");
+    const LOOP2_JOIN_TXID: &str = "5ad2764c5151592915ccfc2e1ac2cbc763a34c3c522aa6f98655f1fc88559bb8";
+    const LOOP2_P2_HOP_TXID: &str = "6ec7a0e8c453019fe665627031eb33a15e8891e1b123fa96a067d1a9cd54d8c8";
+
+    #[test]
+    fn loop2_incomplete_join_beef_subject_is_the_join_not_the_sorted_last_hop() {
+        let mut beef = Beef::from_binary(LOOP2_INCOMPLETE_JOIN_BEEF).expect("the captured body parses");
+        assert!(!beef.is_atomic(), "the loop-2 client sent a plain BEEF (no atomic name)");
+        // The trap: every order-dependent reader picks something OTHER than
+        // the JOIN (the SDK's `toBinary()` order and bsv-rs's `sort_txs`
+        // differ in which valid tx lands last — p2's hop for the SDK, the
+        // last resolved valid tx for bsv-rs — and neither is the subject).
+        let sorted_last = sorted_last_txid_of(&beef).expect("a sorted last");
+        assert_ne!(sorted_last, LOOP2_JOIN_TXID, "the trap: sorted-last is never the JOIN here");
+        assert!(
+            beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(&sorted_last)),
+            "the sorted-last is one of the BEEF's txs"
+        );
+        assert!(
+            beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(LOOP2_P2_HOP_TXID)),
+            "p2's hop is in the body (the SDK's sorted-last)"
+        );
+        assert_eq!(subject_txid_of(&mut beef).as_deref(), Some(LOOP2_JOIN_TXID), "the unique tip is the JOIN");
+
+        let (efs, subject_txid) = beef_to_ef_batch(LOOP2_INCOMPLETE_JOIN_BEEF).expect("converts");
+        assert_eq!(subject_txid, LOOP2_JOIN_TXID);
+        assert!(efs.iter().any(|e| e.txid == LOOP2_JOIN_TXID), "the JOIN's own EF leg is in the batch");
+        assert!(
+            missing_source_txids(LOOP2_INCOMPLETE_JOIN_BEEF).is_empty(),
+            "the JOIN's DIRECT sources are present — the gap is a grandparent"
+        );
+        let raw = proven_subject_raw(LOOP2_INCOMPLETE_JOIN_BEEF).expect("subject raw");
+        assert_eq!(Transaction::from_binary(&raw).unwrap().id(), LOOP2_JOIN_TXID);
+    }
+
+    /// The same loop's SECOND capture: p2's felt re-presenting the transient
+    /// hand's JOIN `f9e85aab…` (4 txs, 9,026 B) with p1's hop `4a89ca60…`
+    /// carrying three sources the body lacks — sorted-last is p2's hop
+    /// `6760361c…`; the unique tip is the JOIN.
+    const LOOP2_REPRESENT_BEEF: &[u8] =
+        include_bytes!("../tests/fixtures/ef/loop2_join_f9e85aab_represent.beef");
+
+    #[test]
+    fn loop2_represent_beef_subject_is_the_join_too() {
+        let mut beef = Beef::from_binary(LOOP2_REPRESENT_BEEF).expect("parses");
+        assert_eq!(beef.txs.len(), 4);
+        assert_eq!(
+            sorted_last_txid_of(&beef).as_deref(),
+            Some("6760361c9fbed4ccb68caa32b63f239623c8c6861380d68aeb1154ee7450394e"),
+            "sorted-last: p2's hop"
+        );
+        assert_eq!(
+            subject_txid_of(&mut beef).as_deref(),
+            Some("f9e85aab7cc018cc47040eb7029cc94dd7cec1c7b981c5d1084fbfe862e2bb1d"),
+            "the unique tip: the JOIN"
+        );
+    }
+
+    #[test]
+    fn atomic_beef_names_its_subject_over_wire_order() {
+        // parent proven + subject unmined, serialized ATOMIC for the subject.
+        let mut beef = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+        let subject = Transaction::from_hex(SUBJECT_RAW_HEX.trim()).unwrap();
+        beef.merge_transaction(subject);
+        let atomic = beef.to_binary_atomic(SUBJECT_TXID).unwrap();
+        let mut parsed = Beef::from_binary(&atomic).unwrap();
+        assert!(parsed.is_atomic());
+        assert_eq!(subject_txid_of(&mut parsed).as_deref(), Some(SUBJECT_TXID));
+        let (efs, subject_txid) = beef_to_ef_batch(&atomic).unwrap();
+        assert_eq!(subject_txid, SUBJECT_TXID);
+        assert_eq!(efs.len(), 1);
+        // an atomic name that is NOT in the BEEF is ignored, never trusted
+        let mut stray = Beef::from_binary(&atomic).unwrap();
+        stray.atomic_txid = Some("00".repeat(32));
+        assert_eq!(subject_txid_of(&mut stray).as_deref(), Some(SUBJECT_TXID), "falls to the unique tip");
+    }
+
+    #[test]
+    fn two_tips_fall_back_to_the_reference_sorted_last() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{TransactionInput, TransactionOutput};
+        // a spends b (the fixtures): ONE tip → a, whatever the wire order.
+        let a = Transaction::from_hex(SUBJECT_RAW_HEX.trim()).unwrap();
+        let b = {
+            let pb = Beef::from_hex(PARENT_BEEF_HEX.trim()).unwrap();
+            Transaction::from_hex(&pb.txs.last().unwrap().tx().unwrap().to_hex()).unwrap()
+        };
+        let mut related = Beef::new();
+        related.merge_transaction(a.clone());
+        related.merge_transaction(b.clone());
+        assert_eq!(subject_txid_of(&mut related).as_deref(), Some(SUBJECT_TXID), "a spends b: a is the tip");
+
+        // Two UNRELATED unmined txs (each spends a source the BEEF lacks): no
+        // unique tip → the reference's sorted-last, whichever that is.
+        let stray = |seed: u8| -> Transaction {
+            let mut tx = Transaction::new();
+            tx.inputs.push(TransactionInput {
+                source_txid: Some(format!("{:02x}", seed).repeat(32)),
+                source_output_index: 0,
+                ..Default::default()
+            });
+            tx.outputs.push(TransactionOutput::new(1, LockingScript::from_hex("51").unwrap()));
+            tx
+        };
+        let (c, d) = (stray(0xaa), stray(0xbb));
+        assert_ne!(c.id(), d.id());
+        let mut two = Beef::new();
+        two.merge_transaction(c.clone());
+        two.merge_transaction(d.clone());
+        let expect = sorted_last_txid_of(&two);
+        assert!(expect.is_some());
+        assert_eq!(subject_txid_of(&mut two), expect, "no unique tip → the reference's sorted-last");
     }
 }
