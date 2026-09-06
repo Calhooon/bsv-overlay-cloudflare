@@ -2195,6 +2195,49 @@ impl Engine {
         Ok(report)
     }
 
+    /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): FORGET a PHANTOM applied row —
+    /// (txid, topic) recorded in `applied_transactions` while the topic holds
+    /// NO output of that txid (the engine judged the tx and admitted nothing:
+    /// the loop-2 JOIN `f9e85aab…` under the pre-D5 subject rule). Such a row
+    /// does nothing but block a correct re-submit through the Phase-1 dedup
+    /// (`/admin/readmit` on beta answered `deduped: ["tm_pot_beta"]` and the
+    /// pot stayed `known:false`). A row with ANY stored output on the topic is
+    /// a real admission and is never touched (returns false, as does a missing
+    /// row). The forgotten bytes are then re-VALIDATED by the topic manager
+    /// like any first submit — nothing is admitted here.
+    pub async fn forget_phantom_applied(
+        &self,
+        txid: &str,
+        topic: &str,
+    ) -> Result<bool, EngineError> {
+        let txid = txid.to_ascii_lowercase();
+        let outputs = self
+            .storage
+            .find_outputs_for_transaction(&txid, false)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
+        if outputs.iter().any(|o| o.topic == topic) {
+            return Ok(false);
+        }
+        let rec = AppliedTransaction {
+            txid: txid.clone(),
+            topic: topic.to_string(),
+        };
+        let exists = self
+            .storage
+            .does_applied_transaction_exist(&rec)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
+        if !exists {
+            return Ok(false);
+        }
+        self.storage
+            .delete_applied_transaction(&rec)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
+        Ok(true)
+    }
+
     pub async fn evict_output(
         &self,
         txid: &str,
@@ -6053,6 +6096,12 @@ mod tests {
         ) -> Result<bool, StorageError> {
             self.inner.does_applied_transaction_exist(tx).await
         }
+        async fn delete_applied_transaction(
+            &self,
+            tx: &AppliedTransaction,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_applied_transaction(tx).await
+        }
         async fn find_output(
             &self,
             txid: &str,
@@ -6423,5 +6472,32 @@ mod tests {
         let r2 = engine.renotify_admitted(&txid.to_ascii_uppercase(), "tm_test").await.unwrap();
         assert_eq!((r2.outputs, r2.notified, r2.faults.len()), (1, 2, 0));
         assert_eq!(seen.borrow().len(), 6);
+    }
+
+    /// bsv-low PLAN-PRE-LOOP4 §H4: a PHANTOM applied row (the topic admitted
+    /// NOTHING) dedups every re-submit of those bytes; forgetting it lets the
+    /// same bytes be judged again — while a REAL admission's row is never
+    /// forgotten and a missing row is nothing to forget.
+    #[tokio::test]
+    async fn forget_phantom_applied_unblocks_a_resubmit_but_never_a_real_admission() {
+        // phantom: a TM that admits nothing still records the topic as applied
+        let engine = make_engine(vec![]);
+        let tagged = test_tagged_beef(vec!["tm_test"]);
+        let (steak, r1) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert!(steak.get("tm_test").unwrap().outputs_to_admit.is_empty());
+        assert_eq!(r1.applied_topics, vec!["tm_test".to_string()]);
+        let (_, r2) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert_eq!(r2.deduped_topics, vec!["tm_test".to_string()], "the phantom row dedups the re-submit");
+        assert!(engine.forget_phantom_applied(TEST_TXID, "tm_test").await.unwrap());
+        let (_, r3) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert!(r3.deduped_topics.is_empty(), "judged again after the forget");
+        assert!(!engine.forget_phantom_applied(TEST_TXID, "tm_other").await.unwrap(), "no row: nothing to forget");
+
+        // real: a TM that admits output 0 — its row is a real admission, never forgotten
+        let real = make_engine(vec![0]);
+        real.submit(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert!(!real.forget_phantom_applied(TEST_TXID, "tm_test").await.unwrap());
+        let (_, r4) = real.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        assert_eq!(r4.deduped_topics, vec!["tm_test".to_string()], "a real admission still dedups");
     }
 }

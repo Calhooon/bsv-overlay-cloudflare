@@ -116,6 +116,16 @@ pub trait Storage {
         tx: &AppliedTransaction,
     ) -> Result<bool, StorageError>;
 
+    /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): forget a (txid, topic) applied
+    /// record so a re-submit of those bytes is re-validated instead of
+    /// deduplicated away. The caller proves the row is PHANTOM (no stored
+    /// output of that txid on that topic) before asking — see
+    /// `Engine::forget_phantom_applied`.
+    async fn delete_applied_transaction(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<(), StorageError>;
+
     // ========================================================================
     // Read operations
     // ========================================================================
@@ -345,6 +355,12 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
         tx: &AppliedTransaction,
     ) -> Result<bool, StorageError> {
         (**self).does_applied_transaction_exist(tx).await
+    }
+    async fn delete_applied_transaction(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<(), StorageError> {
+        (**self).delete_applied_transaction(tx).await
     }
     async fn find_output(
         &self,
@@ -692,6 +708,17 @@ pub mod memory {
                 .lock()
                 .unwrap()
                 .contains_key(&(tx.txid.clone(), tx.topic.clone())))
+        }
+
+        async fn delete_applied_transaction(
+            &self,
+            tx: &AppliedTransaction,
+        ) -> Result<(), StorageError> {
+            self.applied
+                .lock()
+                .unwrap()
+                .remove(&(tx.txid.clone(), tx.topic.clone()));
+            Ok(())
         }
 
         async fn find_output(

@@ -574,6 +574,20 @@ impl Storage for D1Storage {
         Ok(row.is_some_and(|r| r.cnt > 0.0))
     }
 
+    /// bsv-low §H4: forget a PHANTOM applied row (the engine proved the topic
+    /// holds no output of this txid) so a subject-named re-submit is judged.
+    async fn delete_applied_transaction(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<(), StorageError> {
+        Query::new("DELETE FROM applied_transactions WHERE txid = ? AND topic = ?")
+            .bind(&*tx.txid)
+            .bind(&*tx.topic)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
     async fn find_output(
         &self,
         txid: &str,

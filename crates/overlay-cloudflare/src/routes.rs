@@ -2415,6 +2415,20 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
     }
 
     // ── arm 2: the engine never judged it on this topic — re-submit its MINED bytes, subject-named ──
+    // A PHANTOM applied row (the topic admitted nothing under the pre-D5
+    // subject rule) would dedup the re-submit away: forget it first. A real
+    // admission's row is never touched (arm 1 would have re-notified it).
+    let forgot = match engine.forget_phantom_applied(&txid, &topic).await {
+        Ok(b) => b,
+        Err(e) => {
+            let status = engine_error_status(&e);
+            worker::console_log!("POST /admin/readmit -> {status} (forget phantom applied: {e})");
+            return json_error(&e.to_string(), status);
+        }
+    };
+    if forgot {
+        worker::console_log!("POST /admin/readmit {txid} {topic}: a phantom applied row forgotten — the re-submit is judged");
+    }
     let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env));
     let raw_hex = match fetcher.fetch_raw_hex(&txid).await {
         Ok(h) => h,
@@ -2460,6 +2474,7 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
             );
             json_ok(&serde_json::json!({
                 "status": "success", "mode": "resubmitted", "txid": txid, "topic": topic,
+                "phantomAppliedForgotten": forgot,
                 "steak": steak, "deduped": report.deduped_topics,
                 "faults": report.faults.iter().map(|f| format!("{}:{}: {}", f.topic, f.site, f.error)).collect::<Vec<_>>(),
             }))
