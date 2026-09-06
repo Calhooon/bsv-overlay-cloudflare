@@ -833,8 +833,17 @@ impl Engine {
             }
         }
 
-        // Parse transaction from BEEF
-        let tx = Transaction::from_beef(&tagged_beef.beef, None)
+        // Parse the SUBJECT from the BEEF — order-independent (`subject.rs`,
+        // loop-2 hardening 2026-09-05): `from_beef(_, None)` takes the last
+        // tx in wire order, which an SDK-sorted INCOMPLETE ancestry fills
+        // with a fully-sourced ancestor; the engine then judged a hop, admitted
+        // nothing and the pot never entered the index while its JOIN mined.
+        let subject = {
+            let mut b = bsv_rs::transaction::Beef::from_binary(&tagged_beef.beef)
+                .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+            crate::subject::subject_txid_of(&mut b)
+        };
+        let tx = Transaction::from_beef(&tagged_beef.beef, subject.as_deref())
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
         let txid = tx.id();
 
@@ -1451,7 +1460,12 @@ impl Engine {
         Box::pin(async move {
             let beef_data = output.beef.as_ref().ok_or(EngineError::NodeNotFound)?;
 
-            let root_tx = Transaction::from_beef(beef_data, None)
+            // The stored body's SUBJECT by the same order-independent rule
+            // (`subject.rs`) — a plain stored body's last tx can be an ancestor.
+            let root = bsv_rs::transaction::Beef::from_binary(beef_data)
+                .ok()
+                .and_then(|mut b| crate::subject::subject_txid_of(&mut b));
+            let root_tx = Transaction::from_beef(beef_data, root.as_deref())
                 .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
 
             // Search the transaction tree for the requested txid

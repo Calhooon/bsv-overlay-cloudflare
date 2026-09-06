@@ -41,66 +41,12 @@ pub struct EfTx {
 /// Convert BEEF bytes into Extended Format (BRC-30) binaries for ARC.
 ///
 /// # Returns
-/// The submitted BEEF's SUBJECT — the reference rule of `Transaction.fromBEEF`
-/// (`txid ?? beef.atomicTxid ?? lastTx`, mirrored by bsv-rs `from_beef`) with
-/// ONE hardening rung between the atomic name and the last-tx fallback: the
-/// UNIQUE TIP, the one transaction no other transaction in the BEEF spends.
-///
-/// LOOP-2 FLEET FINDING (2026-09-05, pair-17 DEFINITIVE + the mini's refund
-/// red — `docs/FLEET-LOOP-2026-09-05.md`): a JOIN whose ancestry lacked ONE
-/// source (a hop's parent the wallet had not BEEF'd) is `notValid` to
-/// `sort_txs`, which files it FIRST behind the with-missing-inputs group and
-/// the fully-sourced HOP LAST — so "sorted last" named the HOP the subject,
-/// the pre-flight probe found the hop already SEEN, `tm_pot` judged a hop (no
-/// covenant output → admitted nothing) and the route answered 200: the pot
-/// never entered the index while its JOIN mined (`5ad2764c…`, block 965500).
-/// The SDK's `toBinary()` writes the same order, so the reference's `lastTx`
-/// makes the same choice on an incomplete BEEF; only the atomic name and the
-/// tip are ORDER-INDEPENDENT. Two tips (a malformed multi-subject body) fall
-/// back to the reference's sorted-last so an old client is never refused for
-/// a shape it always sent. `None` only for a BEEF with no transaction data.
-pub fn subject_txid_of(beef: &mut Beef) -> Option<String> {
-    if let Some(atomic) = beef.atomic_txid.clone() {
-        if beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(&atomic)) {
-            return Some(atomic.to_ascii_lowercase());
-        }
-    }
-    let mut spent: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for b in &beef.txs {
-        if let Some(tx) = b.tx() {
-            for input in &tx.inputs {
-                let src = input
-                    .source_txid
-                    .clone()
-                    .or_else(|| input.source_transaction.as_ref().map(|t| t.id()));
-                if let Some(src) = src {
-                    spent.insert(src.to_ascii_lowercase());
-                }
-            }
-        }
-    }
-    let tips: Vec<String> = beef
-        .txs
-        .iter()
-        .filter(|b| b.tx().is_some())
-        .map(|b| b.txid().to_ascii_lowercase())
-        .filter(|t| !spent.contains(t))
-        .collect();
-    if tips.len() == 1 {
-        return tips.into_iter().next();
-    }
-    beef.sort_txs();
-    beef.txs.last().filter(|b| b.tx().is_some()).map(|b| b.txid().to_ascii_lowercase())
-}
-
-/// The sorted-last txid — the pre-loop-2 subject rule, kept ONLY so callers
-/// and pins can name the disagreement with [`subject_txid_of`] (a log line,
-/// never a decision).
-pub fn sorted_last_txid_of(beef: &Beef) -> Option<String> {
-    let mut sorted = beef.clone();
-    sorted.sort_txs();
-    sorted.txs.last().map(|b| b.txid().to_ascii_lowercase())
-}
+/// The submitted BEEF's SUBJECT — `atomic ?? unique tip ?? sorted-last`,
+/// ONE rule for the gate, the EF batch, F-D's completion, the false-ok belt,
+/// the SEEN latch AND the engine's admission (`overlay_engine::subject`; the
+/// loop-2 fleet finding is documented there and pinned below on the real
+/// captured bodies).
+pub use overlay_engine::subject::{sorted_last_txid_of, subject_txid_of};
 
 /// `(efs, subject_txid)` — EF entries for **unproven** transactions in
 /// dependency order, plus the txid of the BEEF's subject (last) transaction.
@@ -650,7 +596,7 @@ mod tests {
         let stray = |seed: u8| -> Transaction {
             let mut tx = Transaction::new();
             tx.inputs.push(TransactionInput {
-                source_txid: Some(format!("{:02x}", seed).repeat(32)),
+                source_txid: Some(format!("{seed:02x}").repeat(32)),
                 source_output_index: 0,
                 ..Default::default()
             });
