@@ -760,6 +760,42 @@ mod tests {
 
     // ── Admit → known, unspent + funding beef stored ─────────────────────
 
+    /// LOOP-2 FLEET PIN (2026-09-05, pair-17 DEFINITIVE): the real 57,100-byte
+    /// JOIN body p2's felt POSTed — its ancestry lacks one grandparent, so the
+    /// wire-last (and sorted-last) tx is p2's HOP, not the JOIN `5ad2764c…`.
+    /// This hook re-parses its payload with `from_beef(_, None)`: fed the
+    /// PLAIN body it judged the hop, failed the pot shape check and wrote NO
+    /// record (the engine had admitted the pot: `known:false` for a mined
+    /// pot). The engine now hands lookup services a body that NAMES the
+    /// subject (BRC-95 atomic prefix over the whole body) — both halves
+    /// pinned here: the named body records the pot; the same bytes un-named
+    /// still skip (the trap, documented at the service's own door).
+    const LOOP2_INCOMPLETE_JOIN_BEEF: &[u8] = include_bytes!(
+        "../../../overlay-cloudflare/tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef"
+    );
+    const LOOP2_JOIN_TXID: &str = "5ad2764c5151592915ccfc2e1ac2cbc763a34c3c522aa6f98655f1fc88559bb8";
+
+    #[tokio::test]
+    async fn loop2_named_body_records_the_pot_the_plain_body_missed() {
+        use bsv_rs::transaction::Beef;
+        // the trap: un-named, the hook sees the wire-last hop → no record
+        let (svc, storage) = make_service_with_storage();
+        svc.output_admitted_by_topic(&admit(LOOP2_INCOMPLETE_JOIN_BEEF.to_vec(), 0))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0, "the plain body's wire-last is a hop — skipped");
+
+        // the fix: the engine names the subject; the hook records the pot
+        let mut beef = Beef::from_binary(LOOP2_INCOMPLETE_JOIN_BEEF).unwrap();
+        let named = beef.to_binary_atomic(LOOP2_JOIN_TXID).unwrap();
+        let (svc, storage) = make_service_with_storage();
+        svc.output_admitted_by_topic(&admit(named, 0)).await.unwrap();
+        assert_eq!(storage.record_count(), 1);
+        let arr = spent_status(&svc, serde_json::json!([{"txid": LOOP2_JOIN_TXID, "vout": 0}])).await;
+        assert_eq!(arr[0]["known"], true);
+        assert_eq!(arr[0]["spent"], false);
+    }
+
     #[tokio::test]
     async fn admit_then_lookup_known_unspent() {
         let (svc, storage) = make_service_with_storage();
