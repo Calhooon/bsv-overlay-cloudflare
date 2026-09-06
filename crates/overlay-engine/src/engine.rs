@@ -542,6 +542,19 @@ impl Engine {
     ) -> Result<(Steak, MutationReport), EngineError> {
         let (validations, mut steak, tx, txid) = self.run_validation(tagged_beef, mode).await?;
         let mut report = MutationReport::default();
+        // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
+        // atomic prefix over the WHOLE submitted body — bsv-rs's
+        // `to_binary_atomic` sorts, names, never prunes). Lookup services
+        // re-parse it with `from_beef(_, None)`; on a plain incomplete body
+        // that pick is the wire-last ANCESTOR, so the pot index's admit hook
+        // shape-checked a hop and wrote no record while the engine had
+        // admitted the pot (loop-2 fleet, 2026-09-05; the live proof after
+        // the engine's own subject fix). A body that cannot be re-serialized
+        // (never, for a parsed subject) is handed through as submitted.
+        let subject_named_beef: Vec<u8> = bsv_rs::transaction::Beef::from_binary(&tagged_beef.beef)
+            .ok()
+            .and_then(|mut b| b.to_binary_atomic(&txid).ok())
+            .unwrap_or_else(|| tagged_beef.beef.clone());
 
         // =================================================================
         // PHASE 3: MUTATE STORAGE
@@ -610,7 +623,7 @@ impl Engine {
                             txid: prev_output.txid.clone(),
                             output_index: prev_output.output_index,
                             topic: topic.clone(),
-                            spending_atomic_beef: tagged_beef.beef.clone(),
+                            spending_atomic_beef: subject_named_beef.clone(),
                             off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                     };
@@ -726,7 +739,7 @@ impl Engine {
                             off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                         AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
-                            atomic_beef: tagged_beef.beef.clone(),
+                            atomic_beef: subject_named_beef.clone(),
                             output_index,
                             topic: topic.clone(),
                             off_chain_values: tagged_beef.off_chain_values.clone(),
@@ -3831,8 +3844,14 @@ mod tests {
                 assert_eq!(txid, PREVIOUS_TXID);
                 assert_eq!(*output_index, 0);
                 assert_eq!(topic, "tm_test");
-                // The spending BEEF should be the entire BEEF we submitted
-                assert_eq!(spending_atomic_beef, &test_beef());
+                // The spending BEEF is the entire BEEF we submitted, NAMED
+                // (atomic prefix) for the lookup service's own re-parse.
+                let mut named = bsv_rs::transaction::Beef::from_binary(spending_atomic_beef).unwrap();
+                assert!(named.is_atomic());
+                let submitted = bsv_rs::transaction::Beef::from_binary(&test_beef()).unwrap();
+                assert_eq!(named.txs.len(), submitted.txs.len(), "the whole body, never pruned");
+                let tip = crate::subject::subject_txid_of(&mut named).unwrap();
+                assert_eq!(named.atomic_txid.as_deref(), Some(tip.as_str()));
             }
             other => panic!("Expected OutputSpent::WholeTx, got: {other:?}"),
         }
