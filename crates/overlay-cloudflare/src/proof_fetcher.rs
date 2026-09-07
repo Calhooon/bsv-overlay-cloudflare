@@ -3671,7 +3671,16 @@ pub async fn apply_pushed_proof_to_pot_stores(
                     .mark_confirmed_for_spender(&rec.txid, rec.output_index, txid, spent_height)
                     .await
                 {
-                    Ok(true) => summary.spends_confirmed += 1,
+                    Ok(true) => {
+                        summary.spends_confirmed += 1;
+                        // bsv-low loop 6 (2026-09-07): this latch is the FIRST time the
+                        // index knows a mined spend (Arcade's MINED push, ~4.5 min after
+                        // the block) — and it used to notify nobody: the seat's row and
+                        // card waited for a client re-read or the 15-min cron's flush.
+                        // Note the outpoint; the route flushes ONE pot-changed webhook
+                        // (`pot_changes`), the app-layer files each seat's `pot` event.
+                        crate::pot_changes::note(&rec.txid, rec.output_index);
+                    }
                     Ok(false) => {
                         summary.spends_cas_missed += 1;
                         push_log(&format!(
@@ -5961,6 +5970,37 @@ mod tests {
             pool.contains(&settle_txid),
             "the confirmed spender still completes its own proof normally"
         );
+    }
+
+    /// bsv-low loop 6 (2026-09-07): the push path's spend confirmation is an
+    /// EVENT — the pot outpoint it confirms is noted for the pot-changed webhook
+    /// (the route flushes it), so a seat's served row/card flips on the callback,
+    /// not on the next client re-read or the 15-min cron.
+    #[tokio::test]
+    async fn pushed_proof_that_confirms_a_spend_notes_the_pot_outpoint_for_the_webhook() {
+        let _ = crate::pot_changes::drain(); // this thread's set may carry other tests' notes
+        let store = MemoryPotStorage::new();
+        let pot = "ee".repeat(32);
+        store.store_record(&undecoded_row(&pot)).await.unwrap();
+        let (settle_beef, settle_txid) = spender_beef(&pot, &[(1200, p2pkh_script(&[0xAA; 20]))]);
+        store.store_beef(&settle_txid, &settle_beef).await.unwrap();
+        // the settle is the row's spender, UNCONFIRMED (SEEN, not mined)
+        store
+            .mark_spent(&pot, 0, &settle_txid, false, None, None, None)
+            .await
+            .unwrap();
+        let bump_hex = single_tx_bump(&settle_txid, HEIGHT).to_hex();
+        let s = apply_pushed_proof_to_pot_stores(&store, &settle_txid, &bump_hex).await;
+        assert_eq!(s.spends_confirmed, 1, "the pushed bump confirms the spend");
+        let noted = crate::pot_changes::drain();
+        assert!(
+            noted.contains(&(pot.clone(), 0)),
+            "the confirmed pot outpoint must be noted for the pot-changed webhook, got {noted:?}"
+        );
+        // and NOT when nothing confirmed (a second push of the same bump)
+        let s2 = apply_pushed_proof_to_pot_stores(&store, &settle_txid, &bump_hex).await;
+        assert_eq!(s2.spends_confirmed, 0);
+        assert!(crate::pot_changes::drain().is_empty(), "no confirmation, no note");
     }
 
     /// Confirm beats the latch through the PRODUCTION push path: a reorg

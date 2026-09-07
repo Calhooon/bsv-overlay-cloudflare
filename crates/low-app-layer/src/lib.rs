@@ -153,7 +153,7 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 /// on the way out, so a cross-origin browser always sees the real status
 /// instead of an opaque network error.
 #[event(fetch)]
-pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // 2026-09-04: the WoC api key for this isolate's provider reads (see routes::provider_get).
     routes::set_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()));
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
@@ -180,7 +180,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // BEFORE the BRC-103 front door, exactly like the relay's /broadcast:
     // the callers are our workers, not identities with a wallet.
     if req.method() == worker::Method::Post && req.path() == "/internal/tip-changed" {
-        return internal_events::tip_changed(req, &env).await;
+        return internal_events::tip_changed(req, &env, &ctx).await;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/pot-changed" {
         return routes::internal_pot_changed(req, &env).await;

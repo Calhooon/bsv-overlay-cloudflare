@@ -1892,6 +1892,13 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
 /// chaintracks (same discipline as the cron fetcher) — BYTE-IDENTICAL to the
 /// pre-#228 check. An unverifiable proof is refused (422) and nothing is
 /// stitched; the poll backstop remains.
+/// The engine's "no such transaction" for a proof push (`handle_new_merkle_proof`:
+/// `find_outputs_for_transaction` empty). PURE — pinned below; the message is the
+/// reference engine's own sentence (`ts-stack Engine.ts`), unchanged since.
+pub(crate) fn is_unknown_txid_for_proof_ingest(e: &EngineError) -> bool {
+    matches!(e, EngineError::Other(m) if m.contains("Could not find matching transaction outputs"))
+}
+
 pub async fn arc_ingest(
     engine: &Engine,
     mut req: Request,
@@ -2058,7 +2065,25 @@ pub async fn arc_ingest(
                 message: "Transaction status updated",
             })
         }
-        // Nobody knows this txid — keep the pre-#228 error surface.
+        // Nobody knows this txid. bsv-low loop 6 (2026-09-07): Arcade pushes
+        // MINED for every txid a broadcast registered a webhook for — including
+        // the ones no topic admitted (a `/submit` that admitted 0 outputs). Nobody
+        // holds them and nothing is owed; the old 500 made Arcade RETRY the same
+        // callback a second later (twice per txid in the beta log) and paged the
+        // ops log on a healthy stream. Acknowledged 200, COUNTED (Rule 13).
+        Err(e) if is_unknown_txid_for_proof_ingest(&e) => {
+            worker::console_log!(
+                "POST /arc-ingest txid={txid} -> 200 (acknowledged; unknown txid — no topic holds it, nothing latched)"
+            );
+            if let Some(db) = ops_db {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_UNKNOWN_TXID, 1).await;
+            }
+            json_ok(&SuccessBody {
+                status: "success",
+                message: "Acknowledged (unknown txid)",
+            })
+        }
+        // Any other engine fault keeps the pre-#228 error surface.
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /arc-ingest -> {}", status);
@@ -3922,6 +3947,18 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn arc_ingest_unknown_txid_is_the_engine_not_found_sentence_only() {
+        // bsv-low loop 6: exactly the engine's "no such transaction" is acknowledged;
+        // a storage fault, a bad proof or any other engine error keeps its status.
+        assert!(is_unknown_txid_for_proof_ingest(&EngineError::Other(
+            "Could not find matching transaction outputs for proof ingest!".into()
+        )));
+        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::StorageError("d1 down".into())));
+        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::Other("Invalid merkle proof hex: zz".into())));
+        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::SpvError("bad".into())));
     }
 
     #[test]

@@ -71,6 +71,13 @@ pub const COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: &str = "arc_ingest_unauthorized_no
 /// `/arc-ingest` callbacks REFUSED 401 because a token WAS presented and did
 /// not equal the subject txid. Diagnosis: a stale registration, or a prober.
 pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_bad_token_total";
+/// bsv-low loop 6 (2026-09-07): MINED callbacks for a txid NO topic admitted
+/// (a `/submit` that admitted 0 outputs still registered the webhook) — nobody
+/// holds it, nothing is owed; acknowledged 200 and COUNTED (a 5xx made Arcade
+/// retry the same callback a second later, twice per txid in the beta log).
+pub const COUNTER_ARC_INGEST_UNKNOWN_TXID: &str = "arc_ingest_unknown_txid_total";
+/// bsv-low loop 6: block-event spend-confirmation passes run (`/internal/tip-changed`).
+pub const COUNTER_TIP_PASS_TOTAL: &str = "tip_pass_total";
 /// bsv-low (2026-09-04) — the missing-spend DISCOVERY pass (`proof_fetcher::
 /// discover_missing_spends`), lifetime totals: candidates scanned, spends
 /// discovered (an unconfirmed pointer written), courier-ladder faults, and
@@ -491,6 +498,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARC_INGEST_STATUS_IGNORED: 0,
         COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: 0,
         COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: 0,
+        COUNTER_ARC_INGEST_UNKNOWN_TXID: 0,
+        COUNTER_TIP_PASS_TOTAL: 0,
         // S2 (2026-08-29): seeded so a never-bumped counter reads an explicit
         // 0 on the surface — an ABSENT key is an unknown, and an unknown must
         // not read as fine.
@@ -543,7 +552,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
 /// spelling of the same value is what `read_counters` deliberately avoids.
 fn arc_ingest_push_health(counters: &serde_json::Value) -> &'static str {
     let v = |name: &str| counters.get(name).and_then(|x| x.as_u64()).unwrap_or(0);
-    let admitted = v(COUNTER_ARC_INGEST_PUSHED) + v(COUNTER_ARC_INGEST_STATUS_IGNORED);
+    let admitted =
+        v(COUNTER_ARC_INGEST_PUSHED) + v(COUNTER_ARC_INGEST_STATUS_IGNORED) + v(COUNTER_ARC_INGEST_UNKNOWN_TXID);
     let refused = v(COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN) + v(COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN);
     match (admitted, refused) {
         (0, 0) => "silent",

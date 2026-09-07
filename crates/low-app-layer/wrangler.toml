@@ -52,6 +52,8 @@ AUTH_ENFORCE = "false"
 # reached through the RELAY service binding; the URL names the path/host the
 # relay sees. Pushes no-op without the BROADCAST_TOKEN secret.
 RELAY_URL = "https://low-relay.dev-a3e.workers.dev"
+# bsv-low loop 6: the path the OVERLAY binding sees for the block-event pass. Not a secret.
+OVERLAY_URL = "https://low-overlay.dev-a3e.workers.dev"
 
 # Storage epoch (bsv-low THE ORDER item 2, owner-ruled 2026-08-06): served
 # verbatim by `GET /epoch` as {"storageEpoch": "<value>"}. BUMPING THIS VALUE
@@ -131,6 +133,13 @@ service = "low-watchtower"
 [[services]]
 binding = "RELAY"
 service = "low-relay"
+# bsv-low loop 6 (2026-09-07): the LOW overlay (same account) for the
+# block-event spend-confirmation pass (`POST /internal/tip-changed`, bearer
+# INTERNAL_TOKEN) forwarded from chaintracks' tip. Same 1042 rule as RELAY.
+# `service` is a worker name, not a secret.
+[[services]]
+binding = "OVERLAY"
+service = "low-overlay"
 
 # ══════════════════════════════════════════════════════════════════════════
 # beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
@@ -172,6 +181,7 @@ name = "low-app-layer-beta"
 
 [env.beta.vars]
 RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
+OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
 AUTH_ENFORCE = "false"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.
@@ -218,6 +228,10 @@ service = "low-watchtower-beta"
 [[env.beta.services]]
 binding = "RELAY"
 service = "low-relay-beta"
+# The BETA overlay for the block-event pass (see the prod OVERLAY binding).
+[[env.beta.services]]
+binding = "OVERLAY"
+service = "low-overlay-beta"
 
 [env.beta.durable_objects]
 bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]

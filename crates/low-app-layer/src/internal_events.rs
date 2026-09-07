@@ -303,7 +303,54 @@ pub async fn lobby_changed(mut req: Request, env: &Env) -> Result<Response> {
 
 /// `POST /internal/tip-changed` (bearer `INTERNAL_TOKEN`, body `{height}`):
 /// chaintracks' cron calls it once per synced tip; we broadcast the tip.
-pub async fn tip_changed(mut req: Request, env: &Env) -> Result<Response> {
+/// The overlay's block-event pass body — `{"height": n}` (bsv-low loop 6).
+pub fn overlay_tip_body(height: u64) -> String {
+    json!({ "height": height }).to_string()
+}
+
+/// bsv-low loop 6 (2026-09-07): the tip is ALSO the overlay's cue to confirm
+/// its spent-but-unconfirmed pot rows (`POST /internal/tip-changed`, bearer
+/// `INTERNAL_TOKEN` — the same shared first-party secret the overlay uses to
+/// call us). Through the OVERLAY service binding (a plain fetch between two
+/// Workers on one zone is refused, 1042); best-effort and logged; an
+/// unconfigured deploy no-ops. Meant to run under `wait_until`.
+pub async fn forward_tip_to_overlay(env: Env, height: u64) {
+    let (Ok(url), Ok(token)) = (
+        env.var("OVERLAY_URL").map(|v| v.to_string()),
+        env.secret("INTERNAL_TOKEN").map(|v| v.to_string()),
+    ) else {
+        console_log!("[tip] overlay block-event pass not configured (OVERLAY_URL / INTERNAL_TOKEN) — height {height} not forwarded");
+        return;
+    };
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let headers = Headers::new();
+    if headers.set("Authorization", &format!("Bearer {token}")).is_err()
+        || headers.set("content-type", "application/json").is_err()
+    {
+        console_log!("[tip] overlay block-event pass: header build failed — height {height} not forwarded");
+        return;
+    }
+    init.with_headers(headers);
+    init.with_body(Some(overlay_tip_body(height).into()));
+    let req = match Request::new_with_init(&format!("{}/internal/tip-changed", url.trim_end_matches('/')), &init) {
+        Ok(r) => r,
+        Err(e) => {
+            console_log!("[tip] overlay block-event pass: request build failed ({e}) — height {height} not forwarded");
+            return;
+        }
+    };
+    let res = match env.service("OVERLAY") {
+        Ok(svc) => svc.fetch_request(req).await,
+        Err(_) => Fetch::Request(req).send().await,
+    };
+    match res {
+        Ok(r) => console_log!("[tip] overlay block-event pass for {height}: HTTP {}", r.status_code()),
+        Err(e) => console_log!("[tip] overlay block-event pass for {height} failed: {e}"),
+    }
+}
+
+pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<Response> {
     if !internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
@@ -317,12 +364,20 @@ pub async fn tip_changed(mut req: Request, env: &Env) -> Result<Response> {
         tip_event_body(height, Date::now().as_millis()),
     )
     .await;
+    // the overlay's block-event pass, off the critical path (the webhook answers now)
+    let env2 = env.clone();
+    ctx.wait_until(async move { forward_tip_to_overlay(env2, height).await });
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_tip_body_is_the_height_object() {
+        assert_eq!(overlay_tip_body(965702), r#"{"height":965702}"#);
+    }
 
     #[test]
     fn parse_tip_changed_accepts_a_positive_height_only() {

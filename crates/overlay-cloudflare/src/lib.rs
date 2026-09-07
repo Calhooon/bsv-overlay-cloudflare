@@ -23,6 +23,7 @@ pub mod mainnet_fanout;
 pub mod ops;
 pub mod peer_crawler;
 pub mod pot_changes;
+pub mod tip_pass;
 pub mod proof_fetcher;
 pub mod queue;
 pub mod relatch;
@@ -271,15 +272,25 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                 // (X-FullStatusUpdates) are acknowledged and counted, never a
                 // parse error.
                 let tracker = lookup_service_chain_tracker(&env);
-                arc_ingest(
+                let out = arc_ingest(
                     &engine,
                     req,
                     tracker.as_deref(),
                     pot_storage.as_ref(),
                     Some(&ops_db),
                 )
-                .await
+                .await;
+                // bsv-low loop 6: a spend the push confirmed is a pot CHANGE —
+                // ship the pot-changed webhook off the critical path (the same
+                // flush `/submit` runs), so the seats' events boxes hear it.
+                crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
+                out
             }
+        }
+        // bsv-low loop 6: the block-event spend-confirmation pass (bearer
+        // INTERNAL_TOKEN, forwarded by the app-layer from chaintracks' tip).
+        (Method::Post, "/internal/tip-changed") => {
+            crate::tip_pass::internal_tip_changed(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
