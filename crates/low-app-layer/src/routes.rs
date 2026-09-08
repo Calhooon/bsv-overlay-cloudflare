@@ -2188,6 +2188,16 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
     if outpoints.is_empty() {
         return Response::error("body must be {\"outpoints\":[{\"txid\",\"vout\"}]}", 400);
     }
+    // bsv-low loop 10 D2 (2026-09-08, the pair-10 finding): announce EVERY
+    // changed outpoint in the pots room FIRST, before any attribution (see
+    // `internal_events::POTS_ROOM`). A seat that holds this JOIN but never
+    // published its marker (a seat blocked at funding) hears it here and reads
+    // the network; the per-seat durable event below still files for every
+    // attributed seat.
+    let announced_at = worker::Date::now().as_millis();
+    for (txid, vout) in &outpoints {
+        crate::internal_events::push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(txid, *vout, announced_at)).await;
+    }
     let db = env.d1("OVERLAY_DB")?;
     let era = written_off_before_ms_env(env);
     let mut filed: Vec<serde_json::Value> = Vec::new();
