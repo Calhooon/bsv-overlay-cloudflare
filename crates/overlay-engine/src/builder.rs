@@ -34,6 +34,7 @@ pub struct EngineBuilder {
     ship_trackers: Vec<String>,
     slap_trackers: Vec<String>,
     suppress_default_sync_ads: bool,
+    verify_scripts: bool,
 }
 
 impl EngineBuilder {
@@ -51,6 +52,7 @@ impl EngineBuilder {
             ship_trackers: Vec::new(),
             slap_trackers: Vec::new(),
             suppress_default_sync_ads: true,
+            verify_scripts: true,
         }
     }
 
@@ -117,9 +119,28 @@ impl EngineBuilder {
         self
     }
 
+    /// Reference-parity script verification on submit, **DEFAULT ON**.
+    ///
+    /// On, every submit outside `HistoricalTxNoSpv` runs the reference's
+    /// `tx.verify(chainTracker)` walk: merkle paths against the chain tracker
+    /// AND every unproven input's unlocking script EXECUTED against its
+    /// source output, recursively over the ancestry in the BEEF; with no chain
+    /// tracker the walk is the ts-sdk's `'scripts only'`. A spend the
+    /// interpreter refuses is [`crate::engine::EngineError::ScriptVerificationFailed`].
+    ///
+    /// `false` is an ESCAPE HATCH, not a mode: for an operator who must admit
+    /// a body the interpreter wrongly refuses while the defect is fixed. It
+    /// restores the pre-2026-09-08 structural check (BEEF validity + roots,
+    /// tracker permitting; nothing without a tracker), under which an invalid
+    /// spend no broadcaster had yet refused was admitted on structure alone.
+    pub fn with_script_verification(mut self, enabled: bool) -> Self {
+        self.verify_scripts = enabled;
+        self
+    }
+
     /// Build the Engine.
     pub fn build(self) -> Engine {
-        Engine::with_all(
+        let mut engine = Engine::with_all(
             self.managers,
             self.lookup_services,
             self.storage,
@@ -134,7 +155,9 @@ impl EngineBuilder {
                 sync_configuration: HashMap::new(),
                 suppress_default_sync_advertisements: self.suppress_default_sync_ads,
             },
-        )
+        );
+        engine.set_script_verification(self.verify_scripts);
+        engine
     }
 }
 
@@ -267,6 +290,23 @@ mod tests {
     fn builder_empty_is_valid() {
         let engine = EngineBuilder::new(Box::new(MemoryStorage::new())).build();
         assert!(engine.config().hosting_url.is_none());
+    }
+
+    #[test]
+    fn builder_script_verification_defaults_on_and_can_be_switched_off() {
+        let engine = EngineBuilder::new(Box::new(MemoryStorage::new())).build();
+        assert!(
+            engine.script_verification(),
+            "reference parity: scripts are verified on submit by default"
+        );
+
+        let engine = EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_script_verification(false)
+            .build();
+        assert!(
+            !engine.script_verification(),
+            "the escape hatch turns it off"
+        );
     }
 
     #[test]

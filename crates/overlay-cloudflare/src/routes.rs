@@ -65,6 +65,9 @@ fn engine_error_status(e: &EngineError) -> u16 {
         EngineError::SpvError(_) => 400,
         EngineError::BeefParseError(_) => 400,
         EngineError::Other(_) => 500,
+        // A spend the interpreter refused (reference parity, 2026-09-08):
+        // the caller's transaction is invalid, the same class as a bad proof.
+        EngineError::ScriptVerificationFailed { .. } => 400,
     }
 }
 

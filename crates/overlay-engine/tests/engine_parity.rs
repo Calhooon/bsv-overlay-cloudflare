@@ -1035,12 +1035,11 @@ use bsv_overlay_engine::storage::Storage;
 
 // ============================================================================
 // TS Test: "Verifies the BEEF for the provided transaction"
-// When a ChainTracker is configured, submit() attempts SPV verification.
-// With AlwaysValidTracker and HistoricalTx mode, the verification succeeds.
-// NOTE: The BRC62 BEEF parsed by bsv-rs does not link source_transaction on
-// inputs, so CurrentTx mode with ChainTracker hits a verify error. We test
-// HistoricalTxNoSpv (no verify) succeeds, and that verify is attempted for
-// CurrentTx by observing the SpvError.
+// submit() verifies the subject like the reference (2026-09-08): the BRC62
+// subject is unproven, so its P2PKH input script is EXECUTED against the
+// proven parent, whose merkle root is checked against the chain tracker.
+// HistoricalTxNoSpv skips all of it; a tracker that refuses the root is an
+// SpvError (`ts_submit_rejects_invalid_spv`).
 // ============================================================================
 
 #[tokio::test]
@@ -1065,8 +1064,8 @@ async fn ts_submit_verifies_beef_with_chain_tracker() {
         .unwrap();
     assert_eq!(steak["Hello"].outputs_to_admit, vec![0]);
 
-    // With CurrentTx + AlwaysValidTracker, SPV verification passes:
-    // Beef::verify_valid() validates internal proof structure, then each
+    // With CurrentTx + AlwaysValidTracker, SPV verification passes: the
+    // subject's input script runs against its proven parent, and the parent's
     // merkle root is checked against the chain tracker (which always returns true).
     let mut mgrs2: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
     mgrs2.insert("Hello".into(), Box::new(MockTopicManager::new(vec![0])));
