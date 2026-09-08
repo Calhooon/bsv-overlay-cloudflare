@@ -63,6 +63,16 @@ pub fn parse_tip_changed(raw: &[u8]) -> Option<u64> {
     (h > 0).then_some(h)
 }
 
+/// bsv-low M19 R2 round 2 (review H3): the header HASH chaintracks sends
+/// beside the height (`{"height": n, "hash": "<64 hex>"}`, since it announces
+/// on ANY tip change); lower-cased; absent or malformed → `None` (an older
+/// announcer: the forward reads the header itself).
+pub fn parse_tip_changed_hash(raw: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let h = v.get("hash")?.as_str()?.trim();
+    (h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).then(|| h.to_ascii_lowercase())
+}
+
 /// The broadcast body clients receive in `broadcast-low-tip`: a SNAPSHOT
 /// (the height itself), never a delta.
 pub fn tip_event_body(height: u64, at_ms: u64) -> Value {
@@ -404,7 +414,7 @@ pub fn parse_header_hash(frame: &serde_json::Value, height: u64) -> Option<Strin
 /// call us). Through the OVERLAY service binding (a plain fetch between two
 /// Workers on one zone is refused, 1042); best-effort and logged; an
 /// unconfigured deploy no-ops. Meant to run under `wait_until`.
-pub async fn forward_tip_to_overlay(env: Env, height: u64) {
+pub async fn forward_tip_to_overlay(env: Env, height: u64, announced_hash: Option<String>) {
     let (Ok(url), Ok(token)) = (
         env.var("OVERLAY_URL").map(|v| v.to_string()),
         env.secret("INTERNAL_TOKEN").map(|v| v.to_string()),
@@ -423,8 +433,14 @@ pub async fn forward_tip_to_overlay(env: Env, height: u64) {
     }
     init.with_headers(headers);
     // bsv-low M19 R2: carry the header hash so the overlay can detect a reorg
-    // (a hash change at a height it already acted on); best-effort.
-    let body = match chaintracks_block_hash(&env, height).await {
+    // (a hash change at a height it already acted on). Round 2: the hash the
+    // announcer sent rides through as-is; only a hash-less announce (an older
+    // chaintracks) costs a header read; best-effort either way.
+    let hash = match announced_hash {
+        Some(h) => Some(h),
+        None => chaintracks_block_hash(&env, height).await,
+    };
+    let body = match hash {
         Some(hash) => overlay_tip_body_with_hash(height, &hash),
         None => overlay_tip_body(height),
     };
@@ -454,6 +470,7 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     let Some(height) = parse_tip_changed(&raw) else {
         return Response::error("body must be {\"height\": <positive integer>}", 400);
     };
+    let announced_hash = parse_tip_changed_hash(&raw);
     // the `/beef` read-side guard's present-height latch (bsv-low M19 R2)
     crate::beef_guard::latch_present_tip(height);
     push_broadcast(
@@ -464,7 +481,7 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     .await;
     // the overlay's block-event pass, off the critical path (the webhook answers now)
     let env2 = env.clone();
-    ctx.wait_until(async move { forward_tip_to_overlay(env2, height).await });
+    ctx.wait_until(async move { forward_tip_to_overlay(env2, height, announced_hash).await });
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
 
@@ -475,6 +492,20 @@ mod tests {
     #[test]
     fn overlay_tip_body_is_the_height_object() {
         assert_eq!(overlay_tip_body(965702), r#"{"height":965702}"#);
+    }
+
+    #[test]
+    fn the_announcers_hash_is_a_lowercased_64_hex_or_nothing() {
+        let h = "00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D";
+        assert_eq!(
+            parse_tip_changed_hash(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()).as_deref(),
+            Some(h.to_ascii_lowercase().as_str())
+        );
+        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771}"#), None, "an older announcer: the forward reads the header");
+        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771, "hash": "abc"}"#), None);
+        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771, "hash": 12}"#), None);
+        assert_eq!(parse_tip_changed_hash(b"nope"), None);
+        assert_eq!(parse_tip_changed(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()), Some(965771), "the height parser is untouched by the hash");
     }
 
     #[test]

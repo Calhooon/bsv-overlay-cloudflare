@@ -319,17 +319,29 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 /// unretained coin is cleaned up. Missing everywhere (no row, NULL/empty
 /// beef, undecodable) → 404, so the answer upgrades by itself once the
 /// overlay stores the tx.
-/// Load ONE stored BEEF by txid, with the same trust/compaction semantics
-/// `/beef/:txid` serves. `Ok(None)` = genuinely absent; `Err(())` = the read
-/// faulted (never shape a fault like a definitive not-found).
+/// Why a stored BEEF could not be served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadFault {
+    /// The read faulted (never shaped like a definitive not-found).
+    Db,
+    /// bsv-low M19 R2: a bump the current header refutes could not be
+    /// stripped (a trimmed store): 503 until the overlay re-anchors.
+    Refuted(u64),
+}
+
+/// Load ONE stored BEEF by txid, with the same trust/guard/compaction
+/// semantics every serving route needs. `Ok(None)` = genuinely absent.
 ///
-/// Factored out of `beef` so `/credit-beef` cannot drift from it: an assembled
-/// ancestry that trusted different bytes than the single-txid route would be a
-/// second source of truth for the same question.
+/// THE one loader (round-2 review M3): `/beef` and every step of the
+/// `/credit-beef` walk read through it, so the read-side reorg guard
+/// (`beef_guard`) and the trust-licensed compaction apply to both, and an
+/// assembled ancestry can never trust different bytes than the single-txid
+/// route.
 async fn load_stored_beef(
+    env: &worker::Env,
     db: &worker::D1Database,
     txid: &str,
-) -> std::result::Result<Option<Vec<u8>>, ()> {
+) -> std::result::Result<Option<Vec<u8>>, LoadFault> {
     let key = txid.to_ascii_lowercase();
     let mut faulted = false;
     for (table, sql, legacy_sql) in [
@@ -371,6 +383,18 @@ async fn load_stored_beef(
                 }
             };
         if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
+            // bsv-low M19 R2: never serve a bump the current header refutes
+            // (a verified row: its recent bumps; an unverified row: every
+            // bump). A refuted one is stripped, or the row is refused.
+            let bytes = match crate::beef_guard::guard_served_beef(env, Some(db), &key, &bytes, proof_verified).await {
+                crate::beef_guard::Guarded::Serve(bytes) => bytes,
+                crate::beef_guard::Guarded::Refuted { height } => return Err(LoadFault::Refuted(height)),
+            };
+            // Serve-time compaction (#192/#193, P4), licensed ONLY by the
+            // row's VERIFIED proof latch (bsv-low#304): trimming decides
+            // mined-ness from IN-BEEF bump presence, and an unverified row's
+            // bumps are submitter bytes. An unverified row is served
+            // byte-for-byte as stored (weaker, never wrong).
             return Ok(Some(if proof_verified {
                 crate::compaction::compact_beef(&key, &bytes)
             } else {
@@ -379,9 +403,17 @@ async fn load_stored_beef(
         }
     }
     if faulted {
-        return Err(());
+        return Err(LoadFault::Db);
     }
     Ok(None)
+}
+
+/// The one answer for a [`LoadFault`] (both routes).
+fn load_fault_response(fault: LoadFault) -> Result<Response> {
+    match fault {
+        LoadFault::Db => json_error("database query failed", 503),
+        LoadFault::Refuted(height) => json_error(&crate::beef_guard::refuted_body(height), 503),
+    }
 }
 
 /// `GET /credit-beef/:txid` — the ancestry a WALLET needs to credit this
@@ -411,10 +443,10 @@ pub async fn credit_beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<
         }
     };
 
-    let subject = match load_stored_beef(&db, &txid).await {
+    let subject = match load_stored_beef(&ctx.env, &db, &txid).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return json_error(&format!("BEEF not found for txid: {txid}"), 404),
-        Err(()) => return json_error("database query failed", 503),
+        Err(fault) => return load_fault_response(fault),
     };
     let acc = match bsv_rs::transaction::Beef::from_binary(&subject) {
         Ok(b) => b,
@@ -431,7 +463,7 @@ pub async fn credit_beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<
     while let Some(wanted) = walk.next_wanted() {
         let mut progressed = false;
         for parent in wanted {
-            match load_stored_beef(&db, &parent).await {
+            match load_stored_beef(&ctx.env, &db, &parent).await {
                 Ok(bytes) => {
                     // A parent we do not hold (a foreign tx never submitted
                     // through us) still counts as a fetch, so an absent row
@@ -440,7 +472,9 @@ pub async fn credit_beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<
                         progressed = true;
                     }
                 }
-                Err(()) => return json_error("database query failed", 503),
+                // a refuted parent refuses the whole ancestry: the wallet
+                // must never internalize over an orphan's bump
+                Err(fault) => return load_fault_response(fault),
             }
         }
         if !progressed {
@@ -473,101 +507,16 @@ pub async fn beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respons
         }
     };
 
-    // pot_beefs first (durable), transactions second (lifecycle-managed).
-    // Read the BLOB back as hex — the engine's own read-back idiom
-    // (SQLite hex() emits uppercase; decode_beef_hex accepts either case).
-    // A faulted query (e.g. the overlay worker's migration adding pot_beefs
-    // has not run yet) still tries the other table for a hit, but a miss
-    // after any fault is 503, never 404 — a fault must not be shaped like a
-    // definitive not-found (module note above).
-    let key = txid.to_ascii_lowercase();
-    let mut faulted = false;
-    for (table, sql, legacy_sql) in [
-        (
-            "pot_beefs",
-            POT_BEEFS_TRUST_SQL,
-            "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?",
-        ),
-        (
-            "transactions",
-            TRANSACTIONS_TRUST_SQL,
-            "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?",
-        ),
-    ] {
-        // Trust-flag query first (bsv-low#304); if it faults (e.g. this
-        // worker deployed ahead of the overlay's additive migration), fall
-        // back to the legacy no-flag read and treat the row as UNVERIFIED —
-        // availability is preserved, trust is not strengthened.
-        let stmt = db.prepare(sql).bind(&[JsValue::from_str(&key)])?;
-        let (row, proof_verified): (Option<BeefRow>, bool) =
-            match stmt.first::<BeefTrustRow>(None).await {
-                Ok(row) => {
-                    let verified =
-                        row.as_ref().and_then(|r| r.proof_verified).unwrap_or(0.0) != 0.0;
-                    (row.map(|r| BeefRow { beef: r.beef }), verified)
-                }
-                Err(e) => {
-                    console_warn!("[beef] {table} trust query failed ({e}) — legacy no-flag read");
-                    let stmt = db.prepare(legacy_sql).bind(&[JsValue::from_str(&key)])?;
-                    match stmt.first::<BeefRow>(None).await {
-                        Ok(row) => (row, false),
-                        Err(e) => {
-                            console_warn!("[beef] {table} query failed: {e}");
-                            faulted = true;
-                            continue;
-                        }
-                    }
-                }
-            };
-        if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
-            // bsv-low M19 R2 (2026-09-08): never serve a bump the current
-            // header refutes. Every bump anchored in the last
-            // `BEEF_REFUTE_DEPTH` heights is re-checked against chaintracks
-            // on read; a refuted one is stripped (served raw with ancestry)
-            // or, when the trimmed store cannot source the tx without it,
-            // refused 503 (the route's retryable shape) until the overlay's
-            // block-event pass re-anchors the row.
-            let bytes = match crate::beef_guard::guard_served_beef(&ctx.env, &key, &bytes).await {
-                crate::beef_guard::Guarded::Serve(bytes) => bytes,
-                crate::beef_guard::Guarded::Refuted { height } => {
-                    return json_error(
-                        &format!(
-                            "stored proof refuted by the current header at height {height} (reorg); re-anchoring pending, retry"
-                        ),
-                        503,
-                    );
-                }
-            };
-            // Serve-time compaction (#192/#193, P4): once the overlay's
-            // completion pass / Arcade MINED callback has stitched a
-            // chaintracks-verified BUMP into this BEEF, its now-proven
-            // ancestry is dead weight the frontend `createAction` chokes on.
-            // `compact_beef` trims it — STRICTLY passthrough-on-failure, so a
-            // proofless (or already-minimal) BEEF is returned byte-for-byte
-            // unchanged. The subject is the lowercase DB key (BEEF txids are
-            // lowercase hex).
-            //
-            // bsv-low#304 TRIMMING LICENSE: compaction is licensed ONLY by
-            // the row's VERIFIED proof latch. Trimming decides mined-ness
-            // from IN-BEEF bump presence, and an unverified row's bumps are
-            // submitter bytes (possibly forged) — trimming on them would
-            // drop the very ancestry an honest verifier needs. An
-            // unverified row is served byte-for-byte as stored (weaker,
-            // never wrong); a verified row keeps trimming exactly as
-            // before.
-            let compacted = if proof_verified {
-                crate::compaction::compact_beef(&key, &bytes)
-            } else {
-                bytes
-            };
-            return json_response(beef_body(&txid, &compacted), 200);
-        }
+    // THE one loader (round-2 review M3): pot_beefs first (durable),
+    // transactions second (lifecycle-managed); the read-side reorg guard and
+    // the trust-licensed compaction live inside it, shared with the
+    // `/credit-beef` walk. A miss after any fault is 503, never 404 (a fault
+    // must not be shaped like a definitive not-found).
+    match load_stored_beef(&ctx.env, &db, &txid).await {
+        Ok(Some(bytes)) => json_response(beef_body(&txid, &bytes), 200),
+        Ok(None) => json_error(&format!("BEEF not found for txid: {txid}"), 404),
+        Err(fault) => load_fault_response(fault),
     }
-
-    if faulted {
-        return json_error("database query failed", 503);
-    }
-    json_error(&format!("BEEF not found for txid: {txid}"), 404)
 }
 
 /// Fetch the present chain height through the `CHAINTRACKS` service binding.

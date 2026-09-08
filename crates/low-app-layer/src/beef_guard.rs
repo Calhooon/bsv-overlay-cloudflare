@@ -31,11 +31,21 @@
 //! latched by every `tip-changed` webhook this isolate receives); a header
 //! root is cached per height for [`HEADER_TTL_MS`], at most
 //! [`HEADER_CACHE_MAX`] heights. A read with no recent bump costs nothing.
-//! Fail direction: with NO header in hand (chaintracks unreadable, or a
-//! height it does not hold yet) nothing is refuted and the stored bytes are
-//! served as before, LOGGED — the read side must not turn a chaintracks
-//! outage into a `/beef` outage on the money path; the overlay's sweep
-//! (which counts its faults) is the path that never reads unknown as fine.
+//! Fail direction (a STATED divergence, round-2 review L3): with NO header
+//! in hand (chaintracks unreadable, or a height it does not hold yet)
+//! nothing is refuted and the stored bytes are served as before, LOGGED and
+//! COUNTED (`beef_guard_unchecked_total` on `/health/invariants`) — the read
+//! side must not turn a chaintracks outage into a `/beef` outage on the
+//! money path, and the wallet re-validates every root it ingests against
+//! its own header source; the overlay's sweep (which counts its faults) is
+//! the path that never reads unknown as fine.
+//!
+//! Round-2 review L2: an UNVERIFIED row (its latch dropped by the overlay's
+//! reconcile, or never latched) has EVERY bump re-checked regardless of
+//! height, cached per height, so a known-refuted bump is never served
+//! again from outside the window while the completion pass refetches.
+//! Round-2 review M3: the guard lives in the ONE shared loader
+//! (`routes::load_stored_beef`), so `/beef` and `/credit-beef` cannot drift.
 
 use bsv_rs::transaction::{Beef, MerklePath};
 use std::cell::{Cell, RefCell};
@@ -81,6 +91,43 @@ pub fn recent_bumps(beef: &Beef, tip: u64, depth: u64) -> Vec<(usize, u64)> {
         .map(|(i, b)| (i, u64::from(b.block_height)))
         .filter(|(_, h)| in_recheck_window(*h, tip, depth))
         .collect()
+}
+
+/// PURE (review L2): which bumps a read re-checks. A VERIFIED row: the
+/// window (`tip` known) or nothing (`tip` unknown). An UNVERIFIED row: EVERY
+/// bump, whatever the height and whether or not a tip is known.
+pub fn bumps_to_check(beef: &Beef, tip: Option<u64>, depth: u64, verified: bool) -> Vec<(usize, u64)> {
+    if !verified {
+        return beef.bumps.iter().enumerate().map(|(i, b)| (i, u64::from(b.block_height))).collect();
+    }
+    match tip {
+        Some(tip) => recent_bumps(beef, tip, depth),
+        None => Vec::new(),
+    }
+}
+
+/// The guard's counters, written into the overlay's `ops_counters` (the
+/// same OVERLAY_DB; surfaced on `/health/invariants`).
+pub const COUNTER_STRIPPED: &str = "beef_guard_stripped_total";
+pub const COUNTER_REFUSED: &str = "beef_guard_refused_total";
+pub const COUNTER_UNCHECKED: &str = "beef_guard_unchecked_total";
+
+/// The overlay's counter upsert, verbatim (`ops::bump_counter`).
+pub const BUMP_COUNTER_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?, 1) \
+     ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
+
+async fn bump_counter(db: Option<&worker::D1Database>, name: &str) {
+    let Some(db) = db else { return };
+    let stmt = match db.prepare(BUMP_COUNTER_SQL).bind(&[worker::wasm_bindgen::JsValue::from_str(name)]) {
+        Ok(s) => s,
+        Err(e) => {
+            worker::console_warn!("[beef-guard] counter {name} bind failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = stmt.run().await {
+        worker::console_warn!("[beef-guard] counter {name} write failed: {e}");
+    }
 }
 
 /// PURE: the merkle root a bump claims, from its own leaves (every leaf of
@@ -245,27 +292,41 @@ async fn canonical_root(env: &Env, height: u64) -> Option<String> {
     Some(root)
 }
 
-/// The read-side guard for `/beef/:txid`: re-check every bump of `bytes`
-/// anchored in the last [`BEEF_REFUTE_DEPTH`] heights against chaintracks;
-/// a refuted bump is stripped (served raw with ancestry) or, when the store
+/// The read-side guard for every served stored BEEF (`/beef/:txid` and the
+/// `/credit-beef` walk, through the one shared loader): re-check the bumps
+/// [`bumps_to_check`] names (the last [`BEEF_REFUTE_DEPTH`] heights of a
+/// verified row; EVERY bump of an unverified one) against chaintracks; a
+/// refuted bump is stripped (served raw with ancestry) or, when the store
 /// cannot source the now-unproven tx, refused.
-pub async fn guard_served_beef(env: &Env, subject: &str, bytes: &[u8]) -> Guarded {
+pub async fn guard_served_beef(
+    env: &Env,
+    db: Option<&worker::D1Database>,
+    subject: &str,
+    bytes: &[u8],
+    verified: bool,
+) -> Guarded {
     let Ok(beef) = Beef::from_binary(bytes) else {
         return Guarded::Serve(bytes.to_vec()); // unparseable: passthrough, as compaction does
     };
     if beef.bumps.is_empty() {
         return Guarded::Serve(bytes.to_vec());
     }
-    let Some(tip) = present_tip(env).await else {
+    // an unverified row needs no tip (every bump is checked); a verified one
+    // needs the tip for its window
+    let tip = if verified { present_tip(env).await } else { None };
+    if verified && tip.is_none() {
+        worker::console_warn!("[beef-guard] {subject}: no tip in hand; its recent bumps are served UNCHECKED (the stated fail-open)");
+        bump_counter(db, COUNTER_UNCHECKED).await;
         return Guarded::Serve(bytes.to_vec());
-    };
-    let recent = recent_bumps(&beef, tip, BEEF_REFUTE_DEPTH);
-    if recent.is_empty() {
+    }
+    let to_check = bumps_to_check(&beef, tip, BEEF_REFUTE_DEPTH, verified);
+    if to_check.is_empty() {
         return Guarded::Serve(bytes.to_vec());
     }
     let mut refuted: Vec<usize> = Vec::new();
     let mut refuted_height = 0u64;
-    for (idx, height) in recent {
+    let mut unchecked = false;
+    for (idx, height) in to_check {
         let Some(claimed) = beef.bumps.get(idx).and_then(claimed_root) else {
             continue;
         };
@@ -273,8 +334,9 @@ pub async fn guard_served_beef(env: &Env, subject: &str, bytes: &[u8]) -> Guarde
         match judge_bump(&claimed, canonical.as_deref()) {
             BumpVerdict::Standing => {}
             BumpVerdict::Unknown => {
+                unchecked = true;
                 worker::console_warn!(
-                    "[beef-guard] {subject}: no header in hand for {height}; its bump is served unchecked"
+                    "[beef-guard] {subject}: no header in hand for {height}; its bump is served UNCHECKED (the stated fail-open)"
                 );
             }
             BumpVerdict::Refuted => {
@@ -287,6 +349,9 @@ pub async fn guard_served_beef(env: &Env, subject: &str, bytes: &[u8]) -> Guarde
             }
         }
     }
+    if unchecked {
+        bump_counter(db, COUNTER_UNCHECKED).await;
+    }
     if refuted.is_empty() {
         return Guarded::Serve(bytes.to_vec());
     }
@@ -298,15 +363,23 @@ pub async fn guard_served_beef(env: &Env, subject: &str, bytes: &[u8]) -> Guarde
                 bytes.len(),
                 stripped.len()
             );
+            bump_counter(db, COUNTER_STRIPPED).await;
             Guarded::Serve(stripped)
         }
         None => {
             worker::console_warn!(
                 "[beef-guard] {subject}: the stored BEEF cannot source its tx without the refuted bump at {refuted_height} (trimmed store) — refusing 503 until the overlay re-anchors"
             );
+            bump_counter(db, COUNTER_REFUSED).await;
             Guarded::Refuted { height: refuted_height }
         }
     }
+}
+
+/// The one 503 both routes answer on a refuted trimmed row (review M3: one
+/// shape, one sentence, never a 404).
+pub fn refuted_body(height: u64) -> String {
+    format!("stored proof refuted by the current header at height {height} (reorg); re-anchoring pending, retry")
 }
 
 #[cfg(test)]
@@ -371,6 +444,38 @@ mod tests {
         assert!(in_recheck_window(965_780, 965_776, 6), "above a stale tip is recent");
         assert!(!in_recheck_window(965_776, 965_776, 0));
         assert!(in_recheck_window(1, 3, 6), "clamped at genesis");
+    }
+
+    /// Review L2: an unverified row has EVERY bump checked, tip or no tip;
+    /// a verified row only its window, and nothing without a tip.
+    #[test]
+    fn an_unverified_row_has_every_bump_checked_and_a_verified_one_only_its_window() {
+        let (bytes, _, _) = fixture(965_771, false); // bumps at 965771 (index 0) and 965700 (index 1)
+        let beef = Beef::from_binary(&bytes).unwrap();
+        assert_eq!(bumps_to_check(&beef, Some(965_776), 6, true), vec![(0, 965_771)]);
+        assert_eq!(bumps_to_check(&beef, None, 6, true), vec![], "a verified row with no tip: nothing to window on");
+        assert_eq!(bumps_to_check(&beef, Some(965_776), 6, false), vec![(0, 965_771), (1, 965_700)], "unverified: all of them");
+        assert_eq!(bumps_to_check(&beef, None, 6, false), vec![(0, 965_771), (1, 965_700)], "unverified: all, no tip needed");
+    }
+
+    /// Review L3: the guard's counters ride the overlay's own counter upsert
+    /// (the shipped statement on the shipped schema), so they surface on
+    /// `/health/invariants` beside the sweep's.
+    #[test]
+    fn the_guard_counters_use_the_overlays_counter_upsert_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        for name in [COUNTER_STRIPPED, COUNTER_REFUSED, COUNTER_UNCHECKED, COUNTER_UNCHECKED] {
+            conn.execute(BUMP_COUNTER_SQL, [name]).unwrap();
+        }
+        let read = |name: &str| -> i64 { conn.query_row("SELECT value FROM ops_counters WHERE name = ?", [name], |r| r.get(0)).unwrap() };
+        assert_eq!((read(COUNTER_STRIPPED), read(COUNTER_REFUSED), read(COUNTER_UNCHECKED)), (1, 1, 2));
+        assert_eq!(refuted_body(965_771), "stored proof refuted by the current header at height 965771 (reorg); re-anchoring pending, retry");
     }
 
     #[test]
