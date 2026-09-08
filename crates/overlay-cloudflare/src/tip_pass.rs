@@ -205,6 +205,76 @@ pub async fn internal_tip_changed(
     }))
 }
 
+/// PURE: the `POST /internal/reorg` body — `{"fromHeight": n}` with an
+/// optional `"limit"` (clamped to [`REORG_DEMOTE_LIMIT`]); `None` for
+/// anything else. `fromHeight` must be a positive integer.
+pub fn parse_reorg_trigger(raw: &[u8]) -> Option<(u64, u64)> {
+    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let from = v.get("fromHeight")?.as_u64().filter(|h| *h > 0)?;
+    let limit = v
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|l| *l > 0)
+        .map_or(REORG_DEMOTE_LIMIT, |l| l.min(REORG_DEMOTE_LIMIT));
+    Some((from, limit))
+}
+
+/// `POST /internal/reorg` (bearer `INTERNAL_TOKEN`): run [`handle_reorg`]
+/// from a named height, for a reorg the detector could not have seen (the
+/// 2026-09-07 rows at 965771 pre-date this build, and the sweep window has
+/// long moved past them). Demotion only: every row goes back to SEEN and its
+/// spender loses the proof latch; the confirm arm re-proves each against
+/// the canonical chain on the next pass. Bounded per call (the body's
+/// `limit`, at most [`REORG_DEMOTE_LIMIT`]); call again to drain. Counted
+/// under the same counters as a detected reorg.
+///
+/// [`handle_reorg`]: crate::proof_fetcher::handle_reorg
+pub async fn internal_reorg(
+    mut req: Request,
+    env: &Env,
+    ctx: &Context,
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    ops_db: Option<&D1Database>,
+) -> Result<Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        console_log!("POST /internal/reorg -> 401");
+        return Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let Some((from, limit)) = parse_reorg_trigger(&raw) else {
+        return Response::error(
+            "body must be {\"fromHeight\": <positive integer>, \"limit\"?: <positive integer>}",
+            400,
+        );
+    };
+    let demotion = crate::proof_fetcher::handle_reorg(pot_storage, from, limit).await;
+    if let Some(db) = ops_db {
+        crate::ops::bump_counter(db, crate::ops::COUNTER_CHAIN_REORGS_DETECTED, 1).await;
+        if demotion.demoted > 0 {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, demotion.demoted as u64).await;
+        }
+    }
+    console_log!(
+        "POST /internal/reorg fromHeight={from} limit={limit} -> 200 (demoted={} unlatched={} errors={})",
+        demotion.demoted,
+        demotion.unlatched,
+        demotion.errors
+    );
+    // a demotion is a served-state change: ship the pot-changed webhook
+    crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
+    Response::from_json(&serde_json::json!({
+        "ok": true,
+        "fromHeight": from,
+        "limit": limit,
+        "demoted": demotion.demoted,
+        "unlatched": demotion.unlatched,
+        "errors": demotion.errors,
+        "drained": (demotion.demoted as u64) < limit,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +324,21 @@ mod tests {
         assert!(!first_pass_for(h), "a repeat of the same tip is not a new block");
         assert!(!first_pass_for(h - 1), "an older tip is not a new block");
         assert!(first_pass_for(h + 1), "the next block runs again");
+    }
+
+    #[test]
+    fn reorg_trigger_body_is_a_positive_height_with_a_clamped_limit() {
+        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":965771}"#), Some((965771, REORG_DEMOTE_LIMIT)));
+        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":965771,"limit":50}"#), Some((965771, 50)));
+        assert_eq!(
+            parse_reorg_trigger(br#"{"fromHeight":965771,"limit":100000}"#),
+            Some((965771, REORG_DEMOTE_LIMIT)),
+            "the per-call bound holds"
+        );
+        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":965771,"limit":0}"#), Some((965771, REORG_DEMOTE_LIMIT)));
+        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":0}"#), None);
+        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":-1}"#), None);
+        assert_eq!(parse_reorg_trigger(br#"{"height":965771}"#), None);
+        assert_eq!(parse_reorg_trigger(b"nope"), None);
     }
 }

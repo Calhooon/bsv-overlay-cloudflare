@@ -292,6 +292,11 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         (Method::Post, "/internal/tip-changed") => {
             crate::tip_pass::internal_tip_changed(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
         }
+        // bsv-low M19 R2: the manual reorg demotion from a named height (the
+        // rows a past reorg left behind; bearer INTERNAL_TOKEN; bounded).
+        (Method::Post, "/internal/reorg") => {
+            crate::tip_pass::internal_reorg(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
+        }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
 
