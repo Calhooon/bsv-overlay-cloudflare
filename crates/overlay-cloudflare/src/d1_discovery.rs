@@ -13491,7 +13491,8 @@ mod tests {
         let doc1 = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":{"height":965771,"rowid":40},"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":0,"fault_passes":0}}"#;
         assert_eq!(write(doc1, 1_000, None), Some(1), "the first write inserts version 1");
         assert_eq!(read(), Some((doc1.to_string(), 1, Some(1_000))));
-        let doc2 = r#"{"v":1,"cursor":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"pending":null}"#;
+        // round 3: the document carries a RELEASED event on record (the operator's heal list)
+        let doc2 = r#"{"v":1,"cursor":{"orphaned_at":"2026-09-07T22:48:27.809Z","height":965773,"hash":"0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33"},"pending":null,"unresolved":[{"key":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"why":"fault-ceiling"}]}"#;
         assert_eq!(write(doc2, 2_000, Some(1)), Some(2), "a write against the version it read replaces the document and bumps the version");
         assert_eq!(read(), Some((doc2.to_string(), 2, Some(2_000))));
         assert_eq!(write(doc1, 3_000, Some(1)), None, "a STALE writer (it read version 1, the row is at 2) writes nothing");
@@ -13499,10 +13500,16 @@ mod tests {
         assert_eq!(read(), Some((doc2.to_string(), 2, Some(2_000))), "the loser changed nothing");
         let rows: i64 = conn.query_row("SELECT count(*) FROM arcade_reorg_state", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "one row per name");
-        // what the reader deserialises is exactly what the writer stored
+        // what the reader deserialises is exactly what the writer stored, the released
+        // event's record included (round 3: the versioned CAS keeps the operator's heal list)
         let back = overlay_discovery::pot::arcade_events::ConsumerState::from_json(&read().unwrap().0).unwrap();
-        assert_eq!(back.cursor.as_ref().map(|c| c.height), Some(965771));
+        assert_eq!(back.cursor.as_ref().map(|c| c.height), Some(965773));
         assert!(back.pending.is_none());
+        assert_eq!(back.unresolved.len(), 1);
+        assert_eq!(back.unresolved[0].why, overlay_discovery::pot::arcade_events::ReleaseReason::FaultCeiling);
+        assert_eq!(back.unresolved[0].key.height, 965771);
+        assert_eq!(back.unresolved[0].key.hash, "0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1");
+        assert_eq!(back.to_json(), doc2, "the document is stored byte-for-byte");
 
         // ── the height-bound demotion (round 2, review MED-1) ──
         index_served(
