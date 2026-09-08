@@ -1905,4 +1905,48 @@ mod tests {
         let out = apply_chain_probes(entries.clone(), &probes);
         assert_eq!(out[1].status, HopStatus::Spent);
     }
+
+    /// bsv-low M19 D1 (#428, 2026-09-08) — the identity window's READ SHAPE,
+    /// pinned by EXPLAIN under real SQLite on the shipped schema. Assessed
+    /// for a per-identity cursor bound on the innermost scan and LEFT AS IS:
+    /// the page rank is a whole-history aggregate over the identity's rows
+    /// (`MAX(...) OVER (PARTITION BY outpoint)`, the unknown quota's
+    /// `ROW_NUMBER`, the `DENSE_RANK` page window), so a cursor that dropped
+    /// older rows from the innermost scan would change which rows rank into
+    /// the served page — not byte-identical, so not done. What bounds the
+    /// rows read per call is the identity index (an equality search, never
+    /// a table walk) plus the #375 era cutoff; this pin holds that shape:
+    /// every base table is reached by an index SEARCH and the only SCANs
+    /// are the query's own co-routines (the window levels).
+    #[test]
+    fn identity_window_reads_are_index_searches_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let plan = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).expect("prepare");
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+                .expect("plan")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        let identity = rusqlite::types::Value::Text("02".repeat(33));
+        let lines = plan(&hops_view_sql(false, Some(1_000), 0), &[identity, rusqlite::types::Value::Integer(1_000)]);
+        let joined = lines.join("\n");
+        for l in &lines {
+            if let Some(scanned) = l.strip_prefix("SCAN ") {
+                assert!(
+                    scanned.starts_with("(subquery-") || scanned == "w",
+                    "a base-table walk crept into the identity window: {l}\n{joined}"
+                );
+            }
+        }
+        for needle in ["SEARCH hp USING INDEX idx_hopparty_identity", "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)", "SEARCH sb USING INDEX sqlite_autoindex_pot_beefs_1 (txid=?)"] {
+            assert!(lines.iter().any(|l| l.contains(needle)), "expected `{needle}` in the plan:\n{joined}");
+        }
+    }
 }

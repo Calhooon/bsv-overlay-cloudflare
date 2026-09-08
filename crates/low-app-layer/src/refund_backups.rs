@@ -40,16 +40,29 @@ pub const REFUND_BACKUPS_ROWS_PER_POT: usize = 4;
 /// `?1` = identity; `?2` = the #375 era cutoff (ms) iff configured, anchored
 /// on the party marker's `createdAt` (the pot's own admission stamp is not
 /// joined here — this read serves bytes, not verdicts).
+///
+/// bsv-low M19 D1 (#428, 2026-09-08): DRIVEN FROM THE PARTY WINDOW. The
+/// first shape was `FROM potrefund_records pr WHERE EXISTS (party …)`, an
+/// EXISTS evaluated per potrefund row: SQLite walked the WHOLE
+/// `potrefund_records` table (every seat's backups, newest first) until it
+/// had 401 matches — ~980k rows read per call at 811 ms on beta in loop 8,
+/// the single heaviest query behind the D1 `overloaded` answers. Now the
+/// identity's party outpoints (an indexed identity scan, a few hundred rows
+/// for the busiest seat) are the driving set and `potrefund_records` is
+/// reached by its `(potTxid, potVout)` index; `refundRawHex` is read only
+/// for the rows that survive to the served page. Same served rows, same
+/// order, same binds.
 pub fn refund_backups_sql(written_off_before_ms: Option<i64>) -> String {
     format!(
         "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, \
                 pr.identity AS identity, pr.refundRawHex AS refundRawHex, \
                 pr.sigHex AS sigHex, pr.txid AS txid, pr.outputIndex AS outputIndex, \
                 pr.createdAt AS createdAt \
-         FROM potrefund_records pr \
-         WHERE EXISTS (SELECT 1 FROM {party} pp \
-                        WHERE pp.identity = ?1{era} \
-                          AND pp.potTxid = pr.potTxid AND pp.potVout = pr.potVout) \
+         FROM (SELECT DISTINCT pp.potTxid AS potTxid, pp.potVout AS potVout \
+                 FROM {party} pp \
+                WHERE pp.identity = ?1{era}) party \
+         JOIN potrefund_records pr \
+           ON pr.potTxid = party.potTxid AND pr.potVout = party.potVout \
          ORDER BY pr.createdAt DESC, pr.rowid DESC \
          LIMIT {probe}",
         party = crate::logic::party_candidates_sql(),
@@ -196,7 +209,13 @@ mod tests {
     #[test]
     fn sql_is_the_party_window_over_potrefund_records_with_one_identity_bind() {
         let sql = refund_backups_sql(None);
-        assert!(sql.contains("FROM potrefund_records pr"));
+        // bsv-low M19 D1 (#428): the party window DRIVES the read; the
+        // potrefund table is JOINED on its (potTxid, potVout) index, never
+        // walked with an EXISTS per row (the 980k-rows-per-call shape).
+        assert!(sql.contains("JOIN potrefund_records pr"));
+        assert!(sql.contains("ON pr.potTxid = party.potTxid AND pr.potVout = party.potVout"));
+        assert!(!sql.contains("WHERE EXISTS"), "no per-row EXISTS over potrefund_records");
+        assert!(sql.contains("SELECT DISTINCT pp.potTxid AS potTxid, pp.potVout AS potVout"));
         assert!(
             sql.contains("potparty_records"),
             "the caller's party window bounds the read"
@@ -289,5 +308,173 @@ mod tests {
         assert_eq!(r.identity, "02ab");
         assert_eq!(r.refund_raw_hex, None, "an empty string is no bytes");
         assert_eq!(r.created_at, Some(12));
+    }
+
+    // ── bsv-low M19 D1 (#428, 2026-09-08): the JOIN shape ────────────────────
+
+    fn migrated() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        conn
+    }
+
+    fn plan_lines(conn: &rusqlite::Connection, sql: &str, binds: &[rusqlite::types::Value]) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).expect("prepare");
+        stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+            .expect("plan")
+            .map(|r| r.expect("row"))
+            .collect()
+    }
+
+    /// The pre-M19 shape, kept ONLY as the equivalence oracle below: SQLite
+    /// planned it as `SCAN pr USING INDEX idx_potrefund_createdAt` with a
+    /// correlated party subquery per row — every seat's backups walked,
+    /// newest first, until 401 matched (loop 8: ~980k rows read per call).
+    fn pre_m19_sql(written_off_before_ms: Option<i64>) -> String {
+        format!(
+            "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, \
+                    pr.identity AS identity, pr.refundRawHex AS refundRawHex, \
+                    pr.sigHex AS sigHex, pr.txid AS txid, pr.outputIndex AS outputIndex, \
+                    pr.createdAt AS createdAt \
+             FROM potrefund_records pr \
+             WHERE EXISTS (SELECT 1 FROM {party} pp \
+                            WHERE pp.identity = ?1{era} \
+                              AND pp.potTxid = pr.potTxid AND pp.potVout = pr.potVout) \
+             ORDER BY pr.createdAt DESC, pr.rowid DESC \
+             LIMIT {probe}",
+            party = crate::logic::party_candidates_sql(),
+            era = crate::logic::era_filter_sql("pp.createdAt", "?2", written_off_before_ms),
+            probe = REFUND_BACKUPS_MAX_ROWS + 1,
+        )
+    }
+
+    /// EXPLAIN pin under real SQLite on the shipped schema: the identity's
+    /// party window DRIVES (an identity-index search on both party tables),
+    /// `potrefund_records` is reached by its `(potTxid, potVout)` index, and
+    /// nothing scans `potrefund_records` — with and without the era bind.
+    #[test]
+    fn plan_drives_from_the_party_window_and_probes_potrefund_by_index_real_sqlite() {
+        let conn = migrated();
+        let identity = rusqlite::types::Value::Text("02".repeat(33));
+        for (sql, binds) in [
+            (refund_backups_sql(None), vec![identity.clone()]),
+            (refund_backups_sql(Some(1_000)), vec![identity.clone(), rusqlite::types::Value::Integer(1_000)]),
+        ] {
+            let plan = plan_lines(&conn, &sql, &binds);
+            let joined = plan.join("\n");
+            assert!(
+                plan.iter().any(|l| l.contains("SEARCH pr USING INDEX idx_potrefund_pot (potTxid=? AND potVout=?)")),
+                "potrefund_records is probed by its outpoint index:\n{joined}"
+            );
+            assert!(
+                plan.iter().any(|l| l.contains("SEARCH potparty_records USING INDEX idx_potparty_identity")),
+                "the potparty arm is an identity-index search:\n{joined}"
+            );
+            assert!(
+                plan.iter().any(|l| l.contains("SEARCH hp USING INDEX idx_hopparty_identity")),
+                "the hopparty arm is an identity-index search:\n{joined}"
+            );
+            assert!(
+                !plan.iter().any(|l| l.starts_with("SCAN pr") || l.contains("SCAN potrefund_records")),
+                "never a walk over potrefund_records:\n{joined}"
+            );
+        }
+        // the oracle's shape really was the scan (the defect this pins against)
+        let old = plan_lines(&conn, &pre_m19_sql(None), &[identity]);
+        assert!(old.iter().any(|l| l.starts_with("SCAN pr USING INDEX idx_potrefund_createdAt")), "{old:?}");
+    }
+
+    /// The served rows are IDENTICAL to the pre-M19 shape's — same rows, same
+    /// order, same binds — over a seeded window that exercises every arm:
+    /// duplicate party markers for one pot (the JOIN needs DISTINCT where
+    /// EXISTS deduped for free), both seats' backup rows for a pot, another
+    /// identity's pot, a pot no party names, a hop-derived pot (the UNION's
+    /// second arm), and the #375 era cutoff.
+    #[test]
+    fn served_rows_equal_the_pre_m19_shape_real_sqlite() {
+        let conn = migrated();
+        let me = "02".repeat(33);
+        let other = "03".repeat(33);
+        let (p1, p2, p3, p4, p5, hop) = ("11".repeat(32), "22".repeat(32), "33".repeat(32), "44".repeat(32), "55".repeat(32), "66".repeat(32));
+        let party = |identity: &str, pot: &str, marker: &str, created: i64| {
+            conn.execute(
+                "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt) \
+                 VALUES (?1, 'opp', 'g', ?2, 0, 100, 'sig', ?3, 0, ?4)",
+                rusqlite::params![identity, pot, marker, created],
+            )
+            .unwrap();
+        };
+        party(&me, &p1, &"a1".repeat(32), 1_000);
+        party(&me, &p1, &"a2".repeat(32), 1_500); // a duplicate marker for the same pot
+        party(&me, &p2, &"a3".repeat(32), 2_000);
+        party(&other, &p3, &"a4".repeat(32), 2_000);
+        // the hop arm: my hop marker, its container spent by pot p5 whose committed pubA is my seat key
+        conn.execute(
+            "INSERT INTO hopparty_records (identity, opponentIdentity, gameId, hopVout, hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, markerValid) \
+             VALUES (?1, 'opp', 'g5', 0, 20000, 'pkA', 'ss', 'is', 'aa', 20000, 3, ?2, 1, 2_500, 1)",
+            rusqlite::params![me, hop],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, createdAt) VALUES (?1, 0, 1, ?2, 2_400)",
+            rusqlite::params![hop, p5],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, paramsDecoded, recoveryHeight, pubA, pubB) VALUES (?1, 0, 0, 2_600, 1, 100, 'pkA', 'pkB')",
+            rusqlite::params![p5],
+        )
+        .unwrap();
+        let backup = |pot: &str, identity: &str, marker: &str, created: i64| {
+            conn.execute(
+                "INSERT INTO potrefund_records (identity, gameId, potTxid, potVout, refundRawHex, sigHex, txid, outputIndex, createdAt) \
+                 VALUES (?1, 'g', ?2, 0, ?3, 'sig', ?4, 0, ?5)",
+                rusqlite::params![identity, pot, format!("raw-{marker}"), marker, created],
+            )
+            .unwrap();
+        };
+        backup(&p1, &me, &"b1".repeat(32), 10);
+        backup(&p1, &other, &"b2".repeat(32), 30); // the counterparty's backup for MY pot: served (both seats file)
+        backup(&p2, &me, &"b3".repeat(32), 20);
+        backup(&p3, &other, &"b4".repeat(32), 40); // the other identity's pot: never mine
+        backup(&p4, &me, &"b5".repeat(32), 50); // a pot no party names: never served
+        backup(&p5, &me, &"b6".repeat(32), 5); // the hop-derived pot
+        backup(&p2, &me, &"b7".repeat(32), 20); // same stamp as b3: the rowid tie-break
+
+        type Row = (String, i64, String, String, Option<String>, Option<String>, String, i64, Option<i64>);
+        let read = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<Row> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        let id = rusqlite::types::Value::Text(me.clone());
+        let new = read(&refund_backups_sql(None), std::slice::from_ref(&id));
+        let old = read(&pre_m19_sql(None), std::slice::from_ref(&id));
+        assert_eq!(new, old, "the served rows and their order are unchanged");
+        let served: Vec<&str> = new.iter().map(|r| r.6.as_str()).collect();
+        assert_eq!(
+            served,
+            ["b2".repeat(32), "b7".repeat(32), "b3".repeat(32), "b1".repeat(32), "b6".repeat(32)]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "newest first, rowid DESC on a tie; both seats' rows; p3/p4 absent; the hop pot present; p1 ONCE"
+        );
+        // the era cutoff (ms) on the party marker's stamp: p1's markers (1000/1500 s) drop, p2 (2000 s) and the hop (2500 s) stay
+        let era = [id, rusqlite::types::Value::Integer(1_600_000)];
+        let new = read(&refund_backups_sql(Some(1_600_000)), &era);
+        let old = read(&pre_m19_sql(Some(1_600_000)), &era);
+        assert_eq!(new, old);
+        let served: Vec<&str> = new.iter().map(|r| r.6.as_str()).collect();
+        assert_eq!(served, ["b7".repeat(32), "b3".repeat(32), "b6".repeat(32)].iter().map(String::as_str).collect::<Vec<_>>());
     }
 }
