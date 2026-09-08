@@ -98,7 +98,20 @@ pub fn recent_bumps(beef: &Beef, tip: u64, depth: u64) -> Vec<(usize, u64)> {
 /// bump, whatever the height and whether or not a tip is known.
 pub fn bumps_to_check(beef: &Beef, tip: Option<u64>, depth: u64, verified: bool) -> Vec<(usize, u64)> {
     if !verified {
-        return beef.bumps.iter().enumerate().map(|(i, b)| (i, u64::from(b.block_height))).collect();
+        // review L3: an unverified row has every bump re-checked, but CAPPED
+        // to the newest `BEEF_UNVERIFIED_MAX_BUMPS` heights — a pathological
+        // BEEF with bumps at many distinct heights must not turn one read
+        // into an unbounded fan of header lookups. Newest first: a reorg
+        // touches the recent tip, never deep history.
+        let mut all: Vec<(usize, u64)> = beef
+            .bumps
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, u64::from(b.block_height)))
+            .collect();
+        all.sort_by_key(|(_, h)| std::cmp::Reverse(*h));
+        all.truncate(BEEF_UNVERIFIED_MAX_BUMPS);
+        return all;
     }
     match tip {
         Some(tip) => recent_bumps(beef, tip, depth),
@@ -106,19 +119,50 @@ pub fn bumps_to_check(beef: &Beef, tip: Option<u64>, depth: u64, verified: bool)
     }
 }
 
+/// The cap on an unverified row's re-checked bumps (review L3).
+pub const BEEF_UNVERIFIED_MAX_BUMPS: usize = 8;
+
 /// The guard's counters, written into the overlay's `ops_counters` (the
 /// same OVERLAY_DB; surfaced on `/health/invariants`).
 pub const COUNTER_STRIPPED: &str = "beef_guard_stripped_total";
 pub const COUNTER_REFUSED: &str = "beef_guard_refused_total";
 pub const COUNTER_UNCHECKED: &str = "beef_guard_unchecked_total";
 
-/// The overlay's counter upsert, verbatim (`ops::bump_counter`).
-pub const BUMP_COUNTER_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?, 1) \
+/// The overlay's counter upsert, verbatim (`ops::bump_counter`) — a DELTA
+/// bind so a batched flush adds many at once.
+pub const BUMP_COUNTER_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
      ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
 
-async fn bump_counter(db: Option<&worker::D1Database>, name: &str) {
+/// review L3: the unchecked-read counter is BATCHED per isolate. A
+/// chaintracks outage fails every `/beef` read open, and one D1 write per
+/// read was the INCIDENT D1-CALLBACK-FLOOD class; accumulate and flush one
+/// write per `UNCHECKED_FLUSH_AT`.
+const UNCHECKED_FLUSH_AT: u64 = 32;
+
+thread_local! {
+    static UNCHECKED_PENDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// PURE: accumulate one unchecked read; returns the new pending count and,
+/// when the threshold is crossed, the delta to flush (and reset to 0).
+pub fn note_and_maybe_flush(pending: u64, flush_at: u64) -> (u64, Option<u64>) {
+    let next = pending + 1;
+    if next >= flush_at {
+        (0, Some(next))
+    } else {
+        (next, None)
+    }
+}
+
+async fn bump_counter_by(db: Option<&worker::D1Database>, name: &str, delta: u64) {
     let Some(db) = db else { return };
-    let stmt = match db.prepare(BUMP_COUNTER_SQL).bind(&[worker::wasm_bindgen::JsValue::from_str(name)]) {
+    if delta == 0 {
+        return;
+    }
+    let stmt = match db.prepare(BUMP_COUNTER_SQL).bind(&[
+        worker::wasm_bindgen::JsValue::from_str(name),
+        worker::wasm_bindgen::JsValue::from_f64(delta as f64),
+    ]) {
         Ok(s) => s,
         Err(e) => {
             worker::console_warn!("[beef-guard] counter {name} bind failed: {e}");
@@ -127,6 +171,24 @@ async fn bump_counter(db: Option<&worker::D1Database>, name: &str) {
     };
     if let Err(e) = stmt.run().await {
         worker::console_warn!("[beef-guard] counter {name} write failed: {e}");
+    }
+}
+
+/// Bump a rare counter by one (stripped / refused — only on a real reorg).
+async fn bump_counter(db: Option<&worker::D1Database>, name: &str) {
+    bump_counter_by(db, name, 1).await;
+}
+
+/// Note one unchecked read; flush the batch to D1 only when the threshold
+/// is crossed (review L3).
+async fn note_unchecked(db: Option<&worker::D1Database>) {
+    let flush = UNCHECKED_PENDING.with(|c| {
+        let (next, flush) = note_and_maybe_flush(c.get(), UNCHECKED_FLUSH_AT);
+        c.set(next);
+        flush
+    });
+    if let Some(delta) = flush {
+        bump_counter_by(db, COUNTER_UNCHECKED, delta).await;
     }
 }
 
@@ -316,7 +378,7 @@ pub async fn guard_served_beef(
     let tip = if verified { present_tip(env).await } else { None };
     if verified && tip.is_none() {
         worker::console_warn!("[beef-guard] {subject}: no tip in hand; its recent bumps are served UNCHECKED (the stated fail-open)");
-        bump_counter(db, COUNTER_UNCHECKED).await;
+        note_unchecked(db).await;
         return Guarded::Serve(bytes.to_vec());
     }
     let to_check = bumps_to_check(&beef, tip, BEEF_REFUTE_DEPTH, verified);
@@ -350,7 +412,7 @@ pub async fn guard_served_beef(
         }
     }
     if unchecked {
-        bump_counter(db, COUNTER_UNCHECKED).await;
+        note_unchecked(db).await;
     }
     if refuted.is_empty() {
         return Guarded::Serve(bytes.to_vec());
@@ -470,12 +532,52 @@ mod tests {
                 assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
             }
         }
-        for name in [COUNTER_STRIPPED, COUNTER_REFUSED, COUNTER_UNCHECKED, COUNTER_UNCHECKED] {
-            conn.execute(BUMP_COUNTER_SQL, [name]).unwrap();
-        }
+        // the rare counters bump by 1; the unchecked counter flushes a BATCH
+        // delta (review L3) — the SQL takes (name, delta).
+        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_STRIPPED, 1i64]).unwrap();
+        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_REFUSED, 1i64]).unwrap();
+        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_UNCHECKED, 32i64]).unwrap();
         let read = |name: &str| -> i64 { conn.query_row("SELECT value FROM ops_counters WHERE name = ?", [name], |r| r.get(0)).unwrap() };
-        assert_eq!((read(COUNTER_STRIPPED), read(COUNTER_REFUSED), read(COUNTER_UNCHECKED)), (1, 1, 2));
+        assert_eq!((read(COUNTER_STRIPPED), read(COUNTER_REFUSED), read(COUNTER_UNCHECKED)), (1, 1, 32), "the batch delta accumulates as one write");
         assert_eq!(refuted_body(965_771), "stored proof refuted by the current header at height 965771 (reorg); re-anchoring pending, retry");
+    }
+
+    /// review L3: the unchecked-read counter batches — one D1 write per
+    /// `UNCHECKED_FLUSH_AT` reads, so a chaintracks outage cannot turn every
+    /// `/beef` read into a counter write (the callback-flood class).
+    #[test]
+    fn the_unchecked_counter_flushes_one_write_per_batch() {
+        let mut pending = 0u64;
+        let mut writes = 0u64;
+        let mut flushed_total = 0u64;
+        for _ in 0..100 {
+            let (next, flush) = note_and_maybe_flush(pending, 32);
+            pending = next;
+            if let Some(delta) = flush {
+                writes += 1;
+                flushed_total += delta;
+            }
+        }
+        assert_eq!(writes, 3, "100 reads at a 32 batch: 3 flushes, not 100 writes");
+        assert_eq!(flushed_total, 96);
+        assert_eq!(pending, 4, "the tail waits for the next flush");
+    }
+
+    /// review L3: an unverified row's bump check is CAPPED to the newest
+    /// heights, so a BEEF with bumps at many heights cannot fan one read
+    /// into unbounded header lookups.
+    #[test]
+    fn an_unverified_rows_bump_check_is_capped_to_the_newest_heights() {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
+        let mut beef = Beef::new();
+        for h in 0..20u32 {
+            beef.merge_bump(MerklePath::new_unchecked(965_700 + h, vec![vec![MerklePathLeaf::new_txid(0, format!("{h:064x}"))]]).unwrap());
+        }
+        let checked = bumps_to_check(&beef, None, 6, false);
+        assert_eq!(checked.len(), BEEF_UNVERIFIED_MAX_BUMPS, "capped");
+        let heights: Vec<u64> = checked.iter().map(|(_, h)| *h).collect();
+        assert_eq!(heights[0], 965_719, "newest first");
+        assert!(heights.iter().all(|h| *h >= 965_712), "only the newest window is checked");
     }
 
     #[test]
