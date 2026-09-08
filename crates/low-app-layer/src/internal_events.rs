@@ -303,10 +303,100 @@ pub async fn lobby_changed(mut req: Request, env: &Env) -> Result<Response> {
 
 /// `POST /internal/tip-changed` (bearer `INTERNAL_TOKEN`, body `{height}`):
 /// chaintracks' cron calls it once per synced tip; we broadcast the tip.
-/// The overlay's block-event pass body — `{"height": n}` (bsv-low loop 6).
+/// The overlay's block-event pass body — `{"height": n}` (bsv-low loop 6);
+/// bsv-low M19 R2 (2026-09-08): `{"height": n, "hash": "<64 hex>"}` when the
+/// header hash is in hand — the overlay's reorg detector compares it with
+/// the hash it acted on at that height. Absent hash ⇒ the height-only body
+/// (the pass still runs; nothing is compared).
 pub fn overlay_tip_body(height: u64) -> String {
     json!({ "height": height }).to_string()
 }
+
+/// The hash-bearing body (see [`overlay_tip_body`]).
+pub fn overlay_tip_body_with_hash(height: u64, hash: &str) -> String {
+    json!({ "height": height, "hash": hash.to_ascii_lowercase() }).to_string()
+}
+
+/// The two header facts the app-layer reads from chaintracks (bsv-low M19
+/// R2): the block hash (forwarded with the tip so the overlay can detect a
+/// reorg) and the merkle root (the `/beef` read-side guard's canon).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderLite {
+    pub hash: String,
+    pub merkle_root: String,
+}
+
+/// bsv-low M19 R2: the header chaintracks holds at `height`, read through
+/// the CHAINTRACKS service binding (`GET /findHeaderHexForHeight?height=N` →
+/// `{"status":"success","value":{"hash": …, "merkleRoot": …, "height": N}}`).
+/// Best-effort: any fault is `None`, logged, never a blocked caller.
+pub async fn chaintracks_header(env: &Env, height: u64) -> Option<HeaderLite> {
+    let svc = match env.service("CHAINTRACKS") {
+        Ok(svc) => svc,
+        Err(e) => {
+            console_log!("[header] CHAINTRACKS binding unavailable ({e}) — no header for {height}");
+            return None;
+        }
+    };
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    let headers = Headers::new();
+    let _ = headers.set("Accept", "application/json");
+    init.with_headers(headers);
+    let url = format!("https://chaintracks/findHeaderHexForHeight?height={height}");
+    let mut resp = match svc.fetch(url, Some(init)).await {
+        Ok(r) => r,
+        Err(e) => {
+            console_log!("[header] chaintracks fetch failed ({e}) — no header for {height}");
+            return None;
+        }
+    };
+    if !(200..300).contains(&resp.status_code()) {
+        console_log!("[header] chaintracks HTTP {} — no header for {height}", resp.status_code());
+        return None;
+    }
+    let frame: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            console_log!("[header] chaintracks header not JSON ({e}) — no header for {height}");
+            return None;
+        }
+    };
+    let header = parse_header(&frame, height);
+    if header.is_none() {
+        console_log!("[header] chaintracks frame carried no usable header for {height}: {frame}");
+    }
+    header
+}
+
+/// The block hash at `height` (see [`chaintracks_header`]).
+pub async fn chaintracks_block_hash(env: &Env, height: u64) -> Option<String> {
+    chaintracks_header(env, height).await.map(|h| h.hash)
+}
+
+/// PURE: the header out of a chaintracks `findHeaderHexForHeight` frame,
+/// only when the frame is a success naming THIS height with 64-hex hash and
+/// merkle root (both lower-cased).
+pub fn parse_header(frame: &serde_json::Value, height: u64) -> Option<HeaderLite> {
+    if frame.get("status")?.as_str()? != "success" {
+        return None;
+    }
+    let value = frame.get("value")?;
+    if value.get("height")?.as_u64()? != height {
+        return None;
+    }
+    let hex64 = |key: &str| -> Option<String> {
+        let v = value.get(key)?.as_str()?.trim();
+        (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
+    };
+    Some(HeaderLite { hash: hex64("hash")?, merkle_root: hex64("merkleRoot")? })
+}
+
+/// PURE: the block hash alone (see [`parse_header`]).
+pub fn parse_header_hash(frame: &serde_json::Value, height: u64) -> Option<String> {
+    parse_header(frame, height).map(|h| h.hash)
+}
+
 
 /// bsv-low loop 6 (2026-09-07): the tip is ALSO the overlay's cue to confirm
 /// its spent-but-unconfirmed pot rows (`POST /internal/tip-changed`, bearer
@@ -332,7 +422,13 @@ pub async fn forward_tip_to_overlay(env: Env, height: u64) {
         return;
     }
     init.with_headers(headers);
-    init.with_body(Some(overlay_tip_body(height).into()));
+    // bsv-low M19 R2: carry the header hash so the overlay can detect a reorg
+    // (a hash change at a height it already acted on); best-effort.
+    let body = match chaintracks_block_hash(&env, height).await {
+        Some(hash) => overlay_tip_body_with_hash(height, &hash),
+        None => overlay_tip_body(height),
+    };
+    init.with_body(Some(body.into()));
     let req = match Request::new_with_init(&format!("{}/internal/tip-changed", url.trim_end_matches('/')), &init) {
         Ok(r) => r,
         Err(e) => {
@@ -358,6 +454,8 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     let Some(height) = parse_tip_changed(&raw) else {
         return Response::error("body must be {\"height\": <positive integer>}", 400);
     };
+    // the `/beef` read-side guard's present-height latch (bsv-low M19 R2)
+    crate::beef_guard::latch_present_tip(height);
     push_broadcast(
         env,
         TIP_ROOM,
@@ -377,6 +475,40 @@ mod tests {
     #[test]
     fn overlay_tip_body_is_the_height_object() {
         assert_eq!(overlay_tip_body(965702), r#"{"height":965702}"#);
+    }
+
+    #[test]
+    fn overlay_tip_body_with_hash_carries_the_lowercased_hash() {
+        let h = "00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D";
+        let body = overlay_tip_body_with_hash(965771, h);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["height"], 965771);
+        assert_eq!(v["hash"], h.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn parse_header_takes_only_a_success_frame_for_this_height() {
+        let root = "A785".repeat(16);
+        let ok = serde_json::json!({"status":"success","value":{"height":965771,"hash":"00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D","merkleRoot":root}});
+        assert_eq!(
+            parse_header(&ok, 965771),
+            Some(HeaderLite {
+                hash: "00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d".into(),
+                merkle_root: "a785".repeat(16),
+            })
+        );
+        assert_eq!(
+            parse_header_hash(&ok, 965771).as_deref(),
+            Some("00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d")
+        );
+        let no_root = serde_json::json!({"status":"success","value":{"height":965771,"hash":"00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D","merkleRoot":"a785"}});
+        assert_eq!(parse_header(&no_root, 965771), None, "a short merkle root is no header");
+        assert_eq!(parse_header_hash(&ok, 965772), None, "another height's header is not this tip's hash");
+        let err = serde_json::json!({"status":"error","value":null});
+        assert_eq!(parse_header_hash(&err, 965771), None);
+        let short = serde_json::json!({"status":"success","value":{"height":965771,"hash":"abc"}});
+        assert_eq!(parse_header_hash(&short, 965771), None);
+        assert_eq!(parse_header_hash(&serde_json::json!("nope"), 965771), None);
     }
 
     #[test]

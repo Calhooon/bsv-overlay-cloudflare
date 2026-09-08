@@ -520,6 +520,24 @@ pub async fn beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respons
                 }
             };
         if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
+            // bsv-low M19 R2 (2026-09-08): never serve a bump the current
+            // header refutes. Every bump anchored in the last
+            // `BEEF_REFUTE_DEPTH` heights is re-checked against chaintracks
+            // on read; a refuted one is stripped (served raw with ancestry)
+            // or, when the trimmed store cannot source the tx without it,
+            // refused 503 (the route's retryable shape) until the overlay's
+            // block-event pass re-anchors the row.
+            let bytes = match crate::beef_guard::guard_served_beef(&ctx.env, &key, &bytes).await {
+                crate::beef_guard::Guarded::Serve(bytes) => bytes,
+                crate::beef_guard::Guarded::Refuted { height } => {
+                    return json_error(
+                        &format!(
+                            "stored proof refuted by the current header at height {height} (reorg); re-anchoring pending, retry"
+                        ),
+                        503,
+                    );
+                }
+            };
             // Serve-time compaction (#192/#193, P4): once the overlay's
             // completion pass / Arcade MINED callback has stitched a
             // chaintracks-verified BUMP into this BEEF, its now-proven
@@ -560,7 +578,16 @@ async fn chaintracks_present_height(
     ctx: &RouteContext<AuthState>,
     tag: &str,
 ) -> std::result::Result<u64, (&'static str, u16)> {
-    let svc = match ctx.env.service("CHAINTRACKS") {
+    chaintracks_present_height_env(&ctx.env, tag).await
+}
+
+/// [`chaintracks_present_height`] over a bare `Env` (the `/beef` read-side
+/// guard has no route context; bsv-low M19 R2).
+pub(crate) async fn chaintracks_present_height_env(
+    env: &worker::Env,
+    tag: &str,
+) -> std::result::Result<u64, (&'static str, u16)> {
+    let svc = match env.service("CHAINTRACKS") {
         Ok(svc) => svc,
         Err(e) => {
             console_warn!("[{tag}] CHAINTRACKS binding unavailable: {e}");

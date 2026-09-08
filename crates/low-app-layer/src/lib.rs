@@ -123,6 +123,7 @@ pub mod board_view;
 pub use board_view::BoardView;
 pub mod armed_pots;
 pub mod auth;
+pub mod beef_guard;
 pub mod compaction;
 pub mod cors;
 pub mod credit_beef;
