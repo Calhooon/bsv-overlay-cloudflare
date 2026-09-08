@@ -2150,6 +2150,86 @@ pub fn confirm_spend_cas_sql() -> &'static str {
      RETURNING txid"
 }
 
+// ── bsv-low M19 R2 (2026-09-08): the reorg reconcile's D1 statements ───────
+//
+// Loop 8's double reorg left 158 rows confirmed at spentHeight 965771 from
+// the orphan's MINED callbacks. These are the reference's `handleReorg` +
+// revalidation sweep in SQL. Every writer is GUARDED (the #301 CAS idiom:
+// the pointer must still be the spender the caller's proof named, and the
+// row must be confirmed), every demotion touches ONLY the two confirmation
+// columns, and every statement is pinned against real SQLite below.
+
+/// The hash the block-event pass acted on at a height (`None` = never).
+pub fn header_seen_prior_sql() -> &'static str {
+    "SELECT hash FROM chain_headers_seen WHERE height = ?"
+}
+
+/// The highest height ever recorded (NULL on an empty table).
+pub fn header_seen_max_sql() -> &'static str {
+    "SELECT MAX(height) AS cnt FROM chain_headers_seen"
+}
+
+/// Record (or replace) the hash at a height. Bind order: height, hash, seenAt.
+pub fn header_seen_upsert_sql() -> &'static str {
+    "INSERT INTO chain_headers_seen (height, hash, seenAt) VALUES (?, ?, ?) \
+     ON CONFLICT(height) DO UPDATE SET hash = excluded.hash, seenAt = excluded.seenAt"
+}
+
+/// The revalidation sweep's candidates: confirmed rows anchored inside a
+/// height window, NEWEST first, bounded. Backed by idx_pot_records_confirmed_height.
+/// Bind order: min_height, max_height.
+pub fn confirmed_in_heights_sql(limit: u64) -> String {
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE spent = 1 AND spentConfirmed = 1 AND spentHeight BETWEEN ? AND ? \
+         ORDER BY spentHeight DESC, txid ASC, outputIndex ASC LIMIT {limit}"
+    )
+}
+
+/// Confirmed rows pointed at a spender (the re-anchor / `reorg_unmined`
+/// lookup). Backed by idx_pot_spending.
+pub fn confirmed_by_spender_sql() -> String {
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE spendingTxid = ? AND spent = 1 AND spentConfirmed = 1"
+    )
+}
+
+/// GUARDED demotion of one row back to SEEN. Bind order: txid, outputIndex,
+/// spendingTxid (guard). A row back = the guard HIT.
+pub fn demote_confirmed_cas_sql() -> &'static str {
+    "UPDATE pot_records SET spentConfirmed = 0, spentHeight = NULL \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spentConfirmed = 1 \
+     RETURNING txid"
+}
+
+/// Bulk demotion for a detected reorg: the NEWEST `limit` confirmed rows at
+/// or above a height, demoted; RETURNING the rows as they now read. Bind
+/// order: from_height.
+pub fn demote_confirmed_from_height_sql(limit: u64) -> String {
+    format!(
+        "UPDATE pot_records SET spentConfirmed = 0, spentHeight = NULL \
+         WHERE rowid IN (SELECT rowid FROM pot_records \
+                          WHERE spent = 1 AND spentConfirmed = 1 AND spentHeight >= ? \
+                          ORDER BY spentHeight DESC, txid ASC, outputIndex ASC LIMIT {limit}) \
+         RETURNING {POT_RECORD_COLUMNS}"
+    )
+}
+
+/// GUARDED re-anchor: move a confirmed row's height to the block a pushed,
+/// verified proof names. Bind order: new_height, txid, outputIndex,
+/// spendingTxid (guard). A row back = the guard HIT.
+pub fn reanchor_confirmed_cas_sql() -> &'static str {
+    "UPDATE pot_records SET spentHeight = ? \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spentConfirmed = 1 \
+     RETURNING txid"
+}
+
+/// Drop the VERIFIED latch on a stored pot BEEF (bytes untouched).
+pub fn unlatch_pot_beef_sql() -> &'static str {
+    "UPDATE pot_beefs SET proof_verified = 0 WHERE txid = ?"
+}
+
 /// The #284 `store_record` upsert: insert-if-absent for the SPEND fields,
 /// STORED-WINS fill for the DECODED columns. The conflict update touches
 /// ONLY decoded columns — never `spent` / `spendingTxid` / `spentConfirmed`
@@ -2636,6 +2716,139 @@ impl PotStorage for D1PotStorage {
         .await
         .map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    // ── bsv-low M19 R2: the reorg reconcile (statements pinned in tests) ──
+
+    async fn record_header_seen(
+        &self,
+        height: u64,
+        hash: &str,
+    ) -> Result<overlay_discovery::pot::reorg::HeaderSeen, PotStorageError> {
+        #[derive(serde::Deserialize)]
+        struct HashRow {
+            hash: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct MaxRow {
+            #[serde(default)]
+            cnt: Option<f64>,
+        }
+        let prior: Option<HashRow> = Query::new(header_seen_prior_sql())
+            .bind(height as f64)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        let max: Option<MaxRow> = Query::new(header_seen_max_sql())
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Query::new(header_seen_upsert_sql())
+            .bind(height as f64)
+            .bind(hash.to_ascii_lowercase())
+            .bind(current_unix_seconds_i64() as f64)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(overlay_discovery::pot::reorg::HeaderSeen {
+            prior_hash_at_height: prior.map(|r| r.hash),
+            max_height_before: max.and_then(|r| r.cnt).map(|v| v as u64),
+        })
+    }
+
+    async fn find_confirmed_in_heights(
+        &self,
+        min_height: u64,
+        max_height: u64,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let rows: Vec<PotRow> = Query::new(confirmed_in_heights_sql(limit))
+            .bind(min_height as f64)
+            .bind(max_height as f64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_confirmed_by_spending_txid(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let rows: Vec<PotRow> = Query::new(confirmed_by_spender_sql())
+            .bind(spending_txid)
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn demote_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+    ) -> Result<bool, PotStorageError> {
+        let hit: Option<serde_json::Value> = Query::new(demote_confirmed_cas_sql())
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        if hit.is_some() {
+            // the served state moved (confirmed → seen): the seats' events
+            // boxes hear it on the route's flush
+            crate::pot_changes::note(txid, output_index);
+        }
+        Ok(hit.is_some())
+    }
+
+    async fn demote_confirmed_from_height(
+        &self,
+        from_height: u64,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let rows: Vec<PotRow> = Query::new(demote_confirmed_from_height_sql(limit))
+            .bind(from_height as f64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        let demoted: Vec<PotRecord> = rows.into_iter().map(PotRow::into_record).collect();
+        for r in &demoted {
+            crate::pot_changes::note(&r.txid, r.output_index);
+        }
+        Ok(demoted)
+    }
+
+    async fn reanchor_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        new_height: u64,
+    ) -> Result<bool, PotStorageError> {
+        let hit: Option<serde_json::Value> = Query::new(reanchor_confirmed_cas_sql())
+            .bind(new_height as f64)
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        if hit.is_some() {
+            crate::pot_changes::note(txid, output_index);
+        }
+        Ok(hit.is_some())
+    }
+
+    async fn unlatch_pot_beef_proof(&self, txid: &str) -> Result<(), PotStorageError> {
+        Query::new(unlatch_pot_beef_sql())
+            .bind(txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(())
     }
 
     async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
@@ -12724,5 +12937,199 @@ mod tests {
                 "column {col} must survive to the outer select"
             );
         }
+    }
+
+    /// bsv-low M19 R2 (2026-09-08): the reorg reconcile's SHIPPED statements
+    /// under real SQLite on the production migrations — the header record's
+    /// prior/max answers, the guarded single-row demotion, the bounded
+    /// newest-first bulk demotion (RETURNING the rows), the guarded
+    /// re-anchor, the latch drop, and the two query plans on the new indexes.
+    #[test]
+    fn reorg_reconcile_statements_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        // ── the header record ──
+        let prior = |h: i64| -> Option<String> {
+            conn.query_row(header_seen_prior_sql(), [h], |r| r.get::<_, String>(0))
+                .ok()
+        };
+        let max = || -> Option<i64> {
+            conn.query_row(header_seen_max_sql(), [], |r| r.get::<_, Option<i64>>(0))
+                .unwrap()
+        };
+        assert_eq!(prior(965771), None);
+        assert_eq!(max(), None, "an empty table answers NULL, never 0");
+        conn.execute(
+            header_seen_upsert_sql(),
+            rusqlite::params![965771i64, "153e10f4orphan", 1i64],
+        )
+        .unwrap();
+        conn.execute(
+            header_seen_upsert_sql(),
+            rusqlite::params![965772i64, "14d2556f", 2i64],
+        )
+        .unwrap();
+        assert_eq!(prior(965771).as_deref(), Some("153e10f4orphan"));
+        assert_eq!(max(), Some(965772));
+        // the replacement at 965771 overwrites the hash (ON CONFLICT)
+        conn.execute(
+            header_seen_upsert_sql(),
+            rusqlite::params![965771i64, "1de5aa96canonical", 3i64],
+        )
+        .unwrap();
+        assert_eq!(prior(965771).as_deref(), Some("1de5aa96canonical"));
+
+        // ── confirmed rows at heights 965770..=965773 + one unconfirmed ──
+        let ins = "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spentHeight, \
+                    spenderFinal, settleSigners, verdict, verdictTxid) VALUES (?, 0, 1, ?, ?, ?, 1, 'coop', 'winner-a', ?)";
+        for (pot, spender, height) in [
+            ("p1", "s1", 965770i64),
+            ("p2", "s2", 965771),
+            ("p3", "s3", 965772),
+            ("p4", "s4", 965773),
+        ] {
+            conn.execute(ins, rusqlite::params![pot, spender, 1i64, height, spender])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) VALUES ('p5', 0, 1, 's5', 0)",
+            [],
+        )
+        .unwrap();
+        for s in ["s1", "s2", "s3", "s4"] {
+            conn.execute(
+                "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) VALUES (?, x'01', 1, 1, 1)",
+                [s],
+            )
+            .unwrap();
+        }
+
+        // ── the sweep window: inside the range, newest first, bounded ──
+        let window = |lo: i64, hi: i64, limit: u64| -> Vec<(String, i64)> {
+            let mut stmt = conn.prepare(&confirmed_in_heights_sql(limit)).unwrap();
+            stmt.query_map([lo, hi], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>("spentHeight")?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            window(965771, 965773, 10),
+            vec![("p4".into(), 965773), ("p3".into(), 965772), ("p2".into(), 965771)]
+        );
+        assert_eq!(window(965771, 965773, 1), vec![("p4".into(), 965773)]);
+        // the plan uses the new index (never a full walk of pot_records)
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", confirmed_in_heights_sql(10)))
+            .unwrap()
+            .query_map([965771i64, 965773i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|l| l.contains("idx_pot_records_confirmed_height")),
+            "the sweep window must ride idx_pot_records_confirmed_height: {plan:?}"
+        );
+        // The index serves the search and the height order; a temp B-tree may
+        // remain for the tie-break terms (txid, outputIndex) only, never for
+        // the whole ORDER BY (that would be a sort over every confirmed row).
+        assert!(
+            !plan.iter().any(|l| l.contains("TEMP B-TREE FOR ORDER BY")),
+            "the composite index must serve the height order, no full temp sort: {plan:?}"
+        );
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT gameId FROM result_markers_v2 WHERE gameId IN (?, ?)")
+            .unwrap()
+            .query_map(["a", "b"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|l| l.contains("idx_result_markers_v2_gameId")),
+            "the gameId lookup must ride idx_result_markers_v2_gameId: {plan:?}"
+        );
+
+        // ── the confirmed-by-spender lookup ──
+        let by_spender = |s: &str| -> Vec<String> {
+            conn.prepare(&confirmed_by_spender_sql())
+                .unwrap()
+                .query_map([s], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(by_spender("s2"), vec!["p2"]);
+        assert!(by_spender("s5").is_empty(), "an unconfirmed spend is not in the confirmed lookup");
+
+        // ── the guarded single-row demotion ──
+        let demote = |pot: &str, spender: &str| -> bool {
+            conn.query_row(demote_confirmed_cas_sql(), rusqlite::params![pot, 0i64, spender], |r| {
+                r.get::<_, String>(0)
+            })
+            .is_ok()
+        };
+        assert!(!demote("p2", "other"), "the wrong spender never demotes");
+        assert!(demote("p2", "s2"));
+        assert!(!demote("p2", "s2"), "an already-demoted row is not demoted twice");
+        let (confirmed, height, spent, pointer, final_, signers, verdict): (i64, Option<i64>, i64, String, i64, String, String) = conn
+            .query_row(
+                "SELECT spentConfirmed, spentHeight, spent, spendingTxid, spenderFinal, settleSigners, verdict FROM pot_records WHERE txid = 'p2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!((confirmed, height), (0, None));
+        assert_eq!((spent, pointer.as_str(), final_, signers.as_str(), verdict.as_str()), (1, "s2", 1, "coop", "winner-a"), "every other fact stays");
+
+        // ── the bounded bulk demotion, newest first, RETURNING the rows ──
+        let bulk = |from: i64, limit: u64| -> Vec<String> {
+            conn.prepare(&demote_confirmed_from_height_sql(limit))
+                .unwrap()
+                .query_map([from], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(bulk(965771, 1), vec!["p4"], "the newest confirmed row above the height goes first");
+        assert_eq!(bulk(965771, 10), vec!["p3"], "then the rest; p2 was already demoted");
+        assert!(bulk(965771, 10).is_empty());
+        let p1: (i64, Option<i64>) = conn
+            .query_row("SELECT spentConfirmed, spentHeight FROM pot_records WHERE txid = 'p1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(p1, (1, Some(965770)), "a row below the reorg height is untouched");
+
+        // ── the guarded re-anchor ──
+        conn.execute(
+            "UPDATE pot_records SET spentConfirmed = 1, spentHeight = 965771 WHERE txid = 'p2'",
+            [],
+        )
+        .unwrap();
+        let reanchor = |pot: &str, spender: &str, h: i64| -> bool {
+            conn.query_row(reanchor_confirmed_cas_sql(), rusqlite::params![h, pot, 0i64, spender], |r| r.get::<_, String>(0))
+                .is_ok()
+        };
+        assert!(!reanchor("p2", "other", 965773));
+        assert!(reanchor("p2", "s2", 965773));
+        let h: i64 = conn
+            .query_row("SELECT spentHeight FROM pot_records WHERE txid = 'p2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(h, 965773);
+        assert!(!reanchor("p3", "s3", 965773), "a demoted (unconfirmed) row is not re-anchored");
+
+        // ── the latch drop keeps the bytes ──
+        conn.execute(unlatch_pot_beef_sql(), ["s2"]).unwrap();
+        let (verified, len): (i64, i64) = conn
+            .query_row("SELECT proof_verified, length(beef) FROM pot_beefs WHERE txid = 's2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((verified, len), (0, 1));
     }
 }

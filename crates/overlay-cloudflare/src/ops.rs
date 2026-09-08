@@ -78,6 +78,31 @@ pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_b
 pub const COUNTER_ARC_INGEST_UNKNOWN_TXID: &str = "arc_ingest_unknown_txid_total";
 /// bsv-low loop 6: block-event spend-confirmation passes run (`/internal/tip-changed`).
 pub const COUNTER_TIP_PASS_TOTAL: &str = "tip_pass_total";
+// ── bsv-low M19 R2 (2026-09-08): the reorg reconcile (#425, #429) ──────────
+/// Reorgs the block-event pass DETECTED (a hash change at a held height, or a
+/// lower announce whose hash we did not hold). Loop 8 saw two in 35 minutes.
+pub const COUNTER_CHAIN_REORGS_DETECTED: &str = "chain_reorgs_detected_total";
+/// Confirmed pot rows DEMOTED back to SEEN by a detected reorg (bulk, from the
+/// reorg height) or by Arcade's `reorg_unmined`: the confirm arm re-upgrades
+/// them on the next good proof.
+pub const COUNTER_REORG_DEMOTED: &str = "reorg_demoted_total";
+/// Confirmed rows the revalidation sweep re-verified against the current
+/// header source (the last 3 heights, every block-event pass).
+pub const COUNTER_REORG_REVERIFIED: &str = "reorg_reverified_total";
+/// Rows whose STORED spender proof the current header source REFUTES (#429):
+/// zero on a healthy stream; every one is a confirmation that rested on an
+/// orphan and was demoted. Surfaced on `/health/invariants`.
+pub const COUNTER_REORG_STALE_PROOFS: &str = "reorg_stale_proofs_total";
+/// Sweep rows whose re-verification could not READ the header source (a
+/// transport / subrequest fault): not a verdict, retried next pass.
+pub const COUNTER_REORG_TRACKER_FAULTS: &str = "reorg_tracker_faults_total";
+/// `/arc-ingest` callbacks carrying an Arcade reorg marker (`extraInfo:
+/// reorg_reanchor` / `reorg_unmined`, Arcade issue #279).
+pub const COUNTER_ARC_INGEST_REORG_EVENTS: &str = "arc_ingest_reorg_events_total";
+/// Confirmed rows whose `spentHeight` MOVED because a pushed, verified proof
+/// named a different block than the stored confirmation (a re-anchor is a
+/// REPLACEMENT, never a `cas_missed`).
+pub const COUNTER_ARC_INGEST_REANCHORED: &str = "arc_ingest_reanchored_total";
 /// bsv-low (2026-09-04) — the missing-spend DISCOVERY pass (`proof_fetcher::
 /// discover_missing_spends`), lifetime totals: candidates scanned, spends
 /// discovered (an unconfirmed pointer written), courier-ladder faults, and

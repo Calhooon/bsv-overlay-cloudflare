@@ -423,7 +423,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// index (`low-app-layer logic::chain_wins_cte`). Index only, additive.
 /// 136 → 137 (2026-09-04): `pot_records.spendDiscoveryAt` — the discovery
 /// pass's examine stamp (its candidate query backs examined rows off an hour).
-pub const OVERLAY_MIGRATION_COUNT: usize = 137;
+/// 137 → 140 for bsv-low M19 (2026-09-08): `chain_headers_seen` (the reorg
+/// detector's per-height record), `idx_pot_records_confirmed_height` (the
+/// revalidation sweep's window), `idx_result_markers_v2_gameId` (#428).
+pub const OVERLAY_MIGRATION_COUNT: usize = 140;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1532,6 +1535,31 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     )",
     // 2026-09-04: the discovery pass's examine stamp (unix seconds); NULL = never examined.
     "ALTER TABLE pot_records ADD COLUMN spendDiscoveryAt INTEGER",
+    // ── bsv-low M19 R2 (2026-09-08): the reorg reconcile ────────────────────
+    // The header the block-event pass acted on, per height: the overlay's
+    // own record of which block it confirmed against (`record_header_seen`).
+    // A hash change at a held height, or a lower announce whose hash we do
+    // not hold, is the reorg detector (`pot::reorg::reorg_from_height`).
+    // One row per height, forever (~144/day); overlay-internal.
+    "CREATE TABLE IF NOT EXISTS chain_headers_seen (
+        height INTEGER PRIMARY KEY,
+        hash TEXT NOT NULL,
+        seenAt INTEGER
+    )",
+    // The revalidation sweep's window read (`find_confirmed_in_heights`,
+    // `demote_confirmed_from_height`) is an equality on spentConfirmed plus
+    // a range on spentHeight, ordered by spentHeight: this composite serves
+    // both the search and the ORDER BY (pinned by EXPLAIN QUERY PLAN under
+    // real SQLite); a bare spentHeight index lost to the older two-column
+    // equality index and a temp B-tree, which on a table where most rows are
+    // confirmed is the scan shape loop 8's D1 overload was made of.
+    "CREATE INDEX IF NOT EXISTS idx_pot_records_confirmed_height \
+         ON pot_records(spentConfirmed, spentHeight)",
+    // bsv-low M19 D1 (#428): `result_markers_v2 WHERE gameId IN (…)` read
+    // ~1.1k rows per call in loop 8 (the app-layer's claims_sql and the
+    // per-game marker reads); the table was indexed by createdAt, potTxid
+    // and winner only.
+    "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_gameId ON result_markers_v2(gameId)",
 ];
 
 // =============================================================================
