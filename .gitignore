@@ -10,3 +10,7 @@ secrets.md
 .wrangler/
 # Docker volumes + container state (reference stack)
 reference/.docker/
+
+# rendered deploy configs (ids injected from the private secrets store; never commit)
+wrangler.deploy.toml
+wrangler.low.deploy.toml

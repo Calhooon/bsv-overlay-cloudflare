@@ -95,7 +95,7 @@ WRITTEN_OFF_BEFORE_HEIGHT = "961353"
 # `npx wrangler kv namespace create AUTH_SESSIONS`).
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"
-id = "022b3f903b7449c0bedf3e3eb8033cc4"  # local deploy id — do not commit
+id = "__LOW_APPLAYER_DEFAULT_KV_AUTH_SESSIONS_ID__"  # injected at deploy time from the private secrets store by name
 
 # The SAME D1 database the low-overlay worker writes (wrangler.low.toml uses
 # the identical binding name + database_name). This worker only ever SELECTs
@@ -104,7 +104,7 @@ id = "022b3f903b7449c0bedf3e3eb8033cc4"  # local deploy id — do not commit
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
-database_id = "9930afce-6154-4d1e-b2a0-71a90065db0a"  # local deploy id — do not commit
+database_id = "__LOW_APPLAYER_DEFAULT_D1_LOW_OVERLAY_DB_ID__"  # injected at deploy time from the private secrets store by name
 
 # Service binding to the ChainTracks worker (same account). /tip uses this to
 # resolve the present chain height: a plain workers.dev URL fetch to a
@@ -206,12 +206,12 @@ WRITTEN_OFF_BEFORE_HEIGHT = "964063"
 # exemptions. Set both, or neither.
 [[env.beta.kv_namespaces]]
 binding = "AUTH_SESSIONS"
-id = "0f329fae1869418ea9c85dfc6fbd4ca4"  # low-app-layer-beta-AUTH_SESSIONS
+id = "__LOW_APPLAYER_BETA_KV_AUTH_SESSIONS_ID__"  # low-app-layer-beta-AUTH_SESSIONS
 
 [[env.beta.d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db-beta"
-database_id = "49d4ecb7-5f4d-4ba5-b149-2939ca7262c3"
+database_id = "__LOW_APPLAYER_BETA_D1_LOW_OVERLAY_DB_BETA_ID__"
 
 [[env.beta.services]]
 binding = "CHAINTRACKS"

@@ -103,6 +103,8 @@ test:
 # exit code, never the build's.
 ci:
 	@set -e; \
+	bash scripts/check-config-ids.sh --self-test; \
+	bash scripts/check-config-ids.sh; \
 	cargo test --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast; \
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
 	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
@@ -368,7 +370,9 @@ ci-route:
 # NETWORK: needs `npx wrangler` and, on a cold machine, the wasm-opt/esbuild
 # downloads — the same dependency `ci-route` already puts in the gate. It does
 # NOT need Cloudflare credentials; `--dry-run` never authenticates, and the
-# configs' account/database ids are committed placeholders.
+# configs' account/database ids are committed placeholders (enforced by
+# scripts/check-config-ids.sh at the top of `ci` since bsv-low M19B-G4; the
+# real ids are injected at deploy time by name, bsv-low render-wrangler.sh).
 #
 # The plain `cargo build --target wasm32` steps in `ci` are kept even though
 # this target recompiles the same crates: they share the cargo cache (so they
