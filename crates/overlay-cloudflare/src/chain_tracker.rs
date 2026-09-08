@@ -257,6 +257,20 @@ fn root_matches_frame(
 /// pass reads it when the announcer's body carried none (an older
 /// chaintracks). `None` on any fault, logged by the caller.
 pub(crate) async fn chaintracks_block_hash(env: &worker::Env, height: u64) -> Option<String> {
+    chaintracks_block_hash_detailed(env, height).await.ok().flatten()
+}
+
+/// bsv-low M19B-G1: [`chaintracks_block_hash`] with the READ FAULT kept
+/// apart from "no header at that height": `Ok(Some(hash))` = the canonical
+/// hash chaintracks holds; `Ok(None)` = chaintracks answered 404 for the
+/// height (it has not reached it: a lag, not a fault); `Err` = the source
+/// could not be read (unconfigured, transport, a non-2xx other than 404, a
+/// malformed frame). The Arcade event consumer holds on `Ok(None)` and
+/// counts an `Err` without moving its cursor.
+pub(crate) async fn chaintracks_block_hash_detailed(
+    env: &worker::Env,
+    height: u64,
+) -> Result<Option<String>, String> {
     #[derive(serde::Deserialize)]
     struct CtHash {
         hash: String,
@@ -267,19 +281,37 @@ pub(crate) async fn chaintracks_block_hash(env: &worker::Env, height: u64) -> Op
         .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
     let service = env.service("CHAINTRACKS").ok();
     if service.is_none() && env.var("CHAIN_TRACKER_URL").is_err() {
-        return None;
+        return Err("no header source configured (CHAINTRACKS binding / CHAIN_TRACKER_URL)".to_string());
     }
     let url = format!("{}/findHeaderHexForHeight?height={height}", base_url.trim_end_matches('/'));
-    let mut response = ct_get(url, &service, "findHeaderHexForHeight").await.ok()?;
-    if !(200..300).contains(&response.status_code()) {
-        return None;
+    let mut response = ct_get(url, &service, "findHeaderHexForHeight")
+        .await
+        .map_err(|e| format!("chaintracks header read at {height}: {e}"))?;
+    let status = response.status_code();
+    if status == 404 {
+        return Ok(None);
     }
-    let frame: ResponseFrame<CtHash> = response.json().await.ok()?;
+    if !(200..300).contains(&status) {
+        return Err(format!("chaintracks header read at {height}: HTTP {status}"));
+    }
+    let frame: ResponseFrame<CtHash> = response
+        .json()
+        .await
+        .map_err(|e| format!("chaintracks header read at {height}: parse: {e}"))?;
     if !frame.is_success() {
-        return None;
+        return Err(format!("chaintracks header read at {height}: status={}", frame.status));
     }
-    let hash = frame.value?.hash.trim().to_ascii_lowercase();
-    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hash)
+    let hash = frame
+        .value
+        .ok_or_else(|| format!("chaintracks header read at {height}: success with no header"))?
+        .hash
+        .trim()
+        .to_ascii_lowercase();
+    if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(hash))
+    } else {
+        Err(format!("chaintracks header read at {height}: malformed hash"))
+    }
 }
 
 /// Fetch the current chain height from ChainTracks.

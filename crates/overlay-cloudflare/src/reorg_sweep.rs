@@ -49,7 +49,7 @@ impl RootMemo {
 }
 
 /// [`verify_bump_detailed`] through the per-pass memo (review MED-3).
-async fn verify_bump_memoized(
+pub(crate) async fn verify_bump_memoized(
     tracker: &dyn ChainTracker,
     memo: &mut RootMemo,
     bump_hex: &str,
@@ -100,7 +100,7 @@ fn own_bump<'a>(beef: &'a Beef, txid: &str) -> Option<&'a MerklePath> {
 }
 
 /// The hex of a stored BEEF's OWN bump for `txid`, if any.
-fn stored_bump_hex(stored_beef: &[u8], txid: &str) -> Option<String> {
+pub(crate) fn stored_bump_hex(stored_beef: &[u8], txid: &str) -> Option<String> {
     let beef = Beef::from_binary(stored_beef).ok()?;
     own_bump(&beef, txid).map(MerklePath::to_hex)
 }
@@ -126,6 +126,12 @@ pub struct ReverifyPassSummary {
     /// Rows re-anchored: STANDING (the stored bump verifies) but the row's
     /// `spentHeight` was stale — moved to the bump's height (review L1).
     pub reanchored: usize,
+    /// bsv-low M19B-G1: REFUTED rows re-anchored WITHOUT a demotion: the
+    /// ladder (Arcade first) answered a chaintracks-verified proof naming
+    /// another block and the stored bump + the row's height were replaced
+    /// in place (`ReverifyMode::reanchor_first`). The served confirmation
+    /// never flickered to SEEN.
+    pub reanchored_from_courier: usize,
     /// Courier-confirmed rows the routine sweep HEALED: re-asked the ladder,
     /// got an agreeing proof, stitched it into the stored BEEF so future
     /// passes verify it locally (review MED-4).
@@ -146,6 +152,24 @@ pub struct ReverifyPassSummary {
     pub next_cursor: Option<RowKey>,
 }
 
+/// How one [`reverify_window_with`] pass treats the rows it cannot verify
+/// locally or finds refuted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReverifyMode {
+    /// Demote rows that have no stored proof to verify (the caller has
+    /// independent reason: a detected reorg at that height, an operator's
+    /// window). Off: the routine sweep's courier re-check (review MED-4).
+    pub demote_proofless: bool,
+    /// bsv-low M19B-G1: before demoting a REFUTED row, ask the courier
+    /// ladder ONCE (Arcade first) for a chaintracks-verified proof and, when
+    /// one names another block, replace the stored bump and the row's
+    /// height IN PLACE (`apply_pushed_proof_to_pot_stores`); demote only
+    /// when no canonical proof is served. Needs a `fetcher`; without one
+    /// the arm is the plain demotion. Off for every R2 caller (their pins
+    /// are unchanged).
+    pub reanchor_first: bool,
+}
+
 /// ONE bounded, evidence-driven pass over the confirmed rows anchored in
 /// `lo..=hi`, continuing after `after`: each row's stored spender bump is
 /// re-verified against the header source; a REFUTED one demotes the row
@@ -164,6 +188,78 @@ pub async fn reverify_window(
     limit: u64,
     demote_proofless: bool,
 ) -> ReverifyPassSummary {
+    reverify_window_with(
+        pot_storage,
+        tracker,
+        fetcher,
+        lo,
+        hi,
+        after,
+        limit,
+        ReverifyMode { demote_proofless, reanchor_first: false },
+    )
+    .await
+}
+
+/// What the ladder said when a REFUTED row asked it for a canonical proof
+/// (`ReverifyMode::reanchor_first`).
+enum LadderReanchor {
+    /// A chaintracks-verified proof naming another block landed in the
+    /// pot stores (bump replaced, height moved where it differed).
+    Reanchored,
+    /// No courier serves a proof that verifies (or the verified one wrote
+    /// nothing): the row's confirmation still rests on the refuted bump.
+    NoCanonicalProof,
+    /// A chaintracks read fault while verifying a candidate: not a verdict.
+    Fault(String),
+}
+
+/// bsv-low M19B-G1: the re-anchor-first arm for ONE refuted confirmed row.
+/// The ladder's `verified_proof_for_detailed` verifies every candidate bump
+/// against chaintracks before answering it (the `apply_pushed_proof_to_pot_stores`
+/// precondition); an `Ok(None)` (unmined, unverifiable, budget) is "no
+/// canonical proof", never a demotion by itself.
+async fn reanchor_from_ladder(
+    pot_storage: &dyn PotStorage,
+    fetcher: &dyn AncestorFetcher,
+    rec: &overlay_discovery::pot::storage::PotRecord,
+    spender: &str,
+) -> LadderReanchor {
+    match fetcher.verified_proof_for_detailed(spender).await {
+        Ok(Some(hex)) => {
+            let applied = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(pot_storage, spender, &hex).await;
+            if applied.landed_anything() {
+                push_log(&format!(
+                    "[reorg] {}:{} RE-ANCHORED IN PLACE: the ladder serves a chaintracks-verified proof for {spender} at another block (pot_beef_reanchored={} spends_reanchored={} compacted={})",
+                    rec.txid, rec.output_index, applied.pot_beef_reanchored, applied.spends_reanchored, applied.pot_beef_compacted
+                ));
+                LadderReanchor::Reanchored
+            } else {
+                push_log(&format!(
+                    "[reorg] {}:{} the ladder's verified proof for {spender} landed NOTHING (cas_missed={} cas_errors={}): demoting on the refuted stored bump",
+                    rec.txid, rec.output_index, applied.spends_cas_missed, applied.spends_cas_errors
+                ));
+                LadderReanchor::NoCanonicalProof
+            }
+        }
+        Ok(None) => LadderReanchor::NoCanonicalProof,
+        Err(e) => LadderReanchor::Fault(e),
+    }
+}
+
+/// [`reverify_window`] with an explicit [`ReverifyMode`].
+#[allow(clippy::too_many_arguments)] // the window bounds, the cursor, the two chain sources, the mode
+pub async fn reverify_window_with(
+    pot_storage: &dyn PotStorage,
+    tracker: Option<&dyn ChainTracker>,
+    fetcher: Option<&dyn AncestorFetcher>,
+    lo: u64,
+    hi: u64,
+    after: Option<RowKey>,
+    limit: u64,
+    mode: ReverifyMode,
+) -> ReverifyPassSummary {
+    let demote_proofless = mode.demote_proofless;
     let mut summary = ReverifyPassSummary { next_cursor: after, ..Default::default() };
     // No header source, no verdict: `verify_bump_detailed` answers Ok(false)
     // without a tracker, which would read as "every stored proof is refuted".
@@ -273,6 +369,29 @@ pub async fn reverify_window(
                 ));
             }
             ReverifyVerdict::Stale => {
+                // bsv-low M19B-G1: a re-anchor is a REPLACEMENT, never a
+                // demote-then-rechase, when the ladder already serves the
+                // canonical proof (Arcade's re-anchored `/tx`, or another
+                // courier). The served confirmation never flickers.
+                if mode.reanchor_first {
+                    if let Some(fetcher) = fetcher {
+                        match reanchor_from_ladder(pot_storage, fetcher, &rec, spender).await {
+                            LadderReanchor::Reanchored => {
+                                summary.reanchored_from_courier += 1;
+                                continue;
+                            }
+                            LadderReanchor::Fault(e) => {
+                                summary.faults += 1;
+                                push_log(&format!(
+                                    "[reorg] {}:{} header READ FAULT while the ladder re-anchored {spender}: not a verdict, nothing changed: {e}",
+                                    rec.txid, rec.output_index
+                                ));
+                                continue;
+                            }
+                            LadderReanchor::NoCanonicalProof => {}
+                        }
+                    }
+                }
                 match pot_storage
                     .demote_confirmed_for_spender(&rec.txid, rec.output_index, spender)
                     .await
@@ -1007,6 +1126,54 @@ mod tests {
         // a second pass finds it standing at the right height, nothing to move
         let s2 = reverify_window(&store, Some(&tracker), None, 965_771, 965_773, None, 50, false).await;
         assert_eq!((s2.standing, s2.reanchored), (1, 0));
+    }
+
+    /// bsv-low M19B-G1: the re-anchor-first arm of `reverify_window_with`.
+    /// A REFUTED row asks the ladder once: a chaintracks-verified proof for
+    /// another block replaces the stored bump and moves the height IN PLACE
+    /// (confirmed throughout, the latch kept); `Ok(None)` demotes (the plain
+    /// arm); a ladder FAULT changes nothing and counts. The R2 wrapper
+    /// (`reverify_window`) never asks the ladder for a refuted row.
+    #[tokio::test]
+    async fn reanchor_first_replaces_a_refuted_bump_from_a_verified_courier_proof_or_demotes() {
+        let store = MemoryPotStorage::new();
+        let mut tracker = MockChainTracker::new(965_860);
+        let reproven = confirmed_pot_with_stored_proof(&store, &pot(80), 965_771).await;
+        tracker.add_root(965_773, reproven.clone());
+        let unproven = confirmed_pot_with_stored_proof(&store, &pot(81), 965_771).await;
+        let faulted = confirmed_pot_with_stored_proof(&store, &pot(82), 965_771).await;
+        let ladder = CourierStub(
+            [
+                (reproven.clone(), Ok(Some(single_tx_bump(&reproven, 965_773).to_hex()))),
+                (unproven.clone(), Ok(None)),
+                (faulted.clone(), Err("chaintracks starved".into())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mode = ReverifyMode { demote_proofless: false, reanchor_first: true };
+        let s = reverify_window_with(&store, Some(&tracker), Some(&ladder), 965_771, 965_771, None, 50, mode).await;
+        assert_eq!((s.scanned, s.reanchored_from_courier, s.stale, s.faults, s.standing), (3, 1, 1, 1, 0), "{s:?}");
+        let r = store.get_spent_status(&pot(80), 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_773), "re-anchored in place: {r:?}");
+        assert_eq!(stored_bump_anchor(&store.get_beef(&reproven).await.unwrap().unwrap(), &reproven), Some(BumpAnchor { height: 965_773, root: reproven.clone() }));
+        assert!(store.pot_beef_proof_verified(&reproven).await.unwrap(), "the latch is kept across the replacement");
+        let r = store.get_spent_status(&pot(81), 0).await.unwrap().unwrap();
+        assert!(r.spent && !r.spent_confirmed, "no canonical proof served: demoted");
+        assert!(!store.pot_beef_proof_verified(&unproven).await.unwrap());
+        let r = store.get_spent_status(&pot(82), 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_771), "a ladder fault is not a verdict");
+        assert!(store.pot_beef_proof_verified(&faulted).await.unwrap());
+        // a second pass: the re-anchored row stands (its stored bump is canonical now), the faulted one is asked again
+        let s2 = reverify_window_with(&store, Some(&tracker), Some(&ladder), 965_771, 965_773, None, 50, mode).await;
+        assert_eq!((s2.scanned, s2.standing, s2.reanchored_from_courier, s2.faults), (2, 1, 0, 1), "{s2:?}");
+        // the R2 wrapper: the same refuted row takes the plain arm, the ladder is never asked
+        let store2 = MemoryPotStorage::new();
+        let refuted = confirmed_pot_with_stored_proof(&store2, &pot(83), 965_771).await;
+        let ladder2 = CourierStub([(refuted.clone(), Ok(Some(single_tx_bump(&refuted, 965_773).to_hex())))].into_iter().collect());
+        let s3 = reverify_window(&store2, Some(&tracker), Some(&ladder2), 965_771, 965_771, None, 50, false).await;
+        assert_eq!((s3.stale, s3.reanchored_from_courier), (1, 0), "the R2 arm demotes; it never re-anchors from the ladder: {s3:?}");
+        assert!(!store2.get_spent_status(&pot(83), 0).await.unwrap().unwrap().spent_confirmed);
     }
 
     #[test]
