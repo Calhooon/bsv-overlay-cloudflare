@@ -93,6 +93,7 @@
 
 use std::sync::OnceLock;
 
+pub mod arcade_events;
 pub mod covenant;
 pub mod lookup_service;
 pub mod lowfund_topic_manager;

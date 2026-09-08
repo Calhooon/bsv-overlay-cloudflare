@@ -96,8 +96,10 @@ pub fn sweep_window(tip: u64, depth: u64) -> Option<(u64, u64)> {
 }
 
 /// One row's position in a height-windowed walk: `(height DESC, rowid
-/// DESC)` is the walk order, and this is the last row examined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// DESC)` is the walk order, and this is the last row examined. Serde
+/// derives (bsv-low M19B-G1): the Arcade event consumer persists a leg's
+/// cursor inside its JSON state document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowKey {
     pub height: u64,
     pub rowid: i64,
