@@ -28,7 +28,7 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
-database_id = "YOUR_D1_DATABASE_ID"  # set to your own D1 database id
+database_id = "__LOW_APPLAYER_DEFAULT_D1_LOW_OVERLAY_DB_ID__"  # the same prod D1 the app-layer reads; injected at deploy time by name
 
 [vars]
 # W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN),
@@ -216,7 +216,7 @@ database_name = "low-overlay-db-beta"
 # Committed deliberately, unlike the prod placeholder above: a D1 id is not a
 # secret (it is inert without the account API token), and an uncommitted id is
 # how a clean-checkout redeploy silently points at the wrong database.
-database_id = "49d4ecb7-5f4d-4ba5-b149-2939ca7262c3"
+database_id = "__LOW_OVERLAY_BETA_D1_LOW_OVERLAY_DB_BETA_ID__"
 
 [[env.beta.services]]
 binding = "CHAINTRACKS"
