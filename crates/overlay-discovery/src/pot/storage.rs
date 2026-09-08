@@ -613,6 +613,23 @@ pub trait PotStorage {
         Ok(false)
     }
 
+    /// bsv-low M19B-G1 round 2 (review MED-1): [`demote_confirmed_for_spender`](Self::demote_confirmed_for_spender)
+    /// ALSO bound to the height the refuted proof was judged at
+    /// (`spentHeight IS judged_height`, NULL-safe): a row another writer
+    /// RE-ANCHORED to a new height between the judging read and this write
+    /// is a guard MISS (nothing written, counted), never a demotion of a
+    /// canonical confirmation. Default: the fail-safe no-op.
+    async fn demote_confirmed_for_spender_at(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        judged_height: Option<u64>,
+    ) -> Result<bool, PotStorageError> {
+        let _ = (txid, output_index, spending_txid, judged_height);
+        Ok(false)
+    }
+
     /// GUARDED re-anchor: a pushed, chaintracks-verified proof names a
     /// different block than the stored confirmation — move `spentHeight`
     /// to `new_height` while the pointer is still `spending_txid` and the
@@ -1752,6 +1769,31 @@ impl PotStorage for MemoryPotStorage {
                 && r.output_index == output_index
                 && r.spent_confirmed
                 && r.spending_txid.as_deref() == Some(spending_txid)
+            {
+                r.spent_confirmed = false;
+                r.spent_height = None;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn demote_confirmed_for_spender_at(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        judged_height: Option<u64>,
+    ) -> Result<bool, PotStorageError> {
+        // the pointer AND the judged height must still be what the caller's
+        // refuted proof was read against (mirrors `spentHeight IS ?`)
+        let mut records = self.records.lock().unwrap();
+        for r in records.iter_mut() {
+            if r.txid == txid
+                && r.output_index == output_index
+                && r.spent_confirmed
+                && r.spending_txid.as_deref() == Some(spending_txid)
+                && r.spent_height == judged_height
             {
                 r.spent_confirmed = false;
                 r.spent_height = None;
@@ -3323,6 +3365,32 @@ mod tests {
         // a lower height never recorded: an old header, never a reorg
         let old = store.record_header_seen(965700, "DD").await.unwrap();
         assert_eq!(classify_tip_announce(965700, "DD", &old), TipAnnounce::Old);
+    }
+
+    /// bsv-low M19B-G1 round 2 (review MED-1): the height-bound demotion
+    /// misses when the row's height moved under the pass (another writer
+    /// re-anchored it), hits only on the pointer AND the judged height, and
+    /// is NULL-safe for a height-less confirmation.
+    #[tokio::test]
+    async fn demote_confirmed_for_spender_at_misses_when_the_height_moved() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&PotRecord { txid: "p".repeat(64), output_index: 0, ..Default::default() }).await.unwrap();
+        store.mark_spent(&"p".repeat(64), 0, &"s".repeat(64), true, None, Some(965_771), Some(true)).await.unwrap();
+        // judged at 965771, then re-anchored to 965773 by another writer
+        assert!(store.reanchor_confirmed_for_spender(&"p".repeat(64), 0, &"s".repeat(64), 965_773).await.unwrap());
+        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_771)).await.unwrap(), "the judged height is stale: a miss");
+        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), None).await.unwrap(), "a NULL judged height against a held height: a miss");
+        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"x".repeat(64), Some(965_773)).await.unwrap(), "the wrong spender: a miss");
+        let r = store.get_spent_status(&"p".repeat(64), 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_773), "nothing written by a miss");
+        assert!(store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_773)).await.unwrap(), "the current height and pointer: the demotion");
+        let r = store.get_spent_status(&"p".repeat(64), 0).await.unwrap().unwrap();
+        assert!(r.spent && !r.spent_confirmed && r.spent_height.is_none());
+        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_773)).await.unwrap(), "not twice");
+        // a height-less confirmation judged height-less
+        store.store_record(&PotRecord { txid: "q".repeat(64), output_index: 0, ..Default::default() }).await.unwrap();
+        store.mark_spent(&"q".repeat(64), 0, &"t".repeat(64), true, None, None, Some(true)).await.unwrap();
+        assert!(store.demote_confirmed_for_spender_at(&"q".repeat(64), 0, &"t".repeat(64), None).await.unwrap());
     }
 
     #[tokio::test]

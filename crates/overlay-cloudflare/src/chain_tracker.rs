@@ -257,23 +257,27 @@ fn root_matches_frame(
 /// pass reads it when the announcer's body carried none (an older
 /// chaintracks). `None` on any fault, logged by the caller.
 pub(crate) async fn chaintracks_block_hash(env: &worker::Env, height: u64) -> Option<String> {
-    chaintracks_block_hash_detailed(env, height).await.ok().flatten()
+    chaintracks_block_hash_detailed(env, height).await.ok().flatten().map(|h| h.0)
 }
 
 /// bsv-low M19B-G1: [`chaintracks_block_hash`] with the READ FAULT kept
-/// apart from "no header at that height": `Ok(Some(hash))` = the canonical
-/// hash chaintracks holds; `Ok(None)` = chaintracks answered 404 for the
-/// height (it has not reached it: a lag, not a fault); `Err` = the source
-/// could not be read (unconfigured, transport, a non-2xx other than 404, a
-/// malformed frame). The Arcade event consumer holds on `Ok(None)` and
-/// counts an `Err` without moving its cursor.
+/// apart from "no header at that height": `Ok(Some((hash, merkle_root)))` =
+/// the canonical header chaintracks holds (round 2, review MED-5: the root
+/// rides along so the pass can seed its memo from this one read);
+/// `Ok(None)` = chaintracks answered 404 for the height (it has not reached
+/// it: a lag, not a fault); `Err` = the source could not be read
+/// (unconfigured, transport, a non-2xx other than 404, a malformed frame).
+/// The Arcade event consumer holds on `Ok(None)` and counts an `Err`
+/// without moving its cursor.
 pub(crate) async fn chaintracks_block_hash_detailed(
     env: &worker::Env,
     height: u64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, Option<String>)>, String> {
     #[derive(serde::Deserialize)]
     struct CtHash {
         hash: String,
+        #[serde(rename = "merkleRoot", default)]
+        merkle_root: Option<String>,
     }
     let base_url = env
         .var("CHAIN_TRACKER_URL")
@@ -301,17 +305,18 @@ pub(crate) async fn chaintracks_block_hash_detailed(
     if !frame.is_success() {
         return Err(format!("chaintracks header read at {height}: status={}", frame.status));
     }
-    let hash = frame
+    let header = frame
         .value
-        .ok_or_else(|| format!("chaintracks header read at {height}: success with no header"))?
-        .hash
-        .trim()
-        .to_ascii_lowercase();
-    if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(Some(hash))
-    } else {
-        Err(format!("chaintracks header read at {height}: malformed hash"))
+        .ok_or_else(|| format!("chaintracks header read at {height}: success with no header"))?;
+    let hash = header.hash.trim().to_ascii_lowercase();
+    if !(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(format!("chaintracks header read at {height}: malformed hash"));
     }
+    let root = header
+        .merkle_root
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| r.len() == 64 && r.bytes().all(|b| b.is_ascii_hexdigit()));
+    Ok(Some((hash, root)))
 }
 
 /// Fetch the current chain height from ChainTracks.

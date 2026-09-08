@@ -72,6 +72,10 @@ pub struct BlockStatusPage {
     /// Arcade's keyset cursor (the lowest height on the page); absent on the
     /// last page.
     pub next_cursor: Option<u64>,
+    /// Round 2 (review LOW-3): the highest `blockHeight` on the page, any
+    /// status: Arcade's view of the tip, which the consumer compares with
+    /// chaintracks' before it reads "the same hash, deep" as Arcade being wrong.
+    pub newest_height: Option<u64>,
 }
 
 /// True for Arcade's stamp shape `YYYY-MM-DDTHH:MM:SS.mmmZ` (24 bytes, UTC).
@@ -114,6 +118,9 @@ pub fn parse_block_status_page(body: &str) -> Result<BlockStatusPage, String> {
         ..Default::default()
     };
     for row in blocks {
+        if let Some(h) = row.get("blockHeight").and_then(serde_json::Value::as_u64) {
+            page.newest_height = Some(page.newest_height.map_or(h, |m| m.max(h)));
+        }
         let status = row.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
         if status != "orphaned" {
             continue;
@@ -168,32 +175,58 @@ pub enum Corroboration {
     /// Chaintracks holds a DIFFERENT block at that height: the orphaned
     /// block is not on our chain. Re-verify the rows anchored there.
     Corroborated,
-    /// Chaintracks still holds the orphaned hash as canonical, `skip_depth`
-    /// or more blocks below its tip: it is not lagging, Arcade's row is
-    /// wrong for our header source (the 2026-09-07 965773 row). Skip the
-    /// event (counted); nothing is re-verified on its account.
+    /// Chaintracks is `skip_depth` or more blocks past that height and
+    /// either still holds the orphaned hash as canonical or serves no
+    /// header there at all: it is not lagging, and the row cannot be
+    /// corroborated by our header source (the 2026-09-07 965773 row). Skip
+    /// the event (counted); nothing is re-verified on its account.
     Uncorroborated,
     /// Chaintracks holds the orphaned hash (or no header yet at that
     /// height) near its tip: it may simply lag Arcade by a sync. Hold the
     /// event for the next pass; nothing changes.
     Held,
+    /// Round 2 (review LOW-3): chaintracks' tip is more than
+    /// `lag_tolerance` blocks BELOW the newest height Arcade lists: our
+    /// header source is behind the feed, so "the same hash, deep" would be
+    /// a false skip. Hold, and count the lag apart from an uncorroborated
+    /// event.
+    TrackerLagging,
 }
 
 /// Classify an orphan event at `height` with `orphan_hash` against the
-/// header chaintracks holds there (`None` = no header at that height yet)
-/// and chaintracks' current `tip`. Case-insensitive on the hash. A read
-/// FAULT is not an input here: the caller counts it and changes nothing.
+/// header chaintracks holds there (`None` = no header at that height),
+/// chaintracks' current `tip`, and the newest height the feed listed
+/// (`feed_tip`, Arcade's view of the tip). Case-insensitive on the hash. A
+/// read FAULT is not an input here: the caller counts it and changes nothing.
 pub fn classify_corroboration(
     canonical_at_height: Option<&str>,
     orphan_hash: &str,
     tip: u64,
     height: u64,
     skip_depth: u64,
+    feed_tip: Option<u64>,
+    lag_tolerance: u64,
 ) -> Corroboration {
+    if feed_tip.is_some_and(|f| f > tip.saturating_add(lag_tolerance)) {
+        return Corroboration::TrackerLagging;
+    }
     match canonical_at_height {
         Some(canonical) if !canonical.eq_ignore_ascii_case(orphan_hash) => Corroboration::Corroborated,
-        Some(_) if tip >= height.saturating_add(skip_depth) => Corroboration::Uncorroborated,
+        _ if tip >= height.saturating_add(skip_depth) => Corroboration::Uncorroborated,
         _ => Corroboration::Held,
+    }
+}
+
+/// Round 2 (review LOW-1): the `before-height` of the NEXT listing page from
+/// a page's `nextCursor` (its lowest height). Arcade pages `block_height <
+/// before`, so `before = nextCursor` would drop the boundary height's rows
+/// beyond the page (exactly the same-height competitors a reorg produces):
+/// the next page starts one above and re-lists the boundary height (the
+/// consumer dedups by key). `None` = the last page.
+pub fn next_page_before(next_cursor: Option<u64>) -> Option<u64> {
+    match next_cursor {
+        Some(c) if c > 0 => Some(c.saturating_add(1)),
+        _ => None,
     }
 }
 
@@ -216,6 +249,11 @@ pub struct PendingEvent {
     pub transactions: LegProgress,
     /// Consecutive passes this event was HELD (chaintracks not yet past it).
     pub held_passes: u32,
+    /// Round 2 (review MED-3): passes this event ended in a read FAULT
+    /// (a header, tip or leg read). Persisted so a ceiling can release a
+    /// permanently faulting event from the head of the queue.
+    #[serde(default)]
+    pub fault_passes: u32,
 }
 
 impl PendingEvent {
@@ -226,12 +264,21 @@ impl PendingEvent {
             pot_beefs: LegProgress::default(),
             transactions: LegProgress::default(),
             held_passes: 0,
+            fault_passes: 0,
         }
     }
 
     /// Every leg walked its height to the end: the event is applied.
     pub fn all_exhausted(&self) -> bool {
         self.spenders.exhausted && self.pot_beefs.exhausted && self.transactions.exhausted
+    }
+
+    /// Round 2 (review MED-3): the head-of-line ceiling. An event held or
+    /// faulting for this many passes is RELEASED (finished as unresolved,
+    /// counted) so the queue behind it moves; the routine sweep and the
+    /// announce detector keep covering its rows.
+    pub fn past_ceiling(&self, held_ceiling: u32, fault_ceiling: u32) -> bool {
+        self.held_passes >= held_ceiling || self.fault_passes >= fault_ceiling
     }
 }
 
@@ -266,7 +313,11 @@ impl Default for ConsumerState {
 impl ConsumerState {
     /// Parse the persisted document. A document from a NEWER writer is an
     /// error (never silently reinterpreted); a missing field reads as its
-    /// default (an older document still reads).
+    /// default (an older document still reads). Round 2 (review MED-4):
+    /// every event the document carries must be well-formed (a 64-hex
+    /// hash, an Arcade stamp, a positive height), else the document is
+    /// refused as a whole: a malformed row is a counted fault for the pass
+    /// that reads it, never a panic ahead of the money passes.
     pub fn from_json(doc: &str) -> Result<Self, String> {
         let s: Self = serde_json::from_str(doc).map_err(|e| format!("consumer state: {e}"))?;
         if s.v > CONSUMER_STATE_VERSION {
@@ -274,6 +325,24 @@ impl ConsumerState {
                 "consumer state: document version {} is newer than this reader's {}",
                 s.v, CONSUMER_STATE_VERSION
             ));
+        }
+        let well_formed = |what: &str, stamp: &str, height: u64, hash: &str| -> Result<(), String> {
+            if !is_block_hash(hash) {
+                return Err(format!("consumer state: {what} carries a malformed hash"));
+            }
+            if !is_arcade_stamp(stamp) {
+                return Err(format!("consumer state: {what} carries a malformed stamp"));
+            }
+            if height == 0 {
+                return Err(format!("consumer state: {what} carries height 0"));
+            }
+            Ok(())
+        };
+        if let Some(c) = &s.cursor {
+            well_formed("the cursor", &c.orphaned_at, c.height, &c.hash)?;
+        }
+        if let Some(p) = &s.pending {
+            well_formed("the pending event", &p.event.orphaned_at, p.event.height, &p.event.hash)?;
         }
         Ok(s)
     }
@@ -302,6 +371,19 @@ impl ConsumerState {
         if let Some(p) = self.pending.as_mut() {
             p.held_passes = p.held_passes.saturating_add(1);
         }
+    }
+
+    /// Round 2 (review MED-3): the pending event's pass ended in a read fault.
+    pub fn note_fault_on_pending(&mut self) {
+        if let Some(p) = self.pending.as_mut() {
+            p.fault_passes = p.fault_passes.saturating_add(1);
+        }
+    }
+
+    /// Round 2 (review MED-3): is the pending event past the head-of-line
+    /// ceiling (see [`PendingEvent::past_ceiling`])?
+    pub fn pending_past_ceiling(&self, held_ceiling: u32, fault_ceiling: u32) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.past_ceiling(held_ceiling, fault_ceiling))
     }
 }
 
@@ -333,6 +415,7 @@ mod tests {
         assert_eq!(page.rows, 8);
         assert_eq!(page.malformed, 0);
         assert_eq!(page.next_cursor, Some(965769), "Arcade's keyset cursor rides along");
+        assert_eq!(page.newest_height, Some(965775), "the page's newest height is Arcade's tip view");
         // the three orphaned rows, in the page's own order (height DESC)
         assert_eq!(
             page.orphans.iter().map(|o| (o.height, o.hash.as_str(), o.orphaned_at.as_str())).collect::<Vec<_>>(),
@@ -358,7 +441,7 @@ mod tests {
         assert!(parse_block_status_page(r#"{"blocks": 3}"#).is_err());
         // an empty last page
         let last = parse_block_status_page(r#"{"blocks":[]}"#).unwrap();
-        assert_eq!((last.rows, last.orphans.len(), last.next_cursor), (0, 0, None));
+        assert_eq!((last.rows, last.orphans.len(), last.next_cursor, last.newest_height), (0, 0, None, None));
     }
 
     #[test]
@@ -443,31 +526,104 @@ mod tests {
 
     #[test]
     fn corroboration_needs_chaintracks_to_disagree_with_the_orphan() {
+        let c = |canonical: Option<&str>, orphan: &str, tip: u64, height: u64| classify_corroboration(canonical, orphan, tip, height, 3, Some(tip), 3);
         // the real 965771: chaintracks holds the canonical block there
-        assert_eq!(
-            classify_corroboration(Some(CANONICAL_965771), ORPHAN_965771, 965_860, 965_771, 3),
-            Corroboration::Corroborated
-        );
+        assert_eq!(c(Some(CANONICAL_965771), ORPHAN_965771, 965_860, 965_771), Corroboration::Corroborated);
         // the real 965773: Arcade says orphaned, chaintracks holds THAT hash deep below its tip
         assert_eq!(
-            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_860, 965_773, 3),
+            c(Some(CANONICAL_965773), CANONICAL_965773, 965_860, 965_773),
             Corroboration::Uncorroborated,
             "Arcade's row is wrong for our header source: skipped, counted"
         );
         assert_eq!(
-            classify_corroboration(Some(&CANONICAL_965773.to_ascii_uppercase()), CANONICAL_965773, 965_860, 965_773, 3),
+            c(Some(&CANONICAL_965773.to_ascii_uppercase()), CANONICAL_965773, 965_860, 965_773),
             Corroboration::Uncorroborated,
             "case-insensitive"
         );
         // the same hash near the tip: chaintracks may lag Arcade by a sync
         for tip in [965_773, 965_774, 965_775] {
-            assert_eq!(classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, tip, 965_773, 3), Corroboration::Held, "tip {tip}");
+            assert_eq!(c(Some(CANONICAL_965773), CANONICAL_965773, tip, 965_773), Corroboration::Held, "tip {tip}");
         }
-        assert_eq!(classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_776, 965_773, 3), Corroboration::Uncorroborated);
-        // no header at that height yet: held, however far the tip reads
-        assert_eq!(classify_corroboration(None, ORPHAN_965771, 965_860, 965_771, 3), Corroboration::Held);
+        assert_eq!(c(Some(CANONICAL_965773), CANONICAL_965773, 965_776, 965_773), Corroboration::Uncorroborated);
+        // round 2 (review MED-3): no header at that height NEAR the tip holds; DEEP below the tip it is
+        // uncorroborated (chaintracks serves nothing there and is not lagging), never a hold forever
+        assert_eq!(c(None, ORPHAN_965771, 965_772, 965_771), Corroboration::Held);
+        assert_eq!(c(None, ORPHAN_965771, 965_860, 965_771), Corroboration::Uncorroborated);
         // a disagreement is corroborated even at the tip
-        assert_eq!(classify_corroboration(Some(CANONICAL_965771), ORPHAN_965771, 965_771, 965_771, 3), Corroboration::Corroborated);
+        assert_eq!(c(Some(CANONICAL_965771), ORPHAN_965771, 965_771, 965_771), Corroboration::Corroborated);
+    }
+
+    /// Round 2 (review LOW-3): a header source BEHIND Arcade's listing by
+    /// more than the tolerance never skips an event as uncorroborated (its
+    /// "same hash, deep" is its own lag); the lag is its own verdict, and
+    /// it wins even over a would-be corroboration (nothing is judged while
+    /// the tracker is behind the feed).
+    #[test]
+    fn a_lagging_tracker_holds_and_is_counted_apart_from_an_uncorroborated_event() {
+        // Arcade lists up to 965860; chaintracks reads 965850: 10 behind, tolerance 3
+        assert_eq!(
+            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_850, 965_773, 3, Some(965_860), 3),
+            Corroboration::TrackerLagging
+        );
+        assert_eq!(
+            classify_corroboration(Some(CANONICAL_965771), ORPHAN_965771, 965_850, 965_771, 3, Some(965_860), 3),
+            Corroboration::TrackerLagging,
+            "even a disagreement waits while our header source is behind the feed"
+        );
+        // within the tolerance the ordinary verdicts apply
+        assert_eq!(
+            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_857, 965_773, 3, Some(965_860), 3),
+            Corroboration::Uncorroborated
+        );
+        // no feed height known: no lag verdict possible
+        assert_eq!(
+            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_850, 965_773, 3, None, 3),
+            Corroboration::Uncorroborated
+        );
+    }
+
+    /// Round 2 (review LOW-1): the next page starts ONE ABOVE the page's
+    /// lowest height, so the boundary height's remaining rows (same-height
+    /// competitors) are listed again rather than skipped.
+    #[test]
+    fn the_next_page_relists_the_boundary_height() {
+        assert_eq!(next_page_before(Some(965_769)), Some(965_770));
+        assert_eq!(next_page_before(None), None, "the last page");
+        assert_eq!(next_page_before(Some(0)), None, "a height-0 cursor is the placeholder floor");
+    }
+
+    /// Round 2 (review MED-3 + MED-4): the head-of-line ceiling releases a
+    /// held or faulting event; a persisted document with a malformed hash,
+    /// stamp or height is refused (a counted fault), never read.
+    #[test]
+    fn the_ceiling_releases_a_stuck_event_and_a_malformed_document_is_refused() {
+        let ev = OrphanEvent { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: 965771, hash: ORPHAN_965771.into() };
+        let mut s = ConsumerState::default();
+        s.start(ev.clone());
+        assert!(!s.pending_past_ceiling(3, 2));
+        s.hold_pending();
+        s.hold_pending();
+        assert!(!s.pending_past_ceiling(3, 2));
+        s.hold_pending();
+        assert!(s.pending_past_ceiling(3, 2), "held three passes: released at the ceiling");
+        let mut f = ConsumerState::default();
+        f.start(ev.clone());
+        f.note_fault_on_pending();
+        assert!(!f.pending_past_ceiling(3, 2));
+        f.note_fault_on_pending();
+        assert!(f.pending_past_ceiling(3, 2), "faulted two passes: released at the ceiling");
+        assert_eq!(ConsumerState::from_json(&f.to_json()).unwrap().pending.unwrap().fault_passes, 2, "the fault count persists");
+        assert!(!ConsumerState::default().pending_past_ceiling(0, 0), "nothing pending: nothing to release");
+        // a document an older writer wrote without the fault field reads as zero faults
+        let older = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":null,"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":1}}"#;
+        assert_eq!(ConsumerState::from_json(older).unwrap().pending.unwrap().fault_passes, 0);
+        // malformed documents: a short hash, a bad stamp, height 0, on the cursor or the pending event
+        let short_hash = r#"{"v":1,"cursor":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"abc"},"pending":null}"#;
+        assert!(ConsumerState::from_json(short_hash).unwrap_err().contains("malformed hash"));
+        let bad_stamp = r#"{"v":1,"cursor":{"orphaned_at":"yesterday","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"pending":null}"#;
+        assert!(ConsumerState::from_json(bad_stamp).unwrap_err().contains("malformed stamp"));
+        let zero = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":0,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":null,"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":0}}"#;
+        assert!(ConsumerState::from_json(zero).unwrap_err().contains("height 0"));
     }
 
     #[test]

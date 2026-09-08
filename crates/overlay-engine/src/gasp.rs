@@ -262,6 +262,15 @@ pub trait AncestorFetcher {
         Ok(self.verified_proof_for(txid).await)
     }
 
+    /// bsv-low M19B-G1 round 2 (review MED-2): the ladder's REMAINING
+    /// per-invocation budget, when it keeps one (`None` = unbounded, or not
+    /// known). A budgeted ladder answers `Ok(None)` to every ask once its
+    /// budget is spent, which a caller must not read as "no courier serves a
+    /// proof": it checks this first and leaves the row for a fresh budget.
+    fn budget_remaining(&self) -> Option<u32> {
+        None
+    }
+
     /// Verify that `bump_hex` is a chaintracks-valid merkle proof for `txid`.
     ///
     /// Used by proof completion to re-check a STORED structural bump before

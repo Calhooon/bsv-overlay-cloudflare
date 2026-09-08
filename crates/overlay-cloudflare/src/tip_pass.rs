@@ -192,14 +192,17 @@ pub async fn internal_tip_changed(
     // stored proof; a refuted spender re-anchored in place when the ladder
     // serves the canonical proof, demoted otherwise). Before the sweep, so a
     // demotion is re-chased in this same tick.
-    let arcade = run_arcade_reorg_pass(env, pot_storage, ops_db, "tip-changed").await;
+    // One root memo for the whole pass (round 2, review MED-5): the consumer
+    // seeds it from its corroboration header read and the sweep reuses it.
+    let mut memo = crate::reorg_sweep::RootMemo::default();
+    let arcade = run_arcade_reorg_pass(env, pot_storage, ops_db, "tip-changed", crate::arcade_reorg::PassLimits::block_event(), &mut memo, false).await;
     // ── the revalidation sweep (reference: the fallback for trackers without
     // a reorg stream; here the PRIMARY path, every block): three cursor-walked
     // legs (spenders, the pots' own proofs, the engine's hop proofs). It runs
     // BEFORE the confirmation pass so a row it demotes is re-chased in this
     // same tick with a proof verified against the canonical chain.
     let tx_store = ops_db.map(crate::reorg_sweep::D1ProvenTxStore);
-    let sweep = crate::reorg_sweep::reorg_revalidation_sweep(
+    let sweep = crate::reorg_sweep::reorg_revalidation_sweep_with(
         pot_storage,
         tx_store.as_ref(),
         tracker.as_deref(),
@@ -207,6 +210,7 @@ pub async fn internal_tip_changed(
         height,
         REORG_SWEEP_DEPTH,
         REORG_SWEEP_LIMIT,
+        &mut memo,
     )
     .await;
     if let Some(db) = ops_db {
@@ -298,6 +302,9 @@ pub async fn run_arcade_reorg_pass(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     ops_db: Option<&D1Database>,
     origin: &str,
+    limits: crate::arcade_reorg::PassLimits,
+    memo: &mut crate::reorg_sweep::RootMemo,
+    release_pending: bool,
 ) -> crate::arcade_reorg::ArcadePassSummary {
     let tracker = crate::lookup_service_chain_tracker(env);
     let Some(db) = ops_db else {
@@ -327,7 +334,9 @@ pub async fn run_arcade_reorg_pass(
         Some(&tx_store),
         Some(tracker.as_ref()),
         Some(&fetcher),
-        crate::arcade_reorg::PassLimits::default(),
+        limits,
+        memo,
+        release_pending,
     )
     .await;
     crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_EVENTS, s.events_finished() as u64).await;
@@ -335,6 +344,10 @@ pub async fn run_arcade_reorg_pass(
     crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_DEMOTED, s.demoted() as u64).await;
     crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_UNCORROBORATED, s.skipped_uncorroborated as u64).await;
     crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_FAULTS, (s.faults + s.errors) as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_UNRESOLVED, (s.skipped_unresolved + s.released_by_operator) as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_TRACKER_LAGGING, s.tracker_lagging as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_CONTENDED, s.contended as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_BUDGET_STOPS, s.budget_stops as u64).await;
     // the R2 lifetime totals count the same rows whatever the producer (the
     // sweep, the announce, the operator, or Arcade's event)
     crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, s.demoted() as u64).await;
@@ -344,33 +357,57 @@ pub async fn run_arcade_reorg_pass(
     crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REANCHORED, s.reanchored() as u64).await;
     crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, (s.spenders.faults + s.pot_beefs.faults + s.transactions.faults) as u64).await;
     console_log!(
-        "[arcade-reorg] ({origin}) feed_read={} rows={} malformed={} events_after_cursor={} applied={} skipped_uncorroborated={} held={} \
-         spenders scanned={} standing={} reanchored={} demoted={} faults={}; pot_beefs scanned={} stale={}; transactions scanned={} stale={}; \
-         faults={} errors={} idle={} cursor={:?} pending={:?} stopped={:?}",
+        "[arcade-reorg] ({origin}) feed_read={} rows={} malformed={} events_after_cursor={} applied={} skipped_uncorroborated={} unresolved={} released={} held={} lagging={} \
+         spenders scanned={} standing={} reanchored={} demoted={} faults={} budget_stops={}; pot_beefs scanned={} stale={}; transactions scanned={} stale={}; \
+         memo seeded={} reads={}; faults={} errors={} contended={} idle={} cursor={:?} pending={:?} stopped={:?}",
         s.feed_read,
         s.feed_rows,
         s.feed_malformed,
         s.feed_events,
         s.applied,
         s.skipped_uncorroborated,
+        s.skipped_unresolved,
+        s.released_by_operator,
         s.held,
+        s.tracker_lagging,
         s.spenders.scanned,
         s.spenders.standing,
         s.reanchored(),
         s.demoted(),
         s.spenders.faults,
+        s.budget_stops,
         s.pot_beefs.scanned,
         s.pot_beefs.stale,
         s.transactions.scanned,
         s.transactions.stale,
+        s.memo_seeded,
+        s.memo_reads,
         s.faults,
         s.errors,
+        s.contended,
         s.idle,
-        s.cursor.as_ref().map(|c| (c.height, &c.hash[..16], c.orphaned_at.as_str())),
-        s.pending.as_ref().map(|(k, held)| (k.height, &k.hash[..16], *held)),
+        s.cursor.as_ref().map(|c| (c.height, crate::arcade_reorg::short(&c.hash), c.orphaned_at.as_str())),
+        s.pending.as_ref().map(|(k, held)| (k.height, crate::arcade_reorg::short(&k.hash), *held)),
         s.stopped
     );
     s
+}
+
+/// PURE: `POST /internal/arcade-reorg`'s optional body. An empty body runs
+/// one pass; `{"skipPending": true}` RELEASES the pending event first
+/// (round 2, review MED-3: the operator's way out of a wedged head of the
+/// queue). Anything else is `None` (400).
+pub fn parse_arcade_reorg_trigger(raw: &[u8]) -> Option<bool> {
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return Some(false);
+    }
+    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let obj = v.as_object()?;
+    match obj.get("skipPending") {
+        None | Some(serde_json::Value::Null) => Some(false),
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        _ => None,
+    }
 }
 
 /// PURE: the JSON body `POST /internal/arcade-reorg` and the block-event
@@ -386,7 +423,14 @@ pub fn arcade_reorg_summary_json(s: &crate::arcade_reorg::ArcadePassSummary) -> 
         "eventsAfterCursor": s.feed_events,
         "applied": s.applied,
         "skippedUncorroborated": s.skipped_uncorroborated,
+        "skippedUnresolved": s.skipped_unresolved,
+        "releasedByOperator": s.released_by_operator,
         "held": s.held,
+        "trackerLagging": s.tracker_lagging,
+        "budgetStops": s.budget_stops,
+        "contended": s.contended,
+        "memoSeeded": s.memo_seeded,
+        "memoReads": s.memo_reads,
         "scanned": s.spenders.scanned + s.pot_beefs.scanned + s.transactions.scanned,
         "standing": s.spenders.standing,
         "reanchored": s.reanchored(),
@@ -407,7 +451,7 @@ pub fn arcade_reorg_summary_json(s: &crate::arcade_reorg::ArcadePassSummary) -> 
 /// operator catch-up). No body. The same pass the block-event route and the
 /// cron run; answers its summary.
 pub async fn internal_arcade_reorg(
-    req: Request,
+    mut req: Request,
     env: &Env,
     ctx: &Context,
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
@@ -419,7 +463,12 @@ pub async fn internal_arcade_reorg(
         console_log!("POST /internal/arcade-reorg -> 401");
         return Response::error("unauthorized", 401);
     }
-    let s = run_arcade_reorg_pass(env, pot_storage, ops_db, "internal").await;
+    let raw = req.bytes().await?;
+    let Some(release_pending) = parse_arcade_reorg_trigger(&raw) else {
+        return Response::error("body must be empty or {\"skipPending\": <bool>}", 400);
+    };
+    let mut memo = crate::reorg_sweep::RootMemo::default();
+    let s = run_arcade_reorg_pass(env, pot_storage, ops_db, "internal", crate::arcade_reorg::PassLimits::cron(), &mut memo, release_pending).await;
     // a demotion or a re-anchor is a served-state change: ship the pot-changed webhook
     crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
     let mut body = arcade_reorg_summary_json(&s);
@@ -683,6 +732,25 @@ mod tests {
         let idle = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary { idle: true, ..Default::default() });
         assert_eq!(idle["idle"], true);
         assert!(idle["cursor"].is_null() && idle["pending"].is_null() && idle["stopped"].is_null());
+        let released = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary { skipped_unresolved: 1, released_by_operator: 1, tracker_lagging: 2, budget_stops: 1, contended: 1, memo_seeded: 1, memo_reads: 3, ..Default::default() });
+        assert_eq!((released["skippedUnresolved"].as_u64(), released["releasedByOperator"].as_u64(), released["trackerLagging"].as_u64()), (Some(1), Some(1), Some(2)));
+        assert_eq!((released["budgetStops"].as_u64(), released["contended"].as_u64(), released["memoSeeded"].as_u64(), released["memoReads"].as_u64()), (Some(1), Some(1), Some(1), Some(3)));
+    }
+
+    /// Round 2 (review MED-3): the operator route's body: empty = one pass,
+    /// `{"skipPending": true}` = release the pending event first; anything
+    /// else is refused.
+    #[test]
+    fn the_arcade_reorg_trigger_body_is_empty_or_a_skip_pending_flag() {
+        assert_eq!(parse_arcade_reorg_trigger(b""), Some(false));
+        assert_eq!(parse_arcade_reorg_trigger(b"  \n"), Some(false));
+        assert_eq!(parse_arcade_reorg_trigger(b"{}"), Some(false));
+        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": false}"#), Some(false));
+        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": null}"#), Some(false));
+        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": true}"#), Some(true));
+        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": "yes"}"#), None);
+        assert_eq!(parse_arcade_reorg_trigger(b"[]"), None);
+        assert_eq!(parse_arcade_reorg_trigger(b"nope"), None);
     }
 
     /// Review H3: the detector's pins run through the REAL producer path,

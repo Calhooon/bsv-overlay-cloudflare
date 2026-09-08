@@ -38,13 +38,31 @@ use crate::proof_fetcher::{push_log, verify_bump_detailed};
 /// — a full 3-height block-event pass drops from up to 150 reads to ~3.
 /// Faults are NOT memoized (they are retried, never cached as a verdict).
 #[derive(Default)]
-pub struct RootMemo(HashMap<(u32, String), bool>);
+pub struct RootMemo {
+    verdicts: HashMap<(u32, String), bool>,
+    /// bsv-low M19B-G1 round 2 (review MED-5): the CANONICAL merkle root
+    /// chaintracks holds at a height, seeded from a header read the pass
+    /// already made (the Arcade event consumer's corroboration read). One
+    /// header per height, so a root at that height is valid iff it is this
+    /// one: every row anchored there is judged without a further read.
+    canonical: HashMap<u32, String>,
+}
 
 impl RootMemo {
     /// The row count is what the memo saves: `reads` is how many distinct
     /// (height, root) pairs actually hit chaintracks this pass.
     pub fn reads(&self) -> usize {
-        self.0.len()
+        self.verdicts.len()
+    }
+
+    /// Seed the canonical root at `height` from a header the pass read.
+    pub fn seed_canonical(&mut self, height: u32, root: &str) {
+        self.canonical.insert(height, root.to_ascii_lowercase());
+    }
+
+    /// Heights with a seeded canonical root.
+    pub fn seeded(&self) -> usize {
+        self.canonical.len()
     }
 }
 
@@ -63,15 +81,18 @@ pub(crate) async fn verify_bump_memoized(
         Ok(r) => r,
         Err(_) => return Ok(false),
     };
+    if let Some(canonical) = memo.canonical.get(&bump.block_height) {
+        return Ok(canonical.eq_ignore_ascii_case(&root));
+    }
     let key = (bump.block_height, root);
-    if let Some(&v) = memo.0.get(&key) {
+    if let Some(&v) = memo.verdicts.get(&key) {
         return Ok(v);
     }
     let v = tracker
         .is_valid_root_for_height(&key.1, key.0)
         .await
         .map_err(|e| format!("chaintracks read failed for {txid}@{}: {e}", key.0))?;
-    memo.0.insert(key, v);
+    memo.verdicts.insert(key, v);
     Ok(v)
 }
 
@@ -139,8 +160,13 @@ pub struct ReverifyPassSummary {
     /// Distinct (height, root) chaintracks reads this pass (review MED-3): the
     /// memo hit for every other row.
     pub memo_reads: usize,
-    /// Refuted rows whose demotion guard MISSED (the pointer moved under the
-    /// pass): nothing written, re-examined next pass.
+    /// bsv-low M19B-G1 round 2 (review MED-2): the ladder's budget ran out
+    /// before a row that needed it; the page STOPPED there (`exhausted` is
+    /// false, `next_cursor` is the last row judged) so a fresh budget
+    /// continues at that row. Nothing was judged blind of the couriers.
+    pub budget_exhausted: bool,
+    /// Refuted rows whose demotion guard MISSED (the pointer OR the judged
+    /// height moved under the pass): nothing written, re-examined next pass.
     pub demote_missed: usize,
     /// Header-source read faults: NOT a verdict, nothing changed, retried.
     pub faults: usize,
@@ -197,6 +223,7 @@ pub async fn reverify_window(
         after,
         limit,
         ReverifyMode { demote_proofless, reanchor_first: false },
+        &mut RootMemo::default(),
     )
     .await
 }
@@ -204,27 +231,47 @@ pub async fn reverify_window(
 /// What the ladder said when a REFUTED row asked it for a canonical proof
 /// (`ReverifyMode::reanchor_first`).
 enum LadderReanchor {
-    /// A chaintracks-verified proof naming another block landed in the
-    /// pot stores (bump replaced, height moved where it differed).
+    /// A chaintracks-verified proof naming another block is in the pot
+    /// stores: landed by this ask, or ALREADY there because another writer
+    /// (an `/arc-ingest` push, another isolate) landed the same anchor
+    /// between this pass's page read and its ask (round 2, review MED-1).
     Reanchored,
     /// No courier serves a proof that verifies (or the verified one wrote
-    /// nothing): the row's confirmation still rests on the refuted bump.
+    /// nothing and the store does not hold its anchor): the row's
+    /// confirmation still rests on the refuted bump.
     NoCanonicalProof,
+    /// The ladder's per-pass budget is spent (round 2, review MED-2): no
+    /// courier was asked, so nothing is known; the page stops here.
+    BudgetExhausted,
     /// A chaintracks read fault while verifying a candidate: not a verdict.
     Fault(String),
+}
+
+/// The anchor a verified pushed proof names for `txid`.
+fn pushed_anchor(hex: &str, txid: &str) -> Option<BumpAnchor> {
+    let mp = MerklePath::from_hex(hex).ok()?;
+    let root = mp.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
+    Some(BumpAnchor { height: u64::from(mp.block_height), root })
 }
 
 /// bsv-low M19B-G1: the re-anchor-first arm for ONE refuted confirmed row.
 /// The ladder's `verified_proof_for_detailed` verifies every candidate bump
 /// against chaintracks before answering it (the `apply_pushed_proof_to_pot_stores`
-/// precondition); an `Ok(None)` (unmined, unverifiable, budget) is "no
-/// canonical proof", never a demotion by itself.
+/// precondition); an `Ok(None)` (unmined, unverifiable) is "no canonical
+/// proof", never a demotion by itself. Round 2: a spent budget is asked of
+/// the ladder BEFORE the ask (its `Ok(None)` would read as "no proof"), and
+/// a verified proof that lands nothing is re-checked against the stored
+/// anchor: the store already holding it means someone else landed it and
+/// the row is canonical, never a demotion.
 async fn reanchor_from_ladder(
     pot_storage: &dyn PotStorage,
     fetcher: &dyn AncestorFetcher,
     rec: &overlay_discovery::pot::storage::PotRecord,
     spender: &str,
 ) -> LadderReanchor {
+    if fetcher.budget_remaining() == Some(0) {
+        return LadderReanchor::BudgetExhausted;
+    }
     match fetcher.verified_proof_for_detailed(spender).await {
         Ok(Some(hex)) => {
             let applied = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(pot_storage, spender, &hex).await;
@@ -233,22 +280,41 @@ async fn reanchor_from_ladder(
                     "[reorg] {}:{} RE-ANCHORED IN PLACE: the ladder serves a chaintracks-verified proof for {spender} at another block (pot_beef_reanchored={} spends_reanchored={} compacted={})",
                     rec.txid, rec.output_index, applied.pot_beef_reanchored, applied.spends_reanchored, applied.pot_beef_compacted
                 ));
-                LadderReanchor::Reanchored
-            } else {
-                push_log(&format!(
-                    "[reorg] {}:{} the ladder's verified proof for {spender} landed NOTHING (cas_missed={} cas_errors={}): demoting on the refuted stored bump",
-                    rec.txid, rec.output_index, applied.spends_cas_missed, applied.spends_cas_errors
-                ));
-                LadderReanchor::NoCanonicalProof
+                return LadderReanchor::Reanchored;
             }
+            // nothing landed: EXACTLY the case where the store already holds
+            // the pushed anchor (another writer got there first, or the
+            // header source flipped between the page read and the ladder's
+            // fresh read). Re-read the stored anchor before believing "no proof".
+            let pushed = pushed_anchor(&hex, spender);
+            let stored = match pot_storage.get_beef(spender).await {
+                Ok(Some(bytes)) => stored_bump_anchor(&bytes, spender),
+                Ok(None) => None,
+                Err(e) => return LadderReanchor::Fault(format!("{spender} pot-beef re-read failed: {e}")),
+            };
+            if pushed.is_some() && pushed == stored {
+                push_log(&format!(
+                    "[reorg] {}:{} ALREADY RE-ANCHORED by another writer: the store holds the ladder's verified anchor for {spender} ({:?}); the row stands",
+                    rec.txid, rec.output_index, stored
+                ));
+                return LadderReanchor::Reanchored;
+            }
+            push_log(&format!(
+                "[reorg] {}:{} the ladder's verified proof for {spender} landed NOTHING (cas_missed={} cas_errors={}) and the store holds {:?}, not {:?}: demoting on the refuted stored bump",
+                rec.txid, rec.output_index, applied.spends_cas_missed, applied.spends_cas_errors, stored, pushed
+            ));
+            LadderReanchor::NoCanonicalProof
         }
         Ok(None) => LadderReanchor::NoCanonicalProof,
         Err(e) => LadderReanchor::Fault(e),
     }
 }
 
-/// [`reverify_window`] with an explicit [`ReverifyMode`].
-#[allow(clippy::too_many_arguments)] // the window bounds, the cursor, the two chain sources, the mode
+/// [`reverify_window`] with an explicit [`ReverifyMode`] and a SHARED
+/// per-pass [`RootMemo`] (round 2, review MED-5: one memo across the legs,
+/// the events and the sweep of a pass; `memo_reads` reports this call's
+/// own reads).
+#[allow(clippy::too_many_arguments)] // the window bounds, the cursor, the two chain sources, the mode, the memo
 pub async fn reverify_window_with(
     pot_storage: &dyn PotStorage,
     tracker: Option<&dyn ChainTracker>,
@@ -258,8 +324,10 @@ pub async fn reverify_window_with(
     after: Option<RowKey>,
     limit: u64,
     mode: ReverifyMode,
+    memo: &mut RootMemo,
 ) -> ReverifyPassSummary {
     let demote_proofless = mode.demote_proofless;
+    let reads_before = memo.reads();
     let mut summary = ReverifyPassSummary { next_cursor: after, ..Default::default() };
     // No header source, no verdict: `verify_bump_detailed` answers Ok(false)
     // without a tracker, which would read as "every stored proof is refuted".
@@ -281,9 +349,12 @@ pub async fn reverify_window_with(
     if let Some((key, _)) = rows.last() {
         summary.next_cursor = Some(*key);
     }
-    let mut memo = RootMemo::default();
-    for (_, rec) in rows {
+    // round 2 (review MED-2): the last row fully judged, where a budget stop
+    // leaves the cursor so a fresh budget resumes at the next row
+    let mut last_judged: Option<RowKey> = after;
+    for (key, rec) in rows {
         let Some(spender) = rec.spending_txid.as_deref() else {
+            last_judged = Some(key);
             continue;
         };
         let stored = match pot_storage.get_beef(spender).await {
@@ -291,6 +362,7 @@ pub async fn reverify_window_with(
             Err(e) => {
                 summary.errors += 1;
                 push_log(&format!("[reorg] {spender} pot-beef read failed: {e}"));
+                last_judged = Some(key);
                 continue;
             }
         };
@@ -301,7 +373,7 @@ pub async fn reverify_window_with(
                 // the operator/reorg window: demote blind (the caller has
                 // independent reason — a reorg at this height).
                 match pot_storage
-                    .demote_confirmed_for_spender(&rec.txid, rec.output_index, spender)
+                    .demote_confirmed_for_spender_at(&rec.txid, rec.output_index, spender, rec.spent_height)
                     .await
                 {
                     Ok(true) => {
@@ -324,12 +396,24 @@ pub async fn reverify_window_with(
                 // so the next pass verifies locally); a disagreeing one
                 // DEMOTES it (its confirming block was orphaned); a fault or
                 // an unprovable answer changes nothing (never demote on
-                // unknown).
+                // unknown). Round 2 (review MED-2): a spent budget stops the
+                // page BEFORE the ask, the cursor at the last row judged.
+                if fetcher.is_some_and(|f| f.budget_remaining() == Some(0)) {
+                    summary.budget_exhausted = true;
+                    summary.exhausted = false;
+                    summary.next_cursor = last_judged;
+                    push_log(&format!(
+                        "[reorg] {}:{} the ladder's budget is spent before {spender}'s re-check: the page stops here, resumed on a fresh budget",
+                        rec.txid, rec.output_index
+                    ));
+                    break;
+                }
                 courier_recheck(pot_storage, fetcher, &rec, spender, stored.as_deref(), &mut summary).await;
             }
+            last_judged = Some(key);
             continue;
         };
-        let answer = verify_bump_memoized(tracker, &mut memo, &bump_hex, spender).await;
+        let answer = verify_bump_memoized(tracker, memo, &bump_hex, spender).await;
         match classify_reverify(&answer) {
             ReverifyVerdict::Standing => {
                 summary.standing += 1;
@@ -378,7 +462,18 @@ pub async fn reverify_window_with(
                         match reanchor_from_ladder(pot_storage, fetcher, &rec, spender).await {
                             LadderReanchor::Reanchored => {
                                 summary.reanchored_from_courier += 1;
+                                last_judged = Some(key);
                                 continue;
+                            }
+                            LadderReanchor::BudgetExhausted => {
+                                summary.budget_exhausted = true;
+                                summary.exhausted = false;
+                                summary.next_cursor = last_judged;
+                                push_log(&format!(
+                                    "[reorg] {}:{} the ladder's budget is spent before {spender}'s re-anchor ask: the page stops here, resumed on a fresh budget (nothing demoted blind of the couriers)",
+                                    rec.txid, rec.output_index
+                                ));
+                                break;
                             }
                             LadderReanchor::Fault(e) => {
                                 summary.faults += 1;
@@ -386,14 +481,18 @@ pub async fn reverify_window_with(
                                     "[reorg] {}:{} header READ FAULT while the ladder re-anchored {spender}: not a verdict, nothing changed: {e}",
                                     rec.txid, rec.output_index
                                 ));
+                                last_judged = Some(key);
                                 continue;
                             }
                             LadderReanchor::NoCanonicalProof => {}
                         }
                     }
                 }
+                // round 2 (review MED-1): the demotion is bound to the height
+                // the refuted bump was judged at; a row another writer moved
+                // meanwhile is a guard MISS, never a demotion
                 match pot_storage
-                    .demote_confirmed_for_spender(&rec.txid, rec.output_index, spender)
+                    .demote_confirmed_for_spender_at(&rec.txid, rec.output_index, spender, rec.spent_height)
                     .await
                 {
                     Ok(true) => {
@@ -415,8 +514,9 @@ pub async fn reverify_window_with(
                 }
             }
         }
+        last_judged = Some(key);
     }
-    summary.memo_reads = memo.reads();
+    summary.memo_reads = memo.reads().saturating_sub(reads_before);
     summary
 }
 
@@ -475,8 +575,9 @@ async fn courier_recheck(
         }
         Some(h) => {
             // disagree: the confirming block was orphaned — demote + unlatch
+            // (bound to the judged height, round 2 review MED-1)
             match pot_storage
-                .demote_confirmed_for_spender(&rec.txid, rec.output_index, spender)
+                .demote_confirmed_for_spender_at(&rec.txid, rec.output_index, spender, rec.spent_height)
                 .await
             {
                 Ok(true) => {
@@ -545,6 +646,20 @@ pub async fn reverify_pot_beefs_window(
     after: Option<RowKey>,
     limit: u64,
 ) -> ProofLegSummary {
+    reverify_pot_beefs_window_with(pot_storage, tracker, lo, hi, after, limit, &mut RootMemo::default()).await
+}
+
+/// [`reverify_pot_beefs_window`] over a SHARED per-pass memo (round 2, MED-5).
+pub async fn reverify_pot_beefs_window_with(
+    pot_storage: &dyn PotStorage,
+    tracker: Option<&dyn ChainTracker>,
+    lo: u64,
+    hi: u64,
+    after: Option<RowKey>,
+    limit: u64,
+    memo: &mut RootMemo,
+) -> ProofLegSummary {
+    let reads_before = memo.reads();
     let mut summary = ProofLegSummary { next_cursor: after, ..Default::default() };
     let Some(tracker) = tracker else {
         return summary;
@@ -562,13 +677,12 @@ pub async fn reverify_pot_beefs_window(
     if let Some((key, _, _)) = rows.last() {
         summary.next_cursor = Some(*key);
     }
-    let mut memo = RootMemo::default();
     for (_, txid, beef) in rows {
         let Some(bump_hex) = stored_bump_hex(&beef, &txid) else {
             summary.no_bump += 1;
             continue;
         };
-        let answer = verify_bump_memoized(tracker, &mut memo, &bump_hex, &txid).await;
+        let answer = verify_bump_memoized(tracker, memo, &bump_hex, &txid).await;
         match classify_reverify(&answer) {
             ReverifyVerdict::Standing => summary.standing += 1,
             ReverifyVerdict::NoStoredProof => summary.no_bump += 1,
@@ -587,7 +701,7 @@ pub async fn reverify_pot_beefs_window(
             },
         }
     }
-    summary.memo_reads = memo.reads();
+    summary.memo_reads = memo.reads().saturating_sub(reads_before);
     summary
 }
 
@@ -613,6 +727,20 @@ pub async fn reverify_transactions_window<S: ProvenTxStore>(
     after: Option<RowKey>,
     limit: u64,
 ) -> ProofLegSummary {
+    reverify_transactions_window_with(store, tracker, lo, hi, after, limit, &mut RootMemo::default()).await
+}
+
+/// [`reverify_transactions_window`] over a SHARED per-pass memo (round 2, MED-5).
+pub async fn reverify_transactions_window_with<S: ProvenTxStore>(
+    store: &S,
+    tracker: Option<&dyn ChainTracker>,
+    lo: u64,
+    hi: u64,
+    after: Option<RowKey>,
+    limit: u64,
+    memo: &mut RootMemo,
+) -> ProofLegSummary {
+    let reads_before = memo.reads();
     let mut summary = ProofLegSummary { next_cursor: after, ..Default::default() };
     let Some(tracker) = tracker else {
         return summary;
@@ -630,13 +758,12 @@ pub async fn reverify_transactions_window<S: ProvenTxStore>(
     if let Some((key, _, _)) = rows.last() {
         summary.next_cursor = Some(*key);
     }
-    let mut memo = RootMemo::default();
     for (_, txid, beef) in rows {
         let Some(bump_hex) = stored_bump_hex(&beef, &txid) else {
             summary.no_bump += 1;
             continue;
         };
-        let answer = verify_bump_memoized(tracker, &mut memo, &bump_hex, &txid).await;
+        let answer = verify_bump_memoized(tracker, memo, &bump_hex, &txid).await;
         match classify_reverify(&answer) {
             ReverifyVerdict::Standing => summary.standing += 1,
             ReverifyVerdict::NoStoredProof => summary.no_bump += 1,
@@ -655,7 +782,7 @@ pub async fn reverify_transactions_window<S: ProvenTxStore>(
             },
         }
     }
-    summary.memo_reads = memo.reads();
+    summary.memo_reads = memo.reads().saturating_sub(reads_before);
     summary
 }
 
@@ -762,6 +889,23 @@ pub async fn reorg_revalidation_sweep<S: ProvenTxStore>(
     depth: u64,
     limit: u64,
 ) -> ReorgSweepSummary {
+    reorg_revalidation_sweep_with(pot_storage, tx_store, tracker, fetcher, tip, depth, limit, &mut RootMemo::default()).await
+}
+
+/// [`reorg_revalidation_sweep`] over a SHARED per-pass memo (round 2, review
+/// MED-5): the block-event pass hands the Arcade event consumer's memo on,
+/// so a height the consumer seeded or read is never asked again here.
+#[allow(clippy::too_many_arguments)] // two stores, the two chain sources, the window bounds, the memo
+pub async fn reorg_revalidation_sweep_with<S: ProvenTxStore>(
+    pot_storage: &dyn PotStorage,
+    tx_store: Option<&S>,
+    tracker: Option<&dyn ChainTracker>,
+    fetcher: Option<&dyn AncestorFetcher>,
+    tip: u64,
+    depth: u64,
+    limit: u64,
+    memo: &mut RootMemo,
+) -> ReorgSweepSummary {
     let mut out = ReorgSweepSummary::default();
     if tracker.is_none() {
         push_log("[reorg-sweep] no header source configured — nothing re-verified, no walk moved");
@@ -806,18 +950,29 @@ pub async fn reorg_revalidation_sweep<S: ProvenTxStore>(
 
     if let Some(w) = plan(pot_storage, WALK_SPENDERS, tip, depth, &mut out.state_errors).await {
         out.spenders_window = Some((w.lo, w.hi));
-        out.spenders = reverify_window(pot_storage, tracker, fetcher, w.lo, w.hi, w.cursor, limit, false).await;
+        out.spenders = reverify_window_with(
+            pot_storage,
+            tracker,
+            fetcher,
+            w.lo,
+            w.hi,
+            w.cursor,
+            limit,
+            ReverifyMode { demote_proofless: false, reanchor_first: false },
+            memo,
+        )
+        .await;
         persist(pot_storage, WALK_SPENDERS, &w, out.spenders.exhausted, out.spenders.next_cursor, &mut out.state_errors).await;
     }
     if let Some(w) = plan(pot_storage, WALK_POT_BEEFS, tip, depth, &mut out.state_errors).await {
         out.pot_beefs_window = Some((w.lo, w.hi));
-        out.pot_beefs = reverify_pot_beefs_window(pot_storage, tracker, w.lo, w.hi, w.cursor, limit).await;
+        out.pot_beefs = reverify_pot_beefs_window_with(pot_storage, tracker, w.lo, w.hi, w.cursor, limit, memo).await;
         persist(pot_storage, WALK_POT_BEEFS, &w, out.pot_beefs.exhausted, out.pot_beefs.next_cursor, &mut out.state_errors).await;
     }
     if let Some(store) = tx_store {
         if let Some(w) = plan(pot_storage, WALK_TRANSACTIONS, tip, depth, &mut out.state_errors).await {
             out.transactions_window = Some((w.lo, w.hi));
-            out.transactions = reverify_transactions_window(store, tracker, w.lo, w.hi, w.cursor, limit).await;
+            out.transactions = reverify_transactions_window_with(store, tracker, w.lo, w.hi, w.cursor, limit, memo).await;
             persist(pot_storage, WALK_TRANSACTIONS, &w, out.transactions.exhausted, out.transactions.next_cursor, &mut out.state_errors).await;
         }
     }
@@ -1152,7 +1307,7 @@ mod tests {
             .collect(),
         );
         let mode = ReverifyMode { demote_proofless: false, reanchor_first: true };
-        let s = reverify_window_with(&store, Some(&tracker), Some(&ladder), 965_771, 965_771, None, 50, mode).await;
+        let s = reverify_window_with(&store, Some(&tracker), Some(&ladder), 965_771, 965_771, None, 50, mode, &mut RootMemo::default()).await;
         assert_eq!((s.scanned, s.reanchored_from_courier, s.stale, s.faults, s.standing), (3, 1, 1, 1, 0), "{s:?}");
         let r = store.get_spent_status(&pot(80), 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed && r.spent_height == Some(965_773), "re-anchored in place: {r:?}");
@@ -1165,7 +1320,7 @@ mod tests {
         assert!(r.spent_confirmed && r.spent_height == Some(965_771), "a ladder fault is not a verdict");
         assert!(store.pot_beef_proof_verified(&faulted).await.unwrap());
         // a second pass: the re-anchored row stands (its stored bump is canonical now), the faulted one is asked again
-        let s2 = reverify_window_with(&store, Some(&tracker), Some(&ladder), 965_771, 965_773, None, 50, mode).await;
+        let s2 = reverify_window_with(&store, Some(&tracker), Some(&ladder), 965_771, 965_773, None, 50, mode, &mut RootMemo::default()).await;
         assert_eq!((s2.scanned, s2.standing, s2.reanchored_from_courier, s2.faults), (2, 1, 0, 1), "{s2:?}");
         // the R2 wrapper: the same refuted row takes the plain arm, the ladder is never asked
         let store2 = MemoryPotStorage::new();
@@ -1174,6 +1329,38 @@ mod tests {
         let s3 = reverify_window(&store2, Some(&tracker), Some(&ladder2), 965_771, 965_771, None, 50, false).await;
         assert_eq!((s3.stale, s3.reanchored_from_courier), (1, 0), "the R2 arm demotes; it never re-anchors from the ladder: {s3:?}");
         assert!(!store2.get_spent_status(&pot(83), 0).await.unwrap().unwrap().spent_confirmed);
+    }
+
+    /// bsv-low M19B-G1 round 2 (review MED-2): a spent ladder budget stops
+    /// the walk's page at the last row JUDGED (nothing demoted blind of the
+    /// couriers, the cursor set for a fresh budget to resume), on both the
+    /// re-anchor-first arm and the routine courier re-check; the pin runs
+    /// through the REAL fetcher at budget 0.
+    #[tokio::test]
+    async fn a_spent_ladder_budget_stops_the_page_at_the_last_judged_row() {
+        let store = MemoryPotStorage::new();
+        let mut tracker = MockChainTracker::new(965_860);
+        let refuted = confirmed_pot_with_stored_proof(&store, &pot(84), 965_771).await;
+        let standing = confirmed_pot_with_stored_proof(&store, &pot(85), 965_771).await; // newest rowid: judged first
+        tracker.add_root(965_771, standing.clone());
+        let real = crate::proof_fetcher::ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(965_860)))).with_budget(0);
+        let mode = ReverifyMode { demote_proofless: false, reanchor_first: true };
+        let s = reverify_window_with(&store, Some(&tracker), Some(&real), 965_771, 965_771, None, 50, mode, &mut RootMemo::default()).await;
+        assert_eq!((s.scanned, s.standing, s.stale, s.budget_exhausted, s.exhausted), (2, 1, 0, true, false), "{s:?}");
+        assert!(s.next_cursor.is_some(), "the cursor is the standing row, the last one judged: {s:?}");
+        assert!(store.get_spent_status(&pot(84), 0).await.unwrap().unwrap().spent_confirmed, "the refuted row was NOT demoted blind");
+        assert!(store.pot_beef_proof_verified(&refuted).await.unwrap());
+        // the routine sweep's courier re-check stops the same way for a proofless row
+        let store2 = MemoryPotStorage::new();
+        let proofless = confirmed_pot_with_proofless_beef(&store2, &pot(86), 965_771).await;
+        let s2 = reverify_window(&store2, Some(&tracker), Some(&real), 965_771, 965_773, None, 50, false).await;
+        assert_eq!((s2.scanned, s2.budget_exhausted, s2.exhausted, s2.next_cursor, s2.stale), (1, true, false, None, 0), "{s2:?}");
+        assert!(store2.get_spent_status(&pot(86), 0).await.unwrap().unwrap().spent_confirmed);
+        let _ = proofless;
+        // a fresh budget resumes at the cursor and judges the refuted row (no proof served: demoted)
+        let fresh = CourierStub([(refuted.clone(), Ok(None))].into_iter().collect());
+        let s3 = reverify_window_with(&store, Some(&tracker), Some(&fresh), 965_771, 965_771, s.next_cursor, 50, mode, &mut RootMemo::default()).await;
+        assert_eq!((s3.scanned, s3.stale, s3.exhausted), (1, 1, true), "{s3:?}");
     }
 
     #[test]

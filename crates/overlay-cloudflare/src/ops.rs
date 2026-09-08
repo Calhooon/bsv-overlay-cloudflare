@@ -148,6 +148,20 @@ pub const COUNTER_ARCADE_REORG_UNCORROBORATED: &str = "arcade_reorg_uncorroborat
 /// where it was. Non-zero and climbing = a source is down; the cursor on
 /// `/health/invariants.arcadeReorg` says where it is stuck.
 pub const COUNTER_ARCADE_REORG_FAULTS: &str = "arcade_reorg_faults_total";
+/// Round 2 (review MED-3): events RELEASED unresolved from the head of the
+/// queue (held or faulting past the ceiling, or by the operator's
+/// `skipPending`): the cursor moved past them without an apply; the sweep
+/// and the announce detector still cover their rows.
+pub const COUNTER_ARCADE_REORG_UNRESOLVED: &str = "arcade_reorg_unresolved_total";
+/// Round 2 (review LOW-3): passes held because our header source was more
+/// than the tolerance behind Arcade's own listing (not an event verdict).
+pub const COUNTER_ARCADE_REORG_TRACKER_LAGGING: &str = "arcade_reorg_tracker_lagging_total";
+/// Round 2 (review LOW-2): passes whose state write lost its compare-and-set
+/// to another isolate (nothing of that pass's progress written).
+pub const COUNTER_ARCADE_REORG_CONTENDED: &str = "arcade_reorg_contended_total";
+/// Round 2 (review MED-2): spenders-leg pages stopped because the ladder's
+/// budget was spent (resumed next pass; nothing judged blind).
+pub const COUNTER_ARCADE_REORG_BUDGET_STOPS: &str = "arcade_reorg_budget_stops_total";
 // The app-layer's `/beef` read-side guard writes three more rows into this
 // table directly (it shares OVERLAY_DB): `beef_guard_stripped_total` (a
 // refuted bump stripped, served raw with ancestry), `beef_guard_refused_total`
@@ -341,6 +355,8 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
     #[derive(serde::Deserialize)]
     struct Row {
         state: String,
+        #[serde(default)]
+        version: Option<f64>,
         #[serde(rename = "updatedAt", default)]
         updated_at: Option<f64>,
     }
@@ -353,7 +369,11 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
         Err(_) => json!({ "readable": false, "everRan": false }),
         Ok(None) => json!({ "readable": true, "everRan": false, "cursor": null, "pending": null }),
         Ok(Some(r)) => match overlay_discovery::pot::arcade_events::ConsumerState::from_json(&r.state) {
-            Ok(state) => arcade_reorg_state_json(&state, r.updated_at.map(|v| v.max(0.0) as i64)),
+            Ok(state) => arcade_reorg_state_json(
+                &state,
+                r.updated_at.map(|v| v.max(0.0) as i64),
+                r.version.map(|v| v.max(0.0) as u64),
+            ),
             Err(e) => json!({ "readable": false, "everRan": true, "error": e }),
         },
     }
@@ -363,6 +383,7 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
 pub fn arcade_reorg_state_json(
     state: &overlay_discovery::pot::arcade_events::ConsumerState,
     updated_at_ms: Option<i64>,
+    version: Option<u64>,
 ) -> serde_json::Value {
     let key = |k: &overlay_discovery::pot::arcade_events::EventKey| {
         json!({ "orphanedAt": k.orphaned_at, "height": k.height, "hash": k.hash })
@@ -374,10 +395,12 @@ pub fn arcade_reorg_state_json(
         "pending": state.pending.as_ref().map(|p| json!({
             "event": key(&p.event.key()),
             "heldPasses": p.held_passes,
+            "faultPasses": p.fault_passes,
             "spendersExhausted": p.spenders.exhausted,
             "potBeefsExhausted": p.pot_beefs.exhausted,
             "transactionsExhausted": p.transactions.exhausted,
         })),
+        "version": version,
         "updatedAtMs": updated_at_ms,
     })
 }
@@ -645,6 +668,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARCADE_REORG_DEMOTED: 0,
         COUNTER_ARCADE_REORG_UNCORROBORATED: 0,
         COUNTER_ARCADE_REORG_FAULTS: 0,
+        COUNTER_ARCADE_REORG_UNRESOLVED: 0,
+        COUNTER_ARCADE_REORG_TRACKER_LAGGING: 0,
+        COUNTER_ARCADE_REORG_CONTENDED: 0,
+        COUNTER_ARCADE_REORG_BUDGET_STOPS: 0,
     });
     // 2026-09-04: every courier rung reads an explicit 0 until it is called.
     for rung in crate::proof_fetcher::COURIER_RUNGS {
@@ -975,21 +1002,24 @@ mod tests {
     fn arcade_reorg_state_json_shows_the_cursor_and_the_pending_event() {
         use overlay_discovery::pot::arcade_events::{ConsumerState, OrphanEvent};
         let mut state = ConsumerState::default();
-        let v = arcade_reorg_state_json(&state, None);
+        let v = arcade_reorg_state_json(&state, None, None);
         assert_eq!(v["readable"], true);
         assert_eq!(v["everRan"], true);
         assert!(v["cursor"].is_null() && v["pending"].is_null());
         let ev = OrphanEvent { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: 965771, hash: "ab".repeat(32) };
         state.start(ev.clone());
         state.hold_pending();
-        let v = arcade_reorg_state_json(&state, Some(1_700_000_000_000));
+        state.note_fault_on_pending();
+        let v = arcade_reorg_state_json(&state, Some(1_700_000_000_000), Some(7));
         assert_eq!(v["pending"]["event"]["height"], 965771);
         assert_eq!(v["pending"]["event"]["orphanedAt"], "2026-09-07T22:45:22.316Z");
         assert_eq!(v["pending"]["heldPasses"], 1);
+        assert_eq!(v["pending"]["faultPasses"], 1);
         assert_eq!(v["pending"]["spendersExhausted"], false);
         assert_eq!(v["updatedAtMs"], 1_700_000_000_000i64);
+        assert_eq!(v["version"], 7);
         state.advance_past_pending();
-        let v = arcade_reorg_state_json(&state, Some(1));
+        let v = arcade_reorg_state_json(&state, Some(1), Some(8));
         assert_eq!(v["cursor"]["hash"], "ab".repeat(32));
         assert!(v["pending"].is_null());
         // every counter the consumer bumps is seeded on the surface
@@ -999,6 +1029,10 @@ mod tests {
             COUNTER_ARCADE_REORG_DEMOTED: 0,
             COUNTER_ARCADE_REORG_UNCORROBORATED: 0,
             COUNTER_ARCADE_REORG_FAULTS: 0,
+            COUNTER_ARCADE_REORG_UNRESOLVED: 0,
+            COUNTER_ARCADE_REORG_TRACKER_LAGGING: 0,
+            COUNTER_ARCADE_REORG_CONTENDED: 0,
+            COUNTER_ARCADE_REORG_BUDGET_STOPS: 0,
         });
         for name in [
             "arcade_reorg_events_total",
@@ -1006,6 +1040,10 @@ mod tests {
             "arcade_reorg_demoted_total",
             "arcade_reorg_uncorroborated_total",
             "arcade_reorg_faults_total",
+            "arcade_reorg_unresolved_total",
+            "arcade_reorg_tracker_lagging_total",
+            "arcade_reorg_contended_total",
+            "arcade_reorg_budget_stops_total",
         ] {
             assert_eq!(obj[name], 0, "{name}");
         }

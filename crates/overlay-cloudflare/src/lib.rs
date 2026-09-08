@@ -1293,7 +1293,16 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // block-event pass is its fast path; this is the drought fallback and
     // the first-run catch-up), BEFORE the confirmation chaser so a row it
     // demotes is re-chased in this same tick. Bounded on its own budget.
-    let _arcade = crate::tip_pass::run_arcade_reorg_pass(&env, pot_storage.as_ref(), Some(&ops_db), "cron").await;
+    let _arcade = crate::tip_pass::run_arcade_reorg_pass(
+        &env,
+        pot_storage.as_ref(),
+        Some(&ops_db),
+        "cron",
+        crate::arcade_reorg::PassLimits::cron(),
+        &mut crate::reorg_sweep::RootMemo::default(),
+        false,
+    )
+    .await;
     let spend_fetcher = courier_fetcher(&env, lookup_service_chain_tracker(&env)).with_budget(20);
     let pot_tracker = lookup_service_chain_tracker(&env);
     let pot_fetcher = courier_fetcher(&env, pot_tracker);

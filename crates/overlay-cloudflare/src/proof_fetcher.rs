@@ -285,22 +285,36 @@ impl ChainProofFetcher {
     /// courier fetch failures stay `Ok(None)`-shaped (honest unknown).
     pub(crate) async fn fetch_verified_proof(&self, txid: &str) -> Result<Option<String>, String> {
         let tracker = self.tracker.as_deref();
+        // bsv-low M19B-G1 round 2 (review MED-3): one rung's candidate at a
+        // height OUR header source does not serve (`BlockNotFound`) is that
+        // rung's miss, not the ladder's fault: the next rung is asked (a
+        // courier re-anchored to a block chaintracks 404s used to abort the
+        // whole ladder with `?`, so Bitails/WoC were never reached and the
+        // caller faulted every pass). A transport fault still aborts.
+        async fn judge(tracker: Option<&dyn ChainTracker>, rung: &str, bump_hex: &str, txid: &str) -> Result<bool, String> {
+            match rung_step(&verify_bump_outcome(tracker, bump_hex, txid).await) {
+                RungStep::Accept => Ok(true),
+                RungStep::NextRung(why) => {
+                    worker::console_log!("[proof] {rung} bump for {txid} not accepted ({why}); next rung");
+                    Ok(false)
+                }
+                RungStep::Abort(e) => Err(e),
+            }
+        }
 
         // 1. Arcade — our own broadcaster's free BUMP (MINED status merklePath).
         if let Some(bump_hex) = self.arcade_merklepath(txid).await {
-            if verify_bump_detailed(tracker, &bump_hex, txid).await? {
+            if judge(tracker, "arcade", &bump_hex, txid).await? {
                 return Ok(Some(bump_hex));
             }
-            worker::console_log!("[proof] arcade bump for {txid} FAILED chaintracks verify");
         }
 
         // 2. Bitails TSC (secondary — tx mined outside Arcade).
         match self.bitails_tsc_bump(txid).await {
             Some(bump_hex) => {
-                if verify_bump_detailed(tracker, &bump_hex, txid).await? {
+                if judge(tracker, "bitails", &bump_hex, txid).await? {
                     return Ok(Some(bump_hex));
                 }
-                worker::console_log!("[proof] bitails bump for {txid} FAILED chaintracks verify");
             }
             None => worker::console_log!(
                 "[proof] bitails returned NO bump for {txid} (tracker_present={})",
@@ -310,10 +324,9 @@ impl ChainProofFetcher {
 
         // 3. WoC TSC (BREAK-GLASS, last resort — WoC 429s on the free tier).
         if let Some(bump_hex) = self.woc_tsc_bump(txid).await {
-            if verify_bump_detailed(tracker, &bump_hex, txid).await? {
+            if judge(tracker, "woc", &bump_hex, txid).await? {
                 return Ok(Some(bump_hex));
             }
-            worker::console_log!("[proof] woc bump for {txid} FAILED chaintracks verify");
         }
 
         Ok(None)
@@ -778,6 +791,10 @@ impl AncestorFetcher for ChainProofFetcher {
         self.verified_proof_for_detailed(txid).await.unwrap_or(None)
     }
 
+    fn budget_remaining(&self) -> Option<u32> {
+        Some(self.budget.get())
+    }
+
     async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
         let remaining = self.budget.get();
         if remaining == 0 {
@@ -834,26 +851,91 @@ pub(crate) async fn verify_bump_detailed(
     bump_hex: &str,
     txid: &str,
 ) -> Result<bool, String> {
+    match verify_bump_outcome(tracker, bump_hex, txid).await {
+        BumpVerdict::Valid => Ok(true),
+        BumpVerdict::Invalid => Ok(false),
+        // unchanged: to every existing caller an absent header is a READ
+        // FAULT (retried, never a refutation); only the ladder's rung fold
+        // (`rung_step`) treats it as that rung's miss
+        BumpVerdict::NoHeader { message, .. } => Err(message),
+        BumpVerdict::Fault(e) => Err(e),
+    }
+}
+
+/// bsv-low M19B-G1 round 2 (review MED-3): what the header source said about
+/// ONE candidate bump, with the absent header kept apart from a transport
+/// fault. The ladder's rung fold ([`rung_step`]) is the one reader that
+/// treats `NoHeader` as a miss rather than a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BumpVerdict {
+    /// The bump's root is the header's root at its height.
+    Valid,
+    /// A definitive local/chain "no": no header source, a malformed bump, a
+    /// root that is not the one at that height.
+    Invalid,
+    /// Chaintracks answered 404 for the bump's height (`BlockNotFound`): it
+    /// holds no block there (a lag, or a courier anchored to a block off our
+    /// chain). Nothing is proven, nothing is refuted.
+    NoHeader { height: u32, message: String },
+    /// The header source could not be READ (transport, a starved subrequest,
+    /// a malformed frame): retryable, not a verdict.
+    Fault(String),
+}
+
+pub(crate) async fn verify_bump_outcome(
+    tracker: Option<&dyn ChainTracker>,
+    bump_hex: &str,
+    txid: &str,
+) -> BumpVerdict {
     let Some(tracker) = tracker else {
-        return Ok(false); // No header source → nothing is a proven fact.
+        return BumpVerdict::Invalid; // No header source → nothing is a proven fact.
     };
     let bump = match MerklePath::from_hex(bump_hex) {
         Ok(b) => b,
-        Err(_) => return Ok(false),
+        Err(_) => return BumpVerdict::Invalid,
     };
     let root = match bump.compute_root(Some(txid)) {
         Ok(r) => r,
-        Err(_) => return Ok(false),
+        Err(_) => return BumpVerdict::Invalid,
     };
-    tracker
-        .is_valid_root_for_height(&root, bump.block_height)
-        .await
-        .map_err(|e| {
-            format!(
-                "chaintracks read failed for {txid}@{}: {e}",
-                bump.block_height
-            )
-        })
+    let height = bump.block_height;
+    match tracker.is_valid_root_for_height(&root, height).await {
+        Ok(true) => BumpVerdict::Valid,
+        Ok(false) => BumpVerdict::Invalid,
+        Err(e) => {
+            let message = format!("chaintracks read failed for {txid}@{height}: {e}");
+            match e {
+                bsv_rs::transaction::ChainTrackerError::BlockNotFound(h) => {
+                    BumpVerdict::NoHeader { height: h, message }
+                }
+                _ => BumpVerdict::Fault(message),
+            }
+        }
+    }
+}
+
+/// PURE: one ladder rung's step from its candidate's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RungStep {
+    /// The candidate verifies: the ladder answers it.
+    Accept,
+    /// This rung's candidate does not verify here (refuted, or anchored at a
+    /// height our header source does not serve): the next rung is asked.
+    NextRung(String),
+    /// The header source could not be read: the ladder aborts with the
+    /// fault (every rung would fail the same read).
+    Abort(String),
+}
+
+pub(crate) fn rung_step(verdict: &BumpVerdict) -> RungStep {
+    match verdict {
+        BumpVerdict::Valid => RungStep::Accept,
+        BumpVerdict::Invalid => RungStep::NextRung("failed chaintracks verify".to_string()),
+        BumpVerdict::NoHeader { height, .. } => {
+            RungStep::NextRung(format!("no header at {height} on our header source"))
+        }
+        BumpVerdict::Fault(e) => RungStep::Abort(e.clone()),
+    }
 }
 
 /// Extract a ready BUMP hex from an Arcade `GET /tx/{txid}` status body: present
@@ -4020,6 +4102,66 @@ pub(crate) mod tests {
     }
 
     // ── 1. Arcade merklePath extraction ──────────────────────────────────────
+
+    /// bsv-low M19B-G1 round 2 (review MED-3): the ladder's rung fold. A
+    /// candidate at a height OUR header source does not serve
+    /// (`BlockNotFound`) is that rung's miss (the next rung is asked), a
+    /// refuted one likewise; only a READ fault aborts the ladder; every
+    /// other caller of `verify_bump_detailed` still sees the absent header
+    /// as a fault (never a refutation).
+    #[tokio::test]
+    async fn a_rung_whose_height_our_header_source_lacks_falls_through_to_the_next_rung() {
+        use bsv_rs::transaction::{ChainTrackerError, MockChainTracker};
+        struct NoHeaderTracker;
+        #[async_trait::async_trait]
+        impl ChainTracker for NoHeaderTracker {
+            async fn is_valid_root_for_height(&self, _root: &str, height: u32) -> Result<bool, ChainTrackerError> {
+                Err(ChainTrackerError::BlockNotFound(height))
+            }
+            async fn current_height(&self) -> Result<u32, ChainTrackerError> {
+                Ok(965_860)
+            }
+        }
+        struct StarvedTracker;
+        #[async_trait::async_trait]
+        impl ChainTracker for StarvedTracker {
+            async fn is_valid_root_for_height(&self, _root: &str, _height: u32) -> Result<bool, ChainTrackerError> {
+                Err(ChainTrackerError::NetworkError("starved".into()))
+            }
+            async fn current_height(&self) -> Result<u32, ChainTrackerError> {
+                Ok(965_860)
+            }
+        }
+        let txid = "ab".repeat(32);
+        let bump = single_tx_bump(&txid, 965_773).to_hex();
+        // the pure fold
+        assert_eq!(rung_step(&BumpVerdict::Valid), RungStep::Accept);
+        assert!(matches!(rung_step(&BumpVerdict::Invalid), RungStep::NextRung(_)));
+        assert!(matches!(rung_step(&BumpVerdict::NoHeader { height: 965_773, message: "x".into() }), RungStep::NextRung(_)), "no header at the candidate's height: the NEXT rung is asked, the ladder does not abort");
+        assert_eq!(rung_step(&BumpVerdict::Fault("starved".into())), RungStep::Abort("starved".into()));
+        // the verdicts from real tracker answers
+        let mut valid = MockChainTracker::new(965_860);
+        valid.add_root(965_773, txid.clone());
+        assert_eq!(verify_bump_outcome(Some(&valid), &bump, &txid).await, BumpVerdict::Valid);
+        assert_eq!(verify_bump_outcome(Some(&MockChainTracker::new(965_860)), &bump, &txid).await, BumpVerdict::Invalid);
+        assert_eq!(verify_bump_outcome(None, &bump, &txid).await, BumpVerdict::Invalid, "no header source proves nothing");
+        assert_eq!(verify_bump_outcome(Some(&valid), "zz", &txid).await, BumpVerdict::Invalid, "a malformed bump");
+        assert!(matches!(verify_bump_outcome(Some(&NoHeaderTracker), &bump, &txid).await, BumpVerdict::NoHeader { height: 965_773, .. }));
+        assert!(matches!(verify_bump_outcome(Some(&StarvedTracker), &bump, &txid).await, BumpVerdict::Fault(_)));
+        // every other caller: the absent header stays a FAULT (retried), the starved read too
+        assert!(verify_bump_detailed(Some(&NoHeaderTracker), &bump, &txid).await.is_err());
+        assert!(verify_bump_detailed(Some(&StarvedTracker), &bump, &txid).await.is_err());
+        assert_eq!(verify_bump_detailed(Some(&valid), &bump, &txid).await, Ok(true));
+        assert_eq!(verify_bump_detailed(Some(&MockChainTracker::new(965_860)), &bump, &txid).await, Ok(false));
+        // the real ladder reports its budget (review MED-2); at 0 its ask is the
+        // budget refusal (`Ok(None)`, no courier reached), which the consumer
+        // never reads as "no proof" because it checks the budget first
+        let f = ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(1)))).with_budget(3);
+        assert_eq!(f.budget_remaining(), Some(3));
+        let spent = ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(1)))).with_budget(0);
+        assert_eq!(spent.budget_remaining(), Some(0));
+        assert_eq!(spent.verified_proof_for_detailed(&txid).await, Ok(None));
+    }
 
     #[test]
     fn arcade_mined_with_merklepath_extracts_bump() {

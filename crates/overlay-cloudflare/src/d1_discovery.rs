@@ -1927,7 +1927,7 @@ struct RefundRawRow {
 }
 
 /// A nullable numeric bind (NULL is the SQL absence; D1 refuses `undefined`).
-fn opt_f64(v: Option<f64>) -> crate::d1::QVal {
+pub(crate) fn opt_f64(v: Option<f64>) -> crate::d1::QVal {
     v.map_or(crate::d1::QVal::Null, crate::d1::QVal::Float)
 }
 
@@ -2237,6 +2237,16 @@ pub fn demote_confirmed_cas_sql() -> &'static str {
      RETURNING txid"
 }
 
+/// bsv-low M19B-G1 round 2 (review MED-1): [`demote_confirmed_cas_sql`] ALSO
+/// bound to the height the refuted proof was judged at (`spentHeight IS ?`,
+/// NULL-safe). Bind order: txid, outputIndex, spendingTxid (guard),
+/// judgedHeight (guard, or NULL). A row back = the guard HIT.
+pub fn demote_confirmed_at_cas_sql() -> &'static str {
+    "UPDATE pot_records SET spentConfirmed = 0, spentHeight = NULL \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spentConfirmed = 1 AND spentHeight IS ? \
+     RETURNING txid"
+}
+
 /// GUARDED re-anchor: move a confirmed row's height to the block a pushed,
 /// verified proof names. Bind order: new_height, txid, outputIndex,
 /// spendingTxid (guard). A row back = the guard HIT.
@@ -2267,22 +2277,30 @@ pub fn sweep_state_upsert_sql() -> &'static str {
 }
 
 /// bsv-low M19B-G1: the Arcade reorg-event consumer's state document (one
-/// row). Bind order: name.
+/// row) and its write version. Bind order: name.
 pub fn arcade_reorg_state_read_sql() -> &'static str {
-    "SELECT state FROM arcade_reorg_state WHERE name = ?"
+    "SELECT state, version FROM arcade_reorg_state WHERE name = ?"
 }
 
-/// The health surface's read of the same row (the document and its stamp).
-/// Bind order: name.
+/// The health surface's read of the same row (the document, its version and
+/// its stamp). Bind order: name.
 pub fn arcade_reorg_state_view_sql() -> &'static str {
-    "SELECT state, updatedAt FROM arcade_reorg_state WHERE name = ?"
+    "SELECT state, version, updatedAt FROM arcade_reorg_state WHERE name = ?"
 }
 
-/// Upsert the consumer's state document. Bind order: name, state (JSON),
-/// updatedAt (ms).
+/// Write the consumer's state document as a COMPARE-AND-SET on the row's
+/// version (round 2, review LOW-2): a first write inserts version 1; a later
+/// write replaces the document only while the row still carries the version
+/// the writer READ, and bumps it. A row back (the new version) = written;
+/// none = another isolate wrote in between (the caller stops its pass).
+/// Bind order: name, state (JSON), updatedAt (ms), expectedVersion (NULL =
+/// the writer read no row).
 pub fn arcade_reorg_state_upsert_sql() -> &'static str {
-    "INSERT INTO arcade_reorg_state (name, state, updatedAt) VALUES (?, ?, ?) \
-     ON CONFLICT(name) DO UPDATE SET state = excluded.state, updatedAt = excluded.updatedAt"
+    "INSERT INTO arcade_reorg_state (name, state, version, updatedAt) VALUES (?, ?, 1, ?) \
+     ON CONFLICT(name) DO UPDATE SET state = excluded.state, \
+         version = arcade_reorg_state.version + 1, updatedAt = excluded.updatedAt \
+     WHERE arcade_reorg_state.version IS ? \
+     RETURNING version"
 }
 
 /// The pot_beefs leg's HEAD page: VERIFIED rows whose own bump is anchored
@@ -3042,6 +3060,27 @@ impl PotStorage for D1PotStorage {
         if hit.is_some() {
             // the served state moved (confirmed → seen): the seats' events
             // boxes hear it on the route's flush
+            crate::pot_changes::note(txid, output_index);
+        }
+        Ok(hit.is_some())
+    }
+
+    async fn demote_confirmed_for_spender_at(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        judged_height: Option<u64>,
+    ) -> Result<bool, PotStorageError> {
+        let hit: Option<serde_json::Value> = Query::new(demote_confirmed_at_cas_sql())
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
+            .bind(opt_f64(judged_height.map(|h| h as f64)))
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        if hit.is_some() {
             crate::pot_changes::note(txid, output_index);
         }
         Ok(hit.is_some())
@@ -13428,6 +13467,7 @@ mod tests {
             assert!(!lines.iter().any(|l| l.contains("TEMP B-TREE")), "{name}: a temp sort:\n{joined}");
         };
         let t = |s: &str| rusqlite::types::Value::Text(s.to_string());
+        let n = |v: i64| rusqlite::types::Value::Integer(v);
         index_served(
             "arcade state read",
             &plan(arcade_reorg_state_read_sql(), &[t("events")]),
@@ -13438,21 +13478,54 @@ mod tests {
             &plan(arcade_reorg_state_view_sql(), &[t("events")]),
             "SEARCH arcade_reorg_state USING INDEX sqlite_autoindex_arcade_reorg_state_1 (name=?)",
         );
-        let read = || -> Option<(String, Option<i64>)> {
-            conn.query_row(arcade_reorg_state_view_sql(), ["events"], |r| Ok((r.get(0)?, r.get(1)?))).ok()
+        let read = || -> Option<(String, i64, Option<i64>)> {
+            conn.query_row(arcade_reorg_state_view_sql(), ["events"], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()
         };
         assert_eq!(read(), None, "no row until the first pass writes one");
-        let doc1 = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":{"height":965771,"rowid":40},"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":0}}"#;
-        conn.execute(arcade_reorg_state_upsert_sql(), rusqlite::params!["events", doc1, 1_000i64]).unwrap();
-        assert_eq!(read(), Some((doc1.to_string(), Some(1_000))));
+        // the versioned CAS (round 2, review LOW-2): bind order name, state, updatedAt, expected version
+        let write = |doc: &str, stamp: i64, expected: Option<i64>| -> Option<i64> {
+            conn.query_row(arcade_reorg_state_upsert_sql(), rusqlite::params![
+                "events", doc, stamp, expected
+            ], |r| r.get::<_, i64>(0)).ok()
+        };
+        let doc1 = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":{"height":965771,"rowid":40},"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":0,"fault_passes":0}}"#;
+        assert_eq!(write(doc1, 1_000, None), Some(1), "the first write inserts version 1");
+        assert_eq!(read(), Some((doc1.to_string(), 1, Some(1_000))));
         let doc2 = r#"{"v":1,"cursor":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"pending":null}"#;
-        conn.execute(arcade_reorg_state_upsert_sql(), rusqlite::params!["events", doc2, 2_000i64]).unwrap();
-        assert_eq!(read(), Some((doc2.to_string(), Some(2_000))), "the upsert replaces the document and the stamp");
+        assert_eq!(write(doc2, 2_000, Some(1)), Some(2), "a write against the version it read replaces the document and bumps the version");
+        assert_eq!(read(), Some((doc2.to_string(), 2, Some(2_000))));
+        assert_eq!(write(doc1, 3_000, Some(1)), None, "a STALE writer (it read version 1, the row is at 2) writes nothing");
+        assert_eq!(write(doc1, 3_000, None), None, "a writer that read no row while one exists writes nothing");
+        assert_eq!(read(), Some((doc2.to_string(), 2, Some(2_000))), "the loser changed nothing");
         let rows: i64 = conn.query_row("SELECT count(*) FROM arcade_reorg_state", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "one row per name");
         // what the reader deserialises is exactly what the writer stored
         let back = overlay_discovery::pot::arcade_events::ConsumerState::from_json(&read().unwrap().0).unwrap();
         assert_eq!(back.cursor.as_ref().map(|c| c.height), Some(965771));
         assert!(back.pending.is_none());
+
+        // ── the height-bound demotion (round 2, review MED-1) ──
+        index_served(
+            "demote at CAS",
+            &plan(demote_confirmed_at_cas_sql(), &[t("p9"), n(0), t("s9"), n(965771)]),
+            "SEARCH pot_records USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)",
+        );
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spentHeight) VALUES ('p9', 0, 1, 's9', 1, 965771)",
+            [],
+        )
+        .unwrap();
+        let demote_at = |pot: &str, spender: &str, h: Option<i64>| -> bool {
+            conn.query_row(demote_confirmed_at_cas_sql(), rusqlite::params![pot, 0i64, spender, h], |r| r.get::<_, String>(0)).is_ok()
+        };
+        assert!(!demote_at("p9", "s9", Some(965773)), "another height than the one judged: a miss (the row moved under the pass)");
+        assert!(!demote_at("p9", "s9", None), "a NULL judged height against a held height: a miss");
+        assert!(!demote_at("p9", "other", Some(965771)), "the wrong spender: a miss");
+        assert!(demote_at("p9", "s9", Some(965771)), "the judged height and pointer: the demotion");
+        let (c, h): (i64, Option<i64>) = conn.query_row("SELECT spentConfirmed, spentHeight FROM pot_records WHERE txid = 'p9'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((c, h), (0, None));
+        assert!(!demote_at("p9", "s9", Some(965771)), "not demoted twice");
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spentHeight) VALUES ('p10', 0, 1, 's10', 1, NULL)", []).unwrap();
+        assert!(demote_at("p10", "s10", None), "a height-less confirmation judged height-less: NULL-safe IS");
     }
 }

@@ -1605,10 +1605,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // document `overlay_discovery::pot::arcade_events::ConsumerState` (the
     // cursor over Arcade's orphaned-block feed, the event in progress with
     // each leg's row cursor). Read by primary key, upserted; moved only past
-    // a FINISHED event, never on a fault (idempotent replay). Overlay-internal.
+    // a FINISHED event, never on a fault (idempotent replay). `version` is
+    // the write's compare-and-set (round 2, review LOW-2): two isolates
+    // running a pass at once cannot both write; the loser stops. Overlay-internal.
     "CREATE TABLE IF NOT EXISTS arcade_reorg_state (
         name TEXT PRIMARY KEY,
         state TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 0,
         updatedAt INTEGER
     )",
 ];
