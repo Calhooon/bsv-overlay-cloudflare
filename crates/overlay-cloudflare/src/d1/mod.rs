@@ -426,7 +426,12 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 137 → 140 for bsv-low M19 (2026-09-08): `chain_headers_seen` (the reorg
 /// detector's per-height record), `idx_pot_records_confirmed_height` (the
 /// revalidation sweep's window), `idx_result_markers_v2_gameId` (#428).
-pub const OVERLAY_MIGRATION_COUNT: usize = 140;
+/// 140 → 145 for the M19 round-2 review: `reorg_sweep_state` (the walk
+/// cursor), `pot_beefs.proofHeight` + `idx_pot_beefs_verified_height`,
+/// `transactions.proofHeight` + `idx_transactions_proven_height`. Every
+/// CREATE INDEX on a big table is pre-created out of band before the deploy
+/// (see the M19 build log) so the cold-start run is a no-op.
+pub const OVERLAY_MIGRATION_COUNT: usize = 145;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1546,13 +1551,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         hash TEXT NOT NULL,
         seenAt INTEGER
     )",
-    // The revalidation sweep's window read (`find_confirmed_in_heights`,
-    // `demote_confirmed_from_height`) is an equality on spentConfirmed plus
-    // a range on spentHeight, ordered by spentHeight: this composite serves
-    // both the search and the ORDER BY (pinned by EXPLAIN QUERY PLAN under
-    // real SQLite); a bare spentHeight index lost to the older two-column
-    // equality index and a temp B-tree, which on a table where most rows are
-    // confirmed is the scan shape loop 8's D1 overload was made of.
+    // The revalidation sweep's window walk (`confirmed_window_page`) is an
+    // equality on spentConfirmed plus a range on spentHeight, ordered by
+    // (spentHeight DESC, rowid DESC): this composite serves the search AND
+    // the whole ORDER BY (rowid is the index's implicit last key; pinned by
+    // EXPLAIN QUERY PLAN under real SQLite without ANALYZE); a bare
+    // spentHeight index lost to the older two-column equality index and a
+    // temp B-tree, which on a table where most rows are confirmed is the
+    // scan shape loop 8's D1 overload was made of.
     "CREATE INDEX IF NOT EXISTS idx_pot_records_confirmed_height \
          ON pot_records(spentConfirmed, spentHeight)",
     // bsv-low M19 D1 (#428): `result_markers_v2 WHERE gameId IN (…)` read
@@ -1560,6 +1566,35 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // per-game marker reads); the table was indexed by createdAt, potTxid
     // and winner only.
     "CREATE INDEX IF NOT EXISTS idx_result_markers_v2_gameId ON result_markers_v2(gameId)",
+    // bsv-low M19 R2 round 2 (2026-09-08, review H3b): the revalidation
+    // sweep's persisted walk cursor, one row per named walk (spenders,
+    // pot_beefs, transactions), so a bounded pass continues where the last
+    // one stopped across passes and isolates until its window is exhausted.
+    "CREATE TABLE IF NOT EXISTS reorg_sweep_state (
+        name TEXT PRIMARY KEY,
+        lo INTEGER NOT NULL,
+        hi INTEGER NOT NULL,
+        cursorHeight INTEGER,
+        cursorRowid INTEGER,
+        exhausted INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER
+    )",
+    // Review M4: the block height a VERIFIED stored pot BEEF's OWN bump
+    // anchors it to, recorded by the verifying writers (the compact write
+    // derives it from the bytes; the latch flips carry it). The sweep's
+    // second leg pages verified pots (a JOIN mined in the orphan) by it.
+    // NULL for rows verified before this column: in no window (they heal
+    // on a re-push only, a stated limit).
+    "ALTER TABLE pot_beefs ADD COLUMN proofHeight INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_pot_beefs_verified_height \
+         ON pot_beefs(proof_verified, proofHeight)",
+    // The same for the engine's transactions store (the hops' proofs): the
+    // verified-stitch upsert derives it; the sweep's third leg pages
+    // has_proof = 1 rows by it and clears has_proof on a refuted bump, which
+    // is exactly the engine's re-fetch cue (`complete_missing_proofs`).
+    "ALTER TABLE transactions ADD COLUMN proofHeight INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_transactions_proven_height \
+         ON transactions(has_proof, proofHeight)",
 ];
 
 // =============================================================================

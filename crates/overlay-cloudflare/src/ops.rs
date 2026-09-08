@@ -103,6 +103,27 @@ pub const COUNTER_ARC_INGEST_REORG_EVENTS: &str = "arc_ingest_reorg_events_total
 /// named a different block than the stored confirmation (a re-anchor is a
 /// REPLACEMENT, never a `cas_missed`).
 pub const COUNTER_ARC_INGEST_REANCHORED: &str = "arc_ingest_reanchored_total";
+/// bsv-low M19 round 2 (review H2): an Arcade `reorg_unmined` marker whose
+/// spender's stored proof chaintracks still HOLDS: the hint changed nothing
+/// (a planted marker, or a stale one). Non-zero on a healthy stream is a
+/// courier or an attacker talking; either way visible.
+pub const COUNTER_REORG_UNMINED_UNCORROBORATED: &str = "reorg_unmined_uncorroborated_total";
+/// bsv-low M19 round 2 (review H3): a tip announce BELOW the highest held
+/// header (an old header announced late, or two webhook tasks landing out
+/// of order): ignored, never a reorg, counted.
+pub const COUNTER_TIP_ANNOUNCE_OLD: &str = "tip_announce_old_total";
+/// bsv-low M19 round 2 (review M4): the sweep's second and third legs, the
+/// pots' own proofs and the engine's transactions (hops) whose stitched
+/// bump chaintracks refutes: unlatched for the completion passes to
+/// re-prove. Zero on a healthy stream (#429).
+pub const COUNTER_REORG_STALE_POT_PROOFS: &str = "reorg_stale_pot_proofs_total";
+pub const COUNTER_REORG_STALE_TX_PROOFS: &str = "reorg_stale_tx_proofs_total";
+// The app-layer's `/beef` read-side guard writes three more rows into this
+// table directly (it shares OVERLAY_DB): `beef_guard_stripped_total` (a
+// refuted bump stripped, served raw with ancestry), `beef_guard_refused_total`
+// (a refuted trimmed row answered 503) and `beef_guard_unchecked_total` (a
+// recent bump served UNCHECKED because no tip or header was in hand: the
+// stated fail-open, review L3). All surface on /health/invariants.
 /// bsv-low (2026-09-04) — the missing-spend DISCOVERY pass (`proof_fetcher::
 /// discover_missing_spends`), lifetime totals: candidates scanned, spends
 /// discovered (an unconfirmed pointer written), courier-ladder faults, and

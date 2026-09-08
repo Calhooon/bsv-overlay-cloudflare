@@ -145,15 +145,44 @@ struct TxBeefRow {
 /// BEATS THE LATCH: a stitch that lands has_proof = 1 clears the retire
 /// columns (the pot_beefs #2b rule, mirrored) so a false retire self-heals.
 pub(crate) const INSERT_OUTPUT_TX_SQL: &str =
-    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason) \
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight) \
      VALUES (?1, ?2, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
              (SELECT retired_ms FROM transactions WHERE txid = ?1), \
-             (SELECT retired_reason FROM transactions WHERE txid = ?1))";
+             (SELECT retired_reason FROM transactions WHERE txid = ?1), NULL)";
+/// bsv-low M19 round 2 (review M4): `?4` = the block height the stitched
+/// bump anchors the tx to (the sweep's transactions leg windows by it), NULL
+/// when the write carries no proof.
 pub(crate) const UPDATE_TX_BEEF_SQL: &str =
-    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason) \
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight) \
      VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
              CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_ms FROM transactions WHERE txid = ?1) END, \
-             CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_reason FROM transactions WHERE txid = ?1) END)";
+             CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_reason FROM transactions WHERE txid = ?1) END, ?4)";
+
+/// The revalidation sweep's transactions leg (bsv-low M19 round 2, review
+/// M4): PROVEN rows anchored in a height window, newest first, keyed by
+/// rowid for the cursor; backed by `idx_transactions_proven_height`. Bind
+/// order: lo, hi.
+pub(crate) fn transactions_proven_head_sql(limit: u64) -> String {
+    format!(
+        "SELECT rowid AS rowKey, proofHeight, txid, hex(beef) AS beef FROM transactions \
+         WHERE has_proof = 1 AND proofHeight BETWEEN ? AND ? \
+         ORDER BY proofHeight DESC, rowid DESC LIMIT {limit}"
+    )
+}
+
+/// The leg's continuation at the cursor's height. Bind order: height, rowid.
+pub(crate) fn transactions_proven_same_height_sql(limit: u64) -> String {
+    format!(
+        "SELECT rowid AS rowKey, proofHeight, txid, hex(beef) AS beef FROM transactions \
+         WHERE has_proof = 1 AND proofHeight = ? AND rowid < ? \
+         ORDER BY rowid DESC LIMIT {limit}"
+    )
+}
+
+/// A refuted stitched bump: `has_proof = 0` is the engine's own re-fetch
+/// cue (`complete_missing_proofs` re-verifies the stored bump, refetches a
+/// canonical one and re-stitches). Bytes and the anchor stay.
+pub(crate) const TRANSACTION_UNPROVE_SQL: &str = "UPDATE transactions SET has_proof = 0 WHERE txid = ?";
 
 /// Rebroadcast-backstop candidate row: TxBeefRow + the `rebroadcast_state`
 /// attempt ledger (LEFT JOIN — NULL = never attempted). D1 returns numeric
@@ -485,6 +514,12 @@ impl Storage for D1Storage {
         // row legitimately flips proofless → proven). Contrast `insert_output`,
         // which is the untrusted ADMIT path and always writes has_proof = 0.
         let has_proof = i64::from(Self::beef_has_proof(txid, beef));
+        // bsv-low M19 round 2 (review M4): the anchor the stitched bump names
+        let proof_height = if has_proof == 1 {
+            overlay_discovery::pot::storage::pot_beef_bump_height(txid, beef).map(|h| h as f64)
+        } else {
+            None
+        };
 
         // INSERT OR REPLACE — txid is PRIMARY KEY, so this upserts.
         // created_at is preserve-or-stamp (#228): the stitch keeps the row's
@@ -498,6 +533,7 @@ impl Storage for D1Storage {
             .bind(txid)
             .bind(beef)
             .bind(has_proof)
+            .bind(proof_height.map_or(crate::d1::QVal::Null, crate::d1::QVal::Float))
             .execute(&self.db)
             .await
             .map_err(d1_err)
@@ -1000,7 +1036,7 @@ mod tests {
         // proofless (a re-stitch of unproven bytes is not proof of life)…
         conn.execute(
             UPDATE_TX_BEEF_SQL,
-            rusqlite::params!["tx1", vec![0xbeu8, 0xef, 0x01], 0i64],
+            rusqlite::params!["tx1", vec![0xbeu8, 0xef, 0x01], 0i64, Option::<i64>::None],
         )
         .unwrap();
         let retired_still: Option<i64> = conn
@@ -1019,7 +1055,7 @@ mod tests {
         // it (the pot_beefs #2b rule mirrored) — as does `mark_transaction_proven`.
         conn.execute(
             UPDATE_TX_BEEF_SQL,
-            rusqlite::params!["tx1", vec![0xbeu8, 0xef, 0x02], 1i64],
+            rusqlite::params!["tx1", vec![0xbeu8, 0xef, 0x02], 1i64, 965771i64],
         )
         .unwrap();
         let (retired2, reason2, proof): (Option<i64>, Option<String>, i64) = conn
@@ -1032,6 +1068,45 @@ mod tests {
         assert_eq!(retired2, None, "a verified proof clears the retire latch");
         assert_eq!(reason2, None);
         assert_eq!(proof, 1);
+        // bsv-low M19 round 2 (review M4): the anchor rides the verified stitch
+        let anchor: Option<i64> = conn
+            .query_row("SELECT proofHeight FROM transactions WHERE txid = 'tx1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(anchor, Some(965771));
+        // the transactions leg's pages and un-prove, EXPLAIN-pinned without ANALYZE
+        let stats: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stats, 0);
+        let plan = |sql: &str, binds: &[i64]| -> Vec<String> {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for (name, lines) in [
+            ("head", plan(&transactions_proven_head_sql(10), &[965770, 965773])),
+            ("same height", plan(&transactions_proven_same_height_sql(10), &[965771, 99])),
+        ] {
+            let joined = lines.join("\n");
+            assert!(lines.iter().any(|l| l.contains("USING INDEX idx_transactions_proven_height")), "{name}: {joined}");
+            assert!(!lines.iter().any(|l| l.starts_with("SCAN ") || l.contains("TEMP B-TREE")), "{name}: {joined}");
+        }
+        let rows: Vec<String> = conn
+            .prepare(&transactions_proven_head_sql(10))
+            .unwrap()
+            .query_map([965770i64, 965773], |r| r.get::<_, String>("txid"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec!["tx1"]);
+        conn.execute(TRANSACTION_UNPROVE_SQL, ["tx1"]).unwrap();
+        let (proof3, anchor3): (i64, Option<i64>) = conn
+            .query_row("SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((proof3, anchor3), (0, Some(965771)), "un-proved for the engine's re-fetch; the anchor stays");
     }
 
     /// bsv-low#302: the SHIPPED peer-health upsert + select on the

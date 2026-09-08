@@ -49,8 +49,8 @@ pub fn parse_tip_changed_hash(raw: &[u8]) -> Option<String> {
     Some(h.to_ascii_lowercase())
 }
 
-/// Rows a detected reorg demotes per block-event pass (a deep reorg drains
-/// over a few passes; the sweep below and the cron cover the rest).
+/// Rows a detected reorg re-verifies per block-event pass at the replaced
+/// height (the sweep's cursor walk covers the rest).
 pub const REORG_DEMOTE_LIMIT: u64 = 200;
 /// The revalidation sweep's window: the last N heights (the reference's
 /// `reorgScanDepth` default).
@@ -97,33 +97,50 @@ pub async fn internal_tip_changed(
     let Some(height) = parse_tip_changed(&raw) else {
         return Response::error("body must be {\"height\": <positive integer>}", 400);
     };
-    // ── bsv-low M19 R2: the reorg detector (reference: Engine.handleReorg) ──
-    // Record the block this pass acts on; a hash change at a held height, or
-    // a lower announce whose hash we do not hold, names the height every
-    // confirmation above it rests on. Durable (D1), so it sees across
-    // isolates; a height-less body (an older app-layer) detects nothing.
-    let hash = parse_tip_changed_hash(&raw);
-    let mut reorg_from: Option<u64> = None;
-    if let Some(h) = hash.as_deref() {
-        match pot_storage.record_header_seen(height, h).await {
-            Ok(seen) => {
-                reorg_from = overlay_discovery::pot::reorg::reorg_from_height(height, h, &seen);
+    // ── bsv-low M19 R2 (round 2): the reorg detector ──
+    // The announce carries the header hash (chaintracks announces on ANY tip
+    // change, height or hash, since m19-reorg-announce; the app-layer
+    // forwards it); an older announcer's hash-less body falls back to a
+    // header read. Recorded per height in D1 (seen across isolates); the ONE
+    // reorg producer is a same-height hash change; a lower unrecorded height
+    // is an OLD header (ignored, counted); a repeat is a repeat.
+    let hash = match parse_tip_changed_hash(&raw) {
+        Some(h) => Some(h),
+        None => {
+            let read = crate::chain_tracker::chaintracks_block_hash(env, height).await;
+            if read.is_none() {
+                console_log!("POST /internal/tip-changed height={height}: no hash in the body and none readable — no reorg detection this pass");
             }
-            Err(e) => console_log!("POST /internal/tip-changed height={height}: header record failed ({e}) — no reorg detection this pass"),
+            read
         }
+    };
+    let announce = match hash.as_deref() {
+        Some(h) => detect_announce(pot_storage, height, h).await,
+        None => None,
+    };
+    let tracker = crate::lookup_service_chain_tracker(env);
+    if announce == Some(overlay_discovery::pot::reorg::TipAnnounce::Old) {
+        console_log!("POST /internal/tip-changed height={height} -> 200 (an OLD header below the held tip: ignored, counted)");
+        if let Some(db) = ops_db {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_TIP_ANNOUNCE_OLD, 1).await;
+        }
+        return Response::from_json(&serde_json::json!({ "ok": true, "height": height, "skipped": "old-header" }));
     }
-    let mut demotion = crate::proof_fetcher::ReorgDemotionSummary::default();
+    let reorg_from = match announce {
+        Some(overlay_discovery::pot::reorg::TipAnnounce::Reorg { from }) => Some(from),
+        _ => None,
+    };
+    let mut demotion = crate::reorg_sweep::ReverifyPassSummary::default();
     if let Some(from) = reorg_from {
         console_log!(
-            "POST /internal/tip-changed height={height} hash={}: REORG detected — confirmations at or above {from} rest on a block the chain no longer holds",
+            "POST /internal/tip-changed height={height} hash={}: REORG detected — the block at {from} was replaced; re-verifying every confirmation anchored there",
             hash.as_deref().unwrap_or("?")
         );
-        demotion = crate::proof_fetcher::handle_reorg(pot_storage, from, REORG_DEMOTE_LIMIT).await;
+        demotion = crate::reorg_sweep::handle_reorg(pot_storage, tracker.as_deref(), from, from, None, REORG_DEMOTE_LIMIT).await;
         if let Some(db) = ops_db {
             crate::ops::bump_counter(db, crate::ops::COUNTER_CHAIN_REORGS_DETECTED, 1).await;
-            if demotion.demoted > 0 {
-                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, demotion.demoted as u64).await;
-            }
+            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, (demotion.stale + demotion.demoted_blind) as u64).await;
+            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, demotion.faults as u64).await;
         }
     }
     // A repeat of an already-passed height runs nothing — unless it carried
@@ -132,13 +149,15 @@ pub async fn internal_tip_changed(
         console_log!("POST /internal/tip-changed height={height} -> 200 (already passed in this isolate)");
         return Response::from_json(&serde_json::json!({ "ok": true, "height": height, "skipped": "already-passed" }));
     }
-    let tracker = crate::lookup_service_chain_tracker(env);
     // ── the revalidation sweep (reference: the fallback for trackers without
-    // a reorg stream; here the PRIMARY path, every block). It runs BEFORE the
-    // confirmation pass so a row it demotes is re-chased in this same tick
-    // with a proof verified against the canonical chain.
-    let sweep = crate::proof_fetcher::reorg_revalidation_sweep(
+    // a reorg stream; here the PRIMARY path, every block): three cursor-walked
+    // legs (spenders, the pots' own proofs, the engine's hop proofs). It runs
+    // BEFORE the confirmation pass so a row it demotes is re-chased in this
+    // same tick with a proof verified against the canonical chain.
+    let tx_store = ops_db.map(crate::reorg_sweep::D1ProvenTxStore);
+    let sweep = crate::reorg_sweep::reorg_revalidation_sweep(
         pot_storage,
+        tx_store.as_ref(),
         tracker.as_deref(),
         height,
         REORG_SWEEP_DEPTH,
@@ -146,16 +165,14 @@ pub async fn internal_tip_changed(
     )
     .await;
     if let Some(db) = ops_db {
-        if sweep.scanned > 0 {
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REVERIFIED, sweep.scanned as u64).await;
-        }
-        if sweep.stale > 0 {
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_PROOFS, sweep.stale as u64).await;
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, sweep.stale as u64).await;
-        }
-        if sweep.faults > 0 {
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, sweep.faults as u64).await;
-        }
+        let scanned = sweep.spenders.scanned + sweep.pot_beefs.scanned + sweep.transactions.scanned;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REVERIFIED, scanned as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_PROOFS, sweep.spenders.stale as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, sweep.spenders.stale as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_POT_PROOFS, sweep.pot_beefs.stale as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_TX_PROOFS, sweep.transactions.stale as u64).await;
+        let faults = sweep.spenders.faults + sweep.pot_beefs.faults + sweep.transactions.faults;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, faults as u64).await;
     }
     let fetcher = crate::courier_fetcher(env, tracker).with_budget(TIP_PASS_BUDGET);
     // min_age 0: the block just landed; every unconfirmed spend is a candidate
@@ -164,7 +181,9 @@ pub async fn internal_tip_changed(
     console_log!(
         "POST /internal/tip-changed height={height} -> 200 (block-event spend-confirmation: scanned={} confirmed={} \
          still_unconfirmed={} fetch_failed={} tracker_faults={} cas_missed={} cas_errors={}; \
-         reorg: from={:?} demoted={} unlatched={}; sweep: scanned={} standing={} stale={} faults={} no_stored_proof={} demote_missed={} errors={})",
+         reorg: from={:?} demoted={} demoted_blind={} standing={} faults={}; \
+         sweep: spenders {:?} scanned={} standing={} stale={} faults={} no_stored_proof={} demote_missed={} errors={} exhausted={}; \
+         pot_beefs {:?} scanned={} stale={} faults={}; transactions {:?} scanned={} stale={} faults={}; state_errors={})",
         s.scanned,
         s.confirmed,
         s.still_unconfirmed,
@@ -173,15 +192,28 @@ pub async fn internal_tip_changed(
         s.cas_missed,
         s.cas_errors,
         reorg_from,
-        demotion.demoted,
-        demotion.unlatched,
-        sweep.scanned,
-        sweep.standing,
-        sweep.stale,
-        sweep.faults,
-        sweep.no_stored_proof,
-        sweep.demote_missed,
-        sweep.errors
+        demotion.stale,
+        demotion.demoted_blind,
+        demotion.standing,
+        demotion.faults,
+        sweep.spenders_window,
+        sweep.spenders.scanned,
+        sweep.spenders.standing,
+        sweep.spenders.stale,
+        sweep.spenders.faults,
+        sweep.spenders.no_stored_proof,
+        sweep.spenders.demote_missed,
+        sweep.spenders.errors,
+        sweep.spenders.exhausted,
+        sweep.pot_beefs_window,
+        sweep.pot_beefs.scanned,
+        sweep.pot_beefs.stale,
+        sweep.pot_beefs.faults,
+        sweep.transactions_window,
+        sweep.transactions.scanned,
+        sweep.transactions.stale,
+        sweep.transactions.faults,
+        sweep.state_errors
     );
     if let Some(db) = ops_db {
         crate::ops::bump_counter(db, crate::ops::COUNTER_TIP_PASS_TOTAL, 1).await;
@@ -198,37 +230,81 @@ pub async fn internal_tip_changed(
         "confirmed": s.confirmed,
         "stillUnconfirmed": s.still_unconfirmed,
         "reorgFrom": reorg_from,
-        "reorgDemoted": demotion.demoted,
-        "sweepScanned": sweep.scanned,
-        "sweepStale": sweep.stale,
-        "sweepFaults": sweep.faults,
+        "reorgDemoted": demotion.stale + demotion.demoted_blind,
+        "reorgStanding": demotion.standing,
+        "sweepScanned": sweep.spenders.scanned + sweep.pot_beefs.scanned + sweep.transactions.scanned,
+        "sweepStale": sweep.spenders.stale + sweep.pot_beefs.stale + sweep.transactions.stale,
+        "sweepFaults": sweep.spenders.faults + sweep.pot_beefs.faults + sweep.transactions.faults,
+        "sweepWindow": sweep.spenders_window,
     }))
 }
 
-/// PURE: the `POST /internal/reorg` body — `{"fromHeight": n}` with an
-/// optional `"limit"` (clamped to [`REORG_DEMOTE_LIMIT`]); `None` for
-/// anything else. `fromHeight` must be a positive integer.
-pub fn parse_reorg_trigger(raw: &[u8]) -> Option<(u64, u64)> {
+/// The reorg detector through the REAL producer path: record the announced
+/// `(height, hash)` and classify it against what was held. `None` only on a
+/// storage fault (no detection this pass).
+pub async fn detect_announce(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    height: u64,
+    hash: &str,
+) -> Option<overlay_discovery::pot::reorg::TipAnnounce> {
+    match pot_storage.record_header_seen(height, hash).await {
+        Ok(seen) => Some(overlay_discovery::pot::reorg::classify_tip_announce(height, hash, &seen)),
+        Err(e) => {
+            crate::proof_fetcher::push_log(&format!(
+                "POST /internal/tip-changed height={height}: header record failed ({e}) — no reorg detection this pass"
+            ));
+            None
+        }
+    }
+}
+
+/// `POST /internal/reorg`'s body, parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorgTrigger {
+    pub from_height: u64,
+    pub to_height: u64,
+    pub limit: u64,
+    pub after: Option<overlay_discovery::pot::reorg::RowKey>,
+}
+
+/// PURE: `{"fromHeight": n, "toHeight"?: m, "limit"?: k, "cursor"?: {"height": h, "rowid": r}}`.
+/// `toHeight` defaults to `fromHeight` and may not be below it; `limit` is
+/// clamped to [`REORG_DEMOTE_LIMIT`]; `cursor` is the `nextCursor` a previous
+/// answer handed back. `None` for anything else.
+pub fn parse_reorg_trigger(raw: &[u8]) -> Option<ReorgTrigger> {
     let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
-    let from = v.get("fromHeight")?.as_u64().filter(|h| *h > 0)?;
+    let from_height = v.get("fromHeight")?.as_u64().filter(|h| *h > 0)?;
+    let to_height = match v.get("toHeight") {
+        None | Some(serde_json::Value::Null) => from_height,
+        Some(t) => t.as_u64().filter(|t| *t >= from_height)?,
+    };
     let limit = v
         .get("limit")
         .and_then(serde_json::Value::as_u64)
         .filter(|l| *l > 0)
         .map_or(REORG_DEMOTE_LIMIT, |l| l.min(REORG_DEMOTE_LIMIT));
-    Some((from, limit))
+    let after = match v.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(c) => Some(overlay_discovery::pot::reorg::RowKey {
+            height: c.get("height")?.as_u64()?,
+            rowid: c.get("rowid")?.as_i64()?,
+        }),
+    };
+    Some(ReorgTrigger { from_height, to_height, limit, after })
 }
 
-/// `POST /internal/reorg` (bearer `INTERNAL_TOKEN`): run [`handle_reorg`]
-/// from a named height, for a reorg the detector could not have seen (the
-/// 2026-09-07 rows at 965771 pre-date this build, and the sweep window has
-/// long moved past them). Demotion only: every row goes back to SEEN and its
-/// spender loses the proof latch; the confirm arm re-proves each against
-/// the canonical chain on the next pass. Bounded per call (the body's
-/// `limit`, at most [`REORG_DEMOTE_LIMIT`]); call again to drain. Counted
-/// under the same counters as a detected reorg.
+/// `POST /internal/reorg` (bearer `INTERNAL_TOKEN`): the operator's
+/// EVIDENCE-DRIVEN demotion over a height window (round-2 review M1), for
+/// rows a past reorg left behind (the 2026-09-07 rows at 965771 pre-date
+/// this build). Every confirmed row anchored in `[fromHeight, toHeight]`
+/// has its stored spender proof re-verified against chaintracks: a REFUTED
+/// one is demoted (guarded) and unlatched, a proofless one is demoted blind
+/// (nothing to verify; the courier arm re-judges it), a canonical one is
+/// untouched and counted. Bounded per call; `drained` says the window is
+/// exhausted, else pass `nextCursor` back as `cursor`. No header source:
+/// 503, nothing demoted.
 ///
-/// [`handle_reorg`]: crate::proof_fetcher::handle_reorg
+/// The heal for the event: `{"fromHeight": 965771, "toHeight": 965771}`.
 pub async fn internal_reorg(
     mut req: Request,
     env: &Env,
@@ -243,35 +319,67 @@ pub async fn internal_reorg(
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
-    let Some((from, limit)) = parse_reorg_trigger(&raw) else {
+    let Some(trigger) = parse_reorg_trigger(&raw) else {
         return Response::error(
-            "body must be {\"fromHeight\": <positive integer>, \"limit\"?: <positive integer>}",
+            "body must be {\"fromHeight\": <positive integer>, \"toHeight\"?: <integer >= fromHeight>, \"limit\"?: <positive integer>, \"cursor\"?: {\"height\", \"rowid\"}}",
             400,
         );
     };
-    let demotion = crate::proof_fetcher::handle_reorg(pot_storage, from, limit).await;
+    let tracker = crate::lookup_service_chain_tracker(env);
+    if tracker.is_none() {
+        console_log!("POST /internal/reorg -> 503 (no header source configured; nothing demoted)");
+        let resp = Response::from_json(&serde_json::json!({
+            "ok": false,
+            "error": "no header source configured; nothing demoted",
+        }))?;
+        return Ok(resp.with_status(503));
+    }
+    let pass = crate::reorg_sweep::handle_reorg(
+        pot_storage,
+        tracker.as_deref(),
+        trigger.from_height,
+        trigger.to_height,
+        trigger.after,
+        trigger.limit,
+    )
+    .await;
     if let Some(db) = ops_db {
         crate::ops::bump_counter(db, crate::ops::COUNTER_CHAIN_REORGS_DETECTED, 1).await;
-        if demotion.demoted > 0 {
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, demotion.demoted as u64).await;
-        }
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, (pass.stale + pass.demoted_blind) as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, pass.faults as u64).await;
     }
     console_log!(
-        "POST /internal/reorg fromHeight={from} limit={limit} -> 200 (demoted={} unlatched={} errors={})",
-        demotion.demoted,
-        demotion.unlatched,
-        demotion.errors
+        "POST /internal/reorg {}..={} limit={} -> 200 (scanned={} standing={} demoted={} demoted_blind={} demote_missed={} faults={} errors={} drained={})",
+        trigger.from_height,
+        trigger.to_height,
+        trigger.limit,
+        pass.scanned,
+        pass.standing,
+        pass.stale,
+        pass.demoted_blind,
+        pass.demote_missed,
+        pass.faults,
+        pass.errors,
+        pass.exhausted
     );
     // a demotion is a served-state change: ship the pot-changed webhook
     crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
     Response::from_json(&serde_json::json!({
         "ok": true,
-        "fromHeight": from,
-        "limit": limit,
-        "demoted": demotion.demoted,
-        "unlatched": demotion.unlatched,
-        "errors": demotion.errors,
-        "drained": (demotion.demoted as u64) < limit,
+        "fromHeight": trigger.from_height,
+        "toHeight": trigger.to_height,
+        "limit": trigger.limit,
+        "scanned": pass.scanned,
+        "standing": pass.standing,
+        "demoted": pass.stale,
+        "demotedBlind": pass.demoted_blind,
+        "demoteMissed": pass.demote_missed,
+        "faults": pass.faults,
+        "errors": pass.errors,
+        "drained": pass.exhausted,
+        "nextCursor": if pass.exhausted { serde_json::Value::Null } else {
+            pass.next_cursor.map_or(serde_json::Value::Null, |c| serde_json::json!({ "height": c.height, "rowid": c.rowid }))
+        },
     }))
 }
 
@@ -327,18 +435,66 @@ mod tests {
     }
 
     #[test]
-    fn reorg_trigger_body_is_a_positive_height_with_a_clamped_limit() {
-        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":965771}"#), Some((965771, REORG_DEMOTE_LIMIT)));
-        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":965771,"limit":50}"#), Some((965771, 50)));
+    fn reorg_trigger_body_is_a_height_window_with_a_clamped_limit_and_a_cursor() {
+        let t = |raw: &str| parse_reorg_trigger(raw.as_bytes());
         assert_eq!(
-            parse_reorg_trigger(br#"{"fromHeight":965771,"limit":100000}"#),
-            Some((965771, REORG_DEMOTE_LIMIT)),
-            "the per-call bound holds"
+            t(r#"{"fromHeight":965771}"#),
+            Some(ReorgTrigger { from_height: 965771, to_height: 965771, limit: REORG_DEMOTE_LIMIT, after: None }),
+            "toHeight defaults to fromHeight: the event's heal is one height"
         );
-        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":965771,"limit":0}"#), Some((965771, REORG_DEMOTE_LIMIT)));
-        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":0}"#), None);
-        assert_eq!(parse_reorg_trigger(br#"{"fromHeight":-1}"#), None);
-        assert_eq!(parse_reorg_trigger(br#"{"height":965771}"#), None);
-        assert_eq!(parse_reorg_trigger(b"nope"), None);
+        assert_eq!(
+            t(r#"{"fromHeight":965771,"toHeight":965773,"limit":50,"cursor":{"height":965772,"rowid":40}}"#),
+            Some(ReorgTrigger {
+                from_height: 965771,
+                to_height: 965773,
+                limit: 50,
+                after: Some(overlay_discovery::pot::reorg::RowKey { height: 965772, rowid: 40 }),
+            })
+        );
+        assert_eq!(t(r#"{"fromHeight":965771,"limit":100000}"#).unwrap().limit, REORG_DEMOTE_LIMIT, "the per-call bound holds");
+        assert_eq!(t(r#"{"fromHeight":965771,"limit":0}"#).unwrap().limit, REORG_DEMOTE_LIMIT);
+        assert_eq!(t(r#"{"fromHeight":965771,"toHeight":null,"cursor":null}"#).unwrap().to_height, 965771);
+        assert_eq!(t(r#"{"fromHeight":965771,"toHeight":965770}"#), None, "a window cannot end below its start");
+        assert_eq!(t(r#"{"fromHeight":965771,"cursor":{"height":1}}"#), None, "a cursor needs both keys");
+        assert_eq!(t(r#"{"fromHeight":0}"#), None);
+        assert_eq!(t(r#"{"fromHeight":-1}"#), None);
+        assert_eq!(t(r#"{"height":965771}"#), None);
+        assert_eq!(t("nope"), None);
+    }
+
+    /// Review H3: the detector's pins run through the REAL producer path,
+    /// the parsed webhook body (`{"height", "hash"}`), the per-height record
+    /// and the classification, on the 2026-09-07 sequence.
+    #[tokio::test]
+    async fn the_detector_runs_through_the_parsed_webhook_body() {
+        use overlay_discovery::pot::reorg::TipAnnounce;
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        const ORPHAN: &str = "0000000000000000153E10F465DBA9697E4BDE364FDF3A3224A736B019FFBFB1";
+        const CANON: &str = "00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d";
+        const NEXT: &str = "0000000000000000014d2556f2b0a0f1c1a0b9b8e7f6d5c4b3a2918070605040";
+        let store = MemoryPotStorage::new();
+        let feed = |raw: String| {
+            let store = &store;
+            async move {
+                let height = parse_tip_changed(raw.as_bytes()).expect("a height");
+                let hash = parse_tip_changed_hash(raw.as_bytes());
+                match hash {
+                    Some(h) => detect_announce(store, height, &h).await,
+                    None => None,
+                }
+            }
+        };
+        // 22:39:20Z the 34 MB block at 965771 (the orphan) announced
+        assert_eq!(feed(format!(r#"{{"height":965771,"hash":"{ORPHAN}"}}"#)).await, Some(TipAnnounce::Extends));
+        // the canonical 965771 announced at the same height: THE reorg producer
+        assert_eq!(feed(format!(r#"{{"height":965771,"hash":"{CANON}"}}"#)).await, Some(TipAnnounce::Reorg { from: 965771 }));
+        // the same announce again (another isolate, a retry): a repeat
+        assert_eq!(feed(format!(r#"{{"height":965771,"hash":"{CANON}"}}"#)).await, Some(TipAnnounce::Repeat));
+        // the chain extends
+        assert_eq!(feed(format!(r#"{{"height":965772,"hash":"{NEXT}"}}"#)).await, Some(TipAnnounce::Extends));
+        // two webhook tasks landing out of order: 965770 after 965772 is an OLD header, never a reorg
+        assert_eq!(feed(format!(r#"{{"height":965770,"hash":"{}"}}"#, "ab".repeat(32))).await, Some(TipAnnounce::Old));
+        // an older announcer's hash-less body: nothing to compare, no detection
+        assert_eq!(feed(r#"{"height":965773}"#.to_string()).await, None);
     }
 }

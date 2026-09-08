@@ -1428,6 +1428,10 @@ impl RevealStorage for D1RevealStorage {
 /// deserialize.
 #[derive(Deserialize, Default)]
 struct PotRow {
+    /// `rowid AS rowKey`: selected ONLY by the windowed-walk pages (the
+    /// cursor); every other SELECT leaves it `None`.
+    #[serde(rename = "rowKey", default)]
+    row_key: Option<f64>,
     txid: String,
     #[serde(rename = "outputIndex")]
     output_index: f64,
@@ -1571,8 +1575,8 @@ pub(crate) const POT_BEEF_ADMIT_WRITE_SQL: &str =
 /// verified proof is chain truth and must never stay suppressed by a
 /// stale supersession verdict, e.g. after a reorg).
 pub(crate) const POT_BEEF_VERIFIED_WRITE_SQL: &str =
-    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified, structurally_unprovable) \
-     VALUES (?, ?, ?, 1, 1, NULL)";
+    "INSERT OR REPLACE INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified, structurally_unprovable, proofHeight) \
+     VALUES (?, ?, ?, 1, 1, NULL, ?)";
 
 /// SHIPPED verified-latch flip ([`D1PotStorage::mark_pot_beef_proven`]) —
 /// no byte rewrite, no createdAt touch. Clears the #2b retirement latch
@@ -1922,6 +1926,11 @@ struct RefundRawRow {
     refund_raw_hex: Option<String>,
 }
 
+/// A nullable numeric bind (NULL is the SQL absence; D1 refuses `undefined`).
+fn opt_f64(v: Option<f64>) -> crate::d1::QVal {
+    v.map_or(crate::d1::QVal::Null, crate::d1::QVal::Float)
+}
+
 fn pot_err(e: String) -> PotStorageError {
     PotStorageError::Database(e)
 }
@@ -2150,14 +2159,20 @@ pub fn confirm_spend_cas_sql() -> &'static str {
      RETURNING txid"
 }
 
-// ── bsv-low M19 R2 (2026-09-08): the reorg reconcile's D1 statements ───────
+// ── bsv-low M19 R2 (2026-09-08, round 2): the reorg reconcile's D1 statements ──
 //
 // Loop 8's double reorg left 158 rows confirmed at spentHeight 965771 from
 // the orphan's MINED callbacks. These are the reference's `handleReorg` +
 // revalidation sweep in SQL. Every writer is GUARDED (the #301 CAS idiom:
 // the pointer must still be the spender the caller's proof named, and the
 // row must be confirmed), every demotion touches ONLY the two confirmation
-// columns, and every statement is pinned against real SQLite below.
+// columns, every read is index-served (EXPLAIN-pinned under real SQLite
+// WITHOUT ANALYZE, review H1: D1 never runs it, so a plan that needs stats
+// is a plan D1 never takes), and every window walk carries a cursor
+// (review H3b). The planner-proofing `+` on the flag terms
+// (`+spent = 1`) hides them from the index chooser so a by-spender lookup
+// can only ride `idx_pot_spending` (`(spent, spentConfirmed)` was the
+// stat-less planner's pick: every confirmed row read per callback).
 
 /// The hash the block-event pass acted on at a height (`None` = never).
 pub fn header_seen_prior_sql() -> &'static str {
@@ -2175,24 +2190,43 @@ pub fn header_seen_upsert_sql() -> &'static str {
      ON CONFLICT(height) DO UPDATE SET hash = excluded.hash, seenAt = excluded.seenAt"
 }
 
-/// The revalidation sweep's candidates: confirmed rows anchored inside a
-/// height window, NEWEST first, bounded. Backed by idx_pot_records_confirmed_height.
-/// Bind order: min_height, max_height.
-pub fn confirmed_in_heights_sql(limit: u64) -> String {
+/// The windowed walk's HEAD page: confirmed rows anchored in `lo..=hi`,
+/// newest first by `(spentHeight DESC, rowid DESC)`, the row key selected
+/// as `rowKey`. Backed by `idx_pot_records_confirmed_height` for the search
+/// AND the order (rowid is the index's implicit last key). Bind order: lo, hi.
+pub fn confirmed_window_head_sql(limit: u64) -> String {
     format!(
-        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
-         WHERE spent = 1 AND spentConfirmed = 1 AND spentHeight BETWEEN ? AND ? \
-         ORDER BY spentHeight DESC, txid ASC, outputIndex ASC LIMIT {limit}"
+        "SELECT rowid AS rowKey, {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE spentConfirmed = 1 AND spentHeight BETWEEN ? AND ? \
+         ORDER BY spentHeight DESC, rowid DESC LIMIT {limit}"
+    )
+}
+
+/// The walk's continuation at the cursor's OWN height: the rows below the
+/// cursor's rowid there (the head page then continues at height - 1).
+/// Bind order: height, rowid.
+pub fn confirmed_window_same_height_sql(limit: u64) -> String {
+    format!(
+        "SELECT rowid AS rowKey, {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE spentConfirmed = 1 AND spentHeight = ? AND rowid < ? \
+         ORDER BY rowid DESC LIMIT {limit}"
     )
 }
 
 /// Confirmed rows pointed at a spender (the re-anchor / `reorg_unmined`
-/// lookup). Backed by idx_pot_spending.
+/// lookup). Planner-proof: only `idx_pot_spending` is usable.
 pub fn confirmed_by_spender_sql() -> String {
     format!(
         "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
-         WHERE spendingTxid = ? AND spent = 1 AND spentConfirmed = 1"
+         WHERE spendingTxid = ? AND +spent = 1 AND +spentConfirmed = 1"
     )
+}
+
+/// Unconfirmed rows pointed at a spender (the push consumer's confirm
+/// lookup, every MINED callback). Planner-proof: only `idx_pot_spending`.
+pub fn unconfirmed_by_spender_sql() -> &'static str {
+    "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
+     WHERE spendingTxid = ? AND +spent = 1 AND +spentConfirmed = 0"
 }
 
 /// GUARDED demotion of one row back to SEEN. Bind order: txid, outputIndex,
@@ -2201,19 +2235,6 @@ pub fn demote_confirmed_cas_sql() -> &'static str {
     "UPDATE pot_records SET spentConfirmed = 0, spentHeight = NULL \
      WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spentConfirmed = 1 \
      RETURNING txid"
-}
-
-/// Bulk demotion for a detected reorg: the NEWEST `limit` confirmed rows at
-/// or above a height, demoted; RETURNING the rows as they now read. Bind
-/// order: from_height.
-pub fn demote_confirmed_from_height_sql(limit: u64) -> String {
-    format!(
-        "UPDATE pot_records SET spentConfirmed = 0, spentHeight = NULL \
-         WHERE rowid IN (SELECT rowid FROM pot_records \
-                          WHERE spent = 1 AND spentConfirmed = 1 AND spentHeight >= ? \
-                          ORDER BY spentHeight DESC, txid ASC, outputIndex ASC LIMIT {limit}) \
-         RETURNING {POT_RECORD_COLUMNS}"
-    )
 }
 
 /// GUARDED re-anchor: move a confirmed row's height to the block a pushed,
@@ -2228,6 +2249,68 @@ pub fn reanchor_confirmed_cas_sql() -> &'static str {
 /// Drop the VERIFIED latch on a stored pot BEEF (bytes untouched).
 pub fn unlatch_pot_beef_sql() -> &'static str {
     "UPDATE pot_beefs SET proof_verified = 0 WHERE txid = ?"
+}
+
+/// The named walk's persisted state. Bind order: name.
+pub fn sweep_state_read_sql() -> &'static str {
+    "SELECT lo, hi, cursorHeight, cursorRowid, exhausted FROM reorg_sweep_state WHERE name = ?"
+}
+
+/// Upsert the named walk's state. Bind order: name, lo, hi, cursorHeight,
+/// cursorRowid, exhausted, updatedAt.
+pub fn sweep_state_upsert_sql() -> &'static str {
+    "INSERT INTO reorg_sweep_state (name, lo, hi, cursorHeight, cursorRowid, exhausted, updatedAt) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) \
+     ON CONFLICT(name) DO UPDATE SET lo = excluded.lo, hi = excluded.hi, \
+         cursorHeight = excluded.cursorHeight, cursorRowid = excluded.cursorRowid, \
+         exhausted = excluded.exhausted, updatedAt = excluded.updatedAt"
+}
+
+/// The pot_beefs leg's HEAD page: VERIFIED rows whose own bump is anchored
+/// in `lo..=hi`, newest first, keyed. Backed by `idx_pot_beefs_verified_height`.
+/// Bind order: lo, hi.
+pub fn verified_pot_beefs_head_sql(limit: u64) -> String {
+    format!(
+        "SELECT rowid AS rowKey, proofHeight, txid, hex(beef) AS beef FROM pot_beefs \
+         WHERE proof_verified = 1 AND proofHeight BETWEEN ? AND ? \
+         ORDER BY proofHeight DESC, rowid DESC LIMIT {limit}"
+    )
+}
+
+/// The pot_beefs leg's continuation at the cursor's height. Bind order:
+/// height, rowid.
+pub fn verified_pot_beefs_same_height_sql(limit: u64) -> String {
+    format!(
+        "SELECT rowid AS rowKey, proofHeight, txid, hex(beef) AS beef FROM pot_beefs \
+         WHERE proof_verified = 1 AND proofHeight = ? AND rowid < ? \
+         ORDER BY rowid DESC LIMIT {limit}"
+    )
+}
+
+/// The verified-latch flip WITH the anchor height (review M4): `proofHeight
+/// = COALESCE(?, proofHeight)` keeps a held anchor when the caller has none.
+/// Bind order: proofHeight (or NULL), txid.
+pub(crate) const POT_BEEF_MARK_PROVEN_AT_SQL: &str =
+    "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1, structurally_unprovable = NULL, \
+         proofHeight = COALESCE(?, proofHeight) \
+     WHERE txid = ?";
+
+/// Chunk size for the batched anchored latch flip: 3 binds per row (the
+/// CASE arm's txid + height, the IN list's txid), 99 binds per statement.
+pub(crate) const POT_BEEF_MARK_PROVEN_AT_CHUNK: usize = 33;
+
+/// Batch form of [`POT_BEEF_MARK_PROVEN_AT_SQL`]: one statement per chunk,
+/// each row's anchor by a `CASE txid` arm. Bind order: for each row (txid,
+/// proofHeight-or-NULL), then every txid again for the IN list.
+pub(crate) fn pot_beef_mark_proven_at_batch_sql(n: usize) -> String {
+    debug_assert!((1..=POT_BEEF_MARK_PROVEN_AT_CHUNK).contains(&n));
+    let arms = vec!["WHEN ? THEN COALESCE(?, proofHeight)"; n].join(" ");
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1, structurally_unprovable = NULL, \
+             proofHeight = CASE txid {arms} END \
+         WHERE txid IN ({placeholders})"
+    )
 }
 
 /// The #284 `store_record` upsert: insert-if-absent for the SPEND fields,
@@ -2707,10 +2790,7 @@ impl PotStorage for D1PotStorage {
         // spender is this txid and whose spend is still unconfirmed — the rows
         // /arc-ingest upgrades (mark_spent confirmed) once the spending tx's
         // pushed bump chaintracks-verifies. Backed by idx_pot_spending.
-        let rows: Vec<PotRow> = Query::new(
-            "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed FROM pot_records \
-             WHERE spendingTxid = ? AND spent = 1 AND spentConfirmed = 0",
-        )
+        let rows: Vec<PotRow> = Query::new(unconfirmed_by_spender_sql())
         .bind(spending_txid)
         .fetch_all(&self.db)
         .await
@@ -2756,19 +2836,163 @@ impl PotStorage for D1PotStorage {
         })
     }
 
-    async fn find_confirmed_in_heights(
+    async fn confirmed_window_page(
         &self,
-        min_height: u64,
-        max_height: u64,
+        lo: u64,
+        hi: u64,
+        after: Option<overlay_discovery::pot::reorg::RowKey>,
         limit: u64,
-    ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let rows: Vec<PotRow> = Query::new(confirmed_in_heights_sql(limit))
-            .bind(min_height as f64)
-            .bind(max_height as f64)
+    ) -> Result<Vec<(overlay_discovery::pot::reorg::RowKey, PotRecord)>, PotStorageError> {
+        use overlay_discovery::pot::reorg::RowKey;
+        fn keyed(rows: Vec<PotRow>, out: &mut Vec<(RowKey, PotRecord)>) {
+            for r in rows {
+                let key = RowKey {
+                    height: r.spent_height.unwrap_or(0.0) as u64,
+                    rowid: r.row_key.unwrap_or(0.0) as i64,
+                };
+                out.push((key, r.into_record()));
+            }
+        }
+        let mut out = Vec::new();
+        if limit == 0 || lo > hi {
+            return Ok(out);
+        }
+        let (below_hi, remaining) = match after {
+            Some(a) => {
+                let rows: Vec<PotRow> = Query::new(confirmed_window_same_height_sql(limit))
+                    .bind(a.height as f64)
+                    .bind(a.rowid as f64)
+                    .fetch_all(&self.db)
+                    .await
+                    .map_err(pot_err)?;
+                keyed(rows, &mut out);
+                let remaining = limit.saturating_sub(out.len() as u64);
+                if remaining == 0 || a.height <= lo {
+                    return Ok(out);
+                }
+                (a.height - 1, remaining)
+            }
+            None => (hi, limit),
+        };
+        let rows: Vec<PotRow> = Query::new(confirmed_window_head_sql(remaining))
+            .bind(lo as f64)
+            .bind(below_hi as f64)
             .fetch_all(&self.db)
             .await
             .map_err(pot_err)?;
-        Ok(rows.into_iter().map(PotRow::into_record).collect())
+        keyed(rows, &mut out);
+        Ok(out)
+    }
+
+    async fn read_sweep_state(
+        &self,
+        name: &str,
+    ) -> Result<Option<overlay_discovery::pot::reorg::SweepState>, PotStorageError> {
+        #[derive(serde::Deserialize)]
+        struct StateRow {
+            lo: f64,
+            hi: f64,
+            #[serde(rename = "cursorHeight", default)]
+            cursor_height: Option<f64>,
+            #[serde(rename = "cursorRowid", default)]
+            cursor_rowid: Option<f64>,
+            #[serde(default)]
+            exhausted: f64,
+        }
+        let row: Option<StateRow> = Query::new(sweep_state_read_sql())
+            .bind(name)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(row.map(|r| overlay_discovery::pot::reorg::SweepState {
+            lo: r.lo as u64,
+            hi: r.hi as u64,
+            cursor: match (r.cursor_height, r.cursor_rowid) {
+                (Some(h), Some(rowid)) => Some(overlay_discovery::pot::reorg::RowKey {
+                    height: h as u64,
+                    rowid: rowid as i64,
+                }),
+                _ => None,
+            },
+            exhausted: r.exhausted != 0.0,
+        }))
+    }
+
+    async fn write_sweep_state(
+        &self,
+        name: &str,
+        state: &overlay_discovery::pot::reorg::SweepState,
+    ) -> Result<(), PotStorageError> {
+        Query::new(sweep_state_upsert_sql())
+            .bind(name)
+            .bind(state.lo as f64)
+            .bind(state.hi as f64)
+            .bind(opt_f64(state.cursor.map(|c| c.height as f64)))
+            .bind(opt_f64(state.cursor.map(|c| c.rowid as f64)))
+            .bind(if state.exhausted { 1.0 } else { 0.0 })
+            .bind(current_unix_seconds_i64() as f64)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(())
+    }
+
+    async fn verified_pot_beefs_page(
+        &self,
+        lo: u64,
+        hi: u64,
+        after: Option<overlay_discovery::pot::reorg::RowKey>,
+        limit: u64,
+    ) -> Result<Vec<(overlay_discovery::pot::reorg::RowKey, String, Vec<u8>)>, PotStorageError> {
+        use overlay_discovery::pot::reorg::RowKey;
+        #[derive(serde::Deserialize)]
+        struct KeyedBeefRow {
+            #[serde(rename = "rowKey")]
+            row_key: f64,
+            #[serde(rename = "proofHeight", default)]
+            proof_height: Option<f64>,
+            txid: String,
+            beef: Option<String>,
+        }
+        fn keyed(rows: Vec<KeyedBeefRow>, out: &mut Vec<(RowKey, String, Vec<u8>)>) {
+            for r in rows {
+                let Some(beef) = decode_pot_beef_hex(r.beef) else { continue };
+                let key = RowKey {
+                    height: r.proof_height.unwrap_or(0.0) as u64,
+                    rowid: r.row_key as i64,
+                };
+                out.push((key, r.txid, beef));
+            }
+        }
+        let mut out = Vec::new();
+        if limit == 0 || lo > hi {
+            return Ok(out);
+        }
+        let (below_hi, remaining) = match after {
+            Some(a) => {
+                let rows: Vec<KeyedBeefRow> = Query::new(verified_pot_beefs_same_height_sql(limit))
+                    .bind(a.height as f64)
+                    .bind(a.rowid as f64)
+                    .fetch_all(&self.db)
+                    .await
+                    .map_err(pot_err)?;
+                keyed(rows, &mut out);
+                let remaining = limit.saturating_sub(out.len() as u64);
+                if remaining == 0 || a.height <= lo {
+                    return Ok(out);
+                }
+                (a.height - 1, remaining)
+            }
+            None => (hi, limit),
+        };
+        let rows: Vec<KeyedBeefRow> = Query::new(verified_pot_beefs_head_sql(remaining))
+            .bind(lo as f64)
+            .bind(below_hi as f64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        keyed(rows, &mut out);
+        Ok(out)
     }
 
     async fn find_confirmed_by_spending_txid(
@@ -2802,23 +3026,6 @@ impl PotStorage for D1PotStorage {
             crate::pot_changes::note(txid, output_index);
         }
         Ok(hit.is_some())
-    }
-
-    async fn demote_confirmed_from_height(
-        &self,
-        from_height: u64,
-        limit: u64,
-    ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let rows: Vec<PotRow> = Query::new(demote_confirmed_from_height_sql(limit))
-            .bind(from_height as f64)
-            .fetch_all(&self.db)
-            .await
-            .map_err(pot_err)?;
-        let demoted: Vec<PotRecord> = rows.into_iter().map(PotRow::into_record).collect();
-        for r in &demoted {
-            crate::pot_changes::note(&r.txid, r.output_index);
-        }
-        Ok(demoted)
     }
 
     async fn reanchor_confirmed_for_spender(
@@ -2947,13 +3154,48 @@ impl PotStorage for D1PotStorage {
         if !pot_beef_has_proof(txid, new_beef) {
             return Ok(());
         }
+        // review M4: the anchor the just-verified bump names, derived from
+        // the bytes (the sweep's pot_beefs leg windows by it)
+        let proof_height =
+            overlay_discovery::pot::storage::pot_beef_bump_height(txid, new_beef).map(|h| h as f64);
         Query::new(POT_BEEF_VERIFIED_WRITE_SQL)
             .bind(txid)
             .bind(new_beef)
             .bind(current_unix_seconds_i64())
+            .bind(opt_f64(proof_height))
             .execute(&self.db)
             .await
             .map_err(pot_err)
+    }
+
+    async fn mark_pot_beef_proven_at(
+        &self,
+        txid: &str,
+        height: Option<u64>,
+    ) -> Result<(), PotStorageError> {
+        Query::new(POT_BEEF_MARK_PROVEN_AT_SQL)
+            .bind(opt_f64(height.map(|h| h as f64)))
+            .bind(txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
+    }
+
+    async fn mark_pot_beefs_proven_at(
+        &self,
+        rows: &[(String, Option<u64>)],
+    ) -> Result<(), PotStorageError> {
+        for chunk in rows.chunks(POT_BEEF_MARK_PROVEN_AT_CHUNK) {
+            let mut q = Query::new(pot_beef_mark_proven_at_batch_sql(chunk.len()));
+            for (txid, height) in chunk {
+                q = q.bind(txid.as_str()).bind(opt_f64(height.map(|h| h as f64)));
+            }
+            for (txid, _) in chunk {
+                q = q.bind(txid.as_str());
+            }
+            q.execute(&self.db).await.map_err(pot_err)?;
+        }
+        Ok(())
     }
 
     async fn mark_pot_beef_proven(&self, txid: &str) -> Result<(), PotStorageError> {
@@ -6475,7 +6717,7 @@ mod tests {
         // The verifying compact write latches BOTH flags → drops out.
         conn.execute(
             POT_BEEF_VERIFIED_WRITE_SQL,
-            rusqlite::params!["fakebumped", vec![0xbeu8, 0xef, 0x01], 200i64],
+            rusqlite::params!["fakebumped", vec![0xbeu8, 0xef, 0x01], 200i64, Option::<i64>::None],
         )
         .unwrap();
         assert_eq!(candidates(0), vec!["proofless".to_string()]);
@@ -6740,7 +6982,7 @@ mod tests {
             .unwrap();
         conn.execute(
             POT_BEEF_VERIFIED_WRITE_SQL,
-            rusqlite::params![settle_txid, vec![0xbeu8, 0xef, 0x01], 200i64],
+            rusqlite::params![settle_txid, vec![0xbeu8, 0xef, 0x01], 200i64, Option::<i64>::None],
         )
         .unwrap();
         assert_eq!(
@@ -12944,6 +13186,16 @@ mod tests {
     /// prior/max answers, the guarded single-row demotion, the bounded
     /// newest-first bulk demotion (RETURNING the rows), the guarded
     /// re-anchor, the latch drop, and the two query plans on the new indexes.
+    /// Round 2 (review H1): EVERY statement the reconcile added or touched,
+    /// executed on the shipped migrations under real SQLite and EXPLAIN-pinned
+    /// index-served with NO table walk, measured WITHOUT ANALYZE (D1 never
+    /// runs it; `sqlite_stat1` must not exist here either, and the pin
+    /// asserts that). The round-1 by-spender shape planned through
+    /// `idx_pot_spent_unconfirmed (spent=? AND spentConfirmed=?)` on a
+    /// stat-less table (every confirmed row read per MINED callback: the
+    /// 2026-09-07 overload class on the hottest path); the `+` on the flag
+    /// terms leaves the planner exactly one index, and the contrast is
+    /// asserted below.
     #[test]
     fn reorg_reconcile_statements_real_sqlite() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
@@ -12956,126 +13208,101 @@ mod tests {
                 );
             }
         }
-        // ── the header record ──
-        let prior = |h: i64| -> Option<String> {
-            conn.query_row(header_seen_prior_sql(), [h], |r| r.get::<_, String>(0))
-                .ok()
-        };
-        let max = || -> Option<i64> {
-            conn.query_row(header_seen_max_sql(), [], |r| r.get::<_, Option<i64>>(0))
+        let stats: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stats, 0, "measured without ANALYZE, as D1 runs");
+        let plan = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap_or_else(|e| panic!("{e}\n{sql}"));
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
                 .unwrap()
         };
+        let index_served = |name: &str, lines: &[String], must: &str| {
+            let joined = lines.join("\n");
+            assert!(lines.iter().any(|l| l.contains(must)), "{name}: expected `{must}` in the plan:\n{joined}");
+            assert!(!lines.iter().any(|l| l.starts_with("SCAN ")), "{name}: a table walk:\n{joined}");
+            assert!(!lines.iter().any(|l| l.contains("TEMP B-TREE")), "{name}: a temp sort:\n{joined}");
+        };
+        let t = |s: &str| rusqlite::types::Value::Text(s.to_string());
+        let n = |v: i64| rusqlite::types::Value::Integer(v);
+
+        // ── the header record ──
+        index_served("header prior", &plan(header_seen_prior_sql(), &[n(965771)]), "SEARCH chain_headers_seen USING INTEGER PRIMARY KEY (rowid=?)");
+        index_served("header max", &plan(header_seen_max_sql(), &[]), "SEARCH chain_headers_seen");
+        let prior = |h: i64| -> Option<String> { conn.query_row(header_seen_prior_sql(), [h], |r| r.get::<_, String>(0)).ok() };
+        let max = || -> Option<i64> { conn.query_row(header_seen_max_sql(), [], |r| r.get::<_, Option<i64>>(0)).unwrap() };
         assert_eq!(prior(965771), None);
         assert_eq!(max(), None, "an empty table answers NULL, never 0");
-        conn.execute(
-            header_seen_upsert_sql(),
-            rusqlite::params![965771i64, "153e10f4orphan", 1i64],
-        )
-        .unwrap();
-        conn.execute(
-            header_seen_upsert_sql(),
-            rusqlite::params![965772i64, "14d2556f", 2i64],
-        )
-        .unwrap();
+        conn.execute(header_seen_upsert_sql(), rusqlite::params![965771i64, "153e10f4orphan", 1i64]).unwrap();
+        conn.execute(header_seen_upsert_sql(), rusqlite::params![965772i64, "14d2556f", 2i64]).unwrap();
         assert_eq!(prior(965771).as_deref(), Some("153e10f4orphan"));
         assert_eq!(max(), Some(965772));
-        // the replacement at 965771 overwrites the hash (ON CONFLICT)
-        conn.execute(
-            header_seen_upsert_sql(),
-            rusqlite::params![965771i64, "1de5aa96canonical", 3i64],
-        )
-        .unwrap();
-        assert_eq!(prior(965771).as_deref(), Some("1de5aa96canonical"));
+        conn.execute(header_seen_upsert_sql(), rusqlite::params![965771i64, "1de5aa96canonical", 3i64]).unwrap();
+        assert_eq!(prior(965771).as_deref(), Some("1de5aa96canonical"), "the replacement overwrites (ON CONFLICT)");
 
-        // ── confirmed rows at heights 965770..=965773 + one unconfirmed ──
+        // ── confirmed rows at 965770..=965773 (two at 965771) + one unconfirmed ──
         let ins = "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spentHeight, \
                     spenderFinal, settleSigners, verdict, verdictTxid) VALUES (?, 0, 1, ?, ?, ?, 1, 'coop', 'winner-a', ?)";
         for (pot, spender, height) in [
             ("p1", "s1", 965770i64),
             ("p2", "s2", 965771),
+            ("p2b", "s2b", 965771),
             ("p3", "s3", 965772),
             ("p4", "s4", 965773),
         ] {
-            conn.execute(ins, rusqlite::params![pot, spender, 1i64, height, spender])
-                .unwrap();
+            conn.execute(ins, rusqlite::params![pot, spender, 1i64, height, spender]).unwrap();
         }
-        conn.execute(
-            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) VALUES ('p5', 0, 1, 's5', 0)",
-            [],
-        )
-        .unwrap();
-        for s in ["s1", "s2", "s3", "s4"] {
-            conn.execute(
-                "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) VALUES (?, x'01', 1, 1, 1)",
-                [s],
-            )
-            .unwrap();
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) VALUES ('p5', 0, 1, 's5', 0)", []).unwrap();
+        for s in ["s1", "s2", "s2b", "s3", "s4"] {
+            conn.execute("INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) VALUES (?, x'01', 1, 1, 1)", [s]).unwrap();
         }
 
-        // ── the sweep window: inside the range, newest first, bounded ──
-        let window = |lo: i64, hi: i64, limit: u64| -> Vec<(String, i64)> {
-            let mut stmt = conn.prepare(&confirmed_in_heights_sql(limit)).unwrap();
-            stmt.query_map([lo, hi], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>("spentHeight")?))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-        };
-        assert_eq!(
-            window(965771, 965773, 10),
-            vec![("p4".into(), 965773), ("p3".into(), 965772), ("p2".into(), 965771)]
-        );
-        assert_eq!(window(965771, 965773, 1), vec![("p4".into(), 965773)]);
-        // the plan uses the new index (never a full walk of pot_records)
-        let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", confirmed_in_heights_sql(10)))
-            .unwrap()
-            .query_map([965771i64, 965773i64], |r| r.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(|l| l.contains("idx_pot_records_confirmed_height")),
-            "the sweep window must ride idx_pot_records_confirmed_height: {plan:?}"
-        );
-        // The index serves the search and the height order; a temp B-tree may
-        // remain for the tie-break terms (txid, outputIndex) only, never for
-        // the whole ORDER BY (that would be a sort over every confirmed row).
-        assert!(
-            !plan.iter().any(|l| l.contains("TEMP B-TREE FOR ORDER BY")),
-            "the composite index must serve the height order, no full temp sort: {plan:?}"
-        );
-        let plan: Vec<String> = conn
-            .prepare("EXPLAIN QUERY PLAN SELECT gameId FROM result_markers_v2 WHERE gameId IN (?, ?)")
-            .unwrap()
-            .query_map(["a", "b"], |r| r.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(|l| l.contains("idx_result_markers_v2_gameId")),
-            "the gameId lookup must ride idx_result_markers_v2_gameId: {plan:?}"
-        );
-
-        // ── the confirmed-by-spender lookup ──
-        let by_spender = |s: &str| -> Vec<String> {
-            conn.prepare(&confirmed_by_spender_sql())
+        // ── the windowed walk: head + same-height continuation, index-ordered ──
+        index_served("window head", &plan(&confirmed_window_head_sql(10), &[n(965771), n(965773)]), "USING INDEX idx_pot_records_confirmed_height");
+        index_served("window same height", &plan(&confirmed_window_same_height_sql(10), &[n(965771), n(99)]), "USING INDEX idx_pot_records_confirmed_height");
+        let page = |sql: &str, a: i64, b: i64| -> Vec<(String, i64, i64)> {
+            conn.prepare(sql)
                 .unwrap()
-                .query_map([s], |r| r.get::<_, String>(0))
+                .query_map([a, b], |r| Ok((r.get::<_, String>("txid")?, r.get::<_, i64>("spentHeight")?, r.get::<_, i64>("rowKey")?)))
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
         };
+        let head = page(&confirmed_window_head_sql(2), 965771, 965773);
+        assert_eq!(head.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["p4", "p3"], "newest height first");
+        let (_, h, rowid) = head[1];
+        assert_eq!(page(&confirmed_window_same_height_sql(10), h, rowid), vec![], "nothing below p3 at its height");
+        let below = page(&confirmed_window_head_sql(10), 965771, h - 1);
+        assert_eq!(below.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["p2b", "p2"], "then height - 1, newest rowid first");
+        let (_, h2, rowid2) = below[0];
+        assert_eq!(page(&confirmed_window_same_height_sql(10), h2, rowid2).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["p2"], "the cursor's own height continues below its rowid");
+
+        // ── the by-spender lookups (review H1): only idx_pot_spending ──
+        index_served("confirmed by spender", &plan(&confirmed_by_spender_sql(), &[t("s2")]), "SEARCH pot_records USING INDEX idx_pot_spending (spendingTxid=?)");
+        index_served("unconfirmed by spender", &plan(unconfirmed_by_spender_sql(), &[t("s5")]), "SEARCH pot_records USING INDEX idx_pot_spending (spendingTxid=?)");
+        // the round-1 shape: the stat-less planner takes the flag index (the trap this pins against)
+        let trap = plan(
+            &format!("SELECT {POT_RECORD_COLUMNS} FROM pot_records WHERE spendingTxid = ? AND spent = 1 AND spentConfirmed = 1"),
+            &[t("s2")],
+        );
+        assert!(trap.iter().any(|l| l.contains("idx_pot_spent_unconfirmed")), "the contrast: {trap:?}");
+        let by_spender = |s: &str| -> Vec<String> {
+            conn.prepare(&confirmed_by_spender_sql()).unwrap().query_map([s], |r| r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
         assert_eq!(by_spender("s2"), vec!["p2"]);
         assert!(by_spender("s5").is_empty(), "an unconfirmed spend is not in the confirmed lookup");
+        let unconfirmed = |s: &str| -> Vec<String> {
+            conn.prepare(unconfirmed_by_spender_sql()).unwrap().query_map([s], |r| r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(unconfirmed("s5"), vec!["p5"]);
+        assert!(unconfirmed("s2").is_empty());
 
         // ── the guarded single-row demotion ──
+        index_served("demote CAS", &plan(demote_confirmed_cas_sql(), &[t("p2"), n(0), t("s2")]), "SEARCH pot_records USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)");
         let demote = |pot: &str, spender: &str| -> bool {
-            conn.query_row(demote_confirmed_cas_sql(), rusqlite::params![pot, 0i64, spender], |r| {
-                r.get::<_, String>(0)
-            })
-            .is_ok()
+            conn.query_row(demote_confirmed_cas_sql(), rusqlite::params![pot, 0i64, spender], |r| r.get::<_, String>(0)).is_ok()
         };
         assert!(!demote("p2", "other"), "the wrong spender never demotes");
         assert!(demote("p2", "s2"));
@@ -13089,47 +13316,61 @@ mod tests {
             .unwrap();
         assert_eq!((confirmed, height), (0, None));
         assert_eq!((spent, pointer.as_str(), final_, signers.as_str(), verdict.as_str()), (1, "s2", 1, "coop", "winner-a"), "every other fact stays");
-
-        // ── the bounded bulk demotion, newest first, RETURNING the rows ──
-        let bulk = |from: i64, limit: u64| -> Vec<String> {
-            conn.prepare(&demote_confirmed_from_height_sql(limit))
-                .unwrap()
-                .query_map([from], |r| r.get::<_, String>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        assert_eq!(bulk(965771, 1), vec!["p4"], "the newest confirmed row above the height goes first");
-        assert_eq!(bulk(965771, 10), vec!["p3"], "then the rest; p2 was already demoted");
-        assert!(bulk(965771, 10).is_empty());
-        let p1: (i64, Option<i64>) = conn
-            .query_row("SELECT spentConfirmed, spentHeight FROM pot_records WHERE txid = 'p1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap();
-        assert_eq!(p1, (1, Some(965770)), "a row below the reorg height is untouched");
+        assert_eq!(unconfirmed("s2"), vec!["p2"], "a demoted row is the chaser's again");
 
         // ── the guarded re-anchor ──
-        conn.execute(
-            "UPDATE pot_records SET spentConfirmed = 1, spentHeight = 965771 WHERE txid = 'p2'",
-            [],
-        )
-        .unwrap();
+        index_served("reanchor CAS", &plan(reanchor_confirmed_cas_sql(), &[n(965773), t("p3"), n(0), t("s3")]), "SEARCH pot_records USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)");
         let reanchor = |pot: &str, spender: &str, h: i64| -> bool {
-            conn.query_row(reanchor_confirmed_cas_sql(), rusqlite::params![h, pot, 0i64, spender], |r| r.get::<_, String>(0))
-                .is_ok()
+            conn.query_row(reanchor_confirmed_cas_sql(), rusqlite::params![h, pot, 0i64, spender], |r| r.get::<_, String>(0)).is_ok()
         };
-        assert!(!reanchor("p2", "other", 965773));
-        assert!(reanchor("p2", "s2", 965773));
-        let h: i64 = conn
-            .query_row("SELECT spentHeight FROM pot_records WHERE txid = 'p2'", [], |r| r.get(0))
-            .unwrap();
+        assert!(!reanchor("p3", "other", 965773));
+        assert!(reanchor("p3", "s3", 965773));
+        let h: i64 = conn.query_row("SELECT spentHeight FROM pot_records WHERE txid = 'p3'", [], |r| r.get(0)).unwrap();
         assert_eq!(h, 965773);
-        assert!(!reanchor("p3", "s3", 965773), "a demoted (unconfirmed) row is not re-anchored");
+        assert!(!reanchor("p2", "s2", 965773), "a demoted (unconfirmed) row is not re-anchored");
 
-        // ── the latch drop keeps the bytes ──
+        // ── the latch drop keeps the bytes; the anchored latch flips ──
+        index_served("unlatch", &plan(unlatch_pot_beef_sql(), &[t("s2")]), "SEARCH pot_beefs USING INDEX sqlite_autoindex_pot_beefs_1 (txid=?)");
         conn.execute(unlatch_pot_beef_sql(), ["s2"]).unwrap();
-        let (verified, len): (i64, i64) = conn
-            .query_row("SELECT proof_verified, length(beef) FROM pot_beefs WHERE txid = 's2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap();
+        let (verified, len): (i64, i64) = conn.query_row("SELECT proof_verified, length(beef) FROM pot_beefs WHERE txid = 's2'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((verified, len), (0, 1));
+        index_served("mark proven at", &plan(POT_BEEF_MARK_PROVEN_AT_SQL, &[n(965773), t("s2")]), "SEARCH pot_beefs USING INDEX sqlite_autoindex_pot_beefs_1 (txid=?)");
+        conn.execute(POT_BEEF_MARK_PROVEN_AT_SQL, rusqlite::params![965773i64, "s2"]).unwrap();
+        let (verified, ph): (i64, Option<i64>) = conn.query_row("SELECT proof_verified, proofHeight FROM pot_beefs WHERE txid = 's2'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((verified, ph), (1, Some(965773)));
+        conn.execute(POT_BEEF_MARK_PROVEN_AT_SQL, rusqlite::params![Option::<i64>::None, "s2"]).unwrap();
+        let ph: Option<i64> = conn.query_row("SELECT proofHeight FROM pot_beefs WHERE txid = 's2'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ph, Some(965773), "a height-less flip keeps the held anchor");
+        let batch = pot_beef_mark_proven_at_batch_sql(2);
+        index_served("mark proven at (batch)", &plan(&batch, &[t("s3"), n(965772), t("s4"), Option::<i64>::None.into(), t("s3"), t("s4")]), "SEARCH pot_beefs USING INDEX sqlite_autoindex_pot_beefs_1 (txid=?)");
+        conn.execute("UPDATE pot_beefs SET proofHeight = 7 WHERE txid = 's4'", []).unwrap();
+        conn.execute(&batch, rusqlite::params!["s3", 965772i64, "s4", Option::<i64>::None, "s3", "s4"]).unwrap();
+        let ph3: Option<i64> = conn.query_row("SELECT proofHeight FROM pot_beefs WHERE txid = 's3'", [], |r| r.get(0)).unwrap();
+        let ph4: Option<i64> = conn.query_row("SELECT proofHeight FROM pot_beefs WHERE txid = 's4'", [], |r| r.get(0)).unwrap();
+        assert_eq!((ph3, ph4), (Some(965772), Some(7)), "each arm binds its own row; NULL keeps the held anchor");
+        // the verified write carries the anchor (the compact path)
+        conn.execute(POT_BEEF_VERIFIED_WRITE_SQL, rusqlite::params!["s1", vec![1u8, 2, 3], 5i64, 965770i64]).unwrap();
+        let (v, ph1): (i64, Option<i64>) = conn.query_row("SELECT proof_verified, proofHeight FROM pot_beefs WHERE txid = 's1'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((v, ph1), (1, Some(965770)));
+
+        // ── the pot_beefs leg's pages ──
+        index_served("pot_beefs head", &plan(&verified_pot_beefs_head_sql(10), &[n(965770), n(965773)]), "USING INDEX idx_pot_beefs_verified_height");
+        index_served("pot_beefs same height", &plan(&verified_pot_beefs_same_height_sql(10), &[n(965773), n(99)]), "USING INDEX idx_pot_beefs_verified_height");
+        let beef_page = |sql: &str, a: i64, b: i64| -> Vec<String> {
+            conn.prepare(sql).unwrap().query_map([a, b], |r| r.get::<_, String>("txid")).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(beef_page(&verified_pot_beefs_head_sql(10), 965770, 965773), vec!["s2", "s3", "s1"], "s2 at 965773, s3 at 965772, s1 at 965770; s4 (7) outside; s2b (NULL) in no window");
+
+        // ── the walk state ──
+        index_served("sweep state read", &plan(sweep_state_read_sql(), &[t("spenders")]), "SEARCH reorg_sweep_state USING INDEX sqlite_autoindex_reorg_sweep_state_1 (name=?)");
+        conn.execute(sweep_state_upsert_sql(), rusqlite::params!["spenders", 965771i64, 965773i64, 965772i64, 40i64, 0i64, 9i64]).unwrap();
+        conn.execute(sweep_state_upsert_sql(), rusqlite::params!["spenders", 965771i64, 965773i64, Option::<i64>::None, Option::<i64>::None, 1i64, 10i64]).unwrap();
+        let (lo, hi, ch, cr, ex): (i64, i64, Option<i64>, Option<i64>, i64) = conn
+            .query_row(sweep_state_read_sql(), ["spenders"], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap();
+        assert_eq!((lo, hi, ch, cr, ex), (965771, 965773, None, None, 1), "the upsert replaces the cursor and the exhausted bit");
+
+        // ── the gameId index (D1 item a) ──
+        index_served("gameId lookup", &plan("SELECT gameId FROM result_markers_v2 WHERE gameId IN (?, ?)", &[t("a"), t("b")]), "idx_result_markers_v2_gameId");
     }
 }

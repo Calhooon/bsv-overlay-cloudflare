@@ -27,6 +27,7 @@ pub mod tip_pass;
 pub mod proof_fetcher;
 pub mod queue;
 pub mod relatch;
+pub mod reorg_sweep;
 pub mod routes;
 pub mod submit_census;
 pub mod submit_gate;

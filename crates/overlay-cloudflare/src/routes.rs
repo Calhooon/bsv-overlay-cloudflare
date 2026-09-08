@@ -1995,12 +1995,18 @@ pub async fn arc_ingest(
             // of. Its confirmed rows go back to SEEN (guarded) and its stored
             // proof loses the latch; the confirm arm re-judges them. The
             // caller's pot-changed flush ships the demotions.
+            // Round-2 review H2: the marker is a HINT. This route's bearer is
+            // the public txid, so anyone can send `reorg_unmined` for any
+            // settle; it triggers a re-verify of the spender's STORED bump
+            // against chaintracks and demotes ONLY when chaintracks refutes
+            // it. Uncorroborated hints are counted, never acted on.
             let marker = overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref());
-            let mut demoted = 0usize;
+            let mut hint = crate::reorg_sweep::UnminedHintSummary::default();
             if marker == Some(overlay_discovery::pot::reorg::ArcadeReorgMarker::Unmined) {
-                demoted = crate::proof_fetcher::demote_spender_unmined(pot_storage, &txid).await;
+                hint = crate::reorg_sweep::unmined_hint(pot_storage, tracker, &txid).await;
                 worker::console_log!(
-                    "POST /arc-ingest txid={txid} reorg_unmined -> demoted {demoted} confirmed row(s) to SEEN"
+                    "POST /arc-ingest txid={txid} reorg_unmined hint -> demoted={} uncorroborated={} no_stored_proof={} faults={} errors={}",
+                    hint.demoted, hint.uncorroborated, hint.no_stored_proof, hint.faults, hint.errors
                 );
             }
             if let Some(db) = ops_db {
@@ -2008,9 +2014,9 @@ pub async fn arc_ingest(
                 if marker.is_some() {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1).await;
                 }
-                if demoted > 0 {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, demoted as u64).await;
-                }
+                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, hint.demoted as u64).await;
+                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_UNMINED_UNCORROBORATED, hint.uncorroborated as u64).await;
+                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, hint.faults as u64).await;
                 if crate::broadcaster::ARCADE_FATAL_STATUSES.contains(&status_upper.as_str()) {
                     crate::ops::record_arc_terminal(
                         db,

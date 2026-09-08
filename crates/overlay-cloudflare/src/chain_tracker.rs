@@ -241,8 +241,45 @@ fn root_matches_frame(
 ) -> Result<bool, ChainTrackerError> {
     match header {
         Some(h) => Ok(h.merkle_root == root),
-        None => Ok(false),
+        // bsv-low M19 round 2 (review L1): a 2xx frame with NO header is not
+        // a verdict on the root. It used to read as `Ok(false)` (refuted),
+        // which the revalidation sweep would have DEMOTED on; a fault is
+        // counted and changes nothing, and the confirm arm stays closed on
+        // it exactly as before.
+        None => Err(ChainTrackerError::InvalidResponse(
+            "ChainTracks findHeaderHexForHeight: success with no header (absent)".to_string(),
+        )),
     }
+}
+
+/// bsv-low M19 round 2 (review H3): the block HASH chaintracks holds at
+/// `height`, through the same binding/URL the tracker uses. The block-event
+/// pass reads it when the announcer's body carried none (an older
+/// chaintracks). `None` on any fault, logged by the caller.
+pub(crate) async fn chaintracks_block_hash(env: &worker::Env, height: u64) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct CtHash {
+        hash: String,
+    }
+    let base_url = env
+        .var("CHAIN_TRACKER_URL")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
+    let service = env.service("CHAINTRACKS").ok();
+    if service.is_none() && env.var("CHAIN_TRACKER_URL").is_err() {
+        return None;
+    }
+    let url = format!("{}/findHeaderHexForHeight?height={height}", base_url.trim_end_matches('/'));
+    let mut response = ct_get(url, &service, "findHeaderHexForHeight").await.ok()?;
+    if !(200..300).contains(&response.status_code()) {
+        return None;
+    }
+    let frame: ResponseFrame<CtHash> = response.json().await.ok()?;
+    if !frame.is_success() {
+        return None;
+    }
+    let hash = frame.value?.hash.trim().to_ascii_lowercase();
+    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hash)
 }
 
 /// Fetch the current chain height from ChainTracks.
@@ -353,7 +390,10 @@ mod root_frame_tests {
     fn absent_header_fails_safe_to_invalid_not_open() {
         // The security fix: a success+null body is UNVERIFIABLE → false, never
         // a fail-open true that would confirm an arbitrary root.
-        assert_eq!(root_matches_frame(None, "anything"), Ok(false));
+        assert!(
+            matches!(root_matches_frame(None, "anything"), Err(bsv_rs::transaction::ChainTrackerError::InvalidResponse(_))),
+            "an absent header is a FAULT, never a refutation (review L1)"
+        );
     }
 }
 
