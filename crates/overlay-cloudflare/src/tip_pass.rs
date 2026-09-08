@@ -49,14 +49,35 @@ pub fn parse_tip_changed_hash(raw: &[u8]) -> Option<String> {
     Some(h.to_ascii_lowercase())
 }
 
+/// bsv-low M19 R2 round 3 (review MED-1): the fork height the chaintracks
+/// announce carries (`{"height", "hash", "reorgFrom": <h>}`) from its own
+/// `handle_reorg` — the lowest height whose block the reorg replaced. `None`
+/// when the announce carried none (no reorg, or an older announcer).
+pub fn parse_tip_changed_reorg_from(raw: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()?
+        .get("reorgFrom")?
+        .as_u64()
+        .filter(|h| *h > 0)
+}
+
 /// Rows a detected reorg re-verifies per block-event pass at the replaced
 /// height (the sweep's cursor walk covers the rest).
 pub const REORG_DEMOTE_LIMIT: u64 = 200;
 /// The revalidation sweep's window: the last N heights (the reference's
 /// `reorgScanDepth` default).
 pub const REORG_SWEEP_DEPTH: u64 = 3;
-/// Confirmed rows the sweep re-verifies per pass (bounded D1 reads).
-pub const REORG_SWEEP_LIMIT: u64 = 50;
+/// Confirmed rows the sweep re-verifies per pass, PER LEG (bounded D1 reads).
+/// bsv-low M19 R2 round 3 (review MED-3): raised 50 → 200 now that the
+/// `(height, root)` memo collapses a whole block's header re-verifies to
+/// ~one chaintracks read — the per-pass cost is the memo's distinct
+/// (height, root) count (~depth), not the row count, so a bigger page keeps
+/// the transactions/hop leg abreast of an 18-pair fleet (~6 proven txs/hand)
+/// without adding subrequests. The D1 row read stays index-served.
+pub const REORG_SWEEP_LIMIT: u64 = 200;
+/// The courier budget for the sweep's MED-4 re-check of courier-confirmed
+/// rows (a small ladder allowance; most passes spend none).
+pub const REORG_SWEEP_BUDGET: u32 = 20;
 
 /// `Authorization: Bearer <INTERNAL_TOKEN>` — exact, non-empty; no secret ⇒ refused.
 pub fn bearer_ok(authorization: Option<&str>, secret: Option<&str>) -> bool {
@@ -119,6 +140,7 @@ pub async fn internal_tip_changed(
         None => None,
     };
     let tracker = crate::lookup_service_chain_tracker(env);
+    let sweep_fetcher = crate::courier_fetcher(env, tracker.clone()).with_budget(REORG_SWEEP_BUDGET);
     if announce == Some(overlay_discovery::pot::reorg::TipAnnounce::Old) {
         console_log!("POST /internal/tip-changed height={height} -> 200 (an OLD header below the held tip: ignored, counted)");
         if let Some(db) = ops_db {
@@ -126,17 +148,33 @@ pub async fn internal_tip_changed(
         }
         return Response::from_json(&serde_json::json!({ "ok": true, "height": height, "skipped": "old-header" }));
     }
-    let reorg_from = match announce {
+    // The targeted `Reorg{from}` range: from EITHER producer, widened to
+    // cover both. (1) The overlay's OWN same-height hash change (the
+    // `classify_tip_announce` arm). (2) The `reorgFrom` the chaintracks
+    // announce carries from its `handle_reorg` (review MED-1): chaintracks
+    // activates a branch only on MORE work, so the common 2026-09-07 shape
+    // (a sibling at equal work at H, the tip flipping only when its child
+    // H+1 lands) reaches us as `{H+1, hash, reorgFrom: fork+1}` — an
+    // `Extends` to the overlay, whose fast arm would otherwise miss it.
+    let announced_from = parse_tip_changed_reorg_from(&raw).filter(|f| *f > 0);
+    let same_height_from = match announce {
         Some(overlay_discovery::pot::reorg::TipAnnounce::Reorg { from }) => Some(from),
         _ => None,
+    };
+    let reorg_from = match (announced_from, same_height_from) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
     };
     let mut demotion = crate::reorg_sweep::ReverifyPassSummary::default();
     if let Some(from) = reorg_from {
         console_log!(
-            "POST /internal/tip-changed height={height} hash={}: REORG detected — the block at {from} was replaced; re-verifying every confirmation anchored there",
+            "POST /internal/tip-changed height={height} hash={} reorgFrom(announced)={announced_from:?} reorgFrom(same-height)={same_height_from:?}: REORG — re-verifying every confirmation in {from}..={height}",
             hash.as_deref().unwrap_or("?")
         );
-        demotion = crate::reorg_sweep::handle_reorg(pot_storage, tracker.as_deref(), from, from, None, REORG_DEMOTE_LIMIT).await;
+        // the whole reorged range, not just one height: a fork at `from`
+        // orphaned every block from there to the new tip.
+        demotion = crate::reorg_sweep::handle_reorg(pot_storage, tracker.as_deref(), from, height, None, REORG_DEMOTE_LIMIT).await;
         if let Some(db) = ops_db {
             crate::ops::bump_counter(db, crate::ops::COUNTER_CHAIN_REORGS_DETECTED, 1).await;
             crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, (demotion.stale + demotion.demoted_blind) as u64).await;
@@ -159,6 +197,7 @@ pub async fn internal_tip_changed(
         pot_storage,
         tx_store.as_ref(),
         tracker.as_deref(),
+        Some(&sweep_fetcher),
         height,
         REORG_SWEEP_DEPTH,
         REORG_SWEEP_LIMIT,
@@ -173,6 +212,8 @@ pub async fn internal_tip_changed(
         crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_TX_PROOFS, sweep.transactions.stale as u64).await;
         let faults = sweep.spenders.faults + sweep.pot_beefs.faults + sweep.transactions.faults;
         crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, faults as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_HEALED_FROM_COURIER, sweep.spenders.stored_from_courier as u64).await;
+        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REANCHORED, sweep.spenders.reanchored as u64).await;
     }
     let fetcher = crate::courier_fetcher(env, tracker).with_budget(TIP_PASS_BUDGET);
     // min_age 0: the block just landed; every unconfirmed spend is a candidate
@@ -344,7 +385,10 @@ pub async fn internal_reorg(
     )
     .await;
     if let Some(db) = ops_db {
-        crate::ops::bump_counter(db, crate::ops::COUNTER_CHAIN_REORGS_DETECTED, 1).await;
+        // review L2: the OPERATOR's manual heal is counted apart from
+        // `chain_reorgs_detected_total`, so "zero detected on a healthy
+        // stream" stays a true invariant.
+        crate::ops::bump_counter(db, crate::ops::COUNTER_OPERATOR_REORG, 1).await;
         crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, (pass.stale + pass.demoted_blind) as u64).await;
         crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, pass.faults as u64).await;
     }

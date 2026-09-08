@@ -184,6 +184,16 @@ pub(crate) fn transactions_proven_same_height_sql(limit: u64) -> String {
 /// canonical one and re-stitches). Bytes and the anchor stay.
 pub(crate) const TRANSACTION_UNPROVE_SQL: &str = "UPDATE transactions SET has_proof = 0 WHERE txid = ?";
 
+/// The anchored fast-path latch (bsv-low M19 R2 round 3, review MED-2): flip
+/// `has_proof = 1` AND record the block height the just-verified bump names
+/// (`proofHeight = COALESCE(?1, proofHeight)`, so a height-less caller keeps
+/// a held anchor), clearing the retire latch like `mark_transaction_proven`.
+/// Bind order: ?1 proofHeight (or NULL), ?2 txid.
+pub(crate) const MARK_TX_PROVEN_AT_SQL: &str =
+    "UPDATE transactions SET has_proof = 1, retired_ms = NULL, retired_reason = NULL, \
+         proofHeight = COALESCE(?1, proofHeight) \
+     WHERE txid = ?2";
+
 /// Rebroadcast-backstop candidate row: TxBeefRow + the `rebroadcast_state`
 /// attempt ledger (LEFT JOIN — NULL = never attempted). D1 returns numeric
 /// columns as f64 (codebase convention).
@@ -534,6 +544,24 @@ impl Storage for D1Storage {
             .bind(beef)
             .bind(has_proof)
             .bind(proof_height.map_or(crate::d1::QVal::Null, crate::d1::QVal::Float))
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn mark_transaction_proven_at(
+        &self,
+        txid: &str,
+        height: Option<u64>,
+    ) -> Result<(), StorageError> {
+        // bsv-low M19 R2 round 3 (review MED-2): the fast path (a stored BEEF
+        // whose own bump just chaintracks-re-verified) records the anchor
+        // height so the revalidation sweep's transactions leg can window the
+        // row — the plain `mark_transaction_proven` left every fast-path row
+        // anchorless, in no window forever.
+        Query::new(MARK_TX_PROVEN_AT_SQL)
+            .bind(height.map(|h| h as f64).map_or(crate::d1::QVal::Null, crate::d1::QVal::Float))
+            .bind(txid)
             .execute(&self.db)
             .await
             .map_err(d1_err)
@@ -1107,6 +1135,33 @@ mod tests {
             .query_row("SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((proof3, anchor3), (0, Some(965771)), "un-proved for the engine's re-fetch; the anchor stays");
+
+        // bsv-low M19 R2 round 3 (review MED-2): the fast-path anchored latch
+        // (`MARK_TX_PROVEN_AT_SQL`) records proofHeight, so a row a stored
+        // bump already proved LANDS in the transactions window — where the
+        // plain `mark_transaction_proven` left it anchorless, in no window.
+        conn.execute(INSERT_OUTPUT_TX_SQL, rusqlite::params!["tx2", vec![0xbeu8, 0xef]]).unwrap();
+        // the OLD plain latch shape: has_proof = 1 but no anchor → never windowed
+        conn.execute("UPDATE transactions SET has_proof = 1 WHERE txid = 'tx2'", []).unwrap();
+        let windowed = |lo: i64, hi: i64| -> Vec<String> {
+            conn.prepare(&transactions_proven_head_sql(10))
+                .unwrap()
+                .query_map([lo, hi], |r| r.get::<_, String>("txid"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(!windowed(965770, 965773).contains(&"tx2".to_string()), "an anchorless proven row is in no window (the MED-2 bug)");
+        conn.execute(MARK_TX_PROVEN_AT_SQL, rusqlite::params![965772i64, "tx2"]).unwrap();
+        let (p2, a2): (i64, Option<i64>) = conn
+            .query_row("SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((p2, a2), (1, Some(965772)));
+        assert!(windowed(965770, 965773).contains(&"tx2".to_string()), "the anchored fast-path row lands in the window");
+        // a height-less flip keeps a held anchor (COALESCE)
+        conn.execute(MARK_TX_PROVEN_AT_SQL, rusqlite::params![Option::<i64>::None, "tx2"]).unwrap();
+        let a3: Option<i64> = conn.query_row("SELECT proofHeight FROM transactions WHERE txid = 'tx2'", [], |r| r.get(0)).unwrap();
+        assert_eq!(a3, Some(965772), "a height-less latch keeps the held anchor");
     }
 
     /// bsv-low#302: the SHIPPED peer-health upsert + select on the

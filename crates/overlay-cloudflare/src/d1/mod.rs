@@ -1543,8 +1543,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // ── bsv-low M19 R2 (2026-09-08): the reorg reconcile ────────────────────
     // The header the block-event pass acted on, per height: the overlay's
     // own record of which block it confirmed against (`record_header_seen`).
-    // A hash change at a held height, or a lower announce whose hash we do
-    // not hold, is the reorg detector (`pot::reorg::reorg_from_height`).
+    // A hash change at a held height is the reorg detector
+    // (`pot::reorg::classify_tip_announce`), alongside the `reorgFrom` the
+    // chaintracks announce carries from its own `handle_reorg`.
     // One row per height, forever (~144/day); overlay-internal.
     "CREATE TABLE IF NOT EXISTS chain_headers_seen (
         height INTEGER PRIMARY KEY,

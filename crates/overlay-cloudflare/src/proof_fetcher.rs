@@ -1466,7 +1466,7 @@ pub async fn run_pot_maintenance(
 /// proven ancestry, and return the compacted BEEF bytes — or `None` on any
 /// parse/serialize failure (fail-closed; the caller retries). The result is
 /// re-checked at the storage layer before it overwrites anything.
-fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> Option<Vec<u8>> {
+pub(crate) fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> Option<Vec<u8>> {
     use bsv_rs::transaction::{Beef, MerklePath, Transaction};
 
     // Rebuild the subject tx (with its ancestry) from the stored BEEF and set

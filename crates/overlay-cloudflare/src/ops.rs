@@ -112,6 +112,16 @@ pub const COUNTER_REORG_UNMINED_UNCORROBORATED: &str = "reorg_unmined_uncorrobor
 /// header (an old header announced late, or two webhook tasks landing out
 /// of order): ignored, never a reorg, counted.
 pub const COUNTER_TIP_ANNOUNCE_OLD: &str = "tip_announce_old_total";
+/// bsv-low M19 R2 round 3 (review L2): the OPERATOR's manual reorg demotion
+/// (`POST /internal/reorg`), counted apart from `chain_reorgs_detected_total`
+/// so "zero detected on a healthy stream" stays a true invariant while the
+/// operator heals a past event by hand.
+pub const COUNTER_OPERATOR_REORG: &str = "operator_reorg_total";
+/// bsv-low M19 R2 round 3 (review MED-4): courier-confirmed rows the routine
+/// sweep re-asked the ladder for and HEALED (stitched an agreeing proof into
+/// the store); and the sweep's L1 re-anchors (a standing bump at a new height).
+pub const COUNTER_REORG_HEALED_FROM_COURIER: &str = "reorg_healed_from_courier_total";
+pub const COUNTER_REORG_REANCHORED: &str = "reorg_reanchored_total";
 /// bsv-low M19 round 2 (review M4): the sweep's second and third legs, the
 /// pots' own proofs and the engine's transactions (hops) whose stitched
 /// bump chaintracks refutes: unlatched for the completion passes to
