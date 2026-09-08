@@ -1790,14 +1790,31 @@ impl Engine {
                 .find_txid(&cand.txid)
                 .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
             {
+                // the tx's OWN bump (its `bump_index`), never `find_bump`
+                // (the FIRST bump containing the txid — the stale one after a
+                // same-height reorg; review HIGH-1).
                 let stored_bump = beef
-                    .find_bump(&cand.txid)
+                    .find_txid(&cand.txid)
+                    .and_then(bsv_rs::transaction::BeefTx::bump_index)
+                    .and_then(|bi| beef.bumps.get(bi))
                     .map(bsv_rs::transaction::MerklePath::to_hex);
                 if let Some(bump_hex) = stored_bump {
                     if fetcher.verify_proof(&cand.txid, &bump_hex).await {
                         // Idempotent + best-effort: a failure here is logged, not
                         // fatal — the row simply lingers one more tick.
-                        if let Err(e) = self.storage.mark_transaction_proven(&cand.txid).await {
+                        // bsv-low M19 R2 round 3 (review MED-2): latch WITH the
+                        // anchor height (from the tx's OWN verified bump) so the
+                        // revalidation sweep's transactions leg can window this
+                        // row — `mark_transaction_proven` alone left every
+                        // fast-path row anchorless, in no window forever.
+                        let height = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
+                            .ok()
+                            .map(|mp| u64::from(mp.block_height));
+                        if let Err(e) = self
+                            .storage
+                            .mark_transaction_proven_at(&cand.txid, height)
+                            .await
+                        {
                             warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] failed to mark verified-proven row");
                         } else {
                             summary.already_proven += 1;
@@ -1879,15 +1896,69 @@ impl Engine {
     /// Returns `None` when the bytes do not parse or `txid` is not in this
     /// BEEF (nothing to stitch — e.g. a consuming row whose ancestry got
     /// trimmed), so callers skip the write instead of writing garbage.
-    fn stitch_proof_into_stored_beef(
+    ///
+    /// bsv-low M19 R2 round 3 (review HIGH-1): a same-height DIFFERENT-root
+    /// proof (the 2026-09-07 reorg shape) does NOT combine in `merge_bump`
+    /// (the roots differ) — it is pushed as a SECOND bump, and
+    /// `update_bump_indices` assigns it only to txs whose `bump_index` is
+    /// `None`, so the reorged subject keeps its index on the STALE bump.
+    /// Left alone, `has_proof`/`proofHeight` and every `find_txid(txid)
+    /// .bump_index()` reader then keep pointing at the orphan bump, and the
+    /// row refutes again next sweep pass forever. So after the merge, FORCE
+    /// the subject onto the bump that actually proves it, then drop any bump
+    /// no transaction references (the orphan's, now unreferenced).
+    pub fn stitch_proof_into_stored_beef(
         stored: &[u8],
         txid: &str,
         proof: &bsv_rs::transaction::MerklePath,
     ) -> Option<Vec<u8>> {
         let mut beef = bsv_rs::transaction::Beef::from_binary(stored).ok()?;
         beef.find_txid(txid)?;
-        beef.merge_bump(proof.clone());
+        let i = beef.merge_bump(proof.clone());
+        // Does the merged bump actually prove `txid` (a flagged txid leaf)?
+        // (It always does for a completion proof; the guard keeps a stray
+        // caller from mis-anchoring a subject onto an ancestor's bump.)
+        let proves_subject = beef.bumps.get(i).is_some_and(|b| {
+            b.path.first().is_some_and(|leaves| {
+                leaves
+                    .iter()
+                    .any(|l| l.txid && l.hash.as_deref() == Some(txid))
+            })
+        });
+        if proves_subject {
+            if let Some(tx) = beef.find_txid_mut(txid) {
+                tx.set_bump_index(Some(i));
+            }
+        }
+        Self::gc_unreferenced_bumps(&mut beef);
         Some(beef.to_binary())
+    }
+
+    /// Drop every BUMP no transaction references and re-index the survivors
+    /// (bsv-low M19 R2 round 3, review HIGH-1): after the subject is moved
+    /// off an orphan bump, that bump is usually dead weight the next reader
+    /// would still `find_bump`. A bump still referenced by ANOTHER tx (a
+    /// sibling mined in the same block) is kept.
+    fn gc_unreferenced_bumps(beef: &mut bsv_rs::transaction::Beef) {
+        let referenced: std::collections::HashSet<usize> =
+            beef.txs.iter().filter_map(bsv_rs::transaction::BeefTx::bump_index).collect();
+        if referenced.len() == beef.bumps.len() {
+            return;
+        }
+        let mut remap: Vec<Option<usize>> = vec![None; beef.bumps.len()];
+        let mut kept = Vec::with_capacity(referenced.len());
+        for (old, bump) in std::mem::take(&mut beef.bumps).into_iter().enumerate() {
+            if referenced.contains(&old) {
+                remap[old] = Some(kept.len());
+                kept.push(bump);
+            }
+        }
+        beef.bumps = kept;
+        for tx in &mut beef.txs {
+            if let Some(old) = tx.bump_index() {
+                tx.set_bump_index(remap[old]);
+            }
+        }
     }
 
     // ========================================================================
@@ -5489,6 +5560,65 @@ mod tests {
         );
     }
 
+    /// bsv-low M19 R2 round 3 (review HIGH-1): a stored BEEF whose SUBJECT
+    /// sits on a stale (orphan) bump at height H, re-stitched with a
+    /// same-height DIFFERENT-root proof, must serialize with the subject on
+    /// the NEW bump and the orphan bump dropped — otherwise the hop leg
+    /// churns and re-latches the orphan proof forever.
+    #[test]
+    fn stitch_reanchors_a_subject_off_a_same_height_orphan_bump() {
+        use bsv_rs::transaction::{Beef, BeefTx, MerklePath, MerklePathLeaf, Transaction};
+        // subject spends a real parent; both are raw in the BEEF
+        let parent = Transaction::from_hex(RAW_PARENT).unwrap();
+        let parent_id = parent.id();
+        let subject = child_of(&parent_id, 0);
+        let subject_id = subject.id();
+        // the ORPHAN bump: a two-leaf block at H so its root is NOT the txid,
+        // and it differs from the canonical block's root
+        let orphan = MerklePath::new_unchecked(
+            965_771,
+            vec![vec![
+                MerklePathLeaf::new_txid(0, subject_id.clone()),
+                MerklePathLeaf::new(1, "aa".repeat(32)),
+            ]],
+        )
+        .unwrap();
+        let mut beef = Beef::new();
+        let bi = beef.merge_bump(orphan.clone());
+        beef.merge_raw_tx(parent.to_binary(), None);
+        beef.merge_raw_tx(subject.to_binary(), Some(bi));
+        let orphan_root = orphan.compute_root(Some(&subject_id)).unwrap();
+        let stored = beef.to_binary();
+        assert_eq!(
+            Beef::from_binary(&stored).unwrap().find_bump(&subject_id).map(|b| b.compute_root(Some(&subject_id)).unwrap()),
+            Some(orphan_root.clone())
+        );
+        // the canonical proof at the SAME height, a DIFFERENT root
+        let canonical = MerklePath::new_unchecked(
+            965_771,
+            vec![vec![
+                MerklePathLeaf::new_txid(0, subject_id.clone()),
+                MerklePathLeaf::new(1, "bb".repeat(32)),
+            ]],
+        )
+        .unwrap();
+        let canonical_root = canonical.compute_root(Some(&subject_id)).unwrap();
+        assert_ne!(canonical_root, orphan_root, "the reorg shape: same height, new root");
+        let out = Engine::stitch_proof_into_stored_beef(&stored, &subject_id, &canonical).unwrap();
+        let after = Beef::from_binary(&out).unwrap();
+        // the subject's OWN bump is the canonical one
+        let own = after
+            .find_txid(&subject_id)
+            .and_then(BeefTx::bump_index)
+            .and_then(|bi| after.bumps.get(bi))
+            .unwrap();
+        assert_eq!(own.compute_root(Some(&subject_id)).unwrap(), canonical_root, "the subject re-anchored to the new bump");
+        // the orphan bump is gone (only the canonical one remains)
+        assert_eq!(after.bumps.len(), 1, "the unreferenced orphan bump was dropped");
+        // and a reader that uses the tx's OWN bump sees canonical, never orphan
+        assert!(after.find_txid(&parent_id).is_some(), "ancestry preserved");
+    }
+
     #[test]
     fn stitch_refuses_a_beef_that_lacks_the_txid() {
         use bsv_rs::transaction::MerklePath;
@@ -5499,6 +5629,22 @@ mod tests {
             Engine::stitch_proof_into_stored_beef(&stored, &foreign, &proof).is_none(),
             "no txid in the beef -> no write, never garbage"
         );
+    }
+
+    /// A real mainnet raw tx, the unproven parent for the re-anchor pin.
+    const RAW_PARENT: &str = "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000";
+
+    /// A minimal raw tx spending `source:vout` with one OP_TRUE output.
+    fn child_of(source_txid: &str, vout: u32) -> bsv_rs::transaction::Transaction {
+        let mut sx = String::from("0100000001");
+        let mut prev = hex::decode(source_txid).unwrap();
+        prev.reverse();
+        sx.push_str(&hex::encode(prev));
+        sx.push_str(&hex::encode(vout.to_le_bytes()));
+        sx.push_str("00ffffffff01");
+        sx.push_str(&hex::encode(1000u64.to_le_bytes()));
+        sx.push_str("015100000000");
+        bsv_rs::transaction::Transaction::from_hex(&sx).unwrap()
     }
 
     /// A minimal valid single-leaf BUMP hex proving `txid` at `height`.

@@ -92,6 +92,21 @@ pub trait Storage {
         Ok(())
     }
 
+    /// [`Self::mark_transaction_proven`] that ALSO records the block height
+    /// the just-verified bump anchors the tx to (`proofHeight`, bsv-low M19
+    /// R2 round 3 review MED-2), so the revalidation sweep's transactions
+    /// leg can window the row. `None` records no anchor. Default: the plain
+    /// latch (a backend without the column loses only the windowing, never
+    /// correctness).
+    async fn mark_transaction_proven_at(
+        &self,
+        txid: &str,
+        height: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let _ = height;
+        self.mark_transaction_proven(txid).await
+    }
+
     /// Update the block height on an output (when it gets mined).
     ///
     /// Optional — backends that don't track block height can provide a no-op default.
