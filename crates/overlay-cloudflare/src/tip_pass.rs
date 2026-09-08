@@ -187,6 +187,12 @@ pub async fn internal_tip_changed(
         console_log!("POST /internal/tip-changed height={height} -> 200 (already passed in this isolate)");
         return Response::from_json(&serde_json::json!({ "ok": true, "height": height, "skipped": "already-passed" }));
     }
+    // ── bsv-low M19B-G1: Arcade's reorg EVENTS first (its orphaned-block
+    // feed, corroborated against chaintracks, every row judged by its own
+    // stored proof; a refuted spender re-anchored in place when the ladder
+    // serves the canonical proof, demoted otherwise). Before the sweep, so a
+    // demotion is re-chased in this same tick.
+    let arcade = run_arcade_reorg_pass(env, pot_storage, ops_db, "tip-changed").await;
     // ── the revalidation sweep (reference: the fallback for trackers without
     // a reorg stream; here the PRIMARY path, every block): three cursor-walked
     // legs (spenders, the pots' own proofs, the engine's hop proofs). It runs
@@ -277,7 +283,148 @@ pub async fn internal_tip_changed(
         "sweepStale": sweep.spenders.stale + sweep.pot_beefs.stale + sweep.transactions.stale,
         "sweepFaults": sweep.spenders.faults + sweep.pot_beefs.faults + sweep.transactions.faults,
         "sweepWindow": sweep.spenders_window,
+        "arcadeReorg": arcade_reorg_summary_json(&arcade),
     }))
+}
+
+/// bsv-low M19B-G1: ONE bounded pass of the Arcade reorg-event consumer
+/// (`crate::arcade_reorg`), on the worker's own sources (the `ARCADE_URL`
+/// feed, chaintracks through the binding, the D1 state row, the courier
+/// ladder on its own budget), its outcome folded into the lifetime
+/// counters. Runs before the routine sweep on every block-event pass, on
+/// the cron, and on demand (`POST /internal/arcade-reorg`).
+pub async fn run_arcade_reorg_pass(
+    env: &Env,
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    ops_db: Option<&D1Database>,
+    origin: &str,
+) -> crate::arcade_reorg::ArcadePassSummary {
+    let tracker = crate::lookup_service_chain_tracker(env);
+    let Some(db) = ops_db else {
+        console_log!("[arcade-reorg] ({origin}) no D1 handle: no state row, no pass");
+        return crate::arcade_reorg::ArcadePassSummary { stopped: Some("no state store".into()), ..Default::default() };
+    };
+    let Some(tracker) = tracker else {
+        console_log!("[arcade-reorg] ({origin}) no header source configured: no pass");
+        return crate::arcade_reorg::ArcadePassSummary { stopped: Some("no header source configured".into()), ..Default::default() };
+    };
+    let arcade_base = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
+    let feed = crate::arcade_reorg::ArcadeBlockStatusFeed::new(arcade_base);
+    let headers = crate::arcade_reorg::EnvHeaderSource { env, tracker: tracker.as_ref() };
+    let state = crate::arcade_reorg::D1ConsumerState(db);
+    let fetcher = crate::courier_fetcher(env, Some(tracker.clone())).with_budget(crate::arcade_reorg::ARCADE_LADDER_BUDGET);
+    let tx_store = crate::reorg_sweep::D1ProvenTxStore(db);
+    let s = crate::arcade_reorg::consume_arcade_reorg_events(
+        &feed,
+        &headers,
+        &state,
+        pot_storage,
+        Some(&tx_store),
+        Some(tracker.as_ref()),
+        Some(&fetcher),
+        crate::arcade_reorg::PassLimits::default(),
+    )
+    .await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_EVENTS, s.events_finished() as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_REANCHORED, s.reanchored() as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_DEMOTED, s.demoted() as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_UNCORROBORATED, s.skipped_uncorroborated as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_FAULTS, (s.faults + s.errors) as u64).await;
+    // the R2 lifetime totals count the same rows whatever the producer (the
+    // sweep, the announce, the operator, or Arcade's event)
+    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, s.demoted() as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_PROOFS, s.demoted() as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_POT_PROOFS, s.pot_beefs.stale as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_TX_PROOFS, s.transactions.stale as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REANCHORED, s.reanchored() as u64).await;
+    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, (s.spenders.faults + s.pot_beefs.faults + s.transactions.faults) as u64).await;
+    console_log!(
+        "[arcade-reorg] ({origin}) feed_read={} rows={} malformed={} events_after_cursor={} applied={} skipped_uncorroborated={} held={} \
+         spenders scanned={} standing={} reanchored={} demoted={} faults={}; pot_beefs scanned={} stale={}; transactions scanned={} stale={}; \
+         faults={} errors={} idle={} cursor={:?} pending={:?} stopped={:?}",
+        s.feed_read,
+        s.feed_rows,
+        s.feed_malformed,
+        s.feed_events,
+        s.applied,
+        s.skipped_uncorroborated,
+        s.held,
+        s.spenders.scanned,
+        s.spenders.standing,
+        s.reanchored(),
+        s.demoted(),
+        s.spenders.faults,
+        s.pot_beefs.scanned,
+        s.pot_beefs.stale,
+        s.transactions.scanned,
+        s.transactions.stale,
+        s.faults,
+        s.errors,
+        s.idle,
+        s.cursor.as_ref().map(|c| (c.height, &c.hash[..16], c.orphaned_at.as_str())),
+        s.pending.as_ref().map(|(k, held)| (k.height, &k.hash[..16], *held)),
+        s.stopped
+    );
+    s
+}
+
+/// PURE: the JSON body `POST /internal/arcade-reorg` and the block-event
+/// pass answer for the consumer's outcome.
+pub fn arcade_reorg_summary_json(s: &crate::arcade_reorg::ArcadePassSummary) -> serde_json::Value {
+    let key = |k: &overlay_discovery::pot::arcade_events::EventKey| {
+        serde_json::json!({ "orphanedAt": k.orphaned_at, "height": k.height, "hash": k.hash })
+    };
+    serde_json::json!({
+        "feedRead": s.feed_read,
+        "feedRows": s.feed_rows,
+        "feedMalformed": s.feed_malformed,
+        "eventsAfterCursor": s.feed_events,
+        "applied": s.applied,
+        "skippedUncorroborated": s.skipped_uncorroborated,
+        "held": s.held,
+        "scanned": s.spenders.scanned + s.pot_beefs.scanned + s.transactions.scanned,
+        "standing": s.spenders.standing,
+        "reanchored": s.reanchored(),
+        "demoted": s.demoted(),
+        "stalePotProofs": s.pot_beefs.stale,
+        "staleTxProofs": s.transactions.stale,
+        "faults": s.faults,
+        "errors": s.errors,
+        "idle": s.idle,
+        "stopped": s.stopped,
+        "cursor": s.cursor.as_ref().map(key),
+        "pending": s.pending.as_ref().map(|(k, held)| serde_json::json!({ "event": key(k), "heldPasses": held })),
+    })
+}
+
+/// `POST /internal/arcade-reorg` (bearer `INTERNAL_TOKEN`): one bounded
+/// pass of the Arcade reorg-event consumer on demand (the deploy check, an
+/// operator catch-up). No body. The same pass the block-event route and the
+/// cron run; answers its summary.
+pub async fn internal_arcade_reorg(
+    req: Request,
+    env: &Env,
+    ctx: &Context,
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    ops_db: Option<&D1Database>,
+) -> Result<Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        console_log!("POST /internal/arcade-reorg -> 401");
+        return Response::error("unauthorized", 401);
+    }
+    let s = run_arcade_reorg_pass(env, pot_storage, ops_db, "internal").await;
+    // a demotion or a re-anchor is a served-state change: ship the pot-changed webhook
+    crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
+    let mut body = arcade_reorg_summary_json(&s);
+    body["ok"] = serde_json::Value::Bool(true);
+    Response::from_json(&body)
 }
 
 /// The reorg detector through the REAL producer path: record the announced
@@ -504,6 +651,38 @@ mod tests {
         assert_eq!(t(r#"{"fromHeight":-1}"#), None);
         assert_eq!(t(r#"{"height":965771}"#), None);
         assert_eq!(t("nope"), None);
+    }
+
+    /// bsv-low M19B-G1: the pass summary the block-event answer and
+    /// `POST /internal/arcade-reorg` carry, shaped from the summary.
+    #[test]
+    fn arcade_reorg_summary_json_carries_the_counts_the_cursor_and_the_pending_event() {
+        use overlay_discovery::pot::arcade_events::EventKey;
+        let key = EventKey { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: 965771, hash: "cd".repeat(32) };
+        let mut s = crate::arcade_reorg::ArcadePassSummary { applied: 1, skipped_uncorroborated: 1, held: 0, cursor: Some(key.clone()), ..Default::default() };
+        s.spenders.scanned = 3;
+        s.spenders.standing = 1;
+        s.spenders.stale = 1;
+        s.spenders.reanchored_from_courier = 1;
+        s.pot_beefs.stale = 2;
+        s.pending = Some((key.clone(), 2));
+        s.stopped = Some("event cd…@965771 continues next pass (a leg is not exhausted)".into());
+        let v = arcade_reorg_summary_json(&s);
+        assert_eq!(v["applied"], 1);
+        assert_eq!(v["skippedUncorroborated"], 1);
+        assert_eq!(v["scanned"], 3);
+        assert_eq!(v["standing"], 1);
+        assert_eq!(v["reanchored"], 1);
+        assert_eq!(v["demoted"], 1);
+        assert_eq!(v["stalePotProofs"], 2);
+        assert_eq!(v["cursor"]["height"], 965771);
+        assert_eq!(v["cursor"]["orphanedAt"], "2026-09-07T22:45:22.316Z");
+        assert_eq!(v["pending"]["heldPasses"], 2);
+        assert_eq!(v["pending"]["event"]["hash"], "cd".repeat(32));
+        assert!(v["stopped"].as_str().unwrap().contains("continues next pass"));
+        let idle = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary { idle: true, ..Default::default() });
+        assert_eq!(idle["idle"], true);
+        assert!(idle["cursor"].is_null() && idle["pending"].is_null() && idle["stopped"].is_null());
     }
 
     /// Review H3: the detector's pins run through the REAL producer path,

@@ -431,7 +431,11 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `transactions.proofHeight` + `idx_transactions_proven_height`. Every
 /// CREATE INDEX on a big table is pre-created out of band before the deploy
 /// (see the M19 build log) so the cold-start run is a no-op.
-pub const OVERLAY_MIGRATION_COUNT: usize = 145;
+/// 145 → 146 for bsv-low M19B-G1 (2026-09-08): `arcade_reorg_state`, the
+/// Arcade reorg-event consumer's ONE persisted row (its cursor over
+/// Arcade's orphaned-block feed and the event in progress, as a JSON
+/// document). Overlay-internal; a primary-key read and an upsert only.
+pub const OVERLAY_MIGRATION_COUNT: usize = 146;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1596,6 +1600,17 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE transactions ADD COLUMN proofHeight INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_transactions_proven_height \
          ON transactions(has_proof, proofHeight)",
+    // bsv-low M19B-G1 (2026-09-08): the Arcade reorg-event consumer's state
+    // (`arcade_reorg.rs`): one row (`name = 'events'`) holding the JSON
+    // document `overlay_discovery::pot::arcade_events::ConsumerState` (the
+    // cursor over Arcade's orphaned-block feed, the event in progress with
+    // each leg's row cursor). Read by primary key, upserted; moved only past
+    // a FINISHED event, never on a fault (idempotent replay). Overlay-internal.
+    "CREATE TABLE IF NOT EXISTS arcade_reorg_state (
+        name TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        updatedAt INTEGER
+    )",
 ];
 
 // =============================================================================

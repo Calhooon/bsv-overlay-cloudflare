@@ -7,6 +7,7 @@
 
 pub mod advert_lifecycle;
 pub mod advertiser;
+pub mod arcade_reorg;
 pub mod ban_storage;
 pub mod broadcaster;
 pub mod chain_tracker;
@@ -297,6 +298,11 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         // rows a past reorg left behind; bearer INTERNAL_TOKEN; bounded).
         (Method::Post, "/internal/reorg") => {
             crate::tip_pass::internal_reorg(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
+        }
+        // bsv-low M19B-G1: one bounded pass of the Arcade reorg-event
+        // consumer on demand (bearer INTERNAL_TOKEN; no body).
+        (Method::Post, "/internal/arcade-reorg") => {
+            crate::tip_pass::internal_arcade_reorg(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
@@ -1283,6 +1289,11 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     //    not-yet-verified pot BEEF; its candidate page is
     //    POT_PROOF_PASS_LIMIT (drain + op math at the const), courier
     //    traffic independently bounded by its fetcher budget.
+    // bsv-low M19B-G1: the Arcade reorg-event consumer's cron leg (the
+    // block-event pass is its fast path; this is the drought fallback and
+    // the first-run catch-up), BEFORE the confirmation chaser so a row it
+    // demotes is re-chased in this same tick. Bounded on its own budget.
+    let _arcade = crate::tip_pass::run_arcade_reorg_pass(&env, pot_storage.as_ref(), Some(&ops_db), "cron").await;
     let spend_fetcher = courier_fetcher(&env, lookup_service_chain_tracker(&env)).with_budget(20);
     let pot_tracker = lookup_service_chain_tracker(&env);
     let pot_fetcher = courier_fetcher(&env, pot_tracker);

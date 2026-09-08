@@ -2266,6 +2266,25 @@ pub fn sweep_state_upsert_sql() -> &'static str {
          exhausted = excluded.exhausted, updatedAt = excluded.updatedAt"
 }
 
+/// bsv-low M19B-G1: the Arcade reorg-event consumer's state document (one
+/// row). Bind order: name.
+pub fn arcade_reorg_state_read_sql() -> &'static str {
+    "SELECT state FROM arcade_reorg_state WHERE name = ?"
+}
+
+/// The health surface's read of the same row (the document and its stamp).
+/// Bind order: name.
+pub fn arcade_reorg_state_view_sql() -> &'static str {
+    "SELECT state, updatedAt FROM arcade_reorg_state WHERE name = ?"
+}
+
+/// Upsert the consumer's state document. Bind order: name, state (JSON),
+/// updatedAt (ms).
+pub fn arcade_reorg_state_upsert_sql() -> &'static str {
+    "INSERT INTO arcade_reorg_state (name, state, updatedAt) VALUES (?, ?, ?) \
+     ON CONFLICT(name) DO UPDATE SET state = excluded.state, updatedAt = excluded.updatedAt"
+}
+
 /// The pot_beefs leg's HEAD page: VERIFIED rows whose own bump is anchored
 /// in `lo..=hi`, newest first, keyed. Backed by `idx_pot_beefs_verified_height`.
 /// Bind order: lo, hi.
@@ -13372,5 +13391,68 @@ mod tests {
 
         // ── the gameId index (D1 item a) ──
         index_served("gameId lookup", &plan("SELECT gameId FROM result_markers_v2 WHERE gameId IN (?, ?)", &[t("a"), t("b")]), "idx_result_markers_v2_gameId");
+    }
+
+    /// bsv-low M19B-G1: the Arcade reorg-event consumer's two statements,
+    /// executed on the shipped migrations under real SQLite (no ANALYZE,
+    /// `sqlite_stat1` asserted absent) and EXPLAIN-pinned index-served: the
+    /// state read is a primary-key search, the upsert replaces the document
+    /// and the stamp on conflict, and the migration is re-executable (a
+    /// second run of the whole list is a no-op: cold-start safe).
+    #[test]
+    fn arcade_reorg_state_statements_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for _round in 0..2 {
+            for sql in crate::d1::OVERLAY_MIGRATIONS {
+                if let Err(e) = conn.execute_batch(sql) {
+                    let msg = e.to_string().to_ascii_lowercase();
+                    assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+                }
+            }
+        }
+        let stats: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stats, 0, "measured without ANALYZE, as D1 runs");
+        let plan = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap_or_else(|e| panic!("{e}\n{sql}"));
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let index_served = |name: &str, lines: &[String], must: &str| {
+            let joined = lines.join("\n");
+            assert!(lines.iter().any(|l| l.contains(must)), "{name}: expected `{must}` in the plan:\n{joined}");
+            assert!(!lines.iter().any(|l| l.starts_with("SCAN ")), "{name}: a table walk:\n{joined}");
+            assert!(!lines.iter().any(|l| l.contains("TEMP B-TREE")), "{name}: a temp sort:\n{joined}");
+        };
+        let t = |s: &str| rusqlite::types::Value::Text(s.to_string());
+        index_served(
+            "arcade state read",
+            &plan(arcade_reorg_state_read_sql(), &[t("events")]),
+            "SEARCH arcade_reorg_state USING INDEX sqlite_autoindex_arcade_reorg_state_1 (name=?)",
+        );
+        index_served(
+            "arcade state view",
+            &plan(arcade_reorg_state_view_sql(), &[t("events")]),
+            "SEARCH arcade_reorg_state USING INDEX sqlite_autoindex_arcade_reorg_state_1 (name=?)",
+        );
+        let read = || -> Option<(String, Option<i64>)> {
+            conn.query_row(arcade_reorg_state_view_sql(), ["events"], |r| Ok((r.get(0)?, r.get(1)?))).ok()
+        };
+        assert_eq!(read(), None, "no row until the first pass writes one");
+        let doc1 = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":{"height":965771,"rowid":40},"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":0}}"#;
+        conn.execute(arcade_reorg_state_upsert_sql(), rusqlite::params!["events", doc1, 1_000i64]).unwrap();
+        assert_eq!(read(), Some((doc1.to_string(), Some(1_000))));
+        let doc2 = r#"{"v":1,"cursor":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"pending":null}"#;
+        conn.execute(arcade_reorg_state_upsert_sql(), rusqlite::params!["events", doc2, 2_000i64]).unwrap();
+        assert_eq!(read(), Some((doc2.to_string(), Some(2_000))), "the upsert replaces the document and the stamp");
+        let rows: i64 = conn.query_row("SELECT count(*) FROM arcade_reorg_state", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "one row per name");
+        // what the reader deserialises is exactly what the writer stored
+        let back = overlay_discovery::pot::arcade_events::ConsumerState::from_json(&read().unwrap().0).unwrap();
+        assert_eq!(back.cursor.as_ref().map(|c| c.height), Some(965771));
+        assert!(back.pending.is_none());
     }
 }
