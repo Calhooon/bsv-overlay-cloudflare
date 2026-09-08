@@ -348,6 +348,16 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
         (**self).mark_transaction_proven(txid).await
     }
+    async fn mark_transaction_proven_at(
+        &self,
+        txid: &str,
+        height: Option<u64>,
+    ) -> Result<(), StorageError> {
+        // review LOW-4: forward the anchored latch too — without this the
+        // Rc blanket hits the trait default (drops the height, re-introducing
+        // MED-2) for any caller routing through an `Rc<dyn Storage>`.
+        (**self).mark_transaction_proven_at(txid, height).await
+    }
     async fn update_output_block_height(
         &self,
         txid: &str,
@@ -516,11 +526,22 @@ pub mod memory {
         /// D1 `gasp_peer_health` table (bsv-low#302); the logical clock
         /// above stands in for `unixepoch()`.
         peer_health: Mutex<HashMap<(String, String), (u64, u64)>>,
+        /// review LOW-4: records the height an `_at` latch carried, so a pin
+        /// can prove the `Rc` blanket forwards `mark_transaction_proven_at`
+        /// (the trait default would drop the height).
+        proven_at: Mutex<HashMap<String, Option<u64>>>,
     }
 
     impl MemoryStorage {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// The anchor height a `mark_transaction_proven_at` recorded for
+        /// `txid` (review LOW-4): `None` = never called `_at`; `Some(h)` =
+        /// called with height `h`.
+        pub fn proven_at_height(&self, txid: &str) -> Option<Option<u64>> {
+            self.proven_at.lock().unwrap().get(txid).copied()
         }
 
         /// Advance the deterministic logical clock by `secs` (test hook for
@@ -686,6 +707,19 @@ pub mod memory {
             // Lightweight flag-flip (no BEEF rewrite), idempotent. Mirrors the
             // D1 `UPDATE transactions SET has_proof = 1 WHERE txid = ?`.
             self.proven.lock().unwrap().insert(txid.to_string());
+            Ok(())
+        }
+
+        async fn mark_transaction_proven_at(
+            &self,
+            txid: &str,
+            height: Option<u64>,
+        ) -> Result<(), StorageError> {
+            // Models the D1 `MARK_TX_PROVEN_AT_SQL`: flip has_proof AND record
+            // the anchor (review MED-2/LOW-4). Recorded so the Rc-forward pin
+            // can observe the height reaching the inner store.
+            self.proven.lock().unwrap().insert(txid.to_string());
+            self.proven_at.lock().unwrap().insert(txid.to_string(), height);
             Ok(())
         }
 
@@ -951,6 +985,22 @@ mod tests {
     use super::memory::MemoryStorage;
     use super::*;
     use crate::types::AppliedTransaction;
+
+    /// review LOW-4: the `Rc<T: Storage>` blanket must FORWARD
+    /// `mark_transaction_proven_at`, not fall through to the trait default
+    /// (which drops the height, re-introducing MED-2). Call it through an
+    /// `Rc<dyn Storage>` and assert the height reached the inner store.
+    #[tokio::test]
+    async fn the_rc_blanket_forwards_the_anchored_proven_latch() {
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        let via_dyn: std::rc::Rc<dyn Storage> = store.clone();
+        via_dyn.mark_transaction_proven_at("tx", Some(965_772)).await.unwrap();
+        assert_eq!(store.proven_at_height("tx"), Some(Some(965_772)), "the Rc blanket forwarded the height to the inner store");
+        // a height-less call still forwards (records None, not "never called")
+        via_dyn.mark_transaction_proven_at("tx2", None).await.unwrap();
+        assert_eq!(store.proven_at_height("tx2"), Some(None));
+        assert_eq!(store.proven_at_height("never"), None, "a txid never latched is absent");
+    }
 
     fn make_output(txid: &str, index: u32, topic: &str, score: f64) -> Output {
         Output {

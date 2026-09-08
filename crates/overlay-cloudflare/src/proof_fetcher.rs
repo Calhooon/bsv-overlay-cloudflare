@@ -1063,16 +1063,13 @@ pub async fn complete_pot_beef_proofs(
         // clears without courier traffic). A bump that FAILS the re-verify
         // is a fake/stale claim: fall through to the fetch path, which
         // replaces it with a chaintracks-verified one (or honestly retries).
+        // review LOW-1: the tx's OWN bump (its `bump_index`), never
+        // `find_bump` (the FIRST bump CONTAINING the txid — a stale orphan
+        // bump, or one where the txid is only a sibling hash). Matches
+        // engine.rs and reorg_sweep.rs.
         let stored_bump = bsv_rs::transaction::Beef::from_binary(&stored_beef)
             .ok()
-            .filter(|b| {
-                b.find_txid(&txid)
-                    .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
-            })
-            .and_then(|b| {
-                b.find_bump(&txid)
-                    .map(bsv_rs::transaction::MerklePath::to_hex)
-            });
+            .and_then(|b| own_bump_hex(&b, &txid));
         if let Some(bump_hex) = stored_bump {
             if fetcher.verify_proof(&txid, &bump_hex).await {
                 // round-2 review M4: the anchor rides the latch, so the
@@ -1466,6 +1463,17 @@ pub async fn run_pot_maintenance(
 /// proven ancestry, and return the compacted BEEF bytes — or `None` on any
 /// parse/serialize failure (fail-closed; the caller retries). The result is
 /// re-checked at the storage layer before it overwrites anything.
+/// The hex of a tx's OWN bump (its `bump_index`), never `find_bump` (review
+/// LOW-1): `Beef::find_bump` returns the first bump whose path CONTAINS the
+/// txid as any leaf hash — which can be a stale orphan bump, or a bump where
+/// the txid is only a sibling. The tx's `bump_index` is the proof that
+/// actually anchors it.
+pub(crate) fn own_bump_hex(beef: &bsv_rs::transaction::Beef, txid: &str) -> Option<String> {
+    beef.find_txid(txid)
+        .and_then(bsv_rs::transaction::BeefTx::bump_index)
+        .and_then(|bi| beef.bumps.get(bi).map(bsv_rs::transaction::MerklePath::to_hex))
+}
+
 pub(crate) fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> Option<Vec<u8>> {
     use bsv_rs::transaction::{Beef, MerklePath, Transaction};
 
@@ -4599,6 +4607,39 @@ pub(crate) mod tests {
             change: false,
         });
         tx.to_hex()
+    }
+
+    /// review LOW-1: a pot_beef BEEF where the subject appears as a SIBLING
+    /// leaf in an earlier bump (so `find_bump` returns the wrong one) still
+    /// reads the subject's OWN bump via `own_bump_hex` — the pot_beefs
+    /// completion fast path's reader. Money-safe today (pot BEEFs are
+    /// single-subject), pinned for consistency with engine.rs/reorg_sweep.rs.
+    #[test]
+    fn own_bump_hex_reads_the_subjects_own_bump_not_find_bump() {
+        use bsv_rs::transaction::{Beef, BeefTx, MerklePath, MerklePathLeaf, Transaction};
+        let a_raw = real_spender_raw(&"aa".repeat(32), 0);
+        let s_raw = real_spender_raw(&"bb".repeat(32), 0);
+        let a = Transaction::from_hex(&a_raw).unwrap().id();
+        let s = Transaction::from_hex(&s_raw).unwrap().id();
+        // bump0 at 965_700 proves A, with S present as a SIBLING hash (not flagged)
+        let bump_a = MerklePath::new_unchecked(
+            965_700,
+            vec![vec![MerklePathLeaf::new_txid(0, a.clone()), MerklePathLeaf::new(1, s.clone())]],
+        )
+        .unwrap();
+        // bump1 at 965_773 is S's OWN single-leaf proof
+        let bump_s = MerklePath::new_unchecked(965_773, vec![vec![MerklePathLeaf::new_txid(0, s.clone())]]).unwrap();
+        let mut beef = Beef::new();
+        let b0 = beef.merge_bump(bump_a);
+        let b1 = beef.merge_bump(bump_s);
+        beef.merge_raw_tx(hex::decode(&a_raw).unwrap(), Some(b0));
+        beef.merge_raw_tx(hex::decode(&s_raw).unwrap(), Some(b1));
+        // find_bump returns bump0 (S is a sibling there) — the WRONG height
+        assert_eq!(beef.find_bump(&s).map(|b| b.block_height), Some(965_700));
+        // own_bump_hex returns S's OWN bump — the right height
+        let own = own_bump_hex(&beef, &s).unwrap();
+        assert_eq!(MerklePath::from_hex(&own).unwrap().block_height, 965_773, "the subject's own bump, not find_bump's");
+        assert_eq!(beef.find_txid(&s).and_then(BeefTx::bump_index), Some(b1));
     }
 
     /// FINDING-4 PIN: the REAL input walk against real bytes — each conjunct
