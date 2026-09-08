@@ -525,17 +525,63 @@ pub trait PotStorage {
         Ok(crate::pot::reorg::HeaderSeen::default())
     }
 
-    /// Spent-and-CONFIRMED rows whose `spentHeight` is within
-    /// `min_height..=max_height`, NEWEST first, at most `limit` — the
-    /// revalidation sweep's candidate set. Rows confirmed without a height
-    /// on record are not in any window (they carry no anchor to refute).
-    async fn find_confirmed_in_heights(
+    /// ONE page of spent-and-CONFIRMED rows anchored in `lo..=hi`, walked
+    /// NEWEST first (`spentHeight DESC, rowid DESC`), continuing AFTER the
+    /// row `after` names when given, at most `limit` rows, each with its
+    /// [`RowKey`](crate::pot::reorg::RowKey) so the caller can persist where
+    /// it stopped (round-2 review H3b: a bounded pass must continue across
+    /// passes, not restart from the newest and strand the tail). Rows
+    /// confirmed without a height on record are in no window (they carry no
+    /// anchor to refute). Backends that cannot page answer empty.
+    async fn confirmed_window_page(
         &self,
-        min_height: u64,
-        max_height: u64,
+        lo: u64,
+        hi: u64,
+        after: Option<crate::pot::reorg::RowKey>,
         limit: u64,
-    ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let _ = (min_height, max_height, limit);
+    ) -> Result<Vec<(crate::pot::reorg::RowKey, PotRecord)>, PotStorageError> {
+        let _ = (lo, hi, after, limit);
+        Ok(Vec::new())
+    }
+
+    /// The persisted state of the named height-windowed walk (`None` =
+    /// never run). Backends without persistence answer `None`: every pass
+    /// then walks the newest window from its head (bounded, never wrong,
+    /// just without the continuity guarantee).
+    async fn read_sweep_state(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::pot::reorg::SweepState>, PotStorageError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Persist the named walk's state (upsert). Default: dropped.
+    async fn write_sweep_state(
+        &self,
+        name: &str,
+        state: &crate::pot::reorg::SweepState,
+    ) -> Result<(), PotStorageError> {
+        let _ = (name, state);
+        Ok(())
+    }
+
+    /// ONE page of VERIFIED stored pot BEEFs whose own bump is anchored in
+    /// `lo..=hi` (`proofHeight`, recorded by the verifying writers), walked
+    /// newest first with the same cursor contract as
+    /// [`confirmed_window_page`](Self::confirmed_window_page): `(key, txid,
+    /// beef)`. The revalidation sweep's second leg (round-2 review M4): the
+    /// pots' OWN proofs (a JOIN mined in the orphan) are re-verified, not
+    /// only the spenders'. Rows verified before the height column existed
+    /// carry no anchor and are in no window. Default: empty.
+    async fn verified_pot_beefs_page(
+        &self,
+        lo: u64,
+        hi: u64,
+        after: Option<crate::pot::reorg::RowKey>,
+        limit: u64,
+    ) -> Result<Vec<(crate::pot::reorg::RowKey, String, Vec<u8>)>, PotStorageError> {
+        let _ = (lo, hi, after, limit);
         Ok(Vec::new())
     }
 
@@ -565,21 +611,6 @@ pub trait PotStorage {
     ) -> Result<bool, PotStorageError> {
         let _ = (txid, output_index, spending_txid);
         Ok(false)
-    }
-
-    /// Bulk demotion for a detected reorg: every confirmed row with
-    /// `spentHeight >= from_height`, NEWEST first, at most `limit`, demoted
-    /// exactly as [`demote_confirmed_for_spender`](Self::demote_confirmed_for_spender)
-    /// does; returns the rows demoted (their spenders' stored proofs are
-    /// the caller's to unlatch). Bounded per call: the block-event pass
-    /// runs once per block and a deep reorg drains over a few passes.
-    async fn demote_confirmed_from_height(
-        &self,
-        from_height: u64,
-        limit: u64,
-    ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let _ = (from_height, limit);
-        Ok(Vec::new())
     }
 
     /// GUARDED re-anchor: a pushed, chaintracks-verified proof names a
@@ -824,6 +855,33 @@ pub trait PotStorage {
         Ok(())
     }
 
+    /// [`mark_pot_beef_proven`](Self::mark_pot_beef_proven) that ALSO records
+    /// the block height the just-verified bump anchors the tx to
+    /// (`proofHeight`), so the revalidation sweep can window the row later
+    /// (round-2 review M4). `None` records no anchor. Default: the plain
+    /// latch (backends without the column).
+    async fn mark_pot_beef_proven_at(
+        &self,
+        txid: &str,
+        height: Option<u64>,
+    ) -> Result<(), PotStorageError> {
+        let _ = height;
+        self.mark_pot_beef_proven(txid).await
+    }
+
+    /// Batch form of [`mark_pot_beef_proven_at`](Self::mark_pot_beef_proven_at)
+    /// (the completion pass's fast path latches a page per tick). Default:
+    /// loop the single form.
+    async fn mark_pot_beefs_proven_at(
+        &self,
+        rows: &[(String, Option<u64>)],
+    ) -> Result<(), PotStorageError> {
+        for (txid, height) in rows {
+            self.mark_pot_beef_proven_at(txid, *height).await?;
+        }
+        Ok(())
+    }
+
     /// Whether `txid`'s stored BEEF carries a VERIFIED proof latch
     /// (bsv-low#304) — i.e. one of the verifying writers latched it. NEVER
     /// derived from byte structure. Default: `false` (backends without the
@@ -834,6 +892,16 @@ pub trait PotStorage {
         let _ = txid;
         Ok(false)
     }
+}
+
+/// The block height `beef`'s OWN bump for `txid` names, when it carries one
+/// (the verifying writers record it as the row's `proofHeight`, the
+/// revalidation sweep's window anchor; round-2 review M4).
+pub fn pot_beef_bump_height(txid: &str, beef: &[u8]) -> Option<u64> {
+    let parsed = bsv_rs::transaction::Beef::from_binary(beef).ok()?;
+    let btx = parsed.find_txid(txid)?;
+    let bump = parsed.bumps.get(btx.bump_index()?)?;
+    Some(u64::from(bump.block_height))
 }
 
 /// Whether `beef` carries a merkle proof for `txid`'s OWN tx (not an
@@ -892,6 +960,16 @@ pub struct MemoryPotStorage {
     verified: std::sync::Mutex<std::collections::HashSet<String>>,
     /// bsv-low M19 R2: the header hash recorded per height by the block-event pass.
     headers_seen: std::sync::Mutex<std::collections::BTreeMap<u64, String>>,
+    /// bsv-low M19 R2 (round 2): a stable per-row ordinal, the memory twin of
+    /// D1's `rowid` (the windowed walks' tie-break and cursor).
+    ordinals: std::sync::Mutex<std::collections::HashMap<(String, u32), i64>>,
+    next_ordinal: std::sync::Mutex<i64>,
+    /// The persisted walk states (`reorg_sweep_state`).
+    sweep_states: std::sync::Mutex<std::collections::HashMap<String, crate::pot::reorg::SweepState>>,
+    /// Per stored beef: its ordinal and the height its verified bump names
+    /// (`pot_beefs.rowid`, `pot_beefs.proofHeight`).
+    beef_ordinals: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    proof_heights: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// txids latched STRUCTURALLY UNPROVABLE (bsv-low handoff #2b) —
     /// models the D1 `pot_beefs.structurally_unprovable` column: the
     /// stored tx's own bytes spend a pot outpoint whose confirmed spend by
@@ -937,6 +1015,33 @@ impl MemoryPotStorage {
 
     fn now(&self) -> u64 {
         *self.clock_secs.lock().unwrap()
+    }
+
+    /// The next rowid twin (monotonic, never reused).
+    fn take_ordinal(&self) -> i64 {
+        let mut n = self.next_ordinal.lock().unwrap();
+        *n += 1;
+        *n
+    }
+
+    fn ordinal_of(&self, txid: &str, output_index: u32) -> i64 {
+        let mut map = self.ordinals.lock().unwrap();
+        if let Some(o) = map.get(&(txid.to_string(), output_index)) {
+            return *o;
+        }
+        let o = self.take_ordinal();
+        map.insert((txid.to_string(), output_index), o);
+        o
+    }
+
+    fn beef_ordinal_of(&self, txid: &str) -> i64 {
+        let mut map = self.beef_ordinals.lock().unwrap();
+        if let Some(o) = map.get(txid) {
+            return *o;
+        }
+        let o = self.take_ordinal();
+        map.insert(txid.to_string(), o);
+        o
     }
 
     /// TEST OBSERVABILITY (#2b): whether `txid` is latched structurally
@@ -1077,7 +1182,12 @@ impl PotStorage for MemoryPotStorage {
             .iter_mut()
             .find(|r| r.txid == record.txid && r.output_index == record.output_index)
         {
-            None => records.push(record.clone()),
+            None => {
+                records.push(record.clone());
+                drop(records);
+                self.ordinal_of(&record.txid, record.output_index);
+                return Ok(());
+            }
             Some(existing) => {
                 fn fill<T: Clone>(slot: &mut Option<T>, incoming: &Option<T>) {
                     if slot.is_none() {
@@ -1391,6 +1501,7 @@ impl PotStorage for MemoryPotStorage {
         if beef.is_empty() {
             return Ok(());
         }
+        self.beef_ordinal_of(txid);
         let now = self.now();
         // bsv-low#304: a VERIFIED row is authoritative — an admit-path
         // write (untrusted, submitter-supplied bytes) must never clobber a
@@ -1535,27 +1646,77 @@ impl PotStorage for MemoryPotStorage {
         })
     }
 
-    async fn find_confirmed_in_heights(
+    async fn confirmed_window_page(
         &self,
-        min_height: u64,
-        max_height: u64,
+        lo: u64,
+        hi: u64,
+        after: Option<crate::pot::reorg::RowKey>,
         limit: u64,
-    ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let mut rows: Vec<PotRecord> = self
+    ) -> Result<Vec<(crate::pot::reorg::RowKey, PotRecord)>, PotStorageError> {
+        use crate::pot::reorg::RowKey;
+        let mut rows: Vec<(RowKey, PotRecord)> = self
             .records
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| {
-                r.spent
-                    && r.spent_confirmed
-                    && r.spent_height
-                        .is_some_and(|h| h >= min_height && h <= max_height)
-            })
+            .filter(|r| r.spent_confirmed && r.spent_height.is_some_and(|h| h >= lo && h <= hi))
             .cloned()
+            .map(|r| {
+                let key = RowKey { height: r.spent_height.unwrap_or(0), rowid: self.ordinal_of(&r.txid, r.output_index) };
+                (key, r)
+            })
             .collect();
-        // NEWEST first (the D1 `ORDER BY spentHeight DESC`), bounded.
-        rows.sort_by_key(|r| std::cmp::Reverse(r.spent_height));
+        // the walk order: spentHeight DESC, rowid DESC (the D1 index order, reversed)
+        rows.sort_by_key(|(k, _)| std::cmp::Reverse((k.height, k.rowid)));
+        if let Some(a) = after {
+            rows.retain(|(k, _)| k.height < a.height || (k.height == a.height && k.rowid < a.rowid));
+        }
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn read_sweep_state(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::pot::reorg::SweepState>, PotStorageError> {
+        Ok(self.sweep_states.lock().unwrap().get(name).cloned())
+    }
+
+    async fn write_sweep_state(
+        &self,
+        name: &str,
+        state: &crate::pot::reorg::SweepState,
+    ) -> Result<(), PotStorageError> {
+        self.sweep_states.lock().unwrap().insert(name.to_string(), state.clone());
+        Ok(())
+    }
+
+    async fn verified_pot_beefs_page(
+        &self,
+        lo: u64,
+        hi: u64,
+        after: Option<crate::pot::reorg::RowKey>,
+        limit: u64,
+    ) -> Result<Vec<(crate::pot::reorg::RowKey, String, Vec<u8>)>, PotStorageError> {
+        use crate::pot::reorg::RowKey;
+        let verified = self.verified.lock().unwrap().clone();
+        let heights = self.proof_heights.lock().unwrap().clone();
+        let beefs = self.beefs.lock().unwrap().clone();
+        let mut rows: Vec<(RowKey, String, Vec<u8>)> = verified
+            .iter()
+            .filter_map(|txid| {
+                let h = *heights.get(txid)?;
+                if h < lo || h > hi {
+                    return None;
+                }
+                let beef = beefs.get(txid)?.clone();
+                Some((RowKey { height: h, rowid: self.beef_ordinal_of(txid) }, txid.clone(), beef))
+            })
+            .collect();
+        rows.sort_by_key(|(k, _, _)| std::cmp::Reverse((k.height, k.rowid)));
+        if let Some(a) = after {
+            rows.retain(|(k, _, _)| k.height < a.height || (k.height == a.height && k.rowid < a.rowid));
+        }
         rows.truncate(limit as usize);
         Ok(rows)
     }
@@ -1600,31 +1761,6 @@ impl PotStorage for MemoryPotStorage {
         Ok(false)
     }
 
-    async fn demote_confirmed_from_height(
-        &self,
-        from_height: u64,
-        limit: u64,
-    ) -> Result<Vec<PotRecord>, PotStorageError> {
-        let mut records = self.records.lock().unwrap();
-        // NEWEST first, bounded: the D1 statement demotes the same slice.
-        let mut idx: Vec<usize> = records
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.spent && r.spent_confirmed && r.spent_height.is_some_and(|h| h >= from_height))
-            .map(|(i, _)| i)
-            .collect();
-        idx.sort_by(|a, b| records[*b].spent_height.cmp(&records[*a].spent_height));
-        idx.truncate(limit as usize);
-        let mut demoted = Vec::with_capacity(idx.len());
-        for i in idx {
-            let r = &mut records[i];
-            r.spent_confirmed = false;
-            r.spent_height = None;
-            demoted.push(r.clone());
-        }
-        Ok(demoted)
-    }
-
     async fn reanchor_confirmed_for_spender(
         &self,
         txid: &str,
@@ -1664,7 +1800,18 @@ impl PotStorage for MemoryPotStorage {
             .lock()
             .unwrap()
             .insert(txid.to_string(), new_beef.to_vec());
+        self.beef_ordinal_of(txid);
         self.verified.lock().unwrap().insert(txid.to_string());
+        // the anchor the just-verified bump names (round 2, M4): derived from
+        // the bytes, as the D1 verifying write does
+        match pot_beef_bump_height(txid, new_beef) {
+            Some(h) => {
+                self.proof_heights.lock().unwrap().insert(txid.to_string(), h);
+            }
+            None => {
+                self.proof_heights.lock().unwrap().remove(txid);
+            }
+        }
         // #2b confirm-beats-latch: a chaintracks-verified proof is chain
         // truth — clear any stale supersession latch (the reorg direction;
         // mirrors POT_BEEF_VERIFIED_WRITE_SQL's explicit NULL).
@@ -1676,6 +1823,18 @@ impl PotStorage for MemoryPotStorage {
         self.verified.lock().unwrap().insert(txid.to_string());
         // #2b confirm-beats-latch (mirrors POT_BEEF_MARK_PROVEN_SQL).
         self.unprovable.lock().unwrap().remove(txid);
+        Ok(())
+    }
+
+    async fn mark_pot_beef_proven_at(
+        &self,
+        txid: &str,
+        height: Option<u64>,
+    ) -> Result<(), PotStorageError> {
+        self.mark_pot_beef_proven(txid).await?;
+        if let Some(h) = height {
+            self.proof_heights.lock().unwrap().insert(txid.to_string(), h);
+        }
         Ok(())
     }
 
@@ -3145,10 +3304,11 @@ mod tests {
 
     #[tokio::test]
     async fn record_header_seen_reports_the_prior_hash_and_the_max_height() {
-        use crate::pot::reorg::{reorg_from_height, HeaderSeen};
+        use crate::pot::reorg::{classify_tip_announce, HeaderSeen, TipAnnounce};
         let store = MemoryPotStorage::new();
         let first = store.record_header_seen(965771, "AA").await.unwrap();
         assert_eq!(first, HeaderSeen::default(), "the first header ever: nothing prior");
+        assert_eq!(classify_tip_announce(965771, "AA", &first), TipAnnounce::Extends);
         let next = store.record_header_seen(965772, "BB").await.unwrap();
         assert_eq!(next.prior_hash_at_height, None);
         assert_eq!(next.max_height_before, Some(965771));
@@ -3156,10 +3316,13 @@ mod tests {
         let replaced = store.record_header_seen(965771, "CC").await.unwrap();
         assert_eq!(replaced.prior_hash_at_height.as_deref(), Some("aa"));
         assert_eq!(replaced.max_height_before, Some(965772));
-        assert_eq!(reorg_from_height(965771, "CC", &replaced), Some(965771));
+        assert_eq!(classify_tip_announce(965771, "CC", &replaced), TipAnnounce::Reorg { from: 965771 });
         // a repeat of the same hash is not a reorg
         let again = store.record_header_seen(965771, "cc").await.unwrap();
-        assert_eq!(reorg_from_height(965771, "CC", &again), None);
+        assert_eq!(classify_tip_announce(965771, "CC", &again), TipAnnounce::Repeat);
+        // a lower height never recorded: an old header, never a reorg
+        let old = store.record_header_seen(965700, "DD").await.unwrap();
+        assert_eq!(classify_tip_announce(965700, "DD", &old), TipAnnounce::Old);
     }
 
     #[tokio::test]
@@ -3189,33 +3352,68 @@ mod tests {
         assert_eq!(again.len(), 1);
     }
 
+    /// The windowed walk: newest first by (height, rowid), a cursor that
+    /// continues exactly after the last row examined, an exhausted tail.
     #[tokio::test]
-    async fn demote_confirmed_from_height_is_newest_first_bounded_and_returns_the_rows() {
+    async fn the_confirmed_window_page_walks_newest_first_and_continues_after_the_cursor() {
+        use crate::pot::reorg::RowKey;
         let store = MemoryPotStorage::new();
-        for (pot, h) in [("p1", 965770), ("p2", 965771), ("p3", 965772), ("p4", 965773)] {
+        // insertion order = rowid order; two rows at 965771, one below, one above the window
+        for (pot, h) in [("p1", 965770), ("p2", 965771), ("p3", 965771), ("p4", 965772), ("p5", 965773)] {
             store.store_record(&pot_record(pot, 0)).await.unwrap();
-            store
-                .mark_spent(pot, 0, &format!("s-{pot}"), true, None, Some(h), None)
-                .await
-                .unwrap();
+            store.mark_spent(pot, 0, &format!("s-{pot}"), true, None, Some(h), None).await.unwrap();
         }
-        // the sweep's candidate window is the same shape
-        let win = store.find_confirmed_in_heights(965771, 965773, 10).await.unwrap();
-        let hs: Vec<u64> = win.iter().map(|r| r.spent_height.unwrap()).collect();
-        assert_eq!(hs, vec![965773, 965772, 965771], "newest first, inside the window");
-        // a bounded demotion from the orphaned height drains newest first
-        let demoted = store.demote_confirmed_from_height(965771, 2).await.unwrap();
-        let ds: Vec<&str> = demoted.iter().map(|r| r.txid.as_str()).collect();
-        assert_eq!(ds, vec!["p4", "p3"]);
-        let rest = store.demote_confirmed_from_height(965771, 10).await.unwrap();
-        assert_eq!(rest.len(), 1, "the last row above the height on the next pass");
-        assert_eq!(rest[0].txid, "p2");
-        assert!(store.demote_confirmed_from_height(965771, 10).await.unwrap().is_empty());
-        // 965770 (below the reorg) was never touched
-        let p1 = store.get_spent_status("p1", 0).await.unwrap().unwrap();
-        assert!(p1.spent_confirmed && p1.spent_height == Some(965770));
-        // every demoted row is back in the chaser's pool
-        assert_eq!(store.find_unconfirmed_by_spending_txid("s-p4").await.unwrap().len(), 1);
+        // an unconfirmed spend inside the heights is in no window
+        store.store_record(&pot_record("p6", 0)).await.unwrap();
+        store.mark_spent("p6", 0, "s-p6", false, None, None, None).await.unwrap();
+        let names = |rows: &[(RowKey, PotRecord)]| rows.iter().map(|(_, r)| r.txid.clone()).collect::<Vec<_>>();
+        let head = store.confirmed_window_page(965771, 965772, None, 2).await.unwrap();
+        assert_eq!(names(&head), vec!["p4", "p3"], "newest height first, then the newest row at a height");
+        let cursor = head.last().unwrap().0;
+        assert_eq!(cursor.height, 965771);
+        let next = store.confirmed_window_page(965771, 965772, Some(cursor), 2).await.unwrap();
+        assert_eq!(names(&next), vec!["p2"], "continues after the cursor, same height first");
+        let end = store.confirmed_window_page(965771, 965772, Some(next.last().unwrap().0), 2).await.unwrap();
+        assert!(end.is_empty(), "exhausted");
+        assert_eq!(names(&store.confirmed_window_page(1, 965773, None, 10).await.unwrap()), vec!["p5", "p4", "p3", "p2", "p1"]);
+    }
+
+    #[tokio::test]
+    async fn sweep_state_round_trips_per_name() {
+        use crate::pot::reorg::{RowKey, SweepState};
+        let store = MemoryPotStorage::new();
+        assert_eq!(store.read_sweep_state("spenders").await.unwrap(), None);
+        let st = SweepState { lo: 965771, hi: 965773, cursor: Some(RowKey { height: 965772, rowid: 7 }), exhausted: false };
+        store.write_sweep_state("spenders", &st).await.unwrap();
+        assert_eq!(store.read_sweep_state("spenders").await.unwrap(), Some(st.clone()));
+        assert_eq!(store.read_sweep_state("pot_beefs").await.unwrap(), None, "names are independent");
+        let done = SweepState { exhausted: true, cursor: None, ..st };
+        store.write_sweep_state("spenders", &done).await.unwrap();
+        assert_eq!(store.read_sweep_state("spenders").await.unwrap(), Some(done));
+    }
+
+    /// The verifying writers record the height their bump names; the
+    /// pot_beefs window pages VERIFIED rows by it, newest first, with the
+    /// same cursor contract; an unlatched row leaves the page.
+    #[tokio::test]
+    async fn verified_pot_beefs_page_is_by_proof_height_and_latch() {
+        let store = MemoryPotStorage::new();
+        store.store_beef("a", &[1]).await.unwrap();
+        store.mark_pot_beef_proven_at("a", Some(965771)).await.unwrap();
+        store.store_beef("b", &[2]).await.unwrap();
+        store.mark_pot_beef_proven_at("b", Some(965772)).await.unwrap();
+        store.store_beef("c", &[3]).await.unwrap();
+        store.mark_pot_beef_proven_at("c", None).await.unwrap(); // verified, no anchor: in no window
+        store.store_beef("d", &[4]).await.unwrap(); // never verified
+        let page = store.verified_pot_beefs_page(965771, 965773, None, 10).await.unwrap();
+        let txids: Vec<&str> = page.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert_eq!(txids, vec!["b", "a"]);
+        let after = page[0].0;
+        let rest = store.verified_pot_beefs_page(965771, 965773, Some(after), 10).await.unwrap();
+        assert_eq!(rest.iter().map(|(_, t, _)| t.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        store.unlatch_pot_beef_proof("a").await.unwrap();
+        assert!(store.verified_pot_beefs_page(965771, 965773, None, 10).await.unwrap().iter().all(|(_, t, _)| t != "a"));
+        assert_eq!(store.get_beef("a").await.unwrap(), Some(vec![1]), "the bytes stay");
     }
 
     #[tokio::test]
