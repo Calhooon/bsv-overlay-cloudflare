@@ -3537,12 +3537,23 @@ pub struct PushedPotSummary {
     /// fault) — counted so a total-RETURNING driver failure self-announces
     /// here too, not only in the poll chaser.
     pub spends_cas_errors: usize,
+    /// bsv-low M19 R2: CONFIRMED rows whose `spentHeight` MOVED because this
+    /// pushed, verified proof names a different block than the stored
+    /// confirmation (Arcade's `reorg_reanchor`, or any later MINED for the
+    /// same spender): a re-anchor is a REPLACEMENT, never a `cas_missed`.
+    pub spends_reanchored: usize,
+    /// bsv-low M19 R2: the stored pot BEEF's bump was REPLACED by this push
+    /// because it named a different block (the old anchor was an orphan's).
+    pub pot_beef_reanchored: bool,
 }
 
 impl PushedPotSummary {
     /// Whether the push landed in ANY pot store.
     pub fn landed_anything(&self) -> bool {
-        self.pot_beef_compacted || self.spends_confirmed > 0
+        self.pot_beef_compacted
+            || self.spends_confirmed > 0
+            || self.spends_reanchored > 0
+            || self.pot_beef_reanchored
     }
 }
 
@@ -3631,25 +3642,49 @@ pub async fn apply_pushed_proof_to_pot_stores(
         .pot_beef_proof_verified(txid)
         .await
         .unwrap_or(false);
+    // bsv-low M19 R2: the block this (route-verified) push names. A stored
+    // VERIFIED bump that names a DIFFERENT block is an orphan's anchor (the
+    // 2026-09-07 class: Arcade pushed the 34 MB block's proofs within 5 s,
+    // then re-anchored to the canonical block 36 min later): the push
+    // REPLACES it — the verified latch is no longer a reason to skip.
+    let pushed_height = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
+        .ok()
+        .map(|mp| u64::from(mp.block_height));
     match pot_storage.get_beef(txid).await {
-        Ok(Some(stored_beef)) if !already_verified => {
-            match stitch_and_trim_pot_beef(txid, &stored_beef, bump_hex) {
-                Some(compacted) => match pot_storage.compact_pot_beef(txid, &compacted).await {
-                    Ok(()) => summary.pot_beef_compacted = true,
-                    Err(e) => {
-                        push_log(&format!("[arc-ingest] {txid} pot-beef compact failed: {e}"));
+        Ok(Some(stored_beef)) => {
+            let stored_height = stored_pot_bump_height(&stored_beef, txid);
+            let reanchor = already_verified
+                && overlay_discovery::pot::reorg::is_reanchor(
+                    stored_height,
+                    pushed_height.unwrap_or(0),
+                );
+            if !already_verified || reanchor {
+                match stitch_and_trim_pot_beef(txid, &stored_beef, bump_hex) {
+                    Some(compacted) => match pot_storage.compact_pot_beef(txid, &compacted).await {
+                        Ok(()) => {
+                            summary.pot_beef_compacted = true;
+                            if reanchor {
+                                summary.pot_beef_reanchored = true;
+                                push_log(&format!(
+                                    "[arc-ingest] {txid} pot-beef RE-ANCHORED {stored_height:?} → {pushed_height:?} (the stored bump named an orphan's block)"
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            push_log(&format!("[arc-ingest] {txid} pot-beef compact failed: {e}"));
+                        }
+                    },
+                    None => {
+                        // Fail-closed: an unstitchable pushed bump writes nothing;
+                        // the poll backstop retries this row later.
+                        push_log(&format!(
+                            "[arc-ingest] {txid} pot-beef stitch failed (backstop will retry)"
+                        ));
                     }
-                },
-                None => {
-                    // Fail-closed: an unstitchable pushed bump writes nothing;
-                    // the poll backstop retries this row later.
-                    push_log(&format!(
-                        "[arc-ingest] {txid} pot-beef stitch failed (backstop will retry)"
-                    ));
                 }
             }
         }
-        Ok(_) => {} // no pot beef, or already VERIFIED-proven — nothing to do
+        Ok(None) => {} // no pot beef — nothing to do
         Err(e) => push_log(&format!("[arc-ingest] {txid} pot-beef read failed: {e}")),
     }
 
@@ -3702,7 +3737,280 @@ pub async fn apply_pushed_proof_to_pot_stores(
         Err(e) => push_log(&format!("[arc-ingest] {txid} spender lookup failed: {e}")),
     }
 
+    // 3. bsv-low M19 R2: rows ALREADY CONFIRMED by this spender at a
+    //    different height are RE-ANCHORED to the block this verified push
+    //    names (a re-anchor is a replacement, never a cas_missed). A
+    //    height-less confirmation is FILLED, not re-anchored, by the confirm
+    //    arm above (`is_reanchor` is false for it).
+    if let Some(new_height) = pushed_height {
+        match pot_storage.find_confirmed_by_spending_txid(txid).await {
+            Ok(records) => {
+                for rec in records {
+                    if !overlay_discovery::pot::reorg::is_reanchor(rec.spent_height, new_height) {
+                        continue;
+                    }
+                    match pot_storage
+                        .reanchor_confirmed_for_spender(&rec.txid, rec.output_index, txid, new_height)
+                        .await
+                    {
+                        Ok(true) => {
+                            summary.spends_reanchored += 1;
+                            push_log(&format!(
+                                "[arc-ingest] {}:{} RE-ANCHORED {:?} → {new_height} on the verified push for {txid}",
+                                rec.txid, rec.output_index, rec.spent_height
+                            ));
+                            crate::pot_changes::note(&rec.txid, rec.output_index);
+                        }
+                        Ok(false) => summary.spends_cas_missed += 1,
+                        Err(e) => {
+                            summary.spends_cas_errors += 1;
+                            push_log(&format!(
+                                "[arc-ingest] {}:{} re-anchor CAS failed: {e}",
+                                rec.txid, rec.output_index
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => push_log(&format!("[arc-ingest] {txid} confirmed-spender lookup failed: {e}")),
+        }
+    }
     summary
+}
+
+/// The block height the stored pot BEEF's OWN bump for `txid` names, if the
+/// BEEF parses and carries one (bsv-low M19 R2).
+fn stored_pot_bump_height(stored_beef: &[u8], txid: &str) -> Option<u64> {
+    let beef = Beef::from_binary(stored_beef).ok()?;
+    beef.find_bump(txid).map(|mp| u64::from(mp.block_height))
+}
+
+// ============================================================================
+// bsv-low M19 R2 (2026-09-08): the reorg reconcile — demotion + the sweep
+// ============================================================================
+//
+// Reference: overlay-express `Engine.handleReorg` (demote proven admissions
+// whose block was orphaned) + its revalidation sweep (re-verify the recent
+// window on every (re)connect / poll; "for chain trackers without a reorg
+// event stream"). On Workers the sweep is the PRIMARY path (it runs on every
+// block-event pass); Arcade's `/v2/reorg/stream` is an accelerator only.
+
+/// What a detected reorg demoted this pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReorgDemotionSummary {
+    /// Confirmed rows demoted back to SEEN (`spentConfirmed = 0`,
+    /// `spentHeight = NULL`; every other fact kept).
+    pub demoted: usize,
+    /// Spender pot BEEFs whose VERIFIED latch was dropped (their bump rests
+    /// on an orphan; the proof-completion pass re-verifies before trust).
+    pub unlatched: usize,
+    /// Storage faults (counted, never silent).
+    pub errors: usize,
+}
+
+/// A detected reorg from `from_height`: demote the NEWEST `limit` confirmed
+/// rows at or above it (bounded per pass; a deep reorg drains over a few
+/// passes) and unlatch their spenders' stored proofs. The existing confirm
+/// arm (the tip pass + the cron) re-upgrades every demoted row on the next
+/// proof verified against the canonical chain, which is the whole point.
+pub async fn handle_reorg(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    from_height: u64,
+    limit: u64,
+) -> ReorgDemotionSummary {
+    let mut summary = ReorgDemotionSummary::default();
+    let demoted = match pot_storage.demote_confirmed_from_height(from_height, limit).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            summary.errors += 1;
+            push_log(&format!("[reorg] demotion from {from_height} failed: {e}"));
+            return summary;
+        }
+    };
+    summary.demoted = demoted.len();
+    for rec in &demoted {
+        push_log(&format!(
+            "[reorg] {}:{} demoted to SEEN (was confirmed at or above {from_height}; spender {})",
+            rec.txid,
+            rec.output_index,
+            rec.spending_txid.as_deref().unwrap_or("?")
+        ));
+        if let Some(spender) = rec.spending_txid.as_deref() {
+            match pot_storage.unlatch_pot_beef_proof(spender).await {
+                Ok(()) => summary.unlatched += 1,
+                Err(e) => {
+                    summary.errors += 1;
+                    push_log(&format!("[reorg] {spender} unlatch failed: {e}"));
+                }
+            }
+        }
+    }
+    summary
+}
+
+/// What the revalidation sweep found this pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReorgSweepSummary {
+    /// Confirmed rows inside the window that were examined.
+    pub scanned: usize,
+    /// Rows whose stored spender proof still matches the canonical header.
+    pub standing: usize,
+    /// Rows whose stored proof the header source REFUTES: demoted + unlatched
+    /// (#429: zero on a healthy stream).
+    pub stale: usize,
+    /// Rows whose demotion guard MISSED (the pointer moved under the sweep):
+    /// nothing written, re-examined next pass.
+    pub demote_missed: usize,
+    /// Rows with no stored spender proof to re-verify locally (confirmed by
+    /// a courier answer whose bump was never stitched): left to the courier
+    /// arm, which already re-judges them; counted so the gap is visible.
+    pub no_stored_proof: usize,
+    /// Header-source read faults (transport / a starved subrequest): NOT a
+    /// verdict, retried next pass.
+    pub faults: usize,
+    /// Storage faults.
+    pub errors: usize,
+}
+
+/// Re-verify every confirmed row anchored in the last `depth` heights ending
+/// at `tip` (at most `limit`, newest first) against the current header
+/// source; a refuted stored proof demotes the row and drops its spender's
+/// latch. Fail-safe on every uncertain arm: a read fault never demotes.
+pub async fn reorg_revalidation_sweep(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    tracker: Option<&dyn ChainTracker>,
+    tip: u64,
+    depth: u64,
+    limit: u64,
+) -> ReorgSweepSummary {
+    use overlay_discovery::pot::reorg::{classify_reverify, sweep_window, ReverifyVerdict};
+    let mut summary = ReorgSweepSummary::default();
+    // No header source ⇒ no verdict is possible: `verify_bump_detailed`
+    // answers Ok(false) without a tracker, which here would read as "every
+    // stored proof is refuted" and demote the whole window every block. A
+    // sweep that cannot ask the chain touches nothing (fail-safe), loudly.
+    let Some(tracker) = tracker else {
+        push_log("[reorg-sweep] no header source configured — nothing re-verified");
+        return summary;
+    };
+    let Some((lo, hi)) = sweep_window(tip, depth) else {
+        return summary;
+    };
+    let rows = match pot_storage.find_confirmed_in_heights(lo, hi, limit).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            summary.errors += 1;
+            push_log(&format!("[reorg-sweep] window {lo}..={hi} read failed: {e}"));
+            return summary;
+        }
+    };
+    summary.scanned = rows.len();
+    for rec in rows {
+        let Some(spender) = rec.spending_txid.as_deref() else {
+            continue;
+        };
+        let stored = match pot_storage.get_beef(spender).await {
+            Ok(b) => b,
+            Err(e) => {
+                summary.errors += 1;
+                push_log(&format!("[reorg-sweep] {spender} pot-beef read failed: {e}"));
+                continue;
+            }
+        };
+        let bump_hex = stored.as_deref().and_then(|bytes| {
+            Beef::from_binary(bytes)
+                .ok()
+                .and_then(|beef| beef.find_bump(spender).map(MerklePath::to_hex))
+        });
+        let Some(bump_hex) = bump_hex else {
+            summary.no_stored_proof += 1;
+            continue;
+        };
+        let answer = verify_bump_detailed(Some(tracker), &bump_hex, spender).await;
+        match classify_reverify(&answer) {
+            ReverifyVerdict::Standing => summary.standing += 1,
+            ReverifyVerdict::Fault => {
+                summary.faults += 1;
+                push_log(&format!(
+                    "[reorg-sweep] {}:{} header READ FAULT re-verifying {spender} — not a verdict: {}",
+                    rec.txid,
+                    rec.output_index,
+                    answer.as_ref().err().map(String::as_str).unwrap_or("?")
+                ));
+            }
+            ReverifyVerdict::Stale => {
+                match pot_storage
+                    .demote_confirmed_for_spender(&rec.txid, rec.output_index, spender)
+                    .await
+                {
+                    Ok(true) => {
+                        summary.stale += 1;
+                        push_log(&format!(
+                            "[reorg-sweep] {}:{} STALE PROOF — the header source refutes {spender}'s stored bump at {:?}; demoted to SEEN",
+                            rec.txid, rec.output_index, rec.spent_height
+                        ));
+                        if let Err(e) = pot_storage.unlatch_pot_beef_proof(spender).await {
+                            summary.errors += 1;
+                            push_log(&format!("[reorg-sweep] {spender} unlatch failed: {e}"));
+                        }
+                    }
+                    Ok(false) => summary.demote_missed += 1,
+                    Err(e) => {
+                        summary.errors += 1;
+                        push_log(&format!(
+                            "[reorg-sweep] {}:{} demote CAS failed: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                    }
+                }
+            }
+            ReverifyVerdict::NoStoredProof => summary.no_stored_proof += 1,
+        }
+    }
+    summary
+}
+
+/// Arcade's `reorg_unmined` (a SEEN_ON_NETWORK flagged as a reorg
+/// correction): the spender was reverted out of an orphaned block it does
+/// not exist outside of — demote every confirmed row it points at back to
+/// SEEN and drop its latch. Returns the rows demoted.
+pub async fn demote_spender_unmined(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    spender: &str,
+) -> usize {
+    let rows = match pot_storage.find_confirmed_by_spending_txid(spender).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            push_log(&format!("[arc-ingest] {spender} reorg_unmined: confirmed lookup failed: {e}"));
+            return 0;
+        }
+    };
+    let mut demoted = 0;
+    for rec in rows {
+        match pot_storage
+            .demote_confirmed_for_spender(&rec.txid, rec.output_index, spender)
+            .await
+        {
+            Ok(true) => {
+                demoted += 1;
+                push_log(&format!(
+                    "[arc-ingest] {}:{} demoted to SEEN — Arcade reports {spender} reorg_unmined",
+                    rec.txid, rec.output_index
+                ));
+            }
+            Ok(false) => {}
+            Err(e) => push_log(&format!(
+                "[arc-ingest] {}:{} reorg_unmined demote failed: {e}",
+                rec.txid, rec.output_index
+            )),
+        }
+    }
+    if demoted > 0 {
+        if let Err(e) = pot_storage.unlatch_pot_beef_proof(spender).await {
+            push_log(&format!("[arc-ingest] {spender} unlatch failed: {e}"));
+        }
+    }
+    demoted
 }
 
 // ============================================================================
@@ -6939,5 +7247,200 @@ mod tests {
         // an unknown subject is refused
         assert!(assemble_ancestry_beef(&"00".repeat(32), &entries).is_err());
         assert!(raw_input_txids("zz").is_err());
+    }
+
+    // ── bsv-low M19 R2 (2026-09-08): the reorg reconcile ────────────────────
+
+    /// A tracker whose header source cannot be read (transport fault): the
+    /// sweep must count it and touch nothing.
+    struct FaultyTracker;
+    #[async_trait::async_trait]
+    impl ChainTracker for FaultyTracker {
+        async fn is_valid_root_for_height(
+            &self,
+            _root: &str,
+            _height: u32,
+        ) -> std::result::Result<bool, bsv_rs::transaction::ChainTrackerError> {
+            Err(bsv_rs::transaction::ChainTrackerError::NetworkError("starved".into()))
+        }
+        async fn current_height(&self) -> std::result::Result<u32, bsv_rs::transaction::ChainTrackerError> {
+            Err(bsv_rs::transaction::ChainTrackerError::NetworkError("starved".into()))
+        }
+    }
+
+    /// A pot CONFIRMED at `height` by a spender whose stored pot BEEF carries
+    /// a single-leaf bump at that height (root = the spender txid), latched
+    /// verified. Returns the spender txid.
+    async fn confirmed_pot_with_stored_proof(
+        store: &MemoryPotStorage,
+        pot: &str,
+        height: u32,
+    ) -> String {
+        let raw = real_spender_raw(pot, 0);
+        let spender = Transaction::from_hex(&raw).unwrap().id();
+        store
+            .store_record(&PotRecord {
+                txid: pot.into(),
+                output_index: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(pot, 0, &spender, true, None, Some(u64::from(height)), Some(true))
+            .await
+            .unwrap();
+        let bump_hex = single_tx_bump(&spender, height).to_hex();
+        let beef = assemble_spender_beef(&raw, &bump_hex, &spender).unwrap();
+        store.store_beef(&spender, &beef).await.unwrap();
+        store.mark_pot_beef_proven(&spender).await.unwrap();
+        spender
+    }
+
+    /// The 2026-09-07 class: two confirmations at 965771, one whose stored
+    /// bump the header source still holds and one whose bump names the
+    /// orphan's root. The sweep demotes ONLY the refuted one, unlatches its
+    /// spender, and leaves the standing one untouched.
+    #[tokio::test]
+    async fn sweep_demotes_the_refuted_stored_bump_and_keeps_the_standing_one() {
+        let store = MemoryPotStorage::new();
+        let pot_a = "aa".repeat(32);
+        let pot_b = "bb".repeat(32);
+        let spender_a = confirmed_pot_with_stored_proof(&store, &pot_a, 965_771).await;
+        let spender_b = confirmed_pot_with_stored_proof(&store, &pot_b, 965_771).await;
+        // the canonical 965771 carries A's root; B's stored bump rests on the orphan
+        let mut tracker = MockChainTracker::new(965_773);
+        tracker.add_root(965_771, spender_a.clone());
+        let s = reorg_revalidation_sweep(&store, Some(&tracker), 965_773, 3, 50).await;
+        assert_eq!((s.scanned, s.standing, s.stale, s.faults, s.errors), (2, 1, 1, 0, 0), "{s:?}");
+        let a = store.get_spent_status(&pot_a, 0).await.unwrap().unwrap();
+        assert!(a.spent_confirmed && a.spent_height == Some(965_771), "the standing row is untouched");
+        assert!(store.pot_beef_proof_verified(&spender_a).await.unwrap());
+        let b = store.get_spent_status(&pot_b, 0).await.unwrap().unwrap();
+        assert!(b.spent && !b.spent_confirmed && b.spent_height.is_none(), "the refuted row is SEEN again");
+        assert_eq!(b.spending_txid.as_deref(), Some(spender_b.as_str()), "the pointer stays");
+        assert_eq!(b.spender_final, Some(true), "the #371 witness stays");
+        assert!(!store.pot_beef_proof_verified(&spender_b).await.unwrap(), "its proof lost the latch");
+        assert_eq!(store.get_beef(&spender_b).await.unwrap().map(|b| !b.is_empty()), Some(true), "the bytes stay");
+        // it is a chaser candidate again (the confirm arm re-judges it)
+        assert_eq!(store.find_unconfirmed_by_spending_txid(&spender_b).await.unwrap().len(), 1);
+        // a second sweep finds one standing row and nothing to demote
+        let s2 = reorg_revalidation_sweep(&store, Some(&tracker), 965_773, 3, 50).await;
+        assert_eq!((s2.scanned, s2.standing, s2.stale), (1, 1, 0));
+    }
+
+    /// The window: a row confirmed below the sweep's depth is never examined.
+    #[tokio::test]
+    async fn sweep_examines_only_the_last_depth_heights() {
+        let store = MemoryPotStorage::new();
+        let old_pot = "cc".repeat(32);
+        let new_pot = "dd".repeat(32);
+        confirmed_pot_with_stored_proof(&store, &old_pot, 965_700).await; // far below
+        confirmed_pot_with_stored_proof(&store, &new_pot, 965_772).await;
+        let tracker = MockChainTracker::new(965_774); // knows NO roots: everything examined is refuted
+        let s = reorg_revalidation_sweep(&store, Some(&tracker), 965_774, 3, 50).await;
+        assert_eq!((s.scanned, s.stale), (1, 1), "{s:?}");
+        let old = store.get_spent_status(&old_pot, 0).await.unwrap().unwrap();
+        assert!(old.spent_confirmed, "outside the window, untouched");
+    }
+
+    /// Fail-safe on every uncertain arm: a header-source read FAULT counts
+    /// and touches nothing; no header source at all touches nothing.
+    #[tokio::test]
+    async fn sweep_never_demotes_on_a_fault_or_without_a_header_source() {
+        let store = MemoryPotStorage::new();
+        let pot = "ee".repeat(32);
+        let spender = confirmed_pot_with_stored_proof(&store, &pot, 965_771).await;
+        let s = reorg_revalidation_sweep(&store, Some(&FaultyTracker), 965_773, 3, 50).await;
+        assert_eq!((s.scanned, s.faults, s.stale, s.standing), (1, 1, 0, 0), "{s:?}");
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_771));
+        assert!(store.pot_beef_proof_verified(&spender).await.unwrap());
+        let s = reorg_revalidation_sweep(&store, None, 965_773, 3, 50).await;
+        assert_eq!(s, ReorgSweepSummary::default(), "no header source: nothing examined, nothing demoted");
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed);
+    }
+
+    /// A detected reorg from a height demotes every confirmation at or above
+    /// it (newest first, bounded) and unlatches the spenders' proofs; rows
+    /// below the height are untouched.
+    #[tokio::test]
+    async fn handle_reorg_demotes_from_the_height_and_unlatches_the_spenders() {
+        let store = MemoryPotStorage::new();
+        let below = "11".repeat(32);
+        let at = "22".repeat(32);
+        let above = "33".repeat(32);
+        let s_below = confirmed_pot_with_stored_proof(&store, &below, 965_770).await;
+        let s_at = confirmed_pot_with_stored_proof(&store, &at, 965_771).await;
+        let s_above = confirmed_pot_with_stored_proof(&store, &above, 965_773).await;
+        let first = handle_reorg(&store, 965_771, 1).await;
+        assert_eq!((first.demoted, first.unlatched, first.errors), (1, 1, 0), "bounded: the newest first");
+        let a = store.get_spent_status(&above, 0).await.unwrap().unwrap();
+        assert!(!a.spent_confirmed && a.spent_height.is_none());
+        assert!(!store.pot_beef_proof_verified(&s_above).await.unwrap());
+        let second = handle_reorg(&store, 965_771, 10).await;
+        assert_eq!((second.demoted, second.unlatched), (1, 1), "the next pass drains the rest");
+        assert!(!store.get_spent_status(&at, 0).await.unwrap().unwrap().spent_confirmed);
+        assert!(!store.pot_beef_proof_verified(&s_at).await.unwrap());
+        let b = store.get_spent_status(&below, 0).await.unwrap().unwrap();
+        assert!(b.spent_confirmed && b.spent_height == Some(965_770), "below the reorg: untouched");
+        assert!(store.pot_beef_proof_verified(&s_below).await.unwrap());
+        assert_eq!(handle_reorg(&store, 965_771, 10).await.demoted, 0);
+    }
+
+    /// Arcade's `reorg_reanchor` (or any later MINED for the same spender at
+    /// a different block): the confirmed row's height MOVES and the stored,
+    /// already-verified bump is REPLACED; the same block again changes
+    /// nothing.
+    #[tokio::test]
+    async fn pushed_proof_reanchors_a_confirmed_row_and_replaces_the_stored_bump() {
+        let store = MemoryPotStorage::new();
+        let pot = "44".repeat(32);
+        let spender = confirmed_pot_with_stored_proof(&store, &pot, 965_771).await;
+        assert_eq!(
+            stored_pot_bump_height(&store.get_beef(&spender).await.unwrap().unwrap(), &spender),
+            Some(965_771)
+        );
+        // the same block again: nothing moves (the verified latch skips the stitch)
+        let same = apply_pushed_proof_to_pot_stores(&store, &spender, &single_tx_bump(&spender, 965_771).to_hex()).await;
+        assert_eq!((same.spends_reanchored, same.pot_beef_reanchored, same.spends_confirmed), (0, false, 0), "{same:?}");
+        // the re-anchor to the canonical 965773
+        let moved = apply_pushed_proof_to_pot_stores(&store, &spender, &single_tx_bump(&spender, 965_773).to_hex()).await;
+        assert_eq!((moved.spends_reanchored, moved.pot_beef_reanchored, moved.spends_cas_missed), (1, true, 0), "{moved:?}");
+        assert!(moved.landed_anything(), "a re-anchor IS a landed push (never the unknown-txid arm)");
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_773));
+        assert_eq!(r.spending_txid.as_deref(), Some(spender.as_str()));
+        assert_eq!(
+            stored_pot_bump_height(&store.get_beef(&spender).await.unwrap().unwrap(), &spender),
+            Some(965_773),
+            "the stored bump names the new block"
+        );
+        assert!(store.pot_beef_proof_verified(&spender).await.unwrap(), "a verifying write keeps the latch");
+        // a height-less confirmation is FILLED by the confirm arm, not re-anchored
+        let filled = "55".repeat(32);
+        let raw = real_spender_raw(&filled, 0);
+        let sp = Transaction::from_hex(&raw).unwrap().id();
+        store.store_record(&PotRecord { txid: filled.clone(), output_index: 0, ..Default::default() }).await.unwrap();
+        store.mark_spent(&filled, 0, &sp, true, None, None, Some(true)).await.unwrap();
+        let fill = apply_pushed_proof_to_pot_stores(&store, &sp, &single_tx_bump(&sp, 965_773).to_hex()).await;
+        assert_eq!(fill.spends_reanchored, 0, "{fill:?}");
+        assert_eq!(store.get_spent_status(&filled, 0).await.unwrap().unwrap().spent_height, None, "a fill is the confirm arm's job on an unconfirmed row; a confirmed height-less row is left as it is");
+    }
+
+    /// Arcade's `reorg_unmined`: the spender left the chain; every confirmed
+    /// row it points at goes back to SEEN and its proof loses the latch.
+    #[tokio::test]
+    async fn unmined_marker_demotes_the_spenders_confirmed_rows() {
+        let store = MemoryPotStorage::new();
+        let pot = "66".repeat(32);
+        let spender = confirmed_pot_with_stored_proof(&store, &pot, 965_771).await;
+        assert_eq!(demote_spender_unmined(&store, &spender).await, 1);
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(r.spent && !r.spent_confirmed && r.spent_height.is_none());
+        assert!(!store.pot_beef_proof_verified(&spender).await.unwrap());
+        assert_eq!(demote_spender_unmined(&store, &spender).await, 0, "idempotent");
+        assert_eq!(demote_spender_unmined(&store, "77".repeat(32).as_str()).await, 0, "an unknown spender demotes nothing");
     }
 }

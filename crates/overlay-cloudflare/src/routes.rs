@@ -1816,11 +1816,16 @@ pub(crate) fn classify_arc_callback_auth(
 /// A classified `/arc-ingest` callback body (#228). PURE — unit-tested.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ArcIngestBody {
-    /// A merklePath-bearing (MINED) callback — the proof push.
+    /// A merklePath-bearing (MINED) callback — the proof push. bsv-low M19
+    /// R2: `block_hash` and `extra_info` ride along (Arcade's
+    /// `reorg_reanchor` marker names a MINED whose block CHANGED, issue #279
+    /// there); the proof's own verification decides, the marker is counted.
     Proof {
         txid: String,
         merkle_path: String,
         block_height: Option<u32>,
+        block_hash: Option<String>,
+        extra_info: Option<String>,
     },
     /// A non-MINED lifecycle callback — carries NO merklePath. Acknowledged
     /// (2xx, counted), never a parse error. A TERMINAL status (REJECTED /
@@ -1849,6 +1854,8 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
         merkle_path: Option<String>,
         #[serde(rename = "blockHeight")]
         block_height: Option<u32>,
+        #[serde(rename = "blockHash", default)]
+        block_hash: Option<String>,
         #[serde(rename = "txStatus", default)]
         tx_status: Option<String>,
         #[serde(rename = "extraInfo", default)]
@@ -1861,6 +1868,8 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
             txid: body.txid,
             merkle_path: mp,
             block_height: body.block_height,
+            block_hash: body.block_hash.map(|h| h.to_ascii_lowercase()),
+            extra_info: body.extra_info,
         }),
         _ => Ok(ArcIngestBody::StatusOnly {
             txid: body.txid,
@@ -1980,8 +1989,28 @@ pub async fn arc_ingest(
                 "POST /arc-ingest txid={txid} status-only ({}) -> 200 (acknowledged, no merklePath)",
                 if tx_status.is_empty() { "?" } else { &tx_status }
             );
+            // bsv-low M19 R2: Arcade's `reorg_unmined` (issue #279 there) is
+            // the one status-only callback that CHANGES a fact — the spender
+            // was reverted out of an orphaned block it does not exist outside
+            // of. Its confirmed rows go back to SEEN (guarded) and its stored
+            // proof loses the latch; the confirm arm re-judges them. The
+            // caller's pot-changed flush ships the demotions.
+            let marker = overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref());
+            let mut demoted = 0usize;
+            if marker == Some(overlay_discovery::pot::reorg::ArcadeReorgMarker::Unmined) {
+                demoted = crate::proof_fetcher::demote_spender_unmined(pot_storage, &txid).await;
+                worker::console_log!(
+                    "POST /arc-ingest txid={txid} reorg_unmined -> demoted {demoted} confirmed row(s) to SEEN"
+                );
+            }
             if let Some(db) = ops_db {
                 let status_upper = tx_status.to_ascii_uppercase();
+                if marker.is_some() {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1).await;
+                }
+                if demoted > 0 {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, demoted as u64).await;
+                }
                 if crate::broadcaster::ARCADE_FATAL_STATUSES.contains(&status_upper.as_str()) {
                     crate::ops::record_arc_terminal(
                         db,
@@ -2002,8 +2031,25 @@ pub async fn arc_ingest(
         ArcIngestBody::Proof {
             merkle_path,
             block_height,
+            block_hash,
+            extra_info,
             ..
-        } => (merkle_path, block_height),
+        } => {
+            // bsv-low M19 R2: a `reorg_reanchor` MINED is counted here; what it
+            // CHANGES is decided by the proof itself below (a verified bump
+            // naming a different block than the stored anchor replaces it —
+            // marker or not, so a re-notify without the marker heals too).
+            if let Some(m) = overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref()) {
+                worker::console_log!(
+                    "POST /arc-ingest txid={txid} carries Arcade reorg marker {m:?} (blockHash={})",
+                    block_hash.as_deref().unwrap_or("?")
+                );
+                if let Some(db) = ops_db {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1).await;
+                }
+            }
+            (merkle_path, block_height)
+        }
     };
 
     worker::console_log!("POST /arc-ingest txid={txid}");
@@ -2030,14 +2076,21 @@ pub async fn arc_ingest(
         crate::proof_fetcher::apply_pushed_proof_to_pot_stores(pot_storage, &txid, &merkle_path)
             .await;
 
+    if let Some(db) = ops_db {
+        if pot.spends_reanchored > 0 {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REANCHORED, pot.spends_reanchored as u64).await;
+        }
+    }
     match engine_res {
         Ok(()) => {
             worker::console_log!(
-                "POST /arc-ingest -> 200 (engine stitched; pot_beef_compacted={} spends_confirmed={} cas_missed={} cas_errors={})",
+                "POST /arc-ingest -> 200 (engine stitched; pot_beef_compacted={} spends_confirmed={} cas_missed={} cas_errors={} reanchored={} beef_reanchored={})",
                 pot.pot_beef_compacted,
                 pot.spends_confirmed,
                 pot.spends_cas_missed,
-                pot.spends_cas_errors
+                pot.spends_cas_errors,
+                pot.spends_reanchored,
+                pot.pot_beef_reanchored
             );
             if let Some(db) = ops_db {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_PUSHED, 1).await;
@@ -2051,11 +2104,13 @@ pub async fn arc_ingest(
         // (the settle/refund/sweep case) — that is a SUCCESSFUL push.
         Err(_) if pot.landed_anything() => {
             worker::console_log!(
-                "POST /arc-ingest -> 200 (pot stores only; pot_beef_compacted={} spends_confirmed={} cas_missed={} cas_errors={})",
+                "POST /arc-ingest -> 200 (pot stores only; pot_beef_compacted={} spends_confirmed={} cas_missed={} cas_errors={} reanchored={} beef_reanchored={})",
                 pot.pot_beef_compacted,
                 pot.spends_confirmed,
                 pot.spends_cas_missed,
-                pot.spends_cas_errors
+                pot.spends_cas_errors,
+                pot.spends_reanchored,
+                pot.pot_beef_reanchored
             );
             if let Some(db) = ops_db {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_PUSHED, 1).await;
@@ -3971,10 +4026,14 @@ mod tests {
                 txid,
                 merkle_path,
                 block_height,
+                block_hash,
+                extra_info,
             } => {
                 assert_eq!(txid, CB_TXID);
                 assert_eq!(merkle_path, "beef00");
                 assert_eq!(block_height, Some(850_000));
+                assert_eq!(block_hash, None);
+                assert_eq!(extra_info, None);
             }
             other => panic!("merklePath body must be Proof, got {other:?}"),
         }
@@ -3986,6 +4045,36 @@ mod tests {
             classify_arc_ingest_body(&garbage).unwrap(),
             ArcIngestBody::Proof { .. }
         ));
+        // bsv-low M19 R2: Arcade's re-anchor (issue #279 there) rides the same
+        // Proof shape with the new block hash (lower-cased) and the marker.
+        let reanchor = format!(
+            r#"{{"txid":"{CB_TXID}","merklePath":"beef00","blockHeight":965773,"blockHash":"0000000000000000146BC084EC137A3C9608A07159128C66302051B6FE176E33","txStatus":"MINED","extraInfo":"reorg_reanchor"}}"#
+        );
+        match classify_arc_ingest_body(&reanchor).unwrap() {
+            ArcIngestBody::Proof { block_hash, extra_info, block_height, .. } => {
+                assert_eq!(block_hash.as_deref(), Some("0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33"));
+                assert_eq!(
+                    overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref()),
+                    Some(overlay_discovery::pot::reorg::ArcadeReorgMarker::Reanchor)
+                );
+                assert_eq!(block_height, Some(965773));
+            }
+            other => panic!("a re-anchor is a Proof, got {other:?}"),
+        }
+        // and the un-mine is a status-only callback whose marker the route reads
+        let unmined = format!(
+            r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK","extraInfo":"reorg_unmined"}}"#
+        );
+        match classify_arc_ingest_body(&unmined).unwrap() {
+            ArcIngestBody::StatusOnly { extra_info, tx_status, .. } => {
+                assert_eq!(tx_status, "SEEN_ON_NETWORK");
+                assert_eq!(
+                    overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref()),
+                    Some(overlay_discovery::pot::reorg::ArcadeReorgMarker::Unmined)
+                );
+            }
+            other => panic!("an un-mine is status-only, got {other:?}"),
+        }
     }
 
     // ── /arc-ingest bearer-auth: read the header the SENDER actually sets ────
