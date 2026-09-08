@@ -443,6 +443,8 @@ pub fn arcade_reorg_summary_json(s: &crate::arcade_reorg::ArcadePassSummary) -> 
         "stopped": s.stopped,
         "cursor": s.cursor.as_ref().map(key),
         "pending": s.pending.as_ref().map(|(k, held)| serde_json::json!({ "event": key(k), "heldPasses": held })),
+        // round 3 (review MED): the released events on record, the operator's heals
+        "unresolved": crate::ops::unresolved_json(&s.unresolved),
     })
 }
 
@@ -732,9 +734,22 @@ mod tests {
         let idle = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary { idle: true, ..Default::default() });
         assert_eq!(idle["idle"], true);
         assert!(idle["cursor"].is_null() && idle["pending"].is_null() && idle["stopped"].is_null());
-        let released = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary { skipped_unresolved: 1, released_by_operator: 1, tracker_lagging: 2, budget_stops: 1, contended: 1, memo_seeded: 1, memo_reads: 3, ..Default::default() });
+        let released = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary {
+            skipped_unresolved: 1,
+            released_by_operator: 1,
+            tracker_lagging: 2,
+            budget_stops: 1,
+            contended: 1,
+            memo_seeded: 1,
+            memo_reads: 3,
+            unresolved: vec![overlay_discovery::pot::arcade_events::UnresolvedEvent { key: key.clone(), why: overlay_discovery::pot::arcade_events::ReleaseReason::Operator }],
+            ..Default::default()
+        });
         assert_eq!((released["skippedUnresolved"].as_u64(), released["releasedByOperator"].as_u64(), released["trackerLagging"].as_u64()), (Some(1), Some(1), Some(2)));
         assert_eq!((released["budgetStops"].as_u64(), released["contended"].as_u64(), released["memoSeeded"].as_u64(), released["memoReads"].as_u64()), (Some(1), Some(1), Some(1), Some(3)));
+        assert_eq!(released["unresolved"][0]["height"], 965771);
+        assert_eq!(released["unresolved"][0]["why"], "operator");
+        assert!(released["unresolved"][0]["heal"].as_str().unwrap().contains("\"fromHeight\": 965771"));
     }
 
     /// Round 2 (review MED-3): the operator route's body: empty = one pass,

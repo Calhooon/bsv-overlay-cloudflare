@@ -150,8 +150,11 @@ pub const COUNTER_ARCADE_REORG_UNCORROBORATED: &str = "arcade_reorg_uncorroborat
 pub const COUNTER_ARCADE_REORG_FAULTS: &str = "arcade_reorg_faults_total";
 /// Round 2 (review MED-3): events RELEASED unresolved from the head of the
 /// queue (held or faulting past the ceiling, or by the operator's
-/// `skipPending`): the cursor moved past them without an apply; the sweep
-/// and the announce detector still cover their rows.
+/// `skipPending`): the cursor moved past them without an apply. Their rows
+/// are the OPERATOR's (round 3, review MED): the routine sweep never walks
+/// a height older than its window again, so each release is recorded on
+/// `/health/invariants.arcadeReorg.unresolved` with the `/internal/reorg`
+/// body that heals it.
 pub const COUNTER_ARCADE_REORG_UNRESOLVED: &str = "arcade_reorg_unresolved_total";
 /// Round 2 (review LOW-3): passes held because our header source was more
 /// than the tolerance behind Arcade's own listing (not an event verdict).
@@ -379,6 +382,30 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
     }
 }
 
+/// PURE (round 3, review MED): the released events on record, each with the
+/// `/internal/reorg` body that heals its height, newest last.
+pub fn unresolved_json(unresolved: &[overlay_discovery::pot::arcade_events::UnresolvedEvent]) -> serde_json::Value {
+    let why = |w: overlay_discovery::pot::arcade_events::ReleaseReason| match w {
+        overlay_discovery::pot::arcade_events::ReleaseReason::HeldCeiling => "held-ceiling",
+        overlay_discovery::pot::arcade_events::ReleaseReason::FaultCeiling => "fault-ceiling",
+        overlay_discovery::pot::arcade_events::ReleaseReason::Operator => "operator",
+    };
+    serde_json::Value::Array(
+        unresolved
+            .iter()
+            .map(|u| {
+                json!({
+                    "height": u.key.height,
+                    "hash": u.key.hash,
+                    "orphanedAt": u.key.orphaned_at,
+                    "why": why(u.why),
+                    "heal": format!("POST /internal/reorg {{\"fromHeight\": {}, \"toHeight\": {}}}", u.key.height, u.key.height),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// PURE: the health surface's shape of a consumer state document.
 pub fn arcade_reorg_state_json(
     state: &overlay_discovery::pot::arcade_events::ConsumerState,
@@ -400,6 +427,8 @@ pub fn arcade_reorg_state_json(
             "potBeefsExhausted": p.pot_beefs.exhausted,
             "transactionsExhausted": p.transactions.exhausted,
         })),
+        // round 3 (review MED): the released events, the operator's heals
+        "unresolved": unresolved_json(&state.unresolved),
         "version": version,
         "updatedAtMs": updated_at_ms,
     })
@@ -1022,6 +1051,16 @@ mod tests {
         let v = arcade_reorg_state_json(&state, Some(1), Some(8));
         assert_eq!(v["cursor"]["hash"], "ab".repeat(32));
         assert!(v["pending"].is_null());
+        assert_eq!(v["unresolved"].as_array().map(Vec::len), Some(0), "nothing released: an empty list, never absent");
+        // round 3 (review MED): a released event is on the surface with its height, hash, reason and heal
+        state.start(OrphanEvent { orphaned_at: "2026-09-07T22:48:27.809Z".into(), height: 965773, hash: "cd".repeat(32) });
+        state.release_pending(overlay_discovery::pot::arcade_events::ReleaseReason::HeldCeiling);
+        let v = arcade_reorg_state_json(&state, Some(1), Some(9));
+        assert_eq!(v["unresolved"][0]["height"], 965773);
+        assert_eq!(v["unresolved"][0]["hash"], "cd".repeat(32));
+        assert_eq!(v["unresolved"][0]["orphanedAt"], "2026-09-07T22:48:27.809Z");
+        assert_eq!(v["unresolved"][0]["why"], "held-ceiling");
+        assert_eq!(v["unresolved"][0]["heal"], "POST /internal/reorg {\"fromHeight\": 965773, \"toHeight\": 965773}");
         // every counter the consumer bumps is seeded on the surface
         let obj = json!({
             COUNTER_ARCADE_REORG_EVENTS: 0,

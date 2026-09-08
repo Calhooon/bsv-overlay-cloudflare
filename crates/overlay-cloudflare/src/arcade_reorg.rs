@@ -51,7 +51,8 @@
 use bsv_rs::transaction::ChainTracker;
 use overlay_discovery::pot::arcade_events::{
     classify_corroboration, events_after, next_page_before, parse_block_status_page,
-    ConsumerState, Corroboration, EventKey, LegProgress, OrphanEvent,
+    ConsumerState, Corroboration, EventKey, LegProgress, OrphanEvent, ReleaseReason,
+    UnresolvedEvent,
 };
 use overlay_discovery::pot::storage::PotStorage;
 use overlay_engine::gasp::AncestorFetcher;
@@ -95,8 +96,12 @@ pub const ARCADE_STATE_NAME: &str = "events";
 /// Round 2 (review MED-3): the head-of-line ceilings. An event HELD this
 /// many passes (chaintracks never got past it) or FAULTING this many passes
 /// (a leg, header or tip read that never succeeds) is released: finished as
-/// unresolved, counted, so the queue behind it moves. The routine sweep and
-/// the announce detector keep covering its rows.
+/// unresolved, counted and RECORDED (round 3, review MED: `unresolved` on
+/// the state row and `/health/invariants.arcadeReorg.unresolved`), so the
+/// queue behind it moves. A released event's rows are the OPERATOR's, not
+/// the sweep's: the routine sweep walks forward and never revisits a height
+/// older than its window, so the heal is `POST /internal/reorg {"fromHeight":
+/// H, "toHeight": H}` for the recorded H.
 pub const ARCADE_HELD_CEILING: u32 = 24;
 pub const ARCADE_FAULT_CEILING: u32 = 12;
 
@@ -202,7 +207,8 @@ pub struct ArcadePassSummary {
     /// hash as canonical (or serves no header there), deep below its tip.
     pub skipped_uncorroborated: usize,
     /// Events finished by RELEASING them at the head-of-line ceiling
-    /// (held or faulting for too many passes): unresolved, counted.
+    /// (held or faulting for too many passes): unresolved, counted and
+    /// recorded; their rows are the operator's (`/internal/reorg`).
     pub skipped_unresolved: usize,
     /// The pending event released by the operator (`skipPending`).
     pub released_by_operator: usize,
@@ -239,6 +245,10 @@ pub struct ArcadePassSummary {
     pub cursor: Option<EventKey>,
     /// The event still pending after the pass, with its held count.
     pub pending: Option<(EventKey, u32)>,
+    /// Round 3 (review MED): the released events the state row records
+    /// (newest last, bounded): the heights the operator owes an
+    /// `/internal/reorg` run.
+    pub unresolved: Vec<UnresolvedEvent>,
 }
 
 impl ArcadePassSummary {
@@ -271,6 +281,7 @@ fn add_spenders(acc: &mut ReverifyPassSummary, s: &ReverifyPassSummary) {
     acc.stored_from_courier += s.stored_from_courier;
     acc.memo_reads += s.memo_reads;
     acc.demote_missed += s.demote_missed;
+    acc.stood_on_recheck += s.stood_on_recheck;
     acc.faults += s.faults;
     acc.errors += s.errors;
     acc.budget_exhausted |= s.budget_exhausted;
@@ -370,12 +381,14 @@ where
     out.cursor = state.cursor.clone();
     // ── the operator's release of the pending event ──
     if release_pending {
-        if let Some(key) = state.advance_past_pending() {
+        if let Some(key) = state.release_pending(ReleaseReason::Operator) {
             push_log(&format!(
-                "[arcade-reorg] RELEASED by the operator: {}@{} (orphanedAt {}) finished unresolved; the cursor moves past it",
+                "[arcade-reorg] RELEASED by the operator: {}@{} (orphanedAt {}) finished unresolved and recorded; its rows are the operator's: POST /internal/reorg {{\"fromHeight\": {}, \"toHeight\": {}}}",
                 short(&key.hash),
                 key.height,
-                key.orphaned_at
+                key.orphaned_at,
+                key.height,
+                key.height
             ));
             if !matches!(persist(state_store, &state, &mut version, &mut out).await, Persist::Written) {
                 out.cursor = state.cursor.clone();
@@ -389,13 +402,15 @@ where
     let mut finished = 0u32;
     while finished < limits.events_per_pass {
         // ── the head-of-line ceiling (round 2, review MED-3) ──
-        if state.pending_past_ceiling(limits.held_ceiling, limits.fault_ceiling) {
-            if let Some(key) = state.advance_past_pending() {
+        if let Some(why) = state.pending_ceiling(limits.held_ceiling, limits.fault_ceiling) {
+            if let Some(key) = state.release_pending(why) {
                 push_log(&format!(
-                    "[arcade-reorg] RELEASED at the ceiling: {}@{} (orphanedAt {}) was held or faulting for too many passes; finished unresolved, counted; the sweep keeps covering its rows",
+                    "[arcade-reorg] RELEASED at the ceiling ({why:?}): {}@{} (orphanedAt {}) finished unresolved, counted and recorded; its rows are NOT the sweep's (a height older than the sweep's window is never walked again): POST /internal/reorg {{\"fromHeight\": {}, \"toHeight\": {}}}",
                     short(&key.hash),
                     key.height,
-                    key.orphaned_at
+                    key.orphaned_at,
+                    key.height,
+                    key.height
                 ));
                 if !matches!(persist(state_store, &state, &mut version, &mut out).await, Persist::Written) {
                     break;
@@ -640,6 +655,7 @@ where
     }
     out.cursor = state.cursor.clone();
     out.pending = state.pending.as_ref().map(|p| (p.event.key(), p.held_passes));
+    out.unresolved = state.unresolved.clone();
     out.memo_reads = memo.reads();
     out
 }
@@ -1201,20 +1217,48 @@ mod tests {
         assert!(r.spent_confirmed && r.spent_height == Some(965_771), "the row STANDS: {r:?}");
         assert!(store.pot_beef_proof_verified(&spender).await.unwrap(), "the latch on a CANONICAL BEEF is kept");
         assert_eq!(stored_bump_anchor(&store.get_beef(&spender).await.unwrap().unwrap(), &spender), Some(BumpAnchor { height: 965_771, root: canonical_root }));
-        // (b) the new-height case with NO proof served after the landing: the
-        // demotion is bound to the judged height (965771) and the row now sits
-        // at 965773: a guard miss, the row stays confirmed
+        // (b) the new-height case with NO proof served after the landing (the
+        // writer replaced the bump AND moved the row to 965773): the round-3
+        // re-check sees the replaced, verifying bump and the row STANDS
         let store2 = MemoryPotStorage::new();
         let mut tracker_new = MockChainTracker::new(965_860);
         let spender2 = confirmed_pot_with_stored_proof(&store2, &pot(91), 965_771).await;
         tracker_new.add_root(965_773, spender2.clone());
         let ladder2 = RacingLadder { store: &store2, spender: spender2.clone(), proof: single_tx_bump(&spender2, 965_773).to_hex(), answer_after_landing: false, calls: Cell::new(0) };
         let state2 = StubState::default();
-        let s2 = run(&StubFeed::of(only_965771), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker_new), Some(&ladder2), limits(2, 50)).await;
-        assert_eq!((s2.applied, s2.demoted(), s2.spenders.demote_missed), (1, 0, 1), "{s2:?}");
+        let s2 = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker_new), Some(&ladder2), limits(2, 50)).await;
+        assert_eq!((s2.applied, s2.demoted(), s2.spenders.stood_on_recheck, s2.spenders.demote_missed), (1, 0, 1, 0), "{s2:?}");
         let r = store2.get_spent_status(&pot(91), 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed && r.spent_height == Some(965_773), "moved under the pass, never demoted: {r:?}");
         assert!(store2.pot_beef_proof_verified(&spender2).await.unwrap());
+        // (c) the height moved under the pass WITHOUT the bump changing (a writer that
+        // only re-anchored the row): the re-check holds the judged verdict and the
+        // height-bound demotion MISSES; the row stays confirmed at its new height
+        struct HeightMover<'a> {
+            store: &'a MemoryPotStorage,
+            pot: String,
+            spender: String,
+        }
+        #[async_trait::async_trait(?Send)]
+        impl AncestorFetcher for HeightMover<'_> {
+            async fn fetch_ancestor(&self, _txid: &str) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError> {
+                Err(overlay_engine::gasp::GASPError::NodeNotFound("stub".into()))
+            }
+            async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
+                if txid == self.spender {
+                    let _ = self.store.reanchor_confirmed_for_spender(&self.pot, 0, &self.spender, 965_773).await;
+                }
+                Ok(None)
+            }
+        }
+        let store3 = MemoryPotStorage::new();
+        let spender3 = confirmed_pot_with_stored_proof(&store3, &pot(92), 965_771).await;
+        let mover = HeightMover { store: &store3, pot: pot(92), spender: spender3.clone() };
+        let state3 = StubState::default();
+        let s3 = run(&StubFeed::of(only_965771), &StubHeaders::real(965_860), &state3, &store3, Some(&txs), Some(&MockChainTracker::new(965_860)), Some(&mover), limits(2, 50)).await;
+        assert_eq!((s3.applied, s3.demoted(), s3.spenders.stood_on_recheck, s3.spenders.demote_missed), (1, 0, 0, 1), "{s3:?}");
+        let r = store3.get_spent_status(&pot(92), 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_773), "the height-bound guard missed, nothing written: {r:?}");
     }
 
     /// Round 2 (review MED-2): a spent ladder budget stops the spenders
@@ -1556,8 +1600,18 @@ mod tests {
         }
         let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&FaultyTracker), Some(&CourierStub::none()), lim).await;
         assert_eq!((s.skipped_unresolved, s.events_finished()), (1, 1), "released at the ceiling: {s:?}");
-        assert_eq!(state.state().cursor, Some(events.iter().find(|e| e.hash == ORPHAN_965771).unwrap().key()), "the cursor moved past the stuck event");
+        let released_key = events.iter().find(|e| e.hash == ORPHAN_965771).unwrap().key();
+        assert_eq!(state.state().cursor, Some(released_key.clone()), "the cursor moved past the stuck event");
         assert!(store.get_spent_status(&pot(34), 0).await.unwrap().unwrap().spent_confirmed, "nothing was demoted by the release");
+        // round 3 (review MED): the release is RECORDED with its reason, on the row and on the summary,
+        // and the health surface names the height the operator owes an /internal/reorg run
+        assert_eq!(state.state().unresolved, vec![UnresolvedEvent { key: released_key.clone(), why: ReleaseReason::FaultCeiling }]);
+        assert_eq!(s.unresolved, state.state().unresolved);
+        let surface = crate::ops::arcade_reorg_state_json(&state.state(), Some(1), Some(3));
+        assert_eq!(surface["unresolved"][0]["height"], 965_771);
+        assert_eq!(surface["unresolved"][0]["hash"], ORPHAN_965771);
+        assert_eq!(surface["unresolved"][0]["why"], "fault-ceiling");
+        assert_eq!(surface["unresolved"][0]["heal"], "POST /internal/reorg {\"fromHeight\": 965771, \"toHeight\": 965771}");
         // HELD: the same-hash event near the tip, held 2 passes, released on the third
         let two_965773: Vec<OrphanEvent> = events.iter().filter(|e| e.height == 965_773).cloned().collect();
         let state2 = StubState::default();
@@ -1573,6 +1627,7 @@ mod tests {
         let s = run(&feed, &StubHeaders::real(965_774), &state2, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), lim).await;
         assert_eq!((s.skipped_unresolved, s.applied), (1, 0), "released at the held ceiling; the budget of one event is spent by the release: {s:?}");
         assert_eq!(state2.state().cursor.as_ref().map(|c| c.hash.as_str()), Some(CANONICAL_965773));
+        assert_eq!(state2.state().unresolved.iter().map(|u| (u.key.height, u.why)).collect::<Vec<_>>(), vec![(965_773, ReleaseReason::HeldCeiling)]);
         // the OPERATOR: a pending event released at once, then the pass proceeds to the next event
         let state3 = StubState::default();
         let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state3, &store, Some(&txs), Some(&FaultyTracker), Some(&CourierStub::none()), lim).await;
@@ -1582,6 +1637,7 @@ mod tests {
         assert_eq!(s.released_by_operator, 1, "{s:?}");
         assert!(s.events_finished() >= 2, "the release, then the next events: {s:?}");
         assert_eq!(state3.state().cursor.as_ref().map(|c| c.height), Some(965_773));
+        assert_eq!(state3.state().unresolved.iter().map(|u| (u.key.hash.as_str(), u.why)).collect::<Vec<_>>(), vec![(ORPHAN_965771, ReleaseReason::Operator)], "the operator's release is recorded too");
         // nothing pending: the operator's release is a no-op
         let s = consume_arcade_reorg_events(&StubFeed::of(events), &StubHeaders::real(965_860), &state3, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50), &mut RootMemo::default(), true).await;
         assert_eq!(s.released_by_operator, 0);

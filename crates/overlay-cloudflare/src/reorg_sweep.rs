@@ -168,6 +168,11 @@ pub struct ReverifyPassSummary {
     /// Refuted rows whose demotion guard MISSED (the pointer OR the judged
     /// height moved under the pass): nothing written, re-examined next pass.
     pub demote_missed: usize,
+    /// Round 3 (review LOW-1): refuted rows whose STORED bump was REPLACED
+    /// under the pass by one that verifies (a same-height sibling landed by
+    /// `/arc-ingest` or another isolate between the read and the demotion):
+    /// re-checked and left standing, never demoted.
+    pub stood_on_recheck: usize,
     /// Header-source read faults: NOT a verdict, nothing changed, retried.
     pub faults: usize,
     /// Storage faults.
@@ -307,6 +312,49 @@ async fn reanchor_from_ladder(
         }
         Ok(None) => LadderReanchor::NoCanonicalProof,
         Err(e) => LadderReanchor::Fault(e),
+    }
+}
+
+/// Round 3 (review LOW-1): what a re-read of a refuted row's stored bump
+/// said, just before its demotion.
+pub(crate) enum Recheck {
+    /// The stored bump CHANGED under the pass and the new one verifies
+    /// (a same-height replacement landed): the row stands.
+    Stands,
+    /// The stored bump is the judged one, or a changed one that is still
+    /// refuted: the demotion proceeds (height-bound).
+    StillRefuted,
+    /// The header source could not be read for the changed bump.
+    Fault(String),
+    /// The store could not be read.
+    Error(String),
+}
+
+/// Re-read `spender`'s stored bump and, when it is no longer `judged_hex`,
+/// verify the new one through the memo (one seeded lookup when the pass
+/// read the height's header). The judged bump's refutation is not re-asked
+/// (the memo holds it).
+pub(crate) async fn recheck_stored_bump(
+    pot_storage: &dyn PotStorage,
+    tracker: &dyn ChainTracker,
+    memo: &mut RootMemo,
+    spender: &str,
+    judged_hex: &str,
+) -> Recheck {
+    let stored = match pot_storage.get_beef(spender).await {
+        Ok(b) => b,
+        Err(e) => return Recheck::Error(format!("{spender} pot-beef re-read failed: {e}")),
+    };
+    let Some(now_hex) = stored.as_deref().and_then(|bytes| stored_bump_hex(bytes, spender)) else {
+        return Recheck::StillRefuted;
+    };
+    if now_hex == judged_hex {
+        return Recheck::StillRefuted;
+    }
+    match verify_bump_memoized(tracker, memo, &now_hex, spender).await {
+        Ok(true) => Recheck::Stands,
+        Ok(false) => Recheck::StillRefuted,
+        Err(e) => Recheck::Fault(e),
     }
 }
 
@@ -486,6 +534,37 @@ pub async fn reverify_window_with(
                             }
                             LadderReanchor::NoCanonicalProof => {}
                         }
+                    }
+                }
+                // round 3 (review LOW-1): a same-height replacement landed
+                // under the pass keeps the row's height (the height guard
+                // below cannot see it): re-read the stored bump first, and
+                // a changed one that verifies leaves the row standing
+                match recheck_stored_bump(pot_storage, tracker, memo, spender, &bump_hex).await {
+                    Recheck::Stands => {
+                        summary.stood_on_recheck += 1;
+                        push_log(&format!(
+                            "[reorg] {}:{} STANDS on re-check: {spender}'s stored bump was replaced under the pass by one the header source holds; nothing demoted",
+                            rec.txid, rec.output_index
+                        ));
+                        last_judged = Some(key);
+                        continue;
+                    }
+                    Recheck::StillRefuted => {}
+                    Recheck::Fault(e) => {
+                        summary.faults += 1;
+                        push_log(&format!(
+                            "[reorg] {}:{} header READ FAULT re-checking {spender}'s replaced bump: not a verdict, nothing changed: {e}",
+                            rec.txid, rec.output_index
+                        ));
+                        last_judged = Some(key);
+                        continue;
+                    }
+                    Recheck::Error(e) => {
+                        summary.errors += 1;
+                        push_log(&format!("[reorg] {}:{} {e}", rec.txid, rec.output_index));
+                        last_judged = Some(key);
+                        continue;
                     }
                 }
                 // round 2 (review MED-1): the demotion is bound to the height
@@ -1361,6 +1440,88 @@ mod tests {
         let fresh = CourierStub([(refuted.clone(), Ok(None))].into_iter().collect());
         let s3 = reverify_window_with(&store, Some(&tracker), Some(&fresh), 965_771, 965_771, s.next_cursor, 50, mode, &mut RootMemo::default()).await;
         assert_eq!((s3.scanned, s3.stale, s3.exhausted), (1, 1, true), "{s3:?}");
+    }
+
+    /// A ladder that lands a SAME-HEIGHT sibling proof into the store and
+    /// then answers nothing (the 965773 class landed by `/arc-ingest` between
+    /// the page read and the ask).
+    struct SameHeightLander<'a> {
+        store: &'a MemoryPotStorage,
+        spender: String,
+        proof: String,
+    }
+    #[async_trait::async_trait(?Send)]
+    impl AncestorFetcher for SameHeightLander<'_> {
+        async fn fetch_ancestor(&self, _txid: &str) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError> {
+            Err(overlay_engine::gasp::GASPError::NodeNotFound("stub".into()))
+        }
+        async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
+            if txid == self.spender {
+                let _ = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(self.store, &self.spender, &self.proof).await;
+            }
+            Ok(None)
+        }
+    }
+
+    /// bsv-low M19B-G1 round 3 (review LOW-1): a refuted row whose stored
+    /// bump another writer REPLACED under the pass with a same-height
+    /// sibling (the height guard cannot see it) is re-checked before the
+    /// demotion and STANDS when the new bump verifies; the helper's other
+    /// outcomes: unchanged = still refuted, changed but refuted = still
+    /// refuted, a header fault = a fault.
+    #[tokio::test]
+    async fn a_bump_replaced_under_the_pass_by_a_verifying_sibling_is_never_demoted() {
+        let store = MemoryPotStorage::new();
+        let spender = confirmed_pot_with_stored_proof(&store, &pot(87), 965_771).await;
+        let two_leaf = bsv_rs::transaction::MerklePath::new(
+            965_771,
+            vec![vec![
+                bsv_rs::transaction::MerklePathLeaf::new_txid(0, spender.clone()),
+                bsv_rs::transaction::MerklePathLeaf::new(1, "ef".repeat(32)),
+            ]],
+        )
+        .unwrap();
+        let canonical_root = two_leaf.compute_root(Some(&spender)).unwrap().to_ascii_lowercase();
+        let mut tracker = MockChainTracker::new(965_860);
+        tracker.add_root(965_771, canonical_root.clone());
+        let lander = SameHeightLander { store: &store, spender: spender.clone(), proof: two_leaf.to_hex() };
+        let mode = ReverifyMode { demote_proofless: false, reanchor_first: true };
+        let s = reverify_window_with(&store, Some(&tracker), Some(&lander), 965_771, 965_771, None, 50, mode, &mut RootMemo::default()).await;
+        assert_eq!((s.scanned, s.stood_on_recheck, s.stale, s.demote_missed, s.faults), (1, 1, 0, 0, 0), "{s:?}");
+        let r = store.get_spent_status(&pot(87), 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965_771), "stands at the same height: {r:?}");
+        assert!(store.pot_beef_proof_verified(&spender).await.unwrap(), "the latch on the canonical BEEF is kept");
+        assert_eq!(stored_bump_anchor(&store.get_beef(&spender).await.unwrap().unwrap(), &spender), Some(BumpAnchor { height: 965_771, root: canonical_root.clone() }));
+        // the helper's outcomes, directly
+        let judged = single_tx_bump(&spender, 965_771).to_hex();
+        let mut memo = RootMemo::default();
+        assert!(matches!(recheck_stored_bump(&store, &tracker, &mut memo, &spender, &judged).await, Recheck::Stands), "changed and verifies");
+        assert!(matches!(recheck_stored_bump(&store, &tracker, &mut memo, &spender, &two_leaf.to_hex()).await, Recheck::StillRefuted), "unchanged: the judged verdict holds");
+        let store2 = MemoryPotStorage::new();
+        let other = confirmed_pot_with_stored_proof(&store2, &pot(88), 965_771).await;
+        let refuted_replacement = single_tx_bump(&other, 965_772).to_hex();
+        // another writer replaces the bytes through the verifying writer (an admit-path
+        // write never clobbers a verified row, bsv-low#304)
+        store2.compact_pot_beef(&other, &crate::proof_fetcher::assemble_spender_beef(&real_spender_raw(&pot(88), 0), &refuted_replacement, &other).unwrap()).await.unwrap();
+        assert_eq!(stored_bump_anchor(&store2.get_beef(&other).await.unwrap().unwrap(), &other).map(|a| a.height), Some(965_772), "the bytes changed");
+        assert!(matches!(recheck_stored_bump(&store2, &tracker, &mut memo, &other, &single_tx_bump(&other, 965_771).to_hex()).await, Recheck::StillRefuted), "changed but still refuted");
+        assert!(matches!(recheck_stored_bump(&store2, &FaultyTracker, &mut RootMemo::default(), &other, &single_tx_bump(&other, 965_771).to_hex()).await, Recheck::Fault(_)), "a header fault on the changed bump");
+        assert!(matches!(recheck_stored_bump(&store2, &tracker, &mut memo, &"77".repeat(32), &judged).await, Recheck::StillRefuted), "no stored beef: nothing to re-check");
+        // the plain (mode-off) arm takes the same re-check: the sibling landed before the demotion
+        let store3 = MemoryPotStorage::new();
+        let sp3 = confirmed_pot_with_stored_proof(&store3, &pot(89), 965_771).await;
+        let sibling3 = bsv_rs::transaction::MerklePath::new(
+            965_771,
+            vec![vec![bsv_rs::transaction::MerklePathLeaf::new_txid(0, sp3.clone()), bsv_rs::transaction::MerklePathLeaf::new(1, "ab".repeat(32))]],
+        )
+        .unwrap();
+        let mut tracker3 = MockChainTracker::new(965_860);
+        tracker3.add_root(965_771, sibling3.compute_root(Some(&sp3)).unwrap().to_ascii_lowercase());
+        // the row is read refuted (its stored single-leaf bump), then the sibling lands before the arm demotes:
+        // modelled by a lander the plain arm never asks, so the landing happens up front here
+        let _ = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(&store3, &sp3, &sibling3.to_hex()).await;
+        let s3 = reverify_window(&store3, Some(&tracker3), None, 965_771, 965_771, None, 50, false).await;
+        assert_eq!((s3.standing, s3.stale), (1, 0), "a canonical stored bump stands on the read itself: {s3:?}");
     }
 
     #[test]

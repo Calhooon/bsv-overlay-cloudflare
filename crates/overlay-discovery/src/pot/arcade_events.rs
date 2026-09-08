@@ -72,9 +72,11 @@ pub struct BlockStatusPage {
     /// Arcade's keyset cursor (the lowest height on the page); absent on the
     /// last page.
     pub next_cursor: Option<u64>,
-    /// Round 2 (review LOW-3): the highest `blockHeight` on the page, any
-    /// status: Arcade's view of the tip, which the consumer compares with
-    /// chaintracks' before it reads "the same hash, deep" as Arcade being wrong.
+    /// Round 2 (review LOW-3): the highest `blockHeight` among the page's
+    /// ACTIVE rows (round 3, review LOW-2: an orphaned or parked row with a
+    /// garbage height must not hold every event): Arcade's view of the tip,
+    /// which the consumer compares with chaintracks' before it reads "the
+    /// same hash, deep" as Arcade being wrong.
     pub newest_height: Option<u64>,
 }
 
@@ -118,10 +120,12 @@ pub fn parse_block_status_page(body: &str) -> Result<BlockStatusPage, String> {
         ..Default::default()
     };
     for row in blocks {
-        if let Some(h) = row.get("blockHeight").and_then(serde_json::Value::as_u64) {
-            page.newest_height = Some(page.newest_height.map_or(h, |m| m.max(h)));
-        }
         let status = row.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+        if status == "active" {
+            if let Some(h) = row.get("blockHeight").and_then(serde_json::Value::as_u64) {
+                page.newest_height = Some(page.newest_height.map_or(h, |m| m.max(h)));
+            }
+        }
         if status != "orphaned" {
             continue;
         }
@@ -286,10 +290,42 @@ impl PendingEvent {
 /// the document as unreadable (a fault, counted) rather than guessing.
 pub const CONSUMER_STATE_VERSION: u32 = 1;
 
+/// Round 3 (review MED): why a pending event was RELEASED (finished
+/// unresolved). Its rows were NOT re-verified by the consumer, and a
+/// released height older than the routine sweep's window is never walked
+/// by the sweep either (`next_sweep_window` is continuous forward), so the
+/// rows are the OPERATOR's: `POST /internal/reorg {"fromHeight": H,
+/// "toHeight": H}`. The record below says which H.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseReason {
+    /// Held (chaintracks never got past the orphaned hash) for the ceiling.
+    HeldCeiling,
+    /// A header, tip or leg read faulted for the ceiling.
+    FaultCeiling,
+    /// The operator's `skipPending`.
+    Operator,
+}
+
+/// One released event: the key (height + hash + stamp) and the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedEvent {
+    pub key: EventKey,
+    pub why: ReleaseReason,
+}
+
+/// How many released events the document keeps (the newest; the oldest
+/// drop). Bounded so the row stays small; every release is also counted
+/// (`arcade_reorg_unresolved_total`) and logged with its height.
+pub const UNRESOLVED_KEPT: usize = 32;
+
 /// The consumer's persisted state: ONE row, a JSON document. `cursor` is
-/// the last event FINISHED (applied, or skipped as uncorroborated); it moves
-/// only through [`ConsumerState::advance_past_pending`], never on a fault
-/// (the pending event replays, idempotently).
+/// the last event FINISHED (applied, skipped as uncorroborated, or
+/// released); it moves only through [`ConsumerState::advance_past_pending`]
+/// and [`ConsumerState::release_pending`], never on a fault (the pending
+/// event replays, idempotently). `unresolved` records the released events
+/// (round 3, review MED) so the operator knows which heights to run
+/// `/internal/reorg` over.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerState {
     #[serde(default = "default_version")]
@@ -298,6 +334,8 @@ pub struct ConsumerState {
     pub cursor: Option<EventKey>,
     #[serde(default)]
     pub pending: Option<PendingEvent>,
+    #[serde(default)]
+    pub unresolved: Vec<UnresolvedEvent>,
 }
 
 fn default_version() -> u32 {
@@ -306,7 +344,7 @@ fn default_version() -> u32 {
 
 impl Default for ConsumerState {
     fn default() -> Self {
-        Self { v: CONSUMER_STATE_VERSION, cursor: None, pending: None }
+        Self { v: CONSUMER_STATE_VERSION, cursor: None, pending: None, unresolved: Vec::new() }
     }
 }
 
@@ -343,6 +381,9 @@ impl ConsumerState {
         }
         if let Some(p) = &s.pending {
             well_formed("the pending event", &p.event.orphaned_at, p.event.height, &p.event.hash)?;
+        }
+        for u in &s.unresolved {
+            well_formed("an unresolved event", &u.key.orphaned_at, u.key.height, &u.key.hash)?;
         }
         Ok(s)
     }
@@ -383,7 +424,34 @@ impl ConsumerState {
     /// Round 2 (review MED-3): is the pending event past the head-of-line
     /// ceiling (see [`PendingEvent::past_ceiling`])?
     pub fn pending_past_ceiling(&self, held_ceiling: u32, fault_ceiling: u32) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.past_ceiling(held_ceiling, fault_ceiling))
+        self.pending_ceiling(held_ceiling, fault_ceiling).is_some()
+    }
+
+    /// Round 3 (review MED): WHICH ceiling the pending event is past, if any
+    /// (the held ceiling first).
+    pub fn pending_ceiling(&self, held_ceiling: u32, fault_ceiling: u32) -> Option<ReleaseReason> {
+        let p = self.pending.as_ref()?;
+        if p.held_passes >= held_ceiling {
+            Some(ReleaseReason::HeldCeiling)
+        } else if p.fault_passes >= fault_ceiling {
+            Some(ReleaseReason::FaultCeiling)
+        } else {
+            None
+        }
+    }
+
+    /// Round 3 (review MED): RELEASE the pending event: the cursor moves
+    /// past it (as [`advance_past_pending`](Self::advance_past_pending)) and
+    /// it is RECORDED in `unresolved` with `why`, the list bounded to the
+    /// newest [`UNRESOLVED_KEPT`]. Returns the released key.
+    pub fn release_pending(&mut self, why: ReleaseReason) -> Option<EventKey> {
+        let key = self.advance_past_pending()?;
+        self.unresolved.push(UnresolvedEvent { key: key.clone(), why });
+        if self.unresolved.len() > UNRESOLVED_KEPT {
+            let excess = self.unresolved.len() - UNRESOLVED_KEPT;
+            self.unresolved.drain(..excess);
+        }
+        Some(key)
     }
 }
 
@@ -415,7 +483,21 @@ mod tests {
         assert_eq!(page.rows, 8);
         assert_eq!(page.malformed, 0);
         assert_eq!(page.next_cursor, Some(965769), "Arcade's keyset cursor rides along");
-        assert_eq!(page.newest_height, Some(965775), "the page's newest height is Arcade's tip view");
+        assert_eq!(page.newest_height, Some(965775), "the page's newest ACTIVE height is Arcade's tip view");
+        // round 3 (review LOW-2): an orphaned or parked row with a garbage height never
+        // raises the feed's tip view (it would hold every event as "tracker lagging")
+        let garbage = format!(
+            r#"{{"blocks":[
+              {{"blockHash":"{ORPHAN_965771}","blockHeight":9999999999,"status":"orphaned","orphanedAt":"2026-09-07T22:45:22.316Z"}},
+              {{"blockHash":"{CANONICAL_965771}","blockHeight":8888888888,"status":"parked"}},
+              {{"blockHash":"{CANONICAL_965771}","blockHeight":965771,"status":"active"}}
+            ]}}"#
+        );
+        let g = parse_block_status_page(&garbage).unwrap();
+        assert_eq!(g.newest_height, Some(965771), "active rows only");
+        assert_eq!(g.orphans.len(), 1, "the garbage-height orphan is still an event (its own corroboration decides it)");
+        let none_active = parse_block_status_page(&format!(r#"{{"blocks":[{{"blockHash":"{ORPHAN_965771}","blockHeight":965771,"status":"orphaned","orphanedAt":"2026-09-07T22:45:22.316Z"}}]}}"#)).unwrap();
+        assert_eq!(none_active.newest_height, None, "no active row: no tip view (no lag verdict possible)");
         // the three orphaned rows, in the page's own order (height DESC)
         assert_eq!(
             page.orphans.iter().map(|o| (o.height, o.hash.as_str(), o.orphaned_at.as_str())).collect::<Vec<_>>(),
@@ -590,6 +672,55 @@ mod tests {
         assert_eq!(next_page_before(Some(965_769)), Some(965_770));
         assert_eq!(next_page_before(None), None, "the last page");
         assert_eq!(next_page_before(Some(0)), None, "a height-0 cursor is the placeholder floor");
+    }
+
+    /// Round 3 (review MED): a release RECORDS the event with its reason in
+    /// the document (a released event's rows are the operator's, and the
+    /// record says which height), the record round-trips, its keys are
+    /// validated like the cursor's, and the list is bounded to the newest
+    /// `UNRESOLVED_KEPT`.
+    #[test]
+    fn a_release_is_recorded_with_its_reason_and_the_record_is_bounded() {
+        let ev = |h: u64| OrphanEvent { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: h, hash: format!("{h:064x}") };
+        let mut s = ConsumerState::default();
+        assert_eq!(s.release_pending(ReleaseReason::Operator), None, "nothing pending: nothing recorded");
+        assert!(s.unresolved.is_empty());
+        // which ceiling
+        s.start(ev(965771));
+        assert_eq!(s.pending_ceiling(2, 2), None);
+        s.note_fault_on_pending();
+        s.note_fault_on_pending();
+        assert_eq!(s.pending_ceiling(2, 2), Some(ReleaseReason::FaultCeiling));
+        let why = s.pending_ceiling(2, 2).unwrap();
+        assert_eq!(s.release_pending(why), Some(ev(965771).key()));
+        assert_eq!(s.cursor, Some(ev(965771).key()), "the cursor moved past it");
+        assert_eq!(s.unresolved, vec![UnresolvedEvent { key: ev(965771).key(), why: ReleaseReason::FaultCeiling }]);
+        s.start(ev(965773));
+        s.hold_pending();
+        s.hold_pending();
+        assert_eq!(s.pending_ceiling(2, 2), Some(ReleaseReason::HeldCeiling), "the held ceiling reads first");
+        s.release_pending(ReleaseReason::HeldCeiling);
+        s.start(ev(965775));
+        s.release_pending(ReleaseReason::Operator);
+        assert_eq!(s.unresolved.iter().map(|u| (u.key.height, u.why)).collect::<Vec<_>>(), vec![(965771, ReleaseReason::FaultCeiling), (965773, ReleaseReason::HeldCeiling), (965775, ReleaseReason::Operator)]);
+        // the record round-trips, with its reasons in kebab-case
+        let doc = s.to_json();
+        assert!(doc.contains("\"fault-ceiling\"") && doc.contains("\"held-ceiling\"") && doc.contains("\"operator\""), "{doc}");
+        assert_eq!(ConsumerState::from_json(&doc).unwrap(), s);
+        // an older document without the field reads as no record
+        assert!(ConsumerState::from_json(r#"{"v":1,"cursor":null,"pending":null}"#).unwrap().unresolved.is_empty());
+        // a malformed recorded key is refused like the cursor's
+        let bad = r#"{"v":1,"cursor":null,"pending":null,"unresolved":[{"key":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"abc"},"why":"operator"}]}"#;
+        assert!(ConsumerState::from_json(bad).unwrap_err().contains("unresolved"));
+        // the bound: the newest UNRESOLVED_KEPT are kept, the oldest drop
+        let mut b = ConsumerState::default();
+        for h in 1..=(UNRESOLVED_KEPT as u64 + 5) {
+            b.start(ev(h));
+            b.release_pending(ReleaseReason::Operator);
+        }
+        assert_eq!(b.unresolved.len(), UNRESOLVED_KEPT);
+        assert_eq!(b.unresolved.first().map(|u| u.key.height), Some(6), "the five oldest dropped");
+        assert_eq!(b.unresolved.last().map(|u| u.key.height), Some(UNRESOLVED_KEPT as u64 + 5));
     }
 
     /// Round 2 (review MED-3 + MED-4): the head-of-line ceiling releases a
