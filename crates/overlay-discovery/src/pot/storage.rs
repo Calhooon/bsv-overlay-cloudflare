@@ -495,6 +495,117 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
+    // ── bsv-low M19 R2 (2026-09-08): the reorg reconcile's storage half ──
+    //
+    // Loop 8's double reorg left 158 rows confirmed at `spentHeight 965771`
+    // from the orphan's MINED callbacks, with their spender proofs latched
+    // verified, and nothing ever revisited them. These methods are the
+    // reference's `Engine.handleReorg` + revalidation sweep, in storage
+    // terms: record what block the overlay acted on per height, find the
+    // confirmations that rest on a range of heights, demote them back to
+    // SEEN (the existing confirm arm re-upgrades them on the next good
+    // proof), and let a pushed proof for a DIFFERENT block replace a stored
+    // anchor instead of missing the CAS.
+    //
+    // Every default is the fail-safe no-op a backend that cannot enumerate
+    // needs: nothing is demoted on a backend's silence, and the counters at
+    // the call site say so.
+
+    /// Record the header the block-event pass acted on at `height`, and
+    /// answer what was held before (the reorg detector's two facts). A
+    /// repeat of the same `(height, hash)` is idempotent. Backends that do
+    /// not persist headers answer the empty [`HeaderSeen`] (no reorg can
+    /// ever be detected through them; the sweep still covers the window).
+    async fn record_header_seen(
+        &self,
+        height: u64,
+        hash: &str,
+    ) -> Result<crate::pot::reorg::HeaderSeen, PotStorageError> {
+        let _ = (height, hash);
+        Ok(crate::pot::reorg::HeaderSeen::default())
+    }
+
+    /// Spent-and-CONFIRMED rows whose `spentHeight` is within
+    /// `min_height..=max_height`, NEWEST first, at most `limit` — the
+    /// revalidation sweep's candidate set. Rows confirmed without a height
+    /// on record are not in any window (they carry no anchor to refute).
+    async fn find_confirmed_in_heights(
+        &self,
+        min_height: u64,
+        max_height: u64,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = (min_height, max_height, limit);
+        Ok(Vec::new())
+    }
+
+    /// Spent-and-CONFIRMED rows whose recorded spender is `spending_txid`
+    /// — the push consumer's lookup for a RE-ANCHOR (a MINED for a spender
+    /// the index already holds confirmed) and for Arcade's `reorg_unmined`.
+    async fn find_confirmed_by_spending_txid(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = spending_txid;
+        Ok(Vec::new())
+    }
+
+    /// GUARDED demotion of ONE confirmed row back to SEEN: `spentConfirmed
+    /// = 0`, `spentHeight = NULL`, everything else untouched (`spent`,
+    /// `spendingTxid`, `spenderFinal`, `settleSigners`, `verdict`,
+    /// `verdictTxid`, `spentAt`), ONLY while the row's current pointer is
+    /// still `spending_txid` and the row is confirmed. Returns whether the
+    /// guard hit. The row re-enters the spend-confirmation chaser's
+    /// candidate set, which is the whole point.
+    async fn demote_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+    ) -> Result<bool, PotStorageError> {
+        let _ = (txid, output_index, spending_txid);
+        Ok(false)
+    }
+
+    /// Bulk demotion for a detected reorg: every confirmed row with
+    /// `spentHeight >= from_height`, NEWEST first, at most `limit`, demoted
+    /// exactly as [`demote_confirmed_for_spender`](Self::demote_confirmed_for_spender)
+    /// does; returns the rows demoted (their spenders' stored proofs are
+    /// the caller's to unlatch). Bounded per call: the block-event pass
+    /// runs once per block and a deep reorg drains over a few passes.
+    async fn demote_confirmed_from_height(
+        &self,
+        from_height: u64,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = (from_height, limit);
+        Ok(Vec::new())
+    }
+
+    /// GUARDED re-anchor: a pushed, chaintracks-verified proof names a
+    /// different block than the stored confirmation — move `spentHeight`
+    /// to `new_height` while the pointer is still `spending_txid` and the
+    /// row is confirmed. Returns whether the guard hit.
+    async fn reanchor_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        new_height: u64,
+    ) -> Result<bool, PotStorageError> {
+        let _ = (txid, output_index, spending_txid, new_height);
+        Ok(false)
+    }
+
+    /// Drop the VERIFIED latch on a stored pot BEEF (`proof_verified = 0`,
+    /// bytes untouched): its bump rests on a block the header source no
+    /// longer holds, so the proof-completion pass must re-verify it before
+    /// anything trusts it again. Backends without the latch no-op.
+    async fn unlatch_pot_beef_proof(&self, txid: &str) -> Result<(), PotStorageError> {
+        let _ = txid;
+        Ok(())
+    }
+
     /// Attach a #284 verdict group to a row via GUARDED COMPARE-AND-SET (gate
     /// finding MEDIUM-2, 2026-07-28): sets `verdict` + `verdict_txid =
     /// spending_txid` + `settle_signers` (#406 — the group rides as one) ONLY
@@ -779,6 +890,8 @@ pub struct MemoryPotStorage {
     /// writers); RESET by any admit-path `store_beef` byte write. A
     /// structural bump in stored bytes never enters this set by itself.
     verified: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// bsv-low M19 R2: the header hash recorded per height by the block-event pass.
+    headers_seen: std::sync::Mutex<std::collections::BTreeMap<u64, String>>,
     /// txids latched STRUCTURALLY UNPROVABLE (bsv-low handoff #2b) —
     /// models the D1 `pot_beefs.structurally_unprovable` column: the
     /// stored tx's own bytes spend a pot outpoint whose confirmed spend by
@@ -1404,6 +1517,138 @@ impl PotStorage for MemoryPotStorage {
             })
             .cloned()
             .collect())
+    }
+
+    // ── bsv-low M19 R2: the reorg reconcile, in-memory (mirrors the D1 SQL) ──
+
+    async fn record_header_seen(
+        &self,
+        height: u64,
+        hash: &str,
+    ) -> Result<crate::pot::reorg::HeaderSeen, PotStorageError> {
+        let mut seen = self.headers_seen.lock().unwrap();
+        let max_height_before = seen.keys().next_back().copied();
+        let prior_hash_at_height = seen.insert(height, hash.to_ascii_lowercase());
+        Ok(crate::pot::reorg::HeaderSeen {
+            prior_hash_at_height,
+            max_height_before,
+        })
+    }
+
+    async fn find_confirmed_in_heights(
+        &self,
+        min_height: u64,
+        max_height: u64,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let mut rows: Vec<PotRecord> = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.spent
+                    && r.spent_confirmed
+                    && r.spent_height
+                        .is_some_and(|h| h >= min_height && h <= max_height)
+            })
+            .cloned()
+            .collect();
+        // NEWEST first (the D1 `ORDER BY spentHeight DESC`), bounded.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.spent_height));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn find_confirmed_by_spending_txid(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.spent && r.spent_confirmed && r.spending_txid.as_deref() == Some(spending_txid)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn demote_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+    ) -> Result<bool, PotStorageError> {
+        // Guarded like the confirm CAS it reverses: the pointer must still be
+        // the spender the caller's (refuted) proof named, and the row must be
+        // confirmed. Everything but the two confirmation columns is kept.
+        let mut records = self.records.lock().unwrap();
+        for r in records.iter_mut() {
+            if r.txid == txid
+                && r.output_index == output_index
+                && r.spent_confirmed
+                && r.spending_txid.as_deref() == Some(spending_txid)
+            {
+                r.spent_confirmed = false;
+                r.spent_height = None;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn demote_confirmed_from_height(
+        &self,
+        from_height: u64,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let mut records = self.records.lock().unwrap();
+        // NEWEST first, bounded: the D1 statement demotes the same slice.
+        let mut idx: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.spent && r.spent_confirmed && r.spent_height.is_some_and(|h| h >= from_height))
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|a, b| records[*b].spent_height.cmp(&records[*a].spent_height));
+        idx.truncate(limit as usize);
+        let mut demoted = Vec::with_capacity(idx.len());
+        for i in idx {
+            let r = &mut records[i];
+            r.spent_confirmed = false;
+            r.spent_height = None;
+            demoted.push(r.clone());
+        }
+        Ok(demoted)
+    }
+
+    async fn reanchor_confirmed_for_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        new_height: u64,
+    ) -> Result<bool, PotStorageError> {
+        let mut records = self.records.lock().unwrap();
+        for r in records.iter_mut() {
+            if r.txid == txid
+                && r.output_index == output_index
+                && r.spent_confirmed
+                && r.spending_txid.as_deref() == Some(spending_txid)
+            {
+                r.spent_height = Some(new_height);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn unlatch_pot_beef_proof(&self, txid: &str) -> Result<(), PotStorageError> {
+        self.verified.lock().unwrap().remove(txid);
+        Ok(())
     }
 
     async fn compact_pot_beef(&self, txid: &str, new_beef: &[u8]) -> Result<(), PotStorageError> {
@@ -2894,5 +3139,111 @@ mod tests {
             1,
             "clearing the latch re-admits the pointed-at row"
         );
+    }
+
+    // ── bsv-low M19 R2: the reorg reconcile's storage pins (memory mirror) ──
+
+    #[tokio::test]
+    async fn record_header_seen_reports_the_prior_hash_and_the_max_height() {
+        use crate::pot::reorg::{reorg_from_height, HeaderSeen};
+        let store = MemoryPotStorage::new();
+        let first = store.record_header_seen(965771, "AA").await.unwrap();
+        assert_eq!(first, HeaderSeen::default(), "the first header ever: nothing prior");
+        let next = store.record_header_seen(965772, "BB").await.unwrap();
+        assert_eq!(next.prior_hash_at_height, None);
+        assert_eq!(next.max_height_before, Some(965771));
+        // the orphan's replacement at 965771: prior = the orphan (lower-cased on write)
+        let replaced = store.record_header_seen(965771, "CC").await.unwrap();
+        assert_eq!(replaced.prior_hash_at_height.as_deref(), Some("aa"));
+        assert_eq!(replaced.max_height_before, Some(965772));
+        assert_eq!(reorg_from_height(965771, "CC", &replaced), Some(965771));
+        // a repeat of the same hash is not a reorg
+        let again = store.record_header_seen(965771, "cc").await.unwrap();
+        assert_eq!(reorg_from_height(965771, "CC", &again), None);
+    }
+
+    #[tokio::test]
+    async fn demote_confirmed_for_spender_is_guarded_and_keeps_every_other_fact() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("pot", 0)).await.unwrap();
+        store
+            .mark_spent("pot", 0, "settle", true, None, Some(965771), Some(true))
+            .await
+            .unwrap();
+        // the wrong spender never demotes
+        assert!(!store.demote_confirmed_for_spender("pot", 0, "other").await.unwrap());
+        let r = store.get_spent_status("pot", 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed && r.spent_height == Some(965771));
+        // the right spender demotes ONLY the two confirmation columns
+        assert!(store.demote_confirmed_for_spender("pot", 0, "settle").await.unwrap());
+        let r = store.get_spent_status("pot", 0).await.unwrap().unwrap();
+        assert!(r.spent, "spent stays");
+        assert_eq!(r.spending_txid.as_deref(), Some("settle"), "the pointer stays");
+        assert!(!r.spent_confirmed);
+        assert_eq!(r.spent_height, None);
+        assert_eq!(r.spender_final, Some(true), "the #371 finality witness stays");
+        // an already-demoted row is not demoted twice
+        assert!(!store.demote_confirmed_for_spender("pot", 0, "settle").await.unwrap());
+        // and it is a chaser candidate again
+        let again = store.find_unconfirmed_by_spending_txid("settle").await.unwrap();
+        assert_eq!(again.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn demote_confirmed_from_height_is_newest_first_bounded_and_returns_the_rows() {
+        let store = MemoryPotStorage::new();
+        for (pot, h) in [("p1", 965770), ("p2", 965771), ("p3", 965772), ("p4", 965773)] {
+            store.store_record(&pot_record(pot, 0)).await.unwrap();
+            store
+                .mark_spent(pot, 0, &format!("s-{pot}"), true, None, Some(h), None)
+                .await
+                .unwrap();
+        }
+        // the sweep's candidate window is the same shape
+        let win = store.find_confirmed_in_heights(965771, 965773, 10).await.unwrap();
+        let hs: Vec<u64> = win.iter().map(|r| r.spent_height.unwrap()).collect();
+        assert_eq!(hs, vec![965773, 965772, 965771], "newest first, inside the window");
+        // a bounded demotion from the orphaned height drains newest first
+        let demoted = store.demote_confirmed_from_height(965771, 2).await.unwrap();
+        let ds: Vec<&str> = demoted.iter().map(|r| r.txid.as_str()).collect();
+        assert_eq!(ds, vec!["p4", "p3"]);
+        let rest = store.demote_confirmed_from_height(965771, 10).await.unwrap();
+        assert_eq!(rest.len(), 1, "the last row above the height on the next pass");
+        assert_eq!(rest[0].txid, "p2");
+        assert!(store.demote_confirmed_from_height(965771, 10).await.unwrap().is_empty());
+        // 965770 (below the reorg) was never touched
+        let p1 = store.get_spent_status("p1", 0).await.unwrap().unwrap();
+        assert!(p1.spent_confirmed && p1.spent_height == Some(965770));
+        // every demoted row is back in the chaser's pool
+        assert_eq!(store.find_unconfirmed_by_spending_txid("s-p4").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reanchor_moves_only_the_height_under_the_same_guard() {
+        let store = MemoryPotStorage::new();
+        store.store_record(&pot_record("pot", 0)).await.unwrap();
+        store
+            .mark_spent("pot", 0, "settle", true, None, Some(965771), Some(true))
+            .await
+            .unwrap();
+        assert!(!store.reanchor_confirmed_for_spender("pot", 0, "other", 965773).await.unwrap());
+        assert!(store.reanchor_confirmed_for_spender("pot", 0, "settle", 965773).await.unwrap());
+        let r = store.get_spent_status("pot", 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed);
+        assert_eq!(r.spent_height, Some(965773));
+        assert_eq!(r.spending_txid.as_deref(), Some("settle"));
+        let confirmed = store.find_confirmed_by_spending_txid("settle").await.unwrap();
+        assert_eq!(confirmed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unlatch_drops_the_verified_latch_without_touching_the_bytes() {
+        let store = MemoryPotStorage::new();
+        store.store_beef("settle", &[1, 2, 3, 4, 5]).await.unwrap();
+        store.mark_pot_beef_proven("settle").await.unwrap();
+        assert!(store.pot_beef_proof_verified("settle").await.unwrap());
+        store.unlatch_pot_beef_proof("settle").await.unwrap();
+        assert!(!store.pot_beef_proof_verified("settle").await.unwrap());
+        assert_eq!(store.get_beef("settle").await.unwrap(), Some(vec![1, 2, 3, 4, 5]));
     }
 }

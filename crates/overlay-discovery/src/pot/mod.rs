@@ -96,6 +96,7 @@ use std::sync::OnceLock;
 pub mod covenant;
 pub mod lookup_service;
 pub mod lowfund_topic_manager;
+pub mod reorg;
 pub mod spend_signers;
 pub mod storage;
 pub mod topic_manager;
