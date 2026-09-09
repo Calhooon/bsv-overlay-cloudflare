@@ -790,9 +790,18 @@ impl Engine {
         }
 
         // Parse transaction from BEEF
-        let tx = Transaction::from_beef(&tagged_beef.beef, None)
+        let mut tx = Transaction::from_beef(&tagged_beef.beef, None)
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
         let txid = tx.id();
+        // Every occurrence of an unproven source gets its own linked ancestry
+        // (see `link_beef_ancestry`): bsv-rs 0.3.20 links a txid the first time
+        // the walk meets it and leaves later clones bare, and the verifier can
+        // pop a bare clone first.
+        if self.verify_scripts && mode != SubmitMode::HistoricalTxNoSpv {
+            if let Ok(beef) = Beef::from_binary(&tagged_beef.beef) {
+                link_beef_ancestry(&mut tx, &beef);
+            }
+        }
 
         // SPV verification, skipped ONLY for HistoricalTxNoSpv, exactly the
         // reference's `if (mode !== 'historical-tx-no-spv') tx.verify(...)`
@@ -2454,6 +2463,62 @@ const BSV_RS_SCRIPT_FAILURE_PREFIX: &str = "Script validation failed for input "
 /// ([`EngineError::ScriptVerificationFailed`]) or anything else, a bad or
 /// unverifiable PROOF, a missing source, a chain-tracker fault
 /// ([`EngineError::SpvError`]).
+/// Re-link every input's source transaction from `beef`, memoized per txid,
+/// so that EVERY occurrence of an unproven ancestor carries its own linked
+/// ancestry and BUMP.
+///
+/// Why (found live, zanaadu 2026-09-08, the first recase of a fresh name head
+/// on beta): `Beef::find_atomic_transaction` in bsv-rs 0.3.20 attaches
+/// sources depth-first with a `visited` set keyed by txid. When two inputs of
+/// one spend source the SAME unproven transaction (a covenant head output and
+/// that head spend's own change output, the shape every second head spend of
+/// a wallet has), the second input receives a fresh clone of the source and
+/// the walk returns at once because the txid was already visited, so that
+/// clone has no sources and no merkle path. `Transaction::verify` pushes both
+/// clones on its stack and pops the bare one first: "Input 0 has no source
+/// transaction", for a BEEF that carries every transaction. The TypeScript
+/// SDK never hits this because its inputs share one `Transaction` object by
+/// reference. Until bsv-rs shares or fully links every clone, the engine
+/// links them here: a proven transaction (a BUMP in the BEEF) is attached and
+/// not descended, an unproven one is linked recursively once and reused from
+/// the memo for every later occurrence.
+fn link_beef_ancestry(tx: &mut Transaction, beef: &Beef) {
+    let mut memo: std::collections::HashMap<String, Transaction> = std::collections::HashMap::new();
+    link_beef_ancestry_rec(tx, beef, &mut memo);
+}
+
+fn link_beef_ancestry_rec(
+    tx: &mut Transaction,
+    beef: &Beef,
+    memo: &mut std::collections::HashMap<String, Transaction>,
+) {
+    let txid = tx.id();
+    if tx.merkle_path.is_none() {
+        if let Some(mp) = beef.find_bump(&txid) {
+            tx.merkle_path = Some(mp.clone());
+        }
+    }
+    if tx.merkle_path.is_some() {
+        return; // proven: the walk trusts it, no ancestry needed
+    }
+    for input in &mut tx.inputs {
+        let Some(src_txid) = input.source_txid.clone() else {
+            continue;
+        };
+        let linked = if let Some(done) = memo.get(&src_txid) {
+            done.clone()
+        } else {
+            let Some(mut src) = beef.find_txid(&src_txid).and_then(|b| b.tx().cloned()) else {
+                continue; // not in this BEEF: verify reports it honestly
+            };
+            link_beef_ancestry_rec(&mut src, beef, memo);
+            memo.insert(src_txid.clone(), src.clone());
+            src
+        };
+        input.source_transaction = Some(Box::new(linked));
+    }
+}
+
 fn classify_verify_failure(subject_txid: &str, e: &bsv_rs::Error) -> EngineError {
     let bsv_rs::Error::TransactionError(msg) = e else {
         return EngineError::SpvError(e.to_string());

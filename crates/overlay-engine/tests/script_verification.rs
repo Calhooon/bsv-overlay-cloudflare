@@ -40,8 +40,8 @@ use bsv_rs::script::{
     UnlockingScript,
 };
 use bsv_rs::transaction::{
-    ChainTracker, ChainTrackerError, MerklePath, MerklePathLeaf, MockChainTracker, Transaction,
-    TransactionInput, TransactionOutput,
+    Beef, ChainTracker, ChainTrackerError, MerklePath, MerklePathLeaf, MockChainTracker,
+    Transaction, TransactionInput, TransactionOutput,
 };
 use std::rc::Rc;
 use std::time::Instant;
@@ -825,4 +825,77 @@ fn script_error_display_names_the_input_and_the_reason() {
             "ab".repeat(32)
         )
     );
+}
+
+/// Two inputs of one spend sourcing the SAME unproven parent (a head output
+/// and that parent's own change): bsv-rs 0.3.20 links the parent for the
+/// first input and leaves the second input's clone bare, and the verifier
+/// popped the bare clone first ("Input 0 has no source transaction"). Found
+/// live on zanaadu beta, 2026-09-08, on the first recase of a fresh name.
+#[tokio::test]
+async fn two_inputs_from_one_unproven_parent_verify() {
+    let key = PrivateKey::random();
+    let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+    // F (proven) -> M (unproven, two outputs) -> R spending M:0 AND M:1.
+    let funding = proven_funding(lock.clone(), 100_000);
+    let funding_txid = funding.id();
+    let mut middle = Transaction::new();
+    middle
+        .add_input_from_tx(funding, 0, P2PKH::unlock(&key, SignOutputs::All, false))
+        .unwrap();
+    middle
+        .outputs
+        .push(TransactionOutput::new(40_000, lock.clone()));
+    middle
+        .outputs
+        .push(TransactionOutput::new(50_000, lock.clone()));
+    middle.sign().await.expect("middle signs");
+    let mut subject = Transaction::new();
+    subject
+        .add_input_from_tx(
+            middle.clone(),
+            0,
+            P2PKH::unlock(&key, SignOutputs::All, false),
+        )
+        .unwrap();
+    subject
+        .add_input_from_tx(
+            middle.clone(),
+            1,
+            P2PKH::unlock(&key, SignOutputs::All, false),
+        )
+        .unwrap();
+    subject.outputs.push(TransactionOutput::new(80_000, lock));
+    subject.sign().await.expect("subject signs");
+    let beef = subject
+        .to_beef(false)
+        .expect("BEEF with the unproven middle and the proven funding");
+    // the BEEF carries the middle ONCE: the shape that tripped the walk
+    assert_eq!(
+        Beef::from_binary(&beef).unwrap().txs.len(),
+        3,
+        "funding, middle, subject"
+    );
+
+    // The positive control for the engine's linker: bsv-rs 0.3.20 alone still
+    // trips on this BEEF. When this assertion fails, bsv-rs has fixed
+    // `find_atomic_transaction` and `link_beef_ancestry` can go.
+    let bare = Transaction::from_beef(&beef, None).unwrap();
+    let bare_result = bare.verify(&*tracker_knowing(&funding_txid), None).await;
+    assert!(
+        format!("{bare_result:?}").contains("has no source transaction"),
+        "bsv-rs 0.3.20 leaves the second clone of the unproven parent bare: {bare_result:?}"
+    );
+
+    let storage = Rc::new(MemoryStorage::new());
+    let engine = engine_with(Rc::clone(&storage), Some(tracker_knowing(&funding_txid)));
+    let steak = engine
+        .submit(
+            &TaggedBEEF::new(beef, vec![TOPIC.into()]),
+            SubmitMode::CurrentTx,
+        )
+        .await
+        .expect("a complete two-level ancestry is admitted, every clone linked");
+    assert_eq!(steak[TOPIC].outputs_to_admit, vec![0]);
+    assert!(is_admitted(&storage, &subject.id()).await);
 }
