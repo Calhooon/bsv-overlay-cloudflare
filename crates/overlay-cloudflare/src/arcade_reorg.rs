@@ -50,9 +50,8 @@
 
 use bsv_rs::transaction::ChainTracker;
 use overlay_discovery::pot::arcade_events::{
-    classify_corroboration, events_after, next_page_before, parse_block_status_page,
-    ConsumerState, Corroboration, EventKey, LegProgress, OrphanEvent, ReleaseReason,
-    UnresolvedEvent,
+    classify_corroboration, events_after, next_page_before, parse_block_status_page, ConsumerState,
+    Corroboration, EventKey, LegProgress, OrphanEvent, ReleaseReason, UnresolvedEvent,
 };
 use overlay_discovery::pot::storage::PotStorage;
 use overlay_engine::gasp::AncestorFetcher;
@@ -132,7 +131,10 @@ pub struct CanonicalHeader {
 /// The header source for corroboration: what chaintracks holds at a height
 /// (`Ok(None)` = no header there) and its tip.
 pub trait HeaderSource {
-    fn hash_at(&self, height: u64) -> impl std::future::Future<Output = Result<Option<CanonicalHeader>, String>>;
+    fn hash_at(
+        &self,
+        height: u64,
+    ) -> impl std::future::Future<Output = Result<Option<CanonicalHeader>, String>>;
     fn tip(&self) -> impl std::future::Future<Output = Result<u64, String>>;
 }
 
@@ -141,7 +143,9 @@ pub trait HeaderSource {
 /// against that version (`Ok(Some(new))`), `Ok(None)` = another isolate
 /// wrote in between and this pass must stop.
 pub trait ConsumerStateStore {
-    fn read(&self) -> impl std::future::Future<Output = Result<(ConsumerState, Option<u64>), String>>;
+    fn read(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(ConsumerState, Option<u64>), String>>;
     fn write(
         &self,
         state: &ConsumerState,
@@ -266,7 +270,10 @@ impl ArcadePassSummary {
 
     /// Events finished (the cursor moved past them).
     pub fn events_finished(&self) -> usize {
-        self.applied + self.skipped_uncorroborated + self.skipped_unresolved + self.released_by_operator
+        self.applied
+            + self.skipped_uncorroborated
+            + self.skipped_unresolved
+            + self.released_by_operator
     }
 }
 
@@ -326,14 +333,18 @@ async fn persist<C: ConsumerStateStore>(
         }
         Ok(None) => {
             out.contended += 1;
-            out.stopped = Some("another isolate owns this pass (the state write lost its compare-and-set)".into());
+            out.stopped = Some(
+                "another isolate owns this pass (the state write lost its compare-and-set)".into(),
+            );
             push_log("[arcade-reorg] the state write lost its compare-and-set: another isolate ran this pass; this pass's progress is redone by whoever holds the row");
             Persist::Contended
         }
         Err(e) => {
             out.errors += 1;
             out.stopped = Some(format!("state write: {e}"));
-            push_log(&format!("[arcade-reorg] state write failed: this pass's progress is redone next pass: {e}"));
+            push_log(&format!(
+                "[arcade-reorg] state write failed: this pass's progress is redone next pass: {e}"
+            ));
             Persist::Faulted
         }
     }
@@ -374,7 +385,9 @@ where
         Err(e) => {
             out.errors += 1;
             out.stopped = Some(format!("state read: {e}"));
-            push_log(&format!("[arcade-reorg] state read failed: nothing consumed: {e}"));
+            push_log(&format!(
+                "[arcade-reorg] state read failed: nothing consumed: {e}"
+            ));
             return out;
         }
     };
@@ -390,7 +403,10 @@ where
                 key.height,
                 key.height
             ));
-            if !matches!(persist(state_store, &state, &mut version, &mut out).await, Persist::Written) {
+            if !matches!(
+                persist(state_store, &state, &mut version, &mut out).await,
+                Persist::Written
+            ) {
                 out.cursor = state.cursor.clone();
                 return out;
             }
@@ -412,7 +428,10 @@ where
                     key.height,
                     key.height
                 ));
-                if !matches!(persist(state_store, &state, &mut version, &mut out).await, Persist::Written) {
+                if !matches!(
+                    persist(state_store, &state, &mut version, &mut out).await,
+                    Persist::Written
+                ) {
                     break;
                 }
                 out.skipped_unresolved += 1;
@@ -435,14 +454,19 @@ where
                     Err(e) => {
                         out.faults += 1;
                         out.stopped = Some(format!("feed read: {e}"));
-                        push_log(&format!("[arcade-reorg] Arcade feed read failed: cursor unchanged: {e}"));
+                        push_log(&format!(
+                            "[arcade-reorg] Arcade feed read failed: cursor unchanged: {e}"
+                        ));
                         break;
                     }
                 }
             }
             let next = feed_events
                 .as_ref()
-                .and_then(|evs| evs.iter().find(|e| state.cursor.as_ref().is_none_or(|c| e.key() > *c)))
+                .and_then(|evs| {
+                    evs.iter()
+                        .find(|e| state.cursor.as_ref().is_none_or(|c| e.key() > *c))
+                })
                 .cloned();
             match next {
                 Some(ev) => state.start(ev),
@@ -452,7 +476,9 @@ where
                 }
             }
         }
-        let Some(pending) = state.pending.clone() else { break };
+        let Some(pending) = state.pending.clone() else {
+            break;
+        };
         let ev = pending.event.clone();
         // ── corroborate the hint against our header source ──
         let canonical = match headers.hash_at(ev.height).await {
@@ -460,7 +486,10 @@ where
             Err(e) => {
                 out.faults += 1;
                 out.stopped = Some(format!("header read at {}: {e}", ev.height));
-                push_log(&format!("[arcade-reorg] header read at {} failed: cursor unchanged: {e}", ev.height));
+                push_log(&format!(
+                    "[arcade-reorg] header read at {} failed: cursor unchanged: {e}",
+                    ev.height
+                ));
                 state.note_fault_on_pending();
                 let _ = persist(state_store, &state, &mut version, &mut out).await;
                 break;
@@ -471,7 +500,9 @@ where
             Err(e) => {
                 out.faults += 1;
                 out.stopped = Some(format!("tip read: {e}"));
-                push_log(&format!("[arcade-reorg] tip read failed: cursor unchanged: {e}"));
+                push_log(&format!(
+                    "[arcade-reorg] tip read failed: cursor unchanged: {e}"
+                ));
                 state.note_fault_on_pending();
                 let _ = persist(state_store, &state, &mut version, &mut out).await;
                 break;
@@ -524,7 +555,10 @@ where
                 state.advance_past_pending();
                 // counted only once the cursor move PERSISTED (a lost write is
                 // the other isolate's event to count)
-                if !matches!(persist(state_store, &state, &mut version, &mut out).await, Persist::Written) {
+                if !matches!(
+                    persist(state_store, &state, &mut version, &mut out).await,
+                    Persist::Written
+                ) {
                     break;
                 }
                 out.skipped_uncorroborated += 1;
@@ -554,48 +588,88 @@ where
                         h,
                         progress.spenders.after,
                         limits.leg_limit,
-                        ReverifyMode { demote_proofless: false, reanchor_first: true },
+                        ReverifyMode {
+                            demote_proofless: false,
+                            reanchor_first: true,
+                        },
                         memo,
                     )
                     .await;
                     add_spenders(&mut out.spenders, &s);
                     if s.faults > 0 || s.errors > 0 {
                         faulted = true;
-                        out.stopped = Some(format!("spenders leg at {h}: faults={} errors={}", s.faults, s.errors));
+                        out.stopped = Some(format!(
+                            "spenders leg at {h}: faults={} errors={}",
+                            s.faults, s.errors
+                        ));
                     } else {
-                        progress.spenders = LegProgress { after: s.next_cursor, exhausted: s.exhausted };
+                        progress.spenders = LegProgress {
+                            after: s.next_cursor,
+                            exhausted: s.exhausted,
+                        };
                         if s.budget_exhausted {
                             budget_stop = true;
                         }
                     }
                 }
                 if !faulted && !budget_stop && !progress.pot_beefs.exhausted {
-                    let s = reverify_pot_beefs_window_with(pot_storage, Some(tracker), h, h, progress.pot_beefs.after, limits.leg_limit, memo).await;
+                    let s = reverify_pot_beefs_window_with(
+                        pot_storage,
+                        Some(tracker),
+                        h,
+                        h,
+                        progress.pot_beefs.after,
+                        limits.leg_limit,
+                        memo,
+                    )
+                    .await;
                     add_leg(&mut out.pot_beefs, &s);
                     if s.faults > 0 || s.errors > 0 {
                         faulted = true;
-                        out.stopped = Some(format!("pot_beefs leg at {h}: faults={} errors={}", s.faults, s.errors));
+                        out.stopped = Some(format!(
+                            "pot_beefs leg at {h}: faults={} errors={}",
+                            s.faults, s.errors
+                        ));
                     } else {
-                        progress.pot_beefs = LegProgress { after: s.next_cursor, exhausted: s.exhausted };
+                        progress.pot_beefs = LegProgress {
+                            after: s.next_cursor,
+                            exhausted: s.exhausted,
+                        };
                     }
                 }
                 if !faulted && !budget_stop && !progress.transactions.exhausted {
                     match tx_store {
                         Some(store) => {
-                            let s = reverify_transactions_window_with(store, Some(tracker), h, h, progress.transactions.after, limits.leg_limit, memo).await;
+                            let s = reverify_transactions_window_with(
+                                store,
+                                Some(tracker),
+                                h,
+                                h,
+                                progress.transactions.after,
+                                limits.leg_limit,
+                                memo,
+                            )
+                            .await;
                             add_leg(&mut out.transactions, &s);
                             if s.faults > 0 || s.errors > 0 {
                                 faulted = true;
-                                out.stopped = Some(format!("transactions leg at {h}: faults={} errors={}", s.faults, s.errors));
+                                out.stopped = Some(format!(
+                                    "transactions leg at {h}: faults={} errors={}",
+                                    s.faults, s.errors
+                                ));
                             } else {
-                                progress.transactions = LegProgress { after: s.next_cursor, exhausted: s.exhausted };
+                                progress.transactions = LegProgress {
+                                    after: s.next_cursor,
+                                    exhausted: s.exhausted,
+                                };
                             }
                         }
                         // round 2 (review LOW-4): a missing transactions store is
                         // a fault, never "that leg is done"
                         None => {
                             faulted = true;
-                            out.stopped = Some("no transactions store: the hop-proof leg cannot run".into());
+                            out.stopped =
+                                Some("no transactions store: the hop-proof leg cannot run".into());
                         }
                     }
                 }
@@ -639,14 +713,21 @@ where
                         out.transactions.stale
                     ));
                     // counted only once the cursor move PERSISTED
-                    if !matches!(persist(state_store, &state, &mut version, &mut out).await, Persist::Written) {
+                    if !matches!(
+                        persist(state_store, &state, &mut version, &mut out).await,
+                        Persist::Written
+                    ) {
                         break;
                     }
                     out.applied += 1;
                     finished += 1;
                 } else {
                     // bounded: one page per leg this pass; the next pass continues
-                    out.stopped = Some(format!("event {}@{} continues next pass (a leg is not exhausted)", short(&ev.hash), h));
+                    out.stopped = Some(format!(
+                        "event {}@{} continues next pass (a leg is not exhausted)",
+                        short(&ev.hash),
+                        h
+                    ));
                     let _ = persist(state_store, &state, &mut version, &mut out).await;
                     break;
                 }
@@ -654,7 +735,10 @@ where
         }
     }
     out.cursor = state.cursor.clone();
-    out.pending = state.pending.as_ref().map(|p| (p.event.key(), p.held_passes));
+    out.pending = state
+        .pending
+        .as_ref()
+        .map(|p| (p.event.key(), p.held_passes));
     out.unresolved = state.unresolved.clone();
     out.memo_reads = memo.reads();
     out
@@ -670,7 +754,9 @@ pub struct ArcadeBlockStatusFeed {
 
 impl ArcadeBlockStatusFeed {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into().trim_end_matches('/').to_string() }
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        }
     }
 
     /// The page URL: the head, or the page below `before_height` (Arcade
@@ -697,7 +783,11 @@ impl OrphanFeed for ArcadeBlockStatusFeed {
             let (status, body) = match fetched {
                 Some(Ok(r)) => r,
                 Some(Err(e)) => return Err(format!("GET {url}: {e}")),
-                None => return Err(format!("GET {url}: no answer within {ARCADE_FEED_TIMEOUT_MS} ms")),
+                None => {
+                    return Err(format!(
+                        "GET {url}: no answer within {ARCADE_FEED_TIMEOUT_MS} ms"
+                    ))
+                }
             };
             if !(200..300).contains(&status) {
                 let head: String = body.chars().take(160).collect();
@@ -757,30 +847,41 @@ impl ConsumerStateStore for D1ConsumerState<'_> {
             #[serde(default)]
             version: Option<f64>,
         }
-        let row: Option<Row> = crate::d1::Query::new(crate::d1_discovery::arcade_reorg_state_read_sql())
-            .bind(ARCADE_STATE_NAME)
-            .fetch_optional(self.0)
-            .await
-            .map_err(|e| e.to_string())?;
+        let row: Option<Row> =
+            crate::d1::Query::new(crate::d1_discovery::arcade_reorg_state_read_sql())
+                .bind(ARCADE_STATE_NAME)
+                .fetch_optional(self.0)
+                .await
+                .map_err(|e| e.to_string())?;
         match row {
-            Some(r) => Ok((ConsumerState::from_json(&r.state)?, Some(r.version.unwrap_or(0.0).max(0.0) as u64))),
+            Some(r) => Ok((
+                ConsumerState::from_json(&r.state)?,
+                Some(r.version.unwrap_or(0.0).max(0.0) as u64),
+            )),
             None => Ok((ConsumerState::default(), None)),
         }
     }
 
-    async fn write(&self, state: &ConsumerState, expected_version: Option<u64>) -> Result<Option<u64>, String> {
+    async fn write(
+        &self,
+        state: &ConsumerState,
+        expected_version: Option<u64>,
+    ) -> Result<Option<u64>, String> {
         #[derive(serde::Deserialize)]
         struct Row {
             version: f64,
         }
-        let row: Option<Row> = crate::d1::Query::new(crate::d1_discovery::arcade_reorg_state_upsert_sql())
-            .bind(ARCADE_STATE_NAME)
-            .bind(state.to_json())
-            .bind(js_sys::Date::now())
-            .bind(crate::d1_discovery::opt_f64(expected_version.map(|v| v as f64)))
-            .fetch_optional(self.0)
-            .await
-            .map_err(|e| e.to_string())?;
+        let row: Option<Row> =
+            crate::d1::Query::new(crate::d1_discovery::arcade_reorg_state_upsert_sql())
+                .bind(ARCADE_STATE_NAME)
+                .bind(state.to_json())
+                .bind(js_sys::Date::now())
+                .bind(crate::d1_discovery::opt_f64(
+                    expected_version.map(|v| v as f64),
+                ))
+                .fetch_optional(self.0)
+                .await
+                .map_err(|e| e.to_string())?;
         Ok(row.map(|r| r.version.max(0.0) as u64))
     }
 }
@@ -800,18 +901,28 @@ mod tests {
 
     // ── the 2026-09-07 facts (chaintracks + WoC agree; Arcade's rows differ) ──
     const ORPHAN_965771: &str = "0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1";
-    const CANONICAL_965771: &str = "00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d";
-    const CANONICAL_965772: &str = "000000000000000014d2556ff86def96cd4ce5a74eb0e26af56104f45168248e";
-    const CANONICAL_965773: &str = "0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33";
-    const EMPTY_SIBLING_965773: &str = "00000000000000000851a554167480b696b3dbd36ab1fd862f2520217988afa0";
-    const CANONICAL_965774: &str = "0000000000000000167282824c6019608da4d6fc6e93eb573afc1b45bacb01cf";
+    const CANONICAL_965771: &str =
+        "00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d";
+    const CANONICAL_965772: &str =
+        "000000000000000014d2556ff86def96cd4ce5a74eb0e26af56104f45168248e";
+    const CANONICAL_965773: &str =
+        "0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33";
+    const EMPTY_SIBLING_965773: &str =
+        "00000000000000000851a554167480b696b3dbd36ab1fd862f2520217988afa0";
+    const CANONICAL_965774: &str =
+        "0000000000000000167282824c6019608da4d6fc6e93eb573afc1b45bacb01cf";
 
     /// Arcade's listing page around the event, verbatim from the deployed
     /// instance (the same bytes `overlay_discovery` pins its parser on).
-    const REAL_PAGE: &str = include_str!("../../overlay-discovery/src/pot/arcade_events_fixture_965769_965775.json");
+    const REAL_PAGE: &str =
+        include_str!("../../overlay-discovery/src/pot/arcade_events_fixture_965769_965775.json");
 
     fn ev(stamp: &str, height: u64, hash: &str) -> OrphanEvent {
-        OrphanEvent { orphaned_at: stamp.into(), height, hash: hash.into() }
+        OrphanEvent {
+            orphaned_at: stamp.into(),
+            height,
+            hash: hash.into(),
+        }
     }
 
     /// The three real events, in Arcade's own order (the page parse).
@@ -829,10 +940,18 @@ mod tests {
     impl StubFeed {
         fn of(events: Vec<OrphanEvent>) -> Self {
             let newest = events.iter().map(|e| e.height).max();
-            Self { answer: RefCell::new(Ok(events)), reads: Cell::new(0), newest: Cell::new(newest) }
+            Self {
+                answer: RefCell::new(Ok(events)),
+                reads: Cell::new(0),
+                newest: Cell::new(newest),
+            }
         }
         fn faulty() -> Self {
-            Self { answer: RefCell::new(Err("arcade 503".into())), reads: Cell::new(0), newest: Cell::new(None) }
+            Self {
+                answer: RefCell::new(Err("arcade 503".into())),
+                reads: Cell::new(0),
+                newest: Cell::new(None),
+            }
         }
     }
     impl OrphanFeed for StubFeed {
@@ -880,7 +999,10 @@ mod tests {
             if self.hash_fault {
                 return Err("chaintracks 502".into());
             }
-            Ok(self.hashes.get(&height).map(|hash| CanonicalHeader { hash: hash.clone(), merkle_root: self.roots.get(&height).cloned() }))
+            Ok(self.hashes.get(&height).map(|hash| CanonicalHeader {
+                hash: hash.clone(),
+                merkle_root: self.roots.get(&height).cloned(),
+            }))
         }
         async fn tip(&self) -> Result<u64, String> {
             self.tip.clone()
@@ -902,7 +1024,12 @@ mod tests {
     }
     impl StubState {
         fn state(&self) -> ConsumerState {
-            self.doc.borrow().as_deref().map_or_else(ConsumerState::default, |d| ConsumerState::from_json(d).unwrap())
+            self.doc
+                .borrow()
+                .as_deref()
+                .map_or_else(ConsumerState::default, |d| {
+                    ConsumerState::from_json(d).unwrap()
+                })
         }
         fn with_doc(doc: &str) -> Self {
             let s = Self::default();
@@ -923,7 +1050,11 @@ mod tests {
             };
             Ok((state, self.version.get()))
         }
-        async fn write(&self, state: &ConsumerState, expected_version: Option<u64>) -> Result<Option<u64>, String> {
+        async fn write(
+            &self,
+            state: &ConsumerState,
+            expected_version: Option<u64>,
+        ) -> Result<Option<u64>, String> {
             if self.write_fault.get() {
                 return Err("d1 write".into());
             }
@@ -947,7 +1078,11 @@ mod tests {
     struct FaultyTracker;
     #[async_trait::async_trait]
     impl ChainTracker for FaultyTracker {
-        async fn is_valid_root_for_height(&self, _root: &str, _height: u32) -> Result<bool, ChainTrackerError> {
+        async fn is_valid_root_for_height(
+            &self,
+            _root: &str,
+            _height: u32,
+        ) -> Result<bool, ChainTrackerError> {
             Err(ChainTrackerError::NetworkError("starved".into()))
         }
         async fn current_height(&self) -> Result<u32, ChainTrackerError> {
@@ -963,7 +1098,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ChainTracker for RecordingTracker {
-        async fn is_valid_root_for_height(&self, root: &str, height: u32) -> Result<bool, ChainTrackerError> {
+        async fn is_valid_root_for_height(
+            &self,
+            root: &str,
+            height: u32,
+        ) -> Result<bool, ChainTrackerError> {
             self.asked.lock().unwrap().push(root.to_string());
             Ok(self.valid.contains(&(height, root.to_string())))
         }
@@ -983,15 +1122,27 @@ mod tests {
     }
     impl CourierStub {
         fn none() -> Self {
-            Self { answers: HashMap::new(), calls: Cell::new(0), budget: Cell::new(None) }
+            Self {
+                answers: HashMap::new(),
+                calls: Cell::new(0),
+                budget: Cell::new(None),
+            }
         }
         fn with(answers: HashMap<String, Result<Option<String>, String>>) -> Self {
-            Self { answers, calls: Cell::new(0), budget: Cell::new(None) }
+            Self {
+                answers,
+                calls: Cell::new(0),
+                budget: Cell::new(None),
+            }
         }
     }
     #[async_trait::async_trait(?Send)]
     impl AncestorFetcher for CourierStub {
-        async fn fetch_ancestor(&self, _txid: &str) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError> {
+        async fn fetch_ancestor(
+            &self,
+            _txid: &str,
+        ) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError>
+        {
             Err(overlay_engine::gasp::GASPError::NodeNotFound("stub".into()))
         }
         async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
@@ -1022,14 +1173,23 @@ mod tests {
     }
     #[async_trait::async_trait(?Send)]
     impl AncestorFetcher for RacingLadder<'_> {
-        async fn fetch_ancestor(&self, _txid: &str) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError> {
+        async fn fetch_ancestor(
+            &self,
+            _txid: &str,
+        ) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError>
+        {
             Err(overlay_engine::gasp::GASPError::NodeNotFound("stub".into()))
         }
         async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
             self.calls.set(self.calls.get() + 1);
             if txid == self.spender {
                 // the concurrent writer lands the verified proof first
-                let _ = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(self.store, &self.spender, &self.proof).await;
+                let _ = crate::proof_fetcher::apply_pushed_proof_to_pot_stores(
+                    self.store,
+                    &self.spender,
+                    &self.proof,
+                )
+                .await;
                 return Ok(self.answer_after_landing.then(|| self.proof.clone()));
             }
             Ok(None)
@@ -1055,18 +1215,35 @@ mod tests {
         }
     }
     impl ProvenTxStore for MemoryTxStore {
-        async fn proven_window_page(&self, lo: u64, hi: u64, after: Option<RowKey>, limit: u64) -> Result<Vec<(RowKey, String, Vec<u8>)>, String> {
+        async fn proven_window_page(
+            &self,
+            lo: u64,
+            hi: u64,
+            after: Option<RowKey>,
+            limit: u64,
+        ) -> Result<Vec<(RowKey, String, Vec<u8>)>, String> {
             let mut page: Vec<(RowKey, String, Vec<u8>)> = self
                 .rows
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|r| r.4 && r.3.is_some_and(|h| h >= lo && h <= hi))
-                .map(|r| (RowKey { height: r.3.unwrap(), rowid: r.0 }, r.1.clone(), r.2.clone()))
+                .map(|r| {
+                    (
+                        RowKey {
+                            height: r.3.unwrap(),
+                            rowid: r.0,
+                        },
+                        r.1.clone(),
+                        r.2.clone(),
+                    )
+                })
                 .collect();
             page.sort_by_key(|(k, _, _)| std::cmp::Reverse((k.height, k.rowid)));
             if let Some(a) = after {
-                page.retain(|(k, _, _)| k.height < a.height || (k.height == a.height && k.rowid < a.rowid));
+                page.retain(|(k, _, _)| {
+                    k.height < a.height || (k.height == a.height && k.rowid < a.rowid)
+                });
             }
             page.truncate(limit as usize);
             Ok(page)
@@ -1088,7 +1265,11 @@ mod tests {
     /// A pot CONFIRMED at `height` by a spender whose stored pot BEEF carries
     /// a single-leaf bump at that height (root = the spender txid), latched
     /// verified with its anchor. Returns the spender txid.
-    async fn confirmed_pot_with_stored_proof(store: &MemoryPotStorage, pot: &str, height: u32) -> String {
+    async fn confirmed_pot_with_stored_proof(
+        store: &MemoryPotStorage,
+        pot: &str,
+        height: u32,
+    ) -> String {
         confirmed_pot_with_proof_at(store, pot, height, true).await
     }
 
@@ -1096,20 +1277,50 @@ mod tests {
     /// `proofHeight`: the pot_beefs leg never pages it, so a pin about the
     /// spenders leg alone can count the header source's questions (the
     /// R2 pins' device; a stored spender BEEF is a `pot_beefs` row too).
-    async fn confirmed_pot_with_proof_at(store: &MemoryPotStorage, pot: &str, height: u32, anchored: bool) -> String {
+    async fn confirmed_pot_with_proof_at(
+        store: &MemoryPotStorage,
+        pot: &str,
+        height: u32,
+        anchored: bool,
+    ) -> String {
         let raw = real_spender_raw(pot, 0);
         let spender = Transaction::from_hex(&raw).unwrap().id();
-        store.store_record(&PotRecord { txid: pot.into(), output_index: 0, ..Default::default() }).await.unwrap();
-        store.mark_spent(pot, 0, &spender, true, None, Some(u64::from(height)), Some(true)).await.unwrap();
+        store
+            .store_record(&PotRecord {
+                txid: pot.into(),
+                output_index: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                pot,
+                0,
+                &spender,
+                true,
+                None,
+                Some(u64::from(height)),
+                Some(true),
+            )
+            .await
+            .unwrap();
         let bump_hex = single_tx_bump(&spender, height).to_hex();
         let beef = crate::proof_fetcher::assemble_spender_beef(&raw, &bump_hex, &spender).unwrap();
         store.store_beef(&spender, &beef).await.unwrap();
-        store.mark_pot_beef_proven_at(&spender, anchored.then_some(u64::from(height))).await.unwrap();
+        store
+            .mark_pot_beef_proven_at(&spender, anchored.then_some(u64::from(height)))
+            .await
+            .unwrap();
         spender
     }
 
     fn limits(events: u32, leg: u64) -> PassLimits {
-        PassLimits { events_per_pass: events, leg_limit: leg, ..PassLimits::cron() }
+        PassLimits {
+            events_per_pass: events,
+            leg_limit: leg,
+            ..PassLimits::cron()
+        }
     }
 
     /// One pass with a fresh memo and no operator release (the common call).
@@ -1124,7 +1335,19 @@ mod tests {
         fetcher: Option<&dyn AncestorFetcher>,
         lim: PassLimits,
     ) -> ArcadePassSummary {
-        consume_arcade_reorg_events(feed, headers, state, store, txs, tracker, fetcher, lim, &mut RootMemo::default(), false).await
+        consume_arcade_reorg_events(
+            feed,
+            headers,
+            state,
+            store,
+            txs,
+            tracker,
+            fetcher,
+            lim,
+            &mut RootMemo::default(),
+            false,
+        )
+        .await
     }
 
     /// The 2026-09-07 event, consumed: the 965771 orphan (corroborated: our
@@ -1144,15 +1367,55 @@ mod tests {
         tracker.add_root(965_773, reproven.clone()); // re-mined in the canonical 965773
         let orphaned_only = confirmed_pot_with_stored_proof(&store, &pot(3), 965_771).await;
         let elsewhere = confirmed_pot_with_stored_proof(&store, &pot(4), 965_774).await; // refuted, but not at the event's height
-        let ladder = CourierStub::with([(reproven.clone(), Ok(Some(single_tx_bump(&reproven, 965_773).to_hex())))].into_iter().collect());
+        let ladder = CourierStub::with(
+            [(
+                reproven.clone(),
+                Ok(Some(single_tx_bump(&reproven, 965_773).to_hex())),
+            )]
+            .into_iter()
+            .collect(),
+        );
         let feed = StubFeed::of(real_events());
         let headers = StubHeaders::real(965_860);
         let state = StubState::default();
         let txs = MemoryTxStore::default();
-        let s = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&ladder), limits(1, 50)).await;
-        assert_eq!((s.applied, s.skipped_uncorroborated, s.held, s.faults, s.errors), (1, 0, 0, 0, 0), "{s:?}");
-        assert_eq!((s.spenders.scanned, s.spenders.standing, s.reanchored(), s.demoted()), (3, 1, 1, 1), "{s:?}");
-        assert_eq!(ladder.calls.get(), 2, "the ladder was asked once per REFUTED row, never for the standing one");
+        let s = run(
+            &feed,
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&ladder),
+            limits(1, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.applied,
+                s.skipped_uncorroborated,
+                s.held,
+                s.faults,
+                s.errors
+            ),
+            (1, 0, 0, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(
+            (
+                s.spenders.scanned,
+                s.spenders.standing,
+                s.reanchored(),
+                s.demoted()
+            ),
+            (3, 1, 1, 1),
+            "{s:?}"
+        );
+        assert_eq!(
+            ladder.calls.get(),
+            2,
+            "the ladder was asked once per REFUTED row, never for the standing one"
+        );
         // standing: untouched
         let r = store.get_spent_status(&pot(1), 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed && r.spent_height == Some(965_771));
@@ -1160,7 +1423,16 @@ mod tests {
         let r = store.get_spent_status(&pot(2), 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed, "a re-anchor never passes through SEEN");
         assert_eq!(r.spent_height, Some(965_773));
-        assert_eq!(stored_bump_anchor(&store.get_beef(&reproven).await.unwrap().unwrap(), &reproven), Some(BumpAnchor { height: 965_773, root: reproven.clone() }));
+        assert_eq!(
+            stored_bump_anchor(
+                &store.get_beef(&reproven).await.unwrap().unwrap(),
+                &reproven
+            ),
+            Some(BumpAnchor {
+                height: 965_773,
+                root: reproven.clone()
+            })
+        );
         assert!(store.pot_beef_proof_verified(&reproven).await.unwrap());
         // orphaned only: SEEN again, the pointer and the witness kept, the proof unlatched, the bytes kept
         let r = store.get_spent_status(&pot(3), 0).await.unwrap().unwrap();
@@ -1169,10 +1441,21 @@ mod tests {
         assert!(!store.pot_beef_proof_verified(&orphaned_only).await.unwrap());
         assert!(store.get_beef(&orphaned_only).await.unwrap().is_some());
         // another height: never examined by this event
-        assert!(store.get_spent_status(&pot(4), 0).await.unwrap().unwrap().spent_confirmed);
+        assert!(
+            store
+                .get_spent_status(&pot(4), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
         assert!(store.pot_beef_proof_verified(&elsewhere).await.unwrap());
         // the cursor is the applied event, nothing pending
-        let key = real_events().iter().find(|e| e.hash == ORPHAN_965771).unwrap().key();
+        let key = real_events()
+            .iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()
+            .key();
         assert_eq!(state.state().cursor, Some(key.clone()));
         assert_eq!(state.state().pending, None);
         assert_eq!(s.cursor, Some(key));
@@ -1202,21 +1485,65 @@ mod tests {
             ]],
         )
         .unwrap();
-        let canonical_root = two_leaf.compute_root(Some(&spender)).unwrap().to_ascii_lowercase();
+        let canonical_root = two_leaf
+            .compute_root(Some(&spender))
+            .unwrap()
+            .to_ascii_lowercase();
         let mut tracker_two = MockChainTracker::new(965_860);
         tracker_two.add_root(965_771, canonical_root.clone());
         let _ = tracker;
-        let ladder = RacingLadder { store: &store, spender: spender.clone(), proof: two_leaf.to_hex(), answer_after_landing: true, calls: Cell::new(0) };
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
+        let ladder = RacingLadder {
+            store: &store,
+            spender: spender.clone(),
+            proof: two_leaf.to_hex(),
+            answer_after_landing: true,
+            calls: Cell::new(0),
+        };
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
         let state = StubState::default();
         let txs = MemoryTxStore::default();
-        let s = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker_two), Some(&ladder), limits(2, 50)).await;
-        assert_eq!((s.applied, s.demoted(), s.reanchored(), s.spenders.demote_missed, s.faults), (1, 0, 1, 0, 0), "{s:?}");
+        let s = run(
+            &StubFeed::of(only_965771.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker_two),
+            Some(&ladder),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.applied,
+                s.demoted(),
+                s.reanchored(),
+                s.spenders.demote_missed,
+                s.faults
+            ),
+            (1, 0, 1, 0, 0),
+            "{s:?}"
+        );
         assert_eq!(ladder.calls.get(), 1);
         let r = store.get_spent_status(&pot(90), 0).await.unwrap().unwrap();
-        assert!(r.spent_confirmed && r.spent_height == Some(965_771), "the row STANDS: {r:?}");
-        assert!(store.pot_beef_proof_verified(&spender).await.unwrap(), "the latch on a CANONICAL BEEF is kept");
-        assert_eq!(stored_bump_anchor(&store.get_beef(&spender).await.unwrap().unwrap(), &spender), Some(BumpAnchor { height: 965_771, root: canonical_root }));
+        assert!(
+            r.spent_confirmed && r.spent_height == Some(965_771),
+            "the row STANDS: {r:?}"
+        );
+        assert!(
+            store.pot_beef_proof_verified(&spender).await.unwrap(),
+            "the latch on a CANONICAL BEEF is kept"
+        );
+        assert_eq!(
+            stored_bump_anchor(&store.get_beef(&spender).await.unwrap().unwrap(), &spender),
+            Some(BumpAnchor {
+                height: 965_771,
+                root: canonical_root
+            })
+        );
         // (b) the new-height case with NO proof served after the landing (the
         // writer replaced the bump AND moved the row to 965773): the round-3
         // re-check sees the replaced, verifying bump and the row STANDS
@@ -1224,12 +1551,40 @@ mod tests {
         let mut tracker_new = MockChainTracker::new(965_860);
         let spender2 = confirmed_pot_with_stored_proof(&store2, &pot(91), 965_771).await;
         tracker_new.add_root(965_773, spender2.clone());
-        let ladder2 = RacingLadder { store: &store2, spender: spender2.clone(), proof: single_tx_bump(&spender2, 965_773).to_hex(), answer_after_landing: false, calls: Cell::new(0) };
+        let ladder2 = RacingLadder {
+            store: &store2,
+            spender: spender2.clone(),
+            proof: single_tx_bump(&spender2, 965_773).to_hex(),
+            answer_after_landing: false,
+            calls: Cell::new(0),
+        };
         let state2 = StubState::default();
-        let s2 = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker_new), Some(&ladder2), limits(2, 50)).await;
-        assert_eq!((s2.applied, s2.demoted(), s2.spenders.stood_on_recheck, s2.spenders.demote_missed), (1, 0, 1, 0), "{s2:?}");
+        let s2 = run(
+            &StubFeed::of(only_965771.clone()),
+            &StubHeaders::real(965_860),
+            &state2,
+            &store2,
+            Some(&txs),
+            Some(&tracker_new),
+            Some(&ladder2),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s2.applied,
+                s2.demoted(),
+                s2.spenders.stood_on_recheck,
+                s2.spenders.demote_missed
+            ),
+            (1, 0, 1, 0),
+            "{s2:?}"
+        );
         let r = store2.get_spent_status(&pot(91), 0).await.unwrap().unwrap();
-        assert!(r.spent_confirmed && r.spent_height == Some(965_773), "moved under the pass, never demoted: {r:?}");
+        assert!(
+            r.spent_confirmed && r.spent_height == Some(965_773),
+            "moved under the pass, never demoted: {r:?}"
+        );
         assert!(store2.pot_beef_proof_verified(&spender2).await.unwrap());
         // (c) the height moved under the pass WITHOUT the bump changing (a writer that
         // only re-anchored the row): the re-check holds the judged verdict and the
@@ -1241,24 +1596,60 @@ mod tests {
         }
         #[async_trait::async_trait(?Send)]
         impl AncestorFetcher for HeightMover<'_> {
-            async fn fetch_ancestor(&self, _txid: &str) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError> {
+            async fn fetch_ancestor(
+                &self,
+                _txid: &str,
+            ) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError>
+            {
                 Err(overlay_engine::gasp::GASPError::NodeNotFound("stub".into()))
             }
-            async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
+            async fn verified_proof_for_detailed(
+                &self,
+                txid: &str,
+            ) -> Result<Option<String>, String> {
                 if txid == self.spender {
-                    let _ = self.store.reanchor_confirmed_for_spender(&self.pot, 0, &self.spender, 965_773).await;
+                    let _ = self
+                        .store
+                        .reanchor_confirmed_for_spender(&self.pot, 0, &self.spender, 965_773)
+                        .await;
                 }
                 Ok(None)
             }
         }
         let store3 = MemoryPotStorage::new();
         let spender3 = confirmed_pot_with_stored_proof(&store3, &pot(92), 965_771).await;
-        let mover = HeightMover { store: &store3, pot: pot(92), spender: spender3.clone() };
+        let mover = HeightMover {
+            store: &store3,
+            pot: pot(92),
+            spender: spender3.clone(),
+        };
         let state3 = StubState::default();
-        let s3 = run(&StubFeed::of(only_965771), &StubHeaders::real(965_860), &state3, &store3, Some(&txs), Some(&MockChainTracker::new(965_860)), Some(&mover), limits(2, 50)).await;
-        assert_eq!((s3.applied, s3.demoted(), s3.spenders.stood_on_recheck, s3.spenders.demote_missed), (1, 0, 0, 1), "{s3:?}");
+        let s3 = run(
+            &StubFeed::of(only_965771),
+            &StubHeaders::real(965_860),
+            &state3,
+            &store3,
+            Some(&txs),
+            Some(&MockChainTracker::new(965_860)),
+            Some(&mover),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s3.applied,
+                s3.demoted(),
+                s3.spenders.stood_on_recheck,
+                s3.spenders.demote_missed
+            ),
+            (1, 0, 0, 1),
+            "{s3:?}"
+        );
         let r = store3.get_spent_status(&pot(92), 0).await.unwrap().unwrap();
-        assert!(r.spent_confirmed && r.spent_height == Some(965_773), "the height-bound guard missed, nothing written: {r:?}");
+        assert!(
+            r.spent_confirmed && r.spent_height == Some(965_773),
+            "the height-bound guard missed, nothing written: {r:?}"
+        );
     }
 
     /// Round 2 (review MED-2): a spent ladder budget stops the spenders
@@ -1276,21 +1667,61 @@ mod tests {
         let standing = confirmed_pot_with_stored_proof(&store, &pot(96), 965_771).await;
         tracker.add_root(965_771, standing.clone());
         let refuted_b = confirmed_pot_with_stored_proof(&store, &pot(97), 965_771).await;
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
         let txs = MemoryTxStore::default();
         // the REAL ladder at budget 0: no courier is asked, nothing is demoted
-        let real = crate::proof_fetcher::ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(965_860)))).with_budget(0);
+        let real = crate::proof_fetcher::ChainProofFetcher::new(Some(std::rc::Rc::new(
+            MockChainTracker::new(965_860),
+        )))
+        .with_budget(0);
         let state = StubState::default();
-        let s = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&real), limits(2, 50)).await;
-        assert_eq!((s.budget_stops, s.demoted(), s.reanchored(), s.applied, s.faults), (1, 0, 0, 0, 0), "{s:?}");
-        assert_eq!(s.spenders.scanned, 3, "the page was read; judged up to the budget stop");
+        let s = run(
+            &StubFeed::of(only_965771.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&real),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.budget_stops,
+                s.demoted(),
+                s.reanchored(),
+                s.applied,
+                s.faults
+            ),
+            (1, 0, 0, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(
+            s.spenders.scanned, 3,
+            "the page was read; judged up to the budget stop"
+        );
         for p in [95, 96, 97] {
-            assert!(store.get_spent_status(&pot(p), 0).await.unwrap().unwrap().spent_confirmed, "pot {p} untouched");
+            assert!(
+                store
+                    .get_spent_status(&pot(p), 0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .spent_confirmed,
+                "pot {p} untouched"
+            );
         }
         let pending = state.state().pending.unwrap();
         assert_eq!(pending.event.hash, ORPHAN_965771, "the event stays pending");
         assert!(!pending.spenders.exhausted);
-        assert_eq!(pending.spenders.after, None, "the first row (refuted_b, newest) needed the ladder: nothing judged before it");
+        assert_eq!(
+            pending.spenders.after, None,
+            "the first row (refuted_b, newest) needed the ladder: nothing judged before it"
+        );
         // the stub at budget 1: refuted_b is asked (no proof: demoted), the
         // standing row is judged, refuted_a stops the page; the cursor is
         // the standing row (the last judged); the next pass (budget 1
@@ -1304,17 +1735,76 @@ mod tests {
         let stub = CourierStub::none();
         stub.budget.set(Some(1));
         let state2 = StubState::default();
-        let s2 = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker2), Some(&stub), limits(2, 50)).await;
-        assert_eq!((s2.budget_stops, s2.demoted(), s2.spenders.standing, s2.applied), (1, 1, 1, 0), "{s2:?}");
+        let s2 = run(
+            &StubFeed::of(only_965771.clone()),
+            &StubHeaders::real(965_860),
+            &state2,
+            &store2,
+            Some(&txs),
+            Some(&tracker2),
+            Some(&stub),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s2.budget_stops,
+                s2.demoted(),
+                s2.spenders.standing,
+                s2.applied
+            ),
+            (1, 1, 1, 0),
+            "{s2:?}"
+        );
         assert_eq!(stub.calls.get(), 1, "one ask, then the budget is spent");
-        assert!(!store2.get_spent_status(&pot(97), 0).await.unwrap().unwrap().spent_confirmed, "b asked and demoted");
-        assert!(store2.get_spent_status(&pot(95), 0).await.unwrap().unwrap().spent_confirmed, "a NOT demoted blind");
+        assert!(
+            !store2
+                .get_spent_status(&pot(97), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "b asked and demoted"
+        );
+        assert!(
+            store2
+                .get_spent_status(&pot(95), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "a NOT demoted blind"
+        );
         let pending = state2.state().pending.unwrap();
-        assert!(pending.spenders.after.is_some() && !pending.spenders.exhausted, "the cursor is the last row judged: {pending:?}");
+        assert!(
+            pending.spenders.after.is_some() && !pending.spenders.exhausted,
+            "the cursor is the last row judged: {pending:?}"
+        );
         stub.budget.set(Some(1));
-        let s3 = run(&StubFeed::of(only_965771), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker2), Some(&stub), limits(2, 50)).await;
-        assert_eq!((s3.applied, s3.demoted(), s3.spenders.scanned), (1, 1, 1), "resumed at the cursor: a alone: {s3:?}");
-        assert!(!store2.get_spent_status(&pot(95), 0).await.unwrap().unwrap().spent_confirmed);
+        let s3 = run(
+            &StubFeed::of(only_965771),
+            &StubHeaders::real(965_860),
+            &state2,
+            &store2,
+            Some(&txs),
+            Some(&tracker2),
+            Some(&stub),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s3.applied, s3.demoted(), s3.spenders.scanned),
+            (1, 1, 1),
+            "resumed at the cursor: a alone: {s3:?}"
+        );
+        assert!(
+            !store2
+                .get_spent_status(&pot(95), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
         let _ = (refuted_a, refuted_b, a, b);
     }
 
@@ -1329,28 +1819,110 @@ mod tests {
         let standing = confirmed_pot_with_stored_proof(&store, &pot(10), 965_771).await;
         tracker.add_root(965_771, standing.clone());
         let _orphaned_only = confirmed_pot_with_stored_proof(&store, &pot(11), 965_771).await;
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
         let feed = StubFeed::of(only_965771.clone());
         let headers = StubHeaders::real(965_860);
         let state = StubState::default();
         let txs = MemoryTxStore::default();
-        let first = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((first.applied, first.demoted(), first.spenders.standing), (1, 1, 1), "{first:?}");
-        assert!(!store.get_spent_status(&pot(11), 0).await.unwrap().unwrap().spent_confirmed);
+        let first = run(
+            &feed,
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (first.applied, first.demoted(), first.spenders.standing),
+            (1, 1, 1),
+            "{first:?}"
+        );
+        assert!(
+            !store
+                .get_spent_status(&pot(11), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
         let writes_after_first = state.writes.get();
         // the same feed again: nothing after the cursor
-        let second = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
+        let second = run(
+            &feed,
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
         assert!(second.idle, "{second:?}");
-        assert_eq!((second.applied, second.demoted(), second.spenders.scanned, second.faults), (0, 0, 0, 0));
-        assert_eq!(state.writes.get(), writes_after_first, "an idle pass writes nothing");
+        assert_eq!(
+            (
+                second.applied,
+                second.demoted(),
+                second.spenders.scanned,
+                second.faults
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            state.writes.get(),
+            writes_after_first,
+            "an idle pass writes nothing"
+        );
         assert_eq!(second.cursor, first.cursor);
         // a replay from BEFORE the cursor (a fresh document): the event applies again as a no-op
         *state.doc.borrow_mut() = None;
         state.version.set(None);
-        let replay = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((replay.applied, replay.demoted(), replay.reanchored(), replay.spenders.scanned, replay.spenders.standing), (1, 0, 0, 1, 1), "{replay:?}");
-        assert!(store.get_spent_status(&pot(10), 0).await.unwrap().unwrap().spent_confirmed, "the standing row still stands");
-        assert!(!store.get_spent_status(&pot(11), 0).await.unwrap().unwrap().spent_confirmed, "the demoted row is not touched again (it is no longer confirmed)");
+        let replay = run(
+            &feed,
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                replay.applied,
+                replay.demoted(),
+                replay.reanchored(),
+                replay.spenders.scanned,
+                replay.spenders.standing
+            ),
+            (1, 0, 0, 1, 1),
+            "{replay:?}"
+        );
+        assert!(
+            store
+                .get_spent_status(&pot(10), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "the standing row still stands"
+        );
+        assert!(
+            !store
+                .get_spent_status(&pot(11), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "the demoted row is not touched again (it is no longer confirmed)"
+        );
         assert_eq!(state.state().cursor, first.cursor);
     }
 
@@ -1361,49 +1933,143 @@ mod tests {
     /// With chaintracks near the tip the same row is HELD: the cursor stays,
     /// the next event is not started, nothing is examined.
     #[tokio::test]
-    async fn an_uncorroborated_event_is_skipped_when_deep_and_held_when_near_the_tip_and_examines_nothing() {
+    async fn an_uncorroborated_event_is_skipped_when_deep_and_held_when_near_the_tip_and_examines_nothing(
+    ) {
         let store = MemoryPotStorage::new();
         let mut tracker = MockChainTracker::new(965_860);
         let mined_965773 = confirmed_pot_with_stored_proof(&store, &pot(20), 965_773).await;
         tracker.add_root(965_773, mined_965773.clone());
         let _refuted_965773 = confirmed_pot_with_stored_proof(&store, &pot(21), 965_773).await; // in no canonical block
-        let two_965773: Vec<OrphanEvent> = real_events().into_iter().filter(|e| e.height == 965_773).collect();
+        let two_965773: Vec<OrphanEvent> = real_events()
+            .into_iter()
+            .filter(|e| e.height == 965_773)
+            .collect();
         assert_eq!(two_965773.len(), 2);
         // DEEP: chaintracks at 965860 holds the canonical 965773 = Arcade's "orphaned" hash
         let feed = StubFeed::of(two_965773.clone());
         let headers = StubHeaders::real(965_860);
         let state = StubState::default();
         let txs = MemoryTxStore::default();
-        let s = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.skipped_uncorroborated, s.applied, s.held, s.faults), (1, 1, 0, 0), "{s:?}");
+        let s = run(
+            &feed,
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s.skipped_uncorroborated, s.applied, s.held, s.faults),
+            (1, 1, 0, 0),
+            "{s:?}"
+        );
         assert_eq!(s.events_finished(), 2);
         // the skipped event examined NOTHING: the refuted row at 965773 is still confirmed after the skip …
         // … but the corroborated sibling event (a real orphan at the same height) examined the height and demoted it
-        assert_eq!((s.spenders.scanned, s.spenders.standing, s.demoted()), (2, 1, 1), "{s:?}");
-        assert!(store.get_spent_status(&pot(20), 0).await.unwrap().unwrap().spent_confirmed);
-        assert!(!store.get_spent_status(&pot(21), 0).await.unwrap().unwrap().spent_confirmed);
-        assert_eq!(state.state().cursor, Some(two_965773.iter().max_by_key(|e| e.key()).unwrap().key()));
+        assert_eq!(
+            (s.spenders.scanned, s.spenders.standing, s.demoted()),
+            (2, 1, 1),
+            "{s:?}"
+        );
+        assert!(
+            store
+                .get_spent_status(&pot(20), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
+        assert!(
+            !store
+                .get_spent_status(&pot(21), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
+        assert_eq!(
+            state.state().cursor,
+            Some(two_965773.iter().max_by_key(|e| e.key()).unwrap().key())
+        );
         // an ONLY-uncorroborated feed examines nothing at all
         let store2 = MemoryPotStorage::new();
         let planted = confirmed_pot_with_stored_proof(&store2, &pot(22), 965_773).await;
-        let bogus = vec![two_965773.iter().find(|e| e.hash == CANONICAL_965773).unwrap().clone()];
+        let bogus = vec![two_965773
+            .iter()
+            .find(|e| e.hash == CANONICAL_965773)
+            .unwrap()
+            .clone()];
         let feed2 = StubFeed::of(bogus.clone());
         let state2 = StubState::default();
-        let s2 = run(&feed2, &headers, &state2, &store2, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s2.skipped_uncorroborated, s2.spenders.scanned, s2.demoted()), (1, 0, 0), "{s2:?}");
-        assert!(store2.get_spent_status(&pot(22), 0).await.unwrap().unwrap().spent_confirmed, "a wrong Arcade row demotes nothing");
+        let s2 = run(
+            &feed2,
+            &headers,
+            &state2,
+            &store2,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s2.skipped_uncorroborated, s2.spenders.scanned, s2.demoted()),
+            (1, 0, 0),
+            "{s2:?}"
+        );
+        assert!(
+            store2
+                .get_spent_status(&pot(22), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "a wrong Arcade row demotes nothing"
+        );
         assert!(store2.pot_beef_proof_verified(&planted).await.unwrap());
         // NEAR THE TIP (965773..965775): held, the cursor stays, nothing examined, nothing started after it
         for tip in [965_773u64, 965_774, 965_775] {
             let state3 = StubState::default();
             let feed3 = StubFeed::of(two_965773.clone());
             feed3.newest.set(Some(tip)); // Arcade at the same tip: no lag
-            let s3 = run(&feed3, &StubHeaders::real(tip), &state3, &store2, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-            assert_eq!((s3.held, s3.skipped_uncorroborated, s3.applied, s3.spenders.scanned), (1, 0, 0, 0), "tip {tip}: {s3:?}");
+            let s3 = run(
+                &feed3,
+                &StubHeaders::real(tip),
+                &state3,
+                &store2,
+                Some(&txs),
+                Some(&tracker),
+                Some(&CourierStub::none()),
+                limits(2, 50),
+            )
+            .await;
+            assert_eq!(
+                (
+                    s3.held,
+                    s3.skipped_uncorroborated,
+                    s3.applied,
+                    s3.spenders.scanned
+                ),
+                (1, 0, 0, 0),
+                "tip {tip}: {s3:?}"
+            );
             assert_eq!(state3.state().cursor, None, "tip {tip}: the cursor stays");
             let pending = state3.state().pending.unwrap();
-            assert_eq!((pending.event.hash.as_str(), pending.held_passes), (CANONICAL_965773, 1));
-            assert!(store2.get_spent_status(&pot(22), 0).await.unwrap().unwrap().spent_confirmed);
+            assert_eq!(
+                (pending.event.hash.as_str(), pending.held_passes),
+                (CANONICAL_965773, 1)
+            );
+            assert!(
+                store2
+                    .get_spent_status(&pot(22), 0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .spent_confirmed
+            );
         }
         // no header at that height yet, near the tip (chaintracks one behind): held too
         let mut lagging = StubHeaders::real(965_772);
@@ -1411,7 +2077,17 @@ mod tests {
         let feed4 = StubFeed::of(bogus);
         feed4.newest.set(Some(965_773));
         let state4 = StubState::default();
-        let s4 = run(&feed4, &lagging, &state4, &store2, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
+        let s4 = run(
+            &feed4,
+            &lagging,
+            &state4,
+            &store2,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
         assert_eq!((s4.held, s4.spenders.scanned), (1, 0), "{s4:?}");
         assert_eq!(state4.state().cursor, None);
     }
@@ -1425,19 +2101,53 @@ mod tests {
         let mut tracker = MockChainTracker::new(965_850);
         let refuted = confirmed_pot_with_stored_proof(&store, &pot(23), 965_771).await;
         let _ = &mut tracker;
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
         let feed = StubFeed::of(only_965771);
         feed.newest.set(Some(965_860)); // Arcade lists ten blocks our header source has not reached
         let mut headers = StubHeaders::real(965_850);
         headers.tip = Ok(965_850);
         let state = StubState::default();
         let txs = MemoryTxStore::default();
-        let s = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.tracker_lagging, s.held, s.skipped_uncorroborated, s.applied, s.spenders.scanned), (1, 0, 0, 0, 0), "{s:?}");
-        assert!(store.get_spent_status(&pot(23), 0).await.unwrap().unwrap().spent_confirmed);
+        let s = run(
+            &feed,
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.tracker_lagging,
+                s.held,
+                s.skipped_uncorroborated,
+                s.applied,
+                s.spenders.scanned
+            ),
+            (1, 0, 0, 0, 0),
+            "{s:?}"
+        );
+        assert!(
+            store
+                .get_spent_status(&pot(23), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
         assert!(store.pot_beef_proof_verified(&refuted).await.unwrap());
         assert_eq!(state.state().cursor, None);
-        assert_eq!(state.state().pending.unwrap().held_passes, 1, "a lag hold counts toward the ceiling too");
+        assert_eq!(
+            state.state().pending.unwrap().held_passes,
+            1,
+            "a lag hold counts toward the ceiling too"
+        );
     }
 
     /// A fault of ANY kind leaves the cursor where it was and changes no
@@ -1455,14 +2165,38 @@ mod tests {
         let events = real_events();
         let txs = MemoryTxStore::default();
         let still_confirmed = || async {
-            let a = store.get_spent_status(&pot(30), 0).await.unwrap().unwrap().spent_confirmed;
-            let b = store.get_spent_status(&pot(31), 0).await.unwrap().unwrap().spent_confirmed;
+            let a = store
+                .get_spent_status(&pot(30), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed;
+            let b = store
+                .get_spent_status(&pot(31), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed;
             a && b && store.pot_beef_proof_verified(&refuted).await.unwrap()
         };
         // the feed
         let state = StubState::default();
-        let s = run(&StubFeed::faulty(), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.faults, s.applied, s.spenders.scanned), (1, 0, 0), "{s:?}");
+        let s = run(
+            &StubFeed::faulty(),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s.faults, s.applied, s.spenders.scanned),
+            (1, 0, 0),
+            "{s:?}"
+        );
         assert!(s.stopped.as_deref().unwrap().starts_with("feed read"));
         assert_eq!(state.state(), ConsumerState::default());
         assert_eq!(state.writes.get(), 0);
@@ -1470,43 +2204,137 @@ mod tests {
         // the header source: the event is pending, its fault counted toward the ceiling
         let mut faulty_headers = StubHeaders::real(965_860);
         faulty_headers.hash_fault = true;
-        let s = run(&StubFeed::of(events.clone()), &faulty_headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.faults, s.applied, s.spenders.scanned), (1, 0, 0), "{s:?}");
-        assert_eq!(state.state().pending.as_ref().map(|p| p.fault_passes), Some(1));
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &faulty_headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s.faults, s.applied, s.spenders.scanned),
+            (1, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(
+            state.state().pending.as_ref().map(|p| p.fault_passes),
+            Some(1)
+        );
         assert_eq!(state.state().cursor, None);
         assert!(still_confirmed().await);
         // the tip
         let mut no_tip = StubHeaders::real(965_860);
         no_tip.tip = Err("tip 502".into());
-        let s = run(&StubFeed::of(events.clone()), &no_tip, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &no_tip,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
         assert_eq!((s.faults, s.applied), (1, 0), "{s:?}");
-        assert_eq!(state.state().pending.as_ref().map(|p| p.fault_passes), Some(2));
+        assert_eq!(
+            state.state().pending.as_ref().map(|p| p.fault_passes),
+            Some(2)
+        );
         assert!(still_confirmed().await);
         // the tracker inside the spenders leg: examined, judged nothing, the leg's cursor not persisted
-        let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&FaultyTracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.faults, s.applied, s.spenders.scanned, s.spenders.faults, s.demoted()), (1, 0, 2, 2, 0), "{s:?}");
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&FaultyTracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.faults,
+                s.applied,
+                s.spenders.scanned,
+                s.spenders.faults,
+                s.demoted()
+            ),
+            (1, 0, 2, 2, 0),
+            "{s:?}"
+        );
         assert!(still_confirmed().await);
         let pending = state.state().pending.unwrap();
         assert_eq!(pending.event.hash, ORPHAN_965771, "the event stays pending");
-        assert_eq!(pending.spenders, LegProgress::default(), "the faulted leg's cursor did not move");
+        assert_eq!(
+            pending.spenders,
+            LegProgress::default(),
+            "the faulted leg's cursor did not move"
+        );
         assert_eq!(pending.fault_passes, 3);
         assert_eq!(state.state().cursor, None);
         // the state row unreadable: nothing read, nothing examined
         state.read_fault.set(true);
-        let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.errors, s.applied, s.spenders.scanned), (1, 0, 0), "{s:?}");
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s.errors, s.applied, s.spenders.scanned),
+            (1, 0, 0),
+            "{s:?}"
+        );
         state.read_fault.set(false);
         // the state row unwritable: the rows ARE judged (idempotent writes) but the cursor cannot
         // move, and an event whose cursor move did not persist is NOT counted as applied
         state.write_fault.set(true);
         let writes = state.writes.get();
-        let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
         assert_eq!((s.errors, s.applied, s.demoted()), (1, 0, 1), "{s:?}");
         assert_eq!(state.writes.get(), writes);
-        assert_eq!(state.state().cursor, None, "the persisted cursor did not move");
+        assert_eq!(
+            state.state().cursor,
+            None,
+            "the persisted cursor did not move"
+        );
         state.write_fault.set(false);
         // no header source at all: nothing consumed
-        let s = consume_arcade_reorg_events::<_, _, _, MemoryTxStore>(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, None, None, None, limits(2, 50), &mut RootMemo::default(), false).await;
+        let s = consume_arcade_reorg_events::<_, _, _, MemoryTxStore>(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            None,
+            None,
+            None,
+            limits(2, 50),
+            &mut RootMemo::default(),
+            false,
+        )
+        .await;
         assert_eq!(s.stopped.as_deref(), Some("no header source configured"));
         assert_eq!((s.faults, s.applied, s.spenders.scanned), (0, 0, 0));
         // no transactions store (review LOW-4): a fault, the event pending with the other legs' progress kept
@@ -1515,11 +2343,32 @@ mod tests {
         let mut tracker_lo4 = MockChainTracker::new(965_860);
         tracker_lo4.add_root(965_771, st);
         let state_lo4 = StubState::default();
-        let s = consume_arcade_reorg_events::<_, _, _, MemoryTxStore>(&StubFeed::of(events), &StubHeaders::real(965_860), &state_lo4, &store_lo4, None, Some(&tracker_lo4), Some(&CourierStub::none()), limits(2, 50), &mut RootMemo::default(), false).await;
+        let s = consume_arcade_reorg_events::<_, _, _, MemoryTxStore>(
+            &StubFeed::of(events),
+            &StubHeaders::real(965_860),
+            &state_lo4,
+            &store_lo4,
+            None,
+            Some(&tracker_lo4),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+            &mut RootMemo::default(),
+            false,
+        )
+        .await;
         assert_eq!((s.faults, s.applied), (1, 0), "{s:?}");
-        assert!(s.stopped.as_deref().unwrap().starts_with("no transactions store"));
+        assert!(s
+            .stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("no transactions store"));
         let pending = state_lo4.state().pending.unwrap();
-        assert!(pending.spenders.exhausted && pending.pot_beefs.exhausted && !pending.transactions.exhausted, "{pending:?}");
+        assert!(
+            pending.spenders.exhausted
+                && pending.pot_beefs.exhausted
+                && !pending.transactions.exhausted,
+            "{pending:?}"
+        );
         assert_eq!(pending.fault_passes, 1);
         assert_eq!(state_lo4.state().cursor, None);
     }
@@ -1542,12 +2391,36 @@ mod tests {
             "not json",
         ] {
             let state = StubState::with_doc(doc);
-            let s = run(&StubFeed::of(real_events()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-            assert_eq!((s.errors, s.faults, s.applied, s.spenders.scanned), (1, 0, 0, 0), "{doc}: {s:?}");
-            assert!(s.stopped.as_deref().unwrap().starts_with("state read"), "{s:?}");
+            let s = run(
+                &StubFeed::of(real_events()),
+                &StubHeaders::real(965_860),
+                &state,
+                &store,
+                Some(&txs),
+                Some(&tracker),
+                Some(&CourierStub::none()),
+                limits(2, 50),
+            )
+            .await;
+            assert_eq!(
+                (s.errors, s.faults, s.applied, s.spenders.scanned),
+                (1, 0, 0, 0),
+                "{doc}: {s:?}"
+            );
+            assert!(
+                s.stopped.as_deref().unwrap().starts_with("state read"),
+                "{s:?}"
+            );
             assert_eq!(state.writes.get(), 0, "{doc}: nothing written over the row");
         }
-        assert!(store.get_spent_status(&pot(32), 0).await.unwrap().unwrap().spent_confirmed);
+        assert!(
+            store
+                .get_spent_status(&pot(32), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
         // and the log helper never slices a short hash
         assert_eq!(short("abc"), "abc");
         assert_eq!(short(ORPHAN_965771), "0000000000000000");
@@ -1566,13 +2439,37 @@ mod tests {
         let txs = MemoryTxStore::default();
         let state = StubState::default();
         state.contend.set(true); // the other isolate's write lands before ours
-        let s = run(&StubFeed::of(real_events()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(1, 50)).await;
-        assert_eq!((s.contended, s.applied, s.errors, s.spenders.scanned), (1, 0, 0, 1), "the rows were judged (idempotent), the write lost, the event NOT counted: {s:?}");
+        let s = run(
+            &StubFeed::of(real_events()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(1, 50),
+        )
+        .await;
+        assert_eq!(
+            (s.contended, s.applied, s.errors, s.spenders.scanned),
+            (1, 0, 0, 1),
+            "the rows were judged (idempotent), the write lost, the event NOT counted: {s:?}"
+        );
         assert_eq!(state.writes.get(), 0, "the loser wrote nothing");
         assert!(s.stopped.as_deref().unwrap().contains("another isolate"));
         assert_eq!(state.state().cursor, None, "the row is the other isolate's");
         // the next pass reads the row afresh and proceeds
-        let s2 = run(&StubFeed::of(real_events()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(1, 50)).await;
+        let s2 = run(
+            &StubFeed::of(real_events()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(1, 50),
+        )
+        .await;
         assert_eq!((s2.contended, s2.applied), (0, 1), "{s2:?}");
         assert_eq!(state.writes.get(), 1);
     }
@@ -1591,55 +2488,208 @@ mod tests {
         let txs = MemoryTxStore::default();
         let events = real_events();
         // FAULTS: the spenders leg faults every pass (a starved tracker); ceiling 2
-        let lim = PassLimits { events_per_pass: 1, leg_limit: 50, held_ceiling: 2, fault_ceiling: 2, ..PassLimits::cron() };
+        let lim = PassLimits {
+            events_per_pass: 1,
+            leg_limit: 50,
+            held_ceiling: 2,
+            fault_ceiling: 2,
+            ..PassLimits::cron()
+        };
         let state = StubState::default();
         for expected_faults in [1u32, 2] {
-            let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&FaultyTracker), Some(&CourierStub::none()), lim).await;
-            assert_eq!((s.faults, s.applied, s.skipped_unresolved), (1, 0, 0), "{s:?}");
-            assert_eq!(state.state().pending.as_ref().map(|p| p.fault_passes), Some(expected_faults));
+            let s = run(
+                &StubFeed::of(events.clone()),
+                &StubHeaders::real(965_860),
+                &state,
+                &store,
+                Some(&txs),
+                Some(&FaultyTracker),
+                Some(&CourierStub::none()),
+                lim,
+            )
+            .await;
+            assert_eq!(
+                (s.faults, s.applied, s.skipped_unresolved),
+                (1, 0, 0),
+                "{s:?}"
+            );
+            assert_eq!(
+                state.state().pending.as_ref().map(|p| p.fault_passes),
+                Some(expected_faults)
+            );
         }
-        let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&FaultyTracker), Some(&CourierStub::none()), lim).await;
-        assert_eq!((s.skipped_unresolved, s.events_finished()), (1, 1), "released at the ceiling: {s:?}");
-        let released_key = events.iter().find(|e| e.hash == ORPHAN_965771).unwrap().key();
-        assert_eq!(state.state().cursor, Some(released_key.clone()), "the cursor moved past the stuck event");
-        assert!(store.get_spent_status(&pot(34), 0).await.unwrap().unwrap().spent_confirmed, "nothing was demoted by the release");
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&FaultyTracker),
+            Some(&CourierStub::none()),
+            lim,
+        )
+        .await;
+        assert_eq!(
+            (s.skipped_unresolved, s.events_finished()),
+            (1, 1),
+            "released at the ceiling: {s:?}"
+        );
+        let released_key = events
+            .iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()
+            .key();
+        assert_eq!(
+            state.state().cursor,
+            Some(released_key.clone()),
+            "the cursor moved past the stuck event"
+        );
+        assert!(
+            store
+                .get_spent_status(&pot(34), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "nothing was demoted by the release"
+        );
         // round 3 (review MED): the release is RECORDED with its reason, on the row and on the summary,
         // and the health surface names the height the operator owes an /internal/reorg run
-        assert_eq!(state.state().unresolved, vec![UnresolvedEvent { key: released_key.clone(), why: ReleaseReason::FaultCeiling }]);
+        assert_eq!(
+            state.state().unresolved,
+            vec![UnresolvedEvent {
+                key: released_key.clone(),
+                why: ReleaseReason::FaultCeiling
+            }]
+        );
         assert_eq!(s.unresolved, state.state().unresolved);
         let surface = crate::ops::arcade_reorg_state_json(&state.state(), Some(1), Some(3));
         assert_eq!(surface["unresolved"][0]["height"], 965_771);
         assert_eq!(surface["unresolved"][0]["hash"], ORPHAN_965771);
         assert_eq!(surface["unresolved"][0]["why"], "fault-ceiling");
-        assert_eq!(surface["unresolved"][0]["heal"], "POST /internal/reorg {\"fromHeight\": 965771, \"toHeight\": 965771}");
+        assert_eq!(
+            surface["unresolved"][0]["heal"],
+            "POST /internal/reorg {\"fromHeight\": 965771, \"toHeight\": 965771}"
+        );
         // HELD: the same-hash event near the tip, held 2 passes, released on the third
-        let two_965773: Vec<OrphanEvent> = events.iter().filter(|e| e.height == 965_773).cloned().collect();
+        let two_965773: Vec<OrphanEvent> = events
+            .iter()
+            .filter(|e| e.height == 965_773)
+            .cloned()
+            .collect();
         let state2 = StubState::default();
         for expected_held in [1u32, 2] {
             let feed = StubFeed::of(two_965773.clone());
             feed.newest.set(Some(965_774));
-            let s = run(&feed, &StubHeaders::real(965_774), &state2, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), lim).await;
+            let s = run(
+                &feed,
+                &StubHeaders::real(965_774),
+                &state2,
+                &store,
+                Some(&txs),
+                Some(&tracker),
+                Some(&CourierStub::none()),
+                lim,
+            )
+            .await;
             assert_eq!((s.held, s.events_finished()), (1, 0), "{s:?}");
-            assert_eq!(state2.state().pending.as_ref().map(|p| p.held_passes), Some(expected_held));
+            assert_eq!(
+                state2.state().pending.as_ref().map(|p| p.held_passes),
+                Some(expected_held)
+            );
         }
         let feed = StubFeed::of(two_965773.clone());
         feed.newest.set(Some(965_774));
-        let s = run(&feed, &StubHeaders::real(965_774), &state2, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), lim).await;
-        assert_eq!((s.skipped_unresolved, s.applied), (1, 0), "released at the held ceiling; the budget of one event is spent by the release: {s:?}");
-        assert_eq!(state2.state().cursor.as_ref().map(|c| c.hash.as_str()), Some(CANONICAL_965773));
-        assert_eq!(state2.state().unresolved.iter().map(|u| (u.key.height, u.why)).collect::<Vec<_>>(), vec![(965_773, ReleaseReason::HeldCeiling)]);
+        let s = run(
+            &feed,
+            &StubHeaders::real(965_774),
+            &state2,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            lim,
+        )
+        .await;
+        assert_eq!(
+            (s.skipped_unresolved, s.applied),
+            (1, 0),
+            "released at the held ceiling; the budget of one event is spent by the release: {s:?}"
+        );
+        assert_eq!(
+            state2.state().cursor.as_ref().map(|c| c.hash.as_str()),
+            Some(CANONICAL_965773)
+        );
+        assert_eq!(
+            state2
+                .state()
+                .unresolved
+                .iter()
+                .map(|u| (u.key.height, u.why))
+                .collect::<Vec<_>>(),
+            vec![(965_773, ReleaseReason::HeldCeiling)]
+        );
         // the OPERATOR: a pending event released at once, then the pass proceeds to the next event
         let state3 = StubState::default();
-        let s = run(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state3, &store, Some(&txs), Some(&FaultyTracker), Some(&CourierStub::none()), lim).await;
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state3,
+            &store,
+            Some(&txs),
+            Some(&FaultyTracker),
+            Some(&CourierStub::none()),
+            lim,
+        )
+        .await;
         assert_eq!(s.faults, 1);
         assert!(state3.state().pending.is_some());
-        let s = consume_arcade_reorg_events(&StubFeed::of(events.clone()), &StubHeaders::real(965_860), &state3, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50), &mut RootMemo::default(), true).await;
+        let s = consume_arcade_reorg_events(
+            &StubFeed::of(events.clone()),
+            &StubHeaders::real(965_860),
+            &state3,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+            &mut RootMemo::default(),
+            true,
+        )
+        .await;
         assert_eq!(s.released_by_operator, 1, "{s:?}");
-        assert!(s.events_finished() >= 2, "the release, then the next events: {s:?}");
-        assert_eq!(state3.state().cursor.as_ref().map(|c| c.height), Some(965_773));
-        assert_eq!(state3.state().unresolved.iter().map(|u| (u.key.hash.as_str(), u.why)).collect::<Vec<_>>(), vec![(ORPHAN_965771, ReleaseReason::Operator)], "the operator's release is recorded too");
+        assert!(
+            s.events_finished() >= 2,
+            "the release, then the next events: {s:?}"
+        );
+        assert_eq!(
+            state3.state().cursor.as_ref().map(|c| c.height),
+            Some(965_773)
+        );
+        assert_eq!(
+            state3
+                .state()
+                .unresolved
+                .iter()
+                .map(|u| (u.key.hash.as_str(), u.why))
+                .collect::<Vec<_>>(),
+            vec![(ORPHAN_965771, ReleaseReason::Operator)],
+            "the operator's release is recorded too"
+        );
         // nothing pending: the operator's release is a no-op
-        let s = consume_arcade_reorg_events(&StubFeed::of(events), &StubHeaders::real(965_860), &state3, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50), &mut RootMemo::default(), true).await;
+        let s = consume_arcade_reorg_events(
+            &StubFeed::of(events),
+            &StubHeaders::real(965_860),
+            &state3,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+            &mut RootMemo::default(),
+            true,
+        )
+        .await;
         assert_eq!(s.released_by_operator, 0);
         assert!(s.idle);
     }
@@ -1657,29 +2707,106 @@ mod tests {
         tracker.add_root(965_771, standing.clone());
         let unverifiable = confirmed_pot_with_stored_proof(&store, &pot(41), 965_771).await;
         let faulted = confirmed_pot_with_stored_proof(&store, &pot(42), 965_771).await;
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
         // the ladder: the standing row is never asked; `unverifiable` gets the ladder's
         // "nothing verifies" (Ok(None)); `faulted` a chaintracks read fault (Err)
-        let ladder = CourierStub::with([(faulted.clone(), Err("chaintracks starved".to_string()))].into_iter().collect());
+        let ladder = CourierStub::with(
+            [(faulted.clone(), Err("chaintracks starved".to_string()))]
+                .into_iter()
+                .collect(),
+        );
         let txs = MemoryTxStore::default();
         let state = StubState::default();
-        let s = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&ladder), limits(2, 50)).await;
-        assert_eq!((s.spenders.scanned, s.spenders.standing, s.reanchored(), s.demoted(), s.spenders.faults, s.faults), (3, 1, 0, 1, 1, 1), "{s:?}");
+        let s = run(
+            &StubFeed::of(only_965771.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&ladder),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.spenders.scanned,
+                s.spenders.standing,
+                s.reanchored(),
+                s.demoted(),
+                s.spenders.faults,
+                s.faults
+            ),
+            (3, 1, 0, 1, 1, 1),
+            "{s:?}"
+        );
         assert_eq!(ladder.calls.get(), 2);
-        assert!(store.get_spent_status(&pot(40), 0).await.unwrap().unwrap().spent_confirmed, "a verifying stored bump is never demoted");
+        assert!(
+            store
+                .get_spent_status(&pot(40), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "a verifying stored bump is never demoted"
+        );
         let r = store.get_spent_status(&pot(41), 0).await.unwrap().unwrap();
         assert!(!r.spent_confirmed, "no verified proof anywhere: demoted");
-        assert_eq!(stored_bump_anchor(&store.get_beef(&unverifiable).await.unwrap().unwrap(), &unverifiable).map(|a| a.height), Some(965_771), "nothing was stored for it");
-        assert!(store.get_spent_status(&pot(42), 0).await.unwrap().unwrap().spent_confirmed, "a ladder FAULT is not a verdict: the row is untouched");
+        assert_eq!(
+            stored_bump_anchor(
+                &store.get_beef(&unverifiable).await.unwrap().unwrap(),
+                &unverifiable
+            )
+            .map(|a| a.height),
+            Some(965_771),
+            "nothing was stored for it"
+        );
+        assert!(
+            store
+                .get_spent_status(&pot(42), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "a ladder FAULT is not a verdict: the row is untouched"
+        );
         assert!(store.pot_beef_proof_verified(&faulted).await.unwrap());
-        assert_eq!(state.state().cursor, None, "the leg faulted: the event stays pending");
+        assert_eq!(
+            state.state().cursor,
+            None,
+            "the leg faulted: the event stays pending"
+        );
         // no courier configured: the refuted rows take the plain demotion arm
         let store2 = MemoryPotStorage::new();
         let refuted = confirmed_pot_with_stored_proof(&store2, &pot(43), 965_771).await;
         let state2 = StubState::default();
-        let s2 = run(&StubFeed::of(only_965771), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker), None, limits(2, 50)).await;
-        assert_eq!((s2.applied, s2.demoted(), s2.reanchored()), (1, 1, 0), "{s2:?}");
-        assert!(!store2.get_spent_status(&pot(43), 0).await.unwrap().unwrap().spent_confirmed);
+        let s2 = run(
+            &StubFeed::of(only_965771),
+            &StubHeaders::real(965_860),
+            &state2,
+            &store2,
+            Some(&txs),
+            Some(&tracker),
+            None,
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (s2.applied, s2.demoted(), s2.reanchored()),
+            (1, 1, 0),
+            "{s2:?}"
+        );
+        assert!(
+            !store2
+                .get_spent_status(&pot(43), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+        );
         assert!(!store2.pot_beef_proof_verified(&refuted).await.unwrap());
     }
 
@@ -1695,9 +2822,16 @@ mod tests {
             spenders.push(confirmed_pot_with_proof_at(&store, &pot(100 + i), 965_771, false).await);
         }
         // every 5th one is refuted (in no canonical block)
-        let valid: std::collections::HashSet<(u32, String)> =
-            spenders.iter().enumerate().filter(|(i, _)| i % 5 != 3).map(|(_, s)| (965_771u32, s.clone())).collect();
-        let tracker = RecordingTracker { valid, asked: Mutex::new(Vec::new()) };
+        let valid: std::collections::HashSet<(u32, String)> = spenders
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 5 != 3)
+            .map(|(_, s)| (965_771u32, s.clone()))
+            .collect();
+        let tracker = RecordingTracker {
+            valid,
+            asked: Mutex::new(Vec::new()),
+        };
         let events = real_events();
         let txs = MemoryTxStore::default();
         let state = StubState::default();
@@ -1708,7 +2842,17 @@ mod tests {
         loop {
             passes += 1;
             let feed = StubFeed::of(events.clone());
-            let s = run(&feed, &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(1, 10)).await;
+            let s = run(
+                &feed,
+                &headers,
+                &state,
+                &store,
+                Some(&txs),
+                Some(&tracker),
+                Some(&CourierStub::none()),
+                limits(1, 10),
+            )
+            .await;
             assert!(s.spenders.scanned <= 10, "{s:?}");
             assert_eq!(s.faults, 0);
             if s.applied == 1 {
@@ -1716,7 +2860,10 @@ mod tests {
             }
             let pending = state.state().pending.unwrap();
             assert_eq!(pending.event.hash, ORPHAN_965771);
-            assert!(pending.spenders.after.is_some() && !pending.spenders.exhausted, "the leg cursor persists: {pending:?}");
+            assert!(
+                pending.spenders.after.is_some() && !pending.spenders.exhausted,
+                "the leg cursor persists: {pending:?}"
+            );
             assert!(passes < 6, "runaway");
         }
         assert_eq!(passes, 3);
@@ -1724,31 +2871,94 @@ mod tests {
         let mut unique = asked.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(asked.len(), 23, "every row asked exactly once across the passes");
+        assert_eq!(
+            asked.len(),
+            23,
+            "every row asked exactly once across the passes"
+        );
         assert_eq!(unique.len(), 23);
         let mut all = spenders.clone();
         all.sort();
         assert_eq!(unique, all, "no row lost");
-        let refuted = spenders.iter().enumerate().filter(|(i, _)| i % 5 == 3).count();
+        let refuted = spenders
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 5 == 3)
+            .count();
         let mut confirmed = 0;
         for i in 0..23u32 {
-            if store.get_spent_status(&pot(100 + i), 0).await.unwrap().unwrap().spent_confirmed {
+            if store
+                .get_spent_status(&pot(100 + i), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed
+            {
                 confirmed += 1;
             }
         }
-        assert_eq!(confirmed, 23 - refuted, "exactly the refuted rows were demoted");
+        assert_eq!(
+            confirmed,
+            23 - refuted,
+            "exactly the refuted rows were demoted"
+        );
         // the event budget: the two 965773 events remain; one per pass
-        let s = run(&StubFeed::of(events.clone()), &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(1, 10)).await;
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(1, 10),
+        )
+        .await;
         assert_eq!(s.events_finished(), 1, "{s:?}");
         assert_eq!(s.feed_events, 2, "two were waiting; the budget took one");
-        let s = run(&StubFeed::of(events.clone()), &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(1, 10)).await;
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(1, 10),
+        )
+        .await;
         assert_eq!(s.events_finished(), 1, "{s:?}");
-        let s = run(&StubFeed::of(events.clone()), &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(1, 10)).await;
+        let s = run(
+            &StubFeed::of(events.clone()),
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(1, 10),
+        )
+        .await;
         assert!(s.idle, "{s:?}");
-        assert_eq!(state.state().cursor, events.iter().map(OrphanEvent::key).max());
+        assert_eq!(
+            state.state().cursor,
+            events.iter().map(OrphanEvent::key).max()
+        );
         // the block-event limits are the smaller ones
-        assert_eq!((PassLimits::block_event().events_per_pass, PassLimits::block_event().leg_limit), (1, 100));
-        assert_eq!((PassLimits::cron().events_per_pass, PassLimits::cron().leg_limit), (2, 200));
+        assert_eq!(
+            (
+                PassLimits::block_event().events_per_pass,
+                PassLimits::block_event().leg_limit
+            ),
+            (1, 100)
+        );
+        assert_eq!(
+            (
+                PassLimits::cron().events_per_pass,
+                PassLimits::cron().leg_limit
+            ),
+            (2, 200)
+        );
     }
 
     /// Round 2 (review MED-5): the corroboration header read seeds the
@@ -1766,32 +2976,104 @@ mod tests {
         for i in 1..6u32 {
             refuted.push(confirmed_pot_with_proof_at(&store, &pot(200 + i), 965_771, false).await);
         }
-        let tracker = RecordingTracker { valid: [(965_771u32, standing.clone())].into_iter().collect(), asked: Mutex::new(Vec::new()) };
+        let tracker = RecordingTracker {
+            valid: [(965_771u32, standing.clone())].into_iter().collect(),
+            asked: Mutex::new(Vec::new()),
+        };
         let mut headers = StubHeaders::real(965_860);
         headers.roots.insert(965_771, standing.clone());
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
         let txs = MemoryTxStore::default();
         let state = StubState::default();
         let mut memo = RootMemo::default();
-        let s = consume_arcade_reorg_events(&StubFeed::of(only_965771), &headers, &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50), &mut memo, false).await;
-        assert_eq!((s.applied, s.spenders.scanned, s.spenders.standing, s.demoted(), s.memo_seeded), (1, 6, 1, 5, 1), "{s:?}");
-        assert_eq!(tracker.asked.lock().unwrap().len(), 0, "every row at the seeded height was judged from the header read");
+        let s = consume_arcade_reorg_events(
+            &StubFeed::of(only_965771),
+            &headers,
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+            &mut memo,
+            false,
+        )
+        .await;
+        assert_eq!(
+            (
+                s.applied,
+                s.spenders.scanned,
+                s.spenders.standing,
+                s.demoted(),
+                s.memo_seeded
+            ),
+            (1, 6, 1, 5, 1),
+            "{s:?}"
+        );
+        assert_eq!(
+            tracker.asked.lock().unwrap().len(),
+            0,
+            "every row at the seeded height was judged from the header read"
+        );
         assert_eq!(s.memo_reads, 0);
         // the sweep over the same memo: a row confirmed at 965771 after the event (a late
         // confirmation) is judged from the seed too
         let late = confirmed_pot_with_proof_at(&store, &pot(210), 965_771, false).await;
-        let sweep = crate::reorg_sweep::reorg_revalidation_sweep_with(&store, Some(&txs), Some(&tracker), None, 965_773, 3, 50, &mut memo).await;
+        let sweep = crate::reorg_sweep::reorg_revalidation_sweep_with(
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            None,
+            965_773,
+            3,
+            50,
+            &mut memo,
+        )
+        .await;
         assert!(sweep.spenders.scanned >= 1, "{sweep:?}");
-        assert_eq!(tracker.asked.lock().unwrap().len(), 0, "the sweep asked nothing for rows at the seeded height");
-        assert!(!store.get_spent_status(&pot(210), 0).await.unwrap().unwrap().spent_confirmed, "the late row's root is not the canonical one: refuted from the seed");
+        assert_eq!(
+            tracker.asked.lock().unwrap().len(),
+            0,
+            "the sweep asked nothing for rows at the seeded height"
+        );
+        assert!(
+            !store
+                .get_spent_status(&pot(210), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_confirmed,
+            "the late row's root is not the canonical one: refuted from the seed"
+        );
         let _ = (refuted, late);
         // without a root on the header read, the memo is not seeded and the rows are read once per root
         let store2 = MemoryPotStorage::new();
         let standing2 = confirmed_pot_with_proof_at(&store2, &pot(220), 965_771, false).await;
-        let tracker2 = RecordingTracker { valid: [(965_771u32, standing2)].into_iter().collect(), asked: Mutex::new(Vec::new()) };
+        let tracker2 = RecordingTracker {
+            valid: [(965_771u32, standing2)].into_iter().collect(),
+            asked: Mutex::new(Vec::new()),
+        };
         let state2 = StubState::default();
         let mut memo2 = RootMemo::default();
-        let s2 = consume_arcade_reorg_events(&StubFeed::of(vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()]), &StubHeaders::real(965_860), &state2, &store2, Some(&txs), Some(&tracker2), Some(&CourierStub::none()), limits(2, 50), &mut memo2, false).await;
+        let s2 = consume_arcade_reorg_events(
+            &StubFeed::of(vec![real_events()
+                .into_iter()
+                .find(|e| e.hash == ORPHAN_965771)
+                .unwrap()]),
+            &StubHeaders::real(965_860),
+            &state2,
+            &store2,
+            Some(&txs),
+            Some(&tracker2),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+            &mut memo2,
+            false,
+        )
+        .await;
         assert_eq!((s2.memo_seeded, s2.memo_reads), (0, 1), "{s2:?}");
         assert_eq!(tracker2.asked.lock().unwrap().len(), 1);
     }
@@ -1801,50 +3083,113 @@ mod tests {
     /// pots' own proofs and the hop proofs at the event's height are
     /// unlatched / un-proved when refuted and kept when standing.
     #[tokio::test]
-    async fn an_event_for_a_height_we_do_not_hold_is_inert_and_the_proof_legs_unlatch_refuted_bumps() {
+    async fn an_event_for_a_height_we_do_not_hold_is_inert_and_the_proof_legs_unlatch_refuted_bumps(
+    ) {
         let store = MemoryPotStorage::new();
         let txs = MemoryTxStore::default();
         let tracker = MockChainTracker::new(965_860);
         let state = StubState::default();
-        let only_965771 = vec![real_events().into_iter().find(|e| e.hash == ORPHAN_965771).unwrap()];
-        let s = run(&StubFeed::of(only_965771.clone()), &StubHeaders::real(965_860), &state, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.applied, s.spenders.scanned, s.pot_beefs.scanned, s.transactions.scanned, s.faults), (1, 0, 0, 0, 0), "{s:?}");
+        let only_965771 = vec![real_events()
+            .into_iter()
+            .find(|e| e.hash == ORPHAN_965771)
+            .unwrap()];
+        let s = run(
+            &StubFeed::of(only_965771.clone()),
+            &StubHeaders::real(965_860),
+            &state,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.applied,
+                s.spenders.scanned,
+                s.pot_beefs.scanned,
+                s.transactions.scanned,
+                s.faults
+            ),
+            (1, 0, 0, 0, 0),
+            "{s:?}"
+        );
         assert_eq!(state.state().cursor, Some(only_965771[0].key()));
         // the proof legs (a SET tracker: two canonical roots at one height,
         // which the one-root-per-height mock cannot hold)
         let pot_beef = |n: u32, height: u32| async move {
             let raw = real_spender_raw(&pot(n), 0);
             let txid = Transaction::from_hex(&raw).unwrap().id();
-            let beef = crate::proof_fetcher::assemble_spender_beef(&raw, &single_tx_bump(&txid, height).to_hex(), &txid).unwrap();
+            let beef = crate::proof_fetcher::assemble_spender_beef(
+                &raw,
+                &single_tx_bump(&txid, height).to_hex(),
+                &txid,
+            )
+            .unwrap();
             (txid, beef)
         };
         let (join_ok, beef_ok) = pot_beef(50, 965_771).await;
         let (join_bad, beef_bad) = pot_beef(51, 965_771).await;
         for (txid, beef) in [(&join_ok, &beef_ok), (&join_bad, &beef_bad)] {
             store.store_beef(txid, beef).await.unwrap();
-            store.mark_pot_beef_proven_at(txid, Some(965_771)).await.unwrap();
+            store
+                .mark_pot_beef_proven_at(txid, Some(965_771))
+                .await
+                .unwrap();
         }
         let (hop_ok, hbeef_ok) = pot_beef(52, 965_771).await;
         let (hop_bad, hbeef_bad) = pot_beef(53, 965_771).await;
         txs.insert(&hop_ok, hbeef_ok, Some(965_771), true);
         txs.insert(&hop_bad, hbeef_bad, Some(965_771), true);
         let tracker = RecordingTracker {
-            valid: [(965_771u32, join_ok.clone()), (965_771u32, hop_ok.clone())].into_iter().collect(),
+            valid: [(965_771u32, join_ok.clone()), (965_771u32, hop_ok.clone())]
+                .into_iter()
+                .collect(),
             asked: Mutex::new(Vec::new()),
         };
         let state2 = StubState::default();
-        let s = run(&StubFeed::of(only_965771), &StubHeaders::real(965_860), &state2, &store, Some(&txs), Some(&tracker), Some(&CourierStub::none()), limits(2, 50)).await;
-        assert_eq!((s.applied, s.pot_beefs.scanned, s.pot_beefs.stale, s.transactions.scanned, s.transactions.stale), (1, 2, 1, 2, 1), "{s:?}");
+        let s = run(
+            &StubFeed::of(only_965771),
+            &StubHeaders::real(965_860),
+            &state2,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&CourierStub::none()),
+            limits(2, 50),
+        )
+        .await;
+        assert_eq!(
+            (
+                s.applied,
+                s.pot_beefs.scanned,
+                s.pot_beefs.stale,
+                s.transactions.scanned,
+                s.transactions.stale
+            ),
+            (1, 2, 1, 2, 1),
+            "{s:?}"
+        );
         assert!(store.pot_beef_proof_verified(&join_ok).await.unwrap());
-        assert!(!store.pot_beef_proof_verified(&join_bad).await.unwrap(), "the orphan's JOIN lost its latch");
+        assert!(
+            !store.pot_beef_proof_verified(&join_bad).await.unwrap(),
+            "the orphan's JOIN lost its latch"
+        );
         assert!(txs.proven(&hop_ok));
-        assert!(!txs.proven(&hop_bad), "un-proved: the engine's completion pass re-fetches it");
+        assert!(
+            !txs.proven(&hop_bad),
+            "un-proved: the engine's completion pass re-fetches it"
+        );
     }
 
     #[test]
     fn the_feed_pages_arcades_listing_by_its_keyset_cursor_one_above_the_boundary() {
         let feed = ArcadeBlockStatusFeed::new("https://arcade-v2-us-1.bsvblockchain.tech/");
-        assert_eq!(feed.page_url(None), "https://arcade-v2-us-1.bsvblockchain.tech/api/v1/blocks/processing-status?limit=100");
+        assert_eq!(
+            feed.page_url(None),
+            "https://arcade-v2-us-1.bsvblockchain.tech/api/v1/blocks/processing-status?limit=100"
+        );
         // round 2 (review LOW-1): the next page is asked ONE ABOVE the page's lowest
         // height, so Arcade's `block_height < before-height` re-lists the boundary
         // height's other rows (the same-height competitors a reorg produces)

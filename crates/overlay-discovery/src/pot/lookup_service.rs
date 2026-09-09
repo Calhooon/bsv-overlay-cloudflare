@@ -773,7 +773,8 @@ mod tests {
     const LOOP2_INCOMPLETE_JOIN_BEEF: &[u8] = include_bytes!(
         "../../../overlay-cloudflare/tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef"
     );
-    const LOOP2_JOIN_TXID: &str = "5ad2764c5151592915ccfc2e1ac2cbc763a34c3c522aa6f98655f1fc88559bb8";
+    const LOOP2_JOIN_TXID: &str =
+        "5ad2764c5151592915ccfc2e1ac2cbc763a34c3c522aa6f98655f1fc88559bb8";
 
     #[tokio::test]
     async fn loop2_named_body_records_the_pot_the_plain_body_missed() {
@@ -783,15 +784,25 @@ mod tests {
         svc.output_admitted_by_topic(&admit(LOOP2_INCOMPLETE_JOIN_BEEF.to_vec(), 0))
             .await
             .unwrap();
-        assert_eq!(storage.record_count(), 0, "the plain body's wire-last is a hop — skipped");
+        assert_eq!(
+            storage.record_count(),
+            0,
+            "the plain body's wire-last is a hop — skipped"
+        );
 
         // the fix: the engine names the subject; the hook records the pot
         let mut beef = Beef::from_binary(LOOP2_INCOMPLETE_JOIN_BEEF).unwrap();
         let named = beef.to_binary_atomic(LOOP2_JOIN_TXID).unwrap();
         let (svc, storage) = make_service_with_storage();
-        svc.output_admitted_by_topic(&admit(named, 0)).await.unwrap();
+        svc.output_admitted_by_topic(&admit(named, 0))
+            .await
+            .unwrap();
         assert_eq!(storage.record_count(), 1);
-        let arr = spent_status(&svc, serde_json::json!([{"txid": LOOP2_JOIN_TXID, "vout": 0}])).await;
+        let arr = spent_status(
+            &svc,
+            serde_json::json!([{"txid": LOOP2_JOIN_TXID, "vout": 0}]),
+        )
+        .await;
         assert_eq!(arr[0]["known"], true);
         assert_eq!(arr[0]["spent"], false);
     }

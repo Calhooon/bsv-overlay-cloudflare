@@ -214,7 +214,10 @@ mod tests {
         // walked with an EXISTS per row (the 980k-rows-per-call shape).
         assert!(sql.contains("JOIN potrefund_records pr"));
         assert!(sql.contains("ON pr.potTxid = party.potTxid AND pr.potVout = party.potVout"));
-        assert!(!sql.contains("WHERE EXISTS"), "no per-row EXISTS over potrefund_records");
+        assert!(
+            !sql.contains("WHERE EXISTS"),
+            "no per-row EXISTS over potrefund_records"
+        );
         assert!(sql.contains("SELECT DISTINCT pp.potTxid AS potTxid, pp.potVout AS potVout"));
         assert!(
             sql.contains("potparty_records"),
@@ -317,18 +320,29 @@ mod tests {
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
                 let msg = e.to_string().to_ascii_lowercase();
-                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
             }
         }
         conn
     }
 
-    fn plan_lines(conn: &rusqlite::Connection, sql: &str, binds: &[rusqlite::types::Value]) -> Vec<String> {
-        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).expect("prepare");
-        stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
-            .expect("plan")
-            .map(|r| r.expect("row"))
-            .collect()
+    fn plan_lines(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        binds: &[rusqlite::types::Value],
+    ) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare");
+        stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            r.get::<_, String>(3)
+        })
+        .expect("plan")
+        .map(|r| r.expect("row"))
+        .collect()
     }
 
     /// The pre-M19 shape, kept ONLY as the equivalence oracle below: SQLite
@@ -363,30 +377,43 @@ mod tests {
         let identity = rusqlite::types::Value::Text("02".repeat(33));
         for (sql, binds) in [
             (refund_backups_sql(None), vec![identity.clone()]),
-            (refund_backups_sql(Some(1_000)), vec![identity.clone(), rusqlite::types::Value::Integer(1_000)]),
+            (
+                refund_backups_sql(Some(1_000)),
+                vec![identity.clone(), rusqlite::types::Value::Integer(1_000)],
+            ),
         ] {
             let plan = plan_lines(&conn, &sql, &binds);
             let joined = plan.join("\n");
             assert!(
-                plan.iter().any(|l| l.contains("SEARCH pr USING INDEX idx_potrefund_pot (potTxid=? AND potVout=?)")),
+                plan.iter().any(|l| l
+                    .contains("SEARCH pr USING INDEX idx_potrefund_pot (potTxid=? AND potVout=?)")),
                 "potrefund_records is probed by its outpoint index:\n{joined}"
             );
             assert!(
-                plan.iter().any(|l| l.contains("SEARCH potparty_records USING INDEX idx_potparty_identity")),
+                plan.iter().any(
+                    |l| l.contains("SEARCH potparty_records USING INDEX idx_potparty_identity")
+                ),
                 "the potparty arm is an identity-index search:\n{joined}"
             );
             assert!(
-                plan.iter().any(|l| l.contains("SEARCH hp USING INDEX idx_hopparty_identity")),
+                plan.iter()
+                    .any(|l| l.contains("SEARCH hp USING INDEX idx_hopparty_identity")),
                 "the hopparty arm is an identity-index search:\n{joined}"
             );
             assert!(
-                !plan.iter().any(|l| l.starts_with("SCAN pr") || l.contains("SCAN potrefund_records")),
+                !plan
+                    .iter()
+                    .any(|l| l.starts_with("SCAN pr") || l.contains("SCAN potrefund_records")),
                 "never a walk over potrefund_records:\n{joined}"
             );
         }
         // the oracle's shape really was the scan (the defect this pins against)
         let old = plan_lines(&conn, &pre_m19_sql(None), &[identity]);
-        assert!(old.iter().any(|l| l.starts_with("SCAN pr USING INDEX idx_potrefund_createdAt")), "{old:?}");
+        assert!(
+            old.iter()
+                .any(|l| l.starts_with("SCAN pr USING INDEX idx_potrefund_createdAt")),
+            "{old:?}"
+        );
     }
 
     /// The served rows are IDENTICAL to the pre-M19 shape's — same rows, same
@@ -400,7 +427,14 @@ mod tests {
         let conn = migrated();
         let me = "02".repeat(33);
         let other = "03".repeat(33);
-        let (p1, p2, p3, p4, p5, hop) = ("11".repeat(32), "22".repeat(32), "33".repeat(32), "44".repeat(32), "55".repeat(32), "66".repeat(32));
+        let (p1, p2, p3, p4, p5, hop) = (
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "66".repeat(32),
+        );
         let party = |identity: &str, pot: &str, marker: &str, created: i64| {
             conn.execute(
                 "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt) \
@@ -446,11 +480,31 @@ mod tests {
         backup(&p5, &me, &"b6".repeat(32), 5); // the hop-derived pot
         backup(&p2, &me, &"b7".repeat(32), 20); // same stamp as b3: the rowid tie-break
 
-        type Row = (String, i64, String, String, Option<String>, Option<String>, String, i64, Option<i64>);
+        type Row = (
+            String,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            Option<i64>,
+        );
         let read = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<Row> {
             let mut stmt = conn.prepare(sql).unwrap();
             stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
             })
             .unwrap()
             .map(|r| r.unwrap())
@@ -475,6 +529,12 @@ mod tests {
         let old = read(&pre_m19_sql(Some(1_600_000)), &era);
         assert_eq!(new, old);
         let served: Vec<&str> = new.iter().map(|r| r.6.as_str()).collect();
-        assert_eq!(served, ["b7".repeat(32), "b3".repeat(32), "b6".repeat(32)].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            served,
+            ["b7".repeat(32), "b3".repeat(32), "b6".repeat(32)]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
     }
 }

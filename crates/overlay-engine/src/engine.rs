@@ -2174,8 +2174,11 @@ impl Engine {
     /// would still `find_bump`. A bump still referenced by ANOTHER tx (a
     /// sibling mined in the same block) is kept.
     fn gc_unreferenced_bumps(beef: &mut bsv_rs::transaction::Beef) {
-        let referenced: std::collections::HashSet<usize> =
-            beef.txs.iter().filter_map(bsv_rs::transaction::BeefTx::bump_index).collect();
+        let referenced: std::collections::HashSet<usize> = beef
+            .txs
+            .iter()
+            .filter_map(bsv_rs::transaction::BeefTx::bump_index)
+            .collect();
         if referenced.len() == beef.bumps.len() {
             return;
         }
@@ -4319,10 +4322,15 @@ mod tests {
                 assert_eq!(topic, "tm_test");
                 // The spending BEEF is the entire BEEF we submitted, NAMED
                 // (atomic prefix) for the lookup service's own re-parse.
-                let mut named = bsv_rs::transaction::Beef::from_binary(spending_atomic_beef).unwrap();
+                let mut named =
+                    bsv_rs::transaction::Beef::from_binary(spending_atomic_beef).unwrap();
                 assert!(named.is_atomic());
                 let submitted = bsv_rs::transaction::Beef::from_binary(&test_beef()).unwrap();
-                assert_eq!(named.txs.len(), submitted.txs.len(), "the whole body, never pruned");
+                assert_eq!(
+                    named.txs.len(),
+                    submitted.txs.len(),
+                    "the whole body, never pruned"
+                );
                 let tip = crate::subject::subject_txid_of(&mut named).unwrap();
                 assert_eq!(named.atomic_txid.as_deref(), Some(tip.as_str()));
             }
@@ -5852,7 +5860,10 @@ mod tests {
         let orphan_root = orphan.compute_root(Some(&subject_id)).unwrap();
         let stored = beef.to_binary();
         assert_eq!(
-            Beef::from_binary(&stored).unwrap().find_bump(&subject_id).map(|b| b.compute_root(Some(&subject_id)).unwrap()),
+            Beef::from_binary(&stored)
+                .unwrap()
+                .find_bump(&subject_id)
+                .map(|b| b.compute_root(Some(&subject_id)).unwrap()),
             Some(orphan_root.clone())
         );
         // the canonical proof at the SAME height, a DIFFERENT root
@@ -5865,7 +5876,10 @@ mod tests {
         )
         .unwrap();
         let canonical_root = canonical.compute_root(Some(&subject_id)).unwrap();
-        assert_ne!(canonical_root, orphan_root, "the reorg shape: same height, new root");
+        assert_ne!(
+            canonical_root, orphan_root,
+            "the reorg shape: same height, new root"
+        );
         let out = Engine::stitch_proof_into_stored_beef(&stored, &subject_id, &canonical).unwrap();
         let after = Beef::from_binary(&out).unwrap();
         // the subject's OWN bump is the canonical one
@@ -5874,9 +5888,17 @@ mod tests {
             .and_then(BeefTx::bump_index)
             .and_then(|bi| after.bumps.get(bi))
             .unwrap();
-        assert_eq!(own.compute_root(Some(&subject_id)).unwrap(), canonical_root, "the subject re-anchored to the new bump");
+        assert_eq!(
+            own.compute_root(Some(&subject_id)).unwrap(),
+            canonical_root,
+            "the subject re-anchored to the new bump"
+        );
         // the orphan bump is gone (only the canonical one remains)
-        assert_eq!(after.bumps.len(), 1, "the unreferenced orphan bump was dropped");
+        assert_eq!(
+            after.bumps.len(),
+            1,
+            "the unreferenced orphan bump was dropped"
+        );
         // and a reader that uses the tx's OWN bump sees canonical, never orphan
         assert!(after.find_txid(&parent_id).is_some(), "ancestry preserved");
     }
@@ -6799,7 +6821,9 @@ mod tests {
                     } => {
                         let beef = Beef::from_binary(atomic_beef).expect("the WholeTx body parses");
                         (
-                            beef.atomic_txid.clone().expect("the WholeTx body NAMES its subject"),
+                            beef.atomic_txid
+                                .clone()
+                                .expect("the WholeTx body NAMES its subject"),
                             *output_index,
                             topic.clone(),
                         )
@@ -6862,7 +6886,10 @@ mod tests {
         assert_eq!(txid, TEST_TXID);
 
         // the premise, RED-verified: the same bytes again are DEDUPED — /submit can never re-notify
-        let (_, report) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        let (_, report) = engine
+            .submit_with_report(&tagged, SubmitMode::CurrentTx)
+            .await
+            .unwrap();
         assert_eq!(report.deduped_topics, vec!["tm_test".to_string()]);
         assert_eq!(seen.borrow().len(), 2, "dedup told nobody");
 
@@ -6881,7 +6908,10 @@ mod tests {
         assert_eq!(seen.borrow().len(), 4);
 
         // idempotent: a second re-notify tells everyone again, faults nothing
-        let r2 = engine.renotify_admitted(&txid.to_ascii_uppercase(), "tm_test").await.unwrap();
+        let r2 = engine
+            .renotify_admitted(&txid.to_ascii_uppercase(), "tm_test")
+            .await
+            .unwrap();
         assert_eq!((r2.outputs, r2.notified, r2.faults.len()), (1, 2, 0));
         assert_eq!(seen.borrow().len(), 6);
     }
@@ -6895,21 +6925,56 @@ mod tests {
         // phantom: a TM that admits nothing still records the topic as applied
         let engine = make_engine(vec![]);
         let tagged = test_tagged_beef(vec!["tm_test"]);
-        let (steak, r1) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
+        let (steak, r1) = engine
+            .submit_with_report(&tagged, SubmitMode::CurrentTx)
+            .await
+            .unwrap();
         assert!(steak.get("tm_test").unwrap().outputs_to_admit.is_empty());
         assert_eq!(r1.applied_topics, vec!["tm_test".to_string()]);
-        let (_, r2) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
-        assert_eq!(r2.deduped_topics, vec!["tm_test".to_string()], "the phantom row dedups the re-submit");
-        assert!(engine.forget_phantom_applied(TEST_TXID, "tm_test").await.unwrap());
-        let (_, r3) = engine.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
-        assert!(r3.deduped_topics.is_empty(), "judged again after the forget");
-        assert!(!engine.forget_phantom_applied(TEST_TXID, "tm_other").await.unwrap(), "no row: nothing to forget");
+        let (_, r2) = engine
+            .submit_with_report(&tagged, SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert_eq!(
+            r2.deduped_topics,
+            vec!["tm_test".to_string()],
+            "the phantom row dedups the re-submit"
+        );
+        assert!(engine
+            .forget_phantom_applied(TEST_TXID, "tm_test")
+            .await
+            .unwrap());
+        let (_, r3) = engine
+            .submit_with_report(&tagged, SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert!(
+            r3.deduped_topics.is_empty(),
+            "judged again after the forget"
+        );
+        assert!(
+            !engine
+                .forget_phantom_applied(TEST_TXID, "tm_other")
+                .await
+                .unwrap(),
+            "no row: nothing to forget"
+        );
 
         // real: a TM that admits output 0 — its row is a real admission, never forgotten
         let real = make_engine(vec![0]);
         real.submit(&tagged, SubmitMode::CurrentTx).await.unwrap();
-        assert!(!real.forget_phantom_applied(TEST_TXID, "tm_test").await.unwrap());
-        let (_, r4) = real.submit_with_report(&tagged, SubmitMode::CurrentTx).await.unwrap();
-        assert_eq!(r4.deduped_topics, vec!["tm_test".to_string()], "a real admission still dedups");
+        assert!(!real
+            .forget_phantom_applied(TEST_TXID, "tm_test")
+            .await
+            .unwrap());
+        let (_, r4) = real
+            .submit_with_report(&tagged, SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert_eq!(
+            r4.deduped_topics,
+            vec!["tm_test".to_string()],
+            "a real admission still dedups"
+        );
     }
 }

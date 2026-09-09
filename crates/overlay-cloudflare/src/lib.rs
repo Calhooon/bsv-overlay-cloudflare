@@ -24,7 +24,6 @@ pub mod mainnet_fanout;
 pub mod ops;
 pub mod peer_crawler;
 pub mod pot_changes;
-pub mod tip_pass;
 pub mod proof_fetcher;
 pub mod queue;
 pub mod relatch;
@@ -32,6 +31,7 @@ pub mod reorg_sweep;
 pub mod routes;
 pub mod submit_census;
 pub mod submit_gate;
+pub mod tip_pass;
 pub mod wallet;
 
 use std::collections::HashMap;
@@ -292,17 +292,32 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         // bsv-low loop 6: the block-event spend-confirmation pass (bearer
         // INTERNAL_TOKEN, forwarded by the app-layer from chaintracks' tip).
         (Method::Post, "/internal/tip-changed") => {
-            crate::tip_pass::internal_tip_changed(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
+            crate::tip_pass::internal_tip_changed(
+                req,
+                &env,
+                &ctx,
+                pot_storage.as_ref(),
+                Some(&ops_db),
+            )
+            .await
         }
         // bsv-low M19 R2: the manual reorg demotion from a named height (the
         // rows a past reorg left behind; bearer INTERNAL_TOKEN; bounded).
         (Method::Post, "/internal/reorg") => {
-            crate::tip_pass::internal_reorg(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
+            crate::tip_pass::internal_reorg(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db))
+                .await
         }
         // bsv-low M19B-G1: one bounded pass of the Arcade reorg-event
         // consumer on demand (bearer INTERNAL_TOKEN; no body).
         (Method::Post, "/internal/arcade-reorg") => {
-            crate::tip_pass::internal_arcade_reorg(req, &env, &ctx, pot_storage.as_ref(), Some(&ops_db)).await
+            crate::tip_pass::internal_arcade_reorg(
+                req,
+                &env,
+                &ctx,
+                pot_storage.as_ref(),
+                Some(&ops_db),
+            )
+            .await
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
@@ -473,7 +488,9 @@ pub(crate) fn courier_fetcher(
     f.with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()))
 }
 
-pub(crate) fn lookup_service_chain_tracker(env: &Env) -> Option<Rc<dyn bsv_rs::transaction::ChainTracker>> {
+pub(crate) fn lookup_service_chain_tracker(
+    env: &Env,
+) -> Option<Rc<dyn bsv_rs::transaction::ChainTracker>> {
     let ct_url = env
         .var("CHAIN_TRACKER_URL")
         .map(|v| v.to_string())

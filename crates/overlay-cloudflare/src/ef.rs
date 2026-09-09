@@ -293,9 +293,14 @@ mod tests {
         only_subject.merge_raw_tx(subject.to_binary(), None);
         let bytes = only_subject.to_binary();
         let missing = missing_source_txids(&bytes);
-        assert!(!missing.is_empty(), "the lone subject names its parents as missing");
+        assert!(
+            !missing.is_empty(),
+            "the lone subject names its parents as missing"
+        );
         assert!(missing.iter().all(|t| t.len() == 64));
-        let parent_beef = Beef::from_binary(&hex::decode(PARENT_BEEF_HEX.trim()).expect("parent beef hex")).expect("parent beef");
+        let parent_beef =
+            Beef::from_binary(&hex::decode(PARENT_BEEF_HEX.trim()).expect("parent beef hex"))
+                .expect("parent beef");
         let (parent_txid, parent_raw_hex) = parent_beef
             .txs
             .iter()
@@ -314,7 +319,6 @@ mod tests {
         assert!(missing_source_txids(b"nope").is_empty());
         assert_eq!(merge_raw_sources(b"nope", &[]), b"nope".to_vec());
     }
-
 
     // Real mainnet transaction pair (subject + funding parent), committed raw
     // so the EF round-trip runs offline (fixtures shared with zanaadu's suite):
@@ -500,38 +504,61 @@ mod tests {
     /// what this shape needed, the subject rule was).
     const LOOP2_INCOMPLETE_JOIN_BEEF: &[u8] =
         include_bytes!("../tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef");
-    const LOOP2_JOIN_TXID: &str = "5ad2764c5151592915ccfc2e1ac2cbc763a34c3c522aa6f98655f1fc88559bb8";
-    const LOOP2_P2_HOP_TXID: &str = "6ec7a0e8c453019fe665627031eb33a15e8891e1b123fa96a067d1a9cd54d8c8";
+    const LOOP2_JOIN_TXID: &str =
+        "5ad2764c5151592915ccfc2e1ac2cbc763a34c3c522aa6f98655f1fc88559bb8";
+    const LOOP2_P2_HOP_TXID: &str =
+        "6ec7a0e8c453019fe665627031eb33a15e8891e1b123fa96a067d1a9cd54d8c8";
 
     #[test]
     fn loop2_incomplete_join_beef_subject_is_the_join_not_the_sorted_last_hop() {
-        let mut beef = Beef::from_binary(LOOP2_INCOMPLETE_JOIN_BEEF).expect("the captured body parses");
-        assert!(!beef.is_atomic(), "the loop-2 client sent a plain BEEF (no atomic name)");
+        let mut beef =
+            Beef::from_binary(LOOP2_INCOMPLETE_JOIN_BEEF).expect("the captured body parses");
+        assert!(
+            !beef.is_atomic(),
+            "the loop-2 client sent a plain BEEF (no atomic name)"
+        );
         // The trap: every order-dependent reader picks something OTHER than
         // the JOIN (the SDK's `toBinary()` order and bsv-rs's `sort_txs`
         // differ in which valid tx lands last — p2's hop for the SDK, the
         // last resolved valid tx for bsv-rs — and neither is the subject).
         let sorted_last = sorted_last_txid_of(&beef).expect("a sorted last");
-        assert_ne!(sorted_last, LOOP2_JOIN_TXID, "the trap: sorted-last is never the JOIN here");
+        assert_ne!(
+            sorted_last, LOOP2_JOIN_TXID,
+            "the trap: sorted-last is never the JOIN here"
+        );
         assert!(
-            beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(&sorted_last)),
+            beef.txs
+                .iter()
+                .any(|b| b.txid().eq_ignore_ascii_case(&sorted_last)),
             "the sorted-last is one of the BEEF's txs"
         );
         assert!(
-            beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(LOOP2_P2_HOP_TXID)),
+            beef.txs
+                .iter()
+                .any(|b| b.txid().eq_ignore_ascii_case(LOOP2_P2_HOP_TXID)),
             "p2's hop is in the body (the SDK's sorted-last)"
         );
-        assert_eq!(subject_txid_of(&mut beef).as_deref(), Some(LOOP2_JOIN_TXID), "the unique tip is the JOIN");
+        assert_eq!(
+            subject_txid_of(&mut beef).as_deref(),
+            Some(LOOP2_JOIN_TXID),
+            "the unique tip is the JOIN"
+        );
 
         let (efs, subject_txid) = beef_to_ef_batch(LOOP2_INCOMPLETE_JOIN_BEEF).expect("converts");
         assert_eq!(subject_txid, LOOP2_JOIN_TXID);
-        assert!(efs.iter().any(|e| e.txid == LOOP2_JOIN_TXID), "the JOIN's own EF leg is in the batch");
+        assert!(
+            efs.iter().any(|e| e.txid == LOOP2_JOIN_TXID),
+            "the JOIN's own EF leg is in the batch"
+        );
         assert!(
             missing_source_txids(LOOP2_INCOMPLETE_JOIN_BEEF).is_empty(),
             "the JOIN's DIRECT sources are present — the gap is a grandparent"
         );
         let raw = proven_subject_raw(LOOP2_INCOMPLETE_JOIN_BEEF).expect("subject raw");
-        assert_eq!(Transaction::from_binary(&raw).unwrap().id(), LOOP2_JOIN_TXID);
+        assert_eq!(
+            Transaction::from_binary(&raw).unwrap().id(),
+            LOOP2_JOIN_TXID
+        );
     }
 
     /// The same loop's SECOND capture: p2's felt re-presenting the transient
@@ -573,7 +600,11 @@ mod tests {
         // an atomic name that is NOT in the BEEF is ignored, never trusted
         let mut stray = Beef::from_binary(&atomic).unwrap();
         stray.atomic_txid = Some("00".repeat(32));
-        assert_eq!(subject_txid_of(&mut stray).as_deref(), Some(SUBJECT_TXID), "falls to the unique tip");
+        assert_eq!(
+            subject_txid_of(&mut stray).as_deref(),
+            Some(SUBJECT_TXID),
+            "falls to the unique tip"
+        );
     }
 
     #[test]
@@ -589,7 +620,11 @@ mod tests {
         let mut related = Beef::new();
         related.merge_transaction(a.clone());
         related.merge_transaction(b.clone());
-        assert_eq!(subject_txid_of(&mut related).as_deref(), Some(SUBJECT_TXID), "a spends b: a is the tip");
+        assert_eq!(
+            subject_txid_of(&mut related).as_deref(),
+            Some(SUBJECT_TXID),
+            "a spends b: a is the tip"
+        );
 
         // Two UNRELATED unmined txs (each spends a source the BEEF lacks): no
         // unique tip → the reference's sorted-last, whichever that is.
@@ -600,7 +635,10 @@ mod tests {
                 source_output_index: 0,
                 ..Default::default()
             });
-            tx.outputs.push(TransactionOutput::new(1, LockingScript::from_hex("51").unwrap()));
+            tx.outputs.push(TransactionOutput::new(
+                1,
+                LockingScript::from_hex("51").unwrap(),
+            ));
             tx
         };
         let (c, d) = (stray(0xaa), stray(0xbb));
@@ -610,6 +648,10 @@ mod tests {
         two.merge_transaction(d.clone());
         let expect = sorted_last_txid_of(&two);
         assert!(expect.is_some());
-        assert_eq!(subject_txid_of(&mut two), expect, "no unique tip → the reference's sorted-last");
+        assert_eq!(
+            subject_txid_of(&mut two),
+            expect,
+            "no unique tip → the reference's sorted-last"
+        );
     }
 }

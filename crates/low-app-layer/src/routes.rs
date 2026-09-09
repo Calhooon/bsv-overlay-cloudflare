@@ -386,9 +386,19 @@ async fn load_stored_beef(
             // bsv-low M19 R2: never serve a bump the current header refutes
             // (a verified row: its recent bumps; an unverified row: every
             // bump). A refuted one is stripped, or the row is refused.
-            let bytes = match crate::beef_guard::guard_served_beef(env, Some(db), &key, &bytes, proof_verified).await {
+            let bytes = match crate::beef_guard::guard_served_beef(
+                env,
+                Some(db),
+                &key,
+                &bytes,
+                proof_verified,
+            )
+            .await
+            {
                 crate::beef_guard::Guarded::Serve(bytes) => bytes,
-                crate::beef_guard::Guarded::Refuted { height } => return Err(LoadFault::Refuted(height)),
+                crate::beef_guard::Guarded::Refuted { height } => {
+                    return Err(LoadFault::Refuted(height))
+                }
             };
             // Serve-time compaction (#192/#193, P4), licensed ONLY by the
             // row's VERIFIED proof latch (bsv-low#304): trimming decides

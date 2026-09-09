@@ -140,13 +140,16 @@ pub async fn internal_tip_changed(
         None => None,
     };
     let tracker = crate::lookup_service_chain_tracker(env);
-    let sweep_fetcher = crate::courier_fetcher(env, tracker.clone()).with_budget(REORG_SWEEP_BUDGET);
+    let sweep_fetcher =
+        crate::courier_fetcher(env, tracker.clone()).with_budget(REORG_SWEEP_BUDGET);
     if announce == Some(overlay_discovery::pot::reorg::TipAnnounce::Old) {
         console_log!("POST /internal/tip-changed height={height} -> 200 (an OLD header below the held tip: ignored, counted)");
         if let Some(db) = ops_db {
             crate::ops::bump_counter(db, crate::ops::COUNTER_TIP_ANNOUNCE_OLD, 1).await;
         }
-        return Response::from_json(&serde_json::json!({ "ok": true, "height": height, "skipped": "old-header" }));
+        return Response::from_json(
+            &serde_json::json!({ "ok": true, "height": height, "skipped": "old-header" }),
+        );
     }
     // The targeted `Reorg{from}` range: from EITHER producer, widened to
     // cover both. (1) The overlay's OWN same-height hash change (the
@@ -174,18 +177,40 @@ pub async fn internal_tip_changed(
         );
         // the whole reorged range, not just one height: a fork at `from`
         // orphaned every block from there to the new tip.
-        demotion = crate::reorg_sweep::handle_reorg(pot_storage, tracker.as_deref(), from, height, None, REORG_DEMOTE_LIMIT).await;
+        demotion = crate::reorg_sweep::handle_reorg(
+            pot_storage,
+            tracker.as_deref(),
+            from,
+            height,
+            None,
+            REORG_DEMOTE_LIMIT,
+        )
+        .await;
         if let Some(db) = ops_db {
             crate::ops::bump_counter(db, crate::ops::COUNTER_CHAIN_REORGS_DETECTED, 1).await;
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, (demotion.stale + demotion.demoted_blind) as u64).await;
-            crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, demotion.faults as u64).await;
+            crate::ops::bump_counter(
+                db,
+                crate::ops::COUNTER_REORG_DEMOTED,
+                (demotion.stale + demotion.demoted_blind) as u64,
+            )
+            .await;
+            crate::ops::bump_counter(
+                db,
+                crate::ops::COUNTER_REORG_TRACKER_FAULTS,
+                demotion.faults as u64,
+            )
+            .await;
         }
     }
     // A repeat of an already-passed height runs nothing — unless it carried
     // a reorg, which must still sweep and re-chase.
     if !first_pass_for(height) && reorg_from.is_none() {
-        console_log!("POST /internal/tip-changed height={height} -> 200 (already passed in this isolate)");
-        return Response::from_json(&serde_json::json!({ "ok": true, "height": height, "skipped": "already-passed" }));
+        console_log!(
+            "POST /internal/tip-changed height={height} -> 200 (already passed in this isolate)"
+        );
+        return Response::from_json(
+            &serde_json::json!({ "ok": true, "height": height, "skipped": "already-passed" }),
+        );
     }
     // ── bsv-low M19B-G1: Arcade's reorg EVENTS first (its orphaned-block
     // feed, corroborated against chaintracks, every row judged by its own
@@ -195,7 +220,16 @@ pub async fn internal_tip_changed(
     // One root memo for the whole pass (round 2, review MED-5): the consumer
     // seeds it from its corroboration header read and the sweep reuses it.
     let mut memo = crate::reorg_sweep::RootMemo::default();
-    let arcade = run_arcade_reorg_pass(env, pot_storage, ops_db, "tip-changed", crate::arcade_reorg::PassLimits::block_event(), &mut memo, false).await;
+    let arcade = run_arcade_reorg_pass(
+        env,
+        pot_storage,
+        ops_db,
+        "tip-changed",
+        crate::arcade_reorg::PassLimits::block_event(),
+        &mut memo,
+        false,
+    )
+    .await;
     // ── the revalidation sweep (reference: the fallback for trackers without
     // a reorg stream; here the PRIMARY path, every block): three cursor-walked
     // legs (spenders, the pots' own proofs, the engine's hop proofs). It runs
@@ -216,19 +250,55 @@ pub async fn internal_tip_changed(
     if let Some(db) = ops_db {
         let scanned = sweep.spenders.scanned + sweep.pot_beefs.scanned + sweep.transactions.scanned;
         crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REVERIFIED, scanned as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_PROOFS, sweep.spenders.stale as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, sweep.spenders.stale as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_POT_PROOFS, sweep.pot_beefs.stale as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_TX_PROOFS, sweep.transactions.stale as u64).await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_STALE_PROOFS,
+            sweep.spenders.stale as u64,
+        )
+        .await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_DEMOTED,
+            sweep.spenders.stale as u64,
+        )
+        .await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_STALE_POT_PROOFS,
+            sweep.pot_beefs.stale as u64,
+        )
+        .await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_STALE_TX_PROOFS,
+            sweep.transactions.stale as u64,
+        )
+        .await;
         let faults = sweep.spenders.faults + sweep.pot_beefs.faults + sweep.transactions.faults;
         crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, faults as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_HEALED_FROM_COURIER, sweep.spenders.stored_from_courier as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REANCHORED, sweep.spenders.reanchored as u64).await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_HEALED_FROM_COURIER,
+            sweep.spenders.stored_from_courier as u64,
+        )
+        .await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_REANCHORED,
+            sweep.spenders.reanchored as u64,
+        )
+        .await;
     }
     let fetcher = crate::courier_fetcher(env, tracker).with_budget(TIP_PASS_BUDGET);
     // min_age 0: the block just landed; every unconfirmed spend is a candidate
     // (the push may still arrive — its CAS then finds the row confirmed, harmless)
-    let s = crate::proof_fetcher::complete_spend_confirmations(pot_storage, &fetcher, TIP_PASS_LIMIT, 0).await;
+    let s = crate::proof_fetcher::complete_spend_confirmations(
+        pot_storage,
+        &fetcher,
+        TIP_PASS_LIMIT,
+        0,
+    )
+    .await;
     console_log!(
         "POST /internal/tip-changed height={height} -> 200 (block-event spend-confirmation: scanned={} confirmed={} \
          still_unconfirmed={} fetch_failed={} tracker_faults={} cas_missed={} cas_errors={}; \
@@ -269,7 +339,8 @@ pub async fn internal_tip_changed(
     if let Some(db) = ops_db {
         crate::ops::bump_counter(db, crate::ops::COUNTER_TIP_PASS_TOTAL, 1).await;
         if s.confirmed > 0 {
-            crate::ops::bump_counter(db, crate::ops::COUNTER_SPENDS_CONFIRMED, s.confirmed as u64).await;
+            crate::ops::bump_counter(db, crate::ops::COUNTER_SPENDS_CONFIRMED, s.confirmed as u64)
+                .await;
         }
     }
     // what the pass confirmed is a pot CHANGE — the seats' events boxes hear it
@@ -309,11 +380,17 @@ pub async fn run_arcade_reorg_pass(
     let tracker = crate::lookup_service_chain_tracker(env);
     let Some(db) = ops_db else {
         console_log!("[arcade-reorg] ({origin}) no D1 handle: no state row, no pass");
-        return crate::arcade_reorg::ArcadePassSummary { stopped: Some("no state store".into()), ..Default::default() };
+        return crate::arcade_reorg::ArcadePassSummary {
+            stopped: Some("no state store".into()),
+            ..Default::default()
+        };
     };
     let Some(tracker) = tracker else {
         console_log!("[arcade-reorg] ({origin}) no header source configured: no pass");
-        return crate::arcade_reorg::ArcadePassSummary { stopped: Some("no header source configured".into()), ..Default::default() };
+        return crate::arcade_reorg::ArcadePassSummary {
+            stopped: Some("no header source configured".into()),
+            ..Default::default()
+        };
     };
     let arcade_base = env
         .var("ARCADE_URL")
@@ -322,9 +399,13 @@ pub async fn run_arcade_reorg_pass(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
     let feed = crate::arcade_reorg::ArcadeBlockStatusFeed::new(arcade_base);
-    let headers = crate::arcade_reorg::EnvHeaderSource { env, tracker: tracker.as_ref() };
+    let headers = crate::arcade_reorg::EnvHeaderSource {
+        env,
+        tracker: tracker.as_ref(),
+    };
     let state = crate::arcade_reorg::D1ConsumerState(db);
-    let fetcher = crate::courier_fetcher(env, Some(tracker.clone())).with_budget(crate::arcade_reorg::ARCADE_LADDER_BUDGET);
+    let fetcher = crate::courier_fetcher(env, Some(tracker.clone()))
+        .with_budget(crate::arcade_reorg::ARCADE_LADDER_BUDGET);
     let tx_store = crate::reorg_sweep::D1ProvenTxStore(db);
     let s = crate::arcade_reorg::consume_arcade_reorg_events(
         &feed,
@@ -339,23 +420,93 @@ pub async fn run_arcade_reorg_pass(
         release_pending,
     )
     .await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_EVENTS, s.events_finished() as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_REANCHORED, s.reanchored() as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_DEMOTED, s.demoted() as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_UNCORROBORATED, s.skipped_uncorroborated as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_FAULTS, (s.faults + s.errors) as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_UNRESOLVED, (s.skipped_unresolved + s.released_by_operator) as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_TRACKER_LAGGING, s.tracker_lagging as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_CONTENDED, s.contended as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_ARCADE_REORG_BUDGET_STOPS, s.budget_stops as u64).await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_EVENTS,
+        s.events_finished() as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_REANCHORED,
+        s.reanchored() as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_DEMOTED,
+        s.demoted() as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_UNCORROBORATED,
+        s.skipped_uncorroborated as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_FAULTS,
+        (s.faults + s.errors) as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_UNRESOLVED,
+        (s.skipped_unresolved + s.released_by_operator) as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_TRACKER_LAGGING,
+        s.tracker_lagging as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_CONTENDED,
+        s.contended as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_ARCADE_REORG_BUDGET_STOPS,
+        s.budget_stops as u64,
+    )
+    .await;
     // the R2 lifetime totals count the same rows whatever the producer (the
     // sweep, the announce, the operator, or Arcade's event)
     crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, s.demoted() as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_PROOFS, s.demoted() as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_POT_PROOFS, s.pot_beefs.stale as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_STALE_TX_PROOFS, s.transactions.stale as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_REANCHORED, s.reanchored() as u64).await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, (s.spenders.faults + s.pot_beefs.faults + s.transactions.faults) as u64).await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_REORG_STALE_PROOFS,
+        s.demoted() as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_REORG_STALE_POT_PROOFS,
+        s.pot_beefs.stale as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_REORG_STALE_TX_PROOFS,
+        s.transactions.stale as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_REORG_REANCHORED,
+        s.reanchored() as u64,
+    )
+    .await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_REORG_TRACKER_FAULTS,
+        (s.spenders.faults + s.pot_beefs.faults + s.transactions.faults) as u64,
+    )
+    .await;
     console_log!(
         "[arcade-reorg] ({origin}) feed_read={} rows={} malformed={} events_after_cursor={} applied={} skipped_uncorroborated={} unresolved={} released={} held={} lagging={} \
          spenders scanned={} standing={} reanchored={} demoted={} faults={} budget_stops={}; pot_beefs scanned={} stale={}; transactions scanned={} stale={}; \
@@ -413,9 +564,7 @@ pub fn parse_arcade_reorg_trigger(raw: &[u8]) -> Option<bool> {
 /// PURE: the JSON body `POST /internal/arcade-reorg` and the block-event
 /// pass answer for the consumer's outcome.
 pub fn arcade_reorg_summary_json(s: &crate::arcade_reorg::ArcadePassSummary) -> serde_json::Value {
-    let key = |k: &overlay_discovery::pot::arcade_events::EventKey| {
-        serde_json::json!({ "orphanedAt": k.orphaned_at, "height": k.height, "hash": k.hash })
-    };
+    let key = |k: &overlay_discovery::pot::arcade_events::EventKey| serde_json::json!({ "orphanedAt": k.orphaned_at, "height": k.height, "hash": k.hash });
     serde_json::json!({
         "feedRead": s.feed_read,
         "feedRows": s.feed_rows,
@@ -470,7 +619,16 @@ pub async fn internal_arcade_reorg(
         return Response::error("body must be empty or {\"skipPending\": <bool>}", 400);
     };
     let mut memo = crate::reorg_sweep::RootMemo::default();
-    let s = run_arcade_reorg_pass(env, pot_storage, ops_db, "internal", crate::arcade_reorg::PassLimits::cron(), &mut memo, release_pending).await;
+    let s = run_arcade_reorg_pass(
+        env,
+        pot_storage,
+        ops_db,
+        "internal",
+        crate::arcade_reorg::PassLimits::cron(),
+        &mut memo,
+        release_pending,
+    )
+    .await;
     // a demotion or a re-anchor is a served-state change: ship the pot-changed webhook
     crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
     let mut body = arcade_reorg_summary_json(&s);
@@ -487,7 +645,9 @@ pub async fn detect_announce(
     hash: &str,
 ) -> Option<overlay_discovery::pot::reorg::TipAnnounce> {
     match pot_storage.record_header_seen(height, hash).await {
-        Ok(seen) => Some(overlay_discovery::pot::reorg::classify_tip_announce(height, hash, &seen)),
+        Ok(seen) => Some(overlay_discovery::pot::reorg::classify_tip_announce(
+            height, hash, &seen,
+        )),
         Err(e) => {
             crate::proof_fetcher::push_log(&format!(
                 "POST /internal/tip-changed height={height}: header record failed ({e}) — no reorg detection this pass"
@@ -529,7 +689,12 @@ pub fn parse_reorg_trigger(raw: &[u8]) -> Option<ReorgTrigger> {
             rowid: c.get("rowid")?.as_i64()?,
         }),
     };
-    Some(ReorgTrigger { from_height, to_height, limit, after })
+    Some(ReorgTrigger {
+        from_height,
+        to_height,
+        limit,
+        after,
+    })
 }
 
 /// `POST /internal/reorg` (bearer `INTERNAL_TOKEN`): the operator's
@@ -587,8 +752,18 @@ pub async fn internal_reorg(
         // `chain_reorgs_detected_total`, so "zero detected on a healthy
         // stream" stays a true invariant.
         crate::ops::bump_counter(db, crate::ops::COUNTER_OPERATOR_REORG, 1).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, (pass.stale + pass.demoted_blind) as u64).await;
-        crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, pass.faults as u64).await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_DEMOTED,
+            (pass.stale + pass.demoted_blind) as u64,
+        )
+        .await;
+        crate::ops::bump_counter(
+            db,
+            crate::ops::COUNTER_REORG_TRACKER_FAULTS,
+            pass.faults as u64,
+        )
+        .await;
     }
     console_log!(
         "POST /internal/reorg {}..={} limit={} -> 200 (scanned={} standing={} demoted={} demoted_blind={} demote_missed={} faults={} errors={} drained={})",
@@ -643,16 +818,26 @@ mod tests {
     fn parse_tip_changed_hash_is_a_lowercased_64_hex_or_nothing() {
         let h = "00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D";
         assert_eq!(
-            parse_tip_changed_hash(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()).as_deref(),
+            parse_tip_changed_hash(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes())
+                .as_deref(),
             Some(h.to_ascii_lowercase().as_str())
         );
         // an older app-layer forwards the height alone: no hash, no detection
         assert_eq!(parse_tip_changed_hash(br#"{"height": 965771}"#), None);
-        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771, "hash": "abc"}"#), None);
-        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771, "hash": 12}"#), None);
+        assert_eq!(
+            parse_tip_changed_hash(br#"{"height": 965771, "hash": "abc"}"#),
+            None
+        );
+        assert_eq!(
+            parse_tip_changed_hash(br#"{"height": 965771, "hash": 12}"#),
+            None
+        );
         assert_eq!(parse_tip_changed_hash(b"nope"), None);
         // the height parser is untouched by the hash's presence
-        assert_eq!(parse_tip_changed(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()), Some(965771));
+        assert_eq!(
+            parse_tip_changed(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()),
+            Some(965771)
+        );
     }
 
     #[test]
@@ -671,7 +856,10 @@ mod tests {
         // a fresh, high height (never used by another test)
         let h = 9_000_000 + u64::from(std::process::id() % 1000);
         assert!(first_pass_for(h), "first announcement runs the pass");
-        assert!(!first_pass_for(h), "a repeat of the same tip is not a new block");
+        assert!(
+            !first_pass_for(h),
+            "a repeat of the same tip is not a new block"
+        );
         assert!(!first_pass_for(h - 1), "an older tip is not a new block");
         assert!(first_pass_for(h + 1), "the next block runs again");
     }
@@ -681,23 +869,53 @@ mod tests {
         let t = |raw: &str| parse_reorg_trigger(raw.as_bytes());
         assert_eq!(
             t(r#"{"fromHeight":965771}"#),
-            Some(ReorgTrigger { from_height: 965771, to_height: 965771, limit: REORG_DEMOTE_LIMIT, after: None }),
+            Some(ReorgTrigger {
+                from_height: 965771,
+                to_height: 965771,
+                limit: REORG_DEMOTE_LIMIT,
+                after: None
+            }),
             "toHeight defaults to fromHeight: the event's heal is one height"
         );
         assert_eq!(
-            t(r#"{"fromHeight":965771,"toHeight":965773,"limit":50,"cursor":{"height":965772,"rowid":40}}"#),
+            t(
+                r#"{"fromHeight":965771,"toHeight":965773,"limit":50,"cursor":{"height":965772,"rowid":40}}"#
+            ),
             Some(ReorgTrigger {
                 from_height: 965771,
                 to_height: 965773,
                 limit: 50,
-                after: Some(overlay_discovery::pot::reorg::RowKey { height: 965772, rowid: 40 }),
+                after: Some(overlay_discovery::pot::reorg::RowKey {
+                    height: 965772,
+                    rowid: 40
+                }),
             })
         );
-        assert_eq!(t(r#"{"fromHeight":965771,"limit":100000}"#).unwrap().limit, REORG_DEMOTE_LIMIT, "the per-call bound holds");
-        assert_eq!(t(r#"{"fromHeight":965771,"limit":0}"#).unwrap().limit, REORG_DEMOTE_LIMIT);
-        assert_eq!(t(r#"{"fromHeight":965771,"toHeight":null,"cursor":null}"#).unwrap().to_height, 965771);
-        assert_eq!(t(r#"{"fromHeight":965771,"toHeight":965770}"#), None, "a window cannot end below its start");
-        assert_eq!(t(r#"{"fromHeight":965771,"cursor":{"height":1}}"#), None, "a cursor needs both keys");
+        assert_eq!(
+            t(r#"{"fromHeight":965771,"limit":100000}"#).unwrap().limit,
+            REORG_DEMOTE_LIMIT,
+            "the per-call bound holds"
+        );
+        assert_eq!(
+            t(r#"{"fromHeight":965771,"limit":0}"#).unwrap().limit,
+            REORG_DEMOTE_LIMIT
+        );
+        assert_eq!(
+            t(r#"{"fromHeight":965771,"toHeight":null,"cursor":null}"#)
+                .unwrap()
+                .to_height,
+            965771
+        );
+        assert_eq!(
+            t(r#"{"fromHeight":965771,"toHeight":965770}"#),
+            None,
+            "a window cannot end below its start"
+        );
+        assert_eq!(
+            t(r#"{"fromHeight":965771,"cursor":{"height":1}}"#),
+            None,
+            "a cursor needs both keys"
+        );
         assert_eq!(t(r#"{"fromHeight":0}"#), None);
         assert_eq!(t(r#"{"fromHeight":-1}"#), None);
         assert_eq!(t(r#"{"height":965771}"#), None);
@@ -709,8 +927,18 @@ mod tests {
     #[test]
     fn arcade_reorg_summary_json_carries_the_counts_the_cursor_and_the_pending_event() {
         use overlay_discovery::pot::arcade_events::EventKey;
-        let key = EventKey { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: 965771, hash: "cd".repeat(32) };
-        let mut s = crate::arcade_reorg::ArcadePassSummary { applied: 1, skipped_uncorroborated: 1, held: 0, cursor: Some(key.clone()), ..Default::default() };
+        let key = EventKey {
+            orphaned_at: "2026-09-07T22:45:22.316Z".into(),
+            height: 965771,
+            hash: "cd".repeat(32),
+        };
+        let mut s = crate::arcade_reorg::ArcadePassSummary {
+            applied: 1,
+            skipped_uncorroborated: 1,
+            held: 0,
+            cursor: Some(key.clone()),
+            ..Default::default()
+        };
         s.spenders.scanned = 3;
         s.spenders.standing = 1;
         s.spenders.stale = 1;
@@ -730,8 +958,14 @@ mod tests {
         assert_eq!(v["cursor"]["orphanedAt"], "2026-09-07T22:45:22.316Z");
         assert_eq!(v["pending"]["heldPasses"], 2);
         assert_eq!(v["pending"]["event"]["hash"], "cd".repeat(32));
-        assert!(v["stopped"].as_str().unwrap().contains("continues next pass"));
-        let idle = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary { idle: true, ..Default::default() });
+        assert!(v["stopped"]
+            .as_str()
+            .unwrap()
+            .contains("continues next pass"));
+        let idle = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary {
+            idle: true,
+            ..Default::default()
+        });
         assert_eq!(idle["idle"], true);
         assert!(idle["cursor"].is_null() && idle["pending"].is_null() && idle["stopped"].is_null());
         let released = arcade_reorg_summary_json(&crate::arcade_reorg::ArcadePassSummary {
@@ -742,14 +976,35 @@ mod tests {
             contended: 1,
             memo_seeded: 1,
             memo_reads: 3,
-            unresolved: vec![overlay_discovery::pot::arcade_events::UnresolvedEvent { key: key.clone(), why: overlay_discovery::pot::arcade_events::ReleaseReason::Operator }],
+            unresolved: vec![overlay_discovery::pot::arcade_events::UnresolvedEvent {
+                key: key.clone(),
+                why: overlay_discovery::pot::arcade_events::ReleaseReason::Operator,
+            }],
             ..Default::default()
         });
-        assert_eq!((released["skippedUnresolved"].as_u64(), released["releasedByOperator"].as_u64(), released["trackerLagging"].as_u64()), (Some(1), Some(1), Some(2)));
-        assert_eq!((released["budgetStops"].as_u64(), released["contended"].as_u64(), released["memoSeeded"].as_u64(), released["memoReads"].as_u64()), (Some(1), Some(1), Some(1), Some(3)));
+        assert_eq!(
+            (
+                released["skippedUnresolved"].as_u64(),
+                released["releasedByOperator"].as_u64(),
+                released["trackerLagging"].as_u64()
+            ),
+            (Some(1), Some(1), Some(2))
+        );
+        assert_eq!(
+            (
+                released["budgetStops"].as_u64(),
+                released["contended"].as_u64(),
+                released["memoSeeded"].as_u64(),
+                released["memoReads"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1), Some(3))
+        );
         assert_eq!(released["unresolved"][0]["height"], 965771);
         assert_eq!(released["unresolved"][0]["why"], "operator");
-        assert!(released["unresolved"][0]["heal"].as_str().unwrap().contains("\"fromHeight\": 965771"));
+        assert!(released["unresolved"][0]["heal"]
+            .as_str()
+            .unwrap()
+            .contains("\"fromHeight\": 965771"));
     }
 
     /// Round 2 (review MED-3): the operator route's body: empty = one pass,
@@ -760,10 +1015,22 @@ mod tests {
         assert_eq!(parse_arcade_reorg_trigger(b""), Some(false));
         assert_eq!(parse_arcade_reorg_trigger(b"  \n"), Some(false));
         assert_eq!(parse_arcade_reorg_trigger(b"{}"), Some(false));
-        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": false}"#), Some(false));
-        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": null}"#), Some(false));
-        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": true}"#), Some(true));
-        assert_eq!(parse_arcade_reorg_trigger(br#"{"skipPending": "yes"}"#), None);
+        assert_eq!(
+            parse_arcade_reorg_trigger(br#"{"skipPending": false}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_arcade_reorg_trigger(br#"{"skipPending": null}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_arcade_reorg_trigger(br#"{"skipPending": true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_arcade_reorg_trigger(br#"{"skipPending": "yes"}"#),
+            None
+        );
         assert_eq!(parse_arcade_reorg_trigger(b"[]"), None);
         assert_eq!(parse_arcade_reorg_trigger(b"nope"), None);
     }
@@ -791,15 +1058,34 @@ mod tests {
             }
         };
         // 22:39:20Z the 34 MB block at 965771 (the orphan) announced
-        assert_eq!(feed(format!(r#"{{"height":965771,"hash":"{ORPHAN}"}}"#)).await, Some(TipAnnounce::Extends));
+        assert_eq!(
+            feed(format!(r#"{{"height":965771,"hash":"{ORPHAN}"}}"#)).await,
+            Some(TipAnnounce::Extends)
+        );
         // the canonical 965771 announced at the same height: THE reorg producer
-        assert_eq!(feed(format!(r#"{{"height":965771,"hash":"{CANON}"}}"#)).await, Some(TipAnnounce::Reorg { from: 965771 }));
+        assert_eq!(
+            feed(format!(r#"{{"height":965771,"hash":"{CANON}"}}"#)).await,
+            Some(TipAnnounce::Reorg { from: 965771 })
+        );
         // the same announce again (another isolate, a retry): a repeat
-        assert_eq!(feed(format!(r#"{{"height":965771,"hash":"{CANON}"}}"#)).await, Some(TipAnnounce::Repeat));
+        assert_eq!(
+            feed(format!(r#"{{"height":965771,"hash":"{CANON}"}}"#)).await,
+            Some(TipAnnounce::Repeat)
+        );
         // the chain extends
-        assert_eq!(feed(format!(r#"{{"height":965772,"hash":"{NEXT}"}}"#)).await, Some(TipAnnounce::Extends));
+        assert_eq!(
+            feed(format!(r#"{{"height":965772,"hash":"{NEXT}"}}"#)).await,
+            Some(TipAnnounce::Extends)
+        );
         // two webhook tasks landing out of order: 965770 after 965772 is an OLD header, never a reorg
-        assert_eq!(feed(format!(r#"{{"height":965770,"hash":"{}"}}"#, "ab".repeat(32))).await, Some(TipAnnounce::Old));
+        assert_eq!(
+            feed(format!(
+                r#"{{"height":965770,"hash":"{}"}}"#,
+                "ab".repeat(32)
+            ))
+            .await,
+            Some(TipAnnounce::Old)
+        );
         // an older announcer's hash-less body: nothing to compare, no detection
         assert_eq!(feed(r#"{"height":965773}"#.to_string()).await, None);
     }

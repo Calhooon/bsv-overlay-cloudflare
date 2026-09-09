@@ -257,7 +257,11 @@ fn root_matches_frame(
 /// pass reads it when the announcer's body carried none (an older
 /// chaintracks). `None` on any fault, logged by the caller.
 pub(crate) async fn chaintracks_block_hash(env: &worker::Env, height: u64) -> Option<String> {
-    chaintracks_block_hash_detailed(env, height).await.ok().flatten().map(|h| h.0)
+    chaintracks_block_hash_detailed(env, height)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.0)
 }
 
 /// bsv-low M19B-G1: [`chaintracks_block_hash`] with the READ FAULT kept
@@ -285,9 +289,14 @@ pub(crate) async fn chaintracks_block_hash_detailed(
         .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
     let service = env.service("CHAINTRACKS").ok();
     if service.is_none() && env.var("CHAIN_TRACKER_URL").is_err() {
-        return Err("no header source configured (CHAINTRACKS binding / CHAIN_TRACKER_URL)".to_string());
+        return Err(
+            "no header source configured (CHAINTRACKS binding / CHAIN_TRACKER_URL)".to_string(),
+        );
     }
-    let url = format!("{}/findHeaderHexForHeight?height={height}", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/findHeaderHexForHeight?height={height}",
+        base_url.trim_end_matches('/')
+    );
     let mut response = ct_get(url, &service, "findHeaderHexForHeight")
         .await
         .map_err(|e| format!("chaintracks header read at {height}: {e}"))?;
@@ -296,21 +305,28 @@ pub(crate) async fn chaintracks_block_hash_detailed(
         return Ok(None);
     }
     if !(200..300).contains(&status) {
-        return Err(format!("chaintracks header read at {height}: HTTP {status}"));
+        return Err(format!(
+            "chaintracks header read at {height}: HTTP {status}"
+        ));
     }
     let frame: ResponseFrame<CtHash> = response
         .json()
         .await
         .map_err(|e| format!("chaintracks header read at {height}: parse: {e}"))?;
     if !frame.is_success() {
-        return Err(format!("chaintracks header read at {height}: status={}", frame.status));
+        return Err(format!(
+            "chaintracks header read at {height}: status={}",
+            frame.status
+        ));
     }
     let header = frame
         .value
         .ok_or_else(|| format!("chaintracks header read at {height}: success with no header"))?;
     let hash = header.hash.trim().to_ascii_lowercase();
     if !(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())) {
-        return Err(format!("chaintracks header read at {height}: malformed hash"));
+        return Err(format!(
+            "chaintracks header read at {height}: malformed hash"
+        ));
     }
     let root = header
         .merkle_root
@@ -428,7 +444,10 @@ mod root_frame_tests {
         // The security fix: a success+null body is UNVERIFIABLE → false, never
         // a fail-open true that would confirm an arbitrary root.
         assert!(
-            matches!(root_matches_frame(None, "anything"), Err(bsv_rs::transaction::ChainTrackerError::InvalidResponse(_))),
+            matches!(
+                root_matches_frame(None, "anything"),
+                Err(bsv_rs::transaction::ChainTrackerError::InvalidResponse(_))
+            ),
             "an absent header is a FAULT, never a refutation (review L1)"
         );
     }

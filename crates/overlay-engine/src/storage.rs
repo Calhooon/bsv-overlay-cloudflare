@@ -136,10 +136,8 @@ pub trait Storage {
     /// deduplicated away. The caller proves the row is PHANTOM (no stored
     /// output of that txid on that topic) before asking — see
     /// `Engine::forget_phantom_applied`.
-    async fn delete_applied_transaction(
-        &self,
-        tx: &AppliedTransaction,
-    ) -> Result<(), StorageError>;
+    async fn delete_applied_transaction(&self, tx: &AppliedTransaction)
+        -> Result<(), StorageError>;
 
     // ========================================================================
     // Read operations
@@ -719,7 +717,10 @@ pub mod memory {
             // the anchor (review MED-2/LOW-4). Recorded so the Rc-forward pin
             // can observe the height reaching the inner store.
             self.proven.lock().unwrap().insert(txid.to_string());
-            self.proven_at.lock().unwrap().insert(txid.to_string(), height);
+            self.proven_at
+                .lock()
+                .unwrap()
+                .insert(txid.to_string(), height);
             Ok(())
         }
 
@@ -994,12 +995,26 @@ mod tests {
     async fn the_rc_blanket_forwards_the_anchored_proven_latch() {
         let store = std::rc::Rc::new(MemoryStorage::new());
         let via_dyn: std::rc::Rc<dyn Storage> = store.clone();
-        via_dyn.mark_transaction_proven_at("tx", Some(965_772)).await.unwrap();
-        assert_eq!(store.proven_at_height("tx"), Some(Some(965_772)), "the Rc blanket forwarded the height to the inner store");
+        via_dyn
+            .mark_transaction_proven_at("tx", Some(965_772))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.proven_at_height("tx"),
+            Some(Some(965_772)),
+            "the Rc blanket forwarded the height to the inner store"
+        );
         // a height-less call still forwards (records None, not "never called")
-        via_dyn.mark_transaction_proven_at("tx2", None).await.unwrap();
+        via_dyn
+            .mark_transaction_proven_at("tx2", None)
+            .await
+            .unwrap();
         assert_eq!(store.proven_at_height("tx2"), Some(None));
-        assert_eq!(store.proven_at_height("never"), None, "a txid never latched is absent");
+        assert_eq!(
+            store.proven_at_height("never"),
+            None,
+            "a txid never latched is absent"
+        );
     }
 
     fn make_output(txid: &str, index: u32, topic: &str, score: f64) -> Output {

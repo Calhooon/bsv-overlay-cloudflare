@@ -371,20 +371,24 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
     match row {
         Err(_) => json!({ "readable": false, "everRan": false }),
         Ok(None) => json!({ "readable": true, "everRan": false, "cursor": null, "pending": null }),
-        Ok(Some(r)) => match overlay_discovery::pot::arcade_events::ConsumerState::from_json(&r.state) {
-            Ok(state) => arcade_reorg_state_json(
-                &state,
-                r.updated_at.map(|v| v.max(0.0) as i64),
-                r.version.map(|v| v.max(0.0) as u64),
-            ),
-            Err(e) => json!({ "readable": false, "everRan": true, "error": e }),
-        },
+        Ok(Some(r)) => {
+            match overlay_discovery::pot::arcade_events::ConsumerState::from_json(&r.state) {
+                Ok(state) => arcade_reorg_state_json(
+                    &state,
+                    r.updated_at.map(|v| v.max(0.0) as i64),
+                    r.version.map(|v| v.max(0.0) as u64),
+                ),
+                Err(e) => json!({ "readable": false, "everRan": true, "error": e }),
+            }
+        }
     }
 }
 
 /// PURE (round 3, review MED): the released events on record, each with the
 /// `/internal/reorg` body that heals its height, newest last.
-pub fn unresolved_json(unresolved: &[overlay_discovery::pot::arcade_events::UnresolvedEvent]) -> serde_json::Value {
+pub fn unresolved_json(
+    unresolved: &[overlay_discovery::pot::arcade_events::UnresolvedEvent],
+) -> serde_json::Value {
     let why = |w: overlay_discovery::pot::arcade_events::ReleaseReason| match w {
         overlay_discovery::pot::arcade_events::ReleaseReason::HeldCeiling => "held-ceiling",
         overlay_discovery::pot::arcade_events::ReleaseReason::FaultCeiling => "fault-ceiling",
@@ -412,9 +416,7 @@ pub fn arcade_reorg_state_json(
     updated_at_ms: Option<i64>,
     version: Option<u64>,
 ) -> serde_json::Value {
-    let key = |k: &overlay_discovery::pot::arcade_events::EventKey| {
-        json!({ "orphanedAt": k.orphaned_at, "height": k.height, "hash": k.hash })
-    };
+    let key = |k: &overlay_discovery::pot::arcade_events::EventKey| json!({ "orphanedAt": k.orphaned_at, "height": k.height, "hash": k.hash });
     json!({
         "readable": true,
         "everRan": true,
@@ -740,8 +742,9 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
 /// spelling of the same value is what `read_counters` deliberately avoids.
 fn arc_ingest_push_health(counters: &serde_json::Value) -> &'static str {
     let v = |name: &str| counters.get(name).and_then(|x| x.as_u64()).unwrap_or(0);
-    let admitted =
-        v(COUNTER_ARC_INGEST_PUSHED) + v(COUNTER_ARC_INGEST_STATUS_IGNORED) + v(COUNTER_ARC_INGEST_UNKNOWN_TXID);
+    let admitted = v(COUNTER_ARC_INGEST_PUSHED)
+        + v(COUNTER_ARC_INGEST_STATUS_IGNORED)
+        + v(COUNTER_ARC_INGEST_UNKNOWN_TXID);
     let refused = v(COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN) + v(COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN);
     match (admitted, refused) {
         (0, 0) => "silent",
@@ -1035,13 +1038,20 @@ mod tests {
         assert_eq!(v["readable"], true);
         assert_eq!(v["everRan"], true);
         assert!(v["cursor"].is_null() && v["pending"].is_null());
-        let ev = OrphanEvent { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: 965771, hash: "ab".repeat(32) };
+        let ev = OrphanEvent {
+            orphaned_at: "2026-09-07T22:45:22.316Z".into(),
+            height: 965771,
+            hash: "ab".repeat(32),
+        };
         state.start(ev.clone());
         state.hold_pending();
         state.note_fault_on_pending();
         let v = arcade_reorg_state_json(&state, Some(1_700_000_000_000), Some(7));
         assert_eq!(v["pending"]["event"]["height"], 965771);
-        assert_eq!(v["pending"]["event"]["orphanedAt"], "2026-09-07T22:45:22.316Z");
+        assert_eq!(
+            v["pending"]["event"]["orphanedAt"],
+            "2026-09-07T22:45:22.316Z"
+        );
         assert_eq!(v["pending"]["heldPasses"], 1);
         assert_eq!(v["pending"]["faultPasses"], 1);
         assert_eq!(v["pending"]["spendersExhausted"], false);
@@ -1051,16 +1061,27 @@ mod tests {
         let v = arcade_reorg_state_json(&state, Some(1), Some(8));
         assert_eq!(v["cursor"]["hash"], "ab".repeat(32));
         assert!(v["pending"].is_null());
-        assert_eq!(v["unresolved"].as_array().map(Vec::len), Some(0), "nothing released: an empty list, never absent");
+        assert_eq!(
+            v["unresolved"].as_array().map(Vec::len),
+            Some(0),
+            "nothing released: an empty list, never absent"
+        );
         // round 3 (review MED): a released event is on the surface with its height, hash, reason and heal
-        state.start(OrphanEvent { orphaned_at: "2026-09-07T22:48:27.809Z".into(), height: 965773, hash: "cd".repeat(32) });
+        state.start(OrphanEvent {
+            orphaned_at: "2026-09-07T22:48:27.809Z".into(),
+            height: 965773,
+            hash: "cd".repeat(32),
+        });
         state.release_pending(overlay_discovery::pot::arcade_events::ReleaseReason::HeldCeiling);
         let v = arcade_reorg_state_json(&state, Some(1), Some(9));
         assert_eq!(v["unresolved"][0]["height"], 965773);
         assert_eq!(v["unresolved"][0]["hash"], "cd".repeat(32));
         assert_eq!(v["unresolved"][0]["orphanedAt"], "2026-09-07T22:48:27.809Z");
         assert_eq!(v["unresolved"][0]["why"], "held-ceiling");
-        assert_eq!(v["unresolved"][0]["heal"], "POST /internal/reorg {\"fromHeight\": 965773, \"toHeight\": 965773}");
+        assert_eq!(
+            v["unresolved"][0]["heal"],
+            "POST /internal/reorg {\"fromHeight\": 965773, \"toHeight\": 965773}"
+        );
         // every counter the consumer bumps is seeded on the surface
         let obj = json!({
             COUNTER_ARCADE_REORG_EVENTS: 0,

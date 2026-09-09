@@ -120,7 +120,10 @@ pub fn parse_block_status_page(body: &str) -> Result<BlockStatusPage, String> {
         ..Default::default()
     };
     for row in blocks {
-        let status = row.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+        let status = row
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if status == "active" {
             if let Some(h) = row.get("blockHeight").and_then(serde_json::Value::as_u64) {
                 page.newest_height = Some(page.newest_height.map_or(h, |m| m.max(h)));
@@ -147,7 +150,11 @@ pub fn parse_block_status_page(body: &str) -> Result<BlockStatusPage, String> {
             .map(str::to_string);
         match (hash, height, orphaned_at) {
             (Some(hash), Some(height), Some(orphaned_at)) => {
-                page.orphans.push(OrphanEvent { orphaned_at, height, hash });
+                page.orphans.push(OrphanEvent {
+                    orphaned_at,
+                    height,
+                    hash,
+                });
             }
             _ => page.malformed += 1,
         }
@@ -215,7 +222,9 @@ pub fn classify_corroboration(
         return Corroboration::TrackerLagging;
     }
     match canonical_at_height {
-        Some(canonical) if !canonical.eq_ignore_ascii_case(orphan_hash) => Corroboration::Corroborated,
+        Some(canonical) if !canonical.eq_ignore_ascii_case(orphan_hash) => {
+            Corroboration::Corroborated
+        }
         _ if tip >= height.saturating_add(skip_depth) => Corroboration::Uncorroborated,
         _ => Corroboration::Held,
     }
@@ -344,7 +353,12 @@ fn default_version() -> u32 {
 
 impl Default for ConsumerState {
     fn default() -> Self {
-        Self { v: CONSUMER_STATE_VERSION, cursor: None, pending: None, unresolved: Vec::new() }
+        Self {
+            v: CONSUMER_STATE_VERSION,
+            cursor: None,
+            pending: None,
+            unresolved: Vec::new(),
+        }
     }
 }
 
@@ -364,26 +378,37 @@ impl ConsumerState {
                 s.v, CONSUMER_STATE_VERSION
             ));
         }
-        let well_formed = |what: &str, stamp: &str, height: u64, hash: &str| -> Result<(), String> {
-            if !is_block_hash(hash) {
-                return Err(format!("consumer state: {what} carries a malformed hash"));
-            }
-            if !is_arcade_stamp(stamp) {
-                return Err(format!("consumer state: {what} carries a malformed stamp"));
-            }
-            if height == 0 {
-                return Err(format!("consumer state: {what} carries height 0"));
-            }
-            Ok(())
-        };
+        let well_formed =
+            |what: &str, stamp: &str, height: u64, hash: &str| -> Result<(), String> {
+                if !is_block_hash(hash) {
+                    return Err(format!("consumer state: {what} carries a malformed hash"));
+                }
+                if !is_arcade_stamp(stamp) {
+                    return Err(format!("consumer state: {what} carries a malformed stamp"));
+                }
+                if height == 0 {
+                    return Err(format!("consumer state: {what} carries height 0"));
+                }
+                Ok(())
+            };
         if let Some(c) = &s.cursor {
             well_formed("the cursor", &c.orphaned_at, c.height, &c.hash)?;
         }
         if let Some(p) = &s.pending {
-            well_formed("the pending event", &p.event.orphaned_at, p.event.height, &p.event.hash)?;
+            well_formed(
+                "the pending event",
+                &p.event.orphaned_at,
+                p.event.height,
+                &p.event.hash,
+            )?;
         }
         for u in &s.unresolved {
-            well_formed("an unresolved event", &u.key.orphaned_at, u.key.height, &u.key.hash)?;
+            well_formed(
+                "an unresolved event",
+                &u.key.orphaned_at,
+                u.key.height,
+                &u.key.hash,
+            )?;
         }
         Ok(s)
     }
@@ -446,7 +471,10 @@ impl ConsumerState {
     /// newest [`UNRESOLVED_KEPT`]. Returns the released key.
     pub fn release_pending(&mut self, why: ReleaseReason) -> Option<EventKey> {
         let key = self.advance_past_pending()?;
-        self.unresolved.push(UnresolvedEvent { key: key.clone(), why });
+        self.unresolved.push(UnresolvedEvent {
+            key: key.clone(),
+            why,
+        });
         if self.unresolved.len() > UNRESOLVED_KEPT {
             let excess = self.unresolved.len() - UNRESOLVED_KEPT;
             self.unresolved.drain(..excess);
@@ -472,18 +500,30 @@ mod tests {
     /// `GET /api/v1/blocks/processing-status/<the 965771 orphan>`, verbatim.
     pub(crate) const REAL_ORPHAN_ROW_965771: &str = r#"{"blockHash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1","blockHeight":965771,"headerSeenAt":"2026-09-07T22:39:23.208Z","processedAt":"2026-09-07T22:39:39.393Z","bumpBuiltAt":"2026-09-07T22:39:39.392Z","status":"orphaned","orphanedAt":"2026-09-07T22:45:22.316Z","hasBlockProcessed":true,"hasCompoundBUMP":true}"#;
 
-    pub(crate) const ORPHAN_965771: &str = "0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1";
-    pub(crate) const CANONICAL_965771: &str = "00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d";
-    pub(crate) const CANONICAL_965773: &str = "0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33";
-    pub(crate) const EMPTY_SIBLING_965773: &str = "00000000000000000851a554167480b696b3dbd36ab1fd862f2520217988afa0";
+    pub(crate) const ORPHAN_965771: &str =
+        "0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1";
+    pub(crate) const CANONICAL_965771: &str =
+        "00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d";
+    pub(crate) const CANONICAL_965773: &str =
+        "0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33";
+    pub(crate) const EMPTY_SIBLING_965773: &str =
+        "00000000000000000851a554167480b696b3dbd36ab1fd862f2520217988afa0";
 
     #[test]
     fn parses_arcades_real_block_status_page_into_ordered_orphan_events() {
         let page = parse_block_status_page(REAL_PAGE_965769_965775).unwrap();
         assert_eq!(page.rows, 8);
         assert_eq!(page.malformed, 0);
-        assert_eq!(page.next_cursor, Some(965769), "Arcade's keyset cursor rides along");
-        assert_eq!(page.newest_height, Some(965775), "the page's newest ACTIVE height is Arcade's tip view");
+        assert_eq!(
+            page.next_cursor,
+            Some(965769),
+            "Arcade's keyset cursor rides along"
+        );
+        assert_eq!(
+            page.newest_height,
+            Some(965775),
+            "the page's newest ACTIVE height is Arcade's tip view"
+        );
         // round 3 (review LOW-2): an orphaned or parked row with a garbage height never
         // raises the feed's tip view (it would hold every event as "tracker lagging")
         let garbage = format!(
@@ -495,12 +535,22 @@ mod tests {
         );
         let g = parse_block_status_page(&garbage).unwrap();
         assert_eq!(g.newest_height, Some(965771), "active rows only");
-        assert_eq!(g.orphans.len(), 1, "the garbage-height orphan is still an event (its own corroboration decides it)");
+        assert_eq!(
+            g.orphans.len(),
+            1,
+            "the garbage-height orphan is still an event (its own corroboration decides it)"
+        );
         let none_active = parse_block_status_page(&format!(r#"{{"blocks":[{{"blockHash":"{ORPHAN_965771}","blockHeight":965771,"status":"orphaned","orphanedAt":"2026-09-07T22:45:22.316Z"}}]}}"#)).unwrap();
-        assert_eq!(none_active.newest_height, None, "no active row: no tip view (no lag verdict possible)");
+        assert_eq!(
+            none_active.newest_height, None,
+            "no active row: no tip view (no lag verdict possible)"
+        );
         // the three orphaned rows, in the page's own order (height DESC)
         assert_eq!(
-            page.orphans.iter().map(|o| (o.height, o.hash.as_str(), o.orphaned_at.as_str())).collect::<Vec<_>>(),
+            page.orphans
+                .iter()
+                .map(|o| (o.height, o.hash.as_str(), o.orphaned_at.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (965773, CANONICAL_965773, "2026-09-07T22:48:27.809Z"),
                 (965773, EMPTY_SIBLING_965773, "2026-09-07T23:14:57.307Z"),
@@ -510,7 +560,10 @@ mod tests {
         // the consumer's order: by the stamp, so the 34 MB orphan is the FIRST event
         let ordered = events_after(&page.orphans, None);
         assert_eq!(
-            ordered.iter().map(|o| (o.orphaned_at.as_str(), o.height)).collect::<Vec<_>>(),
+            ordered
+                .iter()
+                .map(|o| (o.orphaned_at.as_str(), o.height))
+                .collect::<Vec<_>>(),
             vec![
                 ("2026-09-07T22:45:22.316Z", 965771),
                 ("2026-09-07T22:48:27.809Z", 965773),
@@ -523,7 +576,15 @@ mod tests {
         assert!(parse_block_status_page(r#"{"blocks": 3}"#).is_err());
         // an empty last page
         let last = parse_block_status_page(r#"{"blocks":[]}"#).unwrap();
-        assert_eq!((last.rows, last.orphans.len(), last.next_cursor, last.newest_height), (0, 0, None, None));
+        assert_eq!(
+            (
+                last.rows,
+                last.orphans.len(),
+                last.next_cursor,
+                last.newest_height
+            ),
+            (0, 0, None, None)
+        );
     }
 
     #[test]
@@ -548,11 +609,24 @@ mod tests {
         let page = parse_block_status_page(&body).unwrap();
         assert_eq!(page.rows, 8);
         assert_eq!(page.malformed, 5, "the five broken orphan rows are counted");
-        assert_eq!(page.orphans.len(), 1, "active and parked rows are not events");
-        assert_eq!(page.orphans[0].hash, ORPHAN_965771, "the hash is lower-cased");
+        assert_eq!(
+            page.orphans.len(),
+            1,
+            "active and parked rows are not events"
+        );
+        assert_eq!(
+            page.orphans[0].hash, ORPHAN_965771,
+            "the hash is lower-cased"
+        );
         assert!(is_arcade_stamp("2026-09-07T22:45:22.316Z"));
-        assert!(!is_arcade_stamp("2026-09-07T22:45:22Z"), "no millisecond field");
-        assert!(!is_arcade_stamp("2026-09-07T22:45:22.316+02:00"), "a zone offset is not Arcade's UTC shape");
+        assert!(
+            !is_arcade_stamp("2026-09-07T22:45:22Z"),
+            "no millisecond field"
+        );
+        assert!(
+            !is_arcade_stamp("2026-09-07T22:45:22.316+02:00"),
+            "a zone offset is not Arcade's UTC shape"
+        );
         assert!(!is_arcade_stamp("2026-09-07T22:45:22.31Z"));
     }
 
@@ -569,7 +643,10 @@ mod tests {
         let sse_frame = format!(
             r#"{{"orphanedHashes":["{ORPHAN_965771}"],"commonAncestor":{{"height":965770,"hash":"00000000000000000e9fda93c1e2d4a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1"}},"newTip":{{"height":965771,"hash":"{CANONICAL_965771}"}},"depth":1}}"#
         );
-        assert!(parse_block_status_page(&sse_frame).is_err(), "the stream frame is not the listing");
+        assert!(
+            parse_block_status_page(&sse_frame).is_err(),
+            "the stream frame is not the listing"
+        );
         let unknown = format!(
             r#"{{"blocks":[
               {{"blockHash":"{ORPHAN_965771}","blockHeight":965771,"status":"resurrected","orphanedAt":"2026-09-07T22:45:22.316Z"}},
@@ -594,23 +671,50 @@ mod tests {
         let b = ev("2026-09-07T22:45:22.316Z", 965771, &"aa".repeat(32));
         let c = ev("2026-09-07T23:14:57.307Z", 965773, &"cc".repeat(32));
         let d = ev("2026-09-07T22:48:27.809Z", 965773, &"dd".repeat(32));
-        let all = events_after(&[c.clone(), a.clone(), b.clone(), d.clone(), a.clone()], None);
-        assert_eq!(all, vec![b.clone(), a.clone(), d.clone(), c.clone()], "ascending, deduped");
+        let all = events_after(
+            &[c.clone(), a.clone(), b.clone(), d.clone(), a.clone()],
+            None,
+        );
+        assert_eq!(
+            all,
+            vec![b.clone(), a.clone(), d.clone(), c.clone()],
+            "ascending, deduped"
+        );
         // the cursor excludes itself and everything before
-        assert_eq!(events_after(&[c.clone(), a.clone(), b.clone(), d.clone()], Some(&a.key())), vec![d.clone(), c.clone()]);
-        assert_eq!(events_after(&[c.clone(), a.clone(), b.clone(), d.clone()], Some(&c.key())), vec![]);
+        assert_eq!(
+            events_after(
+                &[c.clone(), a.clone(), b.clone(), d.clone()],
+                Some(&a.key())
+            ),
+            vec![d.clone(), c.clone()]
+        );
+        assert_eq!(
+            events_after(
+                &[c.clone(), a.clone(), b.clone(), d.clone()],
+                Some(&c.key())
+            ),
+            vec![]
+        );
         // a resurrected block orphaned AGAIN is a newer stamp: a new event after the old cursor
         let again = ev("2026-09-08T01:00:00.000Z", 965771, &"aa".repeat(32));
-        assert_eq!(events_after(&[b.clone(), again.clone()], Some(&b.key())), vec![again]);
+        assert_eq!(
+            events_after(&[b.clone(), again.clone()], Some(&b.key())),
+            vec![again]
+        );
         // the key's derived order is the stamp first
         assert!(b.key() < a.key() && a.key() < d.key() && d.key() < c.key());
     }
 
     #[test]
     fn corroboration_needs_chaintracks_to_disagree_with_the_orphan() {
-        let c = |canonical: Option<&str>, orphan: &str, tip: u64, height: u64| classify_corroboration(canonical, orphan, tip, height, 3, Some(tip), 3);
+        let c = |canonical: Option<&str>, orphan: &str, tip: u64, height: u64| {
+            classify_corroboration(canonical, orphan, tip, height, 3, Some(tip), 3)
+        };
         // the real 965771: chaintracks holds the canonical block there
-        assert_eq!(c(Some(CANONICAL_965771), ORPHAN_965771, 965_860, 965_771), Corroboration::Corroborated);
+        assert_eq!(
+            c(Some(CANONICAL_965771), ORPHAN_965771, 965_860, 965_771),
+            Corroboration::Corroborated
+        );
         // the real 965773: Arcade says orphaned, chaintracks holds THAT hash deep below its tip
         assert_eq!(
             c(Some(CANONICAL_965773), CANONICAL_965773, 965_860, 965_773),
@@ -618,21 +722,42 @@ mod tests {
             "Arcade's row is wrong for our header source: skipped, counted"
         );
         assert_eq!(
-            c(Some(&CANONICAL_965773.to_ascii_uppercase()), CANONICAL_965773, 965_860, 965_773),
+            c(
+                Some(&CANONICAL_965773.to_ascii_uppercase()),
+                CANONICAL_965773,
+                965_860,
+                965_773
+            ),
             Corroboration::Uncorroborated,
             "case-insensitive"
         );
         // the same hash near the tip: chaintracks may lag Arcade by a sync
         for tip in [965_773, 965_774, 965_775] {
-            assert_eq!(c(Some(CANONICAL_965773), CANONICAL_965773, tip, 965_773), Corroboration::Held, "tip {tip}");
+            assert_eq!(
+                c(Some(CANONICAL_965773), CANONICAL_965773, tip, 965_773),
+                Corroboration::Held,
+                "tip {tip}"
+            );
         }
-        assert_eq!(c(Some(CANONICAL_965773), CANONICAL_965773, 965_776, 965_773), Corroboration::Uncorroborated);
+        assert_eq!(
+            c(Some(CANONICAL_965773), CANONICAL_965773, 965_776, 965_773),
+            Corroboration::Uncorroborated
+        );
         // round 2 (review MED-3): no header at that height NEAR the tip holds; DEEP below the tip it is
         // uncorroborated (chaintracks serves nothing there and is not lagging), never a hold forever
-        assert_eq!(c(None, ORPHAN_965771, 965_772, 965_771), Corroboration::Held);
-        assert_eq!(c(None, ORPHAN_965771, 965_860, 965_771), Corroboration::Uncorroborated);
+        assert_eq!(
+            c(None, ORPHAN_965771, 965_772, 965_771),
+            Corroboration::Held
+        );
+        assert_eq!(
+            c(None, ORPHAN_965771, 965_860, 965_771),
+            Corroboration::Uncorroborated
+        );
         // a disagreement is corroborated even at the tip
-        assert_eq!(c(Some(CANONICAL_965771), ORPHAN_965771, 965_771, 965_771), Corroboration::Corroborated);
+        assert_eq!(
+            c(Some(CANONICAL_965771), ORPHAN_965771, 965_771, 965_771),
+            Corroboration::Corroborated
+        );
     }
 
     /// Round 2 (review LOW-3): a header source BEHIND Arcade's listing by
@@ -644,22 +769,54 @@ mod tests {
     fn a_lagging_tracker_holds_and_is_counted_apart_from_an_uncorroborated_event() {
         // Arcade lists up to 965860; chaintracks reads 965850: 10 behind, tolerance 3
         assert_eq!(
-            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_850, 965_773, 3, Some(965_860), 3),
+            classify_corroboration(
+                Some(CANONICAL_965773),
+                CANONICAL_965773,
+                965_850,
+                965_773,
+                3,
+                Some(965_860),
+                3
+            ),
             Corroboration::TrackerLagging
         );
         assert_eq!(
-            classify_corroboration(Some(CANONICAL_965771), ORPHAN_965771, 965_850, 965_771, 3, Some(965_860), 3),
+            classify_corroboration(
+                Some(CANONICAL_965771),
+                ORPHAN_965771,
+                965_850,
+                965_771,
+                3,
+                Some(965_860),
+                3
+            ),
             Corroboration::TrackerLagging,
             "even a disagreement waits while our header source is behind the feed"
         );
         // within the tolerance the ordinary verdicts apply
         assert_eq!(
-            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_857, 965_773, 3, Some(965_860), 3),
+            classify_corroboration(
+                Some(CANONICAL_965773),
+                CANONICAL_965773,
+                965_857,
+                965_773,
+                3,
+                Some(965_860),
+                3
+            ),
             Corroboration::Uncorroborated
         );
         // no feed height known: no lag verdict possible
         assert_eq!(
-            classify_corroboration(Some(CANONICAL_965773), CANONICAL_965773, 965_850, 965_773, 3, None, 3),
+            classify_corroboration(
+                Some(CANONICAL_965773),
+                CANONICAL_965773,
+                965_850,
+                965_773,
+                3,
+                None,
+                3
+            ),
             Corroboration::Uncorroborated
         );
     }
@@ -671,7 +828,11 @@ mod tests {
     fn the_next_page_relists_the_boundary_height() {
         assert_eq!(next_page_before(Some(965_769)), Some(965_770));
         assert_eq!(next_page_before(None), None, "the last page");
-        assert_eq!(next_page_before(Some(0)), None, "a height-0 cursor is the placeholder floor");
+        assert_eq!(
+            next_page_before(Some(0)),
+            None,
+            "a height-0 cursor is the placeholder floor"
+        );
     }
 
     /// Round 3 (review MED): a release RECORDS the event with its reason in
@@ -681,9 +842,17 @@ mod tests {
     /// `UNRESOLVED_KEPT`.
     #[test]
     fn a_release_is_recorded_with_its_reason_and_the_record_is_bounded() {
-        let ev = |h: u64| OrphanEvent { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: h, hash: format!("{h:064x}") };
+        let ev = |h: u64| OrphanEvent {
+            orphaned_at: "2026-09-07T22:45:22.316Z".into(),
+            height: h,
+            hash: format!("{h:064x}"),
+        };
         let mut s = ConsumerState::default();
-        assert_eq!(s.release_pending(ReleaseReason::Operator), None, "nothing pending: nothing recorded");
+        assert_eq!(
+            s.release_pending(ReleaseReason::Operator),
+            None,
+            "nothing pending: nothing recorded"
+        );
         assert!(s.unresolved.is_empty());
         // which ceiling
         s.start(ev(965771));
@@ -694,24 +863,56 @@ mod tests {
         let why = s.pending_ceiling(2, 2).unwrap();
         assert_eq!(s.release_pending(why), Some(ev(965771).key()));
         assert_eq!(s.cursor, Some(ev(965771).key()), "the cursor moved past it");
-        assert_eq!(s.unresolved, vec![UnresolvedEvent { key: ev(965771).key(), why: ReleaseReason::FaultCeiling }]);
+        assert_eq!(
+            s.unresolved,
+            vec![UnresolvedEvent {
+                key: ev(965771).key(),
+                why: ReleaseReason::FaultCeiling
+            }]
+        );
         s.start(ev(965773));
         s.hold_pending();
         s.hold_pending();
-        assert_eq!(s.pending_ceiling(2, 2), Some(ReleaseReason::HeldCeiling), "the held ceiling reads first");
+        assert_eq!(
+            s.pending_ceiling(2, 2),
+            Some(ReleaseReason::HeldCeiling),
+            "the held ceiling reads first"
+        );
         s.release_pending(ReleaseReason::HeldCeiling);
         s.start(ev(965775));
         s.release_pending(ReleaseReason::Operator);
-        assert_eq!(s.unresolved.iter().map(|u| (u.key.height, u.why)).collect::<Vec<_>>(), vec![(965771, ReleaseReason::FaultCeiling), (965773, ReleaseReason::HeldCeiling), (965775, ReleaseReason::Operator)]);
+        assert_eq!(
+            s.unresolved
+                .iter()
+                .map(|u| (u.key.height, u.why))
+                .collect::<Vec<_>>(),
+            vec![
+                (965771, ReleaseReason::FaultCeiling),
+                (965773, ReleaseReason::HeldCeiling),
+                (965775, ReleaseReason::Operator)
+            ]
+        );
         // the record round-trips, with its reasons in kebab-case
         let doc = s.to_json();
-        assert!(doc.contains("\"fault-ceiling\"") && doc.contains("\"held-ceiling\"") && doc.contains("\"operator\""), "{doc}");
+        assert!(
+            doc.contains("\"fault-ceiling\"")
+                && doc.contains("\"held-ceiling\"")
+                && doc.contains("\"operator\""),
+            "{doc}"
+        );
         assert_eq!(ConsumerState::from_json(&doc).unwrap(), s);
         // an older document without the field reads as no record
-        assert!(ConsumerState::from_json(r#"{"v":1,"cursor":null,"pending":null}"#).unwrap().unresolved.is_empty());
+        assert!(
+            ConsumerState::from_json(r#"{"v":1,"cursor":null,"pending":null}"#)
+                .unwrap()
+                .unresolved
+                .is_empty()
+        );
         // a malformed recorded key is refused like the cursor's
         let bad = r#"{"v":1,"cursor":null,"pending":null,"unresolved":[{"key":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"abc"},"why":"operator"}]}"#;
-        assert!(ConsumerState::from_json(bad).unwrap_err().contains("unresolved"));
+        assert!(ConsumerState::from_json(bad)
+            .unwrap_err()
+            .contains("unresolved"));
         // the bound: the newest UNRESOLVED_KEPT are kept, the oldest drop
         let mut b = ConsumerState::default();
         for h in 1..=(UNRESOLVED_KEPT as u64 + 5) {
@@ -719,8 +920,15 @@ mod tests {
             b.release_pending(ReleaseReason::Operator);
         }
         assert_eq!(b.unresolved.len(), UNRESOLVED_KEPT);
-        assert_eq!(b.unresolved.first().map(|u| u.key.height), Some(6), "the five oldest dropped");
-        assert_eq!(b.unresolved.last().map(|u| u.key.height), Some(UNRESOLVED_KEPT as u64 + 5));
+        assert_eq!(
+            b.unresolved.first().map(|u| u.key.height),
+            Some(6),
+            "the five oldest dropped"
+        );
+        assert_eq!(
+            b.unresolved.last().map(|u| u.key.height),
+            Some(UNRESOLVED_KEPT as u64 + 5)
+        );
     }
 
     /// Round 2 (review MED-3 + MED-4): the head-of-line ceiling releases a
@@ -728,7 +936,11 @@ mod tests {
     /// stamp or height is refused (a counted fault), never read.
     #[test]
     fn the_ceiling_releases_a_stuck_event_and_a_malformed_document_is_refused() {
-        let ev = OrphanEvent { orphaned_at: "2026-09-07T22:45:22.316Z".into(), height: 965771, hash: ORPHAN_965771.into() };
+        let ev = OrphanEvent {
+            orphaned_at: "2026-09-07T22:45:22.316Z".into(),
+            height: 965771,
+            hash: ORPHAN_965771.into(),
+        };
         let mut s = ConsumerState::default();
         s.start(ev.clone());
         assert!(!s.pending_past_ceiling(3, 2));
@@ -736,25 +948,55 @@ mod tests {
         s.hold_pending();
         assert!(!s.pending_past_ceiling(3, 2));
         s.hold_pending();
-        assert!(s.pending_past_ceiling(3, 2), "held three passes: released at the ceiling");
+        assert!(
+            s.pending_past_ceiling(3, 2),
+            "held three passes: released at the ceiling"
+        );
         let mut f = ConsumerState::default();
         f.start(ev.clone());
         f.note_fault_on_pending();
         assert!(!f.pending_past_ceiling(3, 2));
         f.note_fault_on_pending();
-        assert!(f.pending_past_ceiling(3, 2), "faulted two passes: released at the ceiling");
-        assert_eq!(ConsumerState::from_json(&f.to_json()).unwrap().pending.unwrap().fault_passes, 2, "the fault count persists");
-        assert!(!ConsumerState::default().pending_past_ceiling(0, 0), "nothing pending: nothing to release");
+        assert!(
+            f.pending_past_ceiling(3, 2),
+            "faulted two passes: released at the ceiling"
+        );
+        assert_eq!(
+            ConsumerState::from_json(&f.to_json())
+                .unwrap()
+                .pending
+                .unwrap()
+                .fault_passes,
+            2,
+            "the fault count persists"
+        );
+        assert!(
+            !ConsumerState::default().pending_past_ceiling(0, 0),
+            "nothing pending: nothing to release"
+        );
         // a document an older writer wrote without the fault field reads as zero faults
         let older = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":null,"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":1}}"#;
-        assert_eq!(ConsumerState::from_json(older).unwrap().pending.unwrap().fault_passes, 0);
+        assert_eq!(
+            ConsumerState::from_json(older)
+                .unwrap()
+                .pending
+                .unwrap()
+                .fault_passes,
+            0
+        );
         // malformed documents: a short hash, a bad stamp, height 0, on the cursor or the pending event
         let short_hash = r#"{"v":1,"cursor":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":965771,"hash":"abc"},"pending":null}"#;
-        assert!(ConsumerState::from_json(short_hash).unwrap_err().contains("malformed hash"));
+        assert!(ConsumerState::from_json(short_hash)
+            .unwrap_err()
+            .contains("malformed hash"));
         let bad_stamp = r#"{"v":1,"cursor":{"orphaned_at":"yesterday","height":965771,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"pending":null}"#;
-        assert!(ConsumerState::from_json(bad_stamp).unwrap_err().contains("malformed stamp"));
+        assert!(ConsumerState::from_json(bad_stamp)
+            .unwrap_err()
+            .contains("malformed stamp"));
         let zero = r#"{"v":1,"cursor":null,"pending":{"event":{"orphaned_at":"2026-09-07T22:45:22.316Z","height":0,"hash":"0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1"},"spenders":{"after":null,"exhausted":false},"pot_beefs":{"after":null,"exhausted":false},"transactions":{"after":null,"exhausted":false},"held_passes":0}}"#;
-        assert!(ConsumerState::from_json(zero).unwrap_err().contains("height 0"));
+        assert!(ConsumerState::from_json(zero)
+            .unwrap_err()
+            .contains("height 0"));
     }
 
     #[test]
@@ -766,12 +1008,24 @@ mod tests {
         let events = events_after(&page.orphans, None);
         s.start(events[0].clone());
         // a leg's progress persists; the cursor does not move
-        s.pending.as_mut().unwrap().spenders = LegProgress { after: Some(RowKey { height: 965771, rowid: 40 }), exhausted: false };
+        s.pending.as_mut().unwrap().spenders = LegProgress {
+            after: Some(RowKey {
+                height: 965771,
+                rowid: 40,
+            }),
+            exhausted: false,
+        };
         s.hold_pending();
         let back = ConsumerState::from_json(&s.to_json()).unwrap();
         assert_eq!(back, s);
         assert_eq!(back.cursor, None);
-        assert_eq!(back.pending.as_ref().unwrap().spenders.after, Some(RowKey { height: 965771, rowid: 40 }));
+        assert_eq!(
+            back.pending.as_ref().unwrap().spenders.after,
+            Some(RowKey {
+                height: 965771,
+                rowid: 40
+            })
+        );
         assert_eq!(back.pending.as_ref().unwrap().held_passes, 1);
         assert!(!back.pending.as_ref().unwrap().all_exhausted());
         // finished: the cursor is the event's key, nothing pending
@@ -779,14 +1033,24 @@ mod tests {
         assert_eq!(moved, Some(events[0].key()));
         assert_eq!(s.cursor, Some(events[0].key()));
         assert_eq!(s.pending, None);
-        assert_eq!(s.advance_past_pending(), None, "nothing pending: the cursor stays");
+        assert_eq!(
+            s.advance_past_pending(),
+            None,
+            "nothing pending: the cursor stays"
+        );
         assert_eq!(s.cursor, Some(events[0].key()));
         // the next event is the one after the cursor
-        assert_eq!(events_after(&page.orphans, s.cursor.as_ref())[0].hash, CANONICAL_965773);
+        assert_eq!(
+            events_after(&page.orphans, s.cursor.as_ref())[0].hash,
+            CANONICAL_965773
+        );
         // an older document (no version field) reads; a newer one is refused
         let old = ConsumerState::from_json(r#"{"cursor":null,"pending":null}"#).unwrap();
         assert_eq!(old, ConsumerState::default());
-        assert!(ConsumerState::from_json(r#"{"v":2}"#).is_err(), "a newer writer's document is not guessed at");
+        assert!(
+            ConsumerState::from_json(r#"{"v":2}"#).is_err(),
+            "a newer writer's document is not guessed at"
+        );
         assert!(ConsumerState::from_json("garbage").is_err());
     }
 }

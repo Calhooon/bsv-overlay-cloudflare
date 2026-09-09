@@ -6715,18 +6715,28 @@ mod courier_ladder_2026_09_04 {
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
                 let msg = e.to_string().to_ascii_lowercase();
-                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
             }
         }
         let plan = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<String> {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).expect("prepare");
-            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
-                .expect("plan")
-                .map(|r| r.expect("row"))
-                .collect()
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare");
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("plan")
+            .map(|r| r.expect("row"))
+            .collect()
         };
         let identity = rusqlite::types::Value::Text("02".repeat(33));
-        let lines = plan(&results_sql(Some(1_000), 0), &[identity, rusqlite::types::Value::Integer(1_000)]);
+        let lines = plan(
+            &results_sql(Some(1_000), 0),
+            &[identity, rusqlite::types::Value::Integer(1_000)],
+        );
         let joined = lines.join("\n");
         for l in &lines {
             if let Some(scanned) = l.strip_prefix("SCAN ") {
@@ -6736,8 +6746,15 @@ mod courier_ladder_2026_09_04 {
                 );
             }
         }
-        for needle in ["SEARCH potparty_records USING INDEX idx_potparty_identity", "SEARCH hp USING INDEX idx_hopparty_identity", "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)"] {
-            assert!(lines.iter().any(|l| l.contains(needle)), "expected `{needle}` in the plan:\n{joined}");
+        for needle in [
+            "SEARCH potparty_records USING INDEX idx_potparty_identity",
+            "SEARCH hp USING INDEX idx_hopparty_identity",
+            "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.contains(needle)),
+                "expected `{needle}` in the plan:\n{joined}"
+            );
         }
         // the claims leg on the page's gameIds: the M19 `result_markers_v2(gameId)` index
         let claims = plan(&claims_sql(1), &[rusqlite::types::Value::Text("g".into())]);
@@ -6747,7 +6764,10 @@ mod courier_ladder_2026_09_04 {
             claims.join("\n")
         );
         // the decoration leg by potTxid: its (potTxid, createdAt) index
-        let markers = plan(&crate::logic::pot_markers_sql(1), &[rusqlite::types::Value::Text("p".into())]);
+        let markers = plan(
+            &crate::logic::pot_markers_sql(1),
+            &[rusqlite::types::Value::Text("p".into())],
+        );
         assert!(
             markers.iter().any(|l| l.contains("SEARCH result_markers_v2 USING INDEX idx_result_markers_v2_potTxid_createdAt (potTxid=?)")),
             "{}",

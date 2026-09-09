@@ -20,7 +20,11 @@ use bsv_rs::transaction::Beef;
 /// The subject txid (lowercase hex) by `atomic ?? unique tip ?? sorted-last`.
 pub fn subject_txid_of(beef: &mut Beef) -> Option<String> {
     if let Some(atomic) = beef.atomic_txid.clone() {
-        if beef.txs.iter().any(|b| b.txid().eq_ignore_ascii_case(&atomic)) {
+        if beef
+            .txs
+            .iter()
+            .any(|b| b.txid().eq_ignore_ascii_case(&atomic))
+        {
             return Some(atomic.to_ascii_lowercase());
         }
     }
@@ -77,8 +81,10 @@ mod tests {
             source_output_index: 0,
             ..Default::default()
         });
-        tx.outputs
-            .push(TransactionOutput::new(1_000, LockingScript::from_hex("51").unwrap()));
+        tx.outputs.push(TransactionOutput::new(
+            1_000,
+            LockingScript::from_hex("51").unwrap(),
+        ));
         tx
     }
 
@@ -89,8 +95,10 @@ mod tests {
             source_output_index: 0,
             ..Default::default()
         });
-        tx.outputs
-            .push(TransactionOutput::new(900, LockingScript::from_hex("52").unwrap()));
+        tx.outputs.push(TransactionOutput::new(
+            900,
+            LockingScript::from_hex("52").unwrap(),
+        ));
         tx
     }
 
@@ -99,13 +107,19 @@ mod tests {
         // parent (its own source absent → "with missing inputs") + child.
         let parent = stray(0xaa);
         let child = child_of(&parent);
-        for order in [vec![parent.clone(), child.clone()], vec![child.clone(), parent.clone()]] {
+        for order in [
+            vec![parent.clone(), child.clone()],
+            vec![child.clone(), parent.clone()],
+        ] {
             let mut beef = Beef::new();
             for tx in order {
                 beef.merge_transaction(tx);
             }
             let mut parsed = Beef::from_binary(&beef.to_binary()).unwrap();
-            assert_eq!(subject_txid_of(&mut parsed).as_deref(), Some(child.id().as_str()));
+            assert_eq!(
+                subject_txid_of(&mut parsed).as_deref(),
+                Some(child.id().as_str())
+            );
         }
     }
 
@@ -119,10 +133,18 @@ mod tests {
         let atomic = beef.to_binary_atomic(&parent.id()).unwrap();
         let mut named = Beef::from_binary(&atomic).unwrap();
         assert!(named.is_atomic());
-        assert_eq!(subject_txid_of(&mut named).as_deref(), Some(parent.id().as_str()), "the name wins");
+        assert_eq!(
+            subject_txid_of(&mut named).as_deref(),
+            Some(parent.id().as_str()),
+            "the name wins"
+        );
         let mut stray_named = Beef::from_binary(&atomic).unwrap();
         stray_named.atomic_txid = Some("00".repeat(32));
-        assert_eq!(subject_txid_of(&mut stray_named).as_deref(), Some(child.id().as_str()), "a name not in the body is ignored");
+        assert_eq!(
+            subject_txid_of(&mut stray_named).as_deref(),
+            Some(child.id().as_str()),
+            "a name not in the body is ignored"
+        );
     }
 
     #[test]

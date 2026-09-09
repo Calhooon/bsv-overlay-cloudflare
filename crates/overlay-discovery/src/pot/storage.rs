@@ -982,7 +982,8 @@ pub struct MemoryPotStorage {
     ordinals: std::sync::Mutex<std::collections::HashMap<(String, u32), i64>>,
     next_ordinal: std::sync::Mutex<i64>,
     /// The persisted walk states (`reorg_sweep_state`).
-    sweep_states: std::sync::Mutex<std::collections::HashMap<String, crate::pot::reorg::SweepState>>,
+    sweep_states:
+        std::sync::Mutex<std::collections::HashMap<String, crate::pot::reorg::SweepState>>,
     /// Per stored beef: its ordinal and the height its verified bump names
     /// (`pot_beefs.rowid`, `pot_beefs.proofHeight`).
     beef_ordinals: std::sync::Mutex<std::collections::HashMap<String, i64>>,
@@ -1679,14 +1680,19 @@ impl PotStorage for MemoryPotStorage {
             .filter(|r| r.spent_confirmed && r.spent_height.is_some_and(|h| h >= lo && h <= hi))
             .cloned()
             .map(|r| {
-                let key = RowKey { height: r.spent_height.unwrap_or(0), rowid: self.ordinal_of(&r.txid, r.output_index) };
+                let key = RowKey {
+                    height: r.spent_height.unwrap_or(0),
+                    rowid: self.ordinal_of(&r.txid, r.output_index),
+                };
                 (key, r)
             })
             .collect();
         // the walk order: spentHeight DESC, rowid DESC (the D1 index order, reversed)
         rows.sort_by_key(|(k, _)| std::cmp::Reverse((k.height, k.rowid)));
         if let Some(a) = after {
-            rows.retain(|(k, _)| k.height < a.height || (k.height == a.height && k.rowid < a.rowid));
+            rows.retain(|(k, _)| {
+                k.height < a.height || (k.height == a.height && k.rowid < a.rowid)
+            });
         }
         rows.truncate(limit as usize);
         Ok(rows)
@@ -1704,7 +1710,10 @@ impl PotStorage for MemoryPotStorage {
         name: &str,
         state: &crate::pot::reorg::SweepState,
     ) -> Result<(), PotStorageError> {
-        self.sweep_states.lock().unwrap().insert(name.to_string(), state.clone());
+        self.sweep_states
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), state.clone());
         Ok(())
     }
 
@@ -1727,12 +1736,21 @@ impl PotStorage for MemoryPotStorage {
                     return None;
                 }
                 let beef = beefs.get(txid)?.clone();
-                Some((RowKey { height: h, rowid: self.beef_ordinal_of(txid) }, txid.clone(), beef))
+                Some((
+                    RowKey {
+                        height: h,
+                        rowid: self.beef_ordinal_of(txid),
+                    },
+                    txid.clone(),
+                    beef,
+                ))
             })
             .collect();
         rows.sort_by_key(|(k, _, _)| std::cmp::Reverse((k.height, k.rowid)));
         if let Some(a) = after {
-            rows.retain(|(k, _, _)| k.height < a.height || (k.height == a.height && k.rowid < a.rowid));
+            rows.retain(|(k, _, _)| {
+                k.height < a.height || (k.height == a.height && k.rowid < a.rowid)
+            });
         }
         rows.truncate(limit as usize);
         Ok(rows)
@@ -1848,7 +1866,10 @@ impl PotStorage for MemoryPotStorage {
         // the bytes, as the D1 verifying write does
         match pot_beef_bump_height(txid, new_beef) {
             Some(h) => {
-                self.proof_heights.lock().unwrap().insert(txid.to_string(), h);
+                self.proof_heights
+                    .lock()
+                    .unwrap()
+                    .insert(txid.to_string(), h);
             }
             None => {
                 self.proof_heights.lock().unwrap().remove(txid);
@@ -1875,7 +1896,10 @@ impl PotStorage for MemoryPotStorage {
     ) -> Result<(), PotStorageError> {
         self.mark_pot_beef_proven(txid).await?;
         if let Some(h) = height {
-            self.proof_heights.lock().unwrap().insert(txid.to_string(), h);
+            self.proof_heights
+                .lock()
+                .unwrap()
+                .insert(txid.to_string(), h);
         }
         Ok(())
     }
@@ -3349,8 +3373,15 @@ mod tests {
         use crate::pot::reorg::{classify_tip_announce, HeaderSeen, TipAnnounce};
         let store = MemoryPotStorage::new();
         let first = store.record_header_seen(965771, "AA").await.unwrap();
-        assert_eq!(first, HeaderSeen::default(), "the first header ever: nothing prior");
-        assert_eq!(classify_tip_announce(965771, "AA", &first), TipAnnounce::Extends);
+        assert_eq!(
+            first,
+            HeaderSeen::default(),
+            "the first header ever: nothing prior"
+        );
+        assert_eq!(
+            classify_tip_announce(965771, "AA", &first),
+            TipAnnounce::Extends
+        );
         let next = store.record_header_seen(965772, "BB").await.unwrap();
         assert_eq!(next.prior_hash_at_height, None);
         assert_eq!(next.max_height_before, Some(965771));
@@ -3358,10 +3389,16 @@ mod tests {
         let replaced = store.record_header_seen(965771, "CC").await.unwrap();
         assert_eq!(replaced.prior_hash_at_height.as_deref(), Some("aa"));
         assert_eq!(replaced.max_height_before, Some(965772));
-        assert_eq!(classify_tip_announce(965771, "CC", &replaced), TipAnnounce::Reorg { from: 965771 });
+        assert_eq!(
+            classify_tip_announce(965771, "CC", &replaced),
+            TipAnnounce::Reorg { from: 965771 }
+        );
         // a repeat of the same hash is not a reorg
         let again = store.record_header_seen(965771, "cc").await.unwrap();
-        assert_eq!(classify_tip_announce(965771, "CC", &again), TipAnnounce::Repeat);
+        assert_eq!(
+            classify_tip_announce(965771, "CC", &again),
+            TipAnnounce::Repeat
+        );
         // a lower height never recorded: an old header, never a reorg
         let old = store.record_header_seen(965700, "DD").await.unwrap();
         assert_eq!(classify_tip_announce(965700, "DD", &old), TipAnnounce::Old);
@@ -3374,23 +3411,106 @@ mod tests {
     #[tokio::test]
     async fn demote_confirmed_for_spender_at_misses_when_the_height_moved() {
         let store = MemoryPotStorage::new();
-        store.store_record(&PotRecord { txid: "p".repeat(64), output_index: 0, ..Default::default() }).await.unwrap();
-        store.mark_spent(&"p".repeat(64), 0, &"s".repeat(64), true, None, Some(965_771), Some(true)).await.unwrap();
+        store
+            .store_record(&PotRecord {
+                txid: "p".repeat(64),
+                output_index: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                &"p".repeat(64),
+                0,
+                &"s".repeat(64),
+                true,
+                None,
+                Some(965_771),
+                Some(true),
+            )
+            .await
+            .unwrap();
         // judged at 965771, then re-anchored to 965773 by another writer
-        assert!(store.reanchor_confirmed_for_spender(&"p".repeat(64), 0, &"s".repeat(64), 965_773).await.unwrap());
-        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_771)).await.unwrap(), "the judged height is stale: a miss");
-        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), None).await.unwrap(), "a NULL judged height against a held height: a miss");
-        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"x".repeat(64), Some(965_773)).await.unwrap(), "the wrong spender: a miss");
-        let r = store.get_spent_status(&"p".repeat(64), 0).await.unwrap().unwrap();
-        assert!(r.spent_confirmed && r.spent_height == Some(965_773), "nothing written by a miss");
-        assert!(store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_773)).await.unwrap(), "the current height and pointer: the demotion");
-        let r = store.get_spent_status(&"p".repeat(64), 0).await.unwrap().unwrap();
+        assert!(store
+            .reanchor_confirmed_for_spender(&"p".repeat(64), 0, &"s".repeat(64), 965_773)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_771))
+                .await
+                .unwrap(),
+            "the judged height is stale: a miss"
+        );
+        assert!(
+            !store
+                .demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), None)
+                .await
+                .unwrap(),
+            "a NULL judged height against a held height: a miss"
+        );
+        assert!(
+            !store
+                .demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"x".repeat(64), Some(965_773))
+                .await
+                .unwrap(),
+            "the wrong spender: a miss"
+        );
+        let r = store
+            .get_spent_status(&"p".repeat(64), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.spent_confirmed && r.spent_height == Some(965_773),
+            "nothing written by a miss"
+        );
+        assert!(
+            store
+                .demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_773))
+                .await
+                .unwrap(),
+            "the current height and pointer: the demotion"
+        );
+        let r = store
+            .get_spent_status(&"p".repeat(64), 0)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.spent && !r.spent_confirmed && r.spent_height.is_none());
-        assert!(!store.demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_773)).await.unwrap(), "not twice");
+        assert!(
+            !store
+                .demote_confirmed_for_spender_at(&"p".repeat(64), 0, &"s".repeat(64), Some(965_773))
+                .await
+                .unwrap(),
+            "not twice"
+        );
         // a height-less confirmation judged height-less
-        store.store_record(&PotRecord { txid: "q".repeat(64), output_index: 0, ..Default::default() }).await.unwrap();
-        store.mark_spent(&"q".repeat(64), 0, &"t".repeat(64), true, None, None, Some(true)).await.unwrap();
-        assert!(store.demote_confirmed_for_spender_at(&"q".repeat(64), 0, &"t".repeat(64), None).await.unwrap());
+        store
+            .store_record(&PotRecord {
+                txid: "q".repeat(64),
+                output_index: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                &"q".repeat(64),
+                0,
+                &"t".repeat(64),
+                true,
+                None,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .demote_confirmed_for_spender_at(&"q".repeat(64), 0, &"t".repeat(64), None)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -3402,21 +3522,41 @@ mod tests {
             .await
             .unwrap();
         // the wrong spender never demotes
-        assert!(!store.demote_confirmed_for_spender("pot", 0, "other").await.unwrap());
+        assert!(!store
+            .demote_confirmed_for_spender("pot", 0, "other")
+            .await
+            .unwrap());
         let r = store.get_spent_status("pot", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed && r.spent_height == Some(965771));
         // the right spender demotes ONLY the two confirmation columns
-        assert!(store.demote_confirmed_for_spender("pot", 0, "settle").await.unwrap());
+        assert!(store
+            .demote_confirmed_for_spender("pot", 0, "settle")
+            .await
+            .unwrap());
         let r = store.get_spent_status("pot", 0).await.unwrap().unwrap();
         assert!(r.spent, "spent stays");
-        assert_eq!(r.spending_txid.as_deref(), Some("settle"), "the pointer stays");
+        assert_eq!(
+            r.spending_txid.as_deref(),
+            Some("settle"),
+            "the pointer stays"
+        );
         assert!(!r.spent_confirmed);
         assert_eq!(r.spent_height, None);
-        assert_eq!(r.spender_final, Some(true), "the #371 finality witness stays");
+        assert_eq!(
+            r.spender_final,
+            Some(true),
+            "the #371 finality witness stays"
+        );
         // an already-demoted row is not demoted twice
-        assert!(!store.demote_confirmed_for_spender("pot", 0, "settle").await.unwrap());
+        assert!(!store
+            .demote_confirmed_for_spender("pot", 0, "settle")
+            .await
+            .unwrap());
         // and it is a chaser candidate again
-        let again = store.find_unconfirmed_by_spending_txid("settle").await.unwrap();
+        let again = store
+            .find_unconfirmed_by_spending_txid("settle")
+            .await
+            .unwrap();
         assert_eq!(again.len(), 1);
     }
 
@@ -3427,23 +3567,62 @@ mod tests {
         use crate::pot::reorg::RowKey;
         let store = MemoryPotStorage::new();
         // insertion order = rowid order; two rows at 965771, one below, one above the window
-        for (pot, h) in [("p1", 965770), ("p2", 965771), ("p3", 965771), ("p4", 965772), ("p5", 965773)] {
+        for (pot, h) in [
+            ("p1", 965770),
+            ("p2", 965771),
+            ("p3", 965771),
+            ("p4", 965772),
+            ("p5", 965773),
+        ] {
             store.store_record(&pot_record(pot, 0)).await.unwrap();
-            store.mark_spent(pot, 0, &format!("s-{pot}"), true, None, Some(h), None).await.unwrap();
+            store
+                .mark_spent(pot, 0, &format!("s-{pot}"), true, None, Some(h), None)
+                .await
+                .unwrap();
         }
         // an unconfirmed spend inside the heights is in no window
         store.store_record(&pot_record("p6", 0)).await.unwrap();
-        store.mark_spent("p6", 0, "s-p6", false, None, None, None).await.unwrap();
-        let names = |rows: &[(RowKey, PotRecord)]| rows.iter().map(|(_, r)| r.txid.clone()).collect::<Vec<_>>();
-        let head = store.confirmed_window_page(965771, 965772, None, 2).await.unwrap();
-        assert_eq!(names(&head), vec!["p4", "p3"], "newest height first, then the newest row at a height");
+        store
+            .mark_spent("p6", 0, "s-p6", false, None, None, None)
+            .await
+            .unwrap();
+        let names = |rows: &[(RowKey, PotRecord)]| {
+            rows.iter().map(|(_, r)| r.txid.clone()).collect::<Vec<_>>()
+        };
+        let head = store
+            .confirmed_window_page(965771, 965772, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&head),
+            vec!["p4", "p3"],
+            "newest height first, then the newest row at a height"
+        );
         let cursor = head.last().unwrap().0;
         assert_eq!(cursor.height, 965771);
-        let next = store.confirmed_window_page(965771, 965772, Some(cursor), 2).await.unwrap();
-        assert_eq!(names(&next), vec!["p2"], "continues after the cursor, same height first");
-        let end = store.confirmed_window_page(965771, 965772, Some(next.last().unwrap().0), 2).await.unwrap();
+        let next = store
+            .confirmed_window_page(965771, 965772, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&next),
+            vec!["p2"],
+            "continues after the cursor, same height first"
+        );
+        let end = store
+            .confirmed_window_page(965771, 965772, Some(next.last().unwrap().0), 2)
+            .await
+            .unwrap();
         assert!(end.is_empty(), "exhausted");
-        assert_eq!(names(&store.confirmed_window_page(1, 965773, None, 10).await.unwrap()), vec!["p5", "p4", "p3", "p2", "p1"]);
+        assert_eq!(
+            names(
+                &store
+                    .confirmed_window_page(1, 965773, None, 10)
+                    .await
+                    .unwrap()
+            ),
+            vec!["p5", "p4", "p3", "p2", "p1"]
+        );
     }
 
     #[tokio::test]
@@ -3451,13 +3630,35 @@ mod tests {
         use crate::pot::reorg::{RowKey, SweepState};
         let store = MemoryPotStorage::new();
         assert_eq!(store.read_sweep_state("spenders").await.unwrap(), None);
-        let st = SweepState { lo: 965771, hi: 965773, cursor: Some(RowKey { height: 965772, rowid: 7 }), exhausted: false };
+        let st = SweepState {
+            lo: 965771,
+            hi: 965773,
+            cursor: Some(RowKey {
+                height: 965772,
+                rowid: 7,
+            }),
+            exhausted: false,
+        };
         store.write_sweep_state("spenders", &st).await.unwrap();
-        assert_eq!(store.read_sweep_state("spenders").await.unwrap(), Some(st.clone()));
-        assert_eq!(store.read_sweep_state("pot_beefs").await.unwrap(), None, "names are independent");
-        let done = SweepState { exhausted: true, cursor: None, ..st };
+        assert_eq!(
+            store.read_sweep_state("spenders").await.unwrap(),
+            Some(st.clone())
+        );
+        assert_eq!(
+            store.read_sweep_state("pot_beefs").await.unwrap(),
+            None,
+            "names are independent"
+        );
+        let done = SweepState {
+            exhausted: true,
+            cursor: None,
+            ..st
+        };
         store.write_sweep_state("spenders", &done).await.unwrap();
-        assert_eq!(store.read_sweep_state("spenders").await.unwrap(), Some(done));
+        assert_eq!(
+            store.read_sweep_state("spenders").await.unwrap(),
+            Some(done)
+        );
     }
 
     /// The verifying writers record the height their bump names; the
@@ -3467,21 +3668,45 @@ mod tests {
     async fn verified_pot_beefs_page_is_by_proof_height_and_latch() {
         let store = MemoryPotStorage::new();
         store.store_beef("a", &[1]).await.unwrap();
-        store.mark_pot_beef_proven_at("a", Some(965771)).await.unwrap();
+        store
+            .mark_pot_beef_proven_at("a", Some(965771))
+            .await
+            .unwrap();
         store.store_beef("b", &[2]).await.unwrap();
-        store.mark_pot_beef_proven_at("b", Some(965772)).await.unwrap();
+        store
+            .mark_pot_beef_proven_at("b", Some(965772))
+            .await
+            .unwrap();
         store.store_beef("c", &[3]).await.unwrap();
         store.mark_pot_beef_proven_at("c", None).await.unwrap(); // verified, no anchor: in no window
         store.store_beef("d", &[4]).await.unwrap(); // never verified
-        let page = store.verified_pot_beefs_page(965771, 965773, None, 10).await.unwrap();
+        let page = store
+            .verified_pot_beefs_page(965771, 965773, None, 10)
+            .await
+            .unwrap();
         let txids: Vec<&str> = page.iter().map(|(_, t, _)| t.as_str()).collect();
         assert_eq!(txids, vec!["b", "a"]);
         let after = page[0].0;
-        let rest = store.verified_pot_beefs_page(965771, 965773, Some(after), 10).await.unwrap();
-        assert_eq!(rest.iter().map(|(_, t, _)| t.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        let rest = store
+            .verified_pot_beefs_page(965771, 965773, Some(after), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.iter().map(|(_, t, _)| t.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
         store.unlatch_pot_beef_proof("a").await.unwrap();
-        assert!(store.verified_pot_beefs_page(965771, 965773, None, 10).await.unwrap().iter().all(|(_, t, _)| t != "a"));
-        assert_eq!(store.get_beef("a").await.unwrap(), Some(vec![1]), "the bytes stay");
+        assert!(store
+            .verified_pot_beefs_page(965771, 965773, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, t, _)| t != "a"));
+        assert_eq!(
+            store.get_beef("a").await.unwrap(),
+            Some(vec![1]),
+            "the bytes stay"
+        );
     }
 
     #[tokio::test]
@@ -3492,13 +3717,22 @@ mod tests {
             .mark_spent("pot", 0, "settle", true, None, Some(965771), Some(true))
             .await
             .unwrap();
-        assert!(!store.reanchor_confirmed_for_spender("pot", 0, "other", 965773).await.unwrap());
-        assert!(store.reanchor_confirmed_for_spender("pot", 0, "settle", 965773).await.unwrap());
+        assert!(!store
+            .reanchor_confirmed_for_spender("pot", 0, "other", 965773)
+            .await
+            .unwrap());
+        assert!(store
+            .reanchor_confirmed_for_spender("pot", 0, "settle", 965773)
+            .await
+            .unwrap());
         let r = store.get_spent_status("pot", 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed);
         assert_eq!(r.spent_height, Some(965773));
         assert_eq!(r.spending_txid.as_deref(), Some("settle"));
-        let confirmed = store.find_confirmed_by_spending_txid("settle").await.unwrap();
+        let confirmed = store
+            .find_confirmed_by_spending_txid("settle")
+            .await
+            .unwrap();
         assert_eq!(confirmed.len(), 1);
     }
 
@@ -3510,6 +3744,9 @@ mod tests {
         assert!(store.pot_beef_proof_verified("settle").await.unwrap());
         store.unlatch_pot_beef_proof("settle").await.unwrap();
         assert!(!store.pot_beef_proof_verified("settle").await.unwrap());
-        assert_eq!(store.get_beef("settle").await.unwrap(), Some(vec![1, 2, 3, 4, 5]));
+        assert_eq!(
+            store.get_beef("settle").await.unwrap(),
+            Some(vec![1, 2, 3, 4, 5])
+        );
     }
 }

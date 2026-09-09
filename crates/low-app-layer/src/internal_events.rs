@@ -362,7 +362,10 @@ pub async fn chaintracks_header(env: &Env, height: u64) -> Option<HeaderLite> {
         }
     };
     if !(200..300).contains(&resp.status_code()) {
-        console_log!("[header] chaintracks HTTP {} — no header for {height}", resp.status_code());
+        console_log!(
+            "[header] chaintracks HTTP {} — no header for {height}",
+            resp.status_code()
+        );
         return None;
     }
     let frame: serde_json::Value = match resp.json().await {
@@ -399,14 +402,16 @@ pub fn parse_header(frame: &serde_json::Value, height: u64) -> Option<HeaderLite
         let v = value.get(key)?.as_str()?.trim();
         (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
     };
-    Some(HeaderLite { hash: hex64("hash")?, merkle_root: hex64("merkleRoot")? })
+    Some(HeaderLite {
+        hash: hex64("hash")?,
+        merkle_root: hex64("merkleRoot")?,
+    })
 }
 
 /// PURE: the block hash alone (see [`parse_header`]).
 pub fn parse_header_hash(frame: &serde_json::Value, height: u64) -> Option<String> {
     parse_header(frame, height).map(|h| h.hash)
 }
-
 
 /// bsv-low loop 6 (2026-09-07): the tip is ALSO the overlay's cue to confirm
 /// its spent-but-unconfirmed pot rows (`POST /internal/tip-changed`, bearer
@@ -425,10 +430,14 @@ pub async fn forward_tip_to_overlay(env: Env, height: u64, announced_hash: Optio
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     let headers = Headers::new();
-    if headers.set("Authorization", &format!("Bearer {token}")).is_err()
+    if headers
+        .set("Authorization", &format!("Bearer {token}"))
+        .is_err()
         || headers.set("content-type", "application/json").is_err()
     {
-        console_log!("[tip] overlay block-event pass: header build failed — height {height} not forwarded");
+        console_log!(
+            "[tip] overlay block-event pass: header build failed — height {height} not forwarded"
+        );
         return;
     }
     init.with_headers(headers);
@@ -445,7 +454,10 @@ pub async fn forward_tip_to_overlay(env: Env, height: u64, announced_hash: Optio
         None => overlay_tip_body(height),
     };
     init.with_body(Some(body.into()));
-    let req = match Request::new_with_init(&format!("{}/internal/tip-changed", url.trim_end_matches('/')), &init) {
+    let req = match Request::new_with_init(
+        &format!("{}/internal/tip-changed", url.trim_end_matches('/')),
+        &init,
+    ) {
         Ok(r) => r,
         Err(e) => {
             console_log!("[tip] overlay block-event pass: request build failed ({e}) — height {height} not forwarded");
@@ -457,7 +469,10 @@ pub async fn forward_tip_to_overlay(env: Env, height: u64, announced_hash: Optio
         Err(_) => Fetch::Request(req).send().await,
     };
     match res {
-        Ok(r) => console_log!("[tip] overlay block-event pass for {height}: HTTP {}", r.status_code()),
+        Ok(r) => console_log!(
+            "[tip] overlay block-event pass for {height}: HTTP {}",
+            r.status_code()
+        ),
         Err(e) => console_log!("[tip] overlay block-event pass for {height} failed: {e}"),
     }
 }
@@ -498,14 +513,29 @@ mod tests {
     fn the_announcers_hash_is_a_lowercased_64_hex_or_nothing() {
         let h = "00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D";
         assert_eq!(
-            parse_tip_changed_hash(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()).as_deref(),
+            parse_tip_changed_hash(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes())
+                .as_deref(),
             Some(h.to_ascii_lowercase().as_str())
         );
-        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771}"#), None, "an older announcer: the forward reads the header");
-        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771, "hash": "abc"}"#), None);
-        assert_eq!(parse_tip_changed_hash(br#"{"height": 965771, "hash": 12}"#), None);
+        assert_eq!(
+            parse_tip_changed_hash(br#"{"height": 965771}"#),
+            None,
+            "an older announcer: the forward reads the header"
+        );
+        assert_eq!(
+            parse_tip_changed_hash(br#"{"height": 965771, "hash": "abc"}"#),
+            None
+        );
+        assert_eq!(
+            parse_tip_changed_hash(br#"{"height": 965771, "hash": 12}"#),
+            None
+        );
         assert_eq!(parse_tip_changed_hash(b"nope"), None);
-        assert_eq!(parse_tip_changed(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()), Some(965771), "the height parser is untouched by the hash");
+        assert_eq!(
+            parse_tip_changed(format!(r#"{{"height": 965771, "hash": "{h}"}}"#).as_bytes()),
+            Some(965771),
+            "the height parser is untouched by the hash"
+        );
     }
 
     #[test]
@@ -533,8 +563,16 @@ mod tests {
             Some("00000000000000001de5aa96baa3566ce66e4941f8295cc44cc85fc75949db4d")
         );
         let no_root = serde_json::json!({"status":"success","value":{"height":965771,"hash":"00000000000000001DE5AA96BAA3566CE66E4941F8295CC44CC85FC75949DB4D","merkleRoot":"a785"}});
-        assert_eq!(parse_header(&no_root, 965771), None, "a short merkle root is no header");
-        assert_eq!(parse_header_hash(&ok, 965772), None, "another height's header is not this tip's hash");
+        assert_eq!(
+            parse_header(&no_root, 965771),
+            None,
+            "a short merkle root is no header"
+        );
+        assert_eq!(
+            parse_header_hash(&ok, 965772),
+            None,
+            "another height's header is not this tip's hash"
+        );
         let err = serde_json::json!({"status":"error","value":null});
         assert_eq!(parse_header_hash(&err, 965771), None);
         let short = serde_json::json!({"status":"success","value":{"height":965771,"hash":"abc"}});

@@ -7,7 +7,9 @@ use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::slap::storage::SLAPStorage;
 use overlay_engine::engine::{Engine, EngineError};
 use overlay_engine::health_checker::JanitorConfig;
-use overlay_engine::types::{GASPInitialRequest, LookupAnswer, LookupQuestion, SubmitMode, TaggedBEEF};
+use overlay_engine::types::{
+    GASPInitialRequest, LookupAnswer, LookupQuestion, SubmitMode, TaggedBEEF,
+};
 use serde::Deserialize;
 use serde::Serialize;
 use worker::{Context, Env, Request, Response};
@@ -114,7 +116,11 @@ fn json_ok<T: Serialize>(body: &T) -> worker::Result<Response> {
 /// spend). A known pot re-presented after its outputs were consumed is an
 /// idempotent no-op — refusing it 502-churned the client's readmit sweep
 /// forever (loop-1 hardening, 2026-09-05).
-pub(crate) fn false_ok_refusal_applies(funding_shaped: bool, tx_row_stored: bool, pot_known: bool) -> bool {
+pub(crate) fn false_ok_refusal_applies(
+    funding_shaped: bool,
+    tx_row_stored: bool,
+    pot_known: bool,
+) -> bool {
     funding_shaped && !tx_row_stored && !pot_known
 }
 
@@ -171,24 +177,43 @@ pub async fn beef_any(env: &worker::Env, path: &str) -> worker::Result<Response>
             // subject trap began with a subject-only hop on the wire).
             match fetcher.assemble_unmined_beef(&txid).await {
                 Ok(beef) => {
-                    worker::console_log!("[beef-any] {txid}: unmined — ancestry assembled from the couriers");
-                    return json_ok(&serde_json::json!({ "txid": txid, "beef": beef, "source": "courier", "mined": false }));
+                    worker::console_log!(
+                        "[beef-any] {txid}: unmined — ancestry assembled from the couriers"
+                    );
+                    return json_ok(
+                        &serde_json::json!({ "txid": txid, "beef": beef, "source": "courier", "mined": false }),
+                    );
                 }
                 Err(e) => {
-                    worker::console_log!("[beef-any] {txid}: unmined and the ancestry could not be resolved ({e})");
-                    return json_error(&format!("unmined; ancestry not resolvable via the couriers: {e}"), 404);
+                    worker::console_log!(
+                        "[beef-any] {txid}: unmined and the ancestry could not be resolved ({e})"
+                    );
+                    return json_error(
+                        &format!("unmined; ancestry not resolvable via the couriers: {e}"),
+                        404,
+                    );
                 }
             }
         }
         Err(e) => {
             worker::console_log!("[beef-any] {txid}: chaintracks read fault while verifying ({e})");
-            return json_error_retryable("chaintracks read fault while verifying the proof — retry", 503);
+            return json_error_retryable(
+                "chaintracks read fault while verifying the proof — retry",
+                503,
+            );
         }
     };
     match crate::proof_fetcher::assemble_spender_beef(&raw_hex, &bump_hex, &txid) {
         Ok(beef) => {
-            worker::console_log!("[beef-any] {txid}: served a courier-backed verified BEEF ({} bytes)", beef.len());
-            json_ok(&BeefAnyBody { txid: &txid, beef, source: "courier" })
+            worker::console_log!(
+                "[beef-any] {txid}: served a courier-backed verified BEEF ({} bytes)",
+                beef.len()
+            );
+            json_ok(&BeefAnyBody {
+                txid: &txid,
+                beef,
+                source: "courier",
+            })
         }
         Err(e) => {
             worker::console_log!("[beef-any] {txid}: assembly failed ({e})");
@@ -1342,7 +1367,8 @@ async fn submit_inner(
                 } else {
                     false
                 };
-                if false_ok_refusal_applies(funding_shaped, !matches!(stored, Ok(None)), pot_known) {
+                if false_ok_refusal_applies(funding_shaped, !matches!(stored, Ok(None)), pot_known)
+                {
                     worker::console_log!(
                         "POST /submit(broadcast-gated) -> 502 ({subject_txid}: 0 outputs admitted and \
                          nothing stored — refusing the false ok; the client ladder re-presents (#413)"
@@ -1480,8 +1506,9 @@ async fn submit_inner(
                 let named = bsv_rs::transaction::beef::Beef::from_binary(&beef_for_seen)
                     .ok()
                     .and_then(|mut b| crate::ef::subject_txid_of(&mut b));
-                let subject = bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, named.as_deref())
-                    .map(|t| t.id());
+                let subject =
+                    bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, named.as_deref())
+                        .map(|t| t.id());
                 if let Ok(subject) = subject {
                     if seen_arcade.network_witnessed(&subject).await {
                         crate::ops::latch_network_seen(&seen_db, &subject).await;
@@ -2015,11 +2042,27 @@ pub async fn arc_ingest(
             if let Some(db) = ops_db {
                 let status_upper = tx_status.to_ascii_uppercase();
                 if marker.is_some() {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1).await;
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1)
+                        .await;
                 }
-                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_DEMOTED, hint.demoted as u64).await;
-                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_UNMINED_UNCORROBORATED, hint.uncorroborated as u64).await;
-                crate::ops::bump_counter(db, crate::ops::COUNTER_REORG_TRACKER_FAULTS, hint.faults as u64).await;
+                crate::ops::bump_counter(
+                    db,
+                    crate::ops::COUNTER_REORG_DEMOTED,
+                    hint.demoted as u64,
+                )
+                .await;
+                crate::ops::bump_counter(
+                    db,
+                    crate::ops::COUNTER_REORG_UNMINED_UNCORROBORATED,
+                    hint.uncorroborated as u64,
+                )
+                .await;
+                crate::ops::bump_counter(
+                    db,
+                    crate::ops::COUNTER_REORG_TRACKER_FAULTS,
+                    hint.faults as u64,
+                )
+                .await;
                 if crate::broadcaster::ARCADE_FATAL_STATUSES.contains(&status_upper.as_str()) {
                     crate::ops::record_arc_terminal(
                         db,
@@ -2048,13 +2091,16 @@ pub async fn arc_ingest(
             // CHANGES is decided by the proof itself below (a verified bump
             // naming a different block than the stored anchor replaces it —
             // marker or not, so a re-notify without the marker heals too).
-            if let Some(m) = overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref()) {
+            if let Some(m) =
+                overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref())
+            {
                 worker::console_log!(
                     "POST /arc-ingest txid={txid} carries Arcade reorg marker {m:?} (blockHash={})",
                     block_hash.as_deref().unwrap_or("?")
                 );
                 if let Some(db) = ops_db {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1).await;
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REORG_EVENTS, 1)
+                        .await;
                 }
             }
             (merkle_path, block_height)
@@ -2087,7 +2133,12 @@ pub async fn arc_ingest(
 
     if let Some(db) = ops_db {
         if pot.spends_reanchored > 0 {
-            crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_REANCHORED, pot.spends_reanchored as u64).await;
+            crate::ops::bump_counter(
+                db,
+                crate::ops::COUNTER_ARC_INGEST_REANCHORED,
+                pot.spends_reanchored as u64,
+            )
+            .await;
         }
     }
     match engine_res {
@@ -2461,7 +2512,11 @@ pub async fn admin_evict_outpoint(engine: &Engine, mut req: Request) -> worker::
 ///
 /// Bearer-gated at the dispatch like every admin POST. Idempotent: a second
 /// call re-notifies (the pot index's upsert never regresses spend state).
-pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request) -> worker::Result<Response> {
+pub async fn admin_readmit(
+    engine: &Engine,
+    env: &worker::Env,
+    mut req: Request,
+) -> worker::Result<Response> {
     #[derive(Deserialize)]
     struct Body {
         txid: String,
@@ -2524,7 +2579,9 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
     let raw_hex = match fetcher.fetch_raw_hex(&txid).await {
         Ok(h) => h,
         Err(e) => {
-            worker::console_log!("POST /admin/readmit -> 404 ({txid}: raw unavailable via the couriers: {e})");
+            worker::console_log!(
+                "POST /admin/readmit -> 404 ({txid}: raw unavailable via the couriers: {e})"
+            );
             return json_error(&format!("raw tx not available from any courier: {e}"), 404);
         }
     };
@@ -2532,11 +2589,19 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
         Ok(Some(b)) => b,
         Ok(None) => {
             worker::console_log!("POST /admin/readmit -> 409 ({txid}: unmined)");
-            return json_error("unmined — nothing to re-admit yet (the live submit path owns an unmined tx)", 409);
+            return json_error(
+                "unmined — nothing to re-admit yet (the live submit path owns an unmined tx)",
+                409,
+            );
         }
         Err(e) => {
-            worker::console_log!("POST /admin/readmit -> 503 ({txid}: chaintracks read fault: {e})");
-            return json_error_retryable("chaintracks read fault while verifying the proof — retry", 503);
+            worker::console_log!(
+                "POST /admin/readmit -> 503 ({txid}: chaintracks read fault: {e})"
+            );
+            return json_error_retryable(
+                "chaintracks read fault while verifying the proof — retry",
+                503,
+            );
         }
     };
     let beef = match crate::proof_fetcher::assemble_spender_beef(&raw_hex, &bump_hex, &txid) {
@@ -2552,7 +2617,10 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
         .and_then(|mut b| b.to_binary_atomic(&txid).ok())
         .unwrap_or(beef);
     let tagged = TaggedBEEF::new(atomic, vec![topic.clone()]);
-    match engine.submit_with_report(&tagged, SubmitMode::HistoricalTx).await {
+    match engine
+        .submit_with_report(&tagged, SubmitMode::HistoricalTx)
+        .await
+    {
         Ok((steak, report)) => {
             let admitted = steak
                 .get(&topic)
@@ -2585,7 +2653,11 @@ pub async fn admin_readmit(engine: &Engine, env: &worker::Env, mut req: Request)
 /// budget; unconfirmed pointer now, the confirmation pass proves it on its
 /// tick). Fail-open: a storage/binding fault is reported, never a refusal —
 /// the admission already stands.
-async fn readmit_spend_discovery(env: &worker::Env, txid: &str, vouts: &[u32]) -> serde_json::Value {
+async fn readmit_spend_discovery(
+    env: &worker::Env,
+    txid: &str,
+    vouts: &[u32],
+) -> serde_json::Value {
     if vouts.is_empty() {
         return serde_json::json!({ "scanned": 0, "note": "nothing admitted" });
     }
@@ -2597,7 +2669,8 @@ async fn readmit_spend_discovery(env: &worker::Env, txid: &str, vouts: &[u32]) -
     let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env))
         .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET);
     let outpoints: Vec<(String, u32)> = vouts.iter().map(|v| (txid.to_string(), *v)).collect();
-    let s = crate::proof_fetcher::discover_spends_for_outpoints(&storage, &fetcher, &outpoints).await;
+    let s =
+        crate::proof_fetcher::discover_spends_for_outpoints(&storage, &fetcher, &outpoints).await;
     serde_json::json!({
         "scanned": s.scanned, "discovered": s.discovered, "byScript": s.by_script, "noHint": s.no_hint,
         "unbound": s.unbound, "faults": s.faults, "writeErrors": s.write_errors,
@@ -3372,9 +3445,9 @@ pub fn not_found() -> worker::Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    use super::beef_any_txid;
     use super::engine_error_status;
     use super::false_ok_refusal_applies;
-    use super::beef_any_txid;
 
     /// Loop-1 hardening (2026-09-05): a KNOWN pot re-presented after the
     /// refund/settle consumed its last output must NOT trip the #413 false-ok
@@ -3387,8 +3460,14 @@ mod tests {
     #[test]
     fn beef_any_path_parses_only_a_64_hex_txid() {
         let id = "67877CAE0f1b444111f467a3ebb076409542b498456f853bb950e98538f90039";
-        assert_eq!(beef_any_txid(&format!("/beef-any/{id}")).as_deref(), Some(id.to_ascii_lowercase().as_str()));
-        assert_eq!(beef_any_txid(&format!("/beef-any/{id}/")).as_deref(), Some(id.to_ascii_lowercase().as_str()));
+        assert_eq!(
+            beef_any_txid(&format!("/beef-any/{id}")).as_deref(),
+            Some(id.to_ascii_lowercase().as_str())
+        );
+        assert_eq!(
+            beef_any_txid(&format!("/beef-any/{id}/")).as_deref(),
+            Some(id.to_ascii_lowercase().as_str())
+        );
         assert!(beef_any_txid("/beef-any/").is_none());
         assert!(beef_any_txid("/beef-any/abc").is_none());
         assert!(beef_any_txid(&format!("/beef-any/{}zz", &id[..62])).is_none());
@@ -4020,9 +4099,15 @@ mod tests {
         assert!(is_unknown_txid_for_proof_ingest(&EngineError::Other(
             "Could not find matching transaction outputs for proof ingest!".into()
         )));
-        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::StorageError("d1 down".into())));
-        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::Other("Invalid merkle proof hex: zz".into())));
-        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::SpvError("bad".into())));
+        assert!(!is_unknown_txid_for_proof_ingest(
+            &EngineError::StorageError("d1 down".into())
+        ));
+        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::Other(
+            "Invalid merkle proof hex: zz".into()
+        )));
+        assert!(!is_unknown_txid_for_proof_ingest(&EngineError::SpvError(
+            "bad".into()
+        )));
     }
 
     #[test]
@@ -4060,8 +4145,16 @@ mod tests {
             r#"{{"txid":"{CB_TXID}","merklePath":"beef00","blockHeight":965773,"blockHash":"0000000000000000146BC084EC137A3C9608A07159128C66302051B6FE176E33","txStatus":"MINED","extraInfo":"reorg_reanchor"}}"#
         );
         match classify_arc_ingest_body(&reanchor).unwrap() {
-            ArcIngestBody::Proof { block_hash, extra_info, block_height, .. } => {
-                assert_eq!(block_hash.as_deref(), Some("0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33"));
+            ArcIngestBody::Proof {
+                block_hash,
+                extra_info,
+                block_height,
+                ..
+            } => {
+                assert_eq!(
+                    block_hash.as_deref(),
+                    Some("0000000000000000146bc084ec137a3c9608a07159128c66302051b6fe176e33")
+                );
                 assert_eq!(
                     overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref()),
                     Some(overlay_discovery::pot::reorg::ArcadeReorgMarker::Reanchor)
@@ -4075,7 +4168,11 @@ mod tests {
             r#"{{"txid":"{CB_TXID}","txStatus":"SEEN_ON_NETWORK","extraInfo":"reorg_unmined"}}"#
         );
         match classify_arc_ingest_body(&unmined).unwrap() {
-            ArcIngestBody::StatusOnly { extra_info, tx_status, .. } => {
+            ArcIngestBody::StatusOnly {
+                extra_info,
+                tx_status,
+                ..
+            } => {
                 assert_eq!(tx_status, "SEEN_ON_NETWORK");
                 assert_eq!(
                     overlay_discovery::pot::reorg::arcade_reorg_marker(extra_info.as_deref()),

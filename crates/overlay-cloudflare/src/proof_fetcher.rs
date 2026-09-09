@@ -291,11 +291,18 @@ impl ChainProofFetcher {
         // courier re-anchored to a block chaintracks 404s used to abort the
         // whole ladder with `?`, so Bitails/WoC were never reached and the
         // caller faulted every pass). A transport fault still aborts.
-        async fn judge(tracker: Option<&dyn ChainTracker>, rung: &str, bump_hex: &str, txid: &str) -> Result<bool, String> {
+        async fn judge(
+            tracker: Option<&dyn ChainTracker>,
+            rung: &str,
+            bump_hex: &str,
+            txid: &str,
+        ) -> Result<bool, String> {
             match rung_step(&verify_bump_outcome(tracker, bump_hex, txid).await) {
                 RungStep::Accept => Ok(true),
                 RungStep::NextRung(why) => {
-                    worker::console_log!("[proof] {rung} bump for {txid} not accepted ({why}); next rung");
+                    worker::console_log!(
+                        "[proof] {rung} bump for {txid} not accepted ({why}); next rung"
+                    );
                     Ok(false)
                 }
                 RungStep::Abort(e) => Err(e),
@@ -507,7 +514,8 @@ impl ChainProofFetcher {
         //                 spender for a SPENT output, and reports an unspent
         //                 output as `spent: ""` — which parses as "could not
         //                 look" (a fault), never as "unspent".
-        #[allow(clippy::type_complexity)] // a local courier-rung tuple; an alias would only relocate the shape
+        #[allow(clippy::type_complexity)]
+        // a local courier-rung tuple; an alias would only relocate the shape
         let rungs: [(
             &'static str,
             String,
@@ -1384,9 +1392,7 @@ async fn discover_spend_for_row(
                 None
             } else {
                 let from_store = match pot_storage.get_beef(&rec.txid).await {
-                    Ok(Some(bytes)) => {
-                        funding_output_script(&bytes, &rec.txid, rec.output_index)
-                    }
+                    Ok(Some(bytes)) => funding_output_script(&bytes, &rec.txid, rec.output_index),
                     _ => None,
                 };
                 let script = match from_store {
@@ -1419,8 +1425,7 @@ async fn discover_spend_for_row(
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
-                                    script_fault =
-                                        Some(format!("candidate {cand} raw fault: {e}"));
+                                    script_fault = Some(format!("candidate {cand} raw fault: {e}"));
                                     break;
                                 }
                             }
@@ -1553,10 +1558,18 @@ pub async fn run_pot_maintenance(
 pub(crate) fn own_bump_hex(beef: &bsv_rs::transaction::Beef, txid: &str) -> Option<String> {
     beef.find_txid(txid)
         .and_then(bsv_rs::transaction::BeefTx::bump_index)
-        .and_then(|bi| beef.bumps.get(bi).map(bsv_rs::transaction::MerklePath::to_hex))
+        .and_then(|bi| {
+            beef.bumps
+                .get(bi)
+                .map(bsv_rs::transaction::MerklePath::to_hex)
+        })
 }
 
-pub(crate) fn stitch_and_trim_pot_beef(txid: &str, stored_beef: &[u8], bump_hex: &str) -> Option<Vec<u8>> {
+pub(crate) fn stitch_and_trim_pot_beef(
+    txid: &str,
+    stored_beef: &[u8],
+    bump_hex: &str,
+) -> Option<Vec<u8>> {
     use bsv_rs::transaction::{Beef, MerklePath, Transaction};
 
     // Rebuild the subject tx (with its ancestry) from the stored BEEF and set
@@ -1978,7 +1991,11 @@ fn tx_consumes_outpoint(raw_hex: &str, txid: &str, vout: u32) -> Result<bool, St
 /// visible but its WIN stays unattributable (`/results`/leaderboard need
 /// `spender_beef_hex`). Pure; any failure is the caller's cue to log and
 /// proceed (the POINTER write is the money fix — this is enrichment).
-pub(crate) fn assemble_spender_beef(raw_hex: &str, bump_hex: &str, txid: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn assemble_spender_beef(
+    raw_hex: &str,
+    bump_hex: &str,
+    txid: &str,
+) -> Result<Vec<u8>, String> {
     let bump = MerklePath::from_hex(bump_hex).map_err(|e| format!("bump parse: {e}"))?;
     let raw = hex::decode(raw_hex).map_err(|e| format!("raw decode: {e}"))?;
     let mut beef = Beef::new();
@@ -2015,13 +2032,17 @@ pub(crate) type AncestryEntry = (String, String, Option<String>);
 /// services). Refuses (Err) any set that is not BRC-62 VALID: an unmined entry
 /// whose input is absent, a bump that does not cover its tx — a partial BEEF
 /// is never served (the client's fallback rung would trust it as complete).
-pub(crate) fn assemble_ancestry_beef(subject: &str, entries: &[AncestryEntry]) -> Result<Vec<u8>, String> {
+pub(crate) fn assemble_ancestry_beef(
+    subject: &str,
+    entries: &[AncestryEntry],
+) -> Result<Vec<u8>, String> {
     let mut beef = Beef::new();
     for (txid, raw_hex, bump_hex) in entries {
         let raw = hex::decode(raw_hex).map_err(|e| format!("{txid}: raw decode: {e}"))?;
         let bump_index = match bump_hex {
             Some(b) => {
-                let bump = MerklePath::from_hex(b).map_err(|e| format!("{txid}: bump parse: {e}"))?;
+                let bump =
+                    MerklePath::from_hex(b).map_err(|e| format!("{txid}: bump parse: {e}"))?;
                 Some(beef.merge_bump(bump))
             }
             None => None,
@@ -2034,7 +2055,8 @@ pub(crate) fn assemble_ancestry_beef(subject: &str, entries: &[AncestryEntry]) -
     if !beef.is_valid(false) {
         return Err("resolved ancestry is not a valid BEEF (an unmined entry lacks a source, or a bump does not cover its tx)".to_string());
     }
-    beef.to_binary_atomic(subject).map_err(|e| format!("beef serialize: {e}"))
+    beef.to_binary_atomic(subject)
+        .map_err(|e| format!("beef serialize: {e}"))
 }
 
 /// Bounds for the unmined-ancestry walk: a JOIN under a deep no-block stretch
@@ -2054,17 +2076,22 @@ impl ChainProofFetcher {
         let subject = txid.to_ascii_lowercase();
         let mut entries: Vec<AncestryEntry> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut frontier: std::collections::VecDeque<(String, usize)> = std::collections::VecDeque::new();
+        let mut frontier: std::collections::VecDeque<(String, usize)> =
+            std::collections::VecDeque::new();
         frontier.push_back((subject.clone(), 0));
         while let Some((id, depth)) = frontier.pop_front() {
             if !seen.insert(id.clone()) {
                 continue;
             }
             if entries.len() >= ANCESTRY_MAX_TXS {
-                return Err(format!("ancestry budget exceeded ({ANCESTRY_MAX_TXS} txs) at {id}"));
+                return Err(format!(
+                    "ancestry budget exceeded ({ANCESTRY_MAX_TXS} txs) at {id}"
+                ));
             }
             if depth > ANCESTRY_MAX_DEPTH {
-                return Err(format!("ancestry depth exceeded ({ANCESTRY_MAX_DEPTH}) at {id}"));
+                return Err(format!(
+                    "ancestry depth exceeded ({ANCESTRY_MAX_DEPTH}) at {id}"
+                ));
             }
             let raw_hex = self
                 .fetch_raw_hex(&id)
@@ -2073,7 +2100,9 @@ impl ChainProofFetcher {
             let bump = if id == subject {
                 None // the caller established the subject is unmined
             } else {
-                self.fetch_verified_proof(&id).await.map_err(|e| format!("{id}: proof read fault ({e})"))?
+                self.fetch_verified_proof(&id)
+                    .await
+                    .map_err(|e| format!("{id}: proof read fault ({e})"))?
             };
             let closes_branch = bump.is_some();
             entries.push((id.clone(), raw_hex.clone(), bump));
@@ -3744,12 +3773,16 @@ pub async fn apply_pushed_proof_to_pot_stores(
     // anchor (the 2026-09-07 class: Arcade pushed the 34 MB block's proofs
     // within 5 s, then re-anchored to the canonical block 36 min later):
     // the push REPLACES it — the verified latch is no longer a reason to skip.
-    let pushed_anchor = bsv_rs::transaction::MerklePath::from_hex(bump_hex).ok().and_then(|mp| {
-        mp.compute_root(Some(txid)).ok().map(|root| overlay_discovery::pot::reorg::BumpAnchor {
-            height: u64::from(mp.block_height),
-            root: root.to_ascii_lowercase(),
-        })
-    });
+    let pushed_anchor = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
+        .ok()
+        .and_then(|mp| {
+            mp.compute_root(Some(txid))
+                .ok()
+                .map(|root| overlay_discovery::pot::reorg::BumpAnchor {
+                    height: u64::from(mp.block_height),
+                    root: root.to_ascii_lowercase(),
+                })
+        });
     let pushed_height = pushed_anchor.as_ref().map(|a| a.height);
     match pot_storage.get_beef(txid).await {
         Ok(Some(stored_beef)) => {
@@ -3854,7 +3887,12 @@ pub async fn apply_pushed_proof_to_pot_stores(
                         continue;
                     }
                     match pot_storage
-                        .reanchor_confirmed_for_spender(&rec.txid, rec.output_index, txid, new_height)
+                        .reanchor_confirmed_for_spender(
+                            &rec.txid,
+                            rec.output_index,
+                            txid,
+                            new_height,
+                        )
                         .await
                     {
                         Ok(true) => {
@@ -3876,7 +3914,9 @@ pub async fn apply_pushed_proof_to_pot_stores(
                     }
                 }
             }
-            Err(e) => push_log(&format!("[arc-ingest] {txid} confirmed-spender lookup failed: {e}")),
+            Err(e) => push_log(&format!(
+                "[arc-ingest] {txid} confirmed-spender lookup failed: {e}"
+            )),
         }
     }
     summary
@@ -4115,7 +4155,11 @@ pub(crate) mod tests {
         struct NoHeaderTracker;
         #[async_trait::async_trait]
         impl ChainTracker for NoHeaderTracker {
-            async fn is_valid_root_for_height(&self, _root: &str, height: u32) -> Result<bool, ChainTrackerError> {
+            async fn is_valid_root_for_height(
+                &self,
+                _root: &str,
+                height: u32,
+            ) -> Result<bool, ChainTrackerError> {
                 Err(ChainTrackerError::BlockNotFound(height))
             }
             async fn current_height(&self) -> Result<u32, ChainTrackerError> {
@@ -4125,7 +4169,11 @@ pub(crate) mod tests {
         struct StarvedTracker;
         #[async_trait::async_trait]
         impl ChainTracker for StarvedTracker {
-            async fn is_valid_root_for_height(&self, _root: &str, _height: u32) -> Result<bool, ChainTrackerError> {
+            async fn is_valid_root_for_height(
+                &self,
+                _root: &str,
+                _height: u32,
+            ) -> Result<bool, ChainTrackerError> {
                 Err(ChainTrackerError::NetworkError("starved".into()))
             }
             async fn current_height(&self) -> Result<u32, ChainTrackerError> {
@@ -4136,29 +4184,70 @@ pub(crate) mod tests {
         let bump = single_tx_bump(&txid, 965_773).to_hex();
         // the pure fold
         assert_eq!(rung_step(&BumpVerdict::Valid), RungStep::Accept);
-        assert!(matches!(rung_step(&BumpVerdict::Invalid), RungStep::NextRung(_)));
+        assert!(matches!(
+            rung_step(&BumpVerdict::Invalid),
+            RungStep::NextRung(_)
+        ));
         assert!(matches!(rung_step(&BumpVerdict::NoHeader { height: 965_773, message: "x".into() }), RungStep::NextRung(_)), "no header at the candidate's height: the NEXT rung is asked, the ladder does not abort");
-        assert_eq!(rung_step(&BumpVerdict::Fault("starved".into())), RungStep::Abort("starved".into()));
+        assert_eq!(
+            rung_step(&BumpVerdict::Fault("starved".into())),
+            RungStep::Abort("starved".into())
+        );
         // the verdicts from real tracker answers
         let mut valid = MockChainTracker::new(965_860);
         valid.add_root(965_773, txid.clone());
-        assert_eq!(verify_bump_outcome(Some(&valid), &bump, &txid).await, BumpVerdict::Valid);
-        assert_eq!(verify_bump_outcome(Some(&MockChainTracker::new(965_860)), &bump, &txid).await, BumpVerdict::Invalid);
-        assert_eq!(verify_bump_outcome(None, &bump, &txid).await, BumpVerdict::Invalid, "no header source proves nothing");
-        assert_eq!(verify_bump_outcome(Some(&valid), "zz", &txid).await, BumpVerdict::Invalid, "a malformed bump");
-        assert!(matches!(verify_bump_outcome(Some(&NoHeaderTracker), &bump, &txid).await, BumpVerdict::NoHeader { height: 965_773, .. }));
-        assert!(matches!(verify_bump_outcome(Some(&StarvedTracker), &bump, &txid).await, BumpVerdict::Fault(_)));
+        assert_eq!(
+            verify_bump_outcome(Some(&valid), &bump, &txid).await,
+            BumpVerdict::Valid
+        );
+        assert_eq!(
+            verify_bump_outcome(Some(&MockChainTracker::new(965_860)), &bump, &txid).await,
+            BumpVerdict::Invalid
+        );
+        assert_eq!(
+            verify_bump_outcome(None, &bump, &txid).await,
+            BumpVerdict::Invalid,
+            "no header source proves nothing"
+        );
+        assert_eq!(
+            verify_bump_outcome(Some(&valid), "zz", &txid).await,
+            BumpVerdict::Invalid,
+            "a malformed bump"
+        );
+        assert!(matches!(
+            verify_bump_outcome(Some(&NoHeaderTracker), &bump, &txid).await,
+            BumpVerdict::NoHeader {
+                height: 965_773,
+                ..
+            }
+        ));
+        assert!(matches!(
+            verify_bump_outcome(Some(&StarvedTracker), &bump, &txid).await,
+            BumpVerdict::Fault(_)
+        ));
         // every other caller: the absent header stays a FAULT (retried), the starved read too
-        assert!(verify_bump_detailed(Some(&NoHeaderTracker), &bump, &txid).await.is_err());
-        assert!(verify_bump_detailed(Some(&StarvedTracker), &bump, &txid).await.is_err());
-        assert_eq!(verify_bump_detailed(Some(&valid), &bump, &txid).await, Ok(true));
-        assert_eq!(verify_bump_detailed(Some(&MockChainTracker::new(965_860)), &bump, &txid).await, Ok(false));
+        assert!(verify_bump_detailed(Some(&NoHeaderTracker), &bump, &txid)
+            .await
+            .is_err());
+        assert!(verify_bump_detailed(Some(&StarvedTracker), &bump, &txid)
+            .await
+            .is_err());
+        assert_eq!(
+            verify_bump_detailed(Some(&valid), &bump, &txid).await,
+            Ok(true)
+        );
+        assert_eq!(
+            verify_bump_detailed(Some(&MockChainTracker::new(965_860)), &bump, &txid).await,
+            Ok(false)
+        );
         // the real ladder reports its budget (review MED-2); at 0 its ask is the
         // budget refusal (`Ok(None)`, no courier reached), which the consumer
         // never reads as "no proof" because it checks the budget first
-        let f = ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(1)))).with_budget(3);
+        let f =
+            ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(1)))).with_budget(3);
         assert_eq!(f.budget_remaining(), Some(3));
-        let spent = ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(1)))).with_budget(0);
+        let spent =
+            ChainProofFetcher::new(Some(std::rc::Rc::new(MockChainTracker::new(1)))).with_budget(0);
         assert_eq!(spent.budget_remaining(), Some(0));
         assert_eq!(spent.verified_proof_for_detailed(&txid).await, Ok(None));
     }
@@ -4766,11 +4855,16 @@ pub(crate) mod tests {
         // bump0 at 965_700 proves A, with S present as a SIBLING hash (not flagged)
         let bump_a = MerklePath::new_unchecked(
             965_700,
-            vec![vec![MerklePathLeaf::new_txid(0, a.clone()), MerklePathLeaf::new(1, s.clone())]],
+            vec![vec![
+                MerklePathLeaf::new_txid(0, a.clone()),
+                MerklePathLeaf::new(1, s.clone()),
+            ]],
         )
         .unwrap();
         // bump1 at 965_773 is S's OWN single-leaf proof
-        let bump_s = MerklePath::new_unchecked(965_773, vec![vec![MerklePathLeaf::new_txid(0, s.clone())]]).unwrap();
+        let bump_s =
+            MerklePath::new_unchecked(965_773, vec![vec![MerklePathLeaf::new_txid(0, s.clone())]])
+                .unwrap();
         let mut beef = Beef::new();
         let b0 = beef.merge_bump(bump_a);
         let b1 = beef.merge_bump(bump_s);
@@ -4780,7 +4874,11 @@ pub(crate) mod tests {
         assert_eq!(beef.find_bump(&s).map(|b| b.block_height), Some(965_700));
         // own_bump_hex returns S's OWN bump — the right height
         let own = own_bump_hex(&beef, &s).unwrap();
-        assert_eq!(MerklePath::from_hex(&own).unwrap().block_height, 965_773, "the subject's own bump, not find_bump's");
+        assert_eq!(
+            MerklePath::from_hex(&own).unwrap().block_height,
+            965_773,
+            "the subject's own bump, not find_bump's"
+        );
         assert_eq!(beef.find_txid(&s).and_then(BeefTx::bump_index), Some(b1));
     }
 
@@ -6270,7 +6368,10 @@ pub(crate) mod tests {
         // and NOT when nothing confirmed (a second push of the same bump)
         let s2 = apply_pushed_proof_to_pot_stores(&store, &settle_txid, &bump_hex).await;
         assert_eq!(s2.spends_confirmed, 0);
-        assert!(crate::pot_changes::drain().is_empty(), "no confirmation, no note");
+        assert!(
+            crate::pot_changes::drain().is_empty(),
+            "no confirmation, no note"
+        );
     }
 
     /// Confirm beats the latch through the PRODUCTION push path: a reorg
@@ -7013,7 +7114,11 @@ pub(crate) mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        store.created_at_secs.lock().unwrap().insert((pot.clone(), 0), now);
+        store
+            .created_at_secs
+            .lock()
+            .unwrap()
+            .insert((pot.clone(), 0), now);
         let spender = "22".repeat(32);
         let mut hints = std::collections::HashMap::new();
         hints.insert((pot.clone(), 0), spender.clone());
@@ -7029,7 +7134,12 @@ pub(crate) mod tests {
         // (the age floor itself is a D1 SQL clause — its RED premise is pinned in the
         // real-SQLite tier: `pot_unspent_by_outpoints_sql_ignores_the_age_floor_real_sqlite`)
         // the by-outpoints pass: discovered at once, the unknown outpoint ignored
-        let s = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0), ("cd".repeat(32), 0)]).await;
+        let s = discover_spends_for_outpoints(
+            &store,
+            &fetcher,
+            &[(pot.clone(), 0), ("cd".repeat(32), 0)],
+        )
+        .await;
         assert_eq!((s.scanned, s.discovered, s.no_hint, s.faults), (1, 1, 0, 0));
         let rec = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
         assert!(rec.spent && rec.spending_txid.as_deref() == Some(spender.as_str()));
@@ -7191,13 +7301,21 @@ pub(crate) mod tests {
         let parent_bump = pb.bumps[parent.bump_index().unwrap()].to_hex();
         let subject_raw = SUBJECT_RAW_HEX.trim().to_string();
         let subject_txid = Transaction::from_hex(&subject_raw).unwrap().id();
-        assert_eq!(raw_input_txids(&subject_raw).unwrap(), vec![parent_txid.clone()]);
+        assert_eq!(
+            raw_input_txids(&subject_raw).unwrap(),
+            vec![parent_txid.clone()]
+        );
 
         let entries: Vec<AncestryEntry> = vec![
-            (parent_txid.clone(), parent_raw.clone(), Some(parent_bump.clone())),
+            (
+                parent_txid.clone(),
+                parent_raw.clone(),
+                Some(parent_bump.clone()),
+            ),
             (subject_txid.clone(), subject_raw.clone(), None),
         ];
-        let bytes = assemble_ancestry_beef(&subject_txid, &entries).expect("valid ancestry assembles");
+        let bytes =
+            assemble_ancestry_beef(&subject_txid, &entries).expect("valid ancestry assembles");
         let mut parsed = Beef::from_binary(&bytes).unwrap();
         assert_eq!(parsed.atomic_txid.as_deref(), Some(subject_txid.as_str()));
         assert!(parsed.is_valid(false));

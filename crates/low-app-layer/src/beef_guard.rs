@@ -96,7 +96,12 @@ pub fn recent_bumps(beef: &Beef, tip: u64, depth: u64) -> Vec<(usize, u64)> {
 /// PURE (review L2): which bumps a read re-checks. A VERIFIED row: the
 /// window (`tip` known) or nothing (`tip` unknown). An UNVERIFIED row: EVERY
 /// bump, whatever the height and whether or not a tip is known.
-pub fn bumps_to_check(beef: &Beef, tip: Option<u64>, depth: u64, verified: bool) -> Vec<(usize, u64)> {
+pub fn bumps_to_check(
+    beef: &Beef,
+    tip: Option<u64>,
+    depth: u64,
+    verified: bool,
+) -> Vec<(usize, u64)> {
     if !verified {
         // review L3: an unverified row has every bump re-checked, but CAPPED
         // to the newest `BEEF_UNVERIFIED_MAX_BUMPS` heights — a pathological
@@ -347,7 +352,9 @@ async fn canonical_root(env: &Env, height: u64) -> Option<String> {
         let mut m = m.borrow_mut();
         m.insert(height, (root.clone(), now + HEADER_TTL_MS));
         while m.len() > HEADER_CACHE_MAX {
-            let Some(&lowest) = m.keys().next() else { break };
+            let Some(&lowest) = m.keys().next() else {
+                break;
+            };
             m.remove(&lowest);
         }
     });
@@ -375,7 +382,11 @@ pub async fn guard_served_beef(
     }
     // an unverified row needs no tip (every bump is checked); a verified one
     // needs the tip for its window
-    let tip = if verified { present_tip(env).await } else { None };
+    let tip = if verified {
+        present_tip(env).await
+    } else {
+        None
+    };
     if verified && tip.is_none() {
         worker::console_warn!("[beef-guard] {subject}: no tip in hand; its recent bumps are served UNCHECKED (the stated fail-open)");
         note_unchecked(db).await;
@@ -433,7 +444,9 @@ pub async fn guard_served_beef(
                 "[beef-guard] {subject}: the stored BEEF cannot source its tx without the refuted bump at {refuted_height} (trimmed store) — refusing 503 until the overlay re-anchors"
             );
             bump_counter(db, COUNTER_REFUSED).await;
-            Guarded::Refuted { height: refuted_height }
+            Guarded::Refuted {
+                height: refuted_height,
+            }
         }
     }
 }
@@ -471,7 +484,11 @@ mod tests {
 
     /// A single-leaf bump (a one-tx block: root == txid) at `height`.
     fn single_leaf_bump(txid: &str, height: u32) -> MerklePath {
-        MerklePath::new_unchecked(height, vec![vec![MerklePathLeaf::new_txid(0, txid.to_string())]]).unwrap()
+        MerklePath::new_unchecked(
+            height,
+            vec![vec![MerklePathLeaf::new_txid(0, txid.to_string())]],
+        )
+        .unwrap()
     }
 
     /// grandparent (proven long ago, at 965_700) ← parent (bump at
@@ -503,7 +520,10 @@ mod tests {
         assert!(in_recheck_window(965_771, 965_776, 6));
         assert!(!in_recheck_window(965_770, 965_776, 6));
         assert!(in_recheck_window(965_776, 965_776, 6));
-        assert!(in_recheck_window(965_780, 965_776, 6), "above a stale tip is recent");
+        assert!(
+            in_recheck_window(965_780, 965_776, 6),
+            "above a stale tip is recent"
+        );
         assert!(!in_recheck_window(965_776, 965_776, 0));
         assert!(in_recheck_window(1, 3, 6), "clamped at genesis");
     }
@@ -514,10 +534,25 @@ mod tests {
     fn an_unverified_row_has_every_bump_checked_and_a_verified_one_only_its_window() {
         let (bytes, _, _) = fixture(965_771, false); // bumps at 965771 (index 0) and 965700 (index 1)
         let beef = Beef::from_binary(&bytes).unwrap();
-        assert_eq!(bumps_to_check(&beef, Some(965_776), 6, true), vec![(0, 965_771)]);
-        assert_eq!(bumps_to_check(&beef, None, 6, true), vec![], "a verified row with no tip: nothing to window on");
-        assert_eq!(bumps_to_check(&beef, Some(965_776), 6, false), vec![(0, 965_771), (1, 965_700)], "unverified: all of them");
-        assert_eq!(bumps_to_check(&beef, None, 6, false), vec![(0, 965_771), (1, 965_700)], "unverified: all, no tip needed");
+        assert_eq!(
+            bumps_to_check(&beef, Some(965_776), 6, true),
+            vec![(0, 965_771)]
+        );
+        assert_eq!(
+            bumps_to_check(&beef, None, 6, true),
+            vec![],
+            "a verified row with no tip: nothing to window on"
+        );
+        assert_eq!(
+            bumps_to_check(&beef, Some(965_776), 6, false),
+            vec![(0, 965_771), (1, 965_700)],
+            "unverified: all of them"
+        );
+        assert_eq!(
+            bumps_to_check(&beef, None, 6, false),
+            vec![(0, 965_771), (1, 965_700)],
+            "unverified: all, no tip needed"
+        );
     }
 
     /// Review L3: the guard's counters ride the overlay's own counter upsert
@@ -529,16 +564,40 @@ mod tests {
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
                 let msg = e.to_string().to_ascii_lowercase();
-                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
             }
         }
         // the rare counters bump by 1; the unchecked counter flushes a BATCH
         // delta (review L3) — the SQL takes (name, delta).
-        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_STRIPPED, 1i64]).unwrap();
-        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_REFUSED, 1i64]).unwrap();
-        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_UNCHECKED, 32i64]).unwrap();
-        let read = |name: &str| -> i64 { conn.query_row("SELECT value FROM ops_counters WHERE name = ?", [name], |r| r.get(0)).unwrap() };
-        assert_eq!((read(COUNTER_STRIPPED), read(COUNTER_REFUSED), read(COUNTER_UNCHECKED)), (1, 1, 32), "the batch delta accumulates as one write");
+        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_STRIPPED, 1i64])
+            .unwrap();
+        conn.execute(BUMP_COUNTER_SQL, rusqlite::params![COUNTER_REFUSED, 1i64])
+            .unwrap();
+        conn.execute(
+            BUMP_COUNTER_SQL,
+            rusqlite::params![COUNTER_UNCHECKED, 32i64],
+        )
+        .unwrap();
+        let read = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT value FROM ops_counters WHERE name = ?",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (
+                read(COUNTER_STRIPPED),
+                read(COUNTER_REFUSED),
+                read(COUNTER_UNCHECKED)
+            ),
+            (1, 1, 32),
+            "the batch delta accumulates as one write"
+        );
         assert_eq!(refuted_body(965_771), "stored proof refuted by the current header at height 965771 (reorg); re-anchoring pending, retry");
     }
 
@@ -558,7 +617,10 @@ mod tests {
                 flushed_total += delta;
             }
         }
-        assert_eq!(writes, 3, "100 reads at a 32 batch: 3 flushes, not 100 writes");
+        assert_eq!(
+            writes, 3,
+            "100 reads at a 32 batch: 3 flushes, not 100 writes"
+        );
         assert_eq!(flushed_total, 96);
         assert_eq!(pending, 4, "the tail waits for the next flush");
     }
@@ -571,13 +633,22 @@ mod tests {
         use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
         let mut beef = Beef::new();
         for h in 0..20u32 {
-            beef.merge_bump(MerklePath::new_unchecked(965_700 + h, vec![vec![MerklePathLeaf::new_txid(0, format!("{h:064x}"))]]).unwrap());
+            beef.merge_bump(
+                MerklePath::new_unchecked(
+                    965_700 + h,
+                    vec![vec![MerklePathLeaf::new_txid(0, format!("{h:064x}"))]],
+                )
+                .unwrap(),
+            );
         }
         let checked = bumps_to_check(&beef, None, 6, false);
         assert_eq!(checked.len(), BEEF_UNVERIFIED_MAX_BUMPS, "capped");
         let heights: Vec<u64> = checked.iter().map(|(_, h)| *h).collect();
         assert_eq!(heights[0], 965_719, "newest first");
-        assert!(heights.iter().all(|h| *h >= 965_712), "only the newest window is checked");
+        assert!(
+            heights.iter().all(|h| *h >= 965_712),
+            "only the newest window is checked"
+        );
     }
 
     #[test]
@@ -585,7 +656,11 @@ mod tests {
         let (bytes, _, _) = fixture(965_771, false);
         let beef = Beef::from_binary(&bytes).unwrap();
         assert_eq!(beef.bumps.len(), 2, "the parent's and the grandparent's");
-        assert_eq!(recent_bumps(&beef, 965_776, 6), vec![(0, 965_771)], "the old one is outside");
+        assert_eq!(
+            recent_bumps(&beef, 965_776, 6),
+            vec![(0, 965_771)],
+            "the old one is outside"
+        );
         assert_eq!(recent_bumps(&beef, 965_777, 6), vec![]);
     }
 
@@ -595,8 +670,14 @@ mod tests {
         let beef = Beef::from_binary(&bytes).unwrap();
         let claimed = claimed_root(&beef.bumps[0]).unwrap();
         assert_eq!(claimed, parent, "a one-tx block's root is the txid");
-        assert_eq!(judge_bump(&claimed, Some(&parent.to_ascii_uppercase())), BumpVerdict::Standing);
-        assert_eq!(judge_bump(&claimed, Some(&"ab".repeat(32))), BumpVerdict::Refuted);
+        assert_eq!(
+            judge_bump(&claimed, Some(&parent.to_ascii_uppercase())),
+            BumpVerdict::Standing
+        );
+        assert_eq!(
+            judge_bump(&claimed, Some(&"ab".repeat(32))),
+            BumpVerdict::Refuted
+        );
         assert_eq!(judge_bump(&claimed, None), BumpVerdict::Unknown);
     }
 
@@ -607,11 +688,19 @@ mod tests {
         let (bytes, child, parent) = fixture(965_771, false);
         let out = strip_bumps(&bytes, &child, &[0]).expect("sourced: served");
         let mut re = Beef::from_binary(&out).unwrap();
-        assert_eq!(re.bumps.len(), 1, "the refuted bump is gone; the grandparent's stands");
+        assert_eq!(
+            re.bumps.len(),
+            1,
+            "the refuted bump is gone; the grandparent's stands"
+        );
         assert_eq!(re.bumps[0].block_height, 965_700);
         assert_eq!(re.txs.len(), 3, "grandparent, parent, child all served");
         assert!(re.find_txid(&child).is_some());
-        assert_eq!(re.find_txid(&parent).unwrap().bump_index(), None, "the parent is now an unproven tx over its proven parent");
+        assert_eq!(
+            re.find_txid(&parent).unwrap().bump_index(),
+            None,
+            "the parent is now an unproven tx over its proven parent"
+        );
         assert!(!re.is_atomic(), "plain in, plain out");
         assert!(re.is_valid(false), "a verifier can walk it");
         assert_ne!(out, bytes);
@@ -645,11 +734,16 @@ mod tests {
         beef.merge_raw_tx(parent.to_binary(), Some(b_parent));
         beef.merge_raw_tx(child.to_binary(), None);
         let bytes = beef.to_binary();
-        let out = strip_bumps(&bytes, &child_txid, &[0]).expect("the parent is sourced by its proven grandparent");
+        let out = strip_bumps(&bytes, &child_txid, &[0])
+            .expect("the parent is sourced by its proven grandparent");
         let mut re = Beef::from_binary(&out).unwrap();
         assert_eq!(re.bumps.len(), 1);
         assert_eq!(re.bumps[0].block_height, 965_700, "the standing bump stays");
-        assert_eq!(re.find_txid(&gp_txid).unwrap().bump_index(), Some(0), "re-indexed 1 → 0");
+        assert_eq!(
+            re.find_txid(&gp_txid).unwrap().bump_index(),
+            Some(0),
+            "re-indexed 1 → 0"
+        );
         assert_eq!(re.find_txid(&parent_txid).unwrap().bump_index(), None);
         assert!(re.is_valid(false));
         // refuting the grandparent's bump instead: the grandparent's own
@@ -660,9 +754,21 @@ mod tests {
     #[test]
     fn strip_refuses_nonsense() {
         let (bytes, child, _) = fixture(965_771, false);
-        assert_eq!(strip_bumps(&bytes, &child, &[]), None, "nothing to strip is not a served answer");
-        assert_eq!(strip_bumps(&bytes, &child, &[7]), None, "not a bump of this BEEF");
-        assert_eq!(strip_bumps(&bytes, &"cd".repeat(32), &[0]), None, "the subject must be present");
+        assert_eq!(
+            strip_bumps(&bytes, &child, &[]),
+            None,
+            "nothing to strip is not a served answer"
+        );
+        assert_eq!(
+            strip_bumps(&bytes, &child, &[7]),
+            None,
+            "not a bump of this BEEF"
+        );
+        assert_eq!(
+            strip_bumps(&bytes, &"cd".repeat(32), &[0]),
+            None,
+            "the subject must be present"
+        );
         assert_eq!(strip_bumps(&[0, 1, 2], &child, &[0]), None, "garbage");
     }
 }

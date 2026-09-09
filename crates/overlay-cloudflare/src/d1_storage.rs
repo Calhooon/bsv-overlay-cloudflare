@@ -182,7 +182,8 @@ pub(crate) fn transactions_proven_same_height_sql(limit: u64) -> String {
 /// A refuted stitched bump: `has_proof = 0` is the engine's own re-fetch
 /// cue (`complete_missing_proofs` re-verifies the stored bump, refetches a
 /// canonical one and re-stitches). Bytes and the anchor stay.
-pub(crate) const TRANSACTION_UNPROVE_SQL: &str = "UPDATE transactions SET has_proof = 0 WHERE txid = ?";
+pub(crate) const TRANSACTION_UNPROVE_SQL: &str =
+    "UPDATE transactions SET has_proof = 0 WHERE txid = ?";
 
 /// The anchored fast-path latch (bsv-low M19 R2 round 3, review MED-2): flip
 /// `has_proof = 1` AND record the block height the just-verified bump names
@@ -560,7 +561,11 @@ impl Storage for D1Storage {
         // row — the plain `mark_transaction_proven` left every fast-path row
         // anchorless, in no window forever.
         Query::new(MARK_TX_PROVEN_AT_SQL)
-            .bind(height.map(|h| h as f64).map_or(crate::d1::QVal::Null, crate::d1::QVal::Float))
+            .bind(
+                height
+                    .map(|h| h as f64)
+                    .map_or(crate::d1::QVal::Null, crate::d1::QVal::Float),
+            )
             .bind(txid)
             .execute(&self.db)
             .await
@@ -1098,29 +1103,55 @@ mod tests {
         assert_eq!(proof, 1);
         // bsv-low M19 round 2 (review M4): the anchor rides the verified stitch
         let anchor: Option<i64> = conn
-            .query_row("SELECT proofHeight FROM transactions WHERE txid = 'tx1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT proofHeight FROM transactions WHERE txid = 'tx1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(anchor, Some(965771));
         // the transactions leg's pages and un-prove, EXPLAIN-pinned without ANALYZE
         let stats: i64 = conn
-            .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stats, 0);
         let plan = |sql: &str, binds: &[i64]| -> Vec<String> {
             conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .unwrap()
-                .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                    r.get::<_, String>(3)
+                })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
         };
         for (name, lines) in [
-            ("head", plan(&transactions_proven_head_sql(10), &[965770, 965773])),
-            ("same height", plan(&transactions_proven_same_height_sql(10), &[965771, 99])),
+            (
+                "head",
+                plan(&transactions_proven_head_sql(10), &[965770, 965773]),
+            ),
+            (
+                "same height",
+                plan(&transactions_proven_same_height_sql(10), &[965771, 99]),
+            ),
         ] {
             let joined = lines.join("\n");
-            assert!(lines.iter().any(|l| l.contains("USING INDEX idx_transactions_proven_height")), "{name}: {joined}");
-            assert!(!lines.iter().any(|l| l.starts_with("SCAN ") || l.contains("TEMP B-TREE")), "{name}: {joined}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("USING INDEX idx_transactions_proven_height")),
+                "{name}: {joined}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.starts_with("SCAN ") || l.contains("TEMP B-TREE")),
+                "{name}: {joined}"
+            );
         }
         let rows: Vec<String> = conn
             .prepare(&transactions_proven_head_sql(10))
@@ -1132,17 +1163,33 @@ mod tests {
         assert_eq!(rows, vec!["tx1"]);
         conn.execute(TRANSACTION_UNPROVE_SQL, ["tx1"]).unwrap();
         let (proof3, anchor3): (i64, Option<i64>) = conn
-            .query_row("SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!((proof3, anchor3), (0, Some(965771)), "un-proved for the engine's re-fetch; the anchor stays");
+        assert_eq!(
+            (proof3, anchor3),
+            (0, Some(965771)),
+            "un-proved for the engine's re-fetch; the anchor stays"
+        );
 
         // bsv-low M19 R2 round 3 (review MED-2): the fast-path anchored latch
         // (`MARK_TX_PROVEN_AT_SQL`) records proofHeight, so a row a stored
         // bump already proved LANDS in the transactions window — where the
         // plain `mark_transaction_proven` left it anchorless, in no window.
-        conn.execute(INSERT_OUTPUT_TX_SQL, rusqlite::params!["tx2", vec![0xbeu8, 0xef]]).unwrap();
+        conn.execute(
+            INSERT_OUTPUT_TX_SQL,
+            rusqlite::params!["tx2", vec![0xbeu8, 0xef]],
+        )
+        .unwrap();
         // the OLD plain latch shape: has_proof = 1 but no anchor → never windowed
-        conn.execute("UPDATE transactions SET has_proof = 1 WHERE txid = 'tx2'", []).unwrap();
+        conn.execute(
+            "UPDATE transactions SET has_proof = 1 WHERE txid = 'tx2'",
+            [],
+        )
+        .unwrap();
         let windowed = |lo: i64, hi: i64| -> Vec<String> {
             conn.prepare(&transactions_proven_head_sql(10))
                 .unwrap()
@@ -1151,17 +1198,42 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
         };
-        assert!(!windowed(965770, 965773).contains(&"tx2".to_string()), "an anchorless proven row is in no window (the MED-2 bug)");
-        conn.execute(MARK_TX_PROVEN_AT_SQL, rusqlite::params![965772i64, "tx2"]).unwrap();
+        assert!(
+            !windowed(965770, 965773).contains(&"tx2".to_string()),
+            "an anchorless proven row is in no window (the MED-2 bug)"
+        );
+        conn.execute(MARK_TX_PROVEN_AT_SQL, rusqlite::params![965772i64, "tx2"])
+            .unwrap();
         let (p2, a2): (i64, Option<i64>) = conn
-            .query_row("SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT has_proof, proofHeight FROM transactions WHERE txid = 'tx2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!((p2, a2), (1, Some(965772)));
-        assert!(windowed(965770, 965773).contains(&"tx2".to_string()), "the anchored fast-path row lands in the window");
+        assert!(
+            windowed(965770, 965773).contains(&"tx2".to_string()),
+            "the anchored fast-path row lands in the window"
+        );
         // a height-less flip keeps a held anchor (COALESCE)
-        conn.execute(MARK_TX_PROVEN_AT_SQL, rusqlite::params![Option::<i64>::None, "tx2"]).unwrap();
-        let a3: Option<i64> = conn.query_row("SELECT proofHeight FROM transactions WHERE txid = 'tx2'", [], |r| r.get(0)).unwrap();
-        assert_eq!(a3, Some(965772), "a height-less latch keeps the held anchor");
+        conn.execute(
+            MARK_TX_PROVEN_AT_SQL,
+            rusqlite::params![Option::<i64>::None, "tx2"],
+        )
+        .unwrap();
+        let a3: Option<i64> = conn
+            .query_row(
+                "SELECT proofHeight FROM transactions WHERE txid = 'tx2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a3,
+            Some(965772),
+            "a height-less latch keeps the held anchor"
+        );
     }
 
     /// bsv-low#302: the SHIPPED peer-health upsert + select on the

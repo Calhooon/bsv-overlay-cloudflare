@@ -204,13 +204,22 @@ mod tests {
     const ORPHAN: &str = "0000000000000000153e10f465dba9697e4bde364fdf3a3224a736b019ffbfb1";
 
     fn seen(prior: Option<&str>, max: Option<u64>) -> HeaderSeen {
-        HeaderSeen { prior_hash_at_height: prior.map(String::from), max_height_before: max }
+        HeaderSeen {
+            prior_hash_at_height: prior.map(String::from),
+            max_height_before: max,
+        }
     }
 
     #[test]
     fn a_new_tip_extends_and_the_same_header_again_repeats() {
-        assert_eq!(classify_tip_announce(965771, A, &HeaderSeen::default()), TipAnnounce::Extends);
-        assert_eq!(classify_tip_announce(965772, A, &seen(None, Some(965771))), TipAnnounce::Extends);
+        assert_eq!(
+            classify_tip_announce(965771, A, &HeaderSeen::default()),
+            TipAnnounce::Extends
+        );
+        assert_eq!(
+            classify_tip_announce(965772, A, &seen(None, Some(965771))),
+            TipAnnounce::Extends
+        );
         assert_eq!(
             classify_tip_announce(965771, A, &seen(Some(&A.to_uppercase()), Some(965771))),
             TipAnnounce::Repeat,
@@ -237,15 +246,24 @@ mod tests {
     fn a_lower_unrecorded_height_is_an_old_header_never_a_reorg() {
         // the former "tip decreased" arm: two webhook tasks landing out of
         // order announce 965772 after 965773 was held. Nothing is demoted.
-        assert_eq!(classify_tip_announce(965772, A, &seen(None, Some(965773))), TipAnnounce::Old);
-        assert_eq!(classify_tip_announce(1, A, &seen(None, Some(965773))), TipAnnounce::Old);
+        assert_eq!(
+            classify_tip_announce(965772, A, &seen(None, Some(965773))),
+            TipAnnounce::Old
+        );
+        assert_eq!(
+            classify_tip_announce(1, A, &seen(None, Some(965773))),
+            TipAnnounce::Old
+        );
     }
 
     #[test]
     fn reverify_folds_fail_safe() {
         assert_eq!(classify_reverify(&Ok(true)), ReverifyVerdict::Standing);
         assert_eq!(classify_reverify(&Ok(false)), ReverifyVerdict::Stale);
-        assert_eq!(classify_reverify(&Err("read failed".into())), ReverifyVerdict::Fault);
+        assert_eq!(
+            classify_reverify(&Err("read failed".into())),
+            ReverifyVerdict::Fault
+        );
     }
 
     #[test]
@@ -262,38 +280,96 @@ mod tests {
         // fresh: the last 3 heights
         assert_eq!(
             next_sweep_window(None, 965774, 3),
-            Some(SweepState { lo: 965772, hi: 965774, cursor: None, exhausted: false })
+            Some(SweepState {
+                lo: 965772,
+                hi: 965774,
+                cursor: None,
+                exhausted: false
+            })
         );
         // in progress: anchored, even though the tip moved on
-        let walking = SweepState { lo: 965771, hi: 965773, cursor: Some(RowKey { height: 965772, rowid: 40 }), exhausted: false };
-        assert_eq!(next_sweep_window(Some(&walking), 965779, 3), Some(walking.clone()));
+        let walking = SweepState {
+            lo: 965771,
+            hi: 965773,
+            cursor: Some(RowKey {
+                height: 965772,
+                rowid: 40,
+            }),
+            exhausted: false,
+        };
+        assert_eq!(
+            next_sweep_window(Some(&walking), 965779, 3),
+            Some(walking.clone())
+        );
         // kept up: exhausted at 965773, tip 965774 → the last 3 heights again
-        let done = SweepState { exhausted: true, ..walking.clone() };
+        let done = SweepState {
+            exhausted: true,
+            ..walking.clone()
+        };
         assert_eq!(
             next_sweep_window(Some(&done), 965774, 3),
-            Some(SweepState { lo: 965772, hi: 965774, cursor: None, exhausted: false })
+            Some(SweepState {
+                lo: 965772,
+                hi: 965774,
+                cursor: None,
+                exhausted: false
+            })
         );
         // fell behind: exhausted at 965770, tip 965774 → continue at 965771 (no height skipped)
-        let behind = SweepState { lo: 965769, hi: 965770, cursor: None, exhausted: true };
+        let behind = SweepState {
+            lo: 965769,
+            hi: 965770,
+            cursor: None,
+            exhausted: true,
+        };
         assert_eq!(
             next_sweep_window(Some(&behind), 965774, 3),
-            Some(SweepState { lo: 965771, hi: 965774, cursor: None, exhausted: false })
+            Some(SweepState {
+                lo: 965771,
+                hi: 965774,
+                cursor: None,
+                exhausted: false
+            })
         );
         // the same tip again after exhaustion: a restart from the newest
-        let same = SweepState { lo: 965772, hi: 965774, cursor: None, exhausted: true };
+        let same = SweepState {
+            lo: 965772,
+            hi: 965774,
+            cursor: None,
+            exhausted: true,
+        };
         assert_eq!(
             next_sweep_window(Some(&same), 965774, 3),
-            Some(SweepState { lo: 965772, hi: 965774, cursor: None, exhausted: false })
+            Some(SweepState {
+                lo: 965772,
+                hi: 965774,
+                cursor: None,
+                exhausted: false
+            })
         );
-        assert_eq!(next_sweep_window(None, 2, 6), Some(SweepState { lo: 1, hi: 2, cursor: None, exhausted: false }));
+        assert_eq!(
+            next_sweep_window(None, 2, 6),
+            Some(SweepState {
+                lo: 1,
+                hi: 2,
+                cursor: None,
+                exhausted: false
+            })
+        );
         assert_eq!(next_sweep_window(None, 965774, 0), None);
         assert_eq!(next_sweep_window(None, 0, 3), None);
     }
 
     #[test]
     fn arcade_markers_are_the_two_spellings_only() {
-        assert_eq!(arcade_reorg_marker(Some("reorg_reanchor")), Some(ArcadeReorgMarker::Reanchor));
-        assert_eq!(arcade_reorg_marker(Some(" reorg_unmined ")), Some(ArcadeReorgMarker::Unmined));
+        assert_eq!(
+            arcade_reorg_marker(Some("reorg_reanchor")),
+            Some(ArcadeReorgMarker::Reanchor)
+        );
+        assert_eq!(
+            arcade_reorg_marker(Some(" reorg_unmined ")),
+            Some(ArcadeReorgMarker::Unmined)
+        );
         assert_eq!(arcade_reorg_marker(Some("UTXO_SPENT (70): x")), None);
         assert_eq!(arcade_reorg_marker(Some("")), None);
         assert_eq!(arcade_reorg_marker(None), None);
@@ -301,13 +377,49 @@ mod tests {
 
     #[test]
     fn a_reanchor_is_a_different_height_or_a_different_root_never_a_fill() {
-        let stored = BumpAnchor { height: 965771, root: "aa".repeat(32) };
-        assert!(is_reanchor(Some(&stored), &BumpAnchor { height: 965773, root: "aa".repeat(32) }), "a new height");
+        let stored = BumpAnchor {
+            height: 965771,
+            root: "aa".repeat(32),
+        };
         assert!(
-            is_reanchor(Some(&stored), &BumpAnchor { height: 965771, root: "bb".repeat(32) }),
+            is_reanchor(
+                Some(&stored),
+                &BumpAnchor {
+                    height: 965773,
+                    root: "aa".repeat(32)
+                }
+            ),
+            "a new height"
+        );
+        assert!(
+            is_reanchor(
+                Some(&stored),
+                &BumpAnchor {
+                    height: 965771,
+                    root: "bb".repeat(32)
+                }
+            ),
             "the SAME height with another root: a tx in both competing blocks"
         );
-        assert!(!is_reanchor(Some(&stored), &BumpAnchor { height: 965771, root: "AA".repeat(32) }), "the same anchor, case-insensitive");
-        assert!(!is_reanchor(None, &BumpAnchor { height: 965773, root: "aa".repeat(32) }), "no stored bump: a fill");
+        assert!(
+            !is_reanchor(
+                Some(&stored),
+                &BumpAnchor {
+                    height: 965771,
+                    root: "AA".repeat(32)
+                }
+            ),
+            "the same anchor, case-insensitive"
+        );
+        assert!(
+            !is_reanchor(
+                None,
+                &BumpAnchor {
+                    height: 965773,
+                    root: "aa".repeat(32)
+                }
+            ),
+            "no stored bump: a fill"
+        );
     }
 }

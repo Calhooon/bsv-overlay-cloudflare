@@ -1206,18 +1206,28 @@ mod tests {
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
                 let msg = e.to_string().to_ascii_lowercase();
-                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
             }
         }
         let plan = |sql: &str, binds: &[rusqlite::types::Value]| -> Vec<String> {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).expect("prepare");
-            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
-                .expect("plan")
-                .map(|r| r.expect("row"))
-                .collect()
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare");
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("plan")
+            .map(|r| r.expect("row"))
+            .collect()
         };
         let identity = rusqlite::types::Value::Text("02".repeat(33));
-        let lines = plan(&refund_view_sql(Some(1_000), 0), &[identity, rusqlite::types::Value::Integer(1_000)]);
+        let lines = plan(
+            &refund_view_sql(Some(1_000), 0),
+            &[identity, rusqlite::types::Value::Integer(1_000)],
+        );
         let joined = lines.join("\n");
         for l in &lines {
             if let Some(scanned) = l.strip_prefix("SCAN ") {
@@ -1227,8 +1237,16 @@ mod tests {
                 );
             }
         }
-        for needle in ["SEARCH potparty_records USING INDEX idx_potparty_identity", "SEARCH hp USING INDEX idx_hopparty_identity", "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)", "SEARCH pr USING COVERING INDEX idx_potrefund_pot (potTxid=? AND potVout=?)"] {
-            assert!(lines.iter().any(|l| l.contains(needle)), "expected `{needle}` in the plan:\n{joined}");
+        for needle in [
+            "SEARCH potparty_records USING INDEX idx_potparty_identity",
+            "SEARCH hp USING INDEX idx_hopparty_identity",
+            "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)",
+            "SEARCH pr USING COVERING INDEX idx_potrefund_pot (potTxid=? AND potVout=?)",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.contains(needle)),
+                "expected `{needle}` in the plan:\n{joined}"
+            );
         }
     }
 }
