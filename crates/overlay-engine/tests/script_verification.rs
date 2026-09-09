@@ -899,3 +899,88 @@ async fn two_inputs_from_one_unproven_parent_verify() {
     assert_eq!(steak[TOPIC].outputs_to_admit, vec![0]);
     assert!(is_admitted(&storage, &subject.id()).await);
 }
+
+/// A DIAMOND chain: every level spends BOTH outputs of the previous unproven
+/// level (a head output and its change, the shape of every second head spend
+/// of a wallet), 24 levels deep and all unproven. A walker that links a clone
+/// per occurrence materializes 2^24 subtrees and dies; the map-based walk is
+/// linear. Found on beta 2026-09-08: a 12-deep unmined chain took the Worker
+/// past its memory on the picture buy of the identity-market soak. The BEEF is
+/// assembled by hand (`merge_raw_tx`) and each level signs against a SHALLOW
+/// copy of its parent, so the test itself stays linear too.
+#[tokio::test]
+async fn a_deep_diamond_chain_of_unproven_spends_verifies_in_linear_time() {
+    let key = PrivateKey::random();
+    let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+    let funding = proven_funding(lock.clone(), 4_000_000);
+    let funding_txid = funding.id();
+    let funding_bump = funding
+        .merkle_path
+        .clone()
+        .expect("proven funding carries a BUMP");
+
+    let shallow = |tx: &Transaction| {
+        let mut t = tx.clone();
+        for input in &mut t.inputs {
+            input.source_transaction = None;
+        }
+        t
+    };
+    let mut beef = Beef::new();
+    let bump_index = beef.merge_bump(funding_bump);
+    beef.merge_raw_tx(funding.to_binary(), Some(bump_index));
+
+    let mut prev = shallow(&funding);
+    let mut sats: u64 = 4_000_000;
+    for level in 0..24u32 {
+        let mut tx = Transaction::new();
+        tx.add_input_from_tx(
+            prev.clone(),
+            0,
+            P2PKH::unlock(&key, SignOutputs::All, false),
+        )
+        .unwrap();
+        if level > 0 {
+            tx.add_input_from_tx(
+                prev.clone(),
+                1,
+                P2PKH::unlock(&key, SignOutputs::All, false),
+            )
+            .unwrap();
+        }
+        sats -= 1_000; // two outputs, a little less than the inputs (the value rule)
+        tx.outputs
+            .push(TransactionOutput::new(sats / 2, lock.clone()));
+        tx.outputs
+            .push(TransactionOutput::new(sats - sats / 2, lock.clone()));
+        tx.sign().await.expect("level signs");
+        beef.merge_raw_tx(tx.to_binary(), None);
+        prev = shallow(&tx);
+    }
+    let subject_txid = prev.id();
+    let beef_bytes = beef.to_binary();
+    assert_eq!(
+        Beef::from_binary(&beef_bytes).unwrap().txs.len(),
+        25,
+        "funding + 24 levels, each once"
+    );
+
+    let storage = Rc::new(MemoryStorage::new());
+    let engine = engine_with(Rc::clone(&storage), Some(tracker_knowing(&funding_txid)));
+    let t0 = std::time::Instant::now();
+    let steak = engine
+        .submit(
+            &TaggedBEEF::new(beef_bytes, vec![TOPIC.into()]),
+            SubmitMode::CurrentTx,
+        )
+        .await
+        .expect("a 24-deep diamond of valid unproven spends is admitted");
+    let elapsed = t0.elapsed();
+    assert_eq!(steak[TOPIC].outputs_to_admit, vec![0]);
+    assert!(is_admitted(&storage, &subject_txid).await);
+    assert!(
+        elapsed.as_secs() < 20,
+        "the walk must be linear in the chain, not exponential: took {elapsed:?}"
+    );
+    println!("24-deep diamond verified in {elapsed:?}");
+}
