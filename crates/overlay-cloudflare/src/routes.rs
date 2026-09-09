@@ -1645,7 +1645,7 @@ async fn submit_inner(
     // carved out of `arcade-broadcast` so the second-broadcaster leg is
     // attributable on its own.
     let server_timing = format!(
-        "arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
+        "script-verify;dur={script_verify_ms:.1}, arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
     );
     let mut resp = with_server_timing(json_ok(&steak)?, &server_timing);
     {

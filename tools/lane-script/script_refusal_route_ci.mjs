@@ -36,8 +36,9 @@
  *     `submit_script_refused_total` unchanged.
  *
  * Boundary, stated: the valid leg's accept claim is corroborated against the
- * hardcoded TAAL/GorillaPool hosts (lane-371's stated boundary), so its final
- * status is not hermetic; the ORDER (walk, then POST) is what this cell pins.
+ * hardcoded TAAL/GorillaPool hosts (lane-371's stated boundary; lane-347's
+ * gated probes already reach the real couriers from CI), so its final status
+ * is not hermetic; the ORDER (walk, then POST) is what this cell pins.
  *
  * Exit 0 = every expectation held.
  */
@@ -62,7 +63,11 @@ const beefOf = (entry) => Buffer.from(readFileSync(new URL(entry.file, FIX), 'ut
 const VALID = beefOf(manifest.valid)
 const CORRUPTED = beefOf(manifest.corrupted)
 
-// ── the fixture Arcade: logs every broadcast POST, answers SEEN ────────────
+// ── the fixture Arcade: logs every broadcast POST; a txid is SEEN only AFTER
+// a POST (the gated arm PRE-FLIGHTS `GET /tx/{txid}` and skips the whole
+// ladder when Arcade already reports ≥SEEN — a fixture that says SEEN to any
+// GET never receives the POST this cell exists to observe; found on the first
+// run, 2026-09-09). ──────────────────────────────────────────────────────────
 const postLog = [] // one entry per POST /tx | /txs (body length)
 const fixture = createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${FIXTURE_PORT}`)
@@ -78,6 +83,11 @@ const fixture = createServer((req, res) => {
   }
   if (req.method === 'GET' && url.pathname.startsWith('/tx/')) {
     const txid = url.pathname.slice('/tx/'.length).toLowerCase()
+    if (postLog.length === 0) {
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'not found' }))
+      return
+    }
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ txid, txStatus: 'SEEN_ON_NETWORK' }))
     return
@@ -160,6 +170,7 @@ try {
   const c1 = await counters()
 
   // 3. a junk body refuses BEFORE the door: no POST, no door counter moves
+  const postsBeforeJunk = postLog.length
   const junk = await postSubmit(Buffer.from('deadbeef', 'hex'))
   if (junk.status >= 400 && junk.status < 500 && junk.json?.code !== 'script-refused') {
     pass(`junk body refused before the door (${junk.status})`)
@@ -168,10 +179,10 @@ try {
   }
   await new Promise((s) => setTimeout(s, 1_500))
   const c2 = await counters()
-  if (postLog.length === postsBefore && c2.refused === c1.refused && c2.inconclusive === c1.inconclusive) {
+  if (postLog.length === postsBeforeJunk && c2.refused === c1.refused && c2.inconclusive === c1.inconclusive) {
     pass('junk body: no POST, no door counter moved (the door counts only its own verdicts)')
   } else {
-    fail('junk body leaves the door untouched', `posts ${postLog.length - postsBefore} refused ${c1.refused}->${c2.refused} inconclusive ${c1.inconclusive}->${c2.inconclusive}`)
+    fail('junk body leaves the door untouched', `posts ${postLog.length - postsBeforeJunk} refused ${c1.refused}->${c2.refused} inconclusive ${c1.inconclusive}->${c2.inconclusive}`)
   }
 
   // 4. the valid spend passes the door and IS broadcast
