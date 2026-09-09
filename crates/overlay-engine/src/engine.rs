@@ -1380,12 +1380,11 @@ impl Engine {
                     // The door's OWN limit tripping inside the interpreter (the
                     // stack memory limit is the budget's element bound) is the
                     // door's verdict, never the network's: over budget, not
-                    // refused. bsv-rs names it "… memory usage has exceeded …"
-                    // (pinned: a wording change reds the pin, never a silent
-                    // reclassification).
-                    Err(e)
-                        if budget.is_some() && e.message.contains("memory usage has exceeded") =>
-                    {
+                    // refused. bsv-rs 0.3.23 reports it as its own class
+                    // (`resource_limit`, the ts-sdk's `ScriptResourceLimitError`:
+                    // the stack budget, the alt stack, NUM2BIN's element-size
+                    // pre-check), so no wording is matched.
+                    Err(e) if budget.is_some() && e.is_resource_limit() => {
                         return Err(over(
                             &txid,
                             judged,

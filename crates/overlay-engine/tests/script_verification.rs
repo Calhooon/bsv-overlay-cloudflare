@@ -1553,3 +1553,41 @@ async fn door_census_weights_a_multisig_by_its_stated_key_count() {
         "a computed key count is charged the maximum the element limit admits: {outcome:?}"
     );
 }
+
+/// bsv-rs 0.3.23 (reference parity): `OP_NUM2BIN` refuses an oversized
+/// element BEFORE allocating it, as an `element-size` RESOURCE limit — under
+/// the door that is the door's bound (over budget), never a refusal, and it
+/// returns fast (no 1 GB allocation attempt).
+#[tokio::test]
+async fn door_num2bin_oversized_element_is_the_doors_bound_before_any_allocation() {
+    // `OP_1 <1e9> OP_NUM2BIN OP_DROP OP_TRUE`: 9 bytes of lock asking for a 1 GB element.
+    let mut script = Script::new();
+    script
+        .write_opcode(OP_1)
+        .write_bin(&1_000_000_000i64.to_le_bytes()[..4])
+        .write_opcode(OP_NUM2BIN)
+        .write_opcode(OP_DROP)
+        .write_opcode(OP_TRUE);
+    let lock = LockingScript::from_script(script);
+    let spend = spend_of(lock, push_unlock(vec![0x42; 8]), 5_000, 4_000, |_| {}).await;
+    let engine = engine(None);
+    let started = Instant::now();
+    let err = engine
+        .verify_scripts_only(&spend.beef, &spend.subject_txid)
+        .await
+        .expect_err("a 1 GB element exceeds the door's element limit");
+    assert!(
+        started.elapsed().as_millis() < 500,
+        "refused before allocating: {:?}",
+        started.elapsed()
+    );
+    match &err {
+        EngineError::ScriptWalkOverBudget { what, .. } => {
+            assert!(
+                what.contains("Script element allocation has exceeded"),
+                "{what}"
+            )
+        }
+        other => panic!("expected the door's bound, got {other}"),
+    }
+}
