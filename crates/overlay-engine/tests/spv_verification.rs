@@ -78,9 +78,9 @@ async fn historical_no_spv_skips_verification() {
     assert_eq!(steak["Hello"].outputs_to_admit, vec![0]);
 }
 
-/// HistoricalTx mode should also work (no broadcast but SPV should still be checked
-/// if chain tracker is configured — but we don't have one, so it should still pass
-/// with our current implementation since verification is best-effort).
+/// HistoricalTx mode is verified exactly like CurrentTx (only `-no-spv` skips):
+/// with no chain tracker the walk is 'scripts only', so the BRC62 subject's
+/// P2PKH script is executed against its parent and passes.
 #[tokio::test]
 async fn historical_tx_mode_works() {
     let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
@@ -103,7 +103,8 @@ async fn historical_tx_mode_works() {
     assert_eq!(steak["Hello"].outputs_to_admit, vec![0]);
 }
 
-/// CurrentTx mode works when no chain tracker is configured (graceful degradation).
+/// CurrentTx mode without a chain tracker: the reference's 'scripts only' walk
+/// (roots accepted unchecked, every unproven input script still executed).
 #[tokio::test]
 async fn current_tx_without_chain_tracker_works() {
     let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
@@ -120,7 +121,9 @@ async fn current_tx_without_chain_tracker_works() {
     let beef = TaggedBEEF::new(decode_hex(BRC62_BEEF_HEX), vec!["Hello".into()]);
     let steak = engine.submit(&beef, SubmitMode::CurrentTx).await.unwrap();
 
-    // Without chain tracker, SPV verification is skipped gracefully
+    // Without a chain tracker the merkle roots are not checked, but the
+    // subject's script IS executed (see tests/script_verification.rs for the
+    // refusal side); the BRC62 spend is valid, so it is admitted.
     assert_eq!(steak["Hello"].outputs_to_admit, vec![0]);
 }
 

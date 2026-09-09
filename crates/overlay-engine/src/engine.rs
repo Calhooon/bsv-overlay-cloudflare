@@ -79,6 +79,18 @@ pub struct Engine {
     /// exceeds the budget is DROPPED (loud log, failure recorded, cursor NOT
     /// advanced) and the loop continues with the next peer.
     peer_sync_budget: Option<(SleepFactory, u64)>,
+    /// Reference-parity spend verification on submit (2026-09-08). `true`
+    /// (DEFAULT): every submit outside `HistoricalTxNoSpv` runs the
+    /// reference's `Transaction.verify` walk: merkle paths against the chain
+    /// tracker AND every input's unlocking script EXECUTED, recursively over
+    /// the unproven ancestry in the BEEF; with no chain tracker the walk is
+    /// the ts-sdk's `'scripts only'` (roots accepted unchecked, scripts still
+    /// run). `false` is an ESCAPE HATCH, not a mode: it restores the
+    /// pre-2026-09-08 structural check (`Beef::verify_valid` + every root
+    /// against the tracker; NOTHING without a tracker), which admitted an
+    /// invalid spend on structure alone. See
+    /// [`Engine::set_script_verification`].
+    verify_scripts: bool,
     config: EngineConfig,
 }
 
@@ -351,6 +363,7 @@ impl Engine {
             gasp_remote_factory: None,
             ancestor_fetcher: None,
             peer_sync_budget: None,
+            verify_scripts: true,
             config,
         }
     }
@@ -394,6 +407,29 @@ impl Engine {
     /// Unset (default) = unbounded, the pre-#302 behavior.
     pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
         self.peer_sync_budget = Some((sleep, budget_ms));
+    }
+
+    /// Turn reference-parity script verification on submit on or off.
+    /// **DEFAULT ON** (set in every constructor).
+    ///
+    /// On, every submit outside `HistoricalTxNoSpv` executes every unproven
+    /// input's unlocking script against its source output (and checks every
+    /// merkle path against the chain tracker), exactly as the reference's
+    /// `Engine.submit` → `tx.verify(this.chainTracker)` does. Off is an
+    /// ESCAPE HATCH for an operator who must admit a body the interpreter
+    /// refuses (a bsv-rs interpreter defect, say) while it is fixed. It is
+    /// NOT a mode: it restores the pre-2026-09-08 structural check, under
+    /// which an invalid spend that no broadcaster had yet refused was
+    /// admitted on BEEF structure alone. Prefer
+    /// [`crate::builder::EngineBuilder::with_script_verification`].
+    pub fn set_script_verification(&mut self, enabled: bool) {
+        self.verify_scripts = enabled;
+    }
+
+    /// Whether submits execute input scripts, see
+    /// [`Engine::set_script_verification`]. `true` by default.
+    pub fn script_verification(&self) -> bool {
+        self.verify_scripts
     }
 
     // ========================================================================
@@ -660,6 +696,83 @@ impl Engine {
         Ok(steak)
     }
 
+    /// The reference's SPV block (overlay-express `Engine.submit`:
+    /// `const txValid = await tx.verify(this.chainTracker)`; ts-sdk
+    /// `Transaction.verify`), via `bsv_rs::transaction::Transaction::verify`,
+    /// which walks the subject and its unproven ancestry: a transaction WITH
+    /// a merkle path has its root checked against the chain tracker and is
+    /// then trusted (no descent); one WITHOUT has EVERY input's unlocking
+    /// script executed against its source output by the interpreter
+    /// (`bsv_rs::script::Spend`: OP_PUSH_TX-aware, minimal-push, push-only
+    /// unlocking, low-S, clean-stack, the ts-sdk `Spend` flags) and its
+    /// sources enqueued. Without a chain tracker this is the reference's
+    /// `tx.verify('scripts only')`: every root is accepted unchecked (a
+    /// proven ancestor is trusted on its BUMP alone), scripts still run.
+    ///
+    /// Two things the reference does that the bsv-rs walk does not, added
+    /// here: (1) an unproven transaction whose outputs exceed its inputs is
+    /// refused (`if (outputTotal > inputTotal) return false`), and (2) the
+    /// failure is CLASSIFIED: bsv-rs collapses every cause into one
+    /// `Error::TransactionError(String)`, so a bad SPEND is re-raised as
+    /// [`EngineError::ScriptVerificationFailed`] (input index + interpreter
+    /// message) and everything else as [`EngineError::SpvError`], so an
+    /// operator can tell a bad spend from a bad proof.
+    async fn verify_spv_like_the_reference(
+        &self,
+        tx: &Transaction,
+        subject_txid: &str,
+    ) -> Result<(), EngineError> {
+        let scripts_only = ScriptsOnlyChainTracker;
+        let tracker: &dyn bsv_rs::transaction::ChainTracker = match self.chain_tracker.as_deref() {
+            Some(tracker) => tracker,
+            None => &scripts_only,
+        };
+        match tx.verify(tracker, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(EngineError::SpvError(
+                    "Unable to verify SPV information.".into(),
+                ));
+            }
+            Err(e) => return Err(classify_verify_failure(subject_txid, &e)),
+        }
+        check_unproven_value_balance(tx)
+    }
+
+    /// The pre-2026-09-08 SPV block, kept verbatim as the
+    /// [`Engine::set_script_verification`] `false` escape hatch: BEEF
+    /// structural validity plus every root against the chain tracker, and
+    /// NOTHING when no tracker is configured. It never executes a script.
+    async fn verify_spv_structurally(&self, beef_bytes: &[u8]) -> Result<(), EngineError> {
+        let Some(chain_tracker) = self.chain_tracker.as_deref() else {
+            return Ok(());
+        };
+        let mut beef = Beef::from_binary(beef_bytes)
+            .map_err(|e| EngineError::SpvError(format!("BEEF parse error: {e}")))?;
+        let validation = beef.verify_valid(false);
+        if !validation.valid {
+            return Err(EngineError::SpvError(
+                "BEEF internal proof validation failed".into(),
+            ));
+        }
+        for (height, root) in &validation.roots {
+            match chain_tracker.is_valid_root_for_height(root, *height).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(EngineError::SpvError(format!(
+                        "Merkle root {root} invalid for block height {height}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::SpvError(format!(
+                        "Chain tracker error at height {height}: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
     ///
     /// Returns (validations, steak, parsed_tx, txid) so the caller can either
@@ -681,33 +794,15 @@ impl Engine {
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
         let txid = tx.id();
 
-        // SPV verification via BEEF merkle proof validation (skip for HistoricalTxNoSpv)
+        // SPV verification, skipped ONLY for HistoricalTxNoSpv, exactly the
+        // reference's `if (mode !== 'historical-tx-no-spv') tx.verify(...)`
+        // (that mode exists for GASP `finalizeGraph`, whose graphs
+        // `validateGraphAnchor` already verified).
         if mode != SubmitMode::HistoricalTxNoSpv {
-            if let Some(ref chain_tracker) = self.chain_tracker {
-                use bsv_rs::transaction::Beef;
-                let mut beef = Beef::from_binary(&tagged_beef.beef)
-                    .map_err(|e| EngineError::SpvError(format!("BEEF parse error: {e}")))?;
-                let validation = beef.verify_valid(false);
-                if !validation.valid {
-                    return Err(EngineError::SpvError(
-                        "BEEF internal proof validation failed".into(),
-                    ));
-                }
-                for (height, root) in &validation.roots {
-                    match chain_tracker.is_valid_root_for_height(root, *height).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Err(EngineError::SpvError(format!(
-                                "Merkle root {root} invalid for block height {height}"
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(EngineError::SpvError(format!(
-                                "Chain tracker error at height {height}: {e}"
-                            )));
-                        }
-                    }
-                }
+            if self.verify_scripts {
+                self.verify_spv_like_the_reference(&tx, &txid).await?;
+            } else {
+                self.verify_spv_structurally(&tagged_beef.beef).await?;
             }
         }
 
@@ -2320,6 +2415,115 @@ fn parse_ship_domain_from_script(output_script: &[u8]) -> Option<String> {
 }
 
 // ============================================================================
+// Submit-time spend verification helpers (reference parity, 2026-09-08)
+// ============================================================================
+
+/// The reference's `'scripts only'` verification for an engine with NO chain
+/// tracker: every merkle root is accepted unchecked, so
+/// `Transaction::verify` still executes every unproven input's script. Never
+/// installed as the engine's tracker; it exists only to give the bsv-rs walk
+/// something to call, and it has no chain view of its own.
+struct ScriptsOnlyChainTracker;
+
+#[async_trait::async_trait]
+impl bsv_rs::transaction::ChainTracker for ScriptsOnlyChainTracker {
+    async fn is_valid_root_for_height(
+        &self,
+        _root: &str,
+        _height: u32,
+    ) -> Result<bool, bsv_rs::transaction::ChainTrackerError> {
+        Ok(true)
+    }
+
+    async fn current_height(&self) -> Result<u32, bsv_rs::transaction::ChainTrackerError> {
+        Err(bsv_rs::transaction::ChainTrackerError::Other(
+            "scripts-only verification has no chain view".into(),
+        ))
+    }
+}
+
+/// The bsv-rs interpreter failure line inside `Transaction::verify`'s one
+/// `TransactionError` string (bsv-rs 0.3.20 `transaction.rs`:
+/// `format!("Script validation failed for input {}: {}", vin, e.message)`).
+/// If a bsv-rs bump ever rewords it, a script failure degrades to the generic
+/// [`EngineError::SpvError`] (still REFUSED, just mislabelled) and
+/// `tests/script_verification.rs` (which asserts the variant) goes red.
+const BSV_RS_SCRIPT_FAILURE_PREFIX: &str = "Script validation failed for input ";
+
+/// Split one `Transaction::verify` failure into a bad SPEND
+/// ([`EngineError::ScriptVerificationFailed`]) or anything else, a bad or
+/// unverifiable PROOF, a missing source, a chain-tracker fault
+/// ([`EngineError::SpvError`]).
+fn classify_verify_failure(subject_txid: &str, e: &bsv_rs::Error) -> EngineError {
+    let bsv_rs::Error::TransactionError(msg) = e else {
+        return EngineError::SpvError(e.to_string());
+    };
+    if let Some(rest) = msg.strip_prefix(BSV_RS_SCRIPT_FAILURE_PREFIX) {
+        if let Some((vin, reason)) = rest.split_once(": ") {
+            if let Ok(input_index) = vin.parse::<u32>() {
+                return EngineError::ScriptVerificationFailed {
+                    subject_txid: subject_txid.to_string(),
+                    input_index,
+                    reason: reason.to_string(),
+                };
+            }
+        }
+    }
+    EngineError::SpvError(msg.clone())
+}
+
+/// The reference's value rule inside `Transaction.verify`
+/// (`verifyUnminedTransaction`: `if (outputTotal > inputTotal) return false`,
+/// which `Engine.submit` surfaces as "Unable to verify SPV information."):
+/// every UNPROVEN transaction in the subject's ancestry must not create
+/// satoshis. A transaction with a merkle path is trusted, as in the walk.
+/// bsv-rs's `Transaction::verify` omits this rule, so it lives here.
+fn check_unproven_value_balance(subject: &Transaction) -> Result<(), EngineError> {
+    let overflow = |txid: &str| {
+        EngineError::SpvError(format!(
+            "Unable to verify SPV information: satoshi total overflows in transaction {txid}"
+        ))
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: Vec<&Transaction> = vec![subject];
+    while let Some(tx) = queue.pop() {
+        let txid = tx.id();
+        if !seen.insert(txid.clone()) || tx.merkle_path.is_some() {
+            continue;
+        }
+        let mut input_total: u64 = 0;
+        for (vin, input) in tx.inputs.iter().enumerate() {
+            let Some(source) = input.source_transaction.as_deref() else {
+                return Err(EngineError::SpvError(format!(
+                    "Unable to verify SPV information: input {vin} of transaction {txid} has no source transaction"
+                )));
+            };
+            let sats = source
+                .outputs
+                .get(input.source_output_index as usize)
+                .and_then(|o| o.satoshis)
+                .unwrap_or(0);
+            input_total = input_total
+                .checked_add(sats)
+                .ok_or_else(|| overflow(&txid))?;
+            queue.push(source);
+        }
+        let mut output_total: u64 = 0;
+        for output in &tx.outputs {
+            output_total = output_total
+                .checked_add(output.satoshis.unwrap_or(0))
+                .ok_or_else(|| overflow(&txid))?;
+        }
+        if output_total > input_total {
+            return Err(EngineError::SpvError(format!(
+                "Unable to verify SPV information: transaction {txid} creates {output_total} sats from {input_total} sats of inputs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Error type
 // ============================================================================
 
@@ -2359,6 +2563,22 @@ pub enum EngineError {
 
     #[error("BEEF parsing failed: {0}")]
     BeefParseError(String),
+
+    /// A spend in the submitted BEEF does not satisfy its source output's
+    /// locking script: the input's unlocking script was EXECUTED (reference
+    /// parity, 2026-09-08) and the interpreter refused it. Distinct from
+    /// [`EngineError::SpvError`] (a bad or unverifiable PROOF, a missing
+    /// source, a chain-tracker fault) so an operator can tell a bad spend from
+    /// a bad proof. `input_index` is the failing input's position in the
+    /// transaction whose script failed (the subject, or an unproven
+    /// ancestor of it in the same BEEF); `reason` is the interpreter's own
+    /// message.
+    #[error("script verification failed (subject {subject_txid}): input {input_index}: {reason}")]
+    ScriptVerificationFailed {
+        subject_txid: String,
+        input_index: u32,
+        reason: String,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -2589,6 +2809,14 @@ mod tests {
         let child_id = child.id();
         let parent_id = parent.id();
         let mut beef = Beef::new();
+        // The parent's BUMP rides along: the reference-parity walk
+        // (2026-09-08) executes the subject's script against the parent and
+        // then trusts the parent on its proof; without the BUMP it would
+        // demand the parent's own ancestry ("Input 0 has no source
+        // transaction"), which this fixture does not carry.
+        for bump in &parsed.bumps {
+            beef.merge_bump(bump.clone());
+        }
         beef.merge_transaction(child);
         beef.merge_transaction(parent);
         let mut w = bsv_rs::primitives::encoding::Writer::new();

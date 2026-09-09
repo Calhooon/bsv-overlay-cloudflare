@@ -13,9 +13,11 @@ root README for how the four crates compose.
 
 - **`Engine`** — the central orchestrator. Its public surface mirrors
   mainline `@bsv/overlay@2.2.0`:
-  - `submit(&TaggedBEEF, SubmitMode)` — 3-phase pipeline: SPV verify,
-    dedupe, dispatch to the topic manager(s), record admissions, call
-    `Broadcaster`.
+  - `submit(&TaggedBEEF, SubmitMode)` — 3-phase pipeline: SPV verify
+    (the reference's `tx.verify` walk: merkle paths against the
+    `ChainTracker` AND every unproven input's script executed, see the
+    root `CLAUDE.md` "Submit verification"), dedupe, dispatch to the topic
+    manager(s), record admissions, call `Broadcaster`.
   - `lookup(&LookupQuestion)` — dispatch to a registered lookup service.
   - `start_gasp_sync()` — pull outputs from peers per-topic using the
     GASP protocol.
@@ -32,13 +34,14 @@ root README for how the four crates compose.
   | `LookupService` | Per-service query handler. Responds to `LookupQuestion` with an `output-list` or `formula`. | `SHIPLookupService`, etc. (in `overlay-discovery`) |
   | `Advertiser` | Issues, finds, and revokes on-chain SHIP/SLAP advertisements for self. | `WalletAdvertiser` (in `overlay-discovery`), `CloudflareAdvertiser` (in `overlay-cloudflare`) |
   | `Broadcaster` | Propagates an admitted transaction (e.g. ARC, peer overlays). | `WorkerArcBroadcaster`, `WorkerBroadcaster` (in `overlay-cloudflare`) |
-  | `ChainTracker` | Merkle-root verification for SPV. | `WorkerChainTracker` (in `overlay-cloudflare`) |
+  | `ChainTracker` | Merkle-root verification for SPV. Absent, `submit` still executes scripts (the reference's `'scripts only'`). | `WorkerChainTracker` (in `overlay-cloudflare`) |
 
 - **`MemoryStorage`** — a reference in-memory `Storage` impl for tests
   and local dev. Enable with `features = ["memory-storage"]`.
 
 - **`EngineBuilder`** — chainable config for constructing an `Engine`
-  without dozens of constructor positional args.
+  without dozens of constructor positional args. Carries the
+  `with_script_verification(bool)` escape hatch (DEFAULT ON).
 
 - **GASP sync** (`gasp.rs`) — pure-Rust implementation of the Graph
   Aware Sync Protocol for overlay-to-overlay ingestion. Works over any

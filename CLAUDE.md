@@ -80,6 +80,48 @@ POST /admin/health-check, /admin/ban, /admin/unban,
 
 Admin routes except `/admin/config` require `Authorization: Bearer <ADMIN_TOKEN>`.
 
+## Submit verification (reference parity)
+
+`Engine::submit` verifies the subject transaction the way the reference does
+(`overlay-express` `Engine.submit`: `await tx.verify(this.chainTracker)`,
+ts-sdk `Transaction.verify`) in every mode except `historical-tx-no-spv`
+(that mode exists for GASP `finalizeGraph`, whose graphs `validateGraphAnchor`
+already verified). Since 2026-09-08 the walk is
+`bsv_rs::transaction::Transaction::verify` (`engine.rs`
+`verify_spv_like_the_reference`): a transaction WITH a merkle path has its
+root checked against the engine's `ChainTracker` and is then trusted; one
+WITHOUT has EVERY input's unlocking script EXECUTED against its source output
+(`bsv_rs::script::Spend`, OP_PUSH_TX-aware, ts-sdk `Spend` flags) and its
+sources walked in turn. With NO chain tracker the walk is the reference's
+`tx.verify('scripts only')`: roots are accepted unchecked, scripts still run.
+The engine adds the one rule of the reference's walk that bsv-rs omits: an
+unproven transaction may not create satoshis (`outputTotal > inputTotal`).
+
+Before 2026-09-08 this was a divergence: a tracker-less engine checked
+nothing, a tracker-ful one checked BEEF structure plus roots only
+(`Beef::verify_valid`), and no script was ever executed, so an invalid spend
+that no broadcaster had yet refused (or one arriving as `historical-tx`)
+was admitted on structure alone.
+
+Failures are classified so an operator can tell a bad SPEND from a bad PROOF:
+`EngineError::ScriptVerificationFailed { subject_txid, input_index, reason }`
+(the interpreter refused that input; `reason` is its own message) versus
+`EngineError::SpvError` (bad or unverifiable proof, missing source, chain
+tracker fault, the value rule). Both answer 400 on `/submit`.
+
+**Switch:** `EngineBuilder::with_script_verification(bool)` /
+`Engine::set_script_verification(bool)`, DEFAULT ON. `false` is an ESCAPE
+HATCH, not a mode: it restores the pre-2026-09-08 structural check (for an
+operator who must admit a body the interpreter wrongly refuses while the
+defect is fixed). Executable proof, incl. two REAL mainnet OP_PUSH_TX
+covenant legs and a deliberately expensive spend whose verification time is
+printed: `cargo test -p bsv-overlay-engine --features memory-storage --test
+script_verification -- --nocapture`. Measured natively, release profile
+(2026-09-08): the real 3150-byte Poc5 covenant settle is ~1 ms end to end; a
+~7 KB lock / ~20 KB unlock / ~7000-opcode spend that hashes 46 MB is 137 ms
+in `Transaction::verify` (2.1 s in a debug build). Workers wasm is slower
+than native; budget CPU accordingly for big covenant legs.
+
 ## Testing
 
 ```bash
