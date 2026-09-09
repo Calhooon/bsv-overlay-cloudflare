@@ -877,14 +877,17 @@ async fn two_inputs_from_one_unproven_parent_verify() {
         "funding, middle, subject"
     );
 
-    // The positive control for the engine's linker: bsv-rs 0.3.20 alone still
-    // trips on this BEEF. When this assertion fails, bsv-rs has fixed
-    // `find_atomic_transaction` and `link_beef_ancestry` can go.
+    // bsv-rs 0.3.22 links duplicate inputs as bare stubs (linear structure)
+    // and its own verify walks by txid, so the bare SDK walk verifies this
+    // BEEF too (0.3.20 failed it on the bare clone; 0.3.21 linked every clone
+    // in full and was exponential on diamond chains, yanked). The engine keeps
+    // `verify_beef_linear` regardless: it is the reference algorithm and
+    // depends on no clone structure.
     let bare = Transaction::from_beef(&beef, None).unwrap();
     let bare_result = bare.verify(&*tracker_knowing(&funding_txid), None).await;
     assert!(
-        format!("{bare_result:?}").contains("has no source transaction"),
-        "bsv-rs 0.3.20 leaves the second clone of the unproven parent bare: {bare_result:?}"
+        matches!(bare_result, Ok(true)),
+        "bsv-rs 0.3.22 verifies both inputs of one unproven parent: {bare_result:?}"
     );
 
     let storage = Rc::new(MemoryStorage::new());
