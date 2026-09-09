@@ -1083,8 +1083,14 @@ async fn scripts_only_still_applies_the_value_rule_as_a_structural_fault() {
         .await
         .expect_err("an unproven spend may not create satoshis");
     assert!(
-        matches!(err, EngineError::SpvError(_)),
-        "the value rule is structural, never a script fault: {err}"
+        matches!(
+            &err,
+            EngineError::ScriptWalkInconclusive {
+                subject_judged: true,
+                ..
+            }
+        ),
+        "the value rule is structural (the subject's inputs all ran first), never a script fault: {err}"
     );
 }
 
@@ -1114,8 +1120,14 @@ async fn scripts_only_names_a_missing_source_structurally_never_as_a_script_faul
         .await
         .expect_err("a source the BEEF does not carry cannot be executed");
     assert!(
-        matches!(err, EngineError::SpvError(_)),
-        "a missing source is structural: {err}"
+        matches!(
+            &err,
+            EngineError::ScriptWalkInconclusive {
+                subject_judged: false,
+                ..
+            }
+        ),
+        "a missing source on the SUBJECT is structural and leaves the subject UNJUDGED: {err}"
     );
 }
 
@@ -1253,10 +1265,15 @@ async fn emit_lane_script_fixtures() {
     expect_script_error(&err);
     std::fs::write(dir.join("valid.beef.hex"), hex::encode(&valid.beef)).unwrap();
     std::fs::write(dir.join("corrupted.beef.hex"), hex::encode(&corrupted.beef)).unwrap();
+    let raw_of = |beef_bytes: &[u8], txid: &str| -> String {
+        let b = Beef::from_binary(beef_bytes).expect("the fixture parses");
+        let btx = b.find_txid(txid).expect("the subject is in its BEEF");
+        hex::encode(btx.tx().expect("a full tx").to_binary())
+    };
     let manifest = serde_json::json!({
         "producer": "crates/overlay-engine/tests/script_verification.rs emit_lane_script_fixtures (fixed keys; regenerate, never retype)",
-        "valid": { "file": "valid.beef.hex", "subject_txid": valid.subject_txid, "funding_txid": valid.funding_txid },
-        "corrupted": { "file": "corrupted.beef.hex", "subject_txid": corrupted.subject_txid, "funding_txid": corrupted.funding_txid, "defect": "one DER r byte of input 0's signature flipped after signing" },
+        "valid": { "file": "valid.beef.hex", "subject_txid": valid.subject_txid, "funding_txid": valid.funding_txid, "subject_raw_hex": raw_of(&valid.beef, &valid.subject_txid) },
+        "corrupted": { "file": "corrupted.beef.hex", "subject_txid": corrupted.subject_txid, "funding_txid": corrupted.funding_txid, "subject_raw_hex": raw_of(&corrupted.beef, &corrupted.subject_txid), "defect": "one DER r byte of input 0's signature flipped after signing" },
     });
     std::fs::write(
         dir.join("manifest.json"),
@@ -1269,4 +1286,204 @@ async fn emit_lane_script_fixtures() {
         valid.subject_txid,
         corrupted.subject_txid
     );
+}
+
+// ============================================================================
+// (h): the door's BUDGET and its STATS (bsv-low W-A gate MED-1 / MED-2 /
+// LOW-1 / LOW-2, 2026-09-09). Script has no loops, so the work of an input is
+// bounded from its bytes BEFORE anything runs; a breach is the DOOR's verdict
+// (over budget: the network judges), never the interpreter's; the interpreter's
+// memory limit tripping is the same class; and a structural fault names
+// whether the SUBJECT was judged before it.
+// ============================================================================
+
+use bsv_overlay_engine::engine::{DoorBudget, WalkStats};
+
+/// `<n × OP_SHA256> OP_DROP OP_TRUE`, unlocked by any push: VALID under the
+/// reference walk, and its static work estimate is n × the element limit.
+fn hash_heavy_lock(n: usize) -> LockingScript {
+    let mut script = Script::new();
+    for _ in 0..n {
+        script.write_opcode(OP_SHA256);
+    }
+    script.write_opcode(OP_DROP).write_opcode(OP_TRUE);
+    LockingScript::from_script(script)
+}
+
+fn push_unlock(bytes: Vec<u8>) -> ScriptTemplateUnlock {
+    ScriptTemplateUnlock::new(
+        move |_ctx: &SigningContext| {
+            let mut script = Script::new();
+            script.write_bin(&bytes);
+            Ok(UnlockingScript::from_script(script))
+        },
+        || 40,
+    )
+}
+
+#[tokio::test]
+async fn door_stats_describe_the_real_covenant_leg() {
+    let intact = real_covenant_leg(
+        ENFORCED_FUNDING_HEX,
+        ENFORCED_FUNDING_TXID,
+        ENFORCED_SETTLE_HEX,
+        ENFORCED_SETTLE_TXID,
+        None,
+    );
+    let engine = engine(None);
+    let stats: WalkStats = engine
+        .verify_scripts_only(&intact.beef, &intact.subject_txid)
+        .await
+        .expect("the real covenant settle passes the door");
+    assert_eq!(
+        stats.unproven_txs, 1,
+        "the settle alone is unproven (its funding is proven)"
+    );
+    assert_eq!(stats.inputs_executed, 1);
+    assert!(
+        stats.sig_ops >= 1,
+        "OP_PUSH_TX checks at least one signature: {stats:?}"
+    );
+    assert!(
+        stats.script_bytes > 3_000,
+        "the covenant lock is ~3 KB: {stats:?}"
+    );
+    assert!(stats.subject_judged);
+    assert!(
+        stats.work_bytes < DoorBudget::DEFAULT.max_work_bytes / 8,
+        "LOW's real covenant spend sits far inside the budget: {stats:?}"
+    );
+}
+
+#[tokio::test]
+async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_reference_walk_is_untouched() {
+    // 600 hash ops × the 128 KB element limit ≈ 77 MB of estimated work: over
+    // the 64 MB budget from the BYTES alone, before anything executes.
+    let n = (DoorBudget::DEFAULT.max_work_bytes / DoorBudget::DEFAULT.memory_limit as u64) as usize
+        + 100;
+    let heavy = spend_of(
+        hash_heavy_lock(n),
+        push_unlock(vec![0x42; 8]),
+        5_000,
+        4_000,
+        |_| {},
+    )
+    .await;
+    let engine = engine(None);
+    let err = engine
+        .verify_scripts_only(&heavy.beef, &heavy.subject_txid)
+        .await
+        .expect_err("over the door budget");
+    assert!(
+        matches!(
+            &err,
+            EngineError::ScriptWalkOverBudget {
+                subject_judged: false,
+                ..
+            }
+        ),
+        "the door's own bound, never the interpreter's verdict: {err}"
+    );
+    // The reference walk (`submit`) has no budget: the same valid spend is admitted.
+    let storage = Rc::new(MemoryStorage::new());
+    let reference = engine_with(Rc::clone(&storage), None);
+    reference
+        .submit(&tagged(&heavy), SubmitMode::CurrentTx)
+        .await
+        .expect("the reference walk admits a valid spend whatever its cost");
+    assert!(is_admitted(&storage, &heavy.subject_txid).await);
+}
+
+#[tokio::test]
+async fn door_memory_limit_trip_is_the_doors_verdict_not_the_networks() {
+    // `<12 × (OP_DUP OP_CAT)> OP_DROP OP_TRUE` on an 8 KB push doubles the
+    // element to 32 MB: cheap by the static census (no hash ops), so it runs,
+    // and the interpreter's 128 KB memory limit trips mid-way. That is the
+    // DOOR's limit (the reference default is 32 MB and the node's policy
+    // larger still), so it must read over budget, never refused.
+    let mut script = Script::new();
+    for _ in 0..12 {
+        script.write_opcode(OP_DUP).write_opcode(OP_CAT);
+    }
+    script.write_opcode(OP_DROP).write_opcode(OP_TRUE);
+    let cat_lock = LockingScript::from_script(script);
+    let fat = spend_of(
+        cat_lock,
+        push_unlock(vec![0x42; 8 * 1024]),
+        5_000,
+        4_000,
+        |_| {},
+    )
+    .await;
+    let engine = engine(None);
+    let err = engine
+        .verify_scripts_only(&fat.beef, &fat.subject_txid)
+        .await
+        .expect_err("the door's memory limit trips");
+    assert!(
+        matches!(
+            &err,
+            EngineError::ScriptWalkOverBudget {
+                subject_judged: false,
+                ..
+            }
+        ),
+        "a memory-limit trip is the door's verdict: {err}"
+    );
+    if let EngineError::ScriptWalkOverBudget { what, .. } = &err {
+        assert!(
+            what.contains("memory usage has exceeded"),
+            "names the interpreter's own reason: {what}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn door_names_a_judged_subject_apart_from_an_unjudged_one() {
+    // funding (proven) → parent P (unproven) → child C (the subject). The BEEF
+    // carries P and C but NOT the funding: C executes fully (P is its source),
+    // then P's own source is missing — the subject WAS judged.
+    let key = PrivateKey::random();
+    let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+    let funding = proven_funding(lock.clone(), 10_000);
+    let mut parent = Transaction::new();
+    parent
+        .add_input_from_tx(funding, 0, P2PKH::unlock(&key, SignOutputs::All, false))
+        .unwrap();
+    parent
+        .outputs
+        .push(TransactionOutput::new(9_000, lock.clone()));
+    parent.sign().await.unwrap();
+    let mut child = Transaction::new();
+    child
+        .add_input_from_tx(
+            parent.clone(),
+            0,
+            P2PKH::unlock(&key, SignOutputs::All, false),
+        )
+        .unwrap();
+    child.outputs.push(TransactionOutput::new(8_000, lock));
+    child.sign().await.unwrap();
+    let mut beef = Beef::new();
+    beef.merge_raw_tx(parent.to_binary(), None);
+    beef.merge_raw_tx(child.to_binary(), None);
+    let engine = engine(None);
+    let err = engine
+        .verify_scripts_only(&beef.to_binary(), &child.id())
+        .await
+        .expect_err("the parent's source is absent");
+    match &err {
+        EngineError::ScriptWalkInconclusive {
+            at_txid,
+            subject_judged,
+            ..
+        } => {
+            assert_eq!(at_txid, &parent.id(), "the fault is on the ANCESTOR");
+            assert!(
+                *subject_judged,
+                "the subject's inputs all executed before the ancestor faulted: {err}"
+            );
+        }
+        other => panic!("expected an inconclusive walk, got {other}"),
+    }
 }

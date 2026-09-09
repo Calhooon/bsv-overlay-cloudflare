@@ -62,11 +62,22 @@ pub const COUNTER_QUEUE_MUTATION_RETRIED: &str = "queue_mutation_retried_total";
 /// interpreter divergence to investigate, never a silent drop: the client
 /// falls to its own direct broadcast and the network's own verdict.
 pub const COUNTER_SUBMIT_SCRIPT_REFUSED: &str = "submit_script_refused_total";
-/// Network-gated submits whose door walk ended INCONCLUSIVE (a structural
-/// fault: a source the completed BEEF still lacks, the value rule, a parse
-/// fault) — logged, counted, and handed to the network gate unchanged. Not a
-/// refusal class: the interpreter never reached a verdict.
+/// Network-gated submits whose door walk ended INCONCLUSIVE before the
+/// SUBJECT was judged (a structural fault on the subject itself: a source the
+/// completed BEEF still lacks, a parse fault) — logged, counted, and handed
+/// to the network gate unchanged. Not a refusal class: the interpreter never
+/// reached a verdict on the money transaction.
 pub const COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE: &str = "submit_script_walk_inconclusive_total";
+/// …whose door walk judged the SUBJECT (every input executed, none refused)
+/// and then faulted structurally on an ANCESTOR (the routine shape of an
+/// F-D-completed or loop-2 incomplete ancestry). The money tx was judged.
+pub const COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: &str =
+    "submit_script_walk_ancestor_inconclusive_total";
+/// …whose door walk exceeded the door's OWN bound (`DoorBudget`: the static
+/// work estimate or the memory limit) — the door's verdict, never the
+/// network's; the request proceeds to the network gate. Sustained non-zero on
+/// honest traffic means the budget is too tight for a real shape.
+pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: &str = "submit_script_walk_over_budget_total";
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
 /// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
 /// operation, not an error — it proves the webhook stream is alive.
@@ -702,6 +713,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         // door that never refused reads an explicit 0.
         COUNTER_SUBMIT_SCRIPT_REFUSED: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE: 0,
+        COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: 0,
+        COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: 0,
         COUNTER_QUEUE_MUTATION_APPLIED: 0,
         COUNTER_QUEUE_MUTATION_RETRIED: 0,
         // 2026-09-04: the discovery pass — seeded to 0 for the same reason.

@@ -70,6 +70,12 @@ fn engine_error_status(e: &EngineError) -> u16 {
         // A spend the interpreter refused (reference parity, 2026-09-08):
         // the caller's transaction is invalid, the same class as a bad proof.
         EngineError::ScriptVerificationFailed { .. } => 400,
+        // The DOOR walk's own classes (bsv-low W-A): consumed by the gated
+        // arm before this mapping is ever reached (they never refuse there);
+        // mapped as structural for completeness, so a future caller that
+        // surfaces one answers a 400 rather than a 500.
+        EngineError::ScriptWalkInconclusive { .. } => 400,
+        EngineError::ScriptWalkOverBudget { .. } => 400,
     }
 }
 
@@ -235,17 +241,21 @@ fn json_error(message: &str, status: u16) -> worker::Result<Response> {
 /// The `code` of a gated-door script refusal (bsv-low W-A, 2026-09-09): the
 /// interpreter refused the spend's unlocking script BEFORE any broadcast. A
 /// client reads the CODE, never the prose (the #267 orphan-dress lesson).
-pub const SCRIPT_REFUSED_CODE: &str = "script-refused";
+/// Named in the reference's `ERR_*` family (`overlay-express` answers
+/// `{status:"error", code:"ERR_…", description}`).
+pub const SCRIPT_REFUSED_CODE: &str = "ERR_SCRIPT_REFUSED";
 
-/// A coded error — `{status,code,message}`: the same shape as `json_error`
-/// plus a machine-readable `code` a client can branch on without regexing
-/// the message. Used for the classes the client must tell apart from a plain
-/// structural 400 (today: `script-refused`).
+/// A coded error in the REFERENCE's shape — `{status, code, description}`
+/// (`overlay-express` `OverlayExpress.ts`) — plus `message`, the field every
+/// pre-existing body of ours carries and our readers slice. Used for the
+/// classes a client must tell apart from a plain structural 400 (today:
+/// `ERR_SCRIPT_REFUSED`).
 fn json_error_coded(message: &str, code: &str, status: u16) -> worker::Result<Response> {
     json_response(
         &CodedErrorBody {
             status: "error",
             code,
+            description: message,
             message,
         },
         status,
@@ -344,6 +354,7 @@ struct ErrorBody<'a> {
 struct CodedErrorBody<'a> {
     status: &'a str,
     code: &'a str,
+    description: &'a str,
     message: &'a str,
 }
 
@@ -869,8 +880,10 @@ async fn submit_inner(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
-    // bsv-low W-A: the door's script walk, its own segment (0 when skipped).
+    // bsv-low W-A: the door's script walk, its own segment (0 when skipped) and
+    // its stats (`script-walk;desc=…`, the cost instrument on Workers).
     let mut script_verify_ms = 0f64;
+    let mut script_walk_desc = String::from("skipped");
     // Consumed DIRECTLY from the action: there is no local flag to shadow.
     // A re-gate defeated both source pins with
     // `let run_network_gate = run_network_gate && x.is_some() && x.is_none();`
@@ -984,29 +997,49 @@ async fn submit_inner(
             ..
         } = action
         {
+            // `Date.now()` is FROZEN during synchronous work on Workers (a
+            // timing-attack mitigation), so the bracket below reads 0 on the
+            // platform; the walk's own STATS (`script-walk;desc=…`) are the
+            // cost instrument, and the request's CPU time lives in the
+            // Workers Logs (gate MED-2). The bracket is kept for `wrangler
+            // dev`, where the clock runs.
             let walk_started = js_sys::Date::now();
             let verdict = engine.verify_scripts_only(&gated_beef, &subject_txid).await;
             script_verify_ms = js_sys::Date::now() - walk_started;
+            // One counter bump per verdict; a missing binding is said, never
+            // silent (gate NIT c).
+            let count = |name: &'static str| match env.d1("OVERLAY_DB") {
+                Ok(db) => ctx.wait_until(async move {
+                    crate::ops::bump_counter(&db, name, 1).await;
+                }),
+                Err(e) => {
+                    worker::console_log!("door({name}): OVERLAY_DB unavailable, count lost: {e}")
+                }
+            };
             match verdict {
-                Ok(()) => {}
+                Ok(stats) => {
+                    script_walk_desc = format!(
+                        "txs={} inputs={} bytes={} hash={} sig={} work={}",
+                        stats.unproven_txs,
+                        stats.inputs_executed,
+                        stats.script_bytes,
+                        stats.hash_ops,
+                        stats.sig_ops,
+                        stats.work_bytes
+                    );
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated): door walk PASSED for {subject_txid} ({script_walk_desc}; bracket {script_verify_ms:.1} ms)"
+                    );
+                }
                 Err(EngineError::ScriptVerificationFailed {
                     subject_txid: failed_txid,
                     input_index,
                     reason,
                 }) => {
                     worker::console_log!(
-                        "POST /submit(broadcast-gated) -> 400 (script-refused: {failed_txid} input {input_index}: {reason}; walk {script_verify_ms:.1} ms; subject {subject_txid}; NOTHING broadcast)"
+                        "POST /submit(broadcast-gated) -> 400 (script-refused: {failed_txid} input {input_index}: {reason}; subject {subject_txid}; NOTHING broadcast)"
                     );
-                    if let Ok(db) = env.d1("OVERLAY_DB") {
-                        ctx.wait_until(async move {
-                            crate::ops::bump_counter(
-                                &db,
-                                crate::ops::COUNTER_SUBMIT_SCRIPT_REFUSED,
-                                1,
-                            )
-                            .await;
-                        });
-                    }
+                    count(crate::ops::COUNTER_SUBMIT_SCRIPT_REFUSED);
                     let resp = json_error_coded(
                         &format!(
                             "broadcast-gated: script verification failed: transaction {failed_txid} input {input_index}: {reason} (the network would refuse this spend; nothing was broadcast)"
@@ -1019,20 +1052,40 @@ async fn submit_inner(
                         &format!("script-verify;dur={script_verify_ms:.1}"),
                     ));
                 }
-                Err(inconclusive) => {
+                Err(EngineError::ScriptWalkOverBudget {
+                    at_txid,
+                    subject_judged,
+                    what,
+                }) => {
+                    // The DOOR's own bound, never the network's verdict: the
+                    // request proceeds and the network judges.
                     worker::console_log!(
-                        "POST /submit(broadcast-gated): door walk INCONCLUSIVE for {subject_txid} ({inconclusive}; {script_verify_ms:.1} ms) — not the interpreter's verdict; the network judges"
+                        "POST /submit(broadcast-gated): door walk OVER BUDGET at {at_txid} (subject {subject_txid} judged: {subject_judged}; {what}) — the door's bound, the network judges"
                     );
-                    if let Ok(db) = env.d1("OVERLAY_DB") {
-                        ctx.wait_until(async move {
-                            crate::ops::bump_counter(
-                                &db,
-                                crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE,
-                                1,
-                            )
-                            .await;
-                        });
-                    }
+                    count(crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET);
+                }
+                Err(EngineError::ScriptWalkInconclusive {
+                    at_txid,
+                    subject_judged,
+                    reason,
+                }) => {
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated): door walk INCONCLUSIVE at {at_txid} (subject {subject_txid} judged: {subject_judged}; {reason}) — not the interpreter's verdict; the network judges"
+                    );
+                    count(if subject_judged {
+                        crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE
+                    } else {
+                        crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE
+                    });
+                }
+                Err(other) => {
+                    // Any other engine error here (a BEEF that parsed for EF
+                    // conversion but not for the walk) is structural: said,
+                    // counted as unjudged, and the network judges.
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated): door walk could not run for {subject_txid} ({other}) — the network judges"
+                    );
+                    count(crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE);
                 }
             }
         }
@@ -1130,7 +1183,7 @@ async fn submit_inner(
         arcade_broadcast_ms =
             (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms).max(0.0);
         let gated_timing = format!(
-            "script-verify;dur={script_verify_ms:.1}, arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}"
+            "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}"
         );
         match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
@@ -1645,7 +1698,7 @@ async fn submit_inner(
     // carved out of `arcade-broadcast` so the second-broadcaster leg is
     // attributable on its own.
     let server_timing = format!(
-        "script-verify;dur={script_verify_ms:.1}, arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
+        "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
     );
     let mut resp = with_server_timing(json_ok(&steak)?, &server_timing);
     {
@@ -3780,6 +3833,26 @@ mod tests {
             src.find(&walk).unwrap() < src.find(&broadcast).unwrap(),
             "the door walk must run BEFORE the network broadcast — a refused spend is never broadcast"
         );
+        // Gate MED-3: the #413 dual-broadcast (TAAL/GorillaPool, backgrounded)
+        // is a SECOND broadcast; hoisting it above the walk would broadcast a
+        // refused spend while every other pin stayed green. Both its legs
+        // must come after the walk too.
+        let dual = ["let dual_", "legs"].concat();
+        assert_eq!(
+            src.matches(&dual).count(),
+            1,
+            "the #413 dual-broadcast legs exist once"
+        );
+        assert!(
+            src.find(&walk).unwrap() < src.find(&dual).unwrap(),
+            "the door walk must run BEFORE the #413 dual-broadcast legs are built"
+        );
+        let corroborate = ["broadcaster::corroborate_", "tx_hex("].concat();
+        let first_corroborate = src.find(&corroborate).expect("the corroborator is called");
+        assert!(
+            src.find(&walk).unwrap() < first_corroborate,
+            "the door walk must run BEFORE any corroborator push"
+        );
         // The refusal: the interpreter's verdict arm returns a coded 400, once.
         let verdict_arm = ["Err(EngineError::ScriptVerification", "Failed {"].concat();
         assert_eq!(
@@ -3788,7 +3861,15 @@ mod tests {
             "exactly one arm consumes the interpreter's verdict at the door"
         );
         let arm_start = src.find(&verdict_arm).unwrap();
-        let arm = &src[arm_start..src[arm_start..].find("Err(inconclusive)").unwrap() + arm_start];
+        // The arm ends where the NEXT arm (the door's over-budget class)
+        // begins — a split needle, so this test's own text never bounds it
+        // (a plain literal once did, and the slice ran to the test module).
+        let next_arm = ["Err(EngineError::ScriptWalkOver", "Budget {"].concat();
+        let arm_end = src[arm_start..]
+            .find(&next_arm)
+            .expect("the over-budget arm follows")
+            + arm_start;
+        let arm = &src[arm_start..arm_end];
         assert_eq!(
             arm.matches("json_error_coded(").count(),
             1,
@@ -3823,16 +3904,24 @@ mod tests {
         let body = serde_json::to_value(CodedErrorBody {
             status: "error",
             code: SCRIPT_REFUSED_CODE,
+            description: "broadcast-gated: script verification failed: …",
             message: "broadcast-gated: script verification failed: …",
         })
         .unwrap();
         assert_eq!(body["status"], "error");
-        assert_eq!(body["code"], "script-refused");
-        assert!(body["message"]
+        assert_eq!(
+            body["code"], "ERR_SCRIPT_REFUSED",
+            "the reference's ERR_* family"
+        );
+        assert!(body["description"]
             .as_str()
             .unwrap()
             .starts_with("broadcast-gated:"));
-        assert_eq!(body.as_object().unwrap().len(), 3);
+        assert_eq!(
+            body["description"], body["message"],
+            "the reference's field and ours carry the same prose"
+        );
+        assert_eq!(body.as_object().unwrap().len(), 4);
     }
 
     /// #371 (gate MEDIUM-1): the `network_seen` latch must be CALLED from
