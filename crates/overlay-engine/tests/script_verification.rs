@@ -987,3 +987,286 @@ async fn a_deep_diamond_chain_of_unproven_spends_verifies_in_linear_time() {
     );
     println!("24-deep diamond verified in {elapsed:?}");
 }
+
+// ============================================================================
+// (f): `verify_scripts_only` — the reference's 'scripts only' as an EXPLICIT
+// ask at an admission door whose bar is the network (bsv-low W-A, #437 step
+// 2, 2026-09-09). Only the interpreter's verdict is a refusal there; a proven
+// ancestor is trusted as-is and the chain tracker is never consulted.
+// ============================================================================
+
+/// A chain tracker that PANICS when asked: 'scripts only' must never ask it.
+struct MustNotAskTracker;
+
+#[async_trait]
+impl ChainTracker for MustNotAskTracker {
+    async fn is_valid_root_for_height(
+        &self,
+        root: &str,
+        height: u32,
+    ) -> Result<bool, ChainTrackerError> {
+        panic!("'scripts only' consulted the chain tracker (root {root} at height {height})")
+    }
+    async fn current_height(&self) -> Result<u32, ChainTrackerError> {
+        Ok(HEIGHT + 10)
+    }
+}
+
+#[tokio::test]
+async fn scripts_only_refuses_the_corrupted_spend_with_the_interpreters_verdict() {
+    let engine = engine(None);
+    let corrupted = p2pkh_spend(true, 9_000).await;
+    let err = engine
+        .verify_scripts_only(&corrupted.beef, &corrupted.subject_txid)
+        .await
+        .expect_err("a corrupted signature is the interpreter's refusal");
+    let (input_index, reason) = expect_script_error(&err);
+    assert_eq!(input_index, 0);
+    assert!(!reason.is_empty(), "the interpreter names its reason");
+
+    let valid = p2pkh_spend(false, 9_000).await;
+    engine
+        .verify_scripts_only(&valid.beef, &valid.subject_txid)
+        .await
+        .expect("a valid spend passes the door");
+}
+
+#[tokio::test]
+async fn scripts_only_trusts_a_proven_ancestor_without_asking_the_tracker() {
+    let valid = p2pkh_spend(false, 9_000).await;
+    // The FULL walk checks the fixture's fabricated root and a tracker that
+    // knows nothing refuses it…
+    let refusing = engine(Some(tracker_knowing_nothing()));
+    let err = refusing
+        .submit(&tagged(&valid), SubmitMode::CurrentTx)
+        .await
+        .expect_err("the full walk checks the root against the tracker");
+    assert!(
+        matches!(err, EngineError::SpvError(_)),
+        "a wrong root is an SPV error under the full walk: {err}"
+    );
+    // …while 'scripts only' never asks: a tracker that panics when consulted
+    // stays silent and the spend passes on its scripts alone.
+    let never_asked = engine(Some(Box::new(MustNotAskTracker)));
+    never_asked
+        .verify_scripts_only(&valid.beef, &valid.subject_txid)
+        .await
+        .expect("roots are accepted unchecked under 'scripts only'");
+}
+
+#[tokio::test]
+async fn scripts_only_is_independent_of_the_escape_hatch() {
+    let corrupted = p2pkh_spend(true, 9_000).await;
+    let mut engine = engine(None);
+    engine.set_script_verification(false);
+    // The hatch admits the corrupted spend on structure alone (`submit`)…
+    engine
+        .submit(&tagged(&corrupted), SubmitMode::CurrentTx)
+        .await
+        .expect("the escape hatch restores the structural check for submit");
+    // …the explicit ask still executes the script and refuses it.
+    let err = engine
+        .verify_scripts_only(&corrupted.beef, &corrupted.subject_txid)
+        .await
+        .expect_err("the explicit ask executes regardless of the hatch");
+    expect_script_error(&err);
+}
+
+#[tokio::test]
+async fn scripts_only_still_applies_the_value_rule_as_a_structural_fault() {
+    // 10 000 in, 11 000 out: the reference's value rule, NOT the interpreter's
+    // verdict — a caller with the network behind it classifies it apart.
+    let inflating = p2pkh_spend(false, 11_000).await;
+    let engine = engine(None);
+    let err = engine
+        .verify_scripts_only(&inflating.beef, &inflating.subject_txid)
+        .await
+        .expect_err("an unproven spend may not create satoshis");
+    assert!(
+        matches!(err, EngineError::SpvError(_)),
+        "the value rule is structural, never a script fault: {err}"
+    );
+}
+
+#[tokio::test]
+async fn scripts_only_names_a_missing_source_structurally_never_as_a_script_fault() {
+    // A proofless single-tx BEEF whose subject spends a source the BEEF does
+    // not carry: structural (the caller completes sources or lets the network
+    // judge), never the interpreter's verdict.
+    let mut tx = Transaction::new();
+    tx.inputs.push(TransactionInput {
+        source_txid: Some("bb".repeat(32)),
+        source_output_index: 0,
+        unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+        ..Default::default()
+    });
+    let pay_to = PrivateKey::random().public_key().hash160();
+    tx.outputs.push(TransactionOutput::new(
+        1_000,
+        P2PKH::new().lock(&pay_to).unwrap(),
+    ));
+    let subject_txid = tx.id();
+    let mut beef = Beef::new();
+    beef.merge_raw_tx(tx.to_binary(), None);
+    let engine = engine(None);
+    let err = engine
+        .verify_scripts_only(&beef.to_binary(), &subject_txid)
+        .await
+        .expect_err("a source the BEEF does not carry cannot be executed");
+    assert!(
+        matches!(err, EngineError::SpvError(_)),
+        "a missing source is structural: {err}"
+    );
+}
+
+#[tokio::test]
+async fn scripts_only_runs_the_real_covenant_leg_and_refuses_the_tampered_preimage() {
+    // The mainnet Poc5 tower-enforced settle, intact: passes the door on its
+    // OP_PUSH_TX leg with NO tracker (the fabricated block proof is trusted).
+    let intact = real_covenant_leg(
+        ENFORCED_FUNDING_HEX,
+        ENFORCED_FUNDING_TXID,
+        ENFORCED_SETTLE_HEX,
+        ENFORCED_SETTLE_TXID,
+        None,
+    );
+    let engine = engine(Some(Box::new(MustNotAskTracker)));
+    let started = Instant::now();
+    engine
+        .verify_scripts_only(&intact.beef, &intact.subject_txid)
+        .await
+        .expect("the real covenant settle satisfies its lock at the door");
+    println!(
+        "real Poc5 covenant settle {ENFORCED_SETTLE_TXID}: 'scripts only' at the door took {} ms",
+        started.elapsed().as_millis()
+    );
+    // The same leg with one preimage bit flipped: the interpreter's verdict.
+    let tampered = real_covenant_leg(
+        ENFORCED_FUNDING_HEX,
+        ENFORCED_FUNDING_TXID,
+        ENFORCED_SETTLE_HEX,
+        ENFORCED_SETTLE_TXID,
+        Some(PREIMAGE_TAMPER_OFFSET),
+    );
+    let err = engine
+        .verify_scripts_only(&tampered.beef, &tampered.subject_txid)
+        .await
+        .expect_err("a tampered preimage cannot satisfy the covenant at the door");
+    let (input_index, _) = expect_script_error(&err);
+    assert_eq!(input_index, 0);
+}
+
+/// A script that runs to completion and leaves FALSE (a CAT/SHA256 covenant
+/// with a wrong witness; the signature still verifies) is the interpreter's
+/// verdict exactly like a script that ERRORS (a bad signature): two fixture
+/// shapes, one refusal class.
+#[tokio::test]
+async fn scripts_only_refuses_a_witness_that_evaluates_to_false_cleanly() {
+    let key = PrivateKey::random();
+    let pubkey = key.public_key().to_compressed();
+    let a = b"left half of the committed witness".to_vec();
+    let b = b"right half".to_vec();
+    let committed = sha256(&[a.clone(), b.clone()].concat());
+    let lock = cat_sha256_checksig_lock(&pubkey, &committed);
+    let wrong = spend_of(
+        lock,
+        witness_unlock(key, a, b"wrong half".to_vec()),
+        5_000,
+        4_000,
+        |_| {},
+    )
+    .await;
+    let engine = engine(None);
+    let err = engine
+        .verify_scripts_only(&wrong.beef, &wrong.subject_txid)
+        .await
+        .expect_err("a wrong witness leaves FALSE on the stack");
+    let (input_index, reason) = expect_script_error(&err);
+    assert_eq!(input_index, 0);
+    // bsv-rs 0.3.22 reports a clean FALSE as an interpreter ERROR ("The top
+    // stack element must be truthy after script evaluation."), so this too
+    // arrives through the `Err` arm; the engine's `Ok(false)` arm is a
+    // type-completeness arm no fixture reaches with this interpreter. The
+    // wording is the interpreter's own and is NOT pinned — the verdict is.
+    assert!(!reason.is_empty(), "the interpreter names its reason");
+}
+
+// ============================================================================
+// (g): the `make ci-route` lane fixtures (tools/lane-script) — the door's
+// refusal, driven through the REAL wasm route. The bytes are PRODUCED here
+// (fixed keys, so a regeneration is byte-identical) and committed; the lane
+// cell asserts the door's refusal names THIS corrupted subject and that the
+// valid sibling reaches the (fixture) network. Never retype them: regenerate
+// with
+//   cargo test -p bsv-overlay-engine --test script_verification \
+//     emit_lane_script_fixtures -- --ignored --nocapture
+// ============================================================================
+
+/// A signed P2PKH spend of a proven funding output with FIXED keys (10 000
+/// sats in, 9 000 out), optionally with one DER `r` byte flipped after
+/// signing — the same shape as `p2pkh_spend`, made reproducible.
+async fn lane_p2pkh_spend(corrupt_signature: bool) -> SpendFixture {
+    let key = PrivateKey::from_hex(&"11".repeat(32)).expect("a fixed key");
+    let pay_to = PrivateKey::from_hex(&"22".repeat(32))
+        .expect("a fixed key")
+        .public_key()
+        .hash160();
+    let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+    let funding = proven_funding(lock, 10_000);
+    let funding_txid = funding.id();
+    let mut tx = Transaction::new();
+    tx.add_input_from_tx(funding, 0, P2PKH::unlock(&key, SignOutputs::All, false))
+        .unwrap();
+    tx.outputs.push(TransactionOutput::new(
+        9_000,
+        P2PKH::new().lock(&pay_to).unwrap(),
+    ));
+    tx.sign().await.expect("template signing");
+    if corrupt_signature {
+        flip_unlocking_byte(&mut tx, 10);
+    }
+    SpendFixture {
+        beef: tx.to_beef(false).expect("BEEF with the proven parent"),
+        funding_txid,
+        subject_txid: tx.id(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "writes the committed lane fixtures under tools/lane-script/fixtures — run on purpose"]
+async fn emit_lane_script_fixtures() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/lane-script/fixtures");
+    std::fs::create_dir_all(&dir).unwrap();
+    let valid = lane_p2pkh_spend(false).await;
+    let corrupted = lane_p2pkh_spend(true).await;
+    // Self-check before writing: the engine's own verdicts on the bytes.
+    let engine = engine(None);
+    engine
+        .verify_scripts_only(&valid.beef, &valid.subject_txid)
+        .await
+        .expect("the valid fixture passes the door");
+    let err = engine
+        .verify_scripts_only(&corrupted.beef, &corrupted.subject_txid)
+        .await
+        .expect_err("the corrupted fixture is refused at the door");
+    expect_script_error(&err);
+    std::fs::write(dir.join("valid.beef.hex"), hex::encode(&valid.beef)).unwrap();
+    std::fs::write(dir.join("corrupted.beef.hex"), hex::encode(&corrupted.beef)).unwrap();
+    let manifest = serde_json::json!({
+        "producer": "crates/overlay-engine/tests/script_verification.rs emit_lane_script_fixtures (fixed keys; regenerate, never retype)",
+        "valid": { "file": "valid.beef.hex", "subject_txid": valid.subject_txid, "funding_txid": valid.funding_txid },
+        "corrupted": { "file": "corrupted.beef.hex", "subject_txid": corrupted.subject_txid, "funding_txid": corrupted.funding_txid, "defect": "one DER r byte of input 0's signature flipped after signing" },
+    });
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "lane fixtures written to {}: valid {} / corrupted {}",
+        dir.display(),
+        valid.subject_txid,
+        corrupted.subject_txid
+    );
+}

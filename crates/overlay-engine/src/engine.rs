@@ -318,6 +318,18 @@ impl MutationReport {
     }
 }
 
+/// What a merkle path proves during the linear submit walk
+/// ([`Engine::verify_beef_linear`] and [`Engine::verify_scripts_only`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootPolicy {
+    /// The reference's `tx.verify(chainTracker)`: a proven transaction's root
+    /// is checked against the chain tracker when one is configured.
+    AgainstTracker,
+    /// The reference's `tx.verify('scripts only')`: a proven transaction is
+    /// trusted as-is; no root is computed and no tracker is consulted.
+    AcceptUnchecked,
+}
+
 impl Engine {
     /// Page size used by `/requestSyncResponse` when the (public) caller
     /// omits `limit`. A bounded page is not lossy for a conforming
@@ -522,6 +534,38 @@ impl Engine {
     /// [`Engine::set_script_verification`]. `true` by default.
     pub fn script_verification(&self) -> bool {
         self.verify_scripts
+    }
+
+    /// The reference's `tx.verify('scripts only')` over a BEEF: every unproven
+    /// transaction from `subject_txid` down executes every input's unlocking
+    /// script against its source output and obeys the value rule, while a
+    /// transaction that carries a merkle path is TRUSTED AS-IS — no root is
+    /// computed and no chain tracker is consulted (the ts-sdk's own shape when
+    /// `chainTracker === 'scripts only'`: a proven tx is added to the verified
+    /// set and the walk stops there).
+    ///
+    /// Built for an admission path whose bar is the NETWORK, not a proof
+    /// (bsv-low's `broadcast-gated`, register row D1): the overlay broadcasts
+    /// and admits on network evidence, so a lagging tracker must never read as
+    /// a refused transaction — but a spend the interpreter refuses is one the
+    /// network will refuse too, and executing it at the door saves the
+    /// broadcast and names the fault. Independent of
+    /// [`Engine::set_script_verification`] (that switch governs `submit`; this
+    /// is an explicit ask) and of [`Engine::submit`]'s mode (`HistoricalTxNoSpv`
+    /// still skips, as the reference does).
+    ///
+    /// Errors: [`EngineError::ScriptVerificationFailed`] is the INTERPRETER's
+    /// verdict; every other error is structural (a transaction or source
+    /// missing from the BEEF, a parse fault, the value rule) and is the
+    /// caller's to classify — a caller with a stronger bar behind it should
+    /// not refuse on those.
+    pub async fn verify_scripts_only(
+        &self,
+        beef_bytes: &[u8],
+        subject_txid: &str,
+    ) -> Result<(), EngineError> {
+        self.verify_beef_linear_with(beef_bytes, subject_txid, RootPolicy::AcceptUnchecked)
+            .await
     }
 
     // ========================================================================
@@ -909,6 +953,19 @@ impl Engine {
         beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<(), EngineError> {
+        self.verify_beef_linear_with(beef_bytes, subject_txid, RootPolicy::AgainstTracker)
+            .await
+    }
+
+    /// The linear walk of [`Engine::verify_beef_linear`], parameterised by what
+    /// a merkle path means: checked against the chain tracker (the reference's
+    /// `tx.verify(chainTracker)`) or trusted unchecked (its `'scripts only'`).
+    async fn verify_beef_linear_with(
+        &self,
+        beef_bytes: &[u8],
+        subject_txid: &str,
+        roots: RootPolicy,
+    ) -> Result<(), EngineError> {
         use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
         use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
 
@@ -933,6 +990,13 @@ impl Engine {
                 return Err(spv(format!("transaction {txid} is not in the BEEF")));
             };
             if let Some(mp) = beef.find_bump(&txid) {
+                if roots == RootPolicy::AcceptUnchecked {
+                    // 'scripts only': a proven transaction is trusted as-is —
+                    // no root computed, no tracker asked (the reference adds it
+                    // to the verified set and stops). The caller's bar is the
+                    // network's acceptance, never this proof.
+                    continue;
+                }
                 let root = mp
                     .compute_root(Some(&txid))
                     .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;

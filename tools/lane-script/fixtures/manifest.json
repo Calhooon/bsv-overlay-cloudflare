@@ -1,0 +1,14 @@
+{
+  "corrupted": {
+    "defect": "one DER r byte of input 0's signature flipped after signing",
+    "file": "corrupted.beef.hex",
+    "funding_txid": "37cca37dc6574916ed19b1dcae4630c3115b562903dc946b9932c9a4f7b2135d",
+    "subject_txid": "07c627e5b01f7ea14e2aa35dffb2389990ae2dfdf5cc8c56c6ea61a0f4f84019"
+  },
+  "producer": "crates/overlay-engine/tests/script_verification.rs emit_lane_script_fixtures (fixed keys; regenerate, never retype)",
+  "valid": {
+    "file": "valid.beef.hex",
+    "funding_txid": "37cca37dc6574916ed19b1dcae4630c3115b562903dc946b9932c9a4f7b2135d",
+    "subject_txid": "883fb95d6b9444bda41bfde7b521795e7c549771e8127bc150e9f8d29035f73e"
+  }
+}

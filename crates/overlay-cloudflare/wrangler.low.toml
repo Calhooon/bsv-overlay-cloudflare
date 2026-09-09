@@ -54,6 +54,10 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_hand,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
 LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_hand,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
 ENABLE_EXTENSIONS = "true"
+# SCRIPT_VERIFY_NETWORK_GATED — unset on PROD (= the kill switch: the door
+# executes nothing; the network alone judges) until the promotion flips it on
+# the owner's word. See [env.beta.vars] for what "true" does (bsv-low W-A, 2026-09-09).
+# SCRIPT_VERIFY_NETWORK_GATED = "true"
 
 # ── /submit admission gating (bsv-low #347) ───────────────────────────────
 #
@@ -209,6 +213,15 @@ ENABLE_EXTENSIONS = "true"
 #
 # Rollback is this line: set it back to "false" (or delete it) and redeploy.
 SUBMIT_ENFORCE = "true"
+# SCRIPT_VERIFY_NETWORK_GATED — bsv-low W-A / #437 step 2 (2026-09-09): the
+# network-gated arm (the client's only `/submit` mode) EXECUTES every unproven
+# input's script at the door before any broadcast (`Engine::verify_scripts_only`,
+# the reference's 'scripts only': proofs trusted, the tracker never asked) and
+# refuses 400 `code: script-refused` on the INTERPRETER's verdict alone. Only an
+# explicit "true" executes; anything else is the kill switch (the network alone
+# judges, the pre-2026-09-09 behaviour). BETA ON first; prod flips on the
+# owner's word at the promotion, after a full beta loop clean on it.
+SCRIPT_VERIFY_NETWORK_GATED = "true"
 
 [[env.beta.d1_databases]]
 binding = "OVERLAY_DB"

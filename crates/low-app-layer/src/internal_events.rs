@@ -707,21 +707,31 @@ mod tests {
     /// delete it.
     #[test]
     fn internal_pot_changed_announces_every_outpoint_before_attribution() {
-        let routes = include_str!("routes.rs");
+        // Scanned WITHOUT whitespace: rustfmt reflows a call across lines
+        // (2026-09-09: the push call was formatted onto five lines and this
+        // pin's one-line needle stopped matching — a formatter must never be
+        // able to red a source pin, nor to green it). Relative ORDER survives
+        // the squash, which is all the pin asserts.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
         let start = routes
-            .find("pub(crate) async fn internal_pot_changed(")
+            .find(&squash("pub(crate) async fn internal_pot_changed("))
             .expect("the handler");
         let body = &routes[start..];
         let push = body
-            .find("push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(")
+            .find(&squash(
+                "push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(",
+            ))
             .expect("the pots push");
-        let attribution = body.find("attribute_seats(").expect("the attribution");
+        let attribution = body
+            .find(&squash("attribute_seats("))
+            .expect("the attribution");
         assert!(
             push < attribution,
             "the pots push comes BEFORE any attribution"
         );
         let filing_loop = body
-            .find("for (txid, vout) in outpoints {")
+            .find(&squash("for (txid, vout) in outpoints {"))
             .expect("the per-outpoint filing loop");
         assert!(
             push < filing_loop,

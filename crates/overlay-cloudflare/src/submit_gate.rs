@@ -354,6 +354,42 @@ impl GateMode {
     }
 }
 
+/// Whether the NETWORK-GATED arm executes the spend's scripts at the door
+/// (bsv-low W-A / #437 step 2, 2026-09-09), from `SCRIPT_VERIFY_NETWORK_GATED`.
+///
+/// The gated path's bar is the network's acceptance (register row D1), and
+/// the engine mode it submits under (`HistoricalTxNoSpv`) skips the reference
+/// walk by design — so a spend the interpreter would refuse used to be
+/// broadcast anyway and refused by the network. `Execute` runs the
+/// reference's `'scripts only'` walk (`Engine::verify_scripts_only`: scripts
+/// executed, proofs trusted, the tracker never asked) on the completed BEEF
+/// BEFORE any broadcast; only the INTERPRETER's verdict refuses. `Skip` is the
+/// kill switch: the door executes nothing and the network alone judges, the
+/// pre-2026-09-09 behaviour. Only an explicit `"true"` executes, so a missing
+/// var can never change what a deployment admits by surprise.
+///
+/// The policy is derived ONCE, beside the admission decision, and carried on
+/// [`SubmitAction::ProceedWithNetworkGate`] — never on the other arms and
+/// never re-read by the route (the #347 one-derivation discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptPolicy {
+    /// Execute every unproven input's script at the door; refuse on the
+    /// interpreter's verdict alone.
+    Execute,
+    /// Execute nothing at the door; the network is the sole judge.
+    Skip,
+}
+
+impl ScriptPolicy {
+    /// Parse the var: `"true"` (any case) → execute; everything else skips.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some(v) if v.trim().eq_ignore_ascii_case("true") => Self::Execute,
+            _ => Self::Skip,
+        }
+    }
+}
+
 /// What the route should do with this submit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
@@ -416,6 +452,10 @@ pub struct SubmitPlan {
     /// Whether this submit is an unauthenticated caller on an unbarred path
     /// (the lenient-window signal the operator logs and counts).
     pub unauthenticated_unbarred: bool,
+    /// Whether the gated arm executes the spend's scripts at the door. Always
+    /// [`ScriptPolicy::Skip`] when the gate does not run: the policy is a
+    /// property of the network-gated path alone.
+    pub script_policy: ScriptPolicy,
 }
 
 /// What the route must DO — consumed through an exhaustive `match`, so an arm
@@ -429,8 +469,12 @@ pub struct SubmitPlan {
 pub enum SubmitAction {
     /// Unbarred path + unauthenticated + strict → honest 401.
     RefuseUnauthenticated(AdmissionPath),
-    /// The one public path: run the broadcast + SEEN gate, then admit.
-    ProceedWithNetworkGate(AdmissionPath),
+    /// The one public path: run the broadcast + SEEN gate, then admit —
+    /// executing the spend's scripts at the door first when `scripts` says so.
+    ProceedWithNetworkGate {
+        path: AdmissionPath,
+        scripts: ScriptPolicy,
+    },
     /// An operator on an unbarred path, or the lenient window → admit
     /// without the gate. `lenient_unbarred` marks the counted soak case.
     ProceedWithoutGate {
@@ -449,7 +493,7 @@ impl SubmitAction {
     pub fn path(self) -> AdmissionPath {
         match self {
             Self::RefuseUnauthenticated(p) => p,
-            Self::ProceedWithNetworkGate(p) => p,
+            Self::ProceedWithNetworkGate { path, .. } => path,
             Self::ProceedWithoutGate { path, .. } => path,
         }
     }
@@ -481,13 +525,15 @@ pub fn action_for(
     extensions_enabled: bool,
     operator_authed: bool,
     mode: GateMode,
+    scripts: ScriptPolicy,
 ) -> SubmitAction {
-    let plan = plan_submit(header, extensions_enabled, operator_authed, mode);
+    let plan = plan_submit(header, extensions_enabled, operator_authed, mode, scripts);
     let action = match plan.decision {
         GateDecision::RefuseUnauthenticated => SubmitAction::RefuseUnauthenticated(plan.path),
-        GateDecision::Proceed if plan.run_network_gate => {
-            SubmitAction::ProceedWithNetworkGate(plan.path)
-        }
+        GateDecision::Proceed if plan.run_network_gate => SubmitAction::ProceedWithNetworkGate {
+            path: plan.path,
+            scripts: plan.script_policy,
+        },
         GateDecision::Proceed => SubmitAction::ProceedWithoutGate {
             path: plan.path,
             lenient_unbarred: plan.unauthenticated_unbarred,
@@ -503,16 +549,26 @@ pub fn plan_submit(
     extensions_enabled: bool,
     operator_authed: bool,
     mode: GateMode,
+    scripts: ScriptPolicy,
 ) -> SubmitPlan {
     let path = AdmissionPath::from_header(header, extensions_enabled);
     let decision = decide(path, operator_authed, mode);
+    // A refused submit never runs the gate; a barred one always does.
+    let run_network_gate = decision == GateDecision::Proceed && path.network_gate_required();
     SubmitPlan {
         path,
         decision,
         engine_mode: path.engine_mode(),
-        // A refused submit never runs the gate; a barred one always does.
-        run_network_gate: decision == GateDecision::Proceed && path.network_gate_required(),
+        run_network_gate,
         unauthenticated_unbarred: path.requires_operator_auth() && !operator_authed,
+        // The door executes scripts only where the network gate runs: the
+        // operator paths keep the engine's own walk (`submit(mode)`), and a
+        // refusal executes nothing.
+        script_policy: if run_network_gate {
+            scripts
+        } else {
+            ScriptPolicy::Skip
+        },
     }
 }
 
@@ -551,7 +607,7 @@ fn note(action: SubmitAction) {
         SubmitAction::RefuseUnauthenticated(_) => {
             STRICT_REFUSED.fetch_add(1, Ordering::Relaxed);
         }
-        SubmitAction::ProceedWithNetworkGate(_) => {
+        SubmitAction::ProceedWithNetworkGate { .. } => {
             BARRED.fetch_add(1, Ordering::Relaxed);
         }
         SubmitAction::ProceedWithoutGate {
@@ -814,11 +870,17 @@ mod tests {
         }
         // The exact live probe that reproduced the CRITICAL: no header at all,
         // unauthenticated, strict mode → REFUSED.
-        let plan = plan_submit(None, true, false, GateMode::Strict);
+        let plan = plan_submit(None, true, false, GateMode::Strict, ScriptPolicy::Skip);
         assert_eq!(plan.decision, GateDecision::RefuseUnauthenticated);
         assert!(!plan.run_network_gate);
         // …and the same request WITH the honest public mode proceeds, gated.
-        let plan = plan_submit(Some("broadcast-gated"), true, false, GateMode::Strict);
+        let plan = plan_submit(
+            Some("broadcast-gated"),
+            true,
+            false,
+            GateMode::Strict,
+            ScriptPolicy::Skip,
+        );
         assert_eq!(plan.decision, GateDecision::Proceed);
         assert!(
             plan.run_network_gate,
@@ -839,26 +901,43 @@ mod tests {
     fn action_for_maps_every_decision_to_the_action_the_route_consumes() {
         // The refusal must become the Refuse action, not a silent proceed.
         assert_eq!(
-            action_for(None, true, false, GateMode::Strict),
+            action_for(None, true, false, GateMode::Strict, ScriptPolicy::Skip),
             SubmitAction::RefuseUnauthenticated(AdmissionPath::CurrentTx),
         );
         assert_eq!(
-            action_for(Some("historical-tx-no-spv"), true, false, GateMode::Strict),
+            action_for(
+                Some("historical-tx-no-spv"),
+                true,
+                false,
+                GateMode::Strict,
+                ScriptPolicy::Skip
+            ),
             SubmitAction::RefuseUnauthenticated(AdmissionPath::HistoricalUngated),
         );
         // The one public path always gates, in every mode, authed or not.
         for mode in [GateMode::Lenient, GateMode::Strict] {
             for authed in [false, true] {
-                assert_eq!(
-                    action_for(Some("broadcast-gated"), true, authed, mode),
-                    SubmitAction::ProceedWithNetworkGate(AdmissionPath::NetworkGated),
-                );
+                for scripts in [ScriptPolicy::Skip, ScriptPolicy::Execute] {
+                    assert_eq!(
+                        action_for(Some("broadcast-gated"), true, authed, mode, scripts),
+                        SubmitAction::ProceedWithNetworkGate {
+                            path: AdmissionPath::NetworkGated,
+                            scripts,
+                        },
+                    );
+                }
             }
         }
         // An operator on an unbarred path proceeds ungated and is NOT counted
         // as the lenient soak case.
         assert_eq!(
-            action_for(Some("historical-tx-no-spv"), true, true, GateMode::Strict),
+            action_for(
+                Some("historical-tx-no-spv"),
+                true,
+                true,
+                GateMode::Strict,
+                ScriptPolicy::Skip
+            ),
             SubmitAction::ProceedWithoutGate {
                 path: AdmissionPath::HistoricalUngated,
                 lenient_unbarred: false,
@@ -866,7 +945,13 @@ mod tests {
         );
         // The lenient window proceeds ungated and IS counted.
         assert_eq!(
-            action_for(Some("historical-tx-no-spv"), true, false, GateMode::Lenient),
+            action_for(
+                Some("historical-tx-no-spv"),
+                true,
+                false,
+                GateMode::Lenient,
+                ScriptPolicy::Skip
+            ),
             SubmitAction::ProceedWithoutGate {
                 path: AdmissionPath::HistoricalUngated,
                 lenient_unbarred: true,
@@ -889,8 +974,10 @@ mod tests {
             for extensions in [true, false] {
                 for authed in [false, true] {
                     for mode in [GateMode::Lenient, GateMode::Strict] {
-                        let plan = plan_submit(header, extensions, authed, mode);
-                        let action = action_for(header, extensions, authed, mode);
+                        let plan =
+                            plan_submit(header, extensions, authed, mode, ScriptPolicy::Execute);
+                        let action =
+                            action_for(header, extensions, authed, mode, ScriptPolicy::Execute);
                         assert_eq!(action.path(), plan.path);
                         assert_eq!(action.engine_mode(), plan.engine_mode);
                         match action {
@@ -899,9 +986,10 @@ mod tests {
                                 GateDecision::RefuseUnauthenticated,
                                 "a Refuse action must come from a Refuse decision"
                             ),
-                            SubmitAction::ProceedWithNetworkGate(_) => {
+                            SubmitAction::ProceedWithNetworkGate { scripts, .. } => {
                                 assert_eq!(plan.decision, GateDecision::Proceed);
                                 assert!(plan.run_network_gate);
+                                assert_eq!(scripts, plan.script_policy);
                             }
                             SubmitAction::ProceedWithoutGate { .. } => {
                                 assert_eq!(plan.decision, GateDecision::Proceed);
@@ -928,7 +1016,8 @@ mod tests {
             for extensions in [true, false] {
                 for authed in [false, true] {
                     for mode in [GateMode::Lenient, GateMode::Strict] {
-                        let plan = plan_submit(header, extensions, authed, mode);
+                        let plan =
+                            plan_submit(header, extensions, authed, mode, ScriptPolicy::Execute);
                         assert_eq!(plan.engine_mode, plan.path.engine_mode());
                         assert_eq!(
                             plan.run_network_gate,
@@ -1000,6 +1089,79 @@ mod tests {
             assert!(!path.requires_operator_auth(), "{}", path.as_str());
             for mode in [GateMode::Lenient, GateMode::Strict] {
                 assert_eq!(decide(*path, false, mode), GateDecision::Proceed);
+            }
+        }
+    }
+
+    // ── bsv-low W-A / #437 step 2: the door's script policy ─────────────
+
+    /// Only an explicit `"true"` executes; a missing, empty, mangled or
+    /// `false` var skips (a surprise deployment can never start refusing).
+    #[test]
+    fn script_policy_executes_only_on_an_explicit_true() {
+        for on in ["true", "TRUE", " true ", "True"] {
+            assert_eq!(
+                ScriptPolicy::parse(Some(on)),
+                ScriptPolicy::Execute,
+                "{on:?}"
+            );
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("false"),
+            Some("1"),
+            Some("yes"),
+            Some("tru"),
+        ] {
+            assert_eq!(ScriptPolicy::parse(off), ScriptPolicy::Skip, "{off:?}");
+        }
+    }
+
+    /// The policy rides ONLY the network-gated arm: for every header,
+    /// extensions setting, credential and mode, the gated action carries the
+    /// requested policy verbatim, and the plan's policy is `Skip` whenever the
+    /// gate does not run (an operator path keeps the engine's own walk, a
+    /// refusal executes nothing). Asked with BOTH policies so a derivation
+    /// that ignored the request would fail on one of them.
+    #[test]
+    fn the_script_policy_rides_only_the_gated_arm() {
+        for header in [
+            None,
+            Some("historical-tx"),
+            Some("historical-tx-no-spv"),
+            Some("broadcast-gated"),
+            Some("wat"),
+        ] {
+            for extensions in [true, false] {
+                for authed in [false, true] {
+                    for mode in [GateMode::Lenient, GateMode::Strict] {
+                        for requested in [ScriptPolicy::Execute, ScriptPolicy::Skip] {
+                            let plan = plan_submit(header, extensions, authed, mode, requested);
+                            let action = action_for(header, extensions, authed, mode, requested);
+                            if plan.run_network_gate {
+                                assert_eq!(plan.script_policy, requested);
+                                assert_eq!(
+                                    action,
+                                    SubmitAction::ProceedWithNetworkGate {
+                                        path: plan.path,
+                                        scripts: requested,
+                                    }
+                                );
+                            } else {
+                                assert_eq!(
+                                    plan.script_policy,
+                                    ScriptPolicy::Skip,
+                                    "the door executes nothing off the gated path ({header:?}, ext {extensions}, authed {authed}, {mode:?})"
+                                );
+                                assert!(!matches!(
+                                    action,
+                                    SubmitAction::ProceedWithNetworkGate { .. }
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }

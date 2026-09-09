@@ -232,6 +232,26 @@ fn json_error(message: &str, status: u16) -> worker::Result<Response> {
     )
 }
 
+/// The `code` of a gated-door script refusal (bsv-low W-A, 2026-09-09): the
+/// interpreter refused the spend's unlocking script BEFORE any broadcast. A
+/// client reads the CODE, never the prose (the #267 orphan-dress lesson).
+pub const SCRIPT_REFUSED_CODE: &str = "script-refused";
+
+/// A coded error — `{status,code,message}`: the same shape as `json_error`
+/// plus a machine-readable `code` a client can branch on without regexing
+/// the message. Used for the classes the client must tell apart from a plain
+/// structural 400 (today: `script-refused`).
+fn json_error_coded(message: &str, code: &str, status: u16) -> worker::Result<Response> {
+    json_response(
+        &CodedErrorBody {
+            status: "error",
+            code,
+            message,
+        },
+        status,
+    )
+}
+
 /// A retryable error (#211) — `{status,message,retryable:true}` + a
 /// `Retry-After` header so the client knows to fall back for this submit only.
 fn json_error_retryable(message: &str, status: u16) -> worker::Result<Response> {
@@ -320,6 +340,13 @@ struct ErrorBody<'a> {
 /// Error body carrying a `retryable` hint (#211). A `429` cap rejection is
 /// transient: the client should fall back for THIS submit but keep using the
 /// overlay, rather than treating a flat `400` as "the overlay is broken".
+#[derive(Serialize)]
+struct CodedErrorBody<'a> {
+    status: &'a str,
+    code: &'a str,
+    message: &'a str,
+}
+
 #[derive(Serialize)]
 struct RetryableErrorBody<'a> {
     status: &'a str,
@@ -677,6 +704,16 @@ async fn submit_inner(
             .map(|v| v.to_string())
             .as_deref(),
     );
+    // bsv-low W-A / #437 step 2 (2026-09-09): does the gated door EXECUTE the
+    // spend's scripts before broadcasting? Read here, beside the other two
+    // knobs, and folded into the ONE derivation below — the route never reads
+    // it again (the policy rides the derived action).
+    let script_policy = crate::submit_gate::ScriptPolicy::parse(
+        env.var("SCRIPT_VERIFY_NETWORK_GATED")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
     // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
     // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
     // (gate finding M1). Handing the watchtower the admin token would mean a
@@ -708,6 +745,7 @@ async fn submit_inner(
         extensions_enabled,
         operator_authed,
         gate_mode,
+        script_policy,
     );
     let mode = action.engine_mode();
     // ── #371 SEEN corroboration flag — the UNGATED arm's latch feed. ──
@@ -747,7 +785,7 @@ async fn submit_inner(
                 401,
             );
         }
-        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_) => {}
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate { .. } => {}
         crate::submit_gate::SubmitAction::ProceedWithoutGate {
             path,
             lenient_unbarred,
@@ -831,6 +869,8 @@ async fn submit_inner(
     let mut arcade_broadcast_ms = 0f64;
     let mut arcade_poll_ms = 0f64;
     let mut corroborate_ms = 0f64;
+    // bsv-low W-A: the door's script walk, its own segment (0 when skipped).
+    let mut script_verify_ms = 0f64;
     // Consumed DIRECTLY from the action: there is no local flag to shadow.
     // A re-gate defeated both source pins with
     // `let run_network_gate = run_network_gate && x.is_some() && x.is_none();`
@@ -839,7 +879,7 @@ async fn submit_inner(
     // `make ci`'s route tier is what covers the residual.
     if matches!(
         action,
-        crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_)
+        crate::submit_gate::SubmitAction::ProceedWithNetworkGate { .. }
     ) {
         // The OVERLAY is the sole network broadcaster (#192/#193): every
         // unproven tx in the BEEF is submitted to Arcade V2 as Extended Format,
@@ -924,6 +964,77 @@ async fn submit_inner(
                 ),
                 429,
             );
+        }
+        // ── bsv-low W-A / #437 STEP 2 (2026-09-09): EXECUTE THE SPEND AT THE
+        // DOOR. The gated path's engine mode (`HistoricalTxNoSpv`) skips the
+        // reference walk by design (register row D8), so a spend the
+        // interpreter would refuse used to be broadcast anyway and refused by
+        // the network. With the policy on, the completed BEEF (sources merged
+        // above) runs the reference's 'scripts only' walk
+        // (`Engine::verify_scripts_only`: scripts executed, proofs trusted, the
+        // tracker never asked — a lagging tracker must never read as a refused
+        // tx, the D1 rule) BEFORE any broadcast. ONLY the INTERPRETER's verdict
+        // refuses (400 `code: script-refused`, counted, nothing broadcast); a
+        // walk-structural fault is logged + counted and the network stays the
+        // judge. The policy is READ off the derived action (a fourth read,
+        // never a second derivation): with it `Skip` this block executes
+        // nothing — the kill switch.
+        if let crate::submit_gate::SubmitAction::ProceedWithNetworkGate {
+            scripts: crate::submit_gate::ScriptPolicy::Execute,
+            ..
+        } = action
+        {
+            let walk_started = js_sys::Date::now();
+            let verdict = engine.verify_scripts_only(&gated_beef, &subject_txid).await;
+            script_verify_ms = js_sys::Date::now() - walk_started;
+            match verdict {
+                Ok(()) => {}
+                Err(EngineError::ScriptVerificationFailed {
+                    subject_txid: failed_txid,
+                    input_index,
+                    reason,
+                }) => {
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated) -> 400 (script-refused: {failed_txid} input {input_index}: {reason}; walk {script_verify_ms:.1} ms; subject {subject_txid}; NOTHING broadcast)"
+                    );
+                    if let Ok(db) = env.d1("OVERLAY_DB") {
+                        ctx.wait_until(async move {
+                            crate::ops::bump_counter(
+                                &db,
+                                crate::ops::COUNTER_SUBMIT_SCRIPT_REFUSED,
+                                1,
+                            )
+                            .await;
+                        });
+                    }
+                    let resp = json_error_coded(
+                        &format!(
+                            "broadcast-gated: script verification failed: transaction {failed_txid} input {input_index}: {reason} (the network would refuse this spend; nothing was broadcast)"
+                        ),
+                        SCRIPT_REFUSED_CODE,
+                        400,
+                    )?;
+                    return Ok(with_server_timing(
+                        resp,
+                        &format!("script-verify;dur={script_verify_ms:.1}"),
+                    ));
+                }
+                Err(inconclusive) => {
+                    worker::console_log!(
+                        "POST /submit(broadcast-gated): door walk INCONCLUSIVE for {subject_txid} ({inconclusive}; {script_verify_ms:.1} ms) — not the interpreter's verdict; the network judges"
+                    );
+                    if let Ok(db) = env.d1("OVERLAY_DB") {
+                        ctx.wait_until(async move {
+                            crate::ops::bump_counter(
+                                &db,
+                                crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE,
+                                1,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
         }
         // Ancestors are submitted in the same batch but do NOT gate admission —
         // only the SUBJECT reaching SEEN_ON_NETWORK does (they were broadcast
@@ -1019,7 +1130,7 @@ async fn submit_inner(
         arcade_broadcast_ms =
             (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms).max(0.0);
         let gated_timing = format!(
-            "arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}"
+            "script-verify;dur={script_verify_ms:.1}, arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}"
         );
         match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
@@ -1300,7 +1411,7 @@ async fn submit_inner(
             && !mutation_queued
             && matches!(
                 action,
-                crate::submit_gate::SubmitAction::ProceedWithNetworkGate(_)
+                crate::submit_gate::SubmitAction::ProceedWithNetworkGate { .. }
             )
         {
             // Review MEDIUM-3: the SAME subject derivation as the gated arm —
@@ -3613,18 +3724,19 @@ mod tests {
     fn the_network_gate_branch_is_keyed_solely_on_the_derived_decision() {
         let src = code_only(include_str!("routes.rs"));
         // Split so the needle never appears whole in this file.
-        let needle = ["SubmitAction::ProceedWithNetwork", "Gate(_)"].concat();
+        let needle = ["SubmitAction::ProceedWithNetwork", "Gate {"].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            3,
-            "expected EXACTLY three references to the gated action — the match \
-             arm, the branch that runs the broadcast, and the #413 0-admit \
-             refusal (which READS the same derived action — a third READ, \
-             never a second derivation); a changed count means the \
-             only public admission bar MOVED, was RENAMED or was DELETED. An \
-             unchanged count does NOT mean the bar is live: an added conjunct \
-             leaves this at 2 (see this test's stated boundary) — that shape, \
-             and the shadowed rebinding, are the route tier's job"
+            4,
+            "expected EXACTLY four references to the gated action — the match \
+             arm, the branch that runs the broadcast, the #413 0-admit \
+             refusal, and the bsv-low W-A door walk (each READS the same \
+             derived action — a further READ, never a second derivation); a \
+             changed count means the only public admission bar MOVED, was \
+             RENAMED or was DELETED. An unchanged count does NOT mean the bar \
+             is live: an added conjunct leaves this at 4 (see this test's \
+             stated boundary) — that shape, and the shadowed rebinding, are \
+             the route tier's job"
         );
         // The decision is derived EXACTLY once (probe H: a second derivation
         // from a separate argument list let one copy be flipped silently).
@@ -3641,6 +3753,86 @@ mod tests {
             0,
             "the route must not re-derive the plan beside the action"
         );
+    }
+
+    /// bsv-low W-A / #437 step 2 (2026-09-09): the gated door's script walk.
+    /// Source pins, same discipline (positive counts, split needles, comments
+    /// stripped, construct-scoped): the walk is asked EXACTLY once, it comes
+    /// BEFORE the network broadcast, its refusal returns a 400 carrying the
+    /// `script-refused` code, and the policy is read off the DERIVED action
+    /// (never re-read from the env in the route body).
+    #[test]
+    fn the_door_walk_precedes_the_broadcast_and_only_the_interpreter_refuses() {
+        let src = code_only(include_str!("routes.rs"));
+        let walk = ["engine.verify_scripts_", "only("].concat();
+        assert_eq!(
+            src.matches(&walk).count(),
+            1,
+            "the door walk must be asked exactly once, on the completed gated BEEF"
+        );
+        let broadcast = [".broadcast_efs_", "gated("].concat();
+        assert_eq!(
+            src.matches(&broadcast).count(),
+            1,
+            "the gated network broadcast must be asked exactly once"
+        );
+        assert!(
+            src.find(&walk).unwrap() < src.find(&broadcast).unwrap(),
+            "the door walk must run BEFORE the network broadcast — a refused spend is never broadcast"
+        );
+        // The refusal: the interpreter's verdict arm returns a coded 400, once.
+        let verdict_arm = ["Err(EngineError::ScriptVerification", "Failed {"].concat();
+        assert_eq!(
+            src.matches(&verdict_arm).count(),
+            1,
+            "exactly one arm consumes the interpreter's verdict at the door"
+        );
+        let arm_start = src.find(&verdict_arm).unwrap();
+        let arm = &src[arm_start..src[arm_start..].find("Err(inconclusive)").unwrap() + arm_start];
+        assert_eq!(
+            arm.matches("json_error_coded(").count(),
+            1,
+            "the verdict arm must answer with the CODED body"
+        );
+        assert_eq!(arm.matches("SCRIPT_REFUSED_CODE,").count(), 1);
+        assert_eq!(arm.matches("400,").count(), 1, "the verdict is a 400");
+        assert_eq!(
+            arm.matches("return Ok(with_server_timing(").count(),
+            1,
+            "the refusal must RETURN (nothing broadcast), with its timing"
+        );
+        // The policy rides the derived action: read there, never from the env twice.
+        let policy_read = ["scripts: crate::submit_gate::ScriptPolicy::", "Execute,"].concat();
+        assert_eq!(
+            src.matches(&policy_read).count(),
+            1,
+            "the door reads the policy off the derived action exactly once"
+        );
+        let var_read = ["env.var(\"SCRIPT_VERIFY_NETWORK_", "GATED\")"].concat();
+        assert_eq!(
+            src.matches(&var_read).count(),
+            1,
+            "the policy var is read exactly once, beside the other gate knobs"
+        );
+    }
+
+    /// The coded error body serialises to `{status,code,message}` — the
+    /// client branches on `code`, never on the prose.
+    #[test]
+    fn coded_error_body_carries_the_code_beside_status_and_message() {
+        let body = serde_json::to_value(CodedErrorBody {
+            status: "error",
+            code: SCRIPT_REFUSED_CODE,
+            message: "broadcast-gated: script verification failed: …",
+        })
+        .unwrap();
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["code"], "script-refused");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("broadcast-gated:"));
+        assert_eq!(body.as_object().unwrap().len(), 3);
     }
 
     /// #371 (gate MEDIUM-1): the `network_seen` latch must be CALLED from

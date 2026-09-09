@@ -54,6 +54,19 @@ pub const COUNTER_QUEUE_MUTATION_APPLIED: &str = "queue_mutation_applied_total";
 /// back for the platform's retry/backoff. After `max_retries` the message
 /// dead-letters — a growing DLQ is an operator page, never a silent drop.
 pub const COUNTER_QUEUE_MUTATION_RETRIED: &str = "queue_mutation_retried_total";
+// ── bsv-low W-A / #437 step 2: the gated door's script walk (2026-09-09) ──
+/// Network-gated submits REFUSED at the door on the interpreter's verdict
+/// (`Engine::verify_scripts_only`: a spend whose unlocking script the
+/// interpreter refused — the network would have refused it too; nothing was
+/// broadcast). Sustained non-zero on a healthy client population is an
+/// interpreter divergence to investigate, never a silent drop: the client
+/// falls to its own direct broadcast and the network's own verdict.
+pub const COUNTER_SUBMIT_SCRIPT_REFUSED: &str = "submit_script_refused_total";
+/// Network-gated submits whose door walk ended INCONCLUSIVE (a structural
+/// fault: a source the completed BEEF still lacks, the value rule, a parse
+/// fault) — logged, counted, and handed to the network gate unchanged. Not a
+/// refusal class: the interpreter never reached a verdict.
+pub const COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE: &str = "submit_script_walk_inconclusive_total";
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
 /// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
 /// operation, not an error — it proves the webhook stream is alive.
@@ -685,6 +698,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_MUTATION_FAULT: 0,
         COUNTER_SUBMIT_MUTATION_QUEUED: 0,
         COUNTER_SUBMIT_MUTATION_REFUSED: 0,
+        // bsv-low W-A (2026-09-09): the gated door's script walk — seeded so a
+        // door that never refused reads an explicit 0.
+        COUNTER_SUBMIT_SCRIPT_REFUSED: 0,
+        COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE: 0,
         COUNTER_QUEUE_MUTATION_APPLIED: 0,
         COUNTER_QUEUE_MUTATION_RETRIED: 0,
         // 2026-09-04: the discovery pass — seeded to 0 for the same reason.
