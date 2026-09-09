@@ -883,6 +883,8 @@ async fn submit_inner(
     // bsv-low W-A: the door's script walk, its own segment (0 when skipped) and
     // its stats (`script-walk;desc=…`, the cost instrument on Workers).
     let mut script_verify_ms = 0f64;
+    // `skipped` is RESERVED for the kill switch (the door did not run); every
+    // outcome of a walk that ran writes its own desc (gate N3).
     let mut script_walk_desc = String::from("skipped");
     // Consumed DIRECTLY from the action: there is no local flag to shadow.
     // A re-gate defeated both source pins with
@@ -1059,6 +1061,7 @@ async fn submit_inner(
                 }) => {
                     // The DOOR's own bound, never the network's verdict: the
                     // request proceeds and the network judges.
+                    script_walk_desc = format!("over-budget at={at_txid} judged={subject_judged}");
                     worker::console_log!(
                         "POST /submit(broadcast-gated): door walk OVER BUDGET at {at_txid} (subject {subject_txid} judged: {subject_judged}; {what}) — the door's bound, the network judges"
                     );
@@ -1069,6 +1072,7 @@ async fn submit_inner(
                     subject_judged,
                     reason,
                 }) => {
+                    script_walk_desc = format!("inconclusive at={at_txid} judged={subject_judged}");
                     worker::console_log!(
                         "POST /submit(broadcast-gated): door walk INCONCLUSIVE at {at_txid} (subject {subject_txid} judged: {subject_judged}; {reason}) — not the interpreter's verdict; the network judges"
                     );
@@ -1082,6 +1086,7 @@ async fn submit_inner(
                     // Any other engine error here (a BEEF that parsed for EF
                     // conversion but not for the walk) is structural: said,
                     // counted as unjudged, and the network judges.
+                    script_walk_desc = String::from("inconclusive (the walk could not run)");
                     worker::console_log!(
                         "POST /submit(broadcast-gated): door walk could not run for {subject_txid} ({other}) — the network judges"
                     );

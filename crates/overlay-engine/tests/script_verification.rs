@@ -1399,8 +1399,9 @@ async fn door_memory_limit_trip_is_the_doors_verdict_not_the_networks() {
     // `<12 × (OP_DUP OP_CAT)> OP_DROP OP_TRUE` on an 8 KB push doubles the
     // element to 32 MB: cheap by the static census (no hash ops), so it runs,
     // and the interpreter's 128 KB memory limit trips mid-way. That is the
-    // DOOR's limit (the reference default is 32 MB and the node's policy
-    // larger still), so it must read over budget, never refused.
+    // DOOR's limit (the ts-sdk's `Spend` default is `Infinity`, bsv-rs's own
+    // default 32 MB, the node's policy larger still), so it must read over
+    // budget, never refused.
     let mut script = Script::new();
     for _ in 0..12 {
         script.write_opcode(OP_DUP).write_opcode(OP_CAT);
@@ -1486,4 +1487,69 @@ async fn door_names_a_judged_subject_apart_from_an_unjudged_one() {
         }
         other => panic!("expected an inconclusive walk, got {other}"),
     }
+}
+
+/// The census weights a CHECKMULTISIG by its STATED key count (the Poc5
+/// covenant states `OP_3`); a count the script COMPUTES is charged the most
+/// keys the element limit admits.
+#[tokio::test]
+async fn door_census_weights_a_multisig_by_its_stated_key_count() {
+    let intact = real_covenant_leg(
+        ENFORCED_FUNDING_HEX,
+        ENFORCED_FUNDING_TXID,
+        ENFORCED_SETTLE_HEX,
+        ENFORCED_SETTLE_TXID,
+        None,
+    );
+    let engine = engine(None);
+    let stats = engine
+        .verify_scripts_only(&intact.beef, &intact.subject_txid)
+        .await
+        .expect("the real covenant settle passes the door");
+    assert!(
+        stats.sig_ops < 64,
+        "the covenant's multisig is charged by its stated OP_3, not the maximum: {stats:?}"
+    );
+    // `OP_1 <pk> <pk> <pk> OP_1 OP_2 OP_ADD OP_CHECKMULTISIG`: the key count is
+    // computed, not stated — charged the most keys the element limit admits.
+    let key = PrivateKey::random();
+    let pk = key.public_key().to_compressed();
+    let mut script = Script::new();
+    script
+        .write_opcode(OP_1)
+        .write_bin(&pk)
+        .write_bin(&pk)
+        .write_bin(&pk)
+        .write_opcode(OP_1)
+        .write_opcode(OP_2)
+        .write_opcode(OP_ADD)
+        .write_opcode(OP_CHECKMULTISIG);
+    let computed_count_lock = LockingScript::from_script(script);
+    let unlock = ScriptTemplateUnlock::new(
+        {
+            let key = key.clone();
+            move |ctx: &SigningContext| {
+                let scope = compute_sighash_scope(SignOutputs::All, false);
+                let sig = key.sign(&ctx.compute_sighash(scope)?)?;
+                let mut s = Script::new();
+                s.write_opcode(OP_0)
+                    .write_bin(&TransactionSignature::new(sig, scope).to_checksig_format());
+                Ok(UnlockingScript::from_script(s))
+            }
+        },
+        || 80,
+    );
+    let spend = spend_of(computed_count_lock, unlock, 5_000, 4_000, |_| {}).await;
+    let outcome = engine
+        .verify_scripts_only(&spend.beef, &spend.subject_txid)
+        .await;
+    let charged = match &outcome {
+        Ok(stats) => stats.sig_ops,
+        Err(EngineError::ScriptWalkOverBudget { .. }) => usize::MAX,
+        Err(e) => panic!("unexpected: {e}"),
+    };
+    assert!(
+        charged >= DoorBudget::DEFAULT.memory_limit / 33,
+        "a computed key count is charged the maximum the element limit admits: {outcome:?}"
+    );
 }

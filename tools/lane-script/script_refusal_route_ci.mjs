@@ -48,8 +48,9 @@
  * and nowhere else.
  *
  * Every POST is identified (gate LOW-3): the fixture parses `{rawTx}` /
- * `[{rawTx},…]` bodies and the cell asserts the EXPECTED subject's raw tail
- * (outputs + locktime, unchanged by the extended format) is in the body.
+ * `[{rawTx},…]` bodies and the cell asserts a window of the EXPECTED subject's
+ * own SIGNATURE (carried verbatim by the extended format; the one byte the
+ * two fixtures differ by lies inside it) is in the body.
  *
  * Exit 0 = every expectation held.
  */
@@ -167,8 +168,16 @@ await new Promise((resolve, reject) => {
  * after the last input — the outputs and the locktime — are contiguous with
  * the raw. A P2PKH output + locktime is 38 bytes; 35 bytes (70 hex) of tail
  * lie wholly inside that region for both fixtures. */
-const postedSubject = (subjectRawHex, from) =>
-  postLog.slice(from).some((p) => p.rawTxs.some((h) => h.toLowerCase().includes(subjectRawHex.slice(-70).toLowerCase())))
+const postedSubject = (subjectRawHex, from) => {
+  // The gated arm POSTs EXTENDED FORMAT: the input's unlocking script is
+  // carried verbatim, and the two fixtures pay the same output to the same
+  // key while differing by ONE DER byte of the signature — so the SIGNATURE
+  // is the identity (gate LOW-3). A P2PKH spend's unlocking script starts at
+  // raw byte 42 (version 4 · vin 1 · outpoint 36 · length 1); 40 bytes from
+  // byte 43 sit inside the signature on both sides of the flipped byte.
+  const sigWindow = subjectRawHex.slice(86, 86 + 80).toLowerCase()
+  return postLog.slice(from).some((p) => p.rawTxs.some((h) => h.toLowerCase().includes(sigWindow)))
+}
 
 try {
   if (DOOR_ON) {
@@ -242,8 +251,10 @@ try {
     const posted = await pollFor(async () => postedSubject(manifest.corrupted.subject_raw_hex, postsBefore), 20_000)
     if (posted) pass('kill switch: the corrupted spend REACHED the fixture Arcade (its own bytes in a POST)')
     else fail('kill switch: the corrupted spend reached the fixture Arcade', `no fixture POST carrying it; posts=${JSON.stringify(postLog.slice(postsBefore).map((p) => p.bytes))}`)
-    if (/script-walk;desc="skipped"/.test(r.serverTiming) || !/script-walk;desc=/.test(r.serverTiming)) pass('kill switch: no walk stats (the door did not run)')
-    else fail('kill switch: no walk stats', `got ${JSON.stringify(r.serverTiming)}`)
+    // `skipped` is reserved for the kill switch: a door that RAN and ended
+    // inconclusive writes its own desc, so this cannot pass on a stuck-on door.
+    if (/script-walk;desc="skipped"/.test(r.serverTiming)) pass('kill switch: the walk desc is exactly "skipped" (the door did not run)')
+    else fail('kill switch: the walk desc is exactly "skipped"', `got ${JSON.stringify(r.serverTiming)}`)
     await new Promise((s) => setTimeout(s, 1_500))
     const c1 = await counters()
     if ((c1.refused ?? 0) === (c0.refused ?? 0) && (c1.inconclusive ?? 0) === (c0.inconclusive ?? 0)) pass('kill switch: no door counter moved')

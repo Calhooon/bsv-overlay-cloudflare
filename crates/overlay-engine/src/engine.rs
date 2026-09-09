@@ -357,8 +357,24 @@ pub struct DoorBudget {
 impl DoorBudget {
     /// Sized for LOW's real shapes with a wide margin: a 30-deep P2PKH hop
     /// ancestry plus one 3.5 KB OP_PUSH_TX covenant spend estimates under
-    /// 8 MB; the worst case an adversary can buy is ~64 MB of hashing (a few
-    /// hundred ms in wasm), bounded.
+    /// 8 MB. What the static census BOUNDS: hashing (hash-class ops × the
+    /// element limit) and signature checks (× the transaction's size; a
+    /// CHECKMULTISIG weighted by its static key count when the count is a
+    /// small-int push, else by the most keys the element limit admits).
+    ///
+    /// THE OPEN RESIDUAL (the W-A gate's delta-verify, 2026-09-09, measured):
+    /// the interpreter itself meters nothing, so three classes stay charged
+    /// only by their script bytes — bignum arithmetic (`OP_MUL`/`OP_DIV`/
+    /// `OP_MOD` on operands up to the element limit: ~1.3 ms per 30 KB×30 KB
+    /// round, linear in rounds), a CHECKMULTISIG whose key count is a computed
+    /// value (~80 µs per EC verify per key tried), and `OP_NUM2BIN`, which
+    /// allocates its size operand BEFORE the memory limit is consulted (up to
+    /// bsv-rs's 1 GB element size: an isolate kill, not a refusal). None of
+    /// them can refuse a spend (a breach and a trip are the door's bound and
+    /// the request proceeds); all of them cost the beta overlay CPU until
+    /// bsv-rs meters work dynamically (a `work_limit` charged per op with the
+    /// real operand sizes, and a pre-allocation check in NUM2BIN) — OWED
+    /// before any PROD flip of `SCRIPT_VERIFY_NETWORK_GATED`.
     pub const DEFAULT: DoorBudget = DoorBudget {
         max_unproven_txs: 64,
         max_inputs_per_tx: 256,
@@ -400,18 +416,38 @@ struct WalkPolicy {
 }
 
 /// Static opcode census of one input's scripts: (bytes, hash ops, sig ops).
-fn script_census(unlocking: &[u8], locking: &[u8]) -> Result<(usize, usize, usize), String> {
+///
+/// A CHECKMULTISIG is weighted by its KEY COUNT: the small-int push that
+/// precedes it when the script states the count (the Poc5 covenant's
+/// `OP_3`), else the most 33-byte keys the element limit admits (the count is
+/// a computed value the census cannot see; bsv-rs allows up to `i32::MAX`).
+fn script_census(
+    unlocking: &[u8],
+    locking: &[u8],
+    memory_limit: usize,
+) -> Result<(usize, usize, usize), String> {
     use bsv_rs::script::op::*;
+    let most_keys = (memory_limit / 33).max(1);
     let mut hash_ops = 0usize;
     let mut sig_ops = 0usize;
     for (label, bytes) in [("unlocking", unlocking), ("locking", locking)] {
         let script = bsv_rs::script::Script::from_binary(bytes)
             .map_err(|e| format!("{label} script does not parse: {e}"))?;
-        for chunk in script.chunks() {
+        let chunks = script.chunks();
+        for (i, chunk) in chunks.iter().enumerate() {
             match chunk.op {
                 OP_RIPEMD160 | OP_SHA1 | OP_SHA256 | OP_HASH160 | OP_HASH256 => hash_ops += 1,
                 OP_CHECKSIG | OP_CHECKSIGVERIFY => sig_ops += 1,
-                OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => sig_ops += 20,
+                OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                    let stated = i
+                        .checked_sub(1)
+                        .map(|j| chunks[j].op)
+                        .and_then(|op| match op {
+                            OP_1..=OP_16 => Some((op - OP_1 + 1) as usize),
+                            _ => None,
+                        });
+                    sig_ops += stated.unwrap_or(most_keys);
+                }
                 _ => {}
             }
         }
@@ -1262,13 +1298,15 @@ impl Engine {
                 let locking_bytes = source_output.locking_script.to_binary();
                 if let Some(b) = budget {
                     let (bytes, hash_ops, sig_ops) =
-                        script_census(&unlocking_bytes, &locking_bytes).map_err(|e| {
-                            fault(
-                                &txid,
-                                judged,
-                                format!("input {vin} of transaction {txid}: {e}"),
-                            )
-                        })?;
+                        script_census(&unlocking_bytes, &locking_bytes, b.memory_limit).map_err(
+                            |e| {
+                                fault(
+                                    &txid,
+                                    judged,
+                                    format!("input {vin} of transaction {txid}: {e}"),
+                                )
+                            },
+                        )?;
                     stats.script_bytes += bytes;
                     stats.hash_ops += hash_ops;
                     stats.sig_ops += sig_ops;
