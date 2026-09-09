@@ -255,7 +255,42 @@ pub fn verify_raw_bytes(raw: &[u8], txid: &str) -> Option<String> {
 /// The `/tx-any` wire body. `unconfirmable` is additive (#247) — pre-#247
 /// clients ignore it; a client that consumes it gets the terminal-skip
 /// signal for a provably-dead tx.
-pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
+/// bsv-low W-C.3 — the batched route's bound: one `/tx-any?txids=` answers up
+/// to this many txids (the client chunks). Matches the tower's `/cases` bound.
+pub const TX_ANY_BATCH_MAX: usize = 50;
+
+/// bsv-low W-C.3 — how many index MISSES one batch may resolve through the
+/// external (courier) leg. The couriers rate-limit; the rest of a batch's
+/// misses are answered `unknown` and read one at a time by the client.
+pub const TX_ANY_BATCH_EXTERNAL_MAX: usize = 8;
+
+/// `txids=<txid>,…` → lowercase txids, duplicates collapsed (first occurrence
+/// kept, order preserved), empty items between commas ignored; `Err` names
+/// the refusal (400). One malformed item refuses the whole list: a client
+/// must never read a half-answered map as complete.
+pub fn parse_txids(param: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in param.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !crate::logic::valid_txid(item) {
+            return Err(format!("malformed txid (expect 64 hex chars): {item:?}"));
+        }
+        let lc = item.to_ascii_lowercase();
+        if !out.contains(&lc) {
+            out.push(lc);
+        }
+        if out.len() > TX_ANY_BATCH_MAX {
+            return Err(format!("too many txids (max {TX_ANY_BATCH_MAX})"));
+        }
+    }
+    if out.is_empty() {
+        return Err("empty txids parameter".to_string());
+    }
+    Ok(out)
+}
+
+/// The one `/tx-any` answer as a JSON value (the single route's body, the
+/// batched route's per-txid entry — one writer, so the two cannot drift).
+pub fn tx_any_value(txid: &str, a: &TxAnyAnswer) -> serde_json::Value {
     json!({
         "txid": txid,
         "present": a.present,
@@ -265,7 +300,41 @@ pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
         "source": a.source,
         "unconfirmable": a.unconfirmable,
     })
-    .to_string()
+}
+
+/// bsv-low W-C.3 — the batched body: `answers[txid]` = the single route's
+/// body for that txid; `unknown` = the txids this batch did not answer (past
+/// the external budget) — listed apart, never a null.
+pub fn tx_any_batch_body(answers: &[(String, TxAnyAnswer)], unknown: &[String]) -> String {
+    let mut map = serde_json::Map::new();
+    for (txid, a) in answers {
+        map.insert(txid.clone(), tx_any_value(txid, a));
+    }
+    json!({ "answers": serde_json::Value::Object(map), "unknown": unknown }).to_string()
+}
+
+/// Whether an answer is TERMINAL: a mined tx stays mined, and a proven
+/// unconfirmable tx stays unconfirmable (both reorg-negligible — the same
+/// trust the client's durable latch places in them, bsv-low #403).
+pub fn tx_any_terminal(a: &TxAnyAnswer) -> bool {
+    (a.present == Some(true) && a.confirmed == Some(true))
+        || (a.unconfirmable && a.present == Some(false))
+}
+
+/// bsv-low W-C.3 — the `Cache-Control` a `/tx-any/:txid` answer carries: a
+/// terminal answer is `immutable` for a year (the browser and the colo cache
+/// serve every repeat read without a request); anything that can still change
+/// stays `no-store`.
+pub fn tx_any_cache_control(a: &TxAnyAnswer) -> &'static str {
+    if tx_any_terminal(a) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    }
+}
+
+pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
+    tx_any_value(txid, a).to_string()
 }
 
 #[cfg(test)]
@@ -494,5 +563,105 @@ mod tests {
             serde_json::from_str(&tx_any_body("ab", &TxAnyAnswer::default())).unwrap();
         assert!(empty["present"].is_null());
         assert!(empty["source"].is_null());
+    }
+
+    // ── bsv-low W-C.3 (2026-09-09): the batched route + the immutable edge ──
+
+    fn mined() -> TxAnyAnswer {
+        TxAnyAnswer {
+            present: Some(true),
+            confirmed: Some(true),
+            height: Some(965_000),
+            raw_hex: Some(raw()),
+            source: Some("index"),
+            unconfirmable: false,
+        }
+    }
+
+    #[test]
+    fn parse_txids_lowercases_dedupes_bounds_and_refuses_any_malformed_item() {
+        let a = "ab".repeat(32);
+        let b = "cd".repeat(32);
+        assert_eq!(
+            parse_txids(&format!("{},{a},{b},,", a.to_uppercase())).unwrap(),
+            vec![a.clone(), b.clone()]
+        );
+        assert!(parse_txids("").unwrap_err().contains("empty"));
+        assert!(parse_txids(",,").unwrap_err().contains("empty"));
+        assert!(parse_txids("abcd").unwrap_err().contains("malformed txid"));
+        assert!(parse_txids(&format!("{a},zz"))
+            .unwrap_err()
+            .contains("malformed txid"));
+        let fifty: Vec<String> = (0..50).map(|i| format!("{:064x}", i + 1)).collect();
+        assert_eq!(parse_txids(&fifty.join(",")).unwrap().len(), 50);
+        let mut dup = fifty.clone();
+        dup.push(fifty[0].clone());
+        assert_eq!(parse_txids(&dup.join(",")).unwrap().len(), 50);
+        let mut over = fifty;
+        over.push(format!("{:064x}", 99));
+        assert!(parse_txids(&over.join(","))
+            .unwrap_err()
+            .contains("too many txids"));
+    }
+
+    #[test]
+    fn the_batched_entry_is_the_single_body_and_unknowns_stay_apart() {
+        let a = "ab".repeat(32);
+        let u = "ee".repeat(32);
+        let body: serde_json::Value = serde_json::from_str(&tx_any_batch_body(
+            &[(a.clone(), mined())],
+            std::slice::from_ref(&u),
+        ))
+        .unwrap();
+        let single: serde_json::Value = serde_json::from_str(&tx_any_body(&a, &mined())).unwrap();
+        assert_eq!(body["answers"][&a], single);
+        assert!(
+            body["answers"].get(&u).is_none(),
+            "an unknown txid is NOT in answers"
+        );
+        assert_eq!(body["unknown"], json!([u]));
+    }
+
+    #[test]
+    fn only_a_terminal_answer_is_immutable() {
+        assert_eq!(
+            tx_any_cache_control(&mined()),
+            "public, max-age=31536000, immutable"
+        );
+        let unconfirmable = TxAnyAnswer {
+            present: Some(false),
+            confirmed: None,
+            height: None,
+            raw_hex: None,
+            source: Some("external"),
+            unconfirmable: true,
+        };
+        assert_eq!(
+            tx_any_cache_control(&unconfirmable),
+            "public, max-age=31536000, immutable"
+        );
+        let pending = TxAnyAnswer {
+            confirmed: Some(false),
+            height: None,
+            ..mined()
+        };
+        assert_eq!(tx_any_cache_control(&pending), "no-store");
+        let absent = TxAnyAnswer {
+            present: Some(false),
+            confirmed: None,
+            height: None,
+            raw_hex: None,
+            ..mined()
+        };
+        assert_eq!(tx_any_cache_control(&absent), "no-store");
+        // An inconsistent pairing (unconfirmable claimed on a PRESENT tx) is not terminal.
+        let odd = TxAnyAnswer {
+            unconfirmable: true,
+            confirmed: Some(false),
+            height: None,
+            ..mined()
+        };
+        assert_eq!(tx_any_cache_control(&odd), "no-store");
+        assert_eq!(tx_any_cache_control(&TxAnyAnswer::default()), "no-store");
     }
 }

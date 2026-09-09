@@ -261,6 +261,9 @@ fn router(
         .get_async("/live-view", routes::live_view)
         .get_async("/spent-any", routes::spent_any)
         .get_async("/tx-any/:txid", routes::tx_any)
+        // bsv-low W-C.3 (2026-09-09): the same answer for up to 50 txids in one
+        // round trip (the home surface's per-tx presence sweep).
+        .get_async("/tx-any", routes::tx_any_batch)
         .get_async("/beef/:txid", routes::beef)
         // #209 follow-up: server-assembled credit ancestry, so the client
         // never stores BEEF bytes to survive a reload (see `credit_beef`).
