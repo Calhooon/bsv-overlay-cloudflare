@@ -888,47 +888,186 @@ impl Engine {
         Ok((steak, report))
     }
 
-    /// The reference's SPV block (overlay-express `Engine.submit`:
-    /// `const txValid = await tx.verify(this.chainTracker)`; ts-sdk
-    /// `Transaction.verify`), via `bsv_rs::transaction::Transaction::verify`,
-    /// which walks the subject and its unproven ancestry: a transaction WITH
-    /// a merkle path has its root checked against the chain tracker and is
-    /// then trusted (no descent); one WITHOUT has EVERY input's unlocking
-    /// script executed against its source output by the interpreter
-    /// (`bsv_rs::script::Spend`: OP_PUSH_TX-aware, minimal-push, push-only
-    /// unlocking, low-S, clean-stack, the ts-sdk `Spend` flags) and its
-    /// sources enqueued. Without a chain tracker this is the reference's
-    /// `tx.verify('scripts only')`: every root is accepted unchecked (a
-    /// proven ancestor is trusted on its BUMP alone), scripts still run.
+    /// The reference's `tx.verify(chainTracker)` on submit, walked LINEARLY
+    /// over the BEEF's own transaction map: every txid once, a transaction the
+    /// BEEF proves (a BUMP) checked by its root against the chain tracker and
+    /// not descended, an unproven one script-checked on every input with its
+    /// source looked up by txid, plus the reference's value rule (outputs
+    /// never exceed inputs). No source objects are cloned or linked.
     ///
-    /// Two things the reference does that the bsv-rs walk does not, added
-    /// here: (1) an unproven transaction whose outputs exceed its inputs is
-    /// refused (`if (outputTotal > inputTotal) return false`), and (2) the
-    /// failure is CLASSIFIED: bsv-rs collapses every cause into one
-    /// `Error::TransactionError(String)`, so a bad SPEND is re-raised as
-    /// [`EngineError::ScriptVerificationFailed`] (input index + interpreter
-    /// message) and everything else as [`EngineError::SpvError`], so an
-    /// operator can tell a bad spend from a bad proof.
-    async fn verify_spv_like_the_reference(
+    /// Why not bsv-rs `Transaction::verify`: it walks `source_transaction`
+    /// links that `from_beef` builds by CLONING, once per input. Two inputs
+    /// sourcing the same unproven parent (a covenant head output plus that
+    /// spend's own change, the shape of every second head spend of a wallet)
+    /// leave the second clone bare ("Input 0 has no source transaction"), and
+    /// re-linking every clone materializes the ancestry EXPONENTIALLY along a
+    /// diamond chain: a 12-deep unmined chain of head spends took a Worker past
+    /// its memory on beta (zanaadu, 2026-09-08). A map keyed by txid is what the
+    /// TypeScript SDK effectively has (its inputs share one object), in O(n).
+    async fn verify_beef_linear(
         &self,
-        tx: &Transaction,
+        beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<(), EngineError> {
-        let scripts_only = ScriptsOnlyChainTracker;
-        let tracker: &dyn bsv_rs::transaction::ChainTracker = match self.chain_tracker.as_deref() {
-            Some(tracker) => tracker,
-            None => &scripts_only,
-        };
-        match tx.verify(tracker, None).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(EngineError::SpvError(
-                    "Unable to verify SPV information.".into(),
-                ));
+        use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
+        use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
+
+        let beef = Beef::from_binary(beef_bytes)
+            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+        let mut by_txid: HashMap<String, &Transaction> = HashMap::new();
+        for btx in &beef.txs {
+            if let Some(tx) = btx.tx() {
+                by_txid.insert(btx.txid(), tx);
             }
-            Err(e) => return Err(classify_verify_failure(subject_txid, &e)),
         }
-        check_unproven_value_balance(tx)
+        let spv =
+            |msg: String| EngineError::SpvError(format!("Unable to verify SPV information: {msg}"));
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![subject_txid.to_string()];
+        while let Some(txid) = queue.pop() {
+            if !seen.insert(txid.clone()) {
+                continue;
+            }
+            let Some(tx) = by_txid.get(&txid).copied() else {
+                return Err(spv(format!("transaction {txid} is not in the BEEF")));
+            };
+            if let Some(mp) = beef.find_bump(&txid) {
+                let root = mp
+                    .compute_root(Some(&txid))
+                    .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
+                if let Some(tracker) = self.chain_tracker.as_deref() {
+                    match tracker
+                        .is_valid_root_for_height(&root, mp.block_height)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(EngineError::SpvError(format!(
+                                "Invalid merkle path for transaction {txid}: root {root} is not valid for block height {}",
+                                mp.block_height
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(EngineError::SpvError(format!(
+                                "Chain tracker error at height {}: {e}",
+                                mp.block_height
+                            )));
+                        }
+                    }
+                }
+                continue; // proven: trusted, no ancestry needed (the reference stops here too)
+            }
+
+            // Unproven: the value rule and every input's script, sources by txid.
+            let outputs: Vec<TxOutput> = tx
+                .outputs
+                .iter()
+                .map(|o| TxOutput {
+                    satoshis: o.satoshis.unwrap_or(0),
+                    script: o.locking_script.to_binary(),
+                })
+                .collect();
+            let mut input_total: u64 = 0;
+            for (vin, input) in tx.inputs.iter().enumerate() {
+                let Some(src_txid) = input.source_txid.clone() else {
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid} names no source"
+                    )));
+                };
+                let Some(source) = by_txid.get(&src_txid).copied() else {
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid} has no source transaction"
+                    )));
+                };
+                let Some(source_output) = source.outputs.get(input.source_output_index as usize)
+                else {
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid}: source output index out of bounds"
+                    )));
+                };
+                let sats = source_output.satoshis.unwrap_or(0);
+                input_total = input_total
+                    .checked_add(sats)
+                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
+                let Some(unlocking) = input.unlocking_script.as_ref() else {
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid} is missing its unlocking script"
+                    )));
+                };
+                let other_inputs: Vec<TxInput> = tx
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != vin)
+                    .map(|(_, inp)| TxInput {
+                        txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
+                        output_index: inp.source_output_index,
+                        script: inp
+                            .unlocking_script
+                            .as_ref()
+                            .map(bsv_rs::UnlockingScript::to_binary)
+                            .unwrap_or_default(),
+                        sequence: inp.sequence,
+                    })
+                    .collect();
+                let source_txid_bytes = input
+                    .get_source_txid_bytes()
+                    .map_err(|e| spv(format!("input {vin} of transaction {txid}: {e}")))?;
+                let locking_script = LockingScript::from_script(
+                    Script::from_binary(&source_output.locking_script.to_binary())
+                        .map_err(|e| spv(format!("locking script of {src_txid}: {e}")))?,
+                );
+                let unlocking_script = UnlockingScript::from_script(
+                    Script::from_binary(&unlocking.to_binary())
+                        .map_err(|e| spv(format!("unlocking script of {txid}: {e}")))?,
+                );
+                let mut spend = Spend::new(SpendParams {
+                    source_txid: source_txid_bytes,
+                    source_output_index: input.source_output_index,
+                    source_satoshis: sats,
+                    locking_script,
+                    transaction_version: tx.version.cast_signed(),
+                    other_inputs,
+                    outputs: outputs.clone(),
+                    input_index: vin,
+                    unlocking_script,
+                    input_sequence: input.sequence,
+                    lock_time: tx.lock_time,
+                    memory_limit: None,
+                });
+                match spend.validate() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(EngineError::ScriptVerificationFailed {
+                            subject_txid: txid.clone(),
+                            input_index: vin as u32,
+                            reason: "script evaluated to false".into(),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(EngineError::ScriptVerificationFailed {
+                            subject_txid: txid.clone(),
+                            input_index: vin as u32,
+                            reason: e.message.clone(),
+                        });
+                    }
+                }
+                queue.push(src_txid);
+            }
+            let mut output_total: u64 = 0;
+            for output in &tx.outputs {
+                output_total = output_total
+                    .checked_add(output.satoshis.unwrap_or(0))
+                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
+            }
+            if output_total > input_total {
+                return Err(spv(format!(
+                    "transaction {txid} creates {output_total} sats from {input_total} sats of inputs"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The pre-2026-09-08 SPV block, kept verbatim as the
@@ -1001,7 +1140,7 @@ impl Engine {
         // `validateGraphAnchor` already verified).
         if mode != SubmitMode::HistoricalTxNoSpv {
             if self.verify_scripts {
-                self.verify_spv_like_the_reference(&tx, &txid).await?;
+                self.verify_beef_linear(&tagged_beef.beef, &txid).await?;
             } else {
                 self.verify_spv_structurally(&tagged_beef.beef).await?;
             }
@@ -2849,111 +2988,6 @@ fn parse_ship_domain_from_script(output_script: &[u8]) -> Option<String> {
 // ============================================================================
 // Submit-time spend verification helpers (reference parity, 2026-09-08)
 // ============================================================================
-
-/// The reference's `'scripts only'` verification for an engine with NO chain
-/// tracker: every merkle root is accepted unchecked, so
-/// `Transaction::verify` still executes every unproven input's script. Never
-/// installed as the engine's tracker; it exists only to give the bsv-rs walk
-/// something to call, and it has no chain view of its own.
-struct ScriptsOnlyChainTracker;
-
-#[async_trait::async_trait]
-impl bsv_rs::transaction::ChainTracker for ScriptsOnlyChainTracker {
-    async fn is_valid_root_for_height(
-        &self,
-        _root: &str,
-        _height: u32,
-    ) -> Result<bool, bsv_rs::transaction::ChainTrackerError> {
-        Ok(true)
-    }
-
-    async fn current_height(&self) -> Result<u32, bsv_rs::transaction::ChainTrackerError> {
-        Err(bsv_rs::transaction::ChainTrackerError::Other(
-            "scripts-only verification has no chain view".into(),
-        ))
-    }
-}
-
-/// The bsv-rs interpreter failure line inside `Transaction::verify`'s one
-/// `TransactionError` string (bsv-rs 0.3.20 `transaction.rs`:
-/// `format!("Script validation failed for input {}: {}", vin, e.message)`).
-/// If a bsv-rs bump ever rewords it, a script failure degrades to the generic
-/// [`EngineError::SpvError`] (still REFUSED, just mislabelled) and
-/// `tests/script_verification.rs` (which asserts the variant) goes red.
-const BSV_RS_SCRIPT_FAILURE_PREFIX: &str = "Script validation failed for input ";
-
-/// Split one `Transaction::verify` failure into a bad SPEND
-/// ([`EngineError::ScriptVerificationFailed`]) or anything else, a bad or
-/// unverifiable PROOF, a missing source, a chain-tracker fault
-/// ([`EngineError::SpvError`]).
-fn classify_verify_failure(subject_txid: &str, e: &bsv_rs::Error) -> EngineError {
-    let bsv_rs::Error::TransactionError(msg) = e else {
-        return EngineError::SpvError(e.to_string());
-    };
-    if let Some(rest) = msg.strip_prefix(BSV_RS_SCRIPT_FAILURE_PREFIX) {
-        if let Some((vin, reason)) = rest.split_once(": ") {
-            if let Ok(input_index) = vin.parse::<u32>() {
-                return EngineError::ScriptVerificationFailed {
-                    subject_txid: subject_txid.to_string(),
-                    input_index,
-                    reason: reason.to_string(),
-                };
-            }
-        }
-    }
-    EngineError::SpvError(msg.clone())
-}
-
-/// The reference's value rule inside `Transaction.verify`
-/// (`verifyUnminedTransaction`: `if (outputTotal > inputTotal) return false`,
-/// which `Engine.submit` surfaces as "Unable to verify SPV information."):
-/// every UNPROVEN transaction in the subject's ancestry must not create
-/// satoshis. A transaction with a merkle path is trusted, as in the walk.
-/// bsv-rs's `Transaction::verify` omits this rule, so it lives here.
-fn check_unproven_value_balance(subject: &Transaction) -> Result<(), EngineError> {
-    let overflow = |txid: &str| {
-        EngineError::SpvError(format!(
-            "Unable to verify SPV information: satoshi total overflows in transaction {txid}"
-        ))
-    };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut queue: Vec<&Transaction> = vec![subject];
-    while let Some(tx) = queue.pop() {
-        let txid = tx.id();
-        if !seen.insert(txid.clone()) || tx.merkle_path.is_some() {
-            continue;
-        }
-        let mut input_total: u64 = 0;
-        for (vin, input) in tx.inputs.iter().enumerate() {
-            let Some(source) = input.source_transaction.as_deref() else {
-                return Err(EngineError::SpvError(format!(
-                    "Unable to verify SPV information: input {vin} of transaction {txid} has no source transaction"
-                )));
-            };
-            let sats = source
-                .outputs
-                .get(input.source_output_index as usize)
-                .and_then(|o| o.satoshis)
-                .unwrap_or(0);
-            input_total = input_total
-                .checked_add(sats)
-                .ok_or_else(|| overflow(&txid))?;
-            queue.push(source);
-        }
-        let mut output_total: u64 = 0;
-        for output in &tx.outputs {
-            output_total = output_total
-                .checked_add(output.satoshis.unwrap_or(0))
-                .ok_or_else(|| overflow(&txid))?;
-        }
-        if output_total > input_total {
-            return Err(EngineError::SpvError(format!(
-                "Unable to verify SPV information: transaction {txid} creates {output_total} sats from {input_total} sats of inputs"
-            )));
-        }
-    }
-    Ok(())
-}
 
 // ============================================================================
 // Error type
