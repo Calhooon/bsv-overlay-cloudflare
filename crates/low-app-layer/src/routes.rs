@@ -2206,7 +2206,12 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
     // attributed seat.
     let announced_at = worker::Date::now().as_millis();
     for (txid, vout) in &outpoints {
-        crate::internal_events::push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(txid, *vout, announced_at)).await;
+        crate::internal_events::push_broadcast(
+            env,
+            crate::internal_events::POTS_ROOM,
+            crate::internal_events::pot_changed_event_body(txid, *vout, announced_at),
+        )
+        .await;
     }
     let db = env.d1("OVERLAY_DB")?;
     let era = written_off_before_ms_env(env);

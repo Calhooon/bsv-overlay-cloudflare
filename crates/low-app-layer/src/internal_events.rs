@@ -691,7 +691,10 @@ mod tests {
         assert_eq!(b["potOutpoint"]["txid"], "ab");
         assert_eq!(b["potOutpoint"]["vout"], 1);
         assert_eq!(b["at"], 5);
-        assert!(b.get("entry").is_none(), "no served entry: attribution is not needed");
+        assert!(
+            b.get("entry").is_none(),
+            "no served entry: attribution is not needed"
+        );
         assert!(b.get("identity").is_none());
         assert_eq!(POTS_ROOM, "broadcast-low-pots");
     }
@@ -713,11 +716,17 @@ mod tests {
             .find("push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(")
             .expect("the pots push");
         let attribution = body.find("attribute_seats(").expect("the attribution");
-        assert!(push < attribution, "the pots push comes BEFORE any attribution");
+        assert!(
+            push < attribution,
+            "the pots push comes BEFORE any attribution"
+        );
         let filing_loop = body
             .find("for (txid, vout) in outpoints {")
             .expect("the per-outpoint filing loop");
-        assert!(push < filing_loop, "the push runs over every parsed outpoint, before the filing loop");
+        assert!(
+            push < filing_loop,
+            "the push runs over every parsed outpoint, before the filing loop"
+        );
     }
 
     #[test]
