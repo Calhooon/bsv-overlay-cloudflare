@@ -161,10 +161,14 @@ await new Promise((resolve, reject) => {
   fixture.listen(FIXTURE_PORT, '127.0.0.1', resolve)
 })
 
-/** Was `subjectRawHex`'s tail (outputs + locktime; the EF leaves them intact)
- * carried by any POST logged since `from`? */
+/** Was `subjectRawHex`'s tail carried by any POST logged since `from`? The
+ * gated arm POSTs EXTENDED FORMAT (octet-stream): each input gains its
+ * previous output's value + script AFTER its sequence, so only the bytes
+ * after the last input — the outputs and the locktime — are contiguous with
+ * the raw. A P2PKH output + locktime is 38 bytes; 35 bytes (70 hex) of tail
+ * lie wholly inside that region for both fixtures. */
 const postedSubject = (subjectRawHex, from) =>
-  postLog.slice(from).some((p) => p.rawTxs.some((h) => h.toLowerCase().includes(subjectRawHex.slice(-120).toLowerCase())))
+  postLog.slice(from).some((p) => p.rawTxs.some((h) => h.toLowerCase().includes(subjectRawHex.slice(-70).toLowerCase())))
 
 try {
   if (DOOR_ON) {
