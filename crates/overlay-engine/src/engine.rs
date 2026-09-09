@@ -814,7 +814,7 @@ impl Engine {
                         script: inp
                             .unlocking_script
                             .as_ref()
-                            .map(|s| s.to_binary())
+                            .map(bsv_rs::UnlockingScript::to_binary)
                             .unwrap_or_default(),
                         sequence: inp.sequence,
                     })
@@ -835,7 +835,7 @@ impl Engine {
                     source_output_index: input.source_output_index,
                     source_satoshis: sats,
                     locking_script,
-                    transaction_version: tx.version as i32,
+                    transaction_version: tx.version.cast_signed(),
                     other_inputs,
                     outputs: outputs.clone(),
                     input_index: vin,
