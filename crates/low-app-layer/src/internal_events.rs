@@ -234,6 +234,27 @@ pub fn pot_event_body(txid: &str, vout: u32, entry: Value, at_ms: u64) -> Value 
     })
 }
 
+/// bsv-low loop 10 D2 (2026-09-08, the pair-10 finding): the room EVERY
+/// pot-outpoint change is announced in BEFORE any seat attribution. The
+/// durable per-seat `pot` event needs each seat's own verified marker, which a
+/// seat blocked at funding has never published (its felt never learned the
+/// pot funded), and the `board-changed` push only follows a refresh some
+/// client asked for: a quiet stack never pushed it. This one carries the
+/// outpoint alone (no entry, no identities); a seat holding that JOIN reads
+/// the NETWORK on it, bounded, and decides there.
+pub const POTS_ROOM: &str = "broadcast-low-pots";
+
+/// The `pot-changed` broadcast body: the outpoint and the time, nothing else
+/// (the served entry rides the per-seat durable event once attribution exists).
+pub fn pot_changed_event_body(txid: &str, vout: u32, at_ms: u64) -> Value {
+    json!({
+        "v": 1,
+        "kind": "pot-changed",
+        "potOutpoint": { "txid": txid, "vout": vout },
+        "at": at_ms,
+    })
+}
+
 pub const LOBBY_ROOM: &str = "broadcast-low-lobby";
 
 /// `{"changes":[{"txid","vout","kind"},…]}` — the lobby-changed webhook body
@@ -660,6 +681,43 @@ mod tests {
         assert_eq!(b["kind"], "pot");
         assert_eq!(b["potOutpoint"]["txid"], "ab");
         assert_eq!(b["entry"]["outcome"], "won");
+    }
+
+    #[test]
+    fn pot_changed_event_body_carries_the_outpoint_alone_with_the_room_pinned() {
+        let b = pot_changed_event_body("ab", 1, 5);
+        assert_eq!(b["v"], 1);
+        assert_eq!(b["kind"], "pot-changed");
+        assert_eq!(b["potOutpoint"]["txid"], "ab");
+        assert_eq!(b["potOutpoint"]["vout"], 1);
+        assert_eq!(b["at"], 5);
+        assert!(b.get("entry").is_none(), "no served entry: attribution is not needed");
+        assert!(b.get("identity").is_none());
+        assert_eq!(POTS_ROOM, "broadcast-low-pots");
+    }
+
+    /// The handler announces EVERY parsed outpoint in the pots room BEFORE the
+    /// attribution loop (bsv-low loop 10 D2, the pair-10 finding: a seat
+    /// blocked at funding has no marker, so the per-seat event never files for
+    /// it; the beta log read "has no attributed seats yet, nothing to file"
+    /// for both JOINs). To red: move the push below `attribute_seats(` or
+    /// delete it.
+    #[test]
+    fn internal_pot_changed_announces_every_outpoint_before_attribution() {
+        let routes = include_str!("routes.rs");
+        let start = routes
+            .find("pub(crate) async fn internal_pot_changed(")
+            .expect("the handler");
+        let body = &routes[start..];
+        let push = body
+            .find("push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(")
+            .expect("the pots push");
+        let attribution = body.find("attribute_seats(").expect("the attribution");
+        assert!(push < attribution, "the pots push comes BEFORE any attribution");
+        let filing_loop = body
+            .find("for (txid, vout) in outpoints {")
+            .expect("the per-outpoint filing loop");
+        assert!(push < filing_loop, "the push runs over every parsed outpoint, before the filing loop");
     }
 
     #[test]
