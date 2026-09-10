@@ -68,7 +68,7 @@ pub fn refund_backups_sql(written_off_before_ms: Option<i64>) -> String {
         "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, \
                 pr.identity AS identity, pr.refundRawHex AS refundRawHex, \
                 pr.sigHex AS sigHex, pr.txid AS txid, pr.outputIndex AS outputIndex, \
-                pr.createdAt AS createdAt \
+                pr.createdAt AS createdAt, pr.refundValid AS refundValid \
          FROM (SELECT DISTINCT pp.potTxid AS potTxid, pp.potVout AS potVout \
                  FROM {party} pp \
                 WHERE pp.identity = ?1{era}) party \
@@ -101,6 +101,10 @@ pub(crate) struct RefundBackupRowD1 {
     output_index: f64,
     #[serde(rename = "createdAt", default)]
     created_at: Option<f64>,
+    /// 1 = the filing verified the raw as the pot's pre-signed spend (M18-2 B);
+    /// 0 = filed before the pot was indexed; NULL = a chain-admitted row.
+    #[serde(rename = "refundValid", default)]
+    refund_valid: Option<f64>,
 }
 
 impl RefundBackupRowD1 {
@@ -115,6 +119,7 @@ impl RefundBackupRowD1 {
             txid: self.txid.to_lowercase(),
             output_index: self.output_index.max(0.0) as u32,
             created_at: self.created_at.map(|v| v as i64),
+            refund_valid: self.refund_valid.map(|v| v as i64),
         }
     }
 }
@@ -131,6 +136,10 @@ pub struct RefundBackupRow {
     pub txid: String,
     pub output_index: u32,
     pub created_at: Option<i64>,
+    /// See `RefundBackupRowD1::refund_valid`; served as `refundValid` so an
+    /// operator (and a probe) can see which backups carry the committed-key
+    /// verdict. No client money path reads it.
+    pub refund_valid: Option<i64>,
 }
 
 /// One pot's served backups (rows newest first, ≤ `REFUND_BACKUPS_ROWS_PER_POT`).
@@ -185,6 +194,7 @@ pub fn refund_backups_body(identity: &str, backups: &[PotBackups], truncated: bo
                     "refundRawHex": r.refund_raw_hex,
                     "sigHex": r.sig_hex,
                     "txid": r.txid,
+                    "refundValid": r.refund_valid,
                     "outputIndex": r.output_index,
                     "createdAt": r.created_at,
                 })).collect::<Vec<_>>(),
@@ -214,6 +224,7 @@ mod tests {
             txid: format!("{at:064x}"),
             output_index: 0,
             created_at: Some(at),
+            refund_valid: None,
         }
     }
 
@@ -316,6 +327,7 @@ mod tests {
             txid: "CD".repeat(32),
             output_index: 0.0,
             created_at: Some(12.0),
+            refund_valid: None,
         };
         let r = d1.into_row();
         assert_eq!(r.pot_txid, "ab".repeat(32));
