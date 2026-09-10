@@ -4412,8 +4412,19 @@ pub async fn tx_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Respon
     // route is public and identity-free, so one answer fits every caller.
     let cache_key = req.url()?.to_string();
     let edge = worker::Cache::default();
-    if let Ok(Some(hit)) = edge.get(cache_key.as_str(), false).await {
-        return Ok(hit);
+    if let Ok(Some(mut hit)) = edge.get(cache_key.as_str(), false).await {
+        // NEVER return the cached Response verbatim: a Cache API hit carries
+        // IMMUTABLE headers, and the outer wrapper's `add_cors_headers` sets
+        // its headers with `let _ =` — on the hit that silently set nothing,
+        // the browser refused the answer for want of
+        // `Access-Control-Allow-Origin`, and every repeat read of a mined tx
+        // on beta failed (traced hand wc4, 2026-09-10: 227 CORS refusals on
+        // one seat, the raw fallbacks fanning to `/beef`). Rebuild a fresh,
+        // mutable response from the cached body (the same class as the
+        // tower's DO-forwarded responses).
+        if let Ok(body) = hit.text().await {
+            return json_response_immutable(body);
+        }
     }
 
     let now = worker::Date::now().as_millis() as f64;
@@ -4426,16 +4437,29 @@ pub async fn tx_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Respon
     };
 
     let body = crate::txany::tx_any_body(&key, &answer);
-    let mut resp = json_response(body, 200)?;
-    let cc = crate::txany::tx_any_cache_control(&answer);
-    resp.headers_mut().set("Cache-Control", cc)?;
-    if cc != "no-store" {
-        if let Ok(copy) = resp.cloned() {
-            if let Err(e) = edge.put(cache_key.as_str(), copy).await {
-                console_warn!("[tx-any] edge cache put failed for {key}: {e}");
-            }
+    if crate::txany::tx_any_cache_control(&answer) == "no-store" {
+        return json_response(body, 200);
+    }
+    // Terminal: the copy stored at the edge is built apart from the one
+    // returned, so neither response is ever handed out with the other's
+    // (possibly immutable) header map.
+    if let Ok(copy) = json_response_immutable(body.clone()) {
+        if let Err(e) = edge.put(cache_key.as_str(), copy).await {
+            console_warn!("[tx-any] edge cache put failed for {key}: {e}");
         }
     }
+    json_response_immutable(body)
+}
+
+/// A fresh, MUTABLE JSON response carrying the terminal `/tx-any` cache
+/// header (`tx_any_cache_control` for a terminal answer). Built from a body
+/// string so both the returned response and the edge copy, and a rebuilt
+/// cache hit, all start from a header map the outer wrapper can still set.
+fn json_response_immutable(body: String) -> Result<Response> {
+    let mut resp = Response::ok(body)?.with_status(200);
+    resp.headers_mut().set("Content-Type", "application/json")?;
+    resp.headers_mut()
+        .set("Cache-Control", "public, max-age=31536000, immutable")?;
     Ok(resp)
 }
 

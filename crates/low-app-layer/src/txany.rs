@@ -664,4 +664,31 @@ mod tests {
         assert_eq!(tx_any_cache_control(&odd), "no-store");
         assert_eq!(tx_any_cache_control(&TxAnyAnswer::default()), "no-store");
     }
+
+    /// wc4 (2026-09-10): a Cache API hit carries IMMUTABLE headers and the
+    /// outer wrapper sets CORS with `let _ =` — returning the hit verbatim
+    /// silently shipped a response the browser refused. The route must rebuild
+    /// a mutable response from the cached body, never hand the hit out.
+    #[test]
+    fn the_edge_cache_hit_is_never_returned_verbatim() {
+        let src = include_str!("routes.rs");
+        let start = src.find("pub async fn tx_any(").expect("the single route");
+        let end = src[start..]
+            .find("\npub async fn tx_any_batch(")
+            .map(|i| start + i)
+            .expect("the batched route follows");
+        let body = &src[start..end];
+        assert!(
+            !body.contains("return Ok(hit)"),
+            "the hit must be rebuilt, not returned"
+        );
+        assert!(
+            body.contains("hit.text().await"),
+            "the rebuild reads the cached body"
+        );
+        assert!(
+            body.contains("json_response_immutable(body)"),
+            "the rebuilt response is a fresh mutable one"
+        );
+    }
 }
