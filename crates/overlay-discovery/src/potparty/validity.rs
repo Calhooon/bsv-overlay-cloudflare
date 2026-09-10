@@ -274,7 +274,12 @@ pub fn seatsig_preimage(
 /// `pub(crate)` since bsv-low #362: the hopparty latch goes through this
 /// EXACT gate rather than a second copy of it (epoch Rule 10 — the durable
 /// fix for "these two must agree" is one shared predicate, not a test).
-pub(crate) fn canonical_der(sig: &[u8]) -> Option<bsv_rs::primitives::ec::Signature> {
+/// `pub` since bsv-low M18-2 B (2026-09-10, the filing gate's HIGH-2): the
+/// app-layer's `POST /record` applies this SAME gate to every signature it
+/// files for the three families whose serve-time verifier has none
+/// (`result`, `collected`, `potrefund`) — a filed row costs nothing, so a
+/// padded/high-S replay of one honest marker must not mint a second key.
+pub fn canonical_der(sig: &[u8]) -> Option<bsv_rs::primitives::ec::Signature> {
     let parsed = bsv_rs::primitives::ec::Signature::from_der(sig).ok()?;
     if parsed.to_der() != sig || !parsed.is_low_s() {
         return None;

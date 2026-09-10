@@ -30,8 +30,12 @@ use low_app_layer::logic::{
     batch_where_sql, pots_view_join_sql, proof_pointers_sql, recovery_view_sql,
 };
 use low_app_layer::record_post::{
-    lb_row_file_sql, COLLECTED_FILE_SQL, POTPARTY_FILE_SQL, POTREFUND_FILE_SQL, RESULT_FILE_SQL,
+    lb_row_file_sql, COLLECTED_FILED_ROWS_SQL, COLLECTED_FILED_TODAY_SQL, COLLECTED_FILE_SQL,
+    POTPARTY_FILED_ROWS_SQL, POTPARTY_FILED_TODAY_SQL, POTPARTY_FILE_SQL,
+    POTREFUND_FILED_ROWS_SQL, POTREFUND_FILED_TODAY_SQL, POTREFUND_FILE_SQL,
+    RESULT_FILED_ROWS_SQL, RESULT_FILED_TODAY_SQL, RESULT_FILE_SQL,
 };
+use low_app_layer::refund_backups::refund_backups_sql;
 use low_app_layer::refund_view::refund_view_sql;
 use low_app_layer::results::{
     claims_sql, decoded_pots_sql, hop_seat_markers_sql, page_overlay_sql, proof_bundle_bytes_sql,
@@ -74,6 +78,8 @@ fn every_fixed_query_prepares_against_the_production_schema() {
         "recovery_view_sql(era, 0)",
         &recovery_view_sql(ERA, 0),
     );
+    assert_prepares(&conn, "refund_backups_sql", &refund_backups_sql(None));
+    assert_prepares(&conn, "refund_backups_sql(era)", &refund_backups_sql(ERA));
     assert_prepares(&conn, "refund_view_sql", &refund_view_sql(None, 0));
     assert_prepares(&conn, "refund_view_sql(era, 0)", &refund_view_sql(ERA, 0));
     assert_prepares(&conn, "hops_view_sql", &hops_view_sql(false, None, 0));
@@ -99,6 +105,16 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "RESULT_FILE_SQL", RESULT_FILE_SQL);
     assert_prepares(&conn, "COLLECTED_FILE_SQL", COLLECTED_FILE_SQL);
     assert_prepares(&conn, "lb_row_file_sql", lb_row_file_sql());
+    // The filing caps (bsv-low M18-2 B, the gate's HIGH-2/MED-4): FILED rows
+    // per (poster, family, game, pot) and per (poster, family, day).
+    assert_prepares(&conn, "POTPARTY_FILED_ROWS_SQL", POTPARTY_FILED_ROWS_SQL);
+    assert_prepares(&conn, "POTREFUND_FILED_ROWS_SQL", POTREFUND_FILED_ROWS_SQL);
+    assert_prepares(&conn, "RESULT_FILED_ROWS_SQL", RESULT_FILED_ROWS_SQL);
+    assert_prepares(&conn, "COLLECTED_FILED_ROWS_SQL", COLLECTED_FILED_ROWS_SQL);
+    assert_prepares(&conn, "POTPARTY_FILED_TODAY_SQL", POTPARTY_FILED_TODAY_SQL);
+    assert_prepares(&conn, "POTREFUND_FILED_TODAY_SQL", POTREFUND_FILED_TODAY_SQL);
+    assert_prepares(&conn, "RESULT_FILED_TODAY_SQL", RESULT_FILED_TODAY_SQL);
+    assert_prepares(&conn, "COLLECTED_FILED_TODAY_SQL", COLLECTED_FILED_TODAY_SQL);
     assert_eq!(
         lb_row_file_sql(),
         bsv_overlay_cloudflare::d1_discovery::result_write::lb_row_insert_sql(),

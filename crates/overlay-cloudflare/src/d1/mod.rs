@@ -435,7 +435,16 @@ pub fn migration_list_fingerprint() -> u32 {
 /// Arcade reorg-event consumer's ONE persisted row (its cursor over
 /// Arcade's orphaned-block feed and the event in progress, as a JSON
 /// document). Overlay-internal; a primary-key read and an upsert only.
-pub const OVERLAY_MIGRATION_COUNT: usize = 146;
+/// 146 → 147 for bsv-low M18-2 B (2026-09-10, the filing gate's HIGH-1):
+/// `potrefund_records.refundValid` — 1 when the app-layer's `POST /record`
+/// verified the backup's raw as the pot's PRE-SIGNED spend by BOTH committed
+/// settle keys (`settle_signers_for_spend` = `Coop`, height-gated,
+/// non-final); NULL on every chain-admitted row (admission is byte-format
+/// only and has no pot to read). An ORDERING HINT the two live readers lead
+/// on (`/refund-backups`, `ls_potrefund byPot`); never a filter. Unlike
+/// `sigValid` it is UNFORGEABLE in a pot-scoped window (it needs a key the
+/// attacker does not hold) and IMMUTABLE (written once, never re-latched).
+pub const OVERLAY_MIGRATION_COUNT: usize = 147;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1614,6 +1623,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
         version INTEGER NOT NULL DEFAULT 0,
         updatedAt INTEGER
     )",
+    // bsv-low M18-2 B (2026-09-10), the filing gate's HIGH-1: the refund
+    // backup's committed-key verdict, latched by the app-layer's `POST
+    // /record` at filing time (see `OVERLAY_MIGRATION_COUNT`'s 146 → 147
+    // note). Additive + NULLABLE: every chain-admitted row stays NULL.
+    "ALTER TABLE potrefund_records ADD COLUMN refundValid INTEGER",
 ];
 
 // =============================================================================

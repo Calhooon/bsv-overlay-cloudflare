@@ -4614,6 +4614,11 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
         ctx.data.auth_configured,
         &crate::auth::counters_snapshot(),
     );
+    // bsv-low M18-2 B (the filing gate's MED-1): the filings per family, the
+    // refusals, the cap hits, and how many filings came from an anonymous
+    // caller — the poster claim is not a binding, the signature is, so the
+    // operator watches the count rather than trusting the word.
+    body["record"] = crate::record_post::record_health_json();
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
     // future-cutoff belt, i.e. exactly what the views are filtering by and
     // what /epoch serves. `null` = write-off inert. One glance answers

@@ -4767,9 +4767,13 @@ pub fn potparty_list_for_identity_sql() -> String {
 /// It is not live today: no client consumes `ls_potrefund partyFor`
 /// (`app/src/lib/overlay.ts` reaches `ls_potrefund` only via `byPot`). That
 /// is the ONLY reason this is a note and not a defect. **Do not wire a
-/// consumer to it without closing the ordering first** — latch and rank the
-/// refund markers the way #283 ranked the potparty ones, or bind the pot's
-/// committed keys. Whoever wires it inherits the gap silently otherwise.
+/// consumer to it without closing the ordering first** — since bsv-low M18-2
+/// B (2026-09-10) the latch EXISTS: `potrefund_records.refundValid` (the
+/// committed-key verdict of the backup's raw, see [`list_for_pot_sql`]) leads
+/// the two LIVE readers (`ls_potrefund byPot`, the app-layer's
+/// `/refund-backups`). This pot-ranked window is not one of them; a consumer
+/// wiring it leads its per-row order on `COALESCE(refundValid, 0) DESC`
+/// before `tier`, or inherits the gap silently.
 ///
 /// BINDS, in order: `identity`, `limit` (POTS), `quota` (unknown-pot slots),
 /// `row_cap`.
@@ -4909,12 +4913,46 @@ pub fn potrefund_list_for_identity_sql() -> String {
 ///
 /// Built from the caller's own SELECT list so the tests execute the SHIPPED
 /// string rather than a transcription of it.
+///
+/// # The ONE ranked exception: `ls_potrefund byPot` leads on `refundValid`
+/// (bsv-low M18-2 B, 2026-09-10 — the filing gate's HIGH-1)
+///
+/// Points 1–3 above are why `sigValid` must NOT lead a pot-scoped window.
+/// `potrefund_records.refundValid` fails every one of those tests the other
+/// way, which is why it MAY: (1) it is NOT forgeable here — it is latched by
+/// the app-layer's filing route only when the backup's raw classifies as the
+/// pot's pre-signed spend by BOTH committed settle keys
+/// (`settle_signers_for_spend` = `Coop`), so a stranger naming the pot cannot
+/// latch it under any identity, and the counterparty seat can latch it only
+/// with the REAL refund (or a re-signature of its own half over the same
+/// bytes, which is the same refund); (2) it is IMMUTABLE — written once at
+/// the filing, never re-latched by any sweep — so the offset pages cannot
+/// shift mid-enumeration except by a NEW rank-1 row landing at the head,
+/// and the filing caps bound those to one per seat per pot; (3) it lives on
+/// `potrefund_records` only, so the shared SELECT is untouched and the
+/// potparty window keeps its (unranked, oldest-first) order. Chain-admitted
+/// rows are NULL and sort after every rank-1 row in their old order — a
+/// pre-filing honest backup is never demoted below a free row, because a
+/// free row can never be rank 1. `lookupPotRefund` pages every row anyway;
+/// the rank puts the money at the HEAD so page 0 is enough.
 pub fn list_for_pot_sql(select: &str) -> String {
+    list_for_pot_sql_ranked(select, "")
+}
+
+/// [`list_for_pot_sql`] with a leading `ORDER BY` term (`rank` is either empty
+/// or a complete `"<expr> DESC, "` prefix). See the doc above for the one
+/// window that passes a non-empty rank.
+pub fn list_for_pot_sql_ranked(select: &str, rank: &str) -> String {
     format!(
         "{select} WHERE potTxid = ? AND potVout = ? \
-         ORDER BY createdAt ASC, rowid ASC LIMIT ? OFFSET ?"
+         ORDER BY {rank}createdAt ASC, rowid ASC LIMIT ? OFFSET ?"
     )
 }
+
+/// The `ls_potrefund byPot` leading term — the committed-key verdict of the
+/// backup's raw (see [`list_for_pot_sql`]). NULL (a chain-admitted row) sorts
+/// as 0.
+pub const POTREFUND_BY_POT_RANK: &str = "COALESCE(refundValid, 0) DESC, ";
 
 /// THE `byPot` query — statement AND bind list — as a pure value, for both
 /// callers (`ls_potparty` and `ls_potrefund`).
@@ -4941,7 +4979,21 @@ pub fn by_pot_query(
     limit: usize,
     offset: usize,
 ) -> Query {
-    Query::new(list_for_pot_sql(select))
+    by_pot_query_ranked(select, "", pot_txid, pot_vout, limit, offset)
+}
+
+/// [`by_pot_query`] with a leading `ORDER BY` term — the `ls_potrefund byPot`
+/// caller passes [`POTREFUND_BY_POT_RANK`]; every other caller the empty
+/// rank (the same statement [`by_pot_query`] always built).
+pub fn by_pot_query_ranked(
+    select: &str,
+    rank: &str,
+    pot_txid: &str,
+    pot_vout: u32,
+    limit: usize,
+    offset: usize,
+) -> Query {
+    Query::new(list_for_pot_sql_ranked(select, rank))
         .bind(pot_txid)
         .bind(pot_vout)
         .bind(limit as u32)
@@ -5822,16 +5874,23 @@ impl PotrefundStorage for D1PotrefundStorage {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<PotrefundRecord>, PotrefundStorageError> {
-        // OLDEST FIRST, offset-pageable — see `list_for_pot_sql`
-        // (bsv-low #281 / #291 gate M2). Statement AND binds come from the
-        // SHARED `by_pot_query`, so the pin on that builder covers this call
-        // site too (bsv-low#354: a native test cannot watch a `fetch_all`
-        // bind anything).
-        let rows: Vec<PotrefundRow> =
-            by_pot_query(POTREFUND_SELECT, pot_txid, pot_vout, limit, offset)
-                .fetch_all(&self.db)
-                .await
-                .map_err(potrefund_err)?;
+        // `refundValid` FIRST (the committed-key verdict of the backup's raw,
+        // bsv-low M18-2 B — see `list_for_pot_sql`'s "ONE ranked exception"),
+        // then OLDEST FIRST, offset-pageable (bsv-low #281 / #291 gate M2).
+        // Statement AND binds come from the SHARED `by_pot_query_ranked`, so
+        // the pin on that builder covers this call site too (bsv-low#354: a
+        // native test cannot watch a `fetch_all` bind anything).
+        let rows: Vec<PotrefundRow> = by_pot_query_ranked(
+            POTREFUND_SELECT,
+            POTREFUND_BY_POT_RANK,
+            pot_txid,
+            pot_vout,
+            limit,
+            offset,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(potrefund_err)?;
         Ok(rows.into_iter().map(PotrefundRow::into_record).collect())
     }
 }

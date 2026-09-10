@@ -52,6 +52,17 @@ pub const REFUND_BACKUPS_ROWS_PER_POT: usize = 4;
 /// reached by its `(potTxid, potVout)` index; `refundRawHex` is read only
 /// for the rows that survive to the served page. Same served rows, same
 /// order, same binds.
+///
+/// bsv-low M18-2 B (2026-09-10, the filing gate's HIGH-1): `refundValid`
+/// LEADS the order. A filed backup carries 1 only when `POST /record`
+/// verified its raw as the pot's PRE-SIGNED spend by BOTH committed settle
+/// keys (height-gated, non-final); a chain-admitted row is NULL (sorts as 0).
+/// Before this, the served 4-per-pot page was newest-first with no rank, so
+/// four free rows naming a victim's pot under a stranger's identity were the
+/// whole page and the wiped device seeded a junk raw (never broadcast — the
+/// client's own validity gate — but the #191 belt was disabled for that pot).
+/// The rank is unforgeable in this window (it needs a key the attacker does
+/// not hold) and immutable (written once), so it is safe as a leading term.
 pub fn refund_backups_sql(written_off_before_ms: Option<i64>) -> String {
     format!(
         "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, \
@@ -63,7 +74,7 @@ pub fn refund_backups_sql(written_off_before_ms: Option<i64>) -> String {
                 WHERE pp.identity = ?1{era}) party \
          JOIN potrefund_records pr \
            ON pr.potTxid = party.potTxid AND pr.potVout = party.potVout \
-         ORDER BY pr.createdAt DESC, pr.rowid DESC \
+         ORDER BY COALESCE(pr.refundValid, 0) DESC, pr.createdAt DESC, pr.rowid DESC \
          LIMIT {probe}",
         party = crate::logic::party_candidates_sql(),
         era = crate::logic::era_filter_sql("pp.createdAt", "?2", written_off_before_ms),
