@@ -48,6 +48,10 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 # flipping it back; no code change. Full closure criteria: `src/auth.rs` docs.
 [vars]
 AUTH_ENFORCE = "false"
+# bsv-low #441: the session lane (one BRC-103 handshake per origin, then a MAC'd lane
+# on `x-low-session*`). OFF on prod until the promotion decides; the store binding
+# must exist for the flag to mean anything (`session_lane_configured`).
+SESSION_LANE = "false"
 # The relay this worker pushes events to (its /broadcast rooms + /push boxes),
 # reached through the RELAY service binding; the URL names the path/host the
 # relay sees. Pushes no-op without the BROADCAST_TOKEN secret.
@@ -165,11 +169,20 @@ service = "low-overlay"
 # ══════════════════════════════════════════════════════════════════════════
 
 [durable_objects]
-bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]
+bindings = [
+  { name = "BOARD_VIEW", class_name = "BoardView" },
+  # bsv-low #441 (2026-09-10): the session lane's store (bsv-middleware-cloudflare
+  # 0.3.4 `AuthSessionStore`): one object per BRC-104 session nonce and per lane id.
+  { name = "AUTH_SESSION_STORE", class_name = "AuthSessionStore" },
+]
 
 [[migrations]]
 tag = "v2-boardview"
 new_classes = ["BoardView"]
+
+[[migrations]]
+tag = "v3-auth-session-store"
+new_classes = ["AuthSessionStore"]
 
 # Workers Logs (2026-09-03): persistent, queryable invocation logs for the fleet.
 [observability]
@@ -183,6 +196,7 @@ name = "low-app-layer-beta"
 RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
 OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
 AUTH_ENFORCE = "false"
+SESSION_LANE = "true"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.
 STORAGE_EPOCH = "beta-2026-08-12-1"
@@ -234,4 +248,7 @@ binding = "OVERLAY"
 service = "low-overlay-beta"
 
 [env.beta.durable_objects]
-bindings = [{ name = "BOARD_VIEW", class_name = "BoardView" }]
+bindings = [
+  { name = "BOARD_VIEW", class_name = "BoardView" },
+  { name = "AUTH_SESSION_STORE", class_name = "AuthSessionStore" },
+]

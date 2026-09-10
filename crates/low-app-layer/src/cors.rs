@@ -43,8 +43,26 @@ fn auth_header_list() -> String {
 /// Stamp permissive CORS headers onto any response (success, error, 404 —
 /// without them a cross-origin browser sees an opaque network error instead
 /// of the real status).
+/// bsv-low #441: the session lane's headers (the middleware's constants, never
+/// literals): allowed on a request, the seal exposed on the answer.
+fn lane_header_lists() -> (String, String) {
+    use bsv_middleware_cloudflare::session_lane as lane;
+    (
+        [
+            lane::SESSION_HEADER,
+            lane::SESSION_IDENTITY_HEADER,
+            lane::SESSION_COUNTER_HEADER,
+            lane::SESSION_MAC_HEADER,
+            lane::LANE_ASK_HEADER,
+        ]
+        .join(", "),
+        [lane::SESSION_COUNTER_HEADER, lane::SESSION_MAC_HEADER].join(", "),
+    )
+}
+
 pub fn add_cors_headers(resp: &mut Response) {
     let auth_list = auth_header_list();
+    let (lane_allow, lane_expose) = lane_header_lists();
     let h = resp.headers_mut();
     let _ = h.set("Access-Control-Allow-Origin", "*");
     // POST is the BRC-103/104 handshake (`/.well-known/auth`); every data
@@ -52,10 +70,14 @@ pub fn add_cors_headers(resp: &mut Response) {
     let _ = h.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
     let _ = h.set(
         "Access-Control-Allow-Headers",
-        &format!("Content-Type, {auth_list}"),
+        &format!("Content-Type, {auth_list}, {lane_allow}"),
     );
-    // The signed-reply headers the AuthFetch client must read cross-origin.
-    let _ = h.set("Access-Control-Expose-Headers", &auth_list);
+    // The signed-reply headers the AuthFetch client must read cross-origin,
+    // and the lane's seal (#441).
+    let _ = h.set(
+        "Access-Control-Expose-Headers",
+        &format!("{auth_list}, {lane_expose}"),
+    );
     let _ = h.set("Access-Control-Max-Age", "86400");
 }
 

@@ -213,14 +213,25 @@ fn verified_identity_has_exactly_one_producer_the_middleware_result() {
         "exactly one CallerAuth::verified( producer may exist in shipped \
          worker code (the front door's Authenticated arm)"
     );
+    // bsv-low #441 (2026-09-10): the one producer is `verified_state`, and it
+    // is fed ONLY by the middleware's verified context identity — from the
+    // BRC-104 arm and from the session lane's `Laned` arm (two feeds, one
+    // constructor); nothing else may call it.
     let auth = normalized_code("src/auth.rs");
     assert_eq!(
-        count(
-            &auth,
-            &["CallerAuth::verified(", "&context.identity_key)"].concat()
-        ),
+        count(&auth, &["CallerAuth::", "verified(identity_key)"].concat()),
         1,
-        "and it must be fed by the middleware's verified context identity"
+        "the one producer takes the identity `verified_state` was handed"
+    );
+    assert_eq!(
+        count(&auth, &["verified_state(", "global_mode,&context.identity_key,"].concat()),
+        2,
+        "and it must be fed by the middleware's verified context identity, on both doors"
+    );
+    assert_eq!(
+        count(&auth, "verified_state("),
+        3,
+        "the definition and its two feeds: no third caller"
     );
 }
 
@@ -267,10 +278,18 @@ fn every_front_door_outcome_is_counted() {
     );
     let auth = full[..full.find(&marker).unwrap()].to_string();
     let arms = [
-        // The anonymous arm counts with the per-route split (route_idx).
+        // The anonymous arm counts with the per-route split (route_idx), the
+        // free write routes in their own bucket (#441).
         [
             "Disposition::ProceedAnonymous=>{",
-            "count_anonymous_served(route_idx);",
+            "matchwrite_idx{Some(w)=>count_anonymous_write_served(w),",
+            "None=>count_anonymous_served(route_idx),}",
+        ]
+        .concat(),
+        // #441: the session lane's arm counts itself before it proceeds.
+        [
+            "Ok(LaneAuthResult::Laned{context,request,body,lane,})=>{",
+            "count_lane_served();",
         ]
         .concat(),
         [

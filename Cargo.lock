@@ -202,9 +202,8 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80b15850bc73d9f66d703b54ae6304f272ea4edf45e6544d8dff2dfa5e59d981"
+version = "0.3.4"
+source = "git+https://github.com/Calhooon/bsv-middleware-cloudflare?rev=ce00d71#ce00d71a5c7627bafabb71a78e23f3ff5c88fc64"
 dependencies = [
  "async-trait",
  "base64",
@@ -213,10 +212,12 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hex",
+ "hmac",
  "js-sys",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "wasm-bindgen",
  "wasm-bindgen-futures",

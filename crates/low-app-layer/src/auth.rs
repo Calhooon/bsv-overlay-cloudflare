@@ -142,6 +142,22 @@ pub fn route_requires_identity_auth(path: &str) -> bool {
     identity_route_index(path).is_some()
 }
 
+/// bsv-low #441 (2026-09-10): the two FREE WRITE routes. Under
+/// `AUTH_ENFORCE=true` an anonymous POST here is refused like an anonymous
+/// identity read (the poster becomes cryptographic: a BRC-104 session or the
+/// session lane); the GET twin of `/proof` stays public (evidence anyone may
+/// verify). Their anonymous serves are counted apart (`anonymousWriteByRoute`)
+/// so the flip criterion can be read per route. Append, never reorder.
+pub const WRITE_ROUTES: [&str; 2] = ["/record", "/proof"];
+
+/// The write-route index of `(method, path)`, or `None` for everything else.
+pub fn write_route_index(method_is_post: bool, path: &str) -> Option<usize> {
+    if !method_is_post {
+        return None;
+    }
+    WRITE_ROUTES.iter().position(|r| *r == path)
+}
+
 /// The stable index of an identity route (for the per-route anon counter), or
 /// `None` for a public route.
 pub fn identity_route_index(path: &str) -> Option<usize> {
@@ -307,6 +323,10 @@ static ANON_BY_ROUTE: [AtomicU64; 5] = [
 // Anonymous serves on PUBLIC routes — expected to stay non-zero (public routes
 // are never gated), so NOT a migration blocker; surfaced separately so it
 // never masks a stuck identity route.
+static ANON_WRITE_BY_ROUTE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// bsv-low #441: calls verified on the session lane (zero wallet calls, one
+/// store round trip) — the migration signal beside `authenticatedServed`.
+static LANE_SERVED: AtomicU64 = AtomicU64::new(0);
 static PUBLIC_SERVED: AtomicU64 = AtomicU64::new(0);
 static AUTHENTICATED_SERVED: AtomicU64 = AtomicU64::new(0);
 static AUTH_REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -331,6 +351,14 @@ pub fn count_anonymous_served(identity_route: Option<usize>) {
 pub fn count_authenticated_served() {
     AUTHENTICATED_SERVED.fetch_add(1, Ordering::Relaxed);
 }
+pub fn count_anonymous_write_served(write_route: usize) {
+    if write_route < ANON_WRITE_BY_ROUTE.len() {
+        ANON_WRITE_BY_ROUTE[write_route].fetch_add(1, Ordering::Relaxed);
+    }
+}
+pub fn count_lane_served() {
+    LANE_SERVED.fetch_add(1, Ordering::Relaxed);
+}
 pub fn count_auth_refused() {
     AUTH_REFUSED.fetch_add(1, Ordering::Relaxed);
 }
@@ -350,6 +378,10 @@ pub fn count_misconfigured_refused() {
 pub struct AuthCountersSnapshot {
     /// Anonymous serves per identity route, in [`IDENTITY_ROUTES`] order.
     pub anon_by_route: [u64; 5],
+    /// Anonymous serves per free write route, in [`WRITE_ROUTES`] order (#441).
+    pub anon_write_by_route: [u64; 2],
+    /// Calls verified on the session lane (#441).
+    pub lane_served: u64,
     pub public_served: u64,
     pub authenticated_served: u64,
     pub auth_refused: u64,
@@ -363,8 +395,17 @@ pub fn counters_snapshot() -> AuthCountersSnapshot {
     for (dst, src) in anon_by_route.iter_mut().zip(ANON_BY_ROUTE.iter()) {
         *dst = src.load(Ordering::Relaxed);
     }
+    let mut anon_write_by_route = [0u64; 2];
+    for (dst, src) in anon_write_by_route
+        .iter_mut()
+        .zip(ANON_WRITE_BY_ROUTE.iter())
+    {
+        *dst = src.load(Ordering::Relaxed);
+    }
     AuthCountersSnapshot {
         anon_by_route,
+        anon_write_by_route,
+        lane_served: LANE_SERVED.load(Ordering::Relaxed),
         public_served: PUBLIC_SERVED.load(Ordering::Relaxed),
         authenticated_served: AUTHENTICATED_SERVED.load(Ordering::Relaxed),
         auth_refused: AUTH_REFUSED.load(Ordering::Relaxed),
@@ -388,6 +429,11 @@ pub fn auth_health_json(
         .zip(c.anon_by_route.iter())
         .map(|(route, n)| ((*route).to_string(), json!(n)))
         .collect();
+    let anon_write_by_route: serde_json::Map<String, serde_json::Value> = WRITE_ROUTES
+        .iter()
+        .zip(c.anon_write_by_route.iter())
+        .map(|(route, n)| ((*route).to_string(), json!(n)))
+        .collect();
     json!({
         "authMode": mode.as_str(),
         "authConfigured": auth_configured,
@@ -396,6 +442,9 @@ pub fn auth_health_json(
         // The migration-tracked bucket: every value must reach ~0 before the
         // flip. Public-route anonymity is a separate, non-blocking count.
         "anonymousByRoute": anon_by_route,
+        // #441: the free write routes' anonymous serves and the lane's serves.
+        "anonymousWriteByRoute": anon_write_by_route,
+        "laneServed": c.lane_served,
         "publicServed": c.public_served,
         "authenticatedServed": c.authenticated_served,
         "authRefused": c.auth_refused,
@@ -408,7 +457,8 @@ pub fn auth_health_json(
 // ── wasm glue: the front door ───────────────────────────────────────────────
 
 use bsv_middleware_cloudflare::{
-    process_auth, AuthMiddlewareOptions, AuthResult, AuthSession, CloudflareTransport,
+    process_auth, process_auth_lane, request_presents_lane, AuthMiddlewareOptions, AuthResult,
+    AuthSession, CloudflareTransport, LaneAuth, LaneAuthResult, SessionLaneOptions,
 };
 use worker::{Env, Request, Response, Result};
 
@@ -431,10 +481,54 @@ pub struct AuthState {
     /// because the app-layer's first POST route read the request after the
     /// middleware had.
     pub body: Option<Vec<u8>>,
+    /// bsv-low #441: present iff the caller rode the SESSION LANE (verified by
+    /// the lane's store, zero wallet calls); the reply is then SEALED under the
+    /// lane (`seal_lane_response_text`) instead of signed. Never both `session`
+    /// and `lane`.
+    pub lane: Option<LaneAuth>,
+}
+
+/// The lane's store binding name (the relay's, the tower's, ours: one name).
+pub const AUTH_SESSION_STORE_BINDING: &str = "AUTH_SESSION_STORE";
+
+/// The session lane is ON when the operator flag says so AND the store is bound
+/// (`AUTH_SESSION_STORE`); a flag without a binding never mints and never lanes.
+pub fn session_lane_configured(env: &Env) -> bool {
+    let flag = env
+        .var("SESSION_LANE")
+        .ok()
+        .map(|v| v.to_string().trim().to_ascii_lowercase());
+    let on = matches!(flag.as_deref(), Some("1") | Some("true"));
+    on && env.durable_object(AUTH_SESSION_STORE_BINDING).is_ok()
+}
+
+/// The ONLY `Verified` constructor call site — fed exclusively by the
+/// middleware's verified result (a BRC-104 signature, or the session lane's
+/// store verdict), Rule 8b. `session` and `lane` are mutually exclusive by
+/// construction: the BRC-104 arm passes the session, the lane arm the lane.
+fn verified_state(
+    mode: AuthMode,
+    identity_key: &str,
+    auth_configured: bool,
+    session: Option<AuthSession>,
+    body: Vec<u8>,
+    lane: Option<LaneAuth>,
+) -> AuthState {
+    AuthState {
+        mode,
+        caller: CallerAuth::verified(identity_key),
+        auth_configured,
+        session,
+        body: Some(body),
+        lane,
+    }
 }
 
 /// Front-door outcome: either proceed to the router with resolved state, or
 /// reply immediately (handshake reply, 401, 503, middleware error).
+// The state rides one request and dies with it; boxing it would touch every
+// match site for nothing (the lane's `LaneAuth` widened the variant, #441).
+#[allow(clippy::large_enum_variant)]
 pub enum FrontDoor {
     Proceed(Request, AuthState),
     Reply(Response),
@@ -486,17 +580,35 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
     // module docs). The disposition uses the effective (per-route) mode; the
     // state carries the global mode.
     let mode = effective_mode(global_mode, &path);
+    // #441: a free WRITE route is judged by the GLOBAL mode (never lenient by
+    // the public-route exemption); its anonymous serves are counted apart.
+    let write_idx = write_route_index(req.method() == worker::Method::Post, &path);
+    let mode = if write_idx.is_some() {
+        global_mode
+    } else {
+        mode
+    };
     let server_key = nonempty_var(env, "SERVER_PRIVATE_KEY");
     let auth_configured = server_key.is_some() && env.kv("AUTH_SESSIONS").is_ok();
     let is_handshake = CloudflareTransport::is_handshake_request(&req);
-    let auth_attempted = is_handshake || CloudflareTransport::has_auth_headers(&req);
+    let lane_on = session_lane_configured(env);
+    // #441: a presented lane is an auth ATTEMPT — judged by the middleware,
+    // never silently anonymous (the middleware's predicate: no header read
+    // in this crate).
+    let auth_attempted = is_handshake
+        || CloudflareTransport::has_auth_headers(&req)
+        || (lane_on && request_presents_lane(&req));
 
     match front_door_disposition(mode, auth_configured, auth_attempted) {
         Disposition::ProceedAnonymous => {
             // Split the soak signal: an anonymous serve on an identity route is
-            // migration-tracked (`route_idx`); on a public route it's the
-            // non-blocking `publicServed` bucket.
-            count_anonymous_served(route_idx);
+            // migration-tracked (`route_idx`), on a free write route its own
+            // bucket (#441); on a public route it's the non-blocking
+            // `publicServed` bucket.
+            match write_idx {
+                Some(w) => count_anonymous_write_served(w),
+                None => count_anonymous_served(route_idx),
+            }
             Ok(FrontDoor::Proceed(
                 req,
                 AuthState {
@@ -505,6 +617,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     auth_configured,
                     session: None,
                     body: None,
+                    lane: None,
                 },
             ))
         }
@@ -538,12 +651,48 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 // ALWAYS false — see the doc comment above.
                 allow_unauthenticated: false,
                 session_ttl_seconds: 3600,
+                // #441: the lane offer on a handshake that asks, the laned
+                // calls verified by the store — only when the operator turned
+                // it on AND the store is bound; otherwise the reference door.
+                session_lane: if lane_on {
+                    Some(SessionLaneOptions::default())
+                } else {
+                    None
+                },
                 ..Default::default()
+            };
+            // ONE outcome shape for both doors: the lane's `Laned` arm folds
+            // into the same verified-caller construction as BRC-104's.
+            let outcome = if lane_on {
+                process_auth_lane(req, env, &opts, AUTH_SESSION_STORE_BINDING).await
+            } else {
+                process_auth(req, env, &opts)
+                    .await
+                    .map(LaneAuthResult::Reference)
             };
             // A malformed handshake makes `process_auth` return Err — map it
             // to an honest 400 (the tower's V2 mapping), never a bare 500.
-            let auth = match process_auth(req, env, &opts).await {
-                Ok(a) => a,
+            let auth = match outcome {
+                Ok(LaneAuthResult::Laned {
+                    context,
+                    request,
+                    body,
+                    lane,
+                }) => {
+                    count_lane_served();
+                    return Ok(FrontDoor::Proceed(
+                        request,
+                        verified_state(
+                            global_mode,
+                            &context.identity_key,
+                            auth_configured,
+                            None,
+                            body,
+                            Some(lane),
+                        ),
+                    ));
+                }
+                Ok(LaneAuthResult::Reference(a)) => a,
                 Err(e) => {
                     count_auth_refused();
                     return json_reply(
@@ -567,16 +716,14 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                         count_authenticated_served();
                         Ok(FrontDoor::Proceed(
                             request,
-                            AuthState {
-                                mode: global_mode,
-                                // The ONLY `Verified` constructor call site —
-                                // fed exclusively by the middleware's
-                                // verified-signature result (Rule 8b).
-                                caller: CallerAuth::verified(&context.identity_key),
+                            verified_state(
+                                global_mode,
+                                &context.identity_key,
                                 auth_configured,
-                                session: Some(session),
-                                body: Some(body),
-                            },
+                                Some(session),
+                                body,
+                                None,
+                            ),
                         ))
                     }
                     // `allow_unauthenticated: false` means an Authenticated
@@ -787,6 +934,8 @@ mod tests {
     fn auth_health_json_surfaces_mode_and_every_counter() {
         let snap = AuthCountersSnapshot {
             anon_by_route: [7, 6, 5, 4, 3],
+            anon_write_by_route: [11, 12],
+            lane_served: 13,
             public_served: 9,
             authenticated_served: 3,
             auth_refused: 2,
@@ -807,6 +956,10 @@ mod tests {
         // Exactly the five identity routes appear — no more, no less (a new
         // identity route without a counter would show up as a missing key).
         assert_eq!(v["anonymousByRoute"].as_object().unwrap().len(), 5);
+        assert_eq!(v["anonymousWriteByRoute"]["/record"], 11);
+        assert_eq!(v["anonymousWriteByRoute"]["/proof"], 12);
+        assert_eq!(v["anonymousWriteByRoute"].as_object().unwrap().len(), 2);
+        assert_eq!(v["laneServed"], 13);
         assert_eq!(v["publicServed"], 9);
         assert_eq!(v["authenticatedServed"], 3);
         assert_eq!(v["authRefused"], 2);
@@ -829,11 +982,43 @@ mod tests {
         count_anonymous_served(None);
         count_authenticated_served();
         count_mismatch_refused();
+        // #441: the free write routes' anonymous serves and the lane's serves
+        // land in their own buckets; an out-of-range write index is ignored.
+        count_anonymous_write_served(1);
+        count_anonymous_write_served(9);
+        count_lane_served();
         let after = counters_snapshot();
         assert!(after.anon_by_route[2] > before.anon_by_route[2]);
         assert!(after.public_served > before.public_served);
         assert!(after.authenticated_served > before.authenticated_served);
         assert!(after.mismatch_refused > before.mismatch_refused);
+        assert_eq!(
+            after.anon_write_by_route[1],
+            before.anon_write_by_route[1] + 1
+        );
+        assert_eq!(after.anon_write_by_route[0], before.anon_write_by_route[0]);
+        assert_eq!(after.lane_served, before.lane_served + 1);
+    }
+
+    // ── #441: the free write routes ──────────────────────────────────────────
+    #[test]
+    fn the_two_write_routes_are_post_only_and_keep_their_order() {
+        assert_eq!(write_route_index(true, "/record"), Some(0));
+        assert_eq!(write_route_index(true, "/proof"), Some(1));
+        assert_eq!(
+            write_route_index(false, "/proof"),
+            None,
+            "GET /proof is public evidence"
+        );
+        assert_eq!(write_route_index(false, "/record"), None);
+        for other in ["/results", "/health", "/record/x", "/", "/.well-known/auth"] {
+            assert_eq!(write_route_index(true, other), None, "{other}");
+        }
+        assert_eq!(WRITE_ROUTES, ["/record", "/proof"], "append, never reorder");
+        // A write route is NOT an identity route: its exemption from the
+        // per-route lenient mode is decided in the front door, not here.
+        assert!(!route_requires_identity_auth("/record"));
+        assert!(!route_requires_identity_auth("/proof"));
     }
 
     // ── route classification / effective mode ──────────────────────────────

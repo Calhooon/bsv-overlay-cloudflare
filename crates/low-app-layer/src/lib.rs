@@ -121,6 +121,9 @@
 
 pub mod board_view;
 pub use board_view::BoardView;
+/// bsv-low #441: the session lane's store (one Durable Object per BRC-104
+/// session nonce AND per lane id; `bsv-middleware-cloudflare` 0.3.4).
+pub use bsv_middleware_cloudflare::AuthSessionStore;
 pub mod armed_pots;
 pub mod auth;
 pub mod beef_guard;
@@ -209,6 +212,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     };
     // Keep the session for reply-signing; the state moves into the router.
     let session = state.session.clone();
+    let lane = state.lane.clone();
 
     let mut resp = router(state, schema_ready).run(req, env).await?;
 
@@ -216,6 +220,18 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // posture: re-serialize the handler's JSON at its own status code, sign,
     // then stamp no-store + CORS back on — `sign_json_response` builds a
     // fresh response, so the handler's cache header must be re-applied).
+    // bsv-low #441: a call that rode the session lane is answered SEALED under
+    // the lane (the exact bytes sent are the bytes MAC'd), never signed.
+    if let Some(lane) = lane {
+        let status = resp.status_code();
+        let text = resp.text().await.unwrap_or_else(|_| {
+            serde_json::json!({ "error": "handler returned an unreadable response" }).to_string()
+        });
+        resp = bsv_middleware_cloudflare::seal_lane_response_text(text, status, &lane)
+            .map_err(|e| worker::Error::from(e.to_string()))?;
+        cors::add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
     if let Some(session) = session {
         let status = resp.status_code();
         let value: Value = resp.json().await.unwrap_or_else(

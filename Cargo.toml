@@ -41,3 +41,10 @@ url = "2"
 
 # Logging
 tracing = "0.1"
+
+# bsv-low #441 (2026-09-10): the session lane needs bsv-middleware-cloudflare 0.3.4
+# (`session-lane`), NOT PUBLISHED yet. A git REV on the public lineage branch — never a
+# path to a sibling checkout (#439's class) — until the publish, which replaces this
+# block with the registry 0.3.4 (the owner's word).
+[patch.crates-io]
+bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "ce00d71" }
