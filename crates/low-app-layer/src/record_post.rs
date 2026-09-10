@@ -103,8 +103,7 @@ use overlay_discovery::pot::covenant::CovenantParams;
 use overlay_discovery::pot::{settle_signers_for_spend, SettleSigners};
 use overlay_discovery::potparty::validity::canonical_der;
 use overlay_discovery::potparty::{
-    parse_potparty_marker, storage::PotpartyRecord, PotpartyMarker, POTPARTY_TAG,
-    POTPARTY_TAG_V2,
+    parse_potparty_marker, storage::PotpartyRecord, PotpartyMarker, POTPARTY_TAG, POTPARTY_TAG_V2,
 };
 use overlay_discovery::potrefund::{
     parse_potrefund_marker, storage::PotrefundRecord, PotrefundMarker, POTREFUND_TAG,
@@ -340,7 +339,8 @@ pub fn canonical_marker_pushes(script: &[u8]) -> Option<Vec<&[u8]>> {
 /// txid. The same marker — however it was pushed, whatever nonce signed it —
 /// files the same key; a different game, pot, seat or claim a different one.
 fn content_key(tag: &[u8], fields: &[&[u8]]) -> String {
-    let mut pre = Vec::with_capacity(16 + tag.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>());
+    let mut pre =
+        Vec::with_capacity(16 + tag.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>());
     pre.extend_from_slice(b"LOW/filed/v1\n");
     pre.extend_from_slice(&(tag.len() as u32).to_le_bytes());
     pre.extend_from_slice(tag);
@@ -389,13 +389,7 @@ pub fn potrefund_content_key(m: &PotrefundMarker) -> String {
 /// whether it is countersigned (the tier-2 upgrade is a second content).
 pub fn result_content_key(m: &ResultMarker) -> String {
     let countersigned = [u8::from(m.loser_sig.is_some())];
-    let mut fields: Vec<&[u8]> = vec![
-        &m.game_id,
-        &m.winner,
-        &m.loser,
-        &m.pot_txid,
-        &m.settle_txid,
-    ];
+    let mut fields: Vec<&[u8]> = vec![&m.game_id, &m.winner, &m.loser, &m.pot_txid, &m.settle_txid];
     let tag = match &m.cards {
         Some(c) => {
             fields.push(c);
@@ -617,7 +611,10 @@ pub fn refund_is_the_presigned_spend(
         return Err(RecordRefusal::RefundNotThePresignedSpend);
     }
     let digest = compute_sighash_for_signing(&params);
-    for (push, key) in [(pushes[0], &ctx.params.pub_a), (pushes[1], &ctx.params.pub_b)] {
+    for (push, key) in [
+        (pushes[0], &ctx.params.pub_a),
+        (pushes[1], &ctx.params.pub_b),
+    ] {
         let Some((&sighash_byte, der)) = push.split_last() else {
             return Err(RecordRefusal::RefundNotThePresignedSpend);
         };
@@ -797,7 +794,10 @@ pub fn verify_record_post(
             if canonical_der(&m.winner_sig).is_none() {
                 return Err(RecordRefusal::SignatureInvalid);
             }
-            if m.loser_sig.as_deref().is_some_and(|s| canonical_der(s).is_none()) {
+            if m.loser_sig
+                .as_deref()
+                .is_some_and(|s| canonical_der(s).is_none())
+            {
                 return Err(RecordRefusal::SignatureInvalid);
             }
             let record = ResultRecord {
@@ -949,7 +949,12 @@ pub fn chain_rows_query(v: &VerifiedRecord) -> (&'static str, Vec<String>) {
                 r.identity.clone(),
                 r.game_id.clone(),
                 r.pot_txid.clone(),
-                if r.seat_settle_pubkey.is_none() { "1" } else { "0" }.to_string(),
+                if r.seat_settle_pubkey.is_none() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
             ],
         ),
         VerifiedRecord::Potrefund(r, _) => (
@@ -988,19 +993,34 @@ pub fn cap_queries(v: &VerifiedRecord) -> (&'static str, Vec<String>, &'static s
     match v {
         VerifiedRecord::Potparty(r, _) => (
             POTPARTY_FILED_ROWS_SQL,
-            vec![r.identity.clone(), r.game_id.clone(), r.pot_txid.clone(), r.txid.clone()],
+            vec![
+                r.identity.clone(),
+                r.game_id.clone(),
+                r.pot_txid.clone(),
+                r.txid.clone(),
+            ],
             POTPARTY_FILED_TODAY_SQL,
             r.identity.clone(),
         ),
         VerifiedRecord::Potrefund(r, _) => (
             POTREFUND_FILED_ROWS_SQL,
-            vec![r.identity.clone(), r.game_id.clone(), r.pot_txid.clone(), r.txid.clone()],
+            vec![
+                r.identity.clone(),
+                r.game_id.clone(),
+                r.pot_txid.clone(),
+                r.txid.clone(),
+            ],
             POTREFUND_FILED_TODAY_SQL,
             r.identity.clone(),
         ),
         VerifiedRecord::Result(r, _) => (
             RESULT_FILED_ROWS_SQL,
-            vec![r.winner.clone(), r.game_id.clone(), r.pot_txid.clone(), r.txid.clone()],
+            vec![
+                r.winner.clone(),
+                r.game_id.clone(),
+                r.pot_txid.clone(),
+                r.txid.clone(),
+            ],
             RESULT_FILED_TODAY_SQL,
             r.winner.clone(),
         ),
@@ -1191,8 +1211,16 @@ async fn read_pot_context(
     Ok(row.and_then(|r| r.context()))
 }
 
-async fn count(db: &worker::D1Database, sql: &str, binds: &[worker::wasm_bindgen::JsValue]) -> Result<i64> {
-    let row = db.prepare(sql).bind(binds)?.first::<CountRowD1>(None).await?;
+async fn count(
+    db: &worker::D1Database,
+    sql: &str,
+    binds: &[worker::wasm_bindgen::JsValue],
+) -> Result<i64> {
+    let row = db
+        .prepare(sql)
+        .bind(binds)?
+        .first::<CountRowD1>(None)
+        .await?;
     Ok(row.and_then(|r| r.n).map_or(0, |n| n as i64))
 }
 
@@ -1304,7 +1332,11 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     .await?;
     if let Some(r) = cap_refusal(kind, rows_for_pot, rows_today) {
         bump(
-            if r == RecordRefusal::TooManyFiled { &TOO_MANY_FILED_BY_KIND } else { &DAILY_CAP_BY_KIND },
+            if r == RecordRefusal::TooManyFiled {
+                &TOO_MANY_FILED_BY_KIND
+            } else {
+                &DAILY_CAP_BY_KIND
+            },
             kind,
         );
         return refuse(Some(kind), r);
@@ -1354,7 +1386,14 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     .bind(&[js(&r.txid)])?
                     .run()
                     .await?;
-                if latched.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0 {
+                if latched
+                    .meta()
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.changes)
+                    .unwrap_or(0)
+                    > 0
+                {
                     REFUNDS_LATCHED_LATER.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
@@ -1427,7 +1466,8 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     if anonymous {
         bump(&ANONYMOUS_FILED_BY_KIND, kind);
     }
-    let mut body = serde_json::json!({ "filed": true, "kind": kind.as_str(), "key": verified.key() });
+    let mut body =
+        serde_json::json!({ "filed": true, "kind": kind.as_str(), "key": verified.key() });
     if let VerifiedRecord::Potrefund(_, refund_valid) = &verified {
         body["refundValid"] = serde_json::json!(i64::from(*refund_valid));
     }
@@ -1597,7 +1637,10 @@ mod tests {
             satoshis: POT_SATS,
             scope: SIGHASH_ALL | SIGHASH_FORKID,
         };
-        (compute_sighash_for_signing(&params), build_sighash_preimage(&params))
+        (
+            compute_sighash_for_signing(&params),
+            build_sighash_preimage(&params),
+        )
     }
     fn wire_sig(sk: &bsv_rs::primitives::ec::PrivateKey, digest: &[u8; 32]) -> Vec<u8> {
         let mut push = sk.sign(digest).expect("signs").to_der();
@@ -1776,8 +1819,7 @@ mod tests {
             &collected_challenge(&hex::encode(gid), &id_lc),
         );
         let canonical = script(&[b"LOW/collected/v1", &gid, &id, &sig]);
-        let key = match verify_record_post(RecordKind::Collected, &canonical, &id_lc).unwrap()
-        {
+        let key = match verify_record_post(RecordKind::Collected, &canonical, &id_lc).unwrap() {
             VerifiedRecord::Collected(r) => r.txid,
             _ => panic!("collected"),
         };
@@ -1903,7 +1945,8 @@ mod tests {
             verify_record_post(
                 RecordKind::Collected,
                 &s,
-                &hex::encode(identity(&wallet(2))))
+                &hex::encode(identity(&wallet(2)))
+            )
             .unwrap_err(),
             RecordRefusal::PosterMismatch
         );
@@ -1984,40 +2027,40 @@ mod tests {
         let junk = junk_refund_raw(&POT_TXID, 0);
         assert!(refund_spends_pot(&junk, &POT_TXID, 0));
         assert_eq!(
-            verify_and_bind(&potrefund_script(&w, &gid, &junk), &id_lc, Some(&ctx))
-            .unwrap_err(),
+            verify_and_bind(&potrefund_script(&w, &gid, &junk), &id_lc, Some(&ctx)).unwrap_err(),
             RecordRefusal::RefundNotThePresignedSpend
         );
-        assert!(!verify_and_bind(&potrefund_script(&w, &gid, &junk), &id_lc, None).unwrap().1);
+        assert!(
+            !verify_and_bind(&potrefund_script(&w, &gid, &junk), &id_lc, None)
+                .unwrap()
+                .1
+        );
         // A spend one seat signed with the TOWER (a parked sibling / an
         // enforced settle): not the seats' refund.
         for (a, b) in [(&k[0], &k[2]), (&k[1], &k[2])] {
             let r = spend_signed_by(a, b, 0xffff_fffe, 900_000);
             assert_eq!(
-                verify_and_bind(&potrefund_script(&w, &gid, &r), &id_lc, Some(&ctx))
-                .unwrap_err(),
+                verify_and_bind(&potrefund_script(&w, &gid, &r), &id_lc, Some(&ctx)).unwrap_err(),
                 RecordRefusal::RefundNotThePresignedSpend
             );
         }
         // Both seats, but FINAL (a cooperative settle's shape): refused.
         let settle = spend_signed_by(&k[0], &k[1], 0xffff_ffff, 0);
         assert_eq!(
-            verify_and_bind(&potrefund_script(&w, &gid, &settle), &id_lc, Some(&ctx))
-            .unwrap_err(),
+            verify_and_bind(&potrefund_script(&w, &gid, &settle), &id_lc, Some(&ctx)).unwrap_err(),
             RecordRefusal::RefundNotThePresignedSpend
         );
         // Both seats, non-final, but below the committed recovery height.
         let early = spend_signed_by(&k[0], &k[1], 0xffff_fffe, 899_999);
         assert_eq!(
-            verify_and_bind(&potrefund_script(&w, &gid, &early), &id_lc, Some(&ctx))
-            .unwrap_err(),
+            verify_and_bind(&potrefund_script(&w, &gid, &early), &id_lc, Some(&ctx)).unwrap_err(),
             RecordRefusal::RefundNotThePresignedSpend
         );
         // A stranger's keys over the same shape: refused.
         let stranger = spend_signed_by(&skey(7), &skey(8), 0xffff_fffe, 900_000);
         assert_eq!(
             verify_and_bind(&potrefund_script(&w, &gid, &stranger), &id_lc, Some(&ctx))
-            .unwrap_err(),
+                .unwrap_err(),
             RecordRefusal::RefundNotThePresignedSpend
         );
         // A raw spending ANOTHER outpoint under a valid signature: refused
@@ -2136,7 +2179,10 @@ mod tests {
                     assert_eq!(tier, 1, "the winner's claim alone is tier 1");
                     assert_eq!(r.winner, wid_lc);
                     assert!(r.loser_sig_hex.is_none());
-                    assert_eq!(r.txid, result_content_key(&parse_result_marker(&s).unwrap()));
+                    assert_eq!(
+                        r.txid,
+                        result_content_key(&parse_result_marker(&s).unwrap())
+                    );
                 }
                 _ => panic!("result"),
             }
@@ -2165,18 +2211,24 @@ mod tests {
         // the key says countersigned, so the row must be.
         let mut badl = lsig.clone();
         badl[12] ^= 0x01;
-        let s4 = script(&[b"LOW/result/v1", &gid, &wid, &lid, &pot, &settle, &wsig, &badl]);
+        let s4 = script(&[
+            b"LOW/result/v1",
+            &gid,
+            &wid,
+            &lid,
+            &pot,
+            &settle,
+            &wsig,
+            &badl,
+        ]);
         assert_eq!(
             verify_record_post(RecordKind::Result, &s4, &wid_lc).unwrap_err(),
             RecordRefusal::SignatureInvalid
         );
         // A third party is refused; a forged winner signature is refused.
         assert_eq!(
-            verify_record_post(
-                RecordKind::Result,
-                &s,
-                &hex::encode(identity(&wallet(9))))
-            .unwrap_err(),
+            verify_record_post(RecordKind::Result, &s, &hex::encode(identity(&wallet(9))))
+                .unwrap_err(),
             RecordRefusal::PosterMismatch
         );
         let mut bad = wsig.clone();
@@ -2274,7 +2326,11 @@ mod tests {
             Some(RecordRefusal::TooManyFiled)
         );
         assert_eq!(
-            cap_refusal(RecordKind::Collected, 0, RECORD_FILINGS_PER_IDENTITY_PER_DAY),
+            cap_refusal(
+                RecordKind::Collected,
+                0,
+                RECORD_FILINGS_PER_IDENTITY_PER_DAY
+            ),
             Some(RecordRefusal::DailyCapReached)
         );
         // The binds: the poster, the game, the pot and the content key being
@@ -2288,7 +2344,10 @@ mod tests {
         };
         let (rows_sql, binds, day_sql, day_id) = cap_queries(&VerifiedRecord::Collected(r));
         assert_eq!(rows_sql, COLLECTED_FILED_ROWS_SQL);
-        assert_eq!(binds, vec!["02aa".to_string(), "11".repeat(32), "filed:x".to_string()]);
+        assert_eq!(
+            binds,
+            vec!["02aa".to_string(), "11".repeat(32), "filed:x".to_string()]
+        );
         assert_eq!(day_sql, COLLECTED_FILED_TODAY_SQL);
         assert_eq!(day_id, "02aa");
         // The chain no-op binds: potparty carries its VERSION (v1 = 1), a
@@ -2311,14 +2370,25 @@ mod tests {
             true,
         ));
         assert_eq!(csql, POTPARTY_CHAIN_ROWS_SQL);
-        assert_eq!(cbinds, vec!["02aa".to_string(), "11".repeat(32), "22".repeat(32), "0".to_string()]);
+        assert_eq!(
+            cbinds,
+            vec![
+                "02aa".to_string(),
+                "11".repeat(32),
+                "22".repeat(32),
+                "0".to_string()
+            ]
+        );
         for sql in [
             POTPARTY_CHAIN_ROWS_SQL,
             POTREFUND_CHAIN_ROWS_SQL,
             RESULT_CHAIN_ROWS_SQL,
             COLLECTED_CHAIN_ROWS_SQL,
         ] {
-            assert!(sql.contains("txid NOT LIKE 'filed:%'"), "chain rows only: {sql}");
+            assert!(
+                sql.contains("txid NOT LIKE 'filed:%'"),
+                "chain rows only: {sql}"
+            );
         }
         assert!(POTREFUND_LATCH_SQL.contains("COALESCE(refundValid, 0) = 0"));
         for sql in [
@@ -2331,7 +2401,10 @@ mod tests {
             RESULT_FILED_TODAY_SQL,
             COLLECTED_FILED_TODAY_SQL,
         ] {
-            assert!(sql.contains("txid LIKE 'filed:%'"), "filed rows only: {sql}");
+            assert!(
+                sql.contains("txid LIKE 'filed:%'"),
+                "filed rows only: {sql}"
+            );
         }
         assert_eq!(RecordRefusal::TooManyFiled.status(), 409);
         assert_eq!(RecordRefusal::DailyCapReached.status(), 429);
@@ -2340,7 +2413,10 @@ mod tests {
         assert_eq!(RecordRefusal::NotCanonical.status(), 400);
         let h = record_health_json();
         assert_eq!(h["filedRowsCap"]["potrefund"], 1);
-        assert_eq!(h["filingsPerIdentityPerDay"], RECORD_FILINGS_PER_IDENTITY_PER_DAY);
+        assert_eq!(
+            h["filingsPerIdentityPerDay"],
+            RECORD_FILINGS_PER_IDENTITY_PER_DAY
+        );
         assert!(h["anonymousFiledByKind"]["result"].is_u64());
     }
 }
