@@ -4315,11 +4315,6 @@ async fn tx_any_external_leg(
     (woc, absence)
 }
 
-/// `GET /tx-any/:txid` — presence / confirmation / hash-verified raw for an
-/// arbitrary txid, INDEX-FIRST (the overlay is the system of record for every
-/// tx LOW broadcast; external indexers are break-glass for legacy/foreign
-/// txids only — owner doctrine, bsv-low #229). ~15 s in-isolate cache.
-/// Unknown is the honest answer for every fault (`present: null`).
 /// The in-isolate `/tx-any` cache hit for `key`, if still inside its TTL.
 fn tx_any_cached(key: &str, now: f64) -> Option<TxAnyCached> {
     TX_ANY_CACHE.with(|c| {
@@ -4330,8 +4325,23 @@ fn tx_any_cached(key: &str, now: f64) -> Option<TxAnyCached> {
     })
 }
 
-/// Everything AFTER the index leg, shared by the single and the batched route
-/// (bsv-low W-C.3, 2026-09-09) so the two can never answer differently: the
+/// The in-isolate cache write — ONE writer for the single and the batched
+/// route (bsv-low W-C.3), so an answer either route produced is the answer the
+/// other serves for the TTL.
+fn cache_tx_any_answer(key: &str, answer: &TxAnyCached, now: f64) {
+    TX_ANY_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        map.retain(|_, (expiry, _)| *expiry > now);
+        map.insert(
+            key.to_string(),
+            (now + crate::txany::TX_ANY_CACHE_TTL_MS, answer.clone()),
+        );
+    });
+}
+
+/// Everything AFTER the index leg for ONE txid (the single route's whole
+/// decision past the index read; the batched route reuses it only for the
+/// txids its index leg DECIDED, never for the external leg — gate MED-1): the
 /// external leg when the index has no verified-BUMP answer, the #247/#252
 /// unconfirmable probe on an absent tx, and the in-isolate cache write.
 async fn resolve_tx_any(
@@ -4384,18 +4394,20 @@ async fn resolve_tx_any(
             }
         }
     }
-    TX_ANY_CACHE.with(|c| {
-        let mut map = c.borrow_mut();
-        map.retain(|_, (expiry, _)| *expiry > now);
-        map.insert(
-            key.to_string(),
-            (now + crate::txany::TX_ANY_CACHE_TTL_MS, answer.clone()),
-        );
-    });
+    cache_tx_any_answer(key, &answer, now);
     answer
 }
 
-pub async fn tx_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+/// `GET /tx-any/:txid` — presence / confirmation / hash-verified raw for an
+/// arbitrary txid, INDEX-FIRST (the overlay is the system of record for every
+/// tx LOW broadcast; external indexers are break-glass for legacy/foreign
+/// txids only — owner doctrine, bsv-low #229). ~15 s in-isolate cache.
+/// Unknown is the honest answer for every fault (`present: null`). Every
+/// answer is `no-store` (the owner call of 2026-07-14, `lib.rs`): a mined
+/// fact is demotable (D7, the reorg sweep) and an `unconfirmable` negative is
+/// a courier's word, so nothing here may outlive the isolate cache — gate
+/// HIGH-1/HIGH-2 of 2026-09-10 retired an `immutable` edge answer.
+pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let Some(txid) = ctx.param("txid").cloned() else {
         return json_error("missing txid", 400);
     };
@@ -4403,30 +4415,6 @@ pub async fn tx_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Respon
         return json_error("invalid txid (expect 64 hex chars)", 400);
     }
     let key = txid.to_ascii_lowercase();
-
-    // bsv-low W-C.3 (2026-09-09): a TERMINAL answer (mined, or proven
-    // unconfirmable) is an immutable chain fact, so it is served from the
-    // colo's Cache API when it is there, and stored there (and told to the
-    // browser as `immutable`) when it is not. A non-terminal answer stays
-    // `no-store`, exactly as before. The cache key is the request URL: the
-    // route is public and identity-free, so one answer fits every caller.
-    let cache_key = req.url()?.to_string();
-    let edge = worker::Cache::default();
-    if let Ok(Some(mut hit)) = edge.get(cache_key.as_str(), false).await {
-        // NEVER return the cached Response verbatim: a Cache API hit carries
-        // IMMUTABLE headers, and the outer wrapper's `add_cors_headers` sets
-        // its headers with `let _ =` — on the hit that silently set nothing,
-        // the browser refused the answer for want of
-        // `Access-Control-Allow-Origin`, and every repeat read of a mined tx
-        // on beta failed (traced hand wc4, 2026-09-10: 227 CORS refusals on
-        // one seat, the raw fallbacks fanning to `/beef`). Rebuild a fresh,
-        // mutable response from the cached body (the same class as the
-        // tower's DO-forwarded responses).
-        if let Ok(body) = hit.text().await {
-            return json_response_immutable(body);
-        }
-    }
-
     let now = worker::Date::now().as_millis() as f64;
     let answer = match tx_any_cached(&key, now) {
         Some(a) => a,
@@ -4435,32 +4423,7 @@ pub async fn tx_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Respon
             resolve_tx_any(index_raw, index_height, &key, now).await
         }
     };
-
-    let body = crate::txany::tx_any_body(&key, &answer);
-    if crate::txany::tx_any_cache_control(&answer) == "no-store" {
-        return json_response(body, 200);
-    }
-    // Terminal: the copy stored at the edge is built apart from the one
-    // returned, so neither response is ever handed out with the other's
-    // (possibly immutable) header map.
-    if let Ok(copy) = json_response_immutable(body.clone()) {
-        if let Err(e) = edge.put(cache_key.as_str(), copy).await {
-            console_warn!("[tx-any] edge cache put failed for {key}: {e}");
-        }
-    }
-    json_response_immutable(body)
-}
-
-/// A fresh, MUTABLE JSON response carrying the terminal `/tx-any` cache
-/// header (`tx_any_cache_control` for a terminal answer). Built from a body
-/// string so both the returned response and the edge copy, and a rebuilt
-/// cache hit, all start from a header map the outer wrapper can still set.
-fn json_response_immutable(body: String) -> Result<Response> {
-    let mut resp = Response::ok(body)?.with_status(200);
-    resp.headers_mut().set("Content-Type", "application/json")?;
-    resp.headers_mut()
-        .set("Cache-Control", "public, max-age=31536000, immutable")?;
-    Ok(resp)
+    json_response(crate::txany::tx_any_body(&key, &answer), 200)
 }
 
 /// One batched index-leg row: the txid alongside what the single leg reads.
@@ -4472,22 +4435,45 @@ struct BeefTrustRowKeyed {
     proof_verified: Option<f64>,
 }
 
-/// bsv-low W-C.3 — the index leg for MANY txids: one `IN (…)` query per
-/// table per chunk of `D1_CHUNK_OUTPOINTS`, `pot_beefs` first (a hit there is
-/// final, as in the single leg), then `transactions` for the rest. The answer
-/// per txid is byte-for-byte what `tx_any_index_leg` derives: the extracted
-/// raw and the verified-BUMP height. A query fault leaves its txids
-/// unanswered by the index (the caller's external leg or `unknown` decides).
-async fn tx_any_index_leg_batch(
-    ctx: &RouteContext<AuthState>,
-    keys: &[String],
-) -> std::collections::HashMap<String, (Option<String>, Option<u64>)> {
-    let mut out: std::collections::HashMap<String, (Option<String>, Option<u64>)> =
-        std::collections::HashMap::new();
-    let Ok(db) = ctx.env.d1("OVERLAY_DB") else {
-        console_warn!("[tx-any] OVERLAY_DB binding unavailable — break-glass leg only");
-        return out;
+/// What the batched index leg found for a set of txids.
+struct BatchIndexLeg {
+    /// txid → (raw hex, verified-BUMP height): rows the index served AND the
+    /// extractor decoded (a hit is final at the table that served it).
+    hits: std::collections::HashMap<String, (String, Option<u64>)>,
+    /// txids whose chunk faulted at D1 in some table (they were still tried
+    /// in the next table; if they end unresolved the reason is the fault).
+    faulted: std::collections::HashSet<String>,
+}
+
+/// bsv-low W-C.3 — the index leg for MANY txids: one `IN (…)` query per table
+/// per chunk of `TX_ANY_BATCH_D1_CHUNK`, each row bounded by
+/// `TX_ANY_BATCH_BEEF_MAX_BYTES` (gate MED-2: a caller-chosen set must never
+/// materialize an unbounded pile of BEEFs in one isolate; a bigger row is
+/// simply not served here and the per-txid route reads it alone), `pot_beefs`
+/// first (a hit there is final, as in the single leg), then `transactions` for
+/// the rest. The fold of rows into hits/fall-throughs is the pure
+/// `crate::txany::fold_index_rows` (pinned); the SQL is the pure
+/// `tx_any_index_leg_batch_sql` (prepared against the production schema in
+/// `tests/sql_prepares_sqlite.rs`, gate MED-3). A query fault leaves its
+/// txids for the next table and marks them `faulted`.
+async fn tx_any_index_leg_batch(ctx: &RouteContext<AuthState>, keys: &[String]) -> BatchIndexLeg {
+    let mut leg = BatchIndexLeg {
+        hits: std::collections::HashMap::new(),
+        faulted: std::collections::HashSet::new(),
     };
+    let Ok(db) = ctx.env.d1("OVERLAY_DB") else {
+        console_warn!("[tx-any] OVERLAY_DB binding unavailable — batch answers nothing");
+        leg.faulted.extend(keys.iter().cloned());
+        return leg;
+    };
+    let extract =
+        |beef_hex: &str, txid_lc: &str, proof_verified: bool| -> Option<(String, Option<u64>)> {
+            let bytes = decode_beef_hex(beef_hex)?;
+            let raw_hex = crate::logic::extract_raw_tx_hex(&bytes, txid_lc)?;
+            let height =
+                crate::results::verified_beef_block_height(&bytes, txid_lc, proof_verified);
+            Some((raw_hex, height))
+        };
     let mut pending: Vec<String> = keys.to_vec();
     for (table, col) in [
         ("pot_beefs", "proof_verified"),
@@ -4497,11 +4483,8 @@ async fn tx_any_index_leg_batch(
             break;
         }
         let mut next_pending: Vec<String> = Vec::new();
-        for chunk in pending.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-            let marks = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT txid, hex(beef) AS beef, {col} AS proofVerified FROM {table} WHERE txid IN ({marks})"
-            );
+        for chunk in pending.chunks(crate::txany::TX_ANY_BATCH_D1_CHUNK) {
+            let sql = crate::txany::tx_any_index_leg_batch_sql(table, col, chunk.len());
             let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
             let rows: Vec<BeefTrustRowKeyed> = match db.prepare(&sql).bind(&binds) {
                 Ok(stmt) => match stmt
@@ -4511,54 +4494,65 @@ async fn tx_any_index_leg_batch(
                 {
                     Ok(rows) => rows,
                     Err(e) => {
-                        console_warn!("[tx-any] {table} batch query failed: {e}");
+                        console_warn!(
+                            "[tx-any] {table} batch query failed ({} txids): {e}",
+                            chunk.len()
+                        );
+                        leg.faulted.extend(chunk.iter().cloned());
                         next_pending.extend(chunk.iter().cloned());
                         continue;
                     }
                 },
                 Err(e) => {
-                    console_warn!("[tx-any] {table} batch bind failed: {e}");
+                    console_warn!(
+                        "[tx-any] {table} batch bind failed ({} txids): {e}",
+                        chunk.len()
+                    );
+                    leg.faulted.extend(chunk.iter().cloned());
                     next_pending.extend(chunk.iter().cloned());
                     continue;
                 }
             };
-            let mut hit: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for row in rows {
-                let txid_lc = row.txid.to_ascii_lowercase();
-                let proof_verified = row.proof_verified.unwrap_or(0.0) != 0.0;
-                if let Some(bytes) = row.beef.and_then(|h| decode_beef_hex(&h)) {
-                    if let Some(raw_hex) = crate::logic::extract_raw_tx_hex(&bytes, &txid_lc) {
-                        let height = crate::results::verified_beef_block_height(
-                            &bytes,
-                            &txid_lc,
-                            proof_verified,
-                        );
-                        out.insert(txid_lc.clone(), (Some(raw_hex), height));
-                        hit.insert(txid_lc);
-                    }
-                }
+            let served: Vec<(String, Option<String>, bool)> = rows
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.txid.to_ascii_lowercase(),
+                        r.beef,
+                        r.proof_verified.unwrap_or(0.0) != 0.0,
+                    )
+                })
+                .collect();
+            let (resolved, unresolved) = crate::txany::fold_index_rows(&served, chunk, &extract);
+            for (txid, raw, height) in resolved {
+                leg.hits.insert(txid, (raw, height));
             }
-            next_pending.extend(chunk.iter().filter(|k| !hit.contains(*k)).cloned());
+            next_pending.extend(unresolved);
         }
         pending = next_pending;
     }
-    out
+    leg
 }
 
-/// bsv-low W-C.3 (2026-09-09) — `GET /tx-any?txids=<txid>,…` (≤
+/// bsv-low W-C.3 (2026-09-09/10) — `GET /tx-any?txids=<txid>,…` (≤
 /// `TX_ANY_BATCH_MAX`): the single route's answer for MANY txids in ONE round
-/// trip. The home surface of a lived-in identity asked `/tx-any/:txid` once
-/// per watched tx per gather pass (92 distinct reads in a 4 s burst per seat on
-/// the traced hand); the answer per txid here is the SAME decision the single
-/// route makes (the in-isolate cache, the index leg, the external leg, the
-/// unconfirmable probe: `resolve_tx_any`), so nothing can disagree. The
-/// external leg is BUDGETED per batch (`TX_ANY_BATCH_EXTERNAL_MAX`, in request
-/// order): the couriers rate-limit and a 50-wide miss burst would be the
-/// single route's worst hour in one call; every txid past the budget is
-/// listed under `unknown` (never a null, never a guess) and the client's
-/// per-txid read takes it on its own pace.
+/// trip, INDEX-ONLY. The home surface of a lived-in identity asked
+/// `/tx-any/:txid` once per watched tx per pass (92 distinct reads in a 4 s
+/// burst per seat on the traced hand); the vast majority are index-held mined
+/// txs, and those are answered here by the SAME decision the single route
+/// makes for an index hit (`batch_index_answer` == `decide_tx_any` on the
+/// index leg alone, pinned) and written to the SAME cache. Every txid the
+/// index did not DECIDE (a miss, a proofless row, a D1 fault) is listed under
+/// `unknown` with its reason, never a null and never a guess: the client's
+/// per-txid read does the external work on its own single-flighted pace
+/// (gate MED-1: the batch never touches a courier, so it can neither amplify
+/// courier load nor outrun the client's 8 s abort). `no-store` like every
+/// answer here.
 pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
-    let url = req.url()?;
+    let url = match req.url() {
+        Ok(u) => u,
+        Err(_) => return json_error("unreadable request url", 400),
+    };
     let Some(param) = url
         .query_pairs()
         .find(|(k, _)| k == "txids")
@@ -4570,34 +4564,44 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
         Ok(k) => k,
         Err(msg) => return json_error(&msg, 400),
     };
-    let now = worker::Date::now().as_millis() as f64;
     let mut answers: Vec<(String, TxAnyCached)> = Vec::with_capacity(keys.len());
     let mut misses: Vec<String> = Vec::new();
+    let now = worker::Date::now().as_millis() as f64;
     for k in &keys {
         match tx_any_cached(k, now) {
             Some(a) => answers.push((k.clone(), a)),
             None => misses.push(k.clone()),
         }
     }
-    let index = tx_any_index_leg_batch(&ctx, &misses).await;
-    let mut external_budget = crate::txany::TX_ANY_BATCH_EXTERNAL_MAX;
-    let mut unknown: Vec<String> = Vec::new();
+    let leg = tx_any_index_leg_batch(&ctx, &misses).await;
+    let mut unknown: Vec<(String, &'static str)> = Vec::new();
     for k in misses {
-        let (raw, height) = index.get(&k).cloned().unwrap_or((None, None));
-        let decided_by_index = raw.is_some() && height.is_some();
-        if !decided_by_index {
-            if external_budget == 0 {
-                unknown.push(k);
-                continue;
+        let hit = leg.hits.get(&k).cloned();
+        match crate::txany::batch_index_answer(
+            hit.as_ref().map(|(raw, _)| raw.clone()),
+            hit.as_ref().and_then(|(_, h)| *h),
+        ) {
+            Some(a) => {
+                let now = worker::Date::now().as_millis() as f64;
+                cache_tx_any_answer(&k, &a, now);
+                answers.push((k, a));
             }
-            external_budget -= 1;
+            None => {
+                let reason = if leg.faulted.contains(&k) {
+                    "index-fault"
+                } else if hit.is_some() {
+                    "index-unproven"
+                } else {
+                    "index-miss"
+                };
+                unknown.push((k, reason));
+            }
         }
-        let a = resolve_tx_any(raw, height, &k, now).await;
-        answers.push((k, a));
     }
     json_response(crate::txany::tx_any_batch_body(&answers, &unknown), 200)
 }
 
+/// `GET /health` — liveness only (no DB touch).
 pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // #318 (Rule 13 — surface, don't consume): the auth mode + per-isolate
     // counters ride the health body, so "unauthenticated but accepted" is a

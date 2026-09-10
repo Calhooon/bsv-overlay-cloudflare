@@ -256,36 +256,113 @@ pub fn verify_raw_bytes(raw: &[u8], txid: &str) -> Option<String> {
 /// clients ignore it; a client that consumes it gets the terminal-skip
 /// signal for a provably-dead tx.
 /// bsv-low W-C.3 — the batched route's bound: one `/tx-any?txids=` answers up
-/// to this many txids (the client chunks). Matches the tower's `/cases` bound.
+/// to this many txids (the client chunks). Matches the tower's `/cases` shape.
 pub const TX_ANY_BATCH_MAX: usize = 50;
 
-/// bsv-low W-C.3 — how many index MISSES one batch may resolve through the
-/// external (courier) leg. The couriers rate-limit; the rest of a batch's
-/// misses are answered `unknown` and read one at a time by the client.
-pub const TX_ANY_BATCH_EXTERNAL_MAX: usize = 8;
+/// bsv-low W-C.3 (gate MED-2) — how many txids one batched `IN (…)` query
+/// asks for: with the per-row byte bound below, one query materializes at
+/// most `TX_ANY_BATCH_D1_CHUNK × TX_ANY_BATCH_BEEF_MAX_BYTES` of BEEF (4 MiB)
+/// before the hex doubles it, on a set an unauthenticated caller chose.
+pub const TX_ANY_BATCH_D1_CHUNK: usize = 16;
+
+/// bsv-low W-C.3 (gate MED-2) — the largest stored BEEF the batched index leg
+/// serves (bytes). A bigger row is not served by the batch (the txid lands in
+/// `unknown`, `index-miss`) and the per-txid route reads it on its own.
+pub const TX_ANY_BATCH_BEEF_MAX_BYTES: u64 = 262_144;
 
 /// `txids=<txid>,…` → lowercase txids, duplicates collapsed (first occurrence
 /// kept, order preserved), empty items between commas ignored; `Err` names
 /// the refusal (400). One malformed item refuses the whole list: a client
-/// must never read a half-answered map as complete.
+/// must never read a half-answered map as complete. The bound is checked
+/// BEFORE the push (a 51st distinct txid is refused, not admitted).
 pub fn parse_txids(param: &str) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in param.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if !crate::logic::valid_txid(item) {
             return Err(format!("malformed txid (expect 64 hex chars): {item:?}"));
         }
         let lc = item.to_ascii_lowercase();
-        if !out.contains(&lc) {
-            out.push(lc);
+        if !seen.insert(lc.clone()) {
+            continue;
         }
-        if out.len() > TX_ANY_BATCH_MAX {
+        if out.len() >= TX_ANY_BATCH_MAX {
             return Err(format!("too many txids (max {TX_ANY_BATCH_MAX})"));
         }
+        out.push(lc);
     }
     if out.is_empty() {
         return Err("empty txids parameter".to_string());
     }
     Ok(out)
+}
+
+/// bsv-low W-C.3 (gate MED-3) — the batched index-leg query for one table and
+/// `n` txids: `txid IN (?,…)` bounded by the per-row byte budget. Pure, so it
+/// is PREPARED against the production schema in `tests/sql_prepares_sqlite.rs`
+/// like every other builder in this crate.
+pub fn tx_any_index_leg_batch_sql(table: &str, proof_col: &str, n: usize) -> String {
+    let marks = vec!["?"; n.max(1)].join(",");
+    format!(
+        "SELECT txid, hex(beef) AS beef, {proof_col} AS proofVerified FROM {table} \
+         WHERE txid IN ({marks}) AND length(beef) <= {TX_ANY_BATCH_BEEF_MAX_BYTES}"
+    )
+}
+
+/// bsv-low W-C.3 — the batched route's answer for ONE index read: exactly the
+/// single route's decision when its index leg DECIDES (raw AND a verified-BUMP
+/// height → `decide_tx_any` on the index alone), and `None` for anything the
+/// index did not decide (the batch never runs the external leg — gate MED-1).
+pub fn batch_index_answer(
+    index_raw: Option<String>,
+    index_height: Option<u64>,
+) -> Option<TxAnyAnswer> {
+    if index_raw.is_some() && index_height.is_some() {
+        Some(decide_tx_any(
+            index_raw,
+            index_height,
+            None,
+            AbsenceCorroboration::Unknown,
+        ))
+    } else {
+        None
+    }
+}
+
+/// bsv-low W-C.3 — the fold of one chunk's served rows into `(resolved,
+/// unresolved)`: a served row whose BEEF the extractor decodes for its txid is
+/// resolved `(txid, raw, height)` — final at this table; a txid the table did
+/// not serve, or served with bytes the extractor could not decode/extract for
+/// it, is unresolved and falls through to the next table (then to `unknown`).
+/// The extractor is injected so the fall-through semantics are pinned without
+/// a BEEF fixture. Pure.
+pub type IndexExtract<'a> = &'a dyn Fn(&str, &str, bool) -> Option<(String, Option<u64>)>;
+/// A resolved index row: `(txid, raw hex, verified-BUMP height)`.
+pub type IndexResolved = Vec<(String, String, Option<u64>)>;
+
+pub fn fold_index_rows(
+    served: &[(String, Option<String>, bool)],
+    chunk: &[String],
+    extract: IndexExtract<'_>,
+) -> (IndexResolved, Vec<String>) {
+    let mut resolved: IndexResolved = Vec::new();
+    let mut hit: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (txid, beef, proof_verified) in served {
+        if hit.contains(txid) {
+            continue;
+        }
+        let Some(beef) = beef else { continue };
+        if let Some((raw, height)) = extract(beef, txid, *proof_verified) {
+            resolved.push((txid.clone(), raw, height));
+            hit.insert(txid.clone());
+        }
+    }
+    let unresolved = chunk
+        .iter()
+        .filter(|k| !hit.contains(*k))
+        .cloned()
+        .collect();
+    (resolved, unresolved)
 }
 
 /// The one `/tx-any` answer as a JSON value (the single route's body, the
@@ -303,34 +380,25 @@ pub fn tx_any_value(txid: &str, a: &TxAnyAnswer) -> serde_json::Value {
 }
 
 /// bsv-low W-C.3 — the batched body: `answers[txid]` = the single route's
-/// body for that txid; `unknown` = the txids this batch did not answer (past
-/// the external budget) — listed apart, never a null.
-pub fn tx_any_batch_body(answers: &[(String, TxAnyAnswer)], unknown: &[String]) -> String {
+/// body for that txid; `unknown` = the txids this batch did not answer, each
+/// with its reason under `reasons` (`index-miss` | `index-unproven` |
+/// `index-fault`, gate LOW-6) — listed apart, never a null.
+pub fn tx_any_batch_body(answers: &[(String, TxAnyAnswer)], unknown: &[(String, &str)]) -> String {
     let mut map = serde_json::Map::new();
     for (txid, a) in answers {
         map.insert(txid.clone(), tx_any_value(txid, a));
     }
-    json!({ "answers": serde_json::Value::Object(map), "unknown": unknown }).to_string()
-}
-
-/// Whether an answer is TERMINAL: a mined tx stays mined, and a proven
-/// unconfirmable tx stays unconfirmable (both reorg-negligible — the same
-/// trust the client's durable latch places in them, bsv-low #403).
-pub fn tx_any_terminal(a: &TxAnyAnswer) -> bool {
-    (a.present == Some(true) && a.confirmed == Some(true))
-        || (a.unconfirmable && a.present == Some(false))
-}
-
-/// bsv-low W-C.3 — the `Cache-Control` a `/tx-any/:txid` answer carries: a
-/// terminal answer is `immutable` for a year (the browser and the colo cache
-/// serve every repeat read without a request); anything that can still change
-/// stays `no-store`.
-pub fn tx_any_cache_control(a: &TxAnyAnswer) -> &'static str {
-    if tx_any_terminal(a) {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-store"
+    let mut reasons = serde_json::Map::new();
+    for (txid, why) in unknown {
+        reasons.insert(txid.clone(), json!(why));
     }
+    let unknown_ids: Vec<&str> = unknown.iter().map(|(t, _)| t.as_str()).collect();
+    json!({
+        "answers": serde_json::Value::Object(map),
+        "unknown": unknown_ids,
+        "reasons": serde_json::Value::Object(reasons),
+    })
+    .to_string()
 }
 
 pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
@@ -565,7 +633,7 @@ mod tests {
         assert!(empty["source"].is_null());
     }
 
-    // ── bsv-low W-C.3 (2026-09-09): the batched route + the immutable edge ──
+    // ── bsv-low W-C.3 (2026-09-09/10): the batched, index-only route ──
 
     fn mined() -> TxAnyAnswer {
         TxAnyAnswer {
@@ -605,12 +673,13 @@ mod tests {
     }
 
     #[test]
-    fn the_batched_entry_is_the_single_body_and_unknowns_stay_apart() {
+    fn the_batched_entry_is_the_single_body_and_unknowns_stay_apart_with_reasons() {
         let a = "ab".repeat(32);
         let u = "ee".repeat(32);
+        let f = "ff".repeat(32);
         let body: serde_json::Value = serde_json::from_str(&tx_any_batch_body(
             &[(a.clone(), mined())],
-            std::slice::from_ref(&u),
+            &[(u.clone(), "index-miss"), (f.clone(), "index-fault")],
         ))
         .unwrap();
         let single: serde_json::Value = serde_json::from_str(&tx_any_body(&a, &mined())).unwrap();
@@ -619,76 +688,65 @@ mod tests {
             body["answers"].get(&u).is_none(),
             "an unknown txid is NOT in answers"
         );
-        assert_eq!(body["unknown"], json!([u]));
+        assert_eq!(body["unknown"], json!([u, f]));
+        assert_eq!(body["reasons"][&u], json!("index-miss"));
+        assert_eq!(body["reasons"][&f], json!("index-fault"));
+    }
+
+    /// The equivalence the batch rests on: an index HIT is answered by the very
+    /// call the single route makes for an index hit; anything else is not
+    /// answered at all (never a guess, never the external leg).
+    #[test]
+    fn the_batch_answers_an_index_hit_exactly_as_the_single_route_and_nothing_else() {
+        let single = decide_tx_any(Some(raw()), Some(7), None, AbsenceCorroboration::Unknown);
+        assert_eq!(
+            batch_index_answer(Some(raw()), Some(7)),
+            Some(single.clone())
+        );
+        assert_eq!(single.present, Some(true));
+        assert_eq!(single.confirmed, Some(true));
+        assert_eq!(
+            batch_index_answer(Some(raw()), None),
+            None,
+            "a proofless row is not decided"
+        );
+        assert_eq!(batch_index_answer(None, Some(7)), None);
+        assert_eq!(batch_index_answer(None, None), None);
+    }
+
+    /// The batched index leg's only real logic: a served, decodable row is a
+    /// hit (final at its table); an undecodable row and an unserved txid fall
+    /// through; a duplicate row never double-counts.
+    #[test]
+    fn fold_index_rows_hits_are_final_and_everything_else_falls_through() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let c = "cc".repeat(32);
+        let extract = |beef: &str, txid: &str, pv: bool| -> Option<(String, Option<u64>)> {
+            if beef == "bad" {
+                return None;
+            }
+            Some((format!("raw-{txid}"), if pv { Some(1) } else { None }))
+        };
+        let served = vec![
+            (a.clone(), Some("good".to_string()), true),
+            (b.clone(), Some("bad".to_string()), true),
+            (a.clone(), Some("good".to_string()), false), // a duplicate row
+            (c.clone(), None, true),                      // served without bytes
+        ];
+        let chunk = vec![a.clone(), b.clone(), c.clone(), "dd".repeat(32)];
+        let (resolved, unresolved) = fold_index_rows(&served, &chunk, &extract);
+        assert_eq!(resolved, vec![(a.clone(), format!("raw-{a}"), Some(1))]);
+        assert_eq!(unresolved, vec![b, c, "dd".repeat(32)]);
     }
 
     #[test]
-    fn only_a_terminal_answer_is_immutable() {
-        assert_eq!(
-            tx_any_cache_control(&mined()),
-            "public, max-age=31536000, immutable"
-        );
-        let unconfirmable = TxAnyAnswer {
-            present: Some(false),
-            confirmed: None,
-            height: None,
-            raw_hex: None,
-            source: Some("external"),
-            unconfirmable: true,
-        };
-        assert_eq!(
-            tx_any_cache_control(&unconfirmable),
-            "public, max-age=31536000, immutable"
-        );
-        let pending = TxAnyAnswer {
-            confirmed: Some(false),
-            height: None,
-            ..mined()
-        };
-        assert_eq!(tx_any_cache_control(&pending), "no-store");
-        let absent = TxAnyAnswer {
-            present: Some(false),
-            confirmed: None,
-            height: None,
-            raw_hex: None,
-            ..mined()
-        };
-        assert_eq!(tx_any_cache_control(&absent), "no-store");
-        // An inconsistent pairing (unconfirmable claimed on a PRESENT tx) is not terminal.
-        let odd = TxAnyAnswer {
-            unconfirmable: true,
-            confirmed: Some(false),
-            height: None,
-            ..mined()
-        };
-        assert_eq!(tx_any_cache_control(&odd), "no-store");
-        assert_eq!(tx_any_cache_control(&TxAnyAnswer::default()), "no-store");
-    }
-
-    /// wc4 (2026-09-10): a Cache API hit carries IMMUTABLE headers and the
-    /// outer wrapper sets CORS with `let _ =` — returning the hit verbatim
-    /// silently shipped a response the browser refused. The route must rebuild
-    /// a mutable response from the cached body, never hand the hit out.
-    #[test]
-    fn the_edge_cache_hit_is_never_returned_verbatim() {
-        let src = include_str!("routes.rs");
-        let start = src.find("pub async fn tx_any(").expect("the single route");
-        let end = src[start..]
-            .find("\npub async fn tx_any_batch(")
-            .map(|i| start + i)
-            .expect("the batched route follows");
-        let body = &src[start..end];
-        assert!(
-            !body.contains("return Ok(hit)"),
-            "the hit must be rebuilt, not returned"
-        );
-        assert!(
-            body.contains("hit.text().await"),
-            "the rebuild reads the cached body"
-        );
-        assert!(
-            body.contains("json_response_immutable(body)"),
-            "the rebuilt response is a fresh mutable one"
-        );
+    fn the_batched_index_sql_carries_one_mark_per_txid_and_the_byte_bound() {
+        let sql = tx_any_index_leg_batch_sql("pot_beefs", "proof_verified", 3);
+        assert_eq!(sql.matches('?').count(), 3);
+        assert!(sql.contains("length(beef) <= 262144"));
+        assert!(sql.contains("FROM pot_beefs"));
+        assert!(tx_any_index_leg_batch_sql("transactions", "has_proof", 1)
+            .contains("has_proof AS proofVerified"));
     }
 }

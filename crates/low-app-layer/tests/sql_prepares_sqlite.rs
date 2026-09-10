@@ -34,6 +34,7 @@ use low_app_layer::results::{
     claims_sql, decoded_pots_sql, hop_seat_markers_sql, page_overlay_sql, proof_bundle_bytes_sql,
     proof_hands_sql, results_sql, seat_markers_sql,
 };
+use low_app_layer::txany::tx_any_index_leg_batch_sql;
 use rusqlite::Connection;
 
 /// A fresh in-memory SQLite carrying the REAL production schema.
@@ -89,6 +90,17 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "live_view_sql(era, 0)", &live_view_sql(ERA, 0));
     assert_prepares(&conn, "results_sql", &results_sql(None, 0));
     assert_prepares(&conn, "results_sql(era)", &results_sql(ERA, 0));
+    // bsv-low W-C.3 (gate MED-3): the batched `/tx-any` index leg, both tables.
+    assert_prepares(
+        &conn,
+        "tx_any_index_leg_batch_sql(pot_beefs, 16)",
+        &tx_any_index_leg_batch_sql("pot_beefs", "proof_verified", 16),
+    );
+    assert_prepares(
+        &conn,
+        "tx_any_index_leg_batch_sql(transactions, 16)",
+        &tx_any_index_leg_batch_sql("transactions", "has_proof", 16),
+    );
 }
 
 /// #375 — the FIXED queries' bind arity, both era arms: the cutoff is
@@ -108,6 +120,11 @@ fn fixed_queries_declare_the_parameter_count_per_era_arm() {
         ("live_view_sql(era, 0)", live_view_sql(ERA, 0), 2),
         ("results_sql(None, 0)", results_sql(None, 0), 1),
         ("results_sql(era)", results_sql(ERA, 0), 2),
+        (
+            "tx_any_index_leg_batch_sql(pot_beefs, 3)",
+            tx_any_index_leg_batch_sql("pot_beefs", "proof_verified", 3),
+            3,
+        ),
         (
             "hops_view_sql(false, None, 0)",
             hops_view_sql(false, None, 0),
