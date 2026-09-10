@@ -132,6 +132,7 @@ pub mod internal_events;
 pub mod live_view;
 pub mod logic;
 pub mod proof_post;
+pub mod record_post;
 pub mod refund_backups;
 pub mod refund_view;
 pub mod results;
@@ -252,6 +253,9 @@ fn router(
         // transcript proof bundle here instead of spending it on chain.
         .get_async("/proof", proof_post::proof_get)
         .post_async("/proof", proof_post::proof_post)
+        // bsv-low M18-2 (B), W-E: every index marker FILED here instead of bought on
+        // chain — the same bytes, the same verifiers, the same tables.
+        .post_async("/record", record_post::record_post)
         .get_async("/refund-view", routes::refund_view)
         // bsv-low W2 batch B(a) (owner ruling 2026-09-03): the wiped-device
         // seeding pass reads every refund backup in ONE batched call here

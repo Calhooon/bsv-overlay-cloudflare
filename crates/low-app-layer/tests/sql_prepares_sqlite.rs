@@ -29,6 +29,9 @@ use low_app_layer::live_view::{keyless_candidates_sql, live_view_sql};
 use low_app_layer::logic::{
     batch_where_sql, pots_view_join_sql, proof_pointers_sql, recovery_view_sql,
 };
+use low_app_layer::record_post::{
+    lb_row_file_sql, COLLECTED_FILE_SQL, POTPARTY_FILE_SQL, POTREFUND_FILE_SQL, RESULT_FILE_SQL,
+};
 use low_app_layer::refund_view::refund_view_sql;
 use low_app_layer::results::{
     claims_sql, decoded_pots_sql, hop_seat_markers_sql, page_overlay_sql, proof_bundle_bytes_sql,
@@ -90,6 +93,17 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "live_view_sql(era, 0)", &live_view_sql(ERA, 0));
     assert_prepares(&conn, "results_sql", &results_sql(None, 0));
     assert_prepares(&conn, "results_sql(era)", &results_sql(ERA, 0));
+    // bsv-low M18-2 (B): the filed-marker writes carry the overlay's own column lists.
+    assert_prepares(&conn, "POTPARTY_FILE_SQL", POTPARTY_FILE_SQL);
+    assert_prepares(&conn, "POTREFUND_FILE_SQL", POTREFUND_FILE_SQL);
+    assert_prepares(&conn, "RESULT_FILE_SQL", RESULT_FILE_SQL);
+    assert_prepares(&conn, "COLLECTED_FILE_SQL", COLLECTED_FILE_SQL);
+    assert_prepares(&conn, "lb_row_file_sql", lb_row_file_sql());
+    assert_eq!(
+        lb_row_file_sql(),
+        bsv_overlay_cloudflare::d1_discovery::result_write::lb_row_insert_sql(),
+        "the filed result's leaderboard row is the overlay's own SQL, byte for byte"
+    );
     // bsv-low W-C.3 (gate MED-3): the batched `/tx-any` index leg, both tables.
     assert_prepares(
         &conn,
