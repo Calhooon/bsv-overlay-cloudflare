@@ -195,7 +195,10 @@ name = "low-app-layer-beta"
 [env.beta.vars]
 RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
 OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
-AUTH_ENFORCE = "false"
+# bsv-low #441 C6 (2026-09-14): STRICT on beta — the client's identity reads are
+# handshake-first (a cold read waits for its warmup, bounded) so an honest read is
+# never anonymous; prod stays lenient until the promotion.
+AUTH_ENFORCE = "true"
 SESSION_LANE = "true"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.
