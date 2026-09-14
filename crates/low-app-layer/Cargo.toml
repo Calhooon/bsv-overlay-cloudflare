@@ -13,6 +13,7 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 # worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
 # BRC-103/104 middleware, the SAME major the low-watchtower pins — requires
 # `worker ^0.8`. Only `d1` is needed: this worker is a pure READ surface (no

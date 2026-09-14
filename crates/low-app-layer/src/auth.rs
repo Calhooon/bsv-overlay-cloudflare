@@ -542,7 +542,7 @@ pub enum FrontDoor {
     Reply(Response),
 }
 
-fn json_reply(status: u16, body: &serde_json::Value) -> Result<Response> {
+pub(crate) fn json_reply(status: u16, body: &serde_json::Value) -> Result<Response> {
     let mut resp = Response::ok(body.to_string())?.with_status(status);
     resp.headers_mut().set("Content-Type", "application/json")?;
     resp.headers_mut().set("Cache-Control", "no-store")?;

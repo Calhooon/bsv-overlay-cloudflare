@@ -87,7 +87,7 @@ pub fn tip_event_body(height: u64, at_ms: u64) -> Value {
 /// `[broadcast] … HTTP 404 (server=cloudflare) error code: 1042`). Without a
 /// binding it is a public fetch, which is only right for a relay on another
 /// zone.
-async fn relay_post(
+pub(crate) async fn relay_post(
     env: &Env,
     relay: &str,
     path: &str,

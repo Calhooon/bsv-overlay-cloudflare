@@ -203,7 +203,7 @@ dependencies = [
 [[package]]
 name = "bsv-middleware-cloudflare"
 version = "0.3.4"
-source = "git+https://github.com/Calhooon/bsv-middleware-cloudflare?rev=631cd02#631cd02340441924922a42c8e014d0a08ddc3baf"
+source = "git+https://github.com/Calhooon/bsv-middleware-cloudflare?rev=750af11#750af1123780c65524c05746c08a61c2faf6d282"
 dependencies = [
  "async-trait",
  "base64",
@@ -1321,6 +1321,7 @@ dependencies = [
  "bsv-rs",
  "console_error_panic_hook",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
  "rusqlite",
  "serde",

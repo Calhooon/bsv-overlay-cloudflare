@@ -132,6 +132,7 @@ pub mod cors;
 pub mod credit_beef;
 pub mod hops_view;
 pub mod internal_events;
+pub mod lane_attest;
 pub mod live_view;
 pub mod logic;
 pub mod proof_post;
@@ -282,6 +283,8 @@ fn router(
         // bsv-low M18-2 (B), W-E: every index marker FILED here instead of bought on
         // chain — the same bytes, the same verifiers, the same tables.
         .post_async("/record", record_post::record_post)
+        // bsv-low #443 step 4: this door's lane from the relay's attestation (no handshake, no signed read).
+        .post_async("/lane/attest", lane_attest::lane_attest)
         .get_async("/refund-view", routes::refund_view)
         // bsv-low W2 batch B(a) (owner ruling 2026-09-03): the wiped-device
         // seeding pass reads every refund backup in ONE batched call here
