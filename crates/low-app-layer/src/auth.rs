@@ -660,9 +660,10 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 // ALWAYS false — see the doc comment above.
                 allow_unauthenticated: false,
                 session_ttl_seconds: 3600,
-                // #441: the lane offer on a handshake that asks, the laned
-                // calls verified by the store — only when the operator turned
-                // it on AND the store is bound; otherwise the reference door.
+                // #441: the lane offer on the first SIGNED general message
+                // that asks (never the unsigned handshake), the laned calls
+                // verified by the store — only when the operator turned it on
+                // AND the store is bound; otherwise the reference door.
                 session_lane: if lane_on {
                     Some(SessionLaneOptions::default())
                 } else {

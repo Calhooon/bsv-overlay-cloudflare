@@ -56,7 +56,17 @@ fn lane_header_lists() -> (String, String) {
             lane::LANE_ASK_HEADER,
         ]
         .join(", "),
-        [lane::SESSION_COUNTER_HEADER, lane::SESSION_MAC_HEADER].join(", "),
+        // The seal, and the lane OFFER (a SIGNED response header on the first
+        // signed read that asks): unexposed, a cross-origin client neither
+        // sees it nor verifies the answer's signature over it — the
+        // 2026-09-14 delta-verify NEW-2 (`auth-lane.spec.ts` minted nothing
+        // for exactly this).
+        [
+            lane::SESSION_COUNTER_HEADER,
+            lane::SESSION_MAC_HEADER,
+            lane::LANE_OFFER_HEADER,
+        ]
+        .join(", "),
     )
 }
 
@@ -86,4 +96,38 @@ pub fn preflight() -> Result<Response> {
     let mut resp = Response::empty()?.with_status(204);
     add_cors_headers(&mut resp);
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsv_middleware_cloudflare::session_lane as lane;
+
+    /// #441: the lane's request headers are allowed and the seal + the signed
+    /// offer header are EXPOSED (a cross-origin fetch sees exposed headers
+    /// only; the SDK rebuilds the signed payload from what it sees — NEW-2).
+    #[test]
+    fn the_lane_headers_are_allowed_and_the_seal_and_offer_exposed() {
+        let (allow, expose) = lane_header_lists();
+        for h in [
+            lane::SESSION_HEADER,
+            lane::SESSION_IDENTITY_HEADER,
+            lane::SESSION_COUNTER_HEADER,
+            lane::SESSION_MAC_HEADER,
+            lane::LANE_ASK_HEADER,
+        ] {
+            assert!(allow.contains(h), "allow list must carry {h}: {allow}");
+        }
+        for h in [
+            lane::SESSION_COUNTER_HEADER,
+            lane::SESSION_MAC_HEADER,
+            lane::LANE_OFFER_HEADER,
+        ] {
+            assert!(expose.contains(h), "expose list must carry {h}: {expose}");
+        }
+        assert!(
+            !expose.contains(lane::LANE_ASK_HEADER),
+            "the ask is a request header, never exposed"
+        );
+    }
 }

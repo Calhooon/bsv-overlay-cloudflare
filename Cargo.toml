@@ -47,4 +47,4 @@ tracing = "0.1"
 # path to a sibling checkout (#439's class) — until the publish, which replaces this
 # block with the registry 0.3.4 (the owner's word).
 [patch.crates-io]
-bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "c0a0468" }
+bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "631cd02" }
