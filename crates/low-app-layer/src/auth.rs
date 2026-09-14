@@ -457,8 +457,9 @@ pub fn auth_health_json(
 // ── wasm glue: the front door ───────────────────────────────────────────────
 
 use bsv_middleware_cloudflare::{
-    process_auth, process_auth_lane, request_presents_lane, AuthMiddlewareOptions, AuthResult,
-    AuthSession, CloudflareTransport, LaneAuth, LaneAuthResult, SessionLaneOptions,
+    process_auth, process_auth_lane, request_presents_lane, session_lane::LaneOffer,
+    AuthMiddlewareOptions, AuthResult, AuthSession, CloudflareTransport, LaneAuth, LaneAuthResult,
+    SessionLaneOptions,
 };
 use worker::{Env, Request, Response, Result};
 
@@ -486,6 +487,11 @@ pub struct AuthState {
     /// lane (`seal_lane_response_text`) instead of signed. Never both `session`
     /// and `lane`.
     pub lane: Option<LaneAuth>,
+    /// bsv-low #441: a lane minted for THIS BRC-104-verified request (it carried
+    /// the ask): the offer rides the signed reply's `x-bsv-lane-offer` header
+    /// (a signable header: the reference signs it). Only ever set beside
+    /// `session`, never beside `lane`.
+    pub lane_offer: Option<LaneOffer>,
 }
 
 /// The lane's store binding name (the relay's, the tower's, ours: one name).
@@ -513,12 +519,14 @@ fn verified_state(
     session: Option<AuthSession>,
     body: Vec<u8>,
     lane: Option<LaneAuth>,
+    lane_offer: Option<LaneOffer>,
 ) -> AuthState {
     AuthState {
         mode,
         caller: CallerAuth::verified(identity_key),
         auth_configured,
         session,
+        lane_offer,
         body: Some(body),
         lane,
     }
@@ -618,6 +626,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     session: None,
                     body: None,
                     lane: None,
+                    lane_offer: None,
                 },
             ))
         }
@@ -672,6 +681,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
             };
             // A malformed handshake makes `process_auth` return Err — map it
             // to an honest 400 (the tower's V2 mapping), never a bare 500.
+            let mut pending_offer: Option<LaneOffer> = None;
             let auth = match outcome {
                 Ok(LaneAuthResult::Laned {
                     context,
@@ -689,10 +699,18 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                             None,
                             body,
                             Some(lane),
+                            None,
                         ),
                     ));
                 }
                 Ok(LaneAuthResult::Reference(a)) => a,
+                // #441: this BRC-104-verified request carried the ask and the
+                // store minted a lane under the identity the reference PROVED;
+                // the offer rides the signed reply (`lane_offer`).
+                Ok(LaneAuthResult::Offered { auth, offer }) => {
+                    pending_offer = Some(offer);
+                    auth
+                }
                 Err(e) => {
                     count_auth_refused();
                     return json_reply(
@@ -723,6 +741,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                                 Some(session),
                                 body,
                                 None,
+                                pending_offer,
                             ),
                         ))
                     }

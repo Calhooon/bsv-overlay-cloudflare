@@ -213,6 +213,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // Keep the session for reply-signing; the state moves into the router.
     let session = state.session.clone();
     let lane = state.lane.clone();
+    let lane_offer = state.lane_offer.clone();
 
     let mut resp = router(state, schema_ready).run(req, env).await?;
 
@@ -237,7 +238,16 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         let value: Value = resp.json().await.unwrap_or_else(
             |_| serde_json::json!({ "error": "handler returned a non-JSON response" }),
         );
-        resp = bsv_middleware_cloudflare::sign_json_response(&value, status, &[], &session)
+        // bsv-low #441: the request that MINTED a lane gets the offer on its
+        // signed reply (`x-bsv-lane-offer`, a signable header).
+        let extra: Vec<(String, String)> = match lane_offer {
+            Some(offer) => vec![(
+                bsv_middleware_cloudflare::session_lane::LANE_OFFER_HEADER.to_string(),
+                bsv_middleware_cloudflare::session_lane::offer_header_value(&offer),
+            )],
+            None => vec![],
+        };
+        resp = bsv_middleware_cloudflare::sign_json_response(&value, status, &extra, &session)
             .map_err(|e| worker::Error::from(e.to_string()))?;
         resp.headers_mut().set("Content-Type", "application/json")?;
         resp.headers_mut().set("Cache-Control", "no-store")?;
