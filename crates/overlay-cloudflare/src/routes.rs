@@ -894,6 +894,11 @@ async fn submit_inner(
     // `skipped` is RESERVED for the kill switch (the door did not run); every
     // outcome of a walk that ran writes its own desc (gate N3).
     let mut script_walk_desc = String::from("skipped");
+    // admit-fast: how the admission was reached, for the client's profile
+    // digest — `fast` (the sync accept), `pending` (the #397 witnessed-mode
+    // pend), `witnessed` (SEEN or the corroborator on the wire); `ungated` on
+    // the operator paths.
+    let mut admit_desc = "ungated";
     // Consumed DIRECTLY from the action: there is no local flag to shadow.
     // A re-gate defeated both source pins with
     // `let run_network_gate = run_network_gate && x.is_some() && x.is_none();`
@@ -1207,10 +1212,7 @@ async fn submit_inner(
         arcade_poll_ms = arcade.poll_wait_ms();
         arcade_broadcast_ms =
             (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms).max(0.0);
-        // admit-fast: how this answer was reached, for the client's profile
-        // digest — `fast` (the sync accept), `pending` (the #397 witnessed-mode
-        // pend), `witnessed` (SEEN or the corroborator on the wire).
-        let admit_desc = match &arcade_outcome {
+        admit_desc = match &arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => "witnessed",
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_)) => {
                 if admit_fast {
@@ -1736,7 +1738,7 @@ async fn submit_inner(
     // carved out of `arcade-broadcast` so the second-broadcaster leg is
     // attributable on its own.
     let server_timing = format!(
-        "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}"
+        "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, engine-submit;dur={engine_submit_ms:.1}, fanout;dur={fanout_ms:.1}, admit;desc=\"{admit_desc}\""
     );
     let mut resp = with_server_timing(json_ok(&steak)?, &server_timing);
     {
