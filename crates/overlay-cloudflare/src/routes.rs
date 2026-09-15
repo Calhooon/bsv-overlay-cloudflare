@@ -725,6 +725,13 @@ async fn submit_inner(
             .map(|v| v.to_string())
             .as_deref(),
     );
+    // admit-fast step 3 (bsv-low 2026-09-15, the owner's admission model):
+    // does the gated arm ANSWER on Arcade's synchronous accept? Read here,
+    // beside the other knobs, folded into the ONE derivation below; the route
+    // reads it off the derived action only (never a second derivation).
+    let admit_policy = crate::submit_gate::AdmitPolicy::parse(
+        env.var("ADMIT_FAST").ok().map(|v| v.to_string()).as_deref(),
+    );
     // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
     // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
     // (gate finding M1). Handing the watchtower the admin token would mean a
@@ -757,6 +764,7 @@ async fn submit_inner(
         operator_authed,
         gate_mode,
         script_policy,
+        admit_policy,
     );
     let mode = action.engine_mode();
     // ── #371 SEEN corroboration flag — the UNGATED arm's latch feed. ──
@@ -1097,12 +1105,24 @@ async fn submit_inner(
         // Ancestors are submitted in the same batch but do NOT gate admission —
         // only the SUBJECT reaching SEEN_ON_NETWORK does (they were broadcast
         // long ago by construction; Arcade dedupes their re-submit).
+        // admit-fast: read off the derived action (a fifth read, never a
+        // second derivation) — the fast answer rides only the gated arm.
+        let admit_fast = matches!(
+            action,
+            crate::submit_gate::SubmitAction::ProceedWithNetworkGate {
+                admit: crate::submit_gate::AdmitPolicy::Fast,
+                ..
+            }
+        );
         let mut arcade =
             crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
                 // #214: Arcade's async REJECTED is never authoritative
                 // uncorroborated — an exhausted ladder gets a second
                 // broadcaster's word (TAAL → GorillaPool) before any 422.
-                .with_corroborator_key(taal_api_key.clone());
+                .with_corroborator_key(taal_api_key.clone())
+                // admit-fast: the sync accept answers; the witness moves to
+                // the pending watch below (nothing polled on the wire).
+                .with_fast_answer(admit_fast);
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
@@ -1187,8 +1207,23 @@ async fn submit_inner(
         arcade_poll_ms = arcade.poll_wait_ms();
         arcade_broadcast_ms =
             (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms).max(0.0);
+        // admit-fast: how this answer was reached, for the client's profile
+        // digest — `fast` (the sync accept), `pending` (the #397 witnessed-mode
+        // pend), `witnessed` (SEEN or the corroborator on the wire).
+        let admit_desc = match &arcade_outcome {
+            Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => "witnessed",
+            Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_)) => {
+                if admit_fast {
+                    "fast"
+                } else {
+                    "pending"
+                }
+            }
+            Ok(crate::broadcaster::ArcOutcome::Rejected(_)) => "refused",
+            Err(_) => "unavailable",
+        };
         let gated_timing = format!(
-            "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}"
+            "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, admit;desc=\"{admit_desc}\""
         );
         match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
@@ -1238,55 +1273,53 @@ async fn submit_inner(
                 }
             }
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) => {
-                // #397: sync-validated + queued by Arcade, tracker lagging,
-                // corroborator inconclusive, ancestry PROVEN (the broadcaster
-                // never pends an unproven-ancestry subject — #267). ADMIT —
-                // a lagging tracker must not read as a rejected tx — but do
-                // NOT latch `network_seen`: nothing witnessed it yet. Money
-                // views stay gated on the real witness; the background
-                // re-checks below latch it when the tracker catches up, and
-                // the reconcile ladder displaces the claim if the tx truly
-                // never propagates (the act-on-failure design, owner
-                // 2026-08-19).
+                // #397 / admit-fast step 3 (2026-09-15): the subject is
+                // admitted on Arcade's SYNCHRONOUS validation — under
+                // `ADMIT_FAST` for EVERY gated subject (the fast answer: the
+                // door walked the scripts, Arcade validated and queued the
+                // bytes, nothing polled on the wire), otherwise (the witnessed
+                // mode) only for a proven-ancestry single leg whose tracker
+                // lagged and whose corroborator was inconclusive (the
+                // broadcaster never pends an unproven-ancestry subject there,
+                // #267). Either way: ADMIT, do NOT latch `network_seen`
+                // (nothing witnessed it), and hand the witness to the PENDING
+                // WATCH in the background (`admit_fast::pending_watch_job`):
+                // Arcade is looked at 2..18 s after the admission — SEEN
+                // latches (counted, with its latency); a FATAL look runs the
+                // evidence check and a CORROBORATED refusal EVICTS everywhere
+                // (the shadow move); silence is counted and left to the
+                // callbacks and the completion / reconcile passes. Money views
+                // stay gated on the real witness. Accepted residual (gate
+                // LOW-2): a stranger CAN park an inert pending row through
+                // this arm (valid script+fee) — bounded by the subject EF byte
+                // cap, displaceable, evictable, excluded from every money view
+                // until witnessed.
                 worker::console_log!(
-                    "broadcast-gated(arcade): {subject_txid} admitted PENDING ({pending}) — sync-accepted, \
-                     SEEN unwitnessed (#397); scheduling background witness re-checks"
+                    "broadcast-gated(arcade): {subject_txid} admitted PENDING ({pending}; {}) — SEEN unwitnessed; the pending watch owns the witness",
+                    if admit_fast {
+                        "the fast answer"
+                    } else {
+                        "tracker lagging, corroborator inconclusive (#397)"
+                    }
                 );
-                // Accepted residual (gate LOW-2): a stranger CAN park an
-                // inert pending row through this arm (valid script+fee,
-                // tracker quiet, corroborator down) — bounded by the subject
-                // EF byte cap, displaceable by the reconcile CAS, and
-                // excluded from every money view until witnessed. Writing
-                // inert rows is the D2 open-path status quo, not a new power.
-                if let Ok(seen_db) = env.d1("OVERLAY_DB") {
-                    let recheck_arcade = crate::broadcaster::ArcadeBroadcaster::new(
-                        arcade_url.clone().unwrap_or_default(),
-                    );
-                    let recheck_txid = subject_txid.clone();
+                if let Ok(count_db) = env.d1("OVERLAY_DB") {
+                    let name = if admit_fast {
+                        crate::ops::COUNTER_SUBMIT_FAST_ADMITTED
+                    } else {
+                        crate::ops::COUNTER_SUBMIT_PENDING_ADMITTED
+                    };
                     ctx.wait_until(async move {
-                        // Two witness re-checks inside the isolate's post-
-                        // response budget (+6 s, +8 s — gate LOW-1: stay well
-                        // under the ~30 s wait_until ceiling so eviction
-                        // cannot silently skip the latch). Longer lags
-                        // converge via the #371 corroboration on later
-                        // submits, the completion cron, and the reconcile
-                        // ladder.
-                        for delay_ms in [6_000u64, 8_000] {
-                            crate::broadcaster::sleep_ms(delay_ms).await;
-                            if recheck_arcade.network_witnessed(&recheck_txid).await {
-                                crate::ops::latch_network_seen(&seen_db, &recheck_txid).await;
-                                worker::console_log!(
-                                    "#397: background re-check witnessed {recheck_txid} SEEN — latched"
-                                );
-                                return;
-                            }
-                        }
-                        worker::console_log!(
-                            "#397: {recheck_txid} still unwitnessed after background re-checks — \
-                             the completion/reconcile passes own it now"
-                        );
+                        crate::ops::bump_counter(&count_db, name, 1).await;
                     });
                 }
+                let watch_env = crate::admit_fast::EvidenceEnv::from_env(env);
+                let watch_txid = subject_txid.clone();
+                let admitted_at_ms = js_sys::Date::now();
+                ctx.wait_until(crate::admit_fast::pending_watch_job(
+                    watch_env,
+                    watch_txid,
+                    admitted_at_ms,
+                ));
             }
             Ok(crate::broadcaster::ArcOutcome::Rejected(reason)) => {
                 // DEFINITIVE refusal of the SUBJECT → admit NOTHING. (#214:
@@ -3826,16 +3859,16 @@ mod tests {
         let needle = ["SubmitAction::ProceedWithNetwork", "Gate {"].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            4,
-            "expected EXACTLY four references to the gated action — the match \
+            5,
+            "expected EXACTLY five references to the gated action — the match \
              arm, the branch that runs the broadcast, the #413 0-admit \
-             refusal, and the bsv-low W-A door walk (each READS the same \
-             derived action — a further READ, never a second derivation); a \
-             changed count means the only public admission bar MOVED, was \
-             RENAMED or was DELETED. An unchanged count does NOT mean the bar \
-             is live: an added conjunct leaves this at 4 (see this test's \
-             stated boundary) — that shape, and the shadowed rebinding, are \
-             the route tier's job"
+             refusal, the bsv-low W-A door walk, and the admit-fast policy \
+             read (each READS the same derived action — a further READ, never \
+             a second derivation); a changed count means the only public \
+             admission bar MOVED, was RENAMED or was DELETED. An unchanged \
+             count does NOT mean the bar is live: an added conjunct leaves \
+             this at 5 (see this test's stated boundary) — that shape, and \
+             the shadowed rebinding, are the route tier's job"
         );
         // The decision is derived EXACTLY once (probe H: a second derivation
         // from a separate argument list let one copy be flipped silently).
@@ -3971,12 +4004,16 @@ mod tests {
     }
 
     /// #371 (gate MEDIUM-1): the `network_seen` latch must be CALLED from
-    /// exactly FOUR places — the gated Accepted arm (synchronous), the
-    /// post-`engine.submit` ungated corroboration closure, the #397
-    /// AcceptedPending background witness re-check, and the #413
-    /// dual-broadcast delivery latch (writer census mirrored in the
-    /// `network_seen` migration comment — keep both in lockstep). Positive
-    /// count, split needle, comments stripped (Rule 9).
+    /// exactly THREE places in this file — the gated Accepted arm
+    /// (synchronous), the post-`engine.submit` ungated corroboration closure,
+    /// and the #413 dual-broadcast delivery latch — plus, since admit-fast
+    /// step 3 (2026-09-15), the two in `admit_fast.rs` (the callback's
+    /// live-verified witness job and the pending watch behind a pending
+    /// admission, which replaced the #397 re-check that used to live in the
+    /// pending arm here; both pinned there and by
+    /// `pending_admit_latches_only_behind_a_real_witness`). Writer census
+    /// mirrored in the `network_seen` migration comment — keep both in
+    /// lockstep. Positive count, split needle, comments stripped (Rule 9).
     ///
     /// **Stated boundary (Rule 22): this pins the SPELLING, not the effect.**
     /// The UNGATED producer's effect is behaviorally driven by the ci-route
@@ -3996,15 +4033,25 @@ mod tests {
         let needle = ["crate::ops::latch_net", "work_seen("].concat();
         assert_eq!(
             src.matches(&needle).count(),
-            4,
-            "expected EXACTLY four latch calls — the gated Accepted arm, the \
-             ungated post-submit corroboration, the #413 dual-broadcast \
-             delivery latch (fires only on the corroborator's >=SEEN verdict \
-             of OUR OWN TAAL/GP broadcast), and the #397 AcceptedPending \
-             background witness re-check (which latches ONLY on a real \
-             network_witnessed answer — a pending admit itself must never \
-             latch); a changed count means a producer was deleted, moved or \
-             added unaccounted"
+            3,
+            "expected EXACTLY three latch calls in routes.rs — the gated \
+             Accepted arm, the ungated post-submit corroboration, and the #413 \
+             dual-broadcast delivery latch (fires only on the corroborator's \
+             >=SEEN verdict of OUR OWN TAAL/GP broadcast); the pending \
+             admission's latch lives in admit_fast::pending_watch_job (behind \
+             a live Seen look — a pending admit itself must never latch); a \
+             changed count means a producer was deleted, moved or added \
+             unaccounted"
+        );
+        let jobs = code_only(include_str!("admit_fast.rs"));
+        // The module's own tests carry the needle as a string literal (the
+        // callback-route pin): count the production code only.
+        let jobs = &jobs[..jobs.find("#[cfg(test)]").unwrap_or(jobs.len())];
+        assert_eq!(
+            jobs.matches(&needle).count(),
+            2,
+            "expected EXACTLY two latch calls in admit_fast.rs — the callback's \
+             live-verified witness job and the pending watch"
         );
         // The ungated corroboration must sit AFTER the engine submit (gate
         // MEDIUM-2) — assert on the construct: the corroboration flag is
@@ -4060,20 +4107,34 @@ mod tests {
         let needle = ["crate::ops::latch_net", "work_seen("].concat();
         assert_eq!(
             arm.matches(&needle).count(),
-            1,
-            "exactly ONE latch producer inside the pending arm"
+            0,
+            "the pending arm never latches on its own: the pending watch does, behind a live look"
         );
-        let wait_at = arm
-            .find("wait_until")
-            .expect("the pending latch is backgrounded");
-        let witness_at = arm
-            .find("network_witnessed(")
-            .expect("the pending latch is witness-guarded");
-        let latch_at = arm.find(&needle).expect("counted above");
         assert!(
-            wait_at < witness_at && witness_at < latch_at,
-            "the pending arm's latch must sit INSIDE wait_until and strictly AFTER \
-             the network_witnessed guard (wait@{wait_at} witness@{witness_at} latch@{latch_at})"
+            arm.contains("wait_until(crate::admit_fast::pending_watch_job("),
+            "the pending watch is backgrounded, inside wait_until"
+        );
+        // The job itself (admit_fast.rs): exactly one latch producer, strictly
+        // AFTER the Seen look that guards it; the eviction strictly after the
+        // evidence check.
+        let job_src = code_only(include_str!("admit_fast.rs"));
+        let job = &job_src[job_src
+            .find("pub async fn pending_watch_job(")
+            .expect("the watch job exists")..];
+        let job = &job[..job.find("\n}\n").expect("the job ends")];
+        assert_eq!(
+            job.matches(&needle).count(),
+            1,
+            "exactly ONE latch producer inside the pending watch"
+        );
+        let seen_at = job.find("WitnessLook::Seen(").expect("the Seen look");
+        let latch_at = job.find(&needle).expect("counted above");
+        let fatal_at = job.find("WitnessLook::Fatal(").expect("the Fatal look");
+        let evidence_at = job.find("evidence_check(").expect("the evidence check");
+        let evict_at = job.find("evict_txid_everywhere(").expect("the eviction");
+        assert!(
+            seen_at < latch_at && fatal_at < evidence_at && evidence_at < evict_at,
+            "latch after the Seen look (seen@{seen_at} latch@{latch_at}); eviction after the evidence check (fatal@{fatal_at} evidence@{evidence_at} evict@{evict_at})"
         );
     }
 

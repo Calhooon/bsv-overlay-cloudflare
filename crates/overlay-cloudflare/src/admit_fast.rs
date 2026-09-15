@@ -5,13 +5,13 @@
 //! Step 1 (this module + the `/arc-ingest` arms):
 //!   * `SEEN_ON_NETWORK` and above LATCH `network_seen` (today the status-only
 //!     callback only acknowledged; the witness came from the route's own poll).
-//!   * `DOUBLE_SPEND_ATTEMPTED` evicts AT ONCE (a competing spend the nodes
-//!     already hold is not a courier's opinion — zanaadu's rule).
-//!   * `REJECTED` / `SEEN_IN_ORPHAN_MEMPOOL` run the shared EVIDENCE CHECK after
-//!     the 200 (Arcade's LIVE word first — the bearer of `/arc-ingest` is the
-//!     public subject txid, so a stranger can plant any status — then BOTH
-//!     indexers' definitive absence: the #212/#213/#214 bar), and evict on a
-//!     corroborated refusal.
+//!   * `DOUBLE_SPEND_ATTEMPTED` / `REJECTED` / `SEEN_IN_ORPHAN_MEMPOOL` run the
+//!     shared EVIDENCE CHECK after the 200: Arcade's LIVE word first (the
+//!     bearer of `/arc-ingest` is the public subject txid, so a stranger can
+//!     plant any status), then BOTH indexers — a refusal is corroborated only
+//!     when Arcade's live word is fatal-or-missing AND both indexers say
+//!     absent (the #212/#213/#214 bar: a stale Arcade REJECTED of a tx an
+//!     indexer holds, the 2026-07-20/21 class, evicts nothing).
 //!   * A pushed MINED proof for an evicted txid READMITS it before the stitch:
 //!     the chain overrules a courier.
 //!
@@ -30,6 +30,14 @@
 //!
 //! Arcade names each subject on its own callback (a refused hop and its refused
 //! JOIN each get their own push), so no dependent cascade is computed here.
+//!
+//! Step 3 (`pending_watch_job`, behind `ADMIT_FAST`): `/submit(broadcast-gated)`
+//! ANSWERS on Arcade's synchronous accept (the door's script walk, then
+//! Arcade's validation) and admits PENDING; the SEEN witness that used to be
+//! polled on the wire is this module's PENDING WATCH in `ctx.wait_until` — a
+//! live look at 2..18 s: SEEN latches `network_seen` (counted, with its
+//! latency); a FATAL look runs the same evidence check and a corroborated
+//! refusal EVICTS; silence is counted and left to the callbacks and the passes.
 use crate::d1::{QVal, Query};
 use worker::D1Database;
 
@@ -396,20 +404,22 @@ pub fn evidence_verdict(
 ) -> EvidenceVerdict {
     use crate::proof_fetcher::{ArcadeLook, NetworkPresence};
     match arcade {
-        ArcadeLook::Fatal(status, extra) => {
-            EvidenceVerdict::Refused(format!("arcade live {status}: {extra}"))
-        }
         ArcadeLook::Present => EvidenceVerdict::Present,
-        ArcadeLook::Missing | ArcadeLook::Fault => {
+        // A refusal needs TWO sources: Arcade's live word (fatal, or not
+        // holding it) AND both indexers' definitive absence. One broadcaster's
+        // REJECTED is never the network's verdict (#214: Arcade held txs
+        // MINED in 958776 at a sticky REJECTED), and an indexer that holds
+        // the tx is a witness against the refusal.
+        ArcadeLook::Fatal(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
             match crate::proof_fetcher::classify_presence(bitails, woc) {
                 NetworkPresence::Present => EvidenceVerdict::Present,
-                NetworkPresence::Absent => {
-                    EvidenceVerdict::Refused(if matches!(arcade, ArcadeLook::Missing) {
-                        "arcade missing, both indexers absent".to_string()
-                    } else {
-                        "arcade faulted, both indexers absent".to_string()
-                    })
-                }
+                NetworkPresence::Absent => EvidenceVerdict::Refused(match arcade {
+                    ArcadeLook::Fatal(status, extra) => {
+                        format!("arcade live {status}: {extra}; both indexers absent")
+                    }
+                    ArcadeLook::Missing => "arcade missing, both indexers absent".to_string(),
+                    _ => "arcade faulted, both indexers absent".to_string(),
+                }),
                 NetworkPresence::Inconclusive => {
                     EvidenceVerdict::Uncertain("a courier faulted".to_string())
                 }
@@ -450,9 +460,9 @@ pub async fn evidence_check(
 ) -> EvidenceVerdict {
     let look = crate::proof_fetcher::arcade_look(&env.arcade_base, txid, Some(webhook)).await;
     let (bitails, woc) = match look {
-        crate::proof_fetcher::ArcadeLook::Fatal(..) | crate::proof_fetcher::ArcadeLook::Present => {
-            (None, None)
-        }
+        // Arcade holds it: nothing to corroborate. Every other word (fatal,
+        // missing, a fault) is one source; the indexers are the second.
+        crate::proof_fetcher::ArcadeLook::Present => (None, None),
         _ => {
             let b = crate::proof_fetcher::bitails_presence(
                 crate::proof_fetcher::DEFAULT_BITAILS_BASE,
@@ -529,10 +539,129 @@ pub async fn refusal_job(env: EvidenceEnv, txid: String, webhook: (String, Strin
     }
 }
 
+/// admit-fast step 3: when the pending watch LOOKS at Arcade after a pending
+/// admission — sleeps between looks, so the looks land at 2, 4, 6, 8, 11, 14
+/// and 18 s (≈ 20 s with the GETs: under the isolate's post-response
+/// ceiling; the old wire poll saw SEEN on its 4th 2-s look, we22).
+pub const PENDING_WATCH_SLEEPS_MS: [u64; 7] = [2_000, 2_000, 2_000, 2_000, 3_000, 3_000, 4_000];
+
+/// The PENDING WATCH behind a fast (or #397 pending) admission — the witness
+/// that used to be polled on the wire, in the background:
+///   * SEEN or better → `network_seen` latched, counted with its latency
+///     (`submit_pending_seen_ms_total / submit_pending_seen_latched_total`);
+///   * a FATAL look (REJECTED / DOUBLE_SPEND_ATTEMPTED) → the shared evidence
+///     check (Arcade live again, then both indexers) → a CORROBORATED refusal
+///     evicts everywhere (the shadow move), counted; an uncorroborated one is
+///     counted and kept (the callbacks and the passes own it);
+///   * an ORPHAN look keeps watching (the #413 dual push is feeding the parents
+///     to the second broadcaster meanwhile); still an orphan at the end → counted;
+///   * unknown / below SEEN → keep watching; silent at the end → counted.
+///
+/// Every look is one GET; the latch is the only write on the happy path.
+pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f64) {
+    let Ok(db) = env.env.d1("OVERLAY_DB") else {
+        worker::console_log!(
+            "[admit-fast] pending watch for {txid}: no OVERLAY_DB in the job; the passes own it"
+        );
+        return;
+    };
+    let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone());
+    let mut last = crate::broadcaster::WitnessLook::Unknown;
+    for sleep in PENDING_WATCH_SLEEPS_MS {
+        crate::broadcaster::sleep_ms(sleep).await;
+        last = arcade.witness_look(&txid).await;
+        match &last {
+            crate::broadcaster::WitnessLook::Seen(status) => {
+                crate::ops::latch_network_seen(&db, &txid).await;
+                let ms = (worker::js_sys::Date::now() - admitted_at_ms).max(0.0) as u64;
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_LATCHED, 1)
+                    .await;
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_MS, ms).await;
+                worker::console_log!(
+                    "[admit-fast] {txid} {status} {ms} ms after the admission — network_seen latched by the pending watch"
+                );
+                return;
+            }
+            crate::broadcaster::WitnessLook::Fatal(status, extra) => {
+                let now_ms = worker::Date::now().as_millis();
+                match evidence_check(&env, &txid, (status.clone(), extra.clone())).await {
+                    EvidenceVerdict::Refused(reason) => {
+                        let moved = evict_txid_everywhere(
+                            &db,
+                            &txid,
+                            &format!("{status} ({reason})"),
+                            now_ms,
+                        )
+                        .await;
+                        crate::ops::bump_counter(
+                            &db,
+                            crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,
+                            1,
+                        )
+                        .await;
+                        worker::console_log!(
+                            "[admit-fast] {txid} {status} CORROBORATED ({reason}) — evicted {moved} row(s) by the pending watch"
+                        );
+                    }
+                    EvidenceVerdict::Present => {
+                        crate::ops::bump_counter(
+                            &db,
+                            crate::ops::COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
+                            1,
+                        )
+                        .await;
+                        worker::console_log!(
+                            "[admit-fast] {txid} {status} NOT corroborated: a courier still holds it — kept (the #214 class)"
+                        );
+                    }
+                    EvidenceVerdict::Uncertain(why) => {
+                        crate::ops::bump_counter(
+                            &db,
+                            crate::ops::COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
+                            1,
+                        )
+                        .await;
+                        worker::console_log!(
+                            "[admit-fast] {txid} {status} UNCERTAIN ({why}) — kept, counted"
+                        );
+                    }
+                }
+                return;
+            }
+            crate::broadcaster::WitnessLook::Orphan(_)
+            | crate::broadcaster::WitnessLook::Pending(_)
+            | crate::broadcaster::WitnessLook::Unknown => {}
+        }
+    }
+    let name = if matches!(last, crate::broadcaster::WitnessLook::Orphan(_)) {
+        crate::ops::COUNTER_SUBMIT_PENDING_ORPHAN
+    } else {
+        crate::ops::COUNTER_SUBMIT_PENDING_SILENT
+    };
+    crate::ops::bump_counter(&db, name, 1).await;
+    worker::console_log!(
+        "[admit-fast] {txid} unwitnessed after the pending watch ({last:?}) — the callbacks, the completion and the reconcile passes own it"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proof_fetcher::ArcadeLook;
+
+    /// The watch fits the post-response budget (gate LOW-1: eviction of the
+    /// isolate must not silently skip the latch) and looks early (the old wire
+    /// poll's cadence: SEEN typically by the 4th 2-s look).
+    #[test]
+    fn the_pending_watch_fits_the_post_response_budget_and_looks_early() {
+        let total: u64 = PENDING_WATCH_SLEEPS_MS.iter().sum();
+        assert!(total <= 20_000, "{total} ms of sleeps");
+        assert_eq!(PENDING_WATCH_SLEEPS_MS[0], 2_000, "the first look at 2 s");
+        assert!(
+            PENDING_WATCH_SLEEPS_MS[..3].iter().all(|&s| s == 2_000),
+            "2-s cadence through 6 s"
+        );
+    }
 
     #[test]
     fn the_callback_decision_table() {
@@ -573,14 +702,35 @@ mod tests {
 
     #[test]
     fn the_evidence_verdict_never_evicts_on_one_courier_and_never_on_a_fault() {
+        // Arcade's live fatal word is ONE source: alone (the indexers not
+        // asked or faulting) it is uncertain, never a refusal.
         assert!(matches!(
             evidence_verdict(
                 &ArcadeLook::Fatal("REJECTED".into(), "x".into()),
                 None,
                 None
             ),
+            EvidenceVerdict::Uncertain(_)
+        ));
+        // Fatal + both indexers definitively absent: the corroborated refusal.
+        assert!(matches!(
+            evidence_verdict(
+                &ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "x".into()),
+                Some(false),
+                Some(false)
+            ),
             EvidenceVerdict::Refused(_)
         ));
+        // Fatal + an indexer HOLDS it: the #214 class (a stale Arcade
+        // REJECTED of a tx the network holds) — kept.
+        assert_eq!(
+            evidence_verdict(
+                &ArcadeLook::Fatal("REJECTED".into(), "x".into()),
+                Some(false),
+                Some(true)
+            ),
+            EvidenceVerdict::Present
+        );
         assert_eq!(
             evidence_verdict(&ArcadeLook::Present, Some(false), Some(false)),
             EvidenceVerdict::Present,

@@ -1303,15 +1303,20 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // merkle proofs arrive later and gate nothing).
     //
     // `network_seen`: one row per txid THIS OVERLAY ITSELF witnessed accepted
-    // by the network — WRITER CENSUS (review 2026-08-26; keep in lockstep
-    // with the routes latch pin, count 4): (a) the broadcast-gated submit arm
-    // on Arcade's SEEN_ON_NETWORK verdict, (b) the ungated arm's backgrounded
-    // Arcade corroboration (`GET /tx/{txid}` reaching SEEN-or-better, orphan
-    // excluded per #267), (c) the #397 AcceptedPending background re-check —
-    // latching only on a real network_witnessed answer, and (d) the #413
-    // dual-broadcast delivery latch — only on the corroborator's >=SEEN
-    // verdict of OUR OWN TAAL/GP broadcast. All four are broadcaster verdicts
-    // of overlay-performed broadcasts. NEVER written from
+    // by the network — WRITER CENSUS (review 2026-08-26; admit-fast
+    // 2026-09-15; keep in lockstep with the routes latch pin: 3 in routes.rs
+    // + 2 in admit_fast.rs): (a) the broadcast-gated submit arm on Arcade's
+    // SEEN_ON_NETWORK verdict, (b) the ungated arm's backgrounded Arcade
+    // corroboration (`GET /tx/{txid}` reaching SEEN-or-better, orphan
+    // excluded per #267), (c) the #413 dual-broadcast delivery latch — only
+    // on the corroborator's >=SEEN verdict of OUR OWN TAAL/GP broadcast,
+    // (d) the pending watch behind a pending / fast admission
+    // (`admit_fast::pending_watch_job`, replacing the #397 re-check) — only
+    // on a live Arcade look at SEEN-or-better, and (e) the callback's
+    // witness job (`admit_fast::witness_job`) — a SEEN+ push is only a
+    // trigger; Arcade LIVE must say SEEN+ before it latches (the public
+    // bearer). All five are broadcaster verdicts of overlay-performed
+    // broadcasts or live reads of Arcade's own word. NEVER written from
     // a caller's claim: a stranger's /submit cannot mint a row for a tx the
     // network has not seen, which is exactly why the app-layer may trust it
     // (epoch Rule 21: an attacker-planted spend pointer carries no seen-latch

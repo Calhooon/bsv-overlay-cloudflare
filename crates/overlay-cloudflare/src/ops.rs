@@ -138,6 +138,26 @@ pub const COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED: &str =
     "arc_ingest_refusal_uncorroborated_total";
 /// admit-fast: a SEEN+ push Arcade did NOT confirm live (kept unlatched; a plant or a stale word).
 pub const COUNTER_ARC_INGEST_PUSH_UNVERIFIED: &str = "arc_ingest_push_unverified_total";
+/// admit-fast step 3 (2026-09-15): gated submits ANSWERED on Arcade's
+/// synchronous accept (`ADMIT_FAST`), admitted PENDING (the witness in the
+/// background).
+pub const COUNTER_SUBMIT_FAST_ADMITTED: &str = "submit_fast_admitted_total";
+/// #397 pending admissions in the WITNESSED mode (a lagging tracker + an
+/// inconclusive corroborator on a proven-ancestry single leg).
+pub const COUNTER_SUBMIT_PENDING_ADMITTED: &str = "submit_pending_admitted_total";
+/// Pending admissions the pending watch saw SEEN (the latch), and their
+/// summed admission→SEEN milliseconds (the mean SEEN latency is the ratio).
+pub const COUNTER_SUBMIT_PENDING_SEEN_LATCHED: &str = "submit_pending_seen_latched_total";
+pub const COUNTER_SUBMIT_PENDING_SEEN_MS: &str = "submit_pending_seen_ms_total";
+/// Pending admissions the watch EVICTED on a corroborated refusal.
+pub const COUNTER_SUBMIT_PENDING_EVICTED: &str = "submit_pending_evicted_total";
+/// A fatal look the evidence check did not corroborate (kept; the #214 class).
+pub const COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED: &str =
+    "submit_pending_refusal_uncorroborated_total";
+/// Unwitnessed at the end of the watch: silent (unknown / below SEEN), or
+/// still an orphan view (the parents unseen by Arcade).
+pub const COUNTER_SUBMIT_PENDING_SILENT: &str = "submit_pending_silent_total";
+pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
 /// bsv-low M19 round 2 (review H2): an Arcade `reorg_unmined` marker whose
 /// spender's stored proof chaintracks still HOLDS: the hint changed nothing
 /// (a planted marker, or a stale one). Non-zero on a healthy stream is a
@@ -745,6 +765,27 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARCADE_REORG_CONTENDED: 0,
         COUNTER_ARCADE_REORG_BUDGET_STOPS: 0,
     });
+    // admit-fast (2026-09-15): the callback-trigger and pending-watch counters
+    // are served as 0 before their first bump (an absent key reads as an
+    // unknown, never as fine) — added here rather than in the literal above,
+    // which is at serde_json's `json!` recursion limit.
+    for name in [
+        COUNTER_ARC_INGEST_SEEN_LATCHED,
+        COUNTER_ARC_INGEST_EVICTED,
+        COUNTER_ARC_INGEST_READMITTED,
+        COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED,
+        COUNTER_ARC_INGEST_PUSH_UNVERIFIED,
+        COUNTER_SUBMIT_FAST_ADMITTED,
+        COUNTER_SUBMIT_PENDING_ADMITTED,
+        COUNTER_SUBMIT_PENDING_SEEN_LATCHED,
+        COUNTER_SUBMIT_PENDING_SEEN_MS,
+        COUNTER_SUBMIT_PENDING_EVICTED,
+        COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
+        COUNTER_SUBMIT_PENDING_SILENT,
+        COUNTER_SUBMIT_PENDING_ORPHAN,
+    ] {
+        obj[name] = json!(0);
+    }
     // 2026-09-04: every courier rung reads an explicit 0 until it is called.
     for rung in crate::proof_fetcher::COURIER_RUNGS {
         for kind in ["ok", "fault", "skipped"] {

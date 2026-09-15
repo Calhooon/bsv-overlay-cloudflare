@@ -85,6 +85,23 @@ struct ArcResponse {
     extra_info: String,
 }
 
+/// admit-fast: what ONE live Arcade look says about a fast-admitted subject
+/// (the pending watch's input; [`ArcadeBroadcaster::witness_look`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WitnessLook {
+    /// SEEN_ON_NETWORK or better: the network holds it (the #371 bar).
+    Seen(String),
+    /// REJECTED / DOUBLE_SPEND_ATTEMPTED (status, extra_info): the evidence
+    /// check decides, never this look alone.
+    Fatal(String, String),
+    /// An orphan view: Arcade cannot see the parents; a verdict neither way.
+    Orphan(String),
+    /// A lifecycle status below SEEN: keep watching.
+    Pending(String),
+    /// Arcade does not know it, answered about something else, or faulted.
+    Unknown,
+}
+
 /// The classified outcome of one ARC broadcast attempt (broadcast-gated
 /// submit, bsv-low overlay-first 2026-07-17).
 ///
@@ -1251,6 +1268,15 @@ enum GateStep {
     /// as a rejected tx. The ladder answers it by asking the SECOND
     /// broadcaster instead of waiting the lag out.
     AcceptedUnseen,
+    /// admit-fast (bsv-low 2026-09-15, the owner's admission model): Arcade
+    /// accepted the submit SYNCHRONOUSLY (2xx: the bytes validated and
+    /// queued, the echo below SEEN) and the broadcaster is in FAST-ANSWER
+    /// mode, so the gate returns NOW, before any poll. The caller admits
+    /// PENDING (`network_seen` unlatched) and the witness (the pending
+    /// watch, the callbacks, the #413 dual push) arrives in the background;
+    /// a corroborated refusal there EVICTS. Only ever produced when the
+    /// broadcaster's `fast_answer` is on (off by default).
+    SyncAccepted,
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
@@ -1406,6 +1432,12 @@ fn ladder_step(step: GateStep, subject_txid: &str) -> Ladder {
         // lagging tracker), not Ancestry (nothing says parents are missing) —
         // ask the second broadcaster.
         GateStep::AcceptedUnseen => Ladder::Unseen,
+        // admit-fast: the sync accept IS the answer — a PENDING admission
+        // (nothing witnessed it), never a witnessed accept, never a retry,
+        // never a corroboration on the wire: the background owns the rest.
+        GateStep::SyncAccepted => {
+            Ladder::Return(ArcOutcome::AcceptedPending(subject_txid.to_string()))
+        }
     }
 }
 
@@ -1788,6 +1820,10 @@ pub struct ArcadeBroadcaster {
     /// 15–16 s JOIN-submit budget must be attributable per slice: submit
     /// POSTs vs poll waits vs corroboration).
     poll_ms: std::cell::Cell<f64>,
+    /// admit-fast: answer the gate on Arcade's synchronous accept (no SEEN
+    /// poll on the wire). OFF by default — the route turns it on from the
+    /// derived `AdmitPolicy` (`ADMIT_FAST`).
+    fast_answer: bool,
 }
 
 impl ArcadeBroadcaster {
@@ -1805,7 +1841,19 @@ impl ArcadeBroadcaster {
             corroborator_taal_key: None,
             corroborate_ms: std::cell::Cell::new(0.0),
             poll_ms: std::cell::Cell::new(0.0),
+            fast_answer: false,
         }
+    }
+
+    /// admit-fast (bsv-low 2026-09-15): answer the gate on Arcade's
+    /// synchronous accept — `submit_once_and_gate` returns
+    /// [`GateStep::SyncAccepted`] on a 2xx whose echo is below SEEN instead of
+    /// polling; a fatal / orphan / already-SEEN echo still decides first. The
+    /// witness moves to the background (the route's pending watch).
+    #[must_use]
+    pub fn with_fast_answer(mut self, on: bool) -> Self {
+        self.fast_answer = on;
+        self
     }
 
     /// Register the MINED webhook (`X-CallbackUrl`), typically
@@ -2199,7 +2247,19 @@ impl ArcadeBroadcaster {
                             &parsed.extra_info,
                         )));
                     }
-                    GateVerdict::Pending => {}
+                    GateVerdict::Pending => {
+                        // admit-fast: a sync accept below SEEN IS the answer
+                        // when the fast answer is on — nothing polled on the
+                        // wire; the pending watch and the callbacks witness
+                        // it in the background.
+                        if self.fast_answer {
+                            worker::console_log!(
+                                "[arcade] {subject_txid} sync-accepted at {} — fast answer (admit-fast): the witness is the background's",
+                                parsed.tx_status
+                            );
+                            return Ok(GateStep::SyncAccepted);
+                        }
+                    }
                 }
             }
         }
@@ -2411,6 +2471,24 @@ impl ArcadeBroadcaster {
                     )
             }
             None => false,
+        }
+    }
+
+    /// admit-fast: ONE `GET /tx/{txid}` classified for the pending watch (the
+    /// background job behind a fast admission). The echoed txid must match
+    /// the asked one (gate L4), else `Unknown` — an upstream answering about
+    /// something else never witnesses, never condemns, OUR subject.
+    pub(crate) async fn witness_look(&self, txid: &str) -> WitnessLook {
+        match self.tx_status(txid).await {
+            Some(r) if r.txid.eq_ignore_ascii_case(txid) => {
+                match classify_arcade_status(&r.tx_status, ARCADE_GATE_STATUS) {
+                    GateVerdict::Reached => WitnessLook::Seen(r.tx_status),
+                    GateVerdict::Fatal => WitnessLook::Fatal(r.tx_status, r.extra_info),
+                    GateVerdict::Orphan => WitnessLook::Orphan(r.tx_status),
+                    GateVerdict::Pending => WitnessLook::Pending(r.tx_status),
+                }
+            }
+            _ => WitnessLook::Unknown,
         }
     }
 
@@ -3851,6 +3929,91 @@ mod tests {
         .await;
         let err = out.expect_err("provider conflict must not mint a 422");
         assert!(err.contains("CONFLICT"), "{err}");
+    }
+
+    // ── admit-fast (2026-09-15): the fast answer ─────────────────────────────
+
+    #[test]
+    fn ladder_returns_a_pending_admission_on_the_sync_accept() {
+        // The sync accept is an ANSWER (pending): never a witnessed accept,
+        // never a retry, never a corroboration on the wire.
+        assert_eq!(
+            ladder_step(GateStep::SyncAccepted, "subject"),
+            Ladder::Return(ArcOutcome::AcceptedPending("subject".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn wiring_fast_answer_admits_pending_after_one_rung_and_zero_corroborations() {
+        // Proven (1 leg) AND unproven (2 legs: the JOIN) ancestry alike: one
+        // graced subject-only rung, no corroborator on the wire, a pending
+        // admission. The witness and the eviction are the background's.
+        for efs_len in [1usize, 2] {
+            let rungs = std::cell::RefCell::new(Vec::new());
+            let kinds = std::cell::RefCell::new(Vec::new());
+            let out = broadcast_efs_gated_with(
+                efs_len,
+                "subject",
+                |rung| {
+                    rungs.borrow_mut().push(rung);
+                    async move { Ok(GateStep::SyncAccepted) }
+                },
+                |kind| {
+                    kinds.borrow_mut().push(kind);
+                    async { Ok(ArcOutcome::Accepted("subject".into())) }
+                },
+            )
+            .await;
+            assert_eq!(
+                out.unwrap(),
+                ArcOutcome::AcceptedPending("subject".into()),
+                "{efs_len} leg(s)"
+            );
+            assert_eq!(
+                *rungs.borrow(),
+                vec![SubmitRung::SubjectOnly { graced: true }]
+            );
+            assert!(
+                kinds.borrow().is_empty(),
+                "no corroboration on the wire ({efs_len} leg(s))"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fast_answer_is_off_by_default_and_sits_after_the_echo_verdict_before_the_poll() {
+        assert!(
+            !ArcadeBroadcaster::new("").fast_answer,
+            "off unless the route turns it on"
+        );
+        assert!(
+            ArcadeBroadcaster::new("")
+                .with_fast_answer(true)
+                .fast_answer
+        );
+        // Source pin: inside `submit_once_and_gate` the fast return lives in
+        // the echo's PENDING arm — after the Reached/Fatal/Orphan arms (a
+        // fatal or orphan or already-SEEN echo still decides) and before the
+        // poll, which the fast answer never reaches.
+        let src = include_str!("broadcaster.rs");
+        let f = &src[src.find("async fn submit_once_and_gate(").unwrap()..];
+        let f = &f[..f.find("async fn submit_ef(").unwrap()];
+        let reached = f
+            .find("GateVerdict::Reached =>")
+            .expect("the SEEN echo arm");
+        let fatal = f.find("GateVerdict::Fatal =>").expect("the fatal echo arm");
+        let orphan = f
+            .find("GateVerdict::Orphan =>")
+            .expect("the orphan echo arm");
+        let fast = f.find("if self.fast_answer").expect("the fast return");
+        let sync = f
+            .find("GateStep::SyncAccepted")
+            .expect("returns SyncAccepted");
+        let poll = f.find("self.poll_for_status(").expect("the poll");
+        assert!(
+            reached < fast && fatal < fast && orphan < fast && fast < sync && sync < poll,
+            "reached@{reached} fatal@{fatal} orphan@{orphan} fast@{fast} sync@{sync} poll@{poll}"
+        );
     }
 
     // ── #267: SEEN_IN_ORPHAN_MEMPOOL short-circuits to the ancestry rungs ───

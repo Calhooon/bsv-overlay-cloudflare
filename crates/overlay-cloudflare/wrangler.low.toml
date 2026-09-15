@@ -58,6 +58,10 @@ ENABLE_EXTENSIONS = "true"
 # executes nothing; the network alone judges) until the promotion flips it on
 # the owner's word. See [env.beta.vars] for what "true" does (bsv-low W-A, 2026-09-09).
 # SCRIPT_VERIFY_NETWORK_GATED = "true"
+# ADMIT_FAST — unset on PROD (the network witness stays on the wire: the
+# pre-2026-09-15 evidence gate) until the promotion flips it on the owner's
+# word. See [env.beta.vars] for what "true" does (admit-fast step 3).
+# ADMIT_FAST = "true"
 
 # ── /submit admission gating (bsv-low #347) ───────────────────────────────
 #
@@ -222,6 +226,16 @@ SUBMIT_ENFORCE = "true"
 # judges, the pre-2026-09-09 behaviour). BETA ON first; prod flips on the
 # owner's word at the promotion, after a full beta loop clean on it.
 SCRIPT_VERIFY_NETWORK_GATED = "true"
+# ADMIT_FAST — admit-fast step 3 (bsv-low 2026-09-15, the owner's admission
+# model, `docs/DESIGN-ADMIT-FAST-2026-09-15.md`): the gated arm ANSWERS on
+# Arcade's synchronous accept (after the door's script walk), admitting
+# PENDING; the SEEN witness (latched with its latency), the corroboration and
+# a CORROBORATED refusal's eviction everywhere run in the background (the
+# pending watch at 2..18 s, the callbacks, the #413 dual push). Only an
+# explicit "true" answers fast; anything else waits for the witness on the
+# wire (the pre-2026-09-15 gate). BETA ON first; prod on the owner's word at
+# the promotion, after a full beta loop clean on it.
+ADMIT_FAST = "true"
 
 [[env.beta.d1_databases]]
 binding = "OVERLAY_DB"
