@@ -2096,6 +2096,21 @@ pub fn pot_spent_statuses_sql(n: usize) -> String {
     )
 }
 
+/// admit-fast step 4: the pot's own network witness for a txid batch — one
+/// `IN` query over `network_seen` (the #371 latch table, txid PK; pinned
+/// against real SQLite). The txids are bound lowercase (the latch writes
+/// `lower(?)`).
+pub fn network_seen_batch_sql(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(", ");
+    format!("SELECT txid FROM network_seen WHERE txid IN ({placeholders})")
+}
+
+/// One `network_seen` row (the txid only).
+#[derive(serde::Deserialize)]
+struct NetworkSeenRow {
+    txid: String,
+}
+
 /// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
 /// GUARDED COMPARE-AND-SET that attaches a verdict to the pointer it was
 /// computed for — and touches NOTHING else. `WHERE … AND spendingTxid = ?`
@@ -2707,6 +2722,29 @@ impl PotStorage for D1PotStorage {
         Ok(outpoints
             .iter()
             .map(|(txid, output_index)| by_outpoint.get(&(txid.clone(), *output_index)).cloned())
+            .collect())
+    }
+
+    async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // D1 caps bound parameters (100); 1 per txid → chunks of 90.
+        const CHUNK: usize = 90;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for chunk in txids.chunks(CHUNK) {
+            let mut q = Query::new(network_seen_batch_sql(chunk.len()));
+            for txid in chunk {
+                q = q.bind(txid.to_ascii_lowercase());
+            }
+            let rows: Vec<NetworkSeenRow> = q.fetch_all(&self.db).await.map_err(pot_err)?;
+            for row in rows {
+                seen.insert(row.txid.to_ascii_lowercase());
+            }
+        }
+        Ok(txids
+            .iter()
+            .map(|t| seen.contains(&t.to_ascii_lowercase()))
             .collect())
     }
 
@@ -8587,6 +8625,36 @@ mod tests {
             "exactly the requested present outpoints — no txid-only matches, \
              no phantom rows"
         );
+    }
+
+    /// admit-fast step 4: the witness batch query answers exactly the latched
+    /// txids among those asked, on the real schema.
+    #[test]
+    fn network_seen_batch_sql_selects_exact_txids_real_sqlite() {
+        let conn = production_schema_db();
+        conn.execute(
+            "INSERT INTO network_seen (txid, seenAt) VALUES (?1, 1)",
+            [h64(0xaa)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO network_seen (txid, seenAt) VALUES (?1, 2)",
+            [h64(0xcc)],
+        )
+        .unwrap();
+        let sql = network_seen_batch_sql(3);
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("the witness batch SQL must parse on real SQLite");
+        let mut rows: Vec<String> = stmt
+            .query_map(rusqlite::params![h64(0xaa), h64(0xbb), h64(0xdd)], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![h64(0xaa)], "only the asked-and-latched txid");
     }
 
     // ── #282: result_markers_v2 windows + proof oldest-first ─────────────

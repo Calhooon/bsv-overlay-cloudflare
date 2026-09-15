@@ -1169,6 +1169,7 @@ async fn submit_inner(
             if let (false, Ok(dual_db)) = (dual_legs.is_empty(), env.d1("OVERLAY_DB")) {
                 let dual_key = taal_api_key.clone();
                 let dual_txid = subject_txid.clone();
+                let dual_env = env.clone();
                 ctx.wait_until(async move {
                     let mut subject_outcome: Result<crate::broadcaster::ArcOutcome, String> =
                         Err("subject leg never pushed".to_string());
@@ -1182,6 +1183,8 @@ async fn submit_inner(
                     match subject_outcome {
                         Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => {
                             crate::ops::latch_network_seen(&dual_db, &dual_txid).await;
+                            // step 4: a background latch ships its own push.
+                            crate::pot_changes::flush_inline(dual_env).await;
                             worker::console_log!(
                                 "[#413] dual-broadcast delivered {dual_txid} (TAAL >=SEEN) — network_seen latched"
                             );
@@ -1703,6 +1706,7 @@ async fn submit_inner(
             let beef_for_seen = tagged_beef.beef.clone();
             let seen_arcade =
                 crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
+            let seen_env = env.clone();
             ctx.wait_until(async move {
                 // The same subject rule as the gate (loop-2 hardening): a
                 // bare `from_beef(_, None)` takes the wire-last tx, which an
@@ -1716,6 +1720,8 @@ async fn submit_inner(
                 if let Ok(subject) = subject {
                     if seen_arcade.network_witnessed(&subject).await {
                         crate::ops::latch_network_seen(&seen_db, &subject).await;
+                        // step 4: a background latch ships its own push.
+                        crate::pot_changes::flush_inline(seen_env).await;
                     }
                 }
             });
@@ -4137,6 +4143,74 @@ mod tests {
         assert!(
             seen_at < latch_at && fatal_at < evidence_at && evidence_at < evict_at,
             "latch after the Seen look (seen@{seen_at} latch@{latch_at}); eviction after the evidence check (fatal@{fatal_at} evidence@{evidence_at} evict@{evict_at})"
+        );
+    }
+
+    /// admit-fast step 4: every BACKGROUND latch producer ships its own
+    /// pots-room push (`pot_changes::flush_inline`) strictly after its latch —
+    /// the route's end-of-request flush has already drained by the time a
+    /// `wait_until` job latches. The in-request gated Accepted arm rides the
+    /// route's own flush (pinned by order below).
+    #[test]
+    fn background_latchers_flush_the_pot_change_inline() {
+        let needle = ["crate::ops::latch_net", "work_seen("].concat();
+        let flush = "crate::pot_changes::flush_inline(";
+        let src = code_only(include_str!("routes.rs"));
+        // The two background producers here: the ungated corroboration
+        // closure (`seen_env`) and the #413 dual push (`dual_env`).
+        for (label, start_marker) in [
+            ("ungated corroboration", "let seen_env = env.clone();"),
+            ("dual push", "let dual_env = env.clone();"),
+        ] {
+            let start = src
+                .find(start_marker)
+                .unwrap_or_else(|| panic!("{label}: env captured"));
+            let block = &src[start..];
+            let latch = block
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{label}: latches"));
+            let fl = block
+                .find(flush)
+                .unwrap_or_else(|| panic!("{label}: flushes"));
+            assert!(
+                latch < fl && fl - latch < 400,
+                "{label}: flush right after the latch"
+            );
+        }
+        // The in-request producer (the gated Accepted arm) sits BEFORE the
+        // route's own flush, which ships it.
+        let gated = src
+            .find("broadcast-gated(arcade): network accepted")
+            .expect("the gated arm");
+        // The /submit route's own flush is the first one AFTER the gated arm
+        // (other handlers flush earlier in this file).
+        assert!(
+            src[gated..].contains("crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));"),
+            "the /submit route's flush follows the gated latch"
+        );
+        // And in admit_fast.rs: both jobs flush right after their latch.
+        let jobs = code_only(include_str!("admit_fast.rs"));
+        let jobs = &jobs[..jobs.find("#[cfg(test)]").unwrap_or(jobs.len())];
+        let mut from = 0;
+        let mut n = 0;
+        while let Some(i) = jobs[from..].find(&needle) {
+            let at = from + i;
+            let tail = &jobs[at..];
+            let fl = tail
+                .find(flush)
+                .expect("a job latch is followed by a flush");
+            assert!(fl < 400, "the flush sits right after the latch (at {fl})");
+            n += 1;
+            from = at + needle.len();
+        }
+        assert_eq!(n, 2, "the callback witness job and the pending watch");
+        // The latch itself notes every pot row of the txid (the push's key).
+        let ops = code_only(include_str!("ops.rs"));
+        let latch_fn = &ops[ops.find("pub async fn latch_network_seen(").unwrap()..];
+        let latch_fn = &latch_fn[..latch_fn.find("\n}\n").unwrap()];
+        assert!(
+            latch_fn.contains("crate::pot_changes::note(txid, row.output_index)"),
+            "the latch notes the pot rows"
         );
     }
 

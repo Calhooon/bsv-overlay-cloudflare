@@ -505,10 +505,18 @@ impl LookupService for PotLookupService {
             .get_spent_statuses(&keys)
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+        // admit-fast step 4: the pot's OWN network witness (the overlay's
+        // broadcaster-witnessed SEEN latch, D3) — one batched read, aligned.
+        let txids: Vec<String> = keys.iter().map(|(t, _)| t.clone()).collect();
+        let witnessed = self
+            .storage
+            .network_seen_for(&txids)
+            .await
+            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
         // Build an input-ordered array: one entry per requested outpoint.
         let mut entries = Vec::with_capacity(outpoints.len());
-        for (op, record) in outpoints.iter().zip(records) {
+        for ((op, record), seen) in outpoints.iter().zip(records).zip(witnessed) {
             // Fail-safe: an outpoint we never admitted is `known:false` with
             // null spent/spendingTxid/spentConfirmed — never assert
             // "unspent" for an output we never saw.
@@ -554,6 +562,13 @@ impl LookupService for PotLookupService {
                 // #406 (ADDITIVE): who signed the recorded spend — 'coop' /
                 // 'tower-a' / 'tower-b', null = not established.
                 "settleSigners": settle_signers,
+                // admit-fast step 4 (ADDITIVE): has the overlay itself
+                // witnessed the network holding THIS tx (the #371 latch —
+                // never a caller claim)? null for an outpoint we never
+                // admitted. Under admit-fast an admitted pot can be
+                // unwitnessed for seconds: the felt says "awaiting the
+                // network" until this flips, from the pots-room push.
+                "networkSeen": if known { serde_json::Value::Bool(seen) } else { serde_json::Value::Null },
             }));
         }
 
@@ -805,6 +820,50 @@ mod tests {
         .await;
         assert_eq!(arr[0]["known"], true);
         assert_eq!(arr[0]["spent"], false);
+    }
+
+    /// admit-fast step 4: `spentStatus` serves the pot's OWN network witness —
+    /// `true` once the overlay latched it, `false` for an admitted-but-
+    /// unwitnessed pot (the fast admission's window), `null` for an outpoint
+    /// never admitted (never "seen" for something we never saw).
+    #[tokio::test]
+    async fn spent_status_serves_the_pots_own_network_witness() {
+        let (svc, storage) = make_service_with_storage();
+        let seen = funding_tx(1);
+        let unseen = funding_tx(2);
+        let seen_txid = seen.id();
+        let unseen_txid = unseen.id();
+        svc.output_admitted_by_topic(&admit(beef_of(&seen), 0))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit(beef_of(&unseen), 0))
+            .await
+            .unwrap();
+        storage.mark_network_seen(&seen_txid.to_ascii_uppercase());
+        let arr = spent_status(
+            &svc,
+            serde_json::json!([
+                {"txid": seen_txid, "vout": 0},
+                {"txid": unseen_txid, "vout": 0},
+                {"txid": "ab".repeat(32), "vout": 0},
+            ]),
+        )
+        .await;
+        assert_eq!(arr[0]["known"], true);
+        assert_eq!(
+            arr[0]["networkSeen"], true,
+            "the latched pot is witnessed (case-insensitive)"
+        );
+        assert_eq!(arr[1]["known"], true);
+        assert_eq!(
+            arr[1]["networkSeen"], false,
+            "admitted, unwitnessed: the fast window"
+        );
+        assert_eq!(arr[2]["known"], false);
+        assert!(
+            arr[2]["networkSeen"].is_null(),
+            "never admitted: never a witness"
+        );
     }
 
     #[tokio::test]

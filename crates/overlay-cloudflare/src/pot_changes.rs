@@ -142,21 +142,30 @@ mod tests {
         assert!(drain().is_empty());
     }
 
-    /// SOURCE PIN (2026-09-04): every detached pot-writing task in routes.rs
-    /// ships its own notes. The signers self-heal is the one such task today;
-    /// a second `backfill_settle_signers(&storage` under `wait_until` without
-    /// a matching `flush_inline` re-opens the stranded-note hole.
+    /// SOURCE PIN (2026-09-04; admit-fast step 4, 2026-09-15): every detached
+    /// pot-writing task in routes.rs ships its own notes. Three such tasks:
+    /// the signers self-heal (`backfill_settle_signers(&storage`), and — since
+    /// the `network_seen` latch notes the pot rows it witnesses — the two
+    /// background latchers, the ungated corroboration closure (`seen_env`)
+    /// and the #413 dual push (`dual_env`). A fourth detached writer without a
+    /// matching `flush_inline` re-opens the stranded-note hole.
     #[test]
     fn every_detached_pot_writing_task_ships_its_own_notes() {
         let routes = include_str!("routes.rs");
+        // Production code only: the route tests carry these needles as literals.
+        let routes = &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())];
         let heals = routes.matches("backfill_settle_signers(&storage").count();
+        let latchers = routes.matches("let seen_env = env.clone();").count()
+            + routes.matches("let dual_env = env.clone();").count();
         let inline = routes.matches("pot_changes::flush_inline(").count();
         assert!(
             heals >= 1,
             "the signers self-heal task moved — re-point this pin"
         );
+        assert_eq!(latchers, 2, "the two background latchers capture the env");
         assert_eq!(
-            heals, inline,
+            heals + latchers,
+            inline,
             "a detached task writes pot rows without shipping its own notes (see flush_inline)"
         );
     }

@@ -370,6 +370,18 @@ pub trait PotStorage {
         Ok(out)
     }
 
+    /// admit-fast step 4 (bsv-low 2026-09-15): the pot's OWN network witness
+    /// — the overlay's broadcaster-witnessed SEEN latch (`network_seen`, D3)
+    /// — for a batch of txids, ALIGNED index-for-index with the input. The
+    /// default answers "unwitnessed" for every txid (a store without the latch
+    /// table); the D1 backend answers from `network_seen` in one query per
+    /// chunk. Served on `ls_pot spentStatus` as `networkSeen` so a felt can say
+    /// "broadcast, awaiting the network" → "seen" from the pots-room push,
+    /// never from a poll.
+    async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
+        Ok(vec![false; txids.len()])
+    }
+
     /// Spent-but-UNCONFIRMED pot records — the spend-confirmation chaser's
     /// candidate set (#186).
     ///
@@ -981,6 +993,9 @@ pub struct MemoryPotStorage {
     /// D1's `rowid` (the windowed walks' tie-break and cursor).
     ordinals: std::sync::Mutex<std::collections::HashMap<(String, u32), i64>>,
     next_ordinal: std::sync::Mutex<i64>,
+    /// admit-fast step 4: the txids this store reports as network-witnessed
+    /// (`network_seen_for`); `mark_network_seen` is the test hook.
+    network_seen: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The persisted walk states (`reorg_sweep_state`).
     sweep_states:
         std::sync::Mutex<std::collections::HashMap<String, crate::pot::reorg::SweepState>>,
@@ -1019,6 +1034,14 @@ impl MemoryPotStorage {
 
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
+    }
+
+    /// admit-fast step 4: report `txid` as network-witnessed (the latch).
+    pub fn mark_network_seen(&self, txid: &str) {
+        self.network_seen
+            .lock()
+            .unwrap()
+            .insert(txid.to_ascii_lowercase());
     }
 
     pub fn beef_count(&self) -> usize {
@@ -1124,6 +1147,14 @@ impl MemoryPotStorage {
 
 #[async_trait(?Send)]
 impl PotStorage for MemoryPotStorage {
+    async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
+        let seen = self.network_seen.lock().unwrap();
+        Ok(txids
+            .iter()
+            .map(|t| seen.contains(&t.to_ascii_lowercase()))
+            .collect())
+    }
+
     async fn find_unspent_stale(
         &self,
         limit: u64,

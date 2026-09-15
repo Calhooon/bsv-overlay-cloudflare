@@ -494,6 +494,8 @@ pub async fn witness_job(env: EvidenceEnv, txid: String, pushed_status: String) 
     let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone());
     if arcade.network_witnessed(&txid).await {
         crate::ops::latch_network_seen(&db, &txid).await;
+        // step 4: a background latch ships its own pots-room push.
+        crate::pot_changes::flush_inline(env.env.clone()).await;
         crate::ops::bump_counter(&db, crate::ops::COUNTER_ARC_INGEST_SEEN_LATCHED, 1).await;
         worker::console_log!(
             "[admit-fast] {txid} {pushed_status}: verified live — network_seen latched by the push"
@@ -573,6 +575,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
         match &last {
             crate::broadcaster::WitnessLook::Seen(status) => {
                 crate::ops::latch_network_seen(&db, &txid).await;
+                // step 4: a background latch ships its own pots-room push.
+                crate::pot_changes::flush_inline(env.env.clone()).await;
                 let ms = (worker::js_sys::Date::now() - admitted_at_ms).max(0.0) as u64;
                 crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_LATCHED, 1)
                     .await;

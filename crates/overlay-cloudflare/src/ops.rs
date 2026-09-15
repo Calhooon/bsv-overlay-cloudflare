@@ -511,7 +511,32 @@ pub async fn latch_network_seen(db: &D1Database, txid: &str) {
     let q = Query::new(NETWORK_SEEN_INSERT_SQL).bind(txid);
     if let Err(e) = q.execute(db).await {
         worker::console_log!("[#371] network_seen latch failed for {txid}: {e}");
+        return;
     }
+    // admit-fast step 4: the witness is a pot fact the felt renders
+    // ("awaiting the network" → "seen"), so every pot row of the txid is
+    // NOTED for the pots-room push (`ls_pot spentStatus.networkSeen`). The
+    // caller ships the note: the route's end-of-request flush for an
+    // in-request latch, `pot_changes::flush_inline` from a background job.
+    // A non-pot txid (a hop, a settle) has no row and notes nothing.
+    let rows: Vec<PotVoutRow> = Query::new(NETWORK_SEEN_POT_ROWS_SQL)
+        .bind(txid)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    for row in rows {
+        crate::pot_changes::note(txid, row.output_index);
+    }
+}
+
+/// The pot rows a witnessed txid funds (admit-fast step 4; pinned).
+pub const NETWORK_SEEN_POT_ROWS_SQL: &str =
+    "SELECT outputIndex FROM pot_records WHERE txid = lower(?)";
+
+#[derive(Deserialize)]
+struct PotVoutRow {
+    #[serde(rename = "outputIndex")]
+    output_index: u32,
 }
 
 pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
