@@ -97,6 +97,7 @@ fn pots_view_rows(conn: &Connection, ops: &[Outpoint], era: Option<i64>) -> Vec<
                     spent_confirmed: r.get::<_, i64>("spentConfirmed")? != 0,
                     spender_final: None,
                     spender_seen: None,
+                    funding_seen: None,
                 },
                 spender_beef_hex: r.get("spenderBeef")?,
             })

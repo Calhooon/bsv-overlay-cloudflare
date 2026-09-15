@@ -171,6 +171,10 @@ pub struct OutpointStatus {
     /// fallback, never a positive.
     pub spender_seen: Option<bool>,
     pub spender_final: Option<bool>,
+    /// admit-fast step 4: the overlay's own witness that the network holds
+    /// the FUNDING (`network_seen` on the pot txid). Present on the D1 batch
+    /// path (null elsewhere and for an unknown outpoint).
+    pub funding_seen: Option<bool>,
     /// WHY this answer is `known:false` — `None` on every `known:true` row
     /// and on the D1-backed `/utxo-status` path (where absence genuinely
     /// means "no row"). Set by `/spent-any` so an upstream OUTAGE is legible
@@ -212,6 +216,7 @@ impl OutpointStatus {
             spent_confirmed: None,
             spender_seen: None,
             spender_final: None,
+            funding_seen: None,
             reason: None,
         }
     }
@@ -234,7 +239,7 @@ impl OutpointStatus {
         spending_txid: Option<String>,
         spent_confirmed: bool,
     ) -> Self {
-        Self::known_with_witness(op, spent, spending_txid, spent_confirmed, None, None)
+        Self::known_with_witness(op, spent, spending_txid, spent_confirmed, None, None, None)
     }
 
     /// [`Self::known`] carrying the #371 witness pair (the D1 batch read's
@@ -247,6 +252,7 @@ impl OutpointStatus {
         spent_confirmed: bool,
         spender_seen: Option<bool>,
         spender_final: Option<bool>,
+        funding_seen: Option<bool>,
     ) -> Self {
         Self {
             txid: op.txid.clone(),
@@ -257,6 +263,7 @@ impl OutpointStatus {
             spent_confirmed: Some(spent_confirmed),
             spender_seen,
             spender_final,
+            funding_seen,
             reason: None,
         }
     }
@@ -285,6 +292,12 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
                 // neither. Additive: existing consumers ignore unknown keys.
                 "spenderSeen": e.spender_seen,
                 "spenderFinal": e.spender_final,
+                // admit-fast step 4 (ADDITIVE): has the overlay itself witnessed
+                // the network holding the FUNDING? Under admit-fast a pot is
+                // admitted on Arcade's synchronous accept and witnessed seconds
+                // later — the felt says "awaiting the network" until this
+                // flips (`potWitness.ts`). null for an unknown outpoint.
+                "networkSeen": e.funding_seen,
                 // #323 defect 2 — present only when this surface could not
                 // verify an answer; null everywhere else (including every
                 // known:true row and the whole D1 /utxo-status path).
@@ -307,12 +320,18 @@ pub fn batch_where_sql(n: usize) -> String {
     // overlay's OWN network witness, so the leaderboard's counting bar can
     // accept a SEEN covenant settle — the network already validated the
     // covenant spend; an invalid one would never be relayed.
+    // admit-fast step 4 (2026-09-15): the pot's OWN witness rides the same
+    // row (`fundingSeen`: the overlay latched the FUNDING txid as network-seen)
+    // — under admit-fast a pot is admitted on Arcade's synchronous accept and
+    // witnessed seconds later; the felt says "awaiting the network" until then.
     format!(
         "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
-                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen \
+                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen, \
+                fs.txid IS NOT NULL AS fundingSeen \
          FROM pot_records p \
          LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
               AND ns.txid = lower(p.spendingTxid) \
+         LEFT JOIN network_seen fs ON fs.txid = lower(p.txid) \
          WHERE {clause}"
     )
 }
@@ -331,6 +350,10 @@ pub struct PotRecordRow {
     /// and the overlay's own `network_seen` witness for the recorded spender.
     pub spender_final: Option<bool>,
     pub spender_seen: Option<bool>,
+    /// admit-fast step 4: the funding's own witness (`fundingSeen`); None off
+    /// the D1 batch path (every test/fixture row that predates it).
+    #[allow(dead_code)]
+    pub funding_seen: Option<bool>,
 }
 
 /// Map the batch-query rows back onto the REQUESTED outpoints, input-ordered.
@@ -352,6 +375,7 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
                     r.spent_confirmed,
                     r.spender_seen,
                     r.spender_final,
+                    r.funding_seen,
                 ),
                 None => OutpointStatus::unknown(op),
             }
@@ -2771,6 +2795,7 @@ mod tests {
                 false,
                 Some(true),  // spenderSeen — ARC SEEN_ON_NETWORK
                 Some(false), // spenderFinal
+                Some(true),  // fundingSeen — admit-fast step 4
             ),
             OutpointStatus::known(&op_a, false, None, false),
             OutpointStatus::unknown(&op_b),
@@ -2791,6 +2816,14 @@ mod tests {
             "the #371 network-seen witness reaches the wire"
         );
         assert_eq!(arr[0]["spenderFinal"], false);
+        assert_eq!(
+            arr[0]["networkSeen"], true,
+            "admit-fast step 4: the funding's own witness reaches the wire"
+        );
+        assert!(
+            arr[1]["networkSeen"].is_null() && arr[2]["networkSeen"].is_null(),
+            "no witness for a non-D1 producer or an unknown outpoint — never a positive"
+        );
         // Known-unspent row: no witness (produced by `known`, not the D1 path).
         assert_eq!(arr[1]["known"], true);
         assert_eq!(arr[1]["spent"], false);
@@ -2829,10 +2862,12 @@ mod tests {
         assert_eq!(
             batch_where_sql(1),
             "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
-                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen \
+                p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen, \
+                fs.txid IS NOT NULL AS fundingSeen \
          FROM pot_records p \
          LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
               AND ns.txid = lower(p.spendingTxid) \
+         LEFT JOIN network_seen fs ON fs.txid = lower(p.txid) \
          WHERE (p.txid = ? AND p.outputIndex = ?)"
         );
         let three = batch_where_sql(3);
@@ -2869,6 +2904,7 @@ mod tests {
                 spent: false,
                 spending_txid: None,
                 spent_confirmed: false,
+                funding_seen: None,
             },
             PotRecordRow {
                 spender_final: None,
@@ -2878,6 +2914,7 @@ mod tests {
                 spent: true,
                 spending_txid: Some("f0".repeat(32)),
                 spent_confirmed: true,
+                funding_seen: None,
             },
         ];
         let out = assemble_statuses(&ops, &rows);
@@ -2913,6 +2950,7 @@ mod tests {
             spent: true,
             spending_txid: None,
             spent_confirmed: false,
+            funding_seen: None,
         }];
         let out = assemble_statuses(&ops, &rows);
         assert!(out[0].known);
@@ -3082,6 +3120,7 @@ mod tests {
                     spent: true,
                     spending_txid: Some(spender.clone()),
                     spent_confirmed: true,
+                    funding_seen: None,
                 },
                 spender_beef_hex: Some(beef_hex_upper),
             },
@@ -3094,6 +3133,7 @@ mod tests {
                     spent: true,
                     spending_txid: Some(spender.clone()),
                     spent_confirmed: false,
+                    funding_seen: None,
                 },
                 spender_beef_hex: None,
             },
@@ -3106,6 +3146,7 @@ mod tests {
                     spent: false,
                     spending_txid: None,
                     spent_confirmed: false,
+                    funding_seen: None,
                 },
                 spender_beef_hex: None,
             },
@@ -3151,6 +3192,7 @@ mod tests {
                 spent: true,
                 spending_txid: Some("f0".repeat(32)),
                 spent_confirmed: true,
+                funding_seen: None,
             },
             spender_beef_hex: Some("not-hex!!".to_string()),
         }];
@@ -4113,6 +4155,7 @@ mod tests {
                         spent: true,
                         spending_txid: Some(tx(*settle)),
                         spent_confirmed: confirmed,
+                        funding_seen: None,
                     });
                 }
             }
@@ -4182,6 +4225,7 @@ mod tests {
                         spent: true,
                         spending_txid: Some(tx(*settle)),
                         spent_confirmed: true,
+                        funding_seen: None,
                     });
                 }
             }
@@ -4846,6 +4890,7 @@ mod tests {
                             spent: true,
                             spending_txid: Some(tx(*settle)),
                             spent_confirmed: true,
+                            funding_seen: None,
                         });
                     }
                 }

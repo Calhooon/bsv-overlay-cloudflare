@@ -224,6 +224,9 @@ struct PotRowD1 {
     spender_final: Option<f64>,
     #[serde(rename = "spenderSeen", default)]
     spender_seen: Option<f64>,
+    /// admit-fast step 4: `fundingSeen` (the pot's own witness).
+    #[serde(rename = "fundingSeen", default)]
+    funding_seen: Option<f64>,
 }
 
 impl PotRowD1 {
@@ -236,6 +239,7 @@ impl PotRowD1 {
             spent_confirmed: self.spent_confirmed != 0.0,
             spender_final: self.spender_final.map(|v| v != 0.0),
             spender_seen: self.spender_seen.map(|v| v != 0.0),
+            funding_seen: self.funding_seen.map(|v| v != 0.0),
         }
     }
 }
@@ -626,6 +630,7 @@ impl PotsViewRowD1 {
                 // #371 witness pair stays absent (strict bar) here.
                 spender_final: None,
                 spender_seen: None,
+                funding_seen: None,
             },
             spender_beef_hex: self.spender_beef,
         }
@@ -4150,6 +4155,7 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Re
             spender_seen: None,
             spender_final: None,
             reason: row.reason,
+            funding_seen: None,
         });
     }
 
