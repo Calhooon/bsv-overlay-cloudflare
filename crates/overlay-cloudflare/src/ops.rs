@@ -127,6 +127,17 @@ pub const COUNTER_ARC_INGEST_REORG_EVENTS: &str = "arc_ingest_reorg_events_total
 /// named a different block than the stored confirmation (a re-anchor is a
 /// REPLACEMENT, never a `cas_missed`).
 pub const COUNTER_ARC_INGEST_REANCHORED: &str = "arc_ingest_reanchored_total";
+/// admit-fast (2026-09-15): a SEEN+ callback latched `network_seen` (the witness by push).
+pub const COUNTER_ARC_INGEST_SEEN_LATCHED: &str = "arc_ingest_seen_latched_total";
+/// admit-fast: a txid evicted everywhere (a double spend at once, or a corroborated refusal).
+pub const COUNTER_ARC_INGEST_EVICTED: &str = "arc_ingest_evicted_total";
+/// admit-fast: an evicted txid readmitted on a pushed proof (the chain overruled a courier).
+pub const COUNTER_ARC_INGEST_READMITTED: &str = "arc_ingest_readmitted_total";
+/// admit-fast: a refusal callback the evidence check did NOT corroborate (kept; a plant or a stale word).
+pub const COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED: &str =
+    "arc_ingest_refusal_uncorroborated_total";
+/// admit-fast: a SEEN+ push Arcade did NOT confirm live (kept unlatched; a plant or a stale word).
+pub const COUNTER_ARC_INGEST_PUSH_UNVERIFIED: &str = "arc_ingest_push_unverified_total";
 /// bsv-low M19 round 2 (review H2): an Arcade `reorg_unmined` marker whose
 /// spender's stored proof chaintracks still HOLDS: the hint changed nothing
 /// (a planted marker, or a stale one). Non-zero on a healthy stream is a

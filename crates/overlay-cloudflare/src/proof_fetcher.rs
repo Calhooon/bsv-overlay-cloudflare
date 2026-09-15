@@ -3105,7 +3105,7 @@ fn rebroadcast_legs(beef: &[u8]) -> Option<(String, Vec<RebroadcastLeg>)> {
 
 /// Bitails `GET /tx/{txid}` presence: `Some(true)` on 2xx, `Some(false)` on
 /// a definitive 404, `None` on anything else (fault — never a verdict).
-async fn bitails_presence(base: &str, txid: &str) -> Option<bool> {
+pub(crate) async fn bitails_presence(base: &str, txid: &str) -> Option<bool> {
     let url = format!("{}/tx/{}", base.trim_end_matches('/'), txid);
     match http_get(&url, None).await {
         Ok((status, _)) if (200..300).contains(&status) => Some(true),
@@ -3115,7 +3115,7 @@ async fn bitails_presence(base: &str, txid: &str) -> Option<bool> {
 }
 
 /// WoC `GET /tx/hash/{txid}` presence — same three-way contract.
-async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<bool> {
+pub(crate) async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<bool> {
     let url = format!("{}/tx/hash/{}", base.trim_end_matches('/'), txid);
     let hdr = api_key.map(|k| ("woc-api-key", k));
     match http_get(&url, hdr).await {
@@ -3449,7 +3449,7 @@ pub fn retire_verdict(
 /// finding MEDIUM, 2026-09-01). With the live GET first, a plant changes
 /// nothing while Arcade answers, and behind an Arcade outage the
 /// both-indexer absence bar still stands between it and a retire.
-async fn arcade_look(
+pub(crate) async fn arcade_look(
     arcade_base: &str,
     txid: &str,
     webhook_evidence: Option<(String, String)>,

@@ -2113,6 +2113,10 @@ pub async fn arc_ingest(
     tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     ops_db: Option<&worker::D1Database>,
+    // admit-fast (2026-09-15): what the deferred evidence check needs, and the
+    // post-response budget it runs in (`ctx.wait_until`).
+    evidence: crate::admit_fast::EvidenceEnv,
+    spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>),
 ) -> worker::Result<Response> {
     // Read the bearer credential BEFORE consuming the body. BOTH accepted
     // spellings: `Authorization: Bearer <token>` is what Arcade V2 actually
@@ -2208,6 +2212,32 @@ pub async fn arc_ingest(
                     hint.demoted, hint.uncorroborated, hint.no_stored_proof, hint.faults, hint.errors
                 );
             }
+            // admit-fast (2026-09-15): the callback is the WITNESS path. SEEN+
+            // latches `network_seen` (the money views' gate); a double spend the
+            // nodes already hold evicts everywhere at once; a rejection or an
+            // orphan verdict is corroborated (Arcade live first, then both
+            // indexers) in the post-response budget and evicts only then.
+            let af_now = worker::Date::now().as_millis();
+            match crate::admit_fast::callback_action(&tx_status) {
+                crate::admit_fast::CallbackAction::LatchSeen => {
+                    let job_txid = txid.clone();
+                    let job_env = evidence.clone();
+                    let pushed = tx_status.clone();
+                    spawn(Box::pin(async move {
+                        crate::admit_fast::witness_job(job_env, job_txid, pushed).await;
+                    }));
+                }
+                crate::admit_fast::CallbackAction::EvidenceCheck(status) => {
+                    let job_txid = txid.clone();
+                    let job_env = evidence.clone();
+                    let extra = extra_info.clone().unwrap_or_default();
+                    spawn(Box::pin(async move {
+                        crate::admit_fast::refusal_job(job_env, job_txid, (status, extra), af_now)
+                            .await;
+                    }));
+                }
+                crate::admit_fast::CallbackAction::Ignore => {}
+            }
             if let Some(db) = ops_db {
                 let status_upper = tx_status.to_ascii_uppercase();
                 if marker.is_some() {
@@ -2256,6 +2286,17 @@ pub async fn arc_ingest(
             extra_info,
             ..
         } => {
+            // admit-fast (2026-09-15): a pushed proof for a txid the callbacks
+            // evicted READMITS it first — the chain overrules a courier — so the
+            // stitch below finds its outputs.
+            if let Some(db) = ops_db {
+                if crate::admit_fast::readmit_if_evicted(db, &txid, worker::Date::now().as_millis())
+                    .await
+                {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_READMITTED, 1)
+                        .await;
+                }
+            }
             // bsv-low M19 R2: a `reorg_reanchor` MINED is counted here; what it
             // CHANGES is decided by the proof itself below (a verified bump
             // naming a different block than the stored anchor replaces it —

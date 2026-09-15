@@ -560,4 +560,132 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    /// admit-fast step 2 (2026-09-15): the app layer reads the overlay's OWN
+    /// tables, so the overlay's shadow-move eviction of a pot leaves EVERY
+    /// app-layer view by construction — proven here on the shipped
+    /// `/refund-backups` query under the real shipped schema: the refund
+    /// backup for an evicted pot is not served (never as valid), and the
+    /// readmission brings it back byte for byte.
+    #[test]
+    fn an_evicted_pot_s_refund_backup_leaves_refund_backups_and_returns_on_readmission_real_sqlite()
+    {
+        use bsv_overlay_cloudflare::admit_fast::{
+            create_shadow_sql, move_sql, restore_sql, shadow_table, ColumnInfo, MOVED_TABLES,
+        };
+        let conn = migrated();
+        let me = format!("02{}", "ab".repeat(32));
+        let pot = "cd".repeat(32);
+        conn.execute(
+            "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt) \
+             VALUES (?1, 'opp', 'g', ?2, 0, 100, 'sig', ?3, 0, 1000)",
+            rusqlite::params![me, pot, "a1".repeat(32)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO potrefund_records (identity, gameId, potTxid, potVout, refundRawHex, sigHex, txid, outputIndex, createdAt, refundValid) \
+             VALUES (?1, 'g', ?2, 0, '0100', 'rs', ?3, 0, 1100, 1)",
+            rusqlite::params![me, pot, "b1".repeat(32)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 900)",
+            rusqlite::params![pot],
+        )
+        .unwrap();
+        let served = |conn: &rusqlite::Connection| -> Vec<(String, String)> {
+            let mut st = conn.prepare(&refund_backups_sql(None)).unwrap();
+            st.query_map(rusqlite::params![me], |r| {
+                Ok((
+                    r.get::<_, String>("potTxid")?,
+                    r.get::<_, String>("refundRawHex")?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        let before = served(&conn);
+        assert_eq!(
+            before,
+            vec![(pot.clone(), "0100".to_string())],
+            "the backup is served before the eviction"
+        );
+        let cols = |conn: &rusqlite::Connection, t: &str| -> Vec<ColumnInfo> {
+            let mut st = conn
+                .prepare(&format!("PRAGMA table_info(\"{t}\")"))
+                .unwrap();
+            st.query_map([], |r| {
+                Ok(ColumnInfo {
+                    name: r.get(1)?,
+                    ty: r.get::<_, String>(2).unwrap_or_default(),
+                })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        // The overlay's eviction (the same SQL its D1 path runs).
+        let mut moved = 0;
+        for (table, keys) in MOVED_TABLES {
+            let c = cols(&conn, table);
+            if c.is_empty() {
+                continue;
+            }
+            for key in keys.iter() {
+                if !c.iter().any(|x| x.name == *key) {
+                    continue;
+                }
+                let n: i64 = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM \"{table}\" WHERE \"{key}\" = ?1"),
+                        [&pot],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if n == 0 {
+                    continue;
+                }
+                conn.execute_batch(&create_shadow_sql(table, &c)).unwrap();
+                let (ins, del) = move_sql(table, key, &c);
+                conn.execute(
+                    &ins,
+                    rusqlite::params![1_700_000_000_000i64, "REJECTED (corroborated)", &pot],
+                )
+                .unwrap();
+                conn.execute(&del, [&pot]).unwrap();
+                moved += n;
+            }
+        }
+        assert_eq!(moved, 3, "the pot row, its party marker, its refund backup");
+        assert!(served(&conn).is_empty(), "an evicted pot's refund backup is not served (the app layer reads the overlay's tables)");
+        // The readmission on a pushed proof.
+        for (table, keys) in MOVED_TABLES {
+            let c = cols(&conn, table);
+            if c.is_empty() || cols(&conn, &shadow_table(table)).is_empty() {
+                continue;
+            }
+            for key in keys.iter() {
+                if !c.iter().any(|x| x.name == *key) {
+                    continue;
+                }
+                let (ins, del) = restore_sql(table, key, &c);
+                conn.execute(&ins, [&pot]).unwrap();
+                conn.execute(&del, [&pot]).unwrap();
+            }
+        }
+        assert_eq!(
+            served(&conn),
+            before,
+            "the backup is served again, byte for byte"
+        );
+        let valid: i64 = conn
+            .query_row(
+                "SELECT refundValid FROM potrefund_records WHERE potTxid = ?1",
+                [&pot],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(valid, 1, "an ALTER-added column survives the round trip");
+    }
 }

@@ -444,7 +444,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// on (`/refund-backups`, `ls_potrefund byPot`); never a filter. Unlike
 /// `sigValid` it is UNFORGEABLE in a pot-scoped window (it needs a key the
 /// attacker does not hold) and IMMUTABLE (written once, never re-latched).
-pub const OVERLAY_MIGRATION_COUNT: usize = 147;
+pub const OVERLAY_MIGRATION_COUNT: usize = 148;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1628,6 +1628,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // /record` at filing time (see `OVERLAY_MIGRATION_COUNT`'s 146 → 147
     // note). Additive + NULLABLE: every chain-admitted row stays NULL.
     "ALTER TABLE potrefund_records ADD COLUMN refundValid INTEGER",
+    // admit-fast (2026-09-15): the eviction ledger. The `<table>_evicted` twins
+    // are created by `admit_fast::ensure_shadow` at the first eviction (their
+    // columns mirror the source's at run time; a source ALTER heals the twin).
+    "CREATE TABLE IF NOT EXISTS pot_evictions (txid TEXT PRIMARY KEY, reason TEXT NOT NULL, evictedAt INTEGER NOT NULL, readmittedAt INTEGER, rowsMoved INTEGER NOT NULL DEFAULT 0)",
 ];
 
 // =============================================================================

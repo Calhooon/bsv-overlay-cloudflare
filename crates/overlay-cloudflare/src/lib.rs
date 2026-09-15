@@ -5,6 +5,7 @@
 //!
 //! Pattern from ~/bsv/rust-wallet-infra/src/lib.rs.
 
+pub mod admit_fast;
 pub mod advert_lifecycle;
 pub mod advertiser;
 pub mod arcade_reorg;
@@ -280,6 +281,8 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
                     tracker.as_deref(),
                     pot_storage.as_ref(),
                     Some(&ops_db),
+                    crate::admit_fast::EvidenceEnv::from_env(&env),
+                    |fut| ctx.wait_until(fut),
                 )
                 .await;
                 // bsv-low loop 6: a spend the push confirmed is a pot CHANGE —

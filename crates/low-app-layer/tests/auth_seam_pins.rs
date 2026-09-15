@@ -224,7 +224,10 @@ fn verified_identity_has_exactly_one_producer_the_middleware_result() {
         "the one producer takes the identity `verified_state` was handed"
     );
     assert_eq!(
-        count(&auth, &["verified_state(", "global_mode,&context.identity_key,"].concat()),
+        count(
+            &auth,
+            &["verified_state(", "global_mode,&context.identity_key,"].concat()
+        ),
         2,
         "and it must be fed by the middleware's verified context identity, on both doors"
     );
