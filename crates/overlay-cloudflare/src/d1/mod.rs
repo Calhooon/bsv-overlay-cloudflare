@@ -444,7 +444,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// on (`/refund-backups`, `ls_potrefund byPot`); never a filter. Unlike
 /// `sigValid` it is UNFORGEABLE in a pot-scoped window (it needs a key the
 /// attacker does not hold) and IMMUTABLE (written once, never re-latched).
-pub const OVERLAY_MIGRATION_COUNT: usize = 148;
+pub const OVERLAY_MIGRATION_COUNT: usize = 149;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1637,6 +1637,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // are created by `admit_fast::ensure_shadow` at the first eviction (their
     // columns mirror the source's at run time; a source ALTER heals the twin).
     "CREATE TABLE IF NOT EXISTS pot_evictions (txid TEXT PRIMARY KEY, reason TEXT NOT NULL, evictedAt INTEGER NOT NULL, readmittedAt INTEGER, rowsMoved INTEGER NOT NULL DEFAULT 0)",
+    // admit-fast, the joinRefusedVoidsHand cell (2026-09-15): the spend pointers
+    // an evicted tx left on the rows it CONSUMED (its hops' `pot_records`
+    // `spendingTxid`, the engine's `outputs.consumedBy`), released at eviction
+    // and re-marked on readmission (`admit_fast::ReleasedSpend`, JSON). Additive
+    // ALTER; the runner ignores the re-run "duplicate column" error.
+    "ALTER TABLE pot_evictions ADD COLUMN releasedSpends TEXT",
 ];
 
 // =============================================================================

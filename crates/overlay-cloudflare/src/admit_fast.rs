@@ -249,6 +249,195 @@ async fn vouts_of(db: &D1Database, table: &str, txid: &str) -> Vec<u32> {
     .collect()
 }
 
+// ── the spends an evicted tx left on OTHER rows (joinRefusedVoidsHand, 2026-09-15) ──
+//
+// A tx the index admitted also MARKED the outputs it consumed: `pot_records`
+// rows carry `spent = 1, spendingTxid = <it>` (a JOIN on the two hops it
+// spends — the hops are `tm_lowfund` rows of that table; a settle or a refund
+// on its pot). Those rows are keyed by the INPUT's txid, so the shadow move
+// above leaves them behind — and the cell found p1's hop still "spent by" the
+// evicted JOIN on `/utxo-status`, so the seat's own scanner refused to sweep a
+// hop the network held unspent. The eviction RELEASES every such pointer
+// (recorded on the ledger row) and a readmission RE-MARKS them — only where
+// nothing newer took the outpoint meanwhile (a sweep that won the race
+// stands; the chain decides). Only UNCONFIRMED pointers move: a merkle-proven
+// spend is positive evidence no courier's absence may demote (the storage's
+// own never-clobber idiom); a confirmed row is counted and left. The engine's
+// `outputs.consumedBy` is NOT touched: LOW's topic managers retain no coins,
+// so a consumed hop's row is deep-deleted at the JOIN's admission and never
+// carries it (the 2026-09-15 review's H1 — the first cut edited it as a
+// string list; the engine stores outpoint objects).
+
+/// One spend pointer the eviction released: the row and the txid that named it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReleasedSpend {
+    pub table: String,
+    pub txid: String,
+    pub vout: u32,
+}
+
+/// PURE: the `pot_records` rows whose recorded spender is the txid (bind:
+/// txid, lowercase — every writer stores lowercase hex; the plain equality
+/// keeps `idx_pot_spending`), with their confirmation so a proven pointer can
+/// be counted and left alone.
+pub fn select_pot_spends_sql(cols: &[ColumnInfo]) -> String {
+    let confirmed = if cols.iter().any(|c| c.name == "spentConfirmed") {
+        "spentConfirmed"
+    } else {
+        "0 AS spentConfirmed"
+    };
+    format!("SELECT txid, outputIndex, {confirmed} FROM pot_records WHERE spendingTxid = ?")
+}
+
+/// PURE: release the spend pointer on every UNCONFIRMED `pot_records` row the
+/// txid spent (bind: txid, lowercase) — the spend group and, when present, the
+/// verdict group that rides it (`verdictTxid == spendingTxid` is the readers'
+/// guard; a spender that left takes its verdict with it). Only columns the
+/// table has; a `spentConfirmed = 1` row (a merkle-proven spend) never moves.
+pub fn release_pot_spends_sql(cols: &[ColumnInfo]) -> String {
+    let has = |n: &str| cols.iter().any(|c| c.name == n);
+    let mut sets = vec!["spent = 0".to_string(), "spendingTxid = NULL".to_string()];
+    for (col, val) in [
+        ("spentAt", "NULL"),
+        ("spentHeight", "NULL"),
+        ("spenderFinal", "NULL"),
+        ("verdict", "NULL"),
+        ("verdictTxid", "NULL"),
+        ("settleSigners", "NULL"),
+    ] {
+        if has(col) {
+            sets.push(format!("{col} = {val}"));
+        }
+    }
+    let guard = if has("spentConfirmed") {
+        " AND spentConfirmed = 0"
+    } else {
+        ""
+    };
+    format!(
+        "UPDATE pot_records SET {} WHERE spendingTxid = ?{guard}",
+        sets.join(", ")
+    )
+}
+
+/// PURE: re-mark one released `pot_records` spend on readmission (binds: the
+/// spender txid, [spentAt seconds when the table has the column — the bool],
+/// the row's txid, vout) — only if nothing newer spent the outpoint meanwhile.
+/// The pointer comes back UNCONFIRMED with no verdict group even though a
+/// MINED proof triggered the readmission: the chaser confirms it and
+/// `mark_verdict_for_spender` writes the verdict at confirm time, as for any
+/// unconfirmed pointer (stated, accepted).
+pub fn remark_pot_spend_sql(cols: &[ColumnInfo]) -> (String, bool) {
+    let with_at = cols.iter().any(|c| c.name == "spentAt");
+    let spent_at = if with_at { ", spentAt = ?" } else { "" };
+    (
+        format!(
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?{spent_at} WHERE txid = ? AND outputIndex = ? AND spendingTxid IS NULL"
+        ),
+        with_at,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct PotSpendRow {
+    txid: String,
+    #[serde(rename = "outputIndex")]
+    output_index: i64,
+    #[serde(rename = "spentConfirmed", default)]
+    spent_confirmed: i64,
+}
+
+/// Release every UNCONFIRMED spend pointer the txid left on other rows; the
+/// list goes on the ledger row for the readmission. Never fails the eviction:
+/// a faulted read releases nothing (logged), a faulted write leaves the rows
+/// as they were; a confirmed pointer is counted and kept.
+async fn release_spends_of(db: &D1Database, txid: &str) -> Vec<ReleasedSpend> {
+    let mut released = Vec::new();
+    let pot_cols = table_columns(db, "pot_records").await;
+    if !pot_cols.iter().any(|c| c.name == "spendingTxid") {
+        return released;
+    }
+    let rows = match Query::new(select_pot_spends_sql(&pot_cols))
+        .bind(txid)
+        .fetch_all::<PotSpendRow>(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            worker::console_log!(
+                "[admit-fast] evict {txid}: reading its pot_records spends failed: {e} — nothing released"
+            );
+            return released;
+        }
+    };
+    let (kept, movable): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.spent_confirmed != 0);
+    if !kept.is_empty() {
+        worker::console_log!(
+            "[admit-fast] evict {txid}: {} CONFIRMED spend pointer(s) kept (a proven spend is never released on a courier's word)",
+            kept.len()
+        );
+    }
+    if movable.is_empty() {
+        return released;
+    }
+    match Query::new(release_pot_spends_sql(&pot_cols))
+        .bind(txid)
+        .execute(db)
+        .await
+    {
+        Ok(()) => {
+            for r in movable {
+                crate::pot_changes::note(&r.txid, r.output_index.max(0) as u32);
+                released.push(ReleasedSpend {
+                    table: "pot_records".into(),
+                    txid: r.txid.to_ascii_lowercase(),
+                    vout: r.output_index.max(0) as u32,
+                });
+            }
+        }
+        Err(e) => worker::console_log!(
+            "[admit-fast] evict {txid}: releasing its pot_records spends failed: {e}"
+        ),
+    }
+    released
+}
+
+/// Re-mark the spends a readmitted tx had left (the ledger row's list): a
+/// `pot_records` row only where nothing newer spent it. Best-effort.
+async fn remark_spends(
+    db: &D1Database,
+    txid: &str,
+    released: &[ReleasedSpend],
+    now_ms: u64,
+) -> u64 {
+    let mut remarked = 0u64;
+    let pot_cols = table_columns(db, "pot_records").await;
+    let (pot_sql, with_at) = remark_pot_spend_sql(&pot_cols);
+    for r in released {
+        let ok = match r.table.as_str() {
+            "pot_records" => {
+                let mut q = Query::new(pot_sql.clone()).bind(txid);
+                if with_at {
+                    q = q.bind(QVal::Int((now_ms / 1000) as i64));
+                }
+                q.bind(r.txid.as_str())
+                    .bind(QVal::Int(r.vout as i64))
+                    .execute(db)
+                    .await
+                    .is_ok()
+            }
+            _ => false,
+        };
+        if ok {
+            remarked += 1;
+            if r.table == "pot_records" {
+                crate::pot_changes::note(&r.txid, r.vout);
+            }
+        }
+    }
+    remarked
+}
+
 /// Evict every row the txid owns, everywhere, into the twins; note the pot and
 /// lobby changes so the seats and the lobby learn; record the ledger row.
 /// Returns the rows moved (0 = nothing held this txid).
@@ -301,40 +490,58 @@ pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, no
     for v in &advert_vouts {
         crate::lobby_changes::note_evicted(&txid, *v);
     }
+    // the spends it left on the rows it consumed (its hops, its pot) — released
+    let released = release_spends_of(db, &txid).await;
+    let released_json = serde_json::to_string(&released).unwrap_or_else(|_| "[]".into());
     if let Err(e) = Query::new(
-        "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved) VALUES (?, ?, ?, NULL, ?) \
-         ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, evictedAt = excluded.evictedAt, readmittedAt = NULL, rowsMoved = excluded.rowsMoved",
+        "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?, ?, ?, NULL, ?, ?) \
+         ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, evictedAt = excluded.evictedAt, readmittedAt = NULL, rowsMoved = excluded.rowsMoved, \
+             releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), pot_evictions.releasedSpends)",
     )
     .bind(txid.as_str())
     .bind(reason)
     .bind(QVal::Int(now_ms as i64))
     .bind(QVal::Int(moved as i64))
+    .bind(released_json.as_str())
     .execute(db)
     .await
     {
         worker::console_log!("[admit-fast] evict {txid}: the ledger row failed: {e}");
     }
-    worker::console_log!("[admit-fast] evicted {txid} everywhere: {moved} row(s) moved ({reason})");
+    worker::console_log!(
+        "[admit-fast] evicted {txid} everywhere: {moved} row(s) moved, {} spend pointer(s) released ({reason})",
+        released.len()
+    );
     moved
 }
 
 #[derive(serde::Deserialize)]
 struct EvictedRow {
     reason: String,
+    #[serde(rename = "releasedSpends", default)]
+    released_spends: Option<String>,
 }
 
 /// If the txid is in the ledger as evicted and not yet readmitted, move every
 /// twin row back and mark the readmission. `true` when a readmission happened.
 pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> bool {
     let txid = txid.to_ascii_lowercase();
-    let Some(row) =
-        Query::new("SELECT reason FROM pot_evictions WHERE txid = ? AND readmittedAt IS NULL")
-            .bind(txid.as_str())
-            .fetch_optional::<EvictedRow>(db)
-            .await
-            .ok()
-            .flatten()
-    else {
+    let row = match Query::new(
+        "SELECT reason, releasedSpends FROM pot_evictions WHERE txid = ? AND readmittedAt IS NULL",
+    )
+    .bind(txid.as_str())
+    .fetch_optional::<EvictedRow>(db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            worker::console_log!(
+                "[admit-fast] readmit {txid}: the ledger could not be read ({e}) — nothing readmitted this pass"
+            );
+            None
+        }
+    };
+    let Some(row) = row else {
         return false;
     };
     let mut restored = 0u64;
@@ -373,13 +580,21 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
     for v in vouts_of(db, "low_records", &txid).await {
         crate::lobby_changes::note_admitted(&txid, v);
     }
+    // the spends it had left on the rows it consumed — re-marked where nothing newer took them
+    let released: Vec<ReleasedSpend> = row
+        .released_spends
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let remarked = remark_spends(db, &txid, &released, now_ms).await;
     let _ = Query::new("UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ?")
         .bind(QVal::Int(now_ms as i64))
         .bind(txid.as_str())
         .execute(db)
         .await;
     worker::console_log!(
-        "[admit-fast] READMITTED {txid} on the pushed proof: {restored} row(s) restored (was evicted: {})",
+        "[admit-fast] READMITTED {txid} on the pushed proof: {restored} row(s) restored, {remarked}/{} spend pointer(s) re-marked (was evicted: {})",
+        released.len(),
         row.reason
     );
     true
@@ -522,6 +737,9 @@ pub async fn refusal_job(env: EvidenceEnv, txid: String, webhook: (String, Strin
             let moved =
                 evict_txid_everywhere(db, &txid, &format!("{} ({reason})", webhook.0), now_ms)
                     .await;
+            // the eviction is the event the felt voids on: ship its notes now
+            // (the route's own flush drained before this job ran)
+            crate::pot_changes::flush_inline(env.env.clone()).await;
             crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_EVICTED, 1).await;
             worker::console_log!("[admit-fast] refusal {} for {txid} CORROBORATED ({reason}) — evicted {moved} row(s)", webhook.0);
         }
@@ -597,6 +815,9 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
                             now_ms,
                         )
                         .await;
+                        // the eviction is the event the felt voids on: ship its
+                        // notes now (the route's flush drained before the watch)
+                        crate::pot_changes::flush_inline(env.env.clone()).await;
                         crate::ops::bump_counter(
                             &db,
                             crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,
@@ -1038,5 +1259,205 @@ mod tests {
             proof_arm < readmit && readmit < stitch,
             "readmit before the engine stitches"
         );
+    }
+
+    /// The spends an evicted tx left on the rows it CONSUMED are released at
+    /// eviction (the hop reads unspent again — the seat's own sweep may run)
+    /// and re-marked on readmission, only where nothing newer took the
+    /// outpoint; a CONFIRMED pointer never moves; a second eviction keeps the
+    /// first list. Under the REAL shipped schema.
+    #[test]
+    fn the_eviction_releases_the_spends_the_tx_left_on_its_inputs_and_the_readmission_re_marks_them(
+    ) {
+        let conn = shipped_conn();
+        let join = "ab".repeat(32);
+        let hop = "cd".repeat(32);
+        let proven_pot = "aa".repeat(32);
+        let other_hop = "ef".repeat(32);
+        let other_spender = "12".repeat(32);
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spenderFinal, verdict, verdictTxid, createdAt) VALUES (?1, 0, 1, ?2, 0, 1, 'x', ?2, 1700000000)",
+            rusqlite::params![&hop, &join],
+        )
+        .unwrap();
+        // a MINED spend by the same txid (a merkle-proven pointer): never released
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) VALUES (?1, 0, 1, ?2, 1, 1700000000)",
+            rusqlite::params![&proven_pot, &join],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, createdAt) VALUES (?1, 0, 1, ?2, 1700000000)",
+            rusqlite::params![&other_hop, &other_spender],
+        )
+        .unwrap();
+        // ---- release: the exact SQL the D1 path runs ----
+        let pot_cols = cols(&conn, "pot_records");
+        let rows: Vec<(String, i64, i64)> = conn
+            .prepare(&select_pot_spends_sql(&pot_cols))
+            .unwrap()
+            .query_map([&join], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(hop.clone(), 0, 0), (proven_pot.clone(), 0, 1)],
+            "the JOIN's rows with their confirmation, never the other spender's"
+        );
+        conn.execute(&release_pot_spends_sql(&pot_cols), [&join])
+            .unwrap();
+        let (spent, spender, spender_final, verdict): (i64, Option<String>, Option<i64>, Option<String>) =
+            conn.query_row(
+                "SELECT spent, spendingTxid, spenderFinal, verdict FROM pot_records WHERE txid = ?1",
+                [&hop],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (spent, spender, spender_final, verdict),
+            (0, None, None, None),
+            "the hop reads unspent again; the spend and verdict groups left with the spender"
+        );
+        let proven: (i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid = ?1",
+                [&proven_pot],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            proven,
+            (1, Some(join.clone()), 1),
+            "a CONFIRMED pointer is positive evidence: never released on a courier's absence"
+        );
+        let other: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT spent, spendingTxid FROM pot_records WHERE txid = ?1",
+                [&other_hop],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            other,
+            (1, Some(other_spender.clone())),
+            "another spender's row is untouched"
+        );
+        // ---- the ledger column; a second eviction that releases nothing keeps the first list ----
+        let first = "[{\"table\":\"pot_records\",\"txid\":\"cd\",\"vout\":0}]";
+        let upsert = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, 'x', ?2, NULL, 0, ?3) \
+             ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, evictedAt = excluded.evictedAt, readmittedAt = NULL, rowsMoved = excluded.rowsMoved, \
+             releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), pot_evictions.releasedSpends)";
+        conn.execute(upsert, rusqlite::params![&join, 1, first])
+            .unwrap();
+        conn.execute(upsert, rusqlite::params![&join, 2, "[]"])
+            .unwrap();
+        let kept: String = conn
+            .query_row(
+                "SELECT releasedSpends FROM pot_evictions WHERE txid = ?1",
+                [&join],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept, first,
+            "the callback's second eviction (nothing left to release) keeps the watch's list"
+        );
+        let released: Vec<ReleasedSpend> = serde_json::from_str(&kept).unwrap();
+        assert_eq!(
+            released,
+            vec![ReleasedSpend {
+                table: "pot_records".into(),
+                txid: "cd".into(),
+                vout: 0
+            }]
+        );
+        // ---- re-mark: the freed hop is marked again; a hop something newer spent is left alone ----
+        let (remark, with_at) = remark_pot_spend_sql(&pot_cols);
+        assert!(with_at, "the shipped schema carries spentAt");
+        conn.execute(&remark, rusqlite::params![&join, 1_700_000_200i64, &hop, 0])
+            .unwrap();
+        let (spent, spender, at): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT spent, spendingTxid, spentAt FROM pot_records WHERE txid = ?1",
+                [&hop],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (spent, spender, at),
+            (1, Some(join.clone()), Some(1_700_000_200))
+        );
+        conn.execute(
+            "UPDATE pot_records SET spendingTxid = ?1 WHERE txid = ?2",
+            rusqlite::params![&other_spender, &hop],
+        )
+        .unwrap();
+        conn.execute(&remark, rusqlite::params![&join, 1_700_000_300i64, &hop, 0])
+            .unwrap();
+        let spender: Option<String> = conn
+            .query_row(
+                "SELECT spendingTxid FROM pot_records WHERE txid = ?1",
+                [&hop],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            spender,
+            Some(other_spender.clone()),
+            "a newer spender stands: the chain decides"
+        );
+    }
+
+    /// Structural: the eviction releases the consumed spends (before the
+    /// ledger row records them), the readmission re-marks them (after the
+    /// rows are back).
+    #[test]
+    fn the_eviction_releases_and_the_readmission_re_marks_the_consumed_spends() {
+        let src = include_str!("admit_fast.rs");
+        let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
+        let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
+        let release = evict
+            .find("release_spends_of(db, &txid)")
+            .expect("the eviction releases");
+        let ledger = evict
+            .find("INSERT INTO pot_evictions")
+            .expect("the ledger row");
+        assert!(
+            release < ledger,
+            "released BEFORE the ledger row records the list"
+        );
+        assert!(
+            evict.contains(
+                "releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), pot_evictions.releasedSpends)"
+            ),
+            "a second eviction that releases nothing keeps the first list"
+        );
+        let readmit = &src[src.find("pub async fn readmit_if_evicted(").unwrap()..];
+        let readmit = &readmit[..readmit.find("pub enum EvidenceVerdict").unwrap()];
+        let restore = readmit.find("restore_sql(").expect("the restore");
+        let remark = readmit
+            .find("remark_spends(db, &txid, &released, now_ms)")
+            .expect("the re-mark");
+        assert!(restore < remark, "re-marked AFTER the rows are back");
+        // the eviction is the event the felt voids on: BOTH jobs ship the pot
+        // notes right after it (the route's own flush drained before the job)
+        let jobs =
+            &src[src.find("pub async fn refusal_job(").unwrap()..src.find("#[cfg(test)]").unwrap()];
+        let mut from = 0;
+        let mut evictions = 0;
+        while let Some(i) = jobs[from..].find("evict_txid_everywhere(") {
+            let at = from + i;
+            let fl = jobs[at..]
+                .find("crate::pot_changes::flush_inline(")
+                .expect("a flush after the eviction");
+            assert!(
+                fl < 700,
+                "the flush sits right after the eviction (at +{fl})"
+            );
+            evictions += 1;
+            from = at + 1;
+        }
+        assert_eq!(evictions, 2, "the refusal job and the pending watch");
     }
 }
