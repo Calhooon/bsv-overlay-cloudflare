@@ -3924,6 +3924,9 @@ fn arcade_url() -> String {
 /// merkle path computes, from THIS txid, the root the header chaintracks holds at that height (the gate's MEDIUM-1:
 /// the client latches `confirmed` durably, and the index has refused Arcade's pushed bump before on the D7 class).
 /// `None` sends the question to the couriers exactly as before. The verified height rides back for the answer.
+/// STATED LATENCY (the delta-verify's LOW-D): a tx already mined that Arcade still shows SEEN answers
+/// `confirmed:false` where WoC's `confirmations` would have said true, for the earlier of Arcade's MINED flip and
+/// the 30-minute freshness window (re-asked every 15 s; never a false positive — the fail-safe direction).
 async fn arcade_confirmation_look(
     txid_lc: &str,
     caller: &'static str,

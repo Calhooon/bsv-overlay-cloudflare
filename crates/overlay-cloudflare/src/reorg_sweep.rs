@@ -288,7 +288,9 @@ async fn reanchor_from_ladder(
     if fetcher.budget_remaining() == Some(0) {
         return LadderReanchor::BudgetExhausted;
     }
-    match fetcher.verified_proof_for_detailed(spender).await {
+    // #451 slice B: the re-anchor DEMOTES on `Ok(None)` (the refuted stored bump), so it must hear every courier —
+    // never a per-pass stop on Arcade's "held unmined" word during a reorg (the delta-verify's LOW-A)
+    match fetcher.verified_proof_for_exhaustive(spender).await {
         Ok(Some(hex)) => {
             let applied =
                 crate::proof_fetcher::apply_pushed_proof_to_pot_stores(pot_storage, spender, &hex)

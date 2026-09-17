@@ -296,6 +296,26 @@ impl ChainProofFetcher {
     /// fail for every rung, so it propagates immediately as retryable);
     /// courier fetch failures stay `Ok(None)`-shaped (honest unknown).
     pub(crate) async fn fetch_verified_proof(&self, txid: &str) -> Result<Option<String>, String> {
+        self.fetch_verified_proof_with(txid, true).await
+    }
+
+    /// bsv-low #451 slice B: the ladder with NO per-pass stop on Arcade's unmined word — every rung is asked. For
+    /// the callers that ACT on this pass's `Ok(None)` (the reorg re-anchor demotes a refuted row it could not
+    /// re-prove; the unmined-ancestry walk keeps walking an unproven ancestor): the delta-verify's LOW-A.
+    pub(crate) async fn fetch_verified_proof_exhaustive(
+        &self,
+        txid: &str,
+    ) -> Result<Option<String>, String> {
+        self.fetch_verified_proof_with(txid, false).await
+    }
+
+    /// The ladder. `arcade_stop`: may a fresh "held unmined" word from Arcade end this pass without asking the
+    /// couriers (the completion passes: yes; the acting callers above: no).
+    async fn fetch_verified_proof_with(
+        &self,
+        txid: &str,
+        arcade_stop: bool,
+    ) -> Result<Option<String>, String> {
         let tracker = self.tracker.as_deref();
         // bsv-low M19B-G1 round 2 (review MED-3): one rung's candidate at a
         // height OUR header source does not serve (`BlockNotFound`) is that
@@ -329,16 +349,23 @@ impl ChainProofFetcher {
                 }
             }
             // bsv-low #451 slice B (2026-09-17): Arcade HOLDS the tx on the network and said so within the last
-            // 30 minutes. No courier can hold a proof for a tx the network has not mined, so the ladder stops here
-            // THIS PASS — the MINED push or the next tick asks again; an Arcade a block behind delays this row's
-            // proof by one tick, never loses it, and a word older than the freshness window (a wedged Arcade, the
-            // 2026-09-01 class) falls through to the couriers exactly as before (the gate's HIGH-2). Measured
-            // before: every unmined row cost a Bitails read and a WoC read per tick that could only answer "no bump".
+            // 30 minutes. No courier can hold a proof for a tx the network has not mined, so a COMPLETION pass stops
+            // here — the MINED push or the next tick asks again. The cost when Arcade is behind the couriers (a tx
+            // mined that Arcade still shows SEEN): this row's proof waits for the earlier of Arcade's MINED flip and
+            // the 30-minute freshness window, then the couriers are asked as before (the gate's HIGH-2; a wedged
+            // Arcade, the 2026-09-01 class, is bounded the same way). A caller that ACTS on this pass's answer asks
+            // exhaustively (`arcade_stop == false`). Measured before: every unmined row cost a Bitails read and a
+            // WoC read per tick that could only answer "no bump".
             ArcadeProofLook::KnownUnmined(status) => {
+                if arcade_stop {
+                    worker::console_log!(
+                        "[proof] arcade holds {txid} unmined ({status}) — the couriers are not asked this pass"
+                    );
+                    return Ok(None);
+                }
                 worker::console_log!(
-                    "[proof] arcade holds {txid} unmined ({status}) — the couriers are not asked this pass"
+                    "[proof] arcade holds {txid} unmined ({status}) — an exhaustive ask: the couriers are asked anyway"
                 );
-                return Ok(None);
             }
             ArcadeProofLook::Unknown => {}
         }
@@ -852,6 +879,20 @@ impl AncestorFetcher for ChainProofFetcher {
         self.fetch_verified_proof(txid).await
     }
 
+    /// bsv-low #451 slice B (the delta-verify's LOW-A): the budgeted EXHAUSTIVE ask — every rung, no per-pass stop
+    /// on Arcade's unmined word — for the reorg re-anchor. Budget-bounded exactly like the detailed ask.
+    async fn verified_proof_for_exhaustive(&self, txid: &str) -> Result<Option<String>, String> {
+        let remaining = self.budget.get();
+        if remaining == 0 {
+            push_log(&format!(
+                "[proof] per-tick budget exhausted (skipping proof for {txid}; retried next tick)"
+            ));
+            return Ok(None);
+        }
+        self.budget.set(remaining - 1);
+        self.fetch_verified_proof_exhaustive(txid).await
+    }
+
     /// Re-verify a STORED bump against chaintracks (the header source is the
     /// only arbiter of a merkle root). Used by proof completion to refuse
     /// trusting an admit-time structural bump that was never SPV-verified or is
@@ -1074,10 +1115,10 @@ pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
     let s = s.trim();
     let (date, rest) = s.split_once('T')?;
     let mut d = date.split('-');
-    let y: i64 = d.next()?.parse().ok()?;
-    let m: u32 = d.next()?.parse().ok()?;
-    let day: u32 = d.next()?.parse().ok()?;
-    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+    let y = i64::from(digits(d.next()?)?);
+    let m = digits(d.next()?)?;
+    let day = digits(d.next()?)?;
+    if d.next().is_some() || !(1..=12).contains(&m) || day == 0 || day > days_in_month(y, m) {
         return None;
     }
     let time = rest
@@ -1089,9 +1130,10 @@ pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
         None => (time, None),
     };
     let mut t = hms.split(':');
-    let hh: i64 = t.next()?.parse().ok()?;
-    let mm: i64 = t.next()?.parse().ok()?;
-    let ss: i64 = t.next()?.parse().ok()?;
+    // digit-only fields: a `-1` or `+5` never parses (the delta-verify's LOW-C; `u32::from_str` accepts a `+`)
+    let hh = i64::from(digits(t.next()?)?);
+    let mm = i64::from(digits(t.next()?)?);
+    let ss = i64::from(digits(t.next()?)?);
     if t.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
         return None;
     }
@@ -1112,6 +1154,30 @@ pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1_000) + millis)
+}
+
+/// PURE: a non-empty all-ASCII-digit field, as a number (no sign, no whitespace).
+fn digits(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// PURE: the days of `month` in `year` (proleptic Gregorian; a leap year every 4, not every 100, but every 400).
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// Parse a TSC-proof response body (WoC / Bitails share the shape) into a
@@ -2240,7 +2306,9 @@ impl ChainProofFetcher {
             let bump = if id == subject {
                 None // the caller established the subject is unmined
             } else {
-                self.fetch_verified_proof(&id)
+                // #451 slice B: an ancestor Arcade still shows SEEN may be mined (the couriers know): ask them all,
+                // else this walk treats a proven ancestor as a branch to keep walking (the delta-verify's LOW-A)
+                self.fetch_verified_proof_exhaustive(&id)
                     .await
                     .map_err(|e| format!("{id}: proof read fault ({e})"))?
             };
@@ -7125,9 +7193,17 @@ pub(crate) mod tests {
         assert_eq!(rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55+00:00"), Some(1_789_683_775_000));
         assert_eq!(rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0), Some(true), "Arcade's zero stamp is far in the past, never fresh");
-        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ"] {
+        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ",
+                    "2026-09-31T00:00:00Z", "2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z", "2026-09-00T00:00:00Z", "2026-09-17T-1:00:00Z", "2026-09-17T22:+5:00Z", "2026-09-17T22:22:-0Z"] {
             assert_eq!(rfc3339_utc_ms(bad), None, "judged {bad:?}");
         }
+        // the delta-verify's LOW-C: the day is bound by its month, leap years included
+        assert_eq!(rfc3339_utc_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert!(rfc3339_utc_ms("2000-02-29T00:00:00Z").is_some(), "400-year leap");
+        assert_eq!(rfc3339_utc_ms("1900-02-29T00:00:00Z"), None, "100-year non-leap");
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2028, 2), 29);
+        assert_eq!(days_in_month(2026, 13), 0);
     }
 
     #[test]

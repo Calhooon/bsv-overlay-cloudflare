@@ -145,10 +145,10 @@ pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
     let s = s.trim();
     let (date, rest) = s.split_once('T')?;
     let mut d = date.split('-');
-    let y: i64 = d.next()?.parse().ok()?;
-    let m: u32 = d.next()?.parse().ok()?;
-    let day: u32 = d.next()?.parse().ok()?;
-    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+    let y = i64::from(digits(d.next()?)?);
+    let m = digits(d.next()?)?;
+    let day = digits(d.next()?)?;
+    if d.next().is_some() || !(1..=12).contains(&m) || day == 0 || day > days_in_month(y, m) {
         return None;
     }
     let time = rest
@@ -160,9 +160,10 @@ pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
         None => (time, None),
     };
     let mut t = hms.split(':');
-    let hh: i64 = t.next()?.parse().ok()?;
-    let mm: i64 = t.next()?.parse().ok()?;
-    let ss: i64 = t.next()?.parse().ok()?;
+    // digit-only fields: a `-1` or `+5` never parses (the delta-verify's LOW-C; `u32::from_str` accepts a `+`)
+    let hh = i64::from(digits(t.next()?)?);
+    let mm = i64::from(digits(t.next()?)?);
+    let ss = i64::from(digits(t.next()?)?);
     if t.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
         return None;
     }
@@ -183,6 +184,30 @@ pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1_000) + millis)
+}
+
+/// PURE: a non-empty all-ASCII-digit field, as a number (no sign, no whitespace).
+fn digits(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// PURE: the days of `month` in `year` (proleptic Gregorian; a leap year every 4, not every 100, but every 400).
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// The external (WoC) observation of a txid, already shape-validated by the
@@ -235,8 +260,11 @@ pub struct TxAnyAnswer {
     /// confirmations≥1); `Some(false)` = present but not yet confirmed per
     /// the external leg; `None` = unknown.
     pub confirmed: Option<bool>,
-    /// The mined block height per the stored BEEF's verified BUMP (index leg
-    /// only — the external leg never claims a height).
+    /// The mined block height per a chaintracks-VERIFIED bump: the stored
+    /// BEEF's (index leg), or — bsv-low #451 slice B — Arcade's MINED claim
+    /// whose path computed, from this txid, the root chaintracks holds at
+    /// that height (`routes::arcade_confirmation_look`). The courier leg
+    /// never claims a height (a `confirmations` count is a claim, not a proof).
     pub height: Option<u64>,
     /// The raw tx bytes as lowercase hex — index-extracted or externally
     /// hash-verified. Never an unverified byte. Still served when the
@@ -601,9 +629,17 @@ mod tests {
         assert_eq!(rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55+00:00"), Some(1_789_683_775_000));
         assert_eq!(rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0), Some(true), "Arcade's zero stamp is far in the past, never fresh");
-        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ"] {
+        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ",
+                    "2026-09-31T00:00:00Z", "2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z", "2026-09-00T00:00:00Z", "2026-09-17T-1:00:00Z", "2026-09-17T22:+5:00Z", "2026-09-17T22:22:-0Z"] {
             assert_eq!(rfc3339_utc_ms(bad), None, "judged {bad:?}");
         }
+        // the delta-verify's LOW-C: the day is bound by its month, leap years included
+        assert_eq!(rfc3339_utc_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert!(rfc3339_utc_ms("2000-02-29T00:00:00Z").is_some(), "400-year leap");
+        assert_eq!(rfc3339_utc_ms("1900-02-29T00:00:00Z"), None, "100-year non-leap");
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2028, 2), 29);
+        assert_eq!(days_in_month(2026, 13), 0);
     }
 
     /// bsv-low #451 slice B: a bumpless index row + Arcade's live word = present (unconfirmed / confirmed), the raw

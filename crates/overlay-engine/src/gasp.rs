@@ -262,6 +262,17 @@ pub trait AncestorFetcher {
         Ok(self.verified_proof_for(txid).await)
     }
 
+    /// bsv-low #451 slice B (2026-09-17): like [`Self::verified_proof_for_detailed`], but the ladder asks EVERY
+    /// rung — no per-pass short-circuit on the broadcaster's "held unmined" word. The completion passes may stop
+    /// early (a fresh unmined word from Arcade means no courier holds a proof yet; the next tick asks again), but
+    /// a caller that ACTS on `Ok(None)` this pass — the reorg re-anchor, which demotes a refuted row it could not
+    /// re-prove; the unmined-ancestry walk, which treats an unproven ancestor as a branch to keep walking — must
+    /// hear the couriers too (the delta-verify's LOW-A). Default: the detailed ask (a fetcher with no short-circuit
+    /// has nothing to skip).
+    async fn verified_proof_for_exhaustive(&self, txid: &str) -> Result<Option<String>, String> {
+        self.verified_proof_for_detailed(txid).await
+    }
+
     /// bsv-low M19B-G1 round 2 (review MED-2): the ladder's REMAINING
     /// per-invocation budget, when it keeps one (`None` = unbounded, or not
     /// known). A budgeted ladder answers `Ok(None)` to every ask once its
