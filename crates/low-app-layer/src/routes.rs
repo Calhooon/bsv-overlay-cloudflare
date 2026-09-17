@@ -3296,7 +3296,13 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     // swept outside our overlay is never served as recoverable.
     let mut probes: Vec<(String, u32, crate::hops_view::ChainSpendProbe)> = Vec::new();
     for (txid, vout) in crate::hops_view::chain_probe_targets(&entries) {
-        let st = spent_any_resolve_cached(&txid, vout, "hops_view").await;
+        let st = spent_any_resolve_cached(
+            &txid,
+            vout,
+            "hops_view",
+            crate::results::SPENT_ANY_PROBE_MAX_AGE_MS,
+        )
+        .await;
         probes.push((
             txid,
             vout,
@@ -4020,13 +4026,21 @@ const BANANABLOCKS_BASE: &str = "https://bananablocks.com/api/v1";
 /// the isolate cache; the hops view's chain probes and `/tx-any`'s unconfirmable probe called the ladder DIRECTLY —
 /// up to eight courier ladders per `/hops-view` call, twelve to fifteen such calls per seat per hand on the budget
 /// hand, none of them cached. One reader, one writer, one TTL (`SPENT_ANY_CACHE_TTL_MS`).
-async fn spent_any_resolve_cached(txid_lc: &str, vout: u32, caller: &'static str) -> SpentAnyCached {
+/// `max_age_ms`: how old a cached answer this reader accepts (`SPENT_ANY_CACHE_TTL_MS` for `/spent-any`,
+/// `SPENT_ANY_PROBE_MAX_AGE_MS` for the probes); every entry is kept for the longest reader and stamped with its
+/// write time, so a reader with a short need never sees an old row.
+async fn spent_any_resolve_cached(
+    txid_lc: &str,
+    vout: u32,
+    caller: &'static str,
+    max_age_ms: f64,
+) -> SpentAnyCached {
     let now = worker::Date::now().as_millis() as f64;
     let key = format!("{txid_lc}.{vout}");
     let cached = SPENT_ANY_CACHE.with(|c| {
         c.borrow()
             .get(&key)
-            .filter(|(expiry, _)| *expiry > now)
+            .filter(|(written_at, _)| crate::results::spent_any_cache_fresh(*written_at, now, max_age_ms))
             .map(|(_, row)| row.clone())
     });
     if let Some(row) = cached {
@@ -4035,9 +4049,11 @@ async fn spent_any_resolve_cached(txid_lc: &str, vout: u32, caller: &'static str
     let row = spent_any_resolve(txid_lc, vout, caller).await;
     SPENT_ANY_CACHE.with(|c| {
         let mut map = c.borrow_mut();
-        // Prune expired entries so the map stays bounded.
-        map.retain(|_, (expiry, _)| *expiry > now);
-        map.insert(key, (now + crate::results::SPENT_ANY_CACHE_TTL_MS, row.clone()));
+        // Prune entries no reader would accept any more, so the map stays bounded.
+        map.retain(|_, (written_at, _)| {
+            crate::results::spent_any_cache_fresh(*written_at, now, crate::results::SPENT_ANY_PROBE_MAX_AGE_MS)
+        });
+        map.insert(key, (now, row.clone()));
     });
     row
 }
@@ -4226,7 +4242,13 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Re
 
     let mut entries: Vec<crate::logic::OutpointStatus> = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
-        let row = spent_any_resolve_cached(&op.db_txid(), op.vout, "spent_any").await;
+        let row = spent_any_resolve_cached(
+            &op.db_txid(),
+            op.vout,
+            "spent_any",
+            crate::results::SPENT_ANY_CACHE_TTL_MS,
+        )
+        .await;
         entries.push(crate::logic::OutpointStatus {
             txid: op.txid.clone(),
             vout: op.vout,
@@ -4493,6 +4515,7 @@ async fn resolve_tx_any(
                     &src_txid.to_ascii_lowercase(),
                     input.source_output_index,
                     "tx_any_unconfirmable",
+                    crate::results::SPENT_ANY_PROBE_MAX_AGE_MS,
                 )
                 .await;
                 if crate::txany::input_proves_unconfirmable(

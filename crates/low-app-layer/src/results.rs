@@ -3232,8 +3232,22 @@ pub fn claims_sql(n: usize) -> String {
 /// upstream subrequests — bound the fan-out).
 pub const SPENT_ANY_MAX_OUTPOINTS: usize = 20;
 
-/// In-isolate cache TTL for `/spent-any` entries, milliseconds.
+/// In-isolate cache TTL for `/spent-any` entries, milliseconds — the max age `/spent-any` itself accepts (the
+/// Collect press's corroboration of an unspent hop reads through it).
 pub const SPENT_ANY_CACHE_TTL_MS: f64 = 15_000.0;
+
+/// bsv-low #451 slice B (2026-09-17, the census's verdict): the max age the hops view's chain PROBES and `/tx-any`'s
+/// unconfirmable probe accept from the same cache. The two budget hands cost 154 courier calls, 109 of them the
+/// view's probes (up to eight per call, 12–15 calls per seat per hand, every one past the 15 s TTL: 30 WoC
+/// rate-limits). A `recoverable` word may lag a sweep by minutes safely — the sweep is judged at broadcast, nothing
+/// is released on the word — and an input spent by a DIFFERENT confirmed tx is terminal. Five minutes.
+pub const SPENT_ANY_PROBE_MAX_AGE_MS: f64 = 5.0 * 60_000.0;
+
+/// PURE: does a cache row written at `written_at_ms` still serve a reader that accepts `max_age_ms` at `now_ms`?
+pub fn spent_any_cache_fresh(written_at_ms: f64, now_ms: f64, max_age_ms: f64) -> bool {
+    let age = now_ms - written_at_ms;
+    age >= 0.0 && age < max_age_ms
+}
 
 /// One provider observation for an outpoint, already shape-validated by the
 /// route glue. The pure decision logic below is what unit tests pin.
@@ -6796,6 +6810,21 @@ mod courier_ladder_2026_09_04 {
             assert!(!order.contains(&primary), "the primary is never its own corroborator — judged {order:?}");
             assert_eq!(order.last().copied().unwrap_or(""), if primary == "bitails_tx" { "woc" } else { "bitails_tx" }, "judged {order:?}");
         }
+    }
+
+    /// bsv-low #451 slice B: one cache, each reader its own max age — a row the press would refuse at 16 s still
+    /// serves the view's probe, and a row past five minutes serves nobody. RED before (one 15 s TTL for every reader).
+    #[test]
+    fn each_reader_of_the_spent_any_cache_names_its_own_max_age() {
+        let written = 1_000_000.0;
+        let press = SPENT_ANY_CACHE_TTL_MS;
+        let probe = SPENT_ANY_PROBE_MAX_AGE_MS;
+        assert!(spent_any_cache_fresh(written, written + 14_000.0, press), "14 s: fresh for the press");
+        assert!(!spent_any_cache_fresh(written, written + 16_000.0, press), "16 s: stale for the press");
+        assert!(spent_any_cache_fresh(written, written + 16_000.0, probe), "16 s: fresh for the probe");
+        assert!(spent_any_cache_fresh(written, written + 4.0 * 60_000.0, probe), "4 min: fresh for the probe");
+        assert!(!spent_any_cache_fresh(written, written + 6.0 * 60_000.0, probe), "6 min: stale for everyone");
+        assert!(!spent_any_cache_fresh(written, written - 1.0, press), "a row from the future is not fresh");
     }
 
 }
