@@ -25,6 +25,11 @@
 //!
 //! ## `status`/`statusSource` (the spent/unspent honesty pair)
 //!
+//! bsv-low #451 slice B (2026-09-17): a `"chain"` status is read through the app layer's spent-any cache
+//! (`SPENT_ANY_CACHE_TTL_MS`, 15 s in the isolate), so an entry can be served `unspent` up to that long after another
+//! device of the identity swept it — the sweep then fails at broadcast and nothing is released on the word (the
+//! gate's LOW-2, accepted). Before this the view's probes ran the courier ladder uncached on every call.
+//!
 //! | facts                                                   | status    | source |
 //! |---------------------------------------------------------|-----------|--------|
 //! | `pot_records` row, spent = 0, NOT re-checked            | `unspent` | index  |

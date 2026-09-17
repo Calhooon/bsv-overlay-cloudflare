@@ -48,6 +48,143 @@ pub const KNOWN_MINED_TXID: &str =
 /// `/spent-any` — bounds upstream pressure; isolate recycling empties it).
 pub const TX_ANY_CACHE_TTL_MS: f64 = 15_000.0;
 
+/// bsv-low #451 slice B (2026-09-17): an `unconfirmable` verdict (an input spent by a DIFFERENT confirmed tx —
+/// chain truth short of a reorg) lives in the in-isolate cache this long. The seeded home of a lived-in identity asks
+/// the same dead stories on every boot, and each ask was a WoC read, a Bitails read and up to three courier ladders
+/// (1.3–2.0 s per ask, measured on the beta budget hand). The ISOLATE cache, never the edge: the 2026-09-10 gate's
+/// HIGH-1/2 rule (a courier's word never outlives the isolate) stands.
+pub const TX_ANY_UNCONFIRMABLE_TTL_MS: f64 = 10.0 * 60_000.0;
+
+/// PURE: how long one `/tx-any` answer lives in the isolate cache.
+pub fn tx_any_cache_ttl_ms(answer: &TxAnyAnswer) -> f64 {
+    if answer.unconfirmable {
+        TX_ANY_UNCONFIRMABLE_TTL_MS
+    } else {
+        TX_ANY_CACHE_TTL_MS
+    }
+}
+
+/// bsv-low #451 slice B: Arcade's `GET /tx/{txid}` as the FIRST external witness for a tx the index holds WITHOUT a
+/// verified bump (the JOIN's first minutes; a MINED push not yet landed). Arcade is the broadcaster whose SEEN is the
+/// index's own admission witness (CLAUDE.md D1), so its live word is exactly the network presence the external leg
+/// exists to establish. THE GATE'S RULES (2026-09-17, HIGH-1 / HIGH-2 / MEDIUM-1): an ALLOW-LIST, never a deny-list
+/// — only `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` are the network holding it (the overlay's own `SEEN_OR_BETTER`
+/// bar; the orphan view `SEEN_IN_ORPHAN_MEMPOOL` and the pre-network ranks RECEIVED / STORED / ANNOUNCED /
+/// REQUESTED / SENT are NOT — the #267 hole was admitting on exactly that view, and a STORED tx can have mined
+/// through the client's direct-ARC fallback while Arcade never sends it); a SEEN word counts only while its status
+/// stamp is younger than [`ARCADE_WORD_FRESH_MS`] (a wedged or lagging Arcade must not hold the confirmation
+/// question forever: the couriers are each other's fallbacks on every chain question, the 2026-09-04 ruling); a
+/// MINED / IMMUTABLE word is a CLAIM — its `merklePath` + `blockHeight` come back for the caller to verify against
+/// chaintracks before `confirmed` leaves the server (the index refused Arcade's pushed bump once on the D7 class,
+/// and the client latches `confirmed` durably). Everything else is `Unknown`: the couriers decide, as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArcadeWord {
+    /// The network holds it unmined, said within the freshness window.
+    SeenFresh,
+    /// Mined, per Arcade: the bump hex and the height, to be VERIFIED by the caller.
+    Mined { bump_hex: String, height: u64 },
+    /// No usable word: ask the couriers.
+    Unknown,
+}
+
+/// How old Arcade's status stamp may be for its live word to stand alone (the push-backstop reasoning:
+/// `PUSH_BACKSTOP_MIN_AGE_SECS` on the overlay — after this long the push has had its chance).
+pub const ARCADE_WORD_FRESH_MS: i64 = 30 * 60 * 1_000;
+
+/// The two statuses that mean "the network holds it" (mirrors the overlay's `SEEN_OR_BETTER` minus the mined pair).
+pub const ARCADE_SEEN_STATUSES: &[&str] = &["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES"];
+
+/// PURE: the three-way read of one Arcade body at `now_ms`.
+pub fn parse_arcade_word(status: u16, body: &str, now_ms: i64) -> ArcadeWord {
+    if !(200..300).contains(&status) {
+        return ArcadeWord::Unknown;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ArcadeWord::Unknown;
+    };
+    let tx_status = v
+        .get("txStatus")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    if tx_status == "MINED" || tx_status == "IMMUTABLE" {
+        let path = v
+            .get("merklePath")
+            .and_then(|m| m.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_hexdigit()));
+        let height = v.get("blockHeight").and_then(|h| h.as_u64()).filter(|h| *h > 0);
+        return match (path, height) {
+            (Some(p), Some(h)) => ArcadeWord::Mined {
+                bump_hex: p.to_ascii_lowercase(),
+                height: h,
+            },
+            _ => ArcadeWord::Unknown,
+        };
+    }
+    if !ARCADE_SEEN_STATUSES.contains(&tx_status.as_str()) {
+        return ArcadeWord::Unknown;
+    }
+    let fresh = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(rfc3339_utc_ms)
+        .map(|ts| now_ms - ts < ARCADE_WORD_FRESH_MS && ts <= now_ms + 60_000)
+        .unwrap_or(false);
+    if fresh {
+        ArcadeWord::SeenFresh
+    } else {
+        ArcadeWord::Unknown
+    }
+}
+
+/// PURE: an RFC 3339 UTC instant (`YYYY-MM-DDTHH:MM:SS[.frac](Z|+00:00)`, the shape Arcade stamps) as ms since the
+/// epoch; anything else `None`. No calendar crate in this crate — the civil-days arithmetic is Howard Hinnant's.
+pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let time = rest
+        .strip_suffix('Z')
+        .or_else(|| rest.strip_suffix("+00:00"))
+        .or_else(|| rest.strip_suffix("+0000"))?;
+    let (hms, frac) = match time.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (time, None),
+    };
+    let mut t = hms.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss: i64 = t.next()?.parse().ok()?;
+    if t.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let millis: i64 = match frac {
+        Some(f) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => {
+            let digits: String = f.chars().take(3).collect();
+            let v: i64 = digits.parse().ok()?;
+            v * 10_i64.pow(3 - digits.len() as u32)
+        }
+        Some(_) => return None,
+        None => 0,
+    };
+    // days from civil (proleptic Gregorian), 1970-01-01 = 0
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * i64::from(m2) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1_000) + millis)
+}
+
 /// The external (WoC) observation of a txid, already shape-validated by the
 /// route glue. `Present.raw_hex` is `Some` ONLY when the fetched raw bytes
 /// HASHED to the txid (the route verifies before constructing this).
@@ -409,6 +546,79 @@ pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// bsv-low #451 slice B: an unconfirmable verdict lives 10 minutes in the isolate; everything else 15 s.
+    #[test]
+    fn unconfirmable_answers_live_longer_in_the_isolate() {
+        let mut a = TxAnyAnswer::default();
+        assert_eq!(tx_any_cache_ttl_ms(&a), TX_ANY_CACHE_TTL_MS);
+        a.present = Some(false);
+        a.unconfirmable = true;
+        assert_eq!(tx_any_cache_ttl_ms(&a), TX_ANY_UNCONFIRMABLE_TTL_MS);
+        assert!(tx_any_cache_ttl_ms(&a) > tx_any_cache_ttl_ms(&TxAnyAnswer::default()), "the negative outlives the ordinary answer");
+    }
+
+    /// bsv-low #451 slice B (the gate's HIGH-1 / HIGH-2 / MEDIUM-1): an allow-list with a freshness bound; MINED is
+    /// a claim carrying its path and height; the orphan view, the pre-network ranks, a stale SEEN, a refusal, an
+    /// empty status, a 404 and a fault all send the question to the couriers (Unknown).
+    #[test]
+    fn arcade_word_allow_list_and_freshness() {
+        let now = 1_789_683_775_142_i64; // 2026-09-17T22:22:55.142Z
+        let fresh = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T22:10:00Z"}"#;
+        assert_eq!(parse_arcade_word(200, fresh, now), ArcadeWord::SeenFresh);
+        let fresh2 = r#"{"txStatus":"seen_multiple_nodes","timestamp":"2026-09-17T22:22:50.5Z"}"#;
+        assert_eq!(parse_arcade_word(200, fresh2, now), ArcadeWord::SeenFresh);
+        let stale = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T21:52:00Z"}"#;
+        assert_eq!(parse_arcade_word(200, stale, now), ArcadeWord::Unknown, "31 minutes old: the couriers decide");
+        let future = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T23:30:00Z"}"#;
+        assert_eq!(parse_arcade_word(200, future, now), ArcadeWord::Unknown, "a stamp from the future is no word");
+        let unstamped = r#"{"txStatus":"SEEN_ON_NETWORK"}"#;
+        assert_eq!(parse_arcade_word(200, unstamped, now), ArcadeWord::Unknown, "no stamp: not fresh");
+        let zero = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"0001-01-01T00:00:00Z"}"#;
+        assert_eq!(parse_arcade_word(200, zero, now), ArcadeWord::Unknown);
+        for st in ["SEEN_IN_ORPHAN_MEMPOOL", "MINED_IN_STALE_BLOCK", "RECEIVED", "STORED", "ANNOUNCED_TO_NETWORK", "REQUESTED_BY_NETWORK", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK", "QUEUED", "UNKNOWN", "REJECTED", "DOUBLE_SPEND_ATTEMPTED", ""] {
+            let body = format!(r#"{{"txStatus":"{st}","timestamp":"2026-09-17T22:22:00Z"}}"#);
+            assert_eq!(parse_arcade_word(200, &body, now), ArcadeWord::Unknown, "not on the allow-list: the couriers decide — judged {body}");
+        }
+        let mined = r#"{"txStatus":"MINED","blockHeight":965000,"merklePath":"FE0A0B0C","timestamp":"2026-01-01T00:00:00Z"}"#;
+        assert_eq!(parse_arcade_word(200, mined, now), ArcadeWord::Mined { bump_hex: "fe0a0b0c".into(), height: 965000 }, "a MINED word is a claim, age-free, carried for verification");
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"IMMUTABLE","blockHeight":1,"merklePath":"aa"}"#, now), ArcadeWord::Mined { bump_hex: "aa".into(), height: 1 });
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":965000}"#, now), ArcadeWord::Unknown, "MINED without a path: nothing to verify");
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","merklePath":"aa"}"#, now), ArcadeWord::Unknown, "MINED without a height: nothing to verify against");
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":0,"merklePath":"aa"}"#, now), ArcadeWord::Unknown);
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":5,"merklePath":"zz"}"#, now), ArcadeWord::Unknown, "a non-hex path is no bump");
+        assert_eq!(parse_arcade_word(404, fresh, now), ArcadeWord::Unknown, "a 404 body is not a look");
+        assert_eq!(parse_arcade_word(200, "not json", now), ArcadeWord::Unknown);
+        assert_eq!(parse_arcade_word(503, "", now), ArcadeWord::Unknown);
+    }
+
+    /// bsv-low #451 slice B: Arcade's status stamp read as an instant (the freshness bound rests on it).
+    #[test]
+    fn rfc3339_utc_ms_reads_arcade_stamps() {
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55.142485Z"), Some(1_789_683_775_142));
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55Z"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
+        assert_eq!(rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55+00:00"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0), Some(true), "Arcade's zero stamp is far in the past, never fresh");
+        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ"] {
+            assert_eq!(rfc3339_utc_ms(bad), None, "judged {bad:?}");
+        }
+    }
+
+    /// bsv-low #451 slice B: a bumpless index row + Arcade's live word = present (unconfirmed / confirmed), the raw
+    /// served from the index, source `index+external` — the same shape a WoC witness produced.
+    #[test]
+    fn arcade_witness_beside_index_bytes_decides_like_woc() {
+        let raw = "0100".to_string();
+        // the route builds the observation from the word: SeenFresh → unconfirmed presence; a VERIFIED Mined → confirmed
+        let seen = TxObservation::Present { confirmed: false, raw_hex: None };
+        let a = decide_tx_any(Some(raw.clone()), None, Some(&seen), AbsenceCorroboration::Unknown);
+        assert_eq!((a.present, a.confirmed, a.raw_hex.as_deref(), a.source), (Some(true), Some(false), Some("0100"), Some("index+external")));
+        let mined = TxObservation::Present { confirmed: true, raw_hex: None };
+        let a = decide_tx_any(Some(raw), None, Some(&mined), AbsenceCorroboration::Unknown);
+        assert_eq!((a.present, a.confirmed, a.source), (Some(true), Some(true), Some("index+external")));
+    }
 
     fn raw() -> String {
         "aabbccdd00".into() // opaque placeholder bytes — the decision table never parses them

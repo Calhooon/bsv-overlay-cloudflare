@@ -58,6 +58,9 @@ SESSION_LANE = "false"
 RELAY_URL = "https://low-relay.dev-a3e.workers.dev"
 # bsv-low loop 6: the path the OVERLAY binding sees for the block-event pass. Not a secret.
 OVERLAY_URL = "https://low-overlay.dev-a3e.workers.dev"
+# bsv-low #451 slice B: the Arcade endpoint `/tx-any` asks FIRST for a tx the index holds without a verified bump
+# (our broadcaster's live word is the network witness; the couriers only when it does not know). Not a secret.
+ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
 
 # Storage epoch (bsv-low THE ORDER item 2, owner-ruled 2026-08-06): served
 # verbatim by `GET /epoch` as {"storageEpoch": "<value>"}. BUMPING THIS VALUE
@@ -195,6 +198,7 @@ name = "low-app-layer-beta"
 [env.beta.vars]
 RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
 OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
+ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
 # bsv-low #441 C6 (2026-09-14): STRICT on beta — the client's identity reads are
 # handshake-first (a cold read waits for its warmup, bounded) so an honest read is
 # never anonymous; prod stays lenient until the promotion.

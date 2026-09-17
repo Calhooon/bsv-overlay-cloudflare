@@ -128,6 +128,7 @@ pub mod armed_pots;
 pub mod auth;
 pub mod beef_guard;
 pub mod compaction;
+pub mod courier;
 pub mod cors;
 pub mod credit_beef;
 pub mod hops_view;
@@ -162,6 +163,8 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // 2026-09-04: the WoC api key for this isolate's provider reads (see routes::provider_get).
     routes::set_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()));
+    // bsv-low #451 slice B: the Arcade endpoint for `/tx-any`'s first external witness (`routes::arcade_url`).
+    routes::set_arcade_url(env.var("ARCADE_URL").ok().map(|v| v.to_string()));
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
     console_error_panic_hook::set_once();
 
@@ -216,7 +219,14 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let lane = state.lane.clone();
     let lane_offer = state.lane_offer.clone();
 
+    // bsv-low #451 slice B: the courier census's durable deltas ride ONE D1 batch, after the answer, when a flush is
+    // due (`courier::should_flush`: the isolate's exact head, then by calls or by time).
+    let counters_db = env.d1("OVERLAY_DB").ok();
     let mut resp = router(state, schema_ready).run(req, env).await?;
+    let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+    if !pending.is_empty() {
+        ctx.wait_until(async move { courier::flush(counters_db, pending).await });
+    }
 
     // Sign the terminal JSON for an AUTHENTICATED caller (the tower's
     // posture: re-serialize the handler's JSON at its own status code, sign,

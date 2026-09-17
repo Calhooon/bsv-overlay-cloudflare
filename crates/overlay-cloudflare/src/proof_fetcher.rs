@@ -189,6 +189,18 @@ pub const COURIER_RUNGS: [&str; 6] = [
 
 /// PURE: the call order for `n` rungs when this call's rotation index is
 /// `start` — every rung once, wrapping. `rotate_order(3, 4)` = `[1, 2, 0]`.
+/// bsv-low #451 slice B (2026-09-17): the spend ladder's rung ORDER. The two providers that still serve per-output
+/// spend data (BananaBlocks, WoC) rotate as each other's fallback (the 2026-09-04 ruling); Bitails' tx body is the
+/// TERMINAL rung, asked only after both — pruned Bitails answers an unspent output with a fault (measured on beta:
+/// 3,793 faults to 570 answers, 20,734 circuit skips), so as a START rung it burned a call on every unspent outpoint
+/// in a third of the ticks, and as a third rung it was asked after two clean negatives had already decided. Indices
+/// into `spender_hint_ladder`'s rung array: 0 = bananablocks, 1 = woc, 2 = bitails_tx.
+pub fn spend_rung_order(start: usize) -> Vec<usize> {
+    let mut order = rotate_order(2, start);
+    order.push(2);
+    order
+}
+
 pub fn rotate_order(n: usize, start: usize) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
@@ -310,10 +322,25 @@ impl ChainProofFetcher {
         }
 
         // 1. Arcade — our own broadcaster's free BUMP (MINED status merklePath).
-        if let Some(bump_hex) = self.arcade_merklepath(txid).await {
-            if judge(tracker, "arcade", &bump_hex, txid).await? {
-                return Ok(Some(bump_hex));
+        match self.arcade_proof_look(txid).await {
+            ArcadeProofLook::Mined(bump_hex) => {
+                if judge(tracker, "arcade", &bump_hex, txid).await? {
+                    return Ok(Some(bump_hex));
+                }
             }
+            // bsv-low #451 slice B (2026-09-17): Arcade HOLDS the tx on the network and said so within the last
+            // 30 minutes. No courier can hold a proof for a tx the network has not mined, so the ladder stops here
+            // THIS PASS — the MINED push or the next tick asks again; an Arcade a block behind delays this row's
+            // proof by one tick, never loses it, and a word older than the freshness window (a wedged Arcade, the
+            // 2026-09-01 class) falls through to the couriers exactly as before (the gate's HIGH-2). Measured
+            // before: every unmined row cost a Bitails read and a WoC read per tick that could only answer "no bump".
+            ArcadeProofLook::KnownUnmined(status) => {
+                worker::console_log!(
+                    "[proof] arcade holds {txid} unmined ({status}) — the couriers are not asked this pass"
+                );
+                return Ok(None);
+            }
+            ArcadeProofLook::Unknown => {}
         }
 
         // 2. Bitails TSC (secondary — tx mined outside Arcade).
@@ -339,15 +366,16 @@ impl ChainProofFetcher {
         Ok(None)
     }
 
-    /// Arcade `GET /tx/{txid}` → the BUMP hex when the tx is MINED and a
-    /// `merklePath` is present, else `None`.
-    async fn arcade_merklepath(&self, txid: &str) -> Option<String> {
+    /// Arcade `GET /tx/{txid}` → what it says about the tx's PROOF (bsv-low #451 slice B): the BUMP when MINED,
+    /// "held unmined" when Arcade carries a live non-mined status, else unknown (the ladder goes on).
+    async fn arcade_proof_look(&self, txid: &str) -> ArcadeProofLook {
         let url = format!("{}/tx/{}", self.arcade_url, txid);
-        let (status, body) = http_get(&url, None).await.ok()?;
-        if !(200..300).contains(&status) {
-            return None;
+        match http_get(&url, None).await {
+            Ok((status, body)) => {
+                parse_arcade_proof_look(status, &body, worker::Date::now().as_millis() as i64)
+            }
+            Err(_) => ArcadeProofLook::Unknown,
         }
-        parse_arcade_merklepath(&body)
     }
 
     /// WoC `GET /tx/{txid}/proof/tsc` (TSC JSON) + height from
@@ -545,7 +573,12 @@ impl ChainProofFetcher {
         self.rung_rotation.set(start.wrapping_add(1));
         let mut faults: Vec<String> = Vec::new();
         let mut clean_negatives = 0usize;
-        for i in rotate_order(rungs.len(), start) {
+        for i in spend_rung_order(start) {
+            // bsv-low #451 slice B: MIN_CLEAN_NEGATIVES clean negatives ARE the verdict (`ladder_verdict`) — a further
+            // rung can only add a correlated negative, and on this ladder the further rung is pruned Bitails.
+            if clean_negatives >= MIN_CLEAN_NEGATIVES {
+                break;
+            }
             let (name, url, hdr, parse) = &rungs[i];
             match self
                 .call_rung(name, url, *hdr, |st, body| parse(st, body))
@@ -972,6 +1005,113 @@ fn parse_arcade_merklepath(body: &str) -> Option<String> {
         return None;
     }
     Some(mp.to_string())
+}
+
+/// bsv-low #451 slice B: what Arcade's `GET /tx/{txid}` says about a tx's PROOF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArcadeProofLook {
+    /// MINED / IMMUTABLE with a `merklePath`: the BUMP hex (the caller judges it against chaintracks).
+    Mined(String),
+    /// Arcade holds the tx on the network unmined (`SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES`, the overlay's own
+    /// `SEEN_OR_BETTER` bar) and said so within [`ARCADE_WORD_FRESH_MS`]: no proof exists anywhere yet. Carries the
+    /// status for the log line.
+    KnownUnmined(String),
+    /// Everything else — the ladder goes on to the couriers (the gate's HIGH-1 / HIGH-2, 2026-09-17): Arcade does
+    /// not know it (404), faulted, a TERMINAL status (REJECTED / DOUBLE_SPEND_ATTEMPTED: one broadcaster's refusal is
+    /// never the network's verdict), the ORPHAN view (`SEEN_IN_ORPHAN_MEMPOOL` — Arcade orphans and forgets; the tx
+    /// may have mined through another broadcaster), `MINED_IN_STALE_BLOCK`, a PRE-NETWORK rank (RECEIVED / STORED /
+    /// ANNOUNCED / REQUESTED / SENT — a STORED tx can have mined through the client's direct-ARC fallback), a SEEN
+    /// word older than the freshness window (a wedged or lagging Arcade must not hold the ladder for ever), or MINED
+    /// without a path yet.
+    Unknown,
+}
+
+/// How old Arcade's status stamp may be for its unmined word to stop the ladder (the push-backstop reasoning:
+/// [`PUSH_BACKSTOP_MIN_AGE_SECS`] — after this long the push has had its chance and the couriers are asked).
+pub const ARCADE_WORD_FRESH_MS: i64 = 30 * 60 * 1_000;
+
+/// PURE: the three-way read of an Arcade `GET /tx/{txid}` answer (`arcade_proof_look`) at `now_ms`. An ALLOW-LIST:
+/// only a fresh `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` stops the ladder; a non-2xx, an unparseable body, an
+/// empty status, a fatal status and every other status are `Unknown` — the ladder's fail-safe direction is "ask on".
+pub fn parse_arcade_proof_look(status: u16, body: &str, now_ms: i64) -> ArcadeProofLook {
+    if !(200..300).contains(&status) {
+        return ArcadeProofLook::Unknown;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ArcadeProofLook::Unknown;
+    };
+    let tx_status = v
+        .get("txStatus")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    if tx_status == "MINED" || tx_status == "IMMUTABLE" {
+        return match parse_arcade_merklepath(body) {
+            Some(bump_hex) => ArcadeProofLook::Mined(bump_hex),
+            None => ArcadeProofLook::Unknown,
+        };
+    }
+    if tx_status != "SEEN_ON_NETWORK" && tx_status != "SEEN_MULTIPLE_NODES" {
+        return ArcadeProofLook::Unknown;
+    }
+    let fresh = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(rfc3339_utc_ms)
+        .map(|ts| now_ms - ts < ARCADE_WORD_FRESH_MS && ts <= now_ms + 60_000)
+        .unwrap_or(false);
+    if fresh {
+        ArcadeProofLook::KnownUnmined(tx_status)
+    } else {
+        ArcadeProofLook::Unknown
+    }
+}
+
+/// PURE: an RFC 3339 UTC instant (`YYYY-MM-DDTHH:MM:SS[.frac](Z|+00:00)`, the shape Arcade stamps) as ms since the
+/// epoch; anything else `None`. No calendar crate in this crate — the civil-days arithmetic is Howard Hinnant's.
+pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let time = rest
+        .strip_suffix('Z')
+        .or_else(|| rest.strip_suffix("+00:00"))
+        .or_else(|| rest.strip_suffix("+0000"))?;
+    let (hms, frac) = match time.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (time, None),
+    };
+    let mut t = hms.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss: i64 = t.next()?.parse().ok()?;
+    if t.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let millis: i64 = match frac {
+        Some(f) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => {
+            let digits: String = f.chars().take(3).collect();
+            let v: i64 = digits.parse().ok()?;
+            v * 10_i64.pow(3 - digits.len() as u32)
+        }
+        Some(_) => return None,
+        None => 0,
+    };
+    // days from civil (proleptic Gregorian), 1970-01-01 = 0
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * i64::from(m2) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1_000) + millis)
 }
 
 /// Parse a TSC-proof response body (WoC / Bitails share the shape) into a
@@ -6933,6 +7073,61 @@ pub(crate) mod tests {
             woc_spent_url("https://api.whatsonchain.com/v1/bsv/main", "aa", 3),
             "https://api.whatsonchain.com/v1/bsv/main/tx/aa/3/spent"
         );
+    }
+
+    /// bsv-low #451 slice B: Bitails (index 2) is never the START rung and always the LAST; the healthy pair rotates.
+    /// RED before (the ladder rotated over all three): start 2 opened on Bitails.
+    #[test]
+    fn spend_rung_order_rotates_the_healthy_pair_and_keeps_bitails_terminal() {
+        for start in 0..7usize {
+            let order = spend_rung_order(start);
+            assert_eq!(order.len(), 3, "start {start}: every rung once — judged {order:?}");
+            assert_ne!(order[0], 2, "start {start}: pruned Bitails never opens the ladder — judged {order:?}");
+            assert_eq!(order[2], 2, "start {start}: Bitails is the terminal rung — judged {order:?}");
+            let mut pair = order[..2].to_vec();
+            pair.sort_unstable();
+            assert_eq!(pair, vec![0, 1], "start {start}: the healthy pair both asked — judged {order:?}");
+        }
+        assert_ne!(spend_rung_order(0)[0], spend_rung_order(1)[0], "the pair ROTATES between ticks");
+    }
+
+    /// bsv-low #451 slice B (the gate's HIGH-1 / HIGH-2): only a FRESH SEEN stops the proof ladder; the orphan view,
+    /// the pre-network ranks, a stale SEEN, a refusal and MINED-without-a-path ask on.
+    #[test]
+    fn parse_arcade_proof_look_allow_list_and_freshness() {
+        let now = 1_789_683_775_142_i64; // 2026-09-17T22:22:55.142Z
+        let mined = r#"{"txStatus":"MINED","merklePath":"fe0a0b0c","blockHeight":965000,"timestamp":"2026-01-01T00:00:00Z"}"#;
+        assert_eq!(parse_arcade_proof_look(200, mined, now), ArcadeProofLook::Mined("fe0a0b0c".into()));
+        for st in ["SEEN_ON_NETWORK", "seen_multiple_nodes"] {
+            let body = format!(r#"{{"txStatus":"{st}","timestamp":"2026-09-17T22:10:00Z"}}"#);
+            assert_eq!(parse_arcade_proof_look(200, &body, now), ArcadeProofLook::KnownUnmined(st.to_ascii_uppercase()), "a fresh SEEN stops the ladder — judged {body}");
+        }
+        let stale = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T21:52:00Z"}"#;
+        assert_eq!(parse_arcade_proof_look(200, stale, now), ArcadeProofLook::Unknown, "31 minutes old: the couriers are asked");
+        assert_eq!(parse_arcade_proof_look(200, r#"{"txStatus":"SEEN_ON_NETWORK"}"#, now), ArcadeProofLook::Unknown, "no stamp: not fresh");
+        assert_eq!(parse_arcade_proof_look(200, r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"0001-01-01T00:00:00Z"}"#, now), ArcadeProofLook::Unknown);
+        for st in ["SEEN_IN_ORPHAN_MEMPOOL", "MINED_IN_STALE_BLOCK", "RECEIVED", "STORED", "ANNOUNCED_TO_NETWORK", "REQUESTED_BY_NETWORK", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK", "REJECTED", "DOUBLE_SPEND_ATTEMPTED", ""] {
+            let body = format!(r#"{{"txStatus":"{st}","timestamp":"2026-09-17T22:22:00Z"}}"#);
+            assert_eq!(parse_arcade_proof_look(200, &body, now), ArcadeProofLook::Unknown, "not on the allow-list: ask on — judged {body}");
+        }
+        assert_eq!(parse_arcade_proof_look(200, r#"{"txStatus":"MINED"}"#, now), ArcadeProofLook::Unknown, "MINED without a path: ask on");
+        assert_eq!(parse_arcade_proof_look(404, r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T22:22:00Z"}"#, now), ArcadeProofLook::Unknown, "a 404 body is not a look");
+        assert_eq!(parse_arcade_proof_look(200, "not json", now), ArcadeProofLook::Unknown);
+        assert_eq!(parse_arcade_proof_look(503, "", now), ArcadeProofLook::Unknown);
+    }
+
+    /// bsv-low #451 slice B: Arcade's status stamp read as an instant (the freshness bound rests on it).
+    #[test]
+    fn rfc3339_utc_ms_reads_arcade_stamps() {
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55.142485Z"), Some(1_789_683_775_142));
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55Z"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
+        assert_eq!(rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55+00:00"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0), Some(true), "Arcade's zero stamp is far in the past, never fresh");
+        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ"] {
+            assert_eq!(rfc3339_utc_ms(bad), None, "judged {bad:?}");
+        }
     }
 
     #[test]

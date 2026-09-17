@@ -3463,6 +3463,17 @@ pub fn bitails_tx_unspent(
     }
 }
 
+/// bsv-low #451 slice B: the order the unspent CORROBORATORS are asked in, given who answered as the primary — the
+/// two providers that still serve per-output spend data first, pruned Bitails last (its tx body says `spent: ""` for
+/// an unspent output: unknown here, never a corroboration — so before this it was a wasted read whenever BananaBlocks
+/// could not corroborate, asked BEFORE the WoC read that could).
+pub fn unspent_corroborator_order(primary: &str) -> Vec<&'static str> {
+    ["bananablocks", "woc", "bitails_tx"]
+        .into_iter()
+        .filter(|c| *c != primary)
+        .collect()
+}
+
 /// RETIRED corroborator (2026-09-04): Bitails removed per-output spend data
 /// (pruned mode); kept for its pins.
 pub fn parse_bitails_unspent(status: u16, v: Option<&serde_json::Value>) -> UnspentCorroboration {
@@ -6774,4 +6785,17 @@ mod courier_ladder_2026_09_04 {
             markers.join("\n")
         );
     }
+    /// bsv-low #451 slice B: pruned Bitails is never asked before WoC as a corroborator; the primary is never re-asked.
+    #[test]
+    fn unspent_corroborators_ask_the_healthy_pair_before_pruned_bitails() {
+        assert_eq!(unspent_corroborator_order("woc"), vec!["bananablocks", "bitails_tx"]);
+        assert_eq!(unspent_corroborator_order("bananablocks"), vec!["woc", "bitails_tx"]);
+        assert_eq!(unspent_corroborator_order("bitails_tx"), vec!["bananablocks", "woc"]);
+        for primary in ["woc", "bananablocks", "bitails_tx"] {
+            let order = unspent_corroborator_order(primary);
+            assert!(!order.contains(&primary), "the primary is never its own corroborator — judged {order:?}");
+            assert_eq!(order.last().copied().unwrap_or(""), if primary == "bitails_tx" { "woc" } else { "bitails_tx" }, "judged {order:?}");
+        }
+    }
+
 }

@@ -3296,7 +3296,7 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     // swept outside our overlay is never served as recoverable.
     let mut probes: Vec<(String, u32, crate::hops_view::ChainSpendProbe)> = Vec::new();
     for (txid, vout) in crate::hops_view::chain_probe_targets(&entries) {
-        let st = spent_any_resolve(&txid, vout).await;
+        let st = spent_any_resolve_cached(&txid, vout, "hops_view").await;
         probes.push((
             txid,
             vout,
@@ -3901,18 +3901,97 @@ fn woc_api_key() -> Option<String> {
     WOC_API_KEY.with(|k| k.borrow().clone())
 }
 
+/// bsv-low #451 slice B: the Arcade endpoint `/tx-any`'s first external witness asks (`ARCADE_URL`; the overlay's
+/// default when unset). Set per isolate at request entry, like the WoC key.
+pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech";
+thread_local! {
+    static ARCADE_URL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+pub fn set_arcade_url(url: Option<String>) {
+    ARCADE_URL.with(|u| {
+        *u.borrow_mut() = url
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    });
+}
+fn arcade_url() -> String {
+    ARCADE_URL.with(|u| u.borrow().clone().unwrap_or_else(|| DEFAULT_ARCADE_URL.to_string()))
+}
+
+/// bsv-low #451 slice B: the ARCADE leg of `/tx-any` for a tx the index holds without a verified bump (the JOIN's
+/// first minutes; a MINED push not yet landed): ONE read to our broadcaster answers presence (its FRESH `SEEN` word,
+/// `txany::parse_arcade_word`) or confirmation — a MINED word is a CLAIM, and becomes `confirmed` only once its
+/// merkle path computes, from THIS txid, the root the header chaintracks holds at that height (the gate's MEDIUM-1:
+/// the client latches `confirmed` durably, and the index has refused Arcade's pushed bump before on the D7 class).
+/// `None` sends the question to the couriers exactly as before. The verified height rides back for the answer.
+async fn arcade_confirmation_look(
+    txid_lc: &str,
+    caller: &'static str,
+    env: &worker::Env,
+) -> Option<(crate::txany::TxObservation, Option<u64>)> {
+    use crate::txany::{ArcadeWord, TxObservation};
+    let url = format!("{}/tx/{txid_lc}", arcade_url());
+    let (status, body) = provider_get(caller, &url).await?;
+    let now_ms = worker::Date::now().as_millis() as i64;
+    match crate::txany::parse_arcade_word(status, std::str::from_utf8(&body).ok()?, now_ms) {
+        ArcadeWord::SeenFresh => Some((
+            TxObservation::Present {
+                confirmed: false,
+                raw_hex: None,
+            },
+            None,
+        )),
+        ArcadeWord::Mined { bump_hex, height } => {
+            let claimed = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
+                .ok()
+                .and_then(|mp| mp.compute_root(Some(txid_lc)).ok())
+                .map(|r| r.to_ascii_lowercase())?;
+            let canonical = crate::beef_guard::canonical_root(env, height).await?;
+            if claimed != canonical {
+                console_warn!(
+                    "[tx-any] {txid_lc}: arcade's MINED claim at {height} does not compute the canonical root (claimed {claimed}, chaintracks holds {canonical}) — the couriers decide"
+                );
+                return None;
+            }
+            Some((
+                TxObservation::Present {
+                    confirmed: true,
+                    raw_hex: None,
+                },
+                Some(height),
+            ))
+        }
+        ArcadeWord::Unknown => None,
+    }
+}
+
 /// Fetch a URL, returning `(status, body_bytes)`. Faults map to `None`. A
-/// WoC URL carries the api key when one is installed.
-async fn provider_get(url: &str) -> Option<(u16, Vec<u8>)> {
+/// WoC URL carries the api key when one is installed. bsv-low #451 slice B:
+/// every call is COUNTED and LOGGED with its caller (`crate::courier::note`)
+/// and identifies this worker (Arcade's edge 403s bare agents — the
+/// 2026-09-01 incident's lesson on the overlay).
+async fn provider_get(caller: &'static str, url: &str) -> Option<(u16, Vec<u8>)> {
+    let started = worker::Date::now().as_millis() as f64;
+    let got = provider_get_raw(url).await;
+    let ms = worker::Date::now().as_millis() as f64 - started;
+    crate::courier::note(url, caller, got.as_ref().map(|(s, _)| *s), ms);
+    got
+}
+
+/// This worker's courier identity (see `provider_get`).
+const APP_LAYER_USER_AGENT: &str = "low-app-layer/1.0 (+https://bsvarcade.com)";
+
+async fn provider_get_raw(url: &str) -> Option<(u16, Vec<u8>)> {
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
+    let headers = Headers::new();
+    let _ = headers.set("User-Agent", APP_LAYER_USER_AGENT);
     if url.starts_with(WOC_BASE) {
         if let Some(key) = woc_api_key() {
-            let headers = Headers::new();
             let _ = headers.set("woc-api-key", &key);
-            init.with_headers(headers);
         }
     }
+    init.with_headers(headers);
     let request = worker::Request::new_with_init(url, &init).ok()?;
     let mut response = worker::Fetch::Request(request).send().await.ok()?;
     let status = response.status_code();
@@ -3934,7 +4013,33 @@ const BANANABLOCKS_BASE: &str = "https://bananablocks.com/api/v1";
 /// positive = WoC pointer + raw hash/input verification (raw from WoC, then
 /// Bitails); negative = requires clean Bitails corroboration; any fault =
 /// honest unknown.
-async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
+/// bsv-low #451 slice B: the ONE cache-consulting entry to the spent-any ladder. `/spent-any` always read through
+/// the isolate cache; the hops view's chain probes and `/tx-any`'s unconfirmable probe called the ladder DIRECTLY —
+/// up to eight courier ladders per `/hops-view` call, twelve to fifteen such calls per seat per hand on the budget
+/// hand, none of them cached. One reader, one writer, one TTL (`SPENT_ANY_CACHE_TTL_MS`).
+async fn spent_any_resolve_cached(txid_lc: &str, vout: u32, caller: &'static str) -> SpentAnyCached {
+    let now = worker::Date::now().as_millis() as f64;
+    let key = format!("{txid_lc}.{vout}");
+    let cached = SPENT_ANY_CACHE.with(|c| {
+        c.borrow()
+            .get(&key)
+            .filter(|(expiry, _)| *expiry > now)
+            .map(|(_, row)| row.clone())
+    });
+    if let Some(row) = cached {
+        return row;
+    }
+    let row = spent_any_resolve(txid_lc, vout, caller).await;
+    SPENT_ANY_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        // Prune expired entries so the map stays bounded.
+        map.retain(|_, (expiry, _)| *expiry > now);
+        map.insert(key, (now + crate::results::SPENT_ANY_CACHE_TTL_MS, row.clone()));
+    });
+    row
+}
+
+async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> SpentAnyCached {
     use crate::results::{
         parse_bananablocks_unspent, parse_woc_spent_body, spender_raw_verifies, SpentObservation,
         UnspentCorroboration,
@@ -3945,7 +4050,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
     // then BananaBlocks, then Bitails' tx body — a fault falls through, a
     // real answer (spent OR not) stops the ladder. Every positive still
     // passes the same raw-verification bar below, whoever named it.
-    let mut woc = match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
+    let mut woc = match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => parse_woc_spent_body(&v),
             Err(_) => SpentObservation::Fault,
@@ -3959,7 +4064,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
     };
     let mut primary = "woc";
     if matches!(woc, SpentObservation::Fault) {
-        woc = match provider_get(&format!("{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend")).await {
+        woc = match provider_get(caller, &format!("{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend")).await {
             Some((status, body)) => {
                 let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
                 crate::results::parse_bananablocks_spent(status, v.as_ref())
@@ -3969,7 +4074,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
         primary = "bananablocks";
     }
     if matches!(woc, SpentObservation::Fault) {
-        woc = match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+        woc = match provider_get(caller, &format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
             Some((status, body)) => {
                 let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
                 crate::results::parse_bitails_tx_spent(status, v.as_ref(), vout)
@@ -3986,7 +4091,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             // Raw verification: WoC hex first, Bitails binary fallback. A
             // positive is served ONLY when the raw hashes to the reported
             // spender AND spends the requested outpoint.
-            let raw = match provider_get(&format!("{WOC_BASE}/tx/{spender}/hex")).await {
+            let raw = match provider_get(caller, &format!("{WOC_BASE}/tx/{spender}/hex")).await {
                 Some((200, body)) => std::str::from_utf8(&body)
                     .ok()
                     .and_then(|h| hex::decode(h.trim()).ok()),
@@ -3995,7 +4100,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             let raw = match raw {
                 Some(r) => Some(r),
                 None => {
-                    match provider_get(&format!("{BITAILS_BASE}/download/tx/{spender}")).await {
+                    match provider_get(caller, &format!("{BITAILS_BASE}/download/tx/{spender}")).await {
                         Some((200, body)) if !body.is_empty() => Some(body),
                         _ => None,
                     }
@@ -4007,7 +4112,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             let raw = match raw {
                 Some(r) => Some(r),
                 None => {
-                    match provider_get(&format!("{BANANABLOCKS_BASE}/tx/{spender}/hex")).await {
+                    match provider_get(caller, &format!("{BANANABLOCKS_BASE}/tx/{spender}/hex")).await {
                         Some((200, body)) => std::str::from_utf8(&body)
                             .ok()
                             .and_then(|h| hex::decode(h.trim()).ok()),
@@ -4029,12 +4134,10 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
             // unknown, never a verdict. Bitails retired its per-output
             // endpoint; its tx body reports an unspent output as `spent: ""`,
             // which is unknown here, never corroboration.
-            for corroborator in ["bananablocks", "bitails_tx", "woc"] {
-                if corroborator == primary {
-                    continue;
-                }
+            // bsv-low #451 slice B: the healthy pair before pruned Bitails (`unspent_corroborator_order`, pinned).
+            for corroborator in crate::results::unspent_corroborator_order(primary) {
                 let got = match corroborator {
-                    "bananablocks" => match provider_get(&format!(
+                    "bananablocks" => match provider_get(caller, &format!(
                         "{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend"
                     ))
                     .await
@@ -4046,7 +4149,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
                         None => UnspentCorroboration::Unknown,
                     },
                     "bitails_tx" => {
-                        match provider_get(&format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+                        match provider_get(caller, &format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
                             Some((status, body)) => {
                                 let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
                                 crate::results::bitails_tx_unspent(status, v.as_ref(), vout)
@@ -4054,7 +4157,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32) -> SpentAnyCached {
                             None => UnspentCorroboration::Unknown,
                         }
                     }
-                    _ => match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await
+                    _ => match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await
                     {
                         Some((s, _))
                             if matches!(
@@ -4118,32 +4221,9 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Re
         );
     }
 
-    let now = worker::Date::now().as_millis() as f64;
     let mut entries: Vec<crate::logic::OutpointStatus> = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
-        let key = format!("{}.{}", op.db_txid(), op.vout);
-        let cached = SPENT_ANY_CACHE.with(|c| {
-            c.borrow()
-                .get(&key)
-                .filter(|(expiry, _)| *expiry > now)
-                .map(|(_, row)| row.clone())
-        });
-        let row = match cached {
-            Some(row) => row,
-            None => {
-                let row = spent_any_resolve(&op.db_txid(), op.vout).await;
-                SPENT_ANY_CACHE.with(|c| {
-                    let mut map = c.borrow_mut();
-                    // Prune expired entries so the map stays bounded.
-                    map.retain(|_, (expiry, _)| *expiry > now);
-                    map.insert(
-                        key,
-                        (now + crate::results::SPENT_ANY_CACHE_TTL_MS, row.clone()),
-                    );
-                });
-                row
-            }
-        };
+        let row = spent_any_resolve_cached(&op.db_txid(), op.vout, "spent_any").await;
         entries.push(crate::logic::OutpointStatus {
             txid: op.txid.clone(),
             vout: op.vout,
@@ -4255,19 +4335,20 @@ async fn tx_any_index_leg(
 /// 404 behind a healthy route. See `txany.rs` for the full bar.
 async fn tx_any_external_leg(
     txid_lc: &str,
+    caller: &'static str,
 ) -> (
     crate::txany::TxObservation,
     crate::txany::AbsenceCorroboration,
 ) {
     use crate::txany::{AbsenceCorroboration, TxObservation};
 
-    let woc = match provider_get(&format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
+    let woc = match provider_get(caller, &format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => {
                 let confirmed = crate::txany::parse_woc_confirmations(&v);
                 // Positive presence requires the raw in hand, hash-verified
                 // (WoC hex first, Bitails binary fallback).
-                let raw = match provider_get(&format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
+                let raw = match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
                     Some((200, body)) => std::str::from_utf8(&body)
                         .ok()
                         .and_then(|h| hex::decode(h.trim()).ok()),
@@ -4276,7 +4357,7 @@ async fn tx_any_external_leg(
                 let raw = match raw {
                     Some(r) => Some(r),
                     None => {
-                        match provider_get(&format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
+                        match provider_get(caller, &format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
                             Some((200, body)) if !body.is_empty() => Some(body),
                             _ => None,
                         }
@@ -4295,14 +4376,14 @@ async fn tx_any_external_leg(
     if woc == TxObservation::Absent {
         // Corroborate: Bitails must ALSO definitively 404 the txid…
         let bitails_404 = matches!(
-            provider_get(&format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await,
+            provider_get(caller, &format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await,
             Some((404, _))
         );
         if bitails_404 {
             // …and its tx route must prove healthy against the known-mined
             // anchor (route-rot would otherwise fake absence for every txid).
             if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
-                if let Some((200, body)) = provider_get(&format!(
+                if let Some((200, body)) = provider_get(caller, &format!(
                     "{BITAILS_BASE}/download/tx/{}",
                     crate::txany::KNOWN_MINED_TXID
                 ))
@@ -4340,7 +4421,7 @@ fn cache_tx_any_answer(key: &str, answer: &TxAnyCached, now: f64) {
         map.retain(|_, (expiry, _)| *expiry > now);
         map.insert(
             key.to_string(),
-            (now + crate::txany::TX_ANY_CACHE_TTL_MS, answer.clone()),
+            (now + crate::txany::tx_any_cache_ttl_ms(answer), answer.clone()),
         );
     });
 }
@@ -4355,6 +4436,8 @@ async fn resolve_tx_any(
     index_height: Option<u64>,
     key: &str,
     now: f64,
+    caller: &'static str,
+    env: &worker::Env,
 ) -> TxAnyCached {
     let mut answer = if index_raw.is_some() && index_height.is_some() {
         crate::txany::decide_tx_any(
@@ -4363,8 +4446,32 @@ async fn resolve_tx_any(
             None,
             crate::txany::AbsenceCorroboration::Unknown,
         )
+    } else if index_raw.is_some() {
+        // bsv-low #451 slice B: we HOLD the bytes without a verified bump (the JOIN's first minutes; a MINED push not
+        // yet landed). Arcade — the broadcaster whose SEEN is the index's own admission witness — answers presence
+        // and confirmation in ONE read; only when it does not know the tx (mined outside its sight) or refuses to
+        // say do the couriers get asked, exactly as before (`parse_arcade_confirmation`, pinned).
+        match arcade_confirmation_look(key, caller, env).await {
+            Some((external, verified_height)) => {
+                let mut a = crate::txany::decide_tx_any(
+                    index_raw,
+                    index_height,
+                    Some(&external),
+                    crate::txany::AbsenceCorroboration::Unknown,
+                );
+                // the chaintracks-verified height (a proven fact, stronger than any courier's claim)
+                if a.confirmed == Some(true) {
+                    a.height = verified_height;
+                }
+                a
+            }
+            None => {
+                let (external, absence) = tx_any_external_leg(key, caller).await;
+                crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence)
+            }
+        }
     } else {
-        let (external, absence) = tx_any_external_leg(key).await;
+        let (external, absence) = tx_any_external_leg(key, caller).await;
         crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence)
     };
     if answer.present == Some(false) {
@@ -4379,9 +4486,12 @@ async fn resolve_tx_any(
                 let Some(src_txid) = input.source_txid.as_deref() else {
                     continue;
                 };
-                let st =
-                    spent_any_resolve(&src_txid.to_ascii_lowercase(), input.source_output_index)
-                        .await;
+                let st = spent_any_resolve_cached(
+                    &src_txid.to_ascii_lowercase(),
+                    input.source_output_index,
+                    "tx_any_unconfirmable",
+                )
+                .await;
                 if crate::txany::input_proves_unconfirmable(
                     key,
                     st.known,
@@ -4426,7 +4536,7 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         Some(a) => a,
         None => {
             let (index_raw, index_height) = tx_any_index_leg(&ctx, &key).await;
-            resolve_tx_any(index_raw, index_height, &key, now).await
+            resolve_tx_any(index_raw, index_height, &key, now, "tx_any", &ctx.env).await
         }
     };
     json_response(crate::txany::tx_any_body(&key, &answer), 200)
@@ -4625,6 +4735,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // caller — the poster claim is not a binding, the signature is, so the
     // operator watches the count rather than trusting the word.
     body["record"] = crate::record_post::record_health_json();
+    // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
+    body["couriers"] = crate::courier::health_json();
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
     // future-cutoff belt, i.e. exactly what the views are filtering by and
     // what /epoch serves. `null` = write-off inert. One glance answers

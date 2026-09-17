@@ -335,7 +335,7 @@ async fn present_tip(env: &Env) -> Option<u64> {
 
 /// The lowercase merkle root chaintracks holds at `height`, cached per
 /// isolate for [`HEADER_TTL_MS`]; `None` when it cannot be read.
-async fn canonical_root(env: &Env, height: u64) -> Option<String> {
+pub(crate) async fn canonical_root(env: &Env, height: u64) -> Option<String> {
     let now = worker::Date::now().as_millis() as f64;
     let cached = HEADER_ROOTS.with(|m| {
         m.borrow()
