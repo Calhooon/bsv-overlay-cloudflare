@@ -210,6 +210,35 @@ pub fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
+/// bsv-low #451 slice C (iii) (2026-09-18): one memoised UNCONFIRMABLE verdict (`tx_any_verdicts`, overlay
+/// migration 151) — the input a different confirmed tx spent, and that spender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictMemo {
+    pub txid: String,
+    pub verdict_at_ms: i64,
+    /// `<txid>:<vout>` of the input the conflicting spend consumed.
+    pub input_outpoint: String,
+    pub spender_txid: String,
+}
+
+/// How old a verdict memo may be to answer without the couriers: an hour (six blocks — a reorg that un-confirms a
+/// spender that deep is a headline event; the answer stays `no-store` and re-asked after). Served ONLY for an
+/// index-held row (we hold the bytes; the raw is served beside the negative, exactly as the courier leg did).
+pub const VERDICT_MEMO_MAX_AGE_MS: i64 = 60 * 60_000;
+
+/// PURE: does a memo answer for `txid` at `now_ms`?
+pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age_ms: i64) -> bool {
+    let age = now_ms - memo.verdict_at_ms;
+    memo.txid == txid.to_ascii_lowercase() && age >= 0 && age < max_age_ms
+}
+
+/// The memo read for one txid, column order = the row's fields.
+pub const VERDICT_MEMO_READ_SQL: &str =
+    "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid FROM tx_any_verdicts WHERE txid = ?";
+/// The memo upsert.
+pub const VERDICT_MEMO_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid) VALUES (?, ?, ?, ?) \
+     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid";
+
 /// The external (WoC) observation of a txid, already shape-validated by the
 /// route glue. `Present.raw_hex` is `Some` ONLY when the fetched raw bytes
 /// HASHED to the txid (the route verifies before constructing this).
@@ -574,6 +603,24 @@ pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// bsv-low #451 slice C (iii): a verdict memo answers for its own txid inside the hour, never older, never
+    /// from the future, never for another txid.
+    #[test]
+    fn a_verdict_memo_answers_inside_the_hour_for_its_own_txid() {
+        let now = 1_789_683_775_142_i64;
+        let m = |age: i64| VerdictMemo {
+            txid: "ab".repeat(32),
+            verdict_at_ms: now - age,
+            input_outpoint: format!("{}:0", "cd".repeat(32)),
+            spender_txid: "ef".repeat(32),
+        };
+        assert!(verdict_memo_answers(&m(1_000), &"AB".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a minute old, case-insensitive");
+        assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS));
+        assert!(!verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour old: the couriers are asked again");
+        assert!(!verdict_memo_answers(&m(-5_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "from the future: no");
+        assert!(!verdict_memo_answers(&m(1_000), &"ff".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "another txid: no");
+    }
 
     /// bsv-low #451 slice B: an unconfirmable verdict lives 10 minutes in the isolate; everything else 15 s.
     #[test]

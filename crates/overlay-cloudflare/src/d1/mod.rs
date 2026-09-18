@@ -446,7 +446,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// attacker does not hold) and IMMUTABLE (written once, never re-latched).
 /// 149 → 150 for bsv-low #451 slice C (2026-09-17): `hop_chain_probes`, the durable memo of the hops view's chain
 /// probes (an isolate cache cannot carry across isolates).
-pub const OVERLAY_MIGRATION_COUNT: usize = 150;
+/// 150 → 151 for bsv-low #451 slice C (iii): `tx_any_verdicts`, the durable memo of `/tx-any`'s unconfirmable verdicts.
+pub const OVERLAY_MIGRATION_COUNT: usize = 151;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1651,6 +1652,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // (Workers spread a seat's calls across isolates). One row per outpoint, the last KNOWN answer and when it was
     // read; a fault is never written. Read by the app layer (`low-app-layer/src/hops_view.rs`), never the overlay.
     "CREATE TABLE IF NOT EXISTS hop_chain_probes (outpoint TEXT PRIMARY KEY, probedAtMs INTEGER NOT NULL, spent INTEGER NOT NULL, spendingTxid TEXT, spentConfirmed INTEGER)",
+    // bsv-low #451 slice C (iii) (2026-09-18): `/tx-any`'s UNCONFIRMABLE verdicts (an index-held tx whose input a
+    // DIFFERENT confirmed tx spent: chain truth short of a reorg) with their evidence. A dead story is asked on every
+    // fresh boot and every ask was a WoC read, a Bitails read and up to three courier ladders. Read and written by
+    // the app layer (`low-app-layer/src/txany.rs`); a positive is never stored (the index and Arcade answer those).
+    "CREATE TABLE IF NOT EXISTS tx_any_verdicts (txid TEXT PRIMARY KEY, verdictAtMs INTEGER NOT NULL, inputOutpoint TEXT NOT NULL, spenderTxid TEXT NOT NULL)",
 ];
 
 // =============================================================================

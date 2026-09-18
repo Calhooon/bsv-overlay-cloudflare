@@ -3340,6 +3340,67 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     )
 }
 
+/// One `tx_any_verdicts` row as D1 returns it (bsv-low #451 slice C (iii)).
+#[derive(serde::Deserialize)]
+struct VerdictMemoRow {
+    txid: String,
+    #[serde(rename = "verdictAtMs")]
+    verdict_at_ms: i64,
+    #[serde(rename = "inputOutpoint")]
+    input_outpoint: String,
+    #[serde(rename = "spenderTxid")]
+    spender_txid: String,
+}
+
+/// The memo that answers for `txid` at `now_ms`, if a fresh one exists. Fail-soft: no binding / a query fault = none
+/// (the couriers are asked, exactly as before).
+async fn read_verdict_memo(env: &worker::Env, txid: &str, now_ms: i64) -> Option<crate::txany::VerdictMemo> {
+    let db = env.d1("OVERLAY_DB").ok()?;
+    let rows: Vec<VerdictMemoRow> = match db
+        .prepare(crate::txany::VERDICT_MEMO_READ_SQL)
+        .bind(&[JsValue::from_str(txid)])
+    {
+        Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<VerdictMemoRow>()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                console_warn!("[tx-any] verdict memo read failed for {txid}: {e}");
+                return None;
+            }
+        },
+        Err(e) => {
+            console_warn!("[tx-any] verdict memo bind failed for {txid}: {e}");
+            return None;
+        }
+    };
+    rows.into_iter()
+        .map(|r| crate::txany::VerdictMemo {
+            txid: r.txid,
+            verdict_at_ms: r.verdict_at_ms,
+            input_outpoint: r.input_outpoint,
+            spender_txid: r.spender_txid,
+        })
+        .find(|m| crate::txany::verdict_memo_answers(m, txid, now_ms, crate::txany::VERDICT_MEMO_MAX_AGE_MS))
+}
+
+/// Remember a verdict (one upsert). Fail-soft: a failure only forgets (logged).
+async fn write_verdict_memo(env: &worker::Env, memo: &crate::txany::VerdictMemo) {
+    let Ok(db) = env.d1("OVERLAY_DB") else { return };
+    let binds = [
+        JsValue::from_str(&memo.txid),
+        JsValue::from_f64(memo.verdict_at_ms as f64),
+        JsValue::from_str(&memo.input_outpoint),
+        JsValue::from_str(&memo.spender_txid),
+    ];
+    match db.prepare(crate::txany::VERDICT_MEMO_UPSERT_SQL).bind(&binds) {
+        Ok(stmt) => {
+            if let Err(e) = stmt.run().await {
+                console_warn!("[tx-any] verdict memo write failed for {}: {e}", memo.txid);
+            }
+        }
+        Err(e) => console_warn!("[tx-any] verdict memo bind failed for {}: {e}", memo.txid),
+    }
+}
+
 /// One `hop_chain_probes` row as D1 returns it (bsv-low #451 slice C).
 #[derive(serde::Deserialize)]
 struct ProbeMemoRow {
@@ -4564,6 +4625,20 @@ async fn resolve_tx_any(
             None,
             crate::txany::AbsenceCorroboration::Unknown,
         )
+    } else if index_raw.is_some() && read_verdict_memo(env, key, now as i64).await.is_some() {
+        // bsv-low #451 slice C (iii): an index-held row whose UNCONFIRMABLE verdict a memo younger than an hour holds
+        // (`tx_any_verdicts`): the terminal negative, the raw served beside it, ZERO courier calls. Before this a
+        // dead story cost a WoC read, a Bitails read and up to three courier ladders on every fresh boot.
+        let mut a = crate::txany::decide_tx_any(
+            index_raw,
+            index_height,
+            Some(&crate::txany::TxObservation::Absent),
+            crate::txany::AbsenceCorroboration::CorroboratedAbsent,
+        );
+        a.unconfirmable = true;
+        a.source = Some("index+memo");
+        cache_tx_any_answer(key, &a, now);
+        return a;
     } else if index_raw.is_some() {
         // bsv-low #451 slice B: we HOLD the bytes without a verified bump (the JOIN's first minutes; a MINED push not
         // yet landed). Arcade — the broadcaster whose SEEN is the index's own admission witness — answers presence
@@ -4624,6 +4699,21 @@ async fn resolve_tx_any(
                             input.source_output_index
                         );
                     answer.unconfirmable = true;
+                    // #451 slice C (iii): remembered durably with its evidence, for an index-held row only
+                    if answer.raw_hex.is_some() {
+                        if let Some(spender) = st.spending_txid.as_deref() {
+                            write_verdict_memo(
+                                env,
+                                &crate::txany::VerdictMemo {
+                                    txid: key.to_string(),
+                                    verdict_at_ms: now as i64,
+                                    input_outpoint: format!("{}:{}", src_txid.to_ascii_lowercase(), input.source_output_index),
+                                    spender_txid: spender.to_ascii_lowercase(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
                     break;
                 }
             }

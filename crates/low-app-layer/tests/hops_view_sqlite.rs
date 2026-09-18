@@ -1843,3 +1843,20 @@ fn probe_memo_round_trips_on_the_production_schema() {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM hop_chain_probes", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 2);
 }
+
+/// bsv-low #451 slice C (iii): the verdict memo's SQL against the REAL schema (migration 151).
+#[test]
+fn verdict_memo_round_trips_on_the_production_schema() {
+    use low_app_layer::txany::{VERDICT_MEMO_READ_SQL, VERDICT_MEMO_UPSERT_SQL};
+    let conn = production_schema_db();
+    let txid = "ab".repeat(32);
+    conn.execute(VERDICT_MEMO_UPSERT_SQL, params![txid, 1_000_i64, format!("{}:0", "cd".repeat(32)), "ef".repeat(32)]).unwrap();
+    conn.execute(VERDICT_MEMO_UPSERT_SQL, params![txid, 2_000_i64, format!("{}:1", "cd".repeat(32)), "01".repeat(32)]).unwrap();
+    let row: (String, i64, String, String) = conn
+        .query_row(VERDICT_MEMO_READ_SQL, params![txid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap();
+    assert_eq!(row, (txid.clone(), 2_000, format!("{}:1", "cd".repeat(32)), "01".repeat(32)), "the re-upsert replaced the row");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tx_any_verdicts", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    assert!(conn.query_row(VERDICT_MEMO_READ_SQL, params!["ff".repeat(32)], |r| r.get::<_, String>(0)).is_err(), "no row for another txid");
+}
