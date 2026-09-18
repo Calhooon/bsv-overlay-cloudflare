@@ -3603,6 +3603,22 @@ pub enum ArcadeLook {
     Fault,
 }
 
+/// bsv-low #451 slice C (iv): the verdict memo the dead-letter pass leaves for `/tx-any` (the app layer's
+/// `tx_any_verdicts`, the same upsert by value) — the request path serves it with zero courier calls; the couriers
+/// are asked HERE, in the background, bounded per tick. `kind`: `refused` for Arcade's corroborated terminal word,
+/// `absent` for corroborated network absence.
+pub const TX_ANY_VERDICT_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence) VALUES (?, ?, '', '', ?, ?) \
+     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence";
+
+/// PURE: the memo kind a retire reason names (`retire_verdict`'s two arms).
+pub fn verdict_kind_of_retire_reason(reason: &str) -> &'static str {
+    if reason.starts_with("arcade ") {
+        "refused"
+    } else {
+        "absent"
+    }
+}
+
 /// Minimum proofless age before a row is even CONSIDERED for retirement.
 pub const RETIRE_MIN_AGE_SECS: i64 = 3_600;
 /// A row retired purely on ABSENCE (Arcade 404 + both indexers 404) needs
@@ -3811,6 +3827,21 @@ pub async fn run_retire_pass(
                     match write {
                         Ok(()) => {
                             summary.retired += 1;
+                            // bsv-low #451 slice C (iv): the verdict memo for `/tx-any` (the request path never
+                            // asks a courier for an index-held row; this pass did, once, here). Fail-soft.
+                            if let Err(e) = Query::new(TX_ANY_VERDICT_UPSERT_SQL)
+                                .bind(row.txid.as_str())
+                                .bind(now)
+                                .bind(verdict_kind_of_retire_reason(&reason))
+                                .bind(reason.as_str())
+                                .execute(db)
+                                .await
+                            {
+                                worker::console_log!(
+                                    "[retire] verdict memo write failed for {}: {e}",
+                                    row.txid
+                                );
+                            }
                             // Evidence on record (write-once — a webhook row
                             // already present makes this a no-op).
                             if let ArcadeLook::Fatal(status, extra) = &look {
@@ -4170,6 +4201,15 @@ pub(crate) mod tests {
 
     /// The retire fold: every uncertain arm KEEPS; only a corroborated
     /// terminal verdict (or 48 h+ absence everywhere) retires.
+    /// bsv-low #451 slice C (iv): the memo kind a retire reason names.
+    #[test]
+    fn a_retire_reason_names_its_memo_kind() {
+        assert_eq!(verdict_kind_of_retire_reason("arcade REJECTED: UTXO_SPENT (70): x"), "refused");
+        assert_eq!(verdict_kind_of_retire_reason("network-absent 172800s: arcade 404 + both indexers 404"), "absent");
+        let bind_marks = TX_ANY_VERDICT_UPSERT_SQL.matches('?').count();
+        assert_eq!(bind_marks, 4, "txid, verdictAtMs, kind, evidence — judged {TX_ANY_VERDICT_UPSERT_SQL}");
+    }
+
     #[test]
     fn retire_verdict_fails_safe_on_every_uncertain_arm() {
         let fatal = ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT (70): x".into());

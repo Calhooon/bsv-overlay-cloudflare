@@ -3294,44 +3294,13 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     // re-check a bounded number of them against the chain rung (the same
     // corroborated WoC + Bitails read `/spent-any` serves, cached) so a hop
     // swept outside our overlay is never served as recoverable.
-    // bsv-low #451 slice C: the DURABLE memo first (`hop_chain_probes`, one `IN` read) — a fresh memo answers a
-    // target with no courier; only the stale or unknown ones are asked, and their KNOWN answers are written back in
-    // one batch. An isolate cache cut nothing here (Workers spread a seat's calls across isolates); the census
-    // counted 109–183 of these probes per two hands. Fail-soft on both D1 legs: a memo read fault asks every
-    // target as before, a memo write fault only forgets.
-    let targets = crate::hops_view::chain_probe_targets(&entries);
-    let now_ms = worker::Date::now().as_millis() as i64;
-    let memos = read_probe_memos(&db, &targets).await;
-    let (mut probes, to_probe) = crate::hops_view::split_probe_targets(
-        &targets,
-        &memos,
-        now_ms,
-        crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
-    );
-    let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
-    for (txid, vout) in to_probe {
-        let st = spent_any_resolve_cached(
-            &txid,
-            vout,
-            "hops_view",
-            crate::results::SPENT_ANY_PROBE_MAX_AGE_MS,
-        )
-        .await;
-        let probe = crate::hops_view::ChainSpendProbe {
-            known: st.known,
-            spent: st.spent,
-            spending_txid: st.spending_txid.clone(),
-            spent_confirmed: st.spent_confirmed,
-        };
-        if let Some(m) = crate::hops_view::probe_memo_of(&txid, vout, &probe, now_ms) {
-            fresh.push(m);
-        }
-        probes.push((txid, vout, probe));
-    }
-    if !fresh.is_empty() {
-        write_probe_memos(&db, &fresh).await;
-    }
-    let entries = crate::hops_view::apply_chain_probes(entries, &probes);
+    // bsv-low #451 slice C (iv) — THE OWNER'S RULE (2026-09-18): the view serves the INDEX'S word, labelled `index`,
+    // and never asks a courier. The 2026-09-02 belt re-checked every index-unspent hop against the chain on every
+    // call so a hop the player's own wallet swept outside LOW is never served as recoverable; measured on the budget
+    // hand it was 109–183 courier calls per two hands, the whole hot path's hog. The press-time read
+    // (`hopSpenderRead`: `/utxo-status`, then `/spent-any` for what the index does not know) corroborates before
+    // any sweep, and a hop swept elsewhere fails at broadcast — nothing is released on the view's word. The D1 memo
+    // (`hop_chain_probes`, migration 150) and its pure helpers stay for their pins; the route no longer probes.
     // The tip AFTER the D1 facts (`null` on a fault — facts still serve).
     let tip = chaintracks_present_height(&ctx, "hops-view").await.ok();
     json_response(
@@ -3350,6 +3319,10 @@ struct VerdictMemoRow {
     input_outpoint: String,
     #[serde(rename = "spenderTxid")]
     spender_txid: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// The memo that answers for `txid` at `now_ms`, if a fresh one exists. Fail-soft: no binding / a query fault = none
@@ -3373,11 +3346,15 @@ async fn read_verdict_memo(env: &worker::Env, txid: &str, now_ms: i64) -> Option
         }
     };
     rows.into_iter()
-        .map(|r| crate::txany::VerdictMemo {
-            txid: r.txid,
-            verdict_at_ms: r.verdict_at_ms,
-            input_outpoint: r.input_outpoint,
-            spender_txid: r.spender_txid,
+        .filter_map(|r| {
+            Some(crate::txany::VerdictMemo {
+                txid: r.txid,
+                verdict_at_ms: r.verdict_at_ms,
+                input_outpoint: r.input_outpoint,
+                spender_txid: r.spender_txid,
+                kind: crate::txany::VerdictKind::parse(r.kind.as_deref())?,
+                evidence: r.evidence.unwrap_or_default(),
+            })
         })
         .find(|m| crate::txany::verdict_memo_answers(m, txid, now_ms, crate::txany::VERDICT_MEMO_MAX_AGE_MS))
 }
@@ -3390,6 +3367,8 @@ async fn write_verdict_memo(env: &worker::Env, memo: &crate::txany::VerdictMemo)
         JsValue::from_f64(memo.verdict_at_ms as f64),
         JsValue::from_str(&memo.input_outpoint),
         JsValue::from_str(&memo.spender_txid),
+        JsValue::from_str(memo.kind.as_str()),
+        JsValue::from_str(&memo.evidence),
     ];
     match db.prepare(crate::txany::VERDICT_MEMO_UPSERT_SQL).bind(&binds) {
         Ok(stmt) => {
@@ -3398,82 +3377,6 @@ async fn write_verdict_memo(env: &worker::Env, memo: &crate::txany::VerdictMemo)
             }
         }
         Err(e) => console_warn!("[tx-any] verdict memo bind failed for {}: {e}", memo.txid),
-    }
-}
-
-/// One `hop_chain_probes` row as D1 returns it (bsv-low #451 slice C).
-#[derive(serde::Deserialize)]
-struct ProbeMemoRow {
-    outpoint: String,
-    #[serde(rename = "probedAtMs")]
-    probed_at_ms: i64,
-    spent: i64,
-    #[serde(rename = "spendingTxid")]
-    spending_txid: Option<String>,
-    #[serde(rename = "spentConfirmed")]
-    spent_confirmed: Option<i64>,
-}
-
-/// The memos for `targets` (one `IN` read). Fail-soft: a bind/query fault is an empty answer (every target asked).
-async fn read_probe_memos(
-    db: &worker::D1Database,
-    targets: &[(String, u32)],
-) -> Vec<crate::hops_view::ProbeMemo> {
-    if targets.is_empty() {
-        return Vec::new();
-    }
-    let binds: Vec<JsValue> = targets
-        .iter()
-        .map(|(txid, vout)| JsValue::from_str(&format!("{}.{vout}", txid.to_ascii_lowercase())))
-        .collect();
-    let rows: Vec<ProbeMemoRow> = match db
-        .prepare(crate::hops_view::probe_memo_read_sql(targets.len()))
-        .bind(&binds)
-    {
-        Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
-            Ok(rows) => rows,
-            Err(e) => {
-                console_warn!("[hops-view] probe memo read failed ({} targets): {e}", targets.len());
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            console_warn!("[hops-view] probe memo bind failed ({} targets): {e}", targets.len());
-            Vec::new()
-        }
-    };
-    rows.into_iter()
-        .map(|r| crate::hops_view::ProbeMemo {
-            outpoint: r.outpoint,
-            probed_at_ms: r.probed_at_ms,
-            spent: r.spent != 0,
-            spending_txid: r.spending_txid,
-            spent_confirmed: r.spent_confirmed.map(|v| v != 0),
-        })
-        .collect()
-}
-
-/// The fresh memos, ONE batch of upserts. Fail-soft: a failure only forgets (logged).
-async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::ProbeMemo]) {
-    let mut stmts = Vec::with_capacity(memos.len());
-    for m in memos {
-        let binds = [
-            JsValue::from_str(&m.outpoint),
-            JsValue::from_f64(m.probed_at_ms as f64),
-            JsValue::from_f64(if m.spent { 1.0 } else { 0.0 }),
-            m.spending_txid.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL),
-            m.spent_confirmed.map(|v| JsValue::from_f64(if v { 1.0 } else { 0.0 })).unwrap_or(JsValue::NULL),
-        ];
-        match db.prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL).bind(&binds) {
-            Ok(s) => stmts.push(s),
-            Err(e) => console_warn!("[hops-view] probe memo bind failed for {}: {e}", m.outpoint),
-        }
-    }
-    if stmts.is_empty() {
-        return;
-    }
-    if let Err(e) = db.batch(stmts).await {
-        console_warn!("[hops-view] probe memo write failed ({} rows): {e}", memos.len());
     }
 }
 
@@ -4618,6 +4521,13 @@ async fn resolve_tx_any(
     caller: &'static str,
     env: &worker::Env,
 ) -> TxAnyCached {
+    // bsv-low #451 slice C (iv) — THE OWNER'S RULE: the couriers are break-glass, never routine. A verdict memo
+    // (`tx_any_verdicts`: the janitor's corroborated absence or refusal, or a proven input conflict) answers FIRST
+    // for every row without a verified bump, with zero courier calls; an INDEX-HELD row without a memo asks Arcade
+    // (our own broadcaster) and otherwise answers the honest `null` — the overlay's dead-letter pass corroborates
+    // its absence in the background, bounded per tick, and writes the memo; only an index-UNKNOWN row without a
+    // memo (a tx never admitted — the client's own record of a broadcast the overlay refused) still opens the
+    // break-glass at request time, and its corroborated absence is memoised for an hour so it is bought once.
     let mut answer = if index_raw.is_some() && index_height.is_some() {
         crate::txany::decide_tx_any(
             index_raw,
@@ -4625,25 +4535,15 @@ async fn resolve_tx_any(
             None,
             crate::txany::AbsenceCorroboration::Unknown,
         )
-    } else if index_raw.is_some() && read_verdict_memo(env, key, now as i64).await.is_some() {
-        // bsv-low #451 slice C (iii): an index-held row whose UNCONFIRMABLE verdict a memo younger than an hour holds
-        // (`tx_any_verdicts`): the terminal negative, the raw served beside it, ZERO courier calls. Before this a
-        // dead story cost a WoC read, a Bitails read and up to three courier ladders on every fresh boot.
-        let mut a = crate::txany::decide_tx_any(
-            index_raw,
-            index_height,
-            Some(&crate::txany::TxObservation::Absent),
-            crate::txany::AbsenceCorroboration::CorroboratedAbsent,
-        );
-        a.unconfirmable = true;
-        a.source = Some("index+memo");
+    } else if let Some(memo) = read_verdict_memo(env, key, now as i64).await {
+        let a = crate::txany::answer_from_verdict_memo(&memo, index_raw);
         cache_tx_any_answer(key, &a, now);
         return a;
     } else if index_raw.is_some() {
         // bsv-low #451 slice B: we HOLD the bytes without a verified bump (the JOIN's first minutes; a MINED push not
         // yet landed). Arcade — the broadcaster whose SEEN is the index's own admission witness — answers presence
-        // and confirmation in ONE read; only when it does not know the tx (mined outside its sight) or refuses to
-        // say do the couriers get asked, exactly as before (`parse_arcade_confirmation`, pinned).
+        // and confirmation in ONE read (`parse_arcade_word`, pinned); when it does not know or refuses to say, the
+        // answer is the honest unknown — never a courier here (slice C (iv)).
         match arcade_confirmation_look(key, caller, env).await {
             Some((external, verified_height)) => {
                 let mut a = crate::txany::decide_tx_any(
@@ -4658,14 +4558,32 @@ async fn resolve_tx_any(
                 }
                 a
             }
-            None => {
-                let (external, absence) = tx_any_external_leg(key, caller).await;
-                crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence)
-            }
+            None => crate::txany::decide_tx_any(
+                index_raw,
+                index_height,
+                None,
+                crate::txany::AbsenceCorroboration::Unknown,
+            ),
         }
     } else {
+        // the one break-glass left at request time: a tx the index never admitted
         let (external, absence) = tx_any_external_leg(key, caller).await;
-        crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence)
+        let a = crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence);
+        if a.present == Some(false) && absence == crate::txany::AbsenceCorroboration::CorroboratedAbsent {
+            write_verdict_memo(
+                env,
+                &crate::txany::VerdictMemo {
+                    txid: key.to_string(),
+                    verdict_at_ms: now as i64,
+                    input_outpoint: String::new(),
+                    spender_txid: String::new(),
+                    kind: crate::txany::VerdictKind::Absent,
+                    evidence: "request-time break-glass: woc 404 + bitails 404 behind a healthy route".to_string(),
+                },
+            )
+            .await;
+        }
+        a
     };
     if answer.present == Some(false) {
         if let Some(inputs) = answer
@@ -4709,6 +4627,8 @@ async fn resolve_tx_any(
                                     verdict_at_ms: now as i64,
                                     input_outpoint: format!("{}:{}", src_txid.to_ascii_lowercase(), input.source_output_index),
                                     spender_txid: spender.to_ascii_lowercase(),
+                                    kind: crate::txany::VerdictKind::Unconfirmable,
+                                    evidence: format!("input {}:{} spent by the confirmed {}", src_txid.to_ascii_lowercase(), input.source_output_index, spender.to_ascii_lowercase()),
                                 },
                             )
                             .await;

@@ -447,7 +447,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 149 → 150 for bsv-low #451 slice C (2026-09-17): `hop_chain_probes`, the durable memo of the hops view's chain
 /// probes (an isolate cache cannot carry across isolates).
 /// 150 → 151 for bsv-low #451 slice C (iii): `tx_any_verdicts`, the durable memo of `/tx-any`'s unconfirmable verdicts.
-pub const OVERLAY_MIGRATION_COUNT: usize = 151;
+/// 151 → 153 for bsv-low #451 slice C (iv): `tx_any_verdicts.kind` + `.evidence` (two additive ALTERs).
+pub const OVERLAY_MIGRATION_COUNT: usize = 153;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1657,6 +1658,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // fresh boot and every ask was a WoC read, a Bitails read and up to three courier ladders. Read and written by
     // the app layer (`low-app-layer/src/txany.rs`); a positive is never stored (the index and Arcade answer those).
     "CREATE TABLE IF NOT EXISTS tx_any_verdicts (txid TEXT PRIMARY KEY, verdictAtMs INTEGER NOT NULL, inputOutpoint TEXT NOT NULL, spenderTxid TEXT NOT NULL)",
+    // bsv-low #451 slice C (iv) (2026-09-18, the owner's rule: the couriers are break-glass, never routine): the
+    // verdict's KIND (`unconfirmable` = an input conflict; `absent` = corroborated network absence; `refused` =
+    // Arcade's terminal word corroborated by both indexers' absence) and its EVIDENCE as words. The janitor's
+    // dead-letter pass writes `absent` / `refused` when it retires a proofless row; the app layer writes
+    // `unconfirmable` and the request-time break-glass `absent`. Additive ALTERs; the runner ignores the re-run
+    // "duplicate column" error. A row without a kind is a pre-152 `unconfirmable`.
+    "ALTER TABLE tx_any_verdicts ADD COLUMN kind TEXT",
+    "ALTER TABLE tx_any_verdicts ADD COLUMN evidence TEXT",
 ];
 
 // =============================================================================

@@ -25,11 +25,12 @@
 //!
 //! ## `status`/`statusSource` (the spent/unspent honesty pair)
 //!
-//! bsv-low #451 slice B (2026-09-17): a `"chain"` status is read through the app layer's spent-any cache with the
-//! PROBE max age (`SPENT_ANY_PROBE_MAX_AGE_MS`, 5 min in the isolate), so an entry can be served `unspent` up to that
-//! long after another device of the identity swept it — the sweep then fails at broadcast and nothing is released on
-//! the word (the gate's LOW-2, accepted; the census: 109 of 154 courier calls in two hands were these probes past a
-//! 15 s TTL). Before this the view's probes ran the courier ladder uncached on every call.
+//! bsv-low #451 slice C (iv) (2026-09-18, the owner's rule: the couriers are break-glass, never routine): the view
+//! serves the INDEX'S word only — every unspent entry is `statusSource: "index"`; the per-call chain re-check of
+//! 2026-09-02 is retired (109–183 courier calls per two hands on the budget hand). The press-time read corroborates
+//! before any sweep and a hop swept elsewhere fails at broadcast: nothing is released on the view's word. The
+//! `"chain"` word and `apply_chain_probes` remain in the contract for a future caller that proves a spend; the
+//! `hop_chain_probes` memo (migration 150) and its helpers stay for their pins.
 //!
 //! | facts                                                   | status    | source |
 //! |---------------------------------------------------------|-----------|--------|

@@ -216,9 +216,59 @@ pub fn days_in_month(year: i64, month: u32) -> u32 {
 pub struct VerdictMemo {
     pub txid: String,
     pub verdict_at_ms: i64,
-    /// `<txid>:<vout>` of the input the conflicting spend consumed.
+    /// `<txid>:<vout>` of the input the conflicting spend consumed (empty for an absence verdict).
     pub input_outpoint: String,
+    /// The confirmed spender of that input (empty for an absence verdict).
     pub spender_txid: String,
+    /// bsv-low #451 slice C (iv), migration 152: what kind of negative this is.
+    pub kind: VerdictKind,
+    /// The evidence, as words (the janitor's retire reason; the input and its spender).
+    pub evidence: String,
+}
+
+/// The kinds of negative a memo can hold. `Unconfirmable` = an input a DIFFERENT confirmed tx spent (the subject can
+/// never confirm); `Absent` = corroborated network absence (Arcade 404 + both indexers 404, past the janitor's age
+/// bar); `Refused` = Arcade's terminal refusal corroborated by both indexers' absence. Every kind answers
+/// `present: false`; only `Unconfirmable` sets the client's `unconfirmable` flag (the refund rebroadcast retirement
+/// reads it, and only an input conflict earns it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictKind {
+    Unconfirmable,
+    Absent,
+    Refused,
+}
+
+impl VerdictKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerdictKind::Unconfirmable => "unconfirmable",
+            VerdictKind::Absent => "absent",
+            VerdictKind::Refused => "refused",
+        }
+    }
+    /// A row written before migration 152 carries no kind: it was an unconfirmable verdict (the only kind then).
+    pub fn parse(s: Option<&str>) -> Option<VerdictKind> {
+        match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("unconfirmable") => Some(VerdictKind::Unconfirmable),
+            Some("absent") => Some(VerdictKind::Absent),
+            Some("refused") => Some(VerdictKind::Refused),
+            _ => None,
+        }
+    }
+}
+
+/// PURE: the `/tx-any` answer a fresh memo yields for a row whose index bytes are `index_raw` (served beside the
+/// negative when held): every kind is a corroborated `present: false`; only an input conflict is `unconfirmable`.
+pub fn answer_from_verdict_memo(memo: &VerdictMemo, index_raw: Option<String>) -> TxAnyAnswer {
+    let mut a = decide_tx_any(
+        index_raw,
+        None,
+        Some(&TxObservation::Absent),
+        AbsenceCorroboration::CorroboratedAbsent,
+    );
+    a.unconfirmable = memo.kind == VerdictKind::Unconfirmable;
+    a.source = Some("memo");
+    a
 }
 
 /// How old a verdict memo may be to answer without the couriers: an hour (six blocks — a reorg that un-confirms a
@@ -234,10 +284,10 @@ pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age
 
 /// The memo read for one txid, column order = the row's fields.
 pub const VERDICT_MEMO_READ_SQL: &str =
-    "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid FROM tx_any_verdicts WHERE txid = ?";
-/// The memo upsert.
-pub const VERDICT_MEMO_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid) VALUES (?, ?, ?, ?) \
-     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid";
+    "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid = ?";
+/// The memo upsert (the same statement the overlay's dead-letter pass runs, by value).
+pub const VERDICT_MEMO_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence) VALUES (?, ?, ?, ?, ?, ?) \
+     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence";
 
 /// The external (WoC) observation of a txid, already shape-validated by the
 /// route glue. `Present.raw_hex` is `Some` ONLY when the fetched raw bytes
@@ -614,12 +664,32 @@ mod tests {
             verdict_at_ms: now - age,
             input_outpoint: format!("{}:0", "cd".repeat(32)),
             spender_txid: "ef".repeat(32),
+            kind: VerdictKind::Unconfirmable,
+            evidence: String::new(),
         };
         assert!(verdict_memo_answers(&m(1_000), &"AB".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a minute old, case-insensitive");
         assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS));
         assert!(!verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour old: the couriers are asked again");
         assert!(!verdict_memo_answers(&m(-5_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "from the future: no");
         assert!(!verdict_memo_answers(&m(1_000), &"ff".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "another txid: no");
+    }
+
+    /// bsv-low #451 slice C (iv): every memo kind is a corroborated `present: false`; only an input conflict sets
+    /// `unconfirmable`; the index bytes ride beside the negative when held; a pre-152 row (no kind) is unconfirmable.
+    #[test]
+    fn a_memo_answers_present_false_and_only_a_conflict_is_unconfirmable() {
+        let base = VerdictMemo { txid: "ab".repeat(32), verdict_at_ms: 1, input_outpoint: String::new(), spender_txid: String::new(), kind: VerdictKind::Absent, evidence: "network-absent".into() };
+        let a = answer_from_verdict_memo(&base, Some("0100".into()));
+        assert_eq!((a.present, a.confirmed, a.unconfirmable, a.raw_hex.as_deref(), a.source), (Some(false), None, false, Some("0100"), Some("memo")));
+        let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Refused, ..base.clone() }, None);
+        assert_eq!((a.present, a.unconfirmable, a.raw_hex), (Some(false), false, None));
+        let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Unconfirmable, ..base }, Some("0100".into()));
+        assert_eq!((a.present, a.unconfirmable), (Some(false), true), "an input conflict is the one unconfirmable kind");
+        assert_eq!(VerdictKind::parse(None), Some(VerdictKind::Unconfirmable), "a pre-152 row");
+        assert_eq!(VerdictKind::parse(Some("")), Some(VerdictKind::Unconfirmable));
+        assert_eq!(VerdictKind::parse(Some("Absent")), Some(VerdictKind::Absent));
+        assert_eq!(VerdictKind::parse(Some("refused")), Some(VerdictKind::Refused));
+        assert_eq!(VerdictKind::parse(Some("nope")), None, "an unknown kind is no memo");
     }
 
     /// bsv-low #451 slice B: an unconfirmable verdict lives 10 minutes in the isolate; everything else 15 s.
