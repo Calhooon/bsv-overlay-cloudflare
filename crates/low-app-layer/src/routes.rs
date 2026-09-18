@@ -3325,38 +3325,61 @@ struct VerdictMemoRow {
     evidence: Option<String>,
 }
 
-/// The memo that answers for `txid` at `now_ms`, if a fresh one exists. Fail-soft: no binding / a query fault = none
+/// The memo that answers for `txid` at `now_ms`, if one does. Fail-soft: no binding / a query fault = none
 /// (the couriers are asked, exactly as before).
 async fn read_verdict_memo(env: &worker::Env, txid: &str, now_ms: i64) -> Option<crate::txany::VerdictMemo> {
-    let db = env.d1("OVERLAY_DB").ok()?;
-    let rows: Vec<VerdictMemoRow> = match db
-        .prepare(crate::txany::VERDICT_MEMO_READ_SQL)
-        .bind(&[JsValue::from_str(txid)])
-    {
-        Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<VerdictMemoRow>()) {
-            Ok(rows) => rows,
+    read_verdict_memos(env, std::slice::from_ref(&txid.to_string()), now_ms)
+        .await
+        .into_iter()
+        .next()
+}
+
+/// bsv-low #451 slice C (v): the memos that ANSWER for `txids` at `now_ms` — ONE `IN` read (the batched `/tx-any`,
+/// `/spent-any`'s outpoints). Fail-soft: a fault is an empty answer (every txid asked as before).
+async fn read_verdict_memos(
+    env: &worker::Env,
+    txids: &[String],
+    now_ms: i64,
+) -> Vec<crate::txany::VerdictMemo> {
+    if txids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(db) = env.d1("OVERLAY_DB") else { return Vec::new() };
+    let mut out = Vec::new();
+    for chunk in txids.chunks(crate::txany::TX_ANY_BATCH_D1_CHUNK) {
+        let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(&t.to_ascii_lowercase())).collect();
+        let rows: Vec<VerdictMemoRow> = match db
+            .prepare(crate::txany::verdict_memo_read_many_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<VerdictMemoRow>()) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    console_warn!("[tx-any] verdict memo read failed ({} txids): {e}", chunk.len());
+                    continue;
+                }
+            },
             Err(e) => {
-                console_warn!("[tx-any] verdict memo read failed for {txid}: {e}");
-                return None;
+                console_warn!("[tx-any] verdict memo bind failed ({} txids): {e}", chunk.len());
+                continue;
             }
-        },
-        Err(e) => {
-            console_warn!("[tx-any] verdict memo bind failed for {txid}: {e}");
-            return None;
-        }
-    };
-    rows.into_iter()
-        .filter_map(|r| {
-            Some(crate::txany::VerdictMemo {
-                txid: r.txid,
+        };
+        for r in rows {
+            let Some(kind) = crate::txany::VerdictKind::parse(r.kind.as_deref()) else { continue };
+            let m = crate::txany::VerdictMemo {
+                txid: r.txid.to_ascii_lowercase(),
                 verdict_at_ms: r.verdict_at_ms,
                 input_outpoint: r.input_outpoint,
                 spender_txid: r.spender_txid,
-                kind: crate::txany::VerdictKind::parse(r.kind.as_deref())?,
+                kind,
                 evidence: r.evidence.unwrap_or_default(),
-            })
-        })
-        .find(|m| crate::txany::verdict_memo_answers(m, txid, now_ms, crate::txany::VERDICT_MEMO_MAX_AGE_MS))
+            };
+            if crate::txany::verdict_memo_answers(&m, &m.txid.clone(), now_ms, crate::txany::VERDICT_MEMO_MAX_AGE_MS) {
+                out.push(m);
+            }
+        }
+    }
+    out
 }
 
 /// Remember a verdict (one upsert). Fail-soft: a failure only forgets (logged).
@@ -4273,7 +4296,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
 /// cache. `known:false` is the honest answer for every provider fault or
 /// un-corroborated negative — this surface never asserts what it cannot
 /// verify (positives are raw-hash + input-match verified).
-pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Response> {
+pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let url = req.url()?;
     let Some(param) = url
         .query_pairs()
@@ -4298,14 +4321,33 @@ pub async fn spent_any(req: Request, _ctx: RouteContext<AuthState>) -> Result<Re
     }
 
     let mut entries: Vec<crate::logic::OutpointStatus> = Vec::with_capacity(outpoints.len());
+    // bsv-low #451 slice C (v): an outpoint of a tx with a TERMINAL verdict memo (never confirmed: an input conflict,
+    // a corroborated refusal or absence) has no spendable output — answered without a courier, `known:false` with
+    // the reason (a landing proof never rests on it). One `IN` read for the request's txids.
+    let verdicts = {
+        let now_ms = worker::Date::now().as_millis() as i64;
+        let txids: Vec<String> = outpoints.iter().map(|op| op.db_txid()).collect();
+        read_verdict_memos(&ctx.env, &txids, now_ms).await
+    };
     for op in &outpoints {
-        let row = spent_any_resolve_cached(
-            &op.db_txid(),
-            op.vout,
-            "spent_any",
-            crate::results::SPENT_ANY_CACHE_TTL_MS,
-        )
-        .await;
+        let txid_lc = op.db_txid();
+        let row = if verdicts.iter().any(|m| m.txid == txid_lc) {
+            SpentAnyCached {
+                known: false,
+                spent: None,
+                spending_txid: None,
+                spent_confirmed: None,
+                reason: Some(crate::txany::SPENT_ANY_REASON_TX_ABSENT),
+            }
+        } else {
+            spent_any_resolve_cached(
+                &txid_lc,
+                op.vout,
+                "spent_any",
+                crate::results::SPENT_ANY_CACHE_TTL_MS,
+            )
+            .await
+        };
         entries.push(crate::logic::OutpointStatus {
             txid: op.txid.clone(),
             vout: op.vout,
@@ -4820,6 +4862,7 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
     }
     let leg = tx_any_index_leg_batch(&ctx, &misses).await;
     let mut unknown: Vec<(String, &'static str)> = Vec::new();
+    let mut undecided: Vec<(String, Option<String>, &'static str)> = Vec::new();
     for k in misses {
         let hit = leg.hits.get(&k).cloned();
         match crate::txany::batch_index_answer(
@@ -4839,7 +4882,24 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
                 } else {
                     "index-miss"
                 };
-                unknown.push((k, reason));
+                undecided.push((k, hit.map(|(raw, _)| raw), reason));
+            }
+        }
+    }
+    // bsv-low #451 slice C (v): what the index could not decide, a verdict memo may — ONE `IN` read; a dead story is
+    // answered here, terminally, and never falls to a single read (the boot's singles on a lived-in identity).
+    if !undecided.is_empty() {
+        let now_ms = worker::Date::now().as_millis() as i64;
+        let txids: Vec<String> = undecided.iter().map(|(k, _, _)| k.clone()).collect();
+        let memos = read_verdict_memos(&ctx.env, &txids, now_ms).await;
+        for (k, index_raw, reason) in undecided {
+            match memos.iter().find(|m| m.txid == k) {
+                Some(m) => {
+                    let a = crate::txany::answer_from_verdict_memo(m, index_raw);
+                    cache_tx_any_answer(&k, &a, now_ms as f64);
+                    answers.push((k, a));
+                }
+                None => unknown.push((k, reason)),
             }
         }
     }

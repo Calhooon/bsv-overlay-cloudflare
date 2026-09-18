@@ -297,6 +297,15 @@ pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age
 /// The memo read for one txid, column order = the row's fields.
 pub const VERDICT_MEMO_READ_SQL: &str =
     "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid = ?";
+/// The memo read for `n` txids (`IN (?, …)`), the same columns — the batched `/tx-any` and `/spent-any` legs.
+pub fn verdict_memo_read_many_sql(n: usize) -> String {
+    let marks = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ");
+    format!("SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid IN ({marks})")
+}
+/// bsv-low #451 slice C (v): the `/spent-any` reason for an outpoint of a tx with a terminal negative verdict — the
+/// tx never confirmed, so its outputs are moot; no courier is asked. `known:false` keeps the honest unknown for every
+/// consumer (a landing proof never rests on it), the reason says why.
+pub const SPENT_ANY_REASON_TX_ABSENT: &str = "tx-absent";
 /// The memo upsert (the same statement the overlay's dead-letter pass runs, by value).
 pub const VERDICT_MEMO_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence) VALUES (?, ?, ?, ?, ?, ?) \
      ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence";
@@ -710,6 +719,8 @@ mod tests {
         assert_eq!(VerdictKind::parse(Some("Absent")), Some(VerdictKind::Absent));
         assert_eq!(VerdictKind::parse(Some("refused")), Some(VerdictKind::Refused));
         assert_eq!(VerdictKind::parse(Some("nope")), None, "an unknown kind is no memo");
+        assert_eq!(verdict_memo_read_many_sql(2), "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid IN (?, ?)");
+        assert_eq!(verdict_memo_read_many_sql(1).replace("IN (?)", "= ?"), VERDICT_MEMO_READ_SQL, "the same columns as the single read");
     }
 
     /// bsv-low #451 slice B: an unconfirmable verdict lives 10 minutes in the isolate; everything else 15 s.
