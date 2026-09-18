@@ -271,15 +271,27 @@ pub fn answer_from_verdict_memo(memo: &VerdictMemo, index_raw: Option<String>) -
     a
 }
 
-/// How old a verdict memo may be to answer without the couriers: an hour (six blocks — a reorg that un-confirms a
-/// spender that deep is a headline event; the answer stays `no-store` and re-asked after). Served ONLY for an
-/// index-held row (we hold the bytes; the raw is served beside the negative, exactly as the courier leg did).
+/// How old an ABSENCE memo may be to answer without the couriers: an hour — an absence can end (a late broadcast of
+/// the same bytes), so it is re-asked, and for an index-unknown row the request-time break-glass re-asks once an
+/// hour per txid at most. An `Unconfirmable` or `Refused` memo is TERMINAL and answers at any age (slice C (iv),
+/// measured 2026-09-18 03:47Z: when the hour lapsed and the request path no longer re-derived the verdict, every
+/// dead story turned into a recurring `null` — 109 client reads on the felt, 44 `/utxo-status` in one second):
+/// an input a different CONFIRMED tx spent, or Arcade's terminal word corroborated by both indexers' absence, is
+/// chain truth short of a reorg deeper than that spender, a headline event; the reorg sweep is where such a memo
+/// would be revisited, never the request path.
 pub const VERDICT_MEMO_MAX_AGE_MS: i64 = 60 * 60_000;
 
-/// PURE: does a memo answer for `txid` at `now_ms`?
+/// PURE: does a memo answer for `txid` at `now_ms`? A terminal kind at any age (never from the future); an absence
+/// inside `max_age_ms`.
 pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age_ms: i64) -> bool {
     let age = now_ms - memo.verdict_at_ms;
-    memo.txid == txid.to_ascii_lowercase() && age >= 0 && age < max_age_ms
+    if memo.txid != txid.to_ascii_lowercase() || age < 0 {
+        return false;
+    }
+    match memo.kind {
+        VerdictKind::Unconfirmable | VerdictKind::Refused => true,
+        VerdictKind::Absent => age < max_age_ms,
+    }
 }
 
 /// The memo read for one txid, column order = the row's fields.
@@ -669,7 +681,15 @@ mod tests {
         };
         assert!(verdict_memo_answers(&m(1_000), &"AB".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a minute old, case-insensitive");
         assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS));
-        assert!(!verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour old: the couriers are asked again");
+        // slice C (iv), measured: a proven input conflict is TERMINAL — it answers at any age (a lapsed memo turned
+        // every dead story into a recurring null on the felt)
+        assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour old: an input conflict still answers");
+        assert!(verdict_memo_answers(&m(30 * 24 * 60 * 60_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a month old: still terminal");
+        let refused = |age: i64| VerdictMemo { kind: VerdictKind::Refused, ..m(age) };
+        assert!(verdict_memo_answers(&refused(2 * VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a corroborated refusal is terminal too");
+        let absent = |age: i64| VerdictMemo { kind: VerdictKind::Absent, ..m(age) };
+        assert!(verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a fresh absence answers");
+        assert!(!verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour-old absence is re-asked (an absence can end)");
         assert!(!verdict_memo_answers(&m(-5_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "from the future: no");
         assert!(!verdict_memo_answers(&m(1_000), &"ff".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "another txid: no");
     }
