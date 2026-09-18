@@ -702,7 +702,8 @@ pub struct ChainSpendProbe {
 pub const HOPS_VIEW_CHAIN_PROBES_MAX: usize = 8;
 
 /// bsv-low #451 slice C (2026-09-17): one memoised chain probe (`hop_chain_probes`, overlay migration 150) — the
-/// last KNOWN answer for an outpoint and when it was read. A fault (`known: false`) is never remembered.
+/// last KNOWN answer for an outpoint and when it was read. A fault (`known: false`) is never remembered. Since the
+/// second gate's LOW-4 (2026-09-18) this is `/spent-any`'s durable memo (the hops view itself no longer probes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeMemo {
     /// `<txid>.<vout>`, lowercase.

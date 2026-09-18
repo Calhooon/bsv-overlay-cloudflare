@@ -3608,14 +3608,26 @@ pub enum ArcadeLook {
 /// are asked HERE, in the background, bounded per tick. `kind`: `refused` for Arcade's corroborated terminal word,
 /// `absent` for corroborated network absence.
 pub const TX_ANY_VERDICT_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence) VALUES (?, ?, '', '', ?, ?) \
-     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence";
+     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence \
+     WHERE tx_any_verdicts.kind IS NOT 'unconfirmable'";
 
-/// PURE: the memo kind a retire reason names (`retire_verdict`'s two arms).
+/// The memo's reversal (the second gate's MEDIUM-3b, "confirm beats the latch"): a proof landing, a readmission —
+/// the same moments that clear the retire latch — delete the memo, so a retired row that the chain later proves
+/// never answers `present: false` from a stale word.
+pub const TX_ANY_VERDICT_DELETE_SQL: &str = "DELETE FROM tx_any_verdicts WHERE txid = ?";
+/// The GC of request-time absences past their window (the second gate's LOW-1), one statement per retire tick.
+pub const TX_ANY_VERDICT_GC_SQL: &str = "DELETE FROM tx_any_verdicts WHERE kind = 'absent' AND verdictAtMs < ?";
+/// A request-time absence's window (mirrors the app layer's `VERDICT_MEMO_MAX_AGE_MS`).
+pub const TX_ANY_ABSENT_WINDOW_MS: i64 = 5 * 60_000;
+
+/// PURE: the memo kind a retire reason names (`retire_verdict`'s two arms): Arcade's corroborated terminal word
+/// is `refused`; the 48-hour corroborated absence is `retired` — TERMINAL while the row stays retired (the second
+/// gate's HIGH-2: an expiring absence turned into a `null` nothing could re-derive).
 pub fn verdict_kind_of_retire_reason(reason: &str) -> &'static str {
     if reason.starts_with("arcade ") {
         "refused"
     } else {
-        "absent"
+        "retired"
     }
 }
 
@@ -3776,6 +3788,15 @@ pub async fn run_retire_pass(
     use crate::d1::Query;
     let mut summary = RetireSummary::default();
     let now = js_sys::Date::now() as i64;
+    // the second gate's LOW-1: request-time absences past their window are dropped here (one statement per tick),
+    // so a stranger's random-txid asks never grow the table without bound
+    if let Err(e) = Query::new(TX_ANY_VERDICT_GC_SQL)
+        .bind(now - TX_ANY_ABSENT_WINDOW_MS)
+        .execute(db)
+        .await
+    {
+        worker::console_log!("[retire] verdict memo GC failed: {e}");
+    }
     for (candidates_sql, store) in [
         (RETIRE_CANDIDATES_TRANSACTIONS_SQL, "transactions"),
         (RETIRE_CANDIDATES_POT_BEEFS_SQL, "pot_beefs"),
@@ -4205,9 +4226,12 @@ pub(crate) mod tests {
     #[test]
     fn a_retire_reason_names_its_memo_kind() {
         assert_eq!(verdict_kind_of_retire_reason("arcade REJECTED: UTXO_SPENT (70): x"), "refused");
-        assert_eq!(verdict_kind_of_retire_reason("network-absent 172800s: arcade 404 + both indexers 404"), "absent");
+        assert_eq!(verdict_kind_of_retire_reason("network-absent 172800s: arcade 404 + both indexers 404"), "retired");
         let bind_marks = TX_ANY_VERDICT_UPSERT_SQL.matches('?').count();
         assert_eq!(bind_marks, 4, "txid, verdictAtMs, kind, evidence — judged {TX_ANY_VERDICT_UPSERT_SQL}");
+        assert!(TX_ANY_VERDICT_UPSERT_SQL.contains("WHERE tx_any_verdicts.kind IS NOT 'unconfirmable'"), "the janitor never downgrades a proven input conflict (MEDIUM-3c)");
+        assert_eq!(TX_ANY_VERDICT_DELETE_SQL.matches('?').count(), 1);
+        assert_eq!(TX_ANY_VERDICT_GC_SQL.matches('?').count(), 1);
     }
 
     #[test]

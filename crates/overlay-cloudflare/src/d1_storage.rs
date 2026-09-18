@@ -569,6 +569,12 @@ impl Storage for D1Storage {
             .bind(txid)
             .execute(&self.db)
             .await
+            .map_err(d1_err)?;
+        // bsv-low #451 (the second gate's MEDIUM-3b): confirm beats the latch — and the verdict memo
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
+            .bind(txid)
+            .execute(&self.db)
+            .await
             .map_err(d1_err)
     }
 
@@ -591,7 +597,13 @@ impl Storage for D1Storage {
         .bind(txid)
         .execute(&self.db)
         .await
-        .map_err(d1_err)
+        .map_err(d1_err)?;
+        // bsv-low #451 (the second gate's MEDIUM-3b): confirm beats the latch — and the verdict memo
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
+            .bind(txid)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
     }
 
     async fn update_output_block_height(

@@ -1602,6 +1602,14 @@ pub(crate) fn pot_beef_mark_proven_batch_sql(n: usize) -> String {
     )
 }
 
+/// bsv-low #451 (the second gate's MEDIUM-3b): the verdict memos of `n` txids, deleted in one statement beside the
+/// batched latch flips (`tx_any_verdicts` — the app layer's memo table, the same D1).
+pub(crate) fn tx_any_verdict_delete_batch_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!("DELETE FROM tx_any_verdicts WHERE txid IN ({placeholders})")
+}
+
 /// SHIPPED completion-pass candidate scan (bsv-low#304: gated on the
 /// VERIFIED latch, not the structural flag).
 ///
@@ -1862,6 +1870,12 @@ impl D1PotStorage {
     ) -> Result<u64, PotStorageError> {
         // 1. Confirm beats the latch (unconditional, idempotent).
         Query::new(POT_BEEF_CLEAR_UNPROVABLE_SQL)
+            .bind(confirmed_spending_txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        // bsv-low #451 (the second gate's MEDIUM-3b): and the verdict memo, the same moment
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
             .bind(confirmed_spending_txid)
             .execute(&self.db)
             .await
@@ -3280,6 +3294,12 @@ impl PotStorage for D1PotStorage {
             .bind(txid)
             .execute(&self.db)
             .await
+            .map_err(pot_err)?;
+        // bsv-low #451 (the second gate's MEDIUM-3b): confirm beats the latch — and the verdict memo
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
+            .bind(txid)
+            .execute(&self.db)
+            .await
             .map_err(pot_err)
     }
 
@@ -3298,6 +3318,12 @@ impl PotStorage for D1PotStorage {
                 q = q.bind(txid.as_str());
             }
             q.execute(&self.db).await.map_err(pot_err)?;
+            // bsv-low #451 (the second gate's MEDIUM-3b): the memos of the chunk, one statement
+            let mut d = Query::new(tx_any_verdict_delete_batch_sql(chunk.len()));
+            for (txid, _) in chunk {
+                d = d.bind(txid.as_str());
+            }
+            d.execute(&self.db).await.map_err(pot_err)?;
         }
         Ok(())
     }
@@ -3309,6 +3335,12 @@ impl PotStorage for D1PotStorage {
         // fast path). has_proof is latched alongside (the bytes demonstrably
         // carry the bump that just verified).
         Query::new(POT_BEEF_MARK_PROVEN_SQL)
+            .bind(txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        // bsv-low #451 (the second gate's MEDIUM-3b): confirm beats the latch — and the verdict memo
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
             .bind(txid)
             .execute(&self.db)
             .await
@@ -3326,6 +3358,12 @@ impl PotStorage for D1PotStorage {
                 q = q.bind(txid.as_str());
             }
             q.execute(&self.db).await.map_err(pot_err)?;
+            // bsv-low #451 (the second gate's MEDIUM-3b): the memos of the chunk, one statement
+            let mut d = Query::new(tx_any_verdict_delete_batch_sql(chunk.len()));
+            for txid in chunk {
+                d = d.bind(txid.as_str());
+            }
+            d.execute(&self.db).await.map_err(pot_err)?;
         }
         Ok(())
     }

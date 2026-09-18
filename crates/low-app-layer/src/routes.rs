@@ -3309,6 +3309,83 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     )
 }
 
+/// One `hop_chain_probes` row as D1 returns it (bsv-low #451 slice C; `/spent-any`'s durable memo since the second
+/// gate's LOW-4).
+#[derive(serde::Deserialize)]
+struct ProbeMemoRow {
+    outpoint: String,
+    #[serde(rename = "probedAtMs")]
+    probed_at_ms: i64,
+    spent: i64,
+    #[serde(rename = "spendingTxid")]
+    spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed")]
+    spent_confirmed: Option<i64>,
+}
+
+/// The memos for `targets` (one `IN` read). Fail-soft: a bind/query fault is an empty answer (every target asked).
+async fn read_probe_memos(
+    db: &worker::D1Database,
+    targets: &[(String, u32)],
+) -> Vec<crate::hops_view::ProbeMemo> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let binds: Vec<JsValue> = targets
+        .iter()
+        .map(|(txid, vout)| JsValue::from_str(&format!("{}.{vout}", txid.to_ascii_lowercase())))
+        .collect();
+    let rows: Vec<ProbeMemoRow> = match db
+        .prepare(crate::hops_view::probe_memo_read_sql(targets.len()))
+        .bind(&binds)
+    {
+        Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                console_warn!("[spent-any] probe memo read failed ({} targets): {e}", targets.len());
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            console_warn!("[spent-any] probe memo bind failed ({} targets): {e}", targets.len());
+            Vec::new()
+        }
+    };
+    rows.into_iter()
+        .map(|r| crate::hops_view::ProbeMemo {
+            outpoint: r.outpoint,
+            probed_at_ms: r.probed_at_ms,
+            spent: r.spent != 0,
+            spending_txid: r.spending_txid,
+            spent_confirmed: r.spent_confirmed.map(|v| v != 0),
+        })
+        .collect()
+}
+
+/// The fresh memos, ONE batch of upserts. Fail-soft: a failure only forgets (logged).
+async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::ProbeMemo]) {
+    let mut stmts = Vec::with_capacity(memos.len());
+    for m in memos {
+        let binds = [
+            JsValue::from_str(&m.outpoint),
+            JsValue::from_f64(m.probed_at_ms as f64),
+            JsValue::from_f64(if m.spent { 1.0 } else { 0.0 }),
+            m.spending_txid.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL),
+            m.spent_confirmed.map(|v| JsValue::from_f64(if v { 1.0 } else { 0.0 })).unwrap_or(JsValue::NULL),
+        ];
+        match db.prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL).bind(&binds) {
+            Ok(s) => stmts.push(s),
+            Err(e) => console_warn!("[spent-any] probe memo bind failed for {}: {e}", m.outpoint),
+        }
+    }
+    if stmts.is_empty() {
+        return;
+    }
+    if let Err(e) = db.batch(stmts).await {
+        console_warn!("[spent-any] probe memo write failed ({} rows): {e}", memos.len());
+    }
+}
+
 /// One `tx_any_verdicts` row as D1 returns it (bsv-low #451 slice C (iii)).
 #[derive(serde::Deserialize)]
 struct VerdictMemoRow {
@@ -4329,6 +4406,27 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         let txids: Vec<String> = outpoints.iter().map(|op| op.db_txid()).collect();
         read_verdict_memos(&ctx.env, &txids, now_ms).await
     };
+    // the second gate's LOW-4 (2026-09-18): the D1 probe memo (`hop_chain_probes`, migration 150) is `/spent-any`'s
+    // durable memo — a KNOWN answer younger than five minutes serves across isolates; a fresh answer is written
+    // back in one batch (a fault never). The press-time read stays honest: a swept outpoint is `spent` for as long
+    // as the memo says, and the sweep's broadcast is judged by the network either way.
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let probe_targets: Vec<(String, u32)> = outpoints
+        .iter()
+        .filter(|op| !verdicts.iter().any(|m| m.txid == op.db_txid()))
+        .map(|op| (op.db_txid(), op.vout))
+        .collect();
+    let memos = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => read_probe_memos(&db, &probe_targets).await,
+        Err(_) => Vec::new(),
+    };
+    let (memo_answers, _) = crate::hops_view::split_probe_targets(
+        &probe_targets,
+        &memos,
+        now_ms,
+        crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
+    );
+    let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     for op in &outpoints {
         let txid_lc = op.db_txid();
         let row = if verdicts.iter().any(|m| m.txid == txid_lc) {
@@ -4339,14 +4437,32 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
                 spent_confirmed: None,
                 reason: Some(crate::txany::SPENT_ANY_REASON_TX_ABSENT),
             }
+        } else if let Some((_, _, p)) = memo_answers.iter().find(|(t, v, _)| *t == txid_lc && *v == op.vout) {
+            SpentAnyCached {
+                known: true,
+                spent: p.spent,
+                spending_txid: p.spending_txid.clone(),
+                spent_confirmed: p.spent_confirmed,
+                reason: None,
+            }
         } else {
-            spent_any_resolve_cached(
+            let row = spent_any_resolve_cached(
                 &txid_lc,
                 op.vout,
                 "spent_any",
                 crate::results::SPENT_ANY_CACHE_TTL_MS,
             )
-            .await
+            .await;
+            let probe = crate::hops_view::ChainSpendProbe {
+                known: row.known,
+                spent: row.spent,
+                spending_txid: row.spending_txid.clone(),
+                spent_confirmed: row.spent_confirmed,
+            };
+            if let Some(m) = crate::hops_view::probe_memo_of(&txid_lc, op.vout, &probe, now_ms) {
+                fresh.push(m);
+            }
+            row
         };
         entries.push(crate::logic::OutpointStatus {
             txid: op.txid.clone(),
@@ -4363,6 +4479,11 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         });
     }
 
+    if !fresh.is_empty() {
+        if let Ok(db) = ctx.env.d1("OVERLAY_DB") {
+            write_probe_memos(&db, &fresh).await;
+        }
+    }
     json_response(utxo_status_body(&entries), 200)
 }
 
@@ -4380,6 +4501,10 @@ thread_local! {
     /// served (SUCCESS memoized only — a probe fault re-probes next time).
     /// Ported from the client's `bitailsRouteHealthy` route-rot guard.
     static BITAILS_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The same memo for WoC's tx route (the second gate's MEDIUM-3a): a WoC 404 reads as ABSENT only behind a
+    /// route that served the known-mined anchor this isolate — a rotten or rate-limited route is a fault, never
+    /// an absence (and never a memo).
+    static WOC_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// SHIPPED trusted-BEEF reads shared by `/tx-any`'s index leg and `/beef`
@@ -4492,7 +4617,27 @@ async fn tx_any_external_leg(
             }
             Err(_) => TxObservation::Fault,
         },
-        Some((404, _)) => TxObservation::Absent,
+        Some((404, _)) => {
+            // the second gate's MEDIUM-3a: WoC's 404 is an absence only behind a healthy route (the anchor served
+            // once this isolate) — the Bitails rule applied symmetrically; otherwise a fault, never an absence
+            if WOC_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
+                if let Some((200, body)) = provider_get(
+                    caller,
+                    &format!("{WOC_BASE}/tx/hash/{}", crate::txany::KNOWN_MINED_TXID),
+                )
+                .await
+                {
+                    if !body.is_empty() {
+                        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+                    }
+                }
+            }
+            if WOC_ROUTE_HEALTHY.with(std::cell::Cell::get) == Some(true) {
+                TxObservation::Absent
+            } else {
+                TxObservation::Fault
+            }
+        }
         _ => TxObservation::Fault,
     };
 
@@ -4570,7 +4715,7 @@ async fn resolve_tx_any(
     // its absence in the background, bounded per tick, and writes the memo; only an index-UNKNOWN row without a
     // memo (a tx never admitted — the client's own record of a broadcast the overlay refused) still opens the
     // break-glass at request time, and its corroborated absence is memoised for an hour so it is bought once.
-    let mut answer = if index_raw.is_some() && index_height.is_some() {
+    let answer = if index_raw.is_some() && index_height.is_some() {
         crate::txany::decide_tx_any(
             index_raw,
             index_height,
@@ -4627,60 +4772,11 @@ async fn resolve_tx_any(
         }
         a
     };
-    if answer.present == Some(false) {
-        if let Some(inputs) = answer
-            .raw_hex
-            .as_deref()
-            .and_then(|h| hex::decode(h).ok())
-            .and_then(|b| bsv_rs::transaction::Transaction::from_binary(&b).ok())
-            .map(|tx| tx.inputs)
-        {
-            for input in inputs.iter().take(3) {
-                let Some(src_txid) = input.source_txid.as_deref() else {
-                    continue;
-                };
-                let st = spent_any_resolve_cached(
-                    &src_txid.to_ascii_lowercase(),
-                    input.source_output_index,
-                    "tx_any_unconfirmable",
-                    crate::results::SPENT_ANY_PROBE_MAX_AGE_MS,
-                )
-                .await;
-                if crate::txany::input_proves_unconfirmable(
-                    key,
-                    st.known,
-                    st.spent,
-                    st.spending_txid.as_deref(),
-                    st.spent_confirmed,
-                ) {
-                    console_warn!(
-                            "[tx-any] {key} PROVABLY UNCONFIRMABLE — input {}:{} spent by a different confirmed tx",
-                            src_txid,
-                            input.source_output_index
-                        );
-                    answer.unconfirmable = true;
-                    // #451 slice C (iii): remembered durably with its evidence, for an index-held row only
-                    if answer.raw_hex.is_some() {
-                        if let Some(spender) = st.spending_txid.as_deref() {
-                            write_verdict_memo(
-                                env,
-                                &crate::txany::VerdictMemo {
-                                    txid: key.to_string(),
-                                    verdict_at_ms: now as i64,
-                                    input_outpoint: format!("{}:{}", src_txid.to_ascii_lowercase(), input.source_output_index),
-                                    spender_txid: spender.to_ascii_lowercase(),
-                                    kind: crate::txany::VerdictKind::Unconfirmable,
-                                    evidence: format!("input {}:{} spent by the confirmed {}", src_txid.to_ascii_lowercase(), input.source_output_index, spender.to_ascii_lowercase()),
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    }
+    // The second gate's MEDIUM-1 (2026-09-18): the request-time UNCONFIRMABLE probe (up to three inputs through the
+    // spend ladder on a `present:false` answer) is GONE — since the couriers became break-glass the only request-time
+    // `present:false` is the index-unknown leg's, which serves no bytes, so the probe could never run. The
+    // `unconfirmable` word stays served for the memos written before migration 152 and is the janitor's to derive
+    // (a residual on #451: the refund rebroadcast retirement rests on the local direct-ARC failure belt).
     cache_tx_any_answer(key, &answer, now);
     answer
 }

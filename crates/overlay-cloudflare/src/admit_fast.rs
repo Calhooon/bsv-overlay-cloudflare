@@ -524,8 +524,32 @@ struct EvictedRow {
 
 /// If the txid is in the ledger as evicted and not yet readmitted, move every
 /// twin row back and mark the readmission. `true` when a readmission happened.
+/// bsv-low #451 (the second gate's HIGH-1): the `refused` verdict memo for an evicted txid — `/tx-any` serves it as
+/// `present: false` with zero courier calls; a readmission deletes it (`readmit_if_evicted`). Fail-soft.
+pub async fn write_refused_verdict(db: &D1Database, txid: &str, now_ms: i64, reason: &str) {
+    if let Err(e) = Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
+        .bind(txid)
+        .bind(now_ms)
+        .bind("refused")
+        .bind(reason)
+        .execute(db)
+        .await
+    {
+        worker::console_log!("[admit-fast] verdict memo write failed for {txid}: {e}");
+    }
+}
+
 pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> bool {
     let txid = txid.to_ascii_lowercase();
+    // the second gate's MEDIUM-3b: a readmission (a pushed MINED proof — the chain overrules a courier) deletes the
+    // verdict memo first, so no stale `present: false` outlives the row's return
+    if let Err(e) = Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
+        .bind(txid.as_str())
+        .execute(db)
+        .await
+    {
+        worker::console_log!("[admit-fast] readmit {txid}: verdict memo delete failed ({e})");
+    }
     let row = match Query::new(
         "SELECT reason, releasedSpends FROM pot_evictions WHERE txid = ? AND readmittedAt IS NULL",
     )
@@ -737,6 +761,9 @@ pub async fn refusal_job(env: EvidenceEnv, txid: String, webhook: (String, Strin
             let moved =
                 evict_txid_everywhere(db, &txid, &format!("{} ({reason})", webhook.0), now_ms)
                     .await;
+            // the second gate's HIGH-1 (bsv-low #451): the evidence is HERE — `/tx-any` answers `present:false`
+            // for the evicted JOIN at once (the felt's `broadcast-unaccepted` latch), never `null` for an hour
+            write_refused_verdict(db, &txid, now_ms as i64, &format!("{} ({reason})", webhook.0)).await;
             // the eviction is the event the felt voids on: ship its notes now
             // (the route's own flush drained before this job ran)
             crate::pot_changes::flush_inline(env.env.clone()).await;
@@ -815,6 +842,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
                             now_ms,
                         )
                         .await;
+                        // the second gate's HIGH-1: the verdict memo, written where the evidence is
+                        write_refused_verdict(&db, &txid, now_ms as i64, &format!("{status} ({reason})")).await;
                         // the eviction is the event the felt voids on: ship its
                         // notes now (the route's flush drained before the watch)
                         crate::pot_changes::flush_inline(env.env.clone()).await;

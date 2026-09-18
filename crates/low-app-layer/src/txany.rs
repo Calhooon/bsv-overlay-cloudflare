@@ -32,7 +32,8 @@
 //!          callers' fail-safe "unknown ⇒ retry, never a conclusion".
 //!
 //! Wire body: `{"txid","present","confirmed","height","rawHex","source"}`
-//! where `source` is `"index"` / `"index+external"` / `"external"` / `null`
+//! where `source` is `"index"` / `"index+external"` / `"external"` / `"memo"` (bsv-low #451: the durable
+//! verdict memo — a corroborated absence or refusal, a retired row, a proven input conflict) / `null`
 //! (unknown). All-null fields = nothing could be established.
 
 use serde_json::json;
@@ -234,8 +235,14 @@ pub struct VerdictMemo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictKind {
     Unconfirmable,
+    /// The request-time break-glass's corroborated double-404 for a tx the index never admitted — a YOUNG tx can
+    /// double-404 for seconds, so this kind lives only `VERDICT_MEMO_MAX_AGE_MS` (the second gate's MEDIUM-3a).
     Absent,
+    /// Arcade's terminal refusal corroborated by both indexers' absence — the eviction's or the retire pass's word.
     Refused,
+    /// The overlay's dead-letter pass retired the row after 48 h of corroborated network absence (the second gate's
+    /// HIGH-2): terminal while the row stays retired — a proof landing clears the latch AND deletes the memo.
+    Retired,
 }
 
 impl VerdictKind {
@@ -244,6 +251,7 @@ impl VerdictKind {
             VerdictKind::Unconfirmable => "unconfirmable",
             VerdictKind::Absent => "absent",
             VerdictKind::Refused => "refused",
+            VerdictKind::Retired => "retired",
         }
     }
     /// A row written before migration 152 carries no kind: it was an unconfirmable verdict (the only kind then).
@@ -252,8 +260,13 @@ impl VerdictKind {
             None | Some("") | Some("unconfirmable") => Some(VerdictKind::Unconfirmable),
             Some("absent") => Some(VerdictKind::Absent),
             Some("refused") => Some(VerdictKind::Refused),
+            Some("retired") => Some(VerdictKind::Retired),
             _ => None,
         }
+    }
+    /// Terminal kinds answer at any age; an `Absent` inside its window.
+    pub fn terminal(self) -> bool {
+        !matches!(self, VerdictKind::Absent)
     }
 }
 
@@ -271,15 +284,16 @@ pub fn answer_from_verdict_memo(memo: &VerdictMemo, index_raw: Option<String>) -
     a
 }
 
-/// How old an ABSENCE memo may be to answer without the couriers: an hour — an absence can end (a late broadcast of
-/// the same bytes), so it is re-asked, and for an index-unknown row the request-time break-glass re-asks once an
-/// hour per txid at most. An `Unconfirmable` or `Refused` memo is TERMINAL and answers at any age (slice C (iv),
+/// How old a request-time ABSENCE memo may be to answer without the couriers: five minutes (the second gate's
+/// MEDIUM-3a: a tx the client just broadcast through its direct-ARC fallback can double-404 for seconds; an
+/// absence can end), so it is re-asked, and for an index-unknown row the request-time break-glass re-asks once per
+/// window per txid at most. The janitor's 48-hour absence is the `Retired` kind, terminal while the row is retired. An `Unconfirmable` or `Refused` memo is TERMINAL and answers at any age (slice C (iv),
 /// measured 2026-09-18 03:47Z: when the hour lapsed and the request path no longer re-derived the verdict, every
 /// dead story turned into a recurring `null` — 109 client reads on the felt, 44 `/utxo-status` in one second):
 /// an input a different CONFIRMED tx spent, or Arcade's terminal word corroborated by both indexers' absence, is
 /// chain truth short of a reorg deeper than that spender, a headline event; the reorg sweep is where such a memo
 /// would be revisited, never the request path.
-pub const VERDICT_MEMO_MAX_AGE_MS: i64 = 60 * 60_000;
+pub const VERDICT_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
 
 /// PURE: does a memo answer for `txid` at `now_ms`? A terminal kind at any age (never from the future); an absence
 /// inside `max_age_ms`.
@@ -288,9 +302,10 @@ pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age
     if memo.txid != txid.to_ascii_lowercase() || age < 0 {
         return false;
     }
-    match memo.kind {
-        VerdictKind::Unconfirmable | VerdictKind::Refused => true,
-        VerdictKind::Absent => age < max_age_ms,
+    if memo.kind.terminal() {
+        true
+    } else {
+        age < max_age_ms
     }
 }
 
@@ -692,13 +707,15 @@ mod tests {
         assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS));
         // slice C (iv), measured: a proven input conflict is TERMINAL — it answers at any age (a lapsed memo turned
         // every dead story into a recurring null on the felt)
-        assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour old: an input conflict still answers");
+        assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "past the window: an input conflict still answers");
         assert!(verdict_memo_answers(&m(30 * 24 * 60 * 60_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a month old: still terminal");
         let refused = |age: i64| VerdictMemo { kind: VerdictKind::Refused, ..m(age) };
         assert!(verdict_memo_answers(&refused(2 * VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a corroborated refusal is terminal too");
         let absent = |age: i64| VerdictMemo { kind: VerdictKind::Absent, ..m(age) };
         assert!(verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a fresh absence answers");
-        assert!(!verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "an hour-old absence is re-asked (an absence can end)");
+        assert!(!verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a five-minute-old absence is re-asked (an absence can end)");
+        let retired = |age: i64| VerdictMemo { kind: VerdictKind::Retired, ..m(age) };
+        assert!(verdict_memo_answers(&retired(30 * 24 * 60 * 60_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a retired row's absence is terminal while it stays retired");
         assert!(!verdict_memo_answers(&m(-5_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "from the future: no");
         assert!(!verdict_memo_answers(&m(1_000), &"ff".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "another txid: no");
     }
@@ -712,13 +729,19 @@ mod tests {
         assert_eq!((a.present, a.confirmed, a.unconfirmable, a.raw_hex.as_deref(), a.source), (Some(false), None, false, Some("0100"), Some("memo")));
         let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Refused, ..base.clone() }, None);
         assert_eq!((a.present, a.unconfirmable, a.raw_hex), (Some(false), false, None));
-        let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Unconfirmable, ..base }, Some("0100".into()));
+        let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Unconfirmable, ..base.clone() }, Some("0100".into()));
         assert_eq!((a.present, a.unconfirmable), (Some(false), true), "an input conflict is the one unconfirmable kind");
         assert_eq!(VerdictKind::parse(None), Some(VerdictKind::Unconfirmable), "a pre-152 row");
         assert_eq!(VerdictKind::parse(Some("")), Some(VerdictKind::Unconfirmable));
         assert_eq!(VerdictKind::parse(Some("Absent")), Some(VerdictKind::Absent));
         assert_eq!(VerdictKind::parse(Some("refused")), Some(VerdictKind::Refused));
+        assert_eq!(VerdictKind::parse(Some("retired")), Some(VerdictKind::Retired));
         assert_eq!(VerdictKind::parse(Some("nope")), None, "an unknown kind is no memo");
+        // the second gate's HIGH-2: the janitor's retired row answers `present: false` at any age
+        let retired = VerdictMemo { kind: VerdictKind::Retired, verdict_at_ms: 1, ..base.clone() };
+        let a = answer_from_verdict_memo(&retired, Some("0100".into()));
+        assert_eq!((a.present, a.unconfirmable, a.source), (Some(false), false, Some("memo")));
+        assert!(verdict_memo_answers(&retired, &"ab".repeat(32), 1_789_683_775_142, VERDICT_MEMO_MAX_AGE_MS), "a month-old retired memo still answers");
         assert_eq!(verdict_memo_read_many_sql(2), "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid IN (?, ?)");
         assert_eq!(verdict_memo_read_many_sql(1).replace("IN (?)", "= ?"), VERDICT_MEMO_READ_SQL, "the same columns as the single read");
     }
