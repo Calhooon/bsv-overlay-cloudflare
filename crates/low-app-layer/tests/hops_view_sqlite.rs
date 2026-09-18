@@ -1819,3 +1819,27 @@ fn b21_a_hop_swept_outside_the_overlay_is_served_spent_once_the_chain_rung_says_
     );
     assert!(!body.contains("\"status\":\"unspent\""));
 }
+
+/// bsv-low #451 slice C: the memo's SQL against the REAL schema (migration 150): an upsert, a re-upsert, the IN read.
+#[test]
+fn probe_memo_round_trips_on_the_production_schema() {
+    use low_app_layer::hops_view::{probe_memo_read_sql, PROBE_MEMO_UPSERT_SQL};
+    let conn = production_schema_db();
+    let op = |seed: &str| format!("{}.0", seed.repeat(32));
+    conn.execute(PROBE_MEMO_UPSERT_SQL, params![op("a1"), 1_000_i64, 0_i64, Option::<String>::None, Option::<i64>::None]).unwrap();
+    conn.execute(PROBE_MEMO_UPSERT_SQL, params![op("b2"), 2_000_i64, 1_i64, Some("e5".repeat(32)), Some(1_i64)]).unwrap();
+    // the re-upsert REPLACES the row (one row per outpoint)
+    conn.execute(PROBE_MEMO_UPSERT_SQL, params![op("a1"), 3_000_i64, 1_i64, Some("f6".repeat(32)), Some(0_i64)]).unwrap();
+    let mut stmt = conn.prepare(&probe_memo_read_sql(3)).unwrap();
+    type MemoRow = (String, i64, i64, Option<String>, Option<i64>);
+    let rows: Vec<MemoRow> = stmt
+        .query_map(params![op("a1"), op("b2"), op("zz")], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "judged {rows:?}");
+    let a1 = rows.iter().find(|r| r.0 == op("a1")).unwrap();
+    assert_eq!((a1.1, a1.2, a1.3.as_deref(), a1.4), (3_000, 1, Some("f6".repeat(32).as_str()), Some(0)), "the re-upsert replaced the row");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM hop_chain_probes", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 2);
+}

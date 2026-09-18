@@ -700,6 +700,86 @@ pub struct ChainSpendProbe {
 /// never `chain`).
 pub const HOPS_VIEW_CHAIN_PROBES_MAX: usize = 8;
 
+/// bsv-low #451 slice C (2026-09-17): one memoised chain probe (`hop_chain_probes`, overlay migration 150) — the
+/// last KNOWN answer for an outpoint and when it was read. A fault (`known: false`) is never remembered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeMemo {
+    /// `<txid>.<vout>`, lowercase.
+    pub outpoint: String,
+    pub probed_at_ms: i64,
+    pub spent: bool,
+    pub spending_txid: Option<String>,
+    pub spent_confirmed: Option<bool>,
+}
+
+/// How old a memo may be to answer for a probe — the same five minutes as the isolate's `SPENT_ANY_PROBE_MAX_AGE_MS`
+/// (a `recoverable` word may lag a sweep by minutes safely: the sweep is judged at broadcast, nothing is released
+/// on the word).
+pub const PROBE_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
+
+/// The route's probe plan: the probes a fresh memo answered, and the outpoints still to ask.
+pub type ProbePlan = (Vec<(String, u32, ChainSpendProbe)>, Vec<(String, u32)>);
+
+/// PURE: split the route's targets into the probes a FRESH memo answers and the outpoints still to ask (a memo older
+/// than `max_age_ms`, from the future, or absent). Order preserved; a memo for an outpoint not in `targets` is ignored.
+pub fn split_probe_targets(
+    targets: &[(String, u32)],
+    memos: &[ProbeMemo],
+    now_ms: i64,
+    max_age_ms: i64,
+) -> ProbePlan {
+    let mut answered = Vec::new();
+    let mut to_probe = Vec::new();
+    for (txid, vout) in targets {
+        let key = format!("{}.{vout}", txid.to_ascii_lowercase());
+        let fresh = memos.iter().find(|m| {
+            let age = now_ms - m.probed_at_ms;
+            m.outpoint == key && age >= 0 && age < max_age_ms
+        });
+        match fresh {
+            Some(m) => answered.push((
+                txid.clone(),
+                *vout,
+                ChainSpendProbe {
+                    known: true,
+                    spent: Some(m.spent),
+                    spending_txid: m.spending_txid.clone(),
+                    spent_confirmed: m.spent_confirmed,
+                },
+            )),
+            None => to_probe.push((txid.clone(), *vout)),
+        }
+    }
+    (answered, to_probe)
+}
+
+/// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
+pub fn probe_memo_of(txid: &str, vout: u32, probe: &ChainSpendProbe, now_ms: i64) -> Option<ProbeMemo> {
+    if !probe.known {
+        return None;
+    }
+    let spent = probe.spent?;
+    Some(ProbeMemo {
+        outpoint: format!("{}.{vout}", txid.to_ascii_lowercase()),
+        probed_at_ms: now_ms,
+        spent,
+        spending_txid: probe.spending_txid.clone(),
+        spent_confirmed: probe.spent_confirmed,
+    })
+}
+
+/// The memo read for `n` outpoints (`IN (?, …)`), column order = `ProbeMemoRow`'s fields.
+pub fn probe_memo_read_sql(n: usize) -> String {
+    let marks = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ");
+    format!(
+        "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE outpoint IN ({marks})"
+    )
+}
+
+/// The memo upsert (one row; the route batches them).
+pub const PROBE_MEMO_UPSERT_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES (?, ?, ?, ?, ?) \
+     ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = excluded.probedAtMs, spent = excluded.spent, spendingTxid = excluded.spendingTxid, spentConfirmed = excluded.spentConfirmed";
+
 /// The outpoints the route should re-check: the index-unspent entries, in
 /// served order, bounded.
 pub fn chain_probe_targets(entries: &[HopEntry]) -> Vec<(String, u32)> {
@@ -1972,4 +2052,42 @@ mod tests {
             );
         }
     }
+    /// bsv-low #451 slice C: the memo split — fresh answers, stale/missing/future asked, a fault never remembered.
+    /// RED before (no memo: every target asked every call).
+    #[test]
+    fn a_fresh_memo_answers_a_probe_a_stale_or_missing_one_is_asked() {
+        let now = 1_789_683_775_142_i64;
+        let t = |seed: &str| (seed.repeat(32), 0u32);
+        let targets = vec![t("a1"), t("b2"), t("c3"), t("d4")];
+        let memo = |seed: &str, age_ms: i64, spent: bool| ProbeMemo {
+            outpoint: format!("{}.0", seed.repeat(32)),
+            probed_at_ms: now - age_ms,
+            spent,
+            spending_txid: if spent { Some("e5".repeat(32)) } else { None },
+            spent_confirmed: if spent { Some(true) } else { None },
+        };
+        let memos = vec![
+            memo("a1", 60_000, false),                      // fresh, unspent
+            memo("b2", PROBE_MEMO_MAX_AGE_MS + 1, true),    // stale: asked
+            memo("c3", -120_000, false),                    // from the future: asked
+            memo("ff", 1_000, true),                        // not a target: ignored
+        ];
+        let (answered, to_probe) = split_probe_targets(&targets, &memos, now, PROBE_MEMO_MAX_AGE_MS);
+        assert_eq!(answered.len(), 1, "judged {answered:?}");
+        assert_eq!(answered[0].0, "a1".repeat(32));
+        assert_eq!(answered[0].2, ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None });
+        assert_eq!(to_probe, vec![t("b2"), t("c3"), t("d4")], "judged {to_probe:?}");
+        // a fresh SPENT memo carries its spender
+        let (answered, _) = split_probe_targets(&[t("b2")], &[memo("b2", 1_000, true)], now, PROBE_MEMO_MAX_AGE_MS);
+        assert_eq!(answered[0].2.spending_txid.as_deref(), Some("e5".repeat(32).as_str()));
+        // what a probe leaves behind: a known answer only
+        let known = ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some("e5".repeat(32)), spent_confirmed: Some(false) };
+        assert_eq!(probe_memo_of("A1".repeat(32).as_str(), 3, &known, now).map(|m| (m.outpoint, m.spent)), Some((format!("{}.3", "a1".repeat(32)), true)));
+        let fault = ChainSpendProbe { known: false, spent: None, spending_txid: None, spent_confirmed: None };
+        assert_eq!(probe_memo_of("a1", 0, &fault, now), None, "a fault is never remembered");
+        let unknown_spent = ChainSpendProbe { known: true, spent: None, spending_txid: None, spent_confirmed: None };
+        assert_eq!(probe_memo_of("a1", 0, &unknown_spent, now), None);
+        assert_eq!(probe_memo_read_sql(3), "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE outpoint IN (?, ?, ?)");
+    }
+
 }

@@ -444,7 +444,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// on (`/refund-backups`, `ls_potrefund byPot`); never a filter. Unlike
 /// `sigValid` it is UNFORGEABLE in a pot-scoped window (it needs a key the
 /// attacker does not hold) and IMMUTABLE (written once, never re-latched).
-pub const OVERLAY_MIGRATION_COUNT: usize = 149;
+/// 149 → 150 for bsv-low #451 slice C (2026-09-17): `hop_chain_probes`, the durable memo of the hops view's chain
+/// probes (an isolate cache cannot carry across isolates).
+pub const OVERLAY_MIGRATION_COUNT: usize = 150;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1643,6 +1645,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // and re-marked on readmission (`admit_fast::ReleasedSpend`, JSON). Additive
     // ALTER; the runner ignores the re-run "duplicate column" error.
     "ALTER TABLE pot_evictions ADD COLUMN releasedSpends TEXT",
+    // bsv-low #451 slice C (2026-09-17): the hops view's chain-probe MEMO. `/hops-view` re-checks up to eight
+    // index-unspent hops against the couriers on EVERY call (a hop swept outside our overlay must never be served
+    // as recoverable); the census counted 109–183 such probes per two hands, and a per-isolate memo cut nothing
+    // (Workers spread a seat's calls across isolates). One row per outpoint, the last KNOWN answer and when it was
+    // read; a fault is never written. Read by the app layer (`low-app-layer/src/hops_view.rs`), never the overlay.
+    "CREATE TABLE IF NOT EXISTS hop_chain_probes (outpoint TEXT PRIMARY KEY, probedAtMs INTEGER NOT NULL, spent INTEGER NOT NULL, spendingTxid TEXT, spentConfirmed INTEGER)",
 ];
 
 // =============================================================================
