@@ -1440,6 +1440,22 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         signers_summary.missing_beef,
     );
 
+    // 4a'. bsv-low #468: spender PAYOUTS historic backfill — measure what
+    //      each pre-#468 spend paid to the committed homes, from the durable
+    //      spender bytes. Local re-reads only; bounded; converges to zero
+    //      candidates (History's amount column reads the served number).
+    let payouts_summary = crate::proof_fetcher::backfill_spender_payouts(
+        pot_storage.as_ref(),
+        crate::proof_fetcher::SPENDER_PAYOUTS_BACKFILL_LIMIT,
+    )
+    .await;
+    worker::console_log!(
+        "Scheduled: payouts-backfill (pot_records) — scanned={} measured={} missing_beef={}",
+        payouts_summary.scanned,
+        payouts_summary.measured,
+        payouts_summary.missing_beef,
+    );
+
     // 4b. The RE-LATCH fixpoint over the two admission-latched verdict columns
     //     (bsv-low #355 potparty.sigValid + #367 hopparty.markerValid). Pure
     //     re-reads of our own rows — no courier, no tracker, no BEEF parse —
@@ -1805,6 +1821,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         crate::proof_fetcher::SETTLE_SIGNERS_BACKFILL_LIMIT,
     )
     .await;
+    // 4a'. bsv-low #468: spender payouts historic backfill (see the scheduled
+    //      tick) — pokeable so the beta census converges on demand.
+    let payouts_bf = crate::proof_fetcher::backfill_spender_payouts(
+        pot_storage.as_ref(),
+        crate::proof_fetcher::SPENDER_PAYOUTS_BACKFILL_LIMIT,
+    )
+    .await;
     // 4b. the #355/#367 RE-LATCH fixpoint over the verdict columns (four
     //     arms since brain-cutover M1: sigValid, markerValid, claimValid,
     //     rowValid) — same bounds as the scheduled tick; pokeable so a
@@ -1911,6 +1934,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "signers_latched": signers_bf.latched,
         "signers_unresolved": signers_bf.unresolved,
         "signers_missing_beef": signers_bf.missing_beef,
+        "payouts_scanned": payouts_bf.scanned,
+        "payouts_measured": payouts_bf.measured,
+        "payouts_missing_beef": payouts_bf.missing_beef,
         // #355/#367 re-latch counters, per table. `changed` is the fixpoint's
         // progress AND the predicate-regression detector; `demoted` is the
         // alarm (rows the predicate now refuses that it previously accepted);

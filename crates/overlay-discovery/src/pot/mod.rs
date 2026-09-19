@@ -111,6 +111,8 @@ pub use covenant::{
     RawTx, LOCKTIME_THRESHOLD, TEMPLATE_RAKE_DIVISOR,
 };
 pub use spend_signers::{classify_spend_signers, settle_signers_for_spend, SettleSigners};
+// bsv-low #468: the one payout measure, shared by the live `outputSpent` hook and the historic backfill.
+pub use lookup_service::spend_payouts;
 
 /// The compiled `Poc5TemplatePot` covenant template, copied byte-for-byte
 /// from the canonical source

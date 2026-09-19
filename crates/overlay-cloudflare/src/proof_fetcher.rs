@@ -2974,6 +2974,78 @@ pub async fn backfill_decoded_params(
 /// ECDSA verifies, all local).
 pub const SETTLE_SIGNERS_BACKFILL_LIMIT: u64 = 16;
 
+/// bsv-low #468 (2026-09-19): per-tick candidate bound for
+/// [`backfill_spender_payouts`] — one `pot_beefs` read + one parse per row,
+/// no ECDSA, so wider than the signers pass (2,632 candidates on beta at the
+/// deploy: 10,012 spent rows, 7,380 of them hop rows / bare pots with no
+/// decoded home).
+pub const SPENDER_PAYOUTS_BACKFILL_LIMIT: u64 = 64;
+
+/// Tally of one spender-payouts backfill pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpenderPayoutsBackfillSummary {
+    /// Candidate rows scanned this tick.
+    pub scanned: usize,
+    /// Rows whose payouts were MEASURED from the stored spender bytes and written.
+    pub measured: usize,
+    /// Rows skipped because the spender BEEF is missing/unparseable — they
+    /// STAY candidates (the bytes can still arrive via a later submit).
+    pub missing_beef: usize,
+}
+
+/// bsv-low #468: measure, for every SPENT row with decoded pay homes and no
+/// payouts yet (the rows spent before #468 shipped), what the spend paid to
+/// each committed home — from the durable spender BEEF (`pot_beefs`, first
+/// party only: never a courier), through the same `spend_payouts` the live
+/// `outputSpent` hook runs — and write it through the live-pointer CAS. Pure
+/// local re-reads; bounded; RANDOM-sampled; converges to zero candidates and
+/// stays there (a measured side is `Some(0)` when the spend pays that home
+/// nothing, so every measured row leaves the set).
+pub async fn backfill_spender_payouts(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    limit: u64,
+) -> SpenderPayoutsBackfillSummary {
+    use overlay_discovery::pot::spend_payouts;
+    let mut summary = SpenderPayoutsBackfillSummary::default();
+    let candidates = match pot_storage.find_spender_payouts_unlatched(limit).await {
+        Ok(c) => c,
+        Err(e) => {
+            push_log(&format!("[payouts-backfill] candidate scan failed: {e}"));
+            return summary;
+        }
+    };
+    summary.scanned = candidates.len();
+    for row in candidates {
+        let Some(spending_txid) = row.spending_txid.as_deref() else {
+            continue; // cannot happen per the query; leave it alone
+        };
+        let Ok(Some(spender_beef)) = pot_storage.get_beef(spending_txid).await else {
+            summary.missing_beef += 1;
+            continue; // stays a candidate — the bytes can still arrive
+        };
+        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+            summary.missing_beef += 1;
+            continue; // unparseable stored bytes — longer-wins may repair
+        };
+        let (pay_a, pay_b) =
+            spend_payouts(&spending_tx, row.pay_pkh_a.as_deref(), row.pay_pkh_b.as_deref());
+        if pay_a.is_none() && pay_b.is_none() {
+            continue; // cannot happen per the query (a home is decoded); leave it alone
+        }
+        match pot_storage
+            .store_spender_payouts(&row.txid, row.output_index, spending_txid, pay_a, pay_b)
+            .await
+        {
+            Ok(()) => summary.measured += 1,
+            Err(e) => push_log(&format!(
+                "[payouts-backfill] {} write failed: {e}",
+                row.txid
+            )),
+        }
+    }
+    summary
+}
+
 /// Tally of one settle-signers backfill pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SettleSignersBackfillSummary {
@@ -6430,6 +6502,85 @@ pub(crate) mod tests {
         // TERMINATION: latched rows leave the candidate set.
         let s2 = backfill_settle_signers(&store, 20).await;
         assert_eq!(s2.scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn payouts_backfill_measures_the_homes_from_the_durable_bytes() {
+        // bsv-low #468: a pre-#468 spent row (decoded homes, no payouts) is
+        // measured from its stored spender BEEF and leaves the candidate set.
+        let store = MemoryPotStorage::new();
+        let (keys, p) = real_key_params();
+        let pot_txid = hex::encode([0x46u8; 32]);
+        let (settle_bytes, settle_txid) = signed_spender_beef(
+            &pot_txid,
+            &p,
+            2500,
+            &[&keys[1], &keys[2]],
+            &[(2375, p2pkh_script(&p.pay_pkh_b))],
+        );
+        store
+            .store_record(&pre406_row(&pot_txid, &p, 2500))
+            .await
+            .unwrap();
+        store
+            .mark_spent(
+                &pot_txid,
+                0,
+                &settle_txid,
+                false,
+                Some(VerdictWrite::bare("winner-b")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store.store_beef(&settle_txid, &settle_bytes).await.unwrap();
+
+        let s = backfill_spender_payouts(&store, 20).await;
+        assert_eq!((s.scanned, s.measured, s.missing_beef), (1, 1, 0));
+        let r = store.get_spent_status(&pot_txid, 0).await.unwrap().unwrap();
+        assert_eq!(
+            (r.spender_pay_a_sats, r.spender_pay_b_sats),
+            (Some(0), Some(2375)),
+            "home A paid nothing (a measured 0, not an unknown), home B the payout"
+        );
+        // TERMINATION: a measured row leaves the candidate set.
+        let s2 = backfill_spender_payouts(&store, 20).await;
+        assert_eq!(s2.scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn payouts_backfill_missing_spender_beef_stays_a_candidate_and_undecoded_rows_are_not_candidates() {
+        let store = MemoryPotStorage::new();
+        let (_, p) = real_key_params();
+        let pot_txid = hex::encode([0x47u8; 32]);
+        store
+            .store_record(&pre406_row(&pot_txid, &p, 2500))
+            .await
+            .unwrap();
+        store
+            .mark_spent(&pot_txid, 0, &hex::encode([0x48u8; 32]), false, None, None, None)
+            .await
+            .unwrap();
+        // A spent row with NO decoded home (a hop outpoint, a bare pot): never a candidate.
+        let bare = hex::encode([0x49u8; 32]);
+        store
+            .store_record(&PotRecord {
+                txid: bare.clone(),
+                output_index: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(&bare, 0, &hex::encode([0x4au8; 32]), false, None, None, None)
+            .await
+            .unwrap();
+
+        let s = backfill_spender_payouts(&store, 20).await;
+        assert_eq!((s.scanned, s.measured, s.missing_beef), (1, 0, 1));
+        let s2 = backfill_spender_payouts(&store, 20).await;
+        assert_eq!((s2.scanned, s2.missing_beef), (1, 1), "no bytes yet: still a candidate, never latched out");
     }
 
     #[tokio::test]

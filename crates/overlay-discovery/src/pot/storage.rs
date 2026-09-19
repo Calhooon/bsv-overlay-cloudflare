@@ -819,6 +819,28 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
+    /// bsv-low #468 backfill candidates: SPENT rows with DECODED pay homes
+    /// whose payouts are not yet measured (`spendingTxid IS NOT NULL AND
+    /// spenderPayASats IS NULL AND spenderPayBSats IS NULL AND (payPkhA IS
+    /// NOT NULL OR payPkhB IS NOT NULL)`) — the rows spent before #468
+    /// shipped (10,012 on beta at the deploy, 2,632 with decoded homes).
+    /// `proof_fetcher::backfill_spender_payouts` MEASURES them from the
+    /// STORED spender BEEF (the same `spend_payouts` the live `outputSpent`
+    /// hook runs) and writes through
+    /// [`store_spender_payouts`](Self::store_spender_payouts) (CAS on the
+    /// live pointer, stored-wins). A measured side is `Some(0)` when the
+    /// spend pays that home nothing, so a measured row LEAVES the set; a
+    /// row whose spender bytes are missing stays (bounded per tick, RANDOM
+    /// order, same starvation rationale as [`find_params_undecoded`]).
+    /// Backends that can't enumerate return empty → no-op.
+    async fn find_spender_payouts_unlatched(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
     /// Durably store `beef` under `txid` (the stored tx's OWN txid — the
     /// funding txid for a funding beef, the SETTLE txid for a settle beef).
     ///
@@ -1529,6 +1551,28 @@ impl PotStorage for MemoryPotStorage {
             .collect())
     }
 
+    async fn find_spender_payouts_unlatched(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // The #468 candidate bar, mirrored from the D1 query: spent, a home
+        // decoded, neither payout measured yet.
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.spending_txid.is_some()
+                    && r.spender_pay_a_sats.is_none()
+                    && r.spender_pay_b_sats.is_none()
+                    && (r.pay_pkh_a.is_some() || r.pay_pkh_b.is_some())
+            })
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
     async fn store_spender_facts(
         &self,
         txid: &str,
@@ -1580,10 +1624,8 @@ impl PotStorage for MemoryPotStorage {
         else {
             return Ok(());
         };
-        if r.spending_txid.as_deref() != Some(spending_txid)
-            || r.spender_facts_txid.as_deref() != Some(spending_txid)
-        {
-            return Ok(()); // CAS miss: not the live, described spender
+        if r.spending_txid.as_deref() != Some(spending_txid) {
+            return Ok(()); // CAS miss: not the live spender
         }
         if r.spender_pay_a_sats.is_none() {
             r.spender_pay_a_sats = pay_a_sats;

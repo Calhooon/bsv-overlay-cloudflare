@@ -2451,10 +2451,29 @@ pub fn pot_funding_facts_fill_sql() -> &'static str {
 /// (COALESCE; a NULL payout keeps the column). Binds: (payA, payB, txid, vout,
 /// spender, spender). Pub for the REAL-SQLite harness.
 pub fn spender_payouts_cas_sql() -> &'static str {
+    // The LIVE POINTER is the guard (a displaced spender resets both sides in
+    // `spender_facts_cas_sql`); stored-wins per side. No coupling to the facts
+    // txid: 1,325 beta rows have decoded homes and no spender facts at all
+    // (spent before the facts shipped), and the payouts are measured from the
+    // spender's own bytes, whose txid IS the live pointer by construction.
     "UPDATE pot_records SET \
          spenderPayASats = COALESCE(spenderPayASats, ?), \
          spenderPayBSats = COALESCE(spenderPayBSats, ?) \
-     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spenderFactsTxid = ?"
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ?"
+}
+
+/// bsv-low #468 backfill candidates (see `PotStorage::find_spender_payouts_unlatched`),
+/// pinned against real SQLite below. Recency band first, RANDOM within (the
+/// #284 anti-starvation shape shared with the signers pass).
+pub(crate) fn spender_payouts_candidates_sql(limit: u64) -> String {
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
+         WHERE spendingTxid IS NOT NULL \
+           AND spenderPayASats IS NULL AND spenderPayBSats IS NULL \
+           AND (payPkhA IS NOT NULL OR payPkhB IS NOT NULL) \
+         ORDER BY CASE WHEN COALESCE(spentAt, 0) >= unixepoch() - 3600 \
+                       THEN 0 ELSE 1 END, RANDOM() LIMIT {limit}"
+    )
 }
 
 pub fn spender_facts_cas_sql() -> &'static str {
@@ -2482,7 +2501,6 @@ impl PotStorage for D1PotStorage {
             .bind(pay_b_sats.map(|v| v as f64))
             .bind(txid)
             .bind(output_index)
-            .bind(spending_txid)
             .bind(spending_txid)
             .execute(&self.db)
             .await
@@ -2823,6 +2841,19 @@ impl PotStorage for D1PotStorage {
         // bsv-low #406 backfill candidates — see
         // `settle_signers_candidates_sql` (pinned against real SQLite).
         let rows: Vec<PotRow> = Query::new(settle_signers_candidates_sql(limit))
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_spender_payouts_unlatched(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PotRecord>, PotStorageError> {
+        // bsv-low #468 backfill candidates — see
+        // `spender_payouts_candidates_sql` (pinned against real SQLite).
+        let rows: Vec<PotRow> = Query::new(spender_payouts_candidates_sql(limit))
             .fetch_all(&self.db)
             .await
             .map_err(pot_err)?;
@@ -7842,6 +7873,55 @@ mod tests {
     /// writers set it, the verdict-less writers and the displacement CAS never
     /// touch it, the backfill CAS is pointer-guarded, and the candidate scan's
     /// bar (NULL only — 'unresolved' is latched OUT) is WHERE-clause behavior.
+    #[test]
+    fn sql_spender_payouts_candidates_and_cas_real_sqlite() {
+        // bsv-low #468: the candidate bar and the CAS, against real SQLite.
+        let conn = sqlite_with_migrations();
+        let candidates = |limit: u64| -> usize {
+            conn.prepare(&spender_payouts_candidates_sql(limit))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .count()
+        };
+        exec_store(&conn, "potP", 0, 1_000, Some("covenant"), None, Some(500), Some(1_000), 1);
+        assert_eq!(candidates(10), 0, "an UNSPENT row is not a candidate");
+        exec_mark_spent(&conn, "potP", 0, "settleP", false, Some("winner-a"), None);
+        assert_eq!(candidates(10), 0, "spent with NO decoded home is not a candidate (a hop row, a bare pot)");
+        conn.execute(
+            "UPDATE pot_records SET payPkhA = ?1 WHERE txid = 'potP'",
+            rusqlite::params!["11".repeat(20)],
+        )
+        .unwrap();
+        assert_eq!(candidates(10), 1, "spent + a decoded home + no payouts = a candidate");
+        // The CAS: a stale pointer writes nothing; the live one measures; stored-wins.
+        conn.execute(
+            spender_payouts_cas_sql(),
+            rusqlite::params![Some(900_i64), Some(0_i64), "potP", 0_i64, "settleOLD"],
+        )
+        .unwrap();
+        assert_eq!(candidates(10), 1, "a write naming a spender that is not the live pointer is a no-op");
+        conn.execute(
+            spender_payouts_cas_sql(),
+            rusqlite::params![Some(900_i64), Some(0_i64), "potP", 0_i64, "settleP"],
+        )
+        .unwrap();
+        assert_eq!(candidates(10), 0, "a measured row (a Some(0) side included) leaves the set");
+        conn.execute(
+            spender_payouts_cas_sql(),
+            rusqlite::params![Some(1_i64), Some(1_i64), "potP", 0_i64, "settleP"],
+        )
+        .unwrap();
+        let (a, b): (i64, i64) = conn
+            .query_row(
+                "SELECT spenderPayASats, spenderPayBSats FROM pot_records WHERE txid = 'potP'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((a, b), (900, 0), "stored-wins: a second measure never rewrites");
+    }
+
     #[test]
     fn sql_the_verdict_group_carries_settle_signers() {
         let conn = production_schema_db();

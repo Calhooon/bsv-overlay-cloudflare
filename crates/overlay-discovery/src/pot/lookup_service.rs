@@ -629,7 +629,7 @@ impl LookupService for PotLookupService {
 /// spend with no output value known contributes nothing to a sum (the raw was
 /// parsed without values only on a truncated wire, which the caller rejects
 /// earlier). Pure over the parsed tx.
-pub(crate) fn spend_payouts(
+pub fn spend_payouts(
     spending_tx: &Transaction,
     pay_pkh_a_hex: Option<&str>,
     pay_pkh_b_hex: Option<&str>,
