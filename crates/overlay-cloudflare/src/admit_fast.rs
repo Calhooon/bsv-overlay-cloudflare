@@ -508,6 +508,16 @@ pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, no
     {
         worker::console_log!("[admit-fast] evict {txid}: the ledger row failed: {e}");
     }
+    // bsv-low loop 11 (the app layer's gate, LOW-3): the notes above can be flushed by a CONCURRENT request's end on
+    // this isolate before the ledger row exists (the set is isolate-global), and the app layer's recompute then finds
+    // no eviction in its window and writes the hop as young; note the pot and the released hops ONCE MORE after the
+    // row is written (the set dedupes; a second flush after the row is what the derivation needs).
+    for v in &pot_vouts {
+        crate::pot_changes::note(&txid, *v);
+    }
+    for r in &released {
+        crate::pot_changes::note(&r.txid, r.vout);
+    }
     worker::console_log!(
         "[admit-fast] evicted {txid} everywhere: {moved} row(s) moved, {} spend pointer(s) released ({reason})",
         released.len()

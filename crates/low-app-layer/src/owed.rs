@@ -59,6 +59,63 @@ pub const HOP_STRANDED_AFTER_MS: i64 = 30 * 60 * 1000;
 /// The sentence on a young unspent hop's `in-progress` row (the stake is funded, the hand has not started).
 pub const YOUNG_HOP_REASON: &str =
     "your stake is in its funding hop and the hand has not started: rejoin to continue; if it never starts, the stake can be swept back after 30 minutes";
+/// Fleet loop 11 (2026-09-19): the sentence on a hop whose JOIN the network REFUSED (the pot evicted, never
+/// readmitted) — the hand can never start, so the stake is sweepable NOW, not after the young-hop window: the brain
+/// KNOWS (the eviction ledger), and "rejoin to continue" was a lie by omission (`spec-admit-fast-join-refused`).
+pub const JOIN_REFUSED_REASON: &str =
+    "the network refused the transaction that spent this stake (it was evicted from the index): the hand cannot start from it; your stake can be swept back now";
+
+/// PURE: the HOP OUTPOINTS (`txid:vout`, lowercase) whose spend pointer an EVICTED, never readmitted JOIN released —
+/// the overlay's `pot_evictions.releasedSpends` (`[{"table","txid","vout"}, …]`, one entry per `pot_records` row the
+/// evicted tx spent). ONE derivation for the route's probe candidates and the derivation's hop rule: such a hop is
+/// STRANDED at once (never `in-progress` with a rejoin the hand can never honour).
+///
+/// Keyed on the UTXO, never on a name (the gate's HIGH-1, 2026-09-19): the results view serves potparty rows by
+/// byte format, so a stranger can plant a row naming a victim's identity, a live game id and its OWN evicted txid;
+/// keying the refusal on that game id would have handed the victim's live hop a sweep press. A released spend is
+/// unforgeable evidence of WHICH hop the evicted tx spent, and only this seat's key spends this seat's hop. A NULL,
+/// malformed or entry-less column contributes nothing (the pre-change sentence stands: fail-safe).
+pub fn released_hop_outpoints(evictions: &[(String, Option<String>)]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (_txid, released) in evictions {
+        let Some(raw) = released.as_deref() else { continue };
+        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else { continue };
+        for e in entries {
+            let (Some(txid), Some(vout)) = (e.get("txid").and_then(Value::as_str), e.get("vout").and_then(Value::as_u64)) else { continue };
+            if txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                out.insert(outpoint_key(txid, vout as u32));
+            }
+        }
+    }
+    out
+}
+
+/// PURE (pinned): what a coalesced recompute ask leaves behind — the latest source, replacing an earlier one
+/// (`routes::owed_recompute_and_push_coalesced`).
+pub fn owed_rerun_note(map: &mut HashMap<String, String>, identity_lc: &str, source: &str) {
+    map.insert(identity_lc.to_string(), source.to_string());
+}
+
+/// The eviction ledger's RECENT rows, the candidate set for a refused JOIN (the delta-verify's HIGH-A, 2026-09-19):
+/// the results view cannot feed it — the eviction moves the party rows keyed by the pot into their twin, so an
+/// identity's results hold NO entry for an evicted pot and a candidate set derived from them is empty on exactly
+/// the path that matters. The ledger itself is the source: every eviction not yet readmitted inside the window,
+/// intersected below with the identity's OWN hops (`refused_hop_outpoints_of`). Bound `?1` = now − the window.
+pub const OWED_EVICTIONS_WINDOW_SQL: &str =
+    "SELECT lower(txid) AS txid, releasedSpends FROM pot_evictions WHERE readmittedAt IS NULL AND evictedAt >= ?1";
+/// How far back the ledger is read (evictions are rare: 2 in 47 admissions on beta; a hop past the young window
+/// is stranded by AGE regardless, so the window only has to cover the young period, with margin).
+pub const OWED_EVICTION_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// PURE: the identity's own hop outpoints among the released spends of the ledger's recent evictions — the
+/// refusal's key. A released spend names a `pot_records` row the evicted tx spent, and only this seat's key
+/// spends this seat's hop, so a stranger's eviction can never name a hop of ours.
+pub fn refused_hop_outpoints_of(released: &HashSet<String>, hops: &[HopEntry]) -> HashSet<String> {
+    hops.iter()
+        .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
+        .filter(|k| released.contains(k))
+        .collect()
+}
 /// The courier probes ONE recompute may buy for its index-unspent hops (the memoised `hop_chain_probes` answer the
 /// rest; a hop past the budget keeps its last memo's word, named stale, or waits with no claim). Counted per caller
 /// `owed` on the courier census.
@@ -208,6 +265,9 @@ pub struct OwedInputs<'a> {
     pub pot_spenders_faulted: bool,
     /// hop outpoint (`txid:vout`) → the chain rung's word, for the index-unspent hops past the stranded window.
     pub hop_chain: &'a HashMap<String, HopChainWord>,
+    /// hop outpoints (`txid:vout`, lowercase) whose spend pointer an EVICTED, never readmitted JOIN released
+    /// (`released_hop_outpoints`): the network refused the hand's funding — the hop is stranded at once.
+    pub evicted_hop_outpoints: &'a HashSet<String>,
     /// hop outpoint (`txid:vout`) → the newest FILED sweep of this identity for that hop (bsv-low #469 decision 3):
     /// the press's bytes for a stranded hop; a hop spent by that very sweep is a `payout` row (the sweep's credit).
     pub hop_sweeps: &'a HashMap<String, crate::hopsweep::FiledHopSweep>,
@@ -326,8 +386,10 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // the index's word, OR the chain rung's (a spend the index recorded before its block and never re-checked
             // read "not mined yet" for days on the pair: the recompute now probes such hops and the courier's
             // confirmation heals the row without a client action)
-            let chain_confirmed = i.hop_chain.get(&outpoint).is_some_and(|w| w.looked && w.spent == Some(true) && w.spent_confirmed == Some(true));
-            let confirmed = (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true) || chain_confirmed;
+            // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
+            // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
+            // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
+            let confirmed = (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true);
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
@@ -696,7 +758,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             // container never indexed: the chain rung is the only word there is), share one ladder.
             HopStatus::Unspent | HopStatus::Unknown => {
                 let age_ms = h.marker_created_at.map(|c| i.now_ms.saturating_sub(c));
-                let stranded = age_ms.is_some_and(|a| a >= HOP_STRANDED_AFTER_MS);
+                // fleet loop 11: a JOIN the network refused makes its hop stranded NOW — the hand cannot start
+                // (keyed on THIS hop's outpoint in the eviction ledger's released spends, never on the game's name)
+                let join_refused = i.evicted_hop_outpoints.contains(&outpoint);
+                let stranded = join_refused || age_ms.is_some_and(|a| a >= HOP_STRANDED_AFTER_MS);
                 if !stranded {
                     // A YOUNG unspent hop (the stranded cell's run 4 and the device-switch unit, 2026-09-19): the
                     // stake is in its funding hop and the hand has not started. It IS money of this identity's, so
@@ -757,6 +822,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 let chain = i.hop_chain.get(&outpoint);
                 let mut facts = facts_base.clone();
                 facts["ageMs"] = json!(age_ms);
+                facts["joinRefused"] = json!(join_refused); // on every arm: a waiting press says why it is sweepable
                 match chain {
                     Some(w) if w.looked && w.spent == Some(false) => {
                         facts["claim"] = json!("sweep-hop");
@@ -784,7 +850,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: None,
+                            reason: if join_refused { Some(JOIN_REFUSED_REASON.to_string()) } else { None },
                         });
                     }
                     Some(w) if w.looked && w.spent == Some(true) => {
@@ -895,6 +961,12 @@ pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId,
 /// reached (a small band below it, so a missed block still lands) is marked STALE; its next read recomputes.
 pub const OWED_STALE_ON_TIP_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT pp.identity FROM potparty_records pp JOIN pot_records p ON p.txid = pp.potTxid AND p.outputIndex = pp.potVout WHERE p.spent = 0 AND p.recoveryHeight IS NOT NULL AND p.recoveryHeight <= ?1 AND p.recoveryHeight >= ?1 - 6)";
 /// HIGH-4: a filing on a pot marks BOTH parties stale (the counterparty's valid refund makes MY pot claimable).
+/// The gate's MEDIUM-1 (2026-09-19): an outpoint the pot-changed hook cannot attribute through decoded params (an
+/// EVICTED pot's row is gone; a released HOP is a P2PKH row) is attributed through the seats' OWN markers — the
+/// party rows naming the pot and the hop rows naming the hop — so an eviction re-derives both seats' owed rows at
+/// once instead of at the next cadence (up to 5 minutes, with a live Rejoin press on a hand the network refused).
+pub const OWED_ATTRIBUTE_BY_POT_SQL: &str = "SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2";
+pub const OWED_ATTRIBUTE_BY_HOP_SQL: &str = "SELECT DISTINCT identity FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2";
 pub const OWED_STALE_FOR_POT_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2)";
 // N3: both stale marks join EXACTLY (`idx_potparty_pot`, the `pot_records` PK), as every sibling query in this crate
 // does (`results_sql`: `r.txid = pp.potTxid`); a `lower()` on a join key would scan the table per block / per filing.
@@ -956,8 +1028,9 @@ pub fn sort_rows_for_service(rows: &mut [OwedRow]) {
 pub const OWED_MAX_ROWS: usize = 500;
 
 // ── counters (isolate-scoped, on /health like the filings') ─────────────────
-pub const RECOMPUTE_SOURCES: [&str; 5] = ["pot-changed", "filing", "read-first", "read-stale", "read-aged"];
-static RECOMPUTE_BY_SOURCE: [AtomicU64; 5] = [
+pub const RECOMPUTE_SOURCES: [&str; 6] = ["pot-changed", "hop-changed", "filing", "read-first", "read-stale", "read-aged"];
+static RECOMPUTE_BY_SOURCE: [AtomicU64; 6] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -1011,6 +1084,18 @@ pub fn note_recompute(source: &str, rows: &[OwedRow]) {
 pub fn note_recompute_fault() {
     RECOMPUTE_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+/// Asks that found a recompute of the same identity in flight on this isolate and were folded into ONE re-run
+/// after it (fleet loop 11, 2026-09-19: the hooks' twins under the t=0 herd).
+static RECOMPUTE_COALESCED: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_coalesced() {
+    RECOMPUTE_COALESCED.fetch_add(1, Ordering::Relaxed);
+}
+/// An in-flight mark older than the stale bound was TAKEN OVER (the gate's MEDIUM-2: a future the runtime abandoned
+/// would otherwise hold the identity's lock for the isolate's life).
+static RECOMPUTE_LOCK_TAKEOVERS: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_lock_takeover() {
+    RECOMPUTE_LOCK_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
+}
 
 pub fn owed_health_json() -> Value {
     let mut by_source = serde_json::Map::new();
@@ -1026,6 +1111,8 @@ pub fn owed_health_json() -> Value {
         "recomputeBySource": by_source,
         "rowsWrittenByFamily": by_family,
         "recomputeFaults": RECOMPUTE_FAULTS.load(Ordering::Relaxed),
+        "recomputeCoalesced": RECOMPUTE_COALESCED.load(Ordering::Relaxed),
+        "recomputeLockTakeovers": RECOMPUTE_LOCK_TAKEOVERS.load(Ordering::Relaxed),
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
@@ -1128,6 +1215,7 @@ mod tests {
             hop_chain: &NO_CHAIN,
             hop_sweeps: &NO_SWEEPS,
             evicted_pots: &NONE,
+            evicted_hop_outpoints: &NONE,
             spender_outputs: &NO_SPENDERS,
             my_pkh_by_game: &NO_PKHS,
         }
@@ -1605,6 +1693,186 @@ mod tests {
         let mut covenant = lock.clone();
         covenant.push(0x00);
         assert!(p2pkh_pkh_hex(&covenant).is_none());
+    }
+
+    #[test]
+    fn a_refused_join_makes_its_young_hop_stranded_now_with_the_sweep_press() {
+        // fleet loop 11 (2026-09-19): the JOIN evicted (never readmitted) → the pot is no row (the test below) and
+        // the hop, though YOUNG, is stranded at once with its sweep press (the chain word unspent), the reason
+        // naming the refusal; without the eviction the young hop keeps the design's in-progress rejoin. The key is
+        // the HOP OUTPOINT the eviction ledger released (the gate's HIGH-1), never the game's name.
+        let e = [entry(None, None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let young = [hop(HopStatus::Unspent, None, Some(60_000))];
+        let key = format!("{}:0", tx(0x07));
+        let mut chain: HashMap<String, HopChainWord> = HashMap::new();
+        chain.insert(key.clone(), HopChainWord { looked: true, spent: Some(false), spending_txid: None, spent_confirmed: None, stale: false, age_ms: None });
+        let mut i = inputs(&e, &[], &young, &v, &c, &p, Some(900_000));
+        i.hop_chain = &chain;
+        let rows = derive_owed_rows(&i);
+        assert!(rows.iter().any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"), "a young hop of a live game is in-progress");
+        assert!(!rows.iter().any(|r| r.family == OwedFamily::HopStranded));
+        // the eviction row as the overlay writes it: the pot txid + the released spends (this hop's outpoint)
+        let released = format!("[{{\"table\":\"pot_records\",\"txid\":\"{}\",\"vout\":0}}]", tx(0x07));
+        let refused = released_hop_outpoints(&[(tx(0x02), Some(released))]);
+        assert_eq!(refused.len(), 1);
+        assert!(refused.contains(&key));
+        let evicted: HashSet<String> = [tx(0x02)].into_iter().collect();
+        i.evicted_pots = &evicted;
+        i.evicted_hop_outpoints = &refused;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "the pot is no row; the hop is the one row");
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["joinRefused"], true);
+        assert_eq!(rows[0].reason.as_deref(), Some(JOIN_REFUSED_REASON));
+        // HIGH-1: a PLANTED party row naming this identity, a live game and a stranger's own evicted txid releases the
+        // STRANGER's hops, never this seat's: the young hop stays in-progress (a name is never the key)
+        let planted = format!("[{{\"table\":\"pot_records\",\"txid\":\"{}\",\"vout\":0}}]", tx(0x09));
+        let strangers = released_hop_outpoints(&[(tx(0x02), Some(planted))]);
+        i.evicted_hop_outpoints = &strangers;
+        let rows = derive_owed_rows(&i);
+        assert!(rows.iter().any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"), "a plant strands nothing");
+        assert!(!rows.iter().any(|r| r.family == OwedFamily::HopStranded));
+        // the parser: NULL, malformed and non-hex entries contribute nothing (fail-safe)
+        assert!(released_hop_outpoints(&[(tx(0x02), None)]).is_empty());
+        assert!(released_hop_outpoints(&[(tx(0x02), Some("not json".into()))]).is_empty());
+        assert!(released_hop_outpoints(&[(tx(0x02), Some("[{\"txid\":\"zz\",\"vout\":0}]".into()))]).is_empty());
+    }
+
+    /// The delta-verify's HIGH-A (2026-09-19): the refusal's candidate set must come from the eviction LEDGER —
+    /// under the overlay's real eviction SQL the party row keyed by the pot leaves `potparty_records` (the results
+    /// view has no entry to derive a candidate from), while the ledger's window still names the released hop; the
+    /// derivation then strands the identity's young hop. Real SQLite, the shipped migrations, the overlay's own
+    /// move statements (a dev-dependency), the app layer's own query.
+    #[test]
+    fn a_refused_join_is_found_through_the_eviction_ledger_after_the_overlay_moved_the_party_row_real_sqlite() {
+        use bsv_overlay_cloudflare::admit_fast::{create_shadow_sql, move_sql, ColumnInfo, MOVED_TABLES};
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
+            }
+        }
+        let me = ME.to_string();
+        let pot = tx(0x02);
+        let hop_txid = tx(0x07);
+        conn.execute(
+            "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt) \
+             VALUES (?1, 'opp', ?2, ?3, 0, 100, 'sig', ?4, 0, 1000)",
+            rusqlite::params![me, tx(0x01), pot, tx(0x0a)],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 900)", rusqlite::params![pot]).unwrap();
+        // the hop's own row, its spend pointer RELEASED by the eviction (the overlay's release SQL is its own pin)
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)", rusqlite::params![hop_txid]).unwrap();
+        let evicted_at = 1_700_000_000_000i64;
+        conn.execute(
+            "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, 'REJECTED (corroborated)', ?2, NULL, 2, ?3)",
+            rusqlite::params![pot, evicted_at, format!("[{{\"table\":\"pot_records\",\"txid\":\"{hop_txid}\",\"vout\":0}}]")],
+        )
+        .unwrap();
+        let cols = |conn: &rusqlite::Connection, t: &str| -> Vec<ColumnInfo> {
+            let mut st = conn.prepare(&format!("PRAGMA table_info(\"{t}\")")).unwrap();
+            st.query_map([], |r| Ok(ColumnInfo { name: r.get(1)?, ty: r.get::<_, String>(2).unwrap_or_default() })).unwrap().map(|r| r.unwrap()).collect()
+        };
+        // the overlay's eviction: every keyed row of the pot moves to its twin (the same SQL the D1 path runs)
+        for (table, keys) in MOVED_TABLES {
+            let c = cols(&conn, table);
+            if c.is_empty() {
+                continue;
+            }
+            for key in keys.iter() {
+                if !c.iter().any(|x| x.name == *key) {
+                    continue;
+                }
+                conn.execute_batch(&create_shadow_sql(table, &c)).unwrap();
+                let (ins, del) = move_sql(table, key, &c);
+                conn.execute(&ins, rusqlite::params![evicted_at, "REJECTED (corroborated)", &pot]).unwrap();
+                conn.execute(&del, [&pot]).unwrap();
+            }
+        }
+        let party_rows: i64 = conn.query_row("SELECT COUNT(*) FROM potparty_records WHERE identity = ?1", [&me], |r| r.get(0)).unwrap();
+        assert_eq!(party_rows, 0, "the results view has NO entry to derive a candidate from after the eviction");
+        // the app layer's own query on the ledger still names the released hop
+        let mut st = conn.prepare(OWED_EVICTIONS_WINDOW_SQL).unwrap();
+        let rows: Vec<(String, Option<String>)> = st
+            .query_map([evicted_at - OWED_EVICTION_WINDOW_MS + 1], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let released = released_hop_outpoints(&rows);
+        let young = [hop(HopStatus::Unspent, None, Some(60_000))];
+        let refused = refused_hop_outpoints_of(&released, &young);
+        assert_eq!(refused.len(), 1);
+        assert!(refused.contains(&format!("{hop_txid}:0")));
+        // and the derivation strands the young hop (the pot itself is gone from the results, so no pot row at all)
+        let key = format!("{hop_txid}:0");
+        let mut chain: HashMap<String, HopChainWord> = HashMap::new();
+        chain.insert(key, HopChainWord { looked: true, spent: Some(false), spending_txid: None, spent_confirmed: None, stale: false, age_ms: None });
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
+        i.hop_chain = &chain;
+        i.evicted_hop_outpoints = &refused;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(rows[0].facts["joinRefused"], true);
+        // a window that excludes the eviction finds nothing (the bound is the window's whole meaning)
+        let none: Vec<(String, Option<String>)> = conn
+            .prepare(OWED_EVICTIONS_WINDOW_SQL)
+            .unwrap()
+            .query_map([evicted_at + 1], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(none.is_empty());
+        // a stranger's eviction releases the stranger's hops: never a hop of ours
+        let strangers: HashSet<String> = [format!("{}:0", tx(0x09))].into_iter().collect();
+        assert!(refused_hop_outpoints_of(&strangers, &young).is_empty());
+    }
+
+    /// The gate's LOW-3 (2026-09-19): a filed sweep's payout is confirmed by a chain word that NAMES the sweep; a
+    /// word naming a DIFFERENT spender (the JOIN, readmitted on its mine) confirms nothing.
+    #[test]
+    fn a_swept_hops_payout_is_confirmed_only_by_a_chain_word_that_names_the_sweep() {
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let mut named = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        named.spent_confirmed = None; // the index names the sweep, unconfirmed
+        let hops = [named];
+        let verified: HashSet<String> = HashSet::new();
+        // the chain: spent + confirmed by ANOTHER txid → not confirmed
+        let other = tx(0x0d);
+        let by_other = chain_confirmed(&key, true, Some(true), Some(&other), Some(true));
+        let mut i = inputs(&[], &[], &hops, &v, &verified, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        i.hop_chain = &by_other;
+        let rows = derive_owed_rows(&i);
+        let payout = rows.iter().find(|r| r.family == OwedFamily::Payout).expect("the sweep's payout row");
+        assert_eq!(payout.facts["claimable"], false, "a different spender's confirmation is not the sweep's");
+        // the chain naming the sweep, confirmed → claimable
+        let by_sweep = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        i.hop_chain = &by_sweep;
+        let rows = derive_owed_rows(&i);
+        let payout = rows.iter().find(|r| r.family == OwedFamily::Payout).expect("the sweep's payout row");
+        assert_eq!(payout.facts["claimable"], true);
+    }
+
+    #[test]
+    fn a_coalesced_ask_remembers_the_latest_source_and_the_attribution_sql_names_the_marker_tables() {
+        let mut m = HashMap::new();
+        owed_rerun_note(&mut m, "ab", "pot-changed");
+        owed_rerun_note(&mut m, "ab", "hop-changed");
+        assert_eq!(m.get("ab").map(String::as_str), Some("hop-changed"));
+        assert_eq!(m.len(), 1);
+        // MEDIUM-1: the eviction trigger attributes through the seats' own markers, by the marker tables' real columns
+        assert!(OWED_ATTRIBUTE_BY_POT_SQL.contains("FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2"));
+        assert!(OWED_ATTRIBUTE_BY_HOP_SQL.contains("FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2"));
     }
 
     #[test]

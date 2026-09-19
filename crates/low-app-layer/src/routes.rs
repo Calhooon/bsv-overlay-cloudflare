@@ -2197,6 +2197,33 @@ pub async fn compute_results_body_string(
 /// box as a `pot` event. Best-effort per outpoint; the answer names what
 /// was filed. Nothing here is money truth — the client still verifies
 /// landings before any credit.
+/// The identities whose OWN markers name an outpoint: the party rows naming it as a pot, the hop rows naming it as a
+/// hop (`OWED_ATTRIBUTE_BY_POT_SQL` / `_BY_HOP_SQL`). Fail-soft: a faulted read names nobody (the cadence re-derives).
+pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &str, vout: u32) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct IdentityOnlyD1 {
+        identity: String,
+    }
+    let mut out: Vec<String> = Vec::new();
+    for sql in [crate::owed::OWED_ATTRIBUTE_BY_POT_SQL, crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL] {
+        match db.prepare(sql).bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))]) {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<IdentityOnlyD1>()) {
+                Ok(rows) => {
+                    for r in rows {
+                        let id = r.identity.to_ascii_lowercase();
+                        if !out.contains(&id) {
+                            out.push(id);
+                        }
+                    }
+                }
+                Err(e) => console_warn!("[pot-changed] marker attribution read failed for {txid}:{vout}: {e}"),
+            },
+            Err(e) => console_warn!("[pot-changed] marker attribution bind failed for {txid}:{vout}: {e}"),
+        }
+    }
+    out
+}
+
 pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ctx: &worker::Context) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
@@ -2248,8 +2275,20 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
             }
         };
         let Some(params) = rows.first().and_then(|r| r.covenant_params()) else {
+            // fleet loop 11 (the gate's MEDIUM-1): an EVICTED pot's row is gone and a released HOP is a P2PKH row —
+            // neither decodes, but both name their seats through the seats' OWN markers; those identities are
+            // marked stale and re-derived after the answer, so a refusal reaches the owed list at once (nothing is
+            // FILED here: the filing below needs the params)
+            let named = owed_identities_by_marker(&db, &txid, vout).await;
+            let named_n = named.len();
+            for id in named {
+                owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(&id)], "pot-changed (by marker)").await;
+                if !owed_identities.contains(&id) {
+                    owed_identities.push(id);
+                }
+            }
             worker::console_log!(
-                "[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file"
+                "[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file ({named_n} seat(s) attributed by marker)"
             );
 
             skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file") }));
@@ -2346,7 +2385,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
             // N7: ONE tip read for every identity this call recomputes
             let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
             for id in owed_identities {
-                owed_recompute_and_push(&env2, &db, &id, "pot-changed", tip).await;
+                owed_recompute_and_push_coalesced(&env2, &db, &id, "pot-changed", tip).await;
             }
         });
     }
@@ -2380,7 +2419,7 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
         let Ok(db) = env2.d1("OVERLAY_DB") else { return };
         let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
         for id in ids {
-            owed_recompute_and_push(&env2, &db, &id, "hop-changed", tip).await;
+            owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip).await;
         }
     });
     json_response(serde_json::json!({ "ok": true, "identities": identities }).to_string(), 200)
@@ -2625,7 +2664,8 @@ pub(crate) async fn owed_recompute(
         let unknown: Vec<String> = results.iter().filter(|e| e.spent.is_none()).map(|e| e.pot_txid.to_ascii_lowercase()).collect();
         for chunk in unknown.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
             let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
-            let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_evictions WHERE readmittedAt IS NULL AND lower(txid) IN ({placeholders})");
+            // the ledger writes its key lowercased; `txid IN` rides the primary key (the crate's N3 rule)
+            let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_evictions WHERE readmittedAt IS NULL AND txid IN ({placeholders})");
             let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
             match db.prepare(&sql).bind(&b) {
                 Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<TxidOnlyD1>()) {
@@ -2636,6 +2676,33 @@ pub(crate) async fn owed_recompute(
             }
         }
     }
+    // fleet loop 11 (the delta-verify's HIGH-A): the refusal's candidate set is the LEDGER's recent window, never the
+    // results view (the eviction moves the party rows out of it), intersected with the identity's OWN hops — the hop
+    // outpoints the network's refusal freed (`released_hop_outpoints` / `refused_hop_outpoints_of`: the UTXO key of
+    // the refusal, never the game's name). A faulted read names nothing (the pre-change sentence stands).
+    let evicted_hop_outpoints: HashSet<String> = {
+        #[derive(Deserialize)]
+        struct EvictionRowD1 {
+            txid: String,
+            #[serde(rename = "releasedSpends", default)]
+            released_spends: Option<String>,
+        }
+        let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
+        let rows: Vec<(String, Option<String>)> = match db.prepare(crate::owed::OWED_EVICTIONS_WINDOW_SQL).bind(&[since]) {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<EvictionRowD1>()) {
+                Ok(rows) => rows.into_iter().map(|r| (r.txid.to_ascii_lowercase(), r.released_spends)).collect(),
+                Err(e) => {
+                    console_warn!("[owed] evictions window failed (a refused hop keeps its sentence this pass): {e}");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                console_warn!("[owed] evictions window bind failed: {e}");
+                Vec::new()
+            }
+        };
+        crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&rows), &hops)
+    };
     let mut valid_refunds: HashMap<String, ValidRefund> = HashMap::new();
     {
         // Only the UNSPENT pots can be refund-due, so only their filed rows are asked for — a targeted read, never
@@ -2704,8 +2771,11 @@ pub(crate) async fn owed_recompute(
                 let verified = h.marker_verified == crate::hops_view::MarkerVerification::Verified;
                 // the index's Unspent, and its Unknown without a recorded spend (the container never indexed: the
                 // chain rung is the only word there is) — the same set the derivation judges by the chain
+                // fleet loop 11: a hop whose JOIN the network refused is a candidate at ANY age (the derivation
+                // strands it at once; without a chain word its sweep press would wait for nothing)
+                let join_refused = evicted_hop_outpoints.contains(&outpoint_key(&h.hop_txid, h.hop_vout));
                 let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
-                    && h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS);
+                    && (join_refused || h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS));
                 // AND a hop the index shows SPENT by a non-pot spender but never CONFIRMED (a sweep recorded before its
                 // block and never re-checked read "not mined yet" for days on the pair): the courier's confirmation
                 // heals the swept payout's claimability (`swept_home`), within the same probe budget
@@ -2994,6 +3064,7 @@ pub(crate) async fn owed_recompute(
         hop_chain: &hop_chain,
         hop_sweeps: &hop_sweeps,
         evicted_pots: &evicted_pots,
+        evicted_hop_outpoints: &evicted_hop_outpoints,
         spender_outputs: &spender_outputs,
         my_pkh_by_game: &my_pkh_by_game,
     });
@@ -3057,8 +3128,9 @@ pub(crate) async fn owed_recompute(
     Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut })
 }
 
-/// The hooks' entry: recompute for ONE identity and tell the page (`owed-changed` on its durable box). A fault is
-/// counted and logged, never propagated: the hook's caller (the pot-changed handler, a filing) has its own answer.
+/// ONE recompute for ONE identity, then the page told (`owed-changed` on its durable box). A fault is counted and
+/// logged, never propagated. Reached only through the claimed loop (`owed_recompute_claimed`): the hooks and the
+/// read path enter through `owed_recompute_and_push_coalesced` / the read arm's own claim.
 pub(crate) async fn owed_recompute_and_push(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -3086,17 +3158,149 @@ pub(crate) async fn owed_recompute_and_push(
 }
 
 thread_local! {
-    /// The identities whose background refresh is in flight on THIS isolate (wasm is single-threaded; a second
-    /// read inside the window serves the rows in hand without a second kick).
-    static OWED_REFRESHING: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The identities whose recompute is in flight on THIS isolate, with the unix-ms it began (wasm is
+    /// single-threaded; a second ask inside the window is REMEMBERED and run once more after it — never in parallel).
+    /// The gate's MEDIUM-2 (2026-09-19): a mark older than `OWED_IN_FLIGHT_STALE_MS` is treated as abandoned (a
+    /// `wait_until` the runtime dropped would otherwise hold the identity's lock for the isolate's life, folding
+    /// every later ask into a re-run nobody runs) — taken over, counted, logged.
+    static OWED_REFRESHING: std::cell::RefCell<std::collections::HashMap<String, (i64, i64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Fleet loop 11 (2026-09-19): the identities asked AGAIN while their recompute was in flight, with the latest
+    /// source that asked. The hooks fire twice per admission (both seats' `pot-changed` and `hop-changed` within
+    /// milliseconds; the same identity twice 10 ms apart in the 21:06Z log) and the loop's t=0 herd of 36 seats
+    /// drove the shared D1 to "overloaded. Requests queued for too long" (21:04:50Z). One recompute per identity per
+    /// isolate at a time; a coalesced ask re-runs ONCE after the in-flight one (a pair of twins is SERIALISED, not
+    /// halved: two walks one after the other instead of two at once; three or more asks per run shrink to two), so the
+    /// LAST write's state is what gets computed ("computed on every write" holds) and the queue sees no parallel walks.
+    static OWED_RERUN: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
-fn owed_refresh_begin(identity_lc: &str) -> bool {
-    OWED_REFRESHING.with(|s| s.borrow_mut().insert(identity_lc.to_string()))
+/// An in-flight mark whose last PROGRESS is older than this is abandoned. The mark is `(token, last_progress_ms)`
+/// and a live claim re-stamps its progress before every walk (the delta-verify's LOW-2: a claim is up to three
+/// sequential walks whose D1 pages the 12 s outward budget does not bound; a slow-but-answering D1 must never read
+/// as an abandoned future, or the takeover starts the parallel walk this lock exists to prevent).
+pub(crate) const OWED_IN_FLIGHT_STALE_MS: i64 = 60_000;
+/// PURE: may an ask claim the lock now? (no mark, or a mark whose progress is older than the stale bound: a takeover)
+pub(crate) fn owed_lock_free(mark: Option<(i64, i64)>, now_ms: i64) -> bool {
+    mark.is_none_or(|(_, progress)| now_ms.saturating_sub(progress) >= OWED_IN_FLIGHT_STALE_MS)
 }
-fn owed_refresh_end(identity_lc: &str) {
+/// Claim the identity's recompute lock: `Some(token)` (the mark's own stamp, which `owed_refresh_end` needs — the
+/// delta-verify's LOW-A: an original run that outlived a takeover must not free the takeover's mark), `None` when
+/// a live mark holds it.
+fn owed_refresh_begin(identity_lc: &str, now_ms: i64) -> Option<i64> {
     OWED_REFRESHING.with(|s| {
-        s.borrow_mut().remove(identity_lc);
+        let mut m = s.borrow_mut();
+        let prev = m.get(identity_lc).copied();
+        if !owed_lock_free(prev, now_ms) {
+            return None;
+        }
+        if let Some((_, progress)) = prev {
+            crate::owed::note_recompute_lock_takeover();
+            worker::console_log!(
+                "[owed] recompute lock for {}… no progress for {} ms — taken over (an abandoned future)",
+                &identity_lc[..12.min(identity_lc.len())],
+                now_ms.saturating_sub(progress)
+            );
+        }
+        // a token distinct from any earlier mark (a takeover in the same millisecond still gets its own)
+        let token = prev.map_or(now_ms, |(t, _)| now_ms.max(t + 1));
+        m.insert(identity_lc.to_string(), (token, now_ms));
+        Some(token)
+    })
+}
+/// PURE (pinned): release the mark only when it is still OURS.
+pub(crate) fn owed_lock_release(map: &mut std::collections::HashMap<String, (i64, i64)>, identity_lc: &str, token: i64) -> bool {
+    if map.get(identity_lc).map(|(t, _)| *t) == Some(token) {
+        map.remove(identity_lc);
+        true
+    } else {
+        false
+    }
+}
+/// PURE (pinned): a live claim re-stamps its progress (only while the mark is still its own).
+pub(crate) fn owed_lock_touch(map: &mut std::collections::HashMap<String, (i64, i64)>, identity_lc: &str, token: i64, now_ms: i64) -> bool {
+    match map.get_mut(identity_lc) {
+        Some((t, progress)) if *t == token => {
+            *progress = now_ms;
+            true
+        }
+        _ => false,
+    }
+}
+fn owed_refresh_end(identity_lc: &str, token: i64) {
+    OWED_REFRESHING.with(|s| {
+        owed_lock_release(&mut s.borrow_mut(), identity_lc, token);
     });
+}
+fn owed_refresh_touch(identity_lc: &str, token: i64) -> bool {
+    let now_ms = worker::Date::now().as_millis() as i64;
+    OWED_REFRESHING.with(|s| owed_lock_touch(&mut s.borrow_mut(), identity_lc, token, now_ms))
+}
+/// The delta-verify's N-7: how many folded asks one claim serves after its own run (anything further is the stale
+/// mark the read path already honours).
+pub(crate) const OWED_RERUNS_PER_CLAIM: usize = 2;
+/// The isolate's in-flight recomputes, for `/health` (the gate's MEDIUM-2: a wedged isolate must be visible).
+pub(crate) fn owed_in_flight_snapshot(now_ms: i64) -> serde_json::Value {
+    OWED_REFRESHING.with(|s| {
+        let m = s.borrow();
+        let oldest = m.values().map(|(_, progress)| now_ms.saturating_sub(*progress)).max();
+        serde_json::json!({ "count": m.len(), "oldestAgeMs": oldest, "staleAfterMs": OWED_IN_FLIGHT_STALE_MS })
+    })
+}
+
+/// The hooks' and the read path's ONE entry: recompute for an identity unless one is in flight on this isolate, in
+/// which case the ask is remembered and served by one more run after it (see `OWED_RERUN`).
+pub(crate) async fn owed_recompute_and_push_coalesced(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    tip_hint: Option<u64>,
+) {
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let Some(token) = owed_refresh_begin(identity_lc, now_ms) else {
+        OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), identity_lc, source));
+        crate::owed::note_recompute_coalesced();
+        return;
+    };
+    owed_recompute_claimed(env, db, identity_lc, source, tip_hint, token).await;
+}
+
+/// The run behind a CLAIMED lock (`owed_refresh_begin` returned true to the caller, synchronously — the read path
+/// claims at its check so two queued stale reads cannot both kick, the gate's LOW-1): the recompute, then every ask
+/// folded meanwhile, once each, then the lock released. A rerun keeps the caller's tip hint (the gate's LOW-2: a
+/// re-read that blips would compute nothing; a tip a moment old is conservative — a gate reads "not open yet").
+pub(crate) async fn owed_recompute_claimed(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    tip_hint: Option<u64>,
+    token: i64,
+) {
+    let mut src = source.to_string();
+    let mut reruns = 0usize;
+    loop {
+        if !owed_refresh_touch(identity_lc, token) {
+            // the mark is no longer ours (a takeover after a long silence): the other claim owns the rerun map now
+            return;
+        }
+        owed_recompute_and_push(env, db, identity_lc, &src, tip_hint).await;
+        if reruns >= OWED_RERUNS_PER_CLAIM {
+            // the delta-verify's LOW-1: an ask left folded past the bound is served by the NEXT read — but the walk just
+            // wrote `stale = 0`, so the mark is set again here (the ask itself stays in the map for the next claim)
+            if OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc)) {
+                owed_mark_stale(db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(identity_lc)], "coalesced overflow").await;
+            }
+            break;
+        }
+        match OWED_RERUN.with(|m| m.borrow_mut().remove(identity_lc)) {
+            Some(again) => {
+                src = again;
+                reruns += 1;
+            }
+            None => break,
+        }
+    }
+    owed_refresh_end(identity_lc, token);
 }
 
 /// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
@@ -3217,17 +3421,27 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
                     // door with a refused fallback. One refresh per identity per isolate at a time.
                     Some(wait) => {
-                        let kicked = owed_refresh_begin(&identity);
-                        crate::owed::note_read_refresh(kicked);
-                        if kicked {
-                            let env = ctx.env.clone();
-                            let id = identity.clone();
-                            wait.wait_until(async move {
-                                if let Ok(db) = env.d1("OVERLAY_DB") {
-                                    owed_recompute_and_push(&env, &db, &id, source, None).await;
-                                }
-                                owed_refresh_end(&id);
-                            });
+                        let claim = owed_refresh_begin(&identity, worker::Date::now().as_millis() as i64);
+                        crate::owed::note_read_refresh(claim.is_some());
+                        match claim {
+                            Some(token) => {
+                                let env = ctx.env.clone();
+                                let id = identity.clone();
+                                let src = source.to_string();
+                                wait.wait_until(async move {
+                                    if let Ok(db) = env.d1("OVERLAY_DB") {
+                                        owed_recompute_claimed(&env, &db, &id, &src, None, token).await;
+                                    } else {
+                                        owed_refresh_end(&id, token); // the claim must never outlive a run that cannot start
+                                    }
+                                });
+                            }
+                            None => {
+                                // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
+                                // the lock runs it once more (a filing that marked stale during an in-flight walk)
+                                OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), &identity, source));
+                                crate::owed::note_recompute_coalesced();
+                            }
                         }
                         (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)
                     }
@@ -5946,6 +6160,7 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     body["record"] = crate::record_post::record_health_json();
     // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
     body["owed"] = crate::owed::owed_health_json();
+    body["owed"]["inFlight"] = owed_in_flight_snapshot(worker::Date::now().as_millis() as i64);
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
@@ -6066,6 +6281,29 @@ mod owed_mapper_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The delta-verify's LOW-A (2026-09-19): the recompute lock is a TOKEN — an original run that finishes after a
+    /// takeover must not free the takeover's mark (which would let a third walk start beside the takeover's).
+    #[test]
+    fn the_recompute_lock_is_released_only_by_its_own_token() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("ab".to_string(), (1_000i64, 1_000i64));
+        // the original holder's token no longer matches after a takeover re-stamped the mark
+        m.insert("ab".to_string(), (62_000i64, 62_000i64));
+        assert!(!super::owed_lock_release(&mut m, "ab", 1_000), "the original's end must not free the takeover's mark");
+        assert_eq!(m.get("ab").copied(), Some((62_000, 62_000)));
+        // the original cannot re-stamp progress on a mark that is not its own; the holder can
+        assert!(!super::owed_lock_touch(&mut m, "ab", 1_000, 70_000));
+        assert!(super::owed_lock_touch(&mut m, "ab", 62_000, 70_000));
+        assert_eq!(m.get("ab").copied(), Some((62_000, 70_000)));
+        assert!(super::owed_lock_release(&mut m, "ab", 62_000));
+        assert!(!m.contains_key("ab"));
+        // the stale bound judges PROGRESS (the delta-verify's LOW-2: a live claim re-stamps before every walk)
+        assert!(!super::owed_lock_free(Some((1_000, 1_000)), 1_000 + super::OWED_IN_FLIGHT_STALE_MS - 1));
+        assert!(super::owed_lock_free(Some((1_000, 1_000)), 1_000 + super::OWED_IN_FLIGHT_STALE_MS));
+        assert!(!super::owed_lock_free(Some((1_000, 100_000)), 100_000 + super::OWED_IN_FLIGHT_STALE_MS - 1), "a refreshed claim holds");
+        assert!(super::owed_lock_free(None, 0));
+    }
+
     // ── /live-view asks the tower BY OUTPOINT (2026-08-12) ────────────────
     #[test]
     fn tower_case_url_is_outpoint_scoped() {

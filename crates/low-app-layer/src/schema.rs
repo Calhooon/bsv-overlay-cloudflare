@@ -87,7 +87,7 @@
 //! IS pinned natively is the statement's byte-identity with the migration
 //! that owns it and the exact error class this treats as benign.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// The #283 potparty latch column — byte-identical to its migration in the
 /// overlay's `OVERLAY_MIGRATIONS`. Pinned equal by
@@ -263,6 +263,26 @@ pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
 /// cold isolate only.
 static APPLIED: AtomicBool = AtomicBool::new(false);
 
+/// Fleet loop 11 (2026-09-19): the earliest unix-ms at which the NEXT catch-up attempt may start on this isolate.
+///
+/// The retry-on-every-request rule above is right for a one-off fault, and wrong under LOAD: at the loop's t=0
+/// herd (36 seats booting at once) the shared D1 answered "D1 DB is overloaded. Requests queued for too long"
+/// for ~15 s (21:04:50Z), every cold isolate's catch-up failed, and every request on those isolates re-issued the
+/// whole DDL list into the same overloaded queue — an amplifier on the one resource that was saturated. The stamp is
+/// set when an attempt STARTS (a lease: the gate's MEDIUM-3 — N concurrent cold requests must not each issue the
+/// list; at most one attempt per [`CATCHUP_RETRY_BACKOFF_MS`] per isolate, in flight or failed) and stands after a
+/// failure; success latches [`APPLIED`] and the stamp no longer matters. The routes' own queries keep answering
+/// (or faulting, and saying so) meanwhile, exactly as before. Zero = never attempted.
+static RETRY_NOT_BEFORE_MS: AtomicI64 = AtomicI64::new(0);
+/// The lease of one catch-up attempt on this isolate (a D1 overload clears in seconds; a schema fault that does
+/// not clear is answered by the route's own query, which says so).
+pub const CATCHUP_RETRY_BACKOFF_MS: i64 = 15_000;
+
+/// PURE: is a catch-up attempt due? Never once applied; otherwise only past the lease of the last attempt.
+pub fn catchup_due(applied: bool, retry_not_before_ms: i64, now_ms: i64) -> bool {
+    !applied && now_ms >= retry_not_before_ms
+}
+
 /// Is a D1 error the benign "this ALTER already ran" case?
 ///
 /// Kept as a pure predicate so it is testable without a D1 binding — the same
@@ -308,7 +328,10 @@ pub struct LatchColumnsEnsured(());
 /// binding is likewise not this function's problem to report; every route
 /// that needs the database says so itself.
 pub async fn ensure_latch_columns(env: &worker::Env) -> LatchColumnsEnsured {
-    if !APPLIED.load(Ordering::Acquire) {
+    let now_ms = worker::Date::now().as_millis() as i64;
+    if catchup_due(APPLIED.load(Ordering::Acquire), RETRY_NOT_BEFORE_MS.load(Ordering::Acquire), now_ms) {
+        // the lease is taken BEFORE the attempt: every other request on this isolate proceeds without one meanwhile
+        RETRY_NOT_BEFORE_MS.store(now_ms + CATCHUP_RETRY_BACKOFF_MS, Ordering::Release);
         if let Ok(db) = env.d1("OVERLAY_DB") {
             apply(&db).await;
         }
@@ -326,6 +349,8 @@ pub async fn ensure_latch_columns(env: &worker::Env) -> LatchColumnsEnsured {
 /// (epoch Rule 24). The two crates still pin different `worker` majors (0.8
 /// here, 0.7.5 there), so the error TEXT can differ across versions — which
 /// is why the predicates are pinned to agree rather than assumed to.
+/// Issues the list; `APPLIED` is latched inside on full success (the lease the caller took at the attempt's start is
+/// the only backoff — nothing is keyed on the outcome).
 async fn apply(db: &worker::D1Database) {
     let mut all_ok = true;
     // CREATEs FIRST (gate F5): `ROW_VALID_ALTER` targets `hand_markers`,
@@ -364,7 +389,22 @@ async fn apply(db: &worker::D1Database) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn a_failed_catchup_holds_off_and_an_applied_isolate_never_retries() {
+        // never applied, never failed: due at once
+        assert!(catchup_due(false, 0, 1_000));
+        // an attempt leased at t=1000 (in flight, or failed) → not before t=16000: held, then due
+        let not_before = 1_000 + CATCHUP_RETRY_BACKOFF_MS;
+        assert!(!catchup_due(false, not_before, 1_001));
+        assert!(!catchup_due(false, not_before, not_before - 1));
+        assert!(catchup_due(false, not_before, not_before));
+        // applied: never again, whatever the clock says
+        assert!(!catchup_due(true, 0, i64::MAX));
+        assert!(!catchup_due(true, not_before, not_before + 1));
+    }
 
     /// Each app-layer statement must be EXACTLY the overlay migration that
     /// owns its column. A drift here would have this worker add a column the
