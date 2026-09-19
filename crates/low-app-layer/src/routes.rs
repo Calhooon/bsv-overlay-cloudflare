@@ -2197,7 +2197,7 @@ pub async fn compute_results_body_string(
 /// box as a `pot` event. Best-effort per outpoint; the answer names what
 /// was filed. Nothing here is money truth — the client still verifies
 /// landings before any credit.
-pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) -> Result<Response> {
+pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ctx: &worker::Context) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
@@ -2225,6 +2225,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
     let era = written_off_before_ms_env(env);
     let mut filed: Vec<serde_json::Value> = Vec::new();
     let mut skipped: Vec<serde_json::Value> = Vec::new();
+    // bsv-low #469 (the gate's MEDIUM-11): the owed recompute runs AFTER this answer (`wait_until`), once per identity
+    // this call attributed, never inline and never per outpoint × identity.
+    let mut owed_identities: Vec<String> = Vec::new();
     for (txid, vout) in outpoints {
         // (1) committed params for the outpoint (the decoded columns).
         let stmt = db
@@ -2328,13 +2331,594 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env) ->
                 worker::Date::now().as_millis(),
             );
             crate::internal_events::first_party_push(env, &id, event).await;
+            if !owed_identities.contains(&id) {
+                owed_identities.push(id.clone());
+            }
             filed.push(serde_json::json!({ "txid": txid, "vout": vout, "identity": id }));
         }
+    }
+    // bsv-low #469: the owed list is COMPUTED ON WRITE — every identity this call attributed has its rows re-derived
+    // and its page told (`owed-changed`), after the overlay has its answer; the read stays O(1).
+    if !owed_identities.is_empty() {
+        let env2 = env.clone();
+        ctx.wait_until(async move {
+            let Ok(db) = env2.d1("OVERLAY_DB") else { return };
+            // N7: ONE tip read for every identity this call recomputes
+            let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
+            for id in owed_identities {
+                owed_recompute_and_push(&env2, &db, &id, "pot-changed", tip).await;
+            }
+        });
     }
     json_response(
         serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped }).to_string(),
         200,
     )
+}
+
+/// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The
+/// filing route has no background context, so it never recomputes inline (MEDIUM-11): one cheap UPDATE + a push.
+pub(crate) async fn owed_mark_stale(db: &worker::D1Database, sql: &str, binds: &[JsValue], what: &str) {
+    match db.prepare(sql).bind(binds) {
+        Ok(stmt) => {
+            if let Err(e) = stmt.run().await {
+                console_warn!("[owed] stale mark ({what}) failed: {e}");
+            }
+        }
+        Err(e) => console_warn!("[owed] stale mark ({what}) bind failed: {e}"),
+    }
+}
+
+// ── bsv-low #469: THE OWED LIST — the D1 recompute, the read, the hooks ─────
+//
+// The derivation is PURE (`crate::owed::derive_owed_rows`) over the rows the
+// four identity views already serve; this is its plumbing: gather the views
+// for ONE identity, derive, write the rows + the computed marker in ONE batch,
+// tell the page. Triggers: the overlay's `pot-changed` (per attributed seat),
+// a filing (`/record`: potparty / potrefund / collected), the first read of an
+// identity, a stale read (the `refund-due` gate flips on the tip: the read
+// recomputes when the tip has reached an in-progress row's recovery height
+// since the last compute). A fault never serves "nothing owed": the first
+// read's fault is a 503; a later fault keeps the last computed rows.
+
+/// The walk bound per view per recompute (100 rows a page): 2,000 pots or hops per identity before the derivation
+/// stops reading — far past any identity on the fleet; a stop is counted as a truncated list, never a silent cut.
+const OWED_WALK_MAX_PAGES: usize = 20;
+
+pub(crate) struct OwedComputed {
+    pub rows: Vec<crate::owed::OwedRow>,
+    pub tip: Option<u64>,
+    pub computed_at_ms: i64,
+    /// A view's walk hit the page bound while more remained: the list is CUT and says so (never a silent cut).
+    pub truncated: bool,
+}
+
+#[derive(Deserialize)]
+struct OwedRowD1 {
+    identity: String,
+    outpoint: String,
+    family: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    sats: Option<f64>,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: Option<String>,
+    #[serde(rename = "atHeight")]
+    at_height: Option<f64>,
+    facts: String,
+    reason: Option<String>,
+}
+
+impl OwedRowD1 {
+    fn into_row(self) -> Option<crate::owed::OwedRow> {
+        Some(crate::owed::OwedRow {
+            identity: self.identity,
+            outpoint: self.outpoint,
+            family: crate::owed::OwedFamily::parse(&self.family)?,
+            game_id: self.game_id,
+            sats: self.sats.map(|v| v as u64),
+            opponent_identity: self.opponent_identity,
+            at_height: self.at_height.map(|v| v as u64),
+            facts: serde_json::from_str(&self.facts).unwrap_or(serde_json::Value::Null),
+            reason: self.reason,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct OwedStateD1 {
+    #[serde(rename = "computedAtMs")]
+    computed_at_ms: f64,
+    tip: Option<f64>,
+    stale: Option<f64>,
+    #[serde(default)]
+    truncated: Option<f64>,
+}
+
+pub(crate) async fn owed_recompute(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    // N7: a tip the caller already read this invocation (the pot-changed hook reads it once for every identity it
+    // recomputes; the read passes the one it fetched); `None` = read it here.
+    tip_hint: Option<u64>,
+) -> std::result::Result<OwedComputed, String> {
+    use crate::owed::{derive_owed_rows, outpoint_key, refund_output_sats, sort_rows_for_service, OwedInputs, ValidRefund};
+    use crate::results::SeatLetter;
+    use std::collections::{HashMap, HashSet};
+
+    let era = written_off_before_ms_env(env);
+    let tip = match tip_hint {
+        Some(t) => Some(t),
+        None => chaintracks_present_height_env(env, "owed").await.ok(),
+    };
+    if tip.is_none() {
+        // MEDIUM-8: a chaintracks blip must never rewrite the gate rows (refund-due → in-progress); when a previous
+        // compute had a tip, the previous rows STAND and the fault is counted. A first compute proceeds without a
+        // gate (the staleness rule re-derives it minutes later).
+        let prev = match db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&[JsValue::from_str(identity_lc)]) {
+            Ok(stmt) => stmt.first::<OwedStateD1>(None).await.ok().flatten().and_then(|s| s.tip),
+            Err(_) => None,
+        };
+        if prev.is_some() {
+            return Err("chaintracks tip unavailable; the previous rows stand".to_string());
+        }
+    }
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let mut binds: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
+    if let Some(ms) = era {
+        binds.push(era_bind(ms));
+    }
+
+    // 1. the results view: my pots, my seat, the spend, the verdict, the money facts — EVERY page (a lived-in
+    //    identity holds more than one; a page left unread would be a false "nothing owed" for its older pots)
+    let mut walk_cut = false;
+    let mut results: Vec<crate::results::ResultEntry> = Vec::new();
+    {
+        let mut after = 0usize;
+        let mut more = true;
+        for _page in 0..OWED_WALK_MAX_PAGES {
+            let (page, truncated) = gather_result_entries(db, identity_lc, era, after).await?;
+            let n = page.len();
+            results.extend(page);
+            more = truncated && n > 0;
+            if !more {
+                break;
+            }
+            after += crate::results::RESULTS_MAX_ROWS;
+        }
+        walk_cut |= more;
+    }
+
+    // 2. the refund view (the gate + the backup presence + the landing bar)
+    let refunds: Vec<crate::refund_view::RefundEntry> = {
+        let mut all: Vec<crate::refund_view::RefundEntry> = Vec::new();
+        let mut after = 0usize;
+        let mut more = true;
+        for _page in 0..OWED_WALK_MAX_PAGES {
+            let stmt = db
+                .prepare(crate::refund_view::refund_view_sql(era, after))
+                .bind(&binds)
+                .map_err(|e| format!("owed refund bind: {e}"))?;
+            let rows: Vec<crate::refund_view::RefundViewRow> = stmt
+                .all()
+                .await
+                .and_then(|r| r.results::<RefundViewRowD1>())
+                .map_err(|e| format!("owed refund query: {e}"))?
+                .into_iter()
+                .map(RefundViewRowD1::into_row)
+                .collect();
+            let truncated = rows.len() > crate::refund_view::REFUND_VIEW_MAX_ROWS;
+            let page = crate::refund_view::assemble_refund_view(rows, tip);
+            let n = page.len();
+            all.extend(page);
+            more = truncated && n > 0;
+            if !more {
+                break;
+            }
+            after += crate::refund_view::REFUND_VIEW_MAX_ROWS;
+        }
+        walk_cut |= more;
+        all
+    };
+
+    // 3. the hops view, unscoped (my funded outpoints)
+    let hops: Vec<crate::hops_view::HopEntry> = {
+        let mut all: Vec<crate::hops_view::HopEntry> = Vec::new();
+        let mut after = 0usize;
+        let mut more = true;
+        for _page in 0..OWED_WALK_MAX_PAGES {
+            let stmt = db
+                .prepare(crate::hops_view::hops_view_sql(false, era, after))
+                .bind(&binds)
+                .map_err(|e| format!("owed hops bind: {e}"))?;
+            let rows: Vec<crate::hops_view::HopsViewRow> = stmt
+                .all()
+                .await
+                .and_then(|r| r.results::<HopsViewRowD1>())
+                .map_err(|e| format!("owed hops query: {e}"))?
+                .into_iter()
+                .map(HopsViewRowD1::into_row)
+                .collect();
+            let (page, truncated) = crate::hops_view::assemble_hops_view(rows);
+            let n = page.len();
+            all.extend(page);
+            more = truncated && n > 0;
+            if !more {
+                break;
+            }
+            after += crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS;
+        }
+        walk_cut |= more;
+        all
+    };
+
+    // 4. the VALID filed refunds per pot, sized by MY home (the committed pay pkh of my seat)
+    let my_pkh_by_pot: HashMap<String, String> = results
+        .iter()
+        .filter_map(|e| {
+            let keys = e.committed_keys.as_ref()?;
+            let pkh = match e.my_seat? {
+                SeatLetter::A => keys.pay_pkh_a.clone(),
+                SeatLetter::B => keys.pay_pkh_b.clone(),
+            };
+            Some((outpoint_key(&e.pot_txid, e.pot_vout), pkh))
+        })
+        .collect();
+    let mut valid_refunds: HashMap<String, ValidRefund> = HashMap::new();
+    {
+        // Only the UNSPENT pots can be refund-due, so only their filed rows are asked for — a targeted read, never
+        // the identity's whole backups window (that view caps at 400 rows, 4 per pot: an older gate-open pot of a
+        // lived-in identity would fall off it and read `unbound` instead of `refund-due`).
+        #[derive(Deserialize)]
+        struct ValidRefundRowD1 {
+            #[serde(rename = "potTxid")]
+            pot_txid: String,
+            #[serde(rename = "potVout")]
+            pot_vout: f64,
+            #[serde(rename = "refundRawHex", default)]
+            refund_raw_hex: Option<String>,
+        }
+        let unspent: Vec<(String, u32)> = results
+            .iter()
+            .filter(|e| e.spent == Some(false))
+            .map(|e| (e.pot_txid.to_ascii_lowercase(), e.pot_vout))
+            .collect();
+        for chunk in unspent.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let pairs = (0..chunk.len())
+                .map(|i| format!("(lower(potTxid) = ?{} AND potVout = ?{})", 2 * i + 1, 2 * i + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT potTxid, potVout, refundRawHex FROM potrefund_records \
+                 WHERE refundValid = 1 AND refundRawHex IS NOT NULL AND ({pairs}) \
+                 ORDER BY createdAt DESC, rowid DESC LIMIT {}",
+                chunk.len() * 4
+            );
+            let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+            for (t, v) in chunk {
+                b.push(JsValue::from_str(t));
+                b.push(JsValue::from_f64(f64::from(*v)));
+            }
+            let stmt = db.prepare(&sql).bind(&b).map_err(|e| format!("owed backups bind: {e}"))?;
+            let rows: Vec<ValidRefundRowD1> = stmt
+                .all()
+                .await
+                .and_then(|r| r.results::<ValidRefundRowD1>())
+                .map_err(|e| format!("owed backups query: {e}"))?;
+            for r in rows {
+                let Some(raw) = r.refund_raw_hex.as_deref().filter(|h| !h.is_empty()) else {
+                    continue;
+                };
+                let key = outpoint_key(&r.pot_txid, r.pot_vout as u32);
+                if valid_refunds.contains_key(&key) {
+                    continue; // the newest valid row per pot
+                }
+                let my_sats = my_pkh_by_pot.get(&key).and_then(|pkh| refund_output_sats(raw, pkh));
+                valid_refunds.insert(key, ValidRefund { raw_hex: raw.to_string(), my_sats });
+            }
+        }
+    }
+
+    // 5. the `collected` markers naming this identity — VERIFIED under the identity (the gate's HIGH-1: the table
+    //    is byte-format admitted, a stranger can plant a row naming any (identity, game); only a signature the
+    //    identity itself made retires a payout; presence is display provenance). A read fault is counted and leaves
+    //    both sets empty (the rows stay: the safe direction).
+    let mut collected_verified: HashSet<String> = HashSet::new();
+    let mut collected_present: HashSet<String> = HashSet::new();
+    {
+        #[derive(Deserialize)]
+        struct CollectedRowD1 {
+            #[serde(rename = "gameId")]
+            game_id: String,
+            #[serde(rename = "sigHex", default)]
+            sig_hex: Option<String>,
+        }
+        let mut game_ids: Vec<String> = results.iter().filter(|e| e.spent == Some(true)).map(|e| e.game_id.to_ascii_lowercase()).collect();
+        game_ids.sort_unstable();
+        game_ids.dedup();
+        for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            let sql = format!("SELECT gameId, sigHex FROM collected_markers_v2 WHERE identity = ? AND gameId IN ({marks})");
+            let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() + 1);
+            b.push(JsValue::from_str(identity_lc));
+            for g in chunk {
+                b.push(JsValue::from_str(g));
+            }
+            let rows = match db.prepare(&sql).bind(&b) {
+                Ok(stmt) => stmt.all().await.and_then(|r| r.results::<CollectedRowD1>()),
+                Err(e) => Err(e),
+            };
+            match rows {
+                Ok(rows) => {
+                    for r in rows {
+                        let g = r.game_id.to_ascii_lowercase();
+                        collected_present.insert(g.clone());
+                        if r.sig_hex.as_deref().is_some_and(|sig| crate::record_post::collected_sig_verifies(identity_lc, &g, sig)) {
+                            collected_verified.insert(g);
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::owed::note_collected_read_fault();
+                    console_warn!("[owed] collected read failed (no payout retired this pass): {e}");
+                }
+            }
+        }
+    }
+
+    // 6. the hop spenders that ARE LOW pots (the JOIN took the hop: the pot's row tells the story)
+    let mut pot_spenders: HashSet<String> = HashSet::new();
+    let mut pot_spenders_faulted = false;
+    let spenders: Vec<String> = hops
+        .iter()
+        .filter_map(|h| h.spending_txid.as_deref().map(str::to_ascii_lowercase))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    #[derive(Deserialize)]
+    struct TxidRowD1 {
+        txid: String,
+    }
+    for chunk in spenders.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lower(txid) IN ({placeholders})");
+        let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
+        match db.prepare(&sql).bind(&b) {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<TxidRowD1>()) {
+                Ok(rows) => pot_spenders.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase())),
+                Err(e) => {
+                    pot_spenders_faulted = true;
+                    crate::owed::note_pot_spenders_read_fault();
+                    console_warn!("[owed] pot-spenders chunk failed (a spent hop reads \"could not check\" this pass): {e}");
+                }
+            },
+            Err(e) => {
+                pot_spenders_faulted = true;
+                crate::owed::note_pot_spenders_read_fault();
+                console_warn!("[owed] pot-spenders bind failed: {e}");
+            }
+        }
+    }
+
+    // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
+    //    thousands of `unbound` rows; the actionable ones are written first, the list is CUT and says so)
+    let mut rows = derive_owed_rows(&OwedInputs {
+        identity_lc,
+        tip,
+        now_ms,
+        results: &results,
+        refunds: &refunds,
+        hops: &hops,
+        valid_refunds: &valid_refunds,
+        collected_verified: &collected_verified,
+        collected_present: &collected_present,
+        pot_spenders: &pot_spenders,
+        pot_spenders_faulted,
+    });
+    sort_rows_for_service(&mut rows);
+    if rows.len() > crate::owed::OWED_MAX_ROWS {
+        rows.truncate(crate::owed::OWED_MAX_ROWS);
+        walk_cut = true;
+    }
+
+    // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 502 statements)
+    let mut stmts = Vec::with_capacity(rows.len() + 2);
+    stmts.push(
+        db.prepare(crate::owed::OWED_ROWS_DELETE_SQL)
+            .bind(&[JsValue::from_str(identity_lc)])
+            .map_err(|e| format!("owed delete bind: {e}"))?,
+    );
+    for r in &rows {
+        stmts.push(
+            db.prepare(crate::owed::OWED_ROW_INSERT_SQL)
+                .bind(&[
+                    JsValue::from_str(&r.identity),
+                    JsValue::from_str(&r.outpoint),
+                    JsValue::from_str(r.family.as_str()),
+                    JsValue::from_str(&r.game_id),
+                    r.sats.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
+                    r.opponent_identity.as_deref().map_or(JsValue::NULL, JsValue::from_str),
+                    r.at_height.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
+                    JsValue::from_str(&r.facts.to_string()),
+                    JsValue::from_f64(now_ms as f64),
+                    r.reason.as_deref().map_or(JsValue::NULL, JsValue::from_str),
+                ])
+                .map_err(|e| format!("owed row bind: {e}"))?,
+        );
+    }
+    stmts.push(
+        db.prepare(crate::owed::OWED_STATE_UPSERT_SQL)
+            .bind(&[
+                JsValue::from_str(identity_lc),
+                JsValue::from_f64(now_ms as f64),
+                tip.map_or(JsValue::NULL, |t| JsValue::from_f64(t as f64)),
+                JsValue::from_f64(rows.len() as f64),
+                JsValue::from_f64(if walk_cut { 1.0 } else { 0.0 }),
+            ])
+            .map_err(|e| format!("owed state bind: {e}"))?,
+    );
+    debug_assert!(stmts.len() <= 2 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the two bookends");
+    db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    crate::owed::note_recompute(source, &rows);
+    Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut })
+}
+
+/// The hooks' entry: recompute for ONE identity and tell the page (`owed-changed` on its durable box). A fault is
+/// counted and logged, never propagated: the hook's caller (the pot-changed handler, a filing) has its own answer.
+pub(crate) async fn owed_recompute_and_push(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    tip_hint: Option<u64>,
+) {
+    match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+        Ok(c) => {
+            crate::internal_events::first_party_push(
+                env,
+                identity_lc,
+                crate::owed::owed_changed_event_body(identity_lc, source, c.rows.len(), c.computed_at_ms),
+            )
+            .await;
+        }
+        Err(e) => {
+            crate::owed::note_recompute_fault();
+            console_warn!(
+                "[owed] recompute ({source}) for {}… failed: {e}",
+                &identity_lc[..12.min(identity_lc.len())]
+            );
+        }
+    }
+}
+
+/// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
+async fn owed_compute_on_read(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &'static str,
+    tip_hint: Option<u64>,
+) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
+    match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+        Ok(c) => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
+        Err(e) => {
+            crate::owed::note_recompute_fault();
+            console_warn!("[owed] compute on read ({source}) failed: {e}");
+            Err(json_error("the owed list could not be computed", 503))
+        }
+    }
+}
+
+/// `GET /owed?identity=` — the owed list, served from `owed_rows`; computed on the first read of an identity and
+/// on a stale one (the marker's `stale`, or the tip reaching an in-progress row's recovery height since the
+/// compute). A first read that cannot compute is a 503, never "nothing owed".
+pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    let identity = match view_identity(&req, &ctx) {
+        ViewIdentity::Identity(id) => id.to_ascii_lowercase(),
+        ViewIdentity::Refuse(resp) => return resp,
+    };
+    let now_ms = worker::Date::now().as_millis() as i64;
+    if !crate::logic::valid_identity(&identity) {
+        return json_response(crate::owed::owed_body(&identity, None, &[], now_ms, false), 200);
+    }
+    let db = match ctx.env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[owed] OVERLAY_DB binding unavailable: {e}");
+            return json_error("database unavailable", 503);
+        }
+    };
+    let state: Option<OwedStateD1> = match db
+        .prepare(crate::owed::OWED_STATE_READ_SQL)
+        .bind(&[JsValue::from_str(&identity)])
+    {
+        Ok(stmt) => match stmt.first::<OwedStateD1>(None).await {
+            Ok(v) => v,
+            Err(e) => {
+                console_warn!("[owed] state read failed: {e}");
+                return json_error("database query failed", 503);
+            }
+        },
+        Err(e) => {
+            console_warn!("[owed] state bind failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
+    let (rows, tip, computed_at_ms, walk_cut) = match state {
+        None => {
+            // MEDIUM-5: a public read must not WRITE state keyed on a claimable name — an identity with no party row
+            // and no hop row has nothing to derive: an empty body, nothing computed, nothing written.
+            #[derive(Deserialize)]
+            struct PresentD1 {
+                #[allow(dead_code)]
+                present: Option<f64>,
+            }
+            let known = match db.prepare(crate::owed::OWED_IDENTITY_PROBE_SQL).bind(&[JsValue::from_str(&identity)]) {
+                Ok(stmt) => match stmt.first::<PresentD1>(None).await {
+                    Ok(v) => v.is_some(),
+                    Err(e) => {
+                        console_warn!("[owed] identity probe failed: {e}");
+                        return json_error("database query failed", 503);
+                    }
+                },
+                Err(e) => {
+                    console_warn!("[owed] identity probe bind failed: {e}");
+                    return json_error("database query failed", 503);
+                }
+            };
+            if !known {
+                return json_response(crate::owed::owed_body(&identity, None, &[], now_ms, false), 200);
+            }
+            match owed_compute_on_read(&ctx.env, &db, &identity, "read-first", None).await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            }
+        }
+        Some(st) => {
+            let rows: Vec<crate::owed::OwedRow> = match db
+                .prepare(crate::owed::OWED_ROWS_READ_SQL)
+                .bind(&[JsValue::from_str(&identity)])
+            {
+                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<OwedRowD1>()) {
+                    Ok(rows) => rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
+                    Err(e) => {
+                        console_warn!("[owed] rows read failed: {e}");
+                        return json_error("database query failed", 503);
+                    }
+                },
+                Err(e) => {
+                    console_warn!("[owed] rows bind failed: {e}");
+                    return json_error("database query failed", 503);
+                }
+            };
+            // The read's rule (N5, `should_recompute`): the marker's stale flag; the tip reaching an in-progress
+            // row's recovery height since the compute; an OPEN list older than 5 minutes; any list older than 15.
+            // N7: the tip is read only when a row could flip on it (or a recompute is about to need it).
+            let stale = st.stale.unwrap_or(0.0) != 0.0;
+            let prev_tip = st.tip.map(|t| t as u64);
+            let age_ms = now_ms.saturating_sub(st.computed_at_ms as i64);
+            let needs_tip = rows.iter().any(|r| r.family == crate::owed::OwedFamily::InProgress);
+            let mut tip_now: Option<u64> = if needs_tip { chaintracks_present_height(&ctx, "owed").await.ok() } else { None };
+            let cut = st.truncated.unwrap_or(0.0) != 0.0;
+            if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
+                if tip_now.is_none() {
+                    tip_now = chaintracks_present_height(&ctx, "owed").await.ok();
+                }
+                // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing
+                match owed_compute_on_read(&ctx.env, &db, &identity, if stale { "read-stale" } else { "read-aged" }, tip_now).await {
+                    Ok(v) => v,
+                    Err(_) => (rows, prev_tip, st.computed_at_ms as i64, cut),
+                }
+            } else {
+                (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)
+            }
+        }
+    };
+    let truncated = walk_cut || rows.len() > crate::owed::OWED_MAX_ROWS;
+    let served: Vec<crate::owed::OwedRow> = rows.into_iter().take(crate::owed::OWED_MAX_ROWS).collect();
+    json_response(crate::owed::owed_body(&identity, tip, &served, computed_at_ms, truncated), 200)
 }
 
 async fn gather_result_entries(
@@ -3154,6 +3738,8 @@ struct HopsViewRowD1 {
     spender_seen: Option<f64>,
     #[serde(rename = "spenderFinal", default)]
     spender_final: Option<f64>,
+    #[serde(rename = "markerCreatedAt", default)]
+    marker_created_at: Option<f64>,
 }
 
 impl HopsViewRowD1 {
@@ -3185,6 +3771,9 @@ impl HopsViewRowD1 {
             // "refuted", and collapsing it here would relabel every legacy
             // row as a refutation (#362).
             marker_valid: self.marker_valid.map(|v| v != 0.0),
+            // bsv-low #469 (the gate's HIGH-3): `hopparty_records.createdAt` is unix SECONDS (every marker table
+            // here is); the entry carries MILLISECONDS, the unit the owed list's age rule compares.
+            marker_created_at: self.marker_created_at.map(|v| (v as i64).saturating_mul(1000)),
         }
     }
 }
@@ -5023,6 +5612,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // caller — the poster claim is not a binding, the signature is, so the
     // operator watches the count rather than trusting the word.
     body["record"] = crate::record_post::record_health_json();
+    // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
+    body["owed"] = crate::owed::owed_health_json();
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
@@ -5071,6 +5662,74 @@ pub fn epoch(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
 /// Catch-all: JSON 404 for any unknown route/method.
 pub fn not_found(req: Request, _ctx: RouteContext<AuthState>) -> Result<Response> {
     json_error(&format!("no such route: {}", req.path()), 404)
+}
+
+#[cfg(test)]
+mod owed_mapper_tests {
+    use super::*;
+
+    #[test]
+    fn the_hop_rows_marker_time_is_converted_from_the_tables_seconds_to_ms() {
+        // bsv-low #469 (the gate's HIGH-3): `hopparty_records.createdAt` is unix SECONDS; the owed list's stranded
+        // rule compares MILLISECONDS. A hop filed 60 s ago must not read as 56 years old.
+        let row = HopsViewRowD1 {
+            identity: "02".repeat(33),
+            game_id: "01".repeat(32),
+            hop_txid: "07".repeat(32),
+            hop_vout: 0.0,
+            hop_sats: 20_190.0,
+            opponent_identity: "03".repeat(33),
+            seat_settle_pubkey: String::new(),
+            seat_sig_hex: String::new(),
+            identity_sig_hex: String::new(),
+            marker_txid: String::new(),
+            marker_vout: 0.0,
+            hop_lock_hex: None,
+            hop_sats_on_chain: None,
+            container_outputs: 1.0,
+            marker_valid: Some(1.0),
+            spent: Some(0.0),
+            spending_txid: None,
+            spent_confirmed: None,
+            spender_proof_verified: None,
+            spender_seen: None,
+            spender_final: None,
+            marker_created_at: Some(1_758_000_000.0),
+        };
+        // an older row without the column maps to None (never a guess)
+        let older = HopsViewRowD1 { marker_created_at: None, ..row };
+        assert_eq!(older.into_row().marker_created_at, None);
+        let row = HopsViewRowD1 {
+            identity: "02".repeat(33),
+            game_id: "01".repeat(32),
+            hop_txid: "07".repeat(32),
+            hop_vout: 0.0,
+            hop_sats: 20_190.0,
+            opponent_identity: "03".repeat(33),
+            seat_settle_pubkey: String::new(),
+            seat_sig_hex: String::new(),
+            identity_sig_hex: String::new(),
+            marker_txid: String::new(),
+            marker_vout: 0.0,
+            hop_lock_hex: None,
+            hop_sats_on_chain: None,
+            container_outputs: 1.0,
+            marker_valid: Some(1.0),
+            spent: Some(0.0),
+            spending_txid: None,
+            spent_confirmed: None,
+            spender_proof_verified: None,
+            spender_seen: None,
+            spender_final: None,
+            marker_created_at: Some(1_758_000_000.0),
+        };
+        let mapped = row.into_row();
+        assert_eq!(mapped.marker_created_at, Some(1_758_000_000_000));
+        let now_ms: i64 = 1_758_000_060_000; // 60 s later
+        let age = now_ms - mapped.marker_created_at.unwrap();
+        assert!(age < crate::owed::HOP_STRANDED_AFTER_MS, "a minute-old hop is not stranded");
+        assert!(now_ms + 31 * 60 * 1000 - mapped.marker_created_at.unwrap() >= crate::owed::HOP_STRANDED_AFTER_MS);
+    }
 }
 
 #[cfg(test)]

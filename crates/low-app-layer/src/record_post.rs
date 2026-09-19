@@ -446,6 +446,20 @@ pub fn collected_challenge(game_id_lc: &str, identity_lc: &str) -> Vec<u8> {
 /// `anyone_sig_verifies` behind the canonical-DER gate — the three families
 /// whose serve-time verifier has no such bar get it at the FILING, where a
 /// row is free (the gate's HIGH-2; `canonical_der`'s own doc has the why).
+/// bsv-low #469 (the gate's HIGH-1): does this `collected_markers_v2` row's signature verify UNDER the named identity
+/// (the same replay the filing door runs)? Only such a row retires a payout from the owed list; a row that merely
+/// exists is byte-format admitted and proves nothing.
+pub(crate) fn collected_sig_verifies(identity_lc: &str, game_id_lc: &str, sig_hex: &str) -> bool {
+    let Ok(sig) = hex::decode(sig_hex) else { return false };
+    canonical_anyone_sig_verifies(
+        identity_lc,
+        game_id_lc,
+        &collected_challenge(game_id_lc, identity_lc),
+        &sig,
+        collected_protocol(),
+    )
+}
+
 fn canonical_anyone_sig_verifies(
     signer_identity_hex: &str,
     key_id: &str,
@@ -1460,6 +1474,37 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                 ])?
                 .run()
                 .await?;
+        }
+    }
+    // bsv-low #469: a filing changes what is owed (a refund backup makes a gate-open pot claimable for BOTH seats; a
+    // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
+    // party of the pot STALE (their next read recomputes) and tell the filer's page; nothing heavy runs inline on the
+    // funding path.
+    {
+        use worker::wasm_bindgen::JsValue;
+        let (identity, pot): (Option<String>, Option<(String, u32)>) = match &verified {
+            VerifiedRecord::Potparty(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
+            VerifiedRecord::Potrefund(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
+            VerifiedRecord::Collected(r) => (Some(r.identity.to_ascii_lowercase()), None),
+            VerifiedRecord::Result(..) => (None, None),
+        };
+        if let Some((pot_txid, pot_vout)) = &pot {
+            crate::routes::owed_mark_stale(
+                &db,
+                crate::owed::OWED_STALE_FOR_POT_SQL,
+                &[JsValue::from_str(pot_txid), JsValue::from_f64(f64::from(*pot_vout))],
+                "filing: the pot's parties",
+            )
+            .await;
+        }
+        if let Some(id) = &identity {
+            crate::routes::owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(id)], "filing: the filer").await;
+            crate::internal_events::first_party_push(
+                &ctx.env,
+                id,
+                crate::owed::owed_changed_event_body(id, "filing", 0, worker::Date::now().as_millis() as i64),
+            )
+            .await;
         }
     }
     bump(&FILED_BY_KIND, kind);

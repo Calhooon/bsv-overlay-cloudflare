@@ -518,6 +518,20 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     // the overlay's block-event pass, off the critical path (the webhook answers now)
     let env2 = env.clone();
     ctx.wait_until(async move { forward_tip_to_overlay(env2, height, announced_hash).await });
+    // bsv-low #469 (the gate's HIGH-4): the tip flips the recovery gate — every identity party to an unspent pot
+    // whose recovery height this tip has reached is marked STALE; its next read of `/owed` recomputes (the page
+    // re-reads on the tip event it receives on the same room).
+    let env3 = env.clone();
+    ctx.wait_until(async move {
+        let Ok(db) = env3.d1("OVERLAY_DB") else { return };
+        crate::routes::owed_mark_stale(
+            &db,
+            crate::owed::OWED_STALE_ON_TIP_SQL,
+            &[worker::wasm_bindgen::JsValue::from_f64(height as f64)],
+            "tip",
+        )
+        .await;
+    });
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
 

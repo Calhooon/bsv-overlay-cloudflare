@@ -247,6 +247,9 @@ pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     COLLECTED_MARKERS_V2_CREATE,
     HAND_MARKERS_CREATE,
     PROOF_POSTS_CREATE,
+    // bsv-low #469: the owed list's rows + its per-identity computed marker (migrations 156 + 157).
+    crate::owed::OWED_ROWS_CREATE,
+    crate::owed::OWED_STATE_CREATE,
 ];
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
@@ -441,10 +444,11 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            4,
+            6,
             "network_seen (#371), collected_markers_v2 (#252 stage A), \
              hand_markers (#382, mirrored for the brain-cutover M2 join), \
-             proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02)"
+             proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02), \
+             owed_rows + owed_state (bsv-low #469, the owed list)"
         );
         for stmt in CREATE_TABLE_CATCHUPS {
             assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");

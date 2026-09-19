@@ -423,6 +423,7 @@ fn query_rows_inner<P: rusqlite::Params>(
             container_outputs: r.get::<_, i64>("containerOutputs")? as u32,
             // The #362 latch, exactly as the route maps it: NULL stays NULL.
             marker_valid: r.get::<_, Option<i64>>("markerValid")?.map(|v| v != 0),
+            marker_created_at: None,
         })
     })
     .expect("query")
@@ -1860,4 +1861,25 @@ fn verdict_memo_round_trips_on_the_production_schema() {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM tx_any_verdicts", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
     assert!(conn.query_row(VERDICT_MEMO_READ_SQL, params!["ff".repeat(32)], |r| r.get::<_, String>(0)).is_err(), "no row for another txid");
+}
+
+
+#[test]
+fn the_hops_view_projects_the_markers_filing_time() {
+    // bsv-low #469 (the gate's HIGH-2): the owed list's stranded rule reads `markerCreatedAt`; a column that exists
+    // only inside the `w` subquery is never returned by D1. Pinned on the OUTER projection, against real SQLite.
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+    for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+        let _ = conn.execute_batch(sql);
+    }
+    for scoped in [false, true] {
+        let stmt = conn
+            .prepare(&low_app_layer::hops_view::hops_view_sql(scoped, None, 0))
+            .expect("the hops view prepares");
+        let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "markerCreatedAt"),
+            "the outer SELECT projects markerCreatedAt (scoped={scoped}); got {names:?}"
+        );
+    }
 }

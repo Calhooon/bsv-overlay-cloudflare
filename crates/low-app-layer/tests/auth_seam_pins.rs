@@ -47,7 +47,7 @@ fn count(haystack: &str, needle: &str) -> usize {
 /// parses `?identity=` (the parse lives INSIDE the seam, so a handler cannot
 /// re-choose; Rule 15).
 #[test]
-fn six_handlers_use_the_identity_seam_and_no_handler_parses_identity_itself() {
+fn seven_handlers_use_the_identity_seam_and_no_handler_parses_identity_itself() {
     let routes = normalized_code("src/routes.rs");
 
     // Needle assembled from halves so this test file never contains it whole
@@ -55,10 +55,11 @@ fn six_handlers_use_the_identity_seam_and_no_handler_parses_identity_itself() {
     let seam_call = ["view_identity(", "&req,&ctx)"].concat();
     assert_eq!(
         count(&routes, &seam_call),
-        6,
-        "exactly the six identity-scoped handlers (/results, /refund-view, \
-         /live-view, /recovery-view, /hops-view, and since 2026-09-03 \
-         /refund-backups — bsv-low W2 batch B(a)) must call the seam"
+        7,
+        "exactly the seven identity-scoped handlers (/results, /refund-view, \
+         /live-view, /recovery-view, /hops-view, since 2026-09-03 \
+         /refund-backups — bsv-low W2 batch B(a) — and since 2026-09-19 \
+         /owed — bsv-low #469) must call the seam"
     );
 
     // The ?identity= query parse exists ONCE — inside view_identity itself.

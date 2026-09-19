@@ -381,7 +381,8 @@ pub fn hops_view_sql(
                 w.spentConfirmed AS spentConfirmed, \
                 sb.proof_verified AS spenderProofVerified, \
                 w.spenderFinal AS spenderFinal, \
-                ns.txid IS NOT NULL AS spenderSeen \
+                ns.txid IS NOT NULL AS spenderSeen, \
+                w.markerCreatedAt AS markerCreatedAt \
          FROM (SELECT identity, gameId, hopTxid, hopVout, hopSats, opponentIdentity, \
                   seatSettlePubkey, seatSigHex, identitySigHex, markerTxid, markerVout, \
                   hopLockHex, hopSatsOnChain, containerOutputs, markerValid, \
@@ -544,6 +545,11 @@ pub struct HopsViewRow {
     /// has not reached it yet. Nothing else can clear it: this table cannot
     /// self-heal by republish.
     pub marker_valid: Option<bool>,
+    /// bsv-low #469: the hop marker's filing time in MILLISECONDS (the D1
+    /// mapper converts `hopparty_records.createdAt`'s unix SECONDS; the
+    /// SQLite harness feeds ms directly) — the owed list's stranded judgment
+    /// needs the hop's AGE; `None` on an older row.
+    pub marker_created_at: Option<i64>,
 }
 
 /// The three-valued marker verdict — `unknown` first-class.
@@ -871,6 +877,9 @@ pub struct HopEntry {
     pub status: HopStatus,
     pub status_source: Option<&'static str>,
     pub marker_verified: MarkerVerification,
+    /// bsv-low #469: the hop marker's filing time in MILLISECONDS, when the row carried it (the marker table
+    /// stamps unix seconds; the D1 mapper converts).
+    pub marker_created_at: Option<i64>,
 }
 
 /// Assemble the joined rows into response entries + the one honesty bit:
@@ -977,6 +986,7 @@ pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool) {
                 status,
                 status_source,
                 marker_verified,
+                marker_created_at: r.marker_created_at,
             }
         })
         .collect();
@@ -1355,6 +1365,7 @@ mod tests {
             hop_sats_on_chain: Some(80_800),
             container_outputs: 2,
             marker_valid,
+            marker_created_at: None,
         }
     }
 
@@ -1887,6 +1898,7 @@ mod tests {
             status: HopStatus::Unspent,
             status_source: Some("index"),
             marker_verified: MarkerVerification::Verified,
+            marker_created_at: None,
         }
     }
 

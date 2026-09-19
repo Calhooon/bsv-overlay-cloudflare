@@ -136,6 +136,7 @@ pub mod internal_events;
 pub mod lane_attest;
 pub mod live_view;
 pub mod logic;
+pub mod owed;
 pub mod proof_post;
 pub mod record_post;
 pub mod refund_backups;
@@ -192,7 +193,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         return internal_events::tip_changed(req, &env, &ctx).await;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/pot-changed" {
-        return routes::internal_pot_changed(req, &env).await;
+        return routes::internal_pot_changed(req, &env, &ctx).await;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/lobby-changed" {
         return internal_events::lobby_changed(req, &env).await;
@@ -301,6 +302,8 @@ fn router(
         // instead of one overlay lookup per pot.
         .get_async("/refund-backups", routes::refund_backups)
         .get_async("/hops-view", routes::hops_view)
+        // bsv-low #469: THE OWED LIST — one served answer for the games page (computed on write, served on read).
+        .get_async("/owed", routes::owed)
         .get_async("/live-view", routes::live_view)
         .get_async("/spent-any", routes::spent_any)
         .get_async("/tx-any/:txid", routes::tx_any)

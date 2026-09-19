@@ -903,6 +903,15 @@ pub enum SeatLetter {
     B,
 }
 
+impl SeatLetter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeatLetter::A => "A",
+            SeatLetter::B => "B",
+        }
+    }
+}
+
 /// Does the caller PROVABLY hold a committed settle key of THIS POT OUTPOINT?
 ///
 /// # Why the row itself proves nothing
@@ -1672,6 +1681,13 @@ pub struct ResultEntry {
     /// bsv-low P4 slice 2: the served money facts (funding / settle / both
     /// seats' stake txs with size + fee). See [`money_facts`]. DISPLAY-TIER.
     pub money: MoneyFacts,
+    /// bsv-low #469: MY seat in the committed lock (the pot binding's own
+    /// proof: a verified seat marker or the fund-time hop marker), so a
+    /// consumer never re-derives which home is mine. `None` = unbound.
+    pub my_seat: Option<SeatLetter>,
+    /// bsv-low #469: MY committed stake (`stake_a` / `stake_b` by my seat), in
+    /// sats; `None` without a seat or without decoded params.
+    pub stake_sats: Option<u64>,
 }
 
 /// The per-identity outcome enum (wire strings match bsv-low #227's spec).
@@ -2201,20 +2217,24 @@ pub fn assemble_results(
         let hops_for_pot: &[HopSeatRow] = hop_markers_by_pot
             .get(&(pot_txid_lc.clone(), r.pot_vout))
             .map_or(&[], Vec::as_slice);
-        let pot_binding = PotBinding::from_proof(
-            row_params
-                .and_then(|p| {
-                    my_seat_with_hops(
-                        p,
-                        &pot_txid_lc,
-                        r.pot_vout,
-                        identity_lc,
-                        markers_for_pot,
-                        hops_for_pot,
-                    )
-                })
-                .is_some(),
-        );
+        // bsv-low #469: the seat the binding proves, kept for the entry (the
+        // owed list sizes a tie / a refund by it; the page never re-derives).
+        let bound_seat = row_params.and_then(|p| {
+            my_seat_with_hops(
+                p,
+                &pot_txid_lc,
+                r.pot_vout,
+                identity_lc,
+                markers_for_pot,
+                hops_for_pot,
+            )
+        });
+        let pot_binding = PotBinding::from_proof(bound_seat.is_some());
+        let stake_sats = match (bound_seat, row_params) {
+            (Some(SeatLetter::A), Some(p)) => Some(p.stake_a),
+            (Some(SeatLetter::B), Some(p)) => Some(p.stake_b),
+            _ => None,
+        };
         // DECORATION — the same predicate over the strictly narrower set of
         // markers that attest THIS row's gameId. Never gates money; the row's
         // gameId is attacker-ownable. `Chain` here implies `Chain` above.
@@ -2296,6 +2316,8 @@ pub fn assemble_results(
             marker_hands,
             hands_source,
             money: money_facts(&r, row_params, hops_for_pot),
+            my_seat: bound_seat,
+            stake_sats,
             // #343: the pot's own committed keys, from the params the caller
             // already resolved for this outpoint (decoded columns first, else
             // the hash-verified funding bytes) — LOOKED UP, never re-derived
@@ -2419,6 +2441,9 @@ pub fn results_body(
                 "outcome": e.outcome.as_str(),
                 "outcomeSource": e.outcome_source,
                 "at": { "height": e.at_height },
+                // bsv-low #469 (additive): my seat and my stake, as the binding proved them.
+                "mySeat": e.my_seat.map(SeatLetter::as_str),
+                "stakeSats": e.stake_sats,
                 // NEW (#343): the pot's COMMITTED covenant keys, decoded from
                 // its own funding lock, or null. Present so a WIPED device can
                 // ANSWER "is this pot mine?" with its own derivations (its
@@ -5525,6 +5550,8 @@ mod tests {
             committed_keys: Some(k.clone()),
             money: MoneyFacts::default(),
             hands_source: None,
+            my_seat: None,
+            stake_sats: None,
         };
         let results: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5612,6 +5639,8 @@ mod tests {
             committed_keys: Some(keys_fixture()),
             money: MoneyFacts::default(),
             hands_source: None,
+            my_seat: None,
+            stake_sats: None,
         };
         let cannot_say = ResultEntry {
             settle_signers: None,
@@ -5677,6 +5706,8 @@ mod tests {
             committed_keys: None,
             money: MoneyFacts::default(),
             hands_source: None,
+            my_seat: None,
+            stake_sats: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5728,6 +5759,8 @@ mod tests {
             committed_keys: None,
             money: MoneyFacts::default(),
             hands_source: None,
+            my_seat: None,
+            stake_sats: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5773,7 +5806,7 @@ mod tests {
             "outcomeSource",
             "at",
         ];
-        const ADDED_KEYS: [&str; 8] = [
+        const ADDED_KEYS: [&str; 10] = [
             // #406 (2026-08-27) — who signed the recorded spend, served
             // under the verdict group's pointer guard (the enforced-ending
             // narration's missing boundary; additive, null when ungated).
@@ -5794,7 +5827,10 @@ mod tests {
             // of this key keeps its own path untouched.
             "markerHands",
             "money",
-        ];
+        // bsv-low #469: my seat and my stake, as the binding proved them.
+        "mySeat",
+        "stakeSats",
+    ];
         let me = ident(0xaa);
         let e = ResultEntry {
             settle_signers: None,
@@ -5823,6 +5859,8 @@ mod tests {
             committed_keys: None,
             money: MoneyFacts::default(),
             hands_source: None,
+            my_seat: None,
+            stake_sats: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();
@@ -5897,6 +5935,8 @@ mod tests {
             committed_keys: None,
             money: MoneyFacts::default(),
             hands_source: None,
+            my_seat: None,
+            stake_sats: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&results_body(&me, &[e], false, 0)).unwrap();

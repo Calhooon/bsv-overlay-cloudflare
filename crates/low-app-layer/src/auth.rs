@@ -126,12 +126,13 @@ impl AuthMode {
 /// The five identity-scoped read routes — the ONLY routes strict enforcement
 /// gates. Order is the stable index used by the per-route anonymous counter
 /// ([`identity_route_index`] / `anonymousByRoute`); append, never reorder.
-pub const IDENTITY_ROUTES: [&str; 5] = [
+pub const IDENTITY_ROUTES: [&str; 6] = [
     "/results",
     "/refund-view",
     "/live-view",
     "/recovery-view",
     "/hops-view",
+    "/owed", // bsv-low #469: the owed list, an identity read like its four inputs
 ];
 
 /// True iff `path` is one of the identity-scoped views. Every other route is
@@ -313,12 +314,13 @@ pub fn front_door_disposition(
 // Anonymous serves on the FIVE identity routes, indexed by
 // [`IDENTITY_ROUTES`] order — the soak signal that must reach zero. AtomicU64
 // is not Copy, so the array is spelled out (a `[x; 5]` initializer won't do).
-static ANON_BY_ROUTE: [AtomicU64; 5] = [
+static ANON_BY_ROUTE: [AtomicU64; 6] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+    AtomicU64::new(0), // /owed (#469)
 ];
 // Anonymous serves on PUBLIC routes — expected to stay non-zero (public routes
 // are never gated), so NOT a migration blocker; surfaced separately so it

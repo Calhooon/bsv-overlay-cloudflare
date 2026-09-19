@@ -105,6 +105,16 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "POTREFUND_FILE_SQL", POTREFUND_FILE_SQL);
     assert_prepares(&conn, "RESULT_FILE_SQL", RESULT_FILE_SQL);
     assert_prepares(&conn, "COLLECTED_FILE_SQL", COLLECTED_FILE_SQL);
+    // bsv-low #469: the owed list's statements (the gate's MEDIUM-12)
+    assert_prepares(&conn, "OWED_ROWS_DELETE_SQL", low_app_layer::owed::OWED_ROWS_DELETE_SQL);
+    assert_prepares(&conn, "OWED_ROW_INSERT_SQL", low_app_layer::owed::OWED_ROW_INSERT_SQL);
+    assert_prepares(&conn, "OWED_STATE_UPSERT_SQL", low_app_layer::owed::OWED_STATE_UPSERT_SQL);
+    assert_prepares(&conn, "OWED_STATE_READ_SQL", low_app_layer::owed::OWED_STATE_READ_SQL);
+    assert_prepares(&conn, "OWED_ROWS_READ_SQL", low_app_layer::owed::OWED_ROWS_READ_SQL);
+    assert_prepares(&conn, "OWED_STALE_ON_TIP_SQL", low_app_layer::owed::OWED_STALE_ON_TIP_SQL);
+    assert_prepares(&conn, "OWED_STALE_FOR_POT_SQL", low_app_layer::owed::OWED_STALE_FOR_POT_SQL);
+    assert_prepares(&conn, "OWED_STALE_FOR_IDENTITY_SQL", low_app_layer::owed::OWED_STALE_FOR_IDENTITY_SQL);
+    assert_prepares(&conn, "OWED_IDENTITY_PROBE_SQL", low_app_layer::owed::OWED_IDENTITY_PROBE_SQL);
     assert_prepares(&conn, "lb_row_file_sql", lb_row_file_sql());
     // The filing caps (bsv-low M18-2 B, the gate's HIGH-2/MED-4): FILED rows
     // per (poster, family, game, pot) and per (poster, family, day).

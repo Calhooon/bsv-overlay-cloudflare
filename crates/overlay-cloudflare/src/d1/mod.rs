@@ -449,7 +449,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 150 → 151 for bsv-low #451 slice C (iii): `tx_any_verdicts`, the durable memo of `/tx-any`'s unconfirmable verdicts.
 /// 151 → 153 for bsv-low #451 slice C (iv): `tx_any_verdicts.kind` + `.evidence` (two additive ALTERs).
 /// 153 → 155 for bsv-low #468 (2026-09-19): `pot_records.spenderPayASats` + `.spenderPayBSats` (two additive ALTERs).
-pub const OVERLAY_MIGRATION_COUNT: usize = 155;
+/// 155 → 157 for bsv-low #469 (2026-09-19): `owed_rows` + `owed_state` (the owed list, computed on write).
+pub const OVERLAY_MIGRATION_COUNT: usize = 157;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1674,6 +1675,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // so it issues the byte-identical catch-ups (`low-app-layer/src/schema.rs`).
     "ALTER TABLE pot_records ADD COLUMN spenderPayASats INTEGER",
     "ALTER TABLE pot_records ADD COLUMN spenderPayBSats INTEGER",
+    // bsv-low #469 (2026-09-19): THE OWED LIST — the app layer's per-identity owed rows (computed on write, served
+    // on read: `GET /owed`) and the per-identity computed marker (a never-computed identity is computed on its first
+    // read, never served as "nothing owed"). Both READ by the app layer, so it issues the byte-identical catch-ups
+    // (`low-app-layer/src/schema.rs`).
+    "CREATE TABLE IF NOT EXISTS owed_rows (identity TEXT NOT NULL, outpoint TEXT NOT NULL, family TEXT NOT NULL, gameId TEXT NOT NULL, sats INTEGER, opponentIdentity TEXT, atHeight INTEGER, facts TEXT NOT NULL, updatedAtMs INTEGER NOT NULL, reason TEXT, PRIMARY KEY (identity, outpoint))",
+    "CREATE TABLE IF NOT EXISTS owed_state (identity TEXT PRIMARY KEY, computedAtMs INTEGER NOT NULL, tip INTEGER, rows INTEGER NOT NULL, stale INTEGER NOT NULL DEFAULT 0, truncated INTEGER NOT NULL DEFAULT 0)",
 ];
 
 // =============================================================================
