@@ -50,11 +50,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const OWED_WIRE_VERSION: u32 = 1;
 
 /// A hop older than this with no spend is STRANDED (the funding never joined
-/// it): the join window of the hand plus a generous margin. Younger unspent
-/// hops are a hand about to fund, not a row. Compared against
+/// it): the join window of the hand plus a generous margin. A younger unspent
+/// hop is an `in-progress` row with the felt's rejoin (2026-09-19), never a
+/// sweep claim. Compared against
 /// `HopEntry.marker_created_at`, which the D1 mapper converts from the
 /// marker table's unix SECONDS to ms (the gate's HIGH-3).
 pub const HOP_STRANDED_AFTER_MS: i64 = 30 * 60 * 1000;
+/// The sentence on a young unspent hop's `in-progress` row (the stake is funded, the hand has not started).
+pub const YOUNG_HOP_REASON: &str =
+    "your stake is in its funding hop and the hand has not started: rejoin to continue; if it never starts, the stake can be swept back after 30 minutes";
 /// The courier probes ONE recompute may buy for its index-unspent hops (the memoised `hop_chain_probes` answer the
 /// rest; a hop past the budget keeps its last memo's word, named stale, or waits with no claim). Counted per caller
 /// `owed` on the courier census.
@@ -665,7 +669,33 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 let age_ms = h.marker_created_at.map(|c| i.now_ms.saturating_sub(c));
                 let stranded = age_ms.is_some_and(|a| a >= HOP_STRANDED_AFTER_MS);
                 if !stranded {
-                    continue; // a hand about to fund, or an age the brain cannot say: not a row yet
+                    // A YOUNG unspent hop (the stranded cell's run 4 and the device-switch unit, 2026-09-19): the
+                    // stake is in its funding hop and the hand has not started. It IS money of this identity's, so
+                    // it is a row — `in-progress` with the felt's `rejoin` (the #449 hop-only rejoin source adopts
+                    // the hop from served facts; the felt's own stalled-offer door sweeps it back) — never a sweep
+                    // claim before the window (the JOIN may still land). An age the brain cannot say, or a marker
+                    // not yet verified, stays no row (the latch runs within seconds).
+                    if age_ms.is_none() || h.marker_verified != MarkerVerification::Verified {
+                        continue;
+                    }
+                    let mut facts = facts_base.clone();
+                    facts["claim"] = json!("rejoin");
+                    facts["claimable"] = json!(true);
+                    facts["stage"] = json!("hop-funded");
+                    facts["ageMs"] = json!(age_ms);
+                    facts["strandedAfterMs"] = json!(HOP_STRANDED_AFTER_MS);
+                    rows.push(OwedRow {
+                        identity: me.clone(),
+                        outpoint,
+                        family: OwedFamily::InProgress,
+                        game_id: game,
+                        sats: Some(h.hop_sats),
+                        opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                        at_height: None,
+                        facts,
+                        reason: Some(YOUNG_HOP_REASON.to_string()),
+                    });
+                    continue;
                 }
                 // N1: the claim rides a VERIFIED marker only (the shipped client's own bar): `tm_hopparty` admits a
                 // row by byte format, so an unverified or not-yet-latched marker naming this identity is a sentence,
@@ -1273,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim_a_young_one_is_not_a_row() {
+    fn a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim_a_young_one_is_in_progress_with_rejoin() {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
         let key = format!("{}:0", tx(0x07));
@@ -1284,10 +1314,23 @@ mod tests {
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["chainProbe"], "unspent");
+        // a YOUNG unspent hop is an `in-progress` row with the felt's rejoin (the stake is funded, the hand has not
+        // started), sized by the hop, never a sweep claim before the window
         let young = [hop(HopStatus::Unspent, None, Some(60_000))];
-        assert!(derive_owed_rows(&inputs(&[], &[], &young, &v, &c, &p, Some(900_000))).is_empty());
+        let rows = derive_owed_rows(&inputs(&[], &[], &young, &v, &c, &p, Some(900_000)));
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::InProgress, Some(20_190)));
+        assert_eq!(rows[0].facts["claim"], "rejoin");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["stage"], "hop-funded");
+        assert_eq!(rows[0].facts["strandedAfterMs"], HOP_STRANDED_AFTER_MS);
+        assert_eq!(rows[0].reason.as_deref(), Some(YOUNG_HOP_REASON));
+        assert!(rows[0].facts.get("sweepRawHex").is_none());
+        // an age the brain cannot say, or a marker not yet verified: no row
         let ageless = [hop(HopStatus::Unspent, None, None)];
         assert!(derive_owed_rows(&inputs(&[], &[], &ageless, &v, &c, &p, Some(900_000))).is_empty());
+        let mut unverified = hop(HopStatus::Unspent, None, Some(60_000));
+        unverified.marker_verified = MarkerVerification::Unknown;
+        assert!(derive_owed_rows(&inputs(&[], &[], &[unverified], &v, &c, &p, Some(900_000))).is_empty());
     }
 
     #[test]
