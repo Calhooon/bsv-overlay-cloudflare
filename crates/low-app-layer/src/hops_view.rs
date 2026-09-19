@@ -728,6 +728,14 @@ pub const PROBE_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
 /// The route's probe plan: the probes a fresh memo answered, and the outpoints still to ask.
 pub type ProbePlan = (Vec<(String, u32, ChainSpendProbe)>, Vec<(String, u32)>);
 
+/// bsv-low #469, the stranded cell's run 5 (2026-09-19): how long the OWED walk trusts a memo whose spend is CONFIRMED.
+/// A mined spender is terminal for this walk's purposes (nothing is released on the word; a hop the chain shows spent
+/// stays `unbound` "spent by a transaction the index does not hold", and a reorg of a mined spender is the reorg
+/// sweep's business, the cost here a hop shown spent for up to a day after an orphaned spend). Without it the
+/// eight-per-recompute walk re-probed the same confirmed spenders every five minutes, in the hops view's rank order,
+/// and never reached a hop that had just crossed the stranded window (served `unbound` 30 min late on the pair).
+pub const PROBE_MEMO_CONFIRMED_MAX_AGE_MS: i64 = 24 * 60 * 60_000;
+
 /// PURE: split the route's targets into the probes a FRESH memo answers and the outpoints still to ask (a memo older
 /// than `max_age_ms`, from the future, or absent). Order preserved; a memo for an outpoint not in `targets` is ignored.
 pub fn split_probe_targets(
@@ -736,13 +744,26 @@ pub fn split_probe_targets(
     now_ms: i64,
     max_age_ms: i64,
 ) -> ProbePlan {
+    split_probe_targets_with(targets, memos, now_ms, max_age_ms, max_age_ms)
+}
+
+/// PURE: `split_probe_targets` with a second window, `confirmed_max_age_ms`, for a memo that recorded a CONFIRMED
+/// spend (the owed walk passes `PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; every other caller keeps one window).
+pub fn split_probe_targets_with(
+    targets: &[(String, u32)],
+    memos: &[ProbeMemo],
+    now_ms: i64,
+    max_age_ms: i64,
+    confirmed_max_age_ms: i64,
+) -> ProbePlan {
     let mut answered = Vec::new();
     let mut to_probe = Vec::new();
     for (txid, vout) in targets {
         let key = format!("{}.{vout}", txid.to_ascii_lowercase());
         let fresh = memos.iter().find(|m| {
             let age = now_ms - m.probed_at_ms;
-            m.outpoint == key && age >= 0 && age < max_age_ms
+            let window = if m.spent && m.spent_confirmed == Some(true) { confirmed_max_age_ms } else { max_age_ms };
+            m.outpoint == key && age >= 0 && age < window
         });
         match fresh {
             Some(m) => answered.push((
@@ -759,6 +780,32 @@ pub fn split_probe_targets(
         }
     }
     (answered, to_probe)
+}
+
+/// PURE (bsv-low #469, the stranded cell's run 5): the order the OWED walk asks the outpoints no memo answered, under
+/// its per-recompute budget. Never probed first, the NEWEST marker first (a hop that just crossed the stranded window is
+/// the one a player is waiting on), then the expired memos OLDEST first (a round robin: every candidate gets its turn
+/// within a few recomputes instead of the same first eight forever). Stable inside each group; `marker_at` is keyed
+/// `<txid>.<vout>` lowercase and an outpoint without a marker stamp sorts last among the never probed.
+pub fn order_probe_targets(
+    to_probe: Vec<(String, u32)>,
+    memos: &[ProbeMemo],
+    marker_at: &std::collections::HashMap<String, i64>,
+) -> Vec<(String, u32)> {
+    let mut never: Vec<(String, u32)> = Vec::new();
+    let mut expired: Vec<(i64, String, u32)> = Vec::new();
+    for (txid, vout) in to_probe {
+        let key = format!("{}.{vout}", txid.to_ascii_lowercase());
+        match memos.iter().filter(|m| m.outpoint == key).map(|m| m.probed_at_ms).max() {
+            None => never.push((txid, vout)),
+            Some(at) => expired.push((at, txid, vout)),
+        }
+    }
+    never.sort_by_key(|(txid, vout)| {
+        std::cmp::Reverse(marker_at.get(&format!("{}.{vout}", txid.to_ascii_lowercase())).copied().unwrap_or(i64::MIN))
+    });
+    expired.sort_by_key(|(at, _, _)| *at);
+    never.into_iter().chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout))).collect()
 }
 
 /// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
@@ -2102,6 +2149,58 @@ mod tests {
         let unknown_spent = ChainSpendProbe { known: true, spent: None, spending_txid: None, spent_confirmed: None };
         assert_eq!(probe_memo_of("a1", 0, &unknown_spent, now), None);
         assert_eq!(probe_memo_read_sql(3), "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE outpoint IN (?, ?, ?)");
+    }
+
+    /// bsv-low #469, the stranded cell's run 5 (2026-09-19): the owed walk's two rules against starvation, pinned on
+    /// the shape the pair showed (the same first eight re-probed every five minutes; a new hop never reached).
+    #[test]
+    fn the_owed_walk_keeps_a_confirmed_spend_for_a_day_and_asks_the_never_probed_newest_first_then_the_oldest_memo() {
+        let now = 1_789_829_879_169_i64;
+        let t = |seed: &str| (seed.repeat(32), 0u32);
+        let key = |seed: &str| format!("{}.0", seed.repeat(32));
+        let memo = |seed: &str, age_ms: i64, spent: bool, confirmed: Option<bool>| ProbeMemo {
+            outpoint: key(seed),
+            probed_at_ms: now - age_ms,
+            spent,
+            spending_txid: if spent { Some("e5".repeat(32)) } else { None },
+            spent_confirmed: confirmed,
+        };
+        // 1. the confirmed window: a CONFIRMED spend 6 h old answers the owed walk and is asked by everyone else; 25 h
+        //    old it is asked by all; an UNCONFIRMED spend and an UNSPENT word 6 min old are asked by all (5 min window)
+        let memos = vec![
+            memo("a1", 6 * 60 * 60_000, true, Some(true)),
+            memo("b2", 25 * 60 * 60_000, true, Some(true)),
+            memo("c3", 6 * 60_000, true, Some(false)),
+            memo("d4", 6 * 60_000, false, None),
+        ];
+        let targets = vec![t("a1"), t("b2"), t("c3"), t("d4")];
+        let (answered, to_probe) = split_probe_targets_with(&targets, &memos, now, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS);
+        assert_eq!(answered.iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>(), vec!["a1".repeat(32)], "judged {answered:?}");
+        assert_eq!(answered[0].2.spent_confirmed, Some(true));
+        assert_eq!(to_probe, vec![t("b2"), t("c3"), t("d4")], "judged {to_probe:?}");
+        let (answered, to_probe) = split_probe_targets(&targets, &memos, now, PROBE_MEMO_MAX_AGE_MS);
+        assert!(answered.is_empty(), "one window: the confirmed memo past 5 min is asked too ({answered:?})");
+        assert_eq!(to_probe, targets);
+        // 2. the order: never probed first, newest marker first, then the expired memos oldest first
+        let memos = vec![memo("m1", 10 * 60_000, false, None), memo("m2", 20 * 60_000, true, Some(false))];
+        let marker_at: std::collections::HashMap<String, i64> = [
+            (key("n1"), now - 40 * 60_000), // stranded 40 min ago
+            (key("n2"), now - 31 * 60_000), // just crossed the window: first
+            (key("m1"), now - 3 * 60 * 60_000),
+            (key("m2"), now - 2 * 60 * 60_000),
+        ]
+        .into_iter()
+        .collect();
+        let to_probe = vec![t("m1"), t("n1"), t("m2"), t("n0"), t("n2")]; // the hops view's rank order, as the route hands it over
+        let ordered = order_probe_targets(to_probe, &memos, &marker_at);
+        assert_eq!(ordered, vec![t("n2"), t("n1"), t("n0"), t("m2"), t("m1")], "judged {ordered:?}");
+        // a newcomer behind eight expired memos is asked first (the pair's shape: 35 candidates, 8 per recompute)
+        let backlog: Vec<ProbeMemo> = (0..8).map(|i| memo(&format!("{i}{i}"), (i as i64 + 6) * 60_000, true, Some(false))).collect();
+        let mut to_probe: Vec<(String, u32)> = (0..8).map(|i| t(&format!("{i}{i}"))).collect();
+        to_probe.push(t("ff"));
+        let ordered = order_probe_targets(to_probe, &backlog, &std::collections::HashMap::new());
+        assert_eq!(ordered[0], t("ff"), "the never-probed newcomer leads ({ordered:?})");
+        assert_eq!(ordered[1], t("77"), "then the oldest memo ({ordered:?})");
     }
 
 }

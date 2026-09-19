@@ -2716,7 +2716,22 @@ pub(crate) async fn owed_recompute(
             .collect();
         if !candidates.is_empty() {
             let memos = read_probe_memos(db, &candidates).await;
-            let (answered, to_probe) = crate::hops_view::split_probe_targets(&candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS);
+            // bsv-low #469, the stranded cell's run 5 (2026-09-19): a CONFIRMED spend's memo answers for a day, and the
+            // outpoints still to ask go never-probed first (newest marker first) then oldest memo first, so the
+            // eight-per-recompute walk reaches a hop that just crossed the window instead of re-probing the same
+            // first eight of the hops view's rank order every five minutes (both pinned in `hops_view`).
+            let (answered, to_probe) = crate::hops_view::split_probe_targets_with(
+                &candidates,
+                &memos,
+                now_ms,
+                crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
+                crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
+            );
+            let marker_at: HashMap<String, i64> = hops
+                .iter()
+                .filter_map(|h| h.marker_created_at.map(|c| (format!("{}.{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), c)))
+                .collect();
+            let to_probe = crate::hops_view::order_probe_targets(to_probe, &memos, &marker_at);
             for (t, v, p) in answered {
                 if let Some(s) = p.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
