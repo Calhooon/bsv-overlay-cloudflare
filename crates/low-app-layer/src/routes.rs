@@ -2466,6 +2466,11 @@ pub(crate) async fn owed_recompute(
         }
     }
     let now_ms = worker::Date::now().as_millis() as i64;
+    let started_ms = now_ms;
+    let over_budget = || worker::Date::now().as_millis() as i64 - started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS;
+    let mut probes_made = 0usize;
+    let mut spender_reads = 0usize;
+    let mut budget_cut = false;
     let mut binds: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
     if let Some(ms) = era {
         binds.push(era_bind(ms));
@@ -2687,7 +2692,10 @@ pub(crate) async fn owed_recompute(
             let mut probed = 0usize;
             for (t, v) in &to_probe {
                 let key = outpoint_key(t, *v);
-                if probed >= crate::owed::OWED_PROBES_PER_RECOMPUTE {
+                if over_budget() {
+                    budget_cut = true;
+                }
+                if probed >= crate::owed::OWED_PROBES_PER_RECOMPUTE || budget_cut {
                     if let Some(m) = memos.iter().find(|m| m.outpoint == format!("{t}.{v}")) {
                         if let Some(s) = m.spending_txid.as_deref() {
                             chain_spenders.push(s.to_ascii_lowercase());
@@ -2697,6 +2705,7 @@ pub(crate) async fn owed_recompute(
                     continue;
                 }
                 probed += 1;
+                probes_made += 1;
                 let row = spent_any_resolve_cached(t, *v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
                 let probe = crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid.clone(), spent_confirmed: row.spent_confirmed };
                 if let Some(m) = crate::hops_view::probe_memo_of(t, *v, &probe, now_ms) {
@@ -2868,6 +2877,11 @@ pub(crate) async fn owed_recompute(
             spent: Option<f64>,
         }
         for (_at, sp) in ordered.into_iter().take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE) {
+            if over_budget() {
+                budget_cut = true;
+                break;
+            }
+            spender_reads += 1;
             let bytes = match load_stored_beef(env, db, &sp).await {
                 Ok(Some(b)) => b,
                 Ok(None) => continue,
@@ -2972,6 +2986,18 @@ pub(crate) async fn owed_recompute(
     debug_assert!(stmts.len() <= 2 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the two bookends");
     db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
     crate::owed::note_recompute(source, &rows);
+    worker::console_log!(
+        "[owed] recompute {source} for {}…: {} rows in {} ms (results {}, hops {}, probes {}, spender reads {}, budget cut {}, walk cut {})",
+        &identity_lc[..12.min(identity_lc.len())],
+        rows.len(),
+        worker::Date::now().as_millis() as i64 - started_ms,
+        results.len(),
+        hops.len(),
+        probes_made,
+        spender_reads,
+        budget_cut,
+        walk_cut
+    );
     Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut })
 }
 
@@ -3001,6 +3027,20 @@ pub(crate) async fn owed_recompute_and_push(
             );
         }
     }
+}
+
+thread_local! {
+    /// The identities whose background refresh is in flight on THIS isolate (wasm is single-threaded; a second
+    /// read inside the window serves the rows in hand without a second kick).
+    static OWED_REFRESHING: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+fn owed_refresh_begin(identity_lc: &str) -> bool {
+    OWED_REFRESHING.with(|s| s.borrow_mut().insert(identity_lc.to_string()))
+}
+fn owed_refresh_end(identity_lc: &str) {
+    OWED_REFRESHING.with(|s| {
+        s.borrow_mut().remove(identity_lc);
+    });
 }
 
 /// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
@@ -3113,13 +3153,39 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             let mut tip_now: Option<u64> = if needs_tip { chaintracks_present_height(&ctx, "owed").await.ok() } else { None };
             let cut = st.truncated.unwrap_or(0.0) != 0.0;
             if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
-                if tip_now.is_none() {
-                    tip_now = chaintracks_present_height(&ctx, "owed").await.ok();
-                }
-                // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing
-                match owed_compute_on_read(&ctx.env, &db, &identity, if stale { "read-stale" } else { "read-aged" }, tip_now).await {
-                    Ok(v) => v,
-                    Err(_) => (rows, prev_tip, st.computed_at_ms as i64, cut),
+                let source: &'static str = if stale { "read-stale" } else { "read-aged" };
+                match ctx.data.wait.clone() {
+                    // SERVE THEN REFRESH (the stranded cell's run 3, 2026-09-19): the rows in hand answer NOW; the
+                    // recompute (the walks, the chain rung's couriers, the spenders' bytes) runs after the answer
+                    // and tells the page with `owed-changed`. A read must never wait on a courier: the page's read
+                    // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
+                    // door with a refused fallback. One refresh per identity per isolate at a time.
+                    Some(wait) => {
+                        let kicked = owed_refresh_begin(&identity);
+                        crate::owed::note_read_refresh(kicked);
+                        if kicked {
+                            let env = ctx.env.clone();
+                            let id = identity.clone();
+                            wait.wait_until(async move {
+                                if let Ok(db) = env.d1("OVERLAY_DB") {
+                                    owed_recompute_and_push(&env, &db, &id, source, None).await;
+                                }
+                                owed_refresh_end(&id);
+                            });
+                        }
+                        (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)
+                    }
+                    // no fetch context (a test harness): the inline compute, as before
+                    None => {
+                        if tip_now.is_none() {
+                            tip_now = chaintracks_present_height(&ctx, "owed").await.ok();
+                        }
+                        // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing
+                        match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now).await {
+                            Ok(v) => v,
+                            Err(_) => (rows, prev_tip, st.computed_at_ms as i64, cut),
+                        }
+                    }
                 }
             } else {
                 (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)

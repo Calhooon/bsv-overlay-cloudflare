@@ -494,6 +494,9 @@ pub struct AuthState {
     /// (a signable header: the reference signs it). Only ever set beside
     /// `session`, never beside `lane`.
     pub lane_offer: Option<LaneOffer>,
+    /// bsv-low #469: the fetch event's context, for work AFTER the answer (`wait_until`) — the owed list's read
+    /// serves the rows in hand and refreshes them in the background; `None` outside a fetch event (tests).
+    pub wait: Option<std::rc::Rc<worker::Context>>,
 }
 
 /// The lane's store binding name (the relay's, the tower's, ours: one name).
@@ -531,6 +534,7 @@ fn verified_state(
         lane_offer,
         body: Some(body),
         lane,
+        wait: None,
     }
 }
 
@@ -629,6 +633,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     body: None,
                     lane: None,
                     lane_offer: None,
+                    wait: None,
                 },
             ))
         }

@@ -175,6 +175,10 @@ pub struct SweptHome {
 /// Spenders whose stored bytes one recompute reads to classify a hop's spend (bounded: a lived-in identity's
 /// adversarial history can hold dozens; the newest strands first, the rest read "not judged this pass").
 pub const OWED_SPENDER_READS_PER_RECOMPUTE: usize = 16;
+/// The wall-clock budget one recompute spends on its OUTWARD legs (the courier probes, the stored-bytes reads): a
+/// pass past it writes what it has and the next pass continues — a recompute must always finish inside the
+/// worker's own limits (the stranded cell's run 3, 2026-09-19: a pass that never finished kept a list stale for good).
+pub const OWED_RECOMPUTE_TIME_BUDGET_MS: i64 = 12_000;
 
 /// Everything one identity's recompute gathered (every one a served-view row).
 pub struct OwedInputs<'a> {
@@ -914,6 +918,17 @@ static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_spender_read_fault() {
     SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+/// Reads that served the rows in hand and kicked a background refresh (the stale / aged arms of the read rule).
+static READ_REFRESHES: AtomicU64 = AtomicU64::new(0);
+/// Reads that found a refresh of the same identity already in flight on this isolate (served, no second kick).
+static READ_REFRESHES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+pub fn note_read_refresh(kicked: bool) {
+    if kicked {
+        READ_REFRESHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        READ_REFRESHES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
 pub fn note_collected_read_fault() {
     COLLECTED_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -955,6 +970,9 @@ pub fn owed_health_json() -> Value {
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
+        "recomputeTimeBudgetMs": OWED_RECOMPUTE_TIME_BUDGET_MS,
+        "readRefreshesKicked": READ_REFRESHES.load(Ordering::Relaxed),
+        "readRefreshesSkippedInFlight": READ_REFRESHES_SKIPPED.load(Ordering::Relaxed),
         "hopStrandedAfterMs": HOP_STRANDED_AFTER_MS,
         "recomputeOpenAfterMs": OWED_RECOMPUTE_OPEN_AFTER_MS,
         "recomputeAnyAfterMs": OWED_RECOMPUTE_ANY_AFTER_MS,

@@ -209,13 +209,17 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // middleware refusals return here; otherwise the request proceeds with
     // the resolved [`auth::AuthState`] as the router data (in-process only —
     // never a header a stranger could forge, see `auth`'s Rule 8b note).
-    let (req, state) = match auth::front_door(req, &env).await? {
+    let (req, mut state) = match auth::front_door(req, &env).await? {
         auth::FrontDoor::Proceed(req, state) => (req, state),
         auth::FrontDoor::Reply(mut resp) => {
             cors::add_cors_headers(&mut resp);
             return Ok(resp);
         }
     };
+    // bsv-low #469: the fetch context rides the state so a route can finish work AFTER its answer (`/owed` refreshes
+    // a stale list in the background instead of making the page wait for the couriers).
+    let ctx = std::rc::Rc::new(ctx);
+    state.wait = Some(ctx.clone());
     // Keep the session for reply-signing; the state moves into the router.
     let session = state.session.clone();
     let lane = state.lane.clone();
