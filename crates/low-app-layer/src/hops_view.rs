@@ -729,12 +729,14 @@ pub const PROBE_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
 pub type ProbePlan = (Vec<(String, u32, ChainSpendProbe)>, Vec<(String, u32)>);
 
 /// bsv-low #469, the stranded cell's run 5 (2026-09-19): how long the OWED walk trusts a memo whose spend is CONFIRMED.
-/// A mined spender is terminal for this walk's purposes (nothing is released on the word; a hop the chain shows spent
-/// stays `unbound` "spent by a transaction the index does not hold", and a reorg of a mined spender is the reorg
-/// sweep's business, the cost here a hop shown spent for up to a day after an orphaned spend). Without it the
-/// eight-per-recompute walk re-probed the same confirmed spenders every five minutes, in the hops view's rank order,
-/// and never reached a hop that had just crossed the stranded window (served `unbound` 30 min late on the pair).
-pub const PROBE_MEMO_CONFIRMED_MAX_AGE_MS: i64 = 24 * 60 * 60_000;
+/// Without it the eight-per-recompute walk re-probed the same confirmed spenders every five minutes, in the hops view's
+/// rank order, and never reached a hop that had just crossed the stranded window (served `unbound` 30 min late on the
+/// pair). The word is NOT only a suppressor (the gate's M1, 2026-09-19): `swept_home` reads the same memo, so a swept
+/// hop's Payout row is `claimable` on it; after a reorg orphans a mined sweep the row says "ready to collect" until the
+/// memo ages out — a wrong word and a failing press (the press needs a landing proof: no credit), never lost sats. So
+/// the window is TWO HOURS, not a day (ten confirmed candidates cost five probes an hour, nothing), the memo's age rides
+/// the row (`chainProbeAgeMs`), and the reorg pass's invalidation of these memos is bsv-low #484.
+pub const PROBE_MEMO_CONFIRMED_MAX_AGE_MS: i64 = 2 * 60 * 60_000;
 
 /// PURE: split the route's targets into the probes a FRESH memo answers and the outpoints still to ask (a memo older
 /// than `max_age_ms`, from the future, or absent). Order preserved; a memo for an outpoint not in `targets` is ignored.
@@ -760,10 +762,12 @@ pub fn split_probe_targets_with(
     let mut to_probe = Vec::new();
     for (txid, vout) in targets {
         let key = format!("{}.{vout}", txid.to_ascii_lowercase());
-        let fresh = memos.iter().find(|m| {
+        // the NEWEST memo for the key (the gate's L4: the same tie-break as `order_probe_targets`; the PRIMARY KEY makes
+        // it one row today, a second memo source tomorrow must not flip the answer by row order)
+        let fresh = memos.iter().filter(|m| m.outpoint == key).max_by_key(|m| m.probed_at_ms).filter(|m| {
             let age = now_ms - m.probed_at_ms;
             let window = if m.spent && m.spent_confirmed == Some(true) { confirmed_max_age_ms } else { max_age_ms };
-            m.outpoint == key && age >= 0 && age < window
+            age >= 0 && age < window
         });
         match fresh {
             Some(m) => answered.push((
@@ -787,10 +791,16 @@ pub fn split_probe_targets_with(
 /// the one a player is waiting on), then the expired memos OLDEST first (a round robin: every candidate gets its turn
 /// within a few recomputes instead of the same first eight forever). Stable inside each group; `marker_at` is keyed
 /// `<txid>.<vout>` lowercase and an outpoint without a marker stamp sorts last among the never probed.
+///
+/// The gate's M2 (2026-09-19): an outpoint the couriers can never answer leaves NO memo (`probe_memo_of` remembers a
+/// known answer only) and would stay "never probed" for ever; with eight of them the never group ate the whole budget
+/// every pass and no expired memo was refreshed again. So the never group's share of the FRONT is capped at `never_cap`
+/// (the route passes half the budget): `never[..cap]`, then every expired memo oldest first, then the rest of `never`.
 pub fn order_probe_targets(
     to_probe: Vec<(String, u32)>,
     memos: &[ProbeMemo],
     marker_at: &std::collections::HashMap<String, i64>,
+    never_cap: usize,
 ) -> Vec<(String, u32)> {
     let mut never: Vec<(String, u32)> = Vec::new();
     let mut expired: Vec<(i64, String, u32)> = Vec::new();
@@ -805,7 +815,9 @@ pub fn order_probe_targets(
         std::cmp::Reverse(marker_at.get(&format!("{}.{vout}", txid.to_ascii_lowercase())).copied().unwrap_or(i64::MIN))
     });
     expired.sort_by_key(|(at, _, _)| *at);
-    never.into_iter().chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout))).collect()
+    let cap = never_cap.min(never.len());
+    let rest = never.split_off(cap);
+    never.into_iter().chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout))).chain(rest).collect()
 }
 
 /// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
@@ -2154,7 +2166,7 @@ mod tests {
     /// bsv-low #469, the stranded cell's run 5 (2026-09-19): the owed walk's two rules against starvation, pinned on
     /// the shape the pair showed (the same first eight re-probed every five minutes; a new hop never reached).
     #[test]
-    fn the_owed_walk_keeps_a_confirmed_spend_for_a_day_and_asks_the_never_probed_newest_first_then_the_oldest_memo() {
+    fn the_owed_walk_keeps_a_confirmed_spend_for_two_hours_and_asks_the_never_probed_newest_first_then_the_oldest_memo() {
         let now = 1_789_829_879_169_i64;
         let t = |seed: &str| (seed.repeat(32), 0u32);
         let key = |seed: &str| format!("{}.0", seed.repeat(32));
@@ -2165,11 +2177,12 @@ mod tests {
             spending_txid: if spent { Some("e5".repeat(32)) } else { None },
             spent_confirmed: confirmed,
         };
-        // 1. the confirmed window: a CONFIRMED spend 6 h old answers the owed walk and is asked by everyone else; 25 h
-        //    old it is asked by all; an UNCONFIRMED spend and an UNSPENT word 6 min old are asked by all (5 min window)
+        // 1. the confirmed window (2 h since the gate's M1): a CONFIRMED spend 1 h old answers the owed walk and is asked
+        //    by everyone else; 3 h old it is asked by all; an UNCONFIRMED spend and an UNSPENT word 6 min old are asked
+        //    by all (the 5 min window)
         let memos = vec![
-            memo("a1", 6 * 60 * 60_000, true, Some(true)),
-            memo("b2", 25 * 60 * 60_000, true, Some(true)),
+            memo("a1", 60 * 60_000, true, Some(true)),
+            memo("b2", 3 * 60 * 60_000, true, Some(true)),
             memo("c3", 6 * 60_000, true, Some(false)),
             memo("d4", 6 * 60_000, false, None),
         ];
@@ -2192,15 +2205,29 @@ mod tests {
         .into_iter()
         .collect();
         let to_probe = vec![t("m1"), t("n1"), t("m2"), t("n0"), t("n2")]; // the hops view's rank order, as the route hands it over
-        let ordered = order_probe_targets(to_probe, &memos, &marker_at);
+        let ordered = order_probe_targets(to_probe.clone(), &memos, &marker_at, 8);
         assert_eq!(ordered, vec![t("n2"), t("n1"), t("n0"), t("m2"), t("m1")], "judged {ordered:?}");
+        // the gate's M2: the never group's share of the FRONT is capped; the expired memos follow at once, the rest of the
+        // never group after them (here cap 2: n2, n1 lead; m2, m1 next; n0 last)
+        let capped = order_probe_targets(to_probe, &memos, &marker_at, 2);
+        assert_eq!(capped, vec![t("n2"), t("n1"), t("m2"), t("m1"), t("n0")], "judged {capped:?}");
+        // the gate's L4: the split takes the NEWEST memo for a key, never the first row
+        let two_rows = vec![memo("a1", 10 * 60_000, false, None), memo("a1", 60_000, false, None)];
+        let (answered, _) = split_probe_targets(&[t("a1")], &two_rows, now, PROBE_MEMO_MAX_AGE_MS);
+        assert_eq!(answered.len(), 1, "the 1 min memo answers though the 10 min row comes first");
         // a newcomer behind eight expired memos is asked first (the pair's shape: 35 candidates, 8 per recompute)
         let backlog: Vec<ProbeMemo> = (0..8).map(|i| memo(&format!("{i}{i}"), (i as i64 + 6) * 60_000, true, Some(false))).collect();
         let mut to_probe: Vec<(String, u32)> = (0..8).map(|i| t(&format!("{i}{i}"))).collect();
         to_probe.push(t("ff"));
-        let ordered = order_probe_targets(to_probe, &backlog, &std::collections::HashMap::new());
+        let ordered = order_probe_targets(to_probe, &backlog, &std::collections::HashMap::new(), 4);
         assert_eq!(ordered[0], t("ff"), "the never-probed newcomer leads ({ordered:?})");
         assert_eq!(ordered[1], t("77"), "then the oldest memo ({ordered:?})");
+        // M2's shape: nine never-probed unanswerables + eight expired memos, budget 8 → the expired still get four slots
+        let never9: Vec<(String, u32)> = (0..9).map(|i| t(&format!("e{i}"))).collect();
+        let mut mixed = never9.clone();
+        mixed.extend((0..8).map(|i| t(&format!("{i}{i}"))));
+        let front: Vec<(String, u32)> = order_probe_targets(mixed, &backlog, &std::collections::HashMap::new(), 4).into_iter().take(8).collect();
+        assert_eq!(front.iter().filter(|x| never9.contains(x)).count(), 4, "four never, four expired in the first eight ({front:?})");
     }
 
 }

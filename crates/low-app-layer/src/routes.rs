@@ -2731,12 +2731,15 @@ pub(crate) async fn owed_recompute(
                 .iter()
                 .filter_map(|h| h.marker_created_at.map(|c| (format!("{}.{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), c)))
                 .collect();
-            let to_probe = crate::hops_view::order_probe_targets(to_probe, &memos, &marker_at);
+            // the never-probed share of the front is capped at half the budget (the gate's M2): the expired memos always get slots
+            let to_probe = crate::hops_view::order_probe_targets(to_probe, &memos, &marker_at, crate::owed::OWED_PROBES_PER_RECOMPUTE / 2);
             for (t, v, p) in answered {
                 if let Some(s) = p.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
-                hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, spent_confirmed: p.spent_confirmed, stale: false });
+                // the memo's age rides the word (the gate's L5): the newest memo for the key, as the split judged it
+                let age_ms = memos.iter().filter(|m| m.outpoint == format!("{t}.{v}")).map(|m| now_ms - m.probed_at_ms).min();
+                hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, spent_confirmed: p.spent_confirmed, stale: false, age_ms });
             }
             let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
             let mut probed = 0usize;
@@ -2746,11 +2749,11 @@ pub(crate) async fn owed_recompute(
                     budget_cut = true;
                 }
                 if probed >= crate::owed::OWED_PROBES_PER_RECOMPUTE || budget_cut {
-                    if let Some(m) = memos.iter().find(|m| m.outpoint == format!("{t}.{v}")) {
+                    if let Some(m) = memos.iter().filter(|m| m.outpoint == format!("{t}.{v}")).max_by_key(|m| m.probed_at_ms) {
                         if let Some(s) = m.spending_txid.as_deref() {
                             chain_spenders.push(s.to_ascii_lowercase());
                         }
-                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), spent_confirmed: m.spent_confirmed, stale: true });
+                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), spent_confirmed: m.spent_confirmed, stale: true, age_ms: Some(now_ms - m.probed_at_ms) });
                     }
                     continue;
                 }
@@ -2764,7 +2767,7 @@ pub(crate) async fn owed_recompute(
                 if let Some(s) = row.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
-                hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed, stale: false });
+                hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed, stale: false, age_ms: None });
             }
             if !fresh.is_empty() {
                 write_probe_memos(db, &fresh).await;
