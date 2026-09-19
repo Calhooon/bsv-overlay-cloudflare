@@ -2732,7 +2732,7 @@ pub(crate) async fn owed_recompute(
                 .filter_map(|h| h.marker_created_at.map(|c| (format!("{}.{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), c)))
                 .collect();
             // the never-probed share of the front is capped at half the budget (the gate's M2): the expired memos always get slots
-            let to_probe = crate::hops_view::order_probe_targets(to_probe, &memos, &marker_at, crate::owed::OWED_PROBES_PER_RECOMPUTE / 2);
+            let to_probe = crate::hops_view::order_probe_targets(to_probe, &memos, &marker_at, crate::owed::OWED_PROBES_PER_RECOMPUTE / 2, (now_ms / 60_000).max(0) as usize);
             for (t, v, p) in answered {
                 if let Some(s) = p.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());

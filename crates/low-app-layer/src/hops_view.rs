@@ -796,11 +796,16 @@ pub fn split_probe_targets_with(
 /// known answer only) and would stay "never probed" for ever; with eight of them the never group ate the whole budget
 /// every pass and no expired memo was refreshed again. So the never group's share of the FRONT is capped at `never_cap`
 /// (the route passes half the budget): `never[..cap]`, then every expired memo oldest first, then the rest of `never`.
+/// `rotate` (the delta-verify's NEW-2): the never group's LEADER stays the newest marker (the newcomer guarantee), the
+/// other `never_cap - 1` front slots are taken from the rest of the never group at a rotating offset (the route passes
+/// the recompute's minute), so ≥ `never_cap` permanently-unanswerable outpoints with new markers cannot camp the front
+/// and leave the tail unprobed for ever.
 pub fn order_probe_targets(
     to_probe: Vec<(String, u32)>,
     memos: &[ProbeMemo],
     marker_at: &std::collections::HashMap<String, i64>,
     never_cap: usize,
+    rotate: usize,
 ) -> Vec<(String, u32)> {
     let mut never: Vec<(String, u32)> = Vec::new();
     let mut expired: Vec<(i64, String, u32)> = Vec::new();
@@ -816,8 +821,23 @@ pub fn order_probe_targets(
     });
     expired.sort_by_key(|(at, _, _)| *at);
     let cap = never_cap.min(never.len());
-    let rest = never.split_off(cap);
-    never.into_iter().chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout))).chain(rest).collect()
+    let (front, rest): (Vec<(String, u32)>, Vec<(String, u32)>) = if cap == 0 {
+        (Vec::new(), never)
+    } else {
+        // the leader, then `cap - 1` from the others at the rotating offset; the others keep their newest-first order
+        let leader = never.remove(0);
+        let n = never.len();
+        let take = (cap - 1).min(n);
+        let start = if n == 0 { 0 } else { rotate % n };
+        let picked: Vec<usize> = (0..take).map(|k| (start + k) % n).collect();
+        let mut front = vec![leader];
+        let mut rest = Vec::new();
+        for (idx, item) in never.into_iter().enumerate() {
+            if picked.contains(&idx) { front.push(item) } else { rest.push(item) }
+        }
+        (front, rest)
+    };
+    front.into_iter().chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout))).chain(rest).collect()
 }
 
 /// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
@@ -2205,28 +2225,38 @@ mod tests {
         .into_iter()
         .collect();
         let to_probe = vec![t("m1"), t("n1"), t("m2"), t("n0"), t("n2")]; // the hops view's rank order, as the route hands it over
-        let ordered = order_probe_targets(to_probe.clone(), &memos, &marker_at, 8);
+        let ordered = order_probe_targets(to_probe.clone(), &memos, &marker_at, 8, 0);
         assert_eq!(ordered, vec![t("n2"), t("n1"), t("n0"), t("m2"), t("m1")], "judged {ordered:?}");
         // the gate's M2: the never group's share of the FRONT is capped; the expired memos follow at once, the rest of the
         // never group after them (here cap 2: n2, n1 lead; m2, m1 next; n0 last)
-        let capped = order_probe_targets(to_probe, &memos, &marker_at, 2);
+        let capped = order_probe_targets(to_probe.clone(), &memos, &marker_at, 2, 0);
         assert_eq!(capped, vec![t("n2"), t("n1"), t("m2"), t("m1"), t("n0")], "judged {capped:?}");
-        // the gate's L4: the split takes the NEWEST memo for a key, never the first row
-        let two_rows = vec![memo("a1", 10 * 60_000, false, None), memo("a1", 60_000, false, None)];
-        let (answered, _) = split_probe_targets(&[t("a1")], &two_rows, now, PROBE_MEMO_MAX_AGE_MS);
-        assert_eq!(answered.len(), 1, "the 1 min memo answers though the 10 min row comes first");
+        // the delta-verify's NEW-2: with cap 2 the leader is fixed and the ONE other front slot ROTATES through the rest
+        // of the never group (n1 at minute 0, n0 at minute 1), so every never-probed outpoint reaches the front for some
+        // minute; the expired memos follow the front either way
+        let r0 = order_probe_targets(to_probe.clone(), &memos, &marker_at, 2, 0);
+        let r1 = order_probe_targets(to_probe, &memos, &marker_at, 2, 1);
+        assert_eq!(r0, vec![t("n2"), t("n1"), t("m2"), t("m1"), t("n0")], "rotate 0 ({r0:?})");
+        assert_eq!(r1, vec![t("n2"), t("n0"), t("m2"), t("m1"), t("n1")], "rotate 1 ({r1:?})");
+        // the gate's L4 (the delta-verify's NEW-3, the DISCRIMINATING case): two rows for one key with DIFFERENT windows —
+        // an older CONFIRMED row still inside its 2 h window and a newer UNSPENT row past its 5 min window. The split must
+        // judge the NEWEST row (stale → asked); the old first-match-that-fits answered with the older, contradicted word.
+        let two_windows = vec![memo("a1", 30 * 60_000, true, Some(true)), memo("a1", 10 * 60_000, false, None)];
+        let (answered, to_probe2) = split_probe_targets_with(&[t("a1")], &two_windows, now, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS);
+        assert!(answered.is_empty(), "the newest (unspent, 10 min) row is judged, and it is stale ({answered:?})");
+        assert_eq!(to_probe2, vec![t("a1")]);
         // a newcomer behind eight expired memos is asked first (the pair's shape: 35 candidates, 8 per recompute)
         let backlog: Vec<ProbeMemo> = (0..8).map(|i| memo(&format!("{i}{i}"), (i as i64 + 6) * 60_000, true, Some(false))).collect();
         let mut to_probe: Vec<(String, u32)> = (0..8).map(|i| t(&format!("{i}{i}"))).collect();
         to_probe.push(t("ff"));
-        let ordered = order_probe_targets(to_probe, &backlog, &std::collections::HashMap::new(), 4);
+        let ordered = order_probe_targets(to_probe, &backlog, &std::collections::HashMap::new(), 4, 0);
         assert_eq!(ordered[0], t("ff"), "the never-probed newcomer leads ({ordered:?})");
         assert_eq!(ordered[1], t("77"), "then the oldest memo ({ordered:?})");
         // M2's shape: nine never-probed unanswerables + eight expired memos, budget 8 → the expired still get four slots
         let never9: Vec<(String, u32)> = (0..9).map(|i| t(&format!("e{i}"))).collect();
         let mut mixed = never9.clone();
         mixed.extend((0..8).map(|i| t(&format!("{i}{i}"))));
-        let front: Vec<(String, u32)> = order_probe_targets(mixed, &backlog, &std::collections::HashMap::new(), 4).into_iter().take(8).collect();
+        let front: Vec<(String, u32)> = order_probe_targets(mixed, &backlog, &std::collections::HashMap::new(), 4, 0).into_iter().take(8).collect();
         assert_eq!(front.iter().filter(|x| never9.contains(x)).count(), 4, "four never, four expired in the first eight ({front:?})");
     }
 

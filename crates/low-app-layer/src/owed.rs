@@ -612,6 +612,16 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             facts["sweepTxid"] = json!(swept.sweep_txid);
             facts["sweepRawHex"] = json!(swept.raw_hex);
             facts["sweepSource"] = json!(swept.source);
+            // the delta-verify's NEW-1 (2026-09-19): WHICH word made the payout claimable, and how old the chain's word
+            // was — a confirmation from a memo (≤ 2 h) after a reorg is a wrong word an operator must be able to see
+            if swept.confirmed {
+                let by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&swept.sweep_txid)) && h.spent_confirmed == Some(true);
+                let word = i.hop_chain.get(&outpoint);
+                facts["confirmedSource"] = json!(if by_index { "index" } else if word.and_then(|w| w.age_ms).is_some() { "chain-memo" } else { "chain-probe" });
+                if let Some(age) = word.and_then(|w| w.age_ms) {
+                    facts["chainProbeAgeMs"] = json!(age);
+                }
+            }
             facts["creditBeef"] = json!(format!("/credit-beef/{}", swept.sweep_txid));
             facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
             facts["collectedSigVerified"] = json!(verified_collected);
@@ -1135,8 +1145,11 @@ mod tests {
         chain_confirmed(outpoint, looked, spent, spender, None)
     }
     fn chain_confirmed(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>) -> HashMap<String, HopChainWord> {
+        chain_confirmed_aged(outpoint, looked, spent, spender, spent_confirmed, None)
+    }
+    fn chain_confirmed_aged(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>, age_ms: Option<i64>) -> HashMap<String, HopChainWord> {
         let mut m = HashMap::new();
-        m.insert(outpoint.to_string(), HopChainWord { looked, spent, spending_txid: spender.map(str::to_string), spent_confirmed, stale: false, age_ms: None });
+        m.insert(outpoint.to_string(), HopChainWord { looked, spent, spending_txid: spender.map(str::to_string), spent_confirmed, stale: false, age_ms });
         m
     }
     fn filed(outpoint: &str, sweep_txid: &str) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
