@@ -2276,9 +2276,11 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         };
         let Some(params) = rows.first().and_then(|r| r.covenant_params()) else {
             // fleet loop 11 (the gate's MEDIUM-1): an EVICTED pot's row is gone and a released HOP is a P2PKH row —
-            // neither decodes, but both name their seats through the seats' OWN markers; those identities are
-            // marked stale and re-derived after the answer, so a refusal reaches the owed list at once (nothing is
-            // FILED here: the filing below needs the params)
+            // neither decodes. The seats are reached through the seats' OWN markers: for the released HOP its
+            // `hopparty_records` row (never moved by an eviction) names its seat; the by-pot arm answers for a pot
+            // whose party rows still stand (an evicted pot's were moved to their twin, so an eviction reaches both
+            // seats through their hops). Those identities are marked stale and re-derived after the answer, so a
+            // refusal reaches the owed list at once (nothing is FILED here: the filing below needs the params)
             let named = owed_identities_by_marker(&db, &txid, vout).await;
             let named_n = named.len();
             for id in named {
@@ -3264,7 +3266,7 @@ pub(crate) async fn owed_recompute_and_push_coalesced(
     owed_recompute_claimed(env, db, identity_lc, source, tip_hint, token).await;
 }
 
-/// The run behind a CLAIMED lock (`owed_refresh_begin` returned true to the caller, synchronously — the read path
+/// The run behind a CLAIMED lock (`owed_refresh_begin` returned `Some(token)` to the caller, synchronously — the read path
 /// claims at its check so two queued stale reads cannot both kick, the gate's LOW-1): the recompute, then every ask
 /// folded meanwhile, once each, then the lock released. A rerun keeps the caller's tip hint (the gate's LOW-2: a
 /// re-read that blips would compute nothing; a tip a moment old is conservative — a gate reads "not open yet").
@@ -3284,6 +3286,11 @@ pub(crate) async fn owed_recompute_claimed(
             return;
         }
         owed_recompute_and_push(env, db, identity_lc, &src, tip_hint).await;
+        if !owed_refresh_touch(identity_lc, token) {
+            // the delta-verify's LOW-4: a takeover DURING this walk owns the rerun map now — this claim must neither
+            // steal a folded ask (dropping it on its own way out) nor mark stale on the takeover's behalf
+            return;
+        }
         if reruns >= OWED_RERUNS_PER_CLAIM {
             // the delta-verify's LOW-1: an ask left folded past the bound is served by the NEXT read — but the walk just
             // wrote `stale = 0`, so the mark is set again here (the ask itself stays in the map for the next claim)
