@@ -288,6 +288,18 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
     Some((s, w.spent_confirmed == Some(true)))
 }
 
+/// The games whose `collected` filings the recompute must read: every SPENT pot the results name AND every hop the
+/// hops view names (a swept hop's payout is retired by a `collected` filing for its GAME, and a hop-only game — the
+/// stake swept before any JOIN — has no pot row at all; the collect pass of 2026-09-19 pressed five such payouts to
+/// "already in your wallet", filed each, and the rows stood because this lookup read the pots' games only). Sorted,
+/// deduped, lower-case: one chunked `IN (...)` read.
+pub fn collected_lookup_games<'a>(spent_result_games: impl Iterator<Item = &'a str>, hop_games: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut games: Vec<String> = spent_result_games.chain(hop_games).map(str::to_ascii_lowercase).collect();
+    games.sort_unstable();
+    games.dedup();
+    games
+}
+
 /// The hop is spent by ITS OWN SEAT'S SWEEP: the sweep this identity FILED (the index's spender or the chain rung's
 /// names it), else a spender whose stored bytes pay the seat's committed pay home for the game. The payout's
 /// claimability is the spend's confirmation from the source that named it; `output_spent` says the index saw the
@@ -308,7 +320,11 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         let named_by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid));
         let by_chain = i.hop_chain.get(&outpoint).filter(|w| w.looked && w.spent == Some(true) && w.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)));
         if named_by_index || by_chain.is_some() {
-            let confirmed = if named_by_index { h.spent_confirmed == Some(true) } else { by_chain.and_then(|w| w.spent_confirmed) == Some(true) };
+            // the index's word, OR the chain rung's (a spend the index recorded before its block and never re-checked
+            // read "not mined yet" for days on the pair: the recompute now probes such hops and the courier's
+            // confirmation heals the row without a client action)
+            let chain_confirmed = i.hop_chain.get(&outpoint).is_some_and(|w| w.looked && w.spent == Some(true) && w.spent_confirmed == Some(true));
+            let confirmed = (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true) || chain_confirmed;
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
@@ -1716,4 +1732,34 @@ mod tests {
         assert_eq!(refund_output_sats("zz", &hex::encode(pkh)), None);
         assert_eq!(refund_output_sats(&raw, "abcd"), None);
     }
+
+    #[test]
+    fn the_collected_lookup_covers_every_hop_game_beside_the_spent_pots() {
+        let games = collected_lookup_games(["AA".repeat(32).as_str(), &"bb".repeat(32)].into_iter(), [&"cc".repeat(32)[..], &"bb".repeat(32)].into_iter());
+        assert_eq!(games, vec!["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)]);
+        assert!(collected_lookup_games(std::iter::empty(), std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_the_chain_rung_confirms_it() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0c);
+        let key = format!("{}:0", tx(0x07));
+        let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        h.spent_confirmed = Some(false); // the index recorded the spend before its block and never re-checked
+        let filed_sweeps = filed(&key, &sweep);
+        let mut i = inputs(&[], &[], std::slice::from_ref(&h), &v, &c, &p, Some(900_000));
+        i.hop_sweeps = &filed_sweeps;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(rows[0].facts["claimable"], false); // the index's word alone: not yet
+        // the courier's word heals it: the same spender, confirmed
+        let word = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        i.hop_chain = &word;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
+    }
+
 }

@@ -107,6 +107,11 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>) {
 /// `flush_inline(env.clone()).await` so its own notes ride its own task.
 pub async fn flush_inline(env: Env) {
     let changed = drain();
+    // bsv-low #469 (2026-09-19): the hop-marker notes ride every flush the pot notes ride (one set of flush points)
+    let hops = crate::hop_changes::drain();
+    if !hops.is_empty() {
+        crate::hop_changes::ship(env.clone(), hops).await;
+    }
     if changed.is_empty() {
         return;
     }
@@ -121,10 +126,20 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
     wait_until: F,
 ) {
     let changed = drain();
-    if changed.is_empty() {
+    // bsv-low #469 (2026-09-19): the hop-marker notes ride the same flush (one detached task carries both sets)
+    let hops = crate::hop_changes::drain();
+    if changed.is_empty() && hops.is_empty() {
         return;
     }
-    wait_until(Box::pin(ship(env.clone(), changed)));
+    let env2 = env.clone();
+    wait_until(Box::pin(async move {
+        if !hops.is_empty() {
+            crate::hop_changes::ship(env2.clone(), hops).await;
+        }
+        if !changed.is_empty() {
+            ship(env2, changed).await;
+        }
+    }));
 }
 
 #[cfg(test)]

@@ -196,6 +196,9 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Post && req.path() == "/internal/pot-changed" {
         return routes::internal_pot_changed(req, &env, &ctx).await;
     }
+    if req.method() == worker::Method::Post && req.path() == "/internal/hop-changed" {
+        return routes::internal_hop_changed(req, &env, &ctx).await;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/lobby-changed" {
         return internal_events::lobby_changed(req, &env).await;
     }

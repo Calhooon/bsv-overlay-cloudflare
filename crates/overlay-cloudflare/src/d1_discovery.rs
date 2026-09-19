@@ -6528,7 +6528,11 @@ impl HoppartyStorage for D1HoppartyStorage {
                 record.identity
             );
         }
-        self.db.insert(insert).await.map_err(hopparty_err)
+        self.db.insert(insert).await.map_err(hopparty_err)?;
+        // bsv-low #469 (2026-09-19): the owed list is computed on write — both identities this marker names are
+        // re-derived by the app layer once the request's flush ships the note (`hop_changes`)
+        crate::hop_changes::note(&record.identity, &record.opponent_identity);
+        Ok(())
     }
 
     async fn list_for_identity(

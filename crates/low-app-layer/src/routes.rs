@@ -2356,6 +2356,36 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
     )
 }
 
+/// bsv-low #469 (2026-09-19) — `POST /internal/hop-changed` (bearer `INTERNAL_TOKEN`; the overlay's hop-marker
+/// admission through the `APP_LAYER` binding): `{"identities":[…]}` — every identity a just-admitted hop marker names
+/// has its owed rows marked STALE and re-derived after the answer (`wait_until`), the page told by `owed-changed`.
+/// The device-switch unit's hop branch read "nothing owed" for 90 s over a verified marker because only the cadence
+/// re-derived a hop-only identity; a hop funded IS a write the list is computed on.
+pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ctx: &worker::Context) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let identities = crate::internal_events::parse_hop_changed(&raw);
+    if identities.is_empty() {
+        return Response::error("body must be {\"identities\":[\"02…\"]}", 400);
+    }
+    let db = env.d1("OVERLAY_DB")?;
+    for id in &identities {
+        owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(id)], "hop-changed").await;
+    }
+    let env2 = env.clone();
+    let ids = identities.clone();
+    ctx.wait_until(async move {
+        let Ok(db) = env2.d1("OVERLAY_DB") else { return };
+        let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
+        for id in ids {
+            owed_recompute_and_push(&env2, &db, &id, "hop-changed", tip).await;
+        }
+    });
+    json_response(serde_json::json!({ "ok": true, "identities": identities }).to_string(), 200)
+}
+
 /// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The
 /// filing route has no background context, so it never recomputes inline (MEDIUM-11): one cheap UPDATE + a push.
 pub(crate) async fn owed_mark_stale(db: &worker::D1Database, sql: &str, binds: &[JsValue], what: &str) {
@@ -2671,11 +2701,16 @@ pub(crate) async fn owed_recompute(
         let candidates: Vec<(String, u32)> = hops
             .iter()
             .filter(|h| {
+                let verified = h.marker_verified == crate::hops_view::MarkerVerification::Verified;
                 // the index's Unspent, and its Unknown without a recorded spend (the container never indexed: the
                 // chain rung is the only word there is) — the same set the derivation judges by the chain
-                (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
-                    && h.marker_verified == crate::hops_view::MarkerVerification::Verified
-                    && h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS)
+                let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
+                    && h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS);
+                // AND a hop the index shows SPENT by a non-pot spender but never CONFIRMED (a sweep recorded before its
+                // block and never re-checked read "not mined yet" for days on the pair): the courier's confirmation
+                // heals the swept payout's claimability (`swept_home`), within the same probe budget
+                let stale_spent = h.status == crate::hops_view::HopStatus::Spent && h.spent_confirmed != Some(true) && h.spending_txid.is_some();
+                verified && (stranded_candidate || stale_spent)
             })
             .map(|h| (h.hop_txid.to_ascii_lowercase(), h.hop_vout))
             .collect();
@@ -2775,9 +2810,12 @@ pub(crate) async fn owed_recompute(
             #[serde(rename = "sigHex", default)]
             sig_hex: Option<String>,
         }
-        let mut game_ids: Vec<String> = results.iter().filter(|e| e.spent == Some(true)).map(|e| e.game_id.to_ascii_lowercase()).collect();
-        game_ids.sort_unstable();
-        game_ids.dedup();
+        // every spent pot's game AND every hop's game (a swept hop-only game has no pot row; its payout retires by
+        // its game's filing too — the collect pass of 2026-09-19 filed five that stood)
+        let game_ids = crate::owed::collected_lookup_games(
+            results.iter().filter(|e| e.spent == Some(true)).map(|e| e.game_id.as_str()),
+            hops.iter().map(|h| h.game_id.as_str()),
+        );
         for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
             let marks = vec!["?"; chunk.len()].join(", ");
             let sql = format!("SELECT gameId, sigHex FROM collected_markers_v2 WHERE identity = ? AND gameId IN ({marks})");

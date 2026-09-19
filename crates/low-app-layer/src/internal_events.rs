@@ -221,6 +221,33 @@ pub fn parse_pot_changed(raw: &[u8]) -> Vec<(String, u32)> {
     out
 }
 
+/// `{"identities":["02…",…]}` — the hop-changed webhook body (bsv-low #469, 2026-09-19: a hop marker admitted
+/// names two identities whose owed rows must be re-derived). Capped like the pot body.
+pub const HOP_CHANGED_MAX: usize = 8;
+
+pub fn parse_hop_changed(raw: &[u8]) -> Vec<String> {
+    let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("identities").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for o in arr {
+        let id = o.as_str().unwrap_or("").trim().to_ascii_lowercase();
+        if id.len() != 66 || !(id.starts_with("02") || id.starts_with("03")) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+        if out.len() >= HOP_CHANGED_MAX {
+            break;
+        }
+    }
+    out
+}
+
 /// The `pot` event body: the seat's exact served `/results` entry, wrapped
 /// with the routing keys (a SNAPSHOT — the client parses `entry` with the
 /// same parser it uses for `/results`).
@@ -761,4 +788,15 @@ mod tests {
         assert_eq!(b["at"], 1_788_000_000_000u64);
         assert_eq!(TIP_ROOM, "broadcast-low-tip");
     }
+
+    #[test]
+    fn hop_changed_parses_well_formed_identities_once_and_refuses_the_rest() {
+        let a = format!("02{}", "aa".repeat(32));
+        let b = format!("03{}", "bb".repeat(32));
+        let body = format!("{{\"identities\":[\"{}\",\"{b}\",\"{a}\",\"04{}\",\"junk\"]}}", a.to_ascii_uppercase(), "cc".repeat(32));
+        assert_eq!(parse_hop_changed(body.as_bytes()), vec![a, b]);
+        assert!(parse_hop_changed(b"{}").is_empty());
+        assert!(parse_hop_changed(b"not json").is_empty());
+    }
+
 }
