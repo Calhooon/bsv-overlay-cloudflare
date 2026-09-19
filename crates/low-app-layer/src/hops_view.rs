@@ -725,8 +725,10 @@ pub struct ProbeMemo {
 /// on the word).
 pub const PROBE_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
 
+/// An outpoint as the route names it: `(txid, vout)`.
+pub type Outpoints = Vec<(String, u32)>;
 /// The route's probe plan: the probes a fresh memo answered, and the outpoints still to ask.
-pub type ProbePlan = (Vec<(String, u32, ChainSpendProbe)>, Vec<(String, u32)>);
+pub type ProbePlan = (Vec<(String, u32, ChainSpendProbe)>, Outpoints);
 
 /// bsv-low #469, the stranded cell's run 5 (2026-09-19): how long the OWED walk trusts a memo whose spend is CONFIRMED.
 /// Without it the eight-per-recompute walk re-probed the same confirmed spenders every five minutes, in the hops view's
@@ -807,7 +809,7 @@ pub fn order_probe_targets(
     never_cap: usize,
     rotate: usize,
 ) -> Vec<(String, u32)> {
-    let mut never: Vec<(String, u32)> = Vec::new();
+    let mut never: Outpoints = Vec::new();
     let mut expired: Vec<(i64, String, u32)> = Vec::new();
     for (txid, vout) in to_probe {
         let key = format!("{}.{vout}", txid.to_ascii_lowercase());
@@ -821,7 +823,7 @@ pub fn order_probe_targets(
     });
     expired.sort_by_key(|(at, _, _)| *at);
     let cap = never_cap.min(never.len());
-    let (front, rest): (Vec<(String, u32)>, Vec<(String, u32)>) = if cap == 0 {
+    let (front, rest): (Outpoints, Outpoints) = if cap == 0 {
         (Vec::new(), never)
     } else {
         // the leader, then `cap - 1` from the others at the rotating offset; the others keep their newest-first order
