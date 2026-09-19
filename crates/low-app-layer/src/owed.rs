@@ -62,6 +62,10 @@ pub const OWED_PROBES_PER_RECOMPUTE: usize = 8;
 /// A `payout` row is CLAIMABLE only once the spend is confirmed (the credit
 /// path's landing bar); an unconfirmed spend is a row that says so.
 pub const UNCONFIRMED_PAYOUT_REASON: &str = "the spend is seen but not mined yet: the credit lands with the block";
+/// The `spent-elsewhere` story (design §2): the hop was spent by a transaction that is not a LOW pot and pays no
+/// home of this seat — a sweep to another home, or the wallet's own spend. Nothing here can move it.
+pub const SPENT_ELSEWHERE_REASON: &str =
+    "the hop was spent outside this game by a transaction that pays none of your homes (your wallet's own spend, or a sweep elsewhere): if it was yours, the money is already there; nothing here can move it";
 
 /// The families, in the order the page lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -144,6 +148,34 @@ pub struct ValidRefund {
     pub my_sats: Option<u64>,
 }
 
+/// One output of a hop's NON-POT spender as the index's stored bytes show it (a `tm_lowfund`-admitted transaction:
+/// a sweep, a wallet's own spend): the P2PKH pkh when the output is one, its sats, and the index's own spend word
+/// for that output (the swept sats collected and moved on, or still sitting at the home).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpenderOutput {
+    pub vout: u32,
+    pub pkh_hex: Option<String>,
+    pub sats: u64,
+    pub spent: Option<bool>,
+}
+
+/// A hop spent by its OWN seat's sweep — the FILED sweep, or a spender whose stored bytes pay the seat's committed
+/// pay home: the stake is at the home, uncollected, a `payout` row (`source` names which proof).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptHome {
+    pub sweep_txid: String,
+    pub raw_hex: Option<String>,
+    pub pays_sats: Option<u64>,
+    pub confirmed: bool,
+    pub source: &'static str,
+    /// The index shows the home output itself SPENT: collected and moved on — not a row.
+    pub output_spent: bool,
+}
+
+/// Spenders whose stored bytes one recompute reads to classify a hop's spend (bounded: a lived-in identity's
+/// adversarial history can hold dozens; the newest strands first, the rest read "not judged this pass").
+pub const OWED_SPENDER_READS_PER_RECOMPUTE: usize = 16;
+
 /// Everything one identity's recompute gathered (every one a served-view row).
 pub struct OwedInputs<'a> {
     pub identity_lc: &'a str,
@@ -168,6 +200,23 @@ pub struct OwedInputs<'a> {
     /// hop outpoint (`txid:vout`) → the newest FILED sweep of this identity for that hop (bsv-low #469 decision 3):
     /// the press's bytes for a stranded hop; a hop spent by that very sweep is a `payout` row (the sweep's credit).
     pub hop_sweeps: &'a HashMap<String, crate::hopsweep::FiledHopSweep>,
+    /// pot txids (lowercase) the overlay EVICTED and never readmitted (`pot_evictions`): the JOIN the network refused
+    /// never formed a pot — its results entry is not a row; the seat's hop carries the money's story.
+    pub evicted_pots: &'a HashSet<String>,
+    /// non-pot spender txid (lowercase) → its outputs as the index's stored bytes show them (bounded per recompute).
+    pub spender_outputs: &'a HashMap<String, Vec<SpenderOutput>>,
+    /// game id (lowercase) → my committed pay pkh (hex) from the results entries (the covenant's own commitment): the
+    /// home an unfiled sweep must pay to be MY payout.
+    pub my_pkh_by_game: &'a HashMap<String, String>,
+}
+
+/// The 20-byte pkh of a standard P2PKH locking script (`76 a9 14 <20> 88 ac`), lowercase hex; `None` for any other lock.
+pub fn p2pkh_pkh_hex(lock: &[u8]) -> Option<String> {
+    if lock.len() == 25 && lock[0] == 0x76 && lock[1] == 0xa9 && lock[2] == 0x14 && lock[23] == 0x88 && lock[24] == 0xac {
+        Some(hex::encode(&lock[3..23]))
+    } else {
+        None
+    }
 }
 
 pub fn outpoint_key(txid: &str, vout: u32) -> String {
@@ -210,19 +259,78 @@ fn my_settle_sats(e: &ResultEntry) -> Option<u64> {
     }
 }
 
-/// The hop is spent by the sweep THIS identity filed — the index's spender, else the chain rung's word: `Some((the
-/// filing, confirmed))`, the payout's claimability being the spend's confirmation from the source that named it.
-fn swept_by_own_filing<'a>(i: &'a OwedInputs<'a>, h: &HopEntry) -> Option<(&'a crate::hopsweep::FiledHopSweep, bool)> {
+/// The hop's NON-POT spender named by the index (a recorded spend) or the chain rung (a word of spent), with the
+/// confirmation the source carried; `None` when nothing names a spender, or the spender IS a covenant pot (the JOIN
+/// took it: the pot's own row tells the story).
+fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(String, bool)> {
+    if h.spent == Some(true) {
+        if let Some(s) = h.spending_txid.as_deref() {
+            let s = s.to_ascii_lowercase();
+            return if i.pot_spenders.contains(&s) { None } else { Some((s, h.spent_confirmed == Some(true))) };
+        }
+    }
+    let w = i.hop_chain.get(outpoint)?;
+    if !(w.looked && w.spent == Some(true)) {
+        return None;
+    }
+    let s = w.spending_txid.as_deref()?.to_ascii_lowercase();
+    if i.pot_spenders.contains(&s) {
+        return None;
+    }
+    Some((s, w.spent_confirmed == Some(true)))
+}
+
+/// The hop is spent by ITS OWN SEAT'S SWEEP: the sweep this identity FILED (the index's spender or the chain rung's
+/// names it), else a spender whose stored bytes pay the seat's committed pay home for the game. The payout's
+/// claimability is the spend's confirmation from the source that named it; `output_spent` says the index saw the
+/// home output spent since (collected and moved on).
+fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     let outpoint = outpoint_key(&h.hop_txid, h.hop_vout);
-    let filed = i.hop_sweeps.get(&outpoint)?;
-    if h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)) {
-        return Some((filed, h.spent_confirmed == Some(true)));
+    let game = h.game_id.to_ascii_lowercase();
+    let my_pkh = i.my_pkh_by_game.get(&game).map(|p| p.to_ascii_lowercase());
+    // the home outputs' own spend word, when the index holds the spender's bytes
+    let home_spent = |spender: &str| -> bool {
+        let (Some(outs), Some(pkh)) = (i.spender_outputs.get(spender), my_pkh.as_deref()) else {
+            return false;
+        };
+        let mine: Vec<&SpenderOutput> = outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(pkh))).collect();
+        !mine.is_empty() && mine.iter().all(|o| o.spent == Some(true))
+    };
+    if let Some(filed) = i.hop_sweeps.get(&outpoint) {
+        let named_by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid));
+        let by_chain = i.hop_chain.get(&outpoint).filter(|w| w.looked && w.spent == Some(true) && w.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)));
+        if named_by_index || by_chain.is_some() {
+            let confirmed = if named_by_index { h.spent_confirmed == Some(true) } else { by_chain.and_then(|w| w.spent_confirmed) == Some(true) };
+            return Some(SweptHome {
+                sweep_txid: filed.sweep_txid.clone(),
+                raw_hex: Some(filed.raw_hex.clone()),
+                pays_sats: filed.pays_sats,
+                confirmed,
+                source: "hopsweep-filing",
+                output_spent: home_spent(&filed.sweep_txid),
+            });
+        }
     }
-    let w = i.hop_chain.get(&outpoint)?;
-    if w.looked && w.spent == Some(true) && w.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)) {
-        return Some((filed, w.spent_confirmed == Some(true)));
+    // an UNFILED sweep (a device before the filing existed, a recovery tool): the spender's stored bytes pay MY home
+    let (spender, confirmed) = non_pot_spender(i, h, &outpoint)?;
+    let outs = i.spender_outputs.get(&spender)?;
+    let pkh = my_pkh?;
+    let mine: Vec<&SpenderOutput> = outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&pkh))).collect();
+    if mine.is_empty() {
+        return None;
     }
-    None
+    let mut sum = 0u64;
+    for o in &mine {
+        sum = sum.checked_add(o.sats)?;
+    }
+    Some(SweptHome {
+        sweep_txid: spender,
+        raw_hex: None,
+        pays_sats: Some(sum),
+        confirmed,
+        source: "index-bytes",
+        output_spent: mine.iter().all(|o| o.spent == Some(true)),
+    })
 }
 
 /// THE DERIVATION. Pure; one row per outpoint; the families exclusive by the
@@ -244,7 +352,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
     // a hop spent by ITS OWN filed sweep is a payout candidate of the game too (the sweep's credit): the one
     // `collected` marker of a game whose stake came back by a sweep AND whose pot paid keeps both rows
     for h in i.hops {
-        if swept_by_own_filing(i, h).is_some() {
+        if swept_home(i, h).is_some_and(|s| !s.output_spent) {
             *payout_candidates_by_game.entry(h.game_id.to_ascii_lowercase()).or_insert(0) += 1;
         }
     }
@@ -408,8 +516,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
             }
             None => {
-                // The index has no spend word for this pot (never admitted, or
-                // evicted): the brain cannot judge it. A sentence, not silence.
+                // A JOIN the network REFUSED (evicted, never readmitted) never formed a pot: not a row — the seat's
+                // hop carries the money's story (unspent → stranded; swept → the sweep's payout).
+                if i.evicted_pots.contains(&e.pot_txid.to_ascii_lowercase()) {
+                    continue;
+                }
+                // The index has no spend word for this pot (never admitted): the brain cannot judge it. A
+                // sentence, not silence.
                 let mut facts = base_facts.clone();
                 facts["tip"] = json!(i.tip);
                 rows.push(OwedRow {
@@ -449,26 +562,30 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             // against it (`owedPress.buildHopSweepForRow`), matching the key it derives
             "seatSettlePubkey": h.seat_settle_pubkey,
         });
-        // THE SWEPT HOP (bsv-low #469 decision 3): the hop is spent by the sweep this identity FILED — the index's
-        // spender, or the chain rung's — so the stake is at the seat's own home, uncollected: a `payout` row whose
-        // credit is the sweep (`/credit-beef/<sweepTxid>`), claimable once the sweep mined; retired by `collected`
-        // like every payout (one candidate per game, N10 above).
-        if let Some((filed, confirmed)) = swept_by_own_filing(i, h) {
+        // THE SWEPT HOP (bsv-low #469 decision 3): the hop is spent by its own seat's sweep — the sweep this identity
+        // FILED, or a spender whose stored bytes pay the seat's committed home (an unfiled sweep) — so the stake is
+        // at the seat's own home, uncollected: a `payout` row whose credit is the sweep (`/credit-beef/<sweepTxid>`),
+        // claimable once the sweep mined; retired by `collected` like every payout (one candidate per game, N10
+        // above), or by the index's word that the home output was spent since (collected and moved on).
+        if let Some(swept) = swept_home(i, h) {
+            if swept.output_spent {
+                continue;
+            }
             let verified_collected = i.collected_verified.contains(&game);
             if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1 {
                 continue;
             }
             let mut facts = facts_base.clone();
             facts["claim"] = json!("internalize");
-            facts["claimable"] = json!(confirmed);
-            if !confirmed {
+            facts["claimable"] = json!(swept.confirmed);
+            if !swept.confirmed {
                 facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
             }
             facts["outcome"] = json!("hop-sweep");
-            facts["sweepTxid"] = json!(filed.sweep_txid);
-            facts["sweepRawHex"] = json!(filed.raw_hex);
-            facts["sweepSource"] = json!("hopsweep-filing");
-            facts["creditBeef"] = json!(format!("/credit-beef/{}", filed.sweep_txid));
+            facts["sweepTxid"] = json!(swept.sweep_txid);
+            facts["sweepRawHex"] = json!(swept.raw_hex);
+            facts["sweepSource"] = json!(swept.source);
+            facts["creditBeef"] = json!(format!("/credit-beef/{}", swept.sweep_txid));
             facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
             facts["collectedSigVerified"] = json!(verified_collected);
             rows.push(OwedRow {
@@ -476,7 +593,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 outpoint,
                 family: OwedFamily::Payout,
                 game_id: game,
-                sats: filed.pays_sats,
+                sats: swept.pays_sats,
                 opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                 at_height: None,
                 facts,
@@ -493,12 +610,18 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
                 // MEDIUM-7: a spender ABSENT from the index is not evidence of a wallet spend (an unindexed or
                 // evicted JOIN is the common honest case); without positive evidence the brain says it could not
-                // judge, never a custody story. The positive classification from the spender's own bytes (every
-                // output P2PKH = our own sweep) is a step-4 addition beside the client's `spenderShapeKind`.
+                // judge, never a custody story. With the spender's stored BYTES (a `tm_lowfund`-admitted spend that
+                // pays no home of mine) the story is positive: spent outside this game (`spent-elsewhere`).
                 let mut facts = facts_base.clone();
                 facts["claim"] = Value::Null;
+                let bytes_known = spender.as_deref().is_some_and(|s| i.spender_outputs.contains_key(s));
+                if bytes_known {
+                    facts["spendKind"] = json!("spent-elsewhere");
+                }
                 let reason = if i.pot_spenders_faulted {
                     "could not check the hop's spender against the index this pass (a read faulted)"
+                } else if bytes_known {
+                    SPENT_ELSEWHERE_REASON
                 } else {
                     "the hop's spender is not in the index (an unindexed join, or a spend outside the game): could not judge"
                 };
@@ -608,6 +731,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["claim"] = Value::Null;
                         facts["chainProbe"] = json!("spent");
                         facts["chainSpender"] = json!(w.spending_txid);
+                        let bytes_known = spender.as_deref().is_some_and(|s| i.spender_outputs.contains_key(s));
+                        if bytes_known {
+                            facts["spendKind"] = json!("spent-elsewhere");
+                        }
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -618,8 +745,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             at_height: None,
                             facts,
                             reason: Some(
-                                "the chain shows the hop spent by a transaction the index does not hold: could not judge the spender"
-                                    .to_string(),
+                                if bytes_known {
+                                    SPENT_ELSEWHERE_REASON.to_string()
+                                } else {
+                                    "the chain shows the hop spent by a transaction the index does not hold: could not judge the spender".to_string()
+                                },
                             ),
                         });
                     }
@@ -780,6 +910,10 @@ static RECOMPUTE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static COLLECTED_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static POT_SPENDERS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HOP_SWEEPS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+pub fn note_spender_read_fault() {
+    SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
 pub fn note_collected_read_fault() {
     COLLECTED_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -819,6 +953,8 @@ pub fn owed_health_json() -> Value {
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
+        "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
+        "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
         "hopStrandedAfterMs": HOP_STRANDED_AFTER_MS,
         "recomputeOpenAfterMs": OWED_RECOMPUTE_OPEN_AFTER_MS,
         "recomputeAnyAfterMs": OWED_RECOMPUTE_ANY_AFTER_MS,
@@ -912,7 +1048,17 @@ mod tests {
             pot_spenders_faulted: false,
             hop_chain: &NO_CHAIN,
             hop_sweeps: &NO_SWEEPS,
+            evicted_pots: &NONE,
+            spender_outputs: &NO_SPENDERS,
+            my_pkh_by_game: &NO_PKHS,
         }
+    }
+    static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> = std::sync::LazyLock::new(HashMap::new);
+    static NO_PKHS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);
+    fn pays(spender: &str, outs: &[(u32, &str, u64, Option<bool>)]) -> HashMap<String, Vec<SpenderOutput>> {
+        let mut m = HashMap::new();
+        m.insert(spender.to_string(), outs.iter().map(|(v, pkh, sats, spent)| SpenderOutput { vout: *v, pkh_hex: Some((*pkh).to_string()), sats: *sats, spent: *spent }).collect());
+        m
     }
     static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> = std::sync::LazyLock::new(HashMap::new);
     static NO_SWEEPS: std::sync::LazyLock<HashMap<String, crate::hopsweep::FiledHopSweep>> = std::sync::LazyLock::new(HashMap::new);
@@ -1286,6 +1432,99 @@ mod tests {
         let hops = [recorded];
         let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
         assert!(rows[0].reason.as_deref().unwrap().contains("recorded but not confirmed"));
+    }
+
+    #[test]
+    fn a_spender_that_is_not_a_covenant_pot_never_reads_as_the_join_took_it() {
+        // the audit's silent class (2026-09-19): a hop swept by the seat's OLD unfiled sweep; the sweep's output row is
+        // a `tm_lowfund` p2pkh row in pot_records, so the recompute's pot-spender set is COVENANT rows only and this
+        // spender is not in it → with the bytes paying MY committed home → a payout; paying elsewhere → the story
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0d);
+        let my_pkh = "11".repeat(20);
+        let mut pkhs = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        // index: unspent (the pointer released by the eviction); chain: spent by the sweep, mined
+        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let no_pots: HashSet<String> = HashSet::new();
+        // 1. the bytes pay my home, the home output unspent → a claimable payout (source index-bytes, no raw)
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, Some(false))]);
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &by_chain;
+        i.spender_outputs = &mine;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
+        assert_eq!(rows[0].facts["sweepTxid"], sweep);
+        assert!(rows[0].facts["sweepRawHex"].is_null());
+        assert_eq!(rows[0].facts["claimable"], true);
+        // 2. the home output already SPENT (collected and moved on) → not a row
+        let moved = pays(&sweep, &[(0, &my_pkh, 20_000, Some(true))]);
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &by_chain;
+        i.spender_outputs = &moved;
+        i.my_pkh_by_game = &pkhs;
+        assert!(derive_owed_rows(&i).is_empty());
+        // 3. the bytes pay ELSEWHERE → the spent-elsewhere story, no claim
+        let elsewhere = pays(&sweep, &[(0, &"99".repeat(20), 20_000, Some(false))]);
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &by_chain;
+        i.spender_outputs = &elsewhere;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+        // 4. the bytes unknown (not read this pass) → could not judge, as before
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &by_chain;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert!(rows[0].reason.as_deref().unwrap().contains("could not judge the spender"));
+        // 5. the same through the INDEX pointer (status Spent, the spender not a covenant pot)
+        let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        spent.spent_confirmed = Some(true);
+        let hops = [spent];
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &mine;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &elsewhere;
+        i.my_pkh_by_game = &pkhs;
+        assert_eq!(derive_owed_rows(&i)[0].facts["spendKind"], "spent-elsewhere");
+    }
+
+    #[test]
+    fn the_p2pkh_pkh_reader_takes_the_standard_shape_only() {
+        let mut lock = vec![0x76, 0xa9, 0x14];
+        lock.extend_from_slice(&[0x42; 20]);
+        lock.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(p2pkh_pkh_hex(&lock).as_deref(), Some("42".repeat(20).as_str()));
+        assert!(p2pkh_pkh_hex(&lock[..24]).is_none());
+        assert!(p2pkh_pkh_hex(&[0x51]).is_none());
+        let mut covenant = lock.clone();
+        covenant.push(0x00);
+        assert!(p2pkh_pkh_hex(&covenant).is_none());
+    }
+
+    #[test]
+    fn an_evicted_pot_is_not_a_row_the_hop_carries_the_story() {
+        // the JOIN the network refused never formed a pot: its results entry (spent None) is skipped when the
+        // eviction ledger names it; an unadmitted pot without an eviction record keeps its sentence
+        let e = [entry(None, None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let rows = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(900_000)));
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert!(rows[0].reason.as_deref().unwrap().contains("no spend word"));
+        let evicted: HashSet<String> = [tx(0x02)].into_iter().collect();
+        let mut i = inputs(&e, &[], &[], &v, &c, &p, Some(900_000));
+        i.evicted_pots = &evicted;
+        assert!(derive_owed_rows(&i).is_empty());
     }
 
     #[test]

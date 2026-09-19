@@ -2566,6 +2566,41 @@ pub(crate) async fn owed_recompute(
             Some((outpoint_key(&e.pot_txid, e.pot_vout), pkh))
         })
         .collect();
+    // the same commitment by GAME (the home an unfiled sweep of the game's hop must pay to be MY payout)
+    let my_pkh_by_game: HashMap<String, String> = results
+        .iter()
+        .filter_map(|e| {
+            let keys = e.committed_keys.as_ref()?;
+            let pkh = match e.my_seat? {
+                SeatLetter::A => keys.pay_pkh_a.clone(),
+                SeatLetter::B => keys.pay_pkh_b.clone(),
+            };
+            Some((e.game_id.to_ascii_lowercase(), pkh.to_ascii_lowercase()))
+        })
+        .collect();
+
+    // 4a. the pots the overlay EVICTED and never readmitted among those with no spend word (the audit's class of
+    //     2026-09-19: a JOIN the network refused never formed a pot; its entry is not a row — the hop tells the story)
+    let mut evicted_pots: HashSet<String> = HashSet::new();
+    {
+        #[derive(Deserialize)]
+        struct TxidOnlyD1 {
+            txid: String,
+        }
+        let unknown: Vec<String> = results.iter().filter(|e| e.spent.is_none()).map(|e| e.pot_txid.to_ascii_lowercase()).collect();
+        for chunk in unknown.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+            let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_evictions WHERE readmittedAt IS NULL AND lower(txid) IN ({placeholders})");
+            let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
+            match db.prepare(&sql).bind(&b) {
+                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<TxidOnlyD1>()) {
+                    Ok(rows) => evicted_pots.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase())),
+                    Err(e) => console_warn!("[owed] evictions chunk failed (an evicted pot keeps its sentence this pass): {e}"),
+                },
+                Err(e) => console_warn!("[owed] evictions bind failed: {e}"),
+            }
+        }
+    }
     let mut valid_refunds: HashMap<String, ValidRefund> = HashMap::new();
     {
         // Only the UNSPENT pots can be refund-due, so only their filed rows are asked for — a targeted read, never
@@ -2780,7 +2815,9 @@ pub(crate) async fn owed_recompute(
     }
     for chunk in spenders.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
-        let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lower(txid) IN ({placeholders})");
+        // COVENANT rows only (the audit's silent class, 2026-09-19): `pot_records` also holds every `tm_lowfund` P2PKH
+        // output — a seat's own sweep admitted under it read as "a pot took the hop" and the row vanished
+        let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lockKind = 'covenant' AND lower(txid) IN ({placeholders})");
         let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
         match db.prepare(&sql).bind(&b) {
             Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<TxidRowD1>()) {
@@ -2796,6 +2833,77 @@ pub(crate) async fn owed_recompute(
                 crate::owed::note_pot_spenders_read_fault();
                 console_warn!("[owed] pot-spenders bind failed: {e}");
             }
+        }
+    }
+
+    // 6b. the NON-POT spenders' stored bytes (a sweep, a wallet's own spend), bounded per recompute: every P2PKH
+    //     output's pkh + sats from the BEEF the index holds, and the index's own spend word per output — the proof
+    //     that an unfiled sweep paid MY committed home (a payout), or paid elsewhere (the spent-elsewhere story).
+    //     The newest strands first; a spender past the budget reads "could not judge" this pass.
+    let mut spender_outputs: HashMap<String, Vec<crate::owed::SpenderOutput>> = HashMap::new();
+    {
+        // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
+        let mut ordered: Vec<(i64, String)> = Vec::new();
+        let mut seen_spenders: HashSet<String> = HashSet::new();
+        let mut by_hop: Vec<&crate::hops_view::HopEntry> = hops.iter().collect();
+        by_hop.sort_by_key(|h| std::cmp::Reverse(h.marker_created_at.unwrap_or(0)));
+        for h in by_hop {
+            let key = outpoint_key(&h.hop_txid, h.hop_vout);
+            let named: Option<String> = if h.spent == Some(true) {
+                h.spending_txid.as_deref().map(str::to_ascii_lowercase)
+            } else {
+                hop_chain.get(&key).filter(|w| w.looked && w.spent == Some(true)).and_then(|w| w.spending_txid.as_deref().map(str::to_ascii_lowercase))
+            };
+            if let Some(sp) = named {
+                if !pot_spenders.contains(&sp) && seen_spenders.insert(sp.clone()) {
+                    ordered.push((h.marker_created_at.unwrap_or(0), sp));
+                }
+            }
+        }
+        #[derive(Deserialize)]
+        struct SpentRowD1 {
+            #[serde(rename = "outputIndex")]
+            output_index: f64,
+            #[serde(default)]
+            spent: Option<f64>,
+        }
+        for (_at, sp) in ordered.into_iter().take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE) {
+            let bytes = match load_stored_beef(env, db, &sp).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(_) => {
+                    crate::owed::note_spender_read_fault();
+                    continue;
+                }
+            };
+            let Ok(beef) = bsv_rs::transaction::Beef::from_binary(&bytes) else {
+                continue;
+            };
+            let Some(tx) = beef.find_txid(&sp).and_then(|t| t.tx().cloned()) else {
+                continue;
+            };
+            let mut outs: Vec<crate::owed::SpenderOutput> = tx
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(vout, o)| crate::owed::SpenderOutput {
+                    vout: vout as u32,
+                    pkh_hex: crate::owed::p2pkh_pkh_hex(&o.locking_script.to_binary()),
+                    sats: o.satoshis.unwrap_or(0),
+                    spent: None,
+                })
+                .collect();
+            // the index's own spend word per output (the swept sats collected and moved on, or still at the home)
+            if let Ok(stmt) = db.prepare("SELECT outputIndex, spent FROM pot_records WHERE txid = ?1").bind(&[JsValue::from_str(&sp)]) {
+                if let Ok(rows) = stmt.all().await.and_then(|r| r.results::<SpentRowD1>()) {
+                    for r in rows {
+                        if let Some(o) = outs.iter_mut().find(|o| o.vout == r.output_index as u32) {
+                            o.spent = r.spent.map(|v| v >= 1.0);
+                        }
+                    }
+                }
+            }
+            spender_outputs.insert(sp, outs);
         }
     }
 
@@ -2815,6 +2923,9 @@ pub(crate) async fn owed_recompute(
         pot_spenders_faulted,
         hop_chain: &hop_chain,
         hop_sweeps: &hop_sweeps,
+        evicted_pots: &evicted_pots,
+        spender_outputs: &spender_outputs,
+        my_pkh_by_game: &my_pkh_by_game,
     });
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {
