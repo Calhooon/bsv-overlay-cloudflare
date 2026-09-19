@@ -175,6 +175,18 @@ pub struct PotRecord {
     pub spender_size_bytes: Option<u64>,
     #[serde(rename = "spenderFeeSats", default)]
     pub spender_fee_sats: Option<u64>,
+    /// bsv-low #468 (2026-09-19): the spender's outputs paying the pot's
+    /// COMMITTED pay homes (A / B), written beside the size + fee pair under
+    /// the same pointer guard (meaningful only when `spender_facts_txid ==
+    /// spending_txid`). `Some(0)` = this home received nothing from the spend
+    /// (a loss, a refund to the other seat); `None` = not measured (no decoded
+    /// home on the record, or a pre-#468 row). DISPLAY-TIER: History's amount
+    /// column reads it so no client fetches a settle raw for a number; every
+    /// credit still verifies its own bytes.
+    #[serde(rename = "spenderPayASats", default)]
+    pub spender_pay_a_sats: Option<u64>,
+    #[serde(rename = "spenderPayBSats", default)]
+    pub spender_pay_b_sats: Option<u64>,
 }
 
 /// The #284 verdict group as ONE write value (bsv-low #406): the verdict
@@ -330,6 +342,25 @@ pub trait PotStorage {
     /// best-effort at the call site: a failure here never fails the spend
     /// record it follows. The default refuses so a real store cannot forget
     /// it silently; the in-memory and D1 stores implement it.
+    /// bsv-low #468: the spender's outputs to the committed pay homes, keyed
+    /// like the facts pair. CAS on the LIVE pointer AND the facts txid
+    /// already keyed to it (`store_spender_facts` runs first at the one call
+    /// site); stored-wins per value; anything else is a no-op (the reader's
+    /// pointer guard covers a stale pair). DISPLAY-TIER, best-effort.
+    async fn store_spender_payouts(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        pay_a_sats: Option<u64>,
+        pay_b_sats: Option<u64>,
+    ) -> Result<(), PotStorageError> {
+        let _ = (txid, output_index, spending_txid, pay_a_sats, pay_b_sats);
+        Err(PotStorageError::Other(
+            "store_spender_payouts is not implemented by this PotStorage".into(),
+        ))
+    }
+
     async fn store_spender_facts(
         &self,
         txid: &str,
@@ -1527,6 +1558,38 @@ impl PotStorage for MemoryPotStorage {
             r.spender_facts_txid = Some(spending_txid.to_string());
             r.spender_size_bytes = Some(facts.size_bytes);
             r.spender_fee_sats = facts.fee_sats;
+            // a new spender never inherits the old spender's payouts either (#468)
+            r.spender_pay_a_sats = None;
+            r.spender_pay_b_sats = None;
+        }
+        Ok(())
+    }
+
+    async fn store_spender_payouts(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        pay_a_sats: Option<u64>,
+        pay_b_sats: Option<u64>,
+    ) -> Result<(), PotStorageError> {
+        let mut records = self.records.lock().unwrap();
+        let Some(r) = records
+            .iter_mut()
+            .find(|r| r.txid == txid && r.output_index == output_index)
+        else {
+            return Ok(());
+        };
+        if r.spending_txid.as_deref() != Some(spending_txid)
+            || r.spender_facts_txid.as_deref() != Some(spending_txid)
+        {
+            return Ok(()); // CAS miss: not the live, described spender
+        }
+        if r.spender_pay_a_sats.is_none() {
+            r.spender_pay_a_sats = pay_a_sats;
+        }
+        if r.spender_pay_b_sats.is_none() {
+            r.spender_pay_b_sats = pay_b_sats;
         }
         Ok(())
     }

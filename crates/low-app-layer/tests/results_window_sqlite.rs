@@ -839,6 +839,8 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             spender_facts_txid: None,
             spender_size_bytes: None,
             spender_fee_sats: None,
+            spender_pay_a_sats: None,
+            spender_pay_b_sats: None,
         })
     })
     .unwrap()
@@ -883,6 +885,8 @@ fn apply_page_overlay_like_the_route(conn: &Connection, rows: &mut [ResultsRow])
                     .get::<_, Option<i64>>("spenderSizeBytes")?
                     .map(|v| v as f64),
                 spender_fee_sats: r.get::<_, Option<i64>>("spenderFeeSats")?.map(|v| v as f64),
+                spender_pay_a_sats: None,
+                spender_pay_b_sats: None,
             })
         })
         .unwrap()

@@ -443,6 +443,25 @@ impl LookupService for PotLookupService {
                     debug!("POT: spender facts not recorded (display tier, best-effort): {e}");
                 }
             }
+            // bsv-low #468 (2026-09-19): the spend's outputs to the COMMITTED pay
+            // homes, from the tx already parsed and the record's decoded homes
+            // (the funding output's own bytes, #284) — never a caller claim.
+            // History's amount column reads it; no client fetches a settle raw
+            // for a number. Display-tier, best-effort like the facts above.
+            let (pay_a, pay_b) = spend_payouts(
+                &spending_tx,
+                record.pay_pkh_a.as_deref(),
+                record.pay_pkh_b.as_deref(),
+            );
+            if pay_a.is_some() || pay_b.is_some() {
+                if let Err(e) = self
+                    .storage
+                    .store_spender_payouts(txid, output_index, &spending_txid, pay_a, pay_b)
+                    .await
+                {
+                    debug!("POT: spender payouts not recorded (display tier, best-effort): {e}");
+                }
+            }
         }
 
         // Durably persist the SETTLE/refund beef under the SPENDER's txid —
@@ -603,6 +622,37 @@ impl LookupService for PotLookupService {
 /// `None` unless the tx's only input is exactly `(pot_txid, pot_vout)`, every
 /// output value is present and the subtraction does not underflow — never an
 /// estimate, never a multi-input guess (other inputs' values are unknown).
+/// bsv-low #468: the spend's total output value to each COMMITTED pay home
+/// (the P2PKH of the record's decoded `payPkhA` / `payPkhB`). `None` for a
+/// home the record does not name (or a malformed hash); `Some(0)` for a named
+/// home this spend pays nothing (the loser's, a refund to the other seat). A
+/// spend with no output value known contributes nothing to a sum (the raw was
+/// parsed without values only on a truncated wire, which the caller rejects
+/// earlier). Pure over the parsed tx.
+pub(crate) fn spend_payouts(
+    spending_tx: &Transaction,
+    pay_pkh_a_hex: Option<&str>,
+    pay_pkh_b_hex: Option<&str>,
+) -> (Option<u64>, Option<u64>) {
+    fn lock_of(pkh_hex: Option<&str>) -> Option<Vec<u8>> {
+        let hex = pkh_hex?;
+        let bytes = hex::decode(hex).ok()?;
+        let pkh: [u8; 20] = bytes.as_slice().try_into().ok()?;
+        Some(crate::pot::covenant::p2pkh_lock(&pkh))
+    }
+    fn sum_to(spending_tx: &Transaction, lock: &[u8]) -> u64 {
+        spending_tx
+            .outputs
+            .iter()
+            .filter(|o| o.locking_script.to_binary() == lock)
+            .filter_map(|o| o.satoshis)
+            .fold(0u64, |acc, v| acc.saturating_add(v))
+    }
+    let a = lock_of(pay_pkh_a_hex).map(|l| sum_to(spending_tx, &l));
+    let b = lock_of(pay_pkh_b_hex).map(|l| sum_to(spending_tx, &l));
+    (a, b)
+}
+
 pub(crate) fn single_input_pot_fee(
     spending_tx: &Transaction,
     pot_txid: &str,

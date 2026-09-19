@@ -1496,6 +1496,11 @@ struct PotRow {
     spender_size_bytes: Option<f64>,
     #[serde(rename = "spenderFeeSats", default)]
     spender_fee_sats: Option<f64>,
+    // bsv-low #468: the spender's outputs to the committed pay homes (nullable; pre-#468 rows read None).
+    #[serde(rename = "spenderPayASats", default)]
+    spender_pay_a_sats: Option<f64>,
+    #[serde(rename = "spenderPayBSats", default)]
+    spender_pay_b_sats: Option<f64>,
 }
 
 impl PotRow {
@@ -1529,6 +1534,8 @@ impl PotRow {
             spender_facts_txid: self.spender_facts_txid,
             spender_size_bytes: self.spender_size_bytes.map(|v| v as u64),
             spender_fee_sats: self.spender_fee_sats.map(|v| v as u64),
+            spender_pay_a_sats: self.spender_pay_a_sats.map(|v| v as u64),
+            spender_pay_b_sats: self.spender_pay_b_sats.map(|v| v as u64),
         }
     }
 }
@@ -1539,7 +1546,8 @@ const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentC
      lockKind, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, \
      stakeA, stakeB, feeSats, recoveryHeight, potSats, paramsDecoded, \
      verdict, verdictTxid, spentHeight, spenderFinal, settleSigners, \
-     fundingSizeBytes, fundingFeeSats, spenderFactsTxid, spenderSizeBytes, spenderFeeSats";
+     fundingSizeBytes, fundingFeeSats, spenderFactsTxid, spenderSizeBytes, spenderFeeSats, \
+     spenderPayASats, spenderPayBSats";
 
 /// Row for the `pot_beefs` length + verified-latch probe
 /// (`length(beef) AS len, proof_verified`). D1 returns numbers as f64;
@@ -2437,6 +2445,18 @@ pub fn pot_funding_facts_fill_sql() -> &'static str {
 /// PRE-update value (SQLite UPDATE semantics), like the height CASE. Binds:
 /// (spender, spender, size, size, spender, fee, fee, txid, vout, spender).
 /// Pub for the REAL-SQLite harness.
+/// bsv-low #468: the spender PAYOUTS CAS — lands ONLY under the live pointer
+/// that the facts pair already describes (`spendingTxid = ? AND
+/// spenderFactsTxid = ?`, the same spender twice), stored-wins per value
+/// (COALESCE; a NULL payout keeps the column). Binds: (payA, payB, txid, vout,
+/// spender, spender). Pub for the REAL-SQLite harness.
+pub fn spender_payouts_cas_sql() -> &'static str {
+    "UPDATE pot_records SET \
+         spenderPayASats = COALESCE(spenderPayASats, ?), \
+         spenderPayBSats = COALESCE(spenderPayBSats, ?) \
+     WHERE txid = ? AND outputIndex = ? AND spendingTxid = ? AND spenderFactsTxid = ?"
+}
+
 pub fn spender_facts_cas_sql() -> &'static str {
     "UPDATE pot_records SET \
          spenderSizeBytes = CASE WHEN spenderFactsTxid = ? \
@@ -2449,6 +2469,27 @@ pub fn spender_facts_cas_sql() -> &'static str {
 
 #[async_trait(?Send)]
 impl PotStorage for D1PotStorage {
+    async fn store_spender_payouts(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        pay_a_sats: Option<u64>,
+        pay_b_sats: Option<u64>,
+    ) -> Result<(), PotStorageError> {
+        Query::new(spender_payouts_cas_sql())
+            .bind(pay_a_sats.map(|v| v as f64))
+            .bind(pay_b_sats.map(|v| v as f64))
+            .bind(txid)
+            .bind(output_index)
+            .bind(spending_txid)
+            .bind(spending_txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(())
+    }
+
     async fn store_spender_facts(
         &self,
         txid: &str,

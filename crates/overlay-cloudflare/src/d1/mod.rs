@@ -448,7 +448,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// probes (an isolate cache cannot carry across isolates).
 /// 150 → 151 for bsv-low #451 slice C (iii): `tx_any_verdicts`, the durable memo of `/tx-any`'s unconfirmable verdicts.
 /// 151 → 153 for bsv-low #451 slice C (iv): `tx_any_verdicts.kind` + `.evidence` (two additive ALTERs).
-pub const OVERLAY_MIGRATION_COUNT: usize = 153;
+/// 153 → 155 for bsv-low #468 (2026-09-19): `pot_records.spenderPayASats` + `.spenderPayBSats` (two additive ALTERs).
+pub const OVERLAY_MIGRATION_COUNT: usize = 155;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1666,6 +1667,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // "duplicate column" error. A row without a kind is a pre-152 `unconfirmable`.
     "ALTER TABLE tx_any_verdicts ADD COLUMN kind TEXT",
     "ALTER TABLE tx_any_verdicts ADD COLUMN evidence TEXT",
+    // bsv-low #468 (2026-09-19): the spender's outputs to the pot's COMMITTED pay homes (A / B), written beside the
+    // spender facts under the same pointer guard by the pot lookup service's outputSpent (`spend_payouts`); served by
+    // the app layer's `/results` `money.settle` (`payASats` / `payBSats`) so History never fetches a settle raw for
+    // an amount. Additive ALTERs; the runner ignores the re-run "duplicate column" error. The app layer READS them,
+    // so it issues the byte-identical catch-ups (`low-app-layer/src/schema.rs`).
+    "ALTER TABLE pot_records ADD COLUMN spenderPayASats INTEGER",
+    "ALTER TABLE pot_records ADD COLUMN spenderPayBSats INTEGER",
 ];
 
 // =============================================================================

@@ -145,6 +145,13 @@ pub const SETTLE_SIGNERS_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN settl
 /// ordering rule is module-level (gate F5): the CREATE catch-ups run first,
 /// because `ROW_VALID_ALTER` targets a table `HAND_MARKERS_CREATE` may be
 /// creating on the same cold isolate.
+/// bsv-low #468 (2026-09-19): the spender's outputs to the pot's committed
+/// pay homes, same Rule-24 contract — `page_overlay_sql` selects both, so a
+/// cold app-layer isolate against an unwarmed schema would fail to PREPARE the
+/// results overlay without them. Byte-identical to the overlay migration.
+pub const SPENDER_PAY_A_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spenderPayASats INTEGER";
+pub const SPENDER_PAY_B_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spenderPayBSats INTEGER";
+
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SIG_VALID_ALTER,
     MARKER_VALID_ALTER,
@@ -153,6 +160,8 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     CLAIM_VALID_ALTER,
     ROW_VALID_ALTER,
     SETTLE_SIGNERS_ALTER,
+    SPENDER_PAY_A_ALTER,
+    SPENDER_PAY_B_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -364,10 +373,10 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            7,
+            9,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
              spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
-             settleSigners (#406)"
+             settleSigners (#406), spenderPayASats + spenderPayBSats (#468)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt

@@ -704,6 +704,11 @@ pub struct TxMoneyFacts {
     pub txid: String,
     pub size_bytes: Option<u64>,
     pub fee_sats: Option<u64>,
+    /// bsv-low #468: the tx's output value to the pot's committed pay home A /
+    /// B (the settle only; `None` on the funding and on rows the overlay has
+    /// not measured). `Some(0)` = that home received nothing from the spend.
+    pub pay_a_sats: Option<u64>,
+    pub pay_b_sats: Option<u64>,
 }
 
 /// A seat's STAKE tx (the hop container) as served: which committed seat it
@@ -758,6 +763,8 @@ pub fn money_facts(
             txid: pot_txid_lc,
             size_bytes: r.funding_size_bytes,
             fee_sats: r.funding_fee_sats,
+            pay_a_sats: None,
+            pay_b_sats: None,
         });
     let settle = match (r.spending_txid.as_deref(), r.spender_facts_txid.as_deref()) {
         (Some(live), Some(described))
@@ -768,6 +775,9 @@ pub fn money_facts(
                 txid: live.to_ascii_lowercase(),
                 size_bytes: r.spender_size_bytes,
                 fee_sats: r.spender_fee_sats,
+                // #468: under the SAME pointer guard as the size + fee pair
+                pay_a_sats: r.spender_pay_a_sats,
+                pay_b_sats: r.spender_pay_b_sats,
             })
         }
         _ => None,
@@ -845,6 +855,10 @@ pub struct PageOverlay {
     pub spender_size_bytes: Option<f64>,
     #[serde(rename = "spenderFeeSats", default)]
     pub spender_fee_sats: Option<f64>,
+    #[serde(rename = "spenderPayASats", default)]
+    pub spender_pay_a_sats: Option<f64>,
+    #[serde(rename = "spenderPayBSats", default)]
+    pub spender_pay_b_sats: Option<f64>,
 }
 
 /// The overlay's SQL for `n` outpoints (2 binds each: txid, outputIndex) —
@@ -855,7 +869,8 @@ pub fn page_overlay_sql(n: usize) -> String {
     let clause = vec!["(txid = ? AND outputIndex = ?)"; n].join(" OR ");
     format!(
         "SELECT txid, outputIndex, settleSigners, fundingSizeBytes, fundingFeeSats, \
-                spenderFactsTxid, spenderSizeBytes, spenderFeeSats \
+                spenderFactsTxid, spenderSizeBytes, spenderFeeSats, \
+                spenderPayASats, spenderPayBSats \
          FROM pot_records WHERE {clause}"
     )
 }
@@ -876,6 +891,8 @@ pub fn apply_page_overlay(rows: &mut [ResultsRow], overlay: &[PageOverlay]) {
         r.spender_facts_txid = o.and_then(|o| o.spender_facts_txid.clone());
         r.spender_size_bytes = o.and_then(|o| o.spender_size_bytes.map(|v| v as u64));
         r.spender_fee_sats = o.and_then(|o| o.spender_fee_sats.map(|v| v as u64));
+        r.spender_pay_a_sats = o.and_then(|o| o.spender_pay_a_sats.map(|v| v as u64));
+        r.spender_pay_b_sats = o.and_then(|o| o.spender_pay_b_sats.map(|v| v as u64));
     }
 }
 
@@ -1299,6 +1316,10 @@ pub struct ResultsRow {
     pub spender_facts_txid: Option<String>,
     pub spender_size_bytes: Option<u64>,
     pub spender_fee_sats: Option<u64>,
+    /// bsv-low #468: the spender's outputs to the committed pay homes, keyed
+    /// like the pair above (served under the same pointer guard).
+    pub spender_pay_a_sats: Option<u64>,
+    pub spender_pay_b_sats: Option<u64>,
 }
 
 impl ResultsRow {
@@ -2457,8 +2478,11 @@ pub fn results_body(
                     "funding": e.money.funding.as_ref().map(|f| json!({
                         "txid": f.txid, "sizeBytes": f.size_bytes, "feeSats": f.fee_sats,
                     })),
+                    // #468: the settle's outputs to the committed pay homes (A / B) —
+                    // History's amount column reads them; a client picks its seat.
                     "settle": e.money.settle.as_ref().map(|f| json!({
                         "txid": f.txid, "sizeBytes": f.size_bytes, "feeSats": f.fee_sats,
+                        "payASats": f.pay_a_sats, "payBSats": f.pay_b_sats,
                     })),
                     "hops": e.money.hops.iter().map(|h| json!({
                         "identity": h.identity,
@@ -4017,6 +4041,8 @@ mod tests {
             spender_facts_txid: Some("s1".repeat(32)), // same pointer, other case
             spender_size_bytes: Some(3_577),
             spender_fee_sats: Some(400),
+            spender_pay_a_sats: None,
+            spender_pay_b_sats: None,
             ..Default::default()
         };
         let mut hop_a = hop(REAL_ID_A, REAL_PUB_A, Some(true));

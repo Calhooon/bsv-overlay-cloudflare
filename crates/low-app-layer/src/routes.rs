@@ -2059,6 +2059,9 @@ impl ResultsRowD1 {
             fee_sats: self.fee_sats.map(|v| v as u64),
             cov_recovery_height: self.cov_recovery_height.map(|v| v as u64),
             pot_sats: self.pot_sats.map(|v| v as u64),
+            // #468: the payouts ride the page overlay (`apply_page_overlay`), never the window query
+            spender_pay_a_sats: None,
+            spender_pay_b_sats: None,
             verdict: self.verdict,
             verdict_txid: self.verdict_txid,
             spent_height: self.spent_height.map(|v| v as u64),
