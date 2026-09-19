@@ -55,6 +55,10 @@ pub const OWED_WIRE_VERSION: u32 = 1;
 /// `HopEntry.marker_created_at`, which the D1 mapper converts from the
 /// marker table's unix SECONDS to ms (the gate's HIGH-3).
 pub const HOP_STRANDED_AFTER_MS: i64 = 30 * 60 * 1000;
+/// The courier probes ONE recompute may buy for its index-unspent hops (the memoised `hop_chain_probes` answer the
+/// rest; a hop past the budget keeps its last memo's word, named stale, or waits with no claim). Counted per caller
+/// `owed` on the courier census.
+pub const OWED_PROBES_PER_RECOMPUTE: usize = 8;
 /// A `payout` row is CLAIMABLE only once the spend is confirmed (the credit
 /// path's landing bar); an unconfirmed spend is a row that says so.
 pub const UNCONFIRMED_PAYOUT_REASON: &str = "the spend is seen but not mined yet: the credit lands with the block";
@@ -116,6 +120,19 @@ pub struct OwedRow {
     pub reason: Option<String>,
 }
 
+/// The CHAIN rung's word on an index-unspent hop (the memoised `/spent-any` probe, or a fresh one this recompute
+/// bought within its budget): the sweep claim rests on the index AND the chain, the shipped client's own bar
+/// (`hopSpenderRead.looked`). `looked = false` = the providers could not answer (a fault, no corroboration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopChainWord {
+    pub looked: bool,
+    pub spent: Option<bool>,
+    pub spending_txid: Option<String>,
+    /// The word is a memo older than the fresh window (this recompute's probe budget was spent): still the last
+    /// thing the chain said, named as stale.
+    pub stale: bool,
+}
+
 /// A VALID filed refund for one pot (`potrefund_records.refundValid = 1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidRefund {
@@ -144,6 +161,8 @@ pub struct OwedInputs<'a> {
     pub pot_spenders: &'a HashSet<String>,
     /// True when the pot-spenders read FAULTED: a spent hop is then "could not check", never a story.
     pub pot_spenders_faulted: bool,
+    /// hop outpoint (`txid:vout`) → the chain rung's word, for the index-unspent hops past the stranded window.
+    pub hop_chain: &'a HashMap<String, HopChainWord>,
 }
 
 pub fn outpoint_key(txid: &str, vout: u32) -> String {
@@ -432,21 +451,71 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     });
                     continue;
                 }
+                // THE CHAIN RUNG: the index's "unspent" alone never offers the sweep (the client's bar since #451: a
+                // read that could not look is never "unspent"). A chain word of unspent → the claim; spent by a pot →
+                // no row (the JOIN took it); spent by something else → could not judge; no word yet → the claim waits.
+                let chain = i.hop_chain.get(&outpoint);
                 let mut facts = facts_base.clone();
-                facts["claim"] = json!("sweep-hop");
-                facts["claimable"] = json!(true);
                 facts["ageMs"] = json!(age_ms);
-                rows.push(OwedRow {
-                    identity: me.clone(),
-                    outpoint,
-                    family: OwedFamily::HopStranded,
-                    game_id: game,
-                    sats: Some(h.hop_sats),
-                    opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
-                    at_height: None,
-                    facts,
-                    reason: None,
-                });
+                match chain {
+                    Some(w) if w.looked && w.spent == Some(false) => {
+                        facts["claim"] = json!("sweep-hop");
+                        facts["claimable"] = json!(true);
+                        facts["chainProbe"] = json!(if w.stale { "unspent-stale" } else { "unspent" });
+                        rows.push(OwedRow {
+                            identity: me.clone(),
+                            outpoint,
+                            family: OwedFamily::HopStranded,
+                            game_id: game,
+                            sats: Some(h.hop_sats),
+                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                            at_height: None,
+                            facts,
+                            reason: None,
+                        });
+                    }
+                    Some(w) if w.looked && w.spent == Some(true) => {
+                        let spender = w.spending_txid.as_deref().map(str::to_ascii_lowercase);
+                        if spender.as_deref().is_some_and(|s| i.pot_spenders.contains(s)) {
+                            continue; // the JOIN took it after all (the index lagged): the pot's row tells the story
+                        }
+                        facts["claim"] = Value::Null;
+                        facts["chainProbe"] = json!("spent");
+                        facts["chainSpender"] = json!(w.spending_txid);
+                        rows.push(OwedRow {
+                            identity: me.clone(),
+                            outpoint,
+                            family: OwedFamily::Unbound,
+                            game_id: game,
+                            sats: Some(h.hop_sats),
+                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                            at_height: None,
+                            facts,
+                            reason: Some(
+                                "the chain shows the hop spent by a transaction the index does not hold: could not judge the spender"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    _ => {
+                        facts["claim"] = Value::Null;
+                        facts["chainProbe"] = json!("pending");
+                        rows.push(OwedRow {
+                            identity: me.clone(),
+                            outpoint,
+                            family: OwedFamily::Unbound,
+                            game_id: game,
+                            sats: Some(h.hop_sats),
+                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                            at_height: None,
+                            facts,
+                            reason: Some(
+                                "the index says the hop is unspent; the chain rung has not corroborated it yet (the sweep waits for its word)"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                }
             }
             HopStatus::Spent => {
                 let spender = h.spending_txid.as_deref().map(str::to_ascii_lowercase);
@@ -760,7 +829,14 @@ mod tests {
             collected_present: &NONE,
             pot_spenders: pots,
             pot_spenders_faulted: false,
+            hop_chain: &NO_CHAIN,
         }
+    }
+    static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> = std::sync::LazyLock::new(HashMap::new);
+    fn chain(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>) -> HashMap<String, HopChainWord> {
+        let mut m = HashMap::new();
+        m.insert(outpoint.to_string(), HopChainWord { looked, spent, spending_txid: spender.map(str::to_string), stale: false });
+        m
     }
 
     #[test]
@@ -945,9 +1021,14 @@ mod tests {
     fn a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim_a_young_one_is_not_a_row() {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
-        let rows = derive_owed_rows(&inputs(&[], &[], &old, &v, &c, &p, Some(900_000)));
+        let key = format!("{}:0", tx(0x07));
+        let unspent = chain(&key, true, Some(false), None);
+        let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(900_000));
+        i.hop_chain = &unspent;
+        let rows = derive_owed_rows(&i);
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["chainProbe"], "unspent");
         let young = [hop(HopStatus::Unspent, None, Some(60_000))];
         assert!(derive_owed_rows(&inputs(&[], &[], &young, &v, &c, &p, Some(900_000))).is_empty());
         let ageless = [hop(HopStatus::Unspent, None, None)];
@@ -973,6 +1054,40 @@ mod tests {
         i.pot_spenders_faulted = true;
         let rows = derive_owed_rows(&i);
         assert!(rows[0].reason.as_deref().unwrap().contains("could not check"));
+    }
+
+    #[test]
+    fn the_sweep_claim_rests_on_the_chain_rung_too() {
+        // the index's "unspent" alone is a sentence; the chain's unspent is the claim; the chain's spent-by-a-pot is no
+        // row; the chain's spent-by-another is could-not-judge
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let key = format!("{}:0", tx(0x07));
+        // no chain word yet
+        let rows = derive_owed_rows(&inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000)));
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_eq!(rows[0].facts["chainProbe"], "pending");
+        assert!(rows[0].reason.as_deref().unwrap().contains("not corroborated"));
+        // the providers could not look
+        let not_looked = chain(&key, false, None, None);
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &not_looked;
+        assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+        // spent by a POT the index holds (the index lagged): no row
+        let join = tx(0x02);
+        let pots: HashSet<String> = [join.clone()].into_iter().collect();
+        let by_pot = chain(&key, true, Some(true), Some(&join));
+        let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
+        i.hop_chain = &by_pot;
+        assert!(derive_owed_rows(&i).is_empty());
+        // spent by something the index does not hold: could not judge, the spender named in the facts
+        let elsewhere = chain(&key, true, Some(true), Some(&tx(0x09)));
+        let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
+        i.hop_chain = &elsewhere;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_eq!(rows[0].facts["chainProbe"], "spent");
+        assert_eq!(rows[0].facts["chainSpender"], tx(0x09));
     }
 
     #[test]

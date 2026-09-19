@@ -2621,6 +2621,61 @@ pub(crate) async fn owed_recompute(
         }
     }
 
+    // 4b. THE CHAIN RUNG for the index-unspent hops past the stranded window (the sweep claim rests on the index AND
+    //     the chain, the client's own bar): the memoised probes first (`hop_chain_probes`, #451), a bounded courier
+    //     probe for the rest (counted per caller `owed`), the fresh memos written back; a hop past the budget keeps
+    //     its last memo's word, named stale.
+    let mut hop_chain: HashMap<String, crate::owed::HopChainWord> = HashMap::new();
+    let mut chain_spenders: Vec<String> = Vec::new();
+    {
+        let candidates: Vec<(String, u32)> = hops
+            .iter()
+            .filter(|h| {
+                h.status == crate::hops_view::HopStatus::Unspent
+                    && h.marker_verified == crate::hops_view::MarkerVerification::Verified
+                    && h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS)
+            })
+            .map(|h| (h.hop_txid.to_ascii_lowercase(), h.hop_vout))
+            .collect();
+        if !candidates.is_empty() {
+            let memos = read_probe_memos(db, &candidates).await;
+            let (answered, to_probe) = crate::hops_view::split_probe_targets(&candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS);
+            for (t, v, p) in answered {
+                if let Some(s) = p.spending_txid.as_deref() {
+                    chain_spenders.push(s.to_ascii_lowercase());
+                }
+                hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, stale: false });
+            }
+            let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
+            let mut probed = 0usize;
+            for (t, v) in &to_probe {
+                let key = outpoint_key(t, *v);
+                if probed >= crate::owed::OWED_PROBES_PER_RECOMPUTE {
+                    if let Some(m) = memos.iter().find(|m| m.outpoint == format!("{t}.{v}")) {
+                        if let Some(s) = m.spending_txid.as_deref() {
+                            chain_spenders.push(s.to_ascii_lowercase());
+                        }
+                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), stale: true });
+                    }
+                    continue;
+                }
+                probed += 1;
+                let row = spent_any_resolve_cached(t, *v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
+                let probe = crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid.clone(), spent_confirmed: row.spent_confirmed };
+                if let Some(m) = crate::hops_view::probe_memo_of(t, *v, &probe, now_ms) {
+                    fresh.push(m);
+                }
+                if let Some(s) = row.spending_txid.as_deref() {
+                    chain_spenders.push(s.to_ascii_lowercase());
+                }
+                hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, stale: false });
+            }
+            if !fresh.is_empty() {
+                write_probe_memos(db, &fresh).await;
+            }
+        }
+    }
+
     // 5. the `collected` markers naming this identity — VERIFIED under the identity (the gate's HIGH-1: the table
     //    is byte-format admitted, a stranger can plant a row naming any (identity, game); only a signature the
     //    identity itself made retires a payout; presence is display provenance). A read fault is counted and leaves
@@ -2674,6 +2729,7 @@ pub(crate) async fn owed_recompute(
     let spenders: Vec<String> = hops
         .iter()
         .filter_map(|h| h.spending_txid.as_deref().map(str::to_ascii_lowercase))
+        .chain(chain_spenders.iter().cloned())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -2716,6 +2772,7 @@ pub(crate) async fn owed_recompute(
         collected_present: &collected_present,
         pot_spenders: &pot_spenders,
         pot_spenders_faulted,
+        hop_chain: &hop_chain,
     });
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {
