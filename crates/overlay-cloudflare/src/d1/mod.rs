@@ -450,7 +450,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 151 → 153 for bsv-low #451 slice C (iv): `tx_any_verdicts.kind` + `.evidence` (two additive ALTERs).
 /// 153 → 155 for bsv-low #468 (2026-09-19): `pot_records.spenderPayASats` + `.spenderPayBSats` (two additive ALTERs).
 /// 155 → 157 for bsv-low #469 (2026-09-19): `owed_rows` + `owed_state` (the owed list, computed on write).
-pub const OVERLAY_MIGRATION_COUNT: usize = 157;
+/// 157 → 160 for bsv-low #469 decision 3 (2026-09-19): `hopsweep_records` + its two indexes (the filed hop sweeps).
+pub const OVERLAY_MIGRATION_COUNT: usize = 160;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1681,6 +1682,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // (`low-app-layer/src/schema.rs`).
     "CREATE TABLE IF NOT EXISTS owed_rows (identity TEXT NOT NULL, outpoint TEXT NOT NULL, family TEXT NOT NULL, gameId TEXT NOT NULL, sats INTEGER, opponentIdentity TEXT, atHeight INTEGER, facts TEXT NOT NULL, updatedAtMs INTEGER NOT NULL, reason TEXT, PRIMARY KEY (identity, outpoint))",
     "CREATE TABLE IF NOT EXISTS owed_state (identity TEXT PRIMARY KEY, computedAtMs INTEGER NOT NULL, tip INTEGER, rows INTEGER NOT NULL, stale INTEGER NOT NULL DEFAULT 0, truncated INTEGER NOT NULL DEFAULT 0)",
+    // bsv-low #469 decision 3 (2026-09-19): THE FILED HOP SWEEPS — the seat's pre-signed sweep of its own funding
+    // hop, filed with the app layer (`POST /record?kind=hopsweep`, verified as the seat's spend of the hop's own
+    // lock) so a stranded hop is claimable from any device; never on chain. Written by the app layer's door, read
+    // by `/owed`; the app layer issues the byte-identical catch-ups (`low-app-layer/src/schema.rs`).
+    "CREATE TABLE IF NOT EXISTS hopsweep_records (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, sweepTxid TEXT NOT NULL, sweepRawHex TEXT NOT NULL, txid TEXT NOT NULL, outputIndex INTEGER NOT NULL, createdAt INTEGER, PRIMARY KEY (txid, outputIndex))",
+    "CREATE INDEX IF NOT EXISTS idx_hopsweep_identity ON hopsweep_records(identity)",
+    "CREATE INDEX IF NOT EXISTS idx_hopsweep_hop ON hopsweep_records(hopTxid, hopVout)",
 ];
 
 // =============================================================================

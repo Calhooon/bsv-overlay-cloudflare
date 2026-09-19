@@ -1,6 +1,13 @@
 //! bsv-low M18-2 (B), the beta window's W-E (2026-09-10): `POST /record?kind=`
 //! — every index marker LOW used to BUY on chain is FILED here instead.
 //!
+//! bsv-low #469 (2026-09-19, the owed list's decision 3): a FIFTH family that
+//! was never bought, `hopsweep` — the seat's pre-signed sweep of its own
+//! funding hop, filed so a stranded hop is claimable from any device. Its
+//! grammar, its bar (the sweep's own input signature under the hop's lock, the
+//! hop's identity-signed marker as the poster binding; no marker signature)
+//! and its table live in `hopsweep.rs`; this door runs the same ladder for it.
+//!
 //! The four bought families (`potparty` v1+v2, `potrefund`, `result`,
 //! `collected`) were "admitted by BYTE FORMAT ONLY, the security lives in the
 //! client verify" (the crate docs): the chain was the DELIVERY mechanism, and
@@ -137,14 +144,20 @@ pub enum RecordKind {
     Potrefund,
     Result,
     Collected,
+    /// bsv-low #469: the seat's pre-signed hop sweep (`hopsweep.rs`); never bought on chain.
+    Hopsweep,
 }
 
+/// The families, as the counters are sized.
+pub const RECORD_KINDS: usize = 5;
+
 impl RecordKind {
-    pub const ALL: [RecordKind; 4] = [
+    pub const ALL: [RecordKind; RECORD_KINDS] = [
         RecordKind::Potparty,
         RecordKind::Potrefund,
         RecordKind::Result,
         RecordKind::Collected,
+        RecordKind::Hopsweep,
     ];
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -152,6 +165,7 @@ impl RecordKind {
             "potrefund" => Some(Self::Potrefund),
             "result" => Some(Self::Result),
             "collected" => Some(Self::Collected),
+            "hopsweep" => Some(Self::Hopsweep),
             _ => None,
         }
     }
@@ -161,6 +175,7 @@ impl RecordKind {
             Self::Potrefund => "potrefund",
             Self::Result => "result",
             Self::Collected => "collected",
+            Self::Hopsweep => "hopsweep",
         }
     }
     fn index(self) -> usize {
@@ -169,6 +184,7 @@ impl RecordKind {
             Self::Potrefund => 1,
             Self::Result => 2,
             Self::Collected => 3,
+            Self::Hopsweep => 4,
         }
     }
 }
@@ -176,11 +192,13 @@ impl RecordKind {
 /// FILED rows one poster may hold per `(family, game, pot)` — the honest
 /// need, never more: `potparty` v1 + v2 share `potparty_records`; a `result`
 /// is the winner's claim and, at most, its countersigned upgrade (a second
-/// content); `potrefund` and `collected` are one row each. A re-file of the
-/// SAME content is never counted against this (the key is excluded).
+/// content); `potrefund` and `collected` are one row each; a `hopsweep` is the
+/// funding device's pre-sign and, at most, a later re-sign (a pre-sign that
+/// timed out, a fresh device's one-signature press — bsv-low #469). A re-file
+/// of the SAME content is never counted against this (the key is excluded).
 pub const fn filed_rows_cap(kind: RecordKind) -> i64 {
     match kind {
-        RecordKind::Potparty | RecordKind::Result => 2,
+        RecordKind::Potparty | RecordKind::Result | RecordKind::Hopsweep => 2,
         RecordKind::Potrefund | RecordKind::Collected => 1,
     }
 }
@@ -220,12 +238,32 @@ pub enum RecordRefusal {
     TooManyFiled,
     /// The poster's filing budget for the day is spent.
     DailyCapReached,
+    /// bsv-low #469: the index holds no hop marker for this outpoint and poster yet (425: the client's outbox re-files).
+    HopNotIndexed,
+    /// bsv-low #469: the hop's marker does not verify under the poster yet (425: the latch, or the replay, decides later).
+    HopMarkerUnverified,
+    /// bsv-low #469: the sweep's first input does not spend the hop the marker names.
+    SweepDoesNotSpendTheHop,
+    /// bsv-low #469: the sweep is not the seat's spend of the hop (`hopsweep::bind_hop_sweep`).
+    SweepNotTheSeatsSpend,
+}
+
+impl From<crate::hopsweep::SweepRefusal> for RecordRefusal {
+    fn from(r: crate::hopsweep::SweepRefusal) -> Self {
+        use crate::hopsweep::SweepRefusal as S;
+        match r {
+            S::HopNotIndexed => Self::HopNotIndexed,
+            S::HopMarkerUnverified => Self::HopMarkerUnverified,
+            S::SweepDoesNotSpendTheHop => Self::SweepDoesNotSpendTheHop,
+            S::SweepNotTheSeatsSpend => Self::SweepNotTheSeatsSpend,
+        }
+    }
 }
 
 impl RecordRefusal {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::BadKind => "kind must be one of potparty | potrefund | result | collected",
+            Self::BadKind => "kind must be one of potparty | potrefund | result | collected | hopsweep",
             Self::BadScriptHex => "scriptHex must be hex",
             Self::BodyTooLarge => "request body too large for a marker",
             Self::ScriptTooLarge => "script too large",
@@ -249,6 +287,12 @@ impl RecordRefusal {
                 "this identity already holds its filed rows for this family, game and pot"
             }
             Self::DailyCapReached => "this identity's filing budget for the day is spent",
+            Self::HopNotIndexed => "the index holds no hop marker for this outpoint and identity yet (file again once the hop is admitted)",
+            Self::HopMarkerUnverified => "the hop's marker does not verify under this identity yet",
+            Self::SweepDoesNotSpendTheHop => "the hop sweep's first input does not spend the hop it names",
+            Self::SweepNotTheSeatsSpend => {
+                "the hop sweep is not the seat's spend of the hop (the unlock must be the seat's canonical signature over the hop's own lock and value, then the seat's settle key)"
+            }
         }
     }
     pub fn status(self) -> u16 {
@@ -259,7 +303,10 @@ impl RecordRefusal {
             Self::TooManyFiled => 409,
             Self::SignatureInvalid
             | Self::RefundDoesNotSpendThePot
-            | Self::RefundNotThePresignedSpend => 422,
+            | Self::RefundNotThePresignedSpend
+            | Self::SweepDoesNotSpendTheHop
+            | Self::SweepNotTheSeatsSpend => 422,
+            Self::HopNotIndexed | Self::HopMarkerUnverified => 425,
             Self::DailyCapReached => 429,
         }
     }
@@ -338,7 +385,7 @@ pub fn canonical_marker_pushes(script: &[u8]) -> Option<Vec<&[u8]>> {
 /// lists collide). Never 64 hex, so no reader can mistake it for a chain
 /// txid. The same marker — however it was pushed, whatever nonce signed it —
 /// files the same key; a different game, pot, seat or claim a different one.
-fn content_key(tag: &[u8], fields: &[&[u8]]) -> String {
+pub(crate) fn content_key(tag: &[u8], fields: &[&[u8]]) -> String {
     let mut pre =
         Vec::with_capacity(16 + tag.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>());
     pre.extend_from_slice(b"LOW/filed/v1\n");
@@ -511,7 +558,7 @@ pub struct PotContext {
 
 /// The data pushes of an unlocking script (any push encoding; nothing but
 /// pushes; the whole script consumed), or `None`.
-fn unlock_pushes(script: &[u8]) -> Option<Vec<&[u8]>> {
+pub(crate) fn unlock_pushes(script: &[u8]) -> Option<Vec<&[u8]>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < script.len() {
@@ -695,6 +742,10 @@ pub enum VerifiedRecord {
     /// The record and its `claim_tier` (1 = the winner's claim, 2 = countersigned).
     Result(ResultRecord, i64),
     Collected(CollectedRecord),
+    /// bsv-low #469: the parsed sweep filing, UNBOUND (the route reads the hop
+    /// row and binds with `hopsweep::bind_hop_sweep` after the parse); only a
+    /// bound one is written.
+    Hopsweep(crate::hopsweep::HopsweepMarker, crate::hopsweep::HopsweepRecord),
 }
 
 impl VerifiedRecord {
@@ -704,6 +755,7 @@ impl VerifiedRecord {
             Self::Potrefund(r, _) => &r.txid,
             Self::Result(r, _) => &r.txid,
             Self::Collected(r) => &r.txid,
+            Self::Hopsweep(_, r) => &r.txid,
         }
     }
     pub fn kind(&self) -> RecordKind {
@@ -712,6 +764,7 @@ impl VerifiedRecord {
             Self::Potrefund(..) => RecordKind::Potrefund,
             Self::Result(..) => RecordKind::Result,
             Self::Collected(_) => RecordKind::Collected,
+            Self::Hopsweep(..) => RecordKind::Hopsweep,
         }
     }
 }
@@ -867,6 +920,18 @@ pub fn verify_record_post(
                 sig_hex: Some(hex::encode(&m.sig)),
             }))
         }
+        RecordKind::Hopsweep => {
+            let m = crate::hopsweep::parse_hopsweep_marker(script).ok_or(RecordRefusal::NotAMarker)?;
+            if hex::encode(&m.identity) != poster_lc {
+                return Err(RecordRefusal::PosterMismatch);
+            }
+            // the cheap first refusal; the bar (the seat's signature over the hop's lock) needs the hop row
+            if !crate::hopsweep::sweep_spends_hop(&m.sweep_raw, &m.hop_txid, m.hop_vout) {
+                return Err(RecordRefusal::SweepDoesNotSpendTheHop);
+            }
+            let record = crate::hopsweep::record_of(&m).ok_or(RecordRefusal::SweepDoesNotSpendTheHop)?;
+            Ok(VerifiedRecord::Hopsweep(m, record))
+        }
     }
 }
 
@@ -988,6 +1053,10 @@ pub fn chain_rows_query(v: &VerifiedRecord) -> (&'static str, Vec<String>) {
             COLLECTED_CHAIN_ROWS_SQL,
             vec![r.identity.clone(), r.game_id.clone()],
         ),
+        VerifiedRecord::Hopsweep(_, r) => (
+            crate::hopsweep::HOPSWEEP_CHAIN_ROWS_SQL,
+            vec![r.identity.clone(), r.game_id.clone(), r.hop_txid.clone()],
+        ),
     }
 }
 
@@ -1044,6 +1113,12 @@ pub fn cap_queries(v: &VerifiedRecord) -> (&'static str, Vec<String>, &'static s
             COLLECTED_FILED_TODAY_SQL,
             r.identity.clone(),
         ),
+        VerifiedRecord::Hopsweep(_, r) => (
+            crate::hopsweep::HOPSWEEP_FILED_ROWS_SQL,
+            vec![r.identity.clone(), r.game_id.clone(), r.hop_txid.clone(), r.txid.clone()],
+            crate::hopsweep::HOPSWEEP_FILED_TODAY_SQL,
+            r.identity.clone(),
+        ),
     }
 }
 
@@ -1060,52 +1135,22 @@ pub fn cap_refusal(kind: RecordKind, rows_for_pot: i64, rows_today: i64) -> Opti
 
 // ── counters (per isolate; a soak/monitoring surface on /health, Rule 13) ──
 
-static FILED_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static REFUSED_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static TOO_MANY_FILED_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static DAILY_CAP_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static ALREADY_INDEXED_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static REFUSED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static TOO_MANY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static DAILY_CAP_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static ALREADY_INDEXED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
 /// Refund backups written at rank 0 (the pot not indexed at filing time).
 static REFUNDS_FILED_UNBOUND: AtomicU64 = AtomicU64::new(0);
 /// Rank-0 refund rows latched to rank 1 by a later re-file.
 static REFUNDS_LATCHED_LATER: AtomicU64 = AtomicU64::new(0);
-static ANONYMOUS_FILED_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static ANONYMOUS_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
 
-fn bump(c: &[AtomicU64; 4], kind: RecordKind) {
+fn bump(c: &[AtomicU64; RECORD_KINDS], kind: RecordKind) {
     c[kind.index()].fetch_add(1, Ordering::Relaxed);
 }
 
-fn by_kind(c: &[AtomicU64; 4]) -> serde_json::Value {
+fn by_kind(c: &[AtomicU64; RECORD_KINDS]) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     for k in RecordKind::ALL {
         m.insert(
@@ -1135,6 +1180,7 @@ pub fn record_health_json() -> serde_json::Value {
             "potrefund": filed_rows_cap(RecordKind::Potrefund),
             "result": filed_rows_cap(RecordKind::Result),
             "collected": filed_rows_cap(RecordKind::Collected),
+            "hopsweep": filed_rows_cap(RecordKind::Hopsweep),
         },
         "filingsPerIdentityPerDay": RECORD_FILINGS_PER_IDENTITY_PER_DAY,
     })
@@ -1225,6 +1271,55 @@ async fn read_pot_context(
     Ok(row.and_then(|r| r.context()))
 }
 
+/// The `hopparty_records` row of ONE hop outpoint for the poster (bsv-low #469; `hopsweep::HOP_CONTEXT_SQL`).
+#[derive(Deserialize)]
+struct HopRowD1 {
+    identity: String,
+    #[serde(rename = "opponentIdentity")]
+    opponent_identity: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "hopVout")]
+    hop_vout: f64,
+    #[serde(rename = "hopSats")]
+    hop_sats: f64,
+    #[serde(rename = "seatSettlePubkey")]
+    seat_settle_pubkey: String,
+    #[serde(rename = "identitySigHex")]
+    identity_sig_hex: String,
+    #[serde(rename = "hopLockHex", default)]
+    hop_lock_hex: Option<String>,
+    #[serde(rename = "hopSatsOnChain", default)]
+    hop_sats_on_chain: Option<f64>,
+    #[serde(rename = "markerValid", default)]
+    marker_valid: Option<f64>,
+}
+
+async fn read_hop_context(
+    db: &worker::D1Database,
+    hop_txid_lc: &str,
+    hop_vout: u32,
+    poster_lc: &str,
+) -> Result<Option<crate::hopsweep::HopContext>> {
+    let row = db
+        .prepare(crate::hopsweep::HOP_CONTEXT_SQL)
+        .bind(&[js(hop_txid_lc), js_num(i64::from(hop_vout)), js(poster_lc)])?
+        .first::<HopRowD1>(None)
+        .await?;
+    Ok(row.map(|r| crate::hopsweep::HopContext {
+        identity: r.identity.to_ascii_lowercase(),
+        opponent_identity: r.opponent_identity.to_ascii_lowercase(),
+        game_id: r.game_id.to_ascii_lowercase(),
+        hop_vout: r.hop_vout as u32,
+        hop_sats: r.hop_sats as u64,
+        seat_settle_pubkey: r.seat_settle_pubkey.to_ascii_lowercase(),
+        identity_sig_hex: r.identity_sig_hex.to_ascii_lowercase(),
+        hop_lock_hex: r.hop_lock_hex.map(|l| l.to_ascii_lowercase()),
+        hop_sats_on_chain: r.hop_sats_on_chain.map(|v| v as u64),
+        marker_valid: r.marker_valid.map(|v| v >= 1.0),
+    }))
+}
+
 async fn count(
     db: &worker::D1Database,
     sql: &str,
@@ -1304,6 +1399,15 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             Ok(v) => v,
             Err(refusal) => return refuse(Some(kind), refusal),
         };
+    }
+    // bsv-low #469: a hop sweep's hop, as the index holds it for THIS poster — read only after the marker parsed and
+    // the poster matched (no free read of a hop a stranger cannot name); the bind is the seat's own signature over
+    // the hop's lock (`hopsweep::bind_hop_sweep`); an unindexed hop is 425 (the client's outbox re-files).
+    if let VerifiedRecord::Hopsweep(m, r) = &verified {
+        let hop = read_hop_context(&db, &r.hop_txid, r.hop_vout, &identity).await?;
+        if let Err(refusal) = crate::hopsweep::bind_hop_sweep(m, hop.as_ref()) {
+            return refuse(Some(kind), refusal.into());
+        }
     }
     // The overlay stamps every one of these tables in unix SECONDS.
     let now = (worker::Date::now().as_millis() / 1000) as i64;
@@ -1475,6 +1579,22 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                 .run()
                 .await?;
         }
+        VerifiedRecord::Hopsweep(_, r) => {
+            db.prepare(crate::hopsweep::HOPSWEEP_FILE_SQL)
+                .bind(&[
+                    js(&r.identity),
+                    js(&r.game_id),
+                    js(&r.hop_txid),
+                    js_num(i64::from(r.hop_vout)),
+                    js(&r.sweep_txid),
+                    js(&r.sweep_raw_hex),
+                    js(&r.txid),
+                    js_num(0),
+                    js_num(now),
+                ])?
+                .run()
+                .await?;
+        }
     }
     // bsv-low #469: a filing changes what is owed (a refund backup makes a gate-open pot claimable for BOTH seats; a
     // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
@@ -1486,6 +1606,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             VerifiedRecord::Potparty(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
             VerifiedRecord::Potrefund(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
             VerifiedRecord::Collected(r) => (Some(r.identity.to_ascii_lowercase()), None),
+            VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
             VerifiedRecord::Result(..) => (None, None),
         };
         if let Some((pot_txid, pot_vout)) = &pot {
@@ -1784,6 +1905,57 @@ mod tests {
             raw,
             &sig,
         ])
+    }
+
+    #[test]
+    fn the_hop_sweep_family_walks_the_same_door_the_kind_the_poster_and_the_cheap_spend_check() {
+        // bsv-low #469 decision 3: the fifth family through the one ladder (the bar itself is `hopsweep::bind_hop_sweep`)
+        assert_eq!(RecordKind::parse("hopsweep"), Some(RecordKind::Hopsweep));
+        assert_eq!(RecordKind::Hopsweep.as_str(), "hopsweep");
+        assert_eq!(RecordKind::ALL.len(), RECORD_KINDS);
+        assert_eq!(filed_rows_cap(RecordKind::Hopsweep), 2);
+        let w = wallet(0x31);
+        let id = identity(&w);
+        let hop = [0x51u8; 32];
+        let raw = junk_refund_raw(&hop, 0); // input 0 spends hop:0 — the cheap check passes; the bind judges the bytes
+        let s = script(&[b"LOW/hopsweep/v1", &id, &[0x11; 32], &hop, &0u32.to_le_bytes(), &raw]);
+        match verify_record_post(RecordKind::Hopsweep, &s, &hex::encode(&id)) {
+            Ok(VerifiedRecord::Hopsweep(m, r)) => {
+                assert_eq!(m.hop_vout, 0);
+                assert_eq!(r.hop_txid, hex::encode(hop));
+                assert!(r.txid.starts_with("filed:"));
+                assert_eq!(r.txid, crate::hopsweep::hopsweep_content_key(&m));
+                assert_eq!(r.sweep_raw_hex, hex::encode(&raw));
+            }
+            other => panic!("expected a parsed sweep filing, got {other:?}"),
+        }
+        assert_eq!(
+            verify_record_post(RecordKind::Hopsweep, &s, &hex::encode(identity(&wallet(0x32)))).unwrap_err(),
+            RecordRefusal::PosterMismatch
+        );
+        let other_vout = script(&[b"LOW/hopsweep/v1", &id, &[0x11; 32], &hop, &1u32.to_le_bytes(), &raw]);
+        assert_eq!(
+            verify_record_post(RecordKind::Hopsweep, &other_vout, &hex::encode(&id)).unwrap_err(),
+            RecordRefusal::SweepDoesNotSpendTheHop
+        );
+        let five = script(&[b"LOW/hopsweep/v1", &id, &[0x11; 32], &hop, &raw]);
+        assert_eq!(verify_record_post(RecordKind::Hopsweep, &five, &hex::encode(&id)).unwrap_err(), RecordRefusal::NotAMarker);
+        // the ladder's shapes name the hop
+        let v = verify_record_post(RecordKind::Hopsweep, &s, &hex::encode(&id)).unwrap();
+        let (rows_sql, binds, day_sql, day_id) = cap_queries(&v);
+        assert!(rows_sql.contains("hopsweep_records") && day_sql.contains("hopsweep_records"));
+        assert_eq!((binds.len(), binds[2].as_str(), day_id.as_str()), (4, hex::encode(hop).as_str(), hex::encode(&id).as_str()));
+        let (chain_sql, chain_binds) = chain_rows_query(&v);
+        assert!(chain_sql.contains("hopsweep_records") && chain_binds.len() == 3);
+        assert_eq!(cap_refusal(RecordKind::Hopsweep, 2, 0), Some(RecordRefusal::TooManyFiled));
+        assert_eq!(cap_refusal(RecordKind::Hopsweep, 1, 0), None);
+        // the statuses: 425 for the two not-yet classes (the client's outbox re-files), 422 for the two judged ones
+        assert_eq!(RecordRefusal::HopNotIndexed.status(), 425);
+        assert_eq!(RecordRefusal::HopMarkerUnverified.status(), 425);
+        assert_eq!(RecordRefusal::SweepDoesNotSpendTheHop.status(), 422);
+        assert_eq!(RecordRefusal::SweepNotTheSeatsSpend.status(), 422);
+        assert_eq!(record_health_json()["filedRowsCap"]["hopsweep"], 2);
+        assert!(record_health_json()["filedByKind"]["hopsweep"].is_number());
     }
 
     #[test]

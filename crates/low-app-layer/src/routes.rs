@@ -2631,7 +2631,9 @@ pub(crate) async fn owed_recompute(
         let candidates: Vec<(String, u32)> = hops
             .iter()
             .filter(|h| {
-                h.status == crate::hops_view::HopStatus::Unspent
+                // the index's Unspent, and its Unknown without a recorded spend (the container never indexed: the
+                // chain rung is the only word there is) — the same set the derivation judges by the chain
+                (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
                     && h.marker_verified == crate::hops_view::MarkerVerification::Verified
                     && h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS)
             })
@@ -2644,7 +2646,7 @@ pub(crate) async fn owed_recompute(
                 if let Some(s) = p.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
-                hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, stale: false });
+                hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, spent_confirmed: p.spent_confirmed, stale: false });
             }
             let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
             let mut probed = 0usize;
@@ -2655,7 +2657,7 @@ pub(crate) async fn owed_recompute(
                         if let Some(s) = m.spending_txid.as_deref() {
                             chain_spenders.push(s.to_ascii_lowercase());
                         }
-                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), stale: true });
+                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), spent_confirmed: m.spent_confirmed, stale: true });
                     }
                     continue;
                 }
@@ -2668,10 +2670,49 @@ pub(crate) async fn owed_recompute(
                 if let Some(s) = row.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
-                hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, stale: false });
+                hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed, stale: false });
             }
             if !fresh.is_empty() {
                 write_probe_memos(db, &fresh).await;
+            }
+        }
+    }
+
+    // 4c. the FILED hop sweeps of this identity (bsv-low #469 decision 3): the press's bytes for a stranded hop, and
+    //     the word that a hop spent by ITS OWN sweep is a payout (the sweep's credit). The newest per hop outpoint.
+    //     A read fault is counted and leaves the map empty (a stranded hop still offers the press, signed on the
+    //     owning device; a swept hop reads "could not judge" this pass — the safe direction).
+    let mut hop_sweeps: HashMap<String, crate::hopsweep::FiledHopSweep> = HashMap::new();
+    {
+        #[derive(Deserialize)]
+        struct SweepRowD1 {
+            #[serde(rename = "hopTxid")]
+            hop_txid: String,
+            #[serde(rename = "hopVout")]
+            hop_vout: f64,
+            #[serde(rename = "sweepTxid")]
+            sweep_txid: String,
+            #[serde(rename = "sweepRawHex")]
+            sweep_raw_hex: String,
+        }
+        let rows = match db.prepare(crate::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL).bind(&[JsValue::from_str(identity_lc)]) {
+            Ok(stmt) => stmt.all().await.and_then(|r| r.results::<SweepRowD1>()),
+            Err(e) => Err(e),
+        };
+        match rows {
+            Ok(rows) => {
+                for r in rows {
+                    let key = outpoint_key(&r.hop_txid, r.hop_vout as u32);
+                    hop_sweeps.entry(key).or_insert_with(|| crate::hopsweep::FiledHopSweep {
+                        sweep_txid: r.sweep_txid.to_ascii_lowercase(),
+                        raw_hex: r.sweep_raw_hex.to_ascii_lowercase(),
+                        pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
+                    });
+                }
+            }
+            Err(e) => {
+                crate::owed::note_hop_sweeps_read_fault();
+                console_warn!("[owed] hop-sweeps read failed (no filed sweep served this pass): {e}");
             }
         }
     }
@@ -2773,6 +2814,7 @@ pub(crate) async fn owed_recompute(
         pot_spenders: &pot_spenders,
         pot_spenders_faulted,
         hop_chain: &hop_chain,
+        hop_sweeps: &hop_sweeps,
     });
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {

@@ -115,6 +115,13 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "OWED_STALE_FOR_POT_SQL", low_app_layer::owed::OWED_STALE_FOR_POT_SQL);
     assert_prepares(&conn, "OWED_STALE_FOR_IDENTITY_SQL", low_app_layer::owed::OWED_STALE_FOR_IDENTITY_SQL);
     assert_prepares(&conn, "OWED_IDENTITY_PROBE_SQL", low_app_layer::owed::OWED_IDENTITY_PROBE_SQL);
+    // bsv-low #469 decision 3: the filed hop sweeps (migrations 158 to 160)
+    assert_prepares(&conn, "HOPSWEEP_FILE_SQL", low_app_layer::hopsweep::HOPSWEEP_FILE_SQL);
+    assert_prepares(&conn, "HOPSWEEP_FILED_ROWS_SQL", low_app_layer::hopsweep::HOPSWEEP_FILED_ROWS_SQL);
+    assert_prepares(&conn, "HOPSWEEP_FILED_TODAY_SQL", low_app_layer::hopsweep::HOPSWEEP_FILED_TODAY_SQL);
+    assert_prepares(&conn, "HOPSWEEP_CHAIN_ROWS_SQL", low_app_layer::hopsweep::HOPSWEEP_CHAIN_ROWS_SQL);
+    assert_prepares(&conn, "HOP_CONTEXT_SQL", low_app_layer::hopsweep::HOP_CONTEXT_SQL);
+    assert_prepares(&conn, "HOPSWEEPS_FOR_IDENTITY_SQL", low_app_layer::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL);
     assert_prepares(&conn, "lb_row_file_sql", lb_row_file_sql());
     // The filing caps (bsv-low M18-2 B, the gate's HIGH-2/MED-4): FILED rows
     // per (poster, family, game, pot) and per (poster, family, day).

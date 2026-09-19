@@ -136,6 +136,7 @@ pub mod internal_events;
 pub mod lane_attest;
 pub mod live_view;
 pub mod logic;
+pub mod hopsweep;
 pub mod owed;
 pub mod proof_post;
 pub mod record_post;

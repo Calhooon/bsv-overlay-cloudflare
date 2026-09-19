@@ -128,6 +128,8 @@ pub struct HopChainWord {
     pub looked: bool,
     pub spent: Option<bool>,
     pub spending_txid: Option<String>,
+    /// The spender's confirmation, when the rung said (a swept hop's payout is claimable only once its sweep mined).
+    pub spent_confirmed: Option<bool>,
     /// The word is a memo older than the fresh window (this recompute's probe budget was spent): still the last
     /// thing the chain said, named as stale.
     pub stale: bool,
@@ -163,6 +165,9 @@ pub struct OwedInputs<'a> {
     pub pot_spenders_faulted: bool,
     /// hop outpoint (`txid:vout`) → the chain rung's word, for the index-unspent hops past the stranded window.
     pub hop_chain: &'a HashMap<String, HopChainWord>,
+    /// hop outpoint (`txid:vout`) → the newest FILED sweep of this identity for that hop (bsv-low #469 decision 3):
+    /// the press's bytes for a stranded hop; a hop spent by that very sweep is a `payout` row (the sweep's credit).
+    pub hop_sweeps: &'a HashMap<String, crate::hopsweep::FiledHopSweep>,
 }
 
 pub fn outpoint_key(txid: &str, vout: u32) -> String {
@@ -205,6 +210,21 @@ fn my_settle_sats(e: &ResultEntry) -> Option<u64> {
     }
 }
 
+/// The hop is spent by the sweep THIS identity filed — the index's spender, else the chain rung's word: `Some((the
+/// filing, confirmed))`, the payout's claimability being the spend's confirmation from the source that named it.
+fn swept_by_own_filing<'a>(i: &'a OwedInputs<'a>, h: &HopEntry) -> Option<(&'a crate::hopsweep::FiledHopSweep, bool)> {
+    let outpoint = outpoint_key(&h.hop_txid, h.hop_vout);
+    let filed = i.hop_sweeps.get(&outpoint)?;
+    if h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)) {
+        return Some((filed, h.spent_confirmed == Some(true)));
+    }
+    let w = i.hop_chain.get(&outpoint)?;
+    if w.looked && w.spent == Some(true) && w.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)) {
+        return Some((filed, w.spent_confirmed == Some(true)));
+    }
+    None
+}
+
 /// THE DERIVATION. Pure; one row per outpoint; the families exclusive by the
 /// pot's spend state (spent → payout / unbound; unspent → refund-due /
 /// in-progress / unbound; a hop outpoint → hop-stranded).
@@ -219,6 +239,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
     for e in i.results {
         if e.spent == Some(true) && e.verdict.is_some() && matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund) {
             *payout_candidates_by_game.entry(e.game_id.to_ascii_lowercase()).or_insert(0) += 1;
+        }
+    }
+    // a hop spent by ITS OWN filed sweep is a payout candidate of the game too (the sweep's credit): the one
+    // `collected` marker of a game whose stake came back by a sweep AND whose pot paid keeps both rows
+    for h in i.hops {
+        if swept_by_own_filing(i, h).is_some() {
+            *payout_candidates_by_game.entry(h.game_id.to_ascii_lowercase()).or_insert(0) += 1;
         }
     }
 
@@ -418,9 +445,96 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             "statusSource": h.status_source,
             "markerVerified": h.marker_verified.as_str(),
             "markerCreatedAtMs": h.marker_created_at,
+            // the key that owns the hop (the marker's claim): a device without the filing signs its own sweep
+            // against it (`owedPress.buildHopSweepForRow`), matching the key it derives
+            "seatSettlePubkey": h.seat_settle_pubkey,
         });
+        // THE SWEPT HOP (bsv-low #469 decision 3): the hop is spent by the sweep this identity FILED — the index's
+        // spender, or the chain rung's — so the stake is at the seat's own home, uncollected: a `payout` row whose
+        // credit is the sweep (`/credit-beef/<sweepTxid>`), claimable once the sweep mined; retired by `collected`
+        // like every payout (one candidate per game, N10 above).
+        if let Some((filed, confirmed)) = swept_by_own_filing(i, h) {
+            let verified_collected = i.collected_verified.contains(&game);
+            if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1 {
+                continue;
+            }
+            let mut facts = facts_base.clone();
+            facts["claim"] = json!("internalize");
+            facts["claimable"] = json!(confirmed);
+            if !confirmed {
+                facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
+            }
+            facts["outcome"] = json!("hop-sweep");
+            facts["sweepTxid"] = json!(filed.sweep_txid);
+            facts["sweepRawHex"] = json!(filed.raw_hex);
+            facts["sweepSource"] = json!("hopsweep-filing");
+            facts["creditBeef"] = json!(format!("/credit-beef/{}", filed.sweep_txid));
+            facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
+            facts["collectedSigVerified"] = json!(verified_collected);
+            rows.push(OwedRow {
+                identity: me.clone(),
+                outpoint,
+                family: OwedFamily::Payout,
+                game_id: game,
+                sats: filed.pays_sats,
+                opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                at_height: None,
+                facts,
+                reason: None,
+            });
+            continue;
+        }
         match h.status {
-            HopStatus::Unspent => {
+            HopStatus::Spent => {
+                let spender = h.spending_txid.as_deref().map(str::to_ascii_lowercase);
+                let by_pot = spender.as_deref().is_some_and(|s| i.pot_spenders.contains(s));
+                if by_pot {
+                    continue; // the JOIN took it: the pot's own row tells the story
+                }
+                // MEDIUM-7: a spender ABSENT from the index is not evidence of a wallet spend (an unindexed or
+                // evicted JOIN is the common honest case); without positive evidence the brain says it could not
+                // judge, never a custody story. The positive classification from the spender's own bytes (every
+                // output P2PKH = our own sweep) is a step-4 addition beside the client's `spenderShapeKind`.
+                let mut facts = facts_base.clone();
+                facts["claim"] = Value::Null;
+                let reason = if i.pot_spenders_faulted {
+                    "could not check the hop's spender against the index this pass (a read faulted)"
+                } else {
+                    "the hop's spender is not in the index (an unindexed join, or a spend outside the game): could not judge"
+                };
+                rows.push(OwedRow {
+                    identity: me.clone(),
+                    outpoint,
+                    family: OwedFamily::Unbound,
+                    game_id: game,
+                    sats: Some(h.hop_sats),
+                    opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                    at_height: None,
+                    facts,
+                    reason: Some(reason.to_string()),
+                });
+            }
+            HopStatus::Unknown if h.spent == Some(true) => {
+                // MEDIUM-10: "could not judge" is a SENTENCE — a recorded spend the network has not confirmed. (The
+                // other case the view folds into Unknown, a container the index never listed, is judged by the chain
+                // rung below: the sats are almost certainly still there — the loudest stranded case.)
+                let mut facts = facts_base.clone();
+                facts["claim"] = Value::Null;
+                rows.push(OwedRow {
+                    identity: me.clone(),
+                    outpoint,
+                    family: OwedFamily::Unbound,
+                    game_id: game,
+                    sats: Some(h.hop_sats),
+                    opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                    at_height: None,
+                    facts,
+                    reason: Some("the hop's spend is recorded but not confirmed: the outcome is not established yet".to_string()),
+                });
+            }
+            // The stranded judgment: the index's Unspent, and the index's Unknown WITHOUT a recorded spend (the hop's
+            // container never indexed: the chain rung is the only word there is), share one ladder.
+            HopStatus::Unspent | HopStatus::Unknown => {
                 let age_ms = h.marker_created_at.map(|c| i.now_ms.saturating_sub(c));
                 let stranded = age_ms.is_some_and(|a| a >= HOP_STRANDED_AFTER_MS);
                 if !stranded {
@@ -462,6 +576,18 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
                         facts["chainProbe"] = json!(if w.stale { "unspent-stale" } else { "unspent" });
+                        // the FILED sweep rides the row when this identity filed one (any device presses it as it
+                        // is); without one the press signs a sweep on the device that owns the key
+                        match i.hop_sweeps.get(&outpoint) {
+                            Some(f) => {
+                                facts["sweepRawHex"] = json!(f.raw_hex);
+                                facts["sweepTxid"] = json!(f.sweep_txid);
+                                facts["sweepSource"] = json!("hopsweep-filing");
+                            }
+                            None => {
+                                facts["sweepSource"] = json!("sign-here");
+                            }
+                        }
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -500,6 +626,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     _ => {
                         facts["claim"] = Value::Null;
                         facts["chainProbe"] = json!("pending");
+                        let reason = if h.status == HopStatus::Unknown {
+                            "the hop's outpoint is not in the index (the funding never reached it, or it was evicted): the sats are likely still there; the sweep waits for the chain rung's word"
+                        } else {
+                            "the index says the hop is unspent; the chain rung has not corroborated it yet (the sweep waits for its word)"
+                        };
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -509,65 +640,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: Some(
-                                "the index says the hop is unspent; the chain rung has not corroborated it yet (the sweep waits for its word)"
-                                    .to_string(),
-                            ),
+                            reason: Some(reason.to_string()),
                         });
                     }
                 }
-            }
-            HopStatus::Spent => {
-                let spender = h.spending_txid.as_deref().map(str::to_ascii_lowercase);
-                let by_pot = spender.as_deref().is_some_and(|s| i.pot_spenders.contains(s));
-                if by_pot {
-                    continue; // the JOIN took it: the pot's own row tells the story
-                }
-                // MEDIUM-7: a spender ABSENT from the index is not evidence of a wallet spend (an unindexed or
-                // evicted JOIN is the common honest case); without positive evidence the brain says it could not
-                // judge, never a custody story. The positive classification from the spender's own bytes (every
-                // output P2PKH = our own sweep) is a step-4 addition beside the client's `spenderShapeKind`.
-                let mut facts = facts_base.clone();
-                facts["claim"] = Value::Null;
-                let reason = if i.pot_spenders_faulted {
-                    "could not check the hop's spender against the index this pass (a read faulted)"
-                } else {
-                    "the hop's spender is not in the index (an unindexed join, or a spend outside the game): could not judge"
-                };
-                rows.push(OwedRow {
-                    identity: me.clone(),
-                    outpoint,
-                    family: OwedFamily::Unbound,
-                    game_id: game,
-                    sats: Some(h.hop_sats),
-                    opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
-                    at_height: None,
-                    facts,
-                    reason: Some(reason.to_string()),
-                });
-            }
-            HopStatus::Unknown => {
-                // MEDIUM-10: "could not judge" is a SENTENCE. Two cases the view folds into Unknown: the hop's
-                // container never indexed (the sats are almost certainly still there — the loudest stranded case) and
-                // a recorded spend the network has not confirmed.
-                let mut facts = facts_base.clone();
-                facts["claim"] = Value::Null;
-                let reason = if h.spent == Some(true) {
-                    "the hop's spend is recorded but not confirmed: the outcome is not established yet"
-                } else {
-                    "the hop's outpoint is not in the index (the funding never reached it, or it was evicted): the sats are likely still there; the sweep needs the index's word"
-                };
-                rows.push(OwedRow {
-                    identity: me.clone(),
-                    outpoint,
-                    family: OwedFamily::Unbound,
-                    game_id: game,
-                    sats: Some(h.hop_sats),
-                    opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
-                    at_height: None,
-                    facts,
-                    reason: Some(reason.to_string()),
-                });
             }
         }
     }
@@ -703,11 +779,15 @@ static ROWS_BY_FAMILY: [AtomicU64; 5] = [
 static RECOMPUTE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static COLLECTED_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static POT_SPENDERS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+static HOP_SWEEPS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_collected_read_fault() {
     COLLECTED_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
 pub fn note_pot_spenders_read_fault() {
     POT_SPENDERS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn note_hop_sweeps_read_fault() {
+    HOP_SWEEPS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
@@ -738,6 +818,7 @@ pub fn owed_health_json() -> Value {
         "recomputeFaults": RECOMPUTE_FAULTS.load(Ordering::Relaxed),
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
+        "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "hopStrandedAfterMs": HOP_STRANDED_AFTER_MS,
         "recomputeOpenAfterMs": OWED_RECOMPUTE_OPEN_AFTER_MS,
         "recomputeAnyAfterMs": OWED_RECOMPUTE_ANY_AFTER_MS,
@@ -830,12 +911,22 @@ mod tests {
             pot_spenders: pots,
             pot_spenders_faulted: false,
             hop_chain: &NO_CHAIN,
+            hop_sweeps: &NO_SWEEPS,
         }
     }
     static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> = std::sync::LazyLock::new(HashMap::new);
+    static NO_SWEEPS: std::sync::LazyLock<HashMap<String, crate::hopsweep::FiledHopSweep>> = std::sync::LazyLock::new(HashMap::new);
     fn chain(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>) -> HashMap<String, HopChainWord> {
+        chain_confirmed(outpoint, looked, spent, spender, None)
+    }
+    fn chain_confirmed(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>) -> HashMap<String, HopChainWord> {
         let mut m = HashMap::new();
-        m.insert(outpoint.to_string(), HopChainWord { looked, spent, spending_txid: spender.map(str::to_string), stale: false });
+        m.insert(outpoint.to_string(), HopChainWord { looked, spent, spending_txid: spender.map(str::to_string), spent_confirmed, stale: false });
+        m
+    }
+    fn filed(outpoint: &str, sweep_txid: &str) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
+        let mut m = HashMap::new();
+        m.insert(outpoint.to_string(), crate::hopsweep::FiledHopSweep { sweep_txid: sweep_txid.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000) });
         m
     }
 
@@ -1105,6 +1196,116 @@ mod tests {
         let rows = derive_owed_rows(&inputs(&[], &[], std::slice::from_ref(&pending), &v, &c, &p, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("not verified yet"));
+    }
+
+    #[test]
+    fn a_hop_spent_by_its_own_filed_sweep_is_a_payout_row_claimable_once_the_sweep_mined() {
+        // decision 3: the index names my filed sweep as the hop's spender — a payout of the sweep's credit
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        spent.spent_confirmed = Some(false);
+        let hops = [spent];
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(rows[0].facts["claim"], "internalize");
+        assert_eq!(rows[0].facts["claimable"], false, "the sweep is seen, not mined: the credit lands with the block");
+        assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        assert_eq!(rows[0].facts["outcome"], "hop-sweep");
+        assert_eq!(rows[0].facts["sweepTxid"], sweep);
+        assert_eq!(rows[0].facts["creditBeef"], format!("/credit-beef/{sweep}"));
+        assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
+        // mined: claimable
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimable"], true);
+        // the CHAIN rung naming my sweep on an index-unspent hop is the same payout (a sweep broadcast direct to ARC)
+        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        i.hop_chain = &by_chain;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)));
+        // a spender that is NOT my filing (another tx) stays could-not-judge, as before
+        let other = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
+        let mut i = inputs(&[], &[], &other, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+    }
+
+    #[test]
+    fn a_stranded_hop_carries_its_filed_sweep_or_says_sign_here_and_an_unindexed_hop_is_judged_by_the_chain_too() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let unspent = chain(&key, true, Some(false), None);
+        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        // without a filing: the press signs on the owning device
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &unspent;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["sweepSource"], "sign-here");
+        assert!(rows[0].facts["sweepRawHex"].is_null());
+        assert!(rows[0].facts["seatSettlePubkey"].is_string(), "the key the owning device matches its derivation against");
+        // with a filing: the bytes ride the row
+        let sweeps = filed(&key, &tx(0x0c));
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &unspent;
+        i.hop_sweeps = &sweeps;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
+        assert_eq!(rows[0].facts["sweepTxid"], tx(0x0c));
+        assert_eq!(rows[0].facts["sweepRawHex"], "0100".repeat(20));
+        // an UNKNOWN hop (the container never indexed) past the window with the chain's unspent: the same claim
+        let mut unknown = hop(HopStatus::Unknown, None, Some(HOP_STRANDED_AFTER_MS + 1));
+        unknown.spent = None;
+        let hops = [unknown];
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &unspent;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].facts["claim"].as_str()), (OwedFamily::HopStranded, Some("sweep-hop")));
+        // …and without a chain word it is the sentence naming the missing index row
+        let mut unknown = hop(HopStatus::Unknown, None, Some(HOP_STRANDED_AFTER_MS + 1));
+        unknown.spent = None;
+        let hops = [unknown];
+        let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert!(rows[0].reason.as_deref().unwrap().contains("not in the index"));
+        // a recorded-but-unconfirmed spend on an Unknown hop keeps its own sentence
+        let mut recorded = hop(HopStatus::Unknown, Some(&tx(0x09)), Some(HOP_STRANDED_AFTER_MS + 1));
+        recorded.spent = Some(true);
+        let hops = [recorded];
+        let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
+        assert!(rows[0].reason.as_deref().unwrap().contains("recorded but not confirmed"));
+    }
+
+    #[test]
+    fn one_collected_marker_retires_a_swept_hops_payout_when_it_is_the_games_only_candidate() {
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let verified: HashSet<String> = [tx(0x01)].into_iter().collect();
+        let mut i = inputs(&[], &[], &hops, &v, &verified, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        assert!(derive_owed_rows(&i).is_empty(), "collected: the sweep's credit is in the wallet");
+        // the same game ALSO has a paid pot: two candidates, the marker cannot say which; both rows stay
+        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let mut i = inputs(&paid, &[], &hops, &v, &verified, &no_pots, Some(900_200));
+        i.hop_sweeps = &sweeps;
+        assert_eq!(derive_owed_rows(&i).len(), 2);
     }
 
     #[test]
