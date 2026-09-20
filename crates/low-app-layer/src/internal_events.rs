@@ -746,6 +746,32 @@ mod tests {
     /// it; the beta log read "has no attributed seats yet, nothing to file"
     /// for both JOINs). To red: move the push below `attribute_seats(` or
     /// delete it.
+    /// Fleet loop 15 (2026-09-20, pair 1's refundLandedVerify): a pot whose seats never filed their party
+    /// markers (both tabs killed at the funding) has owed rows for the identities the refund-backup and hop
+    /// markers name; its CONFIRM event reached the "no attributed seats" branch, filed nothing and marked
+    /// nobody stale, so the rows said "wait for a block" for a spend that had confirmed. The branch now marks
+    /// the marker-named identities stale and queues their re-derivation, like the no-decoded-params branch.
+    /// To red: drop `owed_identities_by_marker` / `owed_mark_stale` from that branch.
+    #[test]
+    fn internal_pot_changed_marks_the_marker_named_identities_stale_when_no_seat_is_attributed() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let start = routes
+            .find(&squash("pub(crate) async fn internal_pot_changed("))
+            .expect("the handler");
+        let handler = &routes[start..];
+        let branch = handler
+            .find(&squash("if identities.is_empty() {"))
+            .expect("the no-attributed-seats branch");
+        let body = &handler[branch..];
+        let end = body.find(&squash("continue;")).expect("the branch ends with continue");
+        let body = &body[..end];
+        let named = body.find(&squash("owed_identities_by_marker(&db, &txid, vout)")).expect("the marker-named identities are read");
+        let stale = body.find(&squash("owed_mark_stale(")).expect("and marked stale");
+        let queued = body.find(&squash("owed_identities.push(id)")).expect("and queued for the after-answer re-derivation");
+        assert!(named < stale && stale < queued, "read, mark stale, queue — in that order");
+    }
+
     #[test]
     fn internal_pot_changed_announces_every_outpoint_before_attribution() {
         // Scanned WITHOUT whitespace: rustfmt reflows a call across lines

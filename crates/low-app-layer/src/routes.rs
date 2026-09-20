@@ -2314,8 +2314,22 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
             .map(|s| s.to_ascii_lowercase())
             .collect();
         if identities.is_empty() {
+            // fleet loop 15 (2026-09-20, pair 1's refundLandedVerify): a pot whose seats never filed their party
+            // markers (both tabs killed at the funding, the arm-and-verify unit) still has OWED ROWS for the
+            // identities the refund-backup and hop markers name — and its confirm event reached this branch,
+            // filed nothing, and marked nobody stale, so the rows kept saying "wait for a block" for a spend
+            // that had confirmed. The marker-named identities are marked stale and re-derived after the answer,
+            // exactly as the no-decoded-params branch above does.
+            let named = owed_identities_by_marker(&db, &txid, vout).await;
+            let named_n = named.len();
+            for id in named {
+                owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(&id)], "pot-changed (unattributed, by marker)").await;
+                if !owed_identities.contains(&id) {
+                    owed_identities.push(id);
+                }
+            }
             worker::console_log!(
-                "[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file"
+                "[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file ({named_n} seat(s) marked stale by marker)"
             );
 
             skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file") }));
