@@ -912,41 +912,54 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
             | crate::broadcaster::WitnessLook::Unknown => {}
         }
     }
-    let name = if matches!(last, crate::broadcaster::WitnessLook::Orphan(_)) {
-        crate::ops::COUNTER_SUBMIT_PENDING_ORPHAN
-    } else {
-        crate::ops::COUNTER_SUBMIT_PENDING_SILENT
-    };
-    crate::ops::bump_counter(&db, name, 1).await;
-    worker::console_log!(
-        "[admit-fast] {txid} unwitnessed after the pending watch ({last:?}) — the callbacks, the completion and the reconcile passes own it"
-    );
     // fleet loop 15 (2026-09-20, pair 1's refund): a spend that MINED before this index ever saw it — the tower
     // parked it at arm time through TAAL, the node promoted it at H, the client re-presented it after the block —
     // gets Arcade's STORED ECHO (ACCEPTED_BY_NETWORK, never MINED: its status froze at the first presentation)
     // and no callback (already known: none registered), so nothing ever pushes its proof; the 30-minute backstop
     // pass was the only path, and every consumer (the owed row, the felt) waited on a block that had come. The
-    // watch's end runs the single-spend completion NOW: the courier proof ladder, chaintracks-verified, the
-    // guarded CAS — bounded to this one txid.
-    match confirm_spend_now(&env, db.clone(), &txid).await {
+    // watch's end runs the single-spend completion NOW: ONE indexed read names the pots this txid spends
+    // unconfirmed (a JOIN, a funding, a marker: nothing to do, no courier asked); for a recorded spender, the
+    // EXHAUSTIVE proof ladder (Arcade's frozen word must not stop it), chaintracks-verified, the pass's guarded
+    // CAS, the push — once per txid per isolate-minute (a re-present flood of a known spender is not a courier
+    // amplifier). The couriers are asked only when the txid IS a recorded unconfirmed spender.
+    let confirmed_now = match confirm_spend_now(&env, db.clone(), &txid).await {
         ConfirmNow::Confirmed {
             rows,
             cas_missed,
+            cas_faults,
             height,
         } => {
-            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRMED_NOW, 1)
-                .await;
+            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRMED_NOW, 1).await;
             crate::pot_changes::flush_inline(env.env.clone()).await;
             worker::console_log!(
-                "[admit-fast] {txid} CONFIRMED by the watch's own proof read (height {height:?}; {rows} row(s), {cas_missed} CAS miss(es)) — the block had come before the index saw the spend"
+                "[admit-fast] {txid} CONFIRMED by the watch's own proof read (height {height:?}; {rows} row(s), {cas_missed} CAS miss(es), {cas_faults} CAS fault(s)) — the block had come before the index saw the spend"
             );
+            true
         }
-        ConfirmNow::Unmined | ConfirmNow::NoUnconfirmedSpend => {}
+        ConfirmNow::Unmined => {
+            worker::console_log!(
+                "[admit-fast] {txid} the watch's proof read: no verified proof yet (unmined so far) — the passes own it"
+            );
+            false
+        }
+        ConfirmNow::NoUnconfirmedSpend | ConfirmNow::Memoised => false,
         ConfirmNow::Fault(why) => {
             worker::console_log!(
                 "[admit-fast] {txid} the watch's proof read faulted ({why}) — the passes own it"
             );
+            false
         }
+    };
+    if !confirmed_now {
+        let name = if matches!(last, crate::broadcaster::WitnessLook::Orphan(_)) {
+            crate::ops::COUNTER_SUBMIT_PENDING_ORPHAN
+        } else {
+            crate::ops::COUNTER_SUBMIT_PENDING_SILENT
+        };
+        crate::ops::bump_counter(&db, name, 1).await;
+        worker::console_log!(
+            "[admit-fast] {txid} unwitnessed after the pending watch ({last:?}) — the callbacks, the completion and the reconcile passes own it"
+        );
     }
 }
 
@@ -955,12 +968,17 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
 pub enum ConfirmNow {
     /// no pot names this txid as an unconfirmed spender (nothing to confirm)
     NoUnconfirmedSpend,
+    /// the couriers were asked for this txid inside the last minute on this isolate (a re-present flood of a
+    /// known spender is not a courier amplifier); the passes own it
+    Memoised,
     /// the couriers hold no chaintracks-verified proof yet (honestly unmined so far)
     Unmined,
-    /// a verified proof: the rows' confirmations latched through the guarded CAS
+    /// a verified proof: the rows' confirmations latched through the guarded CAS (a CAS read fault on one row is
+    /// counted in `cas_faults` and the loop continues — the cron's shape; the rows that confirmed stay confirmed)
     Confirmed {
         rows: usize,
         cas_missed: usize,
+        cas_faults: usize,
         height: Option<u64>,
     },
     /// a read fault (a courier, chaintracks, or the store): retryable, never a verdict
@@ -983,7 +1001,9 @@ pub async fn confirm_spend_now_with(
     if rows.is_empty() {
         return ConfirmNow::NoUnconfirmedSpend;
     }
-    let bump_hex = match fetcher.verified_proof_for_detailed(txid).await {
+    // EXHAUSTIVE: Arcade's word for this txid is exactly what froze (the review's MED-3); the detailed ask stops
+    // on a fresh "held unmined" from Arcade and would never reach Bitails or WoC for the class this exists for.
+    let bump_hex = match fetcher.verified_proof_for_exhaustive(txid).await {
         Ok(Some(b)) => b,
         Ok(None) => return ConfirmNow::Unmined,
         Err(e) => return ConfirmNow::Fault(format!("proof read: {e}")),
@@ -991,7 +1011,7 @@ pub async fn confirm_spend_now_with(
     let height = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
         .ok()
         .map(|mp| u64::from(mp.block_height));
-    let (mut confirmed, mut cas_missed) = (0usize, 0usize);
+    let (mut confirmed, mut cas_missed, mut cas_faults) = (0usize, 0usize, 0usize);
     for rec in rows {
         match pot_storage
             .mark_confirmed_for_spender(&rec.txid, rec.output_index, txid, height)
@@ -999,29 +1019,84 @@ pub async fn confirm_spend_now_with(
         {
             Ok(true) => {
                 confirmed += 1;
+                // (the D1 store notes the outpoint itself inside its CAS; the note set dedupes — this one is for
+                // a store that does not, and the pots-room push reads the set once)
                 crate::pot_changes::note(&rec.txid, rec.output_index);
             }
             Ok(false) => cas_missed += 1,
-            Err(e) => return ConfirmNow::Fault(format!("confirm CAS: {e}")),
+            // count and continue (the cron's shape): the rows that confirmed stay confirmed and are pushed
+            Err(e) => {
+                cas_faults += 1;
+                worker::console_log!(
+                    "[admit-fast] {txid} confirm CAS on {}:{} faulted: {e}",
+                    rec.txid,
+                    rec.output_index
+                );
+            }
         }
+    }
+    if confirmed == 0 && cas_missed == 0 {
+        return ConfirmNow::Fault(format!("confirm CAS faulted on every row ({cas_faults})"));
     }
     ConfirmNow::Confirmed {
         rows: confirmed,
         cas_missed,
+        cas_faults,
         height,
     }
 }
 
-/// The watch's wiring of [`confirm_spend_now_with`]: the D1 pot store and the courier proof ladder with a small
-/// budget (one txid; the ladder's rungs, chaintracks-verified).
+thread_local! {
+    /// The watch-end confirms asked of the couriers on this isolate, by txid → the ask's ms (the re-present memo).
+    static CONFIRM_NOW_ASKED: std::cell::RefCell<std::collections::HashMap<String, f64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+/// One courier ask per txid per isolate-minute.
+pub const CONFIRM_NOW_MEMO_MS: f64 = 60_000.0;
+
+/// PURE: does the memo still hold at `now_ms` for an ask made at `asked_ms`?
+pub fn confirm_now_memoised(asked_ms: Option<f64>, now_ms: f64) -> bool {
+    asked_ms.is_some_and(|t| now_ms - t < CONFIRM_NOW_MEMO_MS)
+}
+
+/// The watch's wiring of [`confirm_spend_now_with`]: the D1 pot store and the courier proof ladder (the budget
+/// counts ASKS, one here; the ladder's own rungs and chaintracks reads sit outside it). The memo keeps a
+/// re-present flood of one known spender from asking the couriers more than once a minute per isolate; the
+/// spender lookup runs first so a txid that spends no recorded pot never touches the memo or the couriers.
 async fn confirm_spend_now(
     env: &EvidenceEnv,
     db: std::rc::Rc<worker::D1Database>,
     txid: &str,
 ) -> ConfirmNow {
-    let store = crate::d1_discovery::D1PotStorage::new(db);
+    use overlay_discovery::pot::storage::PotStorage;
+    let store = crate::d1_discovery::D1PotStorage::new(db.clone());
+    let rows = match store.find_unconfirmed_by_spending_txid(txid).await {
+        Ok(r) => r,
+        Err(e) => return ConfirmNow::Fault(format!("spender lookup: {e}")),
+    };
+    if rows.is_empty() {
+        return ConfirmNow::NoUnconfirmedSpend;
+    }
+    let now_ms = worker::js_sys::Date::now();
+    let memoised = CONFIRM_NOW_ASKED.with(|m| {
+        let mut m = m.borrow_mut();
+        m.retain(|_, t| now_ms - *t < CONFIRM_NOW_MEMO_MS);
+        if confirm_now_memoised(m.get(txid).copied(), now_ms) {
+            true
+        } else {
+            m.insert(txid.to_string(), now_ms);
+            false
+        }
+    });
+    if memoised {
+        worker::console_log!(
+            "[admit-fast] {txid} the couriers were asked inside the last minute on this isolate — not again; the passes own it"
+        );
+        return ConfirmNow::Memoised;
+    }
+    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRM_ASKED, 1).await;
     let fetcher = crate::courier_fetcher(&env.env, crate::lookup_service_chain_tracker(&env.env))
-        .with_budget(6);
+        .with_budget(1);
     confirm_spend_now_with(&store, &fetcher, txid).await
 }
 
@@ -1117,11 +1192,7 @@ mod tests {
         };
         assert_eq!(
             confirm_spend_now_with(&store, &proven, &spender).await,
-            ConfirmNow::Confirmed {
-                rows: 1,
-                cas_missed: 0,
-                height: Some(967_603)
-            }
+            ConfirmNow::Confirmed { rows: 1, cas_missed: 0, cas_faults: 0, height: Some(967_603) }
         );
         let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed);
@@ -1138,9 +1209,24 @@ mod tests {
         );
     }
 
+    /// The memo: one courier ask per txid per isolate-minute (the review's MED-4: a re-present flood of a known
+    /// spender must not amplify into courier reads); a never-asked txid asks, an aged memo asks again.
+    #[test]
+    fn the_watch_end_confirm_asks_the_couriers_once_a_minute_per_txid() {
+        assert!(!confirm_now_memoised(None, 1e12));
+        assert!(confirm_now_memoised(Some(1e12), 1e12 + 1.0));
+        assert!(confirm_now_memoised(Some(1e12), 1e12 + CONFIRM_NOW_MEMO_MS - 1.0));
+        assert!(!confirm_now_memoised(Some(1e12), 1e12 + CONFIRM_NOW_MEMO_MS));
+    }
+
     /// The watch fits the post-response budget (gate LOW-1: eviction of the
     /// isolate must not silently skip the latch) and looks early (the old wire
-    /// poll's cadence: SEEN typically by the 4th 2-s look).
+    /// poll's cadence: SEEN typically by the 4th 2-s look). Fleet loop 15: the
+    /// watch's END adds the single-spend confirm AFTER the sleeps (one indexed
+    /// read; for a recorded spender, the exhaustive proof ladder's reads) — an
+    /// isolate evicted inside it loses only a confirm the 30-minute backstop
+    /// pass still owns (fail-safe), and the silent/orphan counter is bumped only
+    /// when the confirm did not confirm.
     #[test]
     fn the_pending_watch_fits_the_post_response_budget_and_looks_early() {
         let total: u64 = PENDING_WATCH_SLEEPS_MS.iter().sum();
@@ -1706,8 +1792,13 @@ mod tests {
         assert!(restore < remark, "re-marked AFTER the rows are back");
         // the eviction is the event the felt voids on: BOTH jobs ship the pot
         // notes right after it (the route's own flush drained before the job)
-        let jobs =
-            &src[src.find("pub async fn refusal_job(").unwrap()..src.find("#[cfg(test)]").unwrap()];
+        // fleet loop 15 (2026-09-20): measured on WHITESPACE-SQUASHED text — a rustfmt reflow of an unrelated
+        // call moved the raw distance past the bound and a formatter red'd this pin; a formatter must never be
+        // able to red (or green) a source pin, so the distance is a fact of the tokens, not the line breaks
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let jobs = squash(
+            &src[src.find("pub async fn refusal_job(").unwrap()..src.find("#[cfg(test)]").unwrap()],
+        );
         let mut from = 0;
         let mut evictions = 0;
         while let Some(i) = jobs[from..].find("evict_txid_everywhere(") {
@@ -1717,7 +1808,7 @@ mod tests {
                 .expect("a flush after the eviction");
             assert!(
                 fl < 700,
-                "the flush sits right after the eviction (at +{fl})"
+                "the flush sits right after the eviction (at +{fl}, squashed)"
             );
             evictions += 1;
             from = at + 1;
