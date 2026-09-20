@@ -1173,6 +1173,10 @@ pub const OWED_STALE_ON_TIP_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE i
 /// once instead of at the next cadence (up to 5 minutes, with a live Rejoin press on a hand the network refused).
 pub const OWED_ATTRIBUTE_BY_POT_SQL: &str = "SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2";
 pub const OWED_ATTRIBUTE_BY_HOP_SQL: &str = "SELECT DISTINCT identity FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2";
+/// Fleet loop 15 (2026-09-20, the review's MED-2): the REFUND-BACKUP filing names the pot too (`idx_potrefund_pot`) —
+/// the one marker a seat killed at the funding still filed (its party marker never was), so a pot with no party
+/// rows and no hop match still reaches its seats' owed rows on its confirm event.
+pub const OWED_ATTRIBUTE_BY_POTREFUND_SQL: &str = "SELECT DISTINCT identity FROM potrefund_records WHERE potTxid = ?1 AND potVout = ?2";
 pub const OWED_STALE_FOR_POT_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2)";
 // N3: both stale marks join EXACTLY (`idx_potparty_pot`, the `pot_records` PK), as every sibling query in this crate
 // does (`results_sql`: `r.txid = pp.potTxid`); a `lower()` on a join key would scan the table per block / per filing.

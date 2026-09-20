@@ -2205,7 +2205,11 @@ pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &st
         identity: String,
     }
     let mut out: Vec<String> = Vec::new();
-    for sql in [crate::owed::OWED_ATTRIBUTE_BY_POT_SQL, crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL] {
+    for sql in [
+        crate::owed::OWED_ATTRIBUTE_BY_POT_SQL,
+        crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL,
+        crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL,
+    ] {
         match db.prepare(sql).bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))]) {
             Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<IdentityOnlyD1>()) {
                 Ok(rows) => {
