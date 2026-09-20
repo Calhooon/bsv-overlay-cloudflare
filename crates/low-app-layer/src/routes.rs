@@ -2541,6 +2541,7 @@ pub(crate) async fn owed_recompute(
     let over_budget = || worker::Date::now().as_millis() as i64 - started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS;
     let mut probes_made = 0usize;
     let mut spender_reads = 0usize;
+    let mut courier_reads = 0usize;
     let mut budget_cut = false;
     let mut binds: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
     if let Some(ms) = era {
@@ -2973,11 +2974,21 @@ pub(crate) async fn owed_recompute(
         }
     }
 
-    // 6b. the NON-POT spenders' stored bytes (a sweep, a wallet's own spend), bounded per recompute: every P2PKH
-    //     output's pkh + sats from the BEEF the index holds, and the index's own spend word per output — the proof
-    //     that an unfiled sweep paid MY committed home (a payout), or paid elsewhere (the spent-elsewhere story).
-    //     The newest strands first; a spender past the budget reads "could not judge" this pass.
+    // 6b. the NON-POT spenders' bytes (a sweep, a wallet's own spend, the seat's own competitor), bounded per recompute:
+    //     every P2PKH output's pkh + sats and every INPUT outpoint, from the BEEF the index holds (with the index's own
+    //     spend word per output) or, for a spender the index never held, from the tx-any resolver's hash-verified raw
+    //     (the wave after fleet loop 11, 2026-09-19, `spec-admit-fast-join-refused`). The brain judges from them: a
+    //     payout to MY committed home, spent outside this game, a pot the index does not hold (a covenant output), or
+    //     a pointer the bytes REFUTE (the tx does not spend the hop it was named for: "could not judge", per hop —
+    //     the delta-verify's NEW-4/3, index-held or courier-supplied alike). The newest strands first for the index
+    //     reads; the courier asks go NEVER-ASKED-FIRST, then the oldest ask (the bounded-walk rule of 2026-09-19),
+    //     two per pass (`OWED_SPENDER_COURIER_READS_PER_RECOMPUTE`), memoised per isolate, a fault never re-bought
+    //     inside its cache TTL; a spender past the budget reads "could not judge" this pass.
     let mut spender_outputs: HashMap<String, Vec<crate::owed::SpenderOutput>> = HashMap::new();
+    let mut spender_inputs: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+    // the spenders whose bytes the COURIERS supplied (the gate's M3): a real payout with no index proof to credit from
+    let mut courier_spenders: HashSet<String> = HashSet::new();
+    let mut courier_cap_hit = false;
     {
         // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
         let mut ordered: Vec<(i64, String)> = Vec::new();
@@ -3004,6 +3015,41 @@ pub(crate) async fn owed_recompute(
             #[serde(default)]
             spent: Option<f64>,
         }
+        fn outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
+            tx.outputs
+                .iter()
+                .enumerate()
+                .map(|(vout, o)| {
+                    let lock = o.locking_script.to_binary();
+                    crate::owed::SpenderOutput {
+                        vout: vout as u32,
+                        pkh_hex: crate::owed::p2pkh_pkh_hex(&lock),
+                        sats: o.satoshis.unwrap_or(0),
+                        spent: None,
+                        // the gate's M1: a pot covenant output = a JOIN (refused at the door and broadcast around it,
+                        // or wrongly evicted with its bytes never moved), never a sweep
+                        pot_lock: overlay_discovery::pot::is_pot_covenant_script(&lock),
+                    }
+                })
+                .collect()
+        }
+        fn inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(String, u32)> {
+            tx.inputs
+                .iter()
+                .filter_map(|inp| inp.source_txid.as_deref().map(|t| (t.to_ascii_lowercase(), inp.source_output_index)))
+                .collect()
+        }
+        /// A tx-any answer's raw, parsed and re-checked against the txid it was asked for (content-addressed).
+        fn parse_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes> {
+            let raw = hex::decode(a.raw_hex.as_deref()?).ok()?;
+            let tx = bsv_rs::transaction::Transaction::from_binary(&raw).ok()?;
+            if !tx.id().eq_ignore_ascii_case(sp) {
+                return None;
+            }
+            Some(CourierSpenderBytes { inputs: inputs_of(&tx), outputs: outputs_of(&tx) })
+        }
+        // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
+        let mut wanted: Vec<String> = Vec::new();
         for (_at, sp) in ordered.into_iter().take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE) {
             if over_budget() {
                 budget_cut = true;
@@ -3012,7 +3058,28 @@ pub(crate) async fn owed_recompute(
             spender_reads += 1;
             let bytes = match load_stored_beef(env, db, &sp).await {
                 Ok(Some(b)) => b,
-                Ok(None) => continue,
+                Ok(None) => {
+                    if let Some(parsed) = owed_spender_outputs_memo_get(&sp) {
+                        courier_spenders.insert(sp.clone());
+                        spender_inputs.insert(sp.clone(), parsed.inputs);
+                        spender_outputs.insert(sp, parsed.outputs);
+                        continue;
+                    }
+                    let now_f = worker::Date::now().as_millis() as f64;
+                    // the delta-verify's NEW-1: an answer this isolate already holds (a fault inside its TTL included)
+                    // is never re-bought
+                    if let Some(a) = tx_any_cached(&sp, now_f) {
+                        if let Some(parsed) = parse_answer(&a, &sp) {
+                            owed_spender_outputs_memo_put(&sp, &parsed);
+                            courier_spenders.insert(sp.clone());
+                            spender_inputs.insert(sp.clone(), parsed.inputs);
+                            spender_outputs.insert(sp, parsed.outputs);
+                        }
+                        continue;
+                    }
+                    wanted.push(sp);
+                    continue;
+                }
                 Err(_) => {
                     crate::owed::note_spender_read_fault();
                     continue;
@@ -3024,17 +3091,7 @@ pub(crate) async fn owed_recompute(
             let Some(tx) = beef.find_txid(&sp).and_then(|t| t.tx().cloned()) else {
                 continue;
             };
-            let mut outs: Vec<crate::owed::SpenderOutput> = tx
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(vout, o)| crate::owed::SpenderOutput {
-                    vout: vout as u32,
-                    pkh_hex: crate::owed::p2pkh_pkh_hex(&o.locking_script.to_binary()),
-                    sats: o.satoshis.unwrap_or(0),
-                    spent: None,
-                })
-                .collect();
+            let mut outs = outputs_of(&tx);
             // the index's own spend word per output (the swept sats collected and moved on, or still at the home)
             if let Ok(stmt) = db.prepare("SELECT outputIndex, spent FROM pot_records WHERE txid = ?1").bind(&[JsValue::from_str(&sp)]) {
                 if let Ok(rows) = stmt.all().await.and_then(|r| r.results::<SpentRowD1>()) {
@@ -3045,7 +3102,53 @@ pub(crate) async fn owed_recompute(
                     }
                 }
             }
+            spender_inputs.insert(sp.clone(), inputs_of(&tx));
             spender_outputs.insert(sp, outs);
+        }
+        // phase 2: the courier asks — never-asked-first, then the oldest ask; a fresh ask is a slot whatever it
+        // answers (only a verdict MEMO costs no courier call); the cap is its own word, apart from the time budget
+        wanted.sort_by_key(|sp| owed_courier_asked_at(sp).map_or(0i64, |t| t as i64));
+        for sp in wanted {
+            if courier_reads >= crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE {
+                courier_cap_hit = true;
+                break;
+            }
+            if over_budget() {
+                budget_cut = true;
+                break;
+            }
+            let now_f = worker::Date::now().as_millis() as f64;
+            // the round-3 LOW: another identity's recompute on this isolate (the in-flight lock is per identity;
+            // a competitor JOIN spends BOTH seats' hops within ms) may have bought this spender since phase 1 —
+            // re-check the memo and the cache before spending a ladder on it
+            if let Some(parsed) = owed_spender_outputs_memo_get(&sp) {
+                courier_spenders.insert(sp.clone());
+                spender_inputs.insert(sp.clone(), parsed.inputs);
+                spender_outputs.insert(sp, parsed.outputs);
+                continue;
+            }
+            if let Some(a) = tx_any_cached(&sp, now_f) {
+                if let Some(parsed) = parse_answer(&a, &sp) {
+                    owed_spender_outputs_memo_put(&sp, &parsed);
+                    courier_spenders.insert(sp.clone());
+                    spender_inputs.insert(sp.clone(), parsed.inputs);
+                    spender_outputs.insert(sp, parsed.outputs);
+                }
+                continue;
+            }
+            let a = resolve_tx_any(None, None, &sp, now_f, "owed", env).await;
+            if a.source != Some("memo") {
+                // a courier was really asked: the slot, and the stamp that sends this spender to the back of the
+                // never-asked-first order (a verdict-memo answer costs nothing and is not an ask)
+                courier_reads += 1;
+                owed_courier_note_asked(&sp, now_f);
+            }
+            if let Some(parsed) = parse_answer(&a, &sp) {
+                owed_spender_outputs_memo_put(&sp, &parsed);
+                courier_spenders.insert(sp.clone());
+                spender_inputs.insert(sp.clone(), parsed.inputs);
+                spender_outputs.insert(sp, parsed.outputs);
+            }
         }
     }
 
@@ -3068,6 +3171,8 @@ pub(crate) async fn owed_recompute(
         evicted_pots: &evicted_pots,
         evicted_hop_outpoints: &evicted_hop_outpoints,
         spender_outputs: &spender_outputs,
+        spender_inputs: &spender_inputs,
+        courier_spenders: &courier_spenders,
         my_pkh_by_game: &my_pkh_by_game,
     });
     sort_rows_for_service(&mut rows);
@@ -3115,6 +3220,13 @@ pub(crate) async fn owed_recompute(
     debug_assert!(stmts.len() <= 2 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the two bookends");
     db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
     crate::owed::note_recompute(source, &rows);
+    if courier_reads > 0 || courier_cap_hit {
+        worker::console_log!(
+            "[owed] recompute {source} for {}…: {courier_reads} spender ask(s) went to the tx-any resolver (index-unknown spenders){}",
+            &identity_lc[..12.min(identity_lc.len())],
+            if courier_cap_hit { "; the courier cap held the rest for a later pass" } else { "" }
+        );
+    }
     worker::console_log!(
         "[owed] recompute {source} for {}…: {} rows in {} ms (results {}, hops {}, probes {}, spender reads {}, budget cut {}, walk cut {})",
         &identity_lc[..12.min(identity_lc.len())],
@@ -5636,6 +5748,55 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
 
 /// One cached `/tx-any` answer.
 type TxAnyCached = crate::txany::TxAnyAnswer;
+
+thread_local! {
+    /// The wave after fleet loop 11 (2026-09-19): a hop spender the index never held (the seat's OWN competitor
+    /// broadcast around the overlay, a sweep filed elsewhere), PARSED once per isolate from the tx-any resolver's
+    /// raw — its input outpoints and its outputs — content-addressed (the bytes hashed to the txid before they were
+    /// kept), so the memo can never go stale; bounded, cleared wholesale when full.
+    static OWED_SPENDER_OUTPUTS_MEMO: std::cell::RefCell<std::collections::HashMap<String, CourierSpenderBytes>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const OWED_SPENDER_OUTPUTS_MEMO_MAX: usize = 256;
+/// A courier-fetched spender, parsed once: the outpoints it SPENDS (the gate's L5: the story stands only for a hop
+/// the transaction really consumes — the courier's pointer alone is not that proof) and its outputs.
+#[derive(Clone)]
+struct CourierSpenderBytes {
+    inputs: Vec<(String, u32)>,
+    outputs: Vec<crate::owed::SpenderOutput>,
+}
+thread_local! {
+    /// When this isolate last ASKED the couriers for a spender (the delta-verify's round-2 LOW-2): the two slots
+    /// per pass go to the never-asked first, then the oldest ask — a cold isolate or a WoC 429 streak can no
+    /// longer feed the same two newest spenders forever. Bounded, cleared wholesale when full.
+    static OWED_COURIER_ASKED_AT: std::cell::RefCell<std::collections::HashMap<String, f64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const OWED_COURIER_ASKED_MAX: usize = 1024;
+fn owed_courier_asked_at(txid_lc: &str) -> Option<f64> {
+    OWED_COURIER_ASKED_AT.with(|m| m.borrow().get(txid_lc).copied())
+}
+fn owed_courier_note_asked(txid_lc: &str, now: f64) {
+    OWED_COURIER_ASKED_AT.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= OWED_COURIER_ASKED_MAX {
+            m.clear();
+        }
+        m.insert(txid_lc.to_string(), now);
+    });
+}
+fn owed_spender_outputs_memo_get(txid_lc: &str) -> Option<CourierSpenderBytes> {
+    OWED_SPENDER_OUTPUTS_MEMO.with(|m| m.borrow().get(txid_lc).cloned())
+}
+fn owed_spender_outputs_memo_put(txid_lc: &str, bytes: &CourierSpenderBytes) {
+    OWED_SPENDER_OUTPUTS_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= OWED_SPENDER_OUTPUTS_MEMO_MAX {
+            m.clear();
+        }
+        m.insert(txid_lc.to_string(), bytes.clone());
+    });
+}
 
 thread_local! {
     /// In-isolate `/tx-any` cache (txid → (expiry ms, answer)) — the same

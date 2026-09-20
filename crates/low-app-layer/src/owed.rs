@@ -123,6 +123,23 @@ pub const OWED_PROBES_PER_RECOMPUTE: usize = 8;
 /// A `payout` row is CLAIMABLE only once the spend is confirmed (the credit
 /// path's landing bar); an unconfirmed spend is a row that says so.
 pub const UNCONFIRMED_PAYOUT_REASON: &str = "the spend is seen but not mined yet: the credit lands with the block";
+/// The story on a pot whose spend the index HOLDS (the seat's own refund or settle, submitted here) but the chain has
+/// not confirmed: the verdict (and any press) waits for the block — never "not classified" (fleet loop 11's wave,
+/// 2026-09-19: `refundLandedVerify` read that word for 27 minutes while the refund sat seen-but-unmined between two
+/// blocks, and the harness counted it as a machinery wedge). `facts.chainWait = "block"` says it by machine.
+pub const SPEND_AWAITING_BLOCK_REASON: &str =
+    "the pot's spend is on the network, waiting for its block: the story (and the credit) lands with it";
+/// The gate's M1 (2026-09-20): the hop's spender carries a pot covenant output — a JOIN the index never held. The
+/// felt's own records tell that hand's story; the owed list presses nothing and claims nothing about custody.
+pub const POT_UNINDEXED_REASON: &str =
+    "the hop was taken by a pot the index does not hold (a join that reached the chain around this index): nothing to press here; the table's own records tell that hand's story";
+/// The gate's M2: "pays none of your homes" needs a KNOWN home; a hop-only game (no pot committed one) gets the
+/// spender's pay-to addresses instead, for the device that knows its own home to match.
+pub const HOME_UNKNOWN_REASON: &str =
+    "the hop was spent by a transaction this list cannot match to a home (it cannot tell which committed home is yours here): if one of its pay-to addresses is your wallet's, the money is already there";
+/// The gate's M3: bytes the couriers supplied prove the payout but the index holds no proof to assemble the credit.
+pub const COURIER_BYTES_NO_CREDIT_REASON: &str =
+    "the sats sit at your home on chain, but the index holds no proof for that transaction, so the credit cannot be assembled here: a wallet resync finds them";
 /// The `spent-elsewhere` story (design §2): the hop was spent by a transaction that is not a LOW pot and pays no
 /// home of this seat — a sweep to another home, or the wallet's own spend. Nothing here can move it.
 pub const SPENT_ELSEWHERE_REASON: &str =
@@ -221,6 +238,18 @@ pub struct SpenderOutput {
     pub pkh_hex: Option<String>,
     pub sats: u64,
     pub spent: Option<bool>,
+    /// The output is a LOW pot covenant lock (the gate's M1, 2026-09-20): the spender is a JOIN the index does not
+    /// hold (refused at the door and broadcast around it, or wrongly evicted) — never a custody story.
+    pub pot_lock: bool,
+}
+
+/// True when a parsed spender's bytes do NOT spend this hop: the pointer that named it (the index's, a courier's,
+/// a planted row's) is refuted and the hop is judged as if the bytes were never read ("could not judge"), never a
+/// payout or a custody story off a wrong pointer. A spender whose inputs were not recorded is not refuted.
+fn pointer_refuted(i: &OwedInputs, spender: &str, h: &HopEntry) -> bool {
+    i.spender_inputs
+        .get(spender)
+        .is_some_and(|ins| !ins.iter().any(|(t, v)| *v == h.hop_vout && t.eq_ignore_ascii_case(&h.hop_txid)))
 }
 
 /// A hop spent by its OWN seat's sweep — the FILED sweep, or a spender whose stored bytes pay the seat's committed
@@ -239,6 +268,11 @@ pub struct SweptHome {
 /// Spenders whose stored bytes one recompute reads to classify a hop's spend (bounded: a lived-in identity's
 /// adversarial history can hold dozens; the newest strands first, the rest read "not judged this pass").
 pub const OWED_SPENDER_READS_PER_RECOMPUTE: usize = 16;
+/// Of those, how many may go to the COURIERS for a spender the index never held (the seat's own competitor, a sweep
+/// broadcast elsewhere): each ask is the tx-any resolver's external leg (WoC's tx read gates it; the raw from WoC,
+/// then Bitails; hash-verified), so the pass buys two attempts, faulted or not; the bytes are content-addressed and
+/// memoised in the isolate — a spender is fetched once per isolate, a faulted ask not repeated inside its cache TTL.
+pub const OWED_SPENDER_COURIER_READS_PER_RECOMPUTE: usize = 2;
 /// The wall-clock budget one recompute spends on its OUTWARD legs (the courier probes, the stored-bytes reads): a
 /// pass past it writes what it has and the next pass continues — a recompute must always finish inside the
 /// worker's own limits (the stranded cell's run 3, 2026-09-19: a pass that never finished kept a list stale for good).
@@ -276,6 +310,13 @@ pub struct OwedInputs<'a> {
     pub evicted_pots: &'a HashSet<String>,
     /// non-pot spender txid (lowercase) → its outputs as the index's stored bytes show them (bounded per recompute).
     pub spender_outputs: &'a HashMap<String, Vec<SpenderOutput>>,
+    /// Every parsed spender's INPUT outpoints (index-held or courier-supplied): a story stands only for a hop the
+    /// transaction consumes — a pointer (the index's, a courier's, a planted row's) the bytes refute is judged as
+    /// bytes never read, per hop (the delta-verify's NEW-4 and its round-2 asymmetry).
+    pub spender_inputs: &'a HashMap<String, Vec<(String, u32)>>,
+    /// The spenders whose bytes came from the COURIERS (the tx-any resolver), not the index's stored BEEF (the gate's
+    /// M3): a payout they prove is real but has no index proof to assemble a credit from.
+    pub courier_spenders: &'a HashSet<String>,
     /// game id (lowercase) → my committed pay pkh (hex) from the results entries (the covenant's own commitment): the
     /// home an unfiled sweep must pay to be MY payout.
     pub my_pkh_by_game: &'a HashMap<String, String>,
@@ -337,7 +378,7 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
     if h.spent == Some(true) {
         if let Some(s) = h.spending_txid.as_deref() {
             let s = s.to_ascii_lowercase();
-            return if i.pot_spenders.contains(&s) { None } else { Some((s, h.spent_confirmed == Some(true))) };
+            return if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) { None } else { Some((s, h.spent_confirmed == Some(true))) };
         }
     }
     let w = i.hop_chain.get(outpoint)?;
@@ -345,7 +386,7 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
         return None;
     }
     let s = w.spending_txid.as_deref()?.to_ascii_lowercase();
-    if i.pot_spenders.contains(&s) {
+    if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) {
         return None;
     }
     Some((s, w.spent_confirmed == Some(true)))
@@ -403,6 +444,9 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     // an UNFILED sweep (a device before the filing existed, a recovery tool): the spender's stored bytes pay MY home
     let (spender, confirmed) = non_pot_spender(i, h, &outpoint)?;
     let outs = i.spender_outputs.get(&spender)?;
+    if outs.iter().any(|o| o.pot_lock) {
+        return None; // a transaction that CREATES a pot is a JOIN, never a sweep (the delta-verify's NEW-3)
+    }
     let pkh = my_pkh?;
     let mine: Vec<&SpenderOutput> = outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&pkh))).collect();
     if mine.is_empty() {
@@ -412,14 +456,57 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     for o in &mine {
         sum = sum.checked_add(o.sats)?;
     }
+    let source = if i.courier_spenders.contains(&spender) { "courier-bytes" } else { "index-bytes" };
     Some(SweptHome {
         sweep_txid: spender,
         raw_hex: None,
         pays_sats: Some(sum),
         confirmed,
-        source: "index-bytes",
+        source,
         output_spent: mine.iter().all(|o| o.spent == Some(true)),
     })
+}
+
+/// What a hop spender's BYTES say about the hop it took, once `swept_home` found no payout in them (the gate's M1
+/// and M2, 2026-09-20): a pot covenant output = a JOIN the index does not hold (never a custody story); a home this
+/// list does not know = the pay-to addresses, for the device to match; else spent outside this game.
+enum SpenderStory {
+    Pot,
+    HomeUnknown { pkhs: Vec<String> },
+    Elsewhere,
+}
+
+fn spender_story(i: &OwedInputs, spender: &str, game: &str) -> Option<SpenderStory> {
+    let outs = i.spender_outputs.get(spender)?;
+    if outs.iter().any(|o| o.pot_lock) {
+        return Some(SpenderStory::Pot);
+    }
+    if !i.my_pkh_by_game.contains_key(game) {
+        let mut pkhs: Vec<String> = outs.iter().filter_map(|o| o.pkh_hex.as_deref().map(str::to_ascii_lowercase)).collect();
+        pkhs.sort_unstable();
+        pkhs.dedup();
+        return Some(SpenderStory::HomeUnknown { pkhs });
+    }
+    Some(SpenderStory::Elsewhere)
+}
+
+/// The story's reason, its machine facts written; `unknown` when the bytes were never read.
+fn story_reason(facts: &mut Value, story: Option<SpenderStory>, unknown: &'static str) -> &'static str {
+    match story {
+        Some(SpenderStory::Pot) => {
+            facts["spendKind"] = json!("pot-unindexed");
+            POT_UNINDEXED_REASON
+        }
+        Some(SpenderStory::HomeUnknown { pkhs }) => {
+            facts["spenderPkhs"] = json!(pkhs);
+            HOME_UNKNOWN_REASON
+        }
+        Some(SpenderStory::Elsewhere) => {
+            facts["spendKind"] = json!("spent-elsewhere");
+            SPENT_ELSEWHERE_REASON
+        }
+        None => unknown,
+    }
 }
 
 /// THE DERIVATION. Pure; one row per outpoint; the families exclusive by the
@@ -516,7 +603,18 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         reason: None,
                     });
                 } else {
-                    let reason = if e.verdict.is_none() {
+                    let mut facts = base_facts.clone();
+                    // the gate's L1: a spend with a VERIFIED proof height is mined (the landing bar's third arm),
+                    // whatever `spentConfirmed` says — a classification gap on a mined tx is not a block wait
+                    let awaiting_block =
+                        e.verdict.is_none() && e.settle_txid.is_some() && e.spent_confirmed != Some(true) && e.at_height.is_none();
+                    let reason = if awaiting_block {
+                        // the index holds the spend (the results view names it) and the chain has not confirmed it:
+                        // the verdict is computed at the landing bar, so the row is an honest chain wait
+                        facts["chainWait"] = json!("block");
+                        facts["spendTxid"] = json!(e.settle_txid);
+                        SPEND_AWAITING_BLOCK_REASON
+                    } else if e.verdict.is_none() {
                         "the spend is not classified yet (no verdict)"
                     } else {
                         "the seat binding is unknown (which home is mine could not be established)"
@@ -529,7 +627,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         sats: None,
                         opponent_identity: Some(e.opponent_identity.to_ascii_lowercase()),
                         at_height: e.at_height,
-                        facts: base_facts,
+                        facts,
                         reason: Some(reason.to_string()),
                     });
                 }
@@ -670,6 +768,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             if !swept.confirmed {
                 facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
             }
+            if swept.source == "courier-bytes" {
+                // the gate's M3 (2026-09-20): the index holds no bytes and no proof for this transaction, so
+                // `/credit-beef` cannot assemble the credit; the row tells the truth instead of a press that pends
+                // forever. An UNCONFIRMED one keeps its waiting word (the round-2 LOW-1): the pointer's spend may
+                // still be displaced, so "the sats sit at your home" is said only once the chain confirmed it.
+                facts["claimable"] = json!(false);
+                facts["claimReason"] = json!(if swept.confirmed { COURIER_BYTES_NO_CREDIT_REASON } else { UNCONFIRMED_PAYOUT_REASON });
+                facts["creditKind"] = json!("courier-bytes"); // the residual: this row retires only by a `collected` filing (bsv-low issue)
+            }
             facts["outcome"] = json!("hop-sweep");
             facts["sweepTxid"] = json!(swept.sweep_txid);
             facts["sweepRawHex"] = json!(swept.raw_hex);
@@ -713,16 +820,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 // pays no home of mine) the story is positive: spent outside this game (`spent-elsewhere`).
                 let mut facts = facts_base.clone();
                 facts["claim"] = Value::Null;
-                let bytes_known = spender.as_deref().is_some_and(|s| i.spender_outputs.contains_key(s));
-                if bytes_known {
-                    facts["spendKind"] = json!("spent-elsewhere");
-                }
+                let story = spender.as_deref().filter(|s| !pointer_refuted(i, s, h)).and_then(|s| spender_story(i, s, &game));
                 let reason = if i.pot_spenders_faulted {
                     "could not check the hop's spender against the index this pass (a read faulted)"
-                } else if bytes_known {
-                    SPENT_ELSEWHERE_REASON
                 } else {
-                    "the hop's spender is not in the index (an unindexed join, or a spend outside the game): could not judge"
+                    story_reason(
+                        &mut facts,
+                        story,
+                        "the hop's spender is not in the index (an unindexed join, or a spend outside the game): could not judge",
+                    )
                 };
                 rows.push(OwedRow {
                     identity: me.clone(),
@@ -862,10 +968,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["chainProbe"] = json!("spent");
                         if let Some(age) = w.age_ms { facts["chainProbeAgeMs"] = json!(age); }
                         facts["chainSpender"] = json!(w.spending_txid);
-                        let bytes_known = spender.as_deref().is_some_and(|s| i.spender_outputs.contains_key(s));
-                        if bytes_known {
-                            facts["spendKind"] = json!("spent-elsewhere");
-                        }
+                        let story = spender.as_deref().filter(|s| !pointer_refuted(i, s, h)).and_then(|s| spender_story(i, s, &game));
+                        let reason = story_reason(
+                            &mut facts,
+                            story,
+                            "the chain shows the hop spent by a transaction the index does not hold: could not judge the spender",
+                        );
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -875,13 +983,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: Some(
-                                if bytes_known {
-                                    SPENT_ELSEWHERE_REASON.to_string()
-                                } else {
-                                    "the chain shows the hop spent by a transaction the index does not hold: could not judge the spender".to_string()
-                                },
-                            ),
+                            reason: Some(reason.to_string()),
                         });
                     }
                     _ => {
@@ -1190,6 +1292,191 @@ mod tests {
         }
     }
 
+    /// The gate of 2026-09-20 (M1): a hop spender whose bytes carry a POT covenant output is a JOIN the index does
+    /// not hold — never the custody story, on the index pointer and on the chain rung alike.
+    #[test]
+    fn a_spender_with_a_pot_covenant_output_is_an_unindexed_pot_never_spent_elsewhere() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let join = tx(0x0c);
+        let mut m: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        m.insert(
+            join.clone(),
+            vec![
+                SpenderOutput { vout: 0, pkh_hex: None, sats: 40_000, spent: None, pot_lock: true },
+                // the change pays MY home: a pot-creating tx is still a JOIN, never a 190-sat "sweep" (NEW-3)
+                SpenderOutput { vout: 1, pkh_hex: Some("cc".repeat(20)), sats: 190, spent: None, pot_lock: false },
+            ],
+        );
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), "cc".repeat(20));
+        // 1. the index pointer names the JOIN (status Spent)
+        let hops = [hop(HopStatus::Spent, Some(&join), Some(10_000_000))];
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &m;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_eq!(rows[0].facts["spendKind"], "pot-unindexed");
+        assert_eq!(rows[0].reason.as_deref(), Some(POT_UNINDEXED_REASON));
+        assert!(rows[0].facts.get("claim").is_none_or(|c| c.is_null()));
+        // 2. the chain rung names it (the index says unspent)
+        let old = [hop(HopStatus::Unspent, None, Some(10_000_000))];
+        let by_chain = chain_confirmed(&format!("{}:0", tx(0x07)), true, Some(true), Some(&join), Some(true));
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &by_chain;
+        i.spender_outputs = &m;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["spendKind"], "pot-unindexed");
+        assert_eq!(rows[0].reason.as_deref(), Some(POT_UNINDEXED_REASON));
+    }
+
+    /// The gate's M2: "pays none of your homes" needs a KNOWN home. A hop-only game (no pot committed a home) gets the
+    /// spender's pay-to addresses and a sentence, never `spent-elsewhere`.
+    #[test]
+    fn spent_elsewhere_needs_a_known_home_else_the_addresses_are_served_for_the_device_to_match() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0d);
+        let elsewhere = pays(&sweep, &[(0, &"99".repeat(20), 20_000, Some(false)), (1, &"88".repeat(20), 100, None)]);
+        let hops = [hop(HopStatus::Spent, Some(&sweep), Some(10_000_000))];
+        // home UNKNOWN (no results entry for the game): the addresses, no custody story
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &elsewhere;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_eq!(rows[0].reason.as_deref(), Some(HOME_UNKNOWN_REASON));
+        assert!(rows[0].facts.get("spendKind").is_none());
+        assert_eq!(rows[0].facts["spenderPkhs"], json!(["88".repeat(20), "99".repeat(20)]));
+        // home KNOWN and not paid: spent outside this game, as before
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), "cc".repeat(20));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &elsewhere;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+    }
+
+    /// The gate's M3: a payout proven by COURIER bytes is real but the index holds no proof to assemble a credit
+    /// from: the row says so and offers no press (never a press that pends forever).
+    #[test]
+    fn a_courier_proven_payout_is_a_row_without_a_press_and_says_why() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        spent.spent_confirmed = Some(true);
+        let hops = [spent];
+        let mut courier: HashSet<String> = HashSet::new();
+        courier.insert(sweep.clone());
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
+        assert_eq!(rows[0].facts["creditKind"], "courier-bytes");
+        // the round-2 LOW-1: an UNCONFIRMED courier payout keeps its waiting word (the spend may yet be displaced)
+        let mut unconfirmed = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        unconfirmed.spent_confirmed = Some(false);
+        let hops_u = [unconfirmed];
+        let mut i = inputs(&[], &[], &hops_u, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        assert_eq!(rows[0].facts["creditKind"], "courier-bytes");
+        // NEW-4: bytes that do NOT spend this hop refute the pointer — courier-supplied AND index-held alike:
+        // no payout, "could not judge", no custody story
+        let mut refuted: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        refuted.insert(sweep.clone(), vec![(tx(0x09), 3)]);
+        for courier_sourced in [true, false] {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = &mine;
+            i.spender_inputs = &refuted;
+            i.my_pkh_by_game = &pkhs;
+            if courier_sourced {
+                i.courier_spenders = &courier;
+            }
+            let rows = derive_owed_rows(&i);
+            assert_eq!(rows[0].family, OwedFamily::Unbound, "courier_sourced={courier_sourced}");
+            assert!(rows[0].reason.as_deref().unwrap().contains("could not judge"), "{:?}", rows[0].reason);
+            assert!(rows[0].facts.get("spendKind").is_none());
+        }
+        // the same bytes from the INDEX: claimable, as before
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &mine;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
+        assert_eq!(rows[0].facts["claimable"], true);
+    }
+
+    /// The gate's L1: a spend with a VERIFIED proof height is mined whatever `spentConfirmed` says — a verdict gap on
+    /// it is the old "not classified" sentence, never a block wait.
+    #[test]
+    fn a_proof_verified_spend_without_a_verdict_is_not_a_block_wait() {
+        let mut e = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
+        e.spent_confirmed = Some(false);
+        e.at_height = Some(900_100);
+        let results = vec![e];
+        let refunds: Vec<RefundEntry> = Vec::new();
+        let hops: Vec<HopEntry> = Vec::new();
+        let (valid, none, pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let i = inputs(&results, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].reason.as_deref(), Some("the spend is not classified yet (no verdict)"));
+        assert!(rows[0].facts.get("chainWait").is_none());
+    }
+
+    /// Fleet loop 11's wave (2026-09-19): a pot whose spend the index HOLDS but the chain has not confirmed (the
+    /// refund submitted here, seen, between two blocks) is an honest CHAIN wait, said by machine
+    /// (`facts.chainWait = "block"`), never "not classified" — the verdict is computed at the landing bar.
+    #[test]
+    fn an_index_held_unconfirmed_spend_without_a_verdict_is_a_chain_wait_not_an_unclassified_story() {
+        let mut e = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
+        e.spent_confirmed = Some(false);
+        e.at_height = None; // unconfirmed: no proven height (the fixture's default models a mined spend)
+        let results = vec![e];
+        let refunds: Vec<RefundEntry> = Vec::new();
+        let hops: Vec<HopEntry> = Vec::new();
+        let valid = HashMap::new();
+        let none = HashSet::new();
+        let pots = HashSet::new();
+        let i = inputs(&results, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "one story row");
+        let r = &rows[0];
+        assert_eq!(r.family, OwedFamily::Unbound);
+        assert_eq!(r.reason.as_deref(), Some(SPEND_AWAITING_BLOCK_REASON));
+        assert_eq!(r.facts["chainWait"], json!("block"));
+        assert_eq!(r.facts["spendTxid"], json!(tx(0x03)));
+        assert!(r.facts.get("claim").is_none_or(|c| c.is_null()), "no press before the block");
+
+        // the same spend CONFIRMED without a verdict keeps the old, honest word (a classification gap, not a wait)
+        let mut c = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
+        c.spent_confirmed = Some(true);
+        let results2 = vec![c];
+        let i2 = inputs(&results2, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let rows2 = derive_owed_rows(&i2);
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].reason.as_deref(), Some("the spend is not classified yet (no verdict)"));
+        assert!(rows2[0].facts.get("chainWait").is_none());
+    }
+
     static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
     fn inputs<'a>(
         results: &'a [ResultEntry],
@@ -1217,14 +1504,17 @@ mod tests {
             evicted_pots: &NONE,
             evicted_hop_outpoints: &NONE,
             spender_outputs: &NO_SPENDERS,
+            spender_inputs: &NO_INPUTS,
+            courier_spenders: &NONE,
             my_pkh_by_game: &NO_PKHS,
         }
     }
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> = std::sync::LazyLock::new(HashMap::new);
+    static NO_INPUTS: std::sync::LazyLock<HashMap<String, Vec<(String, u32)>>> = std::sync::LazyLock::new(HashMap::new);
     static NO_PKHS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);
     fn pays(spender: &str, outs: &[(u32, &str, u64, Option<bool>)]) -> HashMap<String, Vec<SpenderOutput>> {
         let mut m = HashMap::new();
-        m.insert(spender.to_string(), outs.iter().map(|(v, pkh, sats, spent)| SpenderOutput { vout: *v, pkh_hex: Some((*pkh).to_string()), sats: *sats, spent: *spent }).collect());
+        m.insert(spender.to_string(), outs.iter().map(|(v, pkh, sats, spent)| SpenderOutput { vout: *v, pkh_hex: Some((*pkh).to_string()), sats: *sats, spent: *spent, pot_lock: false }).collect());
         m
     }
     static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> = std::sync::LazyLock::new(HashMap::new);

@@ -22,7 +22,7 @@ pub const PROVIDERS: [&str; 5] = ["woc", "bananablocks", "bitails", "arcade", "o
 /// The outcome classes, in the tally's index order.
 pub const OUTCOMES: [&str; 4] = ["ok", "notfound", "ratelimited", "fault"];
 /// The routes that ask, in the tally's index order (`"other"` catches a label this list does not know).
-pub const CALLERS: [&str; 5] = ["spent_any", "hops_view", "tx_any", "tx_any_unconfirmable", "other"];
+pub const CALLERS: [&str; 6] = ["spent_any", "hops_view", "tx_any", "tx_any_unconfirmable", "owed", "other"];
 
 /// PURE: the provider a courier URL belongs to, by host.
 pub fn provider_of(url: &str) -> &'static str {
@@ -124,7 +124,7 @@ static TALLY: [[AtomicU64; 4]; 5] = [
     [z(), z(), z(), z()],
 ];
 /// The isolate's calls by caller.
-static BY_CALLER: [AtomicU64; 5] = [z(), z(), z(), z(), z()];
+static BY_CALLER: [AtomicU64; 6] = [z(), z(), z(), z(), z(), z()];
 
 /// Count one courier call: the isolate tally, this request's pending durable deltas, and the log line.
 pub fn note(url: &str, caller: &str, status: Option<u16>, ms: f64) {
