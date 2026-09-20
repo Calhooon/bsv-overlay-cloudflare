@@ -49,4 +49,4 @@ tracing = "0.1"
 [patch.crates-io]
 # 0.3.5 (bsv-low #493, 2026-09-20): the lane's 64-bit replay window rides as a decimal string across the
 # AuthSessionStore DO's storage put (a u64 as a JS number threw past 2^53 on the 54th laned call).
-bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "21ee437" }
+bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "9394c74" }
