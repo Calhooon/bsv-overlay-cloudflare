@@ -2644,7 +2644,7 @@ pub(crate) async fn owed_recompute(
         })
         .collect();
     // the same commitment by GAME (the home an unfiled sweep of the game's hop must pay to be MY payout)
-    let my_pkh_by_game: HashMap<String, String> = results
+    let mut my_pkh_by_game: HashMap<String, String> = results
         .iter()
         .filter_map(|e| {
             let keys = e.committed_keys.as_ref()?;
@@ -2683,7 +2683,7 @@ pub(crate) async fn owed_recompute(
     // results view (the eviction moves the party rows out of it), intersected with the identity's OWN hops — the hop
     // outpoints the network's refusal freed (`released_hop_outpoints` / `refused_hop_outpoints_of`: the UTXO key of
     // the refusal, never the game's name). A faulted read names nothing (the pre-change sentence stands).
-    let evicted_hop_outpoints: HashSet<String> = {
+    let eviction_rows: Vec<(String, Option<String>)> = {
         #[derive(Deserialize)]
         struct EvictionRowD1 {
             txid: String,
@@ -2691,7 +2691,7 @@ pub(crate) async fn owed_recompute(
             released_spends: Option<String>,
         }
         let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
-        let rows: Vec<(String, Option<String>)> = match db.prepare(crate::owed::OWED_EVICTIONS_WINDOW_SQL).bind(&[since]) {
+        match db.prepare(crate::owed::OWED_EVICTIONS_WINDOW_SQL).bind(&[since]) {
             Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<EvictionRowD1>()) {
                 Ok(rows) => rows.into_iter().map(|r| (r.txid.to_ascii_lowercase(), r.released_spends)).collect(),
                 Err(e) => {
@@ -2703,9 +2703,65 @@ pub(crate) async fn owed_recompute(
                 console_warn!("[owed] evictions window bind failed: {e}");
                 Vec::new()
             }
-        };
-        crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&rows), &hops)
+        }
     };
+    let evicted_hop_outpoints: HashSet<String> =
+        crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&eviction_rows), &hops);
+    // 4a-ii. fleet loop 11, the wave's batch 3 (2026-09-20): the refused JOIN's committed home for MY seat, read from the
+    //        `pot_records_evicted` twin (the overlay's own decode of the evicted lock) and KEYED ON THE UTXO the ledger
+    //        names — the hop the evicted JOIN spent (`released_hops_by_eviction`), my own; the seat by that hop's
+    //        VERIFIED marker's settle key against the lock's pubA/pubB (`owed::evicted_pot_homes`). The results view
+    //        holds no entry for an evicted pot (its party rows move too), so no entry and no game name is consulted.
+    //        A faulted read names nothing; a live pot's word is never overwritten.
+    {
+        #[derive(Deserialize)]
+        struct EvictedKeysD1 {
+            txid: String,
+            #[serde(rename = "outputIndex")]
+            output_index: f64,
+            #[serde(rename = "pubA", default)]
+            pub_a: Option<String>,
+            #[serde(rename = "pubB", default)]
+            pub_b: Option<String>,
+            #[serde(rename = "payPkhA", default)]
+            pay_pkh_a: Option<String>,
+            #[serde(rename = "payPkhB", default)]
+            pay_pkh_b: Option<String>,
+        }
+        let released = crate::owed::released_hops_by_eviction(&eviction_rows, &hops);
+        let mut wanted: Vec<String> = released.iter().map(|(_, evicted)| evicted.clone()).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut twin_keys: Vec<(String, u32, crate::results::CommittedKeys)> = Vec::new();
+        for chunk in wanted.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+            // the twin carries its source's columns (`admit_fast::ensure_shadow`), keyed and cased like them
+            let sql = format!(
+                "SELECT lower(txid) AS txid, outputIndex, pubA, pubB, payPkhA, payPkhB FROM pot_records_evicted \
+                 WHERE lockKind = 'covenant' AND paramsDecoded = 1 AND txid IN ({placeholders})"
+            );
+            let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
+            match db.prepare(&sql).bind(&b) {
+                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<EvictedKeysD1>()) {
+                    Ok(rows) => twin_keys.extend(rows.into_iter().filter_map(|r| {
+                        let keys = crate::results::CommittedKeys::from_columns(
+                            r.pub_a.as_deref(),
+                            r.pub_b.as_deref(),
+                            r.pay_pkh_a.as_deref(),
+                            r.pay_pkh_b.as_deref(),
+                        )?;
+                        let vout = u32::try_from(r.output_index as i64).ok()?;
+                        Some((r.txid.to_ascii_lowercase(), vout, keys))
+                    })),
+                    Err(e) => console_warn!("[owed] evicted keys chunk failed (a refused hop keeps its sentence this pass): {e}"),
+                },
+                Err(e) => console_warn!("[owed] evicted keys bind failed: {e}"),
+            }
+        }
+        for (game, pkh) in crate::owed::evicted_pot_homes(&released, &hops, &twin_keys) {
+            my_pkh_by_game.entry(game).or_insert(pkh);
+        }
+    }
     let mut valid_refunds: HashMap<String, ValidRefund> = HashMap::new();
     {
         // Only the UNSPENT pots can be refund-due, so only their filed rows are asked for — a targeted read, never

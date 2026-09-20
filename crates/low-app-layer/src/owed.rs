@@ -335,6 +335,106 @@ pub fn outpoint_key(txid: &str, vout: u32) -> String {
     format!("{}:{vout}", txid.to_ascii_lowercase())
 }
 
+/// PURE: (my hop outpoint, the evicted txid that released it) — the same ledger rows and the same UTXO key as
+/// [`released_hop_outpoints`], keeping WHICH eviction named the hop (the twin row to read). Sorted, deduplicated.
+pub fn released_hops_by_eviction(evictions: &[(String, Option<String>)], hops: &[HopEntry]) -> Vec<(String, String)> {
+    let mine: HashSet<String> = hops.iter().map(|h| outpoint_key(&h.hop_txid, h.hop_vout)).collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (evicted, released) in evictions {
+        if evicted.len() != 64 || !evicted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Some(raw) = released.as_deref() else { continue };
+        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else { continue };
+        for e in entries {
+            let (Some(txid), Some(vout)) = (e.get("txid").and_then(Value::as_str), e.get("vout").and_then(Value::as_u64)) else { continue };
+            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let key = outpoint_key(txid, vout as u32);
+            if mine.contains(&key) {
+                out.push((key, evicted.to_ascii_lowercase()));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// fleet loop 11, the wave's batch 3 (2026-09-20): the home the JOIN the network REFUSED committed for my seat, by
+/// game — so the hop that JOIN spent is judged from its real spender's bytes (`spent-elsewhere`, a sweep home), never
+/// left at "cannot tell which committed home is yours" (`HOME_UNKNOWN_REASON`).
+///
+/// The eviction moves the pot's `pot_records` row AND the seats' party rows into their twins, so the results view
+/// holds NO entry for the refused JOIN (the delta-verify's HIGH-A) and its committed keys reach no map. The overlay's
+/// decode of that lock lives on in `pot_records_evicted`; this reads it KEYED ON THE UTXO the ledger names: the
+/// eviction row's `releasedSpends` names the hop the evicted JOIN spent, only this seat's key spends this seat's hop
+/// (`released_hops_by_eviction`), the hop's own VERIFIED marker attests the settle key it paid, and the lock committed
+/// that key as `pubA` or `pubB` — the seat, hence the home; the game is MY hop marker's. Never a results entry, never
+/// a game id from a plantable party row (the review's MEDIUM-1: a stranger's evicted pot committing my public settle
+/// key beside its own pay pkh, planted under my name, would have named its pkh my home).
+///
+/// One home per game (`BTreeMap`, deterministic); a twin that disagrees with itself, two refused JOINs of one game
+/// that disagree, a lock committing my key on both seats or on neither, an unverified marker → nothing named (the
+/// pre-change sentence stands; never a guess). The caller folds with `or_insert`: a live pot's word is never overwritten.
+pub fn evicted_pot_homes(
+    released: &[(String, String)],
+    hops: &[HopEntry],
+    twin_keys: &[(String, u32, crate::results::CommittedKeys)],
+) -> Vec<(String, String)> {
+    // the twin's word per evicted txid: every covenant row of the JOIN must agree (a JOIN funds ONE pot)
+    let mut keys_by_txid: HashMap<String, Option<&crate::results::CommittedKeys>> = HashMap::new();
+    for (txid, _vout, keys) in twin_keys {
+        keys_by_txid
+            .entry(txid.to_ascii_lowercase())
+            .and_modify(|held| {
+                if held.is_some_and(|h| h != keys) {
+                    *held = None;
+                }
+            })
+            .or_insert(Some(keys));
+    }
+    // my hops by outpoint; two entries of one outpoint that disagree on the key or the game name nothing
+    let mut by_outpoint: HashMap<String, Option<&HopEntry>> = HashMap::new();
+    for h in hops {
+        by_outpoint
+            .entry(outpoint_key(&h.hop_txid, h.hop_vout))
+            .and_modify(|held| {
+                if held.is_some_and(|x| !x.seat_settle_pubkey.eq_ignore_ascii_case(&h.seat_settle_pubkey) || !x.game_id.eq_ignore_ascii_case(&h.game_id)) {
+                    *held = None;
+                }
+            })
+            .or_insert(Some(h));
+    }
+    let mut homes: std::collections::BTreeMap<String, Option<String>> = std::collections::BTreeMap::new();
+    for (hop_outpoint, evicted) in released {
+        let Some(Some(h)) = by_outpoint.get(hop_outpoint) else { continue };
+        if h.marker_verified != MarkerVerification::Verified {
+            continue;
+        }
+        let Some(Some(keys)) = keys_by_txid.get(&evicted.to_ascii_lowercase()) else { continue };
+        let my_key = h.seat_settle_pubkey.to_ascii_lowercase();
+        if my_key.is_empty() {
+            continue;
+        }
+        let pkh = match (my_key == keys.pub_a, my_key == keys.pub_b) {
+            (true, false) => keys.pay_pkh_a.to_ascii_lowercase(),
+            (false, true) => keys.pay_pkh_b.to_ascii_lowercase(),
+            _ => continue, // neither committed key is mine, or both are: no seat to name
+        };
+        homes
+            .entry(h.game_id.to_ascii_lowercase())
+            .and_modify(|held| {
+                if held.as_deref().is_some_and(|x| x != pkh) {
+                    *held = None;
+                }
+            })
+            .or_insert(Some(pkh));
+    }
+    homes.into_iter().filter_map(|(g, p)| p.map(|p| (g, p))).collect()
+}
+
 /// The refund's output to `pay_pkh` (hex, 20 bytes), summed — `None` when the
 /// raw does not parse or the pkh is not 20 bytes.
 pub fn refund_output_sats(raw_hex: &str, pay_pkh_hex: &str) -> Option<u64> {
@@ -581,10 +681,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     let mut facts = base_facts.clone();
                     facts["claim"] = json!("internalize");
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
-                    let confirmed = e.spent_confirmed == Some(true);
+                    // the review's LOW-1 (2026-09-20): a spend with a VERIFIED proof height is mined whatever the flag says
+                    // (the landing bar's third arm, the unbound arm's L1 rule) — never a chain wait said by machine on a mined tx
+                    let confirmed = e.spent_confirmed == Some(true) || e.at_height.is_some();
                     facts["claimable"] = json!(confirmed);
                     if !confirmed {
                         facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
+                        facts["chainWait"] = json!("block"); // a CHAIN wait by machine (the wave's homeKeyRecovery: 25 min counted as a wedge)
                     }
                     facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
                     facts["collectedSigVerified"] = json!(verified_collected);
@@ -767,6 +870,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             facts["claimable"] = json!(swept.confirmed);
             if !swept.confirmed {
                 facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
+                facts["chainWait"] = json!("block");
             }
             if swept.source == "courier-bytes" {
                 // the gate's M3 (2026-09-20): the index holds no bytes and no proof for this transaction, so
@@ -1331,6 +1435,77 @@ mod tests {
         assert_eq!(rows[0].reason.as_deref(), Some(POT_UNINDEXED_REASON));
     }
 
+    /// Fleet loop 11, the wave's batch 3 (`spec-admit-fast-join-refused`): the JOIN the network refused was EVICTED
+    /// with the seats' party rows, so the results view holds no entry and the hop it spent read "cannot tell which
+    /// committed home is yours". The ledger names the hop the JOIN spent (the UTXO), the twin holds the lock's
+    /// decode, my VERIFIED hop marker names my settle key: the home follows and the hop's real spender is judged.
+    #[test]
+    fn a_refused_joins_committed_home_is_read_from_the_twin_keyed_on_the_released_hop_so_its_spender_is_judged() {
+        use crate::results::CommittedKeys;
+        let pub_a = format!("02{}", "aa".repeat(32));
+        let pub_b = format!("03{}", "bb".repeat(32));
+        let keys = CommittedKeys { pub_a: pub_a.clone(), pub_b: pub_b.clone(), pay_pkh_a: "cc".repeat(20), pay_pkh_b: "dd".repeat(20) };
+        let join = tx(0x0c); // the refused JOIN (evicted: its pot row and the party rows live in the twins)
+        let sweep = tx(0x0d); // what took the hop instead (courier-read bytes, pays elsewhere)
+        let released_json = |hop_txid: &str| Some(format!(r#"[{{"table":"pot_records","txid":"{hop_txid}","vout":0}}]"#));
+        let ledger = [(join.clone(), released_json(&tx(0x07)))];
+        let my_hop = |key: &str| {
+            let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+            h.seat_settle_pubkey = key.to_string();
+            h
+        };
+        let hops = [my_hop(&pub_a.to_ascii_uppercase())]; // case-insensitive on the key
+        let released = released_hops_by_eviction(&ledger, &hops);
+        assert_eq!(released, vec![(format!("{}:0", tx(0x07)), join.clone())]);
+        let twin = [(join.to_ascii_uppercase(), 0u32, keys.clone())];
+        let homes = evicted_pot_homes(&released, &hops, &twin);
+        assert_eq!(homes, vec![(tx(0x01), "cc".repeat(20))]);
+        // through THE derivation: the hop's spender pays elsewhere → spent-elsewhere, never "cannot tell which home"
+        let pkhs: HashMap<String, String> = homes.into_iter().collect();
+        let elsewhere = pays(&sweep, &[(0, &"99".repeat(20), 20_000, Some(false))]);
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &elsewhere;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+        // without the twin's word nothing is named (a faulted read) and the pre-change sentence stands
+        assert!(evicted_pot_homes(&released, &hops, &[]).is_empty());
+        let none: HashMap<String, String> = HashMap::new();
+        i.my_pkh_by_game = &none;
+        assert_eq!(derive_owed_rows(&i)[0].reason.as_deref(), Some(HOME_UNKNOWN_REASON));
+        // THE KEY IS THE RELEASED HOP UTXO, never a name: an eviction that released a stranger's hop names nothing,
+        // and a malformed ledger row contributes nothing
+        assert!(released_hops_by_eviction(&[(join.clone(), released_json(&tx(0x08)))], &hops).is_empty());
+        assert!(released_hops_by_eviction(&[(join.clone(), None), ("zz".repeat(32), released_json(&tx(0x07))), (join.clone(), Some("nope".into()))], &hops).is_empty());
+        // the seat must be PROVEN by the hop's own attested key
+        let mut unverified = my_hop(&pub_a);
+        unverified.marker_verified = MarkerVerification::Unverified;
+        assert!(evicted_pot_homes(&released, &[unverified], &twin).is_empty());
+        assert!(evicted_pot_homes(&released, &[my_hop(&format!("02{}", "ee".repeat(32)))], &twin).is_empty());
+        assert!(evicted_pot_homes(&released, &[my_hop("")], &twin).is_empty());
+        let both = [(join.clone(), 0u32, CommittedKeys { pub_b: pub_a.clone(), ..keys.clone() })];
+        assert!(evicted_pot_homes(&released, &hops, &both).is_empty());
+        let split = [twin[0].clone(), (join.clone(), 1u32, CommittedKeys { pay_pkh_a: "ee".repeat(20), ..keys.clone() })];
+        assert!(evicted_pot_homes(&released, &hops, &split).is_empty());
+        // two refused JOINs of ONE game: agreeing twins name the home once; disagreeing twins name nothing
+        let join2 = tx(0x0e);
+        let ledger2 = [ledger[0].clone(), (join2.clone(), released_json(&tx(0x09)))];
+        let mut second = my_hop(&pub_a);
+        second.hop_txid = tx(0x09);
+        let two = [my_hop(&pub_a), second];
+        let released2 = released_hops_by_eviction(&ledger2, &two);
+        assert_eq!(released2.len(), 2);
+        let agree = [twin[0].clone(), (join2.clone(), 0u32, keys.clone())];
+        assert_eq!(evicted_pot_homes(&released2, &two, &agree), vec![(tx(0x01), "cc".repeat(20))]);
+        let disagree = [twin[0].clone(), (join2, 0u32, CommittedKeys { pay_pkh_a: "ee".repeat(20), ..keys.clone() })];
+        assert!(evicted_pot_homes(&released2, &two, &disagree).is_empty());
+        // seat B by the same rule
+        assert_eq!(evicted_pot_homes(&released, &[my_hop(&pub_b)], &twin), vec![(tx(0x01), "dd".repeat(20))]);
+    }
+
     /// The gate's M2: "pays none of your homes" needs a KNOWN home. A hop-only game (no pot committed a home) gets the
     /// spender's pay-to addresses and a sentence, never `spent-elsewhere`.
     #[test]
@@ -1431,6 +1606,7 @@ mod tests {
     fn a_proof_verified_spend_without_a_verdict_is_not_a_block_wait() {
         let mut e = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
         e.spent_confirmed = Some(false);
+        e.at_height = None; // unconfirmed: no verified mined height (the review's LOW-1 bar)
         e.at_height = Some(900_100);
         let results = vec![e];
         let refunds: Vec<RefundEntry> = Vec::new();
@@ -1449,6 +1625,7 @@ mod tests {
     fn an_index_held_unconfirmed_spend_without_a_verdict_is_a_chain_wait_not_an_unclassified_story() {
         let mut e = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
         e.spent_confirmed = Some(false);
+        e.at_height = None; // unconfirmed: no verified mined height (the review's LOW-1 bar)
         e.at_height = None; // unconfirmed: no proven height (the fixture's default models a mined spend)
         let results = vec![e];
         let refunds: Vec<RefundEntry> = Vec::new();
@@ -1466,6 +1643,18 @@ mod tests {
         assert_eq!(r.facts["spendTxid"], json!(tx(0x03)));
         assert!(r.facts.get("claim").is_none_or(|c| c.is_null()), "no press before the block");
 
+        // an unconfirmed PAYOUT (the verdict known, the block not yet): the press waits, the row says the chain wait
+        let mut w = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        w.spent_confirmed = Some(false);
+        w.at_height = None;
+        let results_w = vec![w];
+        let i_w = inputs(&results_w, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let rows_w = derive_owed_rows(&i_w);
+        assert_eq!(rows_w.len(), 1);
+        assert_eq!(rows_w[0].family, OwedFamily::Payout);
+        assert_eq!(rows_w[0].facts["claimable"], false);
+        assert_eq!(rows_w[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        assert_eq!(rows_w[0].facts["chainWait"], json!("block"));
         // the same spend CONFIRMED without a verdict keeps the old, honest word (a classification gap, not a wait)
         let mut c = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
         c.spent_confirmed = Some(true);
@@ -1576,6 +1765,7 @@ mod tests {
     fn an_unconfirmed_payout_is_a_row_that_is_not_claimable_yet() {
         let mut e = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
         e.spent_confirmed = Some(false);
+        e.at_height = None; // unconfirmed: no verified mined height (the review's LOW-1 bar)
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let rows = derive_owed_rows(&inputs(std::slice::from_ref(&e), &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows[0].family, OwedFamily::Payout);
