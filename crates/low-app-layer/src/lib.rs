@@ -139,6 +139,7 @@ pub mod logic;
 pub mod hopsweep;
 pub mod owed;
 pub mod proof_post;
+pub mod rate;
 pub mod record_post;
 pub mod refund_backups;
 pub mod refund_view;
@@ -324,6 +325,9 @@ fn router(
         // #209 follow-up: server-assembled credit ancestry, so the client
         // never stores BEEF bytes to survive a reload (see `credit_beef`).
         .get_async("/credit-beef/:txid", routes::credit_beef)
+        // bsv-low #497 (2026-09-20): the exchange rate from a courier ladder behind a per-isolate cache — the
+        // browser never calls a courier (the same-origin WoC proxy is gone).
+        .get_async("/rate", routes::rate)
         .get_async("/tip", routes::tip)
         .get("/epoch", routes::epoch)
         .get("/health", routes::health)

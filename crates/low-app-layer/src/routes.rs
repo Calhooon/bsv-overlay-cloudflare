@@ -5450,8 +5450,17 @@ async fn arcade_confirmation_look(
 /// and identifies this worker (Arcade's edge 403s bare agents — the
 /// 2026-09-01 incident's lesson on the overlay).
 async fn provider_get(caller: &'static str, url: &str) -> Option<(u16, Vec<u8>)> {
+    provider_get_with(caller, url, None).await
+}
+
+/// `provider_get` with one extra request header (bsv-low #497: CoinMarketCap's key header on the rate ladder).
+pub(crate) async fn provider_get_with(
+    caller: &'static str,
+    url: &str,
+    extra_header: Option<(&str, &str)>,
+) -> Option<(u16, Vec<u8>)> {
     let started = worker::Date::now().as_millis() as f64;
-    let got = provider_get_raw(url).await;
+    let got = provider_get_raw(url, extra_header).await;
     let ms = worker::Date::now().as_millis() as f64 - started;
     crate::courier::note(url, caller, got.as_ref().map(|(s, _)| *s), ms);
     got
@@ -5460,7 +5469,7 @@ async fn provider_get(caller: &'static str, url: &str) -> Option<(u16, Vec<u8>)>
 /// This worker's courier identity (see `provider_get`).
 const APP_LAYER_USER_AGENT: &str = "low-app-layer/1.0 (+https://bsvarcade.com)";
 
-async fn provider_get_raw(url: &str) -> Option<(u16, Vec<u8>)> {
+async fn provider_get_raw(url: &str, extra_header: Option<(&str, &str)>) -> Option<(u16, Vec<u8>)> {
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
     let headers = Headers::new();
@@ -5469,6 +5478,9 @@ async fn provider_get_raw(url: &str) -> Option<(u16, Vec<u8>)> {
         if let Some(key) = woc_api_key() {
             let _ = headers.set("woc-api-key", &key);
         }
+    }
+    if let Some((k, v)) = extra_header {
+        let _ = headers.set(k, v);
     }
     init.with_headers(headers);
     let request = worker::Request::new_with_init(url, &init).ok()?;
@@ -6387,6 +6399,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     body["owed"]["inFlight"] = owed_in_flight_snapshot(worker::Date::now().as_millis() as i64);
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
+    // bsv-low #497: the exchange rate's sample, its age and every rung's counts (this isolate's).
+    body["rate"] = crate::rate::health_json(worker::Date::now().as_millis() as f64);
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
     // future-cutoff belt, i.e. exactly what the views are filtering by and
     // what /epoch serves. `null` = write-off inert. One glance answers
@@ -6401,6 +6415,11 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
         None => serde_json::Value::Null,
     };
     json_response(body.to_string(), 200)
+}
+
+/// `GET /rate` — bsv-low #497: USD per BSV from the app layer's courier ladder behind its cache (`crate::rate`).
+pub(crate) async fn rate(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+    crate::rate::serve(&ctx).await
 }
 
 /// `GET /epoch` — the storage-epoch directive (bsv-low THE ORDER item 2,
