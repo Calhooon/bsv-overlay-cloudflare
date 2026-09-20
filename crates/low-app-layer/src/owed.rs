@@ -766,6 +766,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         reason: None,
                     });
                 } else if !gate_open {
+                    // The rejoin row carries the served recovery gate as the `recoveryHeight` FACT (inherited
+                    // from `base_facts` above, == `served_recovery_height`). It is DISPLAY-TIER: the bsv-low #469
+                    // home card reads it as a SECOND rejoin-safe recovery source (`RejoinWindowLine recoverable`,
+                    // ORed beside this device's own `low_pot_refund_` record), so a seat mid-hand shows "rejoin to
+                    // finish — your stake is safe in the pot" even when the local refund record has not surfaced
+                    // (the fleet-loop-16 R1 gap). The fact rides `facts.recoveryHeight`, NOT `at_height`, ON
+                    // PURPOSE: the gate is a FUTURE block height, and every reader renders `atHeight` as a mined
+                    // "· at height N" (the Your Games owed list) and sorts on it — a future gate there would
+                    // mislabel and mis-order the row. `at_height` stays None (no spend has mined for an unspent pot).
                     let mut facts = base_facts.clone();
                     facts["claim"] = json!("rejoin");
                     facts["claimable"] = json!(true);
@@ -1862,6 +1871,13 @@ mod tests {
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::InProgress, Some(20_000)));
         assert_eq!(rows[0].facts["claim"], "rejoin");
         assert_eq!(rows[0].facts["blocksToGate"], 10);
+        // bsv-low #469 / fleet-loop-16 R1: the rejoin row CARRIES the served recovery gate as the
+        // `recoveryHeight` FACT — the client's SECOND rejoin-safe recovery source (ORed beside this device's own
+        // refund record in `RejoinWindowLine`), so a seat mid-hand shows "rejoin to finish" even before its local
+        // refund record surfaces. It rides `facts.recoveryHeight`, never `at_height` (a future gate is not a mined
+        // "at height": the owed list renders/sorts `atHeight` as one), which stays None on an unspent pot.
+        assert_eq!(rows[0].facts["recoveryHeight"], 900_000);
+        assert!(rows[0].at_height.is_none(), "an unspent in-progress pot has no mined height");
         // the gate open and NO valid filed refund: unbound, with the tower named as the path
         let none = HashMap::new();
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &none, &c, &p, Some(900_005)));
