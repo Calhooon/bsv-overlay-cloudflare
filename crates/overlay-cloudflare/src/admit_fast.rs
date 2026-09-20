@@ -928,13 +928,21 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
             cas_missed,
             cas_faults,
             height,
-        } => {
+        } if rows >= 1 => {
             crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRMED_NOW, 1).await;
             crate::pot_changes::flush_inline(env.env.clone()).await;
             worker::console_log!(
                 "[admit-fast] {txid} CONFIRMED by the watch's own proof read (height {height:?}; {rows} row(s), {cas_missed} CAS miss(es), {cas_faults} CAS fault(s)) — the block had come before the index saw the spend"
             );
             true
+        }
+        // every pointer moved off this txid between the read and the CAS: a proof of a tx no pot row relates to
+        // any more — nothing confirmed, nothing pushed, the watch counts as silent (the delta-verify's N1)
+        ConfirmNow::Confirmed { cas_missed, .. } => {
+            worker::console_log!(
+                "[admit-fast] {txid} the watch's proof read verified but every pointer had moved ({cas_missed} CAS miss(es)) — nothing confirmed"
+            );
+            false
         }
         ConfirmNow::Unmined => {
             worker::console_log!(
@@ -998,6 +1006,17 @@ pub async fn confirm_spend_now_with(
         Ok(r) => r,
         Err(e) => return ConfirmNow::Fault(format!("spender lookup: {e}")),
     };
+    confirm_spend_now_rows(pot_storage, fetcher, txid, rows).await
+}
+
+/// The step after the spender lookup (the rows already read once — the delta-verify's N2: the wiring reads them
+/// for the memo and hands them here, never a second read).
+pub async fn confirm_spend_now_rows(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    txid: &str,
+    rows: Vec<overlay_discovery::pot::storage::PotRecord>,
+) -> ConfirmNow {
     if rows.is_empty() {
         return ConfirmNow::NoUnconfirmedSpend;
     }
@@ -1051,7 +1070,9 @@ thread_local! {
     static CONFIRM_NOW_ASKED: std::cell::RefCell<std::collections::HashMap<String, f64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
-/// One courier ask per txid per isolate-minute.
+/// One courier ask per txid per isolate-minute. The memo records the ATTEMPT, not an answer: a transport fault
+/// inside the ask also holds the memo (fail-safe — the 30-minute backstop owns the row); a memo hit is never
+/// "we have a fresh answer".
 pub const CONFIRM_NOW_MEMO_MS: f64 = 60_000.0;
 
 /// PURE: does the memo still hold at `now_ms` for an ask made at `asked_ms`?
@@ -1097,7 +1118,7 @@ async fn confirm_spend_now(
     crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRM_ASKED, 1).await;
     let fetcher = crate::courier_fetcher(&env.env, crate::lookup_service_chain_tracker(&env.env))
         .with_budget(1);
-    confirm_spend_now_with(&store, &fetcher, txid).await
+    confirm_spend_now_rows(&store, &fetcher, txid, rows).await
 }
 
 #[cfg(test)]
@@ -1796,9 +1817,17 @@ mod tests {
         // call moved the raw distance past the bound and a formatter red'd this pin; a formatter must never be
         // able to red (or green) a source pin, so the distance is a fact of the tokens, not the line breaks
         let squash = |s: &str| s.split_whitespace().collect::<String>();
-        let jobs = squash(
+        // comments stripped too (the delta-verify's N3): a doc line above the flush can never red this pin, and
+        // a commented-out flush can never green it — the 700 is a bound on CODE
+        let code_only = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let jobs = squash(&code_only(
             &src[src.find("pub async fn refusal_job(").unwrap()..src.find("#[cfg(test)]").unwrap()],
-        );
+        ));
         let mut from = 0;
         let mut evictions = 0;
         while let Some(i) = jobs[from..].find("evict_txid_everywhere(") {

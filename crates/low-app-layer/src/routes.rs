@@ -2199,6 +2199,10 @@ pub async fn compute_results_body_string(
 /// landings before any credit.
 /// The identities whose OWN markers name an outpoint: the party rows naming it as a pot, the hop rows naming it as a
 /// hop (`OWED_ATTRIBUTE_BY_POT_SQL` / `_BY_HOP_SQL`). Fail-soft: a faulted read names nobody (the cadence re-derives).
+/// The identities the seats' OWN markers name for an outpoint. Two events share this helper with different key
+/// spaces: a POT event (the no-decoded-params and no-attributed-seats branches) is answered by the party arm and
+/// the refund-backup arm (both keyed by the pot); a released-HOP event by the hop arm (keyed by the hop container's
+/// outpoint, which never matches a pot). An arm that cannot match its event is one indexed empty read.
 pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &str, vout: u32) -> Vec<String> {
     #[derive(Deserialize)]
     struct IdentityOnlyD1 {

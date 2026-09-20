@@ -808,7 +808,11 @@ mod tests {
         assert!(named < stale && stale < queued, "read, mark stale, queue — in that order");
         // and the marker-named read has the refund-backup arm (the one marker a seat killed at the funding filed)
         let helper = routes.find(&squash("pub(crate) async fn owed_identities_by_marker(")).expect("the helper");
-        let helper_body = &routes[helper..helper + 1_200];
+        // bounded to the helper's own body: the next `pub(crate) async fn` (the delta-verify's N4; `find` lands on
+        // an ASCII marker, a char boundary, never a byte offset into an em dash)
+        let rest = &routes[helper + 1..];
+        let end = rest.find(&squash("pub(crate) async fn")).unwrap_or(rest.len());
+        let helper_body = &rest[..end];
         assert!(helper_body.contains(&squash("crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL")), "the potrefund arm");
     }
 
