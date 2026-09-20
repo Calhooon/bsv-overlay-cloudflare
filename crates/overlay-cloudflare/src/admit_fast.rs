@@ -773,7 +773,13 @@ pub async fn refusal_job(env: EvidenceEnv, txid: String, webhook: (String, Strin
                     .await;
             // the second gate's HIGH-1 (bsv-low #451): the evidence is HERE — `/tx-any` answers `present:false`
             // for the evicted JOIN at once (the felt's `broadcast-unaccepted` latch), never `null` for an hour
-            write_refused_verdict(db, &txid, now_ms as i64, &format!("{} ({reason})", webhook.0)).await;
+            write_refused_verdict(
+                db,
+                &txid,
+                now_ms as i64,
+                &format!("{} ({reason})", webhook.0),
+            )
+            .await;
             // the eviction is the event the felt voids on: ship its notes now
             // (the route's own flush drained before this job ran)
             crate::pot_changes::flush_inline(env.env.clone()).await;
@@ -822,6 +828,9 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
         );
         return;
     };
+    // (an Rc: the watch-end proof read below builds the D1 pot store over the same handle; every `&db` below
+    // deref-coerces to `&D1Database`)
+    let db = std::rc::Rc::new(db);
     let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone());
     let mut last = crate::broadcaster::WitnessLook::Unknown;
     for sleep in PENDING_WATCH_SLEEPS_MS {
@@ -853,7 +862,13 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
                         )
                         .await;
                         // the second gate's HIGH-1: the verdict memo, written where the evidence is
-                        write_refused_verdict(&db, &txid, now_ms as i64, &format!("{status} ({reason})")).await;
+                        write_refused_verdict(
+                            &db,
+                            &txid,
+                            now_ms as i64,
+                            &format!("{status} ({reason})"),
+                        )
+                        .await;
                         // the eviction is the event the felt voids on: ship its
                         // notes now (the route's flush drained before the watch)
                         crate::pot_changes::flush_inline(env.env.clone()).await;
@@ -906,12 +921,222 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
     worker::console_log!(
         "[admit-fast] {txid} unwitnessed after the pending watch ({last:?}) — the callbacks, the completion and the reconcile passes own it"
     );
+    // fleet loop 15 (2026-09-20, pair 1's refund): a spend that MINED before this index ever saw it — the tower
+    // parked it at arm time through TAAL, the node promoted it at H, the client re-presented it after the block —
+    // gets Arcade's STORED ECHO (ACCEPTED_BY_NETWORK, never MINED: its status froze at the first presentation)
+    // and no callback (already known: none registered), so nothing ever pushes its proof; the 30-minute backstop
+    // pass was the only path, and every consumer (the owed row, the felt) waited on a block that had come. The
+    // watch's end runs the single-spend completion NOW: the courier proof ladder, chaintracks-verified, the
+    // guarded CAS — bounded to this one txid.
+    match confirm_spend_now(&env, db.clone(), &txid).await {
+        ConfirmNow::Confirmed {
+            rows,
+            cas_missed,
+            height,
+        } => {
+            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRMED_NOW, 1)
+                .await;
+            crate::pot_changes::flush_inline(env.env.clone()).await;
+            worker::console_log!(
+                "[admit-fast] {txid} CONFIRMED by the watch's own proof read (height {height:?}; {rows} row(s), {cas_missed} CAS miss(es)) — the block had come before the index saw the spend"
+            );
+        }
+        ConfirmNow::Unmined | ConfirmNow::NoUnconfirmedSpend => {}
+        ConfirmNow::Fault(why) => {
+            worker::console_log!(
+                "[admit-fast] {txid} the watch's proof read faulted ({why}) — the passes own it"
+            );
+        }
+    }
+}
+
+/// What the watch's own proof read found for one spender txid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmNow {
+    /// no pot names this txid as an unconfirmed spender (nothing to confirm)
+    NoUnconfirmedSpend,
+    /// the couriers hold no chaintracks-verified proof yet (honestly unmined so far)
+    Unmined,
+    /// a verified proof: the rows' confirmations latched through the guarded CAS
+    Confirmed {
+        rows: usize,
+        cas_missed: usize,
+        height: Option<u64>,
+    },
+    /// a read fault (a courier, chaintracks, or the store): retryable, never a verdict
+    Fault(String),
+}
+
+/// PURE over its two ports (the store and the fetcher): confirm every pot outpoint whose recorded, unconfirmed
+/// spender is `txid` from ONE chaintracks-verified proof read — the spend-confirmation pass's per-row step, scoped
+/// to a single spender so the pending watch can run it at its end. The CAS is the pass's own
+/// (`mark_confirmed_for_spender`: a moved pointer confirms nothing and is counted).
+pub async fn confirm_spend_now_with(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    txid: &str,
+) -> ConfirmNow {
+    let rows = match pot_storage.find_unconfirmed_by_spending_txid(txid).await {
+        Ok(r) => r,
+        Err(e) => return ConfirmNow::Fault(format!("spender lookup: {e}")),
+    };
+    if rows.is_empty() {
+        return ConfirmNow::NoUnconfirmedSpend;
+    }
+    let bump_hex = match fetcher.verified_proof_for_detailed(txid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return ConfirmNow::Unmined,
+        Err(e) => return ConfirmNow::Fault(format!("proof read: {e}")),
+    };
+    let height = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
+        .ok()
+        .map(|mp| u64::from(mp.block_height));
+    let (mut confirmed, mut cas_missed) = (0usize, 0usize);
+    for rec in rows {
+        match pot_storage
+            .mark_confirmed_for_spender(&rec.txid, rec.output_index, txid, height)
+            .await
+        {
+            Ok(true) => {
+                confirmed += 1;
+                crate::pot_changes::note(&rec.txid, rec.output_index);
+            }
+            Ok(false) => cas_missed += 1,
+            Err(e) => return ConfirmNow::Fault(format!("confirm CAS: {e}")),
+        }
+    }
+    ConfirmNow::Confirmed {
+        rows: confirmed,
+        cas_missed,
+        height,
+    }
+}
+
+/// The watch's wiring of [`confirm_spend_now_with`]: the D1 pot store and the courier proof ladder with a small
+/// budget (one txid; the ladder's rungs, chaintracks-verified).
+async fn confirm_spend_now(
+    env: &EvidenceEnv,
+    db: std::rc::Rc<worker::D1Database>,
+    txid: &str,
+) -> ConfirmNow {
+    let store = crate::d1_discovery::D1PotStorage::new(db);
+    let fetcher = crate::courier_fetcher(&env.env, crate::lookup_service_chain_tracker(&env.env))
+        .with_budget(6);
+    confirm_spend_now_with(&store, &fetcher, txid).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proof_fetcher::ArcadeLook;
+    use async_trait::async_trait;
+    use overlay_discovery::pot::storage::PotStorage;
+
+    // ── fleet loop 15 (2026-09-20): the watch's own proof read confirms a spend that mined before the index saw it ──
+    struct ProofOnlyFetcher {
+        bump: Option<String>,
+        fault: bool,
+    }
+    #[async_trait(?Send)]
+    impl overlay_engine::gasp::AncestorFetcher for ProofOnlyFetcher {
+        async fn fetch_ancestor(
+            &self,
+            txid: &str,
+        ) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError>
+        {
+            Err(overlay_engine::gasp::GASPError::NodeNotFound(
+                txid.to_string(),
+            ))
+        }
+        async fn verified_proof_for_detailed(&self, _txid: &str) -> Result<Option<String>, String> {
+            if self.fault {
+                return Err("chaintracks read starved".into());
+            }
+            Ok(self.bump.clone())
+        }
+    }
+    fn pot_rec(txid: &str) -> overlay_discovery::pot::storage::PotRecord {
+        overlay_discovery::pot::storage::PotRecord {
+            txid: txid.to_string(),
+            output_index: 0,
+            pot_sats: Some(40_000),
+            params_decoded: true,
+            ..Default::default()
+        }
+    }
+    fn bump_hex(txid: &str, height: u32) -> String {
+        bsv_rs::transaction::MerklePath::new_unchecked(
+            height,
+            vec![vec![bsv_rs::transaction::MerklePathLeaf::new_txid(
+                0,
+                txid.to_string(),
+            )]],
+        )
+        .expect("a one-leaf bump")
+        .to_hex()
+    }
+
+    /// The class: the index records the spend unconfirmed (a re-present after the block; Arcade's echo never says
+    /// MINED and no callback is registered), and the watch's own proof read confirms it at once — the height from
+    /// the bump, the guarded CAS, the outpoint noted for the pots-room push. A fetcher without a proof leaves the
+    /// row honestly unconfirmed; a read fault is a fault, never a verdict; a spender nothing names is nothing to do.
+    #[tokio::test]
+    async fn the_watchs_own_proof_read_confirms_a_spend_that_mined_before_the_index_saw_it() {
+        let store = overlay_discovery::pot::storage::MemoryPotStorage::new();
+        let pot = "ab".repeat(32);
+        let spender = "cd".repeat(32);
+        store.store_record(&pot_rec(&pot)).await.unwrap();
+        store
+            .mark_spent(&pot, 0, &spender, false, None, None, Some(false))
+            .await
+            .unwrap();
+        // no proof yet: honestly unmined, nothing written
+        let none = ProofOnlyFetcher {
+            bump: None,
+            fault: false,
+        };
+        assert_eq!(
+            confirm_spend_now_with(&store, &none, &spender).await,
+            ConfirmNow::Unmined
+        );
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(!r.spent_confirmed);
+        // a read fault: a fault, never a verdict
+        let faulty = ProofOnlyFetcher {
+            bump: None,
+            fault: true,
+        };
+        assert!(matches!(
+            confirm_spend_now_with(&store, &faulty, &spender).await,
+            ConfirmNow::Fault(_)
+        ));
+        // the proof: confirmed now, at the bump's height
+        let proven = ProofOnlyFetcher {
+            bump: Some(bump_hex(&spender, 967_603)),
+            fault: false,
+        };
+        assert_eq!(
+            confirm_spend_now_with(&store, &proven, &spender).await,
+            ConfirmNow::Confirmed {
+                rows: 1,
+                cas_missed: 0,
+                height: Some(967_603)
+            }
+        );
+        let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
+        assert!(r.spent_confirmed);
+        assert_eq!(r.spent_height, Some(967_603));
+        // nothing names a stranger's txid as an unconfirmed spender
+        assert_eq!(
+            confirm_spend_now_with(&store, &proven, &"ef".repeat(32)).await,
+            ConfirmNow::NoUnconfirmedSpend
+        );
+        // and the confirmed row is not confirmed twice (the finder skips confirmed rows)
+        assert_eq!(
+            confirm_spend_now_with(&store, &proven, &spender).await,
+            ConfirmNow::NoUnconfirmedSpend
+        );
+    }
 
     /// The watch fits the post-response budget (gate LOW-1: eviction of the
     /// isolate must not silently skip the latch) and looks early (the old wire

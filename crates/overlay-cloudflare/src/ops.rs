@@ -158,6 +158,9 @@ pub const COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED: &str =
 /// still an orphan view (the parents unseen by Arcade).
 pub const COUNTER_SUBMIT_PENDING_SILENT: &str = "submit_pending_silent_total";
 pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
+/// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
+/// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).
+pub const COUNTER_SUBMIT_PENDING_CONFIRMED_NOW: &str = "submit_pending_confirmed_now_total";
 /// bsv-low M19 round 2 (review H2): an Arcade `reorg_unmined` marker whose
 /// spender's stored proof chaintracks still HOLDS: the hint changed nothing
 /// (a planted marker, or a stale one). Non-zero on a healthy stream is a
@@ -808,6 +811,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
         COUNTER_SUBMIT_PENDING_SILENT,
         COUNTER_SUBMIT_PENDING_ORPHAN,
+        COUNTER_SUBMIT_PENDING_CONFIRMED_NOW,
     ] {
         obj[name] = json!(0);
     }
