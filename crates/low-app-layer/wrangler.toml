@@ -47,7 +47,7 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 # (`anonymousByRoute` ≈ 0 for every identity route), THEN flip. Rollback is
 # flipping it back; no code change. Full closure criteria: `src/auth.rs` docs.
 [vars]
-AUTH_ENFORCE = "false"
+AUTH_ENFORCE = "true"  # the promotion 2026-09-21: the identity reads enforced (C6), as proven on beta
 # bsv-low #441: the session lane (one BRC-103 handshake per origin, then a MAC'd lane
 # on `x-low-session*`). OFF on prod until the promotion decides; the store binding
 # must exist for the flag to mean anything (`session_lane_configured`).

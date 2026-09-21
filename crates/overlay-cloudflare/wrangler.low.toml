@@ -37,6 +37,13 @@ APP_LAYER_URL = "https://low-app-layer.dev-a3e.workers.dev"
 ENVIRONMENT = "production"
 CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
 HOSTING_URL = "https://low-overlay.dev-a3e.workers.dev"
+# THE PROMOTION 2026-09-21 (bsv-low loops 11 to 21, the clean pass): prod runs the configuration the fleet proved.
+# SUBMIT_ENFORCE (#347): the unbarred submit modes are operator-only; the client's only mode is broadcast-gated (#407).
+SUBMIT_ENFORCE = "true"
+# SCRIPT_VERIFY_NETWORK_GATED (D8, #437): the script-verify DOOR before any broadcast (the interpreter's verdict alone refuses).
+SCRIPT_VERIFY_NETWORK_GATED = "true"
+# ADMIT_FAST (D1, the owner's admission model 2026-09-15): the gated answer on Arcade's synchronous accept; the witness is the pending watch's.
+ADMIT_FAST = "true"
 WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # Lobby surface: mainline SHIP/SLAP (so the node can be discovered and can
 # index peer ads if ever needed) + the LOW poker lobby topic + the LOW
