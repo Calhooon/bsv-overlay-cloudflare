@@ -510,6 +510,9 @@ pub fn collected_lookup_games<'a>(spent_result_games: impl Iterator<Item = &'a s
 /// PURE (#517, the gate's LOW-1): the hop's own row or the chain rung names a DIFFERENT tx as its CONFIRMED spender.
 /// The index's proof of the filed sweep never outranks that word (a reorg replaced the sweep's block with a competing
 /// spend and the latch was missed): the ladder below follows the chain's spender, as before the proof existed.
+/// Stated asymmetry (the delta-verify's N-C): this does not consult `pointer_refuted`, so a confirmed pointer whose
+/// bytes were read and do not spend the hop still neutralises the proof; the outcome is the pre-#517 "could not
+/// judge", never worse, and a confirmed refuted pointer would be an overlay attribution bug with no producer today.
 pub fn confirmed_by_other(h: &HopEntry, word: Option<&HopChainWord>, sweep_txid: &str) -> bool {
     let other = |s: &str| !s.eq_ignore_ascii_case(sweep_txid);
     (h.spent == Some(true) && h.spent_confirmed == Some(true) && h.spending_txid.as_deref().is_some_and(other))
@@ -639,6 +642,8 @@ fn story_reason(facts: &mut Value, story: Option<SpenderStory>, unknown: &'stati
 /// pot's spend state (spent → payout / unbound; unspent → refund-due /
 /// in-progress / unbound; a hop outpoint → hop-stranded).
 pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
+    // #517, the gate's LOW-1: the hop outpoints whose proven filing met a contradicting confirmed spender this pass
+    let mut contradicted_hops: HashSet<String> = HashSet::new();
     let me = i.identity_lc.to_ascii_lowercase();
     let mut rows: Vec<OwedRow> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -893,9 +898,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         // claimable once the sweep mined; retired by `collected` like every payout (one candidate per game, N10
         // above), or by the index's word that the home output was spent since (collected and moved on).
         // #517, the gate's LOW-1: a PROVEN filing met a contradicting confirmed spender (the hop row's or the chain
-        // rung's): the proof did not decide (see `confirmed_by_other`); counted once per hop for the operator
+        // rung's): the proof did not decide (see `confirmed_by_other`). The fact rides the hop's row (whatever family
+        // the ladder gives it) so the operator sees WHICH hop; the route counts the rows (the delta-verify's N-A/N-B:
+        // this derivation stays pure, no global moves here)
         if i.hop_sweeps.get(&outpoint).is_some_and(|f| f.index_proven && confirmed_by_other(h, i.hop_chain.get(&outpoint), &f.sweep_txid)) {
-            note_sweep_proof_contradicted();
+            contradicted_hops.insert(outpoint.clone());
         }
         if let Some(swept) = swept_home(i, h) {
             if swept.output_spent {
@@ -1158,6 +1165,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             }
         }
     }
+    if !contradicted_hops.is_empty() {
+        for r in rows.iter_mut() {
+            if contradicted_hops.contains(&r.outpoint) {
+                r.facts["sweepProofContradicted"] = json!(true);
+            }
+        }
+    }
     rows
 }
 
@@ -1334,11 +1348,15 @@ pub fn note_hop_sweeps_read_fault() {
 pub fn note_sweep_proofs_read_fault() {
     SWEEP_PROOFS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
-pub fn note_sweep_proof_contradicted() {
-    SWEEP_PROOF_CONTRADICTIONS.fetch_add(1, Ordering::Relaxed);
+/// The route counts the rows that carry `sweepProofContradicted` (one per hop per recompute).
+pub fn note_sweep_proof_contradictions(n: u64) {
+    if n > 0 {
+        SWEEP_PROOF_CONTRADICTIONS.fetch_add(n, Ordering::Relaxed);
+    }
 }
-pub fn sweep_proof_contradictions() -> u64 {
-    SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed)
+/// PURE: how many rows of one derivation carry the contradiction fact (the route's count, pinned).
+pub fn count_sweep_proof_contradictions(rows: &[OwedRow]) -> u64 {
+    rows.iter().filter(|r| r.facts.get("sweepProofContradicted").and_then(|v| v.as_bool()) == Some(true)).count() as u64
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
@@ -2208,7 +2226,6 @@ mod tests {
         let key = format!("{}:0", tx(0x07));
         let sweep = tx(0x0c);
         let proven = filed_proven(&key, &sweep, Some(967_696));
-        let before = sweep_proof_contradictions();
         // the hop row: spent+confirmed by ANOTHER tx (0x09), whose bytes the pass did not read
         let mut other = hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000));
         other.spent_confirmed = Some(true);
@@ -2218,7 +2235,8 @@ mod tests {
         let rows = derive_owed_rows(&i);
         assert_ne!(rows[0].family, OwedFamily::Payout, "the proof did not decide against the row's confirmed spender");
         assert!(rows[0].reason.as_deref().unwrap_or("").contains("could not judge"), "{:?}", rows[0].reason);
-        assert_eq!(sweep_proof_contradictions(), before + 1);
+        assert_eq!(rows[0].facts["sweepProofContradicted"], true, "the operator sees WHICH hop");
+        assert_eq!(count_sweep_proof_contradictions(&rows), 1);
         // the chain rung naming ANOTHER confirmed spender on an index-unspent hop: the same
         let unspent = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
         let chain_other = chain_confirmed(&key, true, Some(true), Some(&tx(0x09)), Some(true));
@@ -2227,7 +2245,8 @@ mod tests {
         i.hop_chain = &chain_other;
         let rows = derive_owed_rows(&i);
         assert_ne!(rows[0].family, OwedFamily::Payout);
-        assert_eq!(sweep_proof_contradictions(), before + 2);
+        assert_eq!(rows[0].facts["sweepProofContradicted"], true);
+        assert_eq!(count_sweep_proof_contradictions(&rows), 1);
         // an UNCONFIRMED word for another tx does not contradict a proof (a stale pointer the block already settled)
         let mut stale = hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000));
         stale.spent_confirmed = Some(false);
@@ -2236,7 +2255,8 @@ mod tests {
         i.hop_sweeps = &proven;
         let rows = derive_owed_rows(&i);
         assert_eq!((rows[0].family, rows[0].facts["confirmedSource"].as_str()), (OwedFamily::Payout, Some("index-proof")));
-        assert_eq!(sweep_proof_contradictions(), before + 2);
+        assert!(rows[0].facts.get("sweepProofContradicted").is_none());
+        assert_eq!(count_sweep_proof_contradictions(&rows), 0);
     }
 
     #[test]

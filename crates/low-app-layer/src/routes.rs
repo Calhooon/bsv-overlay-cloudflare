@@ -3165,7 +3165,10 @@ pub(crate) async fn owed_recompute(
             }
         }
         // #517 (the gate's NIT-4): a hop whose FILED sweep the index holds proven is judged on that sweep's bytes too
-        // (its home output's spend word, its inputs), even when neither the hop row nor the chain rung named it
+        // (its home output's spend word, its inputs), even when neither the hop row nor the chain rung named it.
+        // Appended after the named spenders under the same cap (the delta-verify's N-D): an identity with sixteen
+        // named spenders reads the proven sweep's bytes on a later pass; the row stands until then or until
+        // `collected`, the pre-fold end state (a bounded-walk residual, never a wrong row)
         for h in hops.iter() {
             let key = outpoint_key(&h.hop_txid, h.hop_vout);
             if let Some(s) = hop_sweeps.get(&key).filter(|s| s.index_proven) {
@@ -3341,6 +3344,8 @@ pub(crate) async fn owed_recompute(
         courier_spenders: &courier_spenders,
         my_pkh_by_game: &my_pkh_by_game,
     });
+    // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
+    crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {
         rows.truncate(crate::owed::OWED_MAX_ROWS);
