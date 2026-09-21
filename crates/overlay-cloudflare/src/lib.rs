@@ -2071,7 +2071,9 @@ async fn queue_handler(
                         Ok(Some(ev)) => {
                             let now_ms = worker::Date::now().as_millis();
                             let moved =
-                                crate::admit_fast::evict_txid_everywhere(db, &subject, &ev.reason, now_ms).await;
+                                crate::admit_fast::evict_txid_everywhere(db, &subject, &ev.reason, now_ms)
+                                    .await
+                                    .moved;
                             crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
                                 .await;
                             crate::pot_changes::flush_inline(env.clone()).await;

@@ -1421,17 +1421,21 @@ async fn submit_inner(
                 // moves nothing), and the felt learns through the flush
                 if let Some(ev) = door_open.take() {
                     if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
-                        let moved = crate::admit_fast::evict_txid_everywhere(
+                        // the ledger's word is the LADDER's fresh reason (round 3, NIT): the earlier one stands in the log
+                        let outcome = crate::admit_fast::evict_txid_everywhere(
                             &ledger_db,
                             &subject_txid,
-                            &ev.reason,
+                            &format!("REJECTED ({reason}; re-refused at the ladder)"),
                             worker::Date::now().as_millis(),
                         )
                         .await;
                         crate::pot_changes::flush_inline(env.clone()).await;
                         worker::console_log!(
-                            "broadcast-gated(arcade): {subject_txid} refused again under an open eviction (at {} ms) — the eviction re-run moved {moved} row(s)",
-                            ev.evicted_at_ms
+                            "broadcast-gated(arcade): {subject_txid} refused again under an open eviction (at {} ms — {}) — the eviction re-run moved {} row(s){}",
+                            ev.evicted_at_ms,
+                            ev.reason,
+                            outcome.moved,
+                            if outcome.yielded { " (it yielded to a readmission)" } else { "" }
                         );
                     }
                 }
@@ -1516,8 +1520,9 @@ async fn submit_inner(
             match crate::admit_fast::open_eviction(&ledger_db, subject).await {
                 Ok(Some(ev)) => {
                     let now_ms = worker::Date::now().as_millis();
-                    let moved =
+                    let outcome =
                         crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms).await;
+                    let moved = outcome.moved;
                     crate::ops::bump_counter(
                         &ledger_db,
                         crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
