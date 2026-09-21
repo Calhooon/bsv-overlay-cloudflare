@@ -318,6 +318,23 @@ pub const HOPSWEEPS_FOR_IDENTITY_SQL: &str = "SELECT hopTxid, hopVout, sweepTxid
 /// path always writes 0; a refuted bump resets it), `proofHeight` the block that bump names.
 pub const SWEEP_PROOFS_SQL_HEAD: &str = "SELECT lower(txid) AS txid, proofHeight FROM transactions WHERE has_proof = 1 AND txid IN (";
 
+/// PURE: the proof read for `n` sweep txids (`?1..?n`), prepared against the shipped schema at representative arities
+/// in `tests/sql_prepares_sqlite.rs` (the crate's #323 rule: a `contains` pin is never the only thing behind a query).
+pub fn sweep_proofs_sql(n: usize) -> String {
+    let placeholders = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    format!("{SWEEP_PROOFS_SQL_HEAD}{placeholders})")
+}
+
+/// PURE (#517, the gate's LOW-2): the filing a hop's row rides. The newest filing, unless an OLDER filing of the same
+/// hop is the one the index holds PROVEN (the cap allows two filings per hop: a sweep re-signed at another fee from a
+/// stale row on a second device; the mined one is the hop's spender and the row's credit).
+pub fn pick_filed_sweep(newest: FiledHopSweep, older: Vec<FiledHopSweep>) -> FiledHopSweep {
+    if newest.index_proven {
+        return newest;
+    }
+    older.into_iter().find(|s| s.index_proven).unwrap_or(newest)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -547,6 +564,18 @@ mod tests {
         assert!(HOP_CONTEXT_SQL.contains("FROM hopparty_records") && HOP_CONTEXT_SQL.contains("markerValid"));
         // #517: the proof read names the engine's own latch, never the admit path's bytes
         assert!(SWEEP_PROOFS_SQL_HEAD.contains("FROM transactions") && SWEEP_PROOFS_SQL_HEAD.contains("has_proof = 1") && SWEEP_PROOFS_SQL_HEAD.ends_with("IN ("));
+        assert_eq!(sweep_proofs_sql(3).matches('?').count(), 3);
+        assert!(sweep_proofs_sql(1).ends_with("IN (?1)"));
+    }
+
+    /// #517, the gate's LOW-2: the newest filing rides the row unless an older filing of the hop is the proven one.
+    #[test]
+    fn the_proven_filing_rides_the_row_even_when_an_older_one_mined() {
+        let f = |txid: &str, proven: bool| FiledHopSweep { sweep_txid: txid.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven: proven, index_proof_height: proven.then_some(967_696) };
+        assert_eq!(pick_filed_sweep(f("aa", false), vec![]).sweep_txid, "aa");
+        assert_eq!(pick_filed_sweep(f("aa", true), vec![f("bb", true)]).sweep_txid, "aa", "the newest proven filing wins");
+        assert_eq!(pick_filed_sweep(f("aa", false), vec![f("bb", false), f("cc", true)]).sweep_txid, "cc", "the older PROVEN filing is the hop's spender");
+        assert_eq!(pick_filed_sweep(f("aa", false), vec![f("bb", false)]).sweep_txid, "aa", "nothing proven: the newest, as before");
         assert_eq!(HOPSWEEP_FILE_SQL.matches('?').count(), 9);
         assert!(HOPSWEEP_CREATE.contains("PRIMARY KEY (txid, outputIndex)"));
     }

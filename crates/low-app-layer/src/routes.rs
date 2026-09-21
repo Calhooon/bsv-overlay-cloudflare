@@ -2867,7 +2867,8 @@ pub(crate) async fn owed_recompute(
             .collect();
         if !candidates.is_empty() {
             let memos = read_probe_memos(db, &candidates).await;
-            // bsv-low #469, the stranded cell's run 5 (2026-09-19): a CONFIRMED spend's memo answers for a day, and the
+            // bsv-low #469, the stranded cell's run 5 (2026-09-19): a CONFIRMED spend's memo answers for two hours
+            // (`PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; the gate's NIT-8: it read "a day" here after the window shrank), and the
             // outpoints still to ask go never-probed first (newest marker first) then oldest memo first, so the
             // eight-per-recompute walk reaches a hop that just crossed the window instead of re-probing the same
             // first eight of the hops view's rank order every five minutes (both pinned in `hops_view`).
@@ -2931,6 +2932,9 @@ pub(crate) async fn owed_recompute(
     //     A read fault is counted and leaves the map empty (a stranded hop still offers the press, signed on the
     //     owning device; a swept hop reads "could not judge" this pass — the safe direction).
     let mut hop_sweeps: HashMap<String, crate::hopsweep::FiledHopSweep> = HashMap::new();
+    // #517 (the gate's LOW-2): the OLDER filings of a hop (the cap allows two), kept so the proof read below can name
+    // the one the index holds proven as the row's sweep
+    let mut older_sweeps: HashMap<String, Vec<crate::hopsweep::FiledHopSweep>> = HashMap::new();
     {
         #[derive(Deserialize)]
         struct SweepRowD1 {
@@ -2951,13 +2955,19 @@ pub(crate) async fn owed_recompute(
             Ok(rows) => {
                 for r in rows {
                     let key = outpoint_key(&r.hop_txid, r.hop_vout as u32);
-                    hop_sweeps.entry(key).or_insert_with(|| crate::hopsweep::FiledHopSweep {
+                    let filing = crate::hopsweep::FiledHopSweep {
                         sweep_txid: r.sweep_txid.to_ascii_lowercase(),
                         raw_hex: r.sweep_raw_hex.to_ascii_lowercase(),
                         pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
                         index_proven: false,
                         index_proof_height: None,
-                    });
+                    };
+                    match hop_sweeps.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(filing);
+                        }
+                        std::collections::hash_map::Entry::Occupied(o) => older_sweeps.entry(o.key().clone()).or_default().push(filing),
+                    }
                 }
             }
             Err(e) => {
@@ -2973,22 +2983,23 @@ pub(crate) async fn owed_recompute(
     //     JOIN's eviction released the pointer and nothing re-marks a tm_lowfund spend) or a courier's word (an
     //     indexer read a 1,997-tx block's sweep "unconfirmed" seven minutes after the mine, memoised five more; three
     //     blocks passed in nine minutes). A read fault is counted and leaves every sweep unproven this pass (the
-    //     courier path, as before: the safe direction). One chunked read, no outward leg.
+    //     courier path, as before: the safe direction). A local D1 read only (no outward leg), so it sits outside the
+    //     recompute's outward-leg budget (`over_budget`): at most a handful of chunks, milliseconds each, and skipping
+    //     it would trade the index's own word for a courier's (the gate's NIT-7, answered here).
     if !hop_sweeps.is_empty() {
         #[derive(Deserialize)]
         struct ProofRowD1 {
             txid: String,
-            #[serde(rename = "proofHeight")]
+            #[serde(rename = "proofHeight", default)]
             proof_height: Option<f64>,
         }
-        let mut sweep_txids: Vec<String> = hop_sweeps.values().map(|s| s.sweep_txid.clone()).collect();
+        let mut sweep_txids: Vec<String> = hop_sweeps.values().map(|s| s.sweep_txid.clone()).chain(older_sweeps.values().flatten().map(|s| s.sweep_txid.clone())).collect();
         sweep_txids.sort_unstable();
         sweep_txids.dedup();
         let mut proven: HashMap<String, Option<u64>> = HashMap::new();
         let mut faulted = false;
-        for chunk in sweep_txids.chunks(50) {
-            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
-            let sql = format!("{}{placeholders})", crate::hopsweep::SWEEP_PROOFS_SQL_HEAD);
+        for chunk in sweep_txids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let sql = crate::hopsweep::sweep_proofs_sql(chunk.len());
             let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
             let rows = match db.prepare(&sql).bind(&binds) {
                 Ok(stmt) => stmt.all().await.and_then(|r| r.results::<ProofRowD1>()),
@@ -3009,10 +3020,24 @@ pub(crate) async fn owed_recompute(
             }
         }
         if !faulted {
-            for s in hop_sweeps.values_mut() {
+            let mark = |s: &mut crate::hopsweep::FiledHopSweep| {
                 if let Some(h) = proven.get(&s.sweep_txid) {
                     s.index_proven = true;
                     s.index_proof_height = *h;
+                }
+            };
+            for s in hop_sweeps.values_mut() {
+                mark(s);
+            }
+            for list in older_sweeps.values_mut() {
+                for s in list.iter_mut() {
+                    mark(s);
+                }
+            }
+            // the gate's LOW-2: the proven filing rides the row, even when it is the older one
+            for (key, older) in older_sweeps.drain() {
+                if let Some(newest) = hop_sweeps.remove(&key) {
+                    hop_sweeps.insert(key, crate::hopsweep::pick_filed_sweep(newest, older));
                 }
             }
         }
@@ -3136,6 +3161,16 @@ pub(crate) async fn owed_recompute(
             if let Some(sp) = named {
                 if !pot_spenders.contains(&sp) && seen_spenders.insert(sp.clone()) {
                     ordered.push((h.marker_created_at.unwrap_or(0), sp));
+                }
+            }
+        }
+        // #517 (the gate's NIT-4): a hop whose FILED sweep the index holds proven is judged on that sweep's bytes too
+        // (its home output's spend word, its inputs), even when neither the hop row nor the chain rung named it
+        for h in hops.iter() {
+            let key = outpoint_key(&h.hop_txid, h.hop_vout);
+            if let Some(s) = hop_sweeps.get(&key).filter(|s| s.index_proven) {
+                if !pot_spenders.contains(&s.sweep_txid) && seen_spenders.insert(s.sweep_txid.clone()) {
+                    ordered.push((h.marker_created_at.unwrap_or(0), s.sweep_txid.clone()));
                 }
             }
         }

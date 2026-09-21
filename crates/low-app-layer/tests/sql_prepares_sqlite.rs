@@ -242,6 +242,8 @@ fn every_batched_query_prepares_at_representative_arities() {
             &seat_markers_sql(n, low_app_layer::results::SEAT_MARKERS_PER_KEY),
         );
         assert_prepares(&conn, &format!("claims_sql({n})"), &claims_sql(n));
+        // bsv-low #517: the filed sweeps' index-proof read (transactions.has_proof + proofHeight)
+        assert_prepares(&conn, &format!("sweep_proofs_sql({n})"), &low_app_layer::hopsweep::sweep_proofs_sql(n));
         // bsv-low P4 slice 2: the /results page overlay (settleSigners + the
         // money facts) and the hop seat/money fetch, against the schema that
         // now carries sizeBytes/feeSats/fundingSizeBytes/… columns.

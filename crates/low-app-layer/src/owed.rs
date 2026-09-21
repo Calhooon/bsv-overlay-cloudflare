@@ -507,6 +507,15 @@ pub fn collected_lookup_games<'a>(spent_result_games: impl Iterator<Item = &'a s
     games
 }
 
+/// PURE (#517, the gate's LOW-1): the hop's own row or the chain rung names a DIFFERENT tx as its CONFIRMED spender.
+/// The index's proof of the filed sweep never outranks that word (a reorg replaced the sweep's block with a competing
+/// spend and the latch was missed): the ladder below follows the chain's spender, as before the proof existed.
+pub fn confirmed_by_other(h: &HopEntry, word: Option<&HopChainWord>, sweep_txid: &str) -> bool {
+    let other = |s: &str| !s.eq_ignore_ascii_case(sweep_txid);
+    (h.spent == Some(true) && h.spent_confirmed == Some(true) && h.spending_txid.as_deref().is_some_and(other))
+        || word.is_some_and(|w| w.looked && w.spent == Some(true) && w.spent_confirmed == Some(true) && w.spending_txid.as_deref().is_some_and(other))
+}
+
 /// The hop is spent by ITS OWN SEAT'S SWEEP: the sweep this identity FILED (the index's spender or the chain rung's
 /// names it), else a spender whose stored bytes pay the seat's committed pay home for the game. The payout's
 /// claimability is the spend's confirmation from the source that named it; `output_spent` says the index saw the
@@ -532,21 +541,25 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         // `/credit-beef` assembles the credit from). Without it the row rested on the hop row (never attributed to a
         // sweep once the JOIN's eviction released its pointer) or a courier's word (an indexer read a 1,997-tx block's
         // sweep "unconfirmed" seven minutes after the mine, memoised five more; three blocks passed in nine minutes).
-        if filed.index_proven || named_by_index || by_chain.is_some() {
+        // the gate's LOW-1 (Rule 6): the proof never outranks a CONTRADICTING confirmed word; the ladder below decides
+        // (counted once per hop in the row pass: this fn also runs in the candidates pre-pass)
+        let contradicted = confirmed_by_other(h, i.hop_chain.get(&outpoint), &filed.sweep_txid);
+        let index_word = filed.index_proven && !contradicted;
+        if index_word || named_by_index || by_chain.is_some() {
             // the index's proof, OR its hop-row word, OR the chain rung's (a spend the index recorded before its block
             // and never re-checked read "not mined yet" for days on the pair: the recompute now probes such hops and
             // the courier's confirmation heals the row without a client action)
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = filed.index_proven || (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true);
+            let confirmed = index_word || (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true);
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
                 pays_sats: filed.pays_sats,
                 confirmed,
-                index_proven: filed.index_proven,
-                index_proof_height: filed.index_proof_height,
+                index_proven: index_word,
+                index_proof_height: if index_word { filed.index_proof_height } else { None },
                 source: "hopsweep-filing",
                 output_spent: home_spent(&filed.sweep_txid),
             });
@@ -879,6 +892,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         // at the seat's own home, uncollected: a `payout` row whose credit is the sweep (`/credit-beef/<sweepTxid>`),
         // claimable once the sweep mined; retired by `collected` like every payout (one candidate per game, N10
         // above), or by the index's word that the home output was spent since (collected and moved on).
+        // #517, the gate's LOW-1: a PROVEN filing met a contradicting confirmed spender (the hop row's or the chain
+        // rung's): the proof did not decide (see `confirmed_by_other`); counted once per hop for the operator
+        if i.hop_sweeps.get(&outpoint).is_some_and(|f| f.index_proven && confirmed_by_other(h, i.hop_chain.get(&outpoint), &f.sweep_txid)) {
+            note_sweep_proof_contradicted();
+        }
         if let Some(swept) = swept_home(i, h) {
             if swept.output_spent {
                 continue;
@@ -930,7 +948,8 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 game_id: game,
                 sats: swept.pays_sats,
                 opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
-                at_height: None,
+                // the gate's NIT-3: the sweep's proven block is the row's height (the service order and the page read it)
+                at_height: swept.index_proof_height,
                 facts,
                 reason: None,
             });
@@ -1285,6 +1304,9 @@ static POT_SPENDERS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HOP_SWEEPS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// #517: the filed sweeps' index-proof read faulted (the pass confirms swept payouts on the courier path alone).
 static SWEEP_PROOFS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// #517 (the gate's LOW-1): a proven filed sweep met a CONTRADICTING confirmed spender (the hop row's or the chain
+/// rung's) and the proof did not decide — a reorg the latch missed, for the operator to see.
+static SWEEP_PROOF_CONTRADICTIONS: AtomicU64 = AtomicU64::new(0);
 static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_spender_read_fault() {
     SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -1311,6 +1333,12 @@ pub fn note_hop_sweeps_read_fault() {
 }
 pub fn note_sweep_proofs_read_fault() {
     SWEEP_PROOFS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn note_sweep_proof_contradicted() {
+    SWEEP_PROOF_CONTRADICTIONS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn sweep_proof_contradictions() -> u64 {
+    SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed)
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
@@ -1357,6 +1385,7 @@ pub fn owed_health_json() -> Value {
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofsReadFaults": SWEEP_PROOFS_READ_FAULTS.load(Ordering::Relaxed),
+        "sweepProofContradictions": SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
         "recomputeTimeBudgetMs": OWED_RECOMPUTE_TIME_BUDGET_MS,
@@ -2148,6 +2177,66 @@ mod tests {
         i.hop_sweeps = &unproven;
         let rows = derive_owed_rows(&i);
         assert_ne!(rows[0].family, OwedFamily::Payout);
+        // the row carries the sweep's proven block as its height (the gate's NIT-3)
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        assert_eq!(derive_owed_rows(&i)[0].at_height, Some(967_696));
+        // an old latch without a recorded height (the gate's NIT-5): proven is proven, no height on the row
+        let proven_no_height = filed_proven(&key, &sweep, None);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven_no_height;
+        i.hop_chain = &lagging;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].facts["claimable"].as_bool(), rows[0].at_height), (Some(true), None));
+        assert!(rows[0].facts.get("sweepProofHeight").is_none());
+        // the precedence: the hop row names the sweep spent+confirmed AND the index holds it proven: "index-proof"
+        let mut named = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        named.spent_confirmed = Some(true);
+        let hops_n = [named];
+        let mut i = inputs(&[], &[], &hops_n, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        assert_eq!(derive_owed_rows(&i)[0].facts["confirmedSource"], "index-proof");
+    }
+
+    /// #517, the gate's LOW-1 (Rule 6): the proof never outranks a CONTRADICTING confirmed word. A hop the index's own
+    /// row, or the chain rung, says was spent+CONFIRMED by ANOTHER tx (a reorg replaced the sweep's block with a
+    /// competing spend and the latch was missed) is judged by the ladder that stood before the proof existed: the
+    /// chain's spender, never the filing's proof; counted for the operator.
+    #[test]
+    fn a_proven_filing_never_outranks_a_contradicting_confirmed_spender() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let proven = filed_proven(&key, &sweep, Some(967_696));
+        let before = sweep_proof_contradictions();
+        // the hop row: spent+confirmed by ANOTHER tx (0x09), whose bytes the pass did not read
+        let mut other = hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000));
+        other.spent_confirmed = Some(true);
+        let hops_o = [other];
+        let mut i = inputs(&[], &[], &hops_o, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        let rows = derive_owed_rows(&i);
+        assert_ne!(rows[0].family, OwedFamily::Payout, "the proof did not decide against the row's confirmed spender");
+        assert!(rows[0].reason.as_deref().unwrap_or("").contains("could not judge"), "{:?}", rows[0].reason);
+        assert_eq!(sweep_proof_contradictions(), before + 1);
+        // the chain rung naming ANOTHER confirmed spender on an index-unspent hop: the same
+        let unspent = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let chain_other = chain_confirmed(&key, true, Some(true), Some(&tx(0x09)), Some(true));
+        let mut i = inputs(&[], &[], &unspent, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        i.hop_chain = &chain_other;
+        let rows = derive_owed_rows(&i);
+        assert_ne!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(sweep_proof_contradictions(), before + 2);
+        // an UNCONFIRMED word for another tx does not contradict a proof (a stale pointer the block already settled)
+        let mut stale = hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000));
+        stale.spent_confirmed = Some(false);
+        let hops_s = [stale];
+        let mut i = inputs(&[], &[], &hops_s, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].facts["confirmedSource"].as_str()), (OwedFamily::Payout, Some("index-proof")));
+        assert_eq!(sweep_proof_contradictions(), before + 2);
     }
 
     #[test]
