@@ -156,9 +156,26 @@ pub fn create_shadow_sql(table: &str, cols: &[ColumnInfo]) -> String {
 }
 
 /// PURE: a column the source gained after the twin was created.
+/// PURE: a default SQLite accepts on `ADD COLUMN` (a number, a quoted string, NULL, or a bare keyword such as
+/// CURRENT_TIMESTAMP). An expression default (`datetime('now')`, which PRAGMA hands back without its
+/// parentheses) is refused there; the restore's COALESCE still lands it (round 5, N7).
+pub fn literal_default(d: &str) -> bool {
+    let d = d.trim();
+    if d.is_empty() {
+        return false;
+    }
+    if d.eq_ignore_ascii_case("NULL") || d.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
+        return true;
+    }
+    if d.starts_with('\'') && d.ends_with('\'') && d.len() >= 2 {
+        return true;
+    }
+    d.parse::<f64>().is_ok()
+}
+
 pub fn heal_shadow_sql(table: &str, col: &ColumnInfo) -> String {
     let default = match col.dflt_value.as_deref() {
-        Some(d) if !d.is_empty() => format!(" DEFAULT {d}"),
+        Some(d) if literal_default(d) => format!(" DEFAULT {d}"),
         _ => String::new(),
     };
     format!(
@@ -224,22 +241,6 @@ pub async fn table_columns(db: &D1Database, table: &str) -> Vec<ColumnInfo> {
         .unwrap_or_default()
 }
 
-async fn count_keyed(db: &D1Database, table: &str, key: &str, txid: &str) -> u64 {
-    #[derive(serde::Deserialize)]
-    struct C {
-        c: i64,
-    }
-    Query::new(format!(
-        "SELECT COUNT(*) AS c FROM \"{table}\" WHERE \"{key}\" = ?"
-    ))
-    .bind(txid)
-    .fetch_optional::<C>(db)
-    .await
-    .ok()
-    .flatten()
-    .map(|r| r.c.max(0) as u64)
-    .unwrap_or(0)
-}
 
 /// Make sure the twin exists and carries every column the source has now (over the shadow storage: D1 in
 /// production, SQLite under the pins).
@@ -805,6 +806,19 @@ pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEvi
     }))
 }
 
+/// The refused verdict memo for a txid (round 5 of the gate, N1): the door's readmission deletes the memo FIRST, so
+/// a `refused` row present after the write was written by a pass that completed after the door — the network's
+/// fresh word, never the door's stale one. `Err` when the memo could not be read.
+pub async fn refused_memo_exists(db: &D1Database, txid: &str) -> Result<bool, String> {
+    let v = db
+        .query_i64(
+            "SELECT 1 AS v FROM tx_any_verdicts WHERE txid = ?1 AND kind = 'refused'",
+            vec![QVal::Text(txid.to_ascii_lowercase())],
+        )
+        .await?;
+    Ok(v.is_some())
+}
+
 /// The refusal's STATUS WORD alone (`REJECTED`, `DOUBLE_SPEND_ATTEMPTED`), for a client-facing line: the reason
 /// text embeds Arcade's `extraInfo`, and the client's already-known belt classifies on text (the gate's NIT).
 pub fn refusal_status_word(reason: &str) -> &str {
@@ -1170,9 +1184,14 @@ pub async fn evict_txid_everywhere(
     if !core.faults.is_empty() {
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
         worker::console_log!(
-            "[admit-fast] evict {txid} INCOMPLETE ({} fault(s): {}) — the row is OPEN; the next accept, proof or eviction converges",
+            "[admit-fast] evict {txid} INCOMPLETE ({} fault(s): {}) — {}",
             core.faults.len(),
-            core.faults.join("; ")
+            core.faults.join("; "),
+            if core.yielded_to_readmission.is_some() && core.restore_faults.is_empty() {
+                "the ledger keeps the readmission (the pass yielded); the faults are the pass's own"
+            } else {
+                "the row is OPEN; the next accept, proof or eviction converges"
+            }
         );
     }
     // bsv-low loop 11 (the app layer's gate, LOW-3): the notes above can be flushed by a CONCURRENT request's end on
@@ -1186,7 +1205,7 @@ pub async fn evict_txid_everywhere(
         crate::pot_changes::note(&r.txid, r.vout);
     }
     worker::console_log!(
-        "[admit-fast] evicted {txid} everywhere: {moved} row(s) moved, {} spend pointer(s) released ({reason}; asked at {asked_ms} ms, stamped {now_ms} ms)",
+        "[admit-fast] evicted {txid} everywhere: {moved} row(s) moved, {} spend pointer(s) released ({reason}; stamped {asked_ms} ms, the evidence's start)",
         released.len()
     );
     EvictionOutcome {
@@ -1288,16 +1307,30 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
         return false;
     }
     // the belt (NEW-1, the other direction): a pass that opened DURING the restore may have moved the restored
-    // rows again before the stamp — the pass's own post-check restores them, and so does this one (idempotent)
-    let mut in_twins = 0u64;
-    for (table, keys) in MOVED_TABLES {
-        let twin = shadow_table(table);
-        for key in keys.iter() {
-            in_twins += count_keyed(db, &twin, key, &txid).await;
-        }
-    }
+    // rows again before the stamp — the pass's own post-check restores them, and so does this one (idempotent).
+    // Gated on the row still carrying THIS stamp (round 5, N2): a pass whose evidence began after this stamp
+    // re-opened the row on purpose (a fresh refusal owns the rows); the count is the checked one (N3).
+    let (in_twins, twins_unreadable) = twin_rows_of(db, &txid).await;
     let mut again = 0u64;
-    if in_twins > 0 {
+    if in_twins > 0 || twins_unreadable {
+        let still_mine = db
+            .query_i64(
+                "SELECT readmittedAt AS v FROM pot_evictions WHERE txid = ?1 AND readmittedAt = ?2",
+                vec![QVal::Text(txid.clone()), QVal::Int(stamp_ms as i64)],
+            )
+            .await;
+        match still_mine {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                worker::console_log!(
+                    "[admit-fast] readmit {txid}: {in_twins} twin row(s) under the restore but the row no longer carries this readmission's stamp (a newer pass re-opened it) — the belt stands down; that pass owns the rows"
+                );
+                return true;
+            }
+            Err(e) => {
+                worker::console_log!("[admit-fast] readmit {txid}: the belt's ledger read faulted ({e}) — the belt runs");
+            }
+        }
         let (r2, f2) = restore_twins(db, &txid).await;
         again = r2;
         worker::console_log!(
@@ -1309,6 +1342,21 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
         }
         for v in vouts_of(db, "low_records", &txid).await {
             crate::lobby_changes::note_admitted(&txid, v);
+        }
+        // the pointers a concurrent pass released after this readmission's re-mark (its close merged them into the
+        // ledger's list): re-marked again, idempotent (round 5, N4)
+        if let Ok(Some(ledger)) = Query::new(RELEASED_SPENDS_SQL)
+            .bind(txid.as_str())
+            .fetch_optional::<ReleasedJsonRow>(db)
+            .await
+        {
+            let list: Vec<ReleasedSpend> = ledger
+                .released_spends
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default();
+            let n = remark_spends(db, &txid, &list, now_ms).await;
+            worker::console_log!("[admit-fast] readmit {txid}: {n}/{} spend pointer(s) re-marked again after the belt", list.len());
         }
         if !f2.is_empty() {
             // round 3 (residual B), narrowed by round 4: never a stamped readmission over twin rows — re-open
@@ -2234,6 +2282,9 @@ mod tests {
             [&pot],
         )
         .unwrap();
+        // round 5 (N7): an advert row too — `low_records.createdAt` carries an EXPRESSION default, so its restore's
+        // COALESCE runs under real SQLite here
+        conn.execute("INSERT INTO low_records (recordType, txid, outputIndex, hostIdentity, gameId) VALUES ('lobby', ?1, 1, '02aa', 'g1')", [&pot]).unwrap();
         let party_cols = cols(&conn, "potparty_records");
         assert!(
             party_cols.iter().any(|c| c.name == "potTxid"),
@@ -2285,8 +2336,8 @@ mod tests {
             }
         }
         assert_eq!(
-            moved, 4,
-            "the pot row, its output, its applied row, its party marker"
+            moved, 5,
+            "the pot row, its output, its applied row, its party marker, its advert row (round 5, N7)"
         );
         assert_eq!(
             count(&conn, "pot_records", "txid", &pot),
@@ -2859,7 +2910,11 @@ mod tests {
             let counter = if job_name.contains("refusal") { "COUNTER_ARC_INGEST_EVICTED" } else { "COUNTER_SUBMIT_PENDING_EVICTED" };
             let cnt = job.find(counter).expect("the eviction counter");
             let cnt_guard = job[..cnt].rfind("if outcome.yielded {").expect("the counter's yield guard");
-            assert!(job[cnt_guard..cnt].contains("} else {"), "{job_name}: the eviction counter sits in the else of the yield guard");
+            let between = &job[cnt_guard..cnt];
+            assert!(
+                between.matches("} else {").count() == 1 && !between.contains("write_refused_verdict("),
+                "{job_name}: the eviction counter sits in the else of ITS OWN yield guard (round 5, N8: the memo's guard is not it)"
+            );
         }
         // the passes never touch the console and read through the shadow storage only
         let passes_src = &src[src.find("pub async fn shadow_move_passes(").unwrap()..];
@@ -3252,5 +3307,23 @@ mod tests {
             "{faults:?}"
         );
         assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 1, "the twin keeps the row it could not land");
+    }
+
+    /// Round 5 (N7): the heal carries only a LITERAL default; an expression default is left to the restore's COALESCE.
+    #[test]
+    fn the_heal_carries_a_literal_default_only() {
+        for d in ["0", "-1", "1.5", "'d'", "''", "NULL", "null", "CURRENT_TIMESTAMP"] {
+            assert!(literal_default(d), "{d}");
+        }
+        for d in ["datetime('now')", "(datetime('now'))", "", "  ", "abc", "1; DROP TABLE x"] {
+            assert!(!literal_default(d), "{d}");
+        }
+        let lit = ColumnInfo { name: "c".into(), ty: "INTEGER".into(), notnull: 1, dflt_value: Some("0".into()) };
+        assert_eq!(heal_shadow_sql("pot_records", &lit), "ALTER TABLE \"pot_records_evicted\" ADD COLUMN \"c\" INTEGER DEFAULT 0");
+        let expr = ColumnInfo { name: "createdAt".into(), ty: "TEXT".into(), notnull: 1, dflt_value: Some("datetime('now')".into()) };
+        assert_eq!(heal_shadow_sql("low_records", &expr), "ALTER TABLE \"low_records_evicted\" ADD COLUMN \"createdAt\" TEXT");
+        // the restore coalesces the NOT NULL expression default all the same (legal in a SELECT)
+        let (ins, _) = restore_sql("low_records", "txid", std::slice::from_ref(&expr));
+        assert!(ins.contains("COALESCE(\"createdAt\", datetime('now'))"), "{ins}");
     }
 }

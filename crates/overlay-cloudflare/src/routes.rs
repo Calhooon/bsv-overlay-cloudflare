@@ -1524,8 +1524,22 @@ async fn submit_inner(
     // fallback path is the same race)
     if let Some(subject) = gated_subject.as_deref().or(ungated_subject.as_deref()) {
         if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
+            // round 5 (N1): the door's STALE open row vs a FRESH corroborated refusal that ran during the write — the
+            // door's readmission deletes the refused memo first, so a `refused` memo present now was written by a
+            // pass that completed after the door: the network's fresh word, taken by the re-evict arm below
+            let fresh_refusal = if door_readmit_failed {
+                match crate::admit_fast::refused_memo_exists(&ledger_db, subject).await {
+                    Ok(present) => present,
+                    Err(e) => {
+                        worker::console_log!("POST /submit: the refused memo could not be read for {subject} ({e}) — read as a fresh refusal");
+                        true
+                    }
+                }
+            } else {
+                false
+            };
             match crate::admit_fast::open_eviction(&ledger_db, subject).await {
-                Ok(Some(ev)) if door_readmit_failed => {
+                Ok(Some(ev)) if door_readmit_failed && !fresh_refusal => {
                     // the network accepted these bytes at the door; the ledger's open row is the stale word — a
                     // second readmission, and a retryable answer if it faults again (never an eviction of an
                     // accepted subject, never a 200 over an open row)
@@ -5083,7 +5097,9 @@ mod tests {
         assert!(post.contains(&reevict), "the write that outran its eviction re-evicts");
         // round 4: a subject the network ACCEPTED at the door whose readmission faulted is readmitted again after the
         // write (never re-evicted), and answers retryable if that faults too
-        let retry = post.find("Ok(Some(ev)) if door_readmit_failed => {").expect("the accepted-subject arm");
+        let retry = post.find("Ok(Some(ev)) if door_readmit_failed && !fresh_refusal => {").expect("the accepted-subject arm");
+        let memo_read = src[write..after].find("refused_memo_exists(&ledger_db, subject)").expect("the refused memo read");
+        assert!(memo_read < after - write, "the refused memo is read before the guard's match: the discriminator (round 5, N1)");
         let reev = post.find(&reevict).expect("the re-evict arm");
         assert!(retry < reev, "the accepted-subject arm precedes the re-evict arm");
         assert!(post[retry..reev].contains(&readmit_needle) && post[retry..reev].contains("502"));
