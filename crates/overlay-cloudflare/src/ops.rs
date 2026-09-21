@@ -158,9 +158,13 @@ pub const COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED: &str =
 /// still an orphan view (the parents unseen by Arcade).
 pub const COUNTER_SUBMIT_PENDING_SILENT: &str = "submit_pending_silent_total";
 pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
-/// bsv-low loop 18 (2026-09-21, pair 11): a gated submit whose subject the ledger holds under an OPEN
-/// eviction — refused at the door (nothing broadcast, nothing written; a MINED proof readmits).
+/// bsv-low loop 18 (2026-09-21, pair 11): an UNGATED write (the operator's historical modes; the lenient
+/// window) refused under an OPEN eviction (nothing written; a MINED proof or the operator's readmit opens it).
 pub const COUNTER_SUBMIT_REFUSED_EVICTED: &str = "submit_refused_evicted_total";
+/// loop 18 (the gate's HIGH-2): a gated subject under an open eviction that the network ACCEPTED again —
+/// readmitted at the door (the fresh word overrules the ledger's stale one; a wrong eviction heals on the next
+/// accepted re-present, never permanently).
+pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str = "submit_readmitted_by_fresh_accept_total";
 /// loop 18: an admission write that outran its own eviction's table loop — re-evicted after the write, the
 /// submit answered as the refusal it is.
 pub const COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE: &str = "admit_fast_reevicted_after_write_total";
@@ -832,6 +836,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_PENDING_CONFIRM_ASKED,
         // bsv-low loop 18 (2026-09-21): the write-side guard's counters read 0 until they fire.
         COUNTER_SUBMIT_REFUSED_EVICTED,
+        COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,

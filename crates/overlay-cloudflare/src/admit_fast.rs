@@ -39,6 +39,7 @@
 //! latency); a FATAL look runs the same evidence check and a corroborated
 //! refusal EVICTS; silence is counted and left to the callbacks and the passes.
 use crate::d1::{QVal, Query};
+use async_trait::async_trait;
 use worker::D1Database;
 
 /// What a status-only callback means for the index (PURE; pinned).
@@ -215,16 +216,17 @@ async fn count_keyed(db: &D1Database, table: &str, key: &str, txid: &str) -> u64
     .unwrap_or(0)
 }
 
-/// Make sure the twin exists and carries every column the source has now.
-async fn ensure_shadow(db: &D1Database, table: &str, cols: &[ColumnInfo]) -> Result<(), String> {
+/// Make sure the twin exists and carries every column the source has now (over the shadow storage: D1 in
+/// production, SQLite under the pins).
+async fn ensure_shadow(db: &dyn ShadowDb, table: &str, cols: &[ColumnInfo]) -> Result<(), String> {
     let twin = shadow_table(table);
-    let have = table_columns(db, &twin).await;
+    let have = db.columns(&twin).await?;
     if have.is_empty() {
-        return Query::new(create_shadow_sql(table, cols)).execute(db).await;
+        return db.exec(&create_shadow_sql(table, cols), vec![]).await;
     }
     for c in cols {
         if !have.iter().any(|h| h.name == c.name) {
-            Query::new(heal_shadow_sql(table, c)).execute(db).await?;
+            db.exec(&heal_shadow_sql(table, c), vec![]).await?;
         }
     }
     Ok(())
@@ -449,55 +451,247 @@ async fn table_columns_checked(db: &D1Database, table: &str) -> Result<Vec<Colum
         .await
 }
 
-/// The keyed rows a table holds NOW, or the fault (never a silent zero: loop 18).
+/// The keyed rows a table holds NOW, or the fault (never a silent zero: loop 18; a COUNT that answers no row at
+/// all is a fault too — the gate's NIT).
 async fn count_keyed_checked(db: &D1Database, table: &str, key: &str, txid: &str) -> Result<u64, String> {
     #[derive(serde::Deserialize)]
     struct C {
         c: i64,
     }
-    Query::new(format!(
+    match Query::new(format!(
         "SELECT COUNT(*) AS c FROM \"{table}\" WHERE \"{key}\" = ?"
     ))
     .bind(txid)
     .fetch_optional::<C>(db)
-    .await
-    .map(|r| r.map(|c| c.c.max(0) as u64).unwrap_or(0))
+    .await?
+    {
+        Some(c) => Ok(c.c.max(0) as u64),
+        None => Err(format!("{table}: COUNT answered no row")),
+    }
 }
 
-/// Copy the keyed rows into the twin (healed to the source's columns first), then delete them; the rows moved.
-/// Fail-LOUD: every faulted step is the caller's to record (loop 18: a skipped step used to read as a clean move).
-/// Re-runnable: a second pass over rows that landed after the first copies them beside the first pass's twins
-/// (a twin never enforces; the restore's `INSERT OR IGNORE` collapses a duplicate on the way back).
+/// THE SHADOW STORAGE (bsv-low loop 18, the gate's NIT on a source-shape-only pin): the two passes of the
+/// shadow move run over this trait — D1 in production, real SQLite under the pins — so the PASSES themselves are
+/// pinned (a row that lands between the first pass and the verification pass is moved by the verification pass,
+/// under the real logic, not a hand-driven copy of its SQL). Every method is fail-LOUD.
+#[async_trait(?Send)]
+pub trait ShadowDb {
+    async fn columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String>;
+    async fn count(&self, table: &str, key: &str, txid: &str) -> Result<u64, String>;
+    /// The `outputIndex` values the keyed rows carry (asked only of the tables that have the column).
+    async fn vouts(&self, table: &str, txid: &str) -> Result<Vec<u32>, String>;
+    async fn exec(&self, sql: &str, binds: Vec<QVal>) -> Result<(), String>;
+    /// The test seam: runs once between the first pass and the verification pass (a late-landing write). A no-op
+    /// in production.
+    async fn between_passes(&self) {}
+}
+
+#[async_trait(?Send)]
+impl ShadowDb for D1Database {
+    async fn columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String> {
+        table_columns_checked(self, table).await
+    }
+    async fn count(&self, table: &str, key: &str, txid: &str) -> Result<u64, String> {
+        count_keyed_checked(self, table, key, txid).await
+    }
+    async fn vouts(&self, table: &str, txid: &str) -> Result<Vec<u32>, String> {
+        if !ident_ok(table) {
+            return Err(format!("{table}: not an identifier"));
+        }
+        Ok(Query::new(format!(
+            "SELECT \"outputIndex\" FROM \"{table}\" WHERE \"txid\" = ?"
+        ))
+        .bind(txid)
+        .fetch_all::<VoutRow>(self)
+        .await?
+        .into_iter()
+        .map(|r| r.output_index.max(0) as u32)
+        .collect())
+    }
+    async fn exec(&self, sql: &str, binds: Vec<QVal>) -> Result<(), String> {
+        let mut q = Query::new(sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        q.execute(self).await
+    }
+}
+
+/// The tables whose moved rows are NOTED (the pots room and the lobby learn): both carry `outputIndex`.
+const NOTED_TABLES: &[&str] = &["pot_records", "low_records"];
+
+/// Copy the keyed rows into the twin (healed to the source's columns first), then delete them; the rows moved and,
+/// for a noted table, the `outputIndex` values they carried (the gate's MEDIUM-1: a survivor the verification
+/// pass moves must be noted too, and `vouts_of` read before the loop cannot see it). Fail-LOUD: every faulted step
+/// is the caller's to record (loop 18: a skipped step used to read as a clean move). Re-runnable: a second pass
+/// over rows that landed after the first copies them beside the first pass's twins (a twin never enforces; the
+/// restore's `INSERT OR IGNORE` collapses a duplicate on the way back).
 async fn move_keyed(
-    db: &D1Database,
+    db: &dyn ShadowDb,
     table: &str,
     key: &str,
     txid: &str,
     cols: &[ColumnInfo],
     reason: &str,
     now_ms: u64,
-) -> Result<u64, String> {
-    let n = count_keyed_checked(db, table, key, txid).await?;
+) -> Result<(u64, Vec<u32>), String> {
+    let n = db.count(table, key, txid).await?;
     if n == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
+    let vouts = if NOTED_TABLES.contains(&table) && key == "txid" {
+        db.vouts(table, txid).await?
+    } else {
+        Vec::new()
+    };
     ensure_shadow(db, table, cols)
         .await
         .map_err(|e| format!("twin: {e}"))?;
     let (ins, del) = move_sql(table, key, cols);
-    Query::new(ins)
-        .bind(QVal::Int(now_ms as i64))
-        .bind(reason)
-        .bind(txid)
-        .execute(db)
-        .await
-        .map_err(|e| format!("copy: {e}"))?;
-    Query::new(del)
-        .bind(txid)
-        .execute(db)
+    db.exec(
+        &ins,
+        vec![
+            QVal::Int(now_ms as i64),
+            QVal::Text(reason.to_string()),
+            QVal::Text(txid.to_string()),
+        ],
+    )
+    .await
+    .map_err(|e| format!("copy: {e}"))?;
+    db.exec(&del, vec![QVal::Text(txid.to_string())])
         .await
         .map_err(|e| format!("delete after the copy: {e}"))?;
-    Ok(n)
+    Ok((n, vouts))
+}
+
+/// What the two passes of a shadow move did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    /// Rows moved by both passes.
+    pub moved: u64,
+    /// The verification pass's verdicts that leave the eviction INCOMPLETE (a table still holding the txid after
+    /// the second move, a read that faulted, a second move that failed).
+    pub incomplete: Vec<String>,
+    /// First-pass faults the verification pass HEALED (the gate's LOW-2: a healed fault is not an incomplete
+    /// eviction; it is said, not alarmed).
+    pub retried: Vec<String>,
+    /// The pot outpoints the moves carried (both passes; the notes' input).
+    pub pot_vouts: Vec<u32>,
+    /// The lobby adverts the moves carried (both passes).
+    pub advert_vouts: Vec<u32>,
+    /// What the verification pass found and did, for the caller's log (the passes never touch the console: they
+    /// run under real SQLite in the pins, where no JS console exists).
+    pub notes: Vec<String>,
+}
+
+/// THE TWO PASSES of the shadow move, over the shadow storage (loop 18). Pass 1 moves what each table holds when
+/// its step runs; a write landing after a table's step survives it (pair 11's JOIN: the pot row and the
+/// `tm_lowfund` applied row landed after their steps while `outputs`, `transactions` and the `tm_pot` applied row
+/// moved). The VERIFICATION pass re-counts every table, moves a survivor once more, and names what still holds
+/// the txid or could not be counted. `skip_verification` is the readmission guard (the gate's LOW-4): a MINED
+/// proof that readmitted the txid AFTER this pass began restored the rows on purpose — a second move would undo
+/// the chain's word.
+pub async fn shadow_move_passes(
+    db: &dyn ShadowDb,
+    txid: &str,
+    reason: &str,
+    now_ms: u64,
+    skip_verification: bool,
+) -> PassReport {
+    let mut report = PassReport::default();
+    let mut pass1_faults: Vec<(String, String)> = Vec::new();
+    let mut moved_tables: Vec<(&str, &str, Vec<ColumnInfo>)> = Vec::new();
+    let take = |report: &mut PassReport, table: &str, n: u64, vouts: Vec<u32>| {
+        report.moved += n;
+        let into = if table == "pot_records" {
+            &mut report.pot_vouts
+        } else if table == "low_records" {
+            &mut report.advert_vouts
+        } else {
+            return;
+        };
+        for v in vouts {
+            if !into.contains(&v) {
+                into.push(v);
+            }
+        }
+    };
+    // pass 1: the move, table by table (the columns read once, reused by the verification pass)
+    for (table, keys) in MOVED_TABLES {
+        let cols = match db.columns(table).await {
+            Ok(c) => c,
+            Err(e) => {
+                pass1_faults.push((table.to_string(), format!("columns unreadable ({e})")));
+                continue;
+            }
+        };
+        if cols.is_empty() {
+            continue; // the table does not exist on this database
+        }
+        for key in keys.iter() {
+            if !cols.iter().any(|c| c.name == *key) {
+                continue;
+            }
+            match move_keyed(db, table, key, txid, &cols, reason, now_ms).await {
+                Ok((n, vouts)) => take(&mut report, table, n, vouts),
+                Err(e) => pass1_faults.push((format!("{table} by {key}"), e)),
+            }
+            moved_tables.push((table, key, cols.clone()));
+        }
+    }
+    db.between_passes().await;
+    if skip_verification {
+        // a readmission stamped after this pass began: its restore stands; the first pass's faults are its own
+        for (where_, e) in pass1_faults {
+            report.incomplete.push(format!("{where_}: {e} (no verification pass: a readmission landed under this pass)"));
+        }
+        return report;
+    }
+    // THE VERIFICATION PASS
+    for (table, key, cols) in &moved_tables {
+        let where_ = format!("{table} by {key}");
+        let faulted_before = pass1_faults.iter().any(|(w, _)| *w == where_);
+        let verdict: Result<(), String> = match db.count(table, key, txid).await {
+            Ok(0) => Ok(()),
+            Ok(n) => {
+                report.notes.push(format!(
+                    "{n} row(s) in {table} by {key} landed after the move (the admission write outran the eviction) — moved"
+                ));
+                match move_keyed(db, table, key, txid, cols, reason, now_ms).await {
+                    Ok((m, vouts)) => {
+                        take(&mut report, table, m, vouts);
+                        match db.count(table, key, txid).await {
+                            Ok(0) => Ok(()),
+                            Ok(left) => Err(format!("{left} row(s) still present after the second move")),
+                            Err(e) => Err(format!("the recount faulted ({e})")),
+                        }
+                    }
+                    Err(e) => Err(format!("the second move failed ({e})")),
+                }
+            }
+            Err(e) => Err(format!("the verification count faulted ({e})")),
+        };
+        match verdict {
+            Ok(()) => {
+                if faulted_before {
+                    let e = pass1_faults
+                        .iter()
+                        .find(|(w, _)| *w == where_)
+                        .map(|(_, e)| e.clone())
+                        .unwrap_or_default();
+                    report.retried.push(format!("{where_}: first pass {e}; the verification pass found it clean"));
+                }
+            }
+            Err(e) => report.incomplete.push(format!("{where_}: {e}")),
+        }
+    }
+    // a first-pass fault on a table the verification pass never saw (its columns were unreadable in pass 1)
+    for (where_, e) in pass1_faults {
+        if !moved_tables.iter().any(|(t, k, _)| format!("{t} by {k}") == where_) {
+            report.incomplete.push(format!("{where_}: {e}"));
+        }
+    }
+    report
 }
 
 /// THE OPEN MARKER (bsv-low loop 18, 2026-09-21, pair 11's JOIN `3b14f0e6…`): the ledger row is written BEFORE
@@ -506,7 +700,7 @@ async fn move_keyed(
 /// second eviction of the same txid (two callbacks and the pending watch race for one refusal) neither moves the
 /// stamp nor resets the ledger; a READMITTED row is re-opened with the new stamp (the chain overruled a courier,
 /// then the network refused it again). PURE: the SQL, pinned under real SQLite below.
-pub const OPEN_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?, ?, ?, NULL, 0, '[]') \
+pub const OPEN_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, ?2, ?3, NULL, 0, '[]') \
      ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, \
      evictedAt = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.evictedAt ELSE excluded.evictedAt END, \
      rowsMoved = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.rowsMoved ELSE 0 END, \
@@ -514,18 +708,27 @@ pub const OPEN_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, rea
      readmittedAt = NULL";
 
 /// THE CLOSE (the end of a pass): the rows this pass moved are ADDED to the open row's count and the released
-/// spends recorded (a later pass's empty list never erases an earlier one's). An upsert, so a pass whose open
-/// marker faulted still leaves the ledger row (binds: txid, reason, evictedAt, rowsMoved, releasedSpends).
-pub const CLOSE_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?, ?, ?, NULL, ?, ?) \
+/// list written (the caller passes the UNION of the ledger's list and this pass's: the gate's LOW-1). An upsert,
+/// so a pass whose open marker faulted still leaves the ledger row. A readmission stamped AFTER this pass began
+/// (`?3` is the pass's stamp) is KEPT (the gate's LOW-4: the chain's word landed under the pass); an older stamp is
+/// re-opened. Binds: ?1 txid, ?2 reason, ?3 evictedAt (the pass's now_ms), ?4 rowsMoved, ?5 releasedSpends.
+pub const CLOSE_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, ?2, ?3, NULL, ?4, ?5) \
      ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, \
-     evictedAt = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.evictedAt ELSE excluded.evictedAt END, \
-     rowsMoved = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.rowsMoved ELSE 0 END + excluded.rowsMoved, \
-     releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.releasedSpends ELSE '[]' END), \
-     readmittedAt = NULL";
+     evictedAt = CASE WHEN pot_evictions.readmittedAt IS NULL OR pot_evictions.readmittedAt > ?3 THEN pot_evictions.evictedAt ELSE excluded.evictedAt END, \
+     rowsMoved = CASE WHEN pot_evictions.readmittedAt IS NULL OR pot_evictions.readmittedAt > ?3 THEN pot_evictions.rowsMoved ELSE 0 END + excluded.rowsMoved, \
+     releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), CASE WHEN pot_evictions.readmittedAt IS NULL OR pot_evictions.readmittedAt > ?3 THEN pot_evictions.releasedSpends ELSE '[]' END), \
+     readmittedAt = CASE WHEN pot_evictions.readmittedAt IS NOT NULL AND pot_evictions.readmittedAt > ?3 THEN pot_evictions.readmittedAt ELSE NULL END";
 
 /// The guard's read: an eviction the ledger holds OPEN for the txid (bind: txid).
 pub const OPEN_EVICTION_SQL: &str =
     "SELECT reason, evictedAt FROM pot_evictions WHERE txid = ? AND readmittedAt IS NULL";
+
+/// The readmission-under-the-pass read (the gate's LOW-4): a `readmittedAt` stamped after the pass's own stamp.
+pub const READMITTED_AFTER_SQL: &str =
+    "SELECT readmittedAt AS at FROM pot_evictions WHERE txid = ?1 AND readmittedAt IS NOT NULL AND readmittedAt > ?2";
+
+/// The ledger's released list for the merge (the gate's LOW-1).
+pub const RELEASED_SPENDS_SQL: &str = "SELECT releasedSpends FROM pot_evictions WHERE txid = ?";
 
 /// An eviction the ledger holds OPEN (not readmitted): what every admission writer must honour.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,11 +744,13 @@ struct OpenEvictionRow {
     evicted_at: i64,
 }
 
-/// THE WRITE-SIDE GUARD (loop 18): is this txid under an OPEN eviction? Asked by the gated submit before it
-/// broadcasts (an evicted subject is refused at the door: the network's corroborated word stands until a MINED
-/// proof readmits it), AGAIN after its engine write (a write that outran the eviction's table loop re-evicts what
-/// it wrote), and by the queue consumer before a replay (a replay never resurrects an evicted pot). Fail-LOUD:
-/// an unreadable ledger is the caller's to name and count, never a silent "none".
+/// THE WRITE-SIDE GUARD (loop 18): is this txid under an OPEN eviction? Asked by the gated submit at the door
+/// (the answer is recorded; the network's FRESH word decides: an accept readmits, a refusal stands — the gate's
+/// HIGH-2: a blind door refusal made a wrong eviction permanent, and a public-bearer push could open one for a
+/// txid the network never saw), AGAIN after its engine write (a write that outran the eviction's table loop
+/// re-evicts what it wrote), by the ungated arms before their write (no ladder there: an open eviction refuses),
+/// and by the queue consumer before and after a replay (a replay never resurrects an evicted pot). Fail-LOUD: an
+/// unreadable ledger is the caller's to name and count, never a silent "none".
 pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEviction>, String> {
     let txid = txid.to_ascii_lowercase();
     let row = Query::new(OPEN_EVICTION_SQL)
@@ -558,6 +763,42 @@ pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEvi
     }))
 }
 
+/// The refusal's STATUS WORD alone (`REJECTED`, `DOUBLE_SPEND_ATTEMPTED`), for a client-facing line: the reason
+/// text embeds Arcade's `extraInfo`, and the client's already-known belt classifies on text (the gate's NIT).
+pub fn refusal_status_word(reason: &str) -> &str {
+    reason
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|w| !w.is_empty())
+        .unwrap_or("REJECTED")
+}
+
+/// PURE (the gate's LOW-1): the union of the ledger's released list and this pass's, by (table, txid, vout).
+pub fn merge_released(existing_json: Option<&str>, fresh: &[ReleasedSpend]) -> Vec<ReleasedSpend> {
+    let mut out: Vec<ReleasedSpend> = existing_json
+        .and_then(|j| serde_json::from_str::<Vec<ReleasedSpend>>(j).ok())
+        .unwrap_or_default();
+    for r in fresh {
+        if !out
+            .iter()
+            .any(|o| o.table == r.table && o.txid == r.txid && o.vout == r.vout)
+        {
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
+#[derive(serde::Deserialize)]
+struct ReadmittedAtRow {
+    at: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleasedJsonRow {
+    #[serde(rename = "releasedSpends", default)]
+    released_spends: Option<String>,
+}
+
 /// Evict every row the txid owns, everywhere, into the twins; note the pot and
 /// lobby changes so the seats and the lobby learn; record the ledger row.
 /// Returns the rows moved (0 = nothing held this txid).
@@ -568,11 +809,14 @@ pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEvi
 /// `tm_pot` applied row moved while the `pot_records` row and the `tm_lowfund` applied row, written after their
 /// steps, stayed: `ls_pot` said `known` for the rest of the cell and neither felt voided. Three belts: the ledger
 /// row is written FIRST as an OPEN marker (every admission writer sees the eviction from its first moment,
-/// `open_eviction`); the table loop is followed by a VERIFICATION pass (a survivor is moved once more; a table
-/// still holding the txid, or a read that faulted, leaves the eviction INCOMPLETE — logged and counted, never a
-/// silent success); and every read is fail-LOUD (a faulted PRAGMA or COUNT used to read as "no rows here").
+/// `open_eviction`); the table loop is followed by a VERIFICATION pass (`shadow_move_passes`: a survivor is
+/// moved once more and NOTED; a table still holding the txid, or a read that faulted, leaves the eviction
+/// INCOMPLETE — logged and counted, never a silent success; a first-pass fault the verification healed is said,
+/// not alarmed); and every read is fail-LOUD. A readmission stamped under the pass (a MINED proof) is honoured:
+/// no second move, the stamp kept by the close.
 pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, now_ms: u64) -> u64 {
     let txid = txid.to_ascii_lowercase();
+    let mut faults: Vec<String> = Vec::new();
     // THE OPEN MARKER, first (loop 18): the writers' guard reads it; the FIRST open stamp is kept.
     if let Err(e) = Query::new(OPEN_EVICTION_MARKER_SQL)
         .bind(txid.as_str())
@@ -582,74 +826,71 @@ pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, no
         .await
     {
         worker::console_log!(
-            "[admit-fast] evict {txid}: the OPEN marker failed ({e}) — the move runs; the close writes the row"
+            "[admit-fast] evict {txid}: the OPEN marker failed ({e}) — the move runs blind to the writers; the close writes the row"
+        );
+        faults.push(format!("the open marker failed ({e})"));
+    }
+    let mut pot_vouts = vouts_of(db, "pot_records", &txid).await;
+    let mut advert_vouts = vouts_of(db, "low_records", &txid).await;
+    // the readmission guard (the gate's LOW-4): a MINED proof that readmitted this txid after this pass's stamp
+    let readmitted_under = match Query::new(READMITTED_AFTER_SQL)
+        .bind(txid.as_str())
+        .bind(QVal::Int(now_ms as i64))
+        .fetch_optional::<ReadmittedAtRow>(db)
+        .await
+    {
+        Ok(Some(r)) => Some(r.at),
+        Ok(None) => None,
+        Err(e) => {
+            worker::console_log!("[admit-fast] evict {txid}: the readmission read faulted ({e}) — the verification pass runs");
+            None
+        }
+    };
+    let report = shadow_move_passes(db, &txid, reason, now_ms, readmitted_under.is_some()).await;
+    if let Some(at) = readmitted_under {
+        worker::console_log!(
+            "[admit-fast] evict {txid}: a readmission at {at} ms landed under this pass ({now_ms} ms) — no verification pass; the chain's word stands"
         );
     }
-    let mut moved = 0u64;
-    let mut incomplete: Vec<String> = Vec::new();
-    let pot_vouts = vouts_of(db, "pot_records", &txid).await;
-    let advert_vouts = vouts_of(db, "low_records", &txid).await;
-    // pass 1: the move, table by table (the columns read once, reused by the verification pass)
-    let mut moved_tables: Vec<(&str, &str, Vec<ColumnInfo>)> = Vec::new();
-    for (table, keys) in MOVED_TABLES {
-        let cols = match table_columns_checked(db, table).await {
-            Ok(c) => c,
-            Err(e) => {
-                incomplete.push(format!("{table}: columns unreadable ({e})"));
-                continue;
-            }
-        };
-        if cols.is_empty() {
-            continue; // the table does not exist on this database
-        }
-        for key in keys.iter() {
-            if !cols.iter().any(|c| c.name == *key) {
-                continue;
-            }
-            match move_keyed(db, table, key, &txid, &cols, reason, now_ms).await {
-                Ok(n) => moved += n,
-                Err(e) => incomplete.push(format!("{table} by {key}: {e}")),
-            }
-            moved_tables.push((table, key, cols.clone()));
+    let moved = report.moved;
+    for v in &report.pot_vouts {
+        if !pot_vouts.contains(v) {
+            pot_vouts.push(*v);
         }
     }
-    // THE VERIFICATION PASS (loop 18): the steps above ran against a live database; a row the subject's own
-    // admission write landed AFTER its table's step is still here. Re-count every table; a survivor is moved once
-    // more; what still holds the txid, or cannot be counted, leaves the eviction INCOMPLETE.
-    for (table, key, cols) in &moved_tables {
-        match count_keyed_checked(db, table, key, &txid).await {
-            Ok(0) => {}
-            Ok(n) => {
-                worker::console_log!(
-                    "[admit-fast] evict {txid}: {n} row(s) in {table} by {key} landed after the move (the admission write outran the eviction) — moving them"
-                );
-                match move_keyed(db, table, key, &txid, cols, reason, now_ms).await {
-                    Ok(m) => {
-                        moved += m;
-                        match count_keyed_checked(db, table, key, &txid).await {
-                            Ok(0) => {}
-                            Ok(left) => incomplete.push(format!(
-                                "{table} by {key}: {left} row(s) still present after the second move"
-                            )),
-                            Err(e) => incomplete
-                                .push(format!("{table} by {key}: the recount faulted ({e})")),
-                        }
-                    }
-                    Err(e) => incomplete.push(format!("{table} by {key}: the second move failed ({e})")),
-                }
-            }
-            Err(e) => incomplete.push(format!("{table} by {key}: the verification count faulted ({e})")),
+    for v in &report.advert_vouts {
+        if !advert_vouts.contains(v) {
+            advert_vouts.push(*v);
         }
     }
+    for n in &report.notes {
+        worker::console_log!("[admit-fast] evict {txid}: {n}");
+    }
+    for r in &report.retried {
+        worker::console_log!("[admit-fast] evict {txid}: retried — {r}");
+    }
+    faults.extend(report.incomplete.iter().cloned());
     for v in &pot_vouts {
         crate::pot_changes::note(&txid, *v);
     }
     for v in &advert_vouts {
         crate::lobby_changes::note_evicted(&txid, *v);
     }
-    // the spends it left on the rows it consumed (its hops, its pot) — released
+    // the spends it left on the rows it consumed (its hops, its pot) — released, and MERGED with the ledger's list
     let released = release_spends_of(db, &txid).await;
-    let released_json = serde_json::to_string(&released).unwrap_or_else(|_| "[]".into());
+    let existing_json = match Query::new(RELEASED_SPENDS_SQL)
+        .bind(txid.as_str())
+        .fetch_optional::<ReleasedJsonRow>(db)
+        .await
+    {
+        Ok(row) => row.and_then(|r| r.released_spends),
+        Err(e) => {
+            worker::console_log!("[admit-fast] evict {txid}: the ledger's released list could not be read ({e}) — this pass's list is written");
+            None
+        }
+    };
+    let merged = merge_released(existing_json.as_deref(), &released);
+    let released_json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
     // THE CLOSE: the pass's rows added to the open row (an upsert: a faulted marker still leaves the row)
     if let Err(e) = Query::new(CLOSE_EVICTION_MARKER_SQL)
         .bind(txid.as_str())
@@ -662,12 +903,12 @@ pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, no
     {
         worker::console_log!("[admit-fast] evict {txid}: the ledger row failed: {e}");
     }
-    if !incomplete.is_empty() {
+    if !faults.is_empty() {
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
         worker::console_log!(
             "[admit-fast] evict {txid} INCOMPLETE ({} fault(s): {}) — the open marker stands; the write-side guard and the next eviction converge",
-            incomplete.len(),
-            incomplete.join("; ")
+            faults.len(),
+            faults.join("; ")
         );
     }
     // bsv-low loop 11 (the app layer's gate, LOW-3): the notes above can be flushed by a CONCURRENT request's end on
@@ -807,11 +1048,21 @@ pub enum EvidenceVerdict {
     Uncertain(String),
 }
 
-/// PURE: fold the three couriers' words (pinned).
+/// A refusal that rests on ABSENCE (Arcade does not hold it, or faulted, and both indexers say absent) needs an
+/// admission at least this old (bsv-low loop 18, the gate's HIGH-2): the indexers lag a young tx by design, so
+/// "absent everywhere" seconds after an admission is the expected shape of a valid tx, not a refusal; and a push
+/// naming a txid the index never admitted (the public bearer: anyone who knows a JOIN's txid before it is
+/// broadcast) must never open an eviction on it. Arcade's OWN fatal word (REJECTED, DOUBLE_SPEND) needs no age:
+/// it is a positive verdict on the bytes. The retire pass keeps its own 48 h floor for its own question.
+pub const REFUSAL_ABSENT_MIN_AGE_MS: u64 = 10 * 60_000;
+
+/// PURE: fold the three couriers' words (pinned). `young`: the admission is younger than
+/// `REFUSAL_ABSENT_MIN_AGE_MS`, or the index holds no admission at all.
 pub fn evidence_verdict(
     arcade: &crate::proof_fetcher::ArcadeLook,
     bitails: Option<bool>,
     woc: Option<bool>,
+    young: bool,
 ) -> EvidenceVerdict {
     use crate::proof_fetcher::{ArcadeLook, NetworkPresence};
     match arcade {
@@ -824,6 +1075,16 @@ pub fn evidence_verdict(
         ArcadeLook::Fatal(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
             match crate::proof_fetcher::classify_presence(bitails, woc) {
                 NetworkPresence::Present => EvidenceVerdict::Present,
+                // Absence-based (Arcade missing or faulted, not its own fatal word): a young or never-admitted
+                // txid is UNCERTAIN (counted), never refused (the gate's HIGH-2).
+                NetworkPresence::Absent
+                    if young && matches!(arcade, ArcadeLook::Missing | ArcadeLook::Fault) =>
+                {
+                    EvidenceVerdict::Uncertain(
+                        "a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission"
+                            .to_string(),
+                    )
+                }
                 NetworkPresence::Absent => EvidenceVerdict::Refused(match arcade {
                     ArcadeLook::Fatal(status, extra) => {
                         format!("arcade live {status}: {extra}; both indexers absent")
@@ -889,7 +1150,48 @@ pub async fn evidence_check(
             (b, w)
         }
     };
-    evidence_verdict(&look, bitails, woc)
+    let young = match &look {
+        crate::proof_fetcher::ArcadeLook::Missing | crate::proof_fetcher::ArcadeLook::Fault => {
+            match env.env.d1("OVERLAY_DB") {
+                Ok(db) => {
+                    let now_ms = worker::Date::now().as_millis();
+                    admission_age_ms(&db, txid, now_ms)
+                        .await
+                        .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS)
+                }
+                Err(_) => true, // no ledger to ask: the conservative word
+            }
+        }
+        _ => false,
+    };
+    evidence_verdict(&look, bitails, woc, young)
+}
+
+#[derive(serde::Deserialize)]
+struct AgeRow {
+    s: Option<f64>,
+}
+
+/// How long ago the index admitted this txid (ms), from the engine's own stamp (`outputs.score`, the admission's
+/// ms) with the pot row's `createdAt` (seconds) as the fallback; `None` when the index holds no admission.
+pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Option<u64> {
+    let txid = txid.to_ascii_lowercase();
+    let stamp_ms: Option<f64> = match Query::new("SELECT MIN(score) AS s FROM outputs WHERE txid = ?")
+        .bind(txid.as_str())
+        .fetch_optional::<AgeRow>(db)
+        .await
+    {
+        Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
+        _ => match Query::new("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?")
+            .bind(txid.as_str())
+            .fetch_optional::<AgeRow>(db)
+            .await
+        {
+            Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
+            _ => None,
+        },
+    };
+    stamp_ms.map(|s| (now_ms as f64 - s).max(0.0) as u64)
 }
 
 /// The deferred job the callback route spawns for a SEEN+ push: Arcade LIVE
@@ -1466,7 +1768,8 @@ mod tests {
             evidence_verdict(
                 &ArcadeLook::Fatal("REJECTED".into(), "x".into()),
                 None,
-                None
+                None,
+                false
             ),
             EvidenceVerdict::Uncertain(_)
         ));
@@ -1475,7 +1778,8 @@ mod tests {
             evidence_verdict(
                 &ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "x".into()),
                 Some(false),
-                Some(false)
+                Some(false),
+                false
             ),
             EvidenceVerdict::Refused(_)
         ));
@@ -1485,43 +1789,44 @@ mod tests {
             evidence_verdict(
                 &ArcadeLook::Fatal("REJECTED".into(), "x".into()),
                 Some(false),
-                Some(true)
+                Some(true),
+                false
             ),
             EvidenceVerdict::Present
         );
         assert_eq!(
-            evidence_verdict(&ArcadeLook::Present, Some(false), Some(false)),
+            evidence_verdict(&ArcadeLook::Present, Some(false), Some(false), false),
             EvidenceVerdict::Present,
             "Arcade live holds it: a planted REJECTED changes nothing"
         );
         assert!(
             matches!(
-                evidence_verdict(&ArcadeLook::Missing, Some(false), Some(false)),
+                evidence_verdict(&ArcadeLook::Missing, Some(false), Some(false), false),
                 EvidenceVerdict::Refused(_)
             ),
             "missing + both absent"
         );
         assert_eq!(
-            evidence_verdict(&ArcadeLook::Missing, Some(true), Some(false)),
+            evidence_verdict(&ArcadeLook::Missing, Some(true), Some(false), false),
             EvidenceVerdict::Present,
             "one indexer holds it"
         );
         assert!(
             matches!(
-                evidence_verdict(&ArcadeLook::Missing, None, Some(false)),
+                evidence_verdict(&ArcadeLook::Missing, None, Some(false), false),
                 EvidenceVerdict::Uncertain(_)
             ),
             "a courier fault is never absence"
         );
         assert!(
             matches!(
-                evidence_verdict(&ArcadeLook::Fault, Some(false), Some(false)),
+                evidence_verdict(&ArcadeLook::Fault, Some(false), Some(false), false),
                 EvidenceVerdict::Refused(_)
             ),
             "Arcade down + both indexers definitive absent"
         );
         assert!(matches!(
-            evidence_verdict(&ArcadeLook::Fault, None, None),
+            evidence_verdict(&ArcadeLook::Fault, None, None, false),
             EvidenceVerdict::Uncertain(_)
         ));
     }
@@ -1792,6 +2097,13 @@ mod tests {
             proof_arm < readmit && readmit < stitch,
             "readmit before the engine stitches"
         );
+        // bsv-low loop 18 (the gate's MEDIUM-2): the readmission closes an open eviction — the ledger's state
+        // gates admission now — so it runs only AFTER the pushed merklePath verified against chaintracks (the
+        // route's bearer is the public txid; a garbage proof must never open the door).
+        let verified = f
+            .find("crate::proof_fetcher::verify_bump(tracker, &merkle_path, &txid)")
+            .expect("the bump verification");
+        assert!(verified < readmit, "the readmission follows the verified bump, never precedes it");
     }
 
     /// The spends an evicted tx left on the rows it CONSUMED are released at
@@ -2167,31 +2479,278 @@ mod tests {
         let marker = evict
             .find("Query::new(OPEN_EVICTION_MARKER_SQL)")
             .expect("the open marker");
-        let looping = evict
-            .find("for (table, keys) in MOVED_TABLES")
-            .expect("the table loop");
-        let verify = evict
-            .find("THE VERIFICATION PASS")
-            .expect("the verification pass");
+        let passes = evict
+            .find("shadow_move_passes(db, &txid, reason, now_ms, readmitted_under.is_some())")
+            .expect("the two passes, over the shadow storage");
         let release = evict
             .find("release_spends_of(db, &txid)")
             .expect("the release");
+        let merge = evict.find("merge_released(").expect("the released list merged");
         let close = evict
             .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
             .expect("the close");
         assert!(
-            marker < looping && looping < verify && verify < release && release < close,
-            "marker → loop → verification → release → close"
-        );
-        assert!(
-            !evict.contains("count_keyed(db") && !evict.contains("table_columns(db"),
-            "the loop reads through the checked variants only"
+            marker < passes && passes < release && release < merge && merge < close,
+            "marker → the passes → release → merge → close"
         );
         assert!(
             evict.contains("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE"),
             "an incomplete pass is counted"
         );
+        let passes_src = &src[src.find("pub async fn shadow_move_passes(").unwrap()..];
+        let passes_src = &passes_src[..passes_src.find("\n}\n").unwrap()];
+        let looping = passes_src
+            .find("for (table, keys) in MOVED_TABLES")
+            .expect("the table loop");
+        let seam = passes_src.find("db.between_passes().await").expect("the seam");
+        let verify = passes_src
+            .find("THE VERIFICATION PASS")
+            .expect("the verification pass");
+        assert!(looping < seam && seam < verify, "pass 1 → the seam → the verification pass");
+        assert!(
+            !passes_src.contains("console_log!"),
+            "the passes never touch the console (they run under real SQLite in the pins)"
+        );
+        assert!(
+            !passes_src.contains("count_keyed(db") && !passes_src.contains("table_columns(db"),
+            "the passes read through the shadow storage only"
+        );
         // the guard's read is the ledger's open row, never the twins (a twin can hold duplicates; the ledger is one row)
         assert!(OPEN_EVICTION_SQL.contains("readmittedAt IS NULL"));
+    }
+
+    /// bsv-low loop 18 (the gate's HIGH-2 b): an ABSENCE-based refusal (Arcade missing or faulted, both indexers
+    /// absent) needs an admission older than `REFUSAL_ABSENT_MIN_AGE_MS`; a young or never-admitted txid is
+    /// UNCERTAIN (a push naming a JOIN's txid before it is broadcast opens nothing). Arcade's own fatal word needs
+    /// no age.
+    #[test]
+    fn an_absence_based_refusal_needs_an_old_admission_but_arcades_own_word_needs_none() {
+        assert!(matches!(
+            evidence_verdict(&ArcadeLook::Missing, Some(false), Some(false), true),
+            EvidenceVerdict::Uncertain(_)
+        ));
+        assert!(matches!(
+            evidence_verdict(&ArcadeLook::Fault, Some(false), Some(false), true),
+            EvidenceVerdict::Uncertain(_)
+        ));
+        assert!(matches!(
+            evidence_verdict(&ArcadeLook::Missing, Some(false), Some(false), false),
+            EvidenceVerdict::Refused(_)
+        ));
+        assert!(matches!(
+            evidence_verdict(
+                &ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT".into()),
+                Some(false),
+                Some(false),
+                true
+            ),
+            EvidenceVerdict::Refused(_)
+        ));
+        // a courier that holds it wins over youth either way
+        assert_eq!(
+            evidence_verdict(&ArcadeLook::Missing, Some(true), Some(false), true),
+            EvidenceVerdict::Present
+        );
+        assert_eq!(REFUSAL_ABSENT_MIN_AGE_MS, 10 * 60_000);
+    }
+
+    /// The shadow storage over real SQLite (the shipped schema): the passes run their REAL logic here. The seam
+    /// `between_passes` lands a late write (pair 11's shape); `fail_first_copy_of` makes one table's first copy
+    /// fault (the gate's LOW-2).
+    type LateWrite = Box<dyn FnOnce(&rusqlite::Connection)>;
+    struct SqliteShadow {
+        conn: rusqlite::Connection,
+        late: std::cell::RefCell<Option<LateWrite>>,
+        fail_first_copy_of: std::cell::RefCell<Option<String>>,
+    }
+    impl SqliteShadow {
+        fn new(conn: rusqlite::Connection) -> Self {
+            Self { conn, late: std::cell::RefCell::new(None), fail_first_copy_of: std::cell::RefCell::new(None) }
+        }
+    }
+    fn to_sql(v: &QVal) -> rusqlite::types::Value {
+        match v {
+            QVal::Null => rusqlite::types::Value::Null,
+            QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+            QVal::Text(t) => rusqlite::types::Value::Text(t.clone()),
+            QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+            QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+            QVal::Float(f) => rusqlite::types::Value::Real(*f),
+        }
+    }
+    #[async_trait(?Send)]
+    impl ShadowDb for SqliteShadow {
+        async fn columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String> {
+            Ok(cols(&self.conn, table))
+        }
+        async fn count(&self, table: &str, key: &str, txid: &str) -> Result<u64, String> {
+            Ok(count(&self.conn, table, key, txid).max(0) as u64)
+        }
+        async fn vouts(&self, table: &str, txid: &str) -> Result<Vec<u32>, String> {
+            let mut st = self
+                .conn
+                .prepare(&format!("SELECT \"outputIndex\" FROM \"{table}\" WHERE \"txid\" = ?1"))
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([txid], |r| r.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?
+                .map(|r| r.map(|v| v.max(0) as u32))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        }
+        async fn exec(&self, sql: &str, binds: Vec<QVal>) -> Result<(), String> {
+            if let Some(rest) = sql.strip_prefix("INSERT INTO \"") {
+                let table = rest.split('"').next().unwrap_or("");
+                if let Some(t) = self.fail_first_copy_of.borrow_mut().take() {
+                    if table == format!("{t}_evicted") {
+                        return Err("simulated D1 fault on the first copy".to_string());
+                    }
+                    *self.fail_first_copy_of.borrow_mut() = Some(t);
+                }
+            }
+            let params: Vec<rusqlite::types::Value> = binds.iter().map(to_sql).collect();
+            self.conn
+                .execute(sql, rusqlite::params_from_iter(params.iter()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        async fn between_passes(&self) {
+            if let Some(f) = self.late.borrow_mut().take() {
+                f(&self.conn);
+            }
+        }
+    }
+
+    /// bsv-low loop 18 (pair 11's JOIN `3b14f0e6…`), pinned under the REAL passes: rows the subject's own
+    /// admission write lands AFTER the first pass survive it (the pre-fix end state, reproduced with the
+    /// verification pass switched off); the verification pass takes them, notes their outpoints, and the
+    /// eviction ends complete.
+    #[tokio::test]
+    async fn the_verification_pass_takes_a_row_that_lands_between_the_passes_under_the_real_logic() {
+        let pot = "ab".repeat(32);
+        let seed = |conn: &rusqlite::Connection| {
+            conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0)", [&pot]).unwrap();
+            conn.execute("INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')", [&pot]).unwrap();
+        };
+        // THE RED CONTROL: the pre-fix shape (no verification pass) leaves the late rows served
+        let db = SqliteShadow::new(shipped_conn());
+        seed(&db.conn);
+        let pot_c = pot.clone();
+        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| late_rows(c, &pot_c)));
+        let r0 = shadow_move_passes(&db, &pot, "REJECTED", 1_000, true).await;
+        assert_eq!(r0.moved, 2);
+        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1, "the pre-fix end state: a pot the index still knows");
+        assert_eq!(count(&db.conn, "applied_transactions", "txid", &pot), 1);
+        assert!(r0.pot_vouts.is_empty(), "nothing noted for the survivor");
+        // THE FIX: the verification pass takes the survivors and notes the pot's outpoint
+        let db = SqliteShadow::new(shipped_conn());
+        seed(&db.conn);
+        let pot_c = pot.clone();
+        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| late_rows(c, &pot_c)));
+        let r1 = shadow_move_passes(&db, &pot, "REJECTED", 1_000, false).await;
+        assert_eq!(r1.moved, 4, "both passes' rows");
+        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 0);
+        assert_eq!(count(&db.conn, "applied_transactions", "txid", &pot), 0);
+        assert_eq!(count(&db.conn, "outputs", "txid", &pot), 0);
+        assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 1);
+        assert_eq!(count(&db.conn, "applied_transactions_evicted", "txid", &pot), 2);
+        assert_eq!(r1.pot_vouts, vec![0], "the survivor's outpoint is noted (the gate's MEDIUM-1)");
+        assert!(r1.incomplete.is_empty(), "complete: {:?}", r1.incomplete);
+        assert!(r1.retried.is_empty());
+        // and the restore brings everything back once
+        for t in ["pot_records", "applied_transactions", "outputs"] {
+            let c = cols(&db.conn, t);
+            let (ins, del) = restore_sql(t, "txid", &c);
+            db.conn.execute(&ins, [&pot]).unwrap();
+            db.conn.execute(&del, [&pot]).unwrap();
+        }
+        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1);
+        assert_eq!(count(&db.conn, "applied_transactions", "txid", &pot), 2);
+        assert_eq!(count(&db.conn, "outputs", "txid", &pot), 1);
+        assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 0);
+    }
+    fn late_rows(conn: &rusqlite::Connection, pot: &str) {
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [pot]).unwrap();
+        conn.execute("INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_lowfund')", [pot]).unwrap();
+    }
+
+    /// The gate's LOW-2: a first-pass fault the verification pass HEALS is said (`retried`), not alarmed
+    /// (`incomplete`); a fault the verification pass cannot heal is incomplete.
+    #[tokio::test]
+    async fn a_first_pass_fault_healed_by_the_verification_pass_is_retried_not_incomplete() {
+        let pot = "ab".repeat(32);
+        let db = SqliteShadow::new(shipped_conn());
+        db.conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0)", [&pot]).unwrap();
+        db.conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
+        *db.fail_first_copy_of.borrow_mut() = Some("pot_records".to_string());
+        let r = shadow_move_passes(&db, &pot, "REJECTED", 1_000, false).await;
+        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 0, "healed by the verification pass");
+        assert_eq!(r.moved, 2);
+        assert_eq!(r.retried.len(), 1, "{:?}", r.retried);
+        assert!(r.retried[0].starts_with("pot_records by txid: first pass copy: simulated"), "{:?}", r.retried);
+        assert!(r.incomplete.is_empty(), "{:?}", r.incomplete);
+        assert_eq!(r.pot_vouts, vec![0]);
+    }
+
+    /// The gate's LOW-4 under real SQLite: a readmission stamped AFTER the pass's own stamp is kept by the close
+    /// (and re-counted as fresh by the next pass), while an older readmission is re-opened.
+    #[test]
+    fn a_readmission_that_lands_under_the_pass_is_kept_by_the_close() {
+        use rusqlite::OptionalExtension;
+        let conn = shipped_conn();
+        let pot = "ab".repeat(32);
+        conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (a)", 1_000i64]).unwrap();
+        // the chain's word lands under the pass: readmittedAt 1_500 > the pass's 1_000
+        conn.execute("UPDATE pot_evictions SET readmittedAt = 1500 WHERE txid = ?1", [&pot]).unwrap();
+        let under: Option<i64> = conn
+            .query_row(READMITTED_AFTER_SQL, rusqlite::params![&pot, 1_000i64], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(under, Some(1_500), "the pass sees the readmission that landed under it");
+        conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (a)", 1_000i64, 3i64, "[]"]).unwrap();
+        let (readmitted, moved): (Option<i64>, i64) = conn
+            .query_row("SELECT readmittedAt, rowsMoved FROM pot_evictions WHERE txid = ?1", [&pot], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(readmitted, Some(1_500), "the close keeps a readmission stamped after the pass");
+        assert_eq!(moved, 3);
+        let open: Option<String> = conn
+            .query_row(OPEN_EVICTION_SQL, [&pot], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(open, None, "not open: the chain's word stands");
+        // an OLDER readmission (before the pass's stamp) is re-opened by the close, as before
+        conn.execute("UPDATE pot_evictions SET readmittedAt = 900 WHERE txid = ?1", [&pot]).unwrap();
+        conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (b)", 2_000i64, 1i64, "[]"]).unwrap();
+        let open: Option<String> = conn
+            .query_row(OPEN_EVICTION_SQL, [&pot], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(open.as_deref(), Some("REJECTED (b)"), "re-opened with fresh counts");
+        let moved: i64 = conn.query_row("SELECT rowsMoved FROM pot_evictions WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        assert_eq!(moved, 1);
+    }
+
+    /// The gate's LOW-1: the released list is a UNION across passes (a re-eviction releasing only hop B keeps hop A).
+    #[test]
+    fn the_released_list_merges_across_passes() {
+        let a = ReleasedSpend { table: "pot_records".into(), txid: "aa".repeat(32), vout: 0 };
+        let b = ReleasedSpend { table: "pot_records".into(), txid: "bb".repeat(32), vout: 0 };
+        let first = serde_json::to_string(&vec![a.clone()]).unwrap();
+        let merged = merge_released(Some(&first), std::slice::from_ref(&b));
+        assert_eq!(merged, vec![a.clone(), b.clone()]);
+        let again = merge_released(Some(&serde_json::to_string(&merged).unwrap()), std::slice::from_ref(&a));
+        assert_eq!(again, vec![a.clone(), b.clone()], "no duplicate");
+        assert_eq!(merge_released(None, std::slice::from_ref(&b)), vec![b.clone()]);
+        assert_eq!(merge_released(Some("not json"), std::slice::from_ref(&a)), vec![a]);
+    }
+
+    /// The gate's NIT: the client-facing line carries the status WORD only (never Arcade's extraInfo).
+    #[test]
+    fn the_refusal_status_word_is_the_first_token() {
+        assert_eq!(refusal_status_word("REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)"), "REJECTED");
+        assert_eq!(refusal_status_word("DOUBLE_SPEND_ATTEMPTED (arcade live …)"), "DOUBLE_SPEND_ATTEMPTED");
+        assert_eq!(refusal_status_word(""), "REJECTED");
+        assert_eq!(refusal_status_word("(257) already known"), "257");
     }
 }
