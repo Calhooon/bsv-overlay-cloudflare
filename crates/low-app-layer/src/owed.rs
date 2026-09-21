@@ -694,6 +694,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             "settleTxid": e.settle_txid,
             "committedKeys": crate::results::CommittedKeys::to_json(e.committed_keys.as_ref()),
         });
+        // bsv-low #518 (loop 20's pre-flight, 2026-09-21): a JOIN the network REFUSED (evicted, never readmitted)
+        // never formed a pot — not a row on ANY arm, whatever its pot row says (a row that outran its eviction
+        // before #513 read "unspent" here and the brain offered a refund for a pot the network never held). The
+        // seat's hop carries the money's story (unspent → stranded; swept → the sweep's payout).
+        if i.evicted_pots.contains(&e.pot_txid.to_ascii_lowercase()) {
+            continue;
+        }
         match e.spent {
             Some(true) => {
                 // A DECIDED LOSS is not a row. A payout the identity ITSELF filed as collected (the marker's
@@ -846,11 +853,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
             }
             None => {
-                // A JOIN the network REFUSED (evicted, never readmitted) never formed a pot: not a row — the seat's
-                // hop carries the money's story (unspent → stranded; swept → the sweep's payout).
-                if i.evicted_pots.contains(&e.pot_txid.to_ascii_lowercase()) {
-                    continue;
-                }
+                // (an evicted pot never reaches here since #518: the check above covers every arm)
                 // The index has no spend word for this pot (never admitted): the brain cannot judge it. A
                 // sentence, not silence.
                 let mut facts = base_facts.clone();
@@ -1948,6 +1951,19 @@ mod tests {
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(899_990)));
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::InProgress, Some(20_000)));
         assert_eq!(rows[0].facts["claim"], "rejoin");
+        // bsv-low #518 (loop 20's pre-flight, 2026-09-21): an EVICTED, never readmitted pot is never a refund-due row
+        // (nor any row of its own), whatever its pot row says — a row that outran its eviction before #513 read
+        // "unspent" and the brain offered a refund for a pot the network never held (SEEN_IN_ORPHAN_MEMPOOL on
+        // every press). The JOIN never formed a pot: the seat's hop carries the money's story.
+        let mut evicted = HashSet::new();
+        evicted.insert(tx(0x02));
+        let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
+        i.evicted_pots = &evicted;
+        let rows = derive_owed_rows(&i);
+        assert!(rows.iter().all(|row| row.family != OwedFamily::RefundDue && row.family != OwedFamily::InProgress), "{rows:?}");
+        let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
+        i.evicted_pots = &evicted;
+        assert!(derive_owed_rows(&i).is_empty());
         assert_eq!(rows[0].facts["blocksToGate"], 10);
         // bsv-low #469 / fleet-loop-16 R1: the rejoin row CARRIES the served recovery gate as the
         // `recoveryHeight` FACT — the client's SECOND rejoin-safe recovery source (ORed beside this device's own
