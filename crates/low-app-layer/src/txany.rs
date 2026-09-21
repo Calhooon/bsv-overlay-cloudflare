@@ -395,6 +395,13 @@ pub struct TxAnyAnswer {
     /// route probes inputs only for a corroborated-absent index-held tx);
     /// `false` means "not proven unconfirmable", never "confirmable".
     pub unconfirmable: bool,
+    /// bsv-low 2026-09-21 (the era belt on "tables that didn't start"): the courier's CLAIMED mined height (WoC's
+    /// `blockheight` on the external leg, `parse_woc_blockheight`), NEVER verified against chaintracks and never a
+    /// substitute for `height` (the proven one, index/Arcade). Served for DISPLAY-TIER readers that must date a tx
+    /// the index no longer holds (a closed table advert judged against the written-off era); a money reader that
+    /// keys on this field is a defect. `None` when no courier answered, the tx is unconfirmed, or the leg was not the
+    /// couriers'.
+    pub claimed_height: Option<u64>,
 }
 
 /// The pure `/tx-any` decision table (unit-tested; the route feeds it real
@@ -418,6 +425,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw),
                 source: Some("index"),
                 unconfirmable: false,
+                claimed_height: None,
             };
         }
         // Stored bytes WITHOUT a BUMP (#247): the store proves we HOLD the
@@ -439,6 +447,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw),
                 source: Some("index+external"),
                 unconfirmable: false,
+                claimed_height: None,
             },
             Some(TxObservation::Absent) if absence == AbsenceCorroboration::CorroboratedAbsent => {
                 TxAnyAnswer {
@@ -448,6 +457,7 @@ pub fn decide_tx_any(
                     raw_hex: Some(raw),
                     source: Some("index+external"),
                     unconfirmable: false,
+                    claimed_height: None,
                 }
             }
             _ => TxAnyAnswer {
@@ -457,6 +467,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw),
                 source: Some("index"),
                 unconfirmable: false,
+                claimed_height: None,
             },
         };
     }
@@ -473,6 +484,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw.clone()),
                 source: Some("external"),
                 unconfirmable: false,
+                claimed_height: None,
             },
             None => TxAnyAnswer::default(),
         },
@@ -484,6 +496,7 @@ pub fn decide_tx_any(
                 raw_hex: None,
                 source: Some("external"),
                 unconfirmable: false,
+                claimed_height: None,
             },
             AbsenceCorroboration::Unknown => TxAnyAnswer::default(),
         },
@@ -515,6 +528,13 @@ pub fn input_proves_unconfirmable(
 /// `confirmations >= 1`. A malformed body is simply "present, unconfirmed
 /// claim unknown" → treated as `confirmed: false` (the caller's
 /// `wocTxConfirmed` parity: anything unsure is false, never a landing).
+/// PURE: WoC's `blockheight` on `/tx/hash/{txid}` as the courier's CLAIMED mined height (`TxAnyAnswer::claimed_height`):
+/// a positive integer, else `None` (absent, 0 = unconfirmed, a non-number). A claim, never a proof: the display
+/// tier's dating of a tx the index no longer holds; `height` stays the chaintracks-verified word.
+pub fn parse_woc_blockheight(v: &serde_json::Value) -> Option<u64> {
+    v.get("blockheight").and_then(|h| h.as_u64()).filter(|h| *h > 0)
+}
+
 pub fn parse_woc_confirmations(v: &serde_json::Value) -> bool {
     v.get("confirmations")
         .and_then(serde_json::Value::as_u64)
@@ -656,6 +676,7 @@ pub fn tx_any_value(txid: &str, a: &TxAnyAnswer) -> serde_json::Value {
         "rawHex": a.raw_hex,
         "source": a.source,
         "unconfirmable": a.unconfirmable,
+        "claimedHeight": a.claimed_height,
     })
 }
 
@@ -1035,12 +1056,21 @@ mod tests {
             raw_hex: Some("aa".into()),
             source: Some("index"),
             unconfirmable: false,
+            claimed_height: None,
         };
         let v: serde_json::Value = serde_json::from_str(&tx_any_body("ab", &a)).unwrap();
         assert_eq!(v["txid"], "ab");
         assert_eq!(v["present"], true);
         assert_eq!(v["confirmed"], true);
         assert_eq!(v["height"], 1);
+        assert!(v["claimedHeight"].is_null(), "no courier claim on an index answer");
+        let mut c = a.clone();
+        c.claimed_height = Some(967_123);
+        assert_eq!(tx_any_value("ab", &c)["claimedHeight"], 967_123);
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"blockheight": 967123})), Some(967_123));
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"blockheight": 0})), None, "0 = unconfirmed");
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"blockheight": "967123"})), None, "a non-number is no claim");
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"confirmations": 3})), None, "absent");
         assert_eq!(v["rawHex"], "aa");
         assert_eq!(v["source"], "index");
         assert_eq!(v["unconfirmable"], false);
@@ -1060,6 +1090,7 @@ mod tests {
             raw_hex: Some(raw()),
             source: Some("index"),
             unconfirmable: false,
+            claimed_height: None,
         }
     }
 

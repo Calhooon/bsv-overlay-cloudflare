@@ -6077,13 +6077,19 @@ async fn tx_any_external_leg(
 ) -> (
     crate::txany::TxObservation,
     crate::txany::AbsenceCorroboration,
+    // bsv-low 2026-09-21: the courier's CLAIMED mined height (WoC's `blockheight`), for `TxAnyAnswer::claimed_height`
+    Option<u64>,
 ) {
     use crate::txany::{AbsenceCorroboration, TxObservation};
 
+    let mut claimed_height: Option<u64> = None;
     let woc = match provider_get(caller, &format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => {
                 let confirmed = crate::txany::parse_woc_confirmations(&v);
+                if confirmed {
+                    claimed_height = crate::txany::parse_woc_blockheight(&v);
+                }
                 // Positive presence requires the raw in hand, hash-verified
                 // (WoC hex first, Bitails binary fallback).
                 let raw = match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
@@ -6157,7 +6163,7 @@ async fn tx_any_external_leg(
             }
         }
     }
-    (woc, absence)
+    (woc, absence, claimed_height)
 }
 
 /// The in-isolate `/tx-any` cache hit for `key`, if still inside its TTL.
@@ -6243,8 +6249,12 @@ async fn resolve_tx_any(
         }
     } else {
         // the one break-glass left at request time: a tx the index never admitted
-        let (external, absence) = tx_any_external_leg(key, caller).await;
-        let a = crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence);
+        let (external, absence, claimed_height) = tx_any_external_leg(key, caller).await;
+        let mut a = crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence);
+        // the courier's claimed height rides a CONFIRMED external answer only (display-tier; `height` stays proven)
+        if a.confirmed == Some(true) && a.height.is_none() {
+            a.claimed_height = claimed_height;
+        }
         if a.present == Some(false) && absence == crate::txany::AbsenceCorroboration::CorroboratedAbsent {
             write_verdict_memo(
                 env,
