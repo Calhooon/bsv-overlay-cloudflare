@@ -155,7 +155,6 @@ pub fn create_shadow_sql(table: &str, cols: &[ColumnInfo]) -> String {
     )
 }
 
-/// PURE: a column the source gained after the twin was created.
 /// PURE: a default SQLite accepts on `ADD COLUMN` (a number, a quoted string, NULL, or a bare keyword such as
 /// CURRENT_TIMESTAMP). An expression default (`datetime('now')`, which PRAGMA hands back without its
 /// parentheses) is refused there; the restore's COALESCE still lands it (round 5, N7).
@@ -173,6 +172,7 @@ pub fn literal_default(d: &str) -> bool {
     d.parse::<f64>().is_ok()
 }
 
+/// PURE: a column the source gained after the twin was created, added to the twin with its literal default.
 pub fn heal_shadow_sql(table: &str, col: &ColumnInfo) -> String {
     let default = match col.dflt_value.as_deref() {
         Some(d) if literal_default(d) => format!(" DEFAULT {d}"),
@@ -2433,6 +2433,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+        // round 5 (N7): the advert row's own end state — moved, then restored with its coalesced createdAt
+        assert_eq!(count(&conn, "low_records", "txid", &pot), 1, "the advert row restored (its expression-default createdAt coalesced)");
+        assert_eq!(count(&conn, "low_records_evicted", "txid", &pot), 0);
     }
 
     /// Structural: the callback route latches SEEN, evicts a double spend at

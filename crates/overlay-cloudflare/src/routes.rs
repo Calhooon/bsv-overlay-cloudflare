@@ -2418,8 +2418,10 @@ pub async fn arc_ingest(
         Ok(b) => b,
         Err(e) => return json_error(&format!("Invalid arc-ingest body: {e}"), 400),
     };
+    // lowercased (round 5 of the loop-18 gate): the ledger, the refused memo's read and the admission age key on
+    // the canonical form; a push's case must never split a txid across them
     let txid = match &body {
-        ArcIngestBody::Proof { txid, .. } | ArcIngestBody::StatusOnly { txid, .. } => txid.clone(),
+        ArcIngestBody::Proof { txid, .. } | ArcIngestBody::StatusOnly { txid, .. } => txid.to_ascii_lowercase(),
     };
 
     // Bearer-auth: the token must be present and equal the subject txid the
