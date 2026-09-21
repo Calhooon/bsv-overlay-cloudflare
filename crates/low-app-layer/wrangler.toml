@@ -217,8 +217,10 @@ STORAGE_EPOCH = "beta-2026-08-12-1"
 # window re-fills; the durable fix is board paging (#403 item 4).
 # (Original stance, kept for the why of the mechanism: the #375 era write-off
 # retires a pre-launch era; wiping beta wholesale is a DELETE, not a cutoff.)
-WRITTEN_OFF_BEFORE_MS = "1787788800000"
-WRITTEN_OFF_BEFORE_HEIGHT = "964063"
+# 2026-09-21 (the M21 promotion's wipe): the beta cutoff bumped to the activation instant 2026-09-21T13:04:21Z / tip 967727
+# (the fleet loops 11 to 21 written off from every view; the collect pass ran first, 14/18 pressed green, 4 #512 already-held).
+WRITTEN_OFF_BEFORE_MS = "1789995861000"
+WRITTEN_OFF_BEFORE_HEIGHT = "967727"
 
 # Beta's OWN session store. AUTH_SESSIONS and SERVER_PRIVATE_KEY are all-or-
 # nothing: the front door computes `configured = key AND kv`, and an
