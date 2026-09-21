@@ -1838,6 +1838,8 @@ pub fn scrub_already_known_tokens(s: &str) -> String {
             let seen = t.contains("seen") && !t.contains("unseen");
             !(t.contains("already") || known || seen || t.contains("mined"))
         })
+        // a token that was only punctuation around a dropped word is a crumb (the second delta-verify's NIT)
+        .filter(|tok| tok.chars().any(|c| c.is_ascii_alphanumeric()))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1863,14 +1865,23 @@ pub fn terminal_memo_lookup(
     memo.get(txid).filter(|(_, at)| now - *at >= 0.0 && now - *at < ttl_ms).map(|(p, _)| *p)
 }
 
-/// PURE: remember a verdict — never a fault (`Inconclusive`), which must be re-asked.
+/// PURE: remember a verdict — never a fault (`Inconclusive`), which must be re-asked, and never an `Absent` read
+/// while the subject was YOUNG (the second delta-verify, 2026-09-21): a memo `Absent` is then always an OLD fresh
+/// read and may decide a refusal within its minute, while a young subject's next re-present asks the couriers again.
 pub fn terminal_memo_store(
     memo: &mut std::collections::HashMap<String, (crate::proof_fetcher::NetworkPresence, f64)>,
     txid: &str,
     presence: crate::proof_fetcher::NetworkPresence,
+    young: bool,
     now: f64,
 ) {
-    if presence != crate::proof_fetcher::NetworkPresence::Inconclusive {
+    use crate::proof_fetcher::NetworkPresence;
+    let remember = match presence {
+        NetworkPresence::Present => true,
+        NetworkPresence::Absent => !young,
+        NetworkPresence::Inconclusive => false,
+    };
+    if remember {
         memo.insert(txid.to_string(), (presence, now));
     }
 }
@@ -2048,9 +2059,12 @@ impl ArcadeBroadcaster {
         }
         let bitails = crate::proof_fetcher::bitails_presence(crate::proof_fetcher::DEFAULT_BITAILS_BASE, txid).await;
         let woc = crate::proof_fetcher::woc_presence(crate::proof_fetcher::DEFAULT_WOC_BASE, self.woc_api_key.as_deref(), txid).await;
-        let presence = crate::proof_fetcher::classify_presence(bitails, woc);
-        TERMINAL_MEMO.with(|m| terminal_memo_store(&mut m.borrow_mut(), txid, presence, now));
-        (presence, "couriers")
+        (crate::proof_fetcher::classify_presence(bitails, woc), "couriers")
+    }
+
+    /// #519: remember a fresh verdict (the branch calls it AFTER the age decision: `terminal_memo_store`'s rule).
+    fn terminal_remember(&self, txid: &str, presence: crate::proof_fetcher::NetworkPresence, young: bool, now: f64) {
+        TERMINAL_MEMO.with(|m| terminal_memo_store(&mut m.borrow_mut(), txid, presence, young, now));
     }
 
     /// admit-fast (bsv-low 2026-09-15): answer the gate on Arcade's
@@ -2328,6 +2342,12 @@ impl ArcadeBroadcaster {
                 let (p, src) = self.terminal_presence_fresh(subject_txid, started).await;
                 presence = p;
                 source = src;
+            }
+            // remembered only AFTER the age decision (the second delta-verify's residual): a young Absent is never
+            // memoised, so a memo Absent was itself an old fresh read and may decide a refusal within its minute —
+            // the dedupe of one refused txid's re-present loop (LOW-3) stands beside the fresh-read rule
+            if source == "couriers" {
+                self.terminal_remember(subject_txid, presence, young, started);
             }
             let judgement = TerminalJudgement::of(presence, young, source == "capped");
             self.terminal_ms
@@ -3764,6 +3784,7 @@ mod tests {
             assert!(!already_known(&e), "{e}");
         }
         assert_eq!(scrub_already_known_tokens("utxo already spent by tx; txn-already-known; unknown inputs; unseen; mined; examined"), "utxo spent by tx; unknown inputs; unseen;");
+        assert_eq!(scrub_already_known_tokens("(already known )"), "", "no punctuation crumbs");
         // the delta-verify's NIT: the belt itself runs over the result, so a dress the scrub cannot clear (a `257`
         // code, a token the rules miss) drops the detail whole — the mirror holds by construction
         for extra in ["error code 257 (already known)", "unknownknown inputs", "\"257\""] {
@@ -3779,8 +3800,8 @@ mod tests {
     fn terminal_judgements_are_memoised_and_capped() {
         use crate::proof_fetcher::NetworkPresence;
         let mut memo = std::collections::HashMap::new();
-        terminal_memo_store(&mut memo, "a", NetworkPresence::Absent, 1_000.0);
-        terminal_memo_store(&mut memo, "b", NetworkPresence::Inconclusive, 1_000.0);
+        terminal_memo_store(&mut memo, "a", NetworkPresence::Absent, false, 1_000.0);
+        terminal_memo_store(&mut memo, "b", NetworkPresence::Inconclusive, false, 1_000.0);
         assert_eq!(terminal_memo_lookup(&memo, "a", 1_000.0 + TERMINAL_MEMO_TTL_MS - 1.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Absent));
         assert_eq!(terminal_memo_lookup(&memo, "a", 1_000.0 + TERMINAL_MEMO_TTL_MS, TERMINAL_MEMO_TTL_MS), None, "expired");
         assert_eq!(terminal_memo_lookup(&memo, "b", 1_001.0, TERMINAL_MEMO_TTL_MS), None, "a fault is never remembered");
@@ -3791,8 +3812,17 @@ mod tests {
         assert!(!terminal_ask_allowed_in(&mut asks, 2.0, 2, 60_000.0), "the cap");
         assert!(terminal_ask_allowed_in(&mut asks, 60_000.0, 2, 60_000.0), "the window slid");
         assert_eq!(asks.len(), 2);
-        // the delta-verify's LOW: a refusal never rests on the memo — a memoised Absent on an old subject re-asks
+        // the delta-verify's LOW: a refusal never rests on a memo written while the subject was young; since the
+        // second delta-verify a young Absent is never remembered, so the belt below fires only for a memo the store
+        // rule cannot write (kept as the belt; the store rule is pinned beside it)
         assert!(must_reask_before_refusing(NetworkPresence::Absent, false, "memo"));
+        let mut m2 = std::collections::HashMap::new();
+        terminal_memo_store(&mut m2, "y", NetworkPresence::Absent, true, 5.0);
+        assert!(m2.is_empty(), "a young Absent is never remembered");
+        terminal_memo_store(&mut m2, "o", NetworkPresence::Absent, false, 5.0);
+        terminal_memo_store(&mut m2, "p", NetworkPresence::Present, true, 5.0);
+        assert_eq!(terminal_memo_lookup(&m2, "o", 6.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Absent), "an old Absent is remembered");
+        assert_eq!(terminal_memo_lookup(&m2, "p", 6.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Present), "a Present is remembered, young or not");
         assert!(!must_reask_before_refusing(NetworkPresence::Absent, true, "memo"), "young: the retryable word, no refusal to rest");
         assert!(!must_reask_before_refusing(NetworkPresence::Absent, false, "couriers"), "already fresh");
         assert!(!must_reask_before_refusing(NetworkPresence::Present, false, "memo"), "an admission may rest on the memo");
@@ -3813,8 +3843,9 @@ mod tests {
         let presence = code.find("self.terminal_presence(subject_txid").expect("the presence judgement");
         let young = code.find("subject_young.await").expect("the age floor");
         let reask = code.find("self.terminal_presence_fresh(subject_txid").expect("the fresh re-ask before a refusal");
+        let remember = code.find("self.terminal_remember(subject_txid").expect("the memo written after the age decision");
         let ret = code.find("return terminal_at_arcade_by_presence(").expect("the return");
-        assert!(young < reask && reask < ret, "young@{young} reask@{reask} return@{ret}");
+        assert!(young < reask && reask < remember && remember < ret, "young@{young} reask@{reask} remember@{remember} return@{ret}");
         let register = code.find("let register_callback").expect("the register-once rule");
         let rung = code.find("broadcast_efs_gated_with(").expect("the ladder's rungs");
         let mined_claim = code.find("CorroborationKind::MinedClaim").expect("the mined-claim dispatch");
