@@ -438,50 +438,207 @@ async fn remark_spends(
     remarked
 }
 
+/// The columns a table has NOW, or the fault that hid them (bsv-low loop 18, 2026-09-21: `table_columns`'s
+/// `unwrap_or_default` read a faulted PRAGMA as "no such table", and the eviction skipped the table in silence).
+async fn table_columns_checked(db: &D1Database, table: &str) -> Result<Vec<ColumnInfo>, String> {
+    if !ident_ok(table) {
+        return Err(format!("{table}: not an identifier"));
+    }
+    Query::new(format!("PRAGMA table_info(\"{table}\")"))
+        .fetch_all::<ColumnInfo>(db)
+        .await
+}
+
+/// The keyed rows a table holds NOW, or the fault (never a silent zero: loop 18).
+async fn count_keyed_checked(db: &D1Database, table: &str, key: &str, txid: &str) -> Result<u64, String> {
+    #[derive(serde::Deserialize)]
+    struct C {
+        c: i64,
+    }
+    Query::new(format!(
+        "SELECT COUNT(*) AS c FROM \"{table}\" WHERE \"{key}\" = ?"
+    ))
+    .bind(txid)
+    .fetch_optional::<C>(db)
+    .await
+    .map(|r| r.map(|c| c.c.max(0) as u64).unwrap_or(0))
+}
+
+/// Copy the keyed rows into the twin (healed to the source's columns first), then delete them; the rows moved.
+/// Fail-LOUD: every faulted step is the caller's to record (loop 18: a skipped step used to read as a clean move).
+/// Re-runnable: a second pass over rows that landed after the first copies them beside the first pass's twins
+/// (a twin never enforces; the restore's `INSERT OR IGNORE` collapses a duplicate on the way back).
+async fn move_keyed(
+    db: &D1Database,
+    table: &str,
+    key: &str,
+    txid: &str,
+    cols: &[ColumnInfo],
+    reason: &str,
+    now_ms: u64,
+) -> Result<u64, String> {
+    let n = count_keyed_checked(db, table, key, txid).await?;
+    if n == 0 {
+        return Ok(0);
+    }
+    ensure_shadow(db, table, cols)
+        .await
+        .map_err(|e| format!("twin: {e}"))?;
+    let (ins, del) = move_sql(table, key, cols);
+    Query::new(ins)
+        .bind(QVal::Int(now_ms as i64))
+        .bind(reason)
+        .bind(txid)
+        .execute(db)
+        .await
+        .map_err(|e| format!("copy: {e}"))?;
+    Query::new(del)
+        .bind(txid)
+        .execute(db)
+        .await
+        .map_err(|e| format!("delete after the copy: {e}"))?;
+    Ok(n)
+}
+
+/// THE OPEN MARKER (bsv-low loop 18, 2026-09-21, pair 11's JOIN `3b14f0e6…`): the ledger row is written BEFORE
+/// the table loop, so every admission writer sees the eviction from its first moment (`open_eviction`). Binds:
+/// txid, reason, evictedAt. An OPEN row (not yet readmitted) keeps its FIRST stamp and its counts — a concurrent
+/// second eviction of the same txid (two callbacks and the pending watch race for one refusal) neither moves the
+/// stamp nor resets the ledger; a READMITTED row is re-opened with the new stamp (the chain overruled a courier,
+/// then the network refused it again). PURE: the SQL, pinned under real SQLite below.
+pub const OPEN_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?, ?, ?, NULL, 0, '[]') \
+     ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, \
+     evictedAt = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.evictedAt ELSE excluded.evictedAt END, \
+     rowsMoved = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.rowsMoved ELSE 0 END, \
+     releasedSpends = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.releasedSpends ELSE '[]' END, \
+     readmittedAt = NULL";
+
+/// THE CLOSE (the end of a pass): the rows this pass moved are ADDED to the open row's count and the released
+/// spends recorded (a later pass's empty list never erases an earlier one's). An upsert, so a pass whose open
+/// marker faulted still leaves the ledger row (binds: txid, reason, evictedAt, rowsMoved, releasedSpends).
+pub const CLOSE_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?, ?, ?, NULL, ?, ?) \
+     ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, \
+     evictedAt = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.evictedAt ELSE excluded.evictedAt END, \
+     rowsMoved = CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.rowsMoved ELSE 0 END + excluded.rowsMoved, \
+     releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), CASE WHEN pot_evictions.readmittedAt IS NULL THEN pot_evictions.releasedSpends ELSE '[]' END), \
+     readmittedAt = NULL";
+
+/// The guard's read: an eviction the ledger holds OPEN for the txid (bind: txid).
+pub const OPEN_EVICTION_SQL: &str =
+    "SELECT reason, evictedAt FROM pot_evictions WHERE txid = ? AND readmittedAt IS NULL";
+
+/// An eviction the ledger holds OPEN (not readmitted): what every admission writer must honour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenEviction {
+    pub reason: String,
+    pub evicted_at_ms: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenEvictionRow {
+    reason: String,
+    #[serde(rename = "evictedAt")]
+    evicted_at: i64,
+}
+
+/// THE WRITE-SIDE GUARD (loop 18): is this txid under an OPEN eviction? Asked by the gated submit before it
+/// broadcasts (an evicted subject is refused at the door: the network's corroborated word stands until a MINED
+/// proof readmits it), AGAIN after its engine write (a write that outran the eviction's table loop re-evicts what
+/// it wrote), and by the queue consumer before a replay (a replay never resurrects an evicted pot). Fail-LOUD:
+/// an unreadable ledger is the caller's to name and count, never a silent "none".
+pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEviction>, String> {
+    let txid = txid.to_ascii_lowercase();
+    let row = Query::new(OPEN_EVICTION_SQL)
+        .bind(txid.as_str())
+        .fetch_optional::<OpenEvictionRow>(db)
+        .await?;
+    Ok(row.map(|r| OpenEviction {
+        reason: r.reason,
+        evicted_at_ms: r.evicted_at.max(0) as u64,
+    }))
+}
+
 /// Evict every row the txid owns, everywhere, into the twins; note the pot and
 /// lobby changes so the seats and the lobby learn; record the ledger row.
 /// Returns the rows moved (0 = nothing held this txid).
+///
+/// bsv-low loop 18 (2026-09-21, pair 11's JOIN `3b14f0e6…`): the two callback jobs' evictions ran their table
+/// steps WHILE the subject's own Phase-3 write was still landing (a 12.8 s engine submit under the fleet's t=0
+/// burst; Arcade's REJECTED push had arrived 200 ms after its sync accept), so `outputs`, `transactions` and the
+/// `tm_pot` applied row moved while the `pot_records` row and the `tm_lowfund` applied row, written after their
+/// steps, stayed: `ls_pot` said `known` for the rest of the cell and neither felt voided. Three belts: the ledger
+/// row is written FIRST as an OPEN marker (every admission writer sees the eviction from its first moment,
+/// `open_eviction`); the table loop is followed by a VERIFICATION pass (a survivor is moved once more; a table
+/// still holding the txid, or a read that faulted, leaves the eviction INCOMPLETE — logged and counted, never a
+/// silent success); and every read is fail-LOUD (a faulted PRAGMA or COUNT used to read as "no rows here").
 pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, now_ms: u64) -> u64 {
     let txid = txid.to_ascii_lowercase();
+    // THE OPEN MARKER, first (loop 18): the writers' guard reads it; the FIRST open stamp is kept.
+    if let Err(e) = Query::new(OPEN_EVICTION_MARKER_SQL)
+        .bind(txid.as_str())
+        .bind(reason)
+        .bind(QVal::Int(now_ms as i64))
+        .execute(db)
+        .await
+    {
+        worker::console_log!(
+            "[admit-fast] evict {txid}: the OPEN marker failed ({e}) — the move runs; the close writes the row"
+        );
+    }
     let mut moved = 0u64;
+    let mut incomplete: Vec<String> = Vec::new();
     let pot_vouts = vouts_of(db, "pot_records", &txid).await;
     let advert_vouts = vouts_of(db, "low_records", &txid).await;
+    // pass 1: the move, table by table (the columns read once, reused by the verification pass)
+    let mut moved_tables: Vec<(&str, &str, Vec<ColumnInfo>)> = Vec::new();
     for (table, keys) in MOVED_TABLES {
-        let cols = table_columns(db, table).await;
+        let cols = match table_columns_checked(db, table).await {
+            Ok(c) => c,
+            Err(e) => {
+                incomplete.push(format!("{table}: columns unreadable ({e})"));
+                continue;
+            }
+        };
         if cols.is_empty() {
-            continue;
+            continue; // the table does not exist on this database
         }
         for key in keys.iter() {
             if !cols.iter().any(|c| c.name == *key) {
                 continue;
             }
-            let n = count_keyed(db, table, key, &txid).await;
-            if n == 0 {
-                continue;
+            match move_keyed(db, table, key, &txid, &cols, reason, now_ms).await {
+                Ok(n) => moved += n,
+                Err(e) => incomplete.push(format!("{table} by {key}: {e}")),
             }
-            if let Err(e) = ensure_shadow(db, table, &cols).await {
-                worker::console_log!("[admit-fast] evict {txid}: twin for {table} failed: {e}");
-                continue;
-            }
-            let (ins, del) = move_sql(table, key, &cols);
-            let ok = Query::new(ins)
-                .bind(QVal::Int(now_ms as i64))
-                .bind(reason)
-                .bind(txid.as_str())
-                .execute(db)
-                .await;
-            match ok {
-                Ok(()) => {
-                    if let Err(e) = Query::new(del).bind(txid.as_str()).execute(db).await {
-                        worker::console_log!("[admit-fast] evict {txid}: delete from {table} by {key} failed after the copy: {e}");
-                    } else {
-                        moved += n;
+            moved_tables.push((table, key, cols.clone()));
+        }
+    }
+    // THE VERIFICATION PASS (loop 18): the steps above ran against a live database; a row the subject's own
+    // admission write landed AFTER its table's step is still here. Re-count every table; a survivor is moved once
+    // more; what still holds the txid, or cannot be counted, leaves the eviction INCOMPLETE.
+    for (table, key, cols) in &moved_tables {
+        match count_keyed_checked(db, table, key, &txid).await {
+            Ok(0) => {}
+            Ok(n) => {
+                worker::console_log!(
+                    "[admit-fast] evict {txid}: {n} row(s) in {table} by {key} landed after the move (the admission write outran the eviction) — moving them"
+                );
+                match move_keyed(db, table, key, &txid, cols, reason, now_ms).await {
+                    Ok(m) => {
+                        moved += m;
+                        match count_keyed_checked(db, table, key, &txid).await {
+                            Ok(0) => {}
+                            Ok(left) => incomplete.push(format!(
+                                "{table} by {key}: {left} row(s) still present after the second move"
+                            )),
+                            Err(e) => incomplete
+                                .push(format!("{table} by {key}: the recount faulted ({e})")),
+                        }
                     }
+                    Err(e) => incomplete.push(format!("{table} by {key}: the second move failed ({e})")),
                 }
-                Err(e) => worker::console_log!(
-                    "[admit-fast] evict {txid}: copy from {table} by {key} failed: {e}"
-                ),
             }
+            Err(e) => incomplete.push(format!("{table} by {key}: the verification count faulted ({e})")),
         }
     }
     for v in &pot_vouts {
@@ -493,20 +650,25 @@ pub async fn evict_txid_everywhere(db: &D1Database, txid: &str, reason: &str, no
     // the spends it left on the rows it consumed (its hops, its pot) — released
     let released = release_spends_of(db, &txid).await;
     let released_json = serde_json::to_string(&released).unwrap_or_else(|_| "[]".into());
-    if let Err(e) = Query::new(
-        "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?, ?, ?, NULL, ?, ?) \
-         ON CONFLICT(txid) DO UPDATE SET reason = excluded.reason, evictedAt = excluded.evictedAt, readmittedAt = NULL, rowsMoved = excluded.rowsMoved, \
-             releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), pot_evictions.releasedSpends)",
-    )
-    .bind(txid.as_str())
-    .bind(reason)
-    .bind(QVal::Int(now_ms as i64))
-    .bind(QVal::Int(moved as i64))
-    .bind(released_json.as_str())
-    .execute(db)
-    .await
+    // THE CLOSE: the pass's rows added to the open row (an upsert: a faulted marker still leaves the row)
+    if let Err(e) = Query::new(CLOSE_EVICTION_MARKER_SQL)
+        .bind(txid.as_str())
+        .bind(reason)
+        .bind(QVal::Int(now_ms as i64))
+        .bind(QVal::Int(moved as i64))
+        .bind(released_json.as_str())
+        .execute(db)
+        .await
     {
         worker::console_log!("[admit-fast] evict {txid}: the ledger row failed: {e}");
+    }
+    if !incomplete.is_empty() {
+        crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
+        worker::console_log!(
+            "[admit-fast] evict {txid} INCOMPLETE ({} fault(s): {}) — the open marker stands; the write-side guard and the next eviction converge",
+            incomplete.len(),
+            incomplete.join("; ")
+        );
     }
     // bsv-low loop 11 (the app layer's gate, LOW-3): the notes above can be flushed by a CONCURRENT request's end on
     // this isolate before the ledger row exists (the set is isolate-global), and the app layer's recompute then finds
@@ -1792,17 +1954,15 @@ mod tests {
             .find("release_spends_of(db, &txid)")
             .expect("the eviction releases");
         let ledger = evict
-            .find("INSERT INTO pot_evictions")
-            .expect("the ledger row");
+            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
+            .expect("the ledger row's close");
         assert!(
             release < ledger,
-            "released BEFORE the ledger row records the list"
+            "released BEFORE the close records the list"
         );
         assert!(
-            evict.contains(
-                "releasedSpends = COALESCE(NULLIF(excluded.releasedSpends, '[]'), pot_evictions.releasedSpends)"
-            ),
-            "a second eviction that releases nothing keeps the first list"
+            CLOSE_EVICTION_MARKER_SQL.contains("COALESCE(NULLIF(excluded.releasedSpends, '[]')"),
+            "a second pass that releases nothing keeps the first list (pinned under SQLite in the marker test)"
         );
         let readmit = &src[src.find("pub async fn readmit_if_evicted(").unwrap()..];
         let readmit = &readmit[..readmit.find("pub enum EvidenceVerdict").unwrap()];
@@ -1843,5 +2003,195 @@ mod tests {
             from = at + 1;
         }
         assert_eq!(evictions, 2, "the refusal job and the pending watch");
+    }
+
+    /// bsv-low loop 18 (2026-09-21, pair 11): the OPEN marker under real SQLite — written first, the FIRST open
+    /// stamp kept across a concurrent second eviction, the pass's rows ADDED by the close, an earlier released
+    /// list never erased by a later empty one, the guard's read true while open and silent once readmitted, and
+    /// a readmitted row re-opened with the new stamp and fresh counts.
+    #[test]
+    fn the_open_marker_keeps_the_first_open_stamp_and_reopens_after_a_readmission() {
+        use rusqlite::OptionalExtension;
+        let conn = shipped_conn();
+        let pot = "ab".repeat(32);
+        let open = |at: i64, reason: &str| {
+            conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, reason, at])
+                .unwrap()
+        };
+        let close = |at: i64, reason: &str, moved: i64, released: &str| {
+            conn.execute(
+                CLOSE_EVICTION_MARKER_SQL,
+                rusqlite::params![&pot, reason, at, moved, released],
+            )
+            .unwrap()
+        };
+        let row = || {
+            conn.query_row(
+                "SELECT reason, evictedAt, readmittedAt, rowsMoved, releasedSpends FROM pot_evictions WHERE txid = ?1",
+                [&pot],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let guard = || {
+            conn.query_row(OPEN_EVICTION_SQL, [&pot], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(guard(), None, "nothing open before any eviction");
+        open(1_000, "REJECTED (a)");
+        assert_eq!(row(), ("REJECTED (a)".into(), 1_000, None, 0, Some("[]".into())));
+        assert_eq!(guard(), Some(("REJECTED (a)".into(), 1_000)), "open from the marker on");
+        // a concurrent second eviction of the same txid: the first open stamp stands
+        open(1_500, "REJECTED (b)");
+        assert_eq!(row().1, 1_000, "the first open stamp is kept");
+        // the close ADDS the pass's rows and records the list; a later close with '[]' keeps it
+        close(1_000, "REJECTED (a)", 3, r#"[{"table":"pot_records","txid":"cd","vout":0}]"#);
+        close(1_500, "REJECTED (b)", 2, "[]");
+        let r = row();
+        assert_eq!((r.1, r.3), (1_000, 5), "both passes' rows added; the stamp unmoved");
+        assert_eq!(
+            r.4.as_deref(),
+            Some(r#"[{"table":"pot_records","txid":"cd","vout":0}]"#),
+            "an empty later list never erases the first"
+        );
+        // readmitted: the guard sees nothing; a new eviction re-opens with the NEW stamp and fresh counts
+        conn.execute("UPDATE pot_evictions SET readmittedAt = 2000 WHERE txid = ?1", [&pot])
+            .unwrap();
+        assert_eq!(guard(), None, "a readmitted row is not open");
+        open(3_000, "REJECTED (c)");
+        assert_eq!(row(), ("REJECTED (c)".into(), 3_000, None, 0, Some("[]".into())));
+        close(3_000, "REJECTED (c)", 1, "[]");
+        assert_eq!(row().3, 1, "fresh counts after a readmission");
+        // a close with NO open marker (the marker faulted) still leaves the row
+        let other = "cd".repeat(32);
+        conn.execute(
+            CLOSE_EVICTION_MARKER_SQL,
+            rusqlite::params![&other, "REJECTED (d)", 4_000i64, 2i64, "[]"],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT rowsMoved FROM pot_evictions WHERE txid = ?1 AND readmittedAt IS NULL",
+                [&other],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// bsv-low loop 18 (pair 11's JOIN `3b14f0e6…`): rows the subject's own admission write lands AFTER a
+    /// table's move step survive the first pass — the pre-fix end state (`outputs` and the `tm_pot` applied row
+    /// in the twins, the pot row and the `tm_lowfund` applied row still served). The verification pass is the
+    /// SAME move SQL re-run: it takes the survivors, the sources end empty, the twins hold both passes' rows,
+    /// and the restore brings everything back once.
+    #[test]
+    fn a_row_that_lands_after_its_tables_move_is_taken_by_the_verification_pass() {
+        let conn = shipped_conn();
+        let pot = "ab".repeat(32);
+        conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0)", [&pot]).unwrap();
+        conn.execute(
+            "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')",
+            [&pot],
+        )
+        .unwrap();
+        let mv = |table: &str| {
+            let c = cols(&conn, table);
+            conn.execute_batch(&create_shadow_sql(table, &c)).unwrap();
+            let (ins, del) = move_sql(table, "txid", &c);
+            conn.execute(&ins, rusqlite::params![1_000i64, "REJECTED", &pot])
+                .unwrap();
+            conn.execute(&del, [&pot]).unwrap();
+        };
+        // pass 1 sees what the write had landed so far
+        for t in ["pot_records", "outputs", "applied_transactions"] {
+            mv(t);
+        }
+        assert_eq!(count(&conn, "outputs", "txid", &pot), 0);
+        assert_eq!(count(&conn, "applied_transactions_evicted", "txid", &pot), 1);
+        // …then the write lands the pot row and the tm_lowfund applied row (pair 11's 12.8 s Phase 3)
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
+        conn.execute(
+            "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_lowfund')",
+            [&pot],
+        )
+        .unwrap();
+        assert_eq!(
+            count(&conn, "pot_records", "txid", &pot),
+            1,
+            "the pre-fix end state: a pot the index still knows"
+        );
+        // the verification pass: the same move, re-run, takes the survivors
+        for t in ["pot_records", "outputs", "applied_transactions"] {
+            mv(t);
+        }
+        assert_eq!(count(&conn, "pot_records", "txid", &pot), 0);
+        assert_eq!(count(&conn, "applied_transactions", "txid", &pot), 0);
+        assert_eq!(count(&conn, "pot_records_evicted", "txid", &pot), 1);
+        assert_eq!(
+            count(&conn, "applied_transactions_evicted", "txid", &pot),
+            2,
+            "both passes' applied rows in the twin"
+        );
+        // the restore brings both applied rows back, the pot row and the output once
+        for t in ["pot_records", "applied_transactions", "outputs"] {
+            let c = cols(&conn, t);
+            let (ins, del) = restore_sql(t, "txid", &c);
+            conn.execute(&ins, [&pot]).unwrap();
+            conn.execute(&del, [&pot]).unwrap();
+        }
+        assert_eq!(count(&conn, "pot_records", "txid", &pot), 1);
+        assert_eq!(count(&conn, "applied_transactions", "txid", &pot), 2);
+        assert_eq!(count(&conn, "outputs", "txid", &pot), 1);
+        assert_eq!(count(&conn, "pot_records_evicted", "txid", &pot), 0);
+    }
+
+    /// Structural (loop 18): the OPEN marker is written BEFORE the table loop, the verification pass runs
+    /// AFTER it, the close after the release; the loop reads through the checked variants only (a faulted
+    /// PRAGMA or COUNT is recorded, never a silent zero), and an incomplete pass is counted.
+    #[test]
+    fn the_eviction_marks_first_verifies_after_and_reads_fail_loud() {
+        let src = include_str!("admit_fast.rs");
+        let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
+        let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
+        let marker = evict
+            .find("Query::new(OPEN_EVICTION_MARKER_SQL)")
+            .expect("the open marker");
+        let looping = evict
+            .find("for (table, keys) in MOVED_TABLES")
+            .expect("the table loop");
+        let verify = evict
+            .find("THE VERIFICATION PASS")
+            .expect("the verification pass");
+        let release = evict
+            .find("release_spends_of(db, &txid)")
+            .expect("the release");
+        let close = evict
+            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
+            .expect("the close");
+        assert!(
+            marker < looping && looping < verify && verify < release && release < close,
+            "marker → loop → verification → release → close"
+        );
+        assert!(
+            !evict.contains("count_keyed(db") && !evict.contains("table_columns(db"),
+            "the loop reads through the checked variants only"
+        );
+        assert!(
+            evict.contains("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE"),
+            "an incomplete pass is counted"
+        );
+        // the guard's read is the ledger's open row, never the twins (a twin can hold duplicates; the ledger is one row)
+        assert!(OPEN_EVICTION_SQL.contains("readmittedAt IS NULL"));
     }
 }

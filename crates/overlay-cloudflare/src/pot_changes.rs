@@ -173,15 +173,20 @@ mod tests {
         let latchers = routes.matches("let seen_env = env.clone();").count()
             + routes.matches("let dual_env = env.clone();").count();
         let inline = routes.matches("pot_changes::flush_inline(").count();
+        // bsv-low loop 18 (2026-09-21, #513): the write-side guard re-evicts INSIDE the request after the engine
+        // write and answers 422 — an early return that skips the route's end flush, so it ships the eviction's
+        // notes inline itself (counted by its counter's name; a comment cannot satisfy a needle).
+        let guard = routes.matches("COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE").count();
         assert!(
             heals >= 1,
             "the signers self-heal task moved — re-point this pin"
         );
         assert_eq!(latchers, 2, "the two background latchers capture the env");
+        assert_eq!(guard, 1, "the write-side guard re-evicts once, after the write");
         assert_eq!(
-            heals + latchers,
+            heals + latchers + guard,
             inline,
-            "a detached task writes pot rows without shipping its own notes (see flush_inline)"
+            "a detached task (or the write-side guard's early return) writes pot rows without shipping its own notes (see flush_inline)"
         );
     }
 

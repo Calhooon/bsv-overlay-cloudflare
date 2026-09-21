@@ -2021,6 +2021,34 @@ async fn queue_handler(
 
         let mode: SubmitMode = crate::queue::replay_submit_mode(&body.mode);
         let counters = env.d1("OVERLAY_DB").ok();
+        // ── bsv-low LOOP 18 (2026-09-21): a replay never resurrects an evicted pot ──
+        // The subject is derived by the ONE rule (D5); an open eviction skips the replay (acked: the twin holds
+        // the rows, a MINED proof readmits); an unreadable ledger retries the replay later (never a blind write).
+        if let Some(db) = &counters {
+            if let Ok((_, subject)) = crate::ef::beef_to_ef_batch(&tagged_beef.beef) {
+                match crate::admit_fast::open_eviction(db, &subject).await {
+                    Ok(Some(ev)) => {
+                        crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED, 1).await;
+                        worker::console_log!(
+                            "Queue: replay of {subject} SKIPPED — under an open eviction (at {} ms — {}); the twin holds it, a MINED proof readmits",
+                            ev.evicted_at_ms,
+                            ev.reason
+                        );
+                        msg.ack();
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
+                        worker::console_log!(
+                            "Queue: the eviction ledger could not be read for {subject} ({e}) — retrying the replay later"
+                        );
+                        msg.retry();
+                        continue;
+                    }
+                }
+            }
+        }
 
         match engine.submit_with_report(&tagged_beef, mode).await {
             Ok((_steak, report)) if report.is_durable() => {

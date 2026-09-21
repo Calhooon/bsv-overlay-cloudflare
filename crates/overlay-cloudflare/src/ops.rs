@@ -158,6 +158,20 @@ pub const COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED: &str =
 /// still an orphan view (the parents unseen by Arcade).
 pub const COUNTER_SUBMIT_PENDING_SILENT: &str = "submit_pending_silent_total";
 pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
+/// bsv-low loop 18 (2026-09-21, pair 11): a gated submit whose subject the ledger holds under an OPEN
+/// eviction — refused at the door (nothing broadcast, nothing written; a MINED proof readmits).
+pub const COUNTER_SUBMIT_REFUSED_EVICTED: &str = "submit_refused_evicted_total";
+/// loop 18: an admission write that outran its own eviction's table loop — re-evicted after the write, the
+/// submit answered as the refusal it is.
+pub const COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE: &str = "admit_fast_reevicted_after_write_total";
+/// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
+/// second move) — the open marker stands; the write-side guard and the next eviction converge.
+pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
+/// loop 18: the eviction ledger could not be read where a guard asked (named, never a silent "none").
+pub const COUNTER_ADMIT_FAST_LEDGER_UNREADABLE: &str = "admit_fast_ledger_unreadable_total";
+/// loop 18: a queued replay skipped because its subject is under an open eviction (a replay never
+/// resurrects an evicted pot).
+pub const COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED: &str = "queue_replay_skipped_evicted_total";
 /// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
 /// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).
 pub const COUNTER_SUBMIT_PENDING_CONFIRMED_NOW: &str = "submit_pending_confirmed_now_total";
@@ -816,6 +830,12 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_PENDING_ORPHAN,
         COUNTER_SUBMIT_PENDING_CONFIRMED_NOW,
         COUNTER_SUBMIT_PENDING_CONFIRM_ASKED,
+        // bsv-low loop 18 (2026-09-21): the write-side guard's counters read 0 until they fire.
+        COUNTER_SUBMIT_REFUSED_EVICTED,
+        COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+        COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
+        COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
+        COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
     ] {
         obj[name] = json!(0);
     }
