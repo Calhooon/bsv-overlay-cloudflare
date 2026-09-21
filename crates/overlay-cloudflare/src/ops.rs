@@ -166,6 +166,14 @@ pub const COUNTER_SUBMIT_REFUSED_EVICTED: &str = "submit_refused_evicted_total";
 /// readmitted at the door (the fresh word overrules the ledger's stale one; a wrong eviction heals on the next
 /// accepted re-present, never permanently).
 pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str = "submit_readmitted_by_fresh_accept_total";
+/// bsv-low #519 (loop 20, 2026-09-21): an Arcade-terminal subject judged at the ladder by the chain's indexers
+/// (never a broadcaster's echo): held by an indexer (admitted), absent past the age floor (the two-source refusal),
+/// absent but young (the retryable word), the indexers inconclusive, or this isolate's courier budget spent.
+pub const COUNTER_SUBMIT_TERMINAL_PRESENT: &str = "submit_terminal_judged_present_total";
+pub const COUNTER_SUBMIT_TERMINAL_ABSENT: &str = "submit_terminal_judged_absent_total";
+pub const COUNTER_SUBMIT_TERMINAL_YOUNG: &str = "submit_terminal_judged_young_total";
+pub const COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE: &str = "submit_terminal_judged_inconclusive_total";
+pub const COUNTER_SUBMIT_TERMINAL_CAPPED: &str = "submit_terminal_judged_capped_total";
 /// loop 18: an admission write that outran its own eviction's table loop — re-evicted after the write, the
 /// submit answered as the refusal it is.
 pub const COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE: &str = "admit_fast_reevicted_after_write_total";
@@ -846,6 +854,12 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         // bsv-low loop 18 (2026-09-21): the write-side guard's counters read 0 until they fire.
         COUNTER_SUBMIT_REFUSED_EVICTED,
         COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
+        // bsv-low #519 (2026-09-21): the terminal judgement's counters read 0 until they fire.
+        COUNTER_SUBMIT_TERMINAL_PRESENT,
+        COUNTER_SUBMIT_TERMINAL_ABSENT,
+        COUNTER_SUBMIT_TERMINAL_YOUNG,
+        COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
+        COUNTER_SUBMIT_TERMINAL_CAPPED,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,

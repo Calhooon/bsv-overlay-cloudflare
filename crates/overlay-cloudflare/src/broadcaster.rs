@@ -1759,24 +1759,163 @@ where
 /// re-presented, Arcade said terminal REJECTED, the corroborator echoed the accept it stored before the competitor
 /// mined, and the door READMITTED the evicted pot — a public lever to resurrect any refused JOIN from its bytes.
 /// #214's own case (Arcade's stale REJECTED for a tx MINED in 958776) is `Present` here and admits as it always did.
-/// `Absent` is the two-source refusal (#513's evidence rule: Arcade's own fatal word plus both indexers absent needs
-/// no age) and answers Rejected, which the route's Rejected arm turns into the 422 and re-runs an open eviction.
-/// `Inconclusive` (a courier faulted) is an honest Err/502: the client retries later; never admit-on-unknown, never
-/// admit on an echo.
+///
+/// The arms, with the gate's findings folded (2026-09-21):
+/// - `Present` admits under our subject txid (one indexer holding it is the network holding it).
+/// - `Absent` with the admission at least `REFUSAL_ABSENT_MIN_AGE_MS` old is the two-source refusal (#513's evidence
+///   rule: Arcade's own fatal word plus both indexers absent) and answers Rejected — the route's 422, an open
+///   eviction re-run. `Absent` on a YOUNG (or never-admitted) subject answers a retryable Err instead (the gate's
+///   MEDIUM-1, Rule 6): the indexers' unconfirmed word is one node's mempool (Bitails, pruned, answers 404 for every
+///   unmined tx: measured 2026-09-21), so a valid tx Arcade wrongly holds terminal that has not propagated yet must
+///   not read as a client-terminal 422 — the client's own direct leg propagates it, and a later re-present finds it.
+/// - `Inconclusive` (a courier faulted, or this isolate's courier budget for terminal subjects is spent) is an honest
+///   Err/502: the client retries later; never admit-on-unknown, never admit on an echo.
+///
+/// The refusal's text carries Arcade's `extraInfo` (the gate's MEDIUM-2: the client's refund classifier keys on
+/// `utxo_spent | spent by | double spend | txn-mempool-conflict`) with the tokens the client's already-known belt
+/// matches scrubbed out (`already | known | seen | mined`: a 422 must never read as success on an older client).
+/// Stated residual (parity, not worse): during a live unconfirmed double-spend race WoC's first-seen view can be
+/// the losing tx → `Present` → readmitted as witnessed with no Arcade lifecycle behind it; the ≥ 1 h retire pass
+/// and the spend-pointer machinery undo it when the competitor mines (the old echo had the same shape, unbounded).
 pub fn terminal_at_arcade_by_presence(
     presence: crate::proof_fetcher::NetworkPresence,
+    young: bool,
     subject_txid: &str,
     arcade_status: &str,
+    extra_info: &str,
 ) -> Result<ArcOutcome, String> {
     use crate::proof_fetcher::NetworkPresence;
     match presence {
         NetworkPresence::Present => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
-        NetworkPresence::Absent => Ok(ArcOutcome::Rejected(format!(
-            "Arcade {arcade_status} {subject_txid}; both indexers absent (#519: an Arcade-terminal subject is judged by the chain's indexers, never a broadcaster's echo)"
+        NetworkPresence::Absent if young => Err(format!(
+            "Arcade holds {subject_txid} terminal ({arcade_status}) and the indexers do not hold it yet, but the admission is under ten minutes old or not recorded: the network has not had its window — retryable, never a definitive refusal on a young subject (#519, Rule 6)"
+        )),
+        NetworkPresence::Absent => Ok(ArcOutcome::Rejected(terminal_refusal_reason(
+            subject_txid,
+            arcade_status,
+            extra_info,
         ))),
         NetworkPresence::Inconclusive => Err(format!(
-            "Arcade holds {subject_txid} terminal ({arcade_status}) and the indexers are inconclusive (a courier faulted): the network's word is unavailable — retryable, never admitted on a broadcaster's echo (#519)"
+            "Arcade holds {subject_txid} terminal ({arcade_status}) and the indexers are inconclusive (a courier faulted, or this isolate's courier budget for terminal subjects is spent): the network's word is unavailable — retryable, never admitted on a broadcaster's echo (#519)"
         )),
+    }
+}
+
+/// PURE (#519, the gate's MEDIUM-2 + NIT-3): the two-source refusal's text, Arcade's `extraInfo` threaded as TEXT
+/// (never a gate: the #213 stale-`extraInfo` trap) so the client's refund classifier keys on the node's reason,
+/// with the already-known belt's tokens scrubbed (`already_known` is the belt's Rust mirror; pinned on the shapes).
+pub fn terminal_refusal_reason(subject_txid: &str, arcade_status: &str, extra_info: &str) -> String {
+    let detail = scrub_already_known_tokens(extra_info);
+    let detail = if detail.is_empty() { String::new() } else { format!(" {detail}") };
+    format!(
+        "Arcade {arcade_status}{detail} {subject_txid}; both indexers absent (#519: an Arcade-terminal subject is judged by the chain's indexers, never a broadcaster's echo)"
+    )
+}
+
+/// PURE: drop every whitespace token the already-known belt would match (`already`; `known` outside `unknown`;
+/// `seen` outside `unseen`; `mined`), keeping the node's reason readable (`utxo already spent by tx` → `utxo spent
+/// by tx`, which the client's refund classifier still reads as a spent input).
+pub fn scrub_already_known_tokens(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|tok| {
+            let t = tok.to_ascii_lowercase();
+            let known = t.contains("known") && !t.contains("unknown");
+            let seen = t.contains("seen") && !t.contains("unseen");
+            !(t.contains("already") || known || seen || t.contains("mined"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// #519 (the gate's LOW-3): how long an isolate remembers an indexer verdict for an Arcade-terminal subject
+/// (`Present` / `Absent` only; a fault is never remembered), so a re-present loop over one txid costs the couriers'
+/// shared budget once a minute, not once a request.
+pub const TERMINAL_MEMO_TTL_MS: f64 = 60_000.0;
+/// #519 (the gate's LOW-3): how many terminal subjects an isolate may ask the couriers about per sliding minute — the
+/// public gated `/submit` is request-driven, and WoC's anonymous bucket also carries the pending watch's evidence
+/// checks, the retire pass (capped at 8 per tick for the same reason) and the backstop. Over the cap the ask is
+/// `Inconclusive` (a retryable 502), counted.
+pub const TERMINAL_ASKS_PER_WINDOW: usize = 20;
+pub const TERMINAL_ASK_WINDOW_MS: f64 = 60_000.0;
+
+/// PURE: the memo lookup — a remembered verdict younger than `ttl_ms`.
+pub fn terminal_memo_lookup(
+    memo: &std::collections::HashMap<String, (crate::proof_fetcher::NetworkPresence, f64)>,
+    txid: &str,
+    now: f64,
+    ttl_ms: f64,
+) -> Option<crate::proof_fetcher::NetworkPresence> {
+    memo.get(txid).filter(|(_, at)| now - *at >= 0.0 && now - *at < ttl_ms).map(|(p, _)| *p)
+}
+
+/// PURE: remember a verdict — never a fault (`Inconclusive`), which must be re-asked.
+pub fn terminal_memo_store(
+    memo: &mut std::collections::HashMap<String, (crate::proof_fetcher::NetworkPresence, f64)>,
+    txid: &str,
+    presence: crate::proof_fetcher::NetworkPresence,
+    now: f64,
+) {
+    if presence != crate::proof_fetcher::NetworkPresence::Inconclusive {
+        memo.insert(txid.to_string(), (presence, now));
+    }
+}
+
+/// PURE: the sliding-window cap — `true` records the ask and lets it go to the couriers.
+pub fn terminal_ask_allowed_in(
+    asks: &mut std::collections::VecDeque<f64>,
+    now: f64,
+    cap: usize,
+    window_ms: f64,
+) -> bool {
+    while asks.front().is_some_and(|t| now - *t >= window_ms) {
+        asks.pop_front();
+    }
+    if asks.len() >= cap {
+        return false;
+    }
+    asks.push_back(now);
+    true
+}
+
+thread_local! {
+    static TERMINAL_MEMO: std::cell::RefCell<std::collections::HashMap<String, (crate::proof_fetcher::NetworkPresence, f64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static TERMINAL_ASKS: std::cell::RefCell<std::collections::VecDeque<f64>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// How the ladder judged an Arcade-terminal subject (the gate's LOW-2: the operator sees which arm fired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalJudgement {
+    Present,
+    Absent,
+    Young,
+    Inconclusive,
+    Capped,
+}
+
+impl TerminalJudgement {
+    pub fn of(presence: crate::proof_fetcher::NetworkPresence, young: bool, capped: bool) -> Self {
+        use crate::proof_fetcher::NetworkPresence;
+        if capped {
+            return TerminalJudgement::Capped;
+        }
+        match presence {
+            NetworkPresence::Present => TerminalJudgement::Present,
+            NetworkPresence::Absent if young => TerminalJudgement::Young,
+            NetworkPresence::Absent => TerminalJudgement::Absent,
+            NetworkPresence::Inconclusive => TerminalJudgement::Inconclusive,
+        }
+    }
+    /// The ops counter this judgement bumps.
+    pub fn counter(self) -> &'static str {
+        match self {
+            TerminalJudgement::Present => crate::ops::COUNTER_SUBMIT_TERMINAL_PRESENT,
+            TerminalJudgement::Absent => crate::ops::COUNTER_SUBMIT_TERMINAL_ABSENT,
+            TerminalJudgement::Young => crate::ops::COUNTER_SUBMIT_TERMINAL_YOUNG,
+            TerminalJudgement::Inconclusive => crate::ops::COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
+            TerminalJudgement::Capped => crate::ops::COUNTER_SUBMIT_TERMINAL_CAPPED,
+        }
     }
 }
 
@@ -1829,6 +1968,12 @@ pub struct ArcadeBroadcaster {
     /// poll on the wire). OFF by default — the route turns it on from the
     /// derived `AdmitPolicy` (`ADMIT_FAST`).
     fast_answer: bool,
+    /// #519: the wall-clock of the indexers' judgement of an Arcade-terminal subject (its own Server-Timing segment).
+    terminal_ms: std::cell::Cell<f64>,
+    /// #519: how the last Arcade-terminal subject of this request was judged (the route counts it).
+    terminal_judged: std::cell::Cell<Option<TerminalJudgement>>,
+    /// #519: the WoC key the presence read carries (the same one `evidence_check` reads; none installed today).
+    woc_api_key: Option<String>,
 }
 
 impl ArcadeBroadcaster {
@@ -1847,7 +1992,45 @@ impl ArcadeBroadcaster {
             corroborate_ms: std::cell::Cell::new(0.0),
             poll_ms: std::cell::Cell::new(0.0),
             fast_answer: false,
+            terminal_ms: std::cell::Cell::new(0.0),
+            terminal_judged: std::cell::Cell::new(None),
+            woc_api_key: None,
         }
+    }
+
+    /// #519: the WoC API key for the terminal judgement's presence read (`evidence_check` reads the same secret).
+    pub fn with_woc_api_key(mut self, key: Option<String>) -> Self {
+        self.woc_api_key = key.filter(|k| !k.trim().is_empty());
+        self
+    }
+
+    /// #519: milliseconds spent judging Arcade-terminal subjects by the indexers in this request (the `terminal`
+    /// Server-Timing segment, carved out of `arcade-broadcast` like the corroborate leg).
+    pub fn terminal_ms(&self) -> f64 {
+        self.terminal_ms.get()
+    }
+
+    /// #519: how this request's Arcade-terminal subject was judged, if one was.
+    pub fn terminal_judgement(&self) -> Option<TerminalJudgement> {
+        self.terminal_judged.get()
+    }
+
+    /// #519: the indexers' presence for an Arcade-terminal subject — the isolate's memo first, then the per-minute
+    /// cap, then both couriers (a verdict remembered, a fault not). The second element names the source.
+    async fn terminal_presence(&self, txid: &str, now: f64) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
+        use crate::proof_fetcher::NetworkPresence;
+        if let Some(p) = TERMINAL_MEMO.with(|m| terminal_memo_lookup(&m.borrow(), txid, now, TERMINAL_MEMO_TTL_MS)) {
+            return (p, "memo");
+        }
+        let allowed = TERMINAL_ASKS.with(|a| terminal_ask_allowed_in(&mut a.borrow_mut(), now, TERMINAL_ASKS_PER_WINDOW, TERMINAL_ASK_WINDOW_MS));
+        if !allowed {
+            return (NetworkPresence::Inconclusive, "capped");
+        }
+        let bitails = crate::proof_fetcher::bitails_presence(crate::proof_fetcher::DEFAULT_BITAILS_BASE, txid).await;
+        let woc = crate::proof_fetcher::woc_presence(crate::proof_fetcher::DEFAULT_WOC_BASE, self.woc_api_key.as_deref(), txid).await;
+        let presence = crate::proof_fetcher::classify_presence(bitails, woc);
+        TERMINAL_MEMO.with(|m| terminal_memo_store(&mut m.borrow_mut(), txid, presence, now));
+        (presence, "couriers")
     }
 
     /// admit-fast (bsv-low 2026-09-15): answer the gate on Arcade's
@@ -1986,7 +2169,9 @@ impl ArcadeBroadcaster {
         } else {
             None
         };
-        self.broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref())
+        // #519: a caller without a ledger view treats an absent Arcade-terminal subject as YOUNG (the retryable word,
+        // never a definitive 422 it cannot justify by age); the route passes the ledger's own age.
+        self.broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref(), std::future::ready(true))
             .await
     }
 
@@ -2043,12 +2228,18 @@ impl ArcadeBroadcaster {
     /// lives in [`broadcast_efs_gated_with`] (natively wiring-tested); this
     /// method supplies the real Arcade submit/poll and TAAL→GorillaPool
     /// corroboration transports.
-    pub async fn broadcast_efs_gated(
+    pub async fn broadcast_efs_gated<Y>(
         &self,
         efs: &[EfTx],
         subject_txid: &str,
         mined_subject_raw: Option<&[u8]>,
-    ) -> Result<ArcOutcome, String> {
+        // #519 (the gate's MEDIUM-1): "the admission is younger than `REFUSAL_ABSENT_MIN_AGE_MS`, or unknown",
+        // awaited only when an Arcade-terminal subject reads absent at the indexers (a lazy ledger read).
+        subject_young: Y,
+    ) -> Result<ArcOutcome, String>
+    where
+        Y: std::future::Future<Output = bool>,
+    {
         // The subject's own EF is what we broadcast first (subject-only).
         // `None` ONLY on the #268 mined-claim path (efs empty), where no
         // submit rung ever runs — the pure control flow corroborates the
@@ -2102,22 +2293,24 @@ impl ArcadeBroadcaster {
                 GateVerdict::Fatal
             )
         {
-            let bitails = crate::proof_fetcher::bitails_presence(
-                crate::proof_fetcher::DEFAULT_BITAILS_BASE,
-                subject_txid,
-            )
-            .await;
-            let woc = crate::proof_fetcher::woc_presence(
-                crate::proof_fetcher::DEFAULT_WOC_BASE,
-                None,
-                subject_txid,
-            )
-            .await;
-            let presence = crate::proof_fetcher::classify_presence(bitails, woc);
+            let started = worker::js_sys::Date::now();
+            let extra_info = probe.as_ref().map(|r| r.extra_info.as_str()).unwrap_or("");
+            let (presence, source) = self.terminal_presence(subject_txid, started).await;
+            // the age floor (the gate's MEDIUM-1, Rule 6): asked only when the indexers do not hold it
+            let young = if presence == crate::proof_fetcher::NetworkPresence::Absent {
+                subject_young.await
+            } else {
+                false
+            };
+            let judgement = TerminalJudgement::of(presence, young, source == "capped");
+            self.terminal_ms
+                .set(self.terminal_ms.get() + (worker::js_sys::Date::now() - started));
+            self.terminal_judged.set(Some(judgement));
             gate_log(&format!(
-                "[arcade] {subject_txid} held TERMINAL by Arcade ({probe_status}) — skipping every Arcade rung; judged by the indexers (bitails {bitails:?}, woc {woc:?} → {presence:?}), never a broadcaster's echo (#519)"
+                "[arcade] {subject_txid} held TERMINAL by Arcade ({probe_status}) — skipping every Arcade rung; judged by the indexers ({source}: {presence:?}{}) → {judgement:?}, never a broadcaster's echo (#519)",
+                if young { ", the admission young" } else { "" }
             ));
-            return terminal_at_arcade_by_presence(presence, subject_txid, probe_status);
+            return terminal_at_arcade_by_presence(presence, young, subject_txid, probe_status, extra_info);
         }
         // REGISTER ONCE PER TXID: a subject Arcade already holds (pending,
         // orphan, or terminal) has its callback registered from its first
@@ -3479,22 +3672,30 @@ mod tests {
     /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 + bsv-low #519 (2026-09-21): a subject Arcade already holds TERMINAL
     /// never touches a submit rung, and its verdict is the CHAIN'S INDEXERS', never a corroborating broadcaster's
     /// echo: Present admits under OUR subject txid (#214's case: Arcade's REJECTED was stale, the tx mined),
-    /// Absent is the two-source refusal (the 422; an open eviction re-runs), Inconclusive an honest Err (502).
+    /// Absent is the two-source refusal (the 422; an open eviction re-runs) once the admission is old enough, a
+    /// YOUNG absent subject answers the retryable word (the gate's MEDIUM-1, Rule 6), Inconclusive an honest Err.
     #[test]
     fn terminal_at_arcade_is_judged_by_the_indexers_never_a_broadcasters_echo() {
         use crate::proof_fetcher::NetworkPresence;
         assert_eq!(
-            terminal_at_arcade_by_presence(NetworkPresence::Present, "subject", "REJECTED").unwrap(),
+            terminal_at_arcade_by_presence(NetworkPresence::Present, false, "subject", "REJECTED", "").unwrap(),
             ArcOutcome::Accepted("subject".into())
         );
-        let refused = terminal_at_arcade_by_presence(NetworkPresence::Absent, "subject", "REJECTED").unwrap();
+        assert_eq!(
+            terminal_at_arcade_by_presence(NetworkPresence::Present, true, "subject", "REJECTED", "").unwrap(),
+            ArcOutcome::Accepted("subject".into()),
+            "an indexer holding it is the network holding it, young or not"
+        );
+        let refused = terminal_at_arcade_by_presence(NetworkPresence::Absent, false, "subject", "REJECTED", "").unwrap();
         match refused {
             ArcOutcome::Rejected(r) => {
                 assert!(r.contains("Arcade REJECTED subject") && r.contains("both indexers absent") && r.contains("#519"), "{r}");
             }
             other => panic!("Absent must refuse, got {other:?}"),
         }
-        let err = terminal_at_arcade_by_presence(NetworkPresence::Inconclusive, "subject", "DOUBLE_SPEND_ATTEMPTED").unwrap_err();
+        let young = terminal_at_arcade_by_presence(NetworkPresence::Absent, true, "subject", "REJECTED", "").unwrap_err();
+        assert!(young.contains("young") && young.contains("retryable") && young.contains("Rule 6"), "{young}");
+        let err = terminal_at_arcade_by_presence(NetworkPresence::Inconclusive, false, "subject", "DOUBLE_SPEND_ATTEMPTED", "").unwrap_err();
         assert!(err.contains("inconclusive") && err.contains("retryable") && err.contains("never admitted"), "{err}");
         // THE 09:39Z SHAPE, pinned by construction: a corroborator's stored accept is not an input here at all —
         // the decision takes the indexers' presence and nothing else. The classifier's rules are pinned in
@@ -3502,18 +3703,89 @@ mod tests {
         assert!(matches!(crate::proof_fetcher::classify_presence(Some(false), Some(false)), NetworkPresence::Absent));
         assert!(matches!(crate::proof_fetcher::classify_presence(Some(true), Some(false)), NetworkPresence::Present));
         assert!(matches!(crate::proof_fetcher::classify_presence(None, Some(false)), NetworkPresence::Inconclusive));
+        // the judgement the operator counts
+        assert_eq!(TerminalJudgement::of(NetworkPresence::Absent, true, false), TerminalJudgement::Young);
+        assert_eq!(TerminalJudgement::of(NetworkPresence::Inconclusive, false, true), TerminalJudgement::Capped);
+        assert_eq!(TerminalJudgement::of(NetworkPresence::Present, true, false), TerminalJudgement::Present);
     }
 
-    /// SOURCE PIN (#519): the production ladder's terminal branch calls the presence judgement and never a
-    /// corroborator; a comment cannot satisfy the needle (the production slice, comments stripped).
+    /// The gate's MEDIUM-2 + NIT-3: the refusal carries Arcade's `extraInfo` so the client's refund classifier
+    /// (`utxo_spent | spent by | double spend | txn-mempool-conflict`) keys on it, and never a token the client's
+    /// already-known belt matches (`already_known` is that belt's Rust mirror): a 422 must never read as success.
     #[test]
-    fn the_ladders_terminal_branch_asks_the_indexers_not_the_corroborator() {
+    fn the_terminal_refusal_carries_the_nodes_reason_and_never_reads_as_already_known() {
+        let shapes = [
+            "UTXO_SPENT (70): UTXO_SPENT (70): 8b6f324a92e45013aa5a893d2b43bb29c64482bbcf2d25b37b87f20cfaba5c30:0 utxo already spent by tx 2e8522349f6e0de46358423ebb946dd523ae2729df0b335b1b28208209612f56[0]",
+            "258 txn-mempool-conflict (double spend attempted)",
+            "PROCESSING (4): failed to validate transaction: missing inputs",
+            "",
+        ];
+        for (i, extra) in shapes.iter().enumerate() {
+            let reason = terminal_refusal_reason("3b14f0e654db348ba70ac6f70c87df8eeede689ab6c5969c0ae33b97511babfc", "REJECTED", extra);
+            assert!(!already_known(&reason), "shape {i}: {reason}");
+            assert!(reason.contains("both indexers absent") && reason.contains("#519"), "{reason}");
+        }
+        let spent = terminal_refusal_reason("x", "REJECTED", shapes[0]).to_lowercase();
+        assert!(spent.contains("utxo_spent") && spent.contains("spent by tx"), "the refund classifier's needles survive: {spent}");
+        let conflict = terminal_refusal_reason("x", "REJECTED", shapes[1]).to_lowercase();
+        assert!(conflict.contains("txn-mempool-conflict") && conflict.contains("double spend"), "{conflict}");
+        // the young and inconclusive words never read as already-known either
+        for e in [
+            terminal_at_arcade_by_presence(crate::proof_fetcher::NetworkPresence::Absent, true, "x", "REJECTED", shapes[0]).unwrap_err(),
+            terminal_at_arcade_by_presence(crate::proof_fetcher::NetworkPresence::Inconclusive, false, "x", "REJECTED", "").unwrap_err(),
+        ] {
+            assert!(!already_known(&e), "{e}");
+        }
+        assert_eq!(scrub_already_known_tokens("utxo already spent by tx; txn-already-known; unknown inputs; unseen; mined; examined"), "utxo spent by tx; unknown inputs; unseen;");
+    }
+
+    /// The gate's LOW-3: a re-present loop costs the couriers' shared budget once a minute per txid (the memo), and at
+    /// most `TERMINAL_ASKS_PER_WINDOW` distinct asks per sliding minute per isolate (the cap); a fault is re-asked.
+    #[test]
+    fn terminal_judgements_are_memoised_and_capped() {
+        use crate::proof_fetcher::NetworkPresence;
+        let mut memo = std::collections::HashMap::new();
+        terminal_memo_store(&mut memo, "a", NetworkPresence::Absent, 1_000.0);
+        terminal_memo_store(&mut memo, "b", NetworkPresence::Inconclusive, 1_000.0);
+        assert_eq!(terminal_memo_lookup(&memo, "a", 1_000.0 + TERMINAL_MEMO_TTL_MS - 1.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Absent));
+        assert_eq!(terminal_memo_lookup(&memo, "a", 1_000.0 + TERMINAL_MEMO_TTL_MS, TERMINAL_MEMO_TTL_MS), None, "expired");
+        assert_eq!(terminal_memo_lookup(&memo, "b", 1_001.0, TERMINAL_MEMO_TTL_MS), None, "a fault is never remembered");
+        assert_eq!(terminal_memo_lookup(&memo, "a", 999.0, TERMINAL_MEMO_TTL_MS), None, "a clock from the future answers nothing");
+        let mut asks = std::collections::VecDeque::new();
+        assert!(terminal_ask_allowed_in(&mut asks, 0.0, 2, 60_000.0));
+        assert!(terminal_ask_allowed_in(&mut asks, 1.0, 2, 60_000.0));
+        assert!(!terminal_ask_allowed_in(&mut asks, 2.0, 2, 60_000.0), "the cap");
+        assert!(terminal_ask_allowed_in(&mut asks, 60_000.0, 2, 60_000.0), "the window slid");
+        assert_eq!(asks.len(), 2);
+    }
+
+    /// SOURCE PIN (#519, the gate's LOW-1): the production ladder's terminal branch judges by the indexers BEFORE any
+    /// rung and never through a corroborator — the ordering inside `broadcast_efs_gated`, the branch's own text
+    /// free of every corroborator and rung name, and the mined-claim dispatch (an all-proven BEEF) after the return
+    /// (no BEEF shape skips the judgement). Comments stripped; a comment cannot satisfy a needle.
+    #[test]
+    fn the_ladders_terminal_branch_asks_the_indexers_before_any_rung_and_never_a_corroborator() {
         let src = include_str!("broadcaster.rs");
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let code: String = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
-        assert_eq!(code.matches("terminal_at_arcade_by_presence(presence, subject_txid, probe_status)").count(), 1);
-        assert_eq!(code.matches("broadcast_terminal_at_arcade_with(").count(), 0, "the corroborator wrapper for terminal subjects is gone");
-        assert!(code.contains("classify_presence(bitails, woc)"));
+        let f = &prod[prod.find("pub async fn broadcast_efs_gated").unwrap()..];
+        let f = &f[..f.find("async fn submit_once_and_gate(").unwrap()];
+        let code: String = f.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let fatal = code.find("GateVerdict::Fatal").expect("the fatal probe arm");
+        let presence = code.find("self.terminal_presence(subject_txid").expect("the presence judgement");
+        let young = code.find("subject_young.await").expect("the age floor");
+        let ret = code.find("return terminal_at_arcade_by_presence(").expect("the return");
+        let register = code.find("let register_callback").expect("the register-once rule");
+        let rung = code.find("broadcast_efs_gated_with(").expect("the ladder's rungs");
+        let mined_claim = code.find("CorroborationKind::MinedClaim").expect("the mined-claim dispatch");
+        assert!(
+            fatal < presence && presence < young && young < ret && ret < register && register < rung && ret < mined_claim,
+            "fatal@{fatal} presence@{presence} young@{young} return@{ret} register@{register} rung@{rung} mined@{mined_claim}"
+        );
+        let branch = &code[fatal..ret];
+        assert!(!branch.contains("corroborate"), "no corroborator in the terminal branch");
+        assert!(!branch.contains("submit_ef") && !branch.contains("submit_once_and_gate"), "no Arcade rung in the terminal branch");
+        assert_eq!(code.matches("broadcast_terminal_at_arcade_with(").count(), 0);
+        assert_eq!(code.matches("return terminal_at_arcade_by_presence(").count(), 1);
     }
 
     #[tokio::test]

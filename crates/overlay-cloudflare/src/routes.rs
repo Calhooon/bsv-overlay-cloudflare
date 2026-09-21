@@ -1165,7 +1165,9 @@ async fn submit_inner(
                 .with_corroborator_key(taal_api_key.clone())
                 // admit-fast: the sync accept answers; the witness moves to
                 // the pending watch below (nothing polled on the wire).
-                .with_fast_answer(admit_fast);
+                .with_fast_answer(admit_fast)
+                // #519: the terminal judgement's WoC read carries the same key the evidence check reads
+                .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()));
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
@@ -1240,8 +1242,24 @@ async fn submit_inner(
         }
         let arcade_started = js_sys::Date::now();
         let arcade_outcome = arcade
-            .broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref())
+            .broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref(), async {
+                // #519 (the gate's MEDIUM-1, Rule 6): the age floor for an Arcade-terminal subject the indexers do
+                // not hold — a lazy ledger read, awaited only on that arm; no ledger to ask is the conservative word
+                match env.d1("OVERLAY_DB") {
+                    Ok(age_db) => crate::admit_fast::admission_age_ms(&age_db, &subject_txid, worker::Date::now().as_millis())
+                        .await
+                        .is_none_or(|age| age < crate::admit_fast::REFUSAL_ABSENT_MIN_AGE_MS),
+                    Err(_) => true,
+                }
+            })
             .await;
+        // #519: the terminal judgement, counted for the operator (which arm fired), its wall-clock its own segment
+        let terminal_ms = arcade.terminal_ms();
+        if let Some(judgement) = arcade.terminal_judgement() {
+            if let Ok(count_db) = env.d1("OVERLAY_DB") {
+                crate::ops::bump_counter(&count_db, judgement.counter(), 1).await;
+            }
+        }
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of
         // `arcade-broadcast` and reported as its own `corroborate` segment
@@ -1252,7 +1270,7 @@ async fn submit_inner(
         corroborate_ms = arcade.corroborate_ms();
         arcade_poll_ms = arcade.poll_wait_ms();
         arcade_broadcast_ms =
-            (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms).max(0.0);
+            (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms - terminal_ms).max(0.0);
         admit_desc = match &arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => "witnessed",
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_)) => {
@@ -1266,7 +1284,7 @@ async fn submit_inner(
             Err(_) => "unavailable",
         };
         let gated_timing = format!(
-            "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, admit;desc=\"{admit_desc}\""
+            "script-verify;dur={script_verify_ms:.1}, script-walk;desc=\"{script_walk_desc}\", arcade-broadcast;dur={arcade_broadcast_ms:.1}, terminal;dur={terminal_ms:.1}, arcade-poll;dur={arcade_poll_ms:.1}, corroborate;dur={corroborate_ms:.1}, admit;desc=\"{admit_desc}\""
         );
         match arcade_outcome {
             Ok(crate::broadcaster::ArcOutcome::Accepted(accepted)) => {
