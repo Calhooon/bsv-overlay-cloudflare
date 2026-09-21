@@ -83,7 +83,9 @@ STORAGE_EPOCH = "2026-08-06-zero-world-1"
 # a second-aligned instant with margin (anchors are unix seconds; a
 # mid-second cutoff can drop up to ~1s of post-cutoff admissions). /health
 # echoes the ACTIVE (post-belt) value — check it after every change.
-WRITTEN_OFF_BEFORE_MS = "1786152389000"
+# 2026-09-21 (the M21 promotion, step 8): the prod era cutoff bumped to the activation instant 2026-09-21T13:44:27Z / tip 967732
+# (every pre-promotion hand written off from every view; prod held zero unspent pots in any era, the two stranded hops were our e2e wallet's).
+WRITTEN_OFF_BEFORE_MS = "1789998267000"
 
 # #375 companion (review H1): the write-off cutoff as a BLOCK HEIGHT — served
 # verbatim on /epoch as {"writtenOffBeforeHeight": <n>}, never used in SQL
@@ -93,7 +95,7 @@ WRITTEN_OFF_BEFORE_MS = "1786152389000"
 # tip-sanes its seeding gate against it. Set it TOGETHER with the ms cutoff:
 # the chain tip at (or just before) the same activation instant. Empty/unset
 # = no rescue belt (stamps alone decide — the pre-#375 posture).
-WRITTEN_OFF_BEFORE_HEIGHT = "961353"
+WRITTEN_OFF_BEFORE_HEIGHT = "967732"
 
 # BRC-103/104 session store for the auth middleware (`process_auth`'s
 # `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
