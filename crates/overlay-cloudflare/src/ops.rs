@@ -181,7 +181,9 @@ pub const COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED: &str = "queue_replay_skipped_evi
 /// under the pass) — the pass's own moves restored again, the ledger left readmitted.
 pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_total";
 /// loop 18, round 2 (NEW-2): a readmission whose restore faulted on a table — the row left OPEN (never a
-/// closed ledger over rows still in a twin); the next accept or proof runs it again.
+/// closed ledger over rows still in a twin); the next accept or proof runs it again. Also bumped by an eviction
+/// pass whose yield-restore faulted with twin rows left (re-opened), by the readmission's belt on the same, and
+/// by a readmission whose stamp UPDATE failed (round 4).
 pub const COUNTER_ADMIT_FAST_READMIT_INCOMPLETE: &str = "admit_fast_readmit_incomplete_total";
 /// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
 /// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).

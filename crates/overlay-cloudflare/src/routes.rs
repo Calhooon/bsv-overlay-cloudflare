@@ -903,6 +903,9 @@ async fn submit_inner(
     // OPEN eviction the door found (the network's fresh word decides it: an accept readmits, a refusal stands).
     let mut gated_subject: Option<String> = None;
     let mut door_open: Option<crate::admit_fast::OpenEviction> = None;
+    // round 4 of the gate: the network ACCEPTED under an open row but the door's readmission returned false (a
+    // transient fault) — the post-write guard retries the readmission instead of re-evicting an accepted subject
+    let mut door_readmit_failed = false;
     // Consumed DIRECTLY from the action: there is no local flag to shadow.
     // A re-gate defeated both source pins with
     // `let run_network_gate = run_network_gate && x.is_some() && x.is_none();`
@@ -1287,6 +1290,8 @@ async fn submit_inner(
                                 1,
                             )
                             .await;
+                        } else {
+                            door_readmit_failed = true;
                         }
                         worker::console_log!(
                             "broadcast-gated(arcade): {subject_txid} was under an open eviction (at {} ms — {}) and the network ACCEPTED it now — {}; the fresh word overrules the ledger",
@@ -1383,6 +1388,8 @@ async fn submit_inner(
                                 1,
                             )
                             .await;
+                        } else {
+                            door_readmit_failed = true;
                         }
                         worker::console_log!(
                             "broadcast-gated(arcade): {subject_txid} was under an open eviction (at {} ms — {}) and the network ACCEPTED it now — {}; the fresh word overrules the ledger",
@@ -1518,6 +1525,26 @@ async fn submit_inner(
     if let Some(subject) = gated_subject.as_deref().or(ungated_subject.as_deref()) {
         if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
             match crate::admit_fast::open_eviction(&ledger_db, subject).await {
+                Ok(Some(ev)) if door_readmit_failed => {
+                    // the network accepted these bytes at the door; the ledger's open row is the stale word — a
+                    // second readmission, and a retryable answer if it faults again (never an eviction of an
+                    // accepted subject, never a 200 over an open row)
+                    let again = crate::admit_fast::readmit_if_evicted(&ledger_db, subject, worker::Date::now().as_millis()).await;
+                    if again {
+                        crate::ops::bump_counter(&ledger_db, crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT, 1).await;
+                        worker::console_log!(
+                            "POST /submit: {subject} readmitted on the second try after the write (the door's readmission had faulted; evicted at {} ms — {})",
+                            ev.evicted_at_ms,
+                            ev.reason
+                        );
+                    } else {
+                        worker::console_log!(
+                            "POST /submit -> 502 (the network accepted {subject} under an open eviction and its readmission faulted twice; retryable)"
+                        );
+                        let resp = json_error_retryable("the accepted subject's readmission faulted — retry", 502)?;
+                        return Ok(with_server_timing(resp, "admit;desc=\"unavailable\""));
+                    }
+                }
                 Ok(Some(ev)) => {
                     let now_ms = worker::Date::now().as_millis();
                     let outcome =
@@ -5054,6 +5081,12 @@ mod tests {
         let post = &src[after..s2];
         let reevict = ["crate::admit_fast::evict_txid_", "everywhere(&ledger_db, subject, &ev.reason, now_ms)"].concat();
         assert!(post.contains(&reevict), "the write that outran its eviction re-evicts");
+        // round 4: a subject the network ACCEPTED at the door whose readmission faulted is readmitted again after the
+        // write (never re-evicted), and answers retryable if that faults too
+        let retry = post.find("Ok(Some(ev)) if door_readmit_failed => {").expect("the accepted-subject arm");
+        let reev = post.find(&reevict).expect("the re-evict arm");
+        assert!(retry < reev, "the accepted-subject arm precedes the re-evict arm");
+        assert!(post[retry..reev].contains(&readmit_needle) && post[retry..reev].contains("502"));
         assert!(post.contains("422"), "and answers the refusal, never a 200 over an evicted pot");
         assert!(post.contains("502"), "an unreadable ledger after the write answers retryable (the gate's LOW-3)");
         assert!(

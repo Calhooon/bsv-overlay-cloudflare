@@ -114,6 +114,14 @@ pub struct ColumnInfo {
     pub name: String,
     #[serde(rename = "type", default)]
     pub ty: String,
+    /// `PRAGMA table_info`'s `notnull` (round 4 of the loop-18 gate).
+    #[serde(default)]
+    pub notnull: i64,
+    /// `PRAGMA table_info`'s `dflt_value`: the column's DEFAULT as SQL text (round 4). A twin healed with it
+    /// materialises the default for its older rows, and the restore coalesces a NOT NULL column onto it, so a
+    /// column added after an eviction never lands NULL (which `INSERT OR IGNORE` would drop in silence).
+    #[serde(default)]
+    pub dflt_value: Option<String>,
 }
 
 fn quoted(cols: &[ColumnInfo]) -> String {
@@ -149,8 +157,12 @@ pub fn create_shadow_sql(table: &str, cols: &[ColumnInfo]) -> String {
 
 /// PURE: a column the source gained after the twin was created.
 pub fn heal_shadow_sql(table: &str, col: &ColumnInfo) -> String {
+    let default = match col.dflt_value.as_deref() {
+        Some(d) if !d.is_empty() => format!(" DEFAULT {d}"),
+        _ => String::new(),
+    };
     format!(
-        "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}",
+        "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}{default}",
         shadow_table(table),
         col.name,
         if col.ty.is_empty() {
@@ -159,6 +171,18 @@ pub fn heal_shadow_sql(table: &str, col: &ColumnInfo) -> String {
             col.ty.as_str()
         }
     )
+}
+
+/// The restore's SELECT list: a NOT NULL column with a DEFAULT is coalesced onto it (a twin healed before the
+/// heal carried defaults holds NULL there; an explicit NULL would be dropped by `INSERT OR IGNORE`).
+fn restore_select(cols: &[ColumnInfo]) -> String {
+    cols.iter()
+        .map(|c| match c.dflt_value.as_deref() {
+            Some(d) if c.notnull != 0 && !d.is_empty() => format!("COALESCE(\"{}\", {d})", c.name),
+            _ => format!("\"{}\"", c.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// PURE: copy the keyed rows into the twin (binds: evictedAt, reason, key), then delete them (bind: key).
@@ -176,9 +200,10 @@ pub fn move_sql(table: &str, key: &str, cols: &[ColumnInfo]) -> (String, String)
 /// PURE: copy the keyed rows back (bind: key), then drop them from the twin (bind: key).
 pub fn restore_sql(table: &str, key: &str, cols: &[ColumnInfo]) -> (String, String) {
     let q = quoted(cols);
+    let sel = restore_select(cols);
     (
         format!(
-            "INSERT OR IGNORE INTO \"{table}\" ({q}) SELECT {q} FROM \"{}\" WHERE \"{key}\" = ?",
+            "INSERT OR IGNORE INTO \"{table}\" ({q}) SELECT {sel} FROM \"{}\" WHERE \"{key}\" = ?",
             shadow_table(table)
         ),
         format!(
@@ -911,6 +936,9 @@ pub struct EvictionCore {
     pub yielded_to_readmission: Option<i64>,
     /// Rows the yield restored (the pass's own moves, undone).
     pub restored: u64,
+    /// The yield's OWN restore faults (a subset of `faults`): the wrapper re-opens the row only for these, and only
+    /// while the twins still hold the txid (round 4 of the gate).
+    pub restore_faults: Vec<String>,
 }
 
 /// The ledger's readmission stamp newer than a pass's own (the gate's LOW-4 / NEW-1), over the shadow storage.
@@ -969,7 +997,8 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
                 core.moved
             ));
             core.restored = restored;
-            core.faults.extend(faults.into_iter().map(|f| format!("yielding to the readmission: {f}")));
+            core.restore_faults = faults.iter().map(|f| format!("yielding to the readmission: {f}")).collect();
+            core.faults.extend(core.restore_faults.iter().cloned());
             core.yielded_to_readmission = Some(at);
         }
         Ok(None) => {}
@@ -978,9 +1007,47 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
     core
 }
 
+/// What an eviction did, for its callers.
+pub struct EvictionOutcome {
+    /// Rows moved by the passes.
+    pub moved: u64,
+    /// The pass yielded to a readmission (the chain's word stands; the pot is served): the callers write no
+    /// `refused` memo over it and count no eviction (round 3 of the gate).
+    pub yielded: bool,
+}
+
+/// The rows the twins still hold for a txid (D1): the re-open gate (round 4 of the gate). `(count, unreadable)`.
+async fn twin_rows_of(db: &D1Database, txid: &str) -> (u64, bool) {
+    let mut total = 0u64;
+    let mut unreadable = false;
+    for (table, keys) in MOVED_TABLES {
+        let twin = shadow_table(table);
+        let cols = match table_columns_checked(db, &twin).await {
+            Ok(c) => c,
+            Err(_) => {
+                unreadable = true;
+                continue;
+            }
+        };
+        if cols.is_empty() {
+            continue;
+        }
+        for key in keys.iter() {
+            if !cols.iter().any(|c| c.name == *key) {
+                continue;
+            }
+            match count_keyed_checked(db, &twin, key, txid).await {
+                Ok(n) => total += n,
+                Err(_) => unreadable = true,
+            }
+        }
+    }
+    (total, unreadable)
+}
+
 /// Evict every row the txid owns, everywhere, into the twins; note the pot and
 /// lobby changes so the seats and the lobby learn; record the ledger row.
-/// Returns the rows moved (0 = nothing held this txid).
+/// Returns what it did (`EvictionOutcome`).
 ///
 /// bsv-low loop 18 (2026-09-21, pair 11's JOIN `3b14f0e6…`): the two callback jobs' evictions ran their table
 /// steps WHILE the subject's own Phase-3 write was still landing (a 12.8 s engine submit under the fleet's t=0
@@ -993,14 +1060,6 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
 /// never a silent success), and the readmission checks around them (the chain's word overtaking a pass is
 /// honoured, never undone). This wrapper adds the D1-only halves: the released spend pointers (skipped when the
 /// pass yielded), the ledger's close, the counters, the notes and the log.
-pub struct EvictionOutcome {
-    /// Rows moved by the passes.
-    pub moved: u64,
-    /// The pass yielded to a readmission (the chain's word stands; the pot is served): the callers write no
-    /// `refused` memo over it (round 3 of the gate).
-    pub yielded: bool,
-}
-
 pub async fn evict_txid_everywhere(
     db: &D1Database,
     txid: &str,
@@ -1008,10 +1067,12 @@ pub async fn evict_txid_everywhere(
     asked_ms: u64,
 ) -> EvictionOutcome {
     let txid = txid.to_ascii_lowercase();
-    // the ledger's stamps are THIS pass's own clock (round 3 of the gate, residual A): the callers' `asked_ms` is
-    // the callback's arrival or the watch's look, seconds before the evidence check ended — a readmission that
-    // landed in between must read as newer than the pass, not older
-    let now_ms = worker::Date::now().as_millis();
+    // THE STAMP POLICY (round 4 of the gate): the ledger's stamp is `asked_ms`, the moment the refusal's EVIDENCE
+    // began (the callback's arrival, the watch's look) — a readmission whose stamp is newer than that (the
+    // readmission stamps with a fresh clock at its own UPDATE) may have landed while the evidence was being
+    // gathered, and the evidence then predates the chain's word: the pass yields. A readmission older than the
+    // evidence's start is a genuine earlier readmission followed by a fresh corroborated refusal: re-opened.
+    let now_ms = asked_ms;
     let mut pot_vouts = vouts_of(db, "pot_records", &txid).await;
     let mut advert_vouts = vouts_of(db, "low_records", &txid).await;
     let core = evict_core(db, &txid, reason, now_ms).await;
@@ -1035,11 +1096,15 @@ pub async fn evict_txid_everywhere(
     for v in &pot_vouts {
         crate::pot_changes::note(&txid, *v);
     }
-    // the lobby learns an EVICTION only when one stands (round 3 of the gate: a yielded pass leaves the adverts
-    // served; the readmission itself noted them admitted)
+    // the lobby learns an EVICTION only when one stands (round 3 of the gate); a pass that yielded restored the
+    // adverts it had moved, so the lobby learns them ADMITTED again (round 4)
     if core.yielded_to_readmission.is_none() {
         for v in &advert_vouts {
             crate::lobby_changes::note_evicted(&txid, *v);
+        }
+    } else {
+        for v in &advert_vouts {
+            crate::lobby_changes::note_admitted(&txid, *v);
         }
     }
     // the spends it left on the rows it consumed (its hops, its pot) — released, and MERGED with the ledger's
@@ -1081,17 +1146,25 @@ pub async fn evict_txid_everywhere(
             "[admit-fast] evict {txid} YIELDED to a readmission at {at} ms ({} row(s) restored): the chain's word stands, the ledger stays readmitted",
             core.restored
         );
-        // round 3 (residual B): a yield whose restore faulted may have left rows in the twins under a KEPT stamp —
-        // never a closed ledger over twin rows: re-open, count, the next accept or proof runs the restore again
-        if !core.faults.is_empty() {
-            if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
-                .bind(txid.as_str())
-                .execute(db)
-                .await
-            {
-                worker::console_log!("[admit-fast] evict {txid}: re-opening after a faulted yield failed ({e})");
+        // round 3 (residual B) narrowed by round 4: a yield whose OWN restore faulted may have left rows in the
+        // twins under a KEPT stamp — never a closed ledger over twin rows. Re-open ONLY then, and only while the
+        // twins still hold the txid (a spurious open row reads as a refused JOIN on the owed list): the next
+        // accept or proof runs the restore again
+        if !core.restore_faults.is_empty() {
+            let (in_twins, twins_unreadable) = twin_rows_of(db, &txid).await;
+            if in_twins > 0 || twins_unreadable {
+                if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
+                    .bind(txid.as_str())
+                    .execute(db)
+                    .await
+                {
+                    worker::console_log!("[admit-fast] evict {txid}: re-opening after a faulted yield failed ({e})");
+                }
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
+                worker::console_log!(
+                    "[admit-fast] evict {txid}: the yield's restore faulted with {in_twins} row(s) still in the twins (unreadable: {twins_unreadable}) — the row re-opened"
+                );
             }
-            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
         }
     }
     if !core.faults.is_empty() {
@@ -1211,6 +1284,7 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
         .await
     {
         worker::console_log!("[admit-fast] readmit {txid}: the stamp failed ({e}) — the row stays open (the rows are back; the next accept or proof stamps it)");
+        crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
         return false;
     }
     // the belt (NEW-1, the other direction): a pass that opened DURING the restore may have moved the restored
@@ -1230,17 +1304,27 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
             "[admit-fast] readmit {txid}: {in_twins} twin row(s) reappeared under the restore (a concurrent pass) — restored again ({r2}; {} fault(s))",
             f2.len()
         );
+        for v in vouts_of(db, "pot_records", &txid).await {
+            crate::pot_changes::note(&txid, v);
+        }
+        for v in vouts_of(db, "low_records", &txid).await {
+            crate::lobby_changes::note_admitted(&txid, v);
+        }
         if !f2.is_empty() {
-            // round 3 (residual B): never a stamped readmission over twin rows — re-open, count, the next pass restores
-            if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
-                .bind(txid.as_str())
-                .execute(db)
-                .await
-            {
-                worker::console_log!("[admit-fast] readmit {txid}: re-opening after the belt's faulted restore failed ({e})");
+            // round 3 (residual B), narrowed by round 4: never a stamped readmission over twin rows — re-open
+            // only while the twins still hold the txid, count, the next pass restores
+            let (left, unreadable) = twin_rows_of(db, &txid).await;
+            if left > 0 || unreadable {
+                if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
+                    .bind(txid.as_str())
+                    .execute(db)
+                    .await
+                {
+                    worker::console_log!("[admit-fast] readmit {txid}: re-opening after the belt's faulted restore failed ({e})");
+                }
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
+                return false;
             }
-            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
-            return false;
         }
     }
     worker::console_log!(
@@ -1476,8 +1560,12 @@ pub async fn refusal_job(env: EvidenceEnv, txid: String, webhook: (String, Strin
             // the eviction is the event the felt voids on: ship its notes now
             // (the route's own flush drained before this job ran)
             crate::pot_changes::flush_inline(env.env.clone()).await;
-            crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_EVICTED, 1).await;
-            worker::console_log!("[admit-fast] refusal {} for {txid} CORROBORATED ({reason}) — evicted {moved} row(s)", webhook.0);
+            if outcome.yielded {
+                worker::console_log!("[admit-fast] refusal {} for {txid} CORROBORATED ({reason}) — the pass YIELDED to a readmission; nothing evicted", webhook.0);
+            } else {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_EVICTED, 1).await;
+                worker::console_log!("[admit-fast] refusal {} for {txid} CORROBORATED ({reason}) — evicted {moved} row(s)", webhook.0);
+            }
         }
         EvidenceVerdict::Present => {
             worker::console_log!("[admit-fast] refusal {} for {txid} NOT corroborated: a courier still holds it — kept", webhook.0);
@@ -1571,15 +1659,21 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
                         // the eviction is the event the felt voids on: ship its
                         // notes now (the route's flush drained before the watch)
                         crate::pot_changes::flush_inline(env.env.clone()).await;
-                        crate::ops::bump_counter(
-                            &db,
-                            crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,
-                            1,
-                        )
-                        .await;
-                        worker::console_log!(
-                            "[admit-fast] {txid} {status} CORROBORATED ({reason}) — evicted {moved} row(s) by the pending watch"
-                        );
+                        if outcome.yielded {
+                            worker::console_log!(
+                                "[admit-fast] {txid} {status} CORROBORATED ({reason}) — the pass YIELDED to a readmission; nothing evicted by the pending watch"
+                            );
+                        } else {
+                            crate::ops::bump_counter(
+                                &db,
+                                crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,
+                                1,
+                            )
+                            .await;
+                            worker::console_log!(
+                                "[admit-fast] {txid} {status} CORROBORATED ({reason}) — evicted {moved} row(s) by the pending watch"
+                            );
+                        }
                     }
                     EvidenceVerdict::Present => {
                         crate::ops::bump_counter(
@@ -2105,6 +2199,8 @@ mod tests {
             Ok(ColumnInfo {
                 name: r.get(1)?,
                 ty: r.get::<_, String>(2).unwrap_or_default(),
+                notnull: r.get::<_, i64>(3).unwrap_or(0),
+                dflt_value: r.get::<_, Option<String>>(4).unwrap_or(None),
             })
         })
         .unwrap()
@@ -2742,20 +2838,28 @@ mod tests {
         );
         assert!(evict.contains("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE"), "an incomplete pass is counted");
         assert!(evict.contains("COUNTER_ADMIT_FAST_EVICT_YIELDED"), "a yielded pass is counted");
+        let squashed: String = evict.split_whitespace().collect();
         assert!(
-            evict.contains("if core.yielded_to_readmission.is_none() {\n        for v in &advert_vouts {"),
-            "the lobby learns an eviction only when one stands"
+            squashed.contains("ifcore.yielded_to_readmission.is_none(){forvin&advert_vouts{crate::lobby_changes::note_evicted("),
+            "the lobby learns an eviction only when one stands (measured on squashed text: a formatter never reds a pin)"
         );
+        let yielded_at = evict.find("COUNTER_ADMIT_FAST_EVICT_YIELDED").unwrap();
+        let reopen = &evict[yielded_at..];
         assert!(
-            evict[evict.find("COUNTER_ADMIT_FAST_EVICT_YIELDED").unwrap()..].contains("SET readmittedAt = NULL"),
-            "a faulted yield re-opens the row (never a closed ledger over twin rows)"
+            reopen.contains("if !core.restore_faults.is_empty() {") && reopen.contains("twin_rows_of(db, &txid)"),
+            "a faulted yield re-opens the row only for the yield's OWN restore faults and only while the twins hold the txid (round 4)"
         );
-        // the two jobs write no refused memo over a yielded eviction (round 3, finding 3)
+        // the two jobs write no refused memo and count no eviction over a yielded pass (round 3, finding 3; round 4)
         for job_name in ["pub async fn refusal_job(", "pub async fn pending_watch_job("] {
             let job = &src[src.find(job_name).unwrap()..];
             let job = &job[..job.find("\n}\n").unwrap()];
-            let memo = job.find("write_refused_verdict(").expect("the memo");
-            assert!(job[..memo].contains("if outcome.yielded {"), "{job_name}: the memo is skipped when the eviction yielded");
+            let guard = job.find("if outcome.yielded {").expect("the yield guard");
+            let memo = job[guard..].find("write_refused_verdict(").expect("the memo") + guard;
+            assert!(job[guard..memo].contains("} else {"), "{job_name}: the memo sits in the else of the yield guard");
+            let counter = if job_name.contains("refusal") { "COUNTER_ARC_INGEST_EVICTED" } else { "COUNTER_SUBMIT_PENDING_EVICTED" };
+            let cnt = job.find(counter).expect("the eviction counter");
+            let cnt_guard = job[..cnt].rfind("if outcome.yielded {").expect("the counter's yield guard");
+            assert!(job[cnt_guard..cnt].contains("} else {"), "{job_name}: the eviction counter sits in the else of the yield guard");
         }
         // the passes never touch the console and read through the shadow storage only
         let passes_src = &src[src.find("pub async fn shadow_move_passes(").unwrap()..];
@@ -2984,12 +3088,13 @@ mod tests {
             .query_row("SELECT reason, readmittedAt FROM pot_evictions WHERE txid = ?1", [&pot], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((kept_reason.as_str(), kept_at), ("REJECTED (a)", Some(1_500)));
-        conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (a)", 1_000i64, 3i64, "[]"]).unwrap();
-        let (readmitted, moved): (Option<i64>, i64) = conn
-            .query_row("SELECT readmittedAt, rowsMoved FROM pot_evictions WHERE txid = ?1", [&pot], |r| Ok((r.get(0)?, r.get(1)?)))
+        conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (closing)", 1_000i64, 3i64, "[]"]).unwrap();
+        let (readmitted, moved, reason): (Option<i64>, i64, String) = conn
+            .query_row("SELECT readmittedAt, rowsMoved, reason FROM pot_evictions WHERE txid = ?1", [&pot], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap();
         assert_eq!(readmitted, Some(1_500), "the close keeps a readmission stamped after the pass");
         assert_eq!(moved, 3);
+        assert_eq!(reason, "REJECTED (a)", "and keeps the reason too (round 4, the CLOSE half of NIT 6)");
         let open: Option<String> = conn
             .query_row(OPEN_EVICTION_SQL, [&pot], |r| r.get(0))
             .optional()
@@ -3095,18 +3200,20 @@ mod tests {
         assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1, "untouched");
     }
 
-    /// Round 2 (NEW-2) + round 3: the restore lands a row whose twin lacks a column the source gained (a migration
-    /// between the eviction and the readmission: the column takes its default), is idempotent, and names a table
-    /// whose copy back landed nothing instead of deleting its twin rows.
+    /// Round 2 (NEW-2) + rounds 3 and 4: the restore lands a row whose twin lacks a NOT NULL DEFAULT column the
+    /// source gained after the eviction (the column takes its default; a later heal carries the default; a NULL
+    /// in a twin healed before that is coalesced onto it), is idempotent, and names a table whose copy back landed
+    /// nothing instead of deleting its twin rows.
     #[tokio::test]
-    async fn restore_twins_heals_the_twin_and_is_fail_loud() {
+    async fn restore_twins_lands_the_default_of_a_column_added_after_the_eviction_and_is_fail_loud() {
         let pot = "ab".repeat(32);
         let db = SqliteShadow::new(shipped_conn());
         db.conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
         let r = shadow_move_passes(&db, &pot, "REJECTED", 1_000, false).await;
         assert_eq!(r.moved, 1);
-        // the source gains a column after the eviction
-        db.conn.execute_batch("ALTER TABLE pot_records ADD COLUMN loop18_new TEXT").unwrap();
+        // the source gains a NOT NULL DEFAULT column after the eviction (the schema's own class: has_proof,
+        // spentConfirmed, paramsDecoded)
+        db.conn.execute_batch("ALTER TABLE pot_records ADD COLUMN loop18_new TEXT NOT NULL DEFAULT 'd'").unwrap();
         assert!(!cols(&db.conn, "pot_records_evicted").iter().any(|c| c.name == "loop18_new"));
         let (restored, faults) = restore_twins(&db, &pot).await;
         assert_eq!((restored, faults.len()), (1, 0), "{faults:?}");
@@ -3114,20 +3221,30 @@ mod tests {
             !cols(&db.conn, "pot_records_evicted").iter().any(|c| c.name == "loop18_new"),
             "the restore never heals the twin: the added column is omitted and takes the source's default"
         );
-        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1);
-        let new_col: Option<String> = db.conn.query_row("SELECT loop18_new FROM pot_records WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
-        assert_eq!(new_col, None, "the added column carries its default (NULL here), not a value the twin never held");
-        assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 0);
+        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1, "the row LANDED (an explicit NULL would have been dropped)");
+        let new_col: String = db.conn.query_row("SELECT loop18_new FROM pot_records WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        assert_eq!(new_col, "d", "the added column carries its DEFAULT");
+        // a twin HEALED after the migration (a later eviction) carries the default for its older rows too
+        let r = shadow_move_passes(&db, &pot, "REJECTED", 2_000, false).await;
+        assert_eq!(r.moved, 1);
+        let twin_cols = cols(&db.conn, "pot_records_evicted");
+        let healed = twin_cols.iter().find(|c| c.name == "loop18_new").expect("the later eviction healed the twin");
+        assert_eq!(healed.dflt_value.as_deref(), Some("'d'"), "healed WITH the default (round 4)");
+        // and even a twin row holding NULL there (a twin healed before the heal carried defaults) restores onto the default
+        db.conn.execute("UPDATE pot_records_evicted SET loop18_new = NULL WHERE txid = ?1", [&pot]).unwrap();
+        let (restored, faults) = restore_twins(&db, &pot).await;
+        assert_eq!((restored, faults.len()), (1, 0), "{faults:?}");
+        let new_col: String = db.conn.query_row("SELECT loop18_new FROM pot_records WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        assert_eq!(new_col, "d", "COALESCEd onto the default");
         // idempotent
         let (again, faults) = restore_twins(&db, &pot).await;
         assert_eq!((again, faults.len()), (0, 0));
-        // a faulted copy is named (the twin dropped from under the restore)
-        let r = shadow_move_passes(&db, &pot, "REJECTED", 2_000, false).await;
+        // a copy back that lands nothing is named and the twin keeps its row (the twin dropped from under the restore)
+        let r = shadow_move_passes(&db, &pot, "REJECTED", 3_000, false).await;
         assert_eq!(r.moved, 1);
         db.conn.execute_batch("DROP TABLE pot_records_evicted").unwrap();
         db.conn.execute_batch("CREATE TABLE pot_records_evicted (af_evictedAt INTEGER NOT NULL, af_reason TEXT NOT NULL, txid TEXT)").unwrap();
         db.conn.execute("INSERT INTO pot_records_evicted (af_evictedAt, af_reason, txid) VALUES (1, 'x', ?1)", [&pot]).unwrap();
-        // the twin holds a row but lacks the source's NOT NULL columns: the copy back must fault, named
         let (restored, faults) = restore_twins(&db, &pot).await;
         assert_eq!(restored, 0);
         assert!(
