@@ -1274,22 +1274,25 @@ async fn submit_inner(
                 // loop 18 (the gate's HIGH-2): the network holds these bytes NOW — an open eviction is stale.
                 if let Some(ev) = door_open.take() {
                     if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
-                        let restored = crate::admit_fast::readmit_if_evicted(
+                        let readmitted = crate::admit_fast::readmit_if_evicted(
                             &ledger_db,
                             &subject_txid,
                             worker::Date::now().as_millis(),
                         )
                         .await;
-                        crate::ops::bump_counter(
-                            &ledger_db,
-                            crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
-                            1,
-                        )
-                        .await;
+                        if readmitted {
+                            crate::ops::bump_counter(
+                                &ledger_db,
+                                crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
+                                1,
+                            )
+                            .await;
+                        }
                         worker::console_log!(
-                            "broadcast-gated(arcade): {subject_txid} was under an open eviction (at {} ms — {}) and the network ACCEPTED it now — readmitted (rows restored: {restored}); the fresh word overrules the ledger",
+                            "broadcast-gated(arcade): {subject_txid} was under an open eviction (at {} ms — {}) and the network ACCEPTED it now — {}; the fresh word overrules the ledger",
                             ev.evicted_at_ms,
-                            ev.reason
+                            ev.reason,
+                            if readmitted { "readmitted" } else { "the row was closed meanwhile, or its restore faulted (left open, counted)" }
                         );
                     }
                 }
@@ -1367,22 +1370,25 @@ async fn submit_inner(
                 // loop 18 (the gate's HIGH-2): the network holds these bytes NOW — an open eviction is stale.
                 if let Some(ev) = door_open.take() {
                     if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
-                        let restored = crate::admit_fast::readmit_if_evicted(
+                        let readmitted = crate::admit_fast::readmit_if_evicted(
                             &ledger_db,
                             &subject_txid,
                             worker::Date::now().as_millis(),
                         )
                         .await;
-                        crate::ops::bump_counter(
-                            &ledger_db,
-                            crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
-                            1,
-                        )
-                        .await;
+                        if readmitted {
+                            crate::ops::bump_counter(
+                                &ledger_db,
+                                crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
+                                1,
+                            )
+                            .await;
+                        }
                         worker::console_log!(
-                            "broadcast-gated(arcade): {subject_txid} was under an open eviction (at {} ms — {}) and the network ACCEPTED it now — readmitted (rows restored: {restored}); the fresh word overrules the ledger",
+                            "broadcast-gated(arcade): {subject_txid} was under an open eviction (at {} ms — {}) and the network ACCEPTED it now — {}; the fresh word overrules the ledger",
                             ev.evicted_at_ms,
-                            ev.reason
+                            ev.reason,
+                            if readmitted { "readmitted" } else { "the row was closed meanwhile, or its restore faulted (left open, counted)" }
                         );
                     }
                 }
@@ -1410,6 +1416,25 @@ async fn submit_inner(
                 // this arm is now reachable only via a SYNCHRONOUS validation
                 // failure or a corroborated async rejection — never on
                 // Arcade's uncorroborated word.)
+                // loop 18, round 2 of the gate (NEW-4): the network refused it AGAIN while the ledger holds an open
+                // eviction — an INCOMPLETE earlier pass converges here (the eviction is idempotent; a complete one
+                // moves nothing), and the felt learns through the flush
+                if let Some(ev) = door_open.take() {
+                    if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
+                        let moved = crate::admit_fast::evict_txid_everywhere(
+                            &ledger_db,
+                            &subject_txid,
+                            &ev.reason,
+                            worker::Date::now().as_millis(),
+                        )
+                        .await;
+                        crate::pot_changes::flush_inline(env.clone()).await;
+                        worker::console_log!(
+                            "broadcast-gated(arcade): {subject_txid} refused again under an open eviction (at {} ms) — the eviction re-run moved {moved} row(s)",
+                            ev.evicted_at_ms
+                        );
+                    }
+                }
                 worker::console_log!(
                     "POST /submit(broadcast-gated) -> 422 (network rejected {subject_txid}: {reason})"
                 );
@@ -1429,9 +1454,11 @@ async fn submit_inner(
     // ── bsv-low LOOP 18 (the gate's MEDIUM-4): the UNGATED arms never see the ladder (the operator's historical
     // modes; on the lenient window any caller): an open eviction REFUSES their write — the openers are a MINED
     // push (`readmit_if_evicted`) and the operator's `/admin/readmit`. The subject by the ONE rule (D5). ──
+    let mut ungated_subject: Option<String> = None;
     if gated_subject.is_none() {
         if let Ok(mut named) = bsv_rs::transaction::beef::Beef::from_binary(&tagged_beef.beef) {
             if let Some(subject) = crate::ef::subject_txid_of(&mut named) {
+                ungated_subject = Some(subject.clone());
                 if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
                     match crate::admit_fast::open_eviction(&ledger_db, &subject).await {
                         Ok(Some(ev)) => {
@@ -1482,7 +1509,9 @@ async fn submit_inner(
     // under the fleet burst), and the rows written after each table's step survived — the pot stayed `known`.
     // The eviction now writes its OPEN marker first, so a write that outran it finds the marker here and moves
     // what it wrote; the submit answers as the refusal it is (never a 200 over an evicted pot).
-    if let Some(subject) = gated_subject.as_deref() {
+    // (round 2 of the gate, NEW-3: the ungated arms' write is guarded after the fact too — the #513 class on the
+    // fallback path is the same race)
+    if let Some(subject) = gated_subject.as_deref().or(ungated_subject.as_deref()) {
         if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
             match crate::admit_fast::open_eviction(&ledger_db, subject).await {
                 Ok(Some(ev)) => {
@@ -4994,9 +5023,22 @@ mod tests {
             arms[rejected..].matches(&readmit_needle).count() == 0,
             "a network refusal never readmits"
         );
+        // round 2 (NEW-4): the Rejected arm re-runs an open eviction (an incomplete pass converges)
+        let rerun = ["crate::admit_fast::evict_txid_", "everywhere("].concat();
+        assert_eq!(arms[rejected..].matches(&rerun).count(), 1, "the Rejected arm re-runs the eviction once under door_open");
+        // round 2 (NEW-5): the fresh-accept counter counts readmissions, not attempts
+        let counted = ["COUNTER_SUBMIT_READMITTED_", "BY_FRESH_ACCEPT"].concat();
+        for at in arms.match_indices(&counted).map(|(i, _)| i) {
+            assert!(arms[at.saturating_sub(200)..at].contains("if readmitted {"), "counted only when readmit_if_evicted returned true");
+        }
         assert!(
             ladder < ungated && ungated < write && write < after && after < s2,
             "the ungated guard sits before the write; the post-write guard between the write and the S2 ack"
+        );
+        // round 2 (NEW-3): the post-write guard covers the ungated arms' write too
+        assert!(
+            src[write..after].contains("gated_subject.as_deref().or(ungated_subject.as_deref())"),
+            "the post-write guard runs on the gated OR the ungated subject"
         );
         let ungated_block = &src[ungated..write];
         assert!(

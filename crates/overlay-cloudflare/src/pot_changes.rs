@@ -177,14 +177,18 @@ mod tests {
         // write and answers 422 — an early return that skips the route's end flush, so it ships the eviction's
         // notes inline itself (counted by its counter's name; a comment cannot satisfy a needle).
         let guard = routes.matches("COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE").count();
+        // round 2 of the same gate (NEW-4): the Rejected arm re-runs an open eviction (an incomplete pass
+        // converges on the network's second refusal) and ships its notes inline the same way
+        let rejected_rerun = routes.matches("refused again under an open eviction").count();
         assert!(
             heals >= 1,
             "the signers self-heal task moved — re-point this pin"
         );
         assert_eq!(latchers, 2, "the two background latchers capture the env");
         assert_eq!(guard, 1, "the write-side guard re-evicts once, after the write");
+        assert_eq!(rejected_rerun, 1, "the Rejected arm re-runs an open eviction once");
         assert_eq!(
-            heals + latchers + guard,
+            heals + latchers + guard + rejected_rerun,
             inline,
             "a detached task (or the write-side guard's early return) writes pot rows without shipping its own notes (see flush_inline)"
         );

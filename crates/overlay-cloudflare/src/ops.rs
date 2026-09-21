@@ -131,7 +131,8 @@ pub const COUNTER_ARC_INGEST_REANCHORED: &str = "arc_ingest_reanchored_total";
 pub const COUNTER_ARC_INGEST_SEEN_LATCHED: &str = "arc_ingest_seen_latched_total";
 /// admit-fast: a txid evicted everywhere (a double spend at once, or a corroborated refusal).
 pub const COUNTER_ARC_INGEST_EVICTED: &str = "arc_ingest_evicted_total";
-/// admit-fast: an evicted txid readmitted on a pushed proof (the chain overruled a courier).
+/// admit-fast: an evicted txid readmitted on a pushed proof (the chain overruled a courier) — or, since loop 18,
+/// by the operator's `/admin/readmit` (the same readmission, the operator's word).
 pub const COUNTER_ARC_INGEST_READMITTED: &str = "arc_ingest_readmitted_total";
 /// admit-fast: a refusal callback the evidence check did NOT corroborate (kept; a plant or a stale word).
 pub const COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED: &str =
@@ -176,6 +177,12 @@ pub const COUNTER_ADMIT_FAST_LEDGER_UNREADABLE: &str = "admit_fast_ledger_unread
 /// loop 18: a queued replay skipped because its subject is under an open eviction (a replay never
 /// resurrects an evicted pot).
 pub const COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED: &str = "queue_replay_skipped_evicted_total";
+/// loop 18, round 2 of the gate (NEW-1): an eviction pass overtaken by a READMISSION (the chain's word landed
+/// under the pass) — the pass's own moves restored again, the ledger left readmitted.
+pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_total";
+/// loop 18, round 2 (NEW-2): a readmission whose restore faulted on a table — the row left OPEN (never a
+/// closed ledger over rows still in a twin); the next accept or proof runs it again.
+pub const COUNTER_ADMIT_FAST_READMIT_INCOMPLETE: &str = "admit_fast_readmit_incomplete_total";
 /// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
 /// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).
 pub const COUNTER_SUBMIT_PENDING_CONFIRMED_NOW: &str = "submit_pending_confirmed_now_total";
@@ -841,6 +848,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
+        COUNTER_ADMIT_FAST_EVICT_YIELDED,
+        COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
     ] {
         obj[name] = json!(0);
     }
