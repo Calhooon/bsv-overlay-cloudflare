@@ -1528,7 +1528,15 @@ pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Optio
         .await
     {
         Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
-        _ => match Query::new("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?")
+        // #519 (the delta-verify's observation): an EVICTED subject's outputs live in the twin with the admission's
+        // own stamp — without this rung a hop or a marker the eviction moved read "young" forever at the door
+        _ => match Query::new("SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?")
+            .bind(txid.as_str())
+            .fetch_optional::<AgeRow>(db)
+            .await
+        {
+            Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
+            _ => match Query::new("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?")
             .bind(txid.as_str())
             .fetch_optional::<AgeRow>(db)
             .await
@@ -1543,6 +1551,7 @@ pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Optio
             {
                 Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
                 _ => None,
+            },
             },
         },
     };

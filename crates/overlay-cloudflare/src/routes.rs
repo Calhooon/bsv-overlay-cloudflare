@@ -1256,9 +1256,13 @@ async fn submit_inner(
         // #519: the terminal judgement, counted for the operator (which arm fired), its wall-clock its own segment
         let terminal_ms = arcade.terminal_ms();
         if let Some(judgement) = arcade.terminal_judgement() {
-            if let Ok(count_db) = env.d1("OVERLAY_DB") {
-                crate::ops::bump_counter(&count_db, judgement.counter(), 1).await;
-            }
+            // counted off the request path, like its sibling counters (the delta-verify's NIT)
+            let judged_env = env.clone();
+            ctx.wait_until(async move {
+                if let Ok(count_db) = judged_env.d1("OVERLAY_DB") {
+                    crate::ops::bump_counter(&count_db, judgement.counter(), 1).await;
+                }
+            });
         }
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of

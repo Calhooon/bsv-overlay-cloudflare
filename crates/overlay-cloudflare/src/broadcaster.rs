@@ -1801,15 +1801,30 @@ pub fn terminal_at_arcade_by_presence(
     }
 }
 
+/// PURE (the delta-verify's LOW, 2026-09-21): a definitive refusal must rest on a FRESH courier read. A memoised
+/// `Absent` taken while the subject was young (and answered retryable then) must not carry it across the age floor
+/// into a 422: when the memo would decide a refusal, the couriers are asked again (the cap still bounds it).
+pub fn must_reask_before_refusing(presence: crate::proof_fetcher::NetworkPresence, young: bool, source: &str) -> bool {
+    presence == crate::proof_fetcher::NetworkPresence::Absent && !young && source == "memo"
+}
+
 /// PURE (#519, the gate's MEDIUM-2 + NIT-3): the two-source refusal's text, Arcade's `extraInfo` threaded as TEXT
 /// (never a gate: the #213 stale-`extraInfo` trap) so the client's refund classifier keys on the node's reason,
-/// with the already-known belt's tokens scrubbed (`already_known` is the belt's Rust mirror; pinned on the shapes).
+/// with the already-known belt's tokens scrubbed — and the belt itself (`already_known`, the client's Rust mirror)
+/// run over the result: a detail the scrub could not clear (a `257` dress, a token the rules miss) is dropped whole,
+/// so the mirror holds by construction, never by token rules (the delta-verify's NIT).
 pub fn terminal_refusal_reason(subject_txid: &str, arcade_status: &str, extra_info: &str) -> String {
+    let tail = format!(
+        "{subject_txid}; both indexers absent (#519: an Arcade-terminal subject is judged by the chain's indexers, never a broadcaster's echo)"
+    );
     let detail = scrub_already_known_tokens(extra_info);
-    let detail = if detail.is_empty() { String::new() } else { format!(" {detail}") };
-    format!(
-        "Arcade {arcade_status}{detail} {subject_txid}; both indexers absent (#519: an Arcade-terminal subject is judged by the chain's indexers, never a broadcaster's echo)"
-    )
+    if !detail.is_empty() {
+        let with_detail = format!("Arcade {arcade_status} {detail} {tail}");
+        if !already_known(&with_detail) {
+            return with_detail;
+        }
+    }
+    format!("Arcade {arcade_status} {tail}")
 }
 
 /// PURE: drop every whitespace token the already-known belt would match (`already`; `known` outside `unknown`;
@@ -2018,10 +2033,15 @@ impl ArcadeBroadcaster {
     /// #519: the indexers' presence for an Arcade-terminal subject — the isolate's memo first, then the per-minute
     /// cap, then both couriers (a verdict remembered, a fault not). The second element names the source.
     async fn terminal_presence(&self, txid: &str, now: f64) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
-        use crate::proof_fetcher::NetworkPresence;
         if let Some(p) = TERMINAL_MEMO.with(|m| terminal_memo_lookup(&m.borrow(), txid, now, TERMINAL_MEMO_TTL_MS)) {
             return (p, "memo");
         }
+        self.terminal_presence_fresh(txid, now).await
+    }
+
+    /// #519: the couriers asked NOW (the memo bypassed, the cap kept): the read a refusal must rest on.
+    async fn terminal_presence_fresh(&self, txid: &str, now: f64) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
+        use crate::proof_fetcher::NetworkPresence;
         let allowed = TERMINAL_ASKS.with(|a| terminal_ask_allowed_in(&mut a.borrow_mut(), now, TERMINAL_ASKS_PER_WINDOW, TERMINAL_ASK_WINDOW_MS));
         if !allowed {
             return (NetworkPresence::Inconclusive, "capped");
@@ -2295,13 +2315,20 @@ impl ArcadeBroadcaster {
         {
             let started = worker::js_sys::Date::now();
             let extra_info = probe.as_ref().map(|r| r.extra_info.as_str()).unwrap_or("");
-            let (presence, source) = self.terminal_presence(subject_txid, started).await;
+            let (mut presence, mut source) = self.terminal_presence(subject_txid, started).await;
             // the age floor (the gate's MEDIUM-1, Rule 6): asked only when the indexers do not hold it
             let young = if presence == crate::proof_fetcher::NetworkPresence::Absent {
                 subject_young.await
             } else {
                 false
             };
+            // the delta-verify's LOW: a 422 rests on a FRESH read — a memoised Absent taken while the subject was
+            // young must not carry it across the floor (the client's direct leg may have landed it meanwhile)
+            if must_reask_before_refusing(presence, young, source) {
+                let (p, src) = self.terminal_presence_fresh(subject_txid, started).await;
+                presence = p;
+                source = src;
+            }
             let judgement = TerminalJudgement::of(presence, young, source == "capped");
             self.terminal_ms
                 .set(self.terminal_ms.get() + (worker::js_sys::Date::now() - started));
@@ -3737,6 +3764,13 @@ mod tests {
             assert!(!already_known(&e), "{e}");
         }
         assert_eq!(scrub_already_known_tokens("utxo already spent by tx; txn-already-known; unknown inputs; unseen; mined; examined"), "utxo spent by tx; unknown inputs; unseen;");
+        // the delta-verify's NIT: the belt itself runs over the result, so a dress the scrub cannot clear (a `257`
+        // code, a token the rules miss) drops the detail whole — the mirror holds by construction
+        for extra in ["error code 257 (already known)", "unknownknown inputs", "\"257\""] {
+            let reason = terminal_refusal_reason("x", "REJECTED", extra);
+            assert!(!already_known(&reason), "{reason}");
+            assert!(reason.starts_with("Arcade REJECTED x;"), "the detail dropped whole: {reason}");
+        }
     }
 
     /// The gate's LOW-3: a re-present loop costs the couriers' shared budget once a minute per txid (the memo), and at
@@ -3757,6 +3791,11 @@ mod tests {
         assert!(!terminal_ask_allowed_in(&mut asks, 2.0, 2, 60_000.0), "the cap");
         assert!(terminal_ask_allowed_in(&mut asks, 60_000.0, 2, 60_000.0), "the window slid");
         assert_eq!(asks.len(), 2);
+        // the delta-verify's LOW: a refusal never rests on the memo — a memoised Absent on an old subject re-asks
+        assert!(must_reask_before_refusing(NetworkPresence::Absent, false, "memo"));
+        assert!(!must_reask_before_refusing(NetworkPresence::Absent, true, "memo"), "young: the retryable word, no refusal to rest");
+        assert!(!must_reask_before_refusing(NetworkPresence::Absent, false, "couriers"), "already fresh");
+        assert!(!must_reask_before_refusing(NetworkPresence::Present, false, "memo"), "an admission may rest on the memo");
     }
 
     /// SOURCE PIN (#519, the gate's LOW-1): the production ladder's terminal branch judges by the indexers BEFORE any
@@ -3773,7 +3812,9 @@ mod tests {
         let fatal = code.find("GateVerdict::Fatal").expect("the fatal probe arm");
         let presence = code.find("self.terminal_presence(subject_txid").expect("the presence judgement");
         let young = code.find("subject_young.await").expect("the age floor");
+        let reask = code.find("self.terminal_presence_fresh(subject_txid").expect("the fresh re-ask before a refusal");
         let ret = code.find("return terminal_at_arcade_by_presence(").expect("the return");
+        assert!(young < reask && reask < ret, "young@{young} reask@{reask} return@{ret}");
         let register = code.find("let register_callback").expect("the register-once rule");
         let rung = code.find("broadcast_efs_gated_with(").expect("the ladder's rungs");
         let mined_claim = code.find("CorroborationKind::MinedClaim").expect("the mined-claim dispatch");
