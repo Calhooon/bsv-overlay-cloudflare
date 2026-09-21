@@ -1959,11 +1959,12 @@ mod tests {
         evicted.insert(tx(0x02));
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
         i.evicted_pots = &evicted;
-        let rows = derive_owed_rows(&i);
-        assert!(rows.iter().all(|row| row.family != OwedFamily::RefundDue && row.family != OwedFamily::InProgress), "{rows:?}");
+        let rows_ev = derive_owed_rows(&i);
+        assert!(rows_ev.iter().all(|row| row.family != OwedFamily::RefundDue && row.family != OwedFamily::InProgress), "{rows_ev:?}");
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
         i.evicted_pots = &evicted;
-        assert!(derive_owed_rows(&i).is_empty());
+        let rows_ev = derive_owed_rows(&i);
+        assert!(rows_ev.is_empty(), "{rows_ev:?}");
         assert_eq!(rows[0].facts["blocksToGate"], 10);
         // bsv-low #469 / fleet-loop-16 R1: the rejoin row CARRIES the served recovery gate as the
         // `recoveryHeight` FACT — the client's SECOND rejoin-safe recovery source (ORed beside this device's own
