@@ -1752,27 +1752,32 @@ where
 /// No submit rung runs: re-POSTing the subject to Arcade cannot change a
 /// verdict its engine has already reached, and every such POST re-spins its
 /// durable retry (the wedge) — the corroborator is consulted directly, with
-/// exactly the exhausted-ladder semantics (#214/#216): the mined-claim
-/// corroboration for an all-proven BEEF (#268), ancestry-primed for unproven
-/// parents, subject-only for a single leg; Accepted admits (Arcade's REJECTED
-/// was stale — the 2026-07-20/21 class), Rejected is the two-provider 422,
-/// inconclusive is an honest Err/502 (the client retries later — and later
-/// the retire classifier, not this ladder, owns "dead").
-async fn broadcast_terminal_at_arcade_with<C, CFut>(
-    efs_len: usize,
+/// bsv-low #519 (loop 20, 2026-09-21): a subject Arcade holds TERMINAL is judged by the INDEXERS' presence — the
+/// chain's own word (mined, or held unconfirmed, or absent) — never by a broadcaster's echo. Before this, #214 sent
+/// the decision to the corroborator (TAAL → GorillaPool), whose answer for a txid it already knows is its STORED
+/// status: a JOIN refused as a double spend six hours earlier (its input spent by a confirmed competitor) was
+/// re-presented, Arcade said terminal REJECTED, the corroborator echoed the accept it stored before the competitor
+/// mined, and the door READMITTED the evicted pot — a public lever to resurrect any refused JOIN from its bytes.
+/// #214's own case (Arcade's stale REJECTED for a tx MINED in 958776) is `Present` here and admits as it always did.
+/// `Absent` is the two-source refusal (#513's evidence rule: Arcade's own fatal word plus both indexers absent needs
+/// no age) and answers Rejected, which the route's Rejected arm turns into the 422 and re-runs an open eviction.
+/// `Inconclusive` (a courier faulted) is an honest Err/502: the client retries later; never admit-on-unknown, never
+/// admit on an echo.
+pub fn terminal_at_arcade_by_presence(
+    presence: crate::proof_fetcher::NetworkPresence,
     subject_txid: &str,
-    mut corroborate: C,
-) -> Result<ArcOutcome, String>
-where
-    C: FnMut(CorroborationKind) -> CFut,
-    CFut: std::future::Future<Output = Result<ArcOutcome, String>>,
-{
-    if efs_len == 0 {
-        let corroborated = corroborate(CorroborationKind::MinedClaim).await;
-        return corroborated_mined_claim(corroborated, subject_txid);
+    arcade_status: &str,
+) -> Result<ArcOutcome, String> {
+    use crate::proof_fetcher::NetworkPresence;
+    match presence {
+        NetworkPresence::Present => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        NetworkPresence::Absent => Ok(ArcOutcome::Rejected(format!(
+            "Arcade {arcade_status} {subject_txid}; both indexers absent (#519: an Arcade-terminal subject is judged by the chain's indexers, never a broadcaster's echo)"
+        ))),
+        NetworkPresence::Inconclusive => Err(format!(
+            "Arcade holds {subject_txid} terminal ({arcade_status}) and the indexers are inconclusive (a courier faulted): the network's word is unavailable — retryable, never admitted on a broadcaster's echo (#519)"
+        )),
     }
-    let corroborated = corroborate(unseen_corroboration_kind(efs_len)).await;
-    corroborated_exhaustion(corroborated, subject_txid)
 }
 
 /// Concatenate an EF batch (dependency order) into a single `POST /txs` body.
@@ -2083,42 +2088,36 @@ impl ArcadeBroadcaster {
         }
         // TERMINAL AT ARCADE → NEVER RE-FEED IT (INCIDENT D1-CALLBACK-FLOOD
         // 2026-09-01, the wedge): a subject Arcade holds at REJECTED /
-        // DOUBLE_SPEND_ATTEMPTED goes straight to the second broadcaster.
-        // #214 stands — Arcade's async REJECTED is not authoritative — but
-        // the corroborator (TAAL → GorillaPool, ancestry-primed when the
-        // parents are unproven) already IS the ladder's exhausted verdict,
-        // and re-POSTing the subject to Arcade first buys nothing except
-        // another spin of its durable-retry engine (retryCount 1,483 and
-        // climbing on a tx it had already declared "giving up") and, before
-        // the register-once rule below, another callback registration.
+        // DOUBLE_SPEND_ATTEMPTED never touches an Arcade rung again (re-POSTing
+        // it buys nothing but another spin of its durable-retry engine and,
+        // before the register-once rule below, another callback registration).
+        // #214 stands — Arcade's REJECTED alone is not the verdict — but since
+        // bsv-low #519 (2026-09-21) the second source is the CHAIN'S INDEXERS,
+        // not a corroborating broadcaster: a broadcaster answers a known txid
+        // with its stored status, and that echo readmitted a refused JOIN's
+        // evicted pot six hours after the network settled against it.
         if probe_is_subject
             && matches!(
                 classify_arcade_status(probe_status, ARCADE_GATE_STATUS),
                 GateVerdict::Fatal
             )
         {
-            gate_log(&format!(
-                "[arcade] {subject_txid} held TERMINAL by Arcade ({probe_status}) — skipping every Arcade rung; the corroborator decides (#214)"
-            ));
-            return broadcast_terminal_at_arcade_with(efs.len(), subject_txid, |kind| async move {
-                match kind {
-                    CorroborationKind::SubjectOnly => {
-                        let subject_ef = subject_ef
-                            .ok_or_else(|| format!("subject {subject_txid} has no EF leg"))?;
-                        self.corroborate_subject(subject_ef).await
-                    }
-                    CorroborationKind::WithAncestry => {
-                        self.corroborate_batch(efs, subject_txid).await
-                    }
-                    CorroborationKind::MinedClaim => match mined_subject_raw {
-                        Some(raw) => self.corroborate_mined_raw(raw).await,
-                        None => Err(format!(
-                            "all-proven BEEF for {subject_txid} carries no subject raw — cannot corroborate the mined-claim; refusing to admit (#268)"
-                        )),
-                    },
-                }
-            })
+            let bitails = crate::proof_fetcher::bitails_presence(
+                crate::proof_fetcher::DEFAULT_BITAILS_BASE,
+                subject_txid,
+            )
             .await;
+            let woc = crate::proof_fetcher::woc_presence(
+                crate::proof_fetcher::DEFAULT_WOC_BASE,
+                None,
+                subject_txid,
+            )
+            .await;
+            let presence = crate::proof_fetcher::classify_presence(bitails, woc);
+            gate_log(&format!(
+                "[arcade] {subject_txid} held TERMINAL by Arcade ({probe_status}) — skipping every Arcade rung; judged by the indexers (bitails {bitails:?}, woc {woc:?} → {presence:?}), never a broadcaster's echo (#519)"
+            ));
+            return terminal_at_arcade_by_presence(presence, subject_txid, probe_status);
         }
         // REGISTER ONCE PER TXID: a subject Arcade already holds (pending,
         // orphan, or terminal) has its callback registered from its first
@@ -3477,51 +3476,44 @@ mod tests {
     // `return Ok(outcome)`, or un-wiring the orphan shortcut, fails HERE even
     // while every leaf test stays green.
 
-    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01: a subject Arcade already holds
-    /// TERMINAL never touches a submit rung — the corroborator decides with
-    /// the exhausted-ladder semantics (ancestry-primed for unproven parents,
-    /// subject-only for one leg, the #268 mined-claim probe for all-proven),
-    /// and its answer maps Accepted → admit, Rejected → 422, fault → 502.
-    #[tokio::test]
-    async fn wiring_terminal_at_arcade_skips_every_rung_and_lets_the_corroborator_decide() {
-        // Unproven ancestry → ancestry-primed; a corroborator ACCEPT admits
-        // under OUR subject txid (Arcade's REJECTED was stale, #214).
-        let kinds = std::cell::RefCell::new(Vec::new());
-        let out = broadcast_terminal_at_arcade_with(2, "subject", |kind| {
-            kinds.borrow_mut().push(kind);
-            async { Ok(ArcOutcome::Accepted("corroborator-echo".into())) }
-        })
-        .await;
-        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
-        assert_eq!(*kinds.borrow(), vec![CorroborationKind::WithAncestry]);
+    /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 + bsv-low #519 (2026-09-21): a subject Arcade already holds TERMINAL
+    /// never touches a submit rung, and its verdict is the CHAIN'S INDEXERS', never a corroborating broadcaster's
+    /// echo: Present admits under OUR subject txid (#214's case: Arcade's REJECTED was stale, the tx mined),
+    /// Absent is the two-source refusal (the 422; an open eviction re-runs), Inconclusive an honest Err (502).
+    #[test]
+    fn terminal_at_arcade_is_judged_by_the_indexers_never_a_broadcasters_echo() {
+        use crate::proof_fetcher::NetworkPresence;
+        assert_eq!(
+            terminal_at_arcade_by_presence(NetworkPresence::Present, "subject", "REJECTED").unwrap(),
+            ArcOutcome::Accepted("subject".into())
+        );
+        let refused = terminal_at_arcade_by_presence(NetworkPresence::Absent, "subject", "REJECTED").unwrap();
+        match refused {
+            ArcOutcome::Rejected(r) => {
+                assert!(r.contains("Arcade REJECTED subject") && r.contains("both indexers absent") && r.contains("#519"), "{r}");
+            }
+            other => panic!("Absent must refuse, got {other:?}"),
+        }
+        let err = terminal_at_arcade_by_presence(NetworkPresence::Inconclusive, "subject", "DOUBLE_SPEND_ATTEMPTED").unwrap_err();
+        assert!(err.contains("inconclusive") && err.contains("retryable") && err.contains("never admitted"), "{err}");
+        // THE 09:39Z SHAPE, pinned by construction: a corroborator's stored accept is not an input here at all —
+        // the decision takes the indexers' presence and nothing else. The classifier's rules are pinned in
+        // `proof_fetcher` (a negative needs BOTH indexers clean; one holder is Present; a fault is Inconclusive).
+        assert!(matches!(crate::proof_fetcher::classify_presence(Some(false), Some(false)), NetworkPresence::Absent));
+        assert!(matches!(crate::proof_fetcher::classify_presence(Some(true), Some(false)), NetworkPresence::Present));
+        assert!(matches!(crate::proof_fetcher::classify_presence(None, Some(false)), NetworkPresence::Inconclusive));
+    }
 
-        // Single leg → subject-only; a corroborator REJECT is the definitive
-        // two-provider 422.
-        let kinds = std::cell::RefCell::new(Vec::new());
-        let out = broadcast_terminal_at_arcade_with(1, "subject", |kind| {
-            kinds.borrow_mut().push(kind);
-            async { Ok(ArcOutcome::Rejected("taal: UTXO_SPENT".into())) }
-        })
-        .await;
-        assert!(matches!(out, Ok(ArcOutcome::Rejected(_))), "{out:?}");
-        assert_eq!(*kinds.borrow(), vec![CorroborationKind::SubjectOnly]);
-
-        // A corroborator fault is an honest Err (502) — never admit-on-unknown,
-        // and never a false 422 on Arcade's word alone.
-        let out = broadcast_terminal_at_arcade_with(1, "subject", |_kind| async {
-            Err::<ArcOutcome, String>("corroborator unavailable".into())
-        })
-        .await;
-        assert!(out.is_err());
-
-        // All-proven BEEF → the #268 mined-claim probe, not a submit rung.
-        let kinds = std::cell::RefCell::new(Vec::new());
-        let _ = broadcast_terminal_at_arcade_with(0, "subject", |kind| {
-            kinds.borrow_mut().push(kind);
-            async { Err::<ArcOutcome, String>("unavailable".into()) }
-        })
-        .await;
-        assert_eq!(*kinds.borrow(), vec![CorroborationKind::MinedClaim]);
+    /// SOURCE PIN (#519): the production ladder's terminal branch calls the presence judgement and never a
+    /// corroborator; a comment cannot satisfy the needle (the production slice, comments stripped).
+    #[test]
+    fn the_ladders_terminal_branch_asks_the_indexers_not_the_corroborator() {
+        let src = include_str!("broadcaster.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code: String = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert_eq!(code.matches("terminal_at_arcade_by_presence(presence, subject_txid, probe_status)").count(), 1);
+        assert_eq!(code.matches("broadcast_terminal_at_arcade_with(").count(), 0, "the corroborator wrapper for terminal subjects is gone");
+        assert!(code.contains("classify_presence(bitails, woc)"));
     }
 
     #[tokio::test]
