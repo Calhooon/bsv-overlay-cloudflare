@@ -619,6 +619,8 @@ mod tests {
                 Ok(ColumnInfo {
                     name: r.get(1)?,
                     ty: r.get::<_, String>(2).unwrap_or_default(),
+                    notnull: r.get::<_, i64>(3).unwrap_or(0),
+                    dflt_value: r.get::<_, Option<String>>(4).unwrap_or(None),
                 })
             })
             .unwrap()

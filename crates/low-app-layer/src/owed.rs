@@ -260,6 +260,9 @@ pub struct SweptHome {
     pub raw_hex: Option<String>,
     pub pays_sats: Option<u64>,
     pub confirmed: bool,
+    /// #517: `confirmed` came from the INDEX's own verified proof of the filed sweep (the strongest word there is).
+    pub index_proven: bool,
+    pub index_proof_height: Option<u64>,
     pub source: &'static str,
     /// The index shows the home output itself SPENT: collected and moved on — not a row.
     pub output_spent: bool,
@@ -523,19 +526,27 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     if let Some(filed) = i.hop_sweeps.get(&outpoint) {
         let named_by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid));
         let by_chain = i.hop_chain.get(&outpoint).filter(|w| w.looked && w.spent == Some(true) && w.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)));
-        if named_by_index || by_chain.is_some() {
-            // the index's word, OR the chain rung's (a spend the index recorded before its block and never re-checked
-            // read "not mined yet" for days on the pair: the recompute now probes such hops and the courier's
-            // confirmation heals the row without a client action)
+        // bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX's own VERIFIED proof of the filed sweep names the
+        // spender and confirms the payout FIRST (`transactions.has_proof`, the latch only the chaintracks-verified stitch
+        // sets: a mined sweep that spends the hop is the hop's spender, definitively; the same word `/tx-any` serves and
+        // `/credit-beef` assembles the credit from). Without it the row rested on the hop row (never attributed to a
+        // sweep once the JOIN's eviction released its pointer) or a courier's word (an indexer read a 1,997-tx block's
+        // sweep "unconfirmed" seven minutes after the mine, memoised five more; three blocks passed in nine minutes).
+        if filed.index_proven || named_by_index || by_chain.is_some() {
+            // the index's proof, OR its hop-row word, OR the chain rung's (a spend the index recorded before its block
+            // and never re-checked read "not mined yet" for days on the pair: the recompute now probes such hops and
+            // the courier's confirmation heals the row without a client action)
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true);
+            let confirmed = filed.index_proven || (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true);
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
                 pays_sats: filed.pays_sats,
                 confirmed,
+                index_proven: filed.index_proven,
+                index_proof_height: filed.index_proof_height,
                 source: "hopsweep-filing",
                 output_spent: home_spent(&filed.sweep_txid),
             });
@@ -562,6 +573,8 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         raw_hex: None,
         pays_sats: Some(sum),
         confirmed,
+        index_proven: false,
+        index_proof_height: None,
         source,
         output_spent: mine.iter().all(|o| o.spent == Some(true)),
     })
@@ -899,7 +912,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             if swept.confirmed {
                 let by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&swept.sweep_txid)) && h.spent_confirmed == Some(true);
                 let word = i.hop_chain.get(&outpoint);
-                facts["confirmedSource"] = json!(if by_index { "index" } else if word.and_then(|w| w.age_ms).is_some() { "chain-memo" } else { "chain-probe" });
+                facts["confirmedSource"] = json!(if swept.index_proven { "index-proof" } else if by_index { "index" } else if word.and_then(|w| w.age_ms).is_some() { "chain-memo" } else { "chain-probe" });
+                if let Some(height) = swept.index_proof_height {
+                    facts["sweepProofHeight"] = json!(height);
+                }
                 if let Some(age) = word.and_then(|w| w.age_ms) {
                     facts["chainProbeAgeMs"] = json!(age);
                 }
@@ -1267,6 +1283,8 @@ static RECOMPUTE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static COLLECTED_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static POT_SPENDERS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HOP_SWEEPS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// #517: the filed sweeps' index-proof read faulted (the pass confirms swept payouts on the courier path alone).
+static SWEEP_PROOFS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_spender_read_fault() {
     SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -1290,6 +1308,9 @@ pub fn note_pot_spenders_read_fault() {
 }
 pub fn note_hop_sweeps_read_fault() {
     HOP_SWEEPS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn note_sweep_proofs_read_fault() {
+    SWEEP_PROOFS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
@@ -1335,6 +1356,7 @@ pub fn owed_health_json() -> Value {
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
+        "sweepProofsReadFaults": SWEEP_PROOFS_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
         "recomputeTimeBudgetMs": OWED_RECOMPUTE_TIME_BUDGET_MS,
@@ -1734,7 +1756,16 @@ mod tests {
     }
     fn filed(outpoint: &str, sweep_txid: &str) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
         let mut m = HashMap::new();
-        m.insert(outpoint.to_string(), crate::hopsweep::FiledHopSweep { sweep_txid: sweep_txid.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000) });
+        m.insert(outpoint.to_string(), crate::hopsweep::FiledHopSweep { sweep_txid: sweep_txid.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven: false, index_proof_height: None });
+        m
+    }
+    /// #517: the same filing, held PROVEN by the index (`transactions.has_proof = 1`, the bump's block when recorded).
+    fn filed_proven(outpoint: &str, sweep_txid: &str, height: Option<u64>) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
+        let mut m = filed(outpoint, sweep_txid);
+        if let Some(s) = m.get_mut(outpoint) {
+            s.index_proven = true;
+            s.index_proof_height = height;
+        }
         m
     }
 
@@ -2071,6 +2102,54 @@ mod tests {
         assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
     }
 
+    /// bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX's own verified proof of the filed sweep confirms the
+    /// payout whatever the hop row says (never attributed to a sweep after the JOIN's eviction released its pointer)
+    /// and whatever a courier says (an indexer's "unconfirmed" seven minutes after a 1,997-tx block, memoised five
+    /// more, kept the row "seen, not mined" thirteen minutes past the mine while three blocks passed in nine).
+    #[test]
+    fn a_filed_sweep_the_index_holds_proven_is_claimable_whatever_the_hop_row_or_a_courier_says() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        // the hop row as the fleet read it: index-unspent (the pointer released), old enough to be stranded
+        let hops = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        // the courier memo: spent by my sweep, NOT confirmed (an indexer lagging the block)
+        let lagging = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
+        let proven = filed_proven(&key, &sweep, Some(967_696));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        i.hop_chain = &lagging;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(rows[0].facts["claimable"], true, "the index's verified proof outranks the courier's lag");
+        assert_eq!(rows[0].facts["confirmedSource"], "index-proof");
+        assert_eq!(rows[0].facts["sweepProofHeight"], 967_696);
+        assert!(rows[0].facts.get("claimReason").is_none());
+        // no courier word at all (never probed): the proof alone names the spender and confirms it
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &proven;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)));
+        assert_eq!(rows[0].facts["confirmedSource"], "index-proof");
+        // the same filing UNPROVEN by the index keeps the old word: the courier's lag is the row's wait
+        let unproven = filed(&key, &sweep);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &unproven;
+        i.hop_chain = &lagging;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        // the proof is keyed on the FILED sweep: a hop the index names spent+confirmed by ANOTHER tx never turns an
+        // unproven filing's payout claimable (the 2026-09-19 gate's LOW-3 shape stands)
+        let mut other = hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000));
+        other.spent_confirmed = Some(true);
+        let hops_o = [other];
+        let mut i = inputs(&[], &[], &hops_o, &v, &c, &no_pots, Some(967_699));
+        i.hop_sweeps = &unproven;
+        let rows = derive_owed_rows(&i);
+        assert_ne!(rows[0].family, OwedFamily::Payout);
+    }
+
     #[test]
     fn a_stranded_hop_carries_its_filed_sweep_or_says_sign_here_and_an_unindexed_hop_is_judged_by_the_chain_too() {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
@@ -2275,7 +2354,7 @@ mod tests {
         .unwrap();
         let cols = |conn: &rusqlite::Connection, t: &str| -> Vec<ColumnInfo> {
             let mut st = conn.prepare(&format!("PRAGMA table_info(\"{t}\")")).unwrap();
-            st.query_map([], |r| Ok(ColumnInfo { name: r.get(1)?, ty: r.get::<_, String>(2).unwrap_or_default() })).unwrap().map(|r| r.unwrap()).collect()
+            st.query_map([], |r| Ok(ColumnInfo { name: r.get(1)?, ty: r.get::<_, String>(2).unwrap_or_default(), notnull: r.get::<_, i64>(3).unwrap_or(0), dflt_value: r.get::<_, Option<String>>(4).unwrap_or(None) })).unwrap().map(|r| r.unwrap()).collect()
         };
         // the overlay's eviction: every keyed row of the pot moves to its twin (the same SQL the D1 path runs)
         for (table, keys) in MOVED_TABLES {

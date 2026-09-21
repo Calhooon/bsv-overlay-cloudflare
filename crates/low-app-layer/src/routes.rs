@@ -2955,12 +2955,65 @@ pub(crate) async fn owed_recompute(
                         sweep_txid: r.sweep_txid.to_ascii_lowercase(),
                         raw_hex: r.sweep_raw_hex.to_ascii_lowercase(),
                         pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
+                        index_proven: false,
+                        index_proof_height: None,
                     });
                 }
             }
             Err(e) => {
                 crate::owed::note_hop_sweeps_read_fault();
                 console_warn!("[owed] hop-sweeps read failed (no filed sweep served this pass): {e}");
+            }
+        }
+    }
+
+    // 4d. bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX's own VERIFIED proof of each filed sweep
+    //     (`transactions.has_proof`, the latch only the chaintracks-verified stitch sets; `proofHeight` the block it
+    //     names). The owed walk confirms a swept payout on it BEFORE the hop row (never attributed to a sweep: the
+    //     JOIN's eviction released the pointer and nothing re-marks a tm_lowfund spend) or a courier's word (an
+    //     indexer read a 1,997-tx block's sweep "unconfirmed" seven minutes after the mine, memoised five more; three
+    //     blocks passed in nine minutes). A read fault is counted and leaves every sweep unproven this pass (the
+    //     courier path, as before: the safe direction). One chunked read, no outward leg.
+    if !hop_sweeps.is_empty() {
+        #[derive(Deserialize)]
+        struct ProofRowD1 {
+            txid: String,
+            #[serde(rename = "proofHeight")]
+            proof_height: Option<f64>,
+        }
+        let mut sweep_txids: Vec<String> = hop_sweeps.values().map(|s| s.sweep_txid.clone()).collect();
+        sweep_txids.sort_unstable();
+        sweep_txids.dedup();
+        let mut proven: HashMap<String, Option<u64>> = HashMap::new();
+        let mut faulted = false;
+        for chunk in sweep_txids.chunks(50) {
+            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+            let sql = format!("{}{placeholders})", crate::hopsweep::SWEEP_PROOFS_SQL_HEAD);
+            let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
+            let rows = match db.prepare(&sql).bind(&binds) {
+                Ok(stmt) => stmt.all().await.and_then(|r| r.results::<ProofRowD1>()),
+                Err(e) => Err(e),
+            };
+            match rows {
+                Ok(rows) => {
+                    for r in rows {
+                        proven.insert(r.txid.to_ascii_lowercase(), r.proof_height.filter(|h| *h > 0.0).map(|h| h as u64));
+                    }
+                }
+                Err(e) => {
+                    faulted = true;
+                    crate::owed::note_sweep_proofs_read_fault();
+                    console_warn!("[owed] sweep-proofs read failed (no filed sweep reads proven this pass): {e}");
+                    break;
+                }
+            }
+        }
+        if !faulted {
+            for s in hop_sweeps.values_mut() {
+                if let Some(h) = proven.get(&s.sweep_txid) {
+                    s.index_proven = true;
+                    s.index_proof_height = *h;
+                }
             }
         }
     }

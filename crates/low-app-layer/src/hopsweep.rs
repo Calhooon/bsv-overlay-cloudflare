@@ -264,6 +264,14 @@ pub struct FiledHopSweep {
     pub raw_hex: String,
     /// What the sweep pays out in all (the seat's one output: its home), when the raw parses.
     pub pays_sats: Option<u64>,
+    /// bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX holds this sweep with a chaintracks-VERIFIED proof
+    /// (`transactions.has_proof`, the latch only the verified stitch sets; the word `/tx-any` serves and
+    /// `/credit-beef` assembles the credit from). The owed walk confirms the swept payout on it before any hop row
+    /// (never attributed to a sweep once the JOIN's eviction released its pointer) or courier word (an indexer lagging
+    /// a big block, memoised five minutes) — false when the read faulted or skipped this pass.
+    pub index_proven: bool,
+    /// The block the verified bump names (`transactions.proofHeight`), when recorded.
+    pub index_proof_height: Option<u64>,
 }
 
 /// The sweep's total output value (a sweep is 1-in/1-out: the hop minus the fee).
@@ -304,6 +312,11 @@ pub const HOP_CONTEXT_SQL: &str = "SELECT identity, opponentIdentity, gameId, ho
 /// Every filed sweep of an identity, newest first (the owed recompute keeps the newest per hop outpoint).
 pub const HOPSWEEPS_FOR_IDENTITY_SQL: &str = "SELECT hopTxid, hopVout, sweepTxid, sweepRawHex FROM hopsweep_records \
      WHERE identity = ?1 ORDER BY createdAt DESC, rowid DESC LIMIT 500";
+
+/// bsv-low #517: the filed sweeps the index holds PROVEN, one chunk of txids per ask (the caller closes the `IN (`
+/// list with its placeholders). `has_proof = 1` is the latch only the chaintracks-verified stitch sets (the admit
+/// path always writes 0; a refuted bump resets it), `proofHeight` the block that bump names.
+pub const SWEEP_PROOFS_SQL_HEAD: &str = "SELECT lower(txid) AS txid, proofHeight FROM transactions WHERE has_proof = 1 AND txid IN (";
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -532,6 +545,8 @@ mod tests {
             assert!(sql.contains("hopsweep_records"));
         }
         assert!(HOP_CONTEXT_SQL.contains("FROM hopparty_records") && HOP_CONTEXT_SQL.contains("markerValid"));
+        // #517: the proof read names the engine's own latch, never the admit path's bytes
+        assert!(SWEEP_PROOFS_SQL_HEAD.contains("FROM transactions") && SWEEP_PROOFS_SQL_HEAD.contains("has_proof = 1") && SWEEP_PROOFS_SQL_HEAD.ends_with("IN ("));
         assert_eq!(HOPSWEEP_FILE_SQL.matches('?').count(), 9);
         assert!(HOPSWEEP_CREATE.contains("PRIMARY KEY (txid, outputIndex)"));
     }
