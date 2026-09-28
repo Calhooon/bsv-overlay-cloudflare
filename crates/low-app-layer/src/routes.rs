@@ -6289,6 +6289,10 @@ async fn resolve_tx_any(
 /// fact is demotable (D7, the reorg sweep) and an `unconfirmable` negative is
 /// a courier's word, so nothing here may outlive the isolate cache — gate
 /// HIGH-1/HIGH-2 of 2026-09-10 retired an `immutable` edge answer.
+/// bsv-low #527 (2026-09-21): a CONFIRMED external answer (the couriers' leg, no proven height) also carries
+/// `claimedHeight`, WoC's `blockheight` as a CLAIM (`TxAnyAnswer::claimed_height`): display-tier dating of a tx the
+/// index no longer holds (a closed table advert judged against the written-off era); `height` stays the
+/// chaintracks-verified word and a money reader keyed on the claim is a defect.
 pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let Some(txid) = ctx.param("txid").cloned() else {
         return json_error("missing txid", 400);

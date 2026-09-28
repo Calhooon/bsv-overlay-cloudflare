@@ -23,6 +23,9 @@
 //!          returned so the caller gets verified bytes for free);
 //!        - `confirmed` carries WoC's `confirmations >= 1` claim — the exact
 //!          trust the client's `wocTxConfirmed` placed in a direct WoC read;
+//!        - `claimedHeight` (bsv-low #527, 2026-09-21) carries WoC's `blockheight` beside a CONFIRMED external
+//!          answer as a claim, never a proof: DISPLAY-TIER dating of a tx the index no longer holds (a closed
+//!          table advert against the written-off era); `height` stays the chaintracks-verified word;
 //!        - NEGATIVE (provably absent) requires BOTH indexers to answer a
 //!          definitive 404 AND the Bitails tx route to prove itself healthy
 //!          against a known-mined anchor (the client's
