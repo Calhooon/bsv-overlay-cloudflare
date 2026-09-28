@@ -6085,8 +6085,12 @@ async fn tx_any_external_leg(
     let mut claimed_height: Option<u64> = None;
     let woc = match provider_get(caller, &format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
+            // bsv-low #527 LOW-3: a 200 body without a numeric `confirmations` field is a FAULT (unknown), never
+            // "present, unconfirmed": the era belt reads an unconfirmed presence as current-era, and every other reader
+            // treats unknown as retry
+            Ok(v) if crate::txany::parse_woc_confirmations(&v).is_none() => TxObservation::Fault,
             Ok(v) => {
-                let confirmed = crate::txany::parse_woc_confirmations(&v);
+                let confirmed = crate::txany::parse_woc_confirmations(&v).unwrap_or(false);
                 if confirmed {
                     claimed_height = crate::txany::parse_woc_blockheight(&v);
                 }

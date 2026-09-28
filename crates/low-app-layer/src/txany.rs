@@ -527,10 +527,6 @@ pub fn input_proves_unconfirmable(
         && spending_txid.is_some_and(|s| !s.eq_ignore_ascii_case(subject_txid))
 }
 
-/// Parse a WoC `GET /tx/hash/{txid}` 200 body into the confirmation claim:
-/// `confirmations >= 1`. A malformed body is simply "present, unconfirmed
-/// claim unknown" → treated as `confirmed: false` (the caller's
-/// `wocTxConfirmed` parity: anything unsure is false, never a landing).
 /// PURE: WoC's `blockheight` on `/tx/hash/{txid}` as the courier's CLAIMED mined height (`TxAnyAnswer::claimed_height`):
 /// a positive integer, else `None` (absent, 0 = unconfirmed, a non-number). A claim, never a proof: the display
 /// tier's dating of a tx the index no longer holds; `height` stays the chaintracks-verified word.
@@ -538,10 +534,18 @@ pub fn parse_woc_blockheight(v: &serde_json::Value) -> Option<u64> {
     v.get("blockheight").and_then(|h| h.as_u64()).filter(|h| *h > 0)
 }
 
-pub fn parse_woc_confirmations(v: &serde_json::Value) -> bool {
-    v.get("confirmations")
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|c| c >= 1)
+/// Parse a WoC `GET /tx/hash/{txid}` 200 body into the confirmation claim:
+/// `Some(confirmations >= 1)`. A body WITHOUT a numeric `confirmations` field is
+/// `None`: NOT "unconfirmed" (bsv-low #527, the fold's LOW-3: the era belt reads
+/// `present:true, confirmed:false` as "present and unconfirmed = current-era",
+/// so a partial or re-shaped courier body answered `confirmed:false` could date
+/// an old advert as current). The leg turns `None` into a FAULT (unknown), the
+/// fail-safe word for every reader (unknown ⇒ retry, never a landing, never a
+/// pending presence). Before this a malformed body read as `false` (the
+/// retired client's `wocTxConfirmed` parity, which had no reader that trusted
+/// `false` as a positive fact).
+pub fn parse_woc_confirmations(v: &serde_json::Value) -> Option<bool> {
+    v.get("confirmations").and_then(serde_json::Value::as_u64).map(|c| c >= 1)
 }
 
 /// Verify externally-fetched raw bytes: they must parse AND hash to `txid`.
@@ -1030,10 +1034,12 @@ mod tests {
 
     #[test]
     fn woc_confirmations_parse() {
-        assert!(parse_woc_confirmations(&json!({"confirmations": 3})));
-        assert!(!parse_woc_confirmations(&json!({"confirmations": 0})));
-        assert!(!parse_woc_confirmations(&json!({})));
-        assert!(!parse_woc_confirmations(&json!({"confirmations": "3"})));
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": 3})), Some(true));
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": 0})), Some(false));
+        // bsv-low #527 LOW-3: a body without the field is NOT "unconfirmed" — it is no claim at all (the leg faults)
+        assert_eq!(parse_woc_confirmations(&json!({})), None);
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": "3"})), None);
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": null})), None);
     }
 
     #[test]
