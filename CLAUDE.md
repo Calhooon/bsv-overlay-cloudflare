@@ -190,6 +190,8 @@ budget its UTXO fails; with none the peer's whole cursor stays for the tick).
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551` (and `fold_medium`).
 
+The limit, stated (bsv-low #559): a finalize submit that does not land stops its graph and holds the cursor below it, which recovers a transaction that had deleted nothing; a storage FAULT on the insert of a mid-chain head of a NON-retaining chain still loses that chain, because `Engine::submit` deletes the old head before it inserts the new one. The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
+
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
 `TopicManager::identify_admissible_outputs` takes the reference's fifth

@@ -3632,6 +3632,8 @@ pub struct TopicSyncResult {
     /// graph had its first transaction submitted whole (the deadline never
     /// lands inside a submit); one whose later submit did not land is still
     /// counted, and its UTXO stays below the cursor.
+    /// A graph is counted as its first submit STARTS; a first submit that FAULTS
+    /// still counts here, so this is not a delivered count (bsv-low #559).
     #[serde(default)]
     pub finalized_graphs: u64,
     /// Graphs that were mid-walk when a peer's sync was dropped at its
