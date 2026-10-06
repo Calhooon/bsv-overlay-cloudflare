@@ -2732,6 +2732,34 @@ pub(crate) async fn owed_recompute(
     };
     let evicted_hop_outpoints: HashSet<String> =
         crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&eviction_rows), &hops);
+    // 4a-i. bsv-low #486: the DOOR's refusal ledger (`submit_refusals`, the overlay's): a JOIN refused synchronously
+    //       was never admitted, so no eviction names its hops. The ledger records a hop only when the hop's own key
+    //       signed the refused transaction (the overlay verifies it); intersected with the identity's OWN hops, the
+    //       same UTXO key as the eviction's released spends. A faulted read (or a database not yet migrated) names
+    //       nothing: the pre-#486 sentence stands.
+    let door_refused_hop_outpoints: HashSet<String> = {
+        #[derive(Deserialize)]
+        struct RefusalRowD1 {
+            txid: String,
+            #[serde(rename = "signedSpends", default)]
+            signed_spends: Option<String>,
+        }
+        let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
+        let rows: Vec<(String, Option<String>)> = match db.prepare(crate::owed::OWED_REFUSALS_WINDOW_SQL).bind(&[since]) {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<RefusalRowD1>()) {
+                Ok(rows) => rows.into_iter().map(|r| (r.txid.to_ascii_lowercase(), r.signed_spends)).collect(),
+                Err(e) => {
+                    console_warn!("[owed] refusals window failed (a door-refused hop keeps its sentence this pass): {e}");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                console_warn!("[owed] refusals window bind failed: {e}");
+                Vec::new()
+            }
+        };
+        crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&rows), &hops)
+    };
     // 4a-ii. fleet loop 11, the wave's batch 3 (2026-09-20): the refused JOIN's committed home for MY seat, read from the
     //        `pot_records_evicted` twin (the overlay's own decode of the evicted lock) and KEYED ON THE UTXO the ledger
     //        names — the hop the evicted JOIN spent (`released_hops_by_eviction`), my own; the seat by that hop's
@@ -2857,7 +2885,9 @@ pub(crate) async fn owed_recompute(
                 // chain rung is the only word there is) — the same set the derivation judges by the chain
                 // fleet loop 11: a hop whose JOIN the network refused is a candidate at ANY age (the derivation
                 // strands it at once; without a chain word its sweep press would wait for nothing)
-                let join_refused = evicted_hop_outpoints.contains(&outpoint_key(&h.hop_txid, h.hop_vout));
+                // (bsv-low #486: refused by an eviction OR synchronously at the door)
+                let hop_key = outpoint_key(&h.hop_txid, h.hop_vout);
+                let join_refused = evicted_hop_outpoints.contains(&hop_key) || door_refused_hop_outpoints.contains(&hop_key);
                 let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
                     && (join_refused || h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS));
                 // AND a hop the index shows SPENT by a non-pot spender but never CONFIRMED (a sweep recorded before its
@@ -3343,6 +3373,7 @@ pub(crate) async fn owed_recompute(
         hop_sweeps: &hop_sweeps,
         evicted_pots: &evicted_pots,
         evicted_hop_outpoints: &evicted_hop_outpoints,
+        door_refused_hop_outpoints: &door_refused_hop_outpoints,
         spender_outputs: &spender_outputs,
         spender_inputs: &spender_inputs,
         courier_spenders: &courier_spenders,

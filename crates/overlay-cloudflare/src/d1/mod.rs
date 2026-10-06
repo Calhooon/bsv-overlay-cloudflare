@@ -451,7 +451,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 153 → 155 for bsv-low #468 (2026-09-19): `pot_records.spenderPayASats` + `.spenderPayBSats` (two additive ALTERs).
 /// 155 → 157 for bsv-low #469 (2026-09-19): `owed_rows` + `owed_state` (the owed list, computed on write).
 /// 157 → 160 for bsv-low #469 decision 3 (2026-09-19): `hopsweep_records` + its two indexes (the filed hop sweeps).
-pub const OVERLAY_MIGRATION_COUNT: usize = 160;
+/// 160 → 162 for bsv-low #486 (2026-10-06): `submit_refusals` + its age index (the door's refusal ledger).
+pub const OVERLAY_MIGRATION_COUNT: usize = 162;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1689,6 +1690,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS hopsweep_records (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, sweepTxid TEXT NOT NULL, sweepRawHex TEXT NOT NULL, txid TEXT NOT NULL, outputIndex INTEGER NOT NULL, createdAt INTEGER, PRIMARY KEY (txid, outputIndex))",
     "CREATE INDEX IF NOT EXISTS idx_hopsweep_identity ON hopsweep_records(identity)",
     "CREATE INDEX IF NOT EXISTS idx_hopsweep_hop ON hopsweep_records(hopTxid, hopVout)",
+    // bsv-low #486 (2026-10-06): THE DOOR'S REFUSAL LEDGER, one row per subject `/submit` refused synchronously
+    // (the interpreter's 400, the network's definitive 422), naming the indexed hops whose own keys signed it
+    // (`submit_refusals.rs`). Written by the door after its answer, read by the app layer's owed walk in a recent
+    // window (fail-soft there: a database without the table names nothing), pruned by age with every write.
+    crate::submit_refusals::SUBMIT_REFUSALS_CREATE,
+    crate::submit_refusals::SUBMIT_REFUSALS_INDEX,
 ];
 
 // =============================================================================

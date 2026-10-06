@@ -111,6 +111,7 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "OWED_STATE_UPSERT_SQL", low_app_layer::owed::OWED_STATE_UPSERT_SQL);
     assert_prepares(&conn, "OWED_STATE_READ_SQL", low_app_layer::owed::OWED_STATE_READ_SQL);
     assert_prepares(&conn, "OWED_STATE_STAMP_SQL", low_app_layer::owed::OWED_STATE_STAMP_SQL);
+    assert_prepares(&conn, "OWED_REFUSALS_WINDOW_SQL", low_app_layer::owed::OWED_REFUSALS_WINDOW_SQL);
     assert_prepares(&conn, "OWED_ROWS_READ_SQL", low_app_layer::owed::OWED_ROWS_READ_SQL);
     assert_prepares(&conn, "OWED_STALE_ON_TIP_SQL", low_app_layer::owed::OWED_STALE_ON_TIP_SQL);
     assert_prepares(&conn, "OWED_STALE_FOR_POT_SQL", low_app_layer::owed::OWED_STALE_FOR_POT_SQL);

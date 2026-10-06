@@ -65,6 +65,18 @@ pub const YOUNG_HOP_REASON: &str =
 pub const JOIN_REFUSED_REASON: &str =
     "the network refused the transaction that spent this stake (it was evicted from the index): the hand cannot start from it; your stake can be swept back now";
 
+/// bsv-low #486: the sentence on a hop whose JOIN the door refused SYNCHRONOUSLY (the interpreter's
+/// `ERR_SCRIPT_REFUSED`, the network's definitive 422): nothing was ever admitted, so no eviction names it, and the
+/// hop read "rejoin to continue" for the whole young window. The overlay's refusal ledger (`submit_refusals`) names
+/// the hop only when the hop's own key signed the refused transaction.
+pub const DOOR_REFUSED_REASON: &str =
+    "the transaction that would have spent this stake was refused before it reached the network's index: the hand cannot start from it; your stake can be swept back now";
+/// The door's refusal ledger, recent rows (the overlay's `submit_refusals`, migration 161): `signedSpends` is the
+/// released-spends entry shape (`[{"txid","vout"}, ...]`), so `released_hop_outpoints` parses it. Bound `?1` = now
+/// minus `OWED_EVICTION_WINDOW_MS` (the same window, for the same reason: a hop past its young period is stranded
+/// by age regardless).
+pub const OWED_REFUSALS_WINDOW_SQL: &str = "SELECT lower(txid) AS txid, signedSpends FROM submit_refusals WHERE refusedAt >= ?1";
+
 /// PURE: the HOP OUTPOINTS (`txid:vout`, lowercase) whose spend pointer an EVICTED, never readmitted JOIN released —
 /// the overlay's `pot_evictions.releasedSpends` (`[{"table","txid","vout"}, …]`, one entry per `pot_records` row the
 /// evicted tx spent). ONE derivation for the route's probe candidates and the derivation's hop rule: such a hop is
@@ -161,62 +173,22 @@ pub const HOME_SPEND_LATCH_PREFIX: &str = "homeproof:";
 /// The courier probes ONE recompute may buy for the home outputs of its courier-proven payouts (each is one
 /// spent-any ladder, memoised like the hops', plus one tx-any read for a named spender's bytes).
 pub const OWED_HOME_PROBES_PER_RECOMPUTE: usize = 2;
-/// An unlocking script longer than this is never executed for the home proof (a P2PKH unlock is about 107 bytes).
-pub const HOME_SPEND_UNLOCK_MAX_BYTES: usize = 512;
-
 /// PURE (bsv-low #485): does `spender_raw` consume `home_txid:home_vout` with an unlocking script that VERIFIES
-/// against the P2PKH lock of `home_pkh_hex` for `sats`? The interpreter runs here (`bsv_rs::script::Spend`, the
-/// engine's own walk), over the sighash of the bytes given: only the home key's holder can produce a `true`, whoever
-/// carried the bytes and whether or not the spender is mined. Anything malformed, oversized or unverifiable is `false`.
+/// against the P2PKH lock of `home_pkh_hex` for `sats`? The interpreter runs here
+/// (`overlay_discovery::pot::p2pkh_input_signed`: `bsv_rs::script::Spend`, the engine's own walk), over the sighash
+/// of the bytes given: only the home key's holder can produce a `true`, whoever carried the bytes and whether or
+/// not the spender is mined. Anything malformed, oversized or unverifiable is `false`.
 pub fn home_output_spend_proven(spender_raw: &[u8], home_txid: &str, home_vout: u32, home_pkh_hex: &str, sats: u64) -> bool {
-    use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
-    use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
     let Ok(tx) = bsv_rs::transaction::Transaction::from_binary(spender_raw) else { return false };
     let Some(pkh) = hex::decode(home_pkh_hex).ok().and_then(|b| <[u8; 20]>::try_from(b).ok()) else { return false };
-    let Some((vin, input)) = tx
+    let Some(vin) = tx
         .inputs
         .iter()
-        .enumerate()
-        .find(|(_, inp)| inp.source_output_index == home_vout && inp.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(home_txid)))
+        .position(|inp| inp.source_output_index == home_vout && inp.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(home_txid)))
     else {
         return false;
     };
-    let Some(unlocking_bytes) = input.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary) else { return false };
-    if unlocking_bytes.is_empty() || unlocking_bytes.len() > HOME_SPEND_UNLOCK_MAX_BYTES {
-        return false;
-    }
-    let Ok(source_txid) = input.get_source_txid_bytes() else { return false };
-    let (Ok(lock), Ok(unlock)) = (Script::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)), Script::from_binary(&unlocking_bytes)) else {
-        return false;
-    };
-    let other_inputs: Vec<TxInput> = tx
-        .inputs
-        .iter()
-        .enumerate()
-        .filter(|(n, _)| *n != vin)
-        .map(|(_, inp)| TxInput {
-            txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
-            output_index: inp.source_output_index,
-            script: inp.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary).unwrap_or_default(),
-            sequence: inp.sequence,
-        })
-        .collect();
-    let outputs: Vec<TxOutput> = tx.outputs.iter().map(|o| TxOutput { satoshis: o.satoshis.unwrap_or(0), script: o.locking_script.to_binary() }).collect();
-    let mut spend = Spend::new(SpendParams {
-        source_txid,
-        source_output_index: input.source_output_index,
-        source_satoshis: sats,
-        locking_script: LockingScript::from_script(lock),
-        transaction_version: tx.version.cast_signed(),
-        other_inputs,
-        outputs,
-        input_index: vin,
-        unlocking_script: UnlockingScript::from_script(unlock),
-        input_sequence: input.sequence,
-        lock_time: tx.lock_time,
-        memory_limit: None,
-    });
-    matches!(spend.validate(), Ok(true))
+    overlay_discovery::pot::p2pkh_input_signed(&tx, vin, &overlay_discovery::pot::p2pkh_lock(&pkh), sats)
 }
 
 /// The `spent-elsewhere` story (design §2): the hop was spent by a transaction that is not a LOW pot and pays no
@@ -386,6 +358,10 @@ pub struct OwedInputs<'a> {
     /// hop outpoints (`txid:vout`, lowercase) whose spend pointer an EVICTED, never readmitted JOIN released
     /// (`released_hop_outpoints`): the network refused the hand's funding — the hop is stranded at once.
     pub evicted_hop_outpoints: &'a HashSet<String>,
+    /// bsv-low #486: hop outpoints (`txid:vout`, lowercase) of THIS identity that a synchronously refused JOIN
+    /// would have spent, as the overlay's refusal ledger names them (only a hop whose own key signed the refused
+    /// transaction is ever recorded): stranded at once, like an evicted JOIN's.
+    pub door_refused_hop_outpoints: &'a HashSet<String>,
     /// hop outpoint (`txid:vout`) → the newest FILED sweep of this identity for that hop (bsv-low #469 decision 3):
     /// the press's bytes for a stranded hop; a hop spent by that very sweep is a `payout` row (the sweep's credit).
     pub hop_sweeps: &'a HashMap<String, crate::hopsweep::FiledHopSweep>,
@@ -1160,7 +1136,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 let age_ms = h.marker_created_at.map(|c| i.now_ms.saturating_sub(c));
                 // fleet loop 11: a JOIN the network refused makes its hop stranded NOW — the hand cannot start
                 // (keyed on THIS hop's outpoint in the eviction ledger's released spends, never on the game's name)
-                let join_refused = i.evicted_hop_outpoints.contains(&outpoint);
+                // bsv-low #486: the same for a JOIN the door refused synchronously (the overlay's refusal ledger names
+                // the hop only when the hop's own key signed the refused transaction)
+                let evicted = i.evicted_hop_outpoints.contains(&outpoint);
+                let door_refused = i.door_refused_hop_outpoints.contains(&outpoint);
+                let join_refused = evicted || door_refused;
                 let stranded = join_refused || age_ms.is_some_and(|a| a >= HOP_STRANDED_AFTER_MS);
                 if !stranded {
                     // A YOUNG unspent hop (the stranded cell's run 4 and the device-switch unit, 2026-09-19): the
@@ -1223,6 +1203,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 let mut facts = facts_base.clone();
                 facts["ageMs"] = json!(age_ms);
                 facts["joinRefused"] = json!(join_refused); // on every arm: a waiting press says why it is sweepable
+                if join_refused {
+                    facts["joinRefusedBy"] = json!(if evicted { "eviction" } else { "door" });
+                }
                 match chain {
                     Some(w) if w.looked && w.spent == Some(false) => {
                         facts["claim"] = json!("sweep-hop");
@@ -1250,7 +1233,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: if join_refused { Some(JOIN_REFUSED_REASON.to_string()) } else { None },
+                            reason: if evicted {
+                                Some(JOIN_REFUSED_REASON.to_string())
+                            } else if door_refused {
+                                Some(DOOR_REFUSED_REASON.to_string())
+                            } else {
+                                None
+                            },
                         });
                     }
                     Some(w) if w.looked && w.spent == Some(true) => {
@@ -1982,6 +1971,7 @@ mod tests {
             hop_sweeps: &NO_SWEEPS,
             evicted_pots: &NONE,
             evicted_hop_outpoints: &NONE,
+            door_refused_hop_outpoints: &NONE,
             spender_outputs: &NO_SPENDERS,
             spender_inputs: &NO_INPUTS,
             courier_spenders: &NONE,
@@ -3184,5 +3174,76 @@ mod tests {
         let (rows, candidates) = derive(&mine, &word(None), &none);
         assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
         assert!(candidates.is_empty());
+    }
+
+    /// bsv-low #486: a JOIN the door refused SYNCHRONOUSLY (never admitted: no eviction row) left its hops on the
+    /// in-progress row with the felt's rejoin, the sweep press only after the 30-minute window. The overlay's
+    /// refusal ledger now names the hops whose own keys signed the refused transaction, and the young hop is
+    /// stranded at once, exactly as the eviction ledger already strands one. Real SQLite, the shipped migrations,
+    /// the overlay's own write statement (a dev-dependency), the app layer's own query.
+    /// To red: drop `door_refused` from the hop ladder's `join_refused`.
+    #[test]
+    fn a_join_refused_at_the_door_strands_its_young_hop_at_once_through_the_refusal_ledger_real_sqlite() {
+        use bsv_overlay_cloudflare::submit_refusals::{SignedSpend, SUBMIT_REFUSAL_UPSERT_SQL};
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
+            }
+        }
+        let hop_txid = tx(0x07);
+        let join = tx(0x0c); // the refused JOIN: never admitted, so no pot row, no party row, no eviction
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)", rusqlite::params![hop_txid]).unwrap();
+        let refused_at = 1_700_000_000_000i64;
+        let spends = serde_json::to_string(&[SignedSpend { txid: hop_txid.clone(), vout: 0 }]).unwrap();
+        conn.execute(SUBMIT_REFUSAL_UPSERT_SQL, rusqlite::params![join, "script-refused", refused_at, spends]).unwrap();
+        let evictions: i64 = conn.query_row("SELECT COUNT(*) FROM pot_evictions", [], |r| r.get(0)).unwrap();
+        assert_eq!(evictions, 0, "the issue's shape: a synchronous refusal writes no eviction row");
+        let window = |since: i64| -> Vec<(String, Option<String>)> {
+            conn.prepare(OWED_REFUSALS_WINDOW_SQL).unwrap().query_map([since], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        let rows = window(refused_at - OWED_EVICTION_WINDOW_MS + 1);
+        assert_eq!(rows.len(), 1);
+        let young = [hop(HopStatus::Unspent, None, Some(60_000))]; // one minute old
+        let refused = refused_hop_outpoints_of(&released_hop_outpoints(&rows), &young);
+        let key = format!("{hop_txid}:0");
+        assert_eq!(refused, [key.clone()].into_iter().collect::<HashSet<String>>());
+        let unspent = chain(&key, true, Some(false), None);
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let derive = |refused: &HashSet<String>, chain_word: &HashMap<String, HopChainWord>| {
+            let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
+            i.hop_chain = chain_word;
+            i.door_refused_hop_outpoints = refused;
+            derive_owed_rows(&i)
+        };
+        // THE FIX: stranded now, the sweep press (the Collect on a stranded hop), never the felt's rejoin
+        let rows = derive(&refused, &unspent);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["joinRefused"], true);
+        assert_eq!(rows[0].facts["joinRefusedBy"], "door");
+        assert_eq!(rows[0].reason.as_deref(), Some(DOOR_REFUSED_REASON));
+        // the press still rests on the chain rung: no word yet is a waiting sentence that says why it will be sweepable
+        let rows = derive(&refused, &NO_CHAIN);
+        assert_eq!((rows[0].family, rows[0].facts["joinRefused"].clone()), (OwedFamily::Unbound, json!(true)));
+        assert!(rows[0].facts.get("claimable").is_none());
+        // without the ledger's word (the pre-#486 list, or a window that excludes the refusal): in progress, rejoin
+        assert!(window(refused_at + 1).is_empty());
+        let rows = derive(&HashSet::new(), &unspent);
+        assert_eq!((rows[0].family, rows[0].facts["claim"].clone()), (OwedFamily::InProgress, json!("rejoin")));
+        // a refusal that names a STRANGER's hop (the only kind a stranger's bytes can earn) strands nothing of mine
+        let theirs = serde_json::to_string(&[SignedSpend { txid: tx(0x09), vout: 0 }]).unwrap();
+        conn.execute(SUBMIT_REFUSAL_UPSERT_SQL, rusqlite::params![tx(0x0d), "network-rejected: REJECTED", refused_at, theirs]).unwrap();
+        let only_theirs: Vec<(String, Option<String>)> = window(0).into_iter().filter(|(t, _)| *t == tx(0x0d)).collect();
+        assert!(refused_hop_outpoints_of(&released_hop_outpoints(&only_theirs), &young).is_empty());
+        // an eviction's word keeps its own sentence when both ledgers name the hop
+        let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
+        i.hop_chain = &unspent;
+        i.door_refused_hop_outpoints = &refused;
+        i.evicted_hop_outpoints = &refused;
+        let rows = derive_owed_rows(&i);
+        assert_eq!((rows[0].facts["joinRefusedBy"].clone(), rows[0].reason.as_deref()), (json!("eviction"), Some(JOIN_REFUSED_REASON)));
     }
 }

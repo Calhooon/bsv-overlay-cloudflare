@@ -293,6 +293,65 @@ pub fn p2pkh_lock(pkh: &[u8; 20]) -> Vec<u8> {
     s
 }
 
+/// True iff `s` is the canonical 25-byte P2PKH locking script.
+pub fn is_p2pkh_lock(s: &[u8]) -> bool {
+    s.len() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac
+}
+
+/// An unlocking script longer than this is never executed by [`p2pkh_input_signed`] (a P2PKH unlock is about 107 bytes).
+pub const P2PKH_UNLOCK_MAX_BYTES: usize = 512;
+
+/// PURE (bsv-low #485 / #486): does input `vin` of `tx` carry an unlocking script that VERIFIES against the P2PKH
+/// lock `lock` holding `sats`? The interpreter runs here (`bsv_rs::script::Spend`, the engine's own walk) over the
+/// sighash of the bytes given, so a `true` is the lock's KEY signing THIS transaction: unforgeable by whoever
+/// carried the bytes, and independent of whether the transaction is mined, admitted or refused elsewhere. Anything
+/// that is not a canonical P2PKH lock, an oversized or absent unlocking script, or a script that does not verify is
+/// `false`. One signature check: the cost is bounded by construction.
+pub fn p2pkh_input_signed(tx: &bsv_rs::transaction::Transaction, vin: usize, lock: &[u8], sats: u64) -> bool {
+    use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
+    use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
+    if !is_p2pkh_lock(lock) {
+        return false;
+    }
+    let Some(input) = tx.inputs.get(vin) else { return false };
+    let Some(unlocking_bytes) = input.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary) else { return false };
+    if unlocking_bytes.is_empty() || unlocking_bytes.len() > P2PKH_UNLOCK_MAX_BYTES {
+        return false;
+    }
+    let Ok(source_txid) = input.get_source_txid_bytes() else { return false };
+    let (Ok(lock), Ok(unlock)) = (Script::from_binary(lock), Script::from_binary(&unlocking_bytes)) else {
+        return false;
+    };
+    let other_inputs: Vec<TxInput> = tx
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(n, _)| *n != vin)
+        .map(|(_, inp)| TxInput {
+            txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
+            output_index: inp.source_output_index,
+            script: inp.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary).unwrap_or_default(),
+            sequence: inp.sequence,
+        })
+        .collect();
+    let outputs: Vec<TxOutput> = tx.outputs.iter().map(|o| TxOutput { satoshis: o.satoshis.unwrap_or(0), script: o.locking_script.to_binary() }).collect();
+    let mut spend = Spend::new(SpendParams {
+        source_txid,
+        source_output_index: input.source_output_index,
+        source_satoshis: sats,
+        locking_script: LockingScript::from_script(lock),
+        transaction_version: tx.version.cast_signed(),
+        other_inputs,
+        outputs,
+        input_index: vin,
+        unlocking_script: UnlockingScript::from_script(unlock),
+        input_sequence: input.sequence,
+        lock_time: tx.lock_time,
+        memory_limit: None,
+    });
+    matches!(spend.validate(), Ok(true))
+}
+
 /// True iff `s` is a bare 2-of-3 multisig lock (`build_2of3_lock` shape):
 /// `OP_2 <33> <33> <33> OP_3 OP_CHECKMULTISIG` — the pre-covenant pot lock.
 pub fn is_bare_2of3_lock(s: &[u8]) -> bool {
