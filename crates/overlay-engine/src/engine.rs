@@ -3029,6 +3029,7 @@ impl Engine {
             };
 
             let mut errors = Vec::new();
+            let mut pruned_inputs: u64 = 0;
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -3069,7 +3070,10 @@ impl Engine {
                     // OPT-IN ancestor hydration: only when a fetcher is
                     // configured do we enable chain-backed ancestor fallback +
                     // strict-BEEF finalize. Default (None) = byte-identical to
-                    // today (tolerant BEEF, peer errors abandon the graph).
+                    // today (tolerant BEEF, peer errors abandon the graph;
+                    // the one exception, with or without a fetcher, is the
+                    // D8 prune of a manager-named input, see
+                    // `GASPSync::process_incoming_node`).
                     let hydration_on = self.ancestor_fetcher.is_some();
 
                     // Create storage adapter and remote
@@ -3109,6 +3113,10 @@ impl Engine {
                     };
 
                     let outcome_success = matches!(sync_outcome, Some(Ok(())));
+                    // D8 decoy rule: branches pruned in this peer's walk. Not
+                    // an error and not a failed UTXO, so it is counted apart
+                    // from `errors` and never touches the outcome or cursor.
+                    pruned_inputs += sync.pruned_inputs();
                     match sync_outcome {
                         None => {
                             let budget_ms = self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
@@ -3207,6 +3215,7 @@ impl Engine {
                     peers,
                     sync_type,
                     errors,
+                    pruned_inputs,
                 },
             );
         }
@@ -3303,6 +3312,11 @@ pub struct TopicSyncResult {
     pub sync_type: String,
     /// Any errors encountered during sync (peer URL -> error message).
     pub errors: Vec<String>,
+    /// Manager-named inputs pruned across this topic's peers because the
+    /// source could not serve them (the D8 decoy rule, `GASPSync::pruned_inputs`).
+    /// Not errors: the graphs completed without those branches.
+    #[serde(default)]
+    pub pruned_inputs: u64,
 }
 
 /// Get current time in milliseconds (for output scores).
@@ -5030,6 +5044,7 @@ mod tests {
                 peers: vec!["https://peer.com".to_string()],
                 sync_type: "ship".to_string(),
                 errors: vec![],
+                pruned_inputs: 0,
             },
         );
 

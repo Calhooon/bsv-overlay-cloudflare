@@ -392,10 +392,19 @@ pub struct GASPSync<'a> {
     pub unidirectional: bool,
     log_prefix: String,
     /// OPT-IN / OFF BY DEFAULT chain-backed ancestor fetcher. When `None`
-    /// (the default), the ingest path is byte-identical to today: a peer's
-    /// `request_node` error propagates and the graph is abandoned upstream.
+    /// (the default), a peer's `request_node` error propagates and the graph
+    /// is abandoned upstream, except for an input NAMED by a proven node's
+    /// topic manager, whose branch is pruned (the D8 decoy rule).
     /// When `Some`, a peer ancestor-serve failure falls back to chain.
     ancestor_fetcher: Option<std::rc::Rc<dyn AncestorFetcher + 'a>>,
+    /// Manager-named inputs whose branch was PRUNED because the source could
+    /// not serve them (zanaadu-v2 #314, D8), keyed `txid.outputIndex`. One
+    /// entry is one failed round trip: an outpoint in this set is never asked
+    /// for again by this orchestrator, whichever parent or graph names it.
+    /// Cleared at the start of each `sync`.
+    pruned: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// Count of pruned inputs over this orchestrator's life (see `pruned`).
+    pruned_inputs: std::cell::Cell<u64>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -417,7 +426,17 @@ impl<'a> GASPSync<'a> {
             unidirectional,
             log_prefix: log_prefix.into(),
             ancestor_fetcher: None,
+            pruned: std::cell::RefCell::new(std::collections::HashSet::new()),
+            pruned_inputs: std::cell::Cell::new(0),
         }
+    }
+
+    /// How many manager-named inputs this orchestrator pruned because the
+    /// source could not serve them (the D8 decoy rule, see
+    /// `process_incoming_node`). A pruned branch is NOT a failed UTXO: the
+    /// graph completes with what it has and the cursor advances.
+    pub fn pruned_inputs(&self) -> u64 {
+        self.pruned_inputs.get()
     }
 
     /// Opt in to chain-backed ancestor hydration (OFF by default).
@@ -445,6 +464,7 @@ impl<'a> GASPSync<'a> {
             "{} Starting sync. last_interaction={}",
             self.log_prefix, self.last_interaction
         );
+        self.pruned.borrow_mut().clear();
 
         // Track what we already know
         let local_utxos = self.storage.find_known_utxos(0, None).await?;
@@ -666,9 +686,51 @@ impl<'a> GASPSync<'a> {
             self.storage.append_to_graph(node, spent_by).await?;
 
             if let Some(needed) = self.storage.find_needed_inputs(node).await? {
+                // THE D8 DECOY RULE (zanaadu-v2 #314, the owner's ruling of
+                // 2026-10-06). A DELIBERATE DIVERGENCE from the reference.
+                //
+                // The reference requests every needed input with no catch
+                // (`GASP.ts:602`, `await this.remote.requestNode(...)` inside
+                // `processIncomingNode`), so one input the peer cannot serve
+                // throws out of the walk and the per-UTXO catch in `sync`
+                // drops that whole UTXO: the graph is never completed.
+                //
+                // We keep that for an UNPROVEN parent and diverge for a PROVEN
+                // one. A proven parent needs no input for SPV; the only
+                // inputs `find_needed_inputs` returns for it are the ones its
+                // topic manager NAMED as history. A manager cannot always
+                // tell which input is the real one: a head covenant that
+                // signs under ANYONECANPAY lets a spender place a decoy
+                // witness-shaped input ahead of the real head input, and once
+                // mined it is permanent. The pairing is that such a manager
+                // names EVERY witness-shaped input (capped), and the engine
+                // PRUNES the branch of a named input the source cannot serve
+                // instead of discarding the graph: warn, count, carry on with
+                // the parent's other named inputs, complete the graph with
+                // what it has. Under the reference's rule one decoy would
+                // strand the chain behind it on every sync, forever.
+                //
+                // An unproven parent's inputs are SPV necessities, not named
+                // history: a missing one still fails the UTXO (the `?` below),
+                // exactly as the reference does.
+                //
+                // The source's error is not classified: a named input that
+                // fails for a transient reason is pruned like a decoy, and the
+                // manager then decides admission from what did arrive.
+                let prune_unserved = node.proof.is_some();
                 for (outpoint, input_req) in &needed.requested_inputs {
                     if let Some((txid, oi)) = parse_outpoint(outpoint) {
-                        let child_node = match &self.ancestor_fetcher {
+                        // One failed round trip per decoy: an outpoint pruned
+                        // earlier in this sync is not asked for again, even
+                        // when a second proven parent names it.
+                        if prune_unserved && self.pruned.borrow().contains(outpoint) {
+                            debug!(
+                                "{} Input {} of {}.{} was already pruned in this sync; not re-requested",
+                                self.log_prefix, outpoint, node_txid, node.output_index
+                            );
+                            continue;
+                        }
+                        let served = match &self.ancestor_fetcher {
                             // OPT-IN ancestry hydration (off by default). When a
                             // fetcher is configured we KNOW the peer cannot serve
                             // ancestry — e.g. legacy beta stores minimal BEEFs and
@@ -697,24 +759,41 @@ impl<'a> GASPSync<'a> {
                             // chain deeper than the budget never bootstraps.
                             // Progress handling is the filed follow-up.
                             Some(fetcher) => {
-                                let ancestor = fetcher.fetch_ancestor(&txid).await?;
-                                GASPNode {
-                                    graph_id: node.graph_id.clone(),
-                                    raw_tx: ancestor.raw_tx,
-                                    output_index: oi,
-                                    proof: ancestor.proof,
-                                    tx_metadata: None,
-                                    output_metadata: None,
-                                    inputs: None,
-                                }
+                                fetcher
+                                    .fetch_ancestor(&txid)
+                                    .await
+                                    .map(|ancestor| GASPNode {
+                                        graph_id: node.graph_id.clone(),
+                                        raw_tx: ancestor.raw_tx,
+                                        output_index: oi,
+                                        proof: ancestor.proof,
+                                        tx_metadata: None,
+                                        output_metadata: None,
+                                        inputs: None,
+                                    })
                             }
-                            // Default / production: no fetcher → ask the peer and
-                            // propagate its error on failure (today's exact behavior).
+                            // Default / production: no fetcher → ask the peer.
                             None => {
                                 self.remote
                                     .request_node(&node.graph_id, &txid, oi, input_req.metadata)
-                                    .await?
+                                    .await
                             }
+                        };
+                        let child_node = match served {
+                            Ok(child_node) => child_node,
+                            // Proven parent: the D8 prune (see above), for the
+                            // peer and the fetcher alike.
+                            Err(e) if prune_unserved => {
+                                warn!(
+                                    "{} Pruned input {} named by proven node {}.{}: the source could not serve it: {}",
+                                    self.log_prefix, outpoint, node_txid, node.output_index, e
+                                );
+                                self.pruned.borrow_mut().insert(outpoint.clone());
+                                self.pruned_inputs.set(self.pruned_inputs.get() + 1);
+                                continue;
+                            }
+                            // Unproven parent: propagate, as the reference does.
+                            Err(e) => return Err(e),
                         };
 
                         let spent_by_str = format!("{}.{}", node_txid, node.output_index);

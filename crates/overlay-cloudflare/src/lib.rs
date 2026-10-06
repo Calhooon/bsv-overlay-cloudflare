@@ -1202,18 +1202,23 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         Some(Ok(r)) => {
             let total_peers: usize = r.topics_synced.values().map(|t| t.peers.len()).sum();
             let total_errors: usize = r.topics_synced.values().map(|t| t.errors.len()).sum();
+            // D8 decoy rule: manager-named inputs a peer could not serve,
+            // pruned from their graphs. Counted apart from errors.
+            let total_pruned: u64 = r.topics_synced.values().map(|t| t.pruned_inputs).sum();
             worker::console_log!(
-                "Scheduled: GASP sync — topics={} peers={} errors={}",
+                "Scheduled: GASP sync — topics={} peers={} errors={} pruned_inputs={}",
                 r.topics_synced.len(),
                 total_peers,
-                total_errors
+                total_errors,
+                total_pruned
             );
             for (topic, res) in &r.topics_synced {
-                if !res.errors.is_empty() {
+                if !res.errors.is_empty() || res.pruned_inputs > 0 {
                     worker::console_log!(
-                        "  Scheduled GASP topic={} sync_type={} errors={:?}",
+                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} errors={:?}",
                         topic,
                         res.sync_type,
+                        res.pruned_inputs,
                         res.errors
                     );
                 }

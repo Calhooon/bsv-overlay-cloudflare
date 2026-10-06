@@ -19,7 +19,7 @@ use bsv_overlay_engine::storage::memory::MemoryStorage;
 use bsv_overlay_engine::storage::Storage;
 use bsv_overlay_engine::topic_manager::{TopicManager, TopicManagerError};
 use bsv_overlay_engine::types::*;
-use bsv_rs::script::LockingScript;
+use bsv_rs::script::{LockingScript, UnlockingScript};
 use bsv_rs::transaction::{
     MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
 };
@@ -264,6 +264,19 @@ async fn synchronize(
     store: &dyn Storage,
     fetcher: Option<Rc<dyn AncestorFetcher>>,
 ) -> (Vec<Request>, Vec<FinalizedGraph>, u64) {
+    let (requests, graphs, cursor, _) =
+        synchronize_counting(nodes, tips, manager, store, fetcher).await;
+    (requests, graphs, cursor)
+}
+
+// The same sync, also returning `GASPSync::pruned_inputs`.
+async fn synchronize_counting(
+    nodes: &[GASPNode],
+    tips: &[usize],
+    manager: Option<&dyn TopicManager>,
+    store: &dyn Storage,
+    fetcher: Option<Rc<dyn AncestorFetcher>>,
+) -> (Vec<Request>, Vec<FinalizedGraph>, u64, u64) {
     let remote = RecordingRemote::new(nodes, tips);
     let requests = remote.requests.clone();
     let sink = new_finalized_graph_sink();
@@ -277,7 +290,12 @@ async fn synchronize(
     sync.sync(None).await.unwrap();
     let graphs = sink.lock().unwrap().clone();
     let requests = requests.borrow().clone();
-    (requests, graphs, sync.last_interaction)
+    (
+        requests,
+        graphs,
+        sync.last_interaction,
+        sync.pruned_inputs(),
+    )
 }
 
 fn graph_txids(graph: &FinalizedGraph) -> Vec<String> {
@@ -329,8 +347,8 @@ impl TopicManager for DefaultInputsManager {
     }
 }
 
-#[tokio::test]
-async fn b_empty_input_managers_preserve_requests_and_finalized_beef_bytes() {
+// Every manager of the workspace that names no inputs, plus the trait default.
+fn workspace_managers() -> Vec<(&'static str, Box<dyn TopicManager>)> {
     use bsv_overlay_discovery::{
         agent::topic_manager::AgentTopicManager,
         collected::topic_manager::CollectedTopicManager,
@@ -348,7 +366,7 @@ async fn b_empty_input_managers_preserve_requests_and_finalized_beef_bytes() {
         slap::topic_manager::SLAPTopicManager,
         uhrp::topic_manager::UHRPTopicManager,
     };
-    let managers: Vec<(&str, Box<dyn TopicManager>)> = vec![
+    vec![
         ("default", Box::new(DefaultInputsManager)),
         ("SHIP", Box::new(SHIPTopicManager::new())),
         ("SLAP", Box::new(SLAPTopicManager::new())),
@@ -366,7 +384,12 @@ async fn b_empty_input_managers_preserve_requests_and_finalized_beef_bytes() {
         ("Potparty", Box::new(PotpartyTopicManager::new())),
         ("Potrefund", Box::new(PotrefundTopicManager::new())),
         ("Hopparty", Box::new(HoppartyTopicManager::new())),
-    ];
+    ]
+}
+
+#[tokio::test]
+async fn b_empty_input_managers_preserve_requests_and_finalized_beef_bytes() {
+    let managers = workspace_managers();
     // A proven tip and an unproven two-hop tip ending at a proven ancestor.
     for unproven_tip in [false, true] {
         let mut nodes = chain(3);
@@ -797,4 +820,447 @@ async fn ancestor_fetcher_honors_named_history_and_empty_managers_still_stop() {
             assert_eq!(graph_txids(&graphs[0]), vec![expected[4].clone()]);
         }
     }
+}
+
+// ============================================================================
+// bsv-low #530 (D8 engine half): the decoy rule (zanaadu-v2 #314).
+//
+// A head covenant that signs under ANYONECANPAY lets a spender place a decoy
+// witness-shaped input ahead of the real head input. The manager cannot tell
+// them apart from the proven node alone, so it names EVERY witness-shaped
+// input (capped), and the engine prunes the branch the source cannot serve.
+// ============================================================================
+
+const WITNESS_CAP: usize = 4;
+
+// The fixture's whole notion of "witness-shaped": exactly two data pushes.
+fn witness_shaped(input: &TransactionInput) -> bool {
+    input.unlocking_script.as_ref().is_some_and(|script| {
+        let chunks = script.chunks();
+        chunks.len() == 2 && chunks.iter().all(|chunk| chunk.data.is_some())
+    })
+}
+
+fn witness_input(txid: String, output_index: u32) -> TransactionInput {
+    let mut input = TransactionInput::new(txid, output_index);
+    input.set_unlocking_script(UnlockingScript::from_hex("01aa01bb").unwrap());
+    input
+}
+
+// An outpoint no peer and no fetcher of these tests holds.
+fn decoy_outpoint(tag: u8) -> Outpoint {
+    Outpoint::new(format!("{tag:02x}").repeat(32), 7)
+}
+
+// A proven head chain. Every spend carries its real head input (witness-shaped)
+// and a plain fee input (not witness-shaped, never named). A height listed in
+// `decoys` carries that decoy witness-shaped input at index 0, AHEAD of the
+// real head input at index 1.
+fn decoy_chain(length: usize, decoys: &[(usize, Outpoint)]) -> Vec<GASPNode> {
+    let mut nodes = Vec::new();
+    let mut previous: Option<String> = None;
+    for height in 0..length {
+        let mut tx = Transaction::new();
+        if let Some(txid) = previous {
+            for (_, decoy) in decoys.iter().filter(|(at, _)| *at == height) {
+                tx.inputs
+                    .push(witness_input(decoy.txid.clone(), decoy.output_index));
+            }
+            tx.inputs.push(witness_input(txid, 0));
+            tx.inputs
+                .push(TransactionInput::new("fe".repeat(32), height as u32));
+        }
+        tx.outputs.push(TransactionOutput::new(
+            1000,
+            LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+        ));
+        let txid = tx.id();
+        let proof = MerklePath::new(
+            100 + height as u32,
+            vec![vec![MerklePathLeaf::new_txid(0, txid.clone())]],
+        )
+        .unwrap();
+        nodes.push(GASPNode {
+            graph_id: String::new(),
+            raw_tx: tx.to_hex(),
+            output_index: 0,
+            proof: Some(proof.to_hex()),
+            tx_metadata: None,
+            output_metadata: None,
+            inputs: None,
+        });
+        previous = Some(txid);
+    }
+    nodes
+}
+
+// Zanaadu's side of the D8 pairing, in miniature: name EVERY witness-shaped
+// input, capped. Admission extends the head when ANY previous coin (an input
+// index the engine found in its own storage) is witness-shaped: the real head
+// is input 1 behind a decoy, so "input 0" would be the wrong question.
+struct DecoyHeadManager(Rc<RefCell<HeadState>>);
+
+impl DecoyHeadManager {
+    fn new() -> Self {
+        Self(Rc::new(RefCell::new(HeadState::default())))
+    }
+}
+
+#[async_trait(?Send)]
+impl TopicManager for DecoyHeadManager {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous_coins: &[u8],
+        _off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        let extends_head = mode == SubmitMode::HistoricalTxNoSpv
+            && previous_coins.chunks_exact(4).any(|index| {
+                let index = u32::from_le_bytes(index.try_into().unwrap()) as usize;
+                tx.inputs.get(index).is_some_and(witness_shaped)
+            });
+        if !tx.inputs.is_empty() && !extends_head {
+            return Ok(AdmittanceInstructions::default());
+        }
+        if mode == SubmitMode::HistoricalTxNoSpv {
+            self.0.borrow_mut().admitted.push(tx.id());
+        }
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: vec![0],
+            ..Default::default()
+        })
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        assert!(off_chain_values.is_none(), "the reference passes only BEEF");
+        let tx = Transaction::from_beef(beef, None).unwrap();
+        assert!(tx.merkle_path.is_some());
+        Ok(tx
+            .inputs
+            .iter()
+            .filter(|input| witness_shaped(input))
+            .take(WITNESS_CAP)
+            .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
+            .collect())
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// The requests for `outpoint`, and the others in the order they were made.
+// A node's requested inputs are a map, so where a decoy falls among its
+// parent's requests is not an order worth pinning.
+fn split_requests(requests: &[Request], outpoint: &Outpoint) -> (usize, Vec<Request>) {
+    let (decoy, chain): (Vec<_>, Vec<_>) = requests
+        .iter()
+        .cloned()
+        .partition(|r| r.0 == outpoint.txid && r.1 == outpoint.output_index);
+    (decoy.len(), chain)
+}
+
+// tracing caches a callsite's interest from the thread that reaches it first,
+// so EVERY test that reaches the prune warn captures logs, not only the tests
+// that read them: a test without a subscriber could otherwise switch the warn
+// off for the tests that assert on it.
+fn capture_logs() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(CaptureLogs(logs.clone()));
+    (logs, guard)
+}
+
+fn tip_to_genesis(nodes: &[GASPNode]) -> Vec<Request> {
+    nodes
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, node)| (node_txid(node), 0, i == 0))
+        .collect()
+}
+
+#[tokio::test]
+async fn d8_a_engine_walks_a_decoy_tip_to_genesis_with_one_failed_round_trip() {
+    let (_logs, _guard) = capture_logs();
+    let decoy = decoy_outpoint(0xd0);
+    let nodes = decoy_chain(5, &[(4, decoy.clone())]);
+    let tip = Transaction::from_hex(&nodes[4].raw_tx).unwrap();
+    assert!(witness_shaped(&tip.inputs[0]) && witness_shaped(&tip.inputs[1]));
+    assert_eq!(tip.inputs[0].get_source_txid().unwrap(), decoy.txid);
+    assert_eq!(
+        tip.inputs[1].get_source_txid().unwrap(),
+        node_txid(&nodes[3])
+    );
+
+    let remote = RecordingRemote::new(&nodes, &[4]);
+    let requests = remote.requests.clone();
+    let manager = DecoyHeadManager::new();
+    let state = manager.0.clone();
+    let store = Rc::new(MemoryStorage::new());
+    let mut engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(manager) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig {
+            sync_configuration: HashMap::from([(
+                TOPIC.to_string(),
+                SyncTarget::Peers(vec!["mock://head-chain".to_string()]),
+            )]),
+            ..Default::default()
+        },
+    );
+    engine.set_gasp_remote_factory(Box::new(remote));
+    let result = engine.start_gasp_sync().await.unwrap();
+
+    let (decoy_requests, chain_requests) = split_requests(&requests.borrow(), &decoy);
+    assert_eq!(decoy_requests, 1, "one failed round trip for the decoy");
+    assert_eq!(
+        chain_requests,
+        tip_to_genesis(&nodes),
+        "walk tip to genesis"
+    );
+    let expected: Vec<_> = nodes.iter().map(node_txid).collect();
+    assert_eq!(state.borrow().admitted, expected, "admit oldest first");
+    let utxos = store
+        .find_utxos_for_topic(TOPIC, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].txid, expected[4]);
+    let topic = &result.topics_synced[TOPIC];
+    assert_eq!(topic.pruned_inputs, 1, "the prune is counted");
+    assert!(topic.errors.is_empty(), "a pruned branch is not an error");
+    assert_eq!(
+        store
+            .get_last_interaction("mock://head-chain", TOPIC)
+            .await
+            .unwrap(),
+        1,
+        "a pruned branch is not a failed UTXO: the cursor advances"
+    );
+    println!(
+        "D8 PIN A engine: 5 transactions, {} requests, 1 failed round trip, pruned_inputs=1",
+        requests.borrow().len()
+    );
+}
+
+#[tokio::test]
+async fn d8_a_sync_finalizes_one_graph_of_five_and_logs_the_prune() {
+    let decoy = decoy_outpoint(0xd0);
+    let nodes = decoy_chain(5, &[(4, decoy.clone())]);
+    let manager = DecoyHeadManager::new();
+    let (logs, _guard) = capture_logs();
+    let (requests, graphs, cursor, pruned) =
+        synchronize_counting(&nodes, &[4], Some(&manager), &MemoryStorage::new(), None).await;
+    let (decoy_requests, chain_requests) = split_requests(&requests, &decoy);
+    assert_eq!(decoy_requests, 1);
+    assert_eq!(chain_requests, tip_to_genesis(&nodes));
+    assert_eq!(graphs.len(), 1, "ONE finalized graph");
+    assert_eq!(
+        graph_txids(&graphs[0]),
+        nodes.iter().map(node_txid).collect::<Vec<_>>()
+    );
+    assert_eq!(cursor, 1);
+    assert_eq!(pruned, 1);
+    let parent = format!("{}.0", node_txid(&nodes[4]));
+    let requested = decoy.to_graph_id();
+    assert!(
+        logs.lock().unwrap().iter().any(|log| log.contains(&parent)
+            && log.contains(&requested)
+            && log.contains("node not found")),
+        "the warn names the parent, the requested outpoint and the source's error"
+    );
+}
+
+#[tokio::test]
+async fn d8_b_mid_chain_decoy_prunes_and_the_walk_continues_below_it() {
+    let (_logs, _guard) = capture_logs();
+    let decoy = decoy_outpoint(0xd1);
+    let nodes = decoy_chain(5, &[(2, decoy.clone())]);
+    let manager = DecoyHeadManager::new();
+    let (requests, graphs, cursor, pruned) =
+        synchronize_counting(&nodes, &[4], Some(&manager), &MemoryStorage::new(), None).await;
+    let (decoy_requests, chain_requests) = split_requests(&requests, &decoy);
+    assert_eq!(decoy_requests, 1);
+    assert_eq!(
+        chain_requests,
+        tip_to_genesis(&nodes),
+        "nodes 1 and 0 below it"
+    );
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(
+        graph_txids(&graphs[0]),
+        nodes.iter().map(node_txid).collect::<Vec<_>>()
+    );
+    assert_eq!((cursor, pruned), (1, 1));
+}
+
+#[tokio::test]
+async fn d8_c_unproven_parent_with_a_missing_spv_input_still_fails_that_utxo() {
+    // The same decoy shape, but the tip is UNPROVEN: its inputs are SPV
+    // necessities, not manager-named history, so the reference's rule holds.
+    let mut nodes = decoy_chain(3, &[(2, decoy_outpoint(0xd2))]);
+    nodes[2].proof = None;
+    let manager = DecoyHeadManager::new();
+    let (logs, _guard) = capture_logs();
+    // Tip 2 at score 1 fails; the independent genesis at score 2 still syncs.
+    let (requests, graphs, cursor, pruned) =
+        synchronize_counting(&nodes, &[2, 0], Some(&manager), &MemoryStorage::new(), None).await;
+    // The unproven tip needs ALL its inputs (decoy, head, fee) and the peer
+    // holds neither the decoy nor the fee outpoint. Whichever of the two is
+    // asked for first fails the UTXO there: one failed round trip, no more.
+    let held: Vec<_> = nodes.iter().map(node_txid).collect();
+    let unserved = requests.iter().filter(|r| !held.contains(&r.0)).count();
+    assert_eq!(unserved, 1, "the first missing SPV input ends the walk");
+    assert_eq!(graphs.len(), 1, "the failed tip finalizes nothing");
+    assert_eq!(graph_txids(&graphs[0]), vec![node_txid(&nodes[0])]);
+    assert_eq!(cursor, 0, "the gap guard keeps the failed tip retryable");
+    assert_eq!(pruned, 0, "an unproven parent never prunes");
+    assert!(logs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|log| log.contains("Error ingesting UTXO") && log.contains("node not found")));
+}
+
+// SHA-256 over everything pin B compares, for every manager and both shapes.
+// Captured on the base (4965995, before the prune existed) and frozen here:
+// managers that name nothing sync byte-for-byte as they did.
+const D8_D_BASE_DIGEST: &str = "2b24dda6f8dfe6aee74e1211c6128680f3d6657376fbbe3c9a444bd156a76ba9";
+
+#[tokio::test]
+async fn d8_d_managers_naming_nothing_sync_byte_for_byte_as_on_the_base() {
+    let mut transcript = Vec::new();
+    let mut comparisons = 0;
+    for unproven_tip in [false, true] {
+        let mut nodes = chain(3);
+        if unproven_tip {
+            nodes[1].proof = None;
+            nodes[2].proof = None;
+        }
+        let store = MemoryStorage::new();
+        for (name, manager) in &workspace_managers() {
+            let (requests, graphs, cursor, pruned) =
+                synchronize_counting(&nodes, &[2], Some(manager.as_ref()), &store, None).await;
+            assert_eq!(pruned, 0, "{name}: nothing named, nothing pruned");
+            transcript.extend_from_slice(
+                format!(
+                    "{name}|{unproven_tip}|{requests:?}|{cursor}|{}|",
+                    graphs.len()
+                )
+                .as_bytes(),
+            );
+            for graph in &graphs {
+                for beef in &graph.beefs {
+                    transcript.extend_from_slice(&(beef.len() as u64).to_le_bytes());
+                    transcript.extend_from_slice(beef);
+                }
+            }
+            comparisons += 1;
+        }
+    }
+    let digest = hex::encode(bsv_rs::primitives::hash::sha256(&transcript));
+    println!("D8 PIN D: {comparisons} syncs, transcript sha256 {digest}");
+    assert_eq!(digest, D8_D_BASE_DIGEST);
+}
+
+// Serves the chain's own transactions and refuses every other txid.
+struct ChainOnlyFetcher {
+    nodes: HashMap<String, GASPNode>,
+    requested: RefCell<Vec<String>>,
+}
+
+#[async_trait(?Send)]
+impl AncestorFetcher for ChainOnlyFetcher {
+    async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+        self.requested.borrow_mut().push(txid.to_string());
+        let node = self
+            .nodes
+            .get(txid)
+            .ok_or_else(|| GASPError::RemoteError(format!("chain has no {txid}")))?;
+        Ok(FetchedAncestor {
+            raw_tx: node.raw_tx.clone(),
+            proof: node.proof.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn d8_e_fetcher_arm_prunes_a_named_input_the_fetcher_cannot_serve() {
+    let decoy = decoy_outpoint(0xd3);
+    let nodes = decoy_chain(5, &[(4, decoy.clone())]);
+    let fetcher = Rc::new(ChainOnlyFetcher {
+        nodes: nodes.iter().map(|n| (node_txid(n), n.clone())).collect(),
+        requested: RefCell::new(Vec::new()),
+    });
+    let manager = DecoyHeadManager::new();
+    let (logs, _guard) = capture_logs();
+    let (requests, graphs, cursor, pruned) = synchronize_counting(
+        &nodes,
+        &[4],
+        Some(&manager),
+        &MemoryStorage::new(),
+        Some(fetcher.clone()),
+    )
+    .await;
+    assert_eq!(
+        requests,
+        vec![(node_txid(&nodes[4]), 0, true)],
+        "the peer serves only the root"
+    );
+    let fetched = fetcher.requested.borrow().clone();
+    assert_eq!(
+        fetched.iter().filter(|txid| **txid == decoy.txid).count(),
+        1,
+        "one failed fetch for the decoy"
+    );
+    assert_eq!(
+        fetched
+            .into_iter()
+            .filter(|txid| *txid != decoy.txid)
+            .collect::<Vec<_>>(),
+        nodes[..4].iter().rev().map(node_txid).collect::<Vec<_>>()
+    );
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(
+        graph_txids(&graphs[0]),
+        nodes.iter().map(node_txid).collect::<Vec<_>>()
+    );
+    assert_eq!((cursor, pruned), (1, 1));
+    assert!(logs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|log| log.contains(&decoy.to_graph_id()) && log.contains("chain has no")));
+}
+
+#[tokio::test]
+async fn d8_f_a_pruned_outpoint_is_requested_once_when_two_parents_name_it() {
+    let (_logs, _guard) = capture_logs();
+    // The same decoy outpoint rides the tip AND a mid-chain spend.
+    let decoy = decoy_outpoint(0xd4);
+    let nodes = decoy_chain(5, &[(4, decoy.clone()), (2, decoy.clone())]);
+    let manager = DecoyHeadManager::new();
+    let (requests, graphs, cursor, pruned) =
+        synchronize_counting(&nodes, &[4], Some(&manager), &MemoryStorage::new(), None).await;
+    let (decoy_requests, chain_requests) = split_requests(&requests, &decoy);
+    assert_eq!(decoy_requests, 1, "asked once, not once per parent");
+    assert_eq!(chain_requests, tip_to_genesis(&nodes));
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graph_txids(&graphs[0]).len(), 5);
+    assert_eq!(cursor, 1);
+    assert_eq!(pruned, 1, "one outpoint, one failed round trip, one count");
 }
