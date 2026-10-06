@@ -7,7 +7,7 @@
 //! POSTED here, bound by the SAME identity signature the on-chain marker
 //! carries (`proofChallenge` = `LOW-proof\nv1\ngid=…\nwinner=…\nbundle=<sha256>`
 //! signed under `[1,'low proof']`, keyID = gameId, counterparty `anyone`),
-//! REPLAYED on write (`overlay_discovery::proof::replay` — both hands
+//! REPLAYED on write (`low_proof_replay`: both hands
 //! re-derived from the signed transcript, never the bundle's words) and
 //! stored. `/results` serves the hands from it exactly as from an on-chain
 //! bundle; the loser never publishes anything after a hand.
@@ -162,9 +162,9 @@ pub fn verify_proof_post(
         .map_err(|_| ProofPostRefusal::BadWinner)?
         .try_into()
         .map_err(|_| ProofPostRefusal::BadWinner)?;
-    let proved = overlay_discovery::proof::replay::prove_bundle(&bundle, &game, &winner_key)
+    let proved = low_proof_replay::prove_bundle(&bundle, &game, &winner_key)
         .ok_or(ProofPostRefusal::BundleRefused)?;
-    let cards = overlay_discovery::proof::replay::ProvedHands::cards_hex;
+    let cards = low_proof_replay::ProvedHands::cards_hex;
     Ok(VerifiedProofPost {
         game_id,
         winner,
@@ -358,7 +358,7 @@ mod tests {
     use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet};
 
     const REAL: &[u8] =
-        include_bytes!("../../overlay-discovery/src/proof/fixtures/bundle-a1081773.bin");
+        include_bytes!("../../low-proof-replay/src/fixtures/bundle-a1081773.bin");
     const REAL_GAME: &str = "a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523";
 
     fn wallet_of(seed: u8) -> ProtoWallet {

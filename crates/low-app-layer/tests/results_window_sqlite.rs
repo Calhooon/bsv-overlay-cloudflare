@@ -4073,7 +4073,7 @@ fn proof_hands_like_the_route(
 fn both_hands_serve_from_the_winners_replayed_bundle() {
     use bsv_overlay_cloudflare::d1_discovery::PROOF_ADMIT_WRITE_SQL;
     const REAL: &[u8] =
-        include_bytes!("../../overlay-discovery/src/proof/fixtures/bundle-a1081773.bin");
+        include_bytes!("../../low-proof-replay/src/fixtures/bundle-a1081773.bin");
     let conn = production_schema_db();
     let winner = "03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0".to_string();
     // Game 1: a row the overlay replayed at admission (columns present).

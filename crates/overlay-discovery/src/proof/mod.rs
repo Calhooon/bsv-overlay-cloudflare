@@ -73,9 +73,37 @@
 //! Clients verify each bundle and use the one that proves.
 
 pub mod lookup_service;
-pub mod replay;
 pub mod storage;
 pub mod topic_manager;
+
+/// Both hands as re-derived from the bundle. Cards are CANONICAL (sorted
+/// ascending ordinals 0..=51), the form the claim and the bundle both carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvedHands {
+    /// 0 = seat A won, 1 = seat B won.
+    pub winner_seat: u8,
+    /// The two wire seat keys, positional (A, B).
+    pub seats: [[u8; 33]; 2],
+    pub winner_cards: [u8; 5],
+    /// `None` when the bundle carries no loser half (an older winner-only
+    /// bundle, or a hand the loser never revealed): never guessed.
+    pub loser_cards: Option<[u8; 5]>,
+}
+
+impl ProvedHands {
+    /// 10-hex canonical card bytes, the wire form `/results` serves.
+    pub fn cards_hex(cards: &[u8; 5]) -> String {
+        hex::encode(cards)
+    }
+}
+
+/// The replay a deployment hands to
+/// [`lookup_service::ProofLookupService::with_prover`]: bundle bytes plus
+/// the marker's own (gameId, winner) pushes in, both re-derived hands out,
+/// `None` on any discrepancy. LOW's is `low_proof_replay::prove_bundle`. It
+/// is a hook and not a dependency because the replay links LOW's private
+/// crates (bsv-low #553): this crate must build from its own repository.
+pub type BundleProver = fn(&[u8], &[u8; 32], &[u8; 33]) -> Option<ProvedHands>;
 
 /// The domain tag the app stamps. v1 = `(tag, gameId, winnerIdentity,
 /// sig, bundle)`. 12 bytes of ASCII — the byte layout is the cross-repo

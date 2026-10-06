@@ -14,6 +14,14 @@
 //!
 //! Pure, no I/O. DISPLAY-TIER consumer (the receipt's showdown): a verdict
 //! here never gates money.
+//!
+//! bsv-low #553 (2026-10-06): this was `overlay_discovery::proof::replay`.
+//! It is its own crate because `low-core` and `low-wire` are PATH deps on the
+//! private `bsv-low` checkout, and cargo reads a path dependency's manifest
+//! even when it is optional: while they sat in `bsv-overlay-discovery`, no
+//! consumer could pin the engine crates by git rev without a `[patch]`. The
+//! two LOW workers link this crate and hand [`prove_bundle`] to
+//! `ProofLookupService::with_prover`; the engine crates name no LOW crate.
 
 use low_core::discard::{exchange_positions, verify_discard_reveal};
 use low_core::mental::{unmask, validate_deck, verify_scalar_commitment};
@@ -24,26 +32,11 @@ use std::io::Read;
 /// The only bundle version deployed clients accept (`b.v !== 1` refuses).
 pub const PROOF_BUNDLE_VERSION: u64 = 1;
 
-/// Both hands as re-derived from the bundle. Cards are CANONICAL (sorted
-/// ascending ordinals 0..=51), the form the claim and the bundle both carry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvedHands {
-    /// 0 = seat A won, 1 = seat B won.
-    pub winner_seat: u8,
-    /// The two wire seat keys, positional (A, B).
-    pub seats: [[u8; 33]; 2],
-    pub winner_cards: [u8; 5],
-    /// `None` when the bundle carries no loser half (an older winner-only
-    /// bundle, or a hand the loser never revealed) — never guessed.
-    pub loser_cards: Option<[u8; 5]>,
-}
-
-impl ProvedHands {
-    /// 10-hex canonical card bytes — the wire form `/results` serves.
-    pub fn cards_hex(cards: &[u8; 5]) -> String {
-        hex::encode(cards)
-    }
-}
+/// Both hands as re-derived from the bundle. The type lives beside the
+/// record it fills (`overlay_discovery::proof`) so the lookup service can
+/// carry a replay it does not link (bsv-low #553); re-exported here so
+/// `ProvedHands::cards_hex` reads the same at every call site.
+pub use overlay_discovery::proof::ProvedHands;
 
 /// The bundle bytes as JSON text: gunzipped when the gzip magic leads, else
 /// UTF-8 as pushed. `None` on undecodable bytes.

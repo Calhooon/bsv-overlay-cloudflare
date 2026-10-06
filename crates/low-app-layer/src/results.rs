@@ -3068,7 +3068,7 @@ pub fn hand_markers_sql(n: usize) -> String {
 
 /// bsv-low P1.1 part b (2026-09-02): one REPLAYED proof bundle for a game —
 /// the winner's identity (the marker push, F1-signed) and both hands the
-/// overlay's `proof::replay` re-derived from the signed transcript material
+/// `low_proof_replay` re-derived from the signed transcript material
 /// (never the bundle's own words). The loser's is `None` when the bundle
 /// carried no provable loser half.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3128,16 +3128,16 @@ pub fn replay_proof_row(
     let game: [u8; 32] = hex::decode(game_id_hex).ok()?.try_into().ok()?;
     let winner: [u8; 33] = hex::decode(winner_hex).ok()?.try_into().ok()?;
     let bytes = hex::decode(bundle_hex).ok()?;
-    let proved = overlay_discovery::proof::replay::prove_bundle(&bytes, &game, &winner)?;
+    let proved = low_proof_replay::prove_bundle(&bytes, &game, &winner)?;
     Some(ProofHandsFact {
         game_id: game_id_hex.to_ascii_lowercase(),
         winner: winner_hex.to_ascii_lowercase(),
-        winner_cards_hex: overlay_discovery::proof::replay::ProvedHands::cards_hex(
+        winner_cards_hex: low_proof_replay::ProvedHands::cards_hex(
             &proved.winner_cards,
         ),
         loser_cards_hex: proved
             .loser_cards
-            .map(|c| overlay_discovery::proof::replay::ProvedHands::cards_hex(&c)),
+            .map(|c| low_proof_replay::ProvedHands::cards_hex(&c)),
     })
 }
 
@@ -4039,7 +4039,7 @@ mod tests {
     #[test]
     fn read_time_replay_of_a_pre_replay_row_derives_both_hands() {
         const REAL: &[u8] =
-            include_bytes!("../../overlay-discovery/src/proof/fixtures/bundle-a1081773.bin");
+            include_bytes!("../../low-proof-replay/src/fixtures/bundle-a1081773.bin");
         let f = replay_proof_row(
             "a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523",
             "03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0",

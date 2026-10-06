@@ -223,7 +223,7 @@ pub const HAND_MARKERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS hand_markers (
 /// winner-signed bundle supersedes; nothing else may touch it). The bytes are
 /// stored verbatim (the poster's identity signature over their sha256 binds
 /// them, exactly as the on-chain marker's does), and the admission-time REPLAY
-/// verdict + both re-derived hands ride the row (`proof::replay`). Ties post
+/// verdict + both re-derived hands ride the row (`low_proof_replay`). Ties post
 /// from the revealed side: `winner` is the POSTER, not a claim of victory.
 pub const PROOF_POSTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS proof_posts (
         gameId TEXT NOT NULL,

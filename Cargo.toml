@@ -1,10 +1,22 @@
+# bsv-low #553 (2026-10-06): THIS workspace is what a consumer pins. A fresh
+# clone of this repository ALONE must build `bsv-overlay-engine` and
+# `bsv-overlay-discovery`, and a crate that names them by git rev must
+# resolve with no `[patch]`. So no member here may carry a path dependency
+# that leaves the repository. The three crates that link LOW's private
+# `bsv-low` checkout (the two deployable workers and the proof replay they
+# share) are a SECOND workspace, `workers/Cargo.toml`, with its own
+# `Cargo.lock`; they are excluded here because cargo loads every member's
+# path dependencies, optional or not, before it builds anything.
 [workspace]
 members = [
     "crates/overlay-engine",
     "crates/overlay-discovery",
+    "parity-harness",
+]
+exclude = [
     "crates/overlay-cloudflare",
     "crates/low-app-layer",
-    "parity-harness",
+    "crates/low-proof-replay",
 ]
 resolver = "2"
 
@@ -14,6 +26,8 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
 
+# Mirrored in `workers/Cargo.toml` (a workspace cannot inherit another's
+# table): change a version in both.
 [workspace.dependencies]
 # BSV SDK — crates.io. `overlay` feature = types + transaction + script +
 # wallet. `auth`/`http` deliberately left off; they pull reqwest/tokio-net
@@ -41,12 +55,3 @@ url = "2"
 
 # Logging
 tracing = "0.1"
-
-# bsv-low #441 (2026-09-10): the session lane needs bsv-middleware-cloudflare 0.3.4
-# (`session-lane`), NOT PUBLISHED yet. A git REV on the public lineage branch — never a
-# path to a sibling checkout (#439's class) — until the publish, which replaces this
-# block with the registry 0.3.4 (the owner's word).
-[patch.crates-io]
-# 0.3.5 (bsv-low #493, 2026-09-20): the lane's 64-bit replay window rides as a decimal string across the
-# AuthSessionStore DO's storage put (a u64 as a JS number threw past 2^53 on the 54th laned call).
-bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "9394c74" }

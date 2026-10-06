@@ -69,9 +69,10 @@ pub struct ProofRecord {
     #[serde(rename = "createdAt")]
     pub created_at: i64,
     /// bsv-low P1.1 part b (2026-09-02): the admission-time REPLAY verdict
-    /// ([`crate::proof::replay::prove_bundle`]) and what it re-derived.
-    /// `None` = recorded before the replay shipped (a reader decodes from the
-    /// retained bytes); `Some(false)` = refused (nothing derived, the row
+    /// (the [`crate::proof::BundleProver`] the deployment links; LOW's is
+    /// `low_proof_replay::prove_bundle`) and what it re-derived. `None` =
+    /// not replayed: recorded before the replay shipped, or by a service
+    /// with no prover (a reader decodes from the retained bytes); `Some(false)` = refused (nothing derived, the row
     /// still exists — admission is byte-format-only); `Some(true)` = both
     /// hands below are the replay's OWN derivation, never the bundle's words.
     #[serde(rename = "bundleValid", default)]

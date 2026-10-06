@@ -1534,7 +1534,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE pot_records ADD COLUMN spenderSizeBytes INTEGER",
     "ALTER TABLE pot_records ADD COLUMN spenderFeeSats INTEGER",
     // bsv-low P1.1 part b (2026-09-02): the proof bundle's admission-time
-    // REPLAY verdict and both re-derived hands (`proof::replay`). Additive,
+    // REPLAY verdict and both re-derived hands (`low_proof_replay`). Additive,
     // NULLable (NULL = admitted before the replay shipped — a reader decodes
     // the retained bundle bytes instead). Display tier: the receipt's showdown.
     "ALTER TABLE proof_markers ADD COLUMN bundleValid INTEGER",

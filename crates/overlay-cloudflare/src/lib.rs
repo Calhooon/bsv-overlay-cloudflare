@@ -724,7 +724,10 @@ fn build_engine_with_storage(
             "ls_proof" => {
                 lookup_services.insert(
                     "ls_proof".into(),
-                    Box::new(ProofLookupService::new(proof_storage.clone())),
+                    Box::new(ProofLookupService::with_prover(
+                        proof_storage.clone(),
+                        low_proof_replay::prove_bundle,
+                    )),
                 );
             }
             "ls_potparty" => {

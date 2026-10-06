@@ -1,0 +1,51 @@
+# The LOW workers' workspace (bsv-low #553, 2026-10-06): the two deployable
+# workers and the `LOW/proof/v1` replay they share. These three crates link
+# `low-core` and `low-wire` by PATH from the private `bsv-low` checkout that
+# must sit beside this repository (`../bsv-low`), so they cannot be members
+# of the root workspace: that one has to load from a fresh clone alone (it is
+# what a consumer pins by git rev). The engine crates are path dependencies
+# of these, never the reverse.
+#
+# A virtual manifest, so neither worker owns the other. Each member names it
+# with `package.workspace`. ONE `Cargo.lock` (`workers/Cargo.lock`) serves
+# all three deployable wrangler configs, and it may hold exactly ONE `worker`
+# version (bsv-low #348; `make ci-deploy` checks this lock).
+#
+#   cargo test --manifest-path workers/Cargo.toml --workspace
+[workspace]
+members = [
+    "../crates/overlay-cloudflare",
+    "../crates/low-app-layer",
+    "../crates/low-proof-replay",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
+
+# Mirrors the root `Cargo.toml` table (a workspace cannot inherit another's):
+# change a version in both.
+[workspace.dependencies]
+# BSV SDK: crates.io. `overlay` feature = types + transaction + script +
+# wallet. `auth`/`http` deliberately left off; they pull reqwest/tokio-net
+# which fail on wasm32.
+bsv-rs = { version = "0.3", features = ["overlay"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+hex = "0.4"
+tracing = "0.1"
+
+# bsv-low #441 (2026-09-10): the session lane needs bsv-middleware-cloudflare 0.3.4
+# (`session-lane`), NOT PUBLISHED yet. A git REV on the public lineage branch (never a
+# path to a sibling checkout, #439's class) until the publish, which replaces this
+# block with the registry 0.3.4 (the owner's word).
+[patch.crates-io]
+# 0.3.5 (bsv-low #493, 2026-09-20): the lane's 64-bit replay window rides as a decimal string across the
+# AuthSessionStore DO's storage put (a u64 as a JS number threw past 2^53 on the 54th laned call).
+bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "9394c74" }

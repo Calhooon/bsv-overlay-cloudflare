@@ -1,0 +1,32 @@
+[package]
+name = "low-proof-replay"
+description = "Server-side replay of a LOW/proof/v1 transcript bundle (both hands re-derived)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+workspace = "../../workers"
+publish = false
+
+[dependencies]
+# `ProvedHands` and the `BundleProver` hook this crate's `prove_bundle` fills.
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
+# bsv-low P1.1 part b (2026-09-02): the SAME pure crates the client's wasm
+# wraps (`low-core` mental/discard math, `low-wire` signed envelopes; native +
+# wasm32, no I/O, no RNG). Cross-repo PATH deps (the sister checkout at
+# ../bsv-low, the same shape bsv-wallet-cli uses for its toolbox); the
+# fields they inherit (`version.workspace`) resolve against THEIR workspace.
+# bsv-low #553: they live HERE and nowhere in the root workspace, so the
+# engine crates build from this repository alone.
+low-core = { path = "../../../bsv-low/crates/low-core" }
+low-wire = { path = "../../../bsv-low/crates/low-wire" }
+serde_json.workspace = true
+hex.workspace = true
+# Bundles are gzip-compressed by the client past a size threshold; the pure
+# Rust backend builds on wasm32-unknown-unknown.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+# tests/admission.rs drives the real replay through `ProofLookupService`.
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# bsv-low #553: a member of the LOW workers' workspace, not the root one.
+workspace = "../../workers"
 
 [lib]
 # `cdylib` for the Cloudflare Workers wasm32 build (worker-build consumes
@@ -47,6 +49,10 @@ bsv-rs.workspace = true
 # frozen template bytes `tm_pot` admits with) — used by the settle classifier
 # (bsv-low #227) to recover a pot's COMMITTED params from its funding lock.
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
+# bsv-low #553: the `LOW/proof/v1` replay (was `overlay_discovery::proof::replay`),
+# run on a posted bundle and on a row the overlay admitted before the replay
+# shipped. It carries the PATH deps on the private `bsv-low` checkout.
+low-proof-replay = { version = "0.1", path = "../low-proof-replay" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"
 # /live-view's bounded tower fan-out: `select` races each service-binding

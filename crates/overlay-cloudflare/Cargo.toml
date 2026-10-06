@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# bsv-low #553: a member of the LOW workers' workspace, not the root one.
+workspace = "../../workers"
 
 [lib]
 # `cdylib` for the Cloudflare Workers wasm32 build (worker-build consumes
@@ -18,6 +20,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
+# bsv-low #553: the `LOW/proof/v1` replay `ls_proof` runs ONCE at admission,
+# handed to `ProofLookupService::with_prover`. It carries the PATH deps on
+# the private `bsv-low` checkout, which is why this crate is not a member of
+# the root workspace.
+low-proof-replay = { version = "0.1", path = "../low-proof-replay" }
 bsv-rs = { workspace = true, features = ["wasm"] }
 # 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
 # compatible with `worker 0.8` — and it is the SAME major the low-watchtower

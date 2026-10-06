@@ -1,4 +1,5 @@
 /target
+/workers/target
 .DS_Store
 *.swp
 *.swo

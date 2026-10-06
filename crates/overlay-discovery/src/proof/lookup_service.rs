@@ -35,6 +35,7 @@ use tracing::debug;
 
 use super::parse_proof_marker;
 use super::storage::{ProofQuery, ProofRecord, ProofStorage};
+use super::{BundleProver, ProvedHands};
 
 /// Default number of records returned when a query omits `limit`.
 /// Deliberately small — each row carries a ~10–15 KB bundle, so this is
@@ -49,12 +50,31 @@ const MAX_LIMIT: usize = 10;
 /// PROOF Lookup Service — indexes markers and answers `proofsFor`.
 pub struct ProofLookupService {
     storage: Rc<dyn ProofStorage>,
+    /// The admission-time replay, when the deployment links one
+    /// (bsv-low #553). `None` records `bundleValid = NULL`: "not replayed",
+    /// the same word a row written before the replay shipped carries.
+    prover: Option<BundleProver>,
 }
 
 impl ProofLookupService {
-    /// Create a new PROOF lookup service backed by the given storage.
+    /// Create a new PROOF lookup service backed by the given storage, with
+    /// NO admission-time replay: every record is stored with
+    /// `bundle_valid = None` and a reader decodes from the retained bytes.
     pub fn new(storage: Rc<dyn ProofStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            prover: None,
+        }
+    }
+
+    /// As [`Self::new`], replaying each admitted bundle ONCE through
+    /// `prover` (LOW's workers pass `low_proof_replay::prove_bundle`): the
+    /// verdict and both re-derived hands ride the record.
+    pub fn with_prover(storage: Rc<dyn ProofStorage>, prover: BundleProver) -> Self {
+        Self {
+            storage,
+            prover: Some(prover),
+        }
     }
 }
 
@@ -105,10 +125,13 @@ impl LookupService for ProofLookupService {
         // bsv-low P1.1 part b: replay ONCE at admission (decode-once, the #284
         // pattern) — the verdict and both re-derived hands ride the record.
         // Admission itself stays byte-format-only: a refused replay is stored
-        // as `bundleValid = 0`, never a rejected marker.
-        let proved = <[u8; 33]>::try_from(marker.winner.as_slice())
-            .ok()
-            .and_then(|w| crate::proof::replay::prove_bundle(&marker.bundle, &marker.game_id, &w));
+        // as `bundleValid = 0`, never a rejected marker. With no prover linked
+        // (bsv-low #553) nothing is claimed either way: `bundleValid = NULL`.
+        let proved = self.prover.and_then(|prove| {
+            <[u8; 33]>::try_from(marker.winner.as_slice())
+                .ok()
+                .and_then(|w| prove(&marker.bundle, &marker.game_id, &w))
+        });
         let record = ProofRecord {
             game_id: hex::encode(marker.game_id),
             winner: hex::encode(&marker.winner),
@@ -122,17 +145,16 @@ impl LookupService for ProofLookupService {
             txid: txid.to_string(),
             output_index,
             created_at: 0, // assigned by the storage layer at insert
-            bundle_valid: Some(proved.is_some()),
+            bundle_valid: self.prover.map(|_| proved.is_some()),
             winner_seat: proved.as_ref().map(|p| p.winner_seat),
             seat_a: proved.as_ref().map(|p| hex::encode(p.seats[0])),
             seat_b: proved.as_ref().map(|p| hex::encode(p.seats[1])),
             winner_cards_hex: proved
                 .as_ref()
-                .map(|p| crate::proof::replay::ProvedHands::cards_hex(&p.winner_cards)),
-            loser_cards_hex: proved.as_ref().and_then(|p| {
-                p.loser_cards
-                    .map(|c| crate::proof::replay::ProvedHands::cards_hex(&c))
-            }),
+                .map(|p| ProvedHands::cards_hex(&p.winner_cards)),
+            loser_cards_hex: proved
+                .as_ref()
+                .and_then(|p| p.loser_cards.map(|c| ProvedHands::cards_hex(&c))),
         };
 
         // Keyed by the OUTPOINT: a replayed submit of the same output is a
@@ -331,42 +353,63 @@ mod tests {
 
     // ── Admission + lookup (the golden vector end-to-end) ────────────────
 
-    /// bsv-low P1.1 part b: admission replays the bundle ONCE and stores the
-    /// verdict + both re-derived hands; a bundle the replay refuses is still
-    /// admitted (byte-format admission) with `bundleValid = Some(false)`.
+    /// bsv-low #553: the replay is a HOOK. With a prover the verdict and both
+    /// hands ride the record, and the prover is handed the marker's own
+    /// bytes; a bundle it refuses is still admitted (byte-format admission)
+    /// with `bundleValid = Some(false)`. The REAL replay over a real bundle
+    /// through this same path is pinned where the replay lives
+    /// (`low-proof-replay`, `admission_replays_the_bundle_and_stores_both_hands`).
     #[tokio::test]
-    async fn admission_replays_the_bundle_and_stores_both_hands() {
-        const REAL: &[u8] = include_bytes!("fixtures/bundle-a1081773.bin");
-        let game: [u8; 32] =
-            hex::decode("a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523")
-                .unwrap()
-                .try_into()
+    async fn admission_runs_the_prover_and_stores_both_hands() {
+        const GAME: [u8; 32] = [0x22; 32];
+        fn stub(bundle: &[u8], game: &[u8; 32], winner: &[u8; 33]) -> Option<ProvedHands> {
+            (bundle == b"proves" && game == &GAME).then_some(ProvedHands {
+                winner_seat: 1,
+                seats: [[0x02; 33], *winner],
+                winner_cards: [1, 2, 3, 4, 5],
+                loser_cards: Some([6, 7, 8, 9, 10]),
+            })
+        }
+        let winner = golden_winner();
+        let storage = Rc::new(MemoryProofStorage::new());
+        let svc = ProofLookupService::with_prover(storage.clone(), stub);
+        for (txid, bundle) in [("txOK", &b"proves"[..]), ("txBAD", &b"garbage"[..])] {
+            let script = super::super::tests::marker_script(&GAME, &winner, &golden_sig(), bundle);
+            svc.output_admitted_by_topic(&admit(txid, 0, script))
+                .await
                 .unwrap();
-        let winner =
-            hex::decode("03926129919f02ae2910ef7505aec13bd9aa937db5e38352f8f20028e0858218e0")
-                .unwrap();
-        let (svc, storage) = make_service_with_storage();
-        let script = super::super::tests::marker_script(&game, &winner, &golden_sig(), REAL);
-        svc.output_admitted_by_topic(&admit("txREAL", 0, script))
-            .await
-            .unwrap();
+        }
         let rows = storage
-            .list_for_game_winner(&hex::encode(game), &hex::encode(&winner), 10)
+            .list_for_game_winner(&hex::encode(GAME), &hex::encode(&winner), 10)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        let r = &rows[0];
-        assert_eq!(r.bundle_valid, Some(true));
-        assert_eq!(r.winner_seat, Some(0));
+        assert_eq!(rows.len(), 2);
+        let ok = rows.iter().find(|r| r.txid == "txOK").unwrap();
+        assert_eq!(ok.bundle_valid, Some(true));
+        assert_eq!(ok.winner_seat, Some(1));
         assert_eq!(
-            r.seat_a.as_deref(),
-            Some("032f0bceeaf001f7d16871c9eba014004a17489c8a39aec9d4e9cccf626fe66e8d")
+            ok.seat_a.as_deref(),
+            Some(hex::encode([0x02u8; 33]).as_str())
         );
-        assert_eq!(r.winner_cards_hex.as_deref(), Some("011f232733"));
-        assert_eq!(r.loser_cards_hex.as_deref(), Some("151c1d2d31"));
-        assert_eq!(r.bundle, REAL, "the bytes are still retained verbatim");
+        assert_eq!(ok.seat_b.as_deref(), Some(hex::encode(&winner).as_str()));
+        assert_eq!(ok.winner_cards_hex.as_deref(), Some("0102030405"));
+        assert_eq!(ok.loser_cards_hex.as_deref(), Some("060708090a"));
+        assert_eq!(
+            ok.bundle, b"proves",
+            "the bytes are still retained verbatim"
+        );
+        let bad = rows.iter().find(|r| r.txid == "txBAD").unwrap();
+        assert_eq!(bad.bundle_valid, Some(false));
+        assert!(bad.winner_seat.is_none() && bad.seat_a.is_none() && bad.seat_b.is_none());
+        assert!(bad.winner_cards_hex.is_none() && bad.loser_cards_hex.is_none());
+    }
 
-        // The golden (format-only) marker: admitted, refused by the replay.
+    /// bsv-low #553: with NO prover the service claims nothing. The record
+    /// is stored with `bundleValid = None` (never `Some(false)`, which would
+    /// say a replay refused it) and the bytes are retained for a reader.
+    #[tokio::test]
+    async fn admission_without_a_prover_records_no_verdict() {
+        let (svc, storage) = make_service_with_storage();
         svc.output_admitted_by_topic(&admit(
             "txGOLDEN",
             0,
@@ -383,8 +426,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(g.len(), 1);
-        assert_eq!(g[0].bundle_valid, Some(false));
-        assert!(g[0].winner_cards_hex.is_none() && g[0].loser_cards_hex.is_none());
+        assert_eq!(g[0].bundle_valid, None);
+        assert!(g[0].winner_seat.is_none() && g[0].winner_cards_hex.is_none());
+        assert_eq!(g[0].bundle, golden_bundle());
     }
 
     #[tokio::test]
