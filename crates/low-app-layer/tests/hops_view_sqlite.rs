@@ -2138,8 +2138,11 @@ mod door_refusals {
     /// One identity's owed rows as the walk derives them: its hops, the door's ledger through its own markers, and
     /// a chain rung that answers unspent for every hop (so the press is decided by the ledger alone).
     fn owed_of(conn: &Connection, identity: &str) -> (Vec<OwedRow>, HashMap<String, DoorRefusal>) {
+        owed_of_at(conn, identity, NOW_MS)
+    }
+    fn owed_of_at(conn: &Connection, identity: &str, now_ms: i64) -> (Vec<OwedRow>, HashMap<String, DoorRefusal>) {
         let hops = hops_of(conn, identity);
-        let door = door_refused_hops(&door_rows(conn, identity, NOW_MS), &hops);
+        let door = door_refused_hops(&door_rows(conn, identity, now_ms), &hops);
         let chain: HashMap<String, HopChainWord> = hops
             .iter()
             .map(|h| (format!("{}:{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), HopChainWord { looked: true, spent: Some(false), spending_txid: None, spent_confirmed: None, stale: false, age_ms: None }))
@@ -2149,7 +2152,7 @@ mod door_refusals {
         let rows = derive_owed_rows(&OwedInputs {
             identity_lc: identity,
             tip: Some(967_700),
-            now_ms: NOW_MS,
+            now_ms,
             results: &[],
             refunds: &[],
             hops: &hops,
@@ -2358,5 +2361,58 @@ mod door_refusals {
         let (beef, late, _) = join(&hop_a, &key_a, &hop_b, &PrivateKey::random()).await;
         assert!(door_refuses(&conn, &beef, &late, REASON_SCRIPT_REFUSED, NOW_MS + 5).is_empty());
         assert_eq!(ledger_rows(&conn), 0);
+    }
+
+    /// The delta fold's LOW-2 and LOW-3: a seat with MORE unspent door-refused hops than one walk reads (seventy,
+    /// each refused a second after the one before). The shipped read returns exactly `OWED_DOOR_REFUSALS_MAX` rows,
+    /// the NEWEST first, so the hop the seat just tried is among the ones stranded at once; the six oldest keep the
+    /// rejoin and are stranded by the thirty-minute age rule like any hop the ledger never named. As the newest is
+    /// swept (the index shows it spent) the next oldest enters the 64. At `762e621` the cut had no order and served
+    /// the 64 lowest txids (`/tmp/b1-fold-2/red-item3-762e621.log`).
+    /// To red: drop the `ORDER BY` from `OWED_DOOR_REFUSALS_SQL`, or change its `LIMIT`.
+    #[test]
+    fn more_door_refused_hops_than_the_read_holds_are_served_newest_first_and_the_rest_wait_for_the_age_rule() {
+        use low_app_layer::owed::OWED_DOOR_REFUSALS_MAX;
+        const HOPS: usize = 70;
+        let conn = production_schema_db();
+        let mut identity = String::new();
+        let mut funded: Vec<String> = Vec::new(); // by refusal time, oldest first
+        for i in 0..HOPS {
+            let (m, hop, _key) = fund_hop(&conn, 0xa1, [0x40 + i as u8; 32], 20_190, 0x40 + i as u8, true);
+            identity = m.identity_hex.clone();
+            for q in write_queries(&[SignedSpend { txid: hop.id(), vout: 0 }], &format!("{:064x}", 0xbad0 + i), REASON_SCRIPT_REFUSED, NOW_MS - 1_000 * (HOPS - i) as i64) {
+                exec_query(&conn, &q);
+            }
+            funded.push(hop.id());
+        }
+        assert_eq!(ledger_rows(&conn), HOPS as i64);
+        let newest_first: Vec<String> = funded.iter().rev().cloned().collect();
+        // the read: exactly the cap, the newest refusals, newest first
+        let rows = door_rows(&conn, &identity, NOW_MS);
+        assert_eq!(rows.len(), OWED_DOOR_REFUSALS_MAX, "the LIMIT, executed");
+        assert_eq!(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), newest_first[..OWED_DOOR_REFUSALS_MAX], "newest first, deterministic");
+        // the walk: 64 stranded at once (the hop just tried among them), the six oldest still the rejoin
+        let (owed, door) = owed_of(&conn, &identity);
+        assert_eq!((owed.len(), door.len()), (HOPS, OWED_DOOR_REFUSALS_MAX));
+        let family_of = |owed: &[OwedRow], txid: &str| owed.iter().find(|r| r.outpoint == format!("{txid}:0")).map(|r| (r.family, r.facts["claim"].clone())).unwrap();
+        assert_eq!(family_of(&owed, &newest_first[0]), (OwedFamily::HopStranded, serde_json::json!("sweep-hop")));
+        for old in &newest_first[OWED_DOOR_REFUSALS_MAX..] {
+            assert_eq!(family_of(&owed, old), (OwedFamily::InProgress, serde_json::json!("rejoin")), "past the read: the pre-#486 word, never a wrong one");
+        }
+        // the next rule: past the young window the age rule strands the overflow, ledger or no ledger
+        let (aged, _) = owed_of_at(&conn, &identity, NOW_MS + 31 * 60_000);
+        for old in &newest_first[OWED_DOOR_REFUSALS_MAX..] {
+            assert_eq!(family_of(&aged, old), (OwedFamily::HopStranded, serde_json::json!("sweep-hop")));
+        }
+        // the cut rotates as the seat sweeps: the newest hop spent, the 65th newest enters
+        mark_hop_spent(&conn, &newest_first[0], &"5e".repeat(32), false);
+        let rows = door_rows(&conn, &identity, NOW_MS);
+        assert_eq!(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), newest_first[1..=OWED_DOOR_REFUSALS_MAX]);
+        // two refusals of the same instant: the outpoint breaks the tie, the same way on every read
+        conn.execute("UPDATE submit_refusals SET refusedAt = ?1", params![NOW_MS - 5]).unwrap();
+        let tied = door_rows(&conn, &identity, NOW_MS);
+        let mut by_txid: Vec<String> = funded.iter().filter(|t| **t != newest_first[0]).cloned().collect();
+        by_txid.sort();
+        assert_eq!(tied.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), by_txid[..OWED_DOOR_REFUSALS_MAX]);
     }
 }

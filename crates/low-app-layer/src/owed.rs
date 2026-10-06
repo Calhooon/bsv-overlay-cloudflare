@@ -79,6 +79,8 @@ pub const DOOR_REFUSED_REASON: &str =
 /// unspent, it returns the seat's own stake (no loss, no profit to the griefer), a landed JOIN makes the hop read
 /// spent and retires the refusal (`submit_refusals::retire_admitted`), and sweep versus JOIN is the race the
 /// 30-minute rule already allows a withholding opponent.
+/// ACCEPTED (the delta lens's LOW-5, 2026-10-06): the wait such an opponent had to sit through is zero now, so
+/// the seat's hop reads "sweep now" at minute 0 instead of minute 30 while the hand is still startable: no loss.
 pub const DOOR_SCRIPT_REFUSED_REASON: &str =
     "a transaction that would have spent this stake was refused at the door and nothing was broadcast: your stake can be swept back now (the sweep returns your own stake)";
 /// Which door arm named the hop (the ledger's `reason`).
@@ -121,7 +123,11 @@ pub const OWED_DOOR_REFUSALS_MAX: usize = 64;
 /// read. A hop the index shows SPENT is skipped (a spend of it was admitted since: the refusal is stale, and the
 /// door retires it). Binds: `?1` the identity (lowercase), `?2` now minus `OWED_EVICTION_WINDOW_MS`.
 /// Cost: the identity's hop markers once more (the hops view walks the same index range), bounded rows out.
-pub const OWED_DOOR_REFUSALS_SQL: &str = "SELECT lower(r.hopTxid) AS hopTxid, r.hopVout AS hopVout, r.reason AS reason      FROM hopparty_records hp CROSS JOIN submit_refusals r ON r.hopTxid = hp.txid AND r.hopVout = hp.hopVout      WHERE hp.identity = ?1 AND r.refusedAt >= ?2        AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = r.hopTxid AND p.outputIndex = r.hopVout AND p.spent = 1)      GROUP BY r.hopTxid, r.hopVout LIMIT 64";
+/// The delta fold's LOW-3 (2026-10-06): NEWEST refusal first (then the outpoint, so the cut is deterministic). A
+/// seat with more than `OWED_DOOR_REFUSALS_MAX` unspent door-refused hops gets the newest 64 stranded at once, the
+/// hop it just tried among them; the older ones keep the rejoin until the 30-minute age rule strands them, and
+/// each enters the 64 as a newer one is swept (a spent hop is skipped). Before, the cut had no order.
+pub const OWED_DOOR_REFUSALS_SQL: &str = "SELECT lower(r.hopTxid) AS hopTxid, r.hopVout AS hopVout, r.reason AS reason      FROM hopparty_records hp CROSS JOIN submit_refusals r ON r.hopTxid = hp.txid AND r.hopVout = hp.hopVout      WHERE hp.identity = ?1 AND r.refusedAt >= ?2        AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = r.hopTxid AND p.outputIndex = r.hopVout AND p.spent = 1)      GROUP BY r.hopTxid, r.hopVout ORDER BY r.refusedAt DESC, r.hopTxid ASC, r.hopVout ASC LIMIT 64";
 const _: () = assert!(OWED_DOOR_REFUSALS_MAX == 64);
 
 /// PURE: the identity's own hop outpoints (`txid:vout`, lowercase) the door's ledger names, with the arm that
