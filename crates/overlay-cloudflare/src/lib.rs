@@ -33,6 +33,7 @@ pub mod reorg_sweep;
 pub mod routes;
 pub mod submit_census;
 pub mod submit_gate;
+pub mod submit_refusals;
 pub mod tip_pass;
 pub mod wallet;
 

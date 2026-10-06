@@ -2484,6 +2484,9 @@ pub(crate) struct OwedComputed {
     pub computed_at_ms: i64,
     /// A view's walk hit the page bound while more remained: the list is CUT and says so (never a silent cut).
     pub truncated: bool,
+    /// bsv-low #487: the write refused this snapshot (the marker already carried a newer one); nothing was written
+    /// and the page is not told (the newer walk told it).
+    pub superseded: bool,
 }
 
 #[derive(Deserialize)]
@@ -2729,6 +2732,37 @@ pub(crate) async fn owed_recompute(
     };
     let evicted_hop_outpoints: HashSet<String> =
         crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&eviction_rows), &hops);
+    // 4a-i. bsv-low #486: the DOOR's refusal ledger (`submit_refusals`, the overlay's): a JOIN refused synchronously
+    //       was never admitted, so no eviction names its hops. The ledger holds one row per hop OUTPOINT, written
+    //       only when the hop's own key signed the refused transaction (the overlay verifies it), and it is read
+    //       through THIS identity's own hop markers (`OWED_DOOR_REFUSALS_SQL`: never a window over every identity's
+    //       refusals), then intersected with the walk's own hops. A faulted read (or a database not yet migrated)
+    //       names nothing: the pre-#486 sentence stands.
+    let door_refused_hop_outpoints: HashMap<String, crate::owed::DoorRefusal> = {
+        #[derive(Deserialize)]
+        struct RefusalRowD1 {
+            #[serde(rename = "hopTxid")]
+            hop_txid: String,
+            #[serde(rename = "hopVout")]
+            hop_vout: f64,
+            reason: String,
+        }
+        let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
+        let rows: Vec<(String, u32, String)> = match db.prepare(crate::owed::OWED_DOOR_REFUSALS_SQL).bind(&[JsValue::from_str(identity_lc), since]) {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<RefusalRowD1>()) {
+                Ok(rows) => rows.into_iter().map(|r| (r.hop_txid, r.hop_vout as u32, r.reason)).collect(),
+                Err(e) => {
+                    console_warn!("[owed] door refusals read failed (a door-refused hop keeps its sentence this pass): {e}");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                console_warn!("[owed] door refusals bind failed: {e}");
+                Vec::new()
+            }
+        };
+        crate::owed::door_refused_hops(&rows, &hops)
+    };
     // 4a-ii. fleet loop 11, the wave's batch 3 (2026-09-20): the refused JOIN's committed home for MY seat, read from the
     //        `pot_records_evicted` twin (the overlay's own decode of the evicted lock) and KEYED ON THE UTXO the ledger
     //        names — the hop the evicted JOIN spent (`released_hops_by_eviction`), my own; the seat by that hop's
@@ -2854,7 +2888,9 @@ pub(crate) async fn owed_recompute(
                 // chain rung is the only word there is) — the same set the derivation judges by the chain
                 // fleet loop 11: a hop whose JOIN the network refused is a candidate at ANY age (the derivation
                 // strands it at once; without a chain word its sweep press would wait for nothing)
-                let join_refused = evicted_hop_outpoints.contains(&outpoint_key(&h.hop_txid, h.hop_vout));
+                // (bsv-low #486: refused by an eviction OR synchronously at the door)
+                let hop_key = outpoint_key(&h.hop_txid, h.hop_vout);
+                let join_refused = evicted_hop_outpoints.contains(&hop_key) || door_refused_hop_outpoints.contains_key(&hop_key);
                 let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
                     && (join_refused || h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS));
                 // AND a hop the index shows SPENT by a non-pot spender but never CONFIRMED (a sweep recorded before its
@@ -3323,7 +3359,8 @@ pub(crate) async fn owed_recompute(
 
     // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
     //    thousands of `unbound` rows; the actionable ones are written first, the list is CUT and says so)
-    let mut rows = derive_owed_rows(&OwedInputs {
+    let no_home_words: HashMap<String, crate::owed::HomeSpendWord> = HashMap::new();
+    let mut inputs = OwedInputs {
         identity_lc,
         tip,
         now_ms,
@@ -3339,11 +3376,19 @@ pub(crate) async fn owed_recompute(
         hop_sweeps: &hop_sweeps,
         evicted_pots: &evicted_pots,
         evicted_hop_outpoints: &evicted_hop_outpoints,
+        door_refused_hop_outpoints: &door_refused_hop_outpoints,
         spender_outputs: &spender_outputs,
         spender_inputs: &spender_inputs,
         courier_spenders: &courier_spenders,
         my_pkh_by_game: &my_pkh_by_game,
-    });
+        home_spends: &no_home_words,
+    };
+    // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
+    //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
+    //     this crate decides: the home key's signature over a spender's bytes (`owed_home_spend_walk`).
+    let home_spends = owed_home_spend_walk(env, db, identity_lc, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
+    inputs.home_spends = &home_spends;
+    let mut rows = derive_owed_rows(&inputs);
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
     crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
     sort_rows_for_service(&mut rows);
@@ -3352,44 +3397,43 @@ pub(crate) async fn owed_recompute(
         walk_cut = true;
     }
 
-    // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 502 statements)
-    let mut stmts = Vec::with_capacity(rows.len() + 2);
-    stmts.push(
-        db.prepare(crate::owed::OWED_ROWS_DELETE_SQL)
-            .bind(&[JsValue::from_str(identity_lc)])
-            .map_err(|e| format!("owed delete bind: {e}"))?,
-    );
-    for r in &rows {
-        stmts.push(
-            db.prepare(crate::owed::OWED_ROW_INSERT_SQL)
-                .bind(&[
-                    JsValue::from_str(&r.identity),
-                    JsValue::from_str(&r.outpoint),
-                    JsValue::from_str(r.family.as_str()),
-                    JsValue::from_str(&r.game_id),
-                    r.sats.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
-                    r.opponent_identity.as_deref().map_or(JsValue::NULL, JsValue::from_str),
-                    r.at_height.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
-                    JsValue::from_str(&r.facts.to_string()),
-                    JsValue::from_f64(now_ms as f64),
-                    r.reason.as_deref().map_or(JsValue::NULL, JsValue::from_str),
-                ])
-                .map_err(|e| format!("owed row bind: {e}"))?,
-        );
+    // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 503
+    //    statements: `owed::owed_write_plan`, the same statements the real-SQLite pin runs)
+    let plan = crate::owed::owed_write_plan(identity_lc, &rows, now_ms, tip, walk_cut);
+    let mut stmts = Vec::with_capacity(plan.len());
+    for (sql, binds) in &plan {
+        let b: Vec<JsValue> = binds
+            .iter()
+            .map(|v| match v {
+                crate::owed::OwedBind::Text(s) => JsValue::from_str(s),
+                crate::owed::OwedBind::Int(n) => JsValue::from_f64(*n as f64),
+                crate::owed::OwedBind::Null => JsValue::NULL,
+            })
+            .collect();
+        stmts.push(db.prepare(*sql).bind(&b).map_err(|e| format!("owed write bind: {e}"))?);
     }
-    stmts.push(
-        db.prepare(crate::owed::OWED_STATE_UPSERT_SQL)
-            .bind(&[
-                JsValue::from_str(identity_lc),
-                JsValue::from_f64(now_ms as f64),
-                tip.map_or(JsValue::NULL, |t| JsValue::from_f64(t as f64)),
-                JsValue::from_f64(rows.len() as f64),
-                JsValue::from_f64(if walk_cut { 1.0 } else { 0.0 }),
-            ])
-            .map_err(|e| format!("owed state bind: {e}"))?,
-    );
-    debug_assert!(stmts.len() <= 2 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the two bookends");
-    db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    debug_assert!(stmts.len() <= 3 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the three bookends");
+    let written = db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    #[derive(Deserialize)]
+    struct StampD1 {
+        #[serde(rename = "computedAtMs")]
+        computed_at_ms: f64,
+    }
+    let stamp_after = written.last().and_then(|r| r.results::<StampD1>().ok()).and_then(|v| v.first().map(|s| s.computed_at_ms as i64));
+    // bsv-low #487: the write is monotonic in the walk's stamp; a snapshot older than the marker's changed nothing
+    // (a walk that outlived its takeover, or the slower of two isolates). An unreadable read-back is taken as landed
+    // (the batch itself succeeded; the pre-#487 word).
+    let superseded = stamp_after.is_some() && !crate::owed::owed_write_landed(stamp_after, now_ms);
+    if superseded {
+        crate::owed::note_recompute_write_superseded();
+        worker::console_log!(
+            "[owed] recompute {source} for {}…: the snapshot of {now_ms} was NOT written, the marker carries a newer one ({}): {} ms in the walk",
+            &identity_lc[..12.min(identity_lc.len())],
+            stamp_after.unwrap_or_default(),
+            worker::Date::now().as_millis() as i64 - started_ms
+        );
+        return Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded });
+    }
     crate::owed::note_recompute(source, &rows);
     if courier_reads > 0 || courier_cap_hit {
         worker::console_log!(
@@ -3410,7 +3454,102 @@ pub(crate) async fn owed_recompute(
         budget_cut,
         walk_cut
     );
-    Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut })
+    Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded })
+}
+
+/// bsv-low #485: what the brain can establish about the home outputs of a courier-proven payout, per outpoint
+/// (`<sweepTxid>:<vout>`). In order: (1) the durable LATCH of an earlier proof (`hop_chain_probes` under
+/// `owed::HOME_SPEND_LATCH_PREFIX`, written here alone); (2) the chain rung's word for the rest (the `/spent-any`
+/// ladder: a positive is a pointer plus raw verification, a negative needs a second provider's clean answer),
+/// memoised like the hops' and bounded per pass; (3) for a named spender, its BYTES (the index's stored BEEF first,
+/// else the isolate's tx-any answer, else one resolver ask) and THE PROOF: the input consuming the home output must
+/// verify against the home's own lock, executed here (`owed::home_output_spend_proven`). Only (1) and (3) say
+/// `Proven`; a courier's word of spent alone is `Unproven` and retires nothing. Every fault leaves the outpoint
+/// unnamed (the row stands: the safe direction).
+///
+/// The delta fold's LOW-1 and LOW-2 (2026-10-06): the pass itself is `owed::home_walk_pass` (pinned, caps and
+/// all); this function is its D1 and courier plumbing. The candidates are a RING walked from the identity's
+/// cursor (`owed::home_walk_window`), and the cursor moves to the first output the pass withheld a look from, so
+/// the window cut, the chain probes and the stored reads all rotate. Cost per pass: one memo read (the cursor,
+/// the window's latches and chain memos), one more for the cursor alone when the identity holds more than
+/// `OWED_HOME_WINDOW` candidates, and one batch of upserts (the fresh memos, the latches, the cursor).
+async fn owed_home_spend_walk(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    candidates: &[crate::owed::CourierHomeOutput],
+    now_ms: i64,
+    started_ms: i64,
+) -> std::collections::HashMap<String, crate::owed::HomeSpendWord> {
+    use crate::owed::{home_cursor_of, home_cursor_target, home_latch_target, home_walk_window, OWED_HOME_WINDOW};
+    if candidates.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let memo_targets = |window: &[crate::owed::CourierHomeOutput]| -> Vec<(String, u32)> {
+        window.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).chain(window.iter().map(|c| (c.sweep_txid.clone(), c.vout))).collect()
+    };
+    // a lived-in identity holds a handful: the cursor rides the one memo read. Past the window, it is read first.
+    let (window, memos) = if candidates.len() <= OWED_HOME_WINDOW {
+        let mut targets = vec![home_cursor_target(identity_lc)];
+        targets.extend(memo_targets(candidates));
+        let memos = read_probe_memos(db, &targets).await;
+        (home_walk_window(candidates, home_cursor_of(&memos, identity_lc).as_deref(), OWED_HOME_WINDOW), memos)
+    } else {
+        let cursor = home_cursor_of(&read_probe_memos(db, &[home_cursor_target(identity_lc)]).await, identity_lc);
+        let window = home_walk_window(candidates, cursor.as_deref(), OWED_HOME_WINDOW);
+        let memos = read_probe_memos(db, &memo_targets(&window)).await;
+        (window, memos)
+    };
+    // the latch keys and the chain keys never collide (`HOME_SPEND_LATCH_PREFIX`), so one list serves both readers
+    let mut world = HomeWalkCouriers { env, db, started_ms };
+    let pass = crate::owed::home_walk_pass(&mut world, &window, &memos, &memos, now_ms).await;
+    let mut writes = pass.memos;
+    for latch in writes.iter().filter(|m| m.outpoint.starts_with(crate::owed::HOME_SPEND_LATCH_PREFIX)) {
+        worker::console_log!(
+            "[owed] home output {} is proven spent by {} (the home key's signature verified): the courier-proven payout retires",
+            latch.outpoint,
+            latch.spending_txid.as_deref().unwrap_or_default()
+        );
+    }
+    if let Some(next) = crate::owed::home_cursor_after(candidates, &window, pass.first_withheld) {
+        writes.push(crate::owed::home_cursor_memo(identity_lc, next, now_ms));
+    }
+    if !writes.is_empty() {
+        write_probe_memos(db, &writes).await;
+    }
+    pass.words
+}
+
+/// The Worker behind `owed::HomeWalkWorld`: the recompute's clock, the `/spent-any` ladder, the stored BEEF and
+/// the tx-any resolver. Fetches only; every decision is `owed::home_walk_pass`'s.
+struct HomeWalkCouriers<'a> {
+    env: &'a worker::Env,
+    db: &'a worker::D1Database,
+    started_ms: i64,
+}
+impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
+    fn over_budget(&self) -> bool {
+        worker::Date::now().as_millis() as i64 - self.started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
+    }
+    async fn probe(&mut self, txid: &str, vout: u32) -> crate::hops_view::ChainSpendProbe {
+        let row = spent_any_resolve_cached(txid, vout, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
+        crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed }
+    }
+    async fn stored_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
+        match load_stored_beef(self.env, self.db, spender_txid).await {
+            Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
+                .ok()
+                .and_then(|beef| beef.find_txid(spender_txid).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
+            _ => None,
+        }
+    }
+    fn cached_spender(&mut self, spender_txid: &str) -> Option<Option<Vec<u8>>> {
+        tx_any_cached(spender_txid, worker::Date::now().as_millis() as f64).map(|a| a.raw_hex.and_then(|h| hex::decode(h).ok()))
+    }
+    async fn resolve_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
+        let now_f = worker::Date::now().as_millis() as f64;
+        resolve_tx_any(None, None, spender_txid, now_f, "owed", self.env).await.raw_hex.and_then(|h| hex::decode(h).ok())
+    }
 }
 
 /// ONE recompute for ONE identity, then the page told (`owed-changed` on its durable box). A fault is counted and
@@ -3424,6 +3563,8 @@ pub(crate) async fn owed_recompute_and_push(
     tip_hint: Option<u64>,
 ) {
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+        // bsv-low #487: a snapshot the write refused is not announced (the newer walk's own push stands)
+        Ok(c) if c.superseded => {}
         Ok(c) => {
             crate::internal_events::first_party_push(
                 env,
@@ -3593,6 +3734,20 @@ pub(crate) async fn owed_recompute_claimed(
     owed_refresh_end(identity_lc, token);
 }
 
+/// The snapshot the table holds for `identity_lc` (the marker, then its rows): what a superseded read serves.
+/// `None` on any fault or a missing marker.
+async fn owed_read_stored(db: &worker::D1Database, identity_lc: &str) -> Option<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)> {
+    let id = [JsValue::from_str(identity_lc)];
+    let st = db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&id).ok()?.first::<OwedStateD1>(None).await.ok()??;
+    let rows = db.prepare(crate::owed::OWED_ROWS_READ_SQL).bind(&id).ok()?.all().await.and_then(|r| r.results::<OwedRowD1>()).ok()?;
+    Some((
+        rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
+        st.tip.map(|t| t as u64),
+        st.computed_at_ms as i64,
+        st.truncated.unwrap_or(0.0) != 0.0,
+    ))
+}
+
 /// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
 async fn owed_compute_on_read(
     env: &worker::Env,
@@ -3602,6 +3757,17 @@ async fn owed_compute_on_read(
     tip_hint: Option<u64>,
 ) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+        // the lens fold's LOW-2: the write refused this walk's snapshot because a NEWER one stands (#487), so this
+        // reader is served the stored rows, never its own older ones. The delta fold's LOW-4: when the stored read
+        // faults too, the walk's own rows are served for that one response with NO claimable word in them
+        // (`owed::superseded_read_snapshot`): the older snapshot may hold a press the newer walk retired.
+        Ok(c) if crate::owed::read_answer_after_compute(c.superseded) == crate::owed::ReadAnswer::Stored => {
+            let stored = owed_read_stored(db, identity_lc).await;
+            if stored.is_none() {
+                console_warn!("[owed] compute on read ({source}): superseded and the stored read faulted: the older rows are served with no claimable word");
+            }
+            Ok(crate::owed::superseded_read_snapshot(stored, (c.rows, c.tip, c.computed_at_ms, c.truncated)))
+        }
         Ok(c) => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
         Err(e) => {
             crate::owed::note_recompute_fault();
@@ -4761,7 +4927,7 @@ async fn read_probe_memos(
     }
     let binds: Vec<JsValue> = targets
         .iter()
-        .map(|(txid, vout)| JsValue::from_str(&format!("{}.{vout}", txid.to_ascii_lowercase())))
+        .map(|(txid, vout)| JsValue::from_str(&crate::hops_view::probe_memo_key(txid, *vout)))
         .collect();
     let rows: Vec<ProbeMemoRow> = match db
         .prepare(crate::hops_view::probe_memo_read_sql(targets.len()))

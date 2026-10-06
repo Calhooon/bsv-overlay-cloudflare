@@ -842,6 +842,11 @@ pub fn order_probe_targets(
     front.into_iter().chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout))).chain(rest).collect()
 }
 
+/// PURE: the memo table's key for an outpoint (`<txid>.<vout>`, lowercase): the ONE spelling the write and the read share.
+pub fn probe_memo_key(txid: &str, vout: u32) -> String {
+    format!("{}.{vout}", txid.to_ascii_lowercase())
+}
+
 /// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
 pub fn probe_memo_of(txid: &str, vout: u32, probe: &ChainSpendProbe, now_ms: i64) -> Option<ProbeMemo> {
     if !probe.known {
@@ -849,7 +854,7 @@ pub fn probe_memo_of(txid: &str, vout: u32, probe: &ChainSpendProbe, now_ms: i64
     }
     let spent = probe.spent?;
     Some(ProbeMemo {
-        outpoint: format!("{}.{vout}", txid.to_ascii_lowercase()),
+        outpoint: probe_memo_key(txid, vout),
         probed_at_ms: now_ms,
         spent,
         spending_txid: probe.spending_txid.clone(),
