@@ -152,6 +152,31 @@ script_verification -- --nocapture`. Measured natively, release profile
 in `Transaction::verify` (2.1 s in a debug build). Workers wasm is slower
 than native; budget CPU accordingly for big covenant legs.
 
+## GASP anchor check (bsv-low #551)
+
+The `historical-tx-no-spv` skip above rests on
+`OverlayGASPStorage::validate_graph_anchor` (`gasp_overlay.rs`), the
+reference's `validateGraphAnchor`. Before a peer's graph is finalized: (1) the
+ROOT node's BEEF goes through the same `verify_spv_like_the_reference` as a
+submit, with the engine's chain tracker and script switch (no tracker is
+`'scripts only'`); (2) the ordered BEEFs are replayed through the topic manager
+over a set of coins (`historical-tx`, the coins as `previous_coins`), and the
+graph is discarded WHOLE unless its root is a coin at the end. A refused graph
+is counted (`TopicSyncResult::discarded_graphs`), is not an error, and the
+cursor advances past it, as in the reference.
+
+Additions to the reference, each stated in the doc comment of
+`validate_graph_anchor`: a coin the storage already holds counts as a previous
+coin (the walk strips held inputs, so the next head of a head chain arrives
+alone); a held source is merged into the checked BEEF of an unproven node;
+every node must be an input of its parent; a conflicting spend inside a graph
+refuses it; and a chain tracker or storage FAULT is
+`GASPError::AnchorUnavailable`, which fails the UTXO so the cursor gap guard
+asks again instead of losing it. A manager whose rule depends on previous
+coins must apply it under `historical-tx` too: that is the mode of the replay.
+Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
+gasp_topic_manager i551`.
+
 ## Testing
 
 ```bash

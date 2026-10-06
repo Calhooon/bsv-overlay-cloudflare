@@ -1207,6 +1207,14 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             // per distinct outpoint per peer: one decoy seen through two
             // peers reads 2.
             let total_pruned: u64 = r.topics_synced.values().map(|t| t.pruned_inputs).sum();
+            // bsv-low #551: graphs the anchor check refused and discarded
+            // whole (a root that does not verify, or one its topic manager
+            // does not admit at the end of the replay). Not errors.
+            let total_discarded: u64 = r
+                .topics_synced
+                .values()
+                .map(|t| t.discarded_graphs)
+                .sum();
             worker::console_log!(
                 "Scheduled: GASP sync — topics={} peers={} errors={} pruned_inputs={}",
                 r.topics_synced.len(),
@@ -1214,13 +1222,20 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 total_errors,
                 total_pruned
             );
+            if total_discarded > 0 {
+                worker::console_log!(
+                    "Scheduled: GASP sync discarded_graphs={}",
+                    total_discarded
+                );
+            }
             for (topic, res) in &r.topics_synced {
-                if !res.errors.is_empty() || res.pruned_inputs > 0 {
+                if !res.errors.is_empty() || res.pruned_inputs > 0 || res.discarded_graphs > 0 {
                     worker::console_log!(
-                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} errors={:?}",
+                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} errors={:?}",
                         topic,
                         res.sync_type,
                         res.pruned_inputs,
+                        res.discarded_graphs,
                         res.errors
                     );
                 }
