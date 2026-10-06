@@ -836,7 +836,7 @@ mod tests {
         assert_eq!(shipped.refused, 0, "nothing dropped at the receiving end");
         assert_eq!(reached, want, "every noted outpoint reaches the handler's list");
         assert_eq!(shipped.posts, 3, "19 outpoints ride ceil(19 / 8) POSTs");
-        assert_eq!(pot_changes::settle(&shipped), (0, 0, 0), "nothing undelivered, retried or deferred");
+        assert_eq!(pot_changes::settle(&shipped), bsv_overlay_cloudflare::change_flush::Tally::default(), "nothing undelivered, retried or deferred");
         // the handler announces and files over the parsed list, and a refused remainder is counted and answered
         let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
@@ -888,7 +888,7 @@ mod tests {
         assert_eq!(shipped.refused, 0, "nothing dropped at the receiving end");
         assert_eq!(reached, want, "every noted identity reaches the handler's list");
         assert_eq!(shipped.posts, 3, "19 identities ride ceil(19 / 8) POSTs");
-        assert_eq!(hop_changes::settle(&shipped), (0, 0, 0));
+        assert_eq!(hop_changes::settle(&shipped), bsv_overlay_cloudflare::change_flush::Tally::default());
         // a body over the cap (a producer that does not chunk) is counted, never trimmed silently
         let whole = hop_changes::body_json(&ids);
         let (kept, dropped) = parse_hop_changed_counted(whole.as_bytes());
@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(shipped.refused, 0, "nothing dropped at the receiving end");
         assert_eq!(reached, want, "every noted change reaches the event's list");
         assert_eq!(shipped.posts, 3, "19 changes ride ceil(19 / 8) POSTs");
-        assert_eq!(lobby_changes::settle(&shipped), (0, 0, 0));
+        assert_eq!(lobby_changes::settle(&shipped), bsv_overlay_cloudflare::change_flush::Tally::default());
         // a body over the cap is counted, never trimmed silently
         let (kept, dropped) = parse_lobby_changed_counted(whole.as_bytes());
         assert_eq!((kept.len(), dropped), (LOBBY_CHANGED_MAX, 19 - LOBBY_CHANGED_MAX));

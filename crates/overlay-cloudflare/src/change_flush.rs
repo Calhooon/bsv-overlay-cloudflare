@@ -15,6 +15,11 @@
 //!    its cadence).
 //! 4. **Nothing is lost silently**: refused by the receiver (`dropped` in its answer), failed twice, retried,
 //!    deferred: each is logged and counted.
+//! 5. **Every note-back is accounted for twice** (the delta lens's D-L2, [`settle`]): once when it is made
+//!    (`*_retried_total`, `*_deferred_total`) and once when a later flush POSTs it again (`*_resent_total`,
+//!    whatever that POST answers). The difference is the note-backs NEVER RE-SENT, served by name on
+//!    `/health/invariants` (`*_noted_back_unresent`); a retry that failed has its own name too
+//!    (`*_retry_failed_total`, the part of `*_undelivered_total` that had its second POST).
 //!
 //! THE COST OF THE BOUND (lens L4, measured by `the_worst_case_flush_is_bounded_in_posts_bytes_and_wall`): the
 //! worst case flush of one set is 16 sequential POSTs of 8 entries (128 entries; a pot body of 8 is at most 767
@@ -24,19 +29,29 @@
 //! body of eight (one broadcast push per outpoint, the attribution reads, the per-seat filings), which no native
 //! pin can measure: it is beta's figure. The wall budget makes the bound hold whatever that figure is: at a
 //! modelled 2 s per POST a flush of 128 gets 10 POSTs out in its 20 s and DEFERS the other 48 entries, counted,
-//! where it used to lose them with the task, uncounted. One POST that hangs past the runtime's wall is still
+//! where it used to lose them with the task, uncounted (the pin runs 131 entries: 80 delivered, 51 deferred). One POST that hangs past the runtime's wall is still
 //! lost with the task (no timeout races it); the budget only stops the flush from starting a POST it cannot
 //! afford.
 //!
-//! THE NOTE-BACK IS NOT DURABLE (lens L3, the stranded-note hole of `pot_changes::flush_inline`'s doc): a
+//! THE NOTE-BACK IS NOT DURABLE (lens L3; the delta lens's D-L2 states what that costs the counters). A
 //! deferred or retried entry is noted back into the isolate's set from inside the detached task, after the
-//! request's own flush, so it waits for the NEXT flush on this isolate (any dispatched fetch since bsv-low
-//! #523, a cron tick, a queue batch) and is lost if the isolate is evicted first. It cannot be made durable
-//! inside the pass without a store of its own (a D1 outbox, a migration and a drain), which a notification the
-//! receiver re-derives on its cadence does not earn. The bound, stated: a note-back needs a failed POST or a
-//! flush past its bound; it is counted when made (`*_retried_total`, `*_deferred_total`), so a lost one shows
-//! as a counted entry with no later `notified` line; its cost is the receiver's own cadence (the owed list's
-//! read-aged recompute, the Lobby's next event), never money.
+//! request's own flush, so it waits for the NEXT flush on THIS isolate (any dispatched fetch since bsv-low
+//! #523, a cron tick, a queue batch). That wait has NO time bound: Cloudflare routes the next request to any
+//! isolate, and an isolate evicted first takes its notes with it. The population is every entry of a POST the
+//! app layer did not accept (any 5xx, since the retry of L2) and every entry past a flush's bound.
+//!
+//! WHAT THE COUNTERS PROVE, stated truthfully. `*_undelivered_total = 0` does NOT prove delivery: it counts
+//! only what an isolate lived to see refused or fail twice. Delivery is proven by `*_undelivered_total = 0`
+//! AND `*_noted_back_unresent = 0` (`retried + deferred - resent`, floored at 0): every note-back made was
+//! POSTed again, and none of those POSTs was refused. `*_noted_back_unresent` is above 0 for the moments
+//! between a note-back and the next flush of its isolate; one that STAYS above 0 is that many entries lost
+//! with an isolate (or with a POST still in flight when the task's wall ended), never re-sent. It errs toward
+//! reading a loss: a note-back whose own counter write failed is not counted at all (the floor hides a resend
+//! that was), and the per-isolate memory of note-backs is bounded ([`RETRY_MEMORY_MAX`],
+//! [`DEFER_MEMORY_MAX`]): past it a failed or deferred entry is not noted back, it is let go and counted
+//! undelivered at once. The cost of every one of these is the receiver's own cadence (the owed list's
+//! read-aged recompute, the Lobby's next event), never money. Making the note-back durable needs a store of
+//! its own (a D1 outbox: a migration, a write per flush and a drain); it is filed as its own issue.
 use std::collections::BTreeSet;
 use std::future::Future;
 
@@ -56,6 +71,10 @@ pub const FLUSH_WALL_BUDGET_MS: u64 = 20_000;
 /// The most entries one isolate remembers as "retried once" per set. Past it a failed entry is not retried
 /// (counted undelivered): the memory is bounded whatever the app layer does.
 pub const RETRY_MEMORY_MAX: usize = 1024;
+
+/// The most entries one isolate remembers as "deferred, not yet re-sent" per set. Past it an entry over a
+/// flush's bound is not noted back (counted undelivered): the memory is bounded whatever the flood is.
+pub const DEFER_MEMORY_MAX: usize = 4096;
 
 /// What one flush did with its entries. Every entry is in exactly one of `delivered`, `failed`, `deferred`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +141,85 @@ pub fn settle_failed<T: Ord + Clone>(retried: &mut BTreeSet<T>, delivered: &[T],
     (again, lost)
 }
 
+/// One isolate's memory of the entries of one set it noted back and has not POSTed again since: the entries
+/// awaiting their one retry, and the entries deferred past a flush's bound. Bounded ([`RETRY_MEMORY_MAX`],
+/// [`DEFER_MEMORY_MAX`]). An entry is in at most one of the two.
+#[derive(Debug)]
+pub struct NotedBack<T> {
+    retried: BTreeSet<T>,
+    deferred: BTreeSet<T>,
+}
+
+impl<T> NotedBack<T> {
+    pub const fn new() -> Self {
+        Self { retried: BTreeSet::new(), deferred: BTreeSet::new() }
+    }
+
+    /// Forget everything (the pins start from an empty memory).
+    pub fn clear(&mut self) {
+        self.retried.clear();
+        self.deferred.clear();
+    }
+}
+
+impl<T> Default for NotedBack<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One flush's account, in entries. `retried + deferred` over every flush is the note-backs MADE; `resent` over
+/// every flush is the note-backs POSTed again; the difference is what was never re-sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// Let go: refused by the app layer, failed on the retry too, or past the note-back memory.
+    pub undelivered: usize,
+    /// The part of `undelivered` whose SECOND POST failed (it was retried and still failed).
+    pub retry_failed: usize,
+    /// Failed for the first time: noted back to be retried once.
+    pub retried: usize,
+    /// Past the flush's bound for the first time: noted back for the next flush.
+    pub deferred: usize,
+    /// Noted back by an earlier flush (retried or deferred) and POSTed by this one, whatever it answered.
+    pub resent: usize,
+}
+
+/// PURE (the delta lens's D-L2): WHAT A FLUSH OWES AFTER ITS POSTS. Returns the entries to note back for the
+/// next flush and the flush's account. A failed POST's entries are retried once ([`settle_failed`]); the entries
+/// past the bound are noted back; and every entry this flush POSTed that an earlier flush had noted back is
+/// counted `resent`, so the note-backs made (`retried`, `deferred`: counted ONCE each, an entry deferred again
+/// while it waits is not a new note-back) and the note-backs re-sent meet when nothing was lost with an isolate.
+pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -> (Vec<T>, Tally) {
+    let mut resent = 0usize;
+    for posted in shipped.delivered.iter().chain(&shipped.failed) {
+        if memory.deferred.remove(posted) || memory.retried.contains(posted) {
+            resent += 1;
+        }
+    }
+    let retry_failed = shipped.failed.iter().filter(|f| memory.retried.contains(*f)).count();
+    let (mut back, lost) = settle_failed(&mut memory.retried, &shipped.delivered, shipped.failed.clone());
+    let retried = back.len();
+    let (mut deferred, mut let_go) = (0usize, 0usize);
+    for d in &shipped.deferred {
+        if memory.retried.contains(d) || memory.deferred.contains(d) {
+            back.push(d.clone()); // still waiting: the same note-back, not a new one
+        } else if memory.deferred.len() < DEFER_MEMORY_MAX {
+            memory.deferred.insert(d.clone());
+            deferred += 1;
+            back.push(d.clone());
+        } else {
+            let_go += 1;
+        }
+    }
+    (back, Tally { undelivered: shipped.refused + lost + let_go, retry_failed, retried, deferred, resent })
+}
+
+/// PURE: the note-backs never re-sent, from the three counters' totals (`/health/invariants` serves it per set
+/// as `*_noted_back_unresent`). Floored at 0: the counters are bumped one statement at a time.
+pub fn noted_back_unresent(retried_total: u64, deferred_total: u64, resent_total: u64) -> u64 {
+    (retried_total + deferred_total).saturating_sub(resent_total)
+}
+
 /// `dropped` in the app layer's 2xx answer (additive since bsv-low #436; an older app layer answers none: 0).
 pub fn answered_dropped(answer: &str) -> usize {
     serde_json::from_str::<serde_json::Value>(answer)
@@ -178,28 +276,40 @@ pub async fn post_body(env: &Env, url: &str, token: &str, path: &str, tag: &str,
     }
 }
 
-/// The four counter names of one set's flush.
+/// The counter names of one set's flush (a [`Tally`]'s five fields), and the name its never-re-sent figure is
+/// served under.
 pub struct FlushCounters {
-    /// Refused by the app layer, or failed on the retry too.
+    /// Refused by the app layer, failed on the retry too, or past the note-back memory.
     pub undelivered: &'static str,
+    /// The part of `undelivered` that was retried and still failed.
+    pub retry_failed: &'static str,
     /// Past one flush's bound, noted back.
     pub deferred: &'static str,
     /// A failed POST's entries, noted back once.
     pub retried: &'static str,
+    /// Noted-back entries a later flush POSTed again.
+    pub resent: &'static str,
+    /// Derived on the read, never written: `retried + deferred - resent`.
+    pub noted_back_unresent: &'static str,
 }
 
 /// The flush's account, after the POSTs: one log line and the counters, only when something did not go through.
-pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: usize, undelivered: usize, retried: usize, deferred: usize) {
-    if undelivered + retried + deferred == 0 {
+pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: usize, tally: Tally) {
+    let Tally { undelivered, retry_failed, retried, deferred, resent } = tally;
+    if undelivered + retried + deferred + resent == 0 {
         return;
     }
-    console_log!(
-        "[{tag}] flush of {shipped} entry(ies): {undelivered} NOT delivered (refused by the app layer, or the POST failed twice), {retried} noted back to retry once, {deferred} deferred to the next flush"
-    );
+    if undelivered + retried + deferred > 0 {
+        console_log!(
+            "[{tag}] flush of {shipped} entry(ies): {undelivered} NOT delivered (refused by the app layer, or the POST failed twice: {retry_failed} after a retry), {retried} noted back to retry once, {deferred} deferred to the next flush"
+        );
+    }
     if let Ok(db) = env.d1("OVERLAY_DB") {
         crate::ops::bump_counter(&db, counters.undelivered, undelivered as u64).await;
+        crate::ops::bump_counter(&db, counters.retry_failed, retry_failed as u64).await;
         crate::ops::bump_counter(&db, counters.retried, retried as u64).await;
         crate::ops::bump_counter(&db, counters.deferred, deferred as u64).await;
+        crate::ops::bump_counter(&db, counters.resent, resent as u64).await;
     }
 }
 
@@ -298,6 +408,84 @@ mod tests {
         let mut full: BTreeSet<u32> = (0..RETRY_MEMORY_MAX as u32).collect();
         let (again, lost) = settle_failed(&mut full, &[], vec![9_000_000]);
         assert_eq!((again.len(), lost, full.len()), (0, 1, RETRY_MEMORY_MAX));
+    }
+
+    /// The delta lens's D-L2: THE NOTE-BACKS MEET THEIR RESENDS, OR THE DIFFERENCE IS THE LOSS. Through the real
+    /// loop and the real settle: a failed chunk is counted `retried` when noted back and `resent` when the next
+    /// flush POSTs it, `retry_failed` by name when that POST fails too; a deferred chunk is counted `deferred`
+    /// once (however often it is deferred again) and `resent` when it is POSTed. An isolate that dies holding
+    /// its notes leaves `retried + deferred` ahead of `resent` by exactly what it held: `undelivered` reads 0
+    /// there and `noted_back_unresent` does not.
+    /// To red: count no `resent` (the base: the figure is the note-backs ever made), or count a re-deferral anew.
+    #[test]
+    fn a_note_back_is_counted_when_made_and_when_resent_and_the_difference_is_what_was_never_resent() {
+        let post_failing = |fail: &'static [usize]| {
+            let calls = Cell::new(0usize);
+            move |_b: String| {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move { if fail.contains(&n) { Err(()) } else { Ok(0) } }
+            }
+        };
+        let add = |sum: &mut Tally, t: Tally| {
+            sum.undelivered += t.undelivered;
+            sum.retry_failed += t.retry_failed;
+            sum.retried += t.retried;
+            sum.deferred += t.deferred;
+            sum.resent += t.resent;
+        };
+        let unresent = |sum: &Tally| noted_back_unresent(sum.retried as u64, sum.deferred as u64, sum.resent as u64);
+        let mut memory: NotedBack<u32> = NotedBack::new();
+        let mut sum = Tally::default();
+
+        // flush 1: 131 entries, the second POST answered 503: eight retried, three deferred, all noted back
+        let (back, t) = settle(&mut memory, &run(ship_chunks(items(131), body, post_failing(&[2]), || 0, 1)));
+        assert_eq!(t, Tally { retried: 8, deferred: 3, ..Tally::default() });
+        assert_eq!(back, [&items(131)[8..16], &items(131)[128..]].concat());
+        add(&mut sum, t);
+        assert_eq!((sum.undelivered, unresent(&sum)), (0, 11), "eleven note-backs made, none re-sent yet");
+
+        // flush 2 (the same isolate): the eleven ride it; the retried chunk fails AGAIN, the deferred three arrive
+        let (back2, t) = settle(&mut memory, &run(ship_chunks(back.clone(), body, post_failing(&[1]), || 0, 1)));
+        assert_eq!(t, Tally { undelivered: 8, retry_failed: 8, resent: 11, ..Tally::default() }, "retried and still failed: its own name");
+        assert!(back2.is_empty(), "the retry is bounded at one");
+        add(&mut sum, t);
+        assert_eq!(unresent(&sum), 0, "every note-back was POSTed again: the account closes");
+        assert!(memory.retried.is_empty() && memory.deferred.is_empty());
+
+        // a flood deferred twice over is ONE note-back per entry: 300 entries, 128 a flush
+        let (back, t) = settle(&mut memory, &run(ship_chunks(items(300), body, post_failing(&[]), || 0, 1)));
+        assert_eq!((t.deferred, back.len()), (172, 172));
+        add(&mut sum, t);
+        let (back, t) = settle(&mut memory, &run(ship_chunks(back, body, post_failing(&[]), || 0, 1)));
+        assert_eq!((t.resent, t.deferred, back.len()), (128, 0, 44), "the 44 still waiting are not counted again");
+        add(&mut sum, t);
+        assert_eq!(unresent(&sum), 44);
+        // a deferred entry whose POST then fails: its deferral is re-sent, its failure is a new note-back
+        let (back, t) = settle(&mut memory, &run(ship_chunks(back, body, post_failing(&[1]), || 0, 1)));
+        assert_eq!(t, Tally { retried: 8, resent: 44, ..Tally::default() });
+        add(&mut sum, t);
+        assert_eq!((back.len(), unresent(&sum)), (8, 8));
+
+        // THE HOLE: the isolate is evicted holding those eight. Nothing more is ever counted for them:
+        // `undelivered` says nothing was lost since the eight of flush 2, and the unresent figure names them.
+        drop(memory);
+        assert_eq!((sum.undelivered, sum.retry_failed, unresent(&sum)), (8, 8, 8), "a loss `undelivered` cannot see, under its own name");
+
+        // a second isolate's flushes do not disturb the figure (its own note-backs meet its own resends)
+        let mut other: NotedBack<u32> = NotedBack::new();
+        let (back, t) = settle(&mut other, &run(ship_chunks(items(9), body, post_failing(&[2]), || 0, 1)));
+        add(&mut sum, t);
+        let (_, t) = settle(&mut other, &run(ship_chunks(back, body, post_failing(&[]), || 0, 1)));
+        add(&mut sum, t);
+        assert_eq!(unresent(&sum), 8);
+
+        // the memory is bounded: past it a deferred entry is let go and counted undelivered, never an untracked note
+        let mut full: NotedBack<u32> = NotedBack::new();
+        full.deferred = (1_000_000..1_000_000 + DEFER_MEMORY_MAX as u32).collect();
+        let (back, t) = settle(&mut full, &run(ship_chunks(items(131), body, post_failing(&[]), || 0, 1)));
+        assert_eq!((back.len(), t), (0, Tally { undelivered: 3, ..Tally::default() }));
+        assert_eq!(noted_back_unresent(1, 1, 5), 0, "floored: the counters are bumped one statement at a time");
     }
 
     /// Lens L4, THE WORST CASE FLUSH MEASURED: 128 pot outpoints (and three more) in one flush. Sixteen

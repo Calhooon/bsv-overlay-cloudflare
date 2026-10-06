@@ -66,19 +66,30 @@ pub const COUNTER_LOBBY_CHANGED_UNDELIVERED: &str = "lobby_changed_undelivered_t
 pub const COUNTER_LOBBY_CHANGED_DEFERRED: &str = "lobby_changed_deferred_total";
 /// Changes of a POST the app layer did not accept, noted back to be retried once.
 pub const COUNTER_LOBBY_CHANGED_RETRIED: &str = "lobby_changed_retried_total";
+/// The part of the undelivered whose retry failed too (the delta lens's D-L2: retried and still failed).
+pub const COUNTER_LOBBY_CHANGED_RETRY_FAILED: &str = "lobby_changed_retry_failed_total";
+/// Noted-back entries (retried or deferred) a later flush POSTed again, whatever that POST answered.
+pub const COUNTER_LOBBY_CHANGED_RESENT: &str = "lobby_changed_resent_total";
+/// Served on `/health/invariants`, derived on the read: `retried + deferred - resent`, the note-backs never
+/// re-sent (lost with an isolate when it stays above 0; see [`crate::change_flush`]).
+pub const LOBBY_CHANGED_NOTED_BACK_UNRESENT: &str = "lobby_changed_noted_back_unresent";
 /// The app layer's own count of the changes a body carried past its cap (it writes this row; pinned equal to
 /// its `COUNTER_LOBBY_CHANGED_DROPPED` from its tests).
 pub const COUNTER_LOBBY_CHANGED_DROPPED: &str = "lobby_changed_dropped_total";
 
-const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
+pub(crate) const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
     undelivered: COUNTER_LOBBY_CHANGED_UNDELIVERED,
     deferred: COUNTER_LOBBY_CHANGED_DEFERRED,
     retried: COUNTER_LOBBY_CHANGED_RETRIED,
+    retry_failed: COUNTER_LOBBY_CHANGED_RETRY_FAILED,
+    resent: COUNTER_LOBBY_CHANGED_RESENT,
+    noted_back_unresent: LOBBY_CHANGED_NOTED_BACK_UNRESENT,
 };
 
 thread_local! {
-    /// The changes noted back once after a failed POST (the retry is bounded at one).
-    static RETRIED: RefCell<BTreeSet<Change>> = const { RefCell::new(BTreeSet::new()) };
+    /// The changes noted back once after a failed POST (the retry is bounded at one), and those deferred past a
+    /// flush's bound, until a later flush POSTs them again (the delta lens's D-L2).
+    static NOTED_BACK: RefCell<crate::change_flush::NotedBack<Change>> = const { RefCell::new(crate::change_flush::NotedBack::new()) };
 }
 
 /// THE FLUSH of the lobby set, transport injected (`ship` runs exactly this, and so do the pins, through a fake
@@ -93,14 +104,14 @@ where
     crate::change_flush::ship_chunks(changes, body_json, post, now_ms, deadline_ms).await
 }
 
-/// What a flush owes after its POSTs: the deferred part and a failed POST's changes (once) are noted back for
-/// the next flush. Returns `(undelivered, retried, deferred)` for the account.
-pub fn settle(shipped: &crate::change_flush::Shipped<Change>) -> (usize, usize, usize) {
-    let (again, lost) = RETRIED.with(|r| crate::change_flush::settle_failed(&mut r.borrow_mut(), &shipped.delivered, shipped.failed.clone()));
-    for (txid, vout, kind) in again.iter().chain(&shipped.deferred) {
+/// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
+/// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
+pub fn settle(shipped: &crate::change_flush::Shipped<Change>) -> crate::change_flush::Tally {
+    let (back, tally) = NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    for (txid, vout, kind) in &back {
         note(txid, *vout, kind);
     }
-    (shipped.refused + lost, again.len(), shipped.deferred.len())
+    tally
 }
 
 /// Ship one flush through the APP_LAYER service binding (a plain fetch between two Workers on one zone is
@@ -127,8 +138,8 @@ pub async fn ship(env: Env, changes: Vec<Change>) {
     if !shipped.delivered.is_empty() {
         console_log!("[lobby-changes] notified {} change(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
-    let (undelivered, retried, deferred) = settle(&shipped);
-    crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, undelivered, retried, deferred).await;
+    let tally = settle(&shipped);
+    crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, tally).await;
 }
 
 /// Drain and ship under the given `wait_until`. One call per unit of work.
@@ -200,10 +211,10 @@ mod tests {
         }
         let want: Vec<(String, u32, String)> = changes.iter().map(|(t, v, k)| (t.clone(), *v, k.to_string())).collect();
         assert_eq!(seen, want, "every change in exactly one body");
-        assert_eq!(settle(&shipped), (0, 3, 0));
+        assert_eq!(settle(&shipped), crate::change_flush::Tally { retried: 3, ..Default::default() });
         assert_eq!(drain(), changes[16..].to_vec(), "the failed chunk rides the next flush");
         let again = crate::change_flush::run(ship_with(changes[16..].to_vec(), |_b: String| async { Err(()) }, || 0, 1));
-        assert_eq!(settle(&again), (3, 0, 0), "a second failure is counted and let go");
+        assert_eq!(settle(&again), crate::change_flush::Tally { undelivered: 3, retry_failed: 3, resent: 3, ..Default::default() }, "a second failure is counted and let go");
         assert!(drain().is_empty());
     }
 }

@@ -60,19 +60,30 @@ pub const COUNTER_POT_CHANGED_UNDELIVERED: &str = "pot_changed_undelivered_total
 pub const COUNTER_POT_CHANGED_DEFERRED: &str = "pot_changed_deferred_total";
 /// Outpoints of a POST the app layer did not accept, noted back to be retried once (lens L2).
 pub const COUNTER_POT_CHANGED_RETRIED: &str = "pot_changed_retried_total";
+/// The part of the undelivered whose retry failed too (the delta lens's D-L2: retried and still failed).
+pub const COUNTER_POT_CHANGED_RETRY_FAILED: &str = "pot_changed_retry_failed_total";
+/// Noted-back entries (retried or deferred) a later flush POSTed again, whatever that POST answered.
+pub const COUNTER_POT_CHANGED_RESENT: &str = "pot_changed_resent_total";
+/// Served on `/health/invariants`, derived on the read: `retried + deferred - resent`, the note-backs never
+/// re-sent (lost with an isolate when it stays above 0; see [`crate::change_flush`]).
+pub const POT_CHANGED_NOTED_BACK_UNRESENT: &str = "pot_changed_noted_back_unresent";
 /// The app layer's own count of the outpoints a body carried past its cap (it writes this row; pinned equal to
 /// its `COUNTER_POT_CHANGED_DROPPED` from its tests, lens N1).
 pub const COUNTER_POT_CHANGED_DROPPED: &str = "pot_changed_dropped_total";
 
-const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
+pub(crate) const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
     undelivered: COUNTER_POT_CHANGED_UNDELIVERED,
     deferred: COUNTER_POT_CHANGED_DEFERRED,
     retried: COUNTER_POT_CHANGED_RETRIED,
+    retry_failed: COUNTER_POT_CHANGED_RETRY_FAILED,
+    resent: COUNTER_POT_CHANGED_RESENT,
+    noted_back_unresent: POT_CHANGED_NOTED_BACK_UNRESENT,
 };
 
 thread_local! {
-    /// The outpoints noted back once after a failed POST (lens L2: the retry is bounded at one).
-    static RETRIED: RefCell<BTreeSet<(String, u32)>> = const { RefCell::new(BTreeSet::new()) };
+    /// The outpoints noted back once after a failed POST (lens L2: the retry is bounded at one), and those deferred
+    /// past a flush's bound, until a later flush POSTs them again (the delta lens's D-L2).
+    static NOTED_BACK: RefCell<crate::change_flush::NotedBack<(String, u32)>> = const { RefCell::new(crate::change_flush::NotedBack::new()) };
 }
 
 /// Noted outpoints, `(txid, vout)`.
@@ -90,14 +101,14 @@ where
     crate::change_flush::ship_chunks(outpoints, body_json, post, now_ms, deadline_ms).await
 }
 
-/// What a flush owes after its POSTs: the deferred part and a failed POST's outpoints (once) are noted back for
-/// the next flush. Returns `(undelivered, retried, deferred)` for the account.
-pub fn settle(shipped: &crate::change_flush::Shipped<(String, u32)>) -> (usize, usize, usize) {
-    let (again, lost) = RETRIED.with(|r| crate::change_flush::settle_failed(&mut r.borrow_mut(), &shipped.delivered, shipped.failed.clone()));
-    for (txid, vout) in again.iter().chain(&shipped.deferred) {
+/// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
+/// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
+pub fn settle(shipped: &crate::change_flush::Shipped<(String, u32)>) -> crate::change_flush::Tally {
+    let (back, tally) = NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    for (txid, vout) in &back {
         note(txid, *vout);
     }
-    (shipped.refused + lost, again.len(), shipped.deferred.len())
+    tally
 }
 
 /// Ship one flush: the outpoints in POSTs of at most [`POT_CHANGED_CHUNK`] (bsv-low #436), one after another,
@@ -126,8 +137,8 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     if !shipped.delivered.is_empty() {
         console_log!("[pot-changes] notified {} outpoint(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
-    let (undelivered, retried, deferred) = settle(&shipped);
-    crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, undelivered, retried, deferred).await;
+    let tally = settle(&shipped);
+    crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;
 }
 
 /// Drain and ship INSIDE a detached task, awaited there (2026-09-04).
@@ -271,7 +282,7 @@ mod tests {
     #[test]
     fn a_failed_chunk_is_noted_back_once_and_a_second_failure_is_counted() {
         drain();
-        RETRIED.with(|r| r.borrow_mut().clear());
+        NOTED_BACK.with(|m| m.borrow_mut().clear());
         let ops: Vec<(String, u32)> = (0..19u32).map(|i| (format!("{i:064x}"), 0)).collect();
         // the first flush: the second of three POSTs is answered 503
         let calls = std::cell::Cell::new(0usize);
@@ -281,7 +292,7 @@ mod tests {
             async move { if n == 2 { Err(()) } else { Ok(0) } }
         };
         let first = crate::change_flush::run(ship_with(ops.clone(), failing_second, || 0, 1));
-        assert_eq!(settle(&first), (0, 8, 0), "eight retried, nothing lost yet");
+        assert_eq!(settle(&first), crate::change_flush::Tally { retried: 8, ..Default::default() }, "eight retried, nothing lost yet");
         let back = drain();
         assert_eq!(back, ops[8..16].to_vec(), "the failed chunk rides the next flush");
         // the next flush ships them with eight new ones: their POST fails again, the new ones' is accepted
@@ -297,12 +308,12 @@ mod tests {
             1,
         ));
         assert_eq!(second.failed, ops[8..16].to_vec(), "the eight retried outpoints fail a second time");
-        assert_eq!(settle(&second), (8, 0, 0), "counted undelivered, not noted back again");
+        assert_eq!(settle(&second), crate::change_flush::Tally { undelivered: 8, retry_failed: 8, resent: 8, ..Default::default() }, "counted undelivered, not noted back again");
         assert!(drain().is_empty(), "the retry is bounded at one");
         // a flood: the part past the bound is noted back
         let flood: Vec<(String, u32)> = (0..131u32).map(|i| (format!("{i:064x}"), 1)).collect();
         let third = crate::change_flush::run(ship_with(flood.clone(), |_b: String| async { Ok(0) }, || 0, 1));
-        assert_eq!(settle(&third), (0, 0, 3));
+        assert_eq!(settle(&third), crate::change_flush::Tally { deferred: 3, ..Default::default() });
         assert_eq!(drain(), flood[128..].to_vec());
     }
 
@@ -317,8 +328,8 @@ mod tests {
         let start = src.find("pub async fn ship(").expect("ship");
         let ship = squash(&code_only(&src[start..start + src[start..].find("\npub async fn flush_inline(").expect("the next fn")]));
         assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),"#)));
-        assert!(ship.contains(&squash("let (undelivered, retried, deferred) = settle(&shipped);")));
-        assert!(ship.contains(&squash(r#"crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, undelivered, retried, deferred).await;"#)));
+        assert!(ship.contains(&squash("let tally = settle(&shipped);")));
+        assert!(ship.contains(&squash(r#"crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;"#)));
         assert!(!ship.contains("body_json("), "ship never builds a body of its own");
         let with = squash(&code_only(&src[src.find("pub async fn ship_with<").expect("ship_with")..start]));
         assert!(with.contains(&squash("crate::change_flush::ship_chunks(outpoints, body_json, post, now_ms, deadline_ms).await")));
