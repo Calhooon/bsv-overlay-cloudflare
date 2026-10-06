@@ -630,10 +630,25 @@ impl Engine {
     ///
     /// `sleep` is the platform sleep factory (ms → future); `budget_ms` is
     /// the wall-clock slice ONE peer's sync may consume. A peer exceeding it
-    /// is dropped (loudly logged, recorded as a failed sync, cursor NOT
-    /// advanced — `update_last_interaction` runs only after a COMPLETED
-    /// sync, so a re-scan next tick is idempotent) and the loop moves on.
-    /// Unset (default) = unbounded, the pre-#302 behavior.
+    /// is dropped (loudly logged, listed in the topic's `errors`) and the
+    /// loop moves on. Unset (default) = unbounded, the pre-#302 behavior.
+    ///
+    /// **Progress survives the deadline (bsv-low #552).** With a budget set,
+    /// every graph is submitted AS IT FINALIZES, inside the raced future (the
+    /// reference submits inside `finalizeGraph` too), so what was finalized
+    /// before the deadline stays admitted. At the deadline the cursor is
+    /// advanced to `GASPSync::completed_cursor`: past the UTXOs whose graphs
+    /// were completed, never past the one in flight. That graph is lost
+    /// whole (nothing of it was finalized) and the next tick walks it again,
+    /// down to whatever is now in storage. A dropped tick that finalized a
+    /// graph or moved the cursor is recorded as a SUCCESSFUL attempt for the
+    /// quarantine count: a peer serving a long bootstrap is not a dead peer.
+    /// One with no progress is a failed attempt, as before.
+    ///
+    /// The budget bounds the work of a TICK. Nothing bounds a GRAPH (parity:
+    /// the reference has no node cap): one graph whose own walk outlasts the
+    /// budget is dropped on every tick (`deadline_dropped_graphs`) and never
+    /// admitted.
     pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
         self.peer_sync_budget = Some((sleep, budget_ms));
     }
@@ -3054,6 +3069,9 @@ impl Engine {
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
+            let mut finalized_graphs: u64 = 0;
+            let mut deadline_dropped_graphs: u64 = 0;
+            let mut cursor_moves: Vec<CursorMove> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -3119,6 +3137,8 @@ impl Engine {
                     let gasp_remote = factory.create_remote(peer_url, topic);
 
                     let log_prefix = format!("[GASP {topic} <-> {peer_url}]");
+                    // Graphs of this peer handed to submit (bsv-low #552).
+                    let peer_finalized = std::cell::Cell::new(0u64);
                     let mut sync = GASPSync::new(
                         Box::new(gasp_storage),
                         gasp_remote,
@@ -3127,13 +3147,26 @@ impl Engine {
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     )
                     .with_ancestor_fetcher(self.ancestor_fetcher.clone());
+                    // bsv-low #552: under a budget each graph is submitted as
+                    // it finalizes, so the deadline cannot take it back. With
+                    // no budget nothing can drop the sync, and the graphs are
+                    // submitted after it as they always were.
+                    if self.peer_sync_budget.is_some() {
+                        sync = sync.with_finalized_graph_hook(Box::new(SubmitAsFinalized {
+                            engine: self,
+                            sink: sink.clone(),
+                            peer_url,
+                            topic,
+                            submitted: &peer_finalized,
+                        }));
+                    }
 
                     // bsv-low#302: bound THIS peer's sync to the configured
                     // budget. `None` from the race = the budget won and the
-                    // sync future was dropped mid-flight — safe, because the
-                    // persisted cursor only ever advances in the completed-Ok
-                    // arm below (idempotent re-scan next tick), and finalized
-                    // graphs are only submitted there too.
+                    // sync future was dropped mid-flight. What it finalized
+                    // before that is already submitted (the hook above); the
+                    // cursor then advances to `completed_cursor` only, see
+                    // the deadline arm below.
                     let sync_outcome = match &self.peer_sync_budget {
                         Some((sleep, budget_ms)) => {
                             crate::gasp::race_or_deadline(
@@ -3145,7 +3178,7 @@ impl Engine {
                         None => Some(sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await),
                     };
 
-                    let outcome_success = matches!(sync_outcome, Some(Ok(())));
+                    let mut outcome_success = matches!(sync_outcome, Some(Ok(())));
                     // D8 decoy rule: branches pruned in this peer's walk. Not
                     // an error and not a failed UTXO, so it is counted apart
                     // from `errors` and never touches the outcome or cursor.
@@ -3165,53 +3198,50 @@ impl Engine {
                             );
                             warn!("[GASP SYNC] {msg}");
                             errors.push(msg);
-                        }
-                        Some(Ok(())) => {
-                            // Submit finalized graphs to the Engine
-                            let finalized: Vec<_> = sink
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .drain(..)
-                                .collect();
 
-                            // Each graph here passed the anchor check: its
-                            // root verified and the replay admitted it, so
-                            // these submits rest on a checked premise and are
-                            // not expected to fail. If one does (a storage
-                            // fault), the REST OF THAT GRAPH is not submitted:
-                            // the reference's `finalizeGraph` awaits each
-                            // submit in order and its throw ends the loop
-                            // (the BEEFs already submitted stay, it has no
-                            // rollback either). A later BEEF would otherwise
-                            // be judged without the coin its ancestor failed
-                            // to leave. Other graphs carry on.
-                            let mut any_submitted = false;
-                            for graph in &finalized {
-                                for beef_bytes in &graph.beefs {
-                                    let tagged = TaggedBEEF::new(
-                                        beef_bytes.clone(),
-                                        vec![graph.topic.clone()],
-                                    );
-                                    match self.submit(&tagged, SubmitMode::HistoricalTxNoSpv).await
-                                    {
-                                        Ok(_) => any_submitted = true,
-                                        Err(e) => {
-                                            warn!(
-                                                "[GASP SYNC] Failed to submit BEEF for topic {}: {e}; the rest of its graph is not submitted",
-                                                graph.topic
-                                            );
-                                            break;
-                                        }
-                                    }
+                            // bsv-low #552: the work COMPLETED before the
+                            // deadline is kept. Its graphs are already
+                            // submitted (the hook); the cursor moves past the
+                            // UTXOs that were completed and stops below the
+                            // one in flight, whose graph is lost whole and
+                            // walked again next tick.
+                            let in_flight = u64::from(sync.graph_in_flight());
+                            deadline_dropped_graphs += in_flight;
+                            let completed = sync.completed_cursor();
+                            if completed > last_interaction {
+                                match self
+                                    .storage
+                                    .update_last_interaction(peer_url, topic, completed)
+                                    .await
+                                {
+                                    Ok(()) => cursor_moves.push(CursorMove {
+                                        peer: peer_url.clone(),
+                                        from: last_interaction,
+                                        to: completed,
+                                    }),
+                                    Err(e) => warn!(
+                                        "[GASP SYNC] Failed to update last_interaction for {peer_url}/{topic}: {e}"
+                                    ),
                                 }
                             }
-
-                            if !finalized.is_empty() {
-                                info!(
-                                    "[GASP SYNC] Submitted {} finalized graph(s) for {topic} from {peer_url}",
-                                    finalized.len()
-                                );
-                            }
+                            // A tick that finalized a graph or moved the
+                            // cursor reached a live peer: not a failed
+                            // attempt for the quarantine count.
+                            outcome_success =
+                                peer_finalized.get() > 0 || completed > last_interaction;
+                            warn!(
+                                "[GASP SYNC] {peer_url} for {topic} at the deadline: finalized_graphs={} deadline_dropped_graphs={in_flight} cursor {last_interaction} -> {} (bsv-low #552)",
+                                peer_finalized.get(),
+                                completed.max(last_interaction)
+                            );
+                        }
+                        Some(Ok(())) => {
+                            // Submit finalized graphs to the Engine (under a
+                            // budget the hook already did, graph by graph,
+                            // and the sink is empty here).
+                            let submitted =
+                                self.submit_finalized_graphs(&sink, peer_url, topic).await;
+                            peer_finalized.set(peer_finalized.get() + submitted);
 
                             // Advance the persisted cursor when it moved forward — i.e.
                             // the peer reported UTXOs at a higher score than our last
@@ -3221,18 +3251,21 @@ impl Engine {
                             // lastInteraction)` — NOT gated on a new submission: a sync
                             // that re-sees already-known UTXOs must still advance, else
                             // every cron re-scans the same range forever (the cursor
-                            // stayed pinned at 0 in prod). `any_submitted` is kept only
-                            // for the completion log below.
-                            let _ = any_submitted;
+                            // stayed pinned at 0 in prod).
                             if sync.last_interaction > last_interaction {
-                                if let Err(e) = self
+                                match self
                                     .storage
                                     .update_last_interaction(peer_url, topic, sync.last_interaction)
                                     .await
                                 {
-                                    warn!(
+                                    Ok(()) => cursor_moves.push(CursorMove {
+                                        peer: peer_url.clone(),
+                                        from: last_interaction,
+                                        to: sync.last_interaction,
+                                    }),
+                                    Err(e) => warn!(
                                         "[GASP SYNC] Failed to update last_interaction for {peer_url}/{topic}: {e}"
-                                    );
+                                    ),
                                 }
                             }
                             info!(
@@ -3246,6 +3279,7 @@ impl Engine {
                             errors.push(msg);
                         }
                     }
+                    finalized_graphs += peer_finalized.get();
 
                     // bsv-low#302: record the attempt outcome (success resets
                     // the consecutive-failure count; timeout/error increments
@@ -3271,6 +3305,9 @@ impl Engine {
                     errors,
                     pruned_inputs,
                     discarded_graphs,
+                    finalized_graphs,
+                    deadline_dropped_graphs,
+                    cursor_moves,
                 },
             );
         }
@@ -3281,6 +3318,52 @@ impl Engine {
         );
 
         Ok(GASPSyncResult { topics_synced })
+    }
+
+    /// Drain `sink` and submit every finalized graph in it, ancestors first
+    /// (`historical-tx-no-spv`: the anchor check already verified them).
+    /// Returns how many graphs were drained.
+    ///
+    /// Each graph here passed the anchor check: its root verified and the
+    /// replay admitted it, so these submits rest on a checked premise and are
+    /// not expected to fail. If one does (a storage fault), the REST OF THAT
+    /// GRAPH is not submitted: the reference's `finalizeGraph` awaits each
+    /// submit in order and its throw ends the loop (the BEEFs already
+    /// submitted stay, it has no rollback either). A later BEEF would
+    /// otherwise be judged without the coin its ancestor failed to leave.
+    /// Other graphs carry on.
+    async fn submit_finalized_graphs(
+        &self,
+        sink: &crate::gasp_overlay::FinalizedGraphSink,
+        peer_url: &str,
+        topic: &str,
+    ) -> u64 {
+        let finalized: Vec<_> = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+
+        for graph in &finalized {
+            for beef_bytes in &graph.beefs {
+                let tagged = TaggedBEEF::new(beef_bytes.clone(), vec![graph.topic.clone()]);
+                if let Err(e) = self.submit(&tagged, SubmitMode::HistoricalTxNoSpv).await {
+                    warn!(
+                        "[GASP SYNC] Failed to submit BEEF for topic {}: {e}; the rest of its graph is not submitted",
+                        graph.topic
+                    );
+                    break;
+                }
+            }
+        }
+
+        if !finalized.is_empty() {
+            info!(
+                "[GASP SYNC] Submitted {} finalized graph(s) for {topic} from {peer_url}",
+                finalized.len()
+            );
+        }
+        finalized.len() as u64
     }
 
     /// Discover peer overlay nodes for a topic via SHIP lookup.
@@ -3374,6 +3457,33 @@ pub(crate) async fn verify_spv_like_the_reference(
     }
 }
 
+/// The engine's [`crate::gasp::FinalizedGraphHook`] (bsv-low #552): submit
+/// what a peer's sync just finalized, before its next UTXO is asked for.
+struct SubmitAsFinalized<'e> {
+    engine: &'e Engine,
+    sink: crate::gasp_overlay::FinalizedGraphSink,
+    peer_url: &'e str,
+    topic: &'e str,
+    submitted: &'e std::cell::Cell<u64>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::gasp::FinalizedGraphHook for SubmitAsFinalized<'_> {
+    async fn graph_completed(&self) {
+        // Counted BEFORE the submits: a sync dropped inside them has
+        // finalized this graph (and left an ancestors-first prefix of it).
+        let pending = self
+            .sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len() as u64;
+        self.submitted.set(self.submitted.get() + pending);
+        self.engine
+            .submit_finalized_graphs(&self.sink, self.peer_url, self.topic)
+            .await;
+    }
+}
+
 /// Result of a GASP sync operation.
 ///
 /// Returned by `Engine::start_gasp_sync()` to summarize what happened.
@@ -3409,6 +3519,37 @@ pub struct TopicSyncResult {
     /// over this topic's peers. Not errors, and nothing of them was admitted.
     #[serde(default)]
     pub discarded_graphs: u64,
+    /// Graphs that passed the anchor check and were handed to submit, summed
+    /// over this topic's peers (bsv-low #552). Under a per-peer budget a
+    /// graph is counted, and submitted, the moment it finalizes, so the
+    /// count includes those of a peer the deadline then dropped.
+    #[serde(default)]
+    pub finalized_graphs: u64,
+    /// Graphs that were mid-walk when a peer's sync was dropped at its
+    /// budget (bsv-low #552): at most one per peer per sync. NOTHING of such
+    /// a graph was admitted; the next sync walks it again. The same root
+    /// counted tick after tick with no `finalized_graphs` and no
+    /// `cursor_moves` is ONE graph whose walk outlasts the budget.
+    #[serde(default)]
+    pub deadline_dropped_graphs: u64,
+    /// Every persisted cursor that moved in this sync (bsv-low #552), one
+    /// entry per peer. After a completed sync `to` is the peer's highest
+    /// score seen (less the gap guard); after a deadline it is
+    /// `GASPSync::completed_cursor`: past completed UTXOs only.
+    #[serde(default)]
+    pub cursor_moves: Vec<CursorMove>,
+}
+
+/// One peer's persisted `last_interaction` cursor moving `from` -> `to` in a
+/// sync ([`TopicSyncResult::cursor_moves`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorMove {
+    /// The peer URL.
+    pub peer: String,
+    /// The cursor the sync entered with.
+    pub from: u64,
+    /// The cursor it persisted.
+    pub to: u64,
 }
 
 /// Get current time in milliseconds (for output scores).
@@ -5138,6 +5279,9 @@ mod tests {
                 errors: vec![],
                 pruned_inputs: 0,
                 discarded_graphs: 0,
+                finalized_graphs: 0,
+                deadline_dropped_graphs: 0,
+                cursor_moves: Vec::new(),
             },
         );
 

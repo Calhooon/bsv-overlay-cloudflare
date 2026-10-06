@@ -229,9 +229,10 @@ pub trait AncestorFetcher {
     /// the already-known strip, and the manager naming nothing at genesis
     /// bound the walk. There is no node cap, matching the reference's undefined
     /// `maxNodesInGraph` in `Engine.startGASPSync`. A per-peer budget drops the
-    /// whole sync future, with nothing submitted outside the completed arm:
-    /// a chain deeper than the budget never bootstraps. Progress handling is
-    /// the filed follow-up.
+    /// sync future at its deadline: the graphs finalized before it stay
+    /// admitted (bsv-low #552, [`FinalizedGraphHook`]), the graph in flight
+    /// is lost whole and walked again by the next sync. ONE graph whose own
+    /// walk outlasts the budget still never completes.
     ///
     /// The implementation MUST verify that the returned bytes hash to the
     /// requested `txid` before returning them (integrity check) so a
@@ -373,6 +374,32 @@ pub struct FetchedAncestor {
 }
 
 // ============================================================================
+// FinalizedGraphHook (bsv-low #552)
+// ============================================================================
+
+/// Called by [`GASPSync::sync`] after EVERY incoming UTXO whose graph was
+/// completed (finalized, or refused by the anchor check and discarded), before
+/// the next UTXO is asked for.
+///
+/// The reference submits inside `finalizeGraph`, so a graph is admitted the
+/// moment it is finalized. Here `OverlayGASPStorage::finalize_graph` only
+/// pushes to a sink (it holds a `Storage`, not the engine), and the engine
+/// used to drain that sink after the WHOLE sync: a sync dropped at its
+/// per-peer budget admitted nothing. With a hook the engine drains the sink
+/// per graph, inside the raced future, so what was finalized before the
+/// deadline stays admitted and the next sync's known-UTXO skip and known-input
+/// strip resume from it.
+///
+/// The hook cannot fail the sync: a submit fault is the hook's to log. While
+/// it runs, [`GASPSync::completed_cursor`] still sits BELOW the UTXO just
+/// completed, so a sync dropped inside the hook asks for that UTXO again.
+#[async_trait(?Send)]
+pub trait FinalizedGraphHook {
+    /// One incoming UTXO's graph was completed; drain what it finalized.
+    async fn graph_completed(&self);
+}
+
+// ============================================================================
 // GASP orchestrator
 // ============================================================================
 
@@ -410,6 +437,13 @@ pub struct GASPSync<'a> {
     /// Graphs REFUSED by `validate_graph_anchor` and discarded in the last
     /// `sync` (bsv-low #551). Cleared at the start of each `sync`.
     discarded_graphs: std::cell::Cell<u64>,
+    /// Called after every completed incoming UTXO (bsv-low #552). `None`
+    /// (the default): nothing is called and `sync` runs as it always did.
+    finalized_hook: Option<Box<dyn FinalizedGraphHook + 'a>>,
+    /// See [`Self::completed_cursor`].
+    completed_cursor: u64,
+    /// See [`Self::graph_in_flight`].
+    graph_in_flight: bool,
 }
 
 impl<'a> GASPSync<'a> {
@@ -434,6 +468,49 @@ impl<'a> GASPSync<'a> {
             pruned: std::cell::RefCell::new(std::collections::HashSet::new()),
             pruned_inputs: std::cell::Cell::new(0),
             discarded_graphs: std::cell::Cell::new(0),
+            finalized_hook: None,
+            completed_cursor: last_interaction,
+            graph_in_flight: false,
+        }
+    }
+
+    /// Have `hook` called after every completed incoming UTXO (bsv-low #552,
+    /// see [`FinalizedGraphHook`]). Without one `sync` is unchanged.
+    #[must_use]
+    pub fn with_finalized_graph_hook(mut self, hook: Box<dyn FinalizedGraphHook + 'a>) -> Self {
+        self.finalized_hook = Some(hook);
+        self
+    }
+
+    /// The cursor that is safe to persist if `sync` stopped RIGHT NOW (its
+    /// future dropped at a deadline; bsv-low #552). It is the gap guard's
+    /// rule applied to unfinished work: strictly below the lowest score of
+    /// any UTXO of the current page not yet completed (the one in flight
+    /// included) and of any UTXO whose ingest failed, never below the cursor
+    /// the sync entered with. The remote serves `score >= since`, so the next
+    /// sync is served everything this one did not finish. After a completed
+    /// `sync` it equals `last_interaction`.
+    ///
+    /// `last_interaction` itself is NOT safe after a drop: it is raised to
+    /// each UTXO's score BEFORE that UTXO is ingested, for pagination.
+    pub fn completed_cursor(&self) -> u64 {
+        self.completed_cursor
+    }
+
+    /// Whether a graph was being fetched, walked or anchor-checked when `sync`
+    /// last stopped: `true` only after a `sync` future dropped mid-graph
+    /// (bsv-low #552). That graph's nodes died with the storage adapter;
+    /// nothing of it was finalized.
+    pub fn graph_in_flight(&self) -> bool {
+        self.graph_in_flight
+    }
+
+    /// `cursor` capped strictly below `lowest_unfinished`, floored at `floor`:
+    /// the gap guard's arithmetic, shared with [`Self::completed_cursor`].
+    fn capped_below(cursor: u64, lowest_unfinished: Option<u64>, floor: u64) -> u64 {
+        match lowest_unfinished {
+            Some(score) => cursor.min(score.saturating_sub(1).max(floor)),
+            None => cursor,
         }
     }
 
@@ -488,6 +565,8 @@ impl<'a> GASPSync<'a> {
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
         self.discarded_graphs.set(0);
+        self.completed_cursor = self.last_interaction;
+        self.graph_in_flight = false;
 
         // Track what we already know
         let local_utxos = self.storage.find_known_utxos(0, None).await?;
@@ -515,6 +594,10 @@ impl<'a> GASPSync<'a> {
         // Paginated pull from remote
         loop {
             let cursor_before_page = self.last_interaction;
+            // Every UTXO seen so far is completed or failed: were the sync
+            // dropped inside the page request below, this is what it did.
+            self.completed_cursor =
+                Self::capped_below(self.last_interaction, min_failed_score, initial_interaction);
             let request = GASPInitialRequest {
                 version: GASP_VERSION,
                 since: self.last_interaction,
@@ -528,7 +611,15 @@ impl<'a> GASPSync<'a> {
                 self.log_prefix, page_size, response.since
             );
 
-            for utxo in &response.utxo_list {
+            // lowest_ahead[i]: the lowest score among this page's UTXOs from
+            // i on, for `completed_cursor` (a page is not assumed sorted).
+            let mut lowest_ahead: Vec<u64> =
+                response.utxo_list.iter().map(|u| u.score as u64).collect();
+            for i in (0..lowest_ahead.len().saturating_sub(1)).rev() {
+                lowest_ahead[i] = lowest_ahead[i].min(lowest_ahead[i + 1]);
+            }
+
+            for (position, utxo) in response.utxo_list.iter().enumerate() {
                 // Track highest score for pagination
                 if utxo.score as u64 > self.last_interaction {
                     self.last_interaction = utxo.score as u64;
@@ -540,8 +631,21 @@ impl<'a> GASPSync<'a> {
                     known_outpoints.remove(&outpoint);
                 } else if !shared_outpoints.contains(&outpoint) {
                     // New UTXO — request and ingest the graph
-                    match self.ingest_utxo(utxo, &outpoint).await {
+                    let lowest_unfinished = min_failed_score
+                        .map_or(lowest_ahead[position], |f| f.min(lowest_ahead[position]));
+                    self.completed_cursor = Self::capped_below(
+                        self.last_interaction,
+                        Some(lowest_unfinished),
+                        initial_interaction,
+                    );
+                    self.graph_in_flight = true;
+                    let ingested = self.ingest_utxo(utxo, &outpoint).await;
+                    self.graph_in_flight = false;
+                    match ingested {
                         Ok(()) => {
+                            if let Some(hook) = &self.finalized_hook {
+                                hook.graph_completed().await;
+                            }
                             shared_outpoints.insert(outpoint);
                         }
                         Err(e) => {
@@ -600,6 +704,7 @@ impl<'a> GASPSync<'a> {
                 self.last_interaction = cap;
             }
         }
+        self.completed_cursor = self.last_interaction;
 
         // Bidirectional: push our UTXOs to remote
         if !self.unidirectional {
@@ -809,10 +914,11 @@ impl<'a> GASPSync<'a> {
                             // manager naming nothing at genesis bound the walk.
                             // There is no node cap, matching the reference's
                             // undefined `maxNodesInGraph` in `Engine.startGASPSync`.
-                            // A per-peer budget drops the whole sync future, with
-                            // nothing submitted outside the completed arm, so a
-                            // chain deeper than the budget never bootstraps.
-                            // Progress handling is the filed follow-up.
+                            // A per-peer budget drops the sync future at its
+                            // deadline: graphs finalized before it stay admitted
+                            // (bsv-low #552), the graph in flight is lost whole,
+                            // and ONE graph whose own walk outlasts the budget
+                            // still never completes.
                             //
                             // Every fetcher error fails the UTXO (the `?`):
                             // the fetcher arm never prunes, see the rule above.

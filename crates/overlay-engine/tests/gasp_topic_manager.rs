@@ -2354,3 +2354,608 @@ async fn i551_j_an_unproven_tip_over_a_held_coin_is_executed_against_the_stored_
         );
     }
 }
+
+// ============================================================================
+// bsv-low #552: progress under the per-peer sync budget. With a budget set the
+// engine submits each graph AS IT FINALIZES, inside the raced future, so the
+// deadline cannot take back what was finalized before it; at the deadline the
+// cursor moves past the COMPLETED UTXOs only.
+// ============================================================================
+
+use std::cell::Cell;
+
+const PEER: &str = "mock://head-chain";
+
+// A clock that counts REQUESTS: every request to the peer costs one unit and
+// a tick may spend `allowance` of them. The request that overspends never
+// answers and the deadline is due from that moment, so `race_or_deadline`
+// drops the sync exactly there, on every run (a wall-clock sleep per request
+// would pin the same thing with a race in it).
+#[derive(Clone)]
+struct RequestClock {
+    spent: Rc<Cell<u64>>,
+    allowance: Rc<Cell<u64>>,
+}
+
+impl RequestClock {
+    fn allowing(allowance: u64) -> Self {
+        Self {
+            spent: Rc::new(Cell::new(0)),
+            allowance: Rc::new(Cell::new(allowance)),
+        }
+    }
+
+    async fn spend(&self) {
+        self.spent.set(self.spent.get() + 1);
+        if self.spent.get() > self.allowance.get() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // The engine asks for one deadline per peer sync: a new tick's budget.
+    fn budget(&self) -> bsv_overlay_engine::engine::SleepFactory {
+        let clock = self.clone();
+        Rc::new(move |_ms| {
+            clock.spent.set(0);
+            let clock = clock.clone();
+            Box::pin(std::future::poll_fn(move |_| {
+                if clock.spent.get() > clock.allowance.get() {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
+        })
+    }
+}
+
+// The recording peer behind the clock. A request is recorded when it is SENT,
+// so the one in flight at the deadline is in the list.
+#[derive(Clone)]
+struct MeteredRemote {
+    inner: RecordingRemote,
+    clock: RequestClock,
+}
+
+impl GASPRemoteFactory for MeteredRemote {
+    fn create_remote(&self, _peer_url: &str, topic: &str) -> Box<dyn GASPRemote> {
+        assert_eq!(topic, TOPIC);
+        Box::new(self.clone())
+    }
+}
+
+#[async_trait(?Send)]
+impl GASPRemote for MeteredRemote {
+    async fn get_initial_response(
+        &self,
+        request: &GASPInitialRequest,
+    ) -> Result<GASPInitialResponse, GASPError> {
+        let answer = self.inner.get_initial_response(request).await;
+        self.clock.spend().await;
+        answer
+    }
+
+    async fn get_initial_reply(
+        &self,
+        response: &GASPInitialResponse,
+    ) -> Result<GASPInitialReply, GASPError> {
+        self.inner.get_initial_reply(response).await
+    }
+
+    async fn request_node(
+        &self,
+        graph_id: &str,
+        txid: &str,
+        output_index: u32,
+        metadata: bool,
+    ) -> Result<GASPNode, GASPError> {
+        let answer = self
+            .inner
+            .request_node(graph_id, txid, output_index, metadata)
+            .await;
+        self.clock.spend().await;
+        answer
+    }
+
+    async fn submit_node(&self, node: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+        self.inner.submit_node(node).await
+    }
+}
+
+fn plain_output() -> TransactionOutput {
+    TransactionOutput::new(
+        1000,
+        LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+    )
+}
+
+// A proven head chain (output 0 is the head, spent by the next link) whose
+// links listed in `records` also carry a RECORD at output 1 that nobody
+// spends. An honest peer lists every record and the tip's head as UTXOs, so
+// the chain reaches the syncing node as several graphs, oldest first.
+fn recorded_chain(length: usize, records: &[usize]) -> Vec<GASPNode> {
+    let mut nodes = Vec::new();
+    let mut previous = None;
+    for height in 0..length {
+        let mut tx = Transaction::new();
+        if let Some(txid) = previous {
+            tx.inputs.push(TransactionInput::new(txid, 0));
+        }
+        tx.outputs.push(plain_output());
+        if records.contains(&height) {
+            tx.outputs.push(plain_output());
+        }
+        let txid = tx.id();
+        nodes.push(node_of(
+            &tx,
+            0,
+            Some(honest_proof(&txid, 100 + height as u32)),
+        ));
+        previous = Some(txid);
+    }
+    nodes
+}
+
+// The peer's UTXO list, in score order: (index into `nodes`, output index).
+fn listing(nodes: &[GASPNode], utxos: &[(usize, u32)]) -> RecordingRemote {
+    let mut remote = RecordingRemote::new(nodes, &[]);
+    remote.utxos = utxos
+        .iter()
+        .enumerate()
+        .map(|(score, &(i, output_index))| GASPOutput {
+            txid: node_txid(&nodes[i]),
+            output_index,
+            score: (score + 1) as f64,
+        })
+        .collect();
+    remote
+}
+
+// Admits every output of a genesis, and of a transaction whose input 0 spends
+// a HEAD (output 0) that is a previous coin; names input 0 as history. A
+// transaction that spends a record does not extend the head.
+struct RecordedHeadManager(Rc<RefCell<HeadState>>);
+
+#[async_trait(?Send)]
+impl TopicManager for RecordedHeadManager {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous_coins: &[u8],
+        _off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        let extends_head = previous_coins
+            .chunks_exact(4)
+            .any(|index| u32::from_le_bytes(index.try_into().unwrap()) == 0)
+            && tx.inputs[0].source_output_index == 0;
+        if !tx.inputs.is_empty() && !extends_head {
+            return Ok(AdmittanceInstructions::default());
+        }
+        if mode == SubmitMode::HistoricalTxNoSpv {
+            self.0.borrow_mut().admitted.push(tx.id());
+        }
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: (0..tx.outputs.len() as u32).collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        _off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        let tx = Transaction::from_beef(beef, None).unwrap();
+        Ok(tx
+            .inputs
+            .first()
+            .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
+            .into_iter()
+            .collect())
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// One engine that syncs the same peer tick after tick under a request budget.
+struct Budgeted {
+    engine: Engine,
+    store: Rc<MemoryStorage>,
+    requests: Requests,
+    clock: RequestClock,
+}
+
+impl Budgeted {
+    fn new(remote: RecordingRemote, manager: Box<dyn TopicManager>, allowance: u64) -> Self {
+        let store = Rc::new(MemoryStorage::new());
+        let requests = remote.requests.clone();
+        let clock = RequestClock::allowing(allowance);
+        let mut engine = Engine::new(
+            HashMap::from([(TOPIC.to_string(), manager)]),
+            HashMap::new(),
+            Box::new(store.clone()),
+            None,
+            EngineConfig {
+                sync_configuration: HashMap::from([(
+                    TOPIC.to_string(),
+                    SyncTarget::Peers(vec![PEER.to_string()]),
+                )]),
+                ..Default::default()
+            },
+        );
+        engine.set_gasp_remote_factory(Box::new(MeteredRemote {
+            inner: remote,
+            clock: clock.clone(),
+        }));
+        engine.set_peer_sync_budget(clock.budget(), 1);
+        Self {
+            engine,
+            store,
+            requests,
+            clock,
+        }
+    }
+
+    // One tick: the topic's result and the node requests this tick SENT.
+    async fn tick(&self) -> (bsv_overlay_engine::engine::TopicSyncResult, Vec<String>) {
+        self.requests.borrow_mut().clear();
+        let result = self.engine.start_gasp_sync().await.unwrap();
+        let sent = self.requests.borrow().iter().map(|r| r.0.clone()).collect();
+        (result.topics_synced[TOPIC].clone(), sent)
+    }
+
+    async fn cursor(&self) -> u64 {
+        self.store.get_last_interaction(PEER, TOPIC).await.unwrap()
+    }
+
+    async fn failures(&self) -> u64 {
+        self.store
+            .get_peer_sync_health(PEER, TOPIC)
+            .await
+            .unwrap()
+            .consecutive_failures
+    }
+}
+
+fn moved(from: u64, to: u64) -> Vec<bsv_overlay_engine::engine::CursorMove> {
+    vec![bsv_overlay_engine::engine::CursorMove {
+        peer: PEER.to_string(),
+        from,
+        to,
+    }]
+}
+
+fn txids(nodes: &[GASPNode], indices: &[usize]) -> Vec<String> {
+    indices.iter().map(|&i| node_txid(&nodes[i])).collect()
+}
+
+// PINS A, B and E. Nine head transactions with a record at heights 2 and 5:
+// three graphs of three requests each (ten requests to sync the chain, with
+// the list). The tick may spend FIVE. On the base the deadline dropped every
+// tick whole and nothing was ever admitted.
+#[tokio::test]
+async fn i552_a_b_e_a_chain_deeper_than_the_budget_bootstraps_over_three_ticks() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = recorded_chain(9, &[2, 5]);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let node = Budgeted::new(
+        listing(&nodes, &[(2, 1), (5, 1), (8, 0)]),
+        Box::new(RecordedHeadManager(state.clone())),
+        5,
+    );
+
+    // TICK 1: the list, the first graph (2, 1, 0), then the second graph is
+    // dropped with one node fetched and the next request in flight.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1, 0, 5, 4]));
+    assert_eq!(
+        state.borrow().admitted,
+        txids(&nodes, &[0, 1, 2]),
+        "PIN A: the finalized graph survives the deadline, oldest first"
+    );
+    assert_eq!(
+        utxo_txids(&node.store).await.len(),
+        2,
+        "PIN B: head 2 and record 2, nothing of the dropped graph (5, 4)"
+    );
+    // PIN E: the counts of a dropped tick.
+    assert_eq!(
+        (topic.finalized_graphs, topic.deadline_dropped_graphs),
+        (1, 1)
+    );
+    assert_eq!(topic.cursor_moves, moved(0, 1));
+    assert_eq!(topic.errors.len(), 1, "the deadline is still an error");
+    assert_eq!(
+        node.cursor().await,
+        1,
+        "past the completed UTXO, not the one in flight"
+    );
+    assert_eq!(
+        node.failures().await,
+        0,
+        "a tick with progress is not a failed attempt"
+    );
+
+    // TICK 2 resumes from the admitted frontier: the first record is known
+    // (not asked for), and the second graph's walk stops at head 2, which the
+    // storage holds. Nodes 0, 1, 2 are never requested again.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(
+        sent,
+        txids(&nodes, &[5, 4, 3, 8, 7]),
+        "PIN B: no admitted ancestor is fetched again; 5 and 4 are (the dropped graph)"
+    );
+    assert_eq!(state.borrow().admitted, txids(&nodes, &[0, 1, 2, 3, 4, 5]));
+    assert_eq!(
+        (topic.finalized_graphs, topic.deadline_dropped_graphs),
+        (1, 1)
+    );
+    assert_eq!(topic.cursor_moves, moved(1, 2));
+    assert_eq!(node.cursor().await, 2);
+
+    // TICK 3 completes: the third graph, then the page that does not advance.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[8, 7, 6]));
+    assert_eq!(
+        state.borrow().admitted,
+        txids(&nodes, &(0..9).collect::<Vec<_>>()),
+        "PIN A: the whole chain, oldest first, each transaction once"
+    );
+    assert_eq!(
+        (topic.finalized_graphs, topic.deadline_dropped_graphs),
+        (1, 0)
+    );
+    assert_eq!(topic.cursor_moves, moved(2, 3));
+    assert!(topic.errors.is_empty());
+    assert_eq!(node.cursor().await, 3);
+    // Head 8 and the records of 2 and 5.
+    let mut expected = txids(&nodes, &[2, 5, 8]);
+    expected.sort();
+    assert_eq!(utxo_txids(&node.store).await, expected);
+
+    // TICK 4: nothing left to do, nothing asked for, nothing moves.
+    let (topic, sent) = node.tick().await;
+    assert!(sent.is_empty());
+    assert_eq!(
+        (topic.finalized_graphs, topic.deadline_dropped_graphs),
+        (0, 0)
+    );
+    assert!(topic.cursor_moves.is_empty() && topic.errors.is_empty());
+    assert_eq!(state.borrow().admitted.len(), 9);
+    println!(
+        "#552 PINS A/B/E: 9 transactions, budget 5 requests: admitted 3, 6, 9 over 3 ticks; \
+         cursor 0->1->2->3; requests 5+5+3=13 against 9 unbudgeted (2 nodes fetched twice per dropped graph)"
+    );
+}
+
+// PIN C. With NO budget the engine runs as it did: the E1 head chain and the
+// D8 decoy chain make the same requests, leave the same cursor and admit the
+// byte-for-byte set frozen on 39081dd (`I551_C_*_BASE_DIGEST`); the managers
+// that name nothing walk as the manager-less adapter does and admit nothing.
+// A budget that is never reached changes none of it.
+#[tokio::test]
+async fn i552_c_without_a_budget_nothing_changes_and_an_unreached_budget_changes_nothing() {
+    let (_logs, _guard) = capture_logs();
+    let decoy = decoy_outpoint(0xd0);
+    let head_nodes = chain(5);
+    let decoy_nodes = decoy_chain(5, &[(4, decoy.clone())]);
+    let shapes: [(&str, &[GASPNode], &str, u64); 2] = [
+        ("head", &head_nodes, I551_C_HEAD_BASE_DIGEST, 0),
+        ("decoy", &decoy_nodes, I551_C_DECOY_BASE_DIGEST, 1),
+    ];
+    for (name, nodes, digest, pruned) in shapes {
+        let manager = |state: &Rc<RefCell<HeadState>>| -> Box<dyn TopicManager> {
+            if name == "head" {
+                Box::new(HeadChainManager(state.clone()))
+            } else {
+                Box::new(DecoyHeadManager(state.clone()))
+            }
+        };
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let plain = engine_sync(
+            RecordingRemote::new(nodes, &[4]),
+            manager(&state),
+            Rc::new(MemoryStorage::new()),
+            None,
+        )
+        .await;
+        let (_, walked) = split_requests(&plain.requests, &decoy);
+        assert_eq!(walked, tip_to_genesis(nodes), "{name}: requests");
+        assert_eq!(plain.requests.len() as u64, 5 + pruned, "{name}");
+        assert_eq!(
+            plain.digest, digest,
+            "{name}: the admitted set, byte for byte"
+        );
+        assert_eq!(
+            state.borrow().admitted,
+            nodes.iter().map(node_txid).collect::<Vec<_>>()
+        );
+        let topic = &plain.result.topics_synced[TOPIC];
+        assert_eq!(
+            plain.store.get_last_interaction(PEER, TOPIC).await.unwrap(),
+            1
+        );
+        assert_eq!(topic.cursor_moves, moved(0, 1), "{name}");
+        assert_eq!(
+            (
+                topic.finalized_graphs,
+                topic.deadline_dropped_graphs,
+                topic.pruned_inputs
+            ),
+            (1, 0, pruned),
+            "{name}"
+        );
+
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let budgeted = Budgeted::new(RecordingRemote::new(nodes, &[4]), manager(&state), u64::MAX);
+        let (topic, _) = budgeted.tick().await;
+        // Where the decoy falls among its parent's requests is a map order.
+        let (decoys, walked) = split_requests(&budgeted.requests.borrow(), &decoy);
+        assert_eq!(walked, tip_to_genesis(nodes), "{name}: budgeted requests");
+        assert_eq!(decoys as u64, pruned, "{name}");
+        assert_eq!(admitted_digest(&budgeted.store).await, digest, "{name}");
+        assert_eq!(budgeted.cursor().await, 1, "{name}");
+        assert_eq!(topic.cursor_moves, moved(0, 1), "{name}");
+        assert_eq!(
+            (topic.finalized_graphs, topic.deadline_dropped_graphs),
+            (1, 0)
+        );
+        assert!(topic.errors.is_empty());
+    }
+
+    let mut walks = 0;
+    for unproven_from in [3, 1] {
+        let nodes = scripted_chain(3, "51", unproven_from);
+        let (baseline, _, _) = synchronize(&nodes, &[2], None, &MemoryStorage::new(), None).await;
+        for index in 0..workspace_managers().len() {
+            let mut managers = workspace_managers();
+            let (name, manager) = managers.swap_remove(index);
+            let plain = engine_sync(
+                RecordingRemote::new(&nodes, &[2]),
+                manager,
+                Rc::new(MemoryStorage::new()),
+                None,
+            )
+            .await;
+            assert_eq!(plain.requests, baseline, "{name}: requests");
+            assert!(utxo_txids(&plain.store).await.is_empty(), "{name}");
+            assert_eq!(
+                plain.store.get_last_interaction(PEER, TOPIC).await.unwrap(),
+                1
+            );
+            let topic = &plain.result.topics_synced[TOPIC];
+            assert_eq!(
+                (
+                    topic.discarded_graphs,
+                    topic.finalized_graphs,
+                    topic.deadline_dropped_graphs
+                ),
+                (1, 0, 0),
+                "{name}"
+            );
+
+            let mut managers = workspace_managers();
+            let (_, manager) = managers.swap_remove(index);
+            let budgeted = Budgeted::new(RecordingRemote::new(&nodes, &[2]), manager, u64::MAX);
+            let (topic, _) = budgeted.tick().await;
+            assert_eq!(*budgeted.requests.borrow(), baseline, "{name}: budgeted");
+            assert!(utxo_txids(&budgeted.store).await.is_empty(), "{name}");
+            assert_eq!(budgeted.cursor().await, 1, "{name}");
+            assert_eq!((topic.discarded_graphs, topic.finalized_graphs), (1, 0));
+            walks += 2;
+        }
+    }
+    println!(
+        "#552 PIN C: head and decoy digests equal the base's with and without a budget; \
+         {walks} walks of managers naming nothing identical"
+    );
+}
+
+// PIN D. The anchor check runs for each graph as it finalizes. The first UTXO
+// the peer lists is X, which spends the RECORD of head 2: its graph (X, 2, 1,
+// 0) replays three good heads and then a root the manager refuses. It is
+// discarded whole BEFORE the tip's graph is asked for: the three good heads
+// behind it are not admitted through it.
+#[tokio::test]
+async fn i552_d_a_refused_ancestor_graph_admits_nothing_under_the_incremental_submit() {
+    let (_logs, _guard) = capture_logs();
+    let mut nodes = recorded_chain(6, &[2]);
+    let mut x = Transaction::new();
+    x.inputs
+        .push(TransactionInput::new(node_txid(&nodes[2]), 1));
+    x.outputs.push(plain_output());
+    nodes.push(node_of(&x, 0, Some(honest_proof(&x.id(), 200))));
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let node = Budgeted::new(
+        listing(&nodes, &[(6, 0), (5, 0)]),
+        Box::new(RecordedHeadManager(state.clone())),
+        5,
+    );
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(
+        sent,
+        txids(&nodes, &[6, 2, 1, 0, 5]),
+        "X's graph is walked and judged before the tip is asked for"
+    );
+    assert!(
+        state.borrow().admitted.is_empty(),
+        "nothing of it is admitted"
+    );
+    assert!(utxo_txids(&node.store).await.is_empty());
+    assert_eq!(
+        (
+            topic.discarded_graphs,
+            topic.finalized_graphs,
+            topic.deadline_dropped_graphs
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        topic.cursor_moves,
+        moved(0, 1),
+        "a refused graph is completed work, as in the reference"
+    );
+
+    // With room, the next tick admits the six heads through the TIP's graph.
+    // X is served again at the cursor's own score and refused again.
+    node.clock.allowance.set(u64::MAX);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[6, 2, 1, 0, 5, 4, 3, 2, 1, 0]));
+    assert_eq!(
+        state.borrow().admitted,
+        txids(&nodes, &[0, 1, 2, 3, 4, 5]),
+        "X is never admitted"
+    );
+    assert_eq!((topic.discarded_graphs, topic.finalized_graphs), (1, 1));
+    assert_eq!(topic.cursor_moves, moved(1, 2));
+    println!("#552 PIN D: refused graph of 4 discarded before the tip, 0 admitted; then 6 admitted, X never");
+}
+
+// PIN F, the limit that remains. ONE graph whose own walk outlasts the budget
+// (a head chain with no record: the tip is the only UTXO) is dropped whole on
+// every tick: nothing is admitted, the cursor does not move, each tick is a
+// failed attempt and it is counted. Nothing bounds a graph (parity), and
+// nothing of a dropped graph may be admitted, so only a larger budget ends it.
+#[tokio::test]
+async fn i552_f_one_graph_deeper_than_the_budget_is_dropped_whole_every_tick() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        5,
+    );
+    for tick in 1..=3u64 {
+        let (topic, sent) = node.tick().await;
+        assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]), "the same five again");
+        assert_eq!(
+            (topic.finalized_graphs, topic.deadline_dropped_graphs),
+            (0, 1)
+        );
+        assert!(topic.cursor_moves.is_empty());
+        assert!(state.borrow().admitted.is_empty());
+        assert!(utxo_txids(&node.store).await.is_empty());
+        assert_eq!(node.cursor().await, 0);
+        assert_eq!(node.failures().await, tick, "no progress: a failed attempt");
+    }
+    // The list, eight nodes, and the page that does not advance.
+    node.clock.allowance.set(10);
+    let (topic, _) = node.tick().await;
+    assert_eq!(state.borrow().admitted.len(), 8);
+    assert_eq!(
+        (topic.finalized_graphs, topic.deadline_dropped_graphs),
+        (1, 0)
+    );
+    assert!(topic.errors.is_empty());
+    assert_eq!(node.failures().await, 0);
+    println!("#552 PIN F: one graph of 8 under a budget of 5: 3 ticks, 15 requests, 0 admitted; budget 10 admits 8");
+}
