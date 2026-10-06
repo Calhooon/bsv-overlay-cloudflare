@@ -51,6 +51,101 @@ where
     .await
 }
 
+/// What makes a deadline COOPERATIVE around a write (bsv-low #552, the lens
+/// fold's HIGH-1). `Engine::submit` is several storage writes (mark spent,
+/// delete the stale coin, insert the outputs, notify, record applied), each
+/// an await on D1, and a future dropped between two of them leaves a head
+/// chain with NO head: the old one deleted, the new one never inserted, and
+/// no applied row to say so.
+///
+/// The writer opens a [`WriteSection`] around ONE transaction's submit and
+/// asks [`SubmitGate::stop_if_due`] between two of them.
+/// [`race_or_deadline_guarded`] does not drop its future while a section is
+/// open: it notes the deadline as due and keeps polling until the section
+/// closes, so the wait is bounded by the writes of one transaction. What the
+/// deadline leaves is then a prefix of whole transactions, never part of one.
+#[derive(Debug, Default)]
+pub struct SubmitGate {
+    writing: std::cell::Cell<u32>,
+    due: std::cell::Cell<bool>,
+}
+
+impl SubmitGate {
+    /// Open a section no guarded race may drop. Closed when the returned
+    /// value is dropped.
+    pub fn write_section(&self) -> WriteSection<'_> {
+        self.writing.set(self.writing.get() + 1);
+        WriteSection(self)
+    }
+
+    /// Whether a guarded race's deadline fell due while a section was open:
+    /// the race is waiting for the writer to stop.
+    pub fn deadline_is_due(&self) -> bool {
+        self.due.get()
+    }
+
+    /// The writer's question at a transaction boundary, with NO section open.
+    /// If a deadline is due this never returns: it hands the future back to
+    /// the race, which drops it on this very poll (only a guarded race sets
+    /// the flag, and it clears it when it ends).
+    pub async fn stop_if_due(&self) {
+        if self.due.get() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// An open write section of a [`SubmitGate`].
+#[must_use = "the section closes when this is dropped"]
+pub struct WriteSection<'g>(&'g SubmitGate);
+
+impl Drop for WriteSection<'_> {
+    fn drop(&mut self) {
+        self.0.writing.set(self.0.writing.get().saturating_sub(1));
+    }
+}
+
+/// [`race_or_deadline`] that never drops `fut` inside a [`WriteSection`] of
+/// `gate`. A deadline that falls due while a section is open is remembered
+/// (and shown to the writer, [`SubmitGate::deadline_is_due`]); `fut` is
+/// polled on, by its own wakers, and dropped at its first pending point
+/// outside a section. `None` then means what it meant: the deadline won.
+pub async fn race_or_deadline_guarded<F, D, T>(fut: F, deadline: D, gate: &SubmitGate) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+    D: std::future::Future<Output = ()>,
+{
+    // The flag never outlives the race that set it, however the race ends
+    // (an outer drop included): a stale one would park the next writer.
+    struct ClearDue<'g>(&'g SubmitGate);
+    impl Drop for ClearDue<'_> {
+        fn drop(&mut self) {
+            self.0.due.set(false);
+        }
+    }
+    let _clear = ClearDue(gate);
+    let mut fut = std::pin::pin!(fut);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut due = false;
+    std::future::poll_fn(move |cx| {
+        if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(v));
+        }
+        if !due && deadline.as_mut().poll(cx).is_ready() {
+            due = true;
+        }
+        if due {
+            if gate.writing.get() == 0 {
+                return std::task::Poll::Ready(None);
+            }
+            // `fut` is parked inside a write: its own waker brings us back.
+            gate.due.set(true);
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// Consecutive all-failure syncs after which a peer is QUARANTINED
 /// (bsv-low#302). At the production `*/15` cron cadence 8 consecutive
 /// failures ≈ 2 hours of unbroken unreachability — comfortably past any
@@ -390,13 +485,16 @@ pub struct FetchedAncestor {
 /// deadline stays admitted and the next sync's known-UTXO skip and known-input
 /// strip resume from it.
 ///
-/// The hook cannot fail the sync: a submit fault is the hook's to log. While
-/// it runs, [`GASPSync::completed_cursor`] still sits BELOW the UTXO just
-/// completed, so a sync dropped inside the hook asks for that UTXO again.
+/// An `Err` FAILS THAT UTXO, exactly as a failed ingest does: the gap guard
+/// keeps the cursor below it and the next sync asks for it again. The engine
+/// answers `Err` when a finalize submit did not land (the lens fold's
+/// MEDIUM-1). It cannot fail the sync. While the hook runs,
+/// [`GASPSync::completed_cursor`] still sits BELOW the UTXO just completed,
+/// so a sync dropped inside the hook asks for that UTXO again.
 #[async_trait(?Send)]
 pub trait FinalizedGraphHook {
     /// One incoming UTXO's graph was completed; drain what it finalized.
-    async fn graph_completed(&self);
+    async fn graph_completed(&self) -> Result<(), GASPError>;
 }
 
 // ============================================================================
@@ -520,8 +618,9 @@ impl<'a> GASPSync<'a> {
     /// #551). Nothing of a discarded graph is finalized. As in the reference
     /// a refused graph is not a failed UTXO: the cursor advances past it. A
     /// graph whose anchor could not be CHECKED
-    /// (`GASPError::AnchorUnavailable`) is not counted here: that one fails
-    /// its UTXO and is asked for again.
+    /// (`GASPError::AnchorUnavailable`: a tracker or storage fault, a topic
+    /// manager error in the replay) is not counted here: that one fails its
+    /// UTXO and is asked for again.
     pub fn discarded_graphs(&self) -> u64 {
         self.discarded_graphs.get()
     }
@@ -639,13 +738,15 @@ impl<'a> GASPSync<'a> {
                         initial_interaction,
                     );
                     self.graph_in_flight = true;
-                    let ingested = self.ingest_utxo(utxo, &outpoint).await;
+                    let mut ingested = self.ingest_utxo(utxo, &outpoint).await;
                     self.graph_in_flight = false;
+                    if ingested.is_ok() {
+                        if let Some(hook) = &self.finalized_hook {
+                            ingested = hook.graph_completed().await;
+                        }
+                    }
                     match ingested {
                         Ok(()) => {
-                            if let Some(hook) = &self.finalized_hook {
-                                hook.graph_completed().await;
-                            }
                             shared_outpoints.insert(outpoint);
                         }
                         Err(e) => {
@@ -1028,7 +1129,8 @@ impl<'a> GASPSync<'a> {
                 );
                 self.storage.discard_graph(graph_id).await?;
                 // The anchor could not be checked (a tracker outage, a
-                // storage fault): no verdict. Fail the UTXO so the gap guard
+                // storage fault, a topic manager that answered the replay
+                // with an error): no verdict. Fail the UTXO so the gap guard
                 // re-requests it, instead of advancing the cursor past a
                 // graph nobody judged (a divergence by addition, bsv-low
                 // #551: the reference discards and moves on either way).
@@ -1084,8 +1186,8 @@ pub enum GASPError {
     StorageError(String),
 
     /// A graph's anchor could not be CHECKED right now (the chain tracker or
-    /// a storage read faulted): a fault of the moment, not a verdict on the
-    /// graph. `GASPSync::complete_graph` discards the graph and fails the
+    /// a storage read faulted, or the topic manager answered the replay with
+    /// an error): a fault of the moment, not a verdict on the graph. `GASPSync::complete_graph` discards the graph and fails the
     /// UTXO, so the cursor gap guard asks for it again (bsv-low #551).
     #[error("anchor unavailable: {0}")]
     AnchorUnavailable(String),
@@ -1117,6 +1219,56 @@ mod tests {
     async fn race_or_deadline_deadline_wins() {
         let out = race_or_deadline(std::future::pending::<u32>(), async {}).await;
         assert_eq!(out, None);
+    }
+
+    // The lens fold's HIGH-1: a deadline that falls due inside a write
+    // section waits for the section to close, then drops the future at its
+    // next pending point; the writer that asks at the boundary stops there.
+    #[tokio::test]
+    async fn guarded_race_never_drops_inside_a_write_section() {
+        let gate = SubmitGate::default();
+        let written = std::cell::Cell::new(0u32);
+        let out = race_or_deadline_guarded(
+            async {
+                for _ in 0..3 {
+                    gate.stop_if_due().await;
+                    let _section = gate.write_section();
+                    // Two writes of one transaction, each a round trip.
+                    tokio::task::yield_now().await;
+                    written.set(written.get() + 1);
+                    tokio::task::yield_now().await;
+                    written.set(written.get() + 1);
+                }
+            },
+            async {},
+            &gate,
+        )
+        .await;
+        assert_eq!(out, None, "the deadline still wins");
+        assert_eq!(written.get(), 2, "one transaction, whole, and no second");
+        assert!(
+            !gate.deadline_is_due(),
+            "the flag does not outlive the race"
+        );
+
+        // With no section open it is `race_or_deadline`.
+        let out = race_or_deadline_guarded(std::future::pending::<u8>(), async {}, &gate).await;
+        assert_eq!(out, None);
+        let out = race_or_deadline_guarded(async { 7u8 }, std::future::pending(), &gate).await;
+        assert_eq!(out, Some(7));
+        // A future that finishes inside its section after the deadline wins.
+        let out = race_or_deadline_guarded(
+            async {
+                let _section = gate.write_section();
+                tokio::task::yield_now().await;
+                7u8
+            },
+            async {},
+            &gate,
+        )
+        .await;
+        assert_eq!(out, Some(7));
+        assert!(!gate.deadline_is_due());
     }
 
     #[tokio::test]

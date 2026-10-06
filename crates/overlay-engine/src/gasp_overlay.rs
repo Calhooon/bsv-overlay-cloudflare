@@ -8,9 +8,10 @@
 //!
 //! When a graph is finalized, the nodes are converted into ordered BEEF byte
 //! arrays (ancestors first, root last) and stored in a shared
-//! `FinalizedGraphSink`. After `GASPSync::sync()` returns, the caller (Engine)
-//! drains the sink and submits each BEEF to `Engine::submit()` with
-//! `HistoricalTxNoSpv` mode.
+//! `FinalizedGraphSink`. The caller (Engine) drains the sink and submits each
+//! BEEF to `Engine::submit()` with `HistoricalTxNoSpv` mode: after
+//! `GASPSync::sync()` returns, or, under a per-peer sync budget, after every
+//! completed UTXO (`gasp::FinalizedGraphHook`, bsv-low #552).
 //!
 //! ## find_needed_inputs
 //!
@@ -768,9 +769,9 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// end, the graph is refused. The set only GROWS, as in the reference at
     /// f999e0c1a: it reads `outputsToAdmit` alone, never `coinsToRetain`, and
     /// removes nothing ("a Set of all historical coins to retain (no need to
-    /// remove them)"). The reference passes `{ dryRun: true }`; the managers
-    /// of this workspace are pure (they evaluate what they are shown and
-    /// write nothing), so the trait needs no flag for it (D13).
+    /// remove them)"). The reference passes `{ dryRun: true }` and so does
+    /// this replay (`TopicAdmittanceContext::DRY_RUN`): a manager that writes
+    /// on admission writes nothing here.
     ///
     /// WITHOUT a topic manager step 2 does not run: there is nothing to
     /// replay, and `Engine::submit` refuses such a topic (`UnsupportedTopic`),
@@ -808,6 +809,17 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     ///   still discarded, but `complete_graph` FAILS the UTXO so the cursor
     ///   gap guard asks for it again. The reference discards and moves on,
     ///   which here would lose the UTXO for good behind an advanced cursor.
+    /// - *A manager error in the replay is "not now", not a refusal.* The
+    ///   replay is where a manager is shown the coins, so it is where one
+    ///   whose own state lags can say it cannot place a transaction YET. An
+    ///   `Err` from it is `GASPError::AnchorUnavailable` too: the UTXO fails
+    ///   and is asked for again. `Ok` with nothing admitted stays the final
+    ///   refusal, and there the cursor moves, as in the reference (which
+    ///   moves it past a refused and a failed graph alike, `GASP.ts` 389 to
+    ///   392, 419 to 423, 559 to 572, `Engine.ts` 1600 to 1604). The cost: a
+    ///   manager that errors FOREVER on one UTXO holds that peer's cursor
+    ///   below it, and what lies above and is not yet held is walked again
+    ///   on every tick.
     ///
     /// **Cost.** Step 1 runs the script of every input of every unproven
     /// transaction in the root's BEEF and asks the tracker once per merkle
@@ -931,6 +943,8 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             }
             // TS passes { dryRun: true }: the replay only asks, the finalize
             // submit is the admission.
+            // An `Err` is the manager's "not now" (a fault of the moment, see
+            // the divergences above); `Ok` with nothing is its refusal.
             let admittance = manager
                 .identify_admissible_outputs(
                     &tx,
@@ -940,7 +954,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     &AdmissionOptions::DRY_RUN,
                 )
                 .await
-                .map_err(|e| refused(format!("the topic manager failed on {txid}: {e}")))?;
+                .map_err(|e| unavailable(format!("the topic manager failed on {txid}: {e}")))?;
             for output_index in admittance.outputs_to_admit {
                 coins.insert(format!("{txid}.{output_index}"));
             }
@@ -959,8 +973,8 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     ///
     /// Computes ordered BEEF byte arrays (ancestors first, root last) from the
     /// temporary graph nodes and stores them in the `FinalizedGraphSink`. The
-    /// Engine retrieves these after sync completes and submits each one with
-    /// `HistoricalTxNoSpv` mode, which skips SPV because
+    /// Engine drains it (after the sync, or per completed UTXO under a
+    /// per-peer budget) and submits each one with `HistoricalTxNoSpv` mode, which skips SPV because
     /// `validate_graph_anchor` has already done it (the reference's
     /// `finalizeGraph`, lines 317 to 333).
     async fn finalize_graph(&self, graph_id: &str) -> Result<(), GASPError> {

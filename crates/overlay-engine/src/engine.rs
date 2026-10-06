@@ -79,6 +79,10 @@ pub struct Engine {
     /// exceeds the budget is DROPPED (loud log, failure recorded, cursor NOT
     /// advanced) and the loop continues with the next peer.
     peer_sync_budget: Option<(SleepFactory, u64)>,
+    /// Open around each GASP finalize submit, so no deadline that races the
+    /// sync drops a transaction between its writes (bsv-low #552, the lens
+    /// fold's HIGH-1). See [`Engine::finalize_submit_gate`].
+    finalize_gate: crate::gasp::SubmitGate,
     /// Reference-parity spend verification on submit (2026-09-08). `true`
     /// (DEFAULT): every submit outside `HistoricalTxNoSpv` runs the
     /// reference's `Transaction.verify` walk: merkle paths against the chain
@@ -592,6 +596,7 @@ impl Engine {
             gasp_remote_factory: None,
             ancestor_fetcher: None,
             peer_sync_budget: None,
+            finalize_gate: crate::gasp::SubmitGate::default(),
             verify_scripts: true,
             config,
         }
@@ -640,7 +645,17 @@ impl Engine {
     /// advanced to `GASPSync::completed_cursor`: past the UTXOs whose graphs
     /// were completed, never past the one in flight. That graph is lost
     /// whole (nothing of it was finalized) and the next tick walks it again,
-    /// down to whatever is now in storage. A dropped tick that finalized a
+    /// down to whatever is now in storage.
+    ///
+    /// **The deadline never lands inside a transaction's writes** (the lens
+    /// fold's HIGH-1). It is cooperative around a finalize submit
+    /// ([`Engine::finalize_submit_gate`]): a deadline that falls due while
+    /// one transaction is being written waits for that transaction, and the
+    /// sync is dropped at the boundary. What a dropped tick leaves of the
+    /// graph being submitted is an ancestors-first prefix of WHOLE
+    /// transactions, with the cursor below its UTXO. Everywhere else (a
+    /// request to the peer, the walk, the anchor check) the deadline drops
+    /// the sync at once, as a budget against a dead peer must. A dropped tick that finalized a
     /// graph or moved the cursor is recorded as a SUCCESSFUL attempt for the
     /// quarantine count: a peer serving a long bootstrap is not a dead peer.
     /// One with no progress is a failed attempt, as before.
@@ -651,6 +666,17 @@ impl Engine {
     /// admitted.
     pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
         self.peer_sync_budget = Some((sleep, budget_ms));
+    }
+
+    /// The gate around every GASP finalize submit (bsv-low #552, the lens
+    /// fold's HIGH-1). `start_gasp_sync` races each peer against its budget
+    /// with [`crate::gasp::race_or_deadline_guarded`] over this gate. A
+    /// caller that races `start_gasp_sync` ITSELF against a deadline (the
+    /// worker's scheduled step) must use the same function over the same
+    /// gate: a plain `race_or_deadline` there can still drop a finalize
+    /// submit between its writes.
+    pub fn finalize_submit_gate(&self) -> &crate::gasp::SubmitGate {
+        &self.finalize_gate
     }
 
     /// Turn reference-parity script verification on submit on or off.
@@ -734,12 +760,21 @@ impl Engine {
     ///
     /// Used by the onSteakReady pattern to return results to clients before
     /// mutations are applied via a queue consumer or `ctx.wait_until()`.
+    ///
+    /// The topic managers are called with `dry_run: true`
+    /// (`AdmissionOptions::DRY_RUN`): nothing is admitted on this call, so a
+    /// manager that writes on admission leaves no trace of it.
     pub async fn submit_validate_only(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<Steak, EngineError> {
-        let (_validations, steak, _tx, _txid) = self.run_validation(tagged_beef, mode).await?;
+        // A validate-only call admits nothing: a dry run by its own name. A
+        // manager that writes on admission must not write here, or the real
+        // submit that follows meets a head this call already advanced.
+        let (_validations, steak, _tx, _txid) = self
+            .run_validation(tagged_beef, mode, &AdmissionOptions::DRY_RUN)
+            .await?;
         Ok(steak)
     }
 
@@ -792,7 +827,10 @@ impl Engine {
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<(Steak, MutationReport), EngineError> {
-        let (validations, mut steak, tx, txid) = self.run_validation(tagged_beef, mode).await?;
+        // A submit is a real admission, never a dry run.
+        let (validations, mut steak, tx, txid) = self
+            .run_validation(tagged_beef, mode, &AdmissionOptions::default())
+            .await?;
         let mut report = MutationReport::default();
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
         // atomic prefix over the WHOLE submitted body — bsv-rs's
@@ -1495,6 +1533,7 @@ impl Engine {
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
+        options: &AdmissionOptions,
     ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
@@ -1623,8 +1662,8 @@ impl Engine {
                         .collect::<Vec<u8>>(),
                     tagged_beef.off_chain_values.as_deref(),
                     mode,
-                    // A submit is a real admission, never a dry run.
-                    &AdmissionOptions::default(),
+                    // `false` on a submit, `true` on a validate-only call.
+                    options,
                 )
                 .await
             {
@@ -3168,12 +3207,16 @@ impl Engine {
                     // sync future was dropped mid-flight. What it finalized
                     // before that is already submitted (the hook above); the
                     // cursor then advances to `completed_cursor` only, see
-                    // the deadline arm below.
+                    // the deadline arm below. The race is GUARDED: it never
+                    // drops the sync inside one transaction's finalize
+                    // submit (the lens fold's HIGH-1), it waits for that
+                    // transaction and the hook stops at the boundary.
                     let sync_outcome = match &self.peer_sync_budget {
                         Some((sleep, budget_ms)) => {
-                            crate::gasp::race_or_deadline(
+                            crate::gasp::race_or_deadline_guarded(
                                 sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)),
                                 sleep(*budget_ms),
+                                &self.finalize_gate,
                             )
                             .await
                         }
@@ -3206,7 +3249,11 @@ impl Engine {
                             // submitted (the hook); the cursor moves past the
                             // UTXOs that were completed and stops below the
                             // one in flight, whose graph is lost whole and
-                            // walked again next tick.
+                            // walked again next tick. A graph the deadline
+                            // met while it was being SUBMITTED is not "in
+                            // flight" here: it left a prefix of whole
+                            // transactions, is counted finalized, and its
+                            // UTXO is below the cursor too.
                             let in_flight = u64::from(sync.graph_in_flight());
                             deadline_dropped_graphs += in_flight;
                             let completed = sync.completed_cursor();
@@ -3241,9 +3288,9 @@ impl Engine {
                             // Submit finalized graphs to the Engine (under a
                             // budget the hook already did, graph by graph,
                             // and the sink is empty here).
-                            let submitted =
-                                self.submit_finalized_graphs(&sink, peer_url, topic).await;
-                            peer_finalized.set(peer_finalized.get() + submitted);
+                            let landed = self
+                                .submit_finalized_graphs(&sink, peer_url, topic, &peer_finalized)
+                                .await;
 
                             // Advance the persisted cursor when it moved forward — i.e.
                             // the peer reported UTXOs at a higher score than our last
@@ -3254,7 +3301,20 @@ impl Engine {
                             // that re-sees already-known UTXOs must still advance, else
                             // every cron re-scans the same range forever (the cursor
                             // stayed pinned at 0 in prod).
-                            if sync.last_interaction > last_interaction {
+                            //
+                            // NOT advanced when a finalize submit above did
+                            // not land (the lens fold's MEDIUM-1): the sink
+                            // does not say which UTXO that graph was, so the
+                            // whole cursor stays and the next sync is served
+                            // the range again (what did land is known and
+                            // skipped). Under a budget the hook fails that
+                            // one UTXO instead and the gap guard has already
+                            // capped `sync.last_interaction` below it.
+                            if !landed {
+                                warn!(
+                                    "[GASP SYNC] a finalize submit for {topic} from {peer_url} did not land: the cursor stays at {last_interaction}"
+                                );
+                            } else if sync.last_interaction > last_interaction {
                                 match self
                                     .storage
                                     .update_last_interaction(peer_url, topic, sync.last_interaction)
@@ -3324,36 +3384,74 @@ impl Engine {
 
     /// Drain `sink` and submit every finalized graph in it, ancestors first
     /// (`historical-tx-no-spv`: the anchor check already verified them).
-    /// Returns how many graphs were drained.
+    /// Each graph is added to `submitted` as its first submit starts. Returns
+    /// whether EVERY transaction of every graph landed.
     ///
     /// Each graph here passed the anchor check: its root verified and the
     /// replay admitted it, so these submits rest on a checked premise and are
-    /// not expected to fail. If one does (a storage fault), the REST OF THAT
-    /// GRAPH is not submitted: the reference's `finalizeGraph` awaits each
-    /// submit in order and its throw ends the loop (the BEEFs already
-    /// submitted stay, it has no rollback either). A later BEEF would
-    /// otherwise be judged without the coin its ancestor failed to leave.
-    /// Other graphs carry on.
+    /// not expected to fail. If one does not LAND, the REST OF THAT GRAPH is
+    /// not submitted: the reference's `finalizeGraph` awaits each submit in
+    /// order and its throw ends the loop (the BEEFs already submitted stay,
+    /// it has no rollback either). A later BEEF would otherwise be judged
+    /// without the coin its ancestor failed to leave, admit nothing and be
+    /// recorded as applied, a dupe for good. "Landed" is read from the
+    /// durability report, not from `Ok`: `submit` answers `Ok` when a storage
+    /// write faulted and when the topic manager failed, and in both it
+    /// records no applied row. A transaction landed when its topic is applied
+    /// or was already applied (a dupe). Other graphs carry on, and the caller
+    /// keeps the cursor from passing a graph that did not land.
+    ///
+    /// Each transaction's submit is one write section of the engine's gate
+    /// ([`Engine::finalize_submit_gate`]) and the gate is asked between two:
+    /// a deadline that is due stops the sequence there (this future is
+    /// dropped at that await, between two whole transactions).
     async fn submit_finalized_graphs(
         &self,
         sink: &crate::gasp_overlay::FinalizedGraphSink,
         peer_url: &str,
         topic: &str,
-    ) -> u64 {
+        submitted: &std::cell::Cell<u64>,
+    ) -> bool {
         let finalized: Vec<_> = sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
             .collect();
 
+        let mut all_landed = true;
         for graph in &finalized {
-            for beef_bytes in &graph.beefs {
+            for (position, beef_bytes) in graph.beefs.iter().enumerate() {
+                self.finalize_gate.stop_if_due().await;
+                if position == 0 {
+                    submitted.set(submitted.get() + 1);
+                }
                 let tagged = TaggedBEEF::new(beef_bytes.clone(), vec![graph.topic.clone()]);
-                if let Err(e) = self.submit(&tagged, SubmitMode::HistoricalTxNoSpv).await {
+                let outcome = {
+                    let _writing = self.finalize_gate.write_section();
+                    self.submit_with_report(&tagged, SubmitMode::HistoricalTxNoSpv)
+                        .await
+                };
+                let not_landed = match outcome {
+                    Ok((_, report)) => {
+                        let landed = report.is_durable()
+                            && (report.applied_topics.contains(&graph.topic)
+                                || report.deduped_topics.contains(&graph.topic));
+                        (!landed).then(|| {
+                            if report.is_durable() {
+                                "the topic manager failed on it".to_string()
+                            } else {
+                                format!("not durable: {}", report.summary())
+                            }
+                        })
+                    }
+                    Err(e) => Some(e.to_string()),
+                };
+                if let Some(why) = not_landed {
                     warn!(
-                        "[GASP SYNC] Failed to submit BEEF for topic {}: {e}; the rest of its graph is not submitted",
+                        "[GASP SYNC] A finalize submit for topic {} did not land ({why}); the rest of its graph is not submitted",
                         graph.topic
                     );
+                    all_landed = false;
                     break;
                 }
             }
@@ -3365,7 +3463,7 @@ impl Engine {
                 finalized.len()
             );
         }
-        finalized.len() as u64
+        all_landed
     }
 
     /// Discover peer overlay nodes for a topic via SHIP lookup.
@@ -3471,18 +3569,23 @@ struct SubmitAsFinalized<'e> {
 
 #[async_trait::async_trait(?Send)]
 impl crate::gasp::FinalizedGraphHook for SubmitAsFinalized<'_> {
-    async fn graph_completed(&self) {
-        // Counted BEFORE the submits: a sync dropped inside them has
-        // finalized this graph (and left an ancestors-first prefix of it).
-        let pending = self
-            .sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len() as u64;
-        self.submitted.set(self.submitted.get() + pending);
-        self.engine
-            .submit_finalized_graphs(&self.sink, self.peer_url, self.topic)
+    async fn graph_completed(&self) -> Result<(), crate::gasp::GASPError> {
+        // A graph is counted as its first submit starts, and the deadline
+        // cannot land inside a submit: a sync dropped in here has written at
+        // least that transaction whole (an ancestors-first prefix).
+        let landed = self
+            .engine
+            .submit_finalized_graphs(&self.sink, self.peer_url, self.topic, self.submitted)
             .await;
+        if landed {
+            Ok(())
+        } else {
+            // Fails this UTXO: the cursor stays below it and the next sync
+            // asks for it again (the lens fold's MEDIUM-1).
+            Err(crate::gasp::GASPError::StorageError(
+                "a finalize submit did not land".to_string(),
+            ))
+        }
     }
 }
 
@@ -3524,7 +3627,10 @@ pub struct TopicSyncResult {
     /// Graphs that passed the anchor check and were handed to submit, summed
     /// over this topic's peers (bsv-low #552). Under a per-peer budget a
     /// graph is counted, and submitted, the moment it finalizes, so the
-    /// count includes those of a peer the deadline then dropped.
+    /// count includes those of a peer the deadline then dropped. A counted
+    /// graph had its first transaction submitted whole (the deadline never
+    /// lands inside a submit); one whose later submit did not land is still
+    /// counted, and its UTXO stays below the cursor.
     #[serde(default)]
     pub finalized_graphs: u64,
     /// Graphs that were mid-walk when a peer's sync was dropped at its

@@ -172,10 +172,23 @@ alone); a held source is merged into the checked BEEF of an unproven node;
 every node must be an input of its parent; a conflicting spend inside a graph
 refuses it; and a chain tracker or storage FAULT is
 `GASPError::AnchorUnavailable`, which fails the UTXO so the cursor gap guard
-asks again instead of losing it. A manager whose rule depends on previous
-coins must apply it under `historical-tx` too: that is the mode of the replay.
+asks again instead of losing it. A topic manager `Err` in the replay is
+`AnchorUnavailable` too (the lens fold of 2026-10-06): the manager's contract
+there is one sentence, `Ok` with nothing admitted is a FINAL refusal and the
+cursor moves (parity: the reference moves it past a refused and a failed graph
+alike), `Err` is "not now" and the cursor waits. Its cost: a manager that
+errors forever on one UTXO holds that peer's cursor below it, and what lies
+above and is not yet held is walked again every tick. A manager whose rule
+depends on previous coins must apply it under `historical-tx` too: that is the
+mode of the replay.
+
+The finalize submits stop at the first transaction that does not LAND
+(`submit_finalized_graphs`: read from the durability report, since `submit`
+answers `Ok` on a storage fault and on a manager failure): nothing behind it
+in that graph is submitted, and the cursor does not pass that graph (under a
+budget its UTXO fails; with none the peer's whole cursor stays for the tick).
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
-gasp_topic_manager i551`.
+gasp_topic_manager i551` (and `fold_medium`).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
@@ -184,9 +197,10 @@ argument, `options: &AdmissionOptions` (`types.rs`; the reference's
 `TopicAdmittanceContext { dryRun }`). The two GASP calls pass
 `AdmissionOptions::DRY_RUN`: the needed-input walk over every proven node of a
 peer (`find_needed_inputs`) and the anchor replay of #551
-(`validate_graph_anchor`). `Engine::submit` passes `dry_run: false`, and it is
-the only other caller (the queue replay, `/submit`, `/arc-ingest`, the peer
-crawler and the GASP finalize all go through it). On a dry run a manager must
+(`validate_graph_anchor`). `Engine::submit` passes `dry_run: false` (the queue
+replay, `/submit`, `/arc-ingest`, the peer crawler and the GASP finalize all go
+through it), and `Engine::submit_validate_only`, the only other caller, passes
+`true`: a validate-only call admits nothing. On a dry run a manager must
 leave NO durable trace: no storage write, no head advance, no counter an
 operator reads as an admission. `mode` is not a substitute: the queue replays
 real submissions under `historical-tx`, the mode of both dry runs. The
@@ -202,7 +216,19 @@ cannot miss the argument on a re-pin. Pins: `cargo test -p bsv-overlay-engine
 set, every graph is submitted AS IT FINALIZES, inside the raced future
 (`gasp::FinalizedGraphHook`, the engine's `SubmitAsFinalized`; the reference
 submits inside `finalizeGraph` too), after lane 551's anchor check of that
-graph, so the deadline cannot take back what was finalized before it. At the
+graph, so the deadline cannot take back what was finalized before it. The
+deadline is COOPERATIVE around a write (the lens fold of 2026-10-06,
+`gasp::SubmitGate`, `race_or_deadline_guarded`): `Engine::submit` is several
+storage writes, each an await on D1, and a submit dropped between the delete
+of the old head and the insert of the new one loses a head chain for good. So
+each transaction's finalize submit is one write section; a deadline that falls
+due inside it waits for that transaction and the sync is dropped at the
+boundary, leaving an ancestors-first prefix of WHOLE transactions with the
+cursor below that graph's UTXO. A request to the peer, the walk and the anchor
+check are still dropped at once. The worker's outer 240 s race of
+`start_gasp_sync` uses the same guarded race over
+`Engine::finalize_submit_gate()`; any other caller that races
+`start_gasp_sync` must too. At the
 deadline the cursor is persisted at `GASPSync::completed_cursor`: strictly
 below the lowest score of any UTXO not yet completed (the one in flight
 included), the gap guard's rule. The graph in flight is lost WHOLE (its nodes
@@ -227,8 +253,9 @@ offer.
 most one per peer per sync; the same count tick after tick with no
 `finalized_graphs` and no `cursor_moves` is the case above) and
 `cursor_moves` (peer, from, to); the worker's `Scheduled: GASP sync` line
-carries the totals and the per-topic line the cursors. Pins: `cargo test -p
-bsv-overlay-engine --features memory-storage --test gasp_topic_manager i552`.
+carries the totals and the per-topic line the cursors (`discarded_graphs` is
+on the first totals line). Pins: `cargo test -p bsv-overlay-engine --features
+memory-storage --test gasp_topic_manager i552` (and `fold_high1`).
 
 ## Testing
 

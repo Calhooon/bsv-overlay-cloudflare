@@ -2582,12 +2582,31 @@ struct Budgeted {
 impl Budgeted {
     fn new(remote: RecordingRemote, manager: Box<dyn TopicManager>, allowance: u64) -> Self {
         let store = Rc::new(MemoryStorage::new());
+        Self::over(
+            remote,
+            manager,
+            RequestClock::allowing(allowance),
+            store.clone(),
+            Box::new(store),
+            true,
+        )
+    }
+
+    // The same node over `storage`, a wrapper of `store` (the lens fold's
+    // `ScriptedStore`), with the per-peer budget of `clock` or with none.
+    fn over(
+        remote: RecordingRemote,
+        manager: Box<dyn TopicManager>,
+        clock: RequestClock,
+        store: Rc<MemoryStorage>,
+        storage: Box<dyn Storage>,
+        budgeted: bool,
+    ) -> Self {
         let requests = remote.requests.clone();
-        let clock = RequestClock::allowing(allowance);
         let mut engine = Engine::new(
             HashMap::from([(TOPIC.to_string(), manager)]),
             HashMap::new(),
-            Box::new(store.clone()),
+            storage,
             None,
             EngineConfig {
                 sync_configuration: HashMap::from([(
@@ -2601,7 +2620,9 @@ impl Budgeted {
             inner: remote,
             clock: clock.clone(),
         }));
-        engine.set_peer_sync_budget(clock.budget(), 1);
+        if budgeted {
+            engine.set_peer_sync_budget(clock.budget(), 1);
+        }
         Self {
             engine,
             store,
@@ -3154,4 +3175,608 @@ async fn dryrun_b_a_graph_the_anchor_check_refuses_never_moves_the_head() {
 fn dryrun_c_the_default_is_a_real_admission() {
     let dry_runs = [AdmissionOptions::default(), AdmissionOptions::DRY_RUN].map(|o| o.dry_run);
     assert_eq!(dry_runs, [false, true]);
+}
+
+// ============================================================================
+// The lens fold of 2026-10-06 (bsv-low #551, #552, #530). HIGH-1: the deadline
+// never drops a finalize submit between its writes. MEDIUM-1: a finalize
+// submit that did not land stops its graph and holds the cursor. MEDIUM-2: a
+// manager error in the anchor replay is "not now", never a refusal. LOW-1:
+// `submit_validate_only` is a dry run.
+// ============================================================================
+
+use bsv_overlay_engine::storage::{PeerSyncHealth, StorageError};
+
+// What a `ScriptedStore` does at the ONE insert it is armed for.
+enum InsertEvent {
+    // The write is a round trip (every D1 call is one) and the per-peer
+    // deadline falls due while it is in flight.
+    DeadlineFallsDue(RequestClock),
+    // The write faults (a D1 outage) until the test disarms the store.
+    Faults,
+}
+
+type Armed = Rc<RefCell<Option<(String, u32, InsertEvent)>>>;
+
+// `MemoryStorage` with one scripted `insert_output`. Every other call
+// delegates.
+struct ScriptedStore {
+    inner: Rc<MemoryStorage>,
+    armed: Armed,
+}
+
+impl ScriptedStore {
+    fn armed(
+        inner: &Rc<MemoryStorage>,
+        txid: String,
+        output_index: u32,
+        event: InsertEvent,
+    ) -> Self {
+        Self {
+            inner: inner.clone(),
+            armed: Rc::new(RefCell::new(Some((txid, output_index, event)))),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl Storage for ScriptedStore {
+    async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+        let hit = {
+            let mut armed = self.armed.borrow_mut();
+            let is_hit = armed.as_ref().is_some_and(|(txid, output_index, _)| {
+                *txid == output.txid && *output_index == output.output_index
+            });
+            match (is_hit, armed.as_ref()) {
+                (true, Some((_, _, InsertEvent::Faults))) => {
+                    return Err(StorageError::Database(
+                        "D1_ERROR: storage overloaded".into(),
+                    ));
+                }
+                (true, _) => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, _, InsertEvent::DeadlineFallsDue(clock))) = hit {
+            clock.spent.set(clock.allowance.get() + 1);
+            tokio::task::yield_now().await;
+        }
+        self.inner.insert_output(output).await
+    }
+    async fn delete_output(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_output(txid, output_index, topic).await
+    }
+    async fn mark_utxo_as_spent(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .mark_utxo_as_spent(txid, output_index, topic)
+            .await
+    }
+    async fn update_consumed_by(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        consumed_by: &[Outpoint],
+    ) -> Result<(), StorageError> {
+        self.inner
+            .update_consumed_by(txid, output_index, topic, consumed_by)
+            .await
+    }
+    async fn update_transaction_beef(&self, txid: &str, beef: &[u8]) -> Result<(), StorageError> {
+        self.inner.update_transaction_beef(txid, beef).await
+    }
+    async fn insert_applied_transaction(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<(), StorageError> {
+        self.inner.insert_applied_transaction(tx).await
+    }
+    async fn does_applied_transaction_exist(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<bool, StorageError> {
+        self.inner.does_applied_transaction_exist(tx).await
+    }
+    async fn delete_applied_transaction(
+        &self,
+        tx: &AppliedTransaction,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_applied_transaction(tx).await
+    }
+    async fn find_output(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: Option<&str>,
+        spent: Option<bool>,
+        include_beef: bool,
+    ) -> Result<Option<Output>, StorageError> {
+        self.inner
+            .find_output(txid, output_index, topic, spent, include_beef)
+            .await
+    }
+    async fn find_outputs_for_transaction(
+        &self,
+        txid: &str,
+        include_beef: bool,
+    ) -> Result<Vec<Output>, StorageError> {
+        self.inner
+            .find_outputs_for_transaction(txid, include_beef)
+            .await
+    }
+    async fn find_utxos_for_topic(
+        &self,
+        topic: &str,
+        since: Option<f64>,
+        limit: Option<u64>,
+        include_beef: bool,
+    ) -> Result<Vec<Output>, StorageError> {
+        self.inner
+            .find_utxos_for_topic(topic, since, limit, include_beef)
+            .await
+    }
+    async fn update_last_interaction(
+        &self,
+        host: &str,
+        topic: &str,
+        since: u64,
+    ) -> Result<(), StorageError> {
+        self.inner.update_last_interaction(host, topic, since).await
+    }
+    async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError> {
+        self.inner.get_last_interaction(host, topic).await
+    }
+    async fn record_peer_sync_outcome(
+        &self,
+        host: &str,
+        topic: &str,
+        success: bool,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .record_peer_sync_outcome(host, topic, success)
+            .await
+    }
+    async fn get_peer_sync_health(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<PeerSyncHealth, StorageError> {
+        self.inner.get_peer_sync_health(host, topic).await
+    }
+}
+
+// The topic's UTXOs as sorted `(index into nodes, output index)`.
+async fn held(store: &MemoryStorage, nodes: &[GASPNode]) -> Vec<(usize, u32)> {
+    let mut held: Vec<_> = store
+        .find_utxos_for_topic(TOPIC, None, None, false)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| {
+            let index = nodes.iter().position(|n| node_txid(n) == o.txid).unwrap();
+            (index, o.output_index)
+        })
+        .collect();
+    held.sort_unstable();
+    held
+}
+
+async fn applied(store: &MemoryStorage, node: &GASPNode) -> bool {
+    store
+        .does_applied_transaction_exist(&AppliedTransaction {
+            txid: node_txid(node),
+            topic: TOPIC.to_string(),
+        })
+        .await
+        .unwrap()
+}
+
+// HIGH-1, the lens's recipe. Six heads with a record at height 2, the peer
+// lists the record and the tip; the manager does not retain a spent head. The
+// deadline falls due INSIDE a finalize submit, at the insert named by `slow`.
+// On a1cf98d the race dropped the submit right there, between its writes.
+struct DroppedInASubmit {
+    nodes: Vec<GASPNode>,
+    state: Rc<RefCell<HeadState>>,
+    node: Budgeted,
+    // The first tick: its result, its requests, what the store held after it.
+    topic: bsv_overlay_engine::engine::TopicSyncResult,
+    sent: Vec<String>,
+    held: Vec<(usize, u32)>,
+    applied: Vec<bool>,
+    cursor: u64,
+    failures: u64,
+}
+
+async fn deadline_inside_a_finalize_submit(slow: (usize, u32)) -> DroppedInASubmit {
+    let nodes = recorded_chain(6, &[2]);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let clock = RequestClock::allowing(1000);
+    let storage = ScriptedStore::armed(
+        &store,
+        node_txid(&nodes[slow.0]),
+        slow.1,
+        InsertEvent::DeadlineFallsDue(clock.clone()),
+    );
+    let node = Budgeted::over(
+        listing(&nodes, &[(2, 1), (5, 0)]),
+        Box::new(RecordedHeadManager(state.clone())),
+        clock,
+        store,
+        Box::new(storage),
+        true,
+    );
+    let (topic, sent) = node.tick().await;
+    let held = held(&node.store, &nodes).await;
+    println!(
+        "#552 HIGH-1: deadline inside the submit of {slow:?}: held after the drop {held:?}, \
+         finalized_graphs={} deadline_dropped_graphs={} cursor_moves={:?}",
+        topic.finalized_graphs, topic.deadline_dropped_graphs, topic.cursor_moves
+    );
+    assert_eq!(topic.errors.len(), 1, "the deadline dropped the tick");
+    let mut rows = Vec::new();
+    for n in &nodes {
+        rows.push(applied(&node.store, n).await);
+    }
+    let (cursor, failures) = (node.cursor().await, node.failures().await);
+
+    // The next ticks resume (asserted by `resumed`, after the first tick's
+    // own asserts).
+    for _ in 0..3 {
+        node.tick().await;
+    }
+    println!(
+        "#552 HIGH-1: deadline inside the submit of {slow:?}: held three ticks later {:?}",
+        self::held(&node.store, &nodes).await
+    );
+    DroppedInASubmit {
+        nodes,
+        state,
+        node,
+        topic,
+        sent,
+        held,
+        applied: rows,
+        cursor,
+        failures,
+    }
+}
+
+impl DroppedInASubmit {
+    // The next ticks resumed: the chain is complete, each transaction
+    // admitted once.
+    async fn resumed(&self) {
+        assert_eq!(
+            held(&self.node.store, &self.nodes).await,
+            vec![(2, 1), (5, 0)],
+            "the record of 2 and head 5 are held at the end"
+        );
+        assert_eq!(self.node.cursor().await, 2);
+        assert_eq!(
+            self.state.borrow().admitted,
+            txids(&self.nodes, &[0, 1, 2, 3, 4, 5]),
+            "each transaction admitted once, oldest first"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fold_high1_a_deadline_inside_a_finalize_submit_leaves_the_old_head_or_the_new_never_neither(
+) {
+    let (_logs, _guard) = capture_logs();
+    // The deadline lands between the delete of head 0 and the insert of head 1.
+    let dropped = deadline_inside_a_finalize_submit((1, 0)).await;
+    assert_eq!(
+        dropped.held,
+        vec![(1, 0)],
+        "the transaction in flight was written whole (the new head) and the sync stopped there"
+    );
+    assert_eq!(
+        dropped.applied[..3],
+        [true, true, false],
+        "a prefix of the graph, ancestors first, each transaction whole"
+    );
+    assert_eq!(dropped.sent, txids(&dropped.nodes, &[2, 1, 0]));
+    assert_eq!(
+        (
+            dropped.topic.finalized_graphs,
+            dropped.topic.deadline_dropped_graphs
+        ),
+        (1, 0)
+    );
+    assert!(
+        dropped.topic.cursor_moves.is_empty() && dropped.cursor == 0,
+        "the graph was not submitted whole: its UTXO is asked for again"
+    );
+    assert_eq!(dropped.failures, 0, "a transaction landed: progress");
+    dropped.resumed().await;
+}
+
+#[tokio::test]
+async fn fold_high1_a_deadline_between_two_outputs_of_one_submit_loses_neither() {
+    let (_logs, _guard) = capture_logs();
+    // One step later: head 2 is inserted, its record (output 1) is not yet.
+    // The transaction is the LAST of its graph, so the graph completes: the
+    // cursor moves past it and the sync is dropped on its next request.
+    let dropped = deadline_inside_a_finalize_submit((2, 1)).await;
+    assert_eq!(dropped.held, vec![(2, 0), (2, 1)]);
+    assert_eq!(dropped.sent, txids(&dropped.nodes, &[2, 1, 0, 5]));
+    assert_eq!(
+        (
+            dropped.topic.finalized_graphs,
+            dropped.topic.deadline_dropped_graphs
+        ),
+        (1, 1)
+    );
+    assert_eq!(dropped.topic.cursor_moves, moved(0, 1));
+    dropped.resumed().await;
+}
+
+// Fails where the wrapped rule would answer, for the transactions in
+// `not_now`: "I cannot place this yet". `in_replay` picks the call: the anchor
+// replay (a dry run that is shown coins) or the finalize submit.
+struct NotNow<M> {
+    rule: M,
+    not_now: Rc<RefCell<HashSet<String>>>,
+    in_replay: bool,
+}
+
+#[async_trait(?Send)]
+impl<M: TopicManager> TopicManager for NotNow<M> {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous_coins: &[u8],
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        options: &AdmissionOptions,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        let this_call = if self.in_replay {
+            options.dry_run && !previous_coins.is_empty()
+        } else {
+            mode == SubmitMode::HistoricalTxNoSpv
+        };
+        if this_call && self.not_now.borrow().contains(&tx.id()) {
+            return Err(TopicManagerError::Other("the head lags: not now".into()));
+        }
+        self.rule
+            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, options)
+            .await
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        self.rule
+            .identify_needed_inputs(beef, off_chain_values)
+            .await
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// MEDIUM-1. Three heads, the tip listed. The finalize submit of the GENESIS
+// does not land (its insert faults, or the manager fails on it).
+// The sequence stops there: no child is submitted (on a1cf98d each child was
+// judged without the coin its ancestor failed to leave, admitted nothing and
+// was recorded as applied, a dupe forever), and the cursor stays, so the next
+// tick submits the graph whole. With a budget (the hook) and without.
+#[tokio::test]
+async fn fold_medium1_a_finalize_submit_that_did_not_land_stops_its_graph_and_holds_the_cursor() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let genesis = node_txid(&nodes[0]);
+    for budgeted in [true, false] {
+        for storage_fault in [true, false] {
+            let state = Rc::new(RefCell::new(HeadState::default()));
+            let store = Rc::new(MemoryStorage::new());
+            let not_now = Rc::new(RefCell::new(HashSet::new()));
+            let mut outage: Option<Armed> = None;
+            let storage: Box<dyn Storage> = if storage_fault {
+                let scripted =
+                    ScriptedStore::armed(&store, genesis.clone(), 0, InsertEvent::Faults);
+                outage = Some(scripted.armed.clone());
+                Box::new(scripted)
+            } else {
+                not_now.borrow_mut().insert(genesis.clone());
+                Box::new(store.clone())
+            };
+            let node = Budgeted::over(
+                RecordingRemote::new(&nodes, &[2]),
+                Box::new(NotNow {
+                    rule: HeadChainManager(state.clone()),
+                    not_now: not_now.clone(),
+                    in_replay: false,
+                }),
+                RequestClock::allowing(u64::MAX - 1),
+                store,
+                storage,
+                budgeted,
+            );
+            let case = format!("budgeted={budgeted} storage_fault={storage_fault}");
+
+            let (topic, _) = node.tick().await;
+            let rows = [
+                applied(&node.store, &nodes[0]).await,
+                applied(&node.store, &nodes[1]).await,
+                applied(&node.store, &nodes[2]).await,
+            ];
+            println!(
+                "#551 MEDIUM-1 {case}: applied rows after the faulted genesis {rows:?}, cursor {}",
+                node.cursor().await
+            );
+            assert_eq!(
+                rows,
+                [false, false, false],
+                "{case}: the genesis did not land and no child was submitted behind it"
+            );
+            assert!(held(&node.store, &nodes).await.is_empty(), "{case}");
+            assert_eq!(node.cursor().await, 0, "{case}: the cursor stays");
+            assert!(topic.cursor_moves.is_empty(), "{case}");
+            // Handed to submit: once after the sync, or, under the hook, once
+            // per page that served it (the boundary row is served again and
+            // the failed UTXO tried again inside the same sync).
+            assert_eq!(
+                topic.finalized_graphs,
+                if budgeted { 2 } else { 1 },
+                "{case}"
+            );
+
+            // The outage ends (the manager catches up): the next tick submits
+            // the graph whole.
+            not_now.borrow_mut().clear();
+            if let Some(armed) = outage {
+                armed.borrow_mut().take();
+            }
+            let (topic, sent) = node.tick().await;
+            assert_eq!(sent, txids(&nodes, &[2, 1, 0]), "{case}: walked again");
+            assert_eq!(held(&node.store, &nodes).await, vec![(2, 0)], "{case}");
+            assert_eq!(topic.cursor_moves, moved(0, 1), "{case}");
+            assert_eq!(node.cursor().await, 1, "{case}");
+        }
+    }
+}
+
+// MEDIUM-2. Two chains, both tips listed; the manager cannot place a
+// transaction of the FIRST yet and says so with an error in the anchor
+// replay. That is "not now", not a refusal: the UTXO fails
+// (`AnchorUnavailable`), nothing is counted as discarded, the cursor waits
+// below it and the next tick admits it. On a1cf98d it was discarded as
+// refused, the cursor moved past it and it was never asked for again.
+#[tokio::test]
+async fn fold_medium2_a_manager_error_in_the_replay_fails_the_utxo_and_the_cursor_waits() {
+    let (_logs, _guard) = capture_logs();
+    let mut nodes = chain(3);
+    nodes.extend(recorded_chain(3, &[0]));
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let not_now = Rc::new(RefCell::new(HashSet::from([node_txid(&nodes[1])])));
+    let store = Rc::new(MemoryStorage::new());
+    let node = Budgeted::over(
+        listing(&nodes, &[(2, 0), (5, 0)]),
+        Box::new(NotNow {
+            rule: RecordedHeadManager(state.clone()),
+            not_now: not_now.clone(),
+            in_replay: true,
+        }),
+        RequestClock::allowing(u64::MAX - 1),
+        store.clone(),
+        Box::new(store),
+        false,
+    );
+
+    let (topic, _) = node.tick().await;
+    println!(
+        "#551 MEDIUM-2: a manager Err in the replay: discarded_graphs={} cursor {} held {:?}",
+        topic.discarded_graphs,
+        node.cursor().await,
+        held(&node.store, &nodes).await
+    );
+    assert_eq!(
+        held(&node.store, &nodes).await,
+        vec![(3, 1), (5, 0)],
+        "the second chain is admitted, nothing of the first"
+    );
+    assert_eq!(topic.discarded_graphs, 0, "an error is not a refusal");
+    assert_eq!(
+        node.cursor().await,
+        0,
+        "the cursor waits below the failed UTXO"
+    );
+
+    not_now.borrow_mut().clear();
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1, 0]), "asked for again");
+    assert_eq!(
+        held(&node.store, &nodes).await,
+        vec![(2, 0), (3, 1), (5, 0)],
+        "and admitted once the manager can place it"
+    );
+    assert_eq!(
+        topic.cursor_moves,
+        moved(0, 2),
+        "Ok with nothing stays the final refusal and moves the cursor: i552_d"
+    );
+}
+
+// LOW-1. `submit_validate_only` asks what WOULD be admitted and writes
+// nothing: the manager is called with `dry_run: true` and the stateful
+// fixture does not advance, so the real submit that follows finds its head
+// where it was.
+#[tokio::test]
+async fn fold_low1_submit_validate_only_is_a_dry_run() {
+    let nodes = chain(1);
+    let mut tx = Transaction::from_hex(&nodes[0].raw_tx).unwrap();
+    tx.merkle_path = Some(MerklePath::from_hex(nodes[0].proof.as_ref().unwrap()).unwrap());
+    let beef = TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![TOPIC.to_string()]);
+    let ledger = Rc::new(RefCell::new(HeadLedger::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(StatefulHead {
+                rule: HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+                ledger: ledger.clone(),
+            }) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig::default(),
+    );
+
+    let steak = engine
+        .submit_validate_only(&beef, SubmitMode::HistoricalTx)
+        .await
+        .unwrap();
+    assert_eq!(
+        steak[TOPIC].outputs_to_admit,
+        vec![0],
+        "the answer of a real call"
+    );
+    assert_eq!(
+        ledger
+            .borrow()
+            .calls
+            .iter()
+            .map(|c| c.dry_run)
+            .collect::<Vec<_>>(),
+        vec![true]
+    );
+    assert!(
+        ledger.borrow().advances.is_empty(),
+        "no write on a validate-only call"
+    );
+    assert_eq!(ledger.borrow().head, None);
+    assert!(utxo_txids(&store).await.is_empty());
+
+    engine
+        .submit(&beef, SubmitMode::HistoricalTx)
+        .await
+        .unwrap();
+    assert_eq!(
+        ledger.borrow().advances.len(),
+        1,
+        "the submit is the admission"
+    );
+    assert!(!ledger.borrow().advances[0].dry_run);
+    assert_eq!(utxo_txids(&store).await, vec![node_txid(&nodes[0])]);
 }
