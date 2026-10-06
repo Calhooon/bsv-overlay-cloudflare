@@ -1190,9 +1190,15 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // per-fetch timeout) hung every cron to the 15-min kill since deploy day;
     // see the budget consts. A timeout drops the sync (cursors persist only
     // per completed peer — idempotent redo next tick) and the tick moves on.
-    match race_or_deadline(
+    // The race is the GUARDED one over the engine's finalize gate (bsv-low
+    // #552, the lens fold's HIGH-1): this belt can fall due while a peer's
+    // graph is being submitted, and a submit dropped between its writes
+    // leaves a head chain with no head. It waits for the transaction being
+    // written and drops the sync at the boundary.
+    match overlay_engine::gasp::race_or_deadline_guarded(
         engine.start_gasp_sync(),
         crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
+        engine.finalize_submit_gate(),
     )
     .await
     {
@@ -1216,18 +1222,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 .map(|t| t.discarded_graphs)
                 .sum();
             worker::console_log!(
-                "Scheduled: GASP sync — topics={} peers={} errors={} pruned_inputs={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
-                total_pruned
+                total_pruned,
+                total_discarded
             );
-            if total_discarded > 0 {
-                worker::console_log!(
-                    "Scheduled: GASP sync discarded_graphs={}",
-                    total_discarded
-                );
-            }
             // bsv-low #552: what the tick got done under the per-peer
             // budget. Graphs are submitted as they finalize, so a peer
             // dropped at its deadline still counts the ones it finished;
