@@ -1542,6 +1542,24 @@ pub fn owed_write_plan(identity_lc: &str, rows: &[OwedRow], computed_at_ms: i64,
 pub fn owed_write_landed(stamp_after: Option<i64>, computed_at_ms: i64) -> bool {
     stamp_after == Some(computed_at_ms)
 }
+/// What a READ answers once its own compute returned (the lens fold's LOW-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAnswer {
+    /// The walk's own rows: its snapshot is the one the table holds.
+    Own,
+    /// The rows the table holds: the write refused this walk's snapshot because a NEWER one stands (#487), and the
+    /// reader is owed the newer rows, never the older ones the guard just declined to store.
+    Stored,
+}
+/// PURE: which rows a read serves after its compute.
+pub fn read_answer_after_compute(superseded: bool) -> ReadAnswer {
+    if superseded {
+        ReadAnswer::Stored
+    } else {
+        ReadAnswer::Own
+    }
+}
+
 pub const OWED_STATE_READ_SQL: &str = "SELECT identity, computedAtMs, tip, rows, stale, truncated FROM owed_state WHERE identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
@@ -3459,5 +3477,47 @@ mod tests {
         assert!(latched_home_words(&candidates[1..], &[weak]).0.is_empty());
         // the stored-read count sits inside the candidate cap
         const _: () = assert!(OWED_HOME_STORED_READS_PER_RECOMPUTE <= crate::logic::D1_CHUNK_OUTPOINTS);
+    }
+
+    /// The lens fold's LOW-2: a read whose own walk was SUPERSEDED (the #487 guard refused its older snapshot) is
+    /// answered with the rows the table holds, the newer walk's, never its own. The decision is
+    /// `read_answer_after_compute`; the rows are what the shipped read statements return after the two writes, on
+    /// real SQLite.
+    /// To red: have `read_answer_after_compute` answer `Own` for a superseded walk.
+    #[test]
+    fn a_superseded_read_is_served_the_newer_stored_rows_never_its_own_real_sqlite() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(OWED_ROWS_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        let row = |outpoint: String, family: OwedFamily| OwedRow {
+            identity: ME.to_string(),
+            outpoint,
+            family,
+            game_id: tx(0x01),
+            sats: Some(20_190),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({ "claim": "sweep-hop" }),
+            reason: None,
+        };
+        let older = [row(format!("{}:0", tx(0x07)), OwedFamily::HopStranded)];
+        let newer = [row(format!("{}:0", tx(0x07)), OwedFamily::Payout), row(format!("{}:1", tx(0x08)), OwedFamily::InProgress)];
+        // the route's stored read: the marker, then the rows, through the shipped statements
+        let stored = |conn: &rusqlite::Connection| -> (Vec<(String, String)>, i64, Option<i64>, bool) {
+            let (at, tip, cut): (i64, Option<i64>, i64) = conn.query_row(OWED_STATE_READ_SQL, [ME], |r| Ok((r.get(1)?, r.get(2)?, r.get(5)?))).unwrap();
+            let rows = conn.prepare(OWED_ROWS_READ_SQL).unwrap().query_map([ME], |r| Ok((r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect();
+            (rows, at, tip, cut != 0)
+        };
+        // the newer walk (began at 71 000) lands first; its own read serves its own rows
+        let landed = owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &newer, 71_000, Some(900_001), true)), 71_000);
+        assert_eq!(read_answer_after_compute(!landed), ReadAnswer::Own);
+        // the older walk (began at 1 000) lands second: refused, and its READER is owed the newer rows
+        let landed = owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &older, 1_000, Some(900_000), false)), 1_000);
+        assert!(!landed);
+        assert_eq!(read_answer_after_compute(!landed), ReadAnswer::Stored);
+        let (rows, at, tip, cut) = stored(&conn);
+        assert_eq!(rows, vec![(format!("{}:0", tx(0x07)), "payout".to_string()), (format!("{}:1", tx(0x08)), "in-progress".to_string())]);
+        assert_ne!(rows.len(), older.len(), "never the older walk's own rows");
+        assert_eq!((at, tip, cut), (71_000, Some(900_001), true), "with the newer snapshot's stamp, tip and cut");
     }
 }

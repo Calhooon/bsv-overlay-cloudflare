@@ -3744,6 +3744,20 @@ pub(crate) async fn owed_recompute_claimed(
     owed_refresh_end(identity_lc, token);
 }
 
+/// The snapshot the table holds for `identity_lc` (the marker, then its rows): what a superseded read serves.
+/// `None` on any fault or a missing marker.
+async fn owed_read_stored(db: &worker::D1Database, identity_lc: &str) -> Option<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)> {
+    let id = [JsValue::from_str(identity_lc)];
+    let st = db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&id).ok()?.first::<OwedStateD1>(None).await.ok()??;
+    let rows = db.prepare(crate::owed::OWED_ROWS_READ_SQL).bind(&id).ok()?.all().await.and_then(|r| r.results::<OwedRowD1>()).ok()?;
+    Some((
+        rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
+        st.tip.map(|t| t as u64),
+        st.computed_at_ms as i64,
+        st.truncated.unwrap_or(0.0) != 0.0,
+    ))
+}
+
 /// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
 async fn owed_compute_on_read(
     env: &worker::Env,
@@ -3753,6 +3767,15 @@ async fn owed_compute_on_read(
     tip_hint: Option<u64>,
 ) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+        // the lens fold's LOW-2: the write refused this walk's snapshot because a NEWER one stands (#487), so this
+        // reader is served the stored rows, never its own older ones. A stored read that faults falls back to the
+        // walk's own rows (the pre-fold answer: one response, display tier).
+        Ok(c) if crate::owed::read_answer_after_compute(c.superseded) == crate::owed::ReadAnswer::Stored => {
+            match owed_read_stored(db, identity_lc).await {
+                Some(stored) => Ok(stored),
+                None => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
+            }
+        }
         Ok(c) => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
         Err(e) => {
             crate::owed::note_recompute_fault();
