@@ -12,6 +12,61 @@ use overlay_engine::types::{
 };
 use serde::Serialize;
 
+/// How a call to a peer failed, before it is given a `GASPError` class.
+#[derive(Debug)]
+enum PeerFailure {
+    /// The request could not be built on our side.
+    Local(String),
+    /// The request could not be built for, or did not reach, the peer.
+    Transport(String),
+    /// The peer answered outside 2xx.
+    Status {
+        url: String,
+        status: u16,
+        body: String,
+    },
+    /// The peer answered 2xx with a body that is not the expected JSON.
+    BadBody(String),
+}
+
+impl PeerFailure {
+    /// The class of a failure that says nothing about what the peer holds.
+    fn into_fault(self) -> GASPError {
+        match self {
+            PeerFailure::Local(message) => GASPError::Other(message),
+            PeerFailure::Transport(message) | PeerFailure::BadBody(message) => {
+                GASPError::RemoteError(message)
+            }
+            PeerFailure::Status { url, status, body } => {
+                GASPError::RemoteError(format!("Peer {url} returned HTTP {status}: {body}"))
+            }
+        }
+    }
+
+    /// The class of a failed `/requestForeignGASPNode` REQUEST for a node.
+    ///
+    /// HTTP 400, and only 400, is the DEFINITE answer "I do not hold that
+    /// outpoint" (`GASPError::NodeNotFound`): the reference peer answers 400
+    /// with a masked body for every throw of `provideForeignGASPNode`
+    /// (`overlay-express/src/OverlayExpress.ts:2208-2219`), and our own route
+    /// answers 400 for `EngineError::NodeNotFound`. The engine prunes a
+    /// manager-named input on that class and on no other (the D8 decoy rule,
+    /// `GASPSync::process_incoming_node`). Everything else (the request did
+    /// not reach the peer, a 5xx, a 429, any other status, a body that does
+    /// not parse) is a fault of the moment: `RemoteError`, the UTXO fails
+    /// and the next sync asks again.
+    fn into_node_request_error(self) -> GASPError {
+        match self {
+            PeerFailure::Status {
+                url,
+                status: 400,
+                body,
+            } => GASPError::NodeNotFound(format!("Peer {url} returned HTTP 400: {body}")),
+            other => other.into_fault(),
+        }
+    }
+}
+
 /// `GASPRemote` implementation using Cloudflare Workers `Fetch` API.
 ///
 /// Makes HTTP POST requests to peer overlay nodes at their standard
@@ -37,10 +92,11 @@ impl WorkerGASPRemote {
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, GASPError> {
+    ) -> Result<T, PeerFailure> {
         let url = format!("{}{}", self.peer_url, path);
 
-        let body_json = serde_json::to_string(body).map_err(|e| GASPError::Other(e.to_string()))?;
+        let body_json =
+            serde_json::to_string(body).map_err(|e| PeerFailure::Local(e.to_string()))?;
 
         let mut init = worker::RequestInit::new();
         init.with_method(worker::Method::Post);
@@ -56,13 +112,13 @@ impl WorkerGASPRemote {
         init.with_body(Some(js_body.into()));
 
         let request = worker::Request::new_with_init(&url, &init).map_err(|e| {
-            GASPError::RemoteError(format!("Failed to create request to {url}: {e}"))
+            PeerFailure::Transport(format!("Failed to create request to {url}: {e}"))
         })?;
 
         let mut response = worker::Fetch::Request(request)
             .send()
             .await
-            .map_err(|e| GASPError::RemoteError(format!("Fetch to {url} failed: {e}")))?;
+            .map_err(|e| PeerFailure::Transport(format!("Fetch to {url} failed: {e}")))?;
 
         let status = response.status_code();
         if !(200..300).contains(&status) {
@@ -70,14 +126,17 @@ impl WorkerGASPRemote {
                 .text()
                 .await
                 .unwrap_or_else(|_| "(no body)".to_string());
-            return Err(GASPError::RemoteError(format!(
-                "Peer {url} returned HTTP {status}: {body_text}"
-            )));
+            return Err(PeerFailure::Status {
+                url,
+                status,
+                body: body_text,
+            });
         }
 
-        response.json().await.map_err(|e| {
-            GASPError::RemoteError(format!("Failed to parse response from {url}: {e}"))
-        })
+        response
+            .json()
+            .await
+            .map_err(|e| PeerFailure::BadBody(format!("Failed to parse response from {url}: {e}")))
     }
 }
 
@@ -91,7 +150,9 @@ impl GASPRemote for WorkerGASPRemote {
         &self,
         request: &GASPInitialRequest,
     ) -> Result<GASPInitialResponse, GASPError> {
-        self.post_json("/requestSyncResponse", request).await
+        self.post_json("/requestSyncResponse", request)
+            .await
+            .map_err(PeerFailure::into_fault)
     }
 
     /// Send our initial response and get the peer's reply.
@@ -102,7 +163,9 @@ impl GASPRemote for WorkerGASPRemote {
         &self,
         response: &GASPInitialResponse,
     ) -> Result<GASPInitialReply, GASPError> {
-        self.post_json("/requestSyncResponse", response).await
+        self.post_json("/requestSyncResponse", response)
+            .await
+            .map_err(PeerFailure::into_fault)
     }
 
     /// Request a specific node from the peer.
@@ -136,6 +199,7 @@ impl GASPRemote for WorkerGASPRemote {
             },
         )
         .await
+        .map_err(PeerFailure::into_node_request_error)
     }
 
     /// Submit a node to the peer and get back which inputs they need.
@@ -173,5 +237,67 @@ impl overlay_engine::gasp::GASPRemoteFactory for WorkerGASPRemoteFactory {
         topic: &str,
     ) -> Box<dyn overlay_engine::gasp::GASPRemote> {
         Box::new(WorkerGASPRemote::new(peer_url, topic))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerFailure;
+    use overlay_engine::gasp::GASPError;
+
+    fn status(status: u16) -> PeerFailure {
+        PeerFailure::Status {
+            url: "https://peer.example/requestForeignGASPNode".into(),
+            status,
+            body: r#"{"status":"error","message":"Request could not be processed"}"#.into(),
+        }
+    }
+
+    /// bsv-low #530 (D8, lens fold): the engine prunes a manager-named input
+    /// on `NodeNotFound` alone, so this mapping decides what is a decoy and
+    /// what is a fault of the moment. 400 is the one definite answer.
+    #[test]
+    fn a_node_request_is_definitely_refused_by_http_400_and_by_nothing_else() {
+        let definite = status(400).into_node_request_error();
+        assert!(
+            matches!(&definite, GASPError::NodeNotFound(m) if m.contains("HTTP 400")),
+            "{definite:?}"
+        );
+
+        let faults = [
+            status(500),
+            status(502),
+            status(503),
+            status(429),
+            status(404),
+            status(401),
+            status(408),
+            PeerFailure::Transport("Fetch to https://peer.example failed: timeout".into()),
+            PeerFailure::BadBody("Failed to parse response: expected value".into()),
+        ];
+        for failure in faults {
+            let shown = format!("{failure:?}");
+            let class = failure.into_node_request_error();
+            assert!(
+                matches!(class, GASPError::RemoteError(_)),
+                "{shown} -> {class:?}"
+            );
+        }
+        assert!(matches!(
+            PeerFailure::Local("serialize".into()).into_node_request_error(),
+            GASPError::Other(_)
+        ));
+    }
+
+    /// A 400 from any OTHER call (the initial request of a sync) is not an
+    /// answer about a node: it stays a fault and fails the peer's sync.
+    #[test]
+    fn a_400_outside_a_node_request_is_a_fault() {
+        assert!(matches!(
+            status(400).into_fault(),
+            GASPError::RemoteError(_)
+        ));
+        let shown = status(500).into_fault().to_string();
+        assert!(shown.contains("returned HTTP 500"), "{shown}");
     }
 }

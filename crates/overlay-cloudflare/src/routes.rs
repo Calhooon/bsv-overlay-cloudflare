@@ -4049,6 +4049,17 @@ mod tests {
         );
     }
 
+    /// bsv-low #530 (D8, lens fold): `/requestForeignGASPNode` answers 400
+    /// for a node this overlay does not hold, as the reference does, and 500
+    /// for its own faults. A syncing peer prunes a decoy input on the 400 and
+    /// on nothing else (`gasp_remote.rs`), so this pair is that contract's
+    /// serving half.
+    #[test]
+    fn a_gasp_node_we_do_not_hold_answers_400_and_our_own_fault_answers_500() {
+        assert_eq!(engine_error_status(&EngineError::NodeNotFound), 400);
+        assert_eq!(engine_error_status(&EngineError::Other("boom".into())), 500);
+    }
+
     // ── #347 Rule 22: can anything observe the seam being IGNORED? ────────
     //
     // The exhaustive `match` on `SubmitAction` makes DELETING the refusal a

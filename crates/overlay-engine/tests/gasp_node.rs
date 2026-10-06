@@ -4,7 +4,7 @@
 //! and the OverlayGASPRemote patterns.
 
 use async_trait::async_trait;
-use bsv_overlay_engine::engine::{Engine, EngineConfig};
+use bsv_overlay_engine::engine::{Engine, EngineConfig, EngineError};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
 use bsv_overlay_engine::storage::Storage;
 use bsv_overlay_engine::topic_manager::{TopicManager, TopicManagerError};
@@ -234,4 +234,62 @@ async fn provide_node_errors_when_no_beef() {
         .provide_foreign_gasp_node(&format!("{EXAMPLE_TXID}.0"), EXAMPLE_TXID, 0)
         .await;
     assert!(result.is_err(), "Should error when output has no BEEF");
+}
+
+/// bsv-low #530 (D8, lens fold): a KNOWN graph root whose tree does not hold
+/// the requested transaction is the decoy case seen from the serving side. It
+/// answers the same class as an unknown root (`NodeNotFound`, HTTP 400 at the
+/// route, as the reference does), so a peer running this engine prunes a
+/// decoy served from us. It answered `Other` (HTTP 500) before, which a
+/// syncing peer reads as a fault of the moment.
+#[tokio::test]
+async fn provide_node_answers_not_found_for_a_txid_a_known_root_does_not_hold() {
+    let storage = MemoryStorage::new();
+    storage
+        .insert_output(&Output {
+            txid: EXAMPLE_TXID.to_string(),
+            output_index: 0,
+            output_script: vec![0x76],
+            satoshis: 26172,
+            topic: "Hello".to_string(),
+            spent: false,
+            outputs_consumed: vec![],
+            consumed_by: vec![],
+            beef: Some(example_beef()),
+            block_height: None,
+            score: Some(1000.0),
+        })
+        .await
+        .unwrap();
+    let engine = Engine::new(
+        HashMap::new(),
+        HashMap::new(),
+        Box::new(storage),
+        None,
+        EngineConfig::default(),
+    );
+
+    let graph_id = format!("{EXAMPLE_TXID}.0");
+    let decoy = "d0".repeat(32);
+    let known_root = engine
+        .provide_foreign_gasp_node(&graph_id, &decoy, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(known_root, EngineError::NodeNotFound),
+        "{known_root:?}"
+    );
+    let unknown_root = engine
+        .provide_foreign_gasp_node(&format!("{decoy}.7"), &decoy, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(unknown_root, EngineError::NodeNotFound),
+        "{unknown_root:?}"
+    );
+    // The root itself is still served.
+    assert!(engine
+        .provide_foreign_gasp_node(&graph_id, EXAMPLE_TXID, 0)
+        .await
+        .is_ok());
 }

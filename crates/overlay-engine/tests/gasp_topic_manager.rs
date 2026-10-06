@@ -1,7 +1,7 @@
 //! bsv-low #530 (E1): topic history can continue behind a proven GASP node.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -70,6 +70,10 @@ struct RecordingRemote {
     nodes: Rc<HashMap<String, GASPNode>>,
     utxos: Vec<GASPOutput>,
     requests: Requests,
+    // Txids the peer cannot answer for RIGHT NOW (a timeout, a 500): a
+    // `RemoteError`, never the definite `NodeNotFound`. Shared, so a test can
+    // heal the peer between two syncs.
+    faults: Rc<RefCell<HashSet<String>>>,
 }
 
 impl RecordingRemote {
@@ -86,6 +90,7 @@ impl RecordingRemote {
                 })
                 .collect(),
             requests: Rc::new(RefCell::new(Vec::new())),
+            faults: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 }
@@ -131,6 +136,11 @@ impl GASPRemote for RecordingRemote {
         self.requests
             .borrow_mut()
             .push((txid.to_string(), output_index, metadata));
+        if self.faults.borrow().contains(txid) {
+            return Err(GASPError::RemoteError(format!(
+                "Peer returned HTTP 500 for {txid}"
+            )));
+        }
         let mut node = self
             .nodes
             .get(txid)
@@ -277,7 +287,16 @@ async fn synchronize_counting(
     store: &dyn Storage,
     fetcher: Option<Rc<dyn AncestorFetcher>>,
 ) -> (Vec<Request>, Vec<FinalizedGraph>, u64, u64) {
-    let remote = RecordingRemote::new(nodes, tips);
+    synchronize_remote(RecordingRemote::new(nodes, tips), manager, store, fetcher).await
+}
+
+// The same sync against a remote the test built itself.
+async fn synchronize_remote(
+    remote: RecordingRemote,
+    manager: Option<&dyn TopicManager>,
+    store: &dyn Storage,
+    fetcher: Option<Rc<dyn AncestorFetcher>>,
+) -> (Vec<Request>, Vec<FinalizedGraph>, u64, u64) {
     let requests = remote.requests.clone();
     let sink = new_finalized_graph_sink();
     let mut adapter =
@@ -828,7 +847,9 @@ async fn ancestor_fetcher_honors_named_history_and_empty_managers_still_stop() {
 // A head covenant that signs under ANYONECANPAY lets a spender place a decoy
 // witness-shaped input ahead of the real head input. The manager cannot tell
 // them apart from the proven node alone, so it names EVERY witness-shaped
-// input (capped), and the engine prunes the branch the source cannot serve.
+// input, and the engine prunes the branch of one the PEER answers it does not
+// hold (`GASPError::NodeNotFound`). Any other error, and every error of a
+// chain fetcher, is a fault of the moment: the UTXO fails and is retried.
 // ============================================================================
 
 const WITNESS_CAP: usize = 4;
@@ -847,7 +868,8 @@ fn witness_input(txid: String, output_index: u32) -> TransactionInput {
     input
 }
 
-// An outpoint no peer and no fetcher of these tests holds.
+// An outpoint no peer and no fetcher of these tests holds: the mock peer
+// answers the definite `NodeNotFound` for it.
 fn decoy_outpoint(tag: u8) -> Outpoint {
     Outpoint::new(format!("{tag:02x}").repeat(32), 7)
 }
@@ -857,6 +879,15 @@ fn decoy_outpoint(tag: u8) -> Outpoint {
 // `decoys` carries that decoy witness-shaped input at index 0, AHEAD of the
 // real head input at index 1.
 fn decoy_chain(length: usize, decoys: &[(usize, Outpoint)]) -> Vec<GASPNode> {
+    decoy_chain_with_tip_outputs(length, decoys, 1)
+}
+
+// The same chain whose TIP has `tip_outputs` outputs (each its own UTXO).
+fn decoy_chain_with_tip_outputs(
+    length: usize,
+    decoys: &[(usize, Outpoint)],
+    tip_outputs: usize,
+) -> Vec<GASPNode> {
     let mut nodes = Vec::new();
     let mut previous: Option<String> = None;
     for height in 0..length {
@@ -870,10 +901,14 @@ fn decoy_chain(length: usize, decoys: &[(usize, Outpoint)]) -> Vec<GASPNode> {
             tx.inputs
                 .push(TransactionInput::new("fe".repeat(32), height as u32));
         }
-        tx.outputs.push(TransactionOutput::new(
-            1000,
-            LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
-        ));
+        let outputs = if height + 1 == length { tip_outputs } else { 1 };
+        for _ in 0..outputs {
+            tx.outputs.push(TransactionOutput::new(
+                1000,
+                LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac")
+                    .unwrap(),
+            ));
+        }
         let txid = tx.id();
         let proof = MerklePath::new(
             100 + height as u32,
@@ -1177,7 +1212,9 @@ async fn d8_d_managers_naming_nothing_sync_byte_for_byte_as_on_the_base() {
     assert_eq!(digest, D8_D_BASE_DIGEST);
 }
 
-// Serves the chain's own transactions and refuses every other txid.
+// Serves the chain's own transactions and fails for every other txid, with
+// the class the worker's chain fetcher gives "all providers failed"
+// (`NodeNotFound`): on the fetcher arm even that class must not prune.
 struct ChainOnlyFetcher {
     nodes: HashMap<String, GASPNode>,
     requested: RefCell<Vec<String>>,
@@ -1190,7 +1227,7 @@ impl AncestorFetcher for ChainOnlyFetcher {
         let node = self
             .nodes
             .get(txid)
-            .ok_or_else(|| GASPError::RemoteError(format!("chain has no {txid}")))?;
+            .ok_or_else(|| GASPError::NodeNotFound(format!("chain has no {txid}")))?;
         Ok(FetchedAncestor {
             raw_tx: node.raw_tx.clone(),
             proof: node.proof.clone(),
@@ -1198,8 +1235,13 @@ impl AncestorFetcher for ChainOnlyFetcher {
     }
 }
 
+// PIN E, inverted by the lens (HIGH 2). A chain fetcher has no definite
+// "cannot serve": every input of a mined transaction is on chain, so each of
+// its errors is a fault of the moment (its budget, a provider outage). A
+// fetch failure on a named input fails the UTXO and is retried; it never
+// prunes. With a real chain fetcher a decoy is SERVED from chain.
 #[tokio::test]
-async fn d8_e_fetcher_arm_prunes_a_named_input_the_fetcher_cannot_serve() {
+async fn d8_e_fetcher_arm_never_prunes_a_fetch_failure_fails_the_utxo() {
     let decoy = decoy_outpoint(0xd3);
     let nodes = decoy_chain(5, &[(4, decoy.clone())]);
     let fetcher = Rc::new(ChainOnlyFetcher {
@@ -1216,51 +1258,171 @@ async fn d8_e_fetcher_arm_prunes_a_named_input_the_fetcher_cannot_serve() {
         Some(fetcher.clone()),
     )
     .await;
-    assert_eq!(
-        requests,
-        vec![(node_txid(&nodes[4]), 0, true)],
-        "the peer serves only the root"
+    assert!(
+        requests
+            .iter()
+            .all(|r| *r == (node_txid(&nodes[4]), 0, true)),
+        "the peer is asked for the root only: {requests:?}"
     );
-    let fetched = fetcher.requested.borrow().clone();
-    assert_eq!(
-        fetched.iter().filter(|txid| **txid == decoy.txid).count(),
-        1,
-        "one failed fetch for the decoy"
+    assert!(
+        fetcher.requested.borrow().contains(&decoy.txid),
+        "the fetcher was asked for the named input and failed"
     );
-    assert_eq!(
-        fetched
-            .into_iter()
-            .filter(|txid| *txid != decoy.txid)
-            .collect::<Vec<_>>(),
-        nodes[..4].iter().rev().map(node_txid).collect::<Vec<_>>()
-    );
-    assert_eq!(graphs.len(), 1);
-    assert_eq!(
-        graph_txids(&graphs[0]),
-        nodes.iter().map(node_txid).collect::<Vec<_>>()
-    );
-    assert_eq!((cursor, pruned), (1, 1));
+    assert!(graphs.is_empty(), "the failed UTXO finalizes nothing");
+    assert_eq!(pruned, 0, "the fetcher arm never prunes");
+    assert_eq!(cursor, 0, "the gap guard keeps the failed tip retryable");
+    let logs = logs.lock().unwrap();
     assert!(logs
-        .lock()
-        .unwrap()
         .iter()
-        .any(|log| log.contains(&decoy.to_graph_id()) && log.contains("chain has no")));
+        .any(|log| log.contains("Error ingesting UTXO") && log.contains("chain has no")));
+    assert!(logs.iter().any(|log| log.contains("Capping cursor")));
+    assert!(!logs.iter().any(|log| log.contains("Pruned input")));
 }
 
+// PIN F, reshaped by the lens (LOW 2). Two mined transactions cannot spend
+// one outpoint, so two PARENTS never share a decoy. What does occur: two
+// UTXOs of the one decoy-bearing tip are two graphs of one sync, and each
+// graph's walk names the decoy. `seen` is per graph; the pruned set is per
+// sync, so the decoy costs one failed round trip, not one per graph.
 #[tokio::test]
-async fn d8_f_a_pruned_outpoint_is_requested_once_when_two_parents_name_it() {
+async fn d8_f_a_decoy_shared_by_two_graphs_of_one_sync_is_requested_once() {
     let (_logs, _guard) = capture_logs();
-    // The same decoy outpoint rides the tip AND a mid-chain spend.
     let decoy = decoy_outpoint(0xd4);
-    let nodes = decoy_chain(5, &[(4, decoy.clone()), (2, decoy.clone())]);
+    let nodes = decoy_chain_with_tip_outputs(5, &[(4, decoy.clone())], 2);
+    let tip = node_txid(&nodes[4]);
+    let mut remote = RecordingRemote::new(&nodes, &[]);
+    remote.utxos = (0..2)
+        .map(|output_index| GASPOutput {
+            txid: tip.clone(),
+            output_index,
+            score: (output_index + 1) as f64,
+        })
+        .collect();
     let manager = DecoyHeadManager::new();
     let (requests, graphs, cursor, pruned) =
-        synchronize_counting(&nodes, &[4], Some(&manager), &MemoryStorage::new(), None).await;
+        synchronize_remote(remote, Some(&manager), &MemoryStorage::new(), None).await;
     let (decoy_requests, chain_requests) = split_requests(&requests, &decoy);
-    assert_eq!(decoy_requests, 1, "asked once, not once per parent");
-    assert_eq!(chain_requests, tip_to_genesis(&nodes));
-    assert_eq!(graphs.len(), 1);
-    assert_eq!(graph_txids(&graphs[0]).len(), 5);
-    assert_eq!(cursor, 1);
+    assert_eq!(decoy_requests, 1, "asked once, not once per graph");
+    let roots: Vec<_> = chain_requests.iter().filter(|r| r.0 == tip).collect();
+    assert_eq!(
+        roots,
+        vec![&(tip.clone(), 0, true), &(tip.clone(), 1, true)],
+        "both UTXOs of the tip were walked as their own graph"
+    );
+    assert_eq!(graphs.len(), 2, "two graphs, both complete");
+    for graph in &graphs {
+        assert_eq!(
+            graph_txids(graph),
+            nodes.iter().map(node_txid).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(cursor, 2);
     assert_eq!(pruned, 1, "one outpoint, one failed round trip, one count");
+    println!(
+        "D8 PIN F: 2 graphs of one sync, {} requests, {decoy_requests} for the shared decoy, pruned_inputs={pruned}",
+        requests.len()
+    );
+}
+
+// PIN G (the lens's MEDIUM 1). The peer holds the whole chain and there is NO
+// decoy, but it cannot answer for the REAL head input right now (a timeout, a
+// 500: `RemoteError`). That is not a definite "not held": nothing is pruned,
+// the UTXO fails, nothing of the graph is admitted and the cursor does not
+// pass it. The failure is carried by the per-UTXO warn and the cursor cap,
+// not by the topic's `errors`: that list holds PEER failures, and four
+// engine tests pin that a failed UTXO does not enter it. The next tick, with
+// the peer healthy, admits the chain. Pruning here would finalize the tip
+// alone, advance the cursor and never ask for the history again.
+#[tokio::test]
+async fn d8_g_a_transient_fault_on_the_real_head_input_fails_the_utxo_and_the_next_tick_recovers() {
+    let (logs, _guard) = capture_logs();
+    let nodes = decoy_chain(5, &[]);
+    let expected: Vec<_> = nodes.iter().map(node_txid).collect();
+    let remote = RecordingRemote::new(&nodes, &[4]);
+    let requests = remote.requests.clone();
+    let faults = remote.faults.clone();
+    // The real head input of the proven tip: node 3.
+    faults.borrow_mut().insert(expected[3].clone());
+    let manager = DecoyHeadManager::new();
+    let state = manager.0.clone();
+    let store = Rc::new(MemoryStorage::new());
+    let mut engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(manager) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig {
+            sync_configuration: HashMap::from([(
+                TOPIC.to_string(),
+                SyncTarget::Peers(vec!["mock://head-chain".to_string()]),
+            )]),
+            ..Default::default()
+        },
+    );
+    engine.set_gasp_remote_factory(Box::new(remote));
+
+    // Tick 1: the peer blips on the real head input.
+    let result = engine.start_gasp_sync().await.unwrap();
+    let topic = &result.topics_synced[TOPIC];
+    assert_eq!(topic.pruned_inputs, 0, "a transient fault is never pruned");
+    {
+        let logs = logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|log| log.contains("Error ingesting UTXO")
+                && log.contains(&format!("{}.0", expected[4]))
+                && log.contains("HTTP 500")),
+            "the failed UTXO is warned with the peer's error"
+        );
+        assert!(logs.iter().any(|log| log.contains("Capping cursor")));
+        assert!(!logs.iter().any(|log| log.contains("Pruned input")));
+    }
+    assert!(state.borrow().admitted.is_empty(), "nothing admitted");
+    assert!(store
+        .find_utxos_for_topic(TOPIC, None, None, false)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .get_last_interaction("mock://head-chain", TOPIC)
+            .await
+            .unwrap(),
+        0,
+        "the cursor does not pass the failed UTXO"
+    );
+    let tick_one = requests.borrow().len();
+    assert!(requests.borrow().iter().any(|r| r.0 == expected[3]));
+
+    // Tick 2: the peer is healthy; the same chain is asked for again.
+    faults.borrow_mut().clear();
+    let result = engine.start_gasp_sync().await.unwrap();
+    let topic = &result.topics_synced[TOPIC];
+    assert_eq!(topic.pruned_inputs, 0);
+    assert!(topic.errors.is_empty(), "{:?}", topic.errors);
+    assert_eq!(
+        requests.borrow()[tick_one..],
+        tip_to_genesis(&nodes),
+        "tick 2 walks tip to genesis"
+    );
+    assert_eq!(state.borrow().admitted, expected, "admit oldest first");
+    let utxos = store
+        .find_utxos_for_topic(TOPIC, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].txid, expected[4]);
+    assert_eq!(
+        store
+            .get_last_interaction("mock://head-chain", TOPIC)
+            .await
+            .unwrap(),
+        1
+    );
+    println!(
+        "D8 PIN G: tick 1 {tick_one} requests, 0 admitted, pruned_inputs=0, cursor 0; tick 2 {} requests, 5 admitted, cursor 1",
+        requests.borrow().len() - tick_one
+    );
 }

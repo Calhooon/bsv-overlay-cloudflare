@@ -1202,8 +1202,10 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         Some(Ok(r)) => {
             let total_peers: usize = r.topics_synced.values().map(|t| t.peers.len()).sum();
             let total_errors: usize = r.topics_synced.values().map(|t| t.errors.len()).sum();
-            // D8 decoy rule: manager-named inputs a peer could not serve,
-            // pruned from their graphs. Counted apart from errors.
+            // D8 decoy rule: manager-named inputs a peer answered it does
+            // not hold, pruned from their graphs. Counted apart from errors,
+            // per distinct outpoint per peer: one decoy seen through two
+            // peers reads 2.
             let total_pruned: u64 = r.topics_synced.values().map(|t| t.pruned_inputs).sum();
             worker::console_log!(
                 "Scheduled: GASP sync — topics={} peers={} errors={} pruned_inputs={}",

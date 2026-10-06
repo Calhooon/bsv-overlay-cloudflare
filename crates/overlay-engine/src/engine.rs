@@ -2124,9 +2124,15 @@ impl Engine {
                 }
             }
 
-            Err(EngineError::Other(
-                "Unable to find output associated with your request!".into(),
-            ))
+            // The graph root is known but neither its BEEF nor anything it
+            // consumed holds the requested transaction. That is a definite
+            // "not held", the same answer as an unknown root: the reference
+            // throws `Unable to find output associated with your request!`
+            // here and its route answers 400. A syncing peer reads the 400 as
+            // `GASPError::NodeNotFound` and prunes a decoy input on it (the D8
+            // rule, `GASPSync::process_incoming_node`); a 500 would read as a
+            // fault of the moment and strand the chain behind the decoy.
+            Err(EngineError::NodeNotFound)
         })
     }
 
@@ -3071,8 +3077,9 @@ impl Engine {
                     // configured do we enable chain-backed ancestor fallback +
                     // strict-BEEF finalize. Default (None) = byte-identical to
                     // today (tolerant BEEF, peer errors abandon the graph;
-                    // the one exception, with or without a fetcher, is the
-                    // D8 prune of a manager-named input, see
+                    // the one exception is the D8 prune of a manager-named
+                    // input the peer answers it does not hold, which exists
+                    // only WITHOUT a fetcher, see
                     // `GASPSync::process_incoming_node`).
                     let hydration_on = self.ancestor_fetcher.is_some();
 
@@ -3116,6 +3123,8 @@ impl Engine {
                     // D8 decoy rule: branches pruned in this peer's walk. Not
                     // an error and not a failed UTXO, so it is counted apart
                     // from `errors` and never touches the outcome or cursor.
+                    // Summed over peers: one decoy seen through two peers
+                    // counts twice.
                     pruned_inputs += sync.pruned_inputs();
                     match sync_outcome {
                         None => {
@@ -3310,11 +3319,17 @@ pub struct TopicSyncResult {
     pub peers: Vec<String>,
     /// How peers were determined: "ship" or "peers".
     pub sync_type: String,
-    /// Any errors encountered during sync (peer URL -> error message).
+    /// Any errors encountered during sync (peer URL -> error message): a
+    /// peer whose sync failed or ran over its budget. A single UTXO whose
+    /// graph ingest failed is NOT listed here: it is warned (`Error ingesting
+    /// UTXO`), held back by the cursor gap guard and asked for again by the
+    /// next sync.
     pub errors: Vec<String>,
-    /// Manager-named inputs pruned across this topic's peers because the
-    /// source could not serve them (the D8 decoy rule, `GASPSync::pruned_inputs`).
-    /// Not errors: the graphs completed without those branches.
+    /// Manager-named inputs pruned because a peer answered that it does not
+    /// hold them (the D8 decoy rule, `GASPSync::pruned_inputs`). Counted per
+    /// distinct outpoint PER PEER per sync and summed over this topic's
+    /// peers: one decoy seen through two peers reads 2. Not errors: the
+    /// graphs completed without those branches.
     #[serde(default)]
     pub pruned_inputs: u64,
 }
