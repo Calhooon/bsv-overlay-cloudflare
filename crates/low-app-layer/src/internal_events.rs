@@ -191,13 +191,22 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
 pub const POT_CHANGED_MAX: usize = 8;
 
 pub fn parse_pot_changed(raw: &[u8]) -> Vec<(String, u32)> {
+    parse_pot_changed_counted(raw).0
+}
+
+/// bsv-low #436: the parse, and HOW MANY well-formed distinct outpoints the cap refused. The overlay chunks its
+/// flush at this bound (`pot_changes::POT_CHANGED_CHUNK`, pinned equal), so the count is 0 from our own producer;
+/// a body that still carries more is never trimmed silently: the handler logs the count, adds it to
+/// `ops_counters` and answers it (`dropped`), and the overlay logs and counts it on its side too.
+pub fn parse_pot_changed_counted(raw: &[u8]) -> (Vec<(String, u32)>, usize) {
     let Ok(v) = serde_json::from_slice::<Value>(raw) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let Some(arr) = v.get("outpoints").and_then(Value::as_array) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut out: Vec<(String, u32)> = Vec::new();
+    let mut over: Vec<(String, u32)> = Vec::new();
     for o in arr {
         let txid = o
             .get("txid")
@@ -211,15 +220,21 @@ pub fn parse_pot_changed(raw: &[u8]) -> Vec<(String, u32)> {
         let Some(vout) = vout.and_then(|v| u32::try_from(v).ok()) else {
             continue;
         };
-        if !out.iter().any(|(t, v)| t == &txid && *v == vout) {
-            out.push((txid, vout));
+        if out.iter().any(|(t, v)| t == &txid && *v == vout) {
+            continue;
         }
-        if out.len() >= POT_CHANGED_MAX {
-            break;
+        if out.len() < POT_CHANGED_MAX {
+            out.push((txid, vout));
+        } else if !over.iter().any(|(t, v)| t == &txid && *v == vout) {
+            over.push((txid, vout));
         }
     }
-    out
+    (out, over.len())
 }
+
+/// bsv-low #436: outpoints a pot-changed body carried past the cap (refused, counted here, in the overlay's
+/// `ops_counters`; served on `/health/invariants` with every other counter row).
+pub const COUNTER_POT_CHANGED_DROPPED: &str = "pot_changed_dropped_total";
 
 /// `{"identities":["02…",…]}` — the hop-changed webhook body (bsv-low #469, 2026-09-19: a hop marker admitted
 /// names two identities whose owed rows must be re-derived). Capped like the pot body.
@@ -713,6 +728,74 @@ mod tests {
             .collect();
         let raw = format!(r#"{{"outpoints":[{}]}}"#, many.join(","));
         assert_eq!(parse_pot_changed(raw.as_bytes()).len(), POT_CHANGED_MAX);
+    }
+
+    /// bsv-low #436: the cap never trims silently. Twenty distinct outpoints in one body: eight kept, twelve
+    /// COUNTED (a repeat of a kept or of a refused outpoint is not a second drop, a malformed entry is not one).
+    #[test]
+    fn parse_pot_changed_counts_what_the_cap_refuses() {
+        let many: Vec<String> = (0..20)
+            .map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32)))
+            .chain([
+                format!(r#"{{"txid":"{}","vout":0}}"#, "cd".repeat(32)),
+                format!(r#"{{"txid":"{}","vout":19}}"#, "CD".repeat(32)),
+                r#"{"txid":"zz","vout":0}"#.to_string(),
+            ])
+            .collect();
+        let raw = format!(r#"{{"outpoints":[{}]}}"#, many.join(","));
+        let (kept, dropped) = parse_pot_changed_counted(raw.as_bytes());
+        assert_eq!((kept.len(), dropped), (POT_CHANGED_MAX, 20 - POT_CHANGED_MAX));
+        assert_eq!(parse_pot_changed_counted(b"nope"), (Vec::new(), 0));
+        let eight: Vec<String> = (0..POT_CHANGED_MAX).map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32))).collect();
+        let raw = format!(r#"{{"outpoints":[{}]}}"#, eight.join(","));
+        assert_eq!(parse_pot_changed_counted(raw.as_bytes()).1, 0, "a body at the bound drops nothing");
+    }
+
+    /// bsv-low #436 (the loop-10 D4 delta review): BOTH ENDS OF THE CONTRACT IN ONE PIN. The overlay's real
+    /// note/drain and its real flush bodies (`bsv_overlay_cloudflare::pot_changes::flush_bodies`, what `ship`
+    /// POSTs), each body through this worker's real parser: nineteen pots noted in one unit of work (a tip pass
+    /// confirming nineteen spends in one block under the 18-pair fleet) ALL reach the handler, which announces
+    /// and files over exactly the parsed list (the two source pins below). Before the fix the overlay shipped
+    /// one body of nineteen and this parser kept eight: eleven pots lost the `broadcast-low-pots` push and the
+    /// durable per-seat `pot` filing, with no log line on this side.
+    /// To red: ship one body (drop the chunking in `flush_bodies`), or move either bound off the other.
+    #[test]
+    fn nineteen_outpoints_in_one_flush_all_reach_the_filing_and_the_push() {
+        use bsv_overlay_cloudflare::pot_changes;
+        assert_eq!(pot_changes::POT_CHANGED_CHUNK, POT_CHANGED_MAX, "the overlay chunks at this worker's bound");
+        let _ = pot_changes::drain();
+        let noted: Vec<(String, u32)> = (0..19u32).map(|i| (format!("{i:064x}"), i % 2)).collect();
+        for (t, v) in &noted {
+            pot_changes::note(t, *v);
+        }
+        let drained = pot_changes::drain();
+        assert_eq!(drained.len(), 19);
+        let bodies = pot_changes::flush_bodies(&drained);
+        let mut reached: Vec<(String, u32)> = Vec::new();
+        let mut dropped = 0;
+        for body in &bodies {
+            let (kept, d) = parse_pot_changed_counted(body.as_bytes());
+            assert!(!kept.is_empty(), "no empty POST (the handler answers 400 to one)");
+            reached.extend(kept);
+            dropped += d;
+        }
+        reached.sort();
+        let mut want = noted.clone();
+        want.sort();
+        assert_eq!(dropped, 0, "nothing dropped at the receiving end");
+        assert_eq!(reached, want, "every noted outpoint reaches the handler's list");
+        assert_eq!(bodies.len(), 3, "19 outpoints ride ceil(19 / 8) POSTs");
+        // the handler announces and files over the parsed list, and a refused remainder is counted and answered
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(&code_only(include_str!("routes.rs")));
+        let start = routes.find(&squash("pub(crate) async fn internal_pot_changed(")).expect("the handler");
+        let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
+        assert!(handler.contains(&squash("let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);")));
+        assert!(handler.contains(&squash("for (txid, vout) in &outpoints {")), "the push loop runs over every parsed outpoint");
+        assert!(handler.contains(&squash("for (txid, vout) in outpoints {")), "and so does the filing loop");
+        assert!(handler.contains(&squash("crate::internal_events::COUNTER_POT_CHANGED_DROPPED")), "a refused remainder is counted");
+        assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
 
     #[test]

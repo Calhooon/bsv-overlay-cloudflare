@@ -2237,9 +2237,26 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
-    let outpoints = crate::internal_events::parse_pot_changed(&raw);
+    let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);
     if outpoints.is_empty() {
         return Response::error("body must be {\"outpoints\":[{\"txid\",\"vout\"}]}", 400);
+    }
+    // bsv-low #436: the overlay chunks its flush at `POT_CHANGED_MAX`, so nothing is over the cap from our own
+    // producer. A body that still carries more is never trimmed silently: logged, counted, and answered.
+    if dropped > 0 {
+        console_warn!(
+            "[pot-changed] body carried {} outpoint(s) past the cap of {}: {dropped} NOT announced and NOT filed (the producer must chunk)",
+            outpoints.len() + dropped,
+            crate::internal_events::POT_CHANGED_MAX
+        );
+        let counter_db = env.d1("OVERLAY_DB").ok();
+        ctx.wait_until(async move {
+            crate::courier::flush(
+                counter_db,
+                vec![(crate::internal_events::COUNTER_POT_CHANGED_DROPPED.to_string(), dropped as u64)],
+            )
+            .await;
+        });
     }
     // bsv-low loop 10 D2 (2026-09-08, the pair-10 finding): announce EVERY
     // changed outpoint in the pots room FIRST, before any attribution (see
@@ -2414,7 +2431,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         });
     }
     json_response(
-        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped }).to_string(),
+        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped, "dropped": dropped }).to_string(),
         200,
     )
 }
