@@ -1883,3 +1883,131 @@ fn the_hops_view_projects_the_markers_filing_time() {
         );
     }
 }
+
+// ── bsv-low #526: the stranded hop "not served" on prod, in its exact shape ─
+
+/// bsv-low #526, as the issue states it: a `hopparty` row for a funding hop (game `e1e409f5…`, vout 0, 20,190
+/// sats, `createdAt` 1787235605, inside the prod era of that day: cutoff 1786152389000), the hop's `pot_records`
+/// row UNSPENT, the chain rung answering unspent, read on 2026-09-21. Driven through the shipped `hops_view_sql`
+/// (the era bind included), the route's seconds-to-ms mapping, `assemble_hops_view` and THE derivation.
+///
+/// What it establishes: the owed walk does NOT drop that shape. It serves the stranded-hop sweep row the design
+/// has (the Collect press), never the felt's rejoin and never silence. This pin is GREEN on the walk as it stood
+/// at 39081dd too (it composes two pins that tree already carries: the verified unspent hop through this SQL, and
+/// `owed::tests::a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim…`, whose fixture is this very hop,
+/// 20,190 sats), so it is a CHARACTERISATION, not a red-then-green pin: the issue's premise did not reproduce.
+///
+/// What the repository's own ledger says instead (bsv-low `DECISION-LOG-spite-relay-2026-07.md`, 2026-09-02, B6 and
+/// B2.1): this hop was swept on 2026-08-29 by `3d43e1f0…`, broadcast direct to ARC by `scripts/recover-hop.mjs`
+/// (the index never held it; `pot_records.spent = 0` is the index's non-observation) and prod's chain rung read it
+/// spent by that sweep on 2026-09-02. Under THAT truth the walk serves a claimless `unbound` row with a sentence
+/// (the second half below), and the prod cell's log (`prod-collect-p0b-2026-09-21.log`: "served 16 rows; claimable
+/// 14") printed the claimable rows only: two claimless rows were served and never printed.
+#[test]
+fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_as_the_sweep_row() {
+    use low_app_layer::owed::{derive_owed_rows, HopChainWord, OwedFamily, OwedInputs, SpenderOutput, HOME_UNKNOWN_REASON};
+    use std::collections::{HashMap, HashSet};
+    const CREATED_AT_SECS: i64 = 1_787_235_605; // the issue's hopparty createdAt
+    const PROD_CUTOFF_THEN_MS: i64 = 1_786_152_389_000; // prod's WRITTEN_OFF_BEFORE_MS until the 2026-09-21 bump
+    const PROD_CUTOFF_AFTER_MS: i64 = 1_789_998_267_000; // the bump (637e413)
+    const READ_AT_MS: i64 = 1_789_997_400_000; // 2026-09-21, the cell's read, before the bump
+    let game: [u8; 32] = {
+        let mut g = [0u8; 32];
+        g[..4].copy_from_slice(&[0xe1, 0xe4, 0x09, 0xf5]);
+        g
+    };
+    let conn = production_schema_db();
+    let m = build_marker(0xa1, game, 0, 20_190, true);
+    let hop_txid = admit_marker(&conn, &m, 20_190, 0x26, CREATED_AT_SECS);
+    admit_hop(&conn, &hop_txid, 20_190, CREATED_AT_SECS);
+
+    // the walk's own read: the shipped SQL with the era bind, the route's seconds-to-ms mapping of the marker stamp
+    let walk = |cutoff_ms: i64| {
+        let mut rows = query_rows_inner(&conn, hops_view_sql(false, Some(cutoff_ms), 0), params![m.identity_hex, cutoff_ms]);
+        for r in rows.iter_mut() {
+            let secs: i64 = conn
+                .query_row("SELECT createdAt FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2", params![r.hop_txid, r.hop_vout], |x| x.get(0))
+                .unwrap();
+            r.marker_created_at = Some(secs.saturating_mul(1000));
+        }
+        assemble_hops_view(rows)
+    };
+    let (hops, truncated) = walk(PROD_CUTOFF_THEN_MS);
+    assert!(!truncated);
+    assert_eq!(hops.len(), 1, "the hop is inside the era of the day and the walk reads it");
+    assert_eq!((hops[0].status, hops[0].marker_verified), (HopStatus::Unspent, MarkerVerification::Verified));
+    assert_eq!(hops[0].marker_created_at, Some(CREATED_AT_SECS * 1000));
+
+    let key = format!("{}:0", hop_txid.to_ascii_lowercase());
+    let (no_refunds, no_set, no_sweeps, no_pkhs) = (HashMap::new(), HashSet::new(), HashMap::new(), HashMap::new());
+    let (no_outs, no_ins, no_home) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let derive = |chain: &HashMap<String, HopChainWord>, outs: &HashMap<String, Vec<SpenderOutput>>, courier: &HashSet<String>| {
+        derive_owed_rows(&OwedInputs {
+            identity_lc: &m.identity_hex,
+            tip: Some(967_700),
+            now_ms: READ_AT_MS,
+            results: &[],
+            refunds: &[],
+            hops: &hops,
+            valid_refunds: &no_refunds,
+            collected_verified: &no_set,
+            collected_present: &no_set,
+            pot_spenders: &no_set,
+            pot_spenders_faulted: false,
+            hop_chain: chain,
+            evicted_hop_outpoints: &no_set,
+            door_refused_hop_outpoints: &no_set,
+            hop_sweeps: &no_sweeps,
+            evicted_pots: &no_set,
+            spender_outputs: outs,
+            spender_inputs: &no_ins,
+            courier_spenders: courier,
+            my_pkh_by_game: &no_pkhs,
+            home_spends: &no_home,
+        })
+    };
+    let word = |spent: bool, spender: Option<&str>| -> HashMap<String, HopChainWord> {
+        [(key.clone(), HopChainWord { looked: true, spent: Some(spent), spending_txid: spender.map(str::to_string), spent_confirmed: spender.map(|_| true), stale: false, age_ms: None })]
+            .into_iter()
+            .collect()
+    };
+
+    // THE ISSUE'S SHAPE: index unspent, chain unspent → the stranded-hop sweep row, exactly
+    let rows = derive(&word(false, None), &no_outs, &no_set);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r.family, OwedFamily::HopStranded);
+    assert_eq!(r.outpoint, key);
+    assert_eq!(r.game_id, hex::encode(game));
+    assert_eq!(r.sats, Some(20_190));
+    assert_eq!(r.facts["claim"], "sweep-hop", "the Collect press on a stranded hop, never the felt's rejoin");
+    assert_eq!(r.facts["claimable"], true);
+    assert_eq!(r.facts["sweepSource"], "sign-here");
+    assert_eq!(r.facts["hopSats"], 20_190);
+    assert_eq!(r.facts["hopVout"], 0);
+    assert_eq!(r.facts["markerVerified"], "verified");
+    assert_eq!(r.facts["joinRefused"], false);
+    assert_eq!(r.reason, None);
+    // before the chain rung has answered (the walk buys eight probes a pass): a sentence, never silence
+    let rows = derive(&HashMap::new(), &no_outs, &no_set);
+    assert_eq!((rows.len(), rows[0].family, rows[0].sats), (1, OwedFamily::Unbound, Some(20_190)));
+    assert_eq!(rows[0].facts["chainProbe"], "pending");
+
+    // THE LEDGER'S TRUTH (2026-09-02): the chain rung names the 08-29 sweep, which the index never held. The game is
+    // hop-only (no pot ever committed a home), so the brain cannot call it a payout: a claimless row with a sentence
+    let sweep = format!("3d43e1f0{}", "0".repeat(56));
+    let rows = derive(&word(true, Some(&sweep)), &no_outs, &no_set);
+    assert_eq!((rows.len(), rows[0].family), (1, OwedFamily::Unbound));
+    assert!(rows[0].facts["claim"].is_null());
+    assert!(rows[0].reason.as_deref().unwrap().contains("could not judge the spender"));
+    let outs: HashMap<String, Vec<SpenderOutput>> =
+        [(sweep.clone(), vec![SpenderOutput { vout: 0, pkh_hex: Some("14".repeat(20)), sats: 20_170, spent: None, pot_lock: false }])].into_iter().collect();
+    let courier: HashSet<String> = [sweep.clone()].into_iter().collect();
+    let rows = derive(&word(true, Some(&sweep)), &outs, &courier);
+    assert_eq!((rows.len(), rows[0].family), (1, OwedFamily::Unbound));
+    assert_eq!(rows[0].reason.as_deref(), Some(HOME_UNKNOWN_REASON));
+    assert_eq!(rows[0].facts["spenderPkhs"][0], "14".repeat(20));
+
+    // and the one way the walk does not read this hop at all, by the era's design: the cutoff of 2026-09-21
+    assert!(walk(PROD_CUTOFF_AFTER_MS).0.is_empty(), "the bump writes the hop off from the views; the sats stay at the key");
+}
