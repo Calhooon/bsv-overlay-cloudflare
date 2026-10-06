@@ -16,7 +16,7 @@ help:
 	@echo "  reference-logs   Tail overlay-express logs"
 	@echo "  wrangler-dev     wrangler dev in parity mode (:8787) — run in a separate shell"
 	@echo "  harness          Run parity-harness once (assumes services are up)"
-	@echo "  test             cargo test --workspace with memory-storage feature"
+	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
@@ -86,8 +86,18 @@ parity-clean:
 
 ## -- Tests + builds -----------------------------------------------------------
 
+# TWO workspaces since bsv-low #553. The ROOT one (engine, discovery, the
+# parity harness) is what a consumer pins by git rev: it must load from a
+# fresh clone with nothing beside it, so it holds no path dependency that
+# leaves the repository. `workers/Cargo.toml` holds the two deployable
+# workers and the `LOW/proof/v1` replay, which link `low-core`/`low-wire`
+# by PATH from the private `../bsv-low` checkout. Every gate below runs
+# BOTH: a root-only `cargo test --workspace` no longer reaches a worker.
+WORKERS := --manifest-path workers/Cargo.toml
+
 test:
 	cargo test --workspace --features bsv-overlay-engine/memory-storage
+	cargo test $(WORKERS) --workspace
 
 # THE GATE. Run this, not a hand-typed approximation of it.
 #
@@ -106,9 +116,12 @@ ci:
 	bash scripts/check-config-ids.sh --self-test; \
 	bash scripts/check-config-ids.sh; \
 	cargo test --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast; \
+	cargo test $(WORKERS) --workspace --no-fail-fast; \
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
-	cargo build -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
-	cargo build -p low-app-layer --target wasm32-unknown-unknown --release; \
+	cargo clippy $(WORKERS) --workspace --all-targets -- -D warnings; \
+	cargo build -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown; \
+	cargo build $(WORKERS) -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
+	cargo build $(WORKERS) -p low-app-layer --target wasm32-unknown-unknown --release; \
 	$(MAKE) ci-deploy; \
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
@@ -365,7 +378,9 @@ ci-route:
 # The gap is structural, not an oversight. `cargo build --target wasm32` is
 # perfectly happy with two `worker` majors in one workspace. `worker-build` —
 # which runs ONLY at deploy time — is not: it resolves `worker` from the
-# WORKSPACE Cargo.lock and takes the LOWEST version present, because its
+# WORKSPACE Cargo.lock (since bsv-low #553 that is `workers/Cargo.lock`, the
+# lock of the workspace both workers belong to; the root lock holds no
+# `worker` at all) and takes the LOWEST version present, because its
 # per-crate disambiguation is dead code (off-by-one in
 # `Lockfile::get_package_version`, `dep.chars().nth(package.len() + 1)` where
 # the space is at `package.len()`; verified present in worker-build 0.7.5,
@@ -414,10 +429,20 @@ DEPLOY_CONFIGS ?= crates/overlay-cloudflare:wrangler.toml \
                   crates/low-app-layer:wrangler.toml
 ci-deploy:
 	@set -e; \
-	vers=$$(awk '/^name = "worker"$$/{getline; gsub(/[^0-9.]/,"",$$0); print}' Cargo.lock | sort -u); \
+	leaks=$$(grep -n 'path *= *"[^"]*bsv-low' Cargo.toml crates/overlay-engine/Cargo.toml \
+	    crates/overlay-discovery/Cargo.toml parity-harness/Cargo.toml || true); \
+	rootw=$$(grep -c '^name = "worker"$$' Cargo.lock || true); \
+	if [ -n "$$leaks" ] || [ "$$rootw" != "0" ]; then \
+	  echo "✗ ci-deploy: the ROOT workspace must build from this repository alone"; \
+	  echo "  (bsv-low #553: consumers pin the engine crates by git rev). It may name"; \
+	  echo "  no path into ../bsv-low and its Cargo.lock may hold no \`worker\`: both"; \
+	  echo "  belong to workers/Cargo.toml. Found: $$leaks; root-lock worker entries: $$rootw"; \
+	  exit 1; \
+	fi; \
+	vers=$$(awk '/^name = "worker"$$/{getline; gsub(/[^0-9.]/,"",$$0); print}' workers/Cargo.lock | sort -u); \
 	nv=$$(printf '%s\n' "$$vers" | sed '/^$$/d' | wc -l | tr -d ' '); \
 	if [ "$$nv" != "1" ]; then \
-	  echo "✗ ci-deploy: Cargo.lock holds $$nv \`worker\` versions —" $$vers; \
+	  echo "✗ ci-deploy: workers/Cargo.lock holds $$nv \`worker\` versions:" $$vers; \
 	  echo "  worker-build takes the LOWEST one for EVERY crate in the workspace,"; \
 	  echo "  so any crate needing a higher one is undeployable (bsv-low #348)."; \
 	  echo "  The workspace may hold exactly ONE \`worker\` version."; \
@@ -457,7 +482,7 @@ ci-deploy:
 	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build"
 
 extensions-build:
-	cargo build -p bsv-overlay-cloudflare --features extensions
+	cargo build $(WORKERS) -p bsv-overlay-cloudflare --features extensions
 
 ## -- End-to-end ---------------------------------------------------------------
 

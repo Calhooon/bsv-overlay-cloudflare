@@ -1,7 +1,7 @@
 # bsv-overlay-cloudflare
 
 Rust port of [`@bsv/overlay-express`][ts] deployed on Cloudflare Workers.
-Three-crate workspace compiled to WebAssembly. 1:1 protocol parity with
+Two cargo workspaces in one repository (see "Two workspaces"), compiled to WebAssembly. 1:1 protocol parity with
 mainline 2.2.0, proven by a differential harness.
 
 [ts]: https://github.com/bsv-blockchain/overlay-express
@@ -46,10 +46,36 @@ bsv-overlay-cloudflare/
 │       │   └── wallet/client.rs# BRC-31-authed wallet-storage HTTP client
 │       └── wrangler.toml
 │
+├── workers/Cargo.toml          # The LOW workers' workspace (own Cargo.lock):
+│                               #   overlay-cloudflare, low-app-layer,
+│                               #   low-proof-replay (crates/, see below)
+│
 └── parity-harness/             # Rust CLI that diffs our Worker vs the
     ├── src/                    #   reference @bsv/overlay-express@2.2.0 docker
     └── corpus/                 #   43 JSON request/response scenarios
 ```
+
+## Two workspaces (bsv-low #553, 2026-10-06)
+
+The ROOT workspace (`Cargo.toml`: `overlay-engine`, `overlay-discovery`,
+`parity-harness`) is what a consumer pins by git rev. It must build from a
+fresh clone of this repository ALONE, so no member may carry a path
+dependency that leaves the repository. Cargo reads a path dependency's
+manifest even when it is `optional`, so a feature gate does NOT satisfy this
+(measured: `failed to load manifest for dependency low-core`).
+
+`workers/Cargo.toml` is a second, virtual workspace with its own
+`workers/Cargo.lock`: `crates/overlay-cloudflare`, `crates/low-app-layer`
+and `crates/low-proof-replay` (each names it with `package.workspace`).
+These link LOW's private `low-core` / `low-wire` by PATH from a `bsv-low`
+checkout that must sit beside this repository. `low-proof-replay` is the
+`LOW/proof/v1` replay (it was `overlay_discovery::proof::replay`);
+`ProofLookupService` takes it as a hook (`with_prover`, a
+`proof::BundleProver`), and with no prover it records `bundleValid = NULL`.
+Both workers pass `low_proof_replay::prove_bundle`.
+
+Cargo commands for a worker need `--manifest-path workers/Cargo.toml` (or
+run inside the crate directory). `make ci` runs both workspaces.
 
 ## Dependencies
 
@@ -57,7 +83,7 @@ bsv-overlay-cloudflare/
 - `bsv-middleware-cloudflare` — BRC-103/104 auth middleware for CF Workers (crates.io), pinned `0.3` — the same lineage the low-watchtower and low-app-layer pin
 - `worker` — Cloudflare Workers Rust SDK, pinned `0.8`
 
-**THE WORKSPACE MAY HOLD EXACTLY ONE `worker` VERSION** (bsv-low #348). `worker-build` — which runs only at DEPLOY time — resolves `worker` from the *workspace* `Cargo.lock` and takes the LOWEST version it finds there, for every crate, regardless of which crate directory it was invoked from; its per-crate disambiguation is dead code (off-by-one in `Lockfile::get_package_version`, verified in worker-build 0.7.5 / 0.8.4 / 0.8.5). Plain `cargo build` is perfectly happy with two majors, so a split is invisible to every native gate: `low-app-layer` sat undeployable for a month with `make ci` green throughout. If a crate ever needs a different `worker`, it must leave the workspace *and* stop depending on anything in it — a path dev-dep drags the other version straight back into the lock. `make ci-deploy` (part of `make ci`) is what enforces this: a lock/pin preflight plus a real `wrangler deploy --dry-run` of all three deployable configs.
+**THE WORKSPACE MAY HOLD EXACTLY ONE `worker` VERSION** (bsv-low #348). `worker-build`, which runs only at DEPLOY time, resolves `worker` from the *workspace* `Cargo.lock` (the workers' one, `workers/Cargo.lock`; the root lock holds no `worker`) and takes the LOWEST version it finds there, for every crate, regardless of which crate directory it was invoked from; its per-crate disambiguation is dead code (off-by-one in `Lockfile::get_package_version`, verified in worker-build 0.7.5 / 0.8.4 / 0.8.5). Plain `cargo build` is perfectly happy with two majors, so a split is invisible to every native gate: `low-app-layer` sat undeployable for a month with `make ci` green throughout. If a crate ever needs a different `worker`, it must leave the workspace *and* stop depending on anything in it: a path dev-dep drags the other version straight back into the lock. `make ci-deploy` (part of `make ci`) is what enforces this: a lock/pin preflight plus a real `wrangler deploy --dry-run` of all three deployable configs.
 
 ## HTTP route set
 
@@ -125,8 +151,9 @@ than native; budget CPU accordingly for big covenant legs.
 ## Testing
 
 ```bash
-# Fast unit + integration (no network)
-cargo test --workspace --features overlay-engine/memory-storage
+# Fast unit + integration (no network): the engine crates, then the workers
+cargo test --workspace --features bsv-overlay-engine/memory-storage
+cargo test --manifest-path workers/Cargo.toml --workspace
 
 # Property tests (proptest, 256 cases each)
 cargo test --workspace --features overlay-engine/memory-storage --test property_tests
@@ -168,7 +195,7 @@ cd crates/overlay-cloudflare
 CLOUDFLARE_API_TOKEN="<token>" CLOUDFLARE_ACCOUNT_ID="<id>" wrangler deploy
 ```
 
-**Three deployable configs**, all built from the one workspace lock: `crates/overlay-cloudflare/wrangler.toml` (`bsv-overlay-cloudflare`), `crates/overlay-cloudflare/wrangler.low.toml` (`low-overlay`, LIVE — `wrangler deploy --config wrangler.low.toml`), and `crates/low-app-layer/wrangler.toml` (`low-app-layer`). Their `[build]` worker-build pins must all match each other and the lock's `worker`; `make ci-deploy` builds all three and refuses on drift. **A green `make ci` without `ci-deploy` is not evidence a worker can be deployed** — that gap is exactly bsv-low #348.
+**Three deployable configs**, all built from the one workers' lock (`workers/Cargo.lock`): `crates/overlay-cloudflare/wrangler.toml` (`bsv-overlay-cloudflare`), `crates/overlay-cloudflare/wrangler.low.toml` (`low-overlay`, LIVE: `wrangler deploy --config wrangler.low.toml`), and `crates/low-app-layer/wrangler.toml` (`low-app-layer`). Their `[build]` worker-build pins must all match each other and the lock's `worker`; `make ci-deploy` builds all three and refuses on drift. **A green `make ci` without `ci-deploy` is not evidence a worker can be deployed**: that gap is exactly bsv-low #348.
 
 - **Admin auth**: Bearer token on all `/admin/*` routes except `/admin/config`.
 - **Cron**: `*/15 * * * *` for ad sync + GASP peer sync.

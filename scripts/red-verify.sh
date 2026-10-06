@@ -41,6 +41,11 @@ ANCHOR_FILE="${2:?file containing the exact text to replace}"
 REPL_FILE="${3:?file containing the injected defect}"
 FILTER="${4:?the test name filter to run}"
 PKG="${5:-low-watchtower}"
+# bsv-low #553: the workers (overlay-cloudflare, low-app-layer,
+# low-proof-replay) are a second workspace. Name its manifest for a package
+# there, e.g. RED_VERIFY_MANIFEST=workers/Cargo.toml; unset = the root one.
+MANIFEST=()
+[ -n "${RED_VERIFY_MANIFEST:-}" ] && MANIFEST=(--manifest-path "$RED_VERIFY_MANIFEST")
 
 inconclusive() {
   echo "❌ INCONCLUSIVE — $1"
@@ -87,13 +92,13 @@ else
 fi
 
 # (3) Confirm it COMPILES. A build break is not a failing test.
-if ! cargo test -p "$PKG" --no-run >/dev/null 2>&1; then
+if ! cargo test ${MANIFEST[@]+"${MANIFEST[@]}"} -p "$PKG" --no-run >/dev/null 2>&1; then
   inconclusive "the injected code does not COMPILE — a build break is not a RED test"
 fi
 echo "✓ injected code compiles"
 
 # (4) Run the suite.
-OUT="$(cargo test -p "$PKG" "$FILTER" 2>&1)"
+OUT="$(cargo test ${MANIFEST[@]+"${MANIFEST[@]}"} -p "$PKG" "$FILTER" 2>&1)"
 echo "$OUT" | grep -E "^test result:" || true
 
 # (5) Only now may the word RED be used.
