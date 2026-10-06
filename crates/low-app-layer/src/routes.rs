@@ -3386,7 +3386,7 @@ pub(crate) async fn owed_recompute(
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
     //     this crate decides: the home key's signature over a spender's bytes (`owed_home_spend_walk`).
-    let home_spends = owed_home_spend_walk(env, db, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
+    let home_spends = owed_home_spend_walk(env, db, identity_lc, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
     inputs.home_spends = &home_spends;
     let mut rows = derive_owed_rows(&inputs);
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
@@ -3466,100 +3466,90 @@ pub(crate) async fn owed_recompute(
 /// verify against the home's own lock, executed here (`owed::home_output_spend_proven`). Only (1) and (3) say
 /// `Proven`; a courier's word of spent alone is `Unproven` and retires nothing. Every fault leaves the outpoint
 /// unnamed (the row stands: the safe direction).
+///
+/// The delta fold's LOW-1 and LOW-2 (2026-10-06): the pass itself is `owed::home_walk_pass` (pinned, caps and
+/// all); this function is its D1 and courier plumbing. The candidates are a RING walked from the identity's
+/// cursor (`owed::home_walk_window`), and the cursor moves to the first output the pass withheld a look from, so
+/// the window cut, the chain probes and the stored reads all rotate. Cost per pass: one memo read (the cursor,
+/// the window's latches and chain memos), one more for the cursor alone when the identity holds more than
+/// `OWED_HOME_WINDOW` candidates, and one batch of upserts (the fresh memos, the latches, the cursor).
 async fn owed_home_spend_walk(
     env: &worker::Env,
     db: &worker::D1Database,
+    identity_lc: &str,
     candidates: &[crate::owed::CourierHomeOutput],
     now_ms: i64,
     started_ms: i64,
 ) -> std::collections::HashMap<String, crate::owed::HomeSpendWord> {
-    use crate::owed::{home_latch_target, outpoint_key, HomeSpendWord};
-    // a lived-in identity holds a handful at most; the bound keeps one read inside D1's bind limit
-    let candidates = &candidates[..candidates.len().min(crate::logic::D1_CHUNK_OUTPOINTS)];
+    use crate::owed::{home_cursor_of, home_cursor_target, home_latch_target, home_walk_window, OWED_HOME_WINDOW};
     if candidates.is_empty() {
         return std::collections::HashMap::new();
     }
-    let over_budget = || worker::Date::now().as_millis() as i64 - started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS;
-    // (1) the latches (`owed::latched_home_words`: the key read is the key the proof wrote)
-    let latch_targets: Vec<(String, u32)> = candidates.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
-    let (mut words, targets): (std::collections::HashMap<String, HomeSpendWord>, Vec<(String, u32)>) =
-        crate::owed::latched_home_words(candidates, &read_probe_memos(db, &latch_targets).await);
-    if targets.is_empty() {
-        return words;
+    let memo_targets = |window: &[crate::owed::CourierHomeOutput]| -> Vec<(String, u32)> {
+        window.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).chain(window.iter().map(|c| (c.sweep_txid.clone(), c.vout))).collect()
+    };
+    // a lived-in identity holds a handful: the cursor rides the one memo read. Past the window, it is read first.
+    let (window, memos) = if candidates.len() <= OWED_HOME_WINDOW {
+        let mut targets = vec![home_cursor_target(identity_lc)];
+        targets.extend(memo_targets(candidates));
+        let memos = read_probe_memos(db, &targets).await;
+        (home_walk_window(candidates, home_cursor_of(&memos, identity_lc).as_deref(), OWED_HOME_WINDOW), memos)
+    } else {
+        let cursor = home_cursor_of(&read_probe_memos(db, &[home_cursor_target(identity_lc)]).await, identity_lc);
+        let window = home_walk_window(candidates, cursor.as_deref(), OWED_HOME_WINDOW);
+        let memos = read_probe_memos(db, &memo_targets(&window)).await;
+        (window, memos)
+    };
+    // the latch keys and the chain keys never collide (`HOME_SPEND_LATCH_PREFIX`), so one list serves both readers
+    let mut world = HomeWalkCouriers { env, db, started_ms };
+    let pass = crate::owed::home_walk_pass(&mut world, &window, &memos, &memos, now_ms).await;
+    let mut writes = pass.memos;
+    for latch in writes.iter().filter(|m| m.outpoint.starts_with(crate::owed::HOME_SPEND_LATCH_PREFIX)) {
+        worker::console_log!(
+            "[owed] home output {} is proven spent by {} (the home key's signature verified): the courier-proven payout retires",
+            latch.outpoint,
+            latch.spending_txid.as_deref().unwrap_or_default()
+        );
     }
-    // (2) the chain rung: the memoised words first, a bounded ladder for the rest
-    let memos = read_probe_memos(db, &targets).await;
-    let (mut seen, to_probe) = crate::hops_view::split_probe_targets_with(
-        &targets,
-        &memos,
-        now_ms,
-        crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
-        crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
-    );
-    let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
-    for (t, v) in to_probe.into_iter().take(crate::owed::OWED_HOME_PROBES_PER_RECOMPUTE) {
-        if over_budget() {
-            break;
-        }
-        let row = spent_any_resolve_cached(&t, v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
-        let probe = crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed };
-        if let Some(m) = crate::hops_view::probe_memo_of(&t, v, &probe, now_ms) {
-            fresh.push(m);
-        }
-        seen.push((t, v, probe));
+    if let Some(next) = crate::owed::home_cursor_after(candidates, &window, pass.first_withheld) {
+        writes.push(crate::owed::home_cursor_memo(identity_lc, next, now_ms));
     }
-    // (3) the proof, per named spender (`owed::home_word` decides; this loop only fetches the bytes). The lens
-    //     fold's LOW-4: the stored-BEEF read is INSIDE the walk's budget now, by the clock and by a count
-    //     (`OWED_HOME_STORED_READS_PER_RECOMPUTE`); before, every memoised spent-and-unproven output bought one per
-    //     pass, bounded only by the 45-candidate cap.
-    let mut latches: Vec<crate::hops_view::ProbeMemo> = Vec::new();
-    let mut resolver_asks = 0usize;
-    let mut stored_reads = 0usize;
-    for (t, v, probe) in seen {
-        let Some(home) = candidates.iter().find(|c| c.vout == v && c.sweep_txid.eq_ignore_ascii_case(&t)) else {
-            continue;
-        };
-        let mut raw: Option<Vec<u8>> = None;
-        if let (true, Some(true), Some(sp)) = (probe.known, probe.spent, probe.spending_txid.as_deref().map(str::to_ascii_lowercase)) {
-            if stored_reads < crate::owed::OWED_HOME_STORED_READS_PER_RECOMPUTE && !over_budget() {
-                stored_reads += 1;
-                raw = match load_stored_beef(env, db, &sp).await {
-                    Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
-                        .ok()
-                        .and_then(|beef| beef.find_txid(&sp).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
-                    _ => None,
-                };
-            }
-            if raw.is_none() {
-                let now_f = worker::Date::now().as_millis() as f64;
-                let answer = match tx_any_cached(&sp, now_f) {
-                    Some(a) => Some(a),
-                    None if resolver_asks < crate::owed::OWED_HOME_PROBES_PER_RECOMPUTE && !over_budget() => {
-                        resolver_asks += 1;
-                        Some(resolve_tx_any(None, None, &sp, now_f, "owed", env).await)
-                    }
-                    None => None,
-                };
-                raw = answer.and_then(|a| a.raw_hex).and_then(|h| hex::decode(h).ok());
-            }
-        }
-        let Some((word, latch)) = crate::owed::home_word(&probe, raw.as_deref(), home, now_ms) else {
-            continue;
-        };
-        if let Some(latch) = latch {
-            worker::console_log!(
-                "[owed] home output {t}:{v} is proven spent by {} (the home key's signature verified): the courier-proven payout retires",
-                latch.spending_txid.as_deref().unwrap_or_default()
-            );
-            latches.push(latch);
-        }
-        words.insert(outpoint_key(&t, v), word);
+    if !writes.is_empty() {
+        write_probe_memos(db, &writes).await;
     }
-    fresh.extend(latches);
-    if !fresh.is_empty() {
-        write_probe_memos(db, &fresh).await;
+    pass.words
+}
+
+/// The Worker behind `owed::HomeWalkWorld`: the recompute's clock, the `/spent-any` ladder, the stored BEEF and
+/// the tx-any resolver. Fetches only; every decision is `owed::home_walk_pass`'s.
+struct HomeWalkCouriers<'a> {
+    env: &'a worker::Env,
+    db: &'a worker::D1Database,
+    started_ms: i64,
+}
+impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
+    fn over_budget(&self) -> bool {
+        worker::Date::now().as_millis() as i64 - self.started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
     }
-    words
+    async fn probe(&mut self, txid: &str, vout: u32) -> crate::hops_view::ChainSpendProbe {
+        let row = spent_any_resolve_cached(txid, vout, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
+        crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed }
+    }
+    async fn stored_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
+        match load_stored_beef(self.env, self.db, spender_txid).await {
+            Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
+                .ok()
+                .and_then(|beef| beef.find_txid(spender_txid).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
+            _ => None,
+        }
+    }
+    fn cached_spender(&mut self, spender_txid: &str) -> Option<Option<Vec<u8>>> {
+        tx_any_cached(spender_txid, worker::Date::now().as_millis() as f64).map(|a| a.raw_hex.and_then(|h| hex::decode(h).ok()))
+    }
+    async fn resolve_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
+        let now_f = worker::Date::now().as_millis() as f64;
+        resolve_tx_any(None, None, spender_txid, now_f, "owed", self.env).await.raw_hex.and_then(|h| hex::decode(h).ok())
+    }
 }
 
 /// ONE recompute for ONE identity, then the page told (`owed-changed` on its durable box). A fault is counted and
