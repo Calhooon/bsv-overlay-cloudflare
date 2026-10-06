@@ -2237,9 +2237,26 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
-    let outpoints = crate::internal_events::parse_pot_changed(&raw);
+    let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);
     if outpoints.is_empty() {
         return Response::error("body must be {\"outpoints\":[{\"txid\",\"vout\"}]}", 400);
+    }
+    // bsv-low #436: the overlay chunks its flush at `POT_CHANGED_MAX`, so nothing is over the cap from our own
+    // producer. A body that still carries more is never trimmed silently: logged, counted, and answered.
+    if dropped > 0 {
+        console_warn!(
+            "[pot-changed] body carried {} outpoint(s) past the cap of {}: {dropped} NOT announced and NOT filed (the producer must chunk)",
+            outpoints.len() + dropped,
+            crate::internal_events::POT_CHANGED_MAX
+        );
+        let counter_db = env.d1("OVERLAY_DB").ok();
+        ctx.wait_until(async move {
+            crate::courier::flush(
+                counter_db,
+                vec![(crate::internal_events::COUNTER_POT_CHANGED_DROPPED.to_string(), dropped as u64)],
+            )
+            .await;
+        });
     }
     // bsv-low loop 10 D2 (2026-09-08, the pair-10 finding): announce EVERY
     // changed outpoint in the pots room FIRST, before any attribution (see
@@ -2414,7 +2431,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         });
     }
     json_response(
-        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped }).to_string(),
+        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped, "dropped": dropped }).to_string(),
         200,
     )
 }
@@ -2429,9 +2446,26 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
-    let identities = crate::internal_events::parse_hop_changed(&raw);
+    let (identities, dropped) = crate::internal_events::parse_hop_changed_counted(&raw);
     if identities.is_empty() {
         return Response::error("body must be {\"identities\":[\"02…\"]}", 400);
+    }
+    // bsv-low #436 (lens fold): the overlay chunks its flush at `HOP_CHANGED_MAX`, so nothing is over the cap from
+    // our own producer. A body that still carries more is never trimmed silently: logged, counted, and answered.
+    if dropped > 0 {
+        console_warn!(
+            "[hop-changed] body carried {} identity(ies) past the cap of {}: {dropped} NOT marked stale and NOT re-derived (the producer must chunk)",
+            identities.len() + dropped,
+            crate::internal_events::HOP_CHANGED_MAX
+        );
+        let counter_db = env.d1("OVERLAY_DB").ok();
+        ctx.wait_until(async move {
+            crate::courier::flush(
+                counter_db,
+                vec![(crate::internal_events::COUNTER_HOP_CHANGED_DROPPED.to_string(), dropped as u64)],
+            )
+            .await;
+        });
     }
     let db = env.d1("OVERLAY_DB")?;
     for id in &identities {
@@ -2446,7 +2480,7 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
             owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip).await;
         }
     });
-    json_response(serde_json::json!({ "ok": true, "identities": identities }).to_string(), 200)
+    json_response(serde_json::json!({ "ok": true, "identities": identities, "dropped": dropped }).to_string(), 200)
 }
 
 /// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The
@@ -2878,6 +2912,12 @@ pub(crate) async fn owed_recompute(
     //     probe for the rest (counted per caller `owed`), the fresh memos written back; a hop past the budget keeps
     //     its last memo's word, named stale.
     let mut hop_chain: HashMap<String, crate::owed::HopChainWord> = HashMap::new();
+    // bsv-low #484 (delta fold, D-M1): the hops whose chain word is a "confirmed" taken inside the reorg grace; their
+    // payout rows are OPEN for the read's rule (`hops_view::mark_reorg_grace_rows`, step 7)
+    let mut grace_words: HashSet<String> = HashSet::new();
+    // delta fold 2 (D2-M1, D2-L1): the past-budget hops whose memo was served WITHOUT its confirmation (hop outpoint
+    // to the spender the memo names): such a word still contradicts a proof (step 4d) and is named on its row (step 7)
+    let mut refused_words: HashMap<String, Option<String>> = HashMap::new();
     let mut chain_spenders: Vec<String> = Vec::new();
     {
         let candidates: Vec<(String, u32)> = hops
@@ -2902,18 +2942,25 @@ pub(crate) async fn owed_recompute(
             .map(|h| (h.hop_txid.to_ascii_lowercase(), h.hop_vout))
             .collect();
         if !candidates.is_empty() {
-            let memos = read_probe_memos(db, &candidates).await;
+            // bsv-low #484 (lens fold, M2): the overlay's reorg tombstone rides the same read (all-or-nothing, in
+            // statements under D1's bind cap since delta fold 2's D-L5: the memos and the stamp arrive together or
+            // not at all, and with no memos every candidate is asked)
+            let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;
             // bsv-low #469, the stranded cell's run 5 (2026-09-19): a CONFIRMED spend's memo answers for two hours
             // (`PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; the gate's NIT-8: it read "a day" here after the window shrank), and the
             // outpoints still to ask go never-probed first (newest marker first) then oldest memo first, so the
             // eight-per-recompute walk reaches a hop that just crossed the window instead of re-probing the same
             // first eight of the hops view's rank order every five minutes (both pinned in `hops_view`).
-            let (answered, to_probe) = crate::hops_view::split_probe_targets_with(
+            // Inside the grace after a reorg clear a confirmed memo has the short window (the pass that clears also
+            // pushes pot-changed, so this walk can follow it by seconds and ask a courier still behind the reorg).
+            let reorg_clear = crate::hops_view::reorg_clear_at(&memos);
+            let (answered, to_probe) = crate::hops_view::split_probe_targets_after_reorg(
                 &candidates,
                 &memos,
                 now_ms,
                 crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
                 crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
+                reorg_clear,
             );
             let marker_at: HashMap<String, i64> = hops
                 .iter()
@@ -2927,6 +2974,9 @@ pub(crate) async fn owed_recompute(
                 }
                 // the memo's age rides the word (the gate's L5): the newest memo for the key, as the split judged it
                 let age_ms = memos.iter().filter(|m| m.outpoint == format!("{t}.{v}")).map(|m| now_ms - m.probed_at_ms).min();
+                if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) {
+                    grace_words.insert(outpoint_key(&t, v));
+                }
                 hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, spent_confirmed: p.spent_confirmed, stale: false, age_ms });
             }
             let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
@@ -2941,7 +2991,12 @@ pub(crate) async fn owed_recompute(
                         if let Some(s) = m.spending_txid.as_deref() {
                             chain_spenders.push(s.to_ascii_lowercase());
                         }
-                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), spent_confirmed: m.spent_confirmed, stale: true, age_ms: Some(now_ms - m.probed_at_ms) });
+                        // D-M1: a confirmed memo the grace refused its window is not served as confirmed
+                        // (D2-M1: remembered with the spender it names, so it can still contradict a proof)
+                        if crate::hops_view::confirmation_refused(m, reorg_clear) {
+                            refused_words.insert(key.clone(), m.spending_txid.as_deref().map(str::to_ascii_lowercase));
+                        }
+                        hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));
                     }
                     continue;
                 }
@@ -2954,6 +3009,9 @@ pub(crate) async fn owed_recompute(
                 }
                 if let Some(s) = row.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
+                }
+                if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) {
+                    grace_words.insert(key.clone());
                 }
                 hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed, stale: false, age_ms: None });
             }
@@ -3078,6 +3136,10 @@ pub(crate) async fn owed_recompute(
             }
         }
     }
+
+    // delta fold 2 (D2-M1): a refused past-budget word naming ANOTHER spender than the filed sweep still contradicts
+    // the index's proof of that sweep (the grace narrows the claimable word, never the contradiction)
+    let proofs_set_aside = crate::hops_view::set_aside_proofs_a_refused_word_contradicts(&mut hop_sweeps, &refused_words);
 
     // 5. the `collected` markers naming this identity — VERIFIED under the identity (the gate's HIGH-1: the table
     //    is byte-format admitted, a stranger can plant a row naming any (identity, game); only a signature the
@@ -3390,7 +3452,9 @@ pub(crate) async fn owed_recompute(
     inputs.home_spends = &home_spends;
     let mut rows = derive_owed_rows(&inputs);
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
+    crate::hops_view::mark_refused_word_rows(&mut rows, &refused_words, &proofs_set_aside);
     crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
+    crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words);
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {
         rows.truncate(crate::owed::OWED_MAX_ROWS);
@@ -4917,34 +4981,31 @@ struct ProbeMemoRow {
     spent_confirmed: Option<i64>,
 }
 
-/// The memos for `targets` (one `IN` read). Fail-soft: a bind/query fault is an empty answer (every target asked).
+/// The memos for `targets`, read in statements of at most `hops_view::PROBE_MEMO_READ_CHUNK` binds (delta fold 2,
+/// D-L5: D1 refuses more than 100 a statement). Fail-soft and ALL-OR-NOTHING: a bind/query fault in any statement
+/// is an empty answer (every target asked; the owed walk's reorg tombstone rides this read and must never be the
+/// only part lost).
 async fn read_probe_memos(
     db: &worker::D1Database,
     targets: &[(String, u32)],
 ) -> Vec<crate::hops_view::ProbeMemo> {
-    if targets.is_empty() {
-        return Vec::new();
-    }
-    let binds: Vec<JsValue> = targets
-        .iter()
-        .map(|(txid, vout)| JsValue::from_str(&crate::hops_view::probe_memo_key(txid, *vout)))
-        .collect();
-    let rows: Vec<ProbeMemoRow> = match db
-        .prepare(crate::hops_view::probe_memo_read_sql(targets.len()))
-        .bind(&binds)
-    {
-        Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
-            Ok(rows) => rows,
+    let mut rows: Vec<ProbeMemoRow> = Vec::new();
+    for keys in crate::hops_view::probe_memo_read_chunks(targets) {
+        let binds: Vec<JsValue> = keys.iter().map(|k| JsValue::from_str(k)).collect();
+        match db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds) {
+            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
+                Ok(chunk) => rows.extend(chunk),
+                Err(e) => {
+                    console_warn!("[spent-any] probe memo read failed ({} targets): {e}", targets.len());
+                    return Vec::new();
+                }
+            },
             Err(e) => {
-                console_warn!("[spent-any] probe memo read failed ({} targets): {e}", targets.len());
-                Vec::new()
+                console_warn!("[spent-any] probe memo bind failed ({} targets): {e}", targets.len());
+                return Vec::new();
             }
-        },
-        Err(e) => {
-            console_warn!("[spent-any] probe memo bind failed ({} targets): {e}", targets.len());
-            Vec::new()
         }
-    };
+    }
     rows.into_iter()
         .map(|r| crate::hops_view::ProbeMemo {
             outpoint: r.outpoint,

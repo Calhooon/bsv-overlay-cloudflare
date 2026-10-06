@@ -751,6 +751,27 @@ pub fn split_probe_targets(
     split_probe_targets_with(targets, memos, now_ms, max_age_ms, max_age_ms)
 }
 
+/// bsv-low #484 (lens fold, M2): the overlay's reorg TOMBSTONE in `hop_chain_probes` (its
+/// `hop_probe_memos::HOP_PROBE_MEMO_REORG_MARK`, pinned equal from the tests, which link that crate): one reserved
+/// row whose `probedAtMs` is the time of the last reorg clear. The key has the memo key's shape, so the owed walk
+/// reads it in the same `IN` read as its memos ([`reorg_mark_target`]).
+pub const PROBE_MEMO_REORG_MARK: &str = "reorg-clear.0";
+
+/// How long after a reorg clear a CONFIRMED memo is refused the long window (the overlay's
+/// `HOP_PROBE_MEMO_REORG_GRACE_MS`, pinned equal): thirty minutes.
+pub const PROBE_MEMO_REORG_GRACE_MS: i64 = 30 * 60_000;
+
+/// The tombstone as a read target: `read_probe_memos` keys a target `<txid>.<vout>`.
+pub fn reorg_mark_target() -> (String, u32) {
+    ("reorg-clear".to_string(), 0)
+}
+
+/// PURE: when the overlay last cleared the confirmed memos on reorg evidence (the tombstone among the rows read),
+/// or `None` (never, or the row was not read).
+pub fn reorg_clear_at(memos: &[ProbeMemo]) -> Option<i64> {
+    memos.iter().filter(|m| m.outpoint == PROBE_MEMO_REORG_MARK).map(|m| m.probed_at_ms).max()
+}
+
 /// PURE: `split_probe_targets` with a second window, `confirmed_max_age_ms`, for a memo that recorded a CONFIRMED
 /// spend (the owed walk passes `PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; every other caller keeps one window).
 pub fn split_probe_targets_with(
@@ -760,6 +781,26 @@ pub fn split_probe_targets_with(
     max_age_ms: i64,
     confirmed_max_age_ms: i64,
 ) -> ProbePlan {
+    split_probe_targets_after_reorg(targets, memos, now_ms, max_age_ms, confirmed_max_age_ms, None)
+}
+
+/// PURE (bsv-low #484, lens fold, M2): THE OWED WALK'S SPLIT. `split_probe_targets_with`, and a CONFIRMED memo
+/// read before `reorg_clear_at_ms + PROBE_MEMO_REORG_GRACE_MS` does NOT count as confirmed for its window: it
+/// answers for `max_age_ms` (five minutes, as any other word) and is then asked again. The reorg pass that clears
+/// the memos also pushes pot-changed, so a walk follows the clear within seconds and asks couriers that may not
+/// have seen the reorg; their "confirmed" used to be memoised for two more hours. Inside the grace the walk keeps
+/// asking; a memo read at or after the grace's end has the long window as before. No lower bound on purpose: the
+/// clear deleted every confirmed memo, so one stamped before it that is still here was written after the delete (a
+/// walk that read its clock before the clear) or survived a failed delete, and is held to the short window too.
+pub fn split_probe_targets_after_reorg(
+    targets: &[(String, u32)],
+    memos: &[ProbeMemo],
+    now_ms: i64,
+    max_age_ms: i64,
+    confirmed_max_age_ms: i64,
+    reorg_clear_at_ms: Option<i64>,
+) -> ProbePlan {
+    let grace_end = reorg_clear_at_ms.map(|at| at.saturating_add(PROBE_MEMO_REORG_GRACE_MS));
     let mut answered = Vec::new();
     let mut to_probe = Vec::new();
     for (txid, vout) in targets {
@@ -768,7 +809,8 @@ pub fn split_probe_targets_with(
         // it one row today, a second memo source tomorrow must not flip the answer by row order)
         let fresh = memos.iter().filter(|m| m.outpoint == key).max_by_key(|m| m.probed_at_ms).filter(|m| {
             let age = now_ms - m.probed_at_ms;
-            let window = if m.spent && m.spent_confirmed == Some(true) { confirmed_max_age_ms } else { max_age_ms };
+            let in_reorg_grace = grace_end.is_some_and(|end| m.probed_at_ms < end);
+            let window = if m.spent && m.spent_confirmed == Some(true) && !in_reorg_grace { confirmed_max_age_ms } else { max_age_ms };
             age >= 0 && age < window
         });
         match fresh {
@@ -786,6 +828,132 @@ pub fn split_probe_targets_with(
         }
     }
     (answered, to_probe)
+}
+
+/// PURE (bsv-low #484, delta fold, D-M1): a word TAKEN at `taken_at_ms` (a memo's `probedAtMs`, or this walk's
+/// clock for a probe it just made) was taken inside the grace after the overlay's last reorg clear. No lower
+/// bound, as in [`split_probe_targets_after_reorg`].
+pub fn in_reorg_grace(taken_at_ms: i64, reorg_clear_at_ms: Option<i64>) -> bool {
+    reorg_clear_at_ms.is_some_and(|at| taken_at_ms < at.saturating_add(PROBE_MEMO_REORG_GRACE_MS))
+}
+
+/// PURE (D-M1): the chain rung said CONFIRMED and said it inside the grace: the word the owed list may serve but
+/// must ask again by the five-minute rule ([`mark_reorg_grace_rows`]).
+pub fn confirmed_in_reorg_grace(spent_confirmed: Option<bool>, taken_at_ms: i64, reorg_clear_at_ms: Option<i64>) -> bool {
+    spent_confirmed == Some(true) && in_reorg_grace(taken_at_ms, reorg_clear_at_ms)
+}
+
+/// PURE (D-M1, the budget half): THE WORD OF A HOP PAST THE WALK'S PROBE BUDGET, its last memo's, named stale.
+/// A CONFIRMED memo read inside the reorg grace has already been refused its window by the split (that is why the
+/// hop is here and not among the answered), so its confirmation is NOT served: the word keeps the spend and the
+/// spender and says nothing of the block (`spent_confirmed: None`), and the row reads "not mined yet" until a
+/// probe says otherwise. It used to ride with `spent_confirmed` intact, and `owed::swept_home` reads that field
+/// and never `stale`: with more candidates than the budget (after a clear every confirmed hop of an identity is
+/// one) a row stayed `claimable: true` on the refused word until the rotation reached it, several walks on.
+/// Any other memo is served as before.
+pub fn stale_memo_word(m: &ProbeMemo, now_ms: i64, reorg_clear_at_ms: Option<i64>) -> crate::owed::HopChainWord {
+    let refused = confirmation_refused(m, reorg_clear_at_ms);
+    crate::owed::HopChainWord {
+        looked: true,
+        spent: Some(m.spent),
+        spending_txid: m.spending_txid.clone(),
+        spent_confirmed: if refused { None } else { m.spent_confirmed },
+        stale: true,
+        age_ms: Some(now_ms - m.probed_at_ms),
+    }
+}
+
+/// PURE: [`stale_memo_word`] serves this memo WITHOUT its confirmation (a confirmed spend read inside the grace).
+pub fn confirmation_refused(m: &ProbeMemo, reorg_clear_at_ms: Option<i64>) -> bool {
+    m.spent && confirmed_in_reorg_grace(m.spent_confirmed, m.probed_at_ms, reorg_clear_at_ms)
+}
+
+/// PURE (bsv-low #484, delta fold 2, D2-M1): THE GRACE NARROWS THE CLAIMABLE WORD, NEVER THE CONTRADICTION.
+/// `refused_words` is the walk's past-budget hops whose memo [`stale_memo_word`] served without its confirmation
+/// (hop outpoint `txid:vout` to the spender the memo names, lowercase). A refused word that names a DIFFERENT
+/// transaction than the hop's filed sweep is still a confirmed rival spender as far as the index's proof of that
+/// sweep goes (#517, the gate's LOW-1, `owed::confirmed_by_other`: the proof never outranks a contradicting
+/// confirmed word, and a courier that HAS seen the reorg is exactly who says it). The word itself stays without
+/// its confirmation, so nothing can claim on it (`owed::swept_home` and `owed::non_pot_spender` read
+/// `spent_confirmed` only); what is set aside here is the PROOF: the filing reads unproven for this pass and the
+/// ladder follows the chain's spender, as it did before the proof existed. Returns the hops set aside, for
+/// [`mark_refused_word_rows`]. Called after the sweep-proof read has settled which filing rides each hop.
+///
+/// Why not hand the confirmation back to a rival word instead (the smaller shape): an UNFILED sweep that pays
+/// the seat's own home is confirmed by `owed::non_pot_spender` on that very field, so a rival word with its
+/// confirmation restored could turn a payout claimable on a word the grace refused.
+pub fn set_aside_proofs_a_refused_word_contradicts(
+    hop_sweeps: &mut std::collections::HashMap<String, crate::hopsweep::FiledHopSweep>,
+    refused_words: &std::collections::HashMap<String, Option<String>>,
+) -> std::collections::HashSet<String> {
+    let mut set_aside = std::collections::HashSet::new();
+    for (outpoint, spender) in refused_words {
+        let (Some(spender), Some(filed)) = (spender.as_deref(), hop_sweeps.get_mut(outpoint)) else {
+            continue;
+        };
+        if filed.index_proven && !spender.eq_ignore_ascii_case(&filed.sweep_txid) {
+            filed.index_proven = false;
+            filed.index_proof_height = None;
+            set_aside.insert(outpoint.clone());
+        }
+    }
+    set_aside
+}
+
+/// The owed row fact [`mark_refused_word_rows`] writes: the row's "not mined yet" is a BUDGET WAIT, not a chain word.
+pub const OWED_FACT_CHAIN_WORD_AWAITS_PROBE: &str = "chainWordAwaitsProbe";
+
+/// The reason such a row carries in place of `owed::UNCONFIRMED_PAYOUT_REASON` (D2-L1).
+pub const CHAIN_WORD_AWAITS_PROBE_REASON: &str =
+    "the chain's last answer for this spend was read just after a reorg and is being asked again in turn: the credit is offered once the answer is fresh";
+
+/// PURE (delta fold 2, D2-M1 and D2-L1): the walk's past-budget refusals, named on the rows they shaped.
+/// 1. A hop in `proofs_set_aside` ([`set_aside_proofs_a_refused_word_contradicts`]) carries
+///    `sweepProofContradicted: true` on its row, whatever family the ladder gave it, as `owed::derive_owed_rows`
+///    writes it for a contradiction it judged itself; the route counts the rows after this mark.
+/// 2. D2-L1: a PAYOUT that is not claimable for want of a confirmation, on a hop whose last chain word said
+///    CONFIRMED and was refused, is not "seen but not mined": the courier said mined and the walk has not asked
+///    again yet. The row says so (`chainWordAwaitsProbe: true` and its own `claimReason`). It reads this way
+///    between the hop's turns in the rotation, which for an identity with more chain candidates than the budget
+///    (eight a walk) outlasts the grace itself: a memo is "inside the grace" by when it was READ until it is
+///    read again (96 hops: an hour or more past the grace's end). The safe direction, accepted by name: a
+///    refused word never claims, and the row is open, so every five-minute walk moves the rotation on.
+pub fn mark_refused_word_rows(
+    rows: &mut [crate::owed::OwedRow],
+    refused_words: &std::collections::HashMap<String, Option<String>>,
+    proofs_set_aside: &std::collections::HashSet<String>,
+) {
+    for r in rows.iter_mut() {
+        if proofs_set_aside.contains(&r.outpoint) {
+            r.facts["sweepProofContradicted"] = json!(true);
+        }
+        if r.family == crate::owed::OwedFamily::Payout
+            && refused_words.contains_key(&r.outpoint)
+            && r.facts["claimable"] == json!(false)
+            && r.facts["claimReason"] == json!(crate::owed::UNCONFIRMED_PAYOUT_REASON)
+        {
+            r.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE] = json!(true);
+            r.facts["claimReason"] = json!(CHAIN_WORD_AWAITS_PROBE_REASON);
+        }
+    }
+}
+
+/// The owed row fact [`mark_reorg_grace_rows`] writes and `owed::row_is_open` reads.
+pub const OWED_FACT_REORG_GRACE_WORD: &str = "chainWordInReorgGrace";
+
+/// PURE (D-M1, the cadence half): a PAYOUT row whose hop's chain word was a "confirmed" taken inside the reorg
+/// grace (`grace_words`: the hop outpoints, `txid:vout`, the walk judged with [`confirmed_in_reorg_grace`]) carries
+/// [`OWED_FACT_REORG_GRACE_WORD`], which makes it an OPEN row for the read's rule: its list is re-derived after
+/// five minutes, not fifteen. A courier behind the reorg answers "confirmed", the row says `claimable: true`, and
+/// the walk that re-derives it finds the memo past its short window and asks again (or, past the budget, serves
+/// [`stale_memo_word`]). A row whose word was taken at or after the grace's end is not marked: the normal rule.
+/// The fact is set on every such payout whatever made it claimable (the index's own proof outranks the word and
+/// the row is right; marking it costs a recompute cadence for the grace, never a wrong word). So the fact does
+/// NOT say "this row rests on a courier" (D2-N3): read `confirmedSource` for that.
+pub fn mark_reorg_grace_rows(rows: &mut [crate::owed::OwedRow], grace_words: &std::collections::HashSet<String>) {
+    for r in rows.iter_mut().filter(|r| r.family == crate::owed::OwedFamily::Payout && grace_words.contains(&r.outpoint)) {
+        r.facts[OWED_FACT_REORG_GRACE_WORD] = json!(true);
+    }
 }
 
 /// PURE (bsv-low #469, the stranded cell's run 5): the order the OWED walk asks the outpoints no memo answered, under
@@ -868,6 +1036,24 @@ pub fn probe_memo_read_sql(n: usize) -> String {
     format!(
         "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE outpoint IN ({marks})"
     )
+}
+
+/// The most outpoints one memo read binds (delta fold 2, D-L5). D1 refuses a statement with more than 100 bound
+/// parameters ("Maximum bound parameters per query: 100", developers.cloudflare.com/d1/platform/limits, read
+/// 2026-10-06; `logic::D1_MAX_BOUND_PARAMS`), and the memo read binds one per outpoint.
+pub const PROBE_MEMO_READ_CHUNK: usize = 90;
+const _: () = assert!(PROBE_MEMO_READ_CHUNK <= crate::logic::D1_MAX_BOUND_PARAMS);
+
+/// PURE (D-L5): the memo read's statements for `targets`, as the keys each one binds (`<txid>.<vout>`, lowercase,
+/// the route's order), at most [`PROBE_MEMO_READ_CHUNK`] a statement. It was ONE `IN` over every target, and the
+/// read fails soft to no memos: an identity with a hundred chain candidates (the reorg tombstone rides the read
+/// as one more) got no memo AND no tombstone back, so the reorg grace was void for it and every walk started
+/// its rotation from nothing. The route runs these in order and keeps the read all-or-nothing: one failed
+/// statement empties the whole answer (the tombstone and the memos arrive together or not at all, the lens
+/// fold's M2; a partial read that lost only the tombstone would serve confirmed memos their long window).
+pub fn probe_memo_read_chunks(targets: &[(String, u32)]) -> Vec<Vec<String>> {
+    let keys: Vec<String> = targets.iter().map(|(txid, vout)| probe_memo_key(txid, *vout)).collect();
+    keys.chunks(PROBE_MEMO_READ_CHUNK).map(<[String]>::to_vec).collect()
 }
 
 /// The memo upsert (one row; the route batches them).
@@ -2152,6 +2338,495 @@ mod tests {
             );
         }
     }
+    /// bsv-low #484 (the 2026-09-19 gate's M1), BOTH WORKERS IN ONE PIN over the shipped schema (real SQLite):
+    /// a CONFIRMED-spend memo written by this worker's own upsert answers the owed walk without a probe (and
+    /// would for two hours, `swept_home` reading it as `claimable`); the overlay's reorg pass runs its clearing
+    /// SQL (`bsv_overlay_cloudflare::hop_probe_memos`); the memo is gone and the NEXT walk re-probes. An unspent
+    /// word beside it is left alone. And the table has the TTL the contract states: the overlay's sweep bound is
+    /// this worker's longest window. To red: make the clear a no-op, or move either bound off the other.
+    #[test]
+    fn a_reorg_clears_the_confirmed_memo_and_the_next_walk_reprobes_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_TTL_MS};
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let now: i64 = 1_800_000_000_000;
+        let swept = ("a1".repeat(32), 0u32);
+        let unspent = ("b2".repeat(32), 1u32);
+        let key = |t: &(String, u32)| format!("{}.{}", t.0, t.1);
+        let write = |outpoint: &str, at: i64, spent: bool, confirmed: Option<bool>| {
+            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![outpoint, at, spent, spent.then(|| "e5".repeat(32)), confirmed]).unwrap();
+        };
+        let read = |targets: &[(String, u32)]| -> Vec<ProbeMemo> {
+            let mut stmt = conn.prepare(&probe_memo_read_sql(targets.len())).unwrap();
+            let keys: Vec<String> = targets.iter().map(key).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get(2)?,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get(4)?,
+                    })
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        // the memo written: a sweep the chain rung saw CONFIRMED an hour ago, and an unspent word a minute old
+        write(&key(&swept), now - 60 * 60_000, true, Some(true));
+        write(&key(&unspent), now - 60_000, false, None);
+        let targets = vec![swept.clone(), unspent.clone()];
+        let walk = |memos: &[ProbeMemo]| split_probe_targets_with(&targets, memos, now, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS);
+        let (answered, to_probe) = walk(&read(&targets));
+        assert_eq!(answered.len(), 2, "both answered from the memo, no probe: {answered:?}");
+        assert!(to_probe.is_empty());
+        assert_eq!(answered[0].2.spent_confirmed, Some(true), "the word `swept_home` reads as claimable");
+        // a reorg event over the sweep's height: the overlay's reorg pass clears
+        let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap();
+        assert_eq!(cleared, 1, "the confirmed memo is gone");
+        // the next walk re-probes the swept hop, and only it
+        let (answered, to_probe) = walk(&read(&targets));
+        assert_eq!(to_probe, vec![swept.clone()], "the next walk re-probes it");
+        assert_eq!(answered.iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>(), vec![unspent.0.clone()]);
+        // the TTL: the overlay deletes exactly what no reader here would honour
+        assert_eq!(HOP_PROBE_MEMO_TTL_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS.max(PROBE_MEMO_MAX_AGE_MS), "the sweep's bound is the longest window a reader passes");
+        write(&key(&swept), now - PROBE_MEMO_CONFIRMED_MAX_AGE_MS - 1, true, Some(true));
+        let (_, to_probe) = walk(&read(&targets));
+        assert_eq!(to_probe, vec![swept.clone()], "past the window no reader honours it");
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now - HOP_PROBE_MEMO_TTL_MS]).unwrap(), 1, "and the sweep deletes it");
+        assert_eq!(read(&targets).len(), 1, "the young unspent word stays");
+    }
+
+    /// bsv-low #484 (lens fold, M2), BOTH WORKERS IN ONE PIN over the shipped schema (real SQLite): THE CLEAR IS
+    /// NOT UNDONE BY THE PUSH. The overlay's reorg pass stamps its tombstone and clears; the pot-changed push the
+    /// same pass sends makes this worker walk seconds later; a courier behind the reorg answers "confirmed" and
+    /// the walk memoises it with this worker's own upsert. Inside the grace that memo has the short window: ten
+    /// minutes on, the walk asks again (it answered for two more hours before, the orphaned sweep reading "ready
+    /// to collect"). A memo read after the grace is trusted for the long window as before, and the one read
+    /// inside it never gains the long window by waiting.
+    /// To red: drop `!in_reorg_grace` from the window, or have the walk split without the tombstone.
+    #[test]
+    fn a_confirmed_memo_rewritten_inside_the_reorg_grace_is_asked_again_and_trusted_only_after_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_MARK, HOP_PROBE_MEMO_REORG_MARK_SQL,
+            HOP_PROBE_MEMO_TTL_MS,
+        };
+        assert_eq!(PROBE_MEMO_REORG_MARK, HOP_PROBE_MEMO_REORG_MARK, "one tombstone key on both workers");
+        assert_eq!(PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_GRACE_MS, "one grace on both workers");
+        let mark = reorg_mark_target();
+        assert_eq!(format!("{}.{}", mark.0, mark.1), PROBE_MEMO_REORG_MARK, "the read target keys to the tombstone");
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let swept = ("a1".repeat(32), 0u32);
+        let key = format!("{}.{}", swept.0, swept.1);
+        let write = |at: i64| {
+            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![key, at, true, "e5".repeat(32), true]).unwrap();
+        };
+        // THE ROUTE'S READ: the walk's candidates and the tombstone in one `IN` read
+        let read = || -> Vec<ProbeMemo> {
+            let targets = [swept.clone(), reorg_mark_target()];
+            let mut stmt = conn.prepare(&probe_memo_read_sql(targets.len())).unwrap();
+            let keys: Vec<String> = targets.iter().map(|t| format!("{}.{}", t.0, t.1)).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo { outpoint: r.get(0)?, probed_at_ms: r.get(1)?, spent: r.get(2)?, spending_txid: r.get(3)?, spent_confirmed: r.get(4)? })
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        // THE ROUTE'S SPLIT at `now`: answered from the memo (true) or asked again (false)
+        let answered_at = |now: i64| -> bool {
+            let memos = read();
+            let (answered, to_probe) =
+                split_probe_targets_after_reorg(std::slice::from_ref(&swept), &memos, now, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear_at(&memos));
+            assert_eq!(answered.len() + to_probe.len(), 1);
+            !answered.is_empty()
+        };
+        let t0: i64 = 1_800_000_000_000;
+        let min = 60_000i64;
+        // a sweep the couriers saw CONFIRMED an hour ago: no reorg yet, the long window answers
+        write(t0 - 60 * min);
+        assert_eq!(reorg_clear_at(&read()), None, "no reorg yet: no tombstone");
+        assert!(answered_at(t0), "the long window, as before");
+        // THE CLEAR at t0 (the overlay's reorg pass): the tombstone first, then the delete
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0]).unwrap();
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1);
+        assert_eq!(reorg_clear_at(&read()), Some(t0));
+        assert!(!answered_at(t0 + 5_000), "cleared: the walk the push triggers asks the couriers");
+        // AN IMMEDIATE RE-PROBE ANSWER: a courier behind the reorg says "confirmed" five seconds after the clear
+        write(t0 + 5_000);
+        assert!(answered_at(t0 + 4 * min), "the short window every word has");
+        assert!(!answered_at(t0 + 10 * min), "INSIDE THE GRACE the memo is not trusted for the long window: the walk asks again");
+        assert!(!answered_at(t0 + 29 * min));
+        assert!(!answered_at(t0 + 45 * min), "and it never gains the long window by waiting the grace out");
+        // a walk late in the grace re-writes it: still the short window
+        write(t0 + 29 * min);
+        assert!(!answered_at(t0 + 40 * min), "read inside the grace, judged by when it was read");
+        // TRUSTED AFTER: the answer read once the grace has passed has the long window again
+        write(t0 + PROBE_MEMO_REORG_GRACE_MS);
+        assert!(answered_at(t0 + 100 * min), "read at the grace's end: trusted as before");
+        assert!(!answered_at(t0 + PROBE_MEMO_REORG_GRACE_MS + PROBE_MEMO_CONFIRMED_MAX_AGE_MS), "for its two hours and no longer");
+        // a memo stamped BEFORE the clear that is still here (written after the delete by a walk that read its
+        // clock first, or a delete that failed) is held to the short window too
+        write(t0 - 1_000);
+        assert!(!answered_at(t0 + 10 * min), "no lower bound on the grace");
+        // a later reorg moves the grace; the tombstone outlives the TTL sweep
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0 + 200 * min]).unwrap();
+        conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![t0 + 200 * min + 10 * HOP_PROBE_MEMO_TTL_MS]).unwrap();
+        assert_eq!(reorg_clear_at(&read()), Some(t0 + 200 * min), "the sweep took the old memo and left the tombstone");
+        // the walk reads the tombstone with its memos and splits by it (source)
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = include_str!("routes.rs");
+        let routes = squash(&code_only(&routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())]));
+        assert!(routes.contains(&squash("let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;")));
+        assert!(routes.contains(&squash(
+            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos); let (answered, to_probe) = crate::hops_view::split_probe_targets_after_reorg( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear, )"
+        )));
+    }
+
+    /// THE ONE PLACE these pins build `owed::OwedInputs` (the second delta lens's D2-M2): the struct holds
+    /// borrows and has no `Default` and no constructor, so a field another lane adds must be added HERE, once
+    /// (an empty map or set), and nowhere else in this file.
+    fn derive_for_pin(
+        me: &str,
+        now_ms: i64,
+        hops: &[HopEntry],
+        chain: &std::collections::HashMap<String, crate::owed::HopChainWord>,
+        sweeps: &std::collections::HashMap<String, crate::hopsweep::FiledHopSweep>,
+    ) -> Vec<crate::owed::OwedRow> {
+        use std::collections::{HashMap, HashSet};
+        let (none, no_refunds, no_spenders, no_inputs, no_pkhs) = (HashSet::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
+        // lane/owed's two fields (bsv-low #486 the door's refusal ledger, #485 the home walk's words): none here
+        let (no_door_refusals, no_home_words) = (HashMap::new(), HashMap::new());
+        crate::owed::derive_owed_rows(&crate::owed::OwedInputs {
+            identity_lc: me,
+            tip: Some(900_000),
+            now_ms,
+            results: &[],
+            refunds: &[],
+            hops,
+            valid_refunds: &no_refunds,
+            collected_verified: &none,
+            collected_present: &none,
+            pot_spenders: &none,
+            pot_spenders_faulted: false,
+            hop_chain: chain,
+            hop_sweeps: sweeps,
+            evicted_pots: &none,
+            evicted_hop_outpoints: &none,
+            door_refused_hop_outpoints: &no_door_refusals,
+            spender_outputs: &no_spenders,
+            spender_inputs: &no_inputs,
+            courier_spenders: &none,
+            my_pkh_by_game: &no_pkhs,
+            home_spends: &no_home_words,
+        })
+    }
+
+    /// bsv-low #484 (delta fold 2, D2-M1): THE GRACE NARROWS THE CLAIMABLE WORD, NEVER THE CONTRADICTION. A filed
+    /// sweep the index holds PROVEN, a reorg clear, a courier that HAS seen the reorg and names a RIVAL confirmed
+    /// spender one minute after it, and the hop past the walk's probe budget six minutes on: the memo's word is
+    /// served without its confirmation (D-M1), and it used to follow that the proof stood uncontradicted and the
+    /// row read `payout, claimable: true, index-proof` (closed, fifteen minutes, uncounted). Through the walk's
+    /// own words (`stale_memo_word`, `confirmation_refused`, `set_aside_proofs_a_refused_word_contradicts`,
+    /// `owed::derive_owed_rows`, `mark_refused_word_rows`) the row is what it was before the grace existed:
+    /// not a payout, `sweepProofContradicted`, counted, open.
+    ///
+    /// To red: skip `set_aside_proofs_a_refused_word_contradicts` in `walk` below (the route at `2335e76`).
+    #[test]
+    fn inside_the_reorg_grace_a_refused_rival_word_still_contradicts_the_index_proof() {
+        use crate::owed::{count_sweep_proof_contradictions, outpoint_key, row_is_open, OwedFamily, OwedRow};
+        use std::collections::HashMap;
+        let t0: i64 = 1_800_000_000_000;
+        let min = 60_000i64;
+        let me = format!("02{}", "aa".repeat(32));
+        let (hop_txid, sweep, rival) = ("a1".repeat(32), "e5".repeat(32), "9b".repeat(32));
+        let key = outpoint_key(&hop_txid, 0);
+        let mut hop = index_unspent(&hop_txid, 0);
+        hop.marker_created_at = Some(t0 - 24 * 60 * min);
+        let hops = [hop];
+        // THE WALK past the budget: the memo's stale word, the refusal remembered, the proof read, the set-aside,
+        // the derivation, the marks (routes.rs steps 4b, 4d, 7, in the route's order)
+        let walk = |memo: &ProbeMemo, now_ms: i64, clear: Option<i64>, index_proven: bool| -> (OwedRow, u64) {
+            let mut refused_words: HashMap<String, Option<String>> = HashMap::new();
+            if confirmation_refused(memo, clear) {
+                refused_words.insert(key.clone(), memo.spending_txid.as_deref().map(str::to_ascii_lowercase));
+            }
+            let chain = HashMap::from([(key.clone(), stale_memo_word(memo, now_ms, clear))]);
+            let mut sweeps = HashMap::from([(
+                key.clone(),
+                crate::hopsweep::FiledHopSweep { sweep_txid: sweep.clone(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven, index_proof_height: Some(899_990) },
+            )]);
+            let set_aside = set_aside_proofs_a_refused_word_contradicts(&mut sweeps, &refused_words);
+            let mut rows = derive_for_pin(&me, now_ms, &hops, &chain, &sweeps);
+            mark_refused_word_rows(&mut rows, &refused_words, &set_aside);
+            let counted = count_sweep_proof_contradictions(&rows);
+            assert_eq!(rows.len(), 1);
+            (rows.remove(0), counted)
+        };
+        let memo_naming = |spender: &str, at: i64| {
+            probe_memo_of(&hop_txid, 0, &ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.to_string()), spent_confirmed: Some(true) }, at).expect("a known answer is memoised")
+        };
+        let (m1, w2) = (t0 + min, t0 + 7 * min);
+
+        // THE REGRESSION: a rival confirmed word read inside the grace, served past the budget
+        let rival_memo = memo_naming(&rival, m1);
+        assert_eq!(stale_memo_word(&rival_memo, w2, Some(t0)).spent_confirmed, None, "the word claims nothing: its confirmation stays refused");
+        let (row, counted) = walk(&rival_memo, w2, Some(t0), true);
+        assert_ne!(row.family, OwedFamily::Payout, "the index's proof never outranks a contradicting confirmed spender, inside the grace too");
+        assert_ne!(row.facts["claimable"], true);
+        assert_eq!(row.facts["sweepProofContradicted"], true, "the operator sees WHICH hop");
+        assert_eq!(counted, 1, "and it is counted");
+        assert!(row_is_open(&row), "an open row: the five-minute rule comes back for it");
+        // the same row the derivation gives with no reorg at all (the word's confirmation intact, `owed`'s own rule)
+        let (base, base_counted) = walk(&rival_memo, w2, None, true);
+        assert_eq!((row.family, row.facts["sweepProofContradicted"].clone(), counted), (base.family, base.facts["sweepProofContradicted"].clone(), base_counted));
+        // upper-case hex names the same rival
+        let (row, _) = walk(&memo_naming(&rival.to_ascii_uppercase(), m1), w2, Some(t0), true);
+        assert_eq!(row.facts["sweepProofContradicted"], true);
+
+        // NOT a contradiction: the refused word names the FILED sweep (the lagging courier of D-M1); the proof decides
+        let (row, counted) = walk(&memo_naming(&sweep, m1), w2, Some(t0), true);
+        assert_eq!((row.family, row.facts["claimable"].as_bool(), row.facts["confirmedSource"].as_str()), (OwedFamily::Payout, Some(true), Some("index-proof")));
+        assert_eq!(row.facts["sweepProofHeight"], 899_990, "the proof is untouched");
+        assert!(row.facts.get("sweepProofContradicted").is_none() && counted == 0);
+        let (row, _) = walk(&memo_naming(&sweep.to_ascii_uppercase(), m1), w2, Some(t0), true);
+        assert_eq!(row.facts["confirmedSource"], "index-proof", "the filed sweep in upper-case hex is not a rival");
+        // an UNCONFIRMED rival word is no contradiction, refused or not (`owed`'s rule, unchanged)
+        let unconfirmed = ProbeMemo { spent_confirmed: Some(false), ..rival_memo.clone() };
+        let (row, counted) = walk(&unconfirmed, w2, Some(t0), true);
+        assert_eq!((row.facts["confirmedSource"].as_str(), counted), (Some("index-proof"), 0));
+        // nothing proven, nothing to set aside: the rival word alone marks no contradiction
+        let (row, counted) = walk(&rival_memo, w2, Some(t0), false);
+        assert!(row.facts.get("sweepProofContradicted").is_none() && counted == 0 && row.facts["claimable"] != true);
+
+        // D2-L1: THE BUDGET WAIT IS NAMED. An honest confirmed sweep past the budget, its memo read inside the grace
+        // and no index proof yet: not claimable, and the row says it waits for the walk, not for a block
+        let (row, _) = walk(&memo_naming(&sweep, m1), w2, Some(t0), false);
+        assert_eq!((row.family, row.facts["claimable"].as_bool()), (OwedFamily::Payout, Some(false)));
+        assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_REASON);
+        assert_eq!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE], true);
+        assert_ne!(CHAIN_WORD_AWAITS_PROBE_REASON, crate::owed::UNCONFIRMED_PAYOUT_REASON);
+        assert!(row_is_open(&row));
+        // a spend the courier itself called unconfirmed keeps the chain's own sentence
+        let honest_unmined = ProbeMemo { spent_confirmed: Some(false), ..memo_naming(&sweep, m1) };
+        let (row, _) = walk(&honest_unmined, w2, Some(t0), false);
+        assert_eq!(row.facts["claimReason"], crate::owed::UNCONFIRMED_PAYOUT_REASON);
+        assert!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE].is_null());
+        // and a memo read past the grace keeps its word and its row: claimable, unnamed
+        let (row, _) = walk(&memo_naming(&sweep, t0 + PROBE_MEMO_REORG_GRACE_MS), t0 + 3 * 60 * min, Some(t0), false);
+        assert_eq!(row.facts["claimable"], true);
+        assert!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE].is_null());
+
+        // THE WALK RUNS THESE (source), in this order: the refusal remembered, the set-aside after the proof read
+        // and before the derivation, the mark before the count
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = include_str!("routes.rs");
+        let routes = squash(&code_only(&routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())]));
+        let at = |needle: &str| routes.find(&squash(needle)).unwrap_or_else(|| panic!("the owed walk no longer runs: {needle}"));
+        let remembered = at("if crate::hops_view::confirmation_refused(m, reorg_clear) { refused_words.insert(key.clone(), m.spending_txid.as_deref().map(str::to_ascii_lowercase)); } hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));");
+        let proof_read = at("hop_sweeps.insert(key, crate::hopsweep::pick_filed_sweep(newest, older));");
+        let set_aside = at("let proofs_set_aside = crate::hops_view::set_aside_proofs_a_refused_word_contradicts(&mut hop_sweeps, &refused_words);");
+        let derived = at("hop_sweeps: &hop_sweeps,");
+        let marked = at("crate::hops_view::mark_refused_word_rows(&mut rows, &refused_words, &proofs_set_aside); crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));");
+        assert!(remembered < proof_read && proof_read < set_aside && set_aside < derived && derived < marked);
+    }
+
+    /// bsv-low #484 (delta fold 2, D-L5): A 101-OUTPOINT IDENTITY STILL READS ITS MEMOS AND THE REORG TOMBSTONE.
+    /// D1 refuses a statement with more than 100 bound parameters, the memo read was one `IN` over every chain
+    /// candidate plus the tombstone, and the read fails soft to nothing: past the cap the walk saw no memo and no
+    /// reorg clear, so the grace (and D-M1 with it) was void for exactly the identities with the most hops. On
+    /// real SQLite, with D1's cap enforced on every statement the read plans.
+    ///
+    /// To red: plan the read as one statement (`vec![keys]` in `probe_memo_read_chunks`, the route at `2335e76`).
+    #[test]
+    fn a_101_outpoint_identity_reads_its_memos_and_the_reorg_tombstone_under_the_d1_bind_cap() {
+        use bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_MARK_SQL;
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let t0: i64 = 1_800_000_000_000;
+        let candidates: Vec<(String, u32)> = (0..101u32).map(|i| (format!("{i:064x}"), i % 3)).collect();
+        for (t, v) in &candidates {
+            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![format!("{t}.{v}"), t0 + 5_000, true, "e5".repeat(32), true]).unwrap();
+        }
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0]).unwrap();
+        // THE ROUTE'S READ (`routes::read_probe_memos`): the candidates and the tombstone, statement by statement
+        let read = |targets: &[(String, u32)]| -> Vec<ProbeMemo> {
+            let mut memos = Vec::new();
+            for keys in probe_memo_read_chunks(targets) {
+                let sql = probe_memo_read_sql(keys.len());
+                assert!(sql.matches('?').count() <= crate::logic::D1_MAX_BOUND_PARAMS, "D1 refuses this statement: {} bound parameters", sql.matches('?').count());
+                assert_eq!(sql.matches('?').count(), keys.len());
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                        Ok(ProbeMemo { outpoint: r.get(0)?, probed_at_ms: r.get(1)?, spent: r.get(2)?, spending_txid: r.get(3)?, spent_confirmed: r.get(4)? })
+                    })
+                    .unwrap();
+                memos.extend(rows.map(|r| r.unwrap()));
+            }
+            memos
+        };
+        let targets = [candidates.as_slice(), &[reorg_mark_target()]].concat();
+        assert_eq!(targets.len(), 102);
+        let memos = read(&targets);
+        assert_eq!(memos.len(), 102, "every memo and the tombstone, each once");
+        assert_eq!(reorg_clear_at(&memos), Some(t0), "the tombstone is read: the grace holds for a big identity");
+        // so the grace bites: ten minutes on, every confirmed memo read inside it is asked again
+        let (answered, to_probe) = split_probe_targets_after_reorg(&candidates, &memos, t0 + 10 * 60_000, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear_at(&memos));
+        assert_eq!((answered.len(), to_probe.len()), (0, 101));
+        // the plan: the route's order kept, every key once, lowercase, no statement over the chunk
+        let plan = probe_memo_read_chunks(&targets);
+        assert_eq!(plan.iter().map(Vec::len).collect::<Vec<_>>(), vec![PROBE_MEMO_READ_CHUNK, 102 - PROBE_MEMO_READ_CHUNK]);
+        assert_eq!(plan.concat(), targets.iter().map(|(t, v)| format!("{t}.{v}")).collect::<Vec<_>>());
+        assert_eq!(probe_memo_read_chunks(&[("AB".repeat(32), 7)]), vec![vec![format!("{}.7", "ab".repeat(32))]]);
+        assert!(probe_memo_read_chunks(&[]).is_empty(), "no target, no statement");
+        // the fleet identity of #523 (96 candidates and the tombstone) and the cap's own edge
+        for n in [8usize, 96, 99, 100, 180, 181] {
+            let plan = probe_memo_read_chunks(&targets.iter().cycle().take(n).cloned().collect::<Vec<_>>());
+            assert!(plan.iter().all(|c| !c.is_empty() && c.len() <= PROBE_MEMO_READ_CHUNK) && plan.concat().len() == n, "{n} targets");
+        }
+        // the route runs the plan, all or nothing (source)
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = include_str!("routes.rs");
+        let routes = squash(&code_only(&routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())]));
+        let body = &routes[routes.find("asyncfnread_probe_memos(").expect("the memo read")..];
+        let body = &body[..body.find("asyncfnwrite_probe_memos(").expect("the memo write follows")];
+        assert!(body.contains(&squash("for keys in crate::hops_view::probe_memo_read_chunks(targets) {")));
+        assert!(body.contains(&squash("db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds)")));
+        assert_eq!(body.matches("returnVec::new();").count(), 2, "a failed statement empties the whole read: the tombstone is never the only part lost");
+        assert!(!body.contains("targets.len())).bind"), "no statement binds every target");
+    }
+
+    /// bsv-low #484 (delta fold, D-M1): INSIDE THE GRACE A LAGGING COURIER'S "CONFIRMED" DRIVES `claimable: true`
+    /// FOR ONE FIVE-MINUTE RECOMPUTE, NOT FIFTEEN MINUTES AND NOT THE ROTATION. Through the real derivation
+    /// (`owed::derive_owed_rows`), the read's one rule (`owed::should_recompute`) and the walk's own words:
+    /// 1. the walk the clear's push triggers asks a courier behind the reorg; the row says `claimable: true` and is
+    ///    an OPEN row, so its list is re-derived after five minutes (it was a closed row: fifteen);
+    /// 2. that re-derivation finds the memo past its short window; past the probe budget the memo's word is served
+    ///    WITHOUT its confirmation and the row reads "not mined yet" (it rode with the confirmation intact and
+    ///    stayed claimable until the rotation reached it);
+    /// 3. past the grace a confirmed word is the normal rule again: a closed row, fifteen minutes, and a stale
+    ///    memo keeps its word; the index's own proof outranks the refused word throughout.
+    ///
+    /// To red: drop the grace clause from `owed::row_is_open`, or serve `m.spent_confirmed` in `stale_memo_word`.
+    #[test]
+    fn inside_the_reorg_grace_a_lagging_confirmed_word_is_claimable_for_one_five_minute_recompute() {
+        use crate::owed::{outpoint_key, should_recompute, HopChainWord, OwedFamily, OwedRow};
+        use std::collections::{HashMap, HashSet};
+        let t0: i64 = 1_800_000_000_000;
+        let min = 60_000i64;
+        let clear = Some(t0);
+        let me = format!("02{}", "aa".repeat(32));
+        let (hop_txid, sweep) = ("a1".repeat(32), "e5".repeat(32));
+        let key = outpoint_key(&hop_txid, 0);
+        // an index-unspent hop past the stranded window whose FILED sweep the chain rung names (the orphaned sweep)
+        let mut hop = index_unspent(&hop_txid, 0);
+        hop.marker_created_at = Some(t0 - 24 * 60 * min);
+        let hops = [hop];
+        let filing = |index_proven: bool| -> HashMap<String, crate::hopsweep::FiledHopSweep> {
+            HashMap::from([(key.clone(), crate::hopsweep::FiledHopSweep { sweep_txid: sweep.clone(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven, index_proof_height: None })])
+        };
+        // THE WALK'S STEP 7: derive over the chain word, then mark the rows whose word was a grace "confirmed"
+        let derive = |now_ms: i64, word: HopChainWord, grace_words: &HashSet<String>, index_proven: bool| -> OwedRow {
+            let chain = HashMap::from([(key.clone(), word)]);
+            let sweeps = filing(index_proven);
+            let mut rows = derive_for_pin(&me, now_ms, &hops, &chain, &sweeps);
+            mark_reorg_grace_rows(&mut rows, grace_words);
+            assert_eq!(rows.len(), 1);
+            rows.remove(0)
+        };
+        // a probe the walk makes at `now` (the fresh arm), and the hops it judges as grace words
+        let fresh = |confirmed: bool| HopChainWord { looked: true, spent: Some(true), spending_txid: Some(sweep.clone()), spent_confirmed: Some(confirmed), stale: false, age_ms: None };
+        let grace_of = |confirmed: Option<bool>, taken_at: i64| -> HashSet<String> {
+            if confirmed_in_reorg_grace(confirmed, taken_at, clear) { HashSet::from([key.clone()]) } else { HashSet::new() }
+        };
+        let recompute = |age_ms: i64, row: &OwedRow| should_recompute(false, age_ms, Some(900_000), Some(900_000), std::slice::from_ref(row));
+
+        // 1. FIVE SECONDS AFTER THE CLEAR: the courier behind the reorg says "confirmed"
+        let w1 = t0 + 5_000;
+        let row = derive(w1, fresh(true), &grace_of(Some(true), w1), false);
+        assert_eq!((row.family, row.facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)), "the lagging word is served, as it always was");
+        assert_eq!(row.facts[OWED_FACT_REORG_GRACE_WORD], true);
+        assert!(!recompute(4 * min, &row));
+        assert!(recompute(5 * min + 1, &row), "an OPEN row: re-derived by the five-minute rule, not left for fifteen");
+        // the memo that walk wrote
+        let memo = probe_memo_of(&hop_txid, 0, &ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(sweep.clone()), spent_confirmed: Some(true) }, w1).expect("a known answer is memoised");
+
+        // 2. THE RE-DERIVATION, six minutes on: the split refuses the memo its window (the lens fold's M2) ...
+        let w2 = w1 + 6 * min;
+        let target = [(hop_txid.clone(), 0u32)];
+        let (answered, to_probe) = split_probe_targets_after_reorg(&target, std::slice::from_ref(&memo), w2, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, clear);
+        assert!(answered.is_empty() && to_probe.len() == 1, "asked again");
+        // ... and PAST THE PROBE BUDGET the memo's word is served without the confirmation the grace refused
+        let stale = stale_memo_word(&memo, w2, clear);
+        assert_eq!((stale.stale, stale.spent, stale.spent_confirmed, stale.age_ms), (true, Some(true), None, Some(6 * min)));
+        let row = derive(w2, stale.clone(), &grace_of(stale.spent_confirmed, memo.probed_at_ms), false);
+        assert_eq!(row.facts["claimable"], false, "NOT claimable on a word the grace refused");
+        assert_eq!(row.facts["claimReason"], crate::owed::UNCONFIRMED_PAYOUT_REASON);
+        assert!(recompute(5 * min + 1, &row), "and open, so the walk comes back for it");
+        // asked again within the budget, the courier has caught up: not mined
+        let row = derive(w2, fresh(false), &grace_of(Some(false), w2), false);
+        assert_eq!(row.facts["claimable"], false);
+        // still behind: the same one-recompute word, never a longer one
+        let row = derive(w2, fresh(true), &grace_of(Some(true), w2), false);
+        assert!(row.facts["claimable"] == true && recompute(5 * min + 1, &row));
+        // a memo answering inside its short window (a recompute a push triggered two minutes on) is the same word
+        let (answered, _) = split_probe_targets_after_reorg(&target, std::slice::from_ref(&memo), w1 + 2 * min, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, clear);
+        assert_eq!(answered.len(), 1);
+        assert!(confirmed_in_reorg_grace(answered[0].2.spent_confirmed, memo.probed_at_ms, clear), "judged by when it was read");
+        // the index's own verified proof outranks the refused word (untouched: `owed::swept_home`)
+        let row = derive(w2, stale, &HashSet::new(), true);
+        assert_eq!((row.facts["claimable"].as_bool(), row.facts["confirmedSource"].as_str()), (Some(true), Some("index-proof")));
+
+        // 3. PAST THE GRACE: the normal rule
+        let w3 = t0 + PROBE_MEMO_REORG_GRACE_MS;
+        assert!(in_reorg_grace(w3 - 1, clear) && !in_reorg_grace(w3, clear) && !in_reorg_grace(w1, None));
+        let row = derive(w3, fresh(true), &grace_of(Some(true), w3), false);
+        assert_eq!(row.facts["claimable"], true);
+        assert!(row.facts[OWED_FACT_REORG_GRACE_WORD].is_null());
+        assert!(!recompute(5 * min + 1, &row), "a closed row again");
+        assert!(recompute(15 * min + 1, &row), "the fifteen-minute rule");
+        let late = ProbeMemo { probed_at_ms: w3, ..memo.clone() };
+        assert_eq!(stale_memo_word(&late, w3 + 3 * 60 * min, clear).spent_confirmed, Some(true), "a memo read past the grace keeps its word when stale, as before");
+        assert_eq!(stale_memo_word(&memo, w2, None).spent_confirmed, Some(true), "no reorg: as before");
+        let unconfirmed = ProbeMemo { spent_confirmed: Some(false), ..memo.clone() };
+        assert_eq!(stale_memo_word(&unconfirmed, w2, clear).spent_confirmed, Some(false), "only a confirmation is refused");
+
+        // THE WALK USES THESE WORDS (source): the three arms and the mark before the write
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = include_str!("routes.rs");
+        let routes = squash(&code_only(&routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())]));
+        for needle in [
+            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos);",
+            "if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) { grace_words.insert(outpoint_key(&t, v)); }",
+            "hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));",
+            "if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) { grace_words.insert(key.clone()); }",
+            "crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words); sort_rows_for_service(&mut rows);",
+        ] {
+            assert!(routes.contains(&squash(needle)), "the owed walk no longer runs: {needle}");
+        }
+    }
+
     /// bsv-low #451 slice C: the memo split — fresh answers, stale/missing/future asked, a fault never remembered.
     /// RED before (no memo: every target asked every call).
     #[test]

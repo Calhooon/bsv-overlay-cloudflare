@@ -1807,9 +1807,10 @@ pub const OWED_RECOMPUTE_OPEN_AFTER_MS: i64 = 5 * 60 * 1000;
 pub const OWED_RECOMPUTE_ANY_AFTER_MS: i64 = 15 * 60 * 1000;
 
 /// A row is OPEN when it is anything but a claimable payout: it can change without a pot-changed event (a gate opens,
-/// a hop crosses its window, a counterparty files).
+/// a hop crosses its window, a counterparty files). bsv-low #484 (delta fold, D-M1): so is a payout whose chain
+/// word was a "confirmed" taken inside the reorg grace (`hops_view::mark_reorg_grace_rows`): asked again in five minutes.
 pub fn row_is_open(r: &OwedRow) -> bool {
-    r.family != OwedFamily::Payout || r.facts["claimable"] == Value::Bool(false)
+    r.family != OwedFamily::Payout || r.facts["claimable"] == Value::Bool(false) || r.facts[crate::hops_view::OWED_FACT_REORG_GRACE_WORD] == Value::Bool(true)
 }
 
 /// The read's rule (N5, the ONE predicate): recompute when the marker says stale; when the tip advanced past an

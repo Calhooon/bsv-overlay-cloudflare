@@ -289,6 +289,16 @@ pub async fn internal_tip_changed(
         )
         .await;
     }
+    // bsv-low #484: the R2 judge's side of the probe-memo invalidation (the D7 pass above ran its own): an
+    // announced reorg, a targeted demotion, or a row the routine sweep re-judged clears the CONFIRMED memos;
+    // a sweep that left every row standing clears nothing. Then the table's TTL, every block.
+    if let Some(db) = ops_db {
+        let evidence = reorg_from.is_some()
+            || crate::hop_probe_memos::reverify_rejudged(&demotion)
+            || crate::hop_probe_memos::sweep_rejudged(&sweep);
+        crate::hop_probe_memos::clear_on_reorg(db, "tip-changed", evidence).await;
+        crate::hop_probe_memos::expire(db, worker::Date::now().as_millis() as i64).await;
+    }
     let fetcher = crate::courier_fetcher(env, tracker).with_budget(TIP_PASS_BUDGET);
     // min_age 0: the block just landed; every unconfirmed spend is a candidate
     // (the push may still arrive — its CAS then finds the row confirmed, harmless)
@@ -507,6 +517,9 @@ pub async fn run_arcade_reorg_pass(
         (s.spenders.faults + s.pot_beefs.faults + s.transactions.faults) as u64,
     )
     .await;
+    // bsv-low #484: an orphan event applied (or any row this pass re-judged) is a reorg: the app layer's
+    // CONFIRMED probe memos are cleared so the next owed walk re-probes (`hop_probe_memos`)
+    crate::hop_probe_memos::clear_on_reorg(db, origin, crate::hop_probe_memos::arcade_pass_rejudged(&s)).await;
     console_log!(
         "[arcade-reorg] ({origin}) feed_read={} rows={} malformed={} events_after_cursor={} applied={} skipped_uncorroborated={} unresolved={} released={} held={} lagging={} \
          spenders scanned={} standing={} reanchored={} demoted={} faults={} budget_stops={}; pot_beefs scanned={} stale={}; transactions scanned={} stale={}; \
@@ -764,6 +777,11 @@ pub async fn internal_reorg(
             pass.faults as u64,
         )
         .await;
+        // bsv-low #484 (lens fold, M3): the operator NAMING a window is reorg evidence by itself, as an announced
+        // `reorg_from` is in the block-event pass: the CONFIRMED probe memos are cleared whether or not a pot row
+        // moved (a reorg both feeds missed that orphaned only a hop sweep leaves no pot row at its height to
+        // re-judge, and this route is its documented heal).
+        crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await;
     }
     console_log!(
         "POST /internal/reorg {}..={} limit={} -> 200 (scanned={} standing={} demoted={} demoted_blind={} demote_missed={} faults={} errors={} drained={})",
