@@ -177,6 +177,24 @@ coins must apply it under `historical-tx` too: that is the mode of the replay.
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551`.
 
+## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
+
+`TopicManager::identify_admissible_outputs` takes the reference's fifth
+argument, `options: &AdmissionOptions` (`types.rs`; the reference's
+`TopicAdmittanceContext { dryRun }`). The two GASP calls pass
+`AdmissionOptions::DRY_RUN`: the needed-input walk over every proven node of a
+peer (`find_needed_inputs`) and the anchor replay of #551
+(`validate_graph_anchor`). `Engine::submit` passes `dry_run: false`, and it is
+the only other caller (the queue replay, `/submit`, `/arc-ingest`, the peer
+crawler and the GASP finalize all go through it). On a dry run a manager must
+leave NO durable trace: no storage write, no head advance, no counter an
+operator reads as an admission. `mode` is not a substitute: the queue replays
+real submissions under `historical-tx`, the mode of both dry runs. The
+workspace's 16 managers hold no state and ignore the flag; a manager that
+writes on admission must read it. The method stays required, so a manager
+cannot miss the argument on a re-pin. Pins: `cargo test -p bsv-overlay-engine
+--features memory-storage --test gasp_topic_manager dryrun`.
+
 ## Progress under the per-peer sync budget (bsv-low #552)
 
 `Engine::start_gasp_sync` races each peer's sync against

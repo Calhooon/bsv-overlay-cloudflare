@@ -1623,6 +1623,8 @@ impl Engine {
                         .collect::<Vec<u8>>(),
                     tagged_beef.off_chain_values.as_deref(),
                     mode,
+                    // A submit is a real admission, never a dry run.
+                    &AdmissionOptions::default(),
                 )
                 .await
             {
@@ -3744,6 +3746,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
+            _options: &AdmissionOptions,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions {
                 outputs_to_admit: self.admit_indices.clone(),
@@ -3938,6 +3941,7 @@ mod tests {
                 _previous_coins: &[u8],
                 _off_chain_values: Option<&[u8]>,
                 _mode: SubmitMode,
+                _options: &AdmissionOptions,
             ) -> Result<AdmittanceInstructions, TopicManagerError> {
                 *self.0.borrow_mut() = Some(tx.id());
                 Ok(AdmittanceInstructions {

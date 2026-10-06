@@ -67,6 +67,7 @@ impl TopicManager for MockTopicManager {
         _prev: &[u8],
         _ocv: Option<&[u8]>,
         _mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.calls.lock().unwrap().push("identify".into());
         Ok(AdmittanceInstructions {
@@ -871,6 +872,7 @@ impl TopicManager for RetainingTopicManager {
         previous_coins: &[u8],
         _ocv: Option<&[u8]>,
         _mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         // Parse previous_coins: each is a u32 in little-endian
         let coins_to_retain: Vec<u32> = previous_coins

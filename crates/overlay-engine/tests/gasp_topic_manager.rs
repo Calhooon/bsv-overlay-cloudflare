@@ -171,6 +171,7 @@ impl TopicManager for HeadChainManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx {
             assert!(tx.merkle_path.is_some(), "the dry run carries the proof");
@@ -382,6 +383,7 @@ impl TopicManager for DefaultInputsManager {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions::default())
     }
@@ -508,6 +510,7 @@ impl TopicManager for ProbeManager {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.admissions.borrow_mut().push(AdmissionCall {
             txid: tx.id(),
@@ -1003,6 +1006,7 @@ impl TopicManager for DecoyHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         // The same rule in every mode (bsv-low #551): the anchor replay runs
         // it under `historical-tx` with the coins of its own set.
@@ -1593,6 +1597,7 @@ impl TopicManager for AdmitsOutputZero {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTxNoSpv {
             self.0.borrow_mut().admitted.push(tx.id());
@@ -2002,6 +2007,7 @@ impl TopicManager for RetainingHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx && !previous_coins.is_empty() {
             self.replay
@@ -2524,6 +2530,7 @@ impl TopicManager for RecordedHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let extends_head = previous_coins
             .chunks_exact(4)
@@ -2958,4 +2965,193 @@ async fn i552_f_one_graph_deeper_than_the_budget_is_dropped_whole_every_tick() {
     assert!(topic.errors.is_empty());
     assert_eq!(node.failures().await, 0);
     println!("#552 PIN F: one graph of 8 under a budget of 5: 3 ticks, 15 requests, 0 admitted; budget 10 admits 8");
+}
+
+// ============================================================================
+// bsv-low #530 (E1, the dry-run option): `identify_admissible_outputs` carries
+// the reference's fifth argument. The GASP walk asks every proven node of the
+// peer what the manager WOULD admit, and the #551 anchor check replays the
+// peer's whole graph the same way, both before anything is admitted: both
+// pass `dry_run: true`, the finalize submit passes `false`. A manager that
+// writes on admission reads the flag and writes nothing on a dry run.
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+struct OptionsCall {
+    txid: String,
+    mode: SubmitMode,
+    dry_run: bool,
+}
+
+#[derive(Default)]
+struct HeadLedger {
+    // Every admission call, in order, with the options it carried.
+    calls: Vec<OptionsCall>,
+    // The manager's own durable state: the head, and every advance of it.
+    head: Option<String>,
+    advances: Vec<OptionsCall>,
+}
+
+// A STATEFUL manager over the rule of `M`: it records every call with its
+// options, and when the rule admits it ADVANCES ITS HEAD, unless the call is
+// a dry run.
+struct StatefulHead<M> {
+    rule: M,
+    ledger: Rc<RefCell<HeadLedger>>,
+}
+
+#[async_trait(?Send)]
+impl<M: TopicManager> TopicManager for StatefulHead<M> {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous_coins: &[u8],
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        options: &AdmissionOptions,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        let call = OptionsCall {
+            txid: tx.id(),
+            mode,
+            dry_run: options.dry_run,
+        };
+        self.ledger.borrow_mut().calls.push(call.clone());
+        let admittance = self
+            .rule
+            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, options)
+            .await?;
+        if !admittance.outputs_to_admit.is_empty() && !options.dry_run {
+            let mut ledger = self.ledger.borrow_mut();
+            ledger.head = Some(call.txid.clone());
+            ledger.advances.push(call);
+        }
+        Ok(admittance)
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        self.rule
+            .identify_needed_inputs(beef, off_chain_values)
+            .await
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// What one sync of a chain must ask, in order: the walk's dry run of every
+// proven node (tip to genesis), the anchor replay's dry run of every ordered
+// BEEF (genesis to tip), then one real admission per finalize submit.
+fn expected_calls(nodes: &[GASPNode]) -> (Vec<OptionsCall>, Vec<OptionsCall>) {
+    let call = |node: &GASPNode, mode, dry_run| OptionsCall {
+        txid: node_txid(node),
+        mode,
+        dry_run,
+    };
+    let walk = nodes
+        .iter()
+        .rev()
+        .map(|node| call(node, SubmitMode::HistoricalTx, true));
+    let replay = nodes
+        .iter()
+        .map(|node| call(node, SubmitMode::HistoricalTx, true));
+    let submits: Vec<_> = nodes
+        .iter()
+        .map(|node| call(node, SubmitMode::HistoricalTxNoSpv, false))
+        .collect();
+    let all = walk.chain(replay).chain(submits.clone()).collect();
+    (all, submits)
+}
+
+// PIN A. The E1 head chain and the D8 decoy chain through the engine, under a
+// tracker: every walk and replay call carries `dry_run: true`, every finalize
+// submit `false`, and the stateful manager advances exactly once per submit
+// and never on a dry run. What is admitted is byte for byte what #551 pinned.
+#[tokio::test]
+async fn dryrun_a_the_walk_and_the_replay_are_dry_runs_and_only_a_submit_advances_the_head() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(5);
+    let ledger = Rc::new(RefCell::new(HeadLedger::default()));
+    let head = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(StatefulHead {
+            rule: HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+            ledger: ledger.clone(),
+        }),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(KnownRoots::of(&nodes))),
+    )
+    .await;
+    let (calls, submits) = expected_calls(&nodes);
+    assert_eq!(ledger.borrow().calls, calls, "5 walk, 5 replay, 5 submits");
+    assert_eq!(ledger.borrow().advances, submits, "one advance per submit");
+    assert_eq!(ledger.borrow().head, Some(node_txid(&nodes[4])));
+    assert_eq!(head.digest, I551_C_HEAD_BASE_DIGEST);
+
+    let decoy = decoy_outpoint(0xd0);
+    let nodes = decoy_chain(5, &[(4, decoy)]);
+    let ledger = Rc::new(RefCell::new(HeadLedger::default()));
+    let decoyed = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(StatefulHead {
+            rule: DecoyHeadManager::new(),
+            ledger: ledger.clone(),
+        }),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(KnownRoots::of(&nodes))),
+    )
+    .await;
+    let (calls, submits) = expected_calls(&nodes);
+    assert_eq!(ledger.borrow().calls, calls, "5 walk, 5 replay, 5 submits");
+    assert_eq!(ledger.borrow().advances, submits, "one advance per submit");
+    assert_eq!(ledger.borrow().head, Some(node_txid(&nodes[4])));
+    assert_eq!(decoyed.digest, I551_C_DECOY_BASE_DIGEST);
+    println!("dry-run PIN A: head and decoy chain: 10 dry runs, 5 submits, 5 advances each");
+}
+
+// PIN B. The case of zanaadu-v2 #314: the peer serves the tip with a
+// fabricated BUMP, so the anchor check discards the graph and nothing is
+// submitted. The walk still asked the manager about all five nodes on the
+// peer's word: every one of those calls is a dry run and the head never moves.
+#[tokio::test]
+async fn dryrun_b_a_graph_the_anchor_check_refuses_never_moves_the_head() {
+    let (_logs, _guard) = capture_logs();
+    let mut nodes = chain(5);
+    let tracker = KnownRoots::of(&nodes);
+    nodes[4].proof = Some(fabricated_proof(&node_txid(&nodes[4]), 104));
+    let ledger = Rc::new(RefCell::new(HeadLedger::default()));
+    let synced = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(StatefulHead {
+            rule: HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+            ledger: ledger.clone(),
+        }),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(tracker)),
+    )
+    .await;
+    assert_eq!(synced.result.topics_synced[TOPIC].discarded_graphs, 1);
+    assert!(utxo_txids(&synced.store).await.is_empty());
+    let ledger = ledger.borrow();
+    assert_eq!(ledger.calls.len(), 5, "the walk asked about every node");
+    assert!(ledger.calls.iter().all(|call| call.dry_run));
+    assert!(ledger.advances.is_empty(), "{:?}", ledger.advances);
+    assert_eq!(ledger.head, None);
+    println!("dry-run PIN B: 5 dry runs on a fabricated BUMP, 0 advances, 0 admitted");
+}
+
+// PIN C. The options themselves: a real admission by default, and the one
+// constant of a dry run.
+#[test]
+fn dryrun_c_the_default_is_a_real_admission() {
+    let dry_runs = [AdmissionOptions::default(), AdmissionOptions::DRY_RUN].map(|o| o.dry_run);
+    assert_eq!(dry_runs, [false, true]);
 }

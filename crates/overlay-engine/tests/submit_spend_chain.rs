@@ -65,6 +65,7 @@ impl TopicManager for TrackingTopicManager {
         previous_coins: &[u8],
         _ocv: Option<&[u8]>,
         _mode: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.received_previous_coins
             .lock()

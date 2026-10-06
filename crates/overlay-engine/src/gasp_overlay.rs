@@ -43,7 +43,9 @@ use tracing::{debug, error, warn};
 use crate::gasp::{GASPError, GASPStorage};
 use crate::storage::Storage;
 use crate::topic_manager::TopicManager;
-use crate::types::{GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode};
+use crate::types::{
+    AdmissionOptions, GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode,
+};
 
 /// A GASP node stored during in-progress graph construction.
 #[derive(Debug, Clone)]
@@ -581,8 +583,8 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     .map_err(|e| GASPError::Other(format!("Failed to parse proof: {e}")))?,
             );
 
-            // TS passes { dryRun: true }. Workspace managers only evaluate
-            // scripts here, so the existing trait needs no additional flag.
+            // TS passes { dryRun: true }: the node is the peer's and nothing
+            // is admitted here, so a manager that writes on admission must not.
             // Utils.toArray(string) defaults to UTF-8, even for hex-like text.
             // This call is outside the needed-input catch in the reference.
             let admittance = manager
@@ -591,6 +593,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     &[],
                     node.tx_metadata.as_deref().map(str::as_bytes),
                     SubmitMode::HistoricalTx,
+                    &AdmissionOptions::DRY_RUN,
                 )
                 .await
                 .map_err(|e| GASPError::Other(e.to_string()))?;
@@ -926,8 +929,16 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     previous_coins.extend_from_slice(&(input_index as u32).to_le_bytes());
                 }
             }
+            // TS passes { dryRun: true }: the replay only asks, the finalize
+            // submit is the admission.
             let admittance = manager
-                .identify_admissible_outputs(&tx, &previous_coins, None, SubmitMode::HistoricalTx)
+                .identify_admissible_outputs(
+                    &tx,
+                    &previous_coins,
+                    None,
+                    SubmitMode::HistoricalTx,
+                    &AdmissionOptions::DRY_RUN,
+                )
                 .await
                 .map_err(|e| refused(format!("the topic manager failed on {txid}: {e}")))?;
             for output_index in admittance.outputs_to_admit {

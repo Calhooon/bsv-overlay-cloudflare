@@ -14,7 +14,9 @@
 use async_trait::async_trait;
 use bsv_rs::transaction::Transaction;
 use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
-use overlay_engine::types::{AdmittanceInstructions, ServiceMetadata, SubmitMode};
+use overlay_engine::types::{
+    AdmissionOptions, AdmittanceInstructions, ServiceMetadata, SubmitMode,
+};
 use tracing::{debug, warn};
 
 use super::is_pot_covenant_script;
@@ -43,6 +45,8 @@ impl TopicManager for PotTopicManager {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
+        // Pure: this manager holds no state, so a dry run is the same work.
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
 
@@ -233,6 +237,7 @@ pub(crate) mod tests {
                 &[],
                 None,
                 SubmitMode::HistoricalTxNoSpv,
+                &AdmissionOptions::default(),
             )
             .await
             .unwrap();
@@ -266,6 +271,7 @@ pub(crate) mod tests {
                 &[],
                 None,
                 SubmitMode::HistoricalTxNoSpv,
+                &AdmissionOptions::default(),
             )
             .await
             .unwrap();

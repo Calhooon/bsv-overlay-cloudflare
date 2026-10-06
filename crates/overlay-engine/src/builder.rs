@@ -182,6 +182,7 @@ mod tests {
             _: &[u8],
             _: Option<&[u8]>,
             _: SubmitMode,
+            _options: &AdmissionOptions,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions::default())
         }

@@ -46,6 +46,7 @@ impl TopicManager for FailingTopicManager {
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Err(TopicManagerError::Other("intentional failure".into()))
     }
@@ -115,6 +116,7 @@ impl TopicManager for OkTopicManager {
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
+        _options: &AdmissionOptions,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions {
             outputs_to_admit: vec![0],
