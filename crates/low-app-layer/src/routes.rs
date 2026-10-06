@@ -3473,26 +3473,17 @@ async fn owed_home_spend_walk(
     now_ms: i64,
     started_ms: i64,
 ) -> std::collections::HashMap<String, crate::owed::HomeSpendWord> {
-    use crate::owed::{outpoint_key, HomeSpendWord, HOME_SPEND_LATCH_PREFIX};
-    let mut words: std::collections::HashMap<String, HomeSpendWord> = std::collections::HashMap::new();
+    use crate::owed::{home_latch_target, outpoint_key, HomeSpendWord};
     // a lived-in identity holds a handful at most; the bound keeps one read inside D1's bind limit
     let candidates = &candidates[..candidates.len().min(crate::logic::D1_CHUNK_OUTPOINTS)];
     if candidates.is_empty() {
-        return words;
+        return std::collections::HashMap::new();
     }
     let over_budget = || worker::Date::now().as_millis() as i64 - started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS;
-    // (1) the latches
-    let latch_keys: Vec<(String, u32)> = candidates.iter().map(|c| (format!("{HOME_SPEND_LATCH_PREFIX}{}", c.sweep_txid), c.vout)).collect();
-    let latched: std::collections::HashSet<String> =
-        read_probe_memos(db, &latch_keys).await.into_iter().filter(|m| m.spent && m.spending_txid.is_some()).map(|m| m.outpoint).collect();
-    let mut targets: Vec<(String, u32)> = Vec::new();
-    for c in candidates {
-        if latched.contains(&format!("{HOME_SPEND_LATCH_PREFIX}{}.{}", c.sweep_txid, c.vout)) {
-            words.insert(outpoint_key(&c.sweep_txid, c.vout), HomeSpendWord::Proven);
-        } else {
-            targets.push((c.sweep_txid.clone(), c.vout));
-        }
-    }
+    // (1) the latches (`owed::latched_home_words`: the key read is the key the proof wrote)
+    let latch_targets: Vec<(String, u32)> = candidates.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
+    let (mut words, targets): (std::collections::HashMap<String, HomeSpendWord>, Vec<(String, u32)>) =
+        crate::owed::latched_home_words(candidates, &read_probe_memos(db, &latch_targets).await);
     if targets.is_empty() {
         return words;
     }
@@ -3517,56 +3508,52 @@ async fn owed_home_spend_walk(
         }
         seen.push((t, v, probe));
     }
-    // (3) the proof, per named spender
+    // (3) the proof, per named spender (`owed::home_word` decides; this loop only fetches the bytes). The lens
+    //     fold's LOW-4: the stored-BEEF read is INSIDE the walk's budget now, by the clock and by a count
+    //     (`OWED_HOME_STORED_READS_PER_RECOMPUTE`); before, every memoised spent-and-unproven output bought one per
+    //     pass, bounded only by the 45-candidate cap.
     let mut latches: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut resolver_asks = 0usize;
+    let mut stored_reads = 0usize;
     for (t, v, probe) in seen {
-        if !probe.known {
+        let Some(home) = candidates.iter().find(|c| c.vout == v && c.sweep_txid.eq_ignore_ascii_case(&t)) else {
             continue;
-        }
-        let key = outpoint_key(&t, v);
-        match probe.spent {
-            Some(false) => {
-                words.insert(key, HomeSpendWord::Unspent);
+        };
+        let mut raw: Option<Vec<u8>> = None;
+        if let (true, Some(true), Some(sp)) = (probe.known, probe.spent, probe.spending_txid.as_deref().map(str::to_ascii_lowercase)) {
+            if stored_reads < crate::owed::OWED_HOME_STORED_READS_PER_RECOMPUTE && !over_budget() {
+                stored_reads += 1;
+                raw = match load_stored_beef(env, db, &sp).await {
+                    Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
+                        .ok()
+                        .and_then(|beef| beef.find_txid(&sp).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
+                    _ => None,
+                };
             }
-            Some(true) => {
-                let mut word = HomeSpendWord::Unproven;
-                let home = candidates.iter().find(|c| c.vout == v && c.sweep_txid.eq_ignore_ascii_case(&t));
-                if let (Some(home), Some(sp)) = (home, probe.spending_txid.as_deref().map(str::to_ascii_lowercase)) {
-                    let mut raw: Option<Vec<u8>> = match load_stored_beef(env, db, &sp).await {
-                        Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
-                            .ok()
-                            .and_then(|beef| beef.find_txid(&sp).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
-                        _ => None,
-                    };
-                    if raw.is_none() {
-                        let now_f = worker::Date::now().as_millis() as f64;
-                        let answer = match tx_any_cached(&sp, now_f) {
-                            Some(a) => Some(a),
-                            None if resolver_asks < crate::owed::OWED_HOME_PROBES_PER_RECOMPUTE && !over_budget() => {
-                                resolver_asks += 1;
-                                Some(resolve_tx_any(None, None, &sp, now_f, "owed", env).await)
-                            }
-                            None => None,
-                        };
-                        raw = answer.and_then(|a| a.raw_hex).and_then(|h| hex::decode(h).ok());
+            if raw.is_none() {
+                let now_f = worker::Date::now().as_millis() as f64;
+                let answer = match tx_any_cached(&sp, now_f) {
+                    Some(a) => Some(a),
+                    None if resolver_asks < crate::owed::OWED_HOME_PROBES_PER_RECOMPUTE && !over_budget() => {
+                        resolver_asks += 1;
+                        Some(resolve_tx_any(None, None, &sp, now_f, "owed", env).await)
                     }
-                    if raw.is_some_and(|raw| crate::owed::home_output_spend_proven(&raw, &t, v, &home.pkh_hex, home.sats)) {
-                        word = HomeSpendWord::Proven;
-                        worker::console_log!("[owed] home output {t}:{v} is proven spent by {sp} (the home key's signature verified): the courier-proven payout retires");
-                        latches.push(crate::hops_view::ProbeMemo {
-                            outpoint: format!("{HOME_SPEND_LATCH_PREFIX}{}.{v}", t.to_ascii_lowercase()),
-                            probed_at_ms: now_ms,
-                            spent: true,
-                            spending_txid: Some(sp),
-                            spent_confirmed: probe.spent_confirmed,
-                        });
-                    }
-                }
-                words.insert(key, word);
+                    None => None,
+                };
+                raw = answer.and_then(|a| a.raw_hex).and_then(|h| hex::decode(h).ok());
             }
-            None => {}
         }
+        let Some((word, latch)) = crate::owed::home_word(&probe, raw.as_deref(), home, now_ms) else {
+            continue;
+        };
+        if let Some(latch) = latch {
+            worker::console_log!(
+                "[owed] home output {t}:{v} is proven spent by {} (the home key's signature verified): the courier-proven payout retires",
+                latch.spending_txid.as_deref().unwrap_or_default()
+            );
+            latches.push(latch);
+        }
+        words.insert(outpoint_key(&t, v), word);
     }
     fresh.extend(latches);
     if !fresh.is_empty() {
@@ -4925,7 +4912,7 @@ async fn read_probe_memos(
     }
     let binds: Vec<JsValue> = targets
         .iter()
-        .map(|(txid, vout)| JsValue::from_str(&format!("{}.{vout}", txid.to_ascii_lowercase())))
+        .map(|(txid, vout)| JsValue::from_str(&crate::hops_view::probe_memo_key(txid, *vout)))
         .collect();
     let rows: Vec<ProbeMemoRow> = match db
         .prepare(crate::hops_view::probe_memo_read_sql(targets.len()))

@@ -254,6 +254,75 @@ pub fn home_output_spend_proven(spender_raw: &[u8], home_txid: &str, home_vout: 
     overlay_discovery::pot::p2pkh_input_signed(&tx, vin, &overlay_discovery::pot::p2pkh_lock(&pkh), sats)
 }
 
+/// PURE: the probe-memo target of a home output's LATCH (`read_probe_memos` and the latch write both key it through
+/// `hops_view::probe_memo_key`, so the key written is the key read back: pinned on real SQLite).
+pub fn home_latch_target(sweep_txid: &str, vout: u32) -> (String, u32) {
+    (format!("{HOME_SPEND_LATCH_PREFIX}{}", sweep_txid.to_ascii_lowercase()), vout)
+}
+
+/// PURE (bsv-low #485, the lens fold's MEDIUM-2): the first rung of the home walk. A candidate whose latch memo
+/// reads spent with a named spender is `Proven` with no network ask; every other candidate is a target of the
+/// chain rung, in candidate order. A memo for a key no candidate has is ignored.
+pub fn latched_home_words(
+    candidates: &[CourierHomeOutput],
+    latch_memos: &[crate::hops_view::ProbeMemo],
+) -> (HashMap<String, HomeSpendWord>, Vec<(String, u32)>) {
+    let latched: HashSet<&str> = latch_memos.iter().filter(|m| m.spent && m.spending_txid.is_some()).map(|m| m.outpoint.as_str()).collect();
+    let mut words: HashMap<String, HomeSpendWord> = HashMap::new();
+    let mut targets: Vec<(String, u32)> = Vec::new();
+    for c in candidates {
+        let (latch_txid, vout) = home_latch_target(&c.sweep_txid, c.vout);
+        if latched.contains(crate::hops_view::probe_memo_key(&latch_txid, vout).as_str()) {
+            words.insert(outpoint_key(&c.sweep_txid, c.vout), HomeSpendWord::Proven);
+        } else {
+            targets.push((c.sweep_txid.clone(), c.vout));
+        }
+    }
+    (words, targets)
+}
+
+/// PURE (bsv-low #485, the lens fold's MEDIUM-2), THE RETIREMENT DECISION for one home output: the chain rung's
+/// probe, plus the named spender's bytes when the walk could read them. `None` = nothing established (a faulted or
+/// unknown probe: the outpoint stays unnamed and the row stands). A corroborated absence is `Unspent`. A word of
+/// spent is `Unproven` unless the bytes carry the home key's signature over this very output
+/// (`home_output_spend_proven`); only then `Proven`, with the latch to write. The latch names the transaction the
+/// PROVEN BYTES hash to (the lens's NIT: never a spender the courier named for other bytes).
+pub fn home_word(
+    probe: &crate::hops_view::ChainSpendProbe,
+    spender_raw: Option<&[u8]>,
+    home: &CourierHomeOutput,
+    now_ms: i64,
+) -> Option<(HomeSpendWord, Option<crate::hops_view::ProbeMemo>)> {
+    if !probe.known {
+        return None;
+    }
+    match probe.spent? {
+        false => Some((HomeSpendWord::Unspent, None)),
+        true => {
+            let Some(raw) = spender_raw.filter(|raw| home_output_spend_proven(raw, &home.sweep_txid, home.vout, &home.pkh_hex, home.sats)) else {
+                return Some((HomeSpendWord::Unproven, None));
+            };
+            let proven_txid = bsv_rs::transaction::Transaction::from_binary(raw).ok()?.id().to_ascii_lowercase();
+            let (latch_txid, vout) = home_latch_target(&home.sweep_txid, home.vout);
+            Some((
+                HomeSpendWord::Proven,
+                Some(crate::hops_view::ProbeMemo {
+                    outpoint: crate::hops_view::probe_memo_key(&latch_txid, vout),
+                    probed_at_ms: now_ms,
+                    spent: true,
+                    spending_txid: Some(proven_txid),
+                    spent_confirmed: probe.spent_confirmed,
+                }),
+            ))
+        }
+    }
+}
+/// The lens fold's LOW-4: stored-BEEF reads ONE recompute's home walk may make (one per chain-named spender, each
+/// a D1 read plus the blob it points at), counted, and all inside the walk's wall-clock budget
+/// (`OWED_RECOMPUTE_TIME_BUDGET_MS`). An output past the count or the clock reads `Unproven` this pass and is
+/// looked at again on the next; a proven one latches and leaves the queue.
+pub const OWED_HOME_STORED_READS_PER_RECOMPUTE: usize = 8;
+
 /// The `spent-elsewhere` story (design §2): the hop was spent by a transaction that is not a LOW pot and pays no
 /// home of this seat — a sweep to another home, or the wallet's own spend. Nothing here can move it.
 pub const SPENT_ELSEWHERE_REASON: &str =
@@ -3304,5 +3373,91 @@ mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!((rows[0].facts["joinRefusedBy"].clone(), rows[0].reason.as_deref()), (json!("eviction"), Some(JOIN_REFUSED_REASON)));
         assert!(rows[0].facts.get("doorRefusal").is_none());
+    }
+
+    /// The lens fold's MEDIUM-2, the home walk's two decisions, EXECUTED, with the latch key round-tripped on real
+    /// SQLite through the shipped memo statements (`PROBE_MEMO_UPSERT_SQL`, `probe_memo_read_sql`) and the shipped
+    /// migrations: a proof writes a latch under the key the next pass reads; a latched output is `Proven` with no
+    /// chain ask (it is not a target); an unknown or faulted probe names nothing; a word of spent without the home
+    /// key's signature is `Unproven` and writes no latch.
+    /// To red: have `home_word` latch on a bare word of spent, or key the latch read differently from its write.
+    #[test]
+    fn the_home_walk_latches_only_a_verified_proof_and_reads_its_own_latch_back_real_sqlite() {
+        use crate::hops_view::{probe_memo_key, probe_memo_read_sql, ChainSpendProbe, ProbeMemo, PROBE_MEMO_UPSERT_SQL};
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
+            }
+        }
+        let write = |m: &ProbeMemo| {
+            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![m.outpoint, m.probed_at_ms, i64::from(m.spent), m.spending_txid, m.spent_confirmed.map(i64::from)]).unwrap();
+        };
+        // the route's `read_probe_memos`: one IN read keyed by `probe_memo_key` of each target
+        let read = |targets: &[(String, u32)]| -> Vec<ProbeMemo> {
+            let keys: Vec<String> = targets.iter().map(|(t, v)| probe_memo_key(t, *v)).collect();
+            conn.prepare(&probe_memo_read_sql(keys.len()))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get::<_, i64>(2)? != 0,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                    })
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let (home, stranger) = (bsv_rs::primitives::PrivateKey::random(), bsv_rs::primitives::PrivateKey::random());
+        let pkh = hex::encode(home.public_key().hash160());
+        let (sweep_a, spend_a) = sweep_and_home_spend(&home, &home, 20_000);
+        let (sweep_b, forged_b) = sweep_and_home_spend(&home, &stranger, 30_000); // spent "by" bytes the home key never signed
+        let cand = |sweep: &str, sats: u64| CourierHomeOutput { sweep_txid: sweep.to_string(), vout: 0, pkh_hex: pkh.clone(), sats };
+        let candidates = [cand(&sweep_a, 20_000), cand(&sweep_b, 30_000)];
+        let latch_targets: Vec<(String, u32)> = candidates.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
+        // pass 1: nothing latched, both outputs go to the chain rung
+        let (words, targets) = latched_home_words(&candidates, &read(&latch_targets));
+        assert!(words.is_empty());
+        assert_eq!(targets, vec![(sweep_a.clone(), 0), (sweep_b.clone(), 0)]);
+        let spent_by = |sp: &str| ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(sp.to_string()), spent_confirmed: Some(true) };
+        let named = tx(0x5a); // the spender a courier NAMED; the proof is over the bytes
+        // an unknown or faulted probe, and a known probe with no verdict: nothing established, the row stands
+        assert_eq!(home_word(&ChainSpendProbe { known: false, spent: Some(true), spending_txid: Some(named.clone()), spent_confirmed: None }, Some(&spend_a), &candidates[0], 5_000), None);
+        assert_eq!(home_word(&ChainSpendProbe { known: true, spent: None, spending_txid: None, spent_confirmed: None }, Some(&spend_a), &candidates[0], 5_000), None);
+        // a corroborated absence
+        assert_eq!(home_word(&ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None }, None, &candidates[0], 5_000), Some((HomeSpendWord::Unspent, None)));
+        // a word of spent with no bytes, with bytes another key signed, with another output's proof: unproven, no latch
+        assert_eq!(home_word(&spent_by(&named), None, &candidates[0], 5_000), Some((HomeSpendWord::Unproven, None)));
+        assert_eq!(home_word(&spent_by(&named), Some(&forged_b), &candidates[1], 5_000), Some((HomeSpendWord::Unproven, None)));
+        assert_eq!(home_word(&spent_by(&named), Some(&spend_a), &candidates[1], 5_000), Some((HomeSpendWord::Unproven, None)));
+        // THE PROOF: the home key's signature over output A's spend
+        let (word, latch) = home_word(&spent_by(&named), Some(&spend_a), &candidates[0], 5_000).expect("a word");
+        let latch = latch.expect("a proof writes its latch");
+        assert_eq!(word, HomeSpendWord::Proven);
+        assert_eq!(latch.outpoint, format!("{HOME_SPEND_LATCH_PREFIX}{sweep_a}.0"));
+        let proven_txid = bsv_rs::transaction::Transaction::from_binary(&spend_a).unwrap().id();
+        assert_eq!(latch.spending_txid.as_deref(), Some(proven_txid.as_str()), "the latch names the transaction the proven bytes hash to");
+        assert_ne!(proven_txid, named);
+        write(&latch);
+        // the chain rung's ordinary memo of output B (keyed `<txid>.<vout>`) is no latch
+        write(&ProbeMemo { outpoint: probe_memo_key(&sweep_b, 0), probed_at_ms: 5_000, spent: true, spending_txid: Some(named.clone()), spent_confirmed: Some(true) });
+        // pass 2: the key written is the key read; A is Proven with no ask, B is still a target
+        let memos = read(&latch_targets);
+        assert_eq!(memos.len(), 1);
+        let (words, targets) = latched_home_words(&candidates, &memos);
+        assert_eq!(words, [(outpoint_key(&sweep_a, 0), HomeSpendWord::Proven)].into_iter().collect::<HashMap<_, _>>());
+        assert_eq!(targets, vec![(sweep_b.clone(), 0)]);
+        // a candidate named in another case reads the same latch
+        let upper = [cand(&sweep_a.to_ascii_uppercase(), 20_000)];
+        let upper_targets: Vec<(String, u32)> = upper.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
+        assert_eq!(latched_home_words(&upper, &read(&upper_targets)).0.len(), 1);
+        // a memo under a latch key that does not say spent-with-a-spender latches nothing
+        let weak = ProbeMemo { outpoint: probe_memo_key(&latch_targets[1].0, 0), probed_at_ms: 5_000, spent: true, spending_txid: None, spent_confirmed: None };
+        assert!(latched_home_words(&candidates[1..], &[weak]).0.is_empty());
+        // the stored-read count sits inside the candidate cap
+        const _: () = assert!(OWED_HOME_STORED_READS_PER_RECOMPUTE <= crate::logic::D1_CHUNK_OUTPOINTS);
     }
 }
