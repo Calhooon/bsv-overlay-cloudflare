@@ -76,6 +76,10 @@ Both workers pass `low_proof_replay::prove_bundle`.
 
 Cargo commands for a worker need `--manifest-path workers/Cargo.toml` (or
 run inside the crate directory). `make ci` runs both workspaces.
+`make ci-deploy` runs `scripts/check-workspaces.sh` first: it refuses any
+`path` in a root-workspace manifest that resolves outside the repository, and
+any entry of `[workspace.package]` / `[workspace.dependencies]` that differs
+between `Cargo.toml` and its hand-kept mirror in `workers/Cargo.toml`.
 
 ## Dependencies
 
@@ -156,11 +160,11 @@ cargo test --workspace --features bsv-overlay-engine/memory-storage
 cargo test --manifest-path workers/Cargo.toml --workspace
 
 # Property tests (proptest, 256 cases each)
-cargo test --workspace --features overlay-engine/memory-storage --test property_tests
+cargo test --workspace --features bsv-overlay-engine/memory-storage --test property_tests
 
 # Live tests — hit a deployed overlay. Require OVERLAY_URL env var.
 OVERLAY_URL=https://<your-overlay>.workers.dev \
-    cargo test --workspace --features overlay-engine/memory-storage -- --ignored
+    cargo test --workspace --features bsv-overlay-engine/memory-storage -- --ignored
 ```
 
 ## Parity harness

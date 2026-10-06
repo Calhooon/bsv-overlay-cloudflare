@@ -6,7 +6,7 @@
 # Exit is non-zero on any un-noted divergence.
 
 .PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy \
-        wrangler-dev harness test extensions-build e2e-bsv-storage clean help
+        wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
 	@echo "bsv-overlay-cloudflare make targets:"
@@ -20,7 +20,6 @@ help:
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
-	@echo "  extensions-build cargo build with --features extensions (opt-in Rust superset)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
 ## -- Reference stack (TS overlay-express 2.2.0 + Mongo + MySQL in Docker) -----
@@ -429,14 +428,13 @@ DEPLOY_CONFIGS ?= crates/overlay-cloudflare:wrangler.toml \
                   crates/low-app-layer:wrangler.toml
 ci-deploy:
 	@set -e; \
-	leaks=$$(grep -n 'path *= *"[^"]*bsv-low' Cargo.toml crates/overlay-engine/Cargo.toml \
-	    crates/overlay-discovery/Cargo.toml parity-harness/Cargo.toml || true); \
+	bash scripts/check-workspaces.sh; \
 	rootw=$$(grep -c '^name = "worker"$$' Cargo.lock || true); \
-	if [ -n "$$leaks" ] || [ "$$rootw" != "0" ]; then \
+	if [ "$$rootw" != "0" ]; then \
 	  echo "✗ ci-deploy: the ROOT workspace must build from this repository alone"; \
-	  echo "  (bsv-low #553: consumers pin the engine crates by git rev). It may name"; \
-	  echo "  no path into ../bsv-low and its Cargo.lock may hold no \`worker\`: both"; \
-	  echo "  belong to workers/Cargo.toml. Found: $$leaks; root-lock worker entries: $$rootw"; \
+	  echo "  (bsv-low #553: consumers pin the engine crates by git rev). Its Cargo.lock"; \
+	  echo "  may hold no \`worker\`: that belongs to workers/Cargo.toml."; \
+	  echo "  Root-lock worker entries: $$rootw"; \
 	  exit 1; \
 	fi; \
 	vers=$$(awk '/^name = "worker"$$/{getline; gsub(/[^0-9.]/,"",$$0); print}' workers/Cargo.lock | sort -u); \
@@ -481,8 +479,7 @@ ci-deploy:
 	done; \
 	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build"
 
-extensions-build:
-	cargo build $(WORKERS) -p bsv-overlay-cloudflare --features extensions
+# `extensions-build` is gone (bsv-low #553 lens L2): `bsv-overlay-cloudflare` has no `extensions` cargo feature, so the target could only fail; the superset is the RUNTIME var ENABLE_EXTENSIONS=true, compiled into every build.
 
 ## -- End-to-end ---------------------------------------------------------------
 

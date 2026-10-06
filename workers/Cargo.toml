@@ -27,7 +27,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
 
 # Mirrors the root `Cargo.toml` table (a workspace cannot inherit another's):
-# change a version in both.
+# change a version in both. `make ci-deploy` refuses a difference
+# (`scripts/check-workspaces.sh`).
 [workspace.dependencies]
 # BSV SDK: crates.io. `overlay` feature = types + transaction + script +
 # wallet. `auth`/`http` deliberately left off; they pull reqwest/tokio-net
