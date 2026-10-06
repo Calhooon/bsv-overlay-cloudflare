@@ -177,6 +177,41 @@ coins must apply it under `historical-tx` too: that is the mode of the replay.
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551`.
 
+## Progress under the per-peer sync budget (bsv-low #552)
+
+`Engine::start_gasp_sync` races each peer's sync against
+`set_peer_sync_budget` and drops the future at the deadline. With a budget
+set, every graph is submitted AS IT FINALIZES, inside the raced future
+(`gasp::FinalizedGraphHook`, the engine's `SubmitAsFinalized`; the reference
+submits inside `finalizeGraph` too), after lane 551's anchor check of that
+graph, so the deadline cannot take back what was finalized before it. At the
+deadline the cursor is persisted at `GASPSync::completed_cursor`: strictly
+below the lowest score of any UTXO not yet completed (the one in flight
+included), the gap guard's rule. The graph in flight is lost WHOLE (its nodes
+die with the storage adapter, nothing of it is admitted) and the next tick
+walks it again, down to what the storage now holds (`find_known_utxos` skips
+admitted roots, the known-input strip stops the walk at the admitted
+frontier): the re-fetch cost is the nodes of that one graph fetched before
+the deadline. A dropped tick that finalized a graph or moved the cursor is a
+SUCCESSFUL attempt for the quarantine count. With NO budget nothing can drop
+the sync and the graphs are submitted after it, as before.
+
+The budget bounds a TICK. Nothing bounds a GRAPH (parity: the reference has
+no node cap). So a chain reaches a node over several ticks only as far as the
+peer lists it as several UTXOs (a record or a second output along the way,
+several shards); ONE graph whose own walk outlasts the budget (a head chain
+whose tip is its only UTXO) is still dropped whole on every tick, never
+admitted, each tick a failed attempt toward quarantine. Resuming a walk needs
+its fetched nodes persisted across ticks, which the `Storage` trait does not
+offer.
+
+`TopicSyncResult` reports `finalized_graphs`, `deadline_dropped_graphs` (at
+most one per peer per sync; the same count tick after tick with no
+`finalized_graphs` and no `cursor_moves` is the case above) and
+`cursor_moves` (peer, from, to); the worker's `Scheduled: GASP sync` line
+carries the totals and the per-topic line the cursors. Pins: `cargo test -p
+bsv-overlay-engine --features memory-storage --test gasp_topic_manager i552`.
+
 ## Testing
 
 ```bash

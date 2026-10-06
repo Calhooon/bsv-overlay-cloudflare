@@ -1228,14 +1228,52 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                     total_discarded
                 );
             }
+            // bsv-low #552: what the tick got done under the per-peer
+            // budget. Graphs are submitted as they finalize, so a peer
+            // dropped at its deadline still counts the ones it finished;
+            // deadline_dropped_graphs are the ones in flight (nothing of them
+            // admitted, walked again next tick); cursor_moves the persisted
+            // cursors that advanced (past completed UTXOs only).
+            let total_finalized: u64 = r
+                .topics_synced
+                .values()
+                .map(|t| t.finalized_graphs)
+                .sum();
+            let total_deadline_dropped: u64 = r
+                .topics_synced
+                .values()
+                .map(|t| t.deadline_dropped_graphs)
+                .sum();
+            let total_cursor_moves: usize =
+                r.topics_synced.values().map(|t| t.cursor_moves.len()).sum();
+            worker::console_log!(
+                "Scheduled: GASP sync finalized_graphs={} deadline_dropped_graphs={} cursor_moves={}",
+                total_finalized,
+                total_deadline_dropped,
+                total_cursor_moves
+            );
             for (topic, res) in &r.topics_synced {
-                if !res.errors.is_empty() || res.pruned_inputs > 0 || res.discarded_graphs > 0 {
+                if !res.errors.is_empty()
+                    || res.pruned_inputs > 0
+                    || res.discarded_graphs > 0
+                    || res.finalized_graphs > 0
+                    || res.deadline_dropped_graphs > 0
+                    || !res.cursor_moves.is_empty()
+                {
+                    let cursors: Vec<String> = res
+                        .cursor_moves
+                        .iter()
+                        .map(|m| format!("{} {}->{}", m.peer, m.from, m.to))
+                        .collect();
                     worker::console_log!(
-                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} errors={:?}",
+                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} finalized_graphs={} deadline_dropped_graphs={} cursors={:?} errors={:?}",
                         topic,
                         res.sync_type,
                         res.pruned_inputs,
                         res.discarded_graphs,
+                        res.finalized_graphs,
+                        res.deadline_dropped_graphs,
+                        cursors,
                         res.errors
                     );
                 }
