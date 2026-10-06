@@ -20,6 +20,7 @@ pub mod error;
 pub mod gasp_remote;
 pub mod health_checker;
 pub mod hop_changes;
+pub mod hop_probe_memos;
 pub mod janitor;
 pub mod lobby_changes;
 pub mod mainnet_fanout;

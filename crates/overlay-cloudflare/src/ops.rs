@@ -480,6 +480,18 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
     }
 }
 
+/// PURE (bsv-low #484): the reorg view carries how many CONFIRMED hop probe memos the reorg passes have cleared
+/// (`hop_probe_memos`; the lifetime counter, 0 until the first), beside the cursor that says where the judge is.
+pub fn with_probe_memos_cleared(mut view: serde_json::Value, counters: &serde_json::Value) -> serde_json::Value {
+    if view.is_object() {
+        view["probeMemosCleared"] = json!(counters
+            .get(crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0));
+    }
+    view
+}
+
 /// PURE (round 3, review MED): the released events on record, each with the
 /// `/internal/reorg` body that heals its height, newest last.
 pub fn unresolved_json(
@@ -866,6 +878,13 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_YIELDED,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
+        // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
+        // bsv-low #436: the pot-changed flush's losses read 0 until one happens (the app layer writes the third).
+        crate::pot_changes::COUNTER_POT_CHANGED_UNDELIVERED,
+        crate::pot_changes::COUNTER_POT_CHANGED_DEFERRED,
+        "pot_changed_dropped_total",
     ] {
         obj[name] = json!(0);
     }
@@ -1098,7 +1117,7 @@ pub async fn health_invariants(
             .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
-    let arcade_reorg = arcade_reorg_view(db).await;
+    let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);

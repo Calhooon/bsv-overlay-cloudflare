@@ -1618,6 +1618,24 @@ mod tests {
         assert!(!noted.contains(&(pot(65), 0)), "the standing pot is not, got {noted:?}");
     }
 
+    /// bsv-low #484, through a REAL pass: the sweep that demotes a row at an orphaned height is reorg evidence
+    /// for the probe memos (`hop_probe_memos::reverify_rejudged`), the same sweep over rows that all stand is
+    /// not. To red: have `reverify_rejudged` ignore `stale`.
+    #[tokio::test]
+    async fn a_sweep_that_demotes_is_reorg_evidence_for_the_probe_memos_and_a_quiet_one_is_not() {
+        let store = MemoryPotStorage::new();
+        let orphaned = confirmed_pot_with_proofless_beef(&store, &pot(66), 965_771).await;
+        let disagree = single_tx_bump(&orphaned, 965_773).to_hex();
+        let fetcher = CourierStub([(orphaned.clone(), Ok(Some(disagree)))].into_iter().collect());
+        let tracker = MockChainTracker::new(965_775);
+        let s = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
+        assert_eq!(s.stale, 1, "{s:?}");
+        assert!(crate::hop_probe_memos::reverify_rejudged(&s), "a demotion at an orphaned height: {s:?}");
+        // the next sweep finds nothing confirmed there: quiet, no evidence
+        let s2 = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
+        assert!(!crate::hop_probe_memos::reverify_rejudged(&s2), "{s2:?}");
+    }
+
     /// bsv-low M19 R2 round 3 (review MED-4): the routine sweep re-asks the
     /// ladder for a courier-confirmed (no-stored-bump) row. An agreeing
     /// proof HEALS it (stitched into the store, verifiable next pass); a

@@ -2147,6 +2147,70 @@ mod tests {
             );
         }
     }
+    /// bsv-low #484 (the 2026-09-19 gate's M1), BOTH WORKERS IN ONE PIN over the shipped schema (real SQLite):
+    /// a CONFIRMED-spend memo written by this worker's own upsert answers the owed walk without a probe (and
+    /// would for two hours, `swept_home` reading it as `claimable`); the overlay's reorg pass runs its clearing
+    /// SQL (`bsv_overlay_cloudflare::hop_probe_memos`); the memo is gone and the NEXT walk re-probes. An unspent
+    /// word beside it is left alone. And the table has the TTL the contract states: the overlay's sweep bound is
+    /// this worker's longest window. To red: make the clear a no-op, or move either bound off the other.
+    #[test]
+    fn a_reorg_clears_the_confirmed_memo_and_the_next_walk_reprobes_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_TTL_MS};
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let now: i64 = 1_800_000_000_000;
+        let swept = ("a1".repeat(32), 0u32);
+        let unspent = ("b2".repeat(32), 1u32);
+        let key = |t: &(String, u32)| format!("{}.{}", t.0, t.1);
+        let write = |outpoint: &str, at: i64, spent: bool, confirmed: Option<bool>| {
+            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![outpoint, at, spent, spent.then(|| "e5".repeat(32)), confirmed]).unwrap();
+        };
+        let read = |targets: &[(String, u32)]| -> Vec<ProbeMemo> {
+            let mut stmt = conn.prepare(&probe_memo_read_sql(targets.len())).unwrap();
+            let keys: Vec<String> = targets.iter().map(key).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get(2)?,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get(4)?,
+                    })
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        // the memo written: a sweep the chain rung saw CONFIRMED an hour ago, and an unspent word a minute old
+        write(&key(&swept), now - 60 * 60_000, true, Some(true));
+        write(&key(&unspent), now - 60_000, false, None);
+        let targets = vec![swept.clone(), unspent.clone()];
+        let walk = |memos: &[ProbeMemo]| split_probe_targets_with(&targets, memos, now, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS);
+        let (answered, to_probe) = walk(&read(&targets));
+        assert_eq!(answered.len(), 2, "both answered from the memo, no probe: {answered:?}");
+        assert!(to_probe.is_empty());
+        assert_eq!(answered[0].2.spent_confirmed, Some(true), "the word `swept_home` reads as claimable");
+        // a reorg event over the sweep's height: the overlay's reorg pass clears
+        let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap();
+        assert_eq!(cleared, 1, "the confirmed memo is gone");
+        // the next walk re-probes the swept hop, and only it
+        let (answered, to_probe) = walk(&read(&targets));
+        assert_eq!(to_probe, vec![swept.clone()], "the next walk re-probes it");
+        assert_eq!(answered.iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>(), vec![unspent.0.clone()]);
+        // the TTL: the overlay deletes exactly what no reader here would honour
+        assert_eq!(HOP_PROBE_MEMO_TTL_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS.max(PROBE_MEMO_MAX_AGE_MS), "the sweep's bound is the longest window a reader passes");
+        write(&key(&swept), now - PROBE_MEMO_CONFIRMED_MAX_AGE_MS - 1, true, Some(true));
+        let (_, to_probe) = walk(&read(&targets));
+        assert_eq!(to_probe, vec![swept.clone()], "past the window no reader honours it");
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now - HOP_PROBE_MEMO_TTL_MS]).unwrap(), 1, "and the sweep deletes it");
+        assert_eq!(read(&targets).len(), 1, "the young unspent word stays");
+    }
+
     /// bsv-low #451 slice C: the memo split — fresh answers, stale/missing/future asked, a fault never remembered.
     /// RED before (no memo: every target asked every call).
     #[test]
