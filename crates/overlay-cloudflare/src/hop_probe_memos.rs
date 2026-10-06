@@ -22,8 +22,24 @@
 //!    it is dead weight: every block-event pass deletes them ([`HOP_PROBE_MEMO_TTL_MS`], pinned equal to the app
 //!    layer's longest window from its tests, which link this crate).
 //!
-//! Residual, stated: a courier that has not yet seen the reorg can answer "confirmed" again right after the
-//! clear and the memo is re-written for its window. The memo's age rides the row (`facts.chainProbeAgeMs`).
+//! 3. **The reorg GRACE (the lens's M2, 2026-10-06).** A reorg pass that demotes a pot also pushes pot-changed
+//!    for it (bsv-low #523), so the app layer recomputes within seconds of the clear and re-probes couriers
+//!    that may not have seen the reorg yet; they answer "confirmed" and the memo was re-written for two more
+//!    hours: rule 1 undone by the push. So the clear leaves a TOMBSTONE in the same table (one reserved row,
+//!    [`HOP_PROBE_MEMO_REORG_MARK`], `probedAtMs` = the time of the last clear), and the owed walk gives a
+//!    confirmed memo read before `clear + HOP_PROBE_MEMO_REORG_GRACE_MS` the short window every other word has
+//!    (five minutes) instead of the two hours (`low-app-layer` `split_probe_targets_after_reorg`): inside the
+//!    grace the walk keeps asking; a memo read after it is trusted as before. The tombstone is written BEFORE
+//!    the delete and judged without a lower bound, so a confirmed memo the delete missed (a fault, or a walk
+//!    that read the couriers before the clear and wrote after it) is held to the short window too. The TTL
+//!    sweep never deletes it (a memo read in the grace's last minute is still inside its two hours when the
+//!    tombstone would age out).
+//!
+//! Residual, stated: the word a recompute reads FRESH from a courier is served by that recompute as it always
+//! was (a courier behind the reorg says "confirmed" and the row says "ready to collect" until the next walk
+//! asks again, at most the short window later; a wrong word and a failing press, never sats), and a hop past
+//! the walk's probe budget keeps its last memo's word, named stale. The memo's age rides the row
+//! (`facts.chainProbeAgeMs`).
 use worker::wasm_bindgen::JsValue;
 use worker::{console_log, D1Database};
 
@@ -35,8 +51,23 @@ pub const HOP_PROBE_MEMO_TTL_MS: i64 = 2 * 60 * 60_000;
 /// Rule 1: every memo that recorded a CONFIRMED spend.
 pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str = "DELETE FROM hop_chain_probes WHERE spentConfirmed = 1";
 
-/// Rule 2: every memo read before the bound (bind: `now - HOP_PROBE_MEMO_TTL_MS`).
-pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str = "DELETE FROM hop_chain_probes WHERE probedAtMs < ?";
+/// Rule 2: every memo no reader honours (bind: `now - HOP_PROBE_MEMO_TTL_MS`; the reader refuses
+/// `age >= window`, so the row read exactly at the bound goes too: the lens's N2), never the reorg tombstone.
+pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str = "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0'";
+
+/// Rule 3: the tombstone's key in `hop_chain_probes.outpoint`. It has the memo key's shape (`<txid>.<vout>`)
+/// with a txid no transaction has, so the app layer reads it in the same `IN` read as the memos it judges (one
+/// read: the memos and the tombstone arrive together or not at all) and no outpoint can collide with it.
+pub const HOP_PROBE_MEMO_REORG_MARK: &str = "reorg-clear.0";
+
+/// Rule 3: how long after a clear a CONFIRMED memo is refused the long window. Thirty minutes: three blocks on
+/// average, and well past the couriers' own lag behind a reorg (their indexers follow the tip within a block).
+pub const HOP_PROBE_MEMO_REORG_GRACE_MS: i64 = 30 * 60_000;
+
+/// Rule 3: stamp the tombstone (bind: now, ms). `spent = 0` and no confirmed word: the clear above never
+/// deletes it, and a reader that met it as a memo would read "unspent", the safe word. The stamp only grows.
+pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('reorg-clear.0', ?, 0, NULL, NULL) \
+     ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)";
 
 /// Confirmed memos a reorg pass cleared (served on `/health/invariants.arcadeReorg.probeMemosCleared` and with
 /// the counters).
@@ -86,11 +117,16 @@ async fn delete(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<u64, St
         .unwrap_or(0) as u64)
 }
 
-/// Rule 1, run by a reorg pass with its outcome in hand: no evidence, no write. Logged and counted; a fault is
+/// Rules 1 and 3, run by a reorg pass with its outcome in hand: no evidence, no write. Logged and counted; a fault is
 /// logged and costs the memo's own window, nothing else. Returns the memos cleared.
 pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u64 {
     if !evidence {
         return 0;
+    }
+    // rule 3: the tombstone FIRST (a memo the delete misses is then held to the short window by its stamp)
+    let now_ms = worker::Date::now().as_millis() as f64;
+    if let Err(e) = delete(db, HOP_PROBE_MEMO_REORG_MARK_SQL, &[JsValue::from_f64(now_ms)]).await {
+        console_log!("[hop-probe-memos] ({origin}) reorg tombstone write FAILED (a memo re-written right after this clear keeps the long window): {e}");
     }
     match delete(db, HOP_PROBE_MEMO_REORG_CLEAR_SQL, &[]).await {
         Ok(cleared) => {
@@ -183,9 +219,42 @@ mod tests {
         plant(&conn, "edge.0", now - HOP_PROBE_MEMO_TTL_MS, true, Some(true));
         plant(&conn, "young.0", now - 60_000, false, None);
         plant(&conn, "ancient.0", 5, false, None);
+        // the reorg tombstone is not a memo: the sweep never takes it, however old (rule 3)
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![7]).unwrap();
         let expired = conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now - HOP_PROBE_MEMO_TTL_MS]).unwrap();
-        assert_eq!(expired, 2);
-        assert_eq!(held(&conn), vec!["edge.0", "young.0"]);
+        assert_eq!(expired, 3, "the row read exactly at the bound is one no reader honours (`age >= window`): the lens's N2");
+        assert_eq!(held(&conn), vec![HOP_PROBE_MEMO_REORG_MARK, "young.0"]);
+    }
+
+    /// bsv-low #484 (lens fold, M2), the tombstone over the SHIPPED schema (real SQLite): the clear stamps one
+    /// reserved row, the stamp only grows, the reorg clear and the TTL sweep both leave it, and its key is the
+    /// one the SQL strings carry. To red: let either DELETE take it, or let an older stamp overwrite a newer.
+    #[test]
+    fn the_reorg_tombstone_is_one_row_that_only_grows_and_no_sweep_deletes_real_sqlite() {
+        let conn = db();
+        let stamp = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT probedAtMs FROM hop_chain_probes WHERE outpoint = ?1", [HOP_PROBE_MEMO_REORG_MARK], |r| r.get(0)).unwrap()
+        };
+        plant(&conn, "a.0", 1_000, true, Some(true));
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![5_000]).unwrap();
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1, "the confirmed memo, not the tombstone");
+        assert_eq!(held(&conn), vec![HOP_PROBE_MEMO_REORG_MARK]);
+        assert_eq!(stamp(&conn), 5_000);
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![9_000]).unwrap();
+        assert_eq!(stamp(&conn), 9_000, "a later clear moves it");
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![6_000]).unwrap();
+        assert_eq!(stamp(&conn), 9_000, "an earlier stamp (two isolates racing) never moves it back");
+        assert_eq!(held(&conn).len(), 1, "one row");
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX]).unwrap(), 0, "the TTL sweep never takes it");
+        for sql in [HOP_PROBE_MEMO_REORG_MARK_SQL, HOP_PROBE_MEMO_EXPIRE_SQL] {
+            assert!(sql.contains(&format!("'{HOP_PROBE_MEMO_REORG_MARK}'")), "{sql}");
+        }
+        const { assert!(HOP_PROBE_MEMO_REORG_GRACE_MS < HOP_PROBE_MEMO_TTL_MS && HOP_PROBE_MEMO_REORG_GRACE_MS > 5 * 60_000, "longer than the short window, shorter than the long one") };
+        // the clear writes the tombstone before it deletes
+        let src = include_str!("hop_probe_memos.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body = &src[src.find("pub async fn clear_on_reorg(").unwrap()..];
+        assert!(body.find("HOP_PROBE_MEMO_REORG_MARK_SQL").unwrap() < body.find("HOP_PROBE_MEMO_REORG_CLEAR_SQL").unwrap());
     }
 
     /// bsv-low #484: what counts as a reorg pass having RE-JUDGED something. A pass that scanned and left every
@@ -267,6 +336,34 @@ mod tests {
         );
         assert!(tip.contains(&squash("crate::hop_probe_memos::expire(db, worker::Date::now().as_millis() as i64).await")), "the TTL sweep");
         let operator = body("internal_reorg");
-        assert!(operator.contains(&squash("crate::hop_probe_memos::clear_on_reorg(db, \"operator\", crate::hop_probe_memos::reverify_rejudged(&pass)).await")), "the operator's window");
+        assert!(operator.contains(&squash("crate::hop_probe_memos::clear_on_reorg(db, \"operator\", true).await")), "the operator's window");
+    }
+
+    /// bsv-low #484 (lens fold, M3): THE OPERATOR'S WINDOW IS REORG EVIDENCE BY ITSELF. Both feeds can miss a
+    /// reorg that orphaned only a hop sweep (the index holds no pot row at that height, so `handle_reorg`
+    /// re-judges nothing); `POST /internal/reorg` over the height is the documented heal, and it cleared the
+    /// memos only if a pot row moved: nothing cleared, the stale memo stood for its window. An operator naming
+    /// a window is the operator's word, as an announced `reorg_from` already is in the block-event pass.
+    /// To red: gate the clear on `reverify_rejudged(&pass)` again.
+    #[test]
+    fn the_operators_reorg_window_clears_the_memos_whether_or_not_a_pot_row_moved() {
+        // the pass an operator's window gets when no pot row sits at the orphaned height
+        let nothing_moved = ReverifyPassSummary { scanned: 0, ..Default::default() };
+        assert!(!reverify_rejudged(&nothing_moved), "the pass itself is no evidence: the old gate cleared nothing here");
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("tip_pass.rs");
+        let src = code_only(&src[..src.find("#[cfg(test)]").unwrap_or(src.len())]);
+        let start = src.find("pub async fn internal_reorg(").expect("the operator's route");
+        let route = squash(&src[start..start + src[start + 1..].find("\npub async fn ").unwrap_or(src.len() - start - 1)]);
+        let clears: Vec<_> = route.match_indices("hop_probe_memos::clear_on_reorg(").collect();
+        assert_eq!(clears.len(), 1, "one clear in the operator's route");
+        assert!(
+            route.contains(&squash(r#"crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await"#)),
+            "the operator's window clears unconditionally"
+        );
+        assert!(!route.contains("reverify_rejudged(&pass)"), "never gated on a pot row having moved");
+        // and it runs after the pass (the tombstone's stamp is the heal's time), on the 200 arm only
+        assert!(route.find("crate::reorg_sweep::handle_reorg(").unwrap() < clears[0].0);
     }
 }

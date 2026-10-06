@@ -777,8 +777,11 @@ pub async fn internal_reorg(
             pass.faults as u64,
         )
         .await;
-        // bsv-low #484: the operator's window re-judged a row: the CONFIRMED probe memos are cleared
-        crate::hop_probe_memos::clear_on_reorg(db, "operator", crate::hop_probe_memos::reverify_rejudged(&pass)).await;
+        // bsv-low #484 (lens fold, M3): the operator NAMING a window is reorg evidence by itself, as an announced
+        // `reorg_from` is in the block-event pass: the CONFIRMED probe memos are cleared whether or not a pot row
+        // moved (a reorg both feeds missed that orphaned only a hop sweep leaves no pot row at its height to
+        // re-judge, and this route is its documented heal).
+        crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await;
     }
     console_log!(
         "POST /internal/reorg {}..={} limit={} -> 200 (scanned={} standing={} demoted={} demoted_blind={} demote_missed={} faults={} errors={} drained={})",

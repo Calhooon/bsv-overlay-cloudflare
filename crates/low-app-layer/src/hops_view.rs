@@ -751,6 +751,27 @@ pub fn split_probe_targets(
     split_probe_targets_with(targets, memos, now_ms, max_age_ms, max_age_ms)
 }
 
+/// bsv-low #484 (lens fold, M2): the overlay's reorg TOMBSTONE in `hop_chain_probes` (its
+/// `hop_probe_memos::HOP_PROBE_MEMO_REORG_MARK`, pinned equal from the tests, which link that crate): one reserved
+/// row whose `probedAtMs` is the time of the last reorg clear. The key has the memo key's shape, so the owed walk
+/// reads it in the same `IN` read as its memos ([`reorg_mark_target`]).
+pub const PROBE_MEMO_REORG_MARK: &str = "reorg-clear.0";
+
+/// How long after a reorg clear a CONFIRMED memo is refused the long window (the overlay's
+/// `HOP_PROBE_MEMO_REORG_GRACE_MS`, pinned equal): thirty minutes.
+pub const PROBE_MEMO_REORG_GRACE_MS: i64 = 30 * 60_000;
+
+/// The tombstone as a read target: `read_probe_memos` keys a target `<txid>.<vout>`.
+pub fn reorg_mark_target() -> (String, u32) {
+    ("reorg-clear".to_string(), 0)
+}
+
+/// PURE: when the overlay last cleared the confirmed memos on reorg evidence (the tombstone among the rows read),
+/// or `None` (never, or the row was not read).
+pub fn reorg_clear_at(memos: &[ProbeMemo]) -> Option<i64> {
+    memos.iter().filter(|m| m.outpoint == PROBE_MEMO_REORG_MARK).map(|m| m.probed_at_ms).max()
+}
+
 /// PURE: `split_probe_targets` with a second window, `confirmed_max_age_ms`, for a memo that recorded a CONFIRMED
 /// spend (the owed walk passes `PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; every other caller keeps one window).
 pub fn split_probe_targets_with(
@@ -760,6 +781,26 @@ pub fn split_probe_targets_with(
     max_age_ms: i64,
     confirmed_max_age_ms: i64,
 ) -> ProbePlan {
+    split_probe_targets_after_reorg(targets, memos, now_ms, max_age_ms, confirmed_max_age_ms, None)
+}
+
+/// PURE (bsv-low #484, lens fold, M2): THE OWED WALK'S SPLIT. `split_probe_targets_with`, and a CONFIRMED memo
+/// read before `reorg_clear_at_ms + PROBE_MEMO_REORG_GRACE_MS` does NOT count as confirmed for its window: it
+/// answers for `max_age_ms` (five minutes, as any other word) and is then asked again. The reorg pass that clears
+/// the memos also pushes pot-changed, so a walk follows the clear within seconds and asks couriers that may not
+/// have seen the reorg; their "confirmed" used to be memoised for two more hours. Inside the grace the walk keeps
+/// asking; a memo read at or after the grace's end has the long window as before. No lower bound on purpose: the
+/// clear deleted every confirmed memo, so one stamped before it that is still here was written after the delete (a
+/// walk that read its clock before the clear) or survived a failed delete, and is held to the short window too.
+pub fn split_probe_targets_after_reorg(
+    targets: &[(String, u32)],
+    memos: &[ProbeMemo],
+    now_ms: i64,
+    max_age_ms: i64,
+    confirmed_max_age_ms: i64,
+    reorg_clear_at_ms: Option<i64>,
+) -> ProbePlan {
+    let grace_end = reorg_clear_at_ms.map(|at| at.saturating_add(PROBE_MEMO_REORG_GRACE_MS));
     let mut answered = Vec::new();
     let mut to_probe = Vec::new();
     for (txid, vout) in targets {
@@ -768,7 +809,8 @@ pub fn split_probe_targets_with(
         // it one row today, a second memo source tomorrow must not flip the answer by row order)
         let fresh = memos.iter().filter(|m| m.outpoint == key).max_by_key(|m| m.probed_at_ms).filter(|m| {
             let age = now_ms - m.probed_at_ms;
-            let window = if m.spent && m.spent_confirmed == Some(true) { confirmed_max_age_ms } else { max_age_ms };
+            let in_reorg_grace = grace_end.is_some_and(|end| m.probed_at_ms < end);
+            let window = if m.spent && m.spent_confirmed == Some(true) && !in_reorg_grace { confirmed_max_age_ms } else { max_age_ms };
             age >= 0 && age < window
         });
         match fresh {
@@ -2209,6 +2251,99 @@ mod tests {
         assert_eq!(to_probe, vec![swept.clone()], "past the window no reader honours it");
         assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now - HOP_PROBE_MEMO_TTL_MS]).unwrap(), 1, "and the sweep deletes it");
         assert_eq!(read(&targets).len(), 1, "the young unspent word stays");
+    }
+
+    /// bsv-low #484 (lens fold, M2), BOTH WORKERS IN ONE PIN over the shipped schema (real SQLite): THE CLEAR IS
+    /// NOT UNDONE BY THE PUSH. The overlay's reorg pass stamps its tombstone and clears; the pot-changed push the
+    /// same pass sends makes this worker walk seconds later; a courier behind the reorg answers "confirmed" and
+    /// the walk memoises it with this worker's own upsert. Inside the grace that memo has the short window: ten
+    /// minutes on, the walk asks again (it answered for two more hours before, the orphaned sweep reading "ready
+    /// to collect"). A memo read after the grace is trusted for the long window as before, and the one read
+    /// inside it never gains the long window by waiting.
+    /// To red: drop `!in_reorg_grace` from the window, or have the walk split without the tombstone.
+    #[test]
+    fn a_confirmed_memo_rewritten_inside_the_reorg_grace_is_asked_again_and_trusted_only_after_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_MARK, HOP_PROBE_MEMO_REORG_MARK_SQL,
+            HOP_PROBE_MEMO_TTL_MS,
+        };
+        assert_eq!(PROBE_MEMO_REORG_MARK, HOP_PROBE_MEMO_REORG_MARK, "one tombstone key on both workers");
+        assert_eq!(PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_GRACE_MS, "one grace on both workers");
+        let mark = reorg_mark_target();
+        assert_eq!(format!("{}.{}", mark.0, mark.1), PROBE_MEMO_REORG_MARK, "the read target keys to the tombstone");
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+            }
+        }
+        let swept = ("a1".repeat(32), 0u32);
+        let key = format!("{}.{}", swept.0, swept.1);
+        let write = |at: i64| {
+            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![key, at, true, "e5".repeat(32), true]).unwrap();
+        };
+        // THE ROUTE'S READ: the walk's candidates and the tombstone in one `IN` read
+        let read = || -> Vec<ProbeMemo> {
+            let targets = [swept.clone(), reorg_mark_target()];
+            let mut stmt = conn.prepare(&probe_memo_read_sql(targets.len())).unwrap();
+            let keys: Vec<String> = targets.iter().map(|t| format!("{}.{}", t.0, t.1)).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo { outpoint: r.get(0)?, probed_at_ms: r.get(1)?, spent: r.get(2)?, spending_txid: r.get(3)?, spent_confirmed: r.get(4)? })
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        // THE ROUTE'S SPLIT at `now`: answered from the memo (true) or asked again (false)
+        let answered_at = |now: i64| -> bool {
+            let memos = read();
+            let (answered, to_probe) =
+                split_probe_targets_after_reorg(std::slice::from_ref(&swept), &memos, now, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear_at(&memos));
+            assert_eq!(answered.len() + to_probe.len(), 1);
+            !answered.is_empty()
+        };
+        let t0: i64 = 1_800_000_000_000;
+        let min = 60_000i64;
+        // a sweep the couriers saw CONFIRMED an hour ago: no reorg yet, the long window answers
+        write(t0 - 60 * min);
+        assert_eq!(reorg_clear_at(&read()), None, "no reorg yet: no tombstone");
+        assert!(answered_at(t0), "the long window, as before");
+        // THE CLEAR at t0 (the overlay's reorg pass): the tombstone first, then the delete
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0]).unwrap();
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1);
+        assert_eq!(reorg_clear_at(&read()), Some(t0));
+        assert!(!answered_at(t0 + 5_000), "cleared: the walk the push triggers asks the couriers");
+        // AN IMMEDIATE RE-PROBE ANSWER: a courier behind the reorg says "confirmed" five seconds after the clear
+        write(t0 + 5_000);
+        assert!(answered_at(t0 + 4 * min), "the short window every word has");
+        assert!(!answered_at(t0 + 10 * min), "INSIDE THE GRACE the memo is not trusted for the long window: the walk asks again");
+        assert!(!answered_at(t0 + 29 * min));
+        assert!(!answered_at(t0 + 45 * min), "and it never gains the long window by waiting the grace out");
+        // a walk late in the grace re-writes it: still the short window
+        write(t0 + 29 * min);
+        assert!(!answered_at(t0 + 40 * min), "read inside the grace, judged by when it was read");
+        // TRUSTED AFTER: the answer read once the grace has passed has the long window again
+        write(t0 + PROBE_MEMO_REORG_GRACE_MS);
+        assert!(answered_at(t0 + 100 * min), "read at the grace's end: trusted as before");
+        assert!(!answered_at(t0 + PROBE_MEMO_REORG_GRACE_MS + PROBE_MEMO_CONFIRMED_MAX_AGE_MS), "for its two hours and no longer");
+        // a memo stamped BEFORE the clear that is still here (written after the delete by a walk that read its
+        // clock first, or a delete that failed) is held to the short window too
+        write(t0 - 1_000);
+        assert!(!answered_at(t0 + 10 * min), "no lower bound on the grace");
+        // a later reorg moves the grace; the tombstone outlives the TTL sweep
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0 + 200 * min]).unwrap();
+        conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![t0 + 200 * min + 10 * HOP_PROBE_MEMO_TTL_MS]).unwrap();
+        assert_eq!(reorg_clear_at(&read()), Some(t0 + 200 * min), "the sweep took the old memo and left the tombstone");
+        // the walk reads the tombstone with its memos and splits by it (source)
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = include_str!("routes.rs");
+        let routes = squash(&code_only(&routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())]));
+        assert!(routes.contains(&squash("let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;")));
+        assert!(routes.contains(&squash(
+            "crate::hops_view::split_probe_targets_after_reorg( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, crate::hops_view::reorg_clear_at(&memos), )"
+        )));
     }
 
     /// bsv-low #451 slice C: the memo split — fresh answers, stale/missing/future asked, a fault never remembered.

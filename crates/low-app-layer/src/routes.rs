@@ -2900,18 +2900,23 @@ pub(crate) async fn owed_recompute(
             .map(|h| (h.hop_txid.to_ascii_lowercase(), h.hop_vout))
             .collect();
         if !candidates.is_empty() {
-            let memos = read_probe_memos(db, &candidates).await;
+            // bsv-low #484 (lens fold, M2): the overlay's reorg tombstone rides the same read (one `IN`: the memos
+            // and the stamp arrive together or not at all, and with no memos every candidate is asked)
+            let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;
             // bsv-low #469, the stranded cell's run 5 (2026-09-19): a CONFIRMED spend's memo answers for two hours
             // (`PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; the gate's NIT-8: it read "a day" here after the window shrank), and the
             // outpoints still to ask go never-probed first (newest marker first) then oldest memo first, so the
             // eight-per-recompute walk reaches a hop that just crossed the window instead of re-probing the same
             // first eight of the hops view's rank order every five minutes (both pinned in `hops_view`).
-            let (answered, to_probe) = crate::hops_view::split_probe_targets_with(
+            // Inside the grace after a reorg clear a confirmed memo has the short window (the pass that clears also
+            // pushes pot-changed, so this walk can follow it by seconds and ask a courier still behind the reorg).
+            let (answered, to_probe) = crate::hops_view::split_probe_targets_after_reorg(
                 &candidates,
                 &memos,
                 now_ms,
                 crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
                 crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
+                crate::hops_view::reorg_clear_at(&memos),
             );
             let marker_at: HashMap<String, i64> = hops
                 .iter()
