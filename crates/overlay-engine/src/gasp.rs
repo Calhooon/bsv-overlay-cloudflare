@@ -225,6 +225,14 @@ pub trait AncestorFetcher {
     /// at the first proven layer. Managers needing history select those inputs
     /// instead of walking every funding/fee input back toward coinbase.
     ///
+    /// The transaction DAG (no cycles), `seen` keyed by `txid.outputIndex`,
+    /// the already-known strip, and the manager naming nothing at genesis
+    /// bound the walk. There is no node cap, matching the reference's undefined
+    /// `maxNodesInGraph` in `Engine.startGASPSync`. A per-peer budget drops the
+    /// whole sync future, with nothing submitted outside the completed arm:
+    /// a chain deeper than the budget never bootstraps. Progress handling is
+    /// the filed follow-up.
+    ///
     /// The implementation MUST verify that the returned bytes hash to the
     /// requested `txid` before returning them (integrity check) so a
     /// malicious/garbled response cannot inject a forged ancestor.
@@ -679,6 +687,15 @@ impl<'a> GASPSync<'a> {
                             // history select their ancestors through this same
                             // fetcher. Without a proof, every input is requested
                             // as before.
+                            // The transaction DAG (no cycles), `seen` keyed by
+                            // `txid.outputIndex`, the already-known strip, and the
+                            // manager naming nothing at genesis bound the walk.
+                            // There is no node cap, matching the reference's
+                            // undefined `maxNodesInGraph` in `Engine.startGASPSync`.
+                            // A per-peer budget drops the whole sync future, with
+                            // nothing submitted outside the completed arm, so a
+                            // chain deeper than the budget never bootstraps.
+                            // Progress handling is the filed follow-up.
                             Some(fetcher) => {
                                 let ancestor = fetcher.fetch_ancestor(&txid).await?;
                                 GASPNode {

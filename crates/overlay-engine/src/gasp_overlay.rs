@@ -424,10 +424,18 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                 return Ok(None);
             }
 
-            let beef = tx
-                .to_beef(false)
-                .map_err(|e| GASPError::Other(format!("Failed to serialize proven BEEF: {e}")))?;
-            match manager.identify_needed_inputs(&beef, None).await {
+            // A serialization RED is unreachable: bsv-rs stops collecting ancestors at a merkle path.
+            let needed_inputs = async {
+                let beef = tx
+                    .to_beef(false)
+                    .map_err(|e| format!("Failed to serialize proven BEEF: {e}"))?;
+                manager
+                    .identify_needed_inputs(&beef, None)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match needed_inputs {
                 Ok(inputs) => {
                     for input in inputs {
                         requested_inputs

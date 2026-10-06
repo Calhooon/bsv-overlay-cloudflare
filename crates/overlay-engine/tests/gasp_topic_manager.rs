@@ -148,7 +148,6 @@ impl GASPRemote for RecordingRemote {
 
 #[derive(Default)]
 struct HeadState {
-    head: Option<Outpoint>,
     admitted: Vec<String>,
 }
 
@@ -167,20 +166,17 @@ impl TopicManager for HeadChainManager {
             assert!(previous_coins.is_empty(), "GASP admission is a dry run");
             assert!(tx.merkle_path.is_some(), "the dry run carries the proof");
         }
-        let mut state = self.0.borrow_mut();
-        let extends_head = tx.inputs.first().is_some_and(|input| {
-            state.head.as_ref()
-                == Some(&Outpoint::new(
-                    input.get_source_txid().unwrap(),
-                    input.source_output_index,
-                ))
-        });
+        // The engine encodes the reference's previousCoins: number[] as
+        // little-endian u32 input indices. Finalize must supply the first input.
+        let extends_head = mode == SubmitMode::HistoricalTxNoSpv
+            && previous_coins
+                .chunks_exact(4)
+                .any(|index| u32::from_le_bytes(index.try_into().unwrap()) == 0);
         if !tx.inputs.is_empty() && !extends_head {
             return Ok(AdmittanceInstructions::default());
         }
         if mode == SubmitMode::HistoricalTxNoSpv {
-            state.admitted.push(tx.id());
-            state.head = Some(Outpoint::new(tx.id(), 0));
+            self.0.borrow_mut().admitted.push(tx.id());
         }
         Ok(AdmittanceInstructions {
             outputs_to_admit: vec![0],
@@ -307,7 +303,7 @@ async fn a_sync_finalizes_one_graph_with_all_five_transactions() {
     );
     assert!(
         manager.0.borrow().admitted.is_empty(),
-        "dry runs do not advance the head"
+        "dry runs do not record admissions"
     );
 }
 
