@@ -15,7 +15,8 @@
 //! ## find_needed_inputs
 //!
 //! Parses the node's raw transaction hex to determine what inputs are needed:
-//! - If the node has a merkle proof, no inputs are needed (it is mined).
+//! - A proven node ends the walk unless its output is not yet admissible and
+//!   its topic manager names inputs needed for overlay history.
 //! - If no proof, all transaction inputs are requested (minus any already
 //!   known in local storage).
 //!
@@ -27,11 +28,12 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bsv_rs::transaction::{MerklePath, Transaction};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::gasp::{GASPError, GASPStorage};
 use crate::storage::Storage;
-use crate::types::{GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput};
+use crate::topic_manager::TopicManager;
+use crate::types::{GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode};
 
 /// A GASP node stored during in-progress graph construction.
 #[derive(Debug, Clone)]
@@ -77,6 +79,8 @@ pub struct OverlayGASPStorage<'a> {
     storage: &'a dyn Storage,
     /// Topic being synchronized.
     topic: String,
+    /// Optional topic manager for overlay-specific history behind proven nodes.
+    topic_manager: Option<&'a dyn TopicManager>,
     /// Temporary graphs being constructed during sync.
     /// Key: node identifier (graph_id for root, "txid.outputIndex" for children).
     /// Value: the pending node with its relationship data.
@@ -104,10 +108,19 @@ impl<'a> OverlayGASPStorage<'a> {
         Self {
             storage,
             topic: topic.into(),
+            topic_manager: None,
             pending_graphs: Mutex::new(HashMap::new()),
             finalized_sink: sink,
             strict_beef: false,
         }
+    }
+
+    /// Consult the topic manager when a proven node needs overlay history.
+    /// Without a manager, proven nodes retain the legacy stopping rule.
+    #[must_use]
+    pub fn with_topic_manager(mut self, manager: &'a dyn TopicManager) -> Self {
+        self.topic_manager = Some(manager);
+        self
     }
 
     /// Enable strict-BEEF finalize (`to_beef(false)`), failing loud on a
@@ -370,42 +383,85 @@ impl GASPStorage for OverlayGASPStorage<'_> {
 
     /// Determine which inputs are needed to validate this node.
     ///
-    /// - If the node has a merkle proof, it is a mined transaction and
-    ///   no further inputs are needed (returns `None`).
+    /// - A proven node ends the walk if its output is admissible, or its topic
+    ///   manager names no inputs. Without a manager, proven nodes always stop.
     /// - If no proof, parses the raw transaction and requests all inputs,
     ///   filtering out any inputs already known in local storage.
-    /// - If the raw_tx cannot be parsed, returns `None` (graceful fallback).
+    /// - Admission errors propagate to GASP's incoming UTXO handler. Errors
+    ///   identifying needed inputs are logged and cut off this node, like TS.
+    /// - Unproven raw_tx parse failures retain the legacy graceful fallback.
     async fn find_needed_inputs(
         &self,
         node: &GASPNode,
     ) -> Result<Option<GASPNodeResponse>, GASPError> {
-        // If there is a merkle proof, this transaction is mined — no inputs needed.
-        if node.proof.is_some() {
-            return Ok(None);
-        }
-
-        // Parse the raw transaction to enumerate its inputs.
-        let tx = match Transaction::from_hex(&node.raw_tx) {
-            Ok(tx) => tx,
-            Err(e) => {
-                warn!(
-                    "Cannot parse raw_tx for find_needed_inputs (graph_id={}): {e}",
-                    node.graph_id
-                );
-                // Graceful fallback: if we can't parse, don't request inputs.
-                return Ok(None);
-            }
-        };
-
         let mut requested_inputs: HashMap<String, GASPInputRequest> = HashMap::new();
 
-        for input in &tx.inputs {
-            let source_txid = input.get_source_txid().unwrap_or_default();
-            if source_txid.is_empty() {
-                continue;
+        if let Some(proof_hex) = &node.proof {
+            let Some(manager) = self.topic_manager else {
+                return Ok(None);
+            };
+            let mut tx = Transaction::from_hex(&node.raw_tx)
+                .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx: {e}")))?;
+            tx.merkle_path = Some(
+                MerklePath::from_hex(proof_hex)
+                    .map_err(|e| GASPError::Other(format!("Failed to parse proof: {e}")))?,
+            );
+
+            // TS passes { dryRun: true }. Workspace managers only evaluate
+            // scripts here, so the existing trait needs no additional flag.
+            // Utils.toArray(string) defaults to UTF-8, even for hex-like text.
+            // This call is outside the needed-input catch in the reference.
+            let admittance = manager
+                .identify_admissible_outputs(
+                    &tx,
+                    &[],
+                    node.tx_metadata.as_deref().map(str::as_bytes),
+                    SubmitMode::HistoricalTx,
+                )
+                .await
+                .map_err(|e| GASPError::Other(e.to_string()))?;
+            if admittance.outputs_to_admit.contains(&node.output_index) {
+                return Ok(None);
             }
-            let outpoint = format!("{}.{}", source_txid, input.source_output_index);
-            requested_inputs.insert(outpoint, GASPInputRequest { metadata: false });
+
+            let beef = tx
+                .to_beef(false)
+                .map_err(|e| GASPError::Other(format!("Failed to serialize proven BEEF: {e}")))?;
+            match manager.identify_needed_inputs(&beef, None).await {
+                Ok(inputs) => {
+                    for input in inputs {
+                        requested_inputs
+                            .insert(input.to_graph_id(), GASPInputRequest { metadata: false });
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "An error occurred when identifying needed inputs for transaction: {}.{}: {e}",
+                        tx.id(), node.output_index
+                    );
+                    return Ok(None);
+                }
+            }
+        } else {
+            // Unproven nodes always need all inputs, independently of the manager.
+            let tx = match Transaction::from_hex(&node.raw_tx) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    warn!(
+                        "Cannot parse raw_tx for find_needed_inputs (graph_id={}): {e}",
+                        node.graph_id
+                    );
+                    return Ok(None);
+                }
+            };
+            for input in &tx.inputs {
+                let source_txid = input.get_source_txid().unwrap_or_default();
+                if source_txid.is_empty() {
+                    continue;
+                }
+                let outpoint = format!("{}.{}", source_txid, input.source_output_index);
+                requested_inputs.insert(outpoint, GASPInputRequest { metadata: false });
+            }
         }
 
         if requested_inputs.is_empty() {

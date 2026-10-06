@@ -3073,9 +3073,12 @@ impl Engine {
                     let hydration_on = self.ancestor_fetcher.is_some();
 
                     // Create storage adapter and remote
-                    let gasp_storage =
+                    let mut gasp_storage =
                         OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone())
                             .with_strict_beef(hydration_on);
+                    if let Some(manager) = self.managers.get(topic) {
+                        gasp_storage = gasp_storage.with_topic_manager(manager.as_ref());
+                    }
                     let gasp_remote = factory.create_remote(peer_url, topic);
 
                     let log_prefix = format!("[GASP {topic} <-> {peer_url}]");

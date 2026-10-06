@@ -220,12 +220,10 @@ pub trait AncestorFetcher {
     /// Fetch an ancestor transaction by txid from chain.
     ///
     /// Returns the raw tx hex plus, when the ancestor is mined, its BUMP merkle
-    /// proof hex. Supplying the proof is important: a synthesized node WITH a
-    /// proof terminates the ingest recursion (it is a mined SPV leaf —
-    /// `find_needed_inputs` returns `None`), so the graph walk stops at the
-    /// first proven layer instead of recursing through every input (including
-    /// funding/fee inputs) back toward coinbase. Omitting it would make a deep
-    /// chain's graph effectively unbounded.
+    /// proof hex. A proven node ends the walk unless its topic manager names
+    /// inputs needed for overlay history. Managers naming nothing still stop
+    /// at the first proven layer. Managers needing history select those inputs
+    /// instead of walking every funding/fee input back toward coinbase.
     ///
     /// The implementation MUST verify that the returned bytes hash to the
     /// requested `txid` before returning them (integrity check) so a
@@ -362,7 +360,7 @@ pub struct FetchedAncestor {
     /// Raw transaction hex.
     pub raw_tx: String,
     /// BUMP merkle proof hex, if the ancestor is mined. When `Some`, the
-    /// synthesized node is a proven SPV leaf and the recursion terminates.
+    /// synthesized node ends the walk unless its topic manager names inputs.
     pub proof: Option<String>,
 }
 
@@ -631,12 +629,13 @@ impl<'a> GASPSync<'a> {
 
             // GOD-TIER proof-anchoring (#126): if the peer served this node WITHOUT
             // a merkle proof but the tx is mined, hydrate its OWN proof via the
-            // ancestor fetcher (WoC `/beef`). A proven node is a self-anchored SPV
-            // leaf — `find_needed_inputs` returns None for it — so we NEVER walk into
-            // the spent prior contract-state (a 2-tx-pattern template, or a covenant's
-            // previous UTXO). Without this, the walk reaches a spent input whose output
+            // ancestor fetcher (WoC `/beef`). A proven node ends the walk UNLESS
+            // its topic manager names inputs needed for overlay history. Managers
+            // naming nothing still avoid the spent prior contract-state (a
+            // 2-tx-pattern template, or a covenant's previous UTXO). Without this,
+            // the walk reaches a spent input whose output
             // record exists in storage (so `find_needed_inputs` strips it) but whose tx
-            // is absent from the in-memory graph → `get_beef_for_node` fails "Missing
+            // is absent from the in-memory graph, so `get_beef_for_node` fails "Missing
             // source transaction" and the whole graph is discarded. Legacy beta's
             // GASP-serve omits proofs, so this is required cross-stack. No-op when no
             // fetcher is configured (production default unchanged) or the node already
@@ -674,13 +673,12 @@ impl<'a> GASPSync<'a> {
                             // exhaust a worker invocation before the graph finalizes.
                             //
                             // The fetcher returns the ancestor's rawtx and, when it
-                            // is mined, its BUMP proof. A proven node is an SPV leaf
-                            // — find_needed_inputs returns None for it — so the walk
-                            // TERMINATES at the first proven layer instead of
-                            // recursing through every input (incl. funding/fee
-                            // inputs) toward coinbase, keeping the graph bounded. If
-                            // proof is None (unmined ancestor), the recursion
-                            // continues to ITS parents as before.
+                            // is mined, its BUMP proof. A proven node ends the walk
+                            // UNLESS its topic manager names inputs. Empty managers
+                            // still stop at the first proven layer; managers needing
+                            // history select their ancestors through this same
+                            // fetcher. Without a proof, every input is requested
+                            // as before.
                             Some(fetcher) => {
                                 let ancestor = fetcher.fetch_ancestor(&txid).await?;
                                 GASPNode {
