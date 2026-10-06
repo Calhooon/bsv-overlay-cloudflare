@@ -23,9 +23,13 @@ base64 = "0.22"
 # repository. The `LOW/proof/v1` replay and its two PATH deps on the private
 # `bsv-low` checkout (`low-core`, `low-wire`) live in `crates/low-proof-replay`,
 # a member of the LOW workers' workspace (`workers/Cargo.toml`), and reach
-# `ProofLookupService` as a hook. Cargo reads a path dependency's manifest
-# even when it is optional, so a feature gate here does not help a consumer
-# that pins this crate by git rev.
+# `ProofLookupService` as a hook. Cargo reads a WORKSPACE MEMBER's path
+# dependencies even when they are optional, so with a feature gate here a
+# fresh clone of this repository alone could not load its workspace
+# (measured: `failed to load manifest for dependency low-core`). That is the
+# clause of the bar the two workspaces meet. A consumer pinning this crate by
+# git rev would have resolved with the gate alone (measured too: inside a git
+# source cargo never loads an unactivated optional path dependency).
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `std::time::SystemTime::now()` panics on wasm32-unknown-unknown — route

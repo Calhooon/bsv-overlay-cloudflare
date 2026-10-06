@@ -778,6 +778,32 @@ mod tests {
     // at the expected gate.
     // ------------------------------------------------------------------
 
+    // Vendored from bsv-storage-cloudflare `tests/fixtures/pushdrop/baseline_small_cdn_url.json` at 698cebe (bsv-low #553: the tests compile from this repository alone).
+    const GOLDEN_BASELINE_SMALL_CDN_URL: &str =
+        include_str!("fixtures/baseline_small_cdn_url.json");
+    /// The canonical file in the `bsv-storage-cloudflare` checkout (a sibling
+    /// repository on the dev machine). The byte-compare guard runs whenever
+    /// it is present.
+    const GOLDEN_BASELINE_SMALL_CDN_URL_CANONICAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../bsv-storage-cloudflare/tests/fixtures/pushdrop/baseline_small_cdn_url.json"
+    );
+
+    /// Vendored copy == the sibling's file, byte for byte. Drift means the
+    /// oracle fixture was regenerated: re-vendor it deliberately, never
+    /// loosen this.
+    #[test]
+    fn golden_baseline_small_cdn_url_matches_the_sibling_when_present() {
+        let Ok(canonical) = std::fs::read_to_string(GOLDEN_BASELINE_SMALL_CDN_URL_CANONICAL) else {
+            eprintln!("bsv-storage-cloudflare not beside this repository: drift guard skipped");
+            return;
+        };
+        assert_eq!(
+            GOLDEN_BASELINE_SMALL_CDN_URL, canonical,
+            "vendored uhrp/fixtures/baseline_small_cdn_url.json drifted from bsv-storage-cloudflare"
+        );
+    }
+
     /// The golden fixtures were built by `scripts/gen-pushdrop-fixtures.mjs`
     /// in `bsv-storage-cloudflare` purely to lock the lock-script encoding
     /// down to byte-exact parity with `@bsv/sdk` — they aren't signed by a
@@ -793,9 +819,7 @@ mod tests {
     /// live-parity `/advertise` round-trip for that proof.
     #[test]
     fn golden_baseline_small_cdn_url_decodes_as_pushdrop() {
-        let fixture_json = include_str!(
-            "../../../../../bsv-storage-cloudflare/tests/fixtures/pushdrop/baseline_small_cdn_url.json"
-        );
+        let fixture_json = GOLDEN_BASELINE_SMALL_CDN_URL;
         let fixture: serde_json::Value = serde_json::from_str(fixture_json).unwrap();
         let script_hex = fixture["expected_locking_script_hex"].as_str().unwrap();
         let script = bsv_rs::script::Script::from_hex(script_hex).unwrap();

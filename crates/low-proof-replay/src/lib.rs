@@ -17,9 +17,12 @@
 //!
 //! bsv-low #553 (2026-10-06): this was `overlay_discovery::proof::replay`.
 //! It is its own crate because `low-core` and `low-wire` are PATH deps on the
-//! private `bsv-low` checkout, and cargo reads a path dependency's manifest
-//! even when it is optional: while they sat in `bsv-overlay-discovery`, no
-//! consumer could pin the engine crates by git rev without a `[patch]`. The
+//! private `bsv-low` checkout, and cargo reads a WORKSPACE MEMBER's path
+//! dependencies even when they are optional: while they sat in
+//! `bsv-overlay-discovery`, gated or not, a fresh clone of this repository
+//! alone could not load its workspace. (A consumer pinning the engine crates
+//! by git rev would have resolved with a feature gate alone; the fresh clone
+//! is the clause that needs the second workspace.) The
 //! two LOW workers link this crate and hand [`prove_bundle`] to
 //! `ProofLookupService::with_prover`; the engine crates name no LOW crate.
 

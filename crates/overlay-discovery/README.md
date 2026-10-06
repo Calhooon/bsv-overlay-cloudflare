@@ -84,7 +84,7 @@ let lookup_service = Box::new(SHIPLookupService::new(ship_storage.clone()));
 cargo test -p overlay-discovery
 
 # With memory storage for end-to-end plugin lifecycle tests
-cargo test -p overlay-discovery --features overlay-engine/memory-storage
+cargo test -p bsv-overlay-discovery --features bsv-overlay-engine/memory-storage
 ```
 
 The `tests/ts_sdk_parity.rs` and `tests/cross_validator.rs` suites

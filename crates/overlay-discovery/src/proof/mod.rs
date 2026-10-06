@@ -76,6 +76,8 @@ pub mod lookup_service;
 pub mod storage;
 pub mod topic_manager;
 
+use std::sync::Arc;
+
 /// Both hands as re-derived from the bundle. Cards are CANONICAL (sorted
 /// ascending ordinals 0..=51), the form the claim and the bundle both carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +105,16 @@ impl ProvedHands {
 /// `None` on any discrepancy. LOW's is `low_proof_replay::prove_bundle`. It
 /// is a hook and not a dependency because the replay links LOW's private
 /// crates (bsv-low #553): this crate must build from its own repository.
-pub type BundleProver = fn(&[u8], &[u8; 32], &[u8; 33]) -> Option<ProvedHands>;
+///
+/// A shared trait object, not a bare `fn` pointer, so a deployment can hand
+/// in a closure that captures state (a verifier with config, a counter)
+/// while `ProofLookupService` stays free of generics. `with_prover` wraps
+/// any matching `Fn` (a free function included), so no caller builds the
+/// `Arc` by hand. `Send + Sync` hold on wasm32 too: they bound only what
+/// the prover captures, not the service (which is `!Send` through its `Rc`
+/// storage either way).
+pub type BundleProver =
+    Arc<dyn Fn(&[u8], &[u8; 32], &[u8; 33]) -> Option<ProvedHands> + Send + Sync>;
 
 /// The domain tag the app stamps. v1 = `(tag, gameId, winnerIdentity,
 /// sig, bundle)`. 12 bytes of ASCII — the byte layout is the cross-repo

@@ -31,6 +31,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::debug;
 
 use super::parse_proof_marker;
@@ -69,11 +70,16 @@ impl ProofLookupService {
 
     /// As [`Self::new`], replaying each admitted bundle ONCE through
     /// `prover` (LOW's workers pass `low_proof_replay::prove_bundle`): the
-    /// verdict and both re-derived hands ride the record.
-    pub fn with_prover(storage: Rc<dyn ProofStorage>, prover: BundleProver) -> Self {
+    /// verdict and both re-derived hands ride the record. Any `Fn` of the
+    /// [`BundleProver`] shape is taken: a free function or a closure that
+    /// captures state.
+    pub fn with_prover<F>(storage: Rc<dyn ProofStorage>, prover: F) -> Self
+    where
+        F: Fn(&[u8], &[u8; 32], &[u8; 33]) -> Option<ProvedHands> + Send + Sync + 'static,
+    {
         Self {
             storage,
-            prover: Some(prover),
+            prover: Some(Arc::new(prover)),
         }
     }
 }
@@ -127,7 +133,7 @@ impl LookupService for ProofLookupService {
         // Admission itself stays byte-format-only: a refused replay is stored
         // as `bundleValid = 0`, never a rejected marker. With no prover linked
         // (bsv-low #553) nothing is claimed either way: `bundleValid = NULL`.
-        let proved = self.prover.and_then(|prove| {
+        let proved = self.prover.as_ref().and_then(|prove| {
             <[u8; 33]>::try_from(marker.winner.as_slice())
                 .ok()
                 .and_then(|w| prove(&marker.bundle, &marker.game_id, &w))
@@ -145,7 +151,7 @@ impl LookupService for ProofLookupService {
             txid: txid.to_string(),
             output_index,
             created_at: 0, // assigned by the storage layer at insert
-            bundle_valid: self.prover.map(|_| proved.is_some()),
+            bundle_valid: self.prover.as_ref().map(|_| proved.is_some()),
             winner_seat: proved.as_ref().map(|p| p.winner_seat),
             seat_a: proved.as_ref().map(|p| hex::encode(p.seats[0])),
             seat_b: proved.as_ref().map(|p| hex::encode(p.seats[1])),
@@ -402,6 +408,55 @@ mod tests {
         assert_eq!(bad.bundle_valid, Some(false));
         assert!(bad.winner_seat.is_none() && bad.seat_a.is_none() && bad.seat_b.is_none());
         assert!(bad.winner_cards_hex.is_none() && bad.loser_cards_hex.is_none());
+    }
+
+    /// bsv-low #553 (lens L3): the prover may be a closure that CAPTURES
+    /// state, not only a free function. This one carries the game it accepts
+    /// and a call counter; both are read back after admission.
+    #[tokio::test]
+    async fn admission_takes_a_capturing_closure_as_the_prover() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let accepted_game = [0x33u8; 32];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let winner = golden_winner();
+        let storage = Rc::new(MemoryProofStorage::new());
+        let svc = ProofLookupService::with_prover(
+            storage.clone(),
+            move |_bundle: &[u8], game: &[u8; 32], winner: &[u8; 33]| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                (game == &accepted_game).then_some(ProvedHands {
+                    winner_seat: 0,
+                    seats: [*winner, [0x03; 33]],
+                    winner_cards: [10, 11, 12, 13, 14],
+                    loser_cards: None,
+                })
+            },
+        );
+        for (txid, game) in [("txMINE", accepted_game), ("txOTHER", [0x44u8; 32])] {
+            let script =
+                super::super::tests::marker_script(&game, &winner, &golden_sig(), b"bundle");
+            svc.output_admitted_by_topic(&admit(txid, 0, script))
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one replay per admission");
+        let mine = storage
+            .list_for_game_winner(&hex::encode(accepted_game), &hex::encode(&winner), 10)
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].bundle_valid, Some(true));
+        assert_eq!(mine[0].winner_cards_hex.as_deref(), Some("0a0b0c0d0e"));
+        assert!(mine[0].loser_cards_hex.is_none());
+        let other = storage
+            .list_for_game_winner(&hex::encode([0x44u8; 32]), &hex::encode(&winner), 10)
+            .await
+            .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].bundle_valid, Some(false));
     }
 
     /// bsv-low #553: with NO prover the service claims nothing. The record
