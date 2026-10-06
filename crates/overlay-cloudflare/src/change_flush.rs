@@ -45,7 +45,13 @@
 //! AND `*_noted_back_unresent = 0` (`retried + deferred - resent`, floored at 0): every note-back made was
 //! POSTed again, and none of those POSTs was refused. `*_noted_back_unresent` is above 0 for the moments
 //! between a note-back and the next flush of its isolate; one that STAYS above 0 is that many entries lost
-//! with an isolate (or with a POST still in flight when the task's wall ended), never re-sent. It errs toward
+//! with an isolate (or with a POST still in flight when the task's wall ended), never re-sent. THE FIGURE IS
+//! CUMULATIVE, NOT A GAUGE (the second delta lens's D2-L2): it is the difference of three totals summed over
+//! every isolate since the counters began, so entries lost once stay in it for good and it does NOT return to
+//! 0 after the first loss. Read it against a RECORDED BASELINE: it rises at a note-back and falls back to the
+//! baseline at the next flush of that isolate; a rise that stays is that many more entries lost, and the new
+//! value is the next baseline. No current figure is served beside it on purpose: what is waiting lives in each
+//! isolate's own memory, and `/health/invariants` answers from whichever isolate takes the request. It errs toward
 //! reading a loss: a note-back whose own counter write failed is not counted at all (the floor hides a resend
 //! that was), and the per-isolate memory of note-backs is bounded ([`RETRY_MEMORY_MAX`],
 //! [`DEFER_MEMORY_MAX`]): past it a failed or deferred entry is not noted back, it is let go and counted
@@ -215,7 +221,8 @@ pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -
 }
 
 /// PURE: the note-backs never re-sent, from the three counters' totals (`/health/invariants` serves it per set
-/// as `*_noted_back_unresent`). Floored at 0: the counters are bumped one statement at a time.
+/// as `*_noted_back_unresent`). Floored at 0: the counters are bumped one statement at a time. Cumulative: read
+/// against a recorded baseline, never against 0 (the module doc, D2-L2).
 pub fn noted_back_unresent(retried_total: u64, deferred_total: u64, resent_total: u64) -> u64 {
     (retried_total + deferred_total).saturating_sub(resent_total)
 }
@@ -301,7 +308,7 @@ pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: us
     }
     if undelivered + retried + deferred > 0 {
         console_log!(
-            "[{tag}] flush of {shipped} entry(ies): {undelivered} NOT delivered (refused by the app layer, or the POST failed twice: {retry_failed} after a retry), {retried} noted back to retry once, {deferred} deferred to the next flush"
+            "[{tag}] flush of {shipped} entry(ies): {undelivered} NOT delivered (refused by the app layer, the POST failed twice: {retry_failed} after a retry, or let go past the isolate's bounded memory of note-backs), {retried} noted back to retry once, {deferred} deferred to the next flush"
         );
     }
     if let Ok(db) = env.d1("OVERLAY_DB") {

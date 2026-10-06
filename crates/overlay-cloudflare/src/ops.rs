@@ -793,7 +793,8 @@ pub const CHANGE_FLUSH_SETS: [&crate::change_flush::FlushCounters; 3] =
 
 /// PURE (the delta lens's D-L2): each set's note-backs NEVER RE-SENT, derived from the served counters
 /// (`retried + deferred - resent`, [`crate::change_flush::noted_back_unresent`]): `(name, value)` per set.
-/// `*_undelivered_total = 0` proves delivery only together with this figure at 0.
+/// `*_undelivered_total = 0` proves delivery only together with this figure at its recorded baseline: the totals
+/// are cumulative across isolates, so after one loss the figure never reads 0 again (D2-L2, `change_flush`'s doc).
 pub fn change_flush_unresent(counters: &serde_json::Value) -> Vec<(&'static str, u64)> {
     let read = |name: &str| counters[name].as_u64().unwrap_or(0);
     CHANGE_FLUSH_SETS
