@@ -1219,9 +1219,71 @@ pub const OWED_ROWS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_rows (identi
 /// is COMPUTED on its first read, never served as "nothing owed".
 pub const OWED_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_state (identity TEXT PRIMARY KEY, computedAtMs INTEGER NOT NULL, tip INTEGER, rows INTEGER NOT NULL, stale INTEGER NOT NULL DEFAULT 0, truncated INTEGER NOT NULL DEFAULT 0)";
 
-pub const OWED_ROWS_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE identity = ?1";
-pub const OWED_ROW_INSERT_SQL: &str = "INSERT INTO owed_rows (identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
-pub const OWED_STATE_UPSERT_SQL: &str = "INSERT OR REPLACE INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated) VALUES (?1, ?2, ?3, ?4, 0, ?5)";
+// bsv-low #487: THE WRITE IS MONOTONIC IN `computedAtMs` (the walk's own start stamp). The recompute lock is
+// isolate-local and leased (`routes::OWED_IN_FLIGHT_STALE_MS`): a walk silent past its lease is taken over while
+// still live, and a walk on ANOTHER isolate is never seen at all, so two walks of one identity can finish in either
+// order. Each statement of the batch carries the same guard against the marker as it stood BEFORE the batch (the
+// marker's own upsert runs last): a snapshot older than the one the marker carries deletes nothing, inserts nothing
+// and stamps nothing, and the closing read-back tells the walk (`owed_write_landed`).
+// Why the guard and not a token fence at the final write: the token lives in one isolate's memory, so a fence can
+// only refuse the takeover's twin on that isolate, and it is checked BEFORE the batch's await; the guard is decided
+// by D1 inside the batch, for every writer. The clocks are the isolates' own (`Date.now()`): a writer whose clock
+// runs behind by the skew is refused for that long and leaves any stale mark standing, so the next read recomputes.
+pub const OWED_ROWS_DELETE_SQL: &str =
+    "DELETE FROM owed_rows WHERE identity = ?1 AND NOT EXISTS (SELECT 1 FROM owed_state WHERE identity = ?1 AND computedAtMs > ?2)";
+/// `?9` is the row's `updatedAtMs`, which IS the walk's stamp (`owed_write_plan`): the guard reads it.
+pub const OWED_ROW_INSERT_SQL: &str = "INSERT INTO owed_rows (identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE NOT EXISTS (SELECT 1 FROM owed_state WHERE identity = ?1 AND computedAtMs > ?9)";
+/// A refused stamp leaves the marker whole: its tip, its row count and its `stale` mark (a filing that marked the
+/// newer snapshot stale is still owed its recompute).
+pub const OWED_STATE_UPSERT_SQL: &str = "INSERT INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated) VALUES (?1, ?2, ?3, ?4, 0, ?5) ON CONFLICT(identity) DO UPDATE SET computedAtMs = excluded.computedAtMs, tip = excluded.tip, rows = excluded.rows, stale = 0, truncated = excluded.truncated WHERE excluded.computedAtMs >= owed_state.computedAtMs";
+/// One bind of the owed write, host-typed so the route (D1) and the real-SQLite pin run the SAME statements with the
+/// SAME values (`owed_write_plan`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwedBind {
+    Text(String),
+    Int(i64),
+    Null,
+}
+/// The read-back that closes the write batch: the stamp the identity's marker carries once the batch ran.
+pub const OWED_STATE_STAMP_SQL: &str = "SELECT computedAtMs FROM owed_state WHERE identity = ?1";
+
+/// PURE: the ONE batch that writes a snapshot (the identity's rows replaced, the marker stamped, the marker's stamp
+/// read back), in order, all or nothing. The route binds it to D1; the pin runs it on real SQLite.
+pub fn owed_write_plan(identity_lc: &str, rows: &[OwedRow], computed_at_ms: i64, tip: Option<u64>, truncated: bool) -> Vec<(&'static str, Vec<OwedBind>)> {
+    let text = |s: &str| OwedBind::Text(s.to_string());
+    let opt_text = |s: Option<&str>| s.map_or(OwedBind::Null, |s| OwedBind::Text(s.to_string()));
+    let opt_int = |v: Option<u64>| v.map_or(OwedBind::Null, |v| OwedBind::Int(v as i64));
+    let mut plan: Vec<(&'static str, Vec<OwedBind>)> = Vec::with_capacity(rows.len() + 3);
+    plan.push((OWED_ROWS_DELETE_SQL, vec![text(identity_lc), OwedBind::Int(computed_at_ms)]));
+    for r in rows {
+        plan.push((
+            OWED_ROW_INSERT_SQL,
+            vec![
+                text(&r.identity),
+                text(&r.outpoint),
+                text(r.family.as_str()),
+                text(&r.game_id),
+                opt_int(r.sats),
+                opt_text(r.opponent_identity.as_deref()),
+                opt_int(r.at_height),
+                text(&r.facts.to_string()),
+                OwedBind::Int(computed_at_ms),
+                opt_text(r.reason.as_deref()),
+            ],
+        ));
+    }
+    plan.push((
+        OWED_STATE_UPSERT_SQL,
+        vec![text(identity_lc), OwedBind::Int(computed_at_ms), opt_int(tip), OwedBind::Int(rows.len() as i64), OwedBind::Int(i64::from(truncated))],
+    ));
+    plan.push((OWED_STATE_STAMP_SQL, vec![text(identity_lc)]));
+    plan
+}
+/// PURE: did this walk's snapshot land? (the marker carries its own stamp after the batch)
+pub fn owed_write_landed(stamp_after: Option<i64>, computed_at_ms: i64) -> bool {
+    stamp_after == Some(computed_at_ms)
+}
+
 pub const OWED_STATE_READ_SQL: &str = "SELECT identity, computedAtMs, tip, rows, stale, truncated FROM owed_state WHERE identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
@@ -1385,6 +1447,12 @@ static RECOMPUTE_LOCK_TAKEOVERS: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_lock_takeover() {
     RECOMPUTE_LOCK_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
 }
+/// bsv-low #487: walks whose snapshot the write REFUSED because the marker already carried a newer one (a walk that
+/// outlived its takeover, or the slower of two isolates).
+static RECOMPUTE_WRITES_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_write_superseded() {
+    RECOMPUTE_WRITES_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+}
 
 pub fn owed_health_json() -> Value {
     let mut by_source = serde_json::Map::new();
@@ -1402,6 +1470,7 @@ pub fn owed_health_json() -> Value {
         "recomputeFaults": RECOMPUTE_FAULTS.load(Ordering::Relaxed),
         "recomputeCoalesced": RECOMPUTE_COALESCED.load(Ordering::Relaxed),
         "recomputeLockTakeovers": RECOMPUTE_LOCK_TAKEOVERS.load(Ordering::Relaxed),
+        "recomputeWritesSuperseded": RECOMPUTE_WRITES_SUPERSEDED.load(Ordering::Relaxed),
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
@@ -2753,4 +2822,103 @@ mod tests {
         assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
     }
 
+    /// The owed write batch on real SQLite, as D1 runs it: every statement in order inside one transaction; the
+    /// closing read-back's stamp is the answer (`owed_write_landed`).
+    fn run_owed_write(conn: &mut rusqlite::Connection, plan: &[(&'static str, Vec<OwedBind>)]) -> Option<i64> {
+        let txn = conn.transaction().expect("begin");
+        let mut stamp: Option<i64> = None;
+        for (n, (sql, binds)) in plan.iter().enumerate() {
+            let vals: Vec<rusqlite::types::Value> = binds
+                .iter()
+                .map(|b| match b {
+                    OwedBind::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                    OwedBind::Int(v) => rusqlite::types::Value::Integer(*v),
+                    OwedBind::Null => rusqlite::types::Value::Null,
+                })
+                .collect();
+            if n + 1 == plan.len() {
+                stamp = txn.query_row(sql, rusqlite::params_from_iter(vals), |r| r.get(0)).ok();
+            } else {
+                txn.execute(sql, rusqlite::params_from_iter(vals)).unwrap_or_else(|e| panic!("statement {n} ({sql}): {e}"));
+            }
+        }
+        txn.commit().expect("commit");
+        stamp
+    }
+    fn served(conn: &rusqlite::Connection, identity: &str) -> (Vec<(String, String)>, i64, i64) {
+        let mut st = conn.prepare("SELECT outpoint, family FROM owed_rows WHERE identity = ?1 ORDER BY outpoint").unwrap();
+        let rows: Vec<(String, String)> = st.query_map([identity], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+        let (stamp, stale): (i64, i64) = conn.query_row("SELECT computedAtMs, stale FROM owed_state WHERE identity = ?1", [identity], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        (rows, stamp, stale)
+    }
+
+    /// bsv-low #487: a walk that stopped touching its lease for 60 s is taken over while still live; the takeover
+    /// finishes and writes, then the FIRST walk finishes and wrote its OLDER snapshot over the newer one (the
+    /// isolate-local lock cannot see a walk on another isolate at all). The write itself now refuses it: a snapshot
+    /// stamped older than the one the marker carries changes no row and no marker, and the walk is told
+    /// (`owed_write_landed`). Two walks, the older landing second, on real SQLite with the shipped statements.
+    /// To red: drop the `NOT EXISTS` guard from `OWED_ROWS_DELETE_SQL` / `OWED_ROW_INSERT_SQL`, or the `WHERE` of
+    /// `OWED_STATE_UPSERT_SQL`.
+    #[test]
+    fn an_older_walk_landing_after_a_newer_one_is_refused_by_the_write_itself_real_sqlite() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(OWED_ROWS_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        let row = |outpoint: &str, family: OwedFamily| OwedRow {
+            identity: ME.to_string(),
+            outpoint: outpoint.to_string(),
+            family,
+            game_id: tx(0x01),
+            sats: Some(20_190),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({ "claim": "sweep-hop" }),
+            reason: None,
+        };
+        // walk ONE began at t = 1 000 and saw the hop stranded; it stalls past the lease (60 s)
+        let one_at = 1_000i64;
+        let one = [row(&format!("{}:0", tx(0x07)), OwedFamily::HopStranded)];
+        // walk TWO (the takeover) began at t = 71 000: the hop was swept meanwhile, so it sees the sweep's payout
+        let two_at = 71_000i64;
+        let two = [row(&format!("{}:0", tx(0x07)), OwedFamily::Payout), row(&format!("{}:1", tx(0x08)), OwedFamily::InProgress)];
+        // TWO lands first
+        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &two, two_at, Some(900_001), false));
+        assert!(owed_write_landed(stamp, two_at));
+        let newer = served(&conn, ME);
+        assert_eq!(newer.0.len(), 2);
+        // a filing marks the newer snapshot stale before ONE lands: a refused write must not clear the mark
+        conn.execute(OWED_STALE_FOR_IDENTITY_SQL, [ME]).unwrap();
+        // ONE lands second, with its older snapshot: REFUSED, nothing moves
+        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &one, one_at, Some(900_000), false));
+        assert!(!owed_write_landed(stamp, one_at), "the older walk is told its snapshot did not land");
+        let after = served(&conn, ME);
+        assert_eq!(after.0, newer.0, "the newer snapshot's rows stand, none replaced and none added");
+        assert_eq!(after.1, two_at, "the marker keeps the newer stamp");
+        assert_eq!(after.2, 1, "and its stale mark");
+        let tip: i64 = conn.query_row("SELECT tip FROM owed_state WHERE identity = ?1", [ME], |r| r.get(0)).unwrap();
+        assert_eq!(tip, 900_001);
+        // the ordinary order still writes: a NEWER walk replaces the rows and clears the mark
+        let three_at = 72_000i64;
+        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &one, three_at, Some(900_002), true));
+        assert!(owed_write_landed(stamp, three_at));
+        let after = served(&conn, ME);
+        assert_eq!(after.0, vec![(format!("{}:0", tx(0x07)), "hop-stranded".to_string())]);
+        assert_eq!((after.1, after.2), (three_at, 0));
+        // the SAME stamp rewrites (one walk's batch retried is idempotent, never a refusal of itself)
+        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &two, three_at, Some(900_002), false));
+        assert!(owed_write_landed(stamp, three_at));
+        assert_eq!(served(&conn, ME).0.len(), 2);
+        // the guard is per identity: another identity's newer marker refuses nothing of mine
+        let other = OPP;
+        let theirs = [OwedRow { identity: other.to_string(), ..row(&format!("{}:0", tx(0x09)), OwedFamily::Payout) }];
+        assert!(owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(other, &theirs, 999_000, None, false)), 999_000));
+        let four_at = 73_000i64;
+        assert!(owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &one, four_at, None, false)), four_at));
+        assert_eq!(served(&conn, ME).0.len(), 1);
+        assert_eq!(served(&conn, other).0.len(), 1);
+        // an EMPTY older snapshot (the false "nothing owed") is refused like any other
+        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &[], 2_000, None, false));
+        assert!(!owed_write_landed(stamp, 2_000));
+        assert_eq!(served(&conn, ME).0.len(), 1);
+    }
 }

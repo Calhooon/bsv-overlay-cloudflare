@@ -2484,6 +2484,9 @@ pub(crate) struct OwedComputed {
     pub computed_at_ms: i64,
     /// A view's walk hit the page bound while more remained: the list is CUT and says so (never a silent cut).
     pub truncated: bool,
+    /// bsv-low #487: the write refused this snapshot (the marker already carried a newer one); nothing was written
+    /// and the page is not told (the newer walk told it).
+    pub superseded: bool,
 }
 
 #[derive(Deserialize)]
@@ -3352,44 +3355,43 @@ pub(crate) async fn owed_recompute(
         walk_cut = true;
     }
 
-    // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 502 statements)
-    let mut stmts = Vec::with_capacity(rows.len() + 2);
-    stmts.push(
-        db.prepare(crate::owed::OWED_ROWS_DELETE_SQL)
-            .bind(&[JsValue::from_str(identity_lc)])
-            .map_err(|e| format!("owed delete bind: {e}"))?,
-    );
-    for r in &rows {
-        stmts.push(
-            db.prepare(crate::owed::OWED_ROW_INSERT_SQL)
-                .bind(&[
-                    JsValue::from_str(&r.identity),
-                    JsValue::from_str(&r.outpoint),
-                    JsValue::from_str(r.family.as_str()),
-                    JsValue::from_str(&r.game_id),
-                    r.sats.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
-                    r.opponent_identity.as_deref().map_or(JsValue::NULL, JsValue::from_str),
-                    r.at_height.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)),
-                    JsValue::from_str(&r.facts.to_string()),
-                    JsValue::from_f64(now_ms as f64),
-                    r.reason.as_deref().map_or(JsValue::NULL, JsValue::from_str),
-                ])
-                .map_err(|e| format!("owed row bind: {e}"))?,
-        );
+    // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 503
+    //    statements: `owed::owed_write_plan`, the same statements the real-SQLite pin runs)
+    let plan = crate::owed::owed_write_plan(identity_lc, &rows, now_ms, tip, walk_cut);
+    let mut stmts = Vec::with_capacity(plan.len());
+    for (sql, binds) in &plan {
+        let b: Vec<JsValue> = binds
+            .iter()
+            .map(|v| match v {
+                crate::owed::OwedBind::Text(s) => JsValue::from_str(s),
+                crate::owed::OwedBind::Int(n) => JsValue::from_f64(*n as f64),
+                crate::owed::OwedBind::Null => JsValue::NULL,
+            })
+            .collect();
+        stmts.push(db.prepare(*sql).bind(&b).map_err(|e| format!("owed write bind: {e}"))?);
     }
-    stmts.push(
-        db.prepare(crate::owed::OWED_STATE_UPSERT_SQL)
-            .bind(&[
-                JsValue::from_str(identity_lc),
-                JsValue::from_f64(now_ms as f64),
-                tip.map_or(JsValue::NULL, |t| JsValue::from_f64(t as f64)),
-                JsValue::from_f64(rows.len() as f64),
-                JsValue::from_f64(if walk_cut { 1.0 } else { 0.0 }),
-            ])
-            .map_err(|e| format!("owed state bind: {e}"))?,
-    );
-    debug_assert!(stmts.len() <= 2 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the two bookends");
-    db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    debug_assert!(stmts.len() <= 3 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the three bookends");
+    let written = db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    #[derive(Deserialize)]
+    struct StampD1 {
+        #[serde(rename = "computedAtMs")]
+        computed_at_ms: f64,
+    }
+    let stamp_after = written.last().and_then(|r| r.results::<StampD1>().ok()).and_then(|v| v.first().map(|s| s.computed_at_ms as i64));
+    // bsv-low #487: the write is monotonic in the walk's stamp; a snapshot older than the marker's changed nothing
+    // (a walk that outlived its takeover, or the slower of two isolates). An unreadable read-back is taken as landed
+    // (the batch itself succeeded; the pre-#487 word).
+    let superseded = stamp_after.is_some() && !crate::owed::owed_write_landed(stamp_after, now_ms);
+    if superseded {
+        crate::owed::note_recompute_write_superseded();
+        worker::console_log!(
+            "[owed] recompute {source} for {}…: the snapshot of {now_ms} was NOT written, the marker carries a newer one ({}): {} ms in the walk",
+            &identity_lc[..12.min(identity_lc.len())],
+            stamp_after.unwrap_or_default(),
+            worker::Date::now().as_millis() as i64 - started_ms
+        );
+        return Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded });
+    }
     crate::owed::note_recompute(source, &rows);
     if courier_reads > 0 || courier_cap_hit {
         worker::console_log!(
@@ -3410,7 +3412,7 @@ pub(crate) async fn owed_recompute(
         budget_cut,
         walk_cut
     );
-    Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut })
+    Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded })
 }
 
 /// ONE recompute for ONE identity, then the page told (`owed-changed` on its durable box). A fault is counted and
@@ -3424,6 +3426,8 @@ pub(crate) async fn owed_recompute_and_push(
     tip_hint: Option<u64>,
 ) {
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+        // bsv-low #487: a snapshot the write refused is not announced (the newer walk's own push stands)
+        Ok(c) if c.superseded => {}
         Ok(c) => {
             crate::internal_events::first_party_push(
                 env,
