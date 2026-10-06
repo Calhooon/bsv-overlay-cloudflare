@@ -3768,13 +3768,15 @@ async fn owed_compute_on_read(
 ) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
         // the lens fold's LOW-2: the write refused this walk's snapshot because a NEWER one stands (#487), so this
-        // reader is served the stored rows, never its own older ones. A stored read that faults falls back to the
-        // walk's own rows (the pre-fold answer: one response, display tier).
+        // reader is served the stored rows, never its own older ones. The delta fold's LOW-4: when the stored read
+        // faults too, the walk's own rows are served for that one response with NO claimable word in them
+        // (`owed::superseded_read_snapshot`): the older snapshot may hold a press the newer walk retired.
         Ok(c) if crate::owed::read_answer_after_compute(c.superseded) == crate::owed::ReadAnswer::Stored => {
-            match owed_read_stored(db, identity_lc).await {
-                Some(stored) => Ok(stored),
-                None => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
+            let stored = owed_read_stored(db, identity_lc).await;
+            if stored.is_none() {
+                console_warn!("[owed] compute on read ({source}): superseded and the stored read faulted: the older rows are served with no claimable word");
             }
+            Ok(crate::owed::superseded_read_snapshot(stored, (c.rows, c.tip, c.computed_at_ms, c.truncated)))
         }
         Ok(c) => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
         Err(e) => {

@@ -1566,6 +1566,32 @@ pub fn read_answer_after_compute(superseded: bool) -> ReadAnswer {
     }
 }
 
+/// The delta fold's LOW-4 (2026-10-06): the word on a row served from a SUPERSEDED walk's own snapshot.
+pub const SUPERSEDED_FALLBACK_REASON: &str = "this list is being refreshed and a newer one could not be read just now: nothing can be pressed from this copy; it is read again in a moment";
+/// PURE (the delta fold's LOW-4): the rows a superseded read serves when the stored read ALSO faulted (two faults
+/// in one request: a lost race and a failed D1 read). They are the older snapshot the monotonic guard just
+/// refused, so a claimable word in them may be one the newer walk retired (a `hop-stranded` sweep press on a hop
+/// it saw spent). For that one response NO row carries a claimable word: every `claimable: true` is cleared to
+/// `false` with `claimReason` saying why and `supersededFallback: true` (additive); a row that was not claimable
+/// keeps its own reason. Nothing is stored; the next read takes the table's rows.
+pub fn superseded_fallback_rows(mut rows: Vec<OwedRow>) -> Vec<OwedRow> {
+    for r in rows.iter_mut() {
+        if r.facts.get("claimable") == Some(&Value::Bool(true)) {
+            r.facts["claimable"] = json!(false);
+            r.facts["claimReason"] = json!(SUPERSEDED_FALLBACK_REASON);
+            r.facts["supersededFallback"] = json!(true);
+        }
+    }
+    rows
+}
+/// One served snapshot: the rows, the tip, the walk's stamp, the cut bit.
+pub type OwedSnapshot = (Vec<OwedRow>, Option<u64>, i64, bool);
+/// PURE: what a SUPERSEDED read answers with: the table's snapshot (the newer walk's) when the stored read
+/// returned one, else its own with every claimable word cleared (`superseded_fallback_rows`).
+pub fn superseded_read_snapshot(stored: Option<OwedSnapshot>, own: OwedSnapshot) -> OwedSnapshot {
+    stored.unwrap_or_else(|| (superseded_fallback_rows(own.0), own.1, own.2, own.3))
+}
+
 pub const OWED_STATE_READ_SQL: &str = "SELECT identity, computedAtMs, tip, rows, stale, truncated FROM owed_state WHERE identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
@@ -3525,5 +3551,50 @@ mod tests {
         assert_eq!(rows, vec![(format!("{}:0", tx(0x07)), "payout".to_string()), (format!("{}:1", tx(0x08)), "in-progress".to_string())]);
         assert_ne!(rows.len(), older.len(), "never the older walk's own rows");
         assert_eq!((at, tip, cut), (71_000, Some(900_001), true), "with the newer snapshot's stamp, tip and cut");
+    }
+
+    /// The delta fold's LOW-4: a SUPERSEDED read whose stored read faults as well (here: no marker row, the shipped
+    /// read statement on real SQLite returns nothing) is answered its own older rows with NO claimable word: the
+    /// newer walk may have retired the press. A row that was not claimable keeps its own reason; a stored snapshot,
+    /// when there is one, is served untouched.
+    /// To red: have `superseded_read_snapshot` fall back to the walk's own rows as they are.
+    #[test]
+    fn a_superseded_read_whose_stored_read_faults_serves_no_claimable_word_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(OWED_ROWS_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        let row = |n: u8, family: OwedFamily, facts: Value| OwedRow {
+            identity: ME.to_string(),
+            outpoint: format!("{}:0", tx(n)),
+            family,
+            game_id: tx(0x01),
+            sats: Some(20_190),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts,
+            reason: None,
+        };
+        let older = vec![
+            row(0x07, OwedFamily::HopStranded, json!({ "claim": "sweep-hop", "claimable": true, "joinRefusedBy": "door" })),
+            row(0x08, OwedFamily::Payout, json!({ "claim": "internalize", "claimable": true, "creditBeef": "/credit-beef/x" })),
+            row(0x09, OwedFamily::Payout, json!({ "claim": "internalize", "claimable": false, "claimReason": UNCONFIRMED_PAYOUT_REASON })),
+            row(0x0a, OwedFamily::Unbound, json!({ "claim": null })),
+        ];
+        // the route's stored read (`owed_read_stored`): the marker first; no marker = no snapshot
+        let marker = conn.query_row(OWED_STATE_READ_SQL, [ME], |r| r.get::<_, i64>(1));
+        assert!(matches!(marker, Err(rusqlite::Error::QueryReturnedNoRows)));
+        assert_eq!(read_answer_after_compute(true), ReadAnswer::Stored);
+        let (rows, tip, at, cut) = superseded_read_snapshot(None, (older.clone(), Some(900_000), 1_000, false));
+        assert_eq!((rows.len(), tip, at, cut), (4, Some(900_000), 1_000, false));
+        assert!(rows.iter().all(|r| r.facts.get("claimable") != Some(&json!(true))), "no claimable word on the double fault: {rows:?}");
+        for r in &rows[..2] {
+            assert_eq!((r.facts["claimable"].clone(), r.facts["claimReason"].clone(), r.facts["supersededFallback"].clone()), (json!(false), json!(SUPERSEDED_FALLBACK_REASON), json!(true)));
+        }
+        assert_eq!((rows[0].facts["claim"].clone(), rows[0].facts["joinRefusedBy"].clone(), rows[1].facts["creditBeef"].clone()), (json!("sweep-hop"), json!("door"), json!("/credit-beef/x")), "every other fact stands");
+        assert_eq!((&rows[2], &rows[3]), (&older[2], &older[3]), "a row with no claimable word is served as it was");
+        assert!(!owed_body(ME, tip, &rows, at, cut).contains("\"claimable\":true"));
+        // with a stored snapshot the reader gets it, untouched
+        let newer = vec![row(0x0b, OwedFamily::HopStranded, json!({ "claim": "sweep-hop", "claimable": true }))];
+        assert_eq!(superseded_read_snapshot(Some((newer.clone(), Some(900_001), 71_000, true)), (older, Some(900_000), 1_000, false)), (newer, Some(900_001), 71_000, true));
     }
 }
