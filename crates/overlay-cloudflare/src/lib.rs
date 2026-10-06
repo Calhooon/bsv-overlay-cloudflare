@@ -409,6 +409,12 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         _ => not_found(),
     };
 
+    // bsv-low #523 (M26): the dispatch's ONE exit ships whatever pot (and hop, and lobby) rows this request
+    // changed, off the critical path. The routes that already flush have drained the set (a no-op here); the
+    // ones that never did (`/admin/complete-proofs` confirmed a tower-broadcast refund's spend and pushed
+    // nothing, `/admin/readmit`'s discovery, a `/lookup` whose serve-time rung latches a spend) ride this one.
+    crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
+    crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut));
     result
 }
 
@@ -2193,6 +2199,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// bsv-low #523 (M26): EVERY fetch route that reaches the dispatch flushes the pot-changed set on its way out,
+    /// in the request that did the work. `/admin/complete-proofs` (the reliably-firing twin of the scheduled
+    /// tick) confirmed a tower-broadcast refund's spend, the storage noted the pot, and the route answered
+    /// without a flush: the note sat in the isolate's set and the seat's owed list heard nothing. One flush at
+    /// the dispatch's single exit covers every route there is and every route added later (the proof-completion
+    /// poke, `/admin/readmit`'s discovery, a `/lookup` whose serve-time rung latches a spend). To red: delete
+    /// the flush between the dispatch and `result`, or add a `return` inside the dispatch that is not an
+    /// auth refusal.
+    #[test]
+    fn every_dispatched_fetch_route_flushes_the_pot_changes_on_its_way_out() {
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn main(req: Request, env: Env, ctx: Context)").expect("the fetch handler");
+        let end = start + src[start..].find("\npub async fn build_engine_from_env(").expect("the next item");
+        let handler = code_only(&src[start..end]);
+        let dispatch = handler.find("let result = match (req.method(), req.path().as_str()) {").expect("the dispatch");
+        let tail = squash(&handler[dispatch..]);
+        assert!(
+            tail.contains(&squash(
+                "}; crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut)); crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut)); result }"
+            )),
+            "the dispatch's single exit flushes the pot (and hop, and lobby) changes before it answers"
+        );
+        let returns = handler[dispatch..].matches("return ").count();
+        let refusals = handler[dispatch..].matches("return resp;").count();
+        assert_eq!(returns, refusals, "the only early returns inside the dispatch are the admin auth refusals (no pot write precedes them)");
     }
 
     // ── bsv-low#257: the cron step deadline race ─────────────────────────

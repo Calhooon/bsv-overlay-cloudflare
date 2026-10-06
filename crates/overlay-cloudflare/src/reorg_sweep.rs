@@ -459,6 +459,8 @@ pub async fn reverify_window_with(
                 {
                     Ok(true) => {
                         summary.demoted_blind += 1;
+                        // bsv-low #523: a row the reorg pass re-judges is a pot change in this pass
+                        crate::pot_changes::note(&rec.txid, rec.output_index);
                         push_log(&format!(
                             "[reorg] {}:{} demoted to SEEN (no stored proof to re-verify at {:?}; the courier arm re-judges it)",
                             rec.txid, rec.output_index, rec.spent_height
@@ -528,6 +530,7 @@ pub async fn reverify_window_with(
                         {
                             Ok(true) => {
                                 summary.reanchored += 1;
+                                crate::pot_changes::note(&rec.txid, rec.output_index); // bsv-low #523
                                 push_log(&format!(
                                     "[reorg] {}:{} RE-ANCHORED {:?} → {} (the stored bump verifies at a different height)",
                                     rec.txid, rec.output_index, rec.spent_height, anchor.height
@@ -636,6 +639,7 @@ pub async fn reverify_window_with(
                 {
                     Ok(true) => {
                         summary.stale += 1;
+                        crate::pot_changes::note(&rec.txid, rec.output_index); // bsv-low #523
                         push_log(&format!(
                             "[reorg] {}:{} STALE PROOF — the header source refutes {spender}'s stored bump at {:?}; demoted to SEEN",
                             rec.txid, rec.output_index, rec.spent_height
@@ -735,6 +739,7 @@ async fn courier_recheck(
             {
                 Ok(true) => {
                     summary.stale += 1;
+                    crate::pot_changes::note(&rec.txid, rec.output_index); // bsv-low #523
                     push_log(&format!(
                         "[reorg] {}:{} STALE — the ladder proves {spender} at {h}, not the confirmed {:?}; demoted to SEEN",
                         rec.txid, rec.output_index, rec.spent_height
@@ -1587,6 +1592,30 @@ mod tests {
         .await;
         assert_eq!(tracker.asked.lock().unwrap().len(), 2);
         assert_eq!(memo.reads(), 2);
+    }
+
+    /// bsv-low #523: a row the REORG pass re-judges changes what the seat is owed (a demotion takes the
+    /// confirmed word away, a re-anchor moves its height), so the pass notes the pot for the pot-changed push
+    /// in the pass that writes it, like every other pass. A row the pass leaves standing notes nothing.
+    /// To red: drop the `pot_changes::note` from the courier arm's demotion.
+    #[tokio::test]
+    async fn the_reorg_pass_notes_the_pot_it_demotes_and_not_the_one_it_leaves_standing() {
+        let store = MemoryPotStorage::new();
+        let orphaned = confirmed_pot_with_proofless_beef(&store, &pot(64), 965_771).await;
+        let quiet = confirmed_pot_with_proofless_beef(&store, &pot(65), 965_771).await;
+        let _ = crate::pot_changes::drain();
+        let disagree = single_tx_bump(&orphaned, 965_773).to_hex();
+        let fetcher = CourierStub(
+            [(orphaned.clone(), Ok(Some(disagree))), (quiet.clone(), Ok(None))]
+                .into_iter()
+                .collect(),
+        );
+        let tracker = MockChainTracker::new(965_775);
+        let s = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
+        assert_eq!(s.stale, 1, "{s:?}");
+        let noted = crate::pot_changes::drain();
+        assert!(noted.contains(&(pot(64), 0)), "the demoted pot is noted, got {noted:?}");
+        assert!(!noted.contains(&(pot(65), 0)), "the standing pot is not, got {noted:?}");
     }
 
     /// bsv-low M19 R2 round 3 (review MED-4): the routine sweep re-asks the

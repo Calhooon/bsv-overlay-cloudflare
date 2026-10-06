@@ -1714,6 +1714,9 @@ async fn discover_spend_for_row(
     {
         Ok(()) => {
             summary.discovered += 1;
+            // bsv-low #523 (M26): a spend this pass DISCOVERED is a pot change in this pass (the spender came
+            // from outside our own broadcast); the caller's flush ships it (`pot_changes`)
+            crate::pot_changes::note(&rec.txid, rec.output_index);
             if via_script {
                 summary.by_script += 1;
             }
@@ -2529,7 +2532,13 @@ pub async fn complete_spend_confirmations(
                     )
                     .await
                 {
-                    Ok(true) => summary.confirmed += 1,
+                    Ok(true) => {
+                        summary.confirmed += 1;
+                        // bsv-low #523 (M26): the confirmation this pass latched is a pot change in this pass
+                        // (a tower-broadcast refund confirmed here and its seat's owed list heard nothing for
+                        // 26 minutes); the caller's flush ships it (`pot_changes`)
+                        crate::pot_changes::note(&rec.txid, rec.output_index);
+                    }
                     Ok(false) => {
                         summary.cas_missed += 1;
                         push_log(&format!(
@@ -2704,6 +2713,8 @@ pub async fn complete_spend_confirmations(
         {
             Ok(true) => {
                 summary.displaced += 1;
+                // bsv-low #523: a displacement latches a confirmed spend under another spender, a pot change
+                crate::pot_changes::note(&rec.txid, rec.output_index);
                 // The row ENDED this tick confirmed — it is not still
                 // unconfirmed, and ops reads must not double-count it.
                 summary.still_unconfirmed = summary.still_unconfirmed.saturating_sub(1);
@@ -6795,6 +6806,97 @@ pub(crate) mod tests {
             crate::pot_changes::drain().is_empty(),
             "no confirmation, no note"
         );
+    }
+
+    /// bsv-low #523 (M26, loop 21 pair 1's refundLandedVerify): a spend the index learns by a PASS (the spender
+    /// came from outside the overlay's own broadcast: the tower broadcast the parked refund) is a pot CHANGE in
+    /// the pass that latches it. The proof-completion pass (`run_pot_maintenance`, what `/admin/complete-proofs`
+    /// and the scheduled tick both run) confirmed the refund twenty-two minutes after its block and the seat's
+    /// owed list heard nothing for another four. The latency this pin measures is ZERO passes: when the pass
+    /// that latched the spend returns, the pot's outpoint is in the pot-changed set its caller flushes.
+    /// To red: drop the `pot_changes::note` from the confirm arm of `complete_spend_confirmations`.
+    #[tokio::test]
+    async fn the_proof_completion_pass_notes_the_pot_whose_spend_it_confirms() {
+        let _ = crate::pot_changes::drain();
+        let store = MemoryPotStorage::new();
+        // the tower-parked refund: the row's pointer, never verifiably mined so far
+        pot_with_parked_claim(&store, "potM26", "refundM26").await;
+        let _ = crate::pot_changes::drain(); // the admission's own notes are not the pass's
+        let fetcher = MockProofFetcher {
+            minable: ["refundM26".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let (spend, _pot) = run_pot_maintenance(&store, &fetcher, 20, &fetcher, 20, 0).await;
+        assert_eq!(spend.confirmed, 1, "the pass confirms the refund");
+        let noted = crate::pot_changes::drain();
+        assert!(
+            noted.contains(&("potm26".to_string(), 0)),
+            "the pass that latched the spend noted its pot for the pot-changed push, got {noted:?}"
+        );
+        // a pass that latches nothing notes nothing (never a poll in disguise)
+        let (again, _) = run_pot_maintenance(&store, &fetcher, 20, &fetcher, 20, 0).await;
+        assert_eq!(again.confirmed, 0);
+        assert!(crate::pot_changes::drain().is_empty(), "no latch, no note");
+    }
+
+    /// bsv-low #523: the same rule for the pass's DISPLACEMENT arm (the recorded claim was never mined, the
+    /// chain's actual spender is; the row ends the pass confirmed under another spender).
+    /// To red: drop the `pot_changes::note` from the displaced arm.
+    #[tokio::test]
+    async fn the_proof_completion_pass_notes_the_pot_whose_spend_it_displaces() {
+        let store = MemoryPotStorage::new();
+        pot_with_parked_claim(&store, "potD", "refundD").await;
+        let _ = crate::pot_changes::drain();
+        let fetcher = MockProofFetcher {
+            minable: ["settleD".to_string()].into_iter().collect(),
+            spender_hints: [(("potD".to_string(), 0u32), "settleD".to_string())]
+                .into_iter()
+                .collect(),
+            binding_raw: [("settleD".to_string(), "not-parseable-raw".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+        assert_eq!(s.displaced, 1);
+        let noted = crate::pot_changes::drain();
+        assert!(noted.contains(&("potd".to_string(), 0)), "the displaced pot is noted, got {noted:?}");
+    }
+
+    /// bsv-low #523: the MISSING-SPEND discovery pass (both the scheduled one and the by-outpoints one share
+    /// `discover_spend_for_row`) writes the pointer of a spend nobody presented: the pot is noted in that pass.
+    /// To red: drop the `pot_changes::note` from the discovery's `mark_spent` success arm.
+    #[tokio::test]
+    async fn the_missing_spend_discovery_notes_the_pot_whose_spender_it_finds() {
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        let pot = "ab".repeat(32);
+        let store = MemoryPotStorage::default();
+        store
+            .store_record(&PotRecord {
+                txid: pot.clone(),
+                output_index: 0,
+                lock_kind: Some("covenant".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = crate::pot_changes::drain();
+        let spender = "22".repeat(32);
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: [((pot.clone(), 0u32), spender.clone())].into_iter().collect(),
+            binding_raw: [(spender.clone(), "00".to_string())].into_iter().collect(),
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        let s = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0)]).await;
+        assert_eq!(s.discovered, 1);
+        let noted = crate::pot_changes::drain();
+        assert!(noted.contains(&(pot.clone(), 0)), "the discovered pot is noted, got {noted:?}");
+        // already spent: nothing to discover, nothing noted
+        let s2 = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0)]).await;
+        assert_eq!(s2.discovered, 0);
+        assert!(crate::pot_changes::drain().is_empty());
     }
 
     /// Confirm beats the latch through the PRODUCTION push path: a reorg
