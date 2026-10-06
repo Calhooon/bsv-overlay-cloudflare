@@ -2733,32 +2733,35 @@ pub(crate) async fn owed_recompute(
     let evicted_hop_outpoints: HashSet<String> =
         crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&eviction_rows), &hops);
     // 4a-i. bsv-low #486: the DOOR's refusal ledger (`submit_refusals`, the overlay's): a JOIN refused synchronously
-    //       was never admitted, so no eviction names its hops. The ledger records a hop only when the hop's own key
-    //       signed the refused transaction (the overlay verifies it); intersected with the identity's OWN hops, the
-    //       same UTXO key as the eviction's released spends. A faulted read (or a database not yet migrated) names
-    //       nothing: the pre-#486 sentence stands.
-    let door_refused_hop_outpoints: HashSet<String> = {
+    //       was never admitted, so no eviction names its hops. The ledger holds one row per hop OUTPOINT, written
+    //       only when the hop's own key signed the refused transaction (the overlay verifies it), and it is read
+    //       through THIS identity's own hop markers (`OWED_DOOR_REFUSALS_SQL`: never a window over every identity's
+    //       refusals), then intersected with the walk's own hops. A faulted read (or a database not yet migrated)
+    //       names nothing: the pre-#486 sentence stands.
+    let door_refused_hop_outpoints: HashMap<String, crate::owed::DoorRefusal> = {
         #[derive(Deserialize)]
         struct RefusalRowD1 {
-            txid: String,
-            #[serde(rename = "signedSpends", default)]
-            signed_spends: Option<String>,
+            #[serde(rename = "hopTxid")]
+            hop_txid: String,
+            #[serde(rename = "hopVout")]
+            hop_vout: f64,
+            reason: String,
         }
         let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
-        let rows: Vec<(String, Option<String>)> = match db.prepare(crate::owed::OWED_REFUSALS_WINDOW_SQL).bind(&[since]) {
+        let rows: Vec<(String, u32, String)> = match db.prepare(crate::owed::OWED_DOOR_REFUSALS_SQL).bind(&[JsValue::from_str(identity_lc), since]) {
             Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<RefusalRowD1>()) {
-                Ok(rows) => rows.into_iter().map(|r| (r.txid.to_ascii_lowercase(), r.signed_spends)).collect(),
+                Ok(rows) => rows.into_iter().map(|r| (r.hop_txid, r.hop_vout as u32, r.reason)).collect(),
                 Err(e) => {
-                    console_warn!("[owed] refusals window failed (a door-refused hop keeps its sentence this pass): {e}");
+                    console_warn!("[owed] door refusals read failed (a door-refused hop keeps its sentence this pass): {e}");
                     Vec::new()
                 }
             },
             Err(e) => {
-                console_warn!("[owed] refusals window bind failed: {e}");
+                console_warn!("[owed] door refusals bind failed: {e}");
                 Vec::new()
             }
         };
-        crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&rows), &hops)
+        crate::owed::door_refused_hops(&rows, &hops)
     };
     // 4a-ii. fleet loop 11, the wave's batch 3 (2026-09-20): the refused JOIN's committed home for MY seat, read from the
     //        `pot_records_evicted` twin (the overlay's own decode of the evicted lock) and KEYED ON THE UTXO the ledger
@@ -2887,7 +2890,7 @@ pub(crate) async fn owed_recompute(
                 // strands it at once; without a chain word its sweep press would wait for nothing)
                 // (bsv-low #486: refused by an eviction OR synchronously at the door)
                 let hop_key = outpoint_key(&h.hop_txid, h.hop_vout);
-                let join_refused = evicted_hop_outpoints.contains(&hop_key) || door_refused_hop_outpoints.contains(&hop_key);
+                let join_refused = evicted_hop_outpoints.contains(&hop_key) || door_refused_hop_outpoints.contains_key(&hop_key);
                 let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
                     && (join_refused || h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS));
                 // AND a hop the index shows SPENT by a non-pot spender but never CONFIRMED (a sweep recorded before its

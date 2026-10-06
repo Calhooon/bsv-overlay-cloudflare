@@ -1099,7 +1099,7 @@ async fn submit_inner(
                         env.clone(),
                         gated_beef.clone(),
                         subject_txid.clone(),
-                        "script-refused".to_string(),
+                        crate::submit_refusals::REASON_SCRIPT_REFUSED.to_string(),
                         worker::Date::now().as_millis() as i64,
                     ));
                     let resp = json_error_coded(
@@ -1485,7 +1485,7 @@ async fn submit_inner(
                     env.clone(),
                     gated_beef.clone(),
                     subject_txid.clone(),
-                    format!("network-rejected: {}", crate::admit_fast::refusal_status_word(&reason)),
+                    crate::submit_refusals::network_rejected_reason(crate::admit_fast::refusal_status_word(&reason)),
                     worker::Date::now().as_millis() as i64,
                 ));
                 let resp = json_error(&format!("network rejected: {reason}"), 422)?;
@@ -1640,6 +1640,18 @@ async fn submit_inner(
                     return Ok(with_server_timing(resp, "admit;desc=\"unavailable\""));
                 }
             }
+        }
+    }
+
+    // bsv-low #486 (lens fold): the write landed, so a refusal the door recorded for an earlier COPY spending the
+    // same hops is stale. Retired by the outpoints the index now shows spent by this subject, after the answer,
+    // fail-soft (one indexed DELETE per admitted subject).
+    if let Some(subject) = gated_subject.as_deref().or(ungated_subject.as_deref()) {
+        if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
+            let subject = subject.to_string();
+            ctx.wait_until(async move {
+                crate::submit_refusals::retire_admitted(&ledger_db, &subject).await;
+            });
         }
     }
 

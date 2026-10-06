@@ -1690,10 +1690,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS hopsweep_records (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, sweepTxid TEXT NOT NULL, sweepRawHex TEXT NOT NULL, txid TEXT NOT NULL, outputIndex INTEGER NOT NULL, createdAt INTEGER, PRIMARY KEY (txid, outputIndex))",
     "CREATE INDEX IF NOT EXISTS idx_hopsweep_identity ON hopsweep_records(identity)",
     "CREATE INDEX IF NOT EXISTS idx_hopsweep_hop ON hopsweep_records(hopTxid, hopVout)",
-    // bsv-low #486 (2026-10-06): THE DOOR'S REFUSAL LEDGER, one row per subject `/submit` refused synchronously
-    // (the interpreter's 400, the network's definitive 422), naming the indexed hops whose own keys signed it
-    // (`submit_refusals.rs`). Written by the door after its answer, read by the app layer's owed walk in a recent
-    // window (fail-soft there: a database without the table names nothing), pruned by age with every write.
+    // bsv-low #486 (2026-10-06): THE DOOR'S REFUSAL LEDGER, one row per HOP OUTPOINT a synchronously refused
+    // subject would have spent (the interpreter's 400, the network's definitive 422) and whose own key signed it
+    // (`submit_refusals.rs`; keyed on the UTXO, never on the refused txid: the lens fold, changed in place before
+    // any deploy). Written by the door after its answer, retired when a spend of the hop is admitted, read by the
+    // app layer's owed walk through the walking identity's own hop markers (fail-soft there: a database without
+    // the table names nothing), pruned by age with every write.
     crate::submit_refusals::SUBMIT_REFUSALS_CREATE,
     crate::submit_refusals::SUBMIT_REFUSALS_INDEX,
 ];

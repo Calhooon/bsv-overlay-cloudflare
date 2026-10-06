@@ -65,17 +65,80 @@ pub const YOUNG_HOP_REASON: &str =
 pub const JOIN_REFUSED_REASON: &str =
     "the network refused the transaction that spent this stake (it was evicted from the index): the hand cannot start from it; your stake can be swept back now";
 
-/// bsv-low #486: the sentence on a hop whose JOIN the door refused SYNCHRONOUSLY (the interpreter's
-/// `ERR_SCRIPT_REFUSED`, the network's definitive 422): nothing was ever admitted, so no eviction names it, and the
-/// hop read "rejoin to continue" for the whole young window. The overlay's refusal ledger (`submit_refusals`) names
-/// the hop only when the hop's own key signed the refused transaction.
+/// bsv-low #486: the sentence on a hop whose JOIN the NETWORK refused definitively at the door (the 422 arm:
+/// nothing was ever admitted, so no eviction names it, and the hop read "rejoin to continue" for the whole young
+/// window). The overlay's refusal ledger (`submit_refusals`) names the hop only when the hop's own key signed the
+/// refused transaction.
 pub const DOOR_REFUSED_REASON: &str =
     "the transaction that would have spent this stake was refused before it reached the network's index: the hand cannot start from it; your stake can be swept back now";
-/// The door's refusal ledger, recent rows (the overlay's `submit_refusals`, migration 161): `signedSpends` is the
-/// released-spends entry shape (`[{"txid","vout"}, ...]`), so `released_hop_outpoints` parses it. Bound `?1` = now
-/// minus `OWED_EVICTION_WINDOW_MS` (the same window, for the same reason: a hop past its young period is stranded
-/// by age regardless).
-pub const OWED_REFUSALS_WINDOW_SQL: &str = "SELECT lower(txid) AS txid, signedSpends FROM submit_refusals WHERE refusedAt >= ?1";
+/// The lens fold's LOW-1 (2026-10-06): the sentence of the 400 arm (the door's interpreter refused a script). That
+/// says ONE copy was refused, never that the hand cannot start: the opponent holds this seat's signed JOIN input and
+/// can corrupt its own input in a copy (another txid than the good JOIN), have it refused, and so turn this seat's
+/// young hop to the sweep press while the good JOIN is still broadcastable. STATED RESIDUAL: that buys an early
+/// sweep press on the seat's OWN money and nothing else. The press still needs the chain rung's corroborated
+/// unspent, it returns the seat's own stake (no loss, no profit to the griefer), a landed JOIN makes the hop read
+/// spent and retires the refusal (`submit_refusals::retire_admitted`), and sweep versus JOIN is the race the
+/// 30-minute rule already allows a withholding opponent.
+pub const DOOR_SCRIPT_REFUSED_REASON: &str =
+    "a transaction that would have spent this stake was refused at the door and nothing was broadcast: your stake can be swept back now (the sweep returns your own stake)";
+/// Which door arm named the hop (the ledger's `reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorRefusal {
+    /// The 400 arm: the door's interpreter refused a script of one copy.
+    Script,
+    /// The 422 arm: the network's definitive word on bytes whose scripts verified.
+    Network,
+}
+impl DoorRefusal {
+    /// The ledger's reason is `script-refused`, or `network-rejected: <word>` (the overlay's `submit_refusals`).
+    /// Anything else reads as the weaker word.
+    pub fn of_reason(reason: &str) -> DoorRefusal {
+        if reason.starts_with("network-rejected") {
+            DoorRefusal::Network
+        } else {
+            DoorRefusal::Script
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DoorRefusal::Script => "script",
+            DoorRefusal::Network => "network",
+        }
+    }
+    pub fn sentence(self) -> &'static str {
+        match self {
+            DoorRefusal::Script => DOOR_SCRIPT_REFUSED_REASON,
+            DoorRefusal::Network => DOOR_REFUSED_REASON,
+        }
+    }
+}
+/// Rows one walk reads from the door's ledger (an identity's young unspent hops are a handful).
+pub const OWED_DOOR_REFUSALS_MAX: usize = 64;
+/// The door's refusal ledger AS THE WALKING IDENTITY OWNS IT (the lens fold's MEDIUM-1): driven from the identity's
+/// own hop markers (`idx_hopparty_identity`), one primary-key probe of the ledger per marker, never a window over
+/// every identity's refusals. The ledger holds one row per hop outpoint, so a stranger's refused variants of a
+/// seat's input cost this read one row at most, and a refusal of a hop no marker of this identity names is never
+/// read. A hop the index shows SPENT is skipped (a spend of it was admitted since: the refusal is stale, and the
+/// door retires it). Binds: `?1` the identity (lowercase), `?2` now minus `OWED_EVICTION_WINDOW_MS`.
+/// Cost: the identity's hop markers once more (the hops view walks the same index range), bounded rows out.
+pub const OWED_DOOR_REFUSALS_SQL: &str = "SELECT lower(r.hopTxid) AS hopTxid, r.hopVout AS hopVout, r.reason AS reason      FROM hopparty_records hp CROSS JOIN submit_refusals r ON r.hopTxid = hp.txid AND r.hopVout = hp.hopVout      WHERE hp.identity = ?1 AND r.refusedAt >= ?2        AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = r.hopTxid AND p.outputIndex = r.hopVout AND p.spent = 1)      GROUP BY r.hopTxid, r.hopVout LIMIT 64";
+const _: () = assert!(OWED_DOOR_REFUSALS_MAX == 64);
+
+/// PURE: the identity's own hop outpoints (`txid:vout`, lowercase) the door's ledger names, with the arm that
+/// named each. `rows` are `OWED_DOOR_REFUSALS_SQL`'s (hopTxid, hopVout, reason); the intersection with the walk's
+/// OWN hops is kept as the belt (the SQL already joins the identity's markers): a row for an outpoint the walk does
+/// not hold names nothing.
+pub fn door_refused_hops(rows: &[(String, u32, String)], hops: &[HopEntry]) -> HashMap<String, DoorRefusal> {
+    let mine: HashSet<String> = hops.iter().map(|h| outpoint_key(&h.hop_txid, h.hop_vout)).collect();
+    let mut out: HashMap<String, DoorRefusal> = HashMap::new();
+    for (txid, vout, reason) in rows {
+        let key = outpoint_key(txid, *vout);
+        if mine.contains(&key) {
+            out.insert(key, DoorRefusal::of_reason(reason));
+        }
+    }
+    out
+}
 
 /// PURE: the HOP OUTPOINTS (`txid:vout`, lowercase) whose spend pointer an EVICTED, never readmitted JOIN released —
 /// the overlay's `pot_evictions.releasedSpends` (`[{"table","txid","vout"}, …]`, one entry per `pot_records` row the
@@ -360,8 +423,9 @@ pub struct OwedInputs<'a> {
     pub evicted_hop_outpoints: &'a HashSet<String>,
     /// bsv-low #486: hop outpoints (`txid:vout`, lowercase) of THIS identity that a synchronously refused JOIN
     /// would have spent, as the overlay's refusal ledger names them (only a hop whose own key signed the refused
-    /// transaction is ever recorded): stranded at once, like an evicted JOIN's.
-    pub door_refused_hop_outpoints: &'a HashSet<String>,
+    /// transaction is ever recorded), with the door arm that named each (`door_refused_hops`): stranded at once,
+    /// like an evicted JOIN's.
+    pub door_refused_hop_outpoints: &'a HashMap<String, DoorRefusal>,
     /// hop outpoint (`txid:vout`) → the newest FILED sweep of this identity for that hop (bsv-low #469 decision 3):
     /// the press's bytes for a stranded hop; a hop spent by that very sweep is a `payout` row (the sweep's credit).
     pub hop_sweeps: &'a HashMap<String, crate::hopsweep::FiledHopSweep>,
@@ -1139,8 +1203,8 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 // bsv-low #486: the same for a JOIN the door refused synchronously (the overlay's refusal ledger names
                 // the hop only when the hop's own key signed the refused transaction)
                 let evicted = i.evicted_hop_outpoints.contains(&outpoint);
-                let door_refused = i.door_refused_hop_outpoints.contains(&outpoint);
-                let join_refused = evicted || door_refused;
+                let door_refused = i.door_refused_hop_outpoints.get(&outpoint).copied();
+                let join_refused = evicted || door_refused.is_some();
                 let stranded = join_refused || age_ms.is_some_and(|a| a >= HOP_STRANDED_AFTER_MS);
                 if !stranded {
                     // A YOUNG unspent hop (the stranded cell's run 4 and the device-switch unit, 2026-09-19): the
@@ -1205,6 +1269,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 facts["joinRefused"] = json!(join_refused); // on every arm: a waiting press says why it is sweepable
                 if join_refused {
                     facts["joinRefusedBy"] = json!(if evicted { "eviction" } else { "door" });
+                    if let (false, Some(door)) = (evicted, door_refused) {
+                        facts["doorRefusal"] = json!(door.as_str());
+                    }
                 }
                 match chain {
                     Some(w) if w.looked && w.spent == Some(false) => {
@@ -1235,10 +1302,8 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             facts,
                             reason: if evicted {
                                 Some(JOIN_REFUSED_REASON.to_string())
-                            } else if door_refused {
-                                Some(DOOR_REFUSED_REASON.to_string())
                             } else {
-                                None
+                                door_refused.map(|door| door.sentence().to_string())
                             },
                         });
                     }
@@ -1408,7 +1473,6 @@ pub fn owed_write_plan(identity_lc: &str, rows: &[OwedRow], computed_at_ms: i64,
 pub fn owed_write_landed(stamp_after: Option<i64>, computed_at_ms: i64) -> bool {
     stamp_after == Some(computed_at_ms)
 }
-
 pub const OWED_STATE_READ_SQL: &str = "SELECT identity, computedAtMs, tip, rows, stale, truncated FROM owed_state WHERE identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
@@ -1971,7 +2035,7 @@ mod tests {
             hop_sweeps: &NO_SWEEPS,
             evicted_pots: &NONE,
             evicted_hop_outpoints: &NONE,
-            door_refused_hop_outpoints: &NONE,
+            door_refused_hop_outpoints: &NO_DOOR,
             spender_outputs: &NO_SPENDERS,
             spender_inputs: &NO_INPUTS,
             courier_spenders: &NONE,
@@ -1980,6 +2044,7 @@ mod tests {
         }
     }
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> = std::sync::LazyLock::new(HashMap::new);
+    static NO_DOOR: std::sync::LazyLock<HashMap<String, DoorRefusal>> = std::sync::LazyLock::new(HashMap::new);
     static NO_INPUTS: std::sync::LazyLock<HashMap<String, Vec<(String, u32)>>> = std::sync::LazyLock::new(HashMap::new);
     static NO_PKHS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);
     fn pays(spender: &str, outs: &[(u32, &str, u64, Option<bool>)]) -> HashMap<String, Vec<SpenderOutput>> {
@@ -3178,72 +3243,66 @@ mod tests {
 
     /// bsv-low #486: a JOIN the door refused SYNCHRONOUSLY (never admitted: no eviction row) left its hops on the
     /// in-progress row with the felt's rejoin, the sweep press only after the 30-minute window. The overlay's
-    /// refusal ledger now names the hops whose own keys signed the refused transaction, and the young hop is
-    /// stranded at once, exactly as the eviction ledger already strands one. Real SQLite, the shipped migrations,
-    /// the overlay's own write statement (a dev-dependency), the app layer's own query.
+    /// refusal ledger names the hops whose own keys signed the refused transaction, and the young hop is stranded
+    /// at once, exactly as the eviction ledger already strands one. This is the DERIVATION's half (the ledger, the
+    /// door and the read run on real SQLite in `tests/hops_view_sqlite.rs`).
+    /// The lens fold's LOW-1: each door arm has its own sentence, and the 400 arm's no longer says the hand cannot
+    /// start (one refused copy does not prove it).
     /// To red: drop `door_refused` from the hop ladder's `join_refused`.
     #[test]
-    fn a_join_refused_at_the_door_strands_its_young_hop_at_once_through_the_refusal_ledger_real_sqlite() {
-        use bsv_overlay_cloudflare::submit_refusals::{SignedSpend, SUBMIT_REFUSAL_UPSERT_SQL};
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
-            if let Err(e) = conn.execute_batch(sql) {
-                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
-            }
-        }
+    fn a_join_refused_at_the_door_strands_its_young_hop_at_once_with_the_sentence_of_its_arm() {
         let hop_txid = tx(0x07);
-        let join = tx(0x0c); // the refused JOIN: never admitted, so no pot row, no party row, no eviction
-        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)", rusqlite::params![hop_txid]).unwrap();
-        let refused_at = 1_700_000_000_000i64;
-        let spends = serde_json::to_string(&[SignedSpend { txid: hop_txid.clone(), vout: 0 }]).unwrap();
-        conn.execute(SUBMIT_REFUSAL_UPSERT_SQL, rusqlite::params![join, "script-refused", refused_at, spends]).unwrap();
-        let evictions: i64 = conn.query_row("SELECT COUNT(*) FROM pot_evictions", [], |r| r.get(0)).unwrap();
-        assert_eq!(evictions, 0, "the issue's shape: a synchronous refusal writes no eviction row");
-        let window = |since: i64| -> Vec<(String, Option<String>)> {
-            conn.prepare(OWED_REFUSALS_WINDOW_SQL).unwrap().query_map([since], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
-        };
-        let rows = window(refused_at - OWED_EVICTION_WINDOW_MS + 1);
-        assert_eq!(rows.len(), 1);
         let young = [hop(HopStatus::Unspent, None, Some(60_000))]; // one minute old
-        let refused = refused_hop_outpoints_of(&released_hop_outpoints(&rows), &young);
         let key = format!("{hop_txid}:0");
-        assert_eq!(refused, [key.clone()].into_iter().collect::<HashSet<String>>());
+        let ledger = |reason: &str| vec![(hop_txid.to_ascii_uppercase(), 0u32, reason.to_string())];
+        let script = door_refused_hops(&ledger("script-refused"), &young);
+        let network = door_refused_hops(&ledger("network-rejected: REJECTED"), &young);
+        assert_eq!(script, [(key.clone(), DoorRefusal::Script)].into_iter().collect::<HashMap<_, _>>());
+        assert_eq!(network.get(&key), Some(&DoorRefusal::Network));
         let unspent = chain(&key, true, Some(false), None);
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let derive = |refused: &HashSet<String>, chain_word: &HashMap<String, HopChainWord>| {
+        let derive = |refused: &HashMap<String, DoorRefusal>, chain_word: &HashMap<String, HopChainWord>| {
             let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
             i.hop_chain = chain_word;
             i.door_refused_hop_outpoints = refused;
             derive_owed_rows(&i)
         };
         // THE FIX: stranded now, the sweep press (the Collect on a stranded hop), never the felt's rejoin
-        let rows = derive(&refused, &unspent);
+        let rows = derive(&script, &unspent);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["joinRefused"], true);
         assert_eq!(rows[0].facts["joinRefusedBy"], "door");
-        assert_eq!(rows[0].reason.as_deref(), Some(DOOR_REFUSED_REASON));
+        assert_eq!(rows[0].facts["doorRefusal"], "script");
+        // LOW-1: the 400 arm says what one refused copy proves, and that the sweep returns the seat's own stake
+        let said = rows[0].reason.as_deref().unwrap();
+        assert_eq!(said, DOOR_SCRIPT_REFUSED_REASON);
+        assert!(!said.contains("cannot start"), "one refused copy does not prove the hand cannot start");
+        assert!(said.contains("refused at the door") && said.contains("swept back now") && said.contains("your own stake"));
+        // the 422 arm (the network's definitive word on bytes whose scripts verified) keeps its sentence
+        let rows = derive(&network, &unspent);
+        assert_eq!((rows[0].family, rows[0].facts["doorRefusal"].clone(), rows[0].reason.as_deref()), (OwedFamily::HopStranded, json!("network"), Some(DOOR_REFUSED_REASON)));
         // the press still rests on the chain rung: no word yet is a waiting sentence that says why it will be sweepable
-        let rows = derive(&refused, &NO_CHAIN);
+        let rows = derive(&script, &NO_CHAIN);
         assert_eq!((rows[0].family, rows[0].facts["joinRefused"].clone()), (OwedFamily::Unbound, json!(true)));
         assert!(rows[0].facts.get("claimable").is_none());
-        // without the ledger's word (the pre-#486 list, or a window that excludes the refusal): in progress, rejoin
-        assert!(window(refused_at + 1).is_empty());
-        let rows = derive(&HashSet::new(), &unspent);
+        // without the ledger's word: in progress, rejoin, and no door fact
+        let rows = derive(&HashMap::new(), &unspent);
         assert_eq!((rows[0].family, rows[0].facts["claim"].clone()), (OwedFamily::InProgress, json!("rejoin")));
-        // a refusal that names a STRANGER's hop (the only kind a stranger's bytes can earn) strands nothing of mine
-        let theirs = serde_json::to_string(&[SignedSpend { txid: tx(0x09), vout: 0 }]).unwrap();
-        conn.execute(SUBMIT_REFUSAL_UPSERT_SQL, rusqlite::params![tx(0x0d), "network-rejected: REJECTED", refused_at, theirs]).unwrap();
-        let only_theirs: Vec<(String, Option<String>)> = window(0).into_iter().filter(|(t, _)| *t == tx(0x0d)).collect();
-        assert!(refused_hop_outpoints_of(&released_hop_outpoints(&only_theirs), &young).is_empty());
+        assert!(rows[0].facts.get("doorRefusal").is_none());
+        // a ledger row for an outpoint the walk does not hold names nothing (the belt behind the SQL's own join)
+        assert!(door_refused_hops(&[(tx(0x09), 0, "script-refused".to_string())], &young).is_empty());
+        assert!(door_refused_hops(&[(hop_txid.clone(), 1, "script-refused".to_string())], &young).is_empty());
         // an eviction's word keeps its own sentence when both ledgers name the hop
+        let evicted: HashSet<String> = [key.clone()].into_iter().collect();
         let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
         i.hop_chain = &unspent;
-        i.door_refused_hop_outpoints = &refused;
-        i.evicted_hop_outpoints = &refused;
+        i.door_refused_hop_outpoints = &script;
+        i.evicted_hop_outpoints = &evicted;
         let rows = derive_owed_rows(&i);
         assert_eq!((rows[0].facts["joinRefusedBy"].clone(), rows[0].reason.as_deref()), (json!("eviction"), Some(JOIN_REFUSED_REASON)));
+        assert!(rows[0].facts.get("doorRefusal").is_none());
     }
 }

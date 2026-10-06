@@ -1941,6 +1941,7 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
     let key = format!("{}:0", hop_txid.to_ascii_lowercase());
     let (no_refunds, no_set, no_sweeps, no_pkhs) = (HashMap::new(), HashSet::new(), HashMap::new(), HashMap::new());
     let (no_outs, no_ins, no_home) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let no_door = HashMap::new();
     let derive = |chain: &HashMap<String, HopChainWord>, outs: &HashMap<String, Vec<SpenderOutput>>, courier: &HashSet<String>| {
         derive_owed_rows(&OwedInputs {
             identity_lc: &m.identity_hex,
@@ -1956,7 +1957,7 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
             pot_spenders_faulted: false,
             hop_chain: chain,
             evicted_hop_outpoints: &no_set,
-            door_refused_hop_outpoints: &no_set,
+            door_refused_hop_outpoints: &no_door,
             hop_sweeps: &no_sweeps,
             evicted_pots: &no_set,
             spender_outputs: outs,
@@ -2010,4 +2011,352 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
 
     // and the one way the walk does not read this hop at all, by the era's design: the cutoff of 2026-09-21
     assert!(walk(PROD_CUTOFF_AFTER_MS).0.is_empty(), "the bump writes the hop off from the views; the sats stay at the key");
+}
+
+// ── bsv-low #486, the lens fold (2026-10-06): the door's refusal ledger, end to end ─
+
+mod door_refusals {
+    use super::*;
+    use bsv_overlay_cloudflare::submit_refusals::{
+        index_read_query, network_rejected_reason, refusals_to_write, retire_query, signed_p2pkh_spends, write_queries, IndexedHop, SignedSpend,
+        REASON_SCRIPT_REFUSED,
+    };
+    use bsv_rs::primitives::PrivateKey;
+    use bsv_rs::script::templates::P2PKH;
+    use bsv_rs::script::{Script, ScriptTemplate, SignOutputs, UnlockingScript};
+    use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
+    use low_app_layer::owed::{
+        derive_owed_rows, door_refused_hops, DoorRefusal, HopChainWord, OwedFamily, OwedInputs, OwedRow, DOOR_REFUSED_REASON, DOOR_SCRIPT_REFUSED_REASON,
+        OWED_DOOR_REFUSALS_SQL, OWED_EVICTION_WINDOW_MS,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    const FUNDED_AT_SECS: i64 = 1_790_000_000;
+    const NOW_MS: i64 = FUNDED_AT_SECS * 1000 + 60_000; // the hops are one minute old: inside the young window
+    const OPPONENT_SEED: u8 = 0xb0; // `build_marker`'s opponent
+
+    fn sqlite_binds(q: &bsv_overlay_cloudflare::d1::Query) -> Vec<rusqlite::types::Value> {
+        q.params()
+            .iter()
+            .map(|p| match p {
+                QVal::Null => rusqlite::types::Value::Null,
+                QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+                QVal::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+                QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+                QVal::Float(f) => rusqlite::types::Value::Real(*f),
+            })
+            .collect()
+    }
+
+    /// THE DOOR'S HOOK, natively: `submit_refusals::record`'s own four steps (the signature filter, the one index
+    /// read, the decision, the writes), each the production function, over real SQLite. Returns the hops written.
+    fn door_refuses(conn: &Connection, beef: &[u8], subject: &str, reason: &str, now_ms: i64) -> Vec<SignedSpend> {
+        let signed = signed_p2pkh_spends(beef, subject);
+        if signed.is_empty() {
+            return Vec::new();
+        }
+        let read = index_read_query(&signed);
+        let index: Vec<IndexedHop> = conn
+            .prepare(read.sql())
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(sqlite_binds(&read).iter()), |r| {
+                Ok(IndexedHop { txid: r.get(0)?, output_index: r.get(1)?, spent: r.get(2)?, held_reason: r.get(3)?, held_at: r.get(4)? })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let to_write = refusals_to_write(&signed, &index, reason, now_ms);
+        for q in write_queries(&to_write, subject, reason, now_ms) {
+            exec_query(conn, &q);
+        }
+        to_write
+    }
+
+    /// The seat's settle PRIVATE key (the key the hop pays): the same BRC-42 derivation `build_marker` takes the
+    /// public half of.
+    fn settle_key(identity_seed: u8, game: [u8; 32]) -> PrivateKey {
+        let root = PrivateKey::from_hex(&format!("{identity_seed:064x}")).unwrap();
+        let opponent = PrivateKey::from_hex(&format!("{OPPONENT_SEED:064x}")).unwrap().public_key();
+        bsv_rs::wallet::KeyDeriver::new(Some(root))
+            .derive_private_key(&Protocol::new(SecurityLevel::Counterparty, "low settle"), &hex::encode(game), &Counterparty::Other(opponent))
+            .unwrap()
+    }
+
+    /// A funded, admitted hop of `identity_seed` for `game`: the production container (output 0 the hop P2PKH to
+    /// the seat's settle key, output 1 its verified marker) through the real marker admission, plus its
+    /// `pot_records` row when `indexed`. The transaction carries a one-leaf BUMP so a JOIN's BEEF can hold it.
+    fn fund_hop(conn: &Connection, identity_seed: u8, game: [u8; 32], sats: u64, nonce: u8, indexed: bool) -> (BuiltMarker, Transaction, PrivateKey) {
+        let m = build_marker(identity_seed, game, 0, sats, true);
+        let mut tx = Transaction::new();
+        tx.add_input(TransactionInput::new(format!("{nonce:02x}").repeat(32), 0)).unwrap();
+        tx.add_output(TransactionOutput { satoshis: Some(sats), locking_script: LockingScript::from_hex(&expected_hop_lock_hex(&m.settle_pub_hex).unwrap()).unwrap(), change: false })
+            .unwrap();
+        tx.add_output(TransactionOutput { satoshis: Some(0), locking_script: LockingScript::from_binary(&m.script).unwrap(), change: false }).unwrap();
+        let beef = tx.to_beef(true).expect("container BEEF");
+        let txid = admit_container(conn, &beef, 1, FUNDED_AT_SECS);
+        assert_eq!(txid, tx.id());
+        if indexed {
+            admit_hop(conn, &txid, sats as i64, FUNDED_AT_SECS);
+        }
+        tx.merkle_path = Some(MerklePath::new(900_000, vec![vec![MerklePathLeaf::new_txid(0, txid)]]).unwrap());
+        let key = settle_key(identity_seed, game);
+        assert_eq!(hex::encode(P2PKH::new().lock(&key.public_key().hash160()).unwrap().to_binary()), expected_hop_lock_hex(&m.settle_pub_hex).unwrap());
+        (m, tx, key)
+    }
+
+    /// A two-input JOIN copy over two hops, each input signed by the key given; `(BEEF, txid, the signed tx)`.
+    async fn join(hop_a: &Transaction, sign_a: &PrivateKey, hop_b: &Transaction, sign_b: &PrivateKey) -> (Vec<u8>, String, Transaction) {
+        let mut tx = Transaction::new();
+        tx.add_input_from_tx(hop_a.clone(), 0, P2PKH::unlock(sign_a, SignOutputs::All, false)).unwrap();
+        tx.add_input_from_tx(hop_b.clone(), 0, P2PKH::unlock(sign_b, SignOutputs::All, false)).unwrap();
+        tx.outputs.push(TransactionOutput::new(40_000, P2PKH::new().lock(&[0x11u8; 20]).unwrap()));
+        tx.sign().await.expect("template signing");
+        (tx.to_beef(false).expect("BEEF with both proven parents"), tx.id(), tx)
+    }
+
+    /// THE WALK'S READ: the shipped `OWED_DOOR_REFUSALS_SQL` with the route's binds, mapped as the route maps it.
+    fn door_rows(conn: &Connection, identity: &str, now_ms: i64) -> Vec<(String, u32, String)> {
+        conn.prepare(OWED_DOOR_REFUSALS_SQL)
+            .unwrap()
+            .query_map(params![identity, now_ms - OWED_EVICTION_WINDOW_MS], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// The walk's own hops: the shipped hops SQL, the route's seconds-to-ms mapping of the marker stamp.
+    fn hops_of(conn: &Connection, identity: &str) -> Vec<low_app_layer::hops_view::HopEntry> {
+        let mut rows = query_rows(conn, identity);
+        for r in rows.iter_mut() {
+            let secs: i64 = conn.query_row("SELECT createdAt FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2", params![r.hop_txid, r.hop_vout], |x| x.get(0)).unwrap();
+            r.marker_created_at = Some(secs.saturating_mul(1000));
+        }
+        assemble_hops_view(rows).0
+    }
+
+    /// One identity's owed rows as the walk derives them: its hops, the door's ledger through its own markers, and
+    /// a chain rung that answers unspent for every hop (so the press is decided by the ledger alone).
+    fn owed_of(conn: &Connection, identity: &str) -> (Vec<OwedRow>, HashMap<String, DoorRefusal>) {
+        let hops = hops_of(conn, identity);
+        let door = door_refused_hops(&door_rows(conn, identity, NOW_MS), &hops);
+        let chain: HashMap<String, HopChainWord> = hops
+            .iter()
+            .map(|h| (format!("{}:{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), HopChainWord { looked: true, spent: Some(false), spending_txid: None, spent_confirmed: None, stale: false, age_ms: None }))
+            .collect();
+        let (no_refunds, no_set, no_sweeps, no_pkhs) = (HashMap::new(), HashSet::new(), HashMap::new(), HashMap::new());
+        let (no_outs, no_ins, no_home) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let rows = derive_owed_rows(&OwedInputs {
+            identity_lc: identity,
+            tip: Some(967_700),
+            now_ms: NOW_MS,
+            results: &[],
+            refunds: &[],
+            hops: &hops,
+            valid_refunds: &no_refunds,
+            collected_verified: &no_set,
+            collected_present: &no_set,
+            pot_spenders: &no_set,
+            pot_spenders_faulted: false,
+            hop_chain: &chain,
+            evicted_hop_outpoints: &no_set,
+            door_refused_hop_outpoints: &door,
+            hop_sweeps: &no_sweeps,
+            evicted_pots: &no_set,
+            spender_outputs: &no_outs,
+            spender_inputs: &no_ins,
+            courier_spenders: &no_set,
+            my_pkh_by_game: &no_pkhs,
+            home_spends: &no_home,
+        });
+        (rows, door)
+    }
+
+    fn ledger_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM submit_refusals", [], |r| r.get(0)).unwrap()
+    }
+
+    const GAME_A: [u8; 32] = [0x21u8; 32];
+    const GAME_B: [u8; 32] = [0x22u8; 32];
+
+    /// THE 400 ARM, end to end (the lens's MEDIUM-2): seat A's hop is funded, marked and indexed; a JOIN copy that
+    /// seat A's settle key signed and whose other input does not verify is refused by the door's interpreter. The
+    /// hook writes exactly seat A's row; seat A's walk reads it through its own marker and the young hop is the
+    /// sweep press with the script arm's sentence. Before the refusal: in progress, rejoin. An UNSIGNED input (a
+    /// stranger's bytes naming seat A's hop) and an UNINDEXED one (signed, no `pot_records` row) write nothing.
+    /// To red: drop the index or the signature filter at the door, or the refusal from the ladder.
+    #[tokio::test]
+    async fn the_400_arm_writes_exactly_the_signed_and_indexed_hop_and_the_seats_walk_strands_it() {
+        let conn = production_schema_db();
+        let (ma, hop_a, key_a) = fund_hop(&conn, 0xa1, GAME_A, 20_190, 0x31, true);
+        let (mb, hop_b, key_b) = fund_hop(&conn, 0xa2, GAME_B, 20_190, 0x32, true);
+        let stranger = PrivateKey::random();
+        let (rows, _) = owed_of(&conn, &ma.identity_hex);
+        assert_eq!((rows.len(), rows[0].family, rows[0].facts["claim"].clone()), (1, OwedFamily::InProgress, serde_json::json!("rejoin")));
+
+        // a stranger's bytes naming both hops (neither key signed): nothing written
+        let (beef, forged, _) = join(&hop_a, &stranger, &hop_b, &stranger).await;
+        assert!(door_refuses(&conn, &beef, &forged, REASON_SCRIPT_REFUSED, NOW_MS).is_empty());
+        assert_eq!(ledger_rows(&conn), 0);
+        // a signed input whose hop the index does not hold (a marker, no `pot_records` row): nothing written
+        let (mc, hop_c, key_c) = fund_hop(&conn, 0xa3, [0x23u8; 32], 20_190, 0x33, false);
+        let (beef, loose, _) = join(&hop_c, &key_c, &hop_b, &stranger).await;
+        assert!(door_refuses(&conn, &beef, &loose, REASON_SCRIPT_REFUSED, NOW_MS).is_empty());
+        assert_eq!(ledger_rows(&conn), 0);
+        assert!(owed_of(&conn, &mc.identity_hex).1.is_empty());
+
+        // THE REFUSAL: seat A signed, the other input does not verify
+        let (beef, refused, _) = join(&hop_a, &key_a, &hop_b, &stranger).await;
+        let wrote = door_refuses(&conn, &beef, &refused, REASON_SCRIPT_REFUSED, NOW_MS);
+        assert_eq!(wrote, vec![SignedSpend { txid: hop_a.id(), vout: 0 }]);
+        let row: (String, i64, String, String, i64) =
+            conn.query_row("SELECT hopTxid, hopVout, refusedTxid, reason, refusedAt FROM submit_refusals", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+        assert_eq!(row, (hop_a.id(), 0, refused.clone(), REASON_SCRIPT_REFUSED.to_string(), NOW_MS), "exactly the row");
+
+        // seat A's walk reads it and strands the young hop
+        let (rows, door) = owed_of(&conn, &ma.identity_hex);
+        assert_eq!(door, [(format!("{}:0", hop_a.id()), DoorRefusal::Script)].into_iter().collect::<HashMap<_, _>>());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["joinRefusedBy"], "door");
+        assert_eq!(rows[0].facts["doorRefusal"], "script");
+        assert_eq!(rows[0].reason.as_deref(), Some(DOOR_SCRIPT_REFUSED_REASON));
+        // seat B's key did not sign: seat B's hop is untouched
+        let (rows, door) = owed_of(&conn, &mb.identity_hex);
+        assert!(door.is_empty());
+        assert_eq!((rows[0].family, rows[0].facts["claim"].clone()), (OwedFamily::InProgress, serde_json::json!("rejoin")));
+        let _ = key_b;
+    }
+
+    /// THE DEFINITIVE 422 ARM, end to end: both seats signed, every script verifies, the network refuses. Both hops
+    /// are written, each seat's walk reads ITS OWN row and nothing of the other's (the lens's MEDIUM-1: the read
+    /// is driven from the walking identity's hop markers), an identity with no hop reads nothing, and the plan
+    /// never scans the ledger.
+    /// To red: read the ledger by window instead of through `hopparty_records`.
+    #[tokio::test]
+    async fn the_422_arm_writes_both_signed_hops_and_each_walk_reads_only_its_own() {
+        let conn = production_schema_db();
+        let (ma, hop_a, key_a) = fund_hop(&conn, 0xa1, GAME_A, 20_190, 0x31, true);
+        let (mb, hop_b, key_b) = fund_hop(&conn, 0xa2, GAME_B, 20_190, 0x32, true);
+        let (beef, refused, _) = join(&hop_a, &key_a, &hop_b, &key_b).await;
+        let reason = network_rejected_reason("REJECTED");
+        assert_eq!(door_refuses(&conn, &beef, &refused, &reason, NOW_MS).len(), 2);
+        assert_eq!(ledger_rows(&conn), 2);
+
+        let a_rows = door_rows(&conn, &ma.identity_hex, NOW_MS);
+        let b_rows = door_rows(&conn, &mb.identity_hex, NOW_MS);
+        assert_eq!(a_rows, vec![(hop_a.id(), 0, reason.clone())], "seat A's walk reads seat A's refusal alone");
+        assert_eq!(b_rows, vec![(hop_b.id(), 0, reason.clone())], "seat B's walk reads seat B's refusal alone");
+        assert!(door_rows(&conn, &"02".repeat(33), NOW_MS).is_empty(), "an identity with no hop marker reads no one's refusals");
+        for m in [&ma, &mb] {
+            let (rows, _) = owed_of(&conn, &m.identity_hex);
+            assert_eq!((rows.len(), rows[0].family, rows[0].facts["doorRefusal"].clone()), (1, OwedFamily::HopStranded, serde_json::json!("network")));
+            assert_eq!(rows[0].reason.as_deref(), Some(DOOR_REFUSED_REASON));
+        }
+        // a refusal older than the reader's window names nothing
+        assert!(door_rows(&conn, &ma.identity_hex, NOW_MS + OWED_EVICTION_WINDOW_MS + 1).is_empty());
+        // the plan: the identity's markers drive, the ledger is probed by its primary key, never scanned
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {OWED_DOOR_REFUSALS_SQL}"))
+            .unwrap()
+            .query_map(params![ma.identity_hex, 0i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(plan.iter().any(|l| l.contains("SEARCH hp") && l.contains("idx_hopparty_identity")), "{plan:?}");
+        assert!(plan.iter().any(|l| l.contains("SEARCH r") && l.contains("sqlite_autoindex_submit_refusals_1")), "{plan:?}");
+        assert!(!plan.iter().any(|l| l.contains("SCAN r") || l.contains("SCAN hp")), "{plan:?}");
+    }
+
+    /// The lens's MEDIUM-1, the lever itself: the opponent holds seat A's SIGNED JOIN input and mints refused
+    /// variants at zero sats (a different unlocking script on its own input each time: a new txid, seat A's
+    /// SIGHASH_ALL signature still good). Thirty variants are one ledger row and one row in seat A's walk; the
+    /// stranger's flood over its OWN indexed output is one row seat A's walk never reads.
+    /// To red: key the ledger on the refused txid.
+    #[tokio::test]
+    async fn a_strangers_refused_variants_of_a_seats_input_cost_the_seats_walk_one_row_at_most() {
+        let conn = production_schema_db();
+        let (ma, hop_a, key_a) = fund_hop(&conn, 0xa1, GAME_A, 20_190, 0x31, true);
+        let (_mb, hop_b, key_b) = fund_hop(&conn, 0xa2, GAME_B, 20_190, 0x32, true);
+        let (_, good, signed) = join(&hop_a, &key_a, &hop_b, &key_b).await;
+        let mut txids: HashSet<String> = HashSet::new();
+        let mut writes = 0usize;
+        for n in 0..30u8 {
+            // built afresh from the signed transaction's parts (a clone keeps its cached hash and bytes): seat A's
+            // input and unlocking script verbatim, the same outputs, another unlocking script on the other input
+            let mut variant = Transaction::new();
+            variant.version = signed.version;
+            variant.lock_time = signed.lock_time;
+            for (vin, (inp, hop)) in signed.inputs.iter().zip([&hop_a, &hop_b]).enumerate() {
+                variant.inputs.push(TransactionInput {
+                    source_transaction: Some(Box::new(hop.clone())),
+                    source_txid: inp.source_txid.clone(),
+                    source_output_index: inp.source_output_index,
+                    unlocking_script: if vin == 0 { inp.unlocking_script.clone() } else { Some(UnlockingScript::from_script(Script::from_binary(&[0x01, n]).unwrap())) },
+                    sequence: inp.sequence,
+                    ..Default::default()
+                });
+            }
+            variant.outputs = signed.outputs.clone();
+            let txid = variant.id();
+            assert_ne!(txid, good);
+            assert!(txids.insert(txid.clone()), "every variant is a new txid");
+            let beef = variant.to_beef(false).unwrap();
+            let wrote = door_refuses(&conn, &beef, &txid, REASON_SCRIPT_REFUSED, NOW_MS + i64::from(n));
+            assert!(wrote.iter().all(|s| s.txid == hop_a.id()), "only the hop whose key signed the variant");
+            writes += wrote.len();
+        }
+        assert_eq!(writes, 1, "the first variant wrote; twenty-nine more cost the door one read each");
+        assert_eq!(ledger_rows(&conn), 1);
+        assert_eq!(door_rows(&conn, &ma.identity_hex, NOW_MS).len(), 1, "one row in the seat's walk, whatever the flood");
+        // the stranger's own indexed output, flooded: one more row, and not one the seat's walk reads
+        let stranger = PrivateKey::random();
+        let mut own = Transaction::new();
+        own.add_input(TransactionInput::new("5e".repeat(32), 0)).unwrap();
+        own.outputs.push(TransactionOutput::new(1_000, P2PKH::new().lock(&stranger.public_key().hash160()).unwrap()));
+        let own_txid = own.id();
+        own.merkle_path = Some(MerklePath::new(900_000, vec![vec![MerklePathLeaf::new_txid(0, own_txid.clone())]]).unwrap());
+        admit_hop(&conn, &own_txid, 1_000, FUNDED_AT_SECS);
+        for _ in 0..30u8 {
+            let (beef, txid, _) = join(&own, &stranger, &hop_b, &PrivateKey::random()).await;
+            door_refuses(&conn, &beef, &txid, REASON_SCRIPT_REFUSED, NOW_MS);
+        }
+        assert_eq!(ledger_rows(&conn), 2);
+        assert_eq!(door_rows(&conn, &ma.identity_hex, NOW_MS), vec![(hop_a.id(), 0, REASON_SCRIPT_REFUSED.to_string())]);
+    }
+
+    /// THE UN-STRAND (the lens's LOW-3): after a copy was refused, the good JOIN is admitted (the index marks the
+    /// hop spent by it, through the shipped `mark_spent_sql`). The walk stops reading the refusal at once (the read
+    /// skips a hop the index shows spent), the hop is no longer the door's sweep press, and the door's retirement
+    /// deletes the row by the outpoint the admitted transaction consumed.
+    /// To red: drop the `NOT EXISTS` from `OWED_DOOR_REFUSALS_SQL`, or retire by the refused txid.
+    #[tokio::test]
+    async fn an_admission_after_a_refusal_un_strands_the_hop_and_retires_the_row() {
+        let conn = production_schema_db();
+        let (ma, hop_a, key_a) = fund_hop(&conn, 0xa1, GAME_A, 20_190, 0x31, true);
+        let (_mb, hop_b, key_b) = fund_hop(&conn, 0xa2, GAME_B, 20_190, 0x32, true);
+        let (beef, refused, _) = join(&hop_a, &key_a, &hop_b, &PrivateKey::random()).await;
+        assert_eq!(door_refuses(&conn, &beef, &refused, REASON_SCRIPT_REFUSED, NOW_MS).len(), 1);
+        assert_eq!(owed_of(&conn, &ma.identity_hex).0[0].family, OwedFamily::HopStranded);
+
+        let (_, good, _) = join(&hop_a, &key_a, &hop_b, &key_b).await;
+        assert_ne!(good, refused);
+        mark_hop_spent(&conn, &hop_a.id(), &good, false);
+        // the read: the refusal is not served for a hop the index shows spent, before any delete ran
+        assert_eq!(ledger_rows(&conn), 1);
+        assert!(door_rows(&conn, &ma.identity_hex, NOW_MS).is_empty());
+        let (rows, door) = owed_of(&conn, &ma.identity_hex);
+        assert!(door.is_empty());
+        assert!(rows.iter().all(|r| r.facts.get("joinRefusedBy").is_none() && r.facts["claim"] != "sweep-hop"), "{rows:?}");
+        // the door's retirement, keyed on the outpoint the admitted transaction consumed
+        let retire = retire_query(&good);
+        assert_eq!(conn.execute(retire.sql(), rusqlite::params_from_iter(sqlite_binds(&retire).iter())).unwrap(), 1);
+        assert_eq!(ledger_rows(&conn), 0);
+        // and a corrupted copy arriving AFTER the admission records nothing (the hop reads spent)
+        let (beef, late, _) = join(&hop_a, &key_a, &hop_b, &PrivateKey::random()).await;
+        assert!(door_refuses(&conn, &beef, &late, REASON_SCRIPT_REFUSED, NOW_MS + 5).is_empty());
+        assert_eq!(ledger_rows(&conn), 0);
+    }
 }
