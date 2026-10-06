@@ -140,6 +140,85 @@ pub const HOME_UNKNOWN_REASON: &str =
 /// The gate's M3: bytes the couriers supplied prove the payout but the index holds no proof to assemble the credit.
 pub const COURIER_BYTES_NO_CREDIT_REASON: &str =
     "the sats sit at your home on chain, but the index holds no proof for that transaction, so the credit cannot be assembled here: a wallet resync finds them";
+/// bsv-low #485: what the brain established about ONE home output of a courier-proven sweep (the sats the sweep
+/// paid to this seat's committed home). The row RETIRES only on `Proven`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeSpendWord {
+    /// A transaction whose bytes consume the home output carries an unlocking script that VERIFIES against the
+    /// home's own lock, executed here (`home_output_spend_proven`): the home key signed the sats away, so the wallet
+    /// held them and moved on. No courier's word is in it: a courier only carried the bytes.
+    Proven,
+    /// The chain rung names a spender, but its bytes could not be read or do not carry the home key's signature:
+    /// a pointer, nothing more. The row stands.
+    Unproven,
+    /// The chain rung's corroborated absence (a second provider's clean answer): the sats sit at the home.
+    Unspent,
+}
+/// The durable latch of a `Proven` word: a `hop_chain_probes` row under this key prefix (`homeproof:<txid>.<vout>`),
+/// written by this crate alone, only after the signature verified here. The table is the app layer's own probe memo
+/// (the overlay never writes it); `/spent-any` keys its rows `<txid>.<vout>`, so the prefix cannot collide.
+pub const HOME_SPEND_LATCH_PREFIX: &str = "homeproof:";
+/// The courier probes ONE recompute may buy for the home outputs of its courier-proven payouts (each is one
+/// spent-any ladder, memoised like the hops', plus one tx-any read for a named spender's bytes).
+pub const OWED_HOME_PROBES_PER_RECOMPUTE: usize = 2;
+/// An unlocking script longer than this is never executed for the home proof (a P2PKH unlock is about 107 bytes).
+pub const HOME_SPEND_UNLOCK_MAX_BYTES: usize = 512;
+
+/// PURE (bsv-low #485): does `spender_raw` consume `home_txid:home_vout` with an unlocking script that VERIFIES
+/// against the P2PKH lock of `home_pkh_hex` for `sats`? The interpreter runs here (`bsv_rs::script::Spend`, the
+/// engine's own walk), over the sighash of the bytes given: only the home key's holder can produce a `true`, whoever
+/// carried the bytes and whether or not the spender is mined. Anything malformed, oversized or unverifiable is `false`.
+pub fn home_output_spend_proven(spender_raw: &[u8], home_txid: &str, home_vout: u32, home_pkh_hex: &str, sats: u64) -> bool {
+    use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
+    use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
+    let Ok(tx) = bsv_rs::transaction::Transaction::from_binary(spender_raw) else { return false };
+    let Some(pkh) = hex::decode(home_pkh_hex).ok().and_then(|b| <[u8; 20]>::try_from(b).ok()) else { return false };
+    let Some((vin, input)) = tx
+        .inputs
+        .iter()
+        .enumerate()
+        .find(|(_, inp)| inp.source_output_index == home_vout && inp.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(home_txid)))
+    else {
+        return false;
+    };
+    let Some(unlocking_bytes) = input.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary) else { return false };
+    if unlocking_bytes.is_empty() || unlocking_bytes.len() > HOME_SPEND_UNLOCK_MAX_BYTES {
+        return false;
+    }
+    let Ok(source_txid) = input.get_source_txid_bytes() else { return false };
+    let (Ok(lock), Ok(unlock)) = (Script::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)), Script::from_binary(&unlocking_bytes)) else {
+        return false;
+    };
+    let other_inputs: Vec<TxInput> = tx
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(n, _)| *n != vin)
+        .map(|(_, inp)| TxInput {
+            txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
+            output_index: inp.source_output_index,
+            script: inp.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary).unwrap_or_default(),
+            sequence: inp.sequence,
+        })
+        .collect();
+    let outputs: Vec<TxOutput> = tx.outputs.iter().map(|o| TxOutput { satoshis: o.satoshis.unwrap_or(0), script: o.locking_script.to_binary() }).collect();
+    let mut spend = Spend::new(SpendParams {
+        source_txid,
+        source_output_index: input.source_output_index,
+        source_satoshis: sats,
+        locking_script: LockingScript::from_script(lock),
+        transaction_version: tx.version.cast_signed(),
+        other_inputs,
+        outputs,
+        input_index: vin,
+        unlocking_script: UnlockingScript::from_script(unlock),
+        input_sequence: input.sequence,
+        lock_time: tx.lock_time,
+        memory_limit: None,
+    });
+    matches!(spend.validate(), Ok(true))
+}
+
 /// The `spent-elsewhere` story (design §2): the hop was spent by a transaction that is not a LOW pot and pays no
 /// home of this seat — a sweep to another home, or the wallet's own spend. Nothing here can move it.
 pub const SPENT_ELSEWHERE_REASON: &str =
@@ -266,6 +345,8 @@ pub struct SweptHome {
     pub source: &'static str,
     /// The index shows the home output itself SPENT: collected and moved on — not a row.
     pub output_spent: bool,
+    /// The sweep's outputs to the seat's home (vout, sats), when its bytes were read and the home is known.
+    pub home_outputs: Vec<(u32, u64)>,
 }
 
 /// Spenders whose stored bytes one recompute reads to classify a hop's spend (bounded: a lived-in identity's
@@ -323,6 +404,9 @@ pub struct OwedInputs<'a> {
     /// game id (lowercase) → my committed pay pkh (hex) from the results entries (the covenant's own commitment): the
     /// home an unfiled sweep must pay to be MY payout.
     pub my_pkh_by_game: &'a HashMap<String, String>,
+    /// bsv-low #485: home outpoint (`<sweepTxid>:<vout>`, lowercase) → what the brain established about its spend
+    /// (the route's bounded walk over `courier_home_outputs`). Absent = not looked this pass.
+    pub home_spends: &'a HashMap<String, HomeSpendWord>,
 }
 
 /// The 20-byte pkh of a standard P2PKH locking script (`76 a9 14 <20> 88 ac`), lowercase hex; `None` for any other lock.
@@ -528,12 +612,18 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     let game = h.game_id.to_ascii_lowercase();
     let my_pkh = i.my_pkh_by_game.get(&game).map(|p| p.to_ascii_lowercase());
     // the home outputs' own spend word, when the index holds the spender's bytes
-    let home_spent = |spender: &str| -> bool {
+    let home_outputs_of = |spender: &str| -> Vec<&SpenderOutput> {
         let (Some(outs), Some(pkh)) = (i.spender_outputs.get(spender), my_pkh.as_deref()) else {
-            return false;
+            return Vec::new();
         };
-        let mine: Vec<&SpenderOutput> = outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(pkh))).collect();
-        !mine.is_empty() && mine.iter().all(|o| o.spent == Some(true))
+        outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(pkh))).collect()
+    };
+    // bsv-low #485: a home output is SPENT by the index's own word, or by the home key's signature this crate
+    // verified over its spender's bytes (`HomeSpendWord::Proven`); never by a courier's word of spent
+    let home_proven = |spender: &str, o: &SpenderOutput| i.home_spends.get(&outpoint_key(spender, o.vout)) == Some(&HomeSpendWord::Proven);
+    let home_spent = |spender: &str| -> bool {
+        let mine = home_outputs_of(spender);
+        !mine.is_empty() && mine.iter().all(|o| o.spent == Some(true) || home_proven(spender, o))
     };
     if let Some(filed) = i.hop_sweeps.get(&outpoint) {
         let named_by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid));
@@ -565,6 +655,7 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
                 index_proof_height: if index_word { filed.index_proof_height } else { None },
                 source: "hopsweep-filing",
                 output_spent: home_spent(&filed.sweep_txid),
+                home_outputs: home_outputs_of(&filed.sweep_txid).iter().map(|o| (o.vout, o.sats)).collect(),
             });
         }
     }
@@ -585,15 +676,50 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     }
     let source = if i.courier_spenders.contains(&spender) { "courier-bytes" } else { "index-bytes" };
     Some(SweptHome {
-        sweep_txid: spender,
         raw_hex: None,
         pays_sats: Some(sum),
         confirmed,
         index_proven: false,
         index_proof_height: None,
         source,
-        output_spent: mine.iter().all(|o| o.spent == Some(true)),
+        output_spent: mine.iter().all(|o| o.spent == Some(true) || home_proven(&spender, o)),
+        home_outputs: mine.iter().map(|o| (o.vout, o.sats)).collect(),
+        sweep_txid: spender,
     })
+}
+
+/// One home output of a courier-proven sweep the route should look at (bsv-low #485).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CourierHomeOutput {
+    pub sweep_txid: String,
+    pub vout: u32,
+    pub pkh_hex: String,
+    pub sats: u64,
+}
+
+/// PURE (bsv-low #485): the home outputs of this identity's CONFIRMED courier-proven payouts, the candidates of the
+/// route's home-spend walk. The same judgment the row is derived from (`swept_home`), so the walk looks at exactly
+/// the outputs a served row rests on; a game the identity itself filed `collected` for is skipped (its row is
+/// retired or retiring by the filing). Sorted, deduplicated.
+pub fn courier_home_outputs(i: &OwedInputs) -> Vec<CourierHomeOutput> {
+    let mut out: Vec<CourierHomeOutput> = Vec::new();
+    for h in i.hops {
+        let game = h.game_id.to_ascii_lowercase();
+        if i.collected_verified.contains(&game) {
+            continue;
+        }
+        let Some(swept) = swept_home(i, h) else { continue };
+        if swept.source != "courier-bytes" || !swept.confirmed || swept.output_spent {
+            continue;
+        }
+        let Some(pkh) = i.my_pkh_by_game.get(&game) else { continue };
+        for (vout, sats) in &swept.home_outputs {
+            out.push(CourierHomeOutput { sweep_txid: swept.sweep_txid.to_ascii_lowercase(), vout: *vout, pkh_hex: pkh.to_ascii_lowercase(), sats: *sats });
+        }
+    }
+    out.sort_by(|a, b| (&a.sweep_txid, a.vout).cmp(&(&b.sweep_txid, b.vout)));
+    out.dedup();
+    out
 }
 
 /// What a hop spender's BYTES say about the hop it took, once `swept_home` found no payout in them (the gate's M1
@@ -929,7 +1055,17 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 // still be displaced, so "the sats sit at your home" is said only once the chain confirmed it.
                 facts["claimable"] = json!(false);
                 facts["claimReason"] = json!(if swept.confirmed { COURIER_BYTES_NO_CREDIT_REASON } else { UNCONFIRMED_PAYOUT_REASON });
-                facts["creditKind"] = json!("courier-bytes"); // the residual: this row retires only by a `collected` filing (bsv-low issue)
+                // bsv-low #485: the row retires by a `collected` filing, or once every home output's spend is PROVEN
+                // (`swept_home`'s `output_spent`: the home key's signature, verified here). Until then it says what the
+                // chain rung's look at the home outputs found, when it looked: `unspent` (a corroborated absence: the
+                // sats were seen at the home) or `unproven` (a spender is named, its bytes do not carry the proof yet).
+                facts["creditKind"] = json!("courier-bytes");
+                let words: Vec<Option<&HomeSpendWord>> = swept.home_outputs.iter().map(|(vout, _)| i.home_spends.get(&outpoint_key(&swept.sweep_txid, *vout))).collect();
+                if words.iter().any(|w| matches!(w, Some(HomeSpendWord::Unproven))) {
+                    facts["homeSpend"] = json!("unproven");
+                } else if !words.is_empty() && words.iter().all(|w| matches!(w, Some(HomeSpendWord::Unspent | HomeSpendWord::Proven))) {
+                    facts["homeSpend"] = json!("unspent");
+                }
             }
             facts["outcome"] = json!("hop-sweep");
             facts["sweepTxid"] = json!(swept.sweep_txid);
@@ -1850,6 +1986,7 @@ mod tests {
             spender_inputs: &NO_INPUTS,
             courier_spenders: &NONE,
             my_pkh_by_game: &NO_PKHS,
+            home_spends: &NO_HOME_SPENDS,
         }
     }
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> = std::sync::LazyLock::new(HashMap::new);
@@ -1861,6 +1998,7 @@ mod tests {
         m
     }
     static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> = std::sync::LazyLock::new(HashMap::new);
+    static NO_HOME_SPENDS: std::sync::LazyLock<HashMap<String, HomeSpendWord>> = std::sync::LazyLock::new(HashMap::new);
     static NO_SWEEPS: std::sync::LazyLock<HashMap<String, crate::hopsweep::FiledHopSweep>> = std::sync::LazyLock::new(HashMap::new);
     fn chain(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>) -> HashMap<String, HopChainWord> {
         chain_confirmed(outpoint, looked, spent, spender, None)
@@ -2920,5 +3058,131 @@ mod tests {
         let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &[], 2_000, None, false));
         assert!(!owed_write_landed(stamp, 2_000));
         assert_eq!(served(&conn, ME).0.len(), 1);
+    }
+
+    /// A real sweep paying `home_key`'s P2PKH `sats`, and a real spend of that home output signed by `signer`.
+    fn sweep_and_home_spend(home_key: &bsv_rs::primitives::PrivateKey, signer: &bsv_rs::primitives::PrivateKey, sats: u64) -> (String, Vec<u8>) {
+        use bsv_rs::script::templates::P2PKH;
+        use bsv_rs::script::{Script, ScriptTemplate, SignOutputs, UnlockingScript};
+        use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+        let mut sweep = Transaction::new();
+        sweep.inputs.push(TransactionInput {
+            source_txid: Some(tx(0x07)), // the hop
+            source_output_index: 0,
+            unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+            ..Default::default()
+        });
+        sweep.outputs.push(TransactionOutput::new(sats, P2PKH::new().lock(&home_key.public_key().hash160()).unwrap()));
+        let sweep_txid = sweep.id();
+        let mut spend = Transaction::new();
+        spend.add_input_from_tx(sweep, 0, P2PKH::unlock(signer, SignOutputs::All, false)).unwrap();
+        spend.outputs.push(TransactionOutput::new(sats - 100, P2PKH::new().lock(&[0x11u8; 20]).unwrap()));
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(spend.sign()).expect("template signing");
+        (sweep_txid, spend.to_binary())
+    }
+
+    /// bsv-low #485, the proof itself: the home output's spend is PROVEN only by the home key's own signature,
+    /// executed here over the bytes; bytes a courier could fabricate (another key's signature, a signature over a
+    /// different amount or outpoint, a damaged one) prove nothing.
+    #[test]
+    fn a_home_outputs_spend_is_proven_by_the_home_keys_signature_and_by_nothing_a_courier_can_fabricate() {
+        let home = bsv_rs::primitives::PrivateKey::random();
+        let stranger = bsv_rs::primitives::PrivateKey::random();
+        let home_pkh = hex::encode(home.public_key().hash160());
+        let (sweep_txid, spend_raw) = sweep_and_home_spend(&home, &home, 20_000);
+        assert!(home_output_spend_proven(&spend_raw, &sweep_txid, 0, &home_pkh, 20_000));
+        assert!(home_output_spend_proven(&spend_raw, &sweep_txid.to_ascii_uppercase(), 0, &home_pkh.to_ascii_uppercase(), 20_000));
+        // a courier's fabrication: bytes that consume the home output under a key that is not the home's
+        let (forged_sweep, forged_raw) = sweep_and_home_spend(&home, &stranger, 20_000);
+        assert!(!home_output_spend_proven(&forged_raw, &forged_sweep, 0, &home_pkh, 20_000));
+        // the signature commits to the amount and to the outpoint
+        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 0, &home_pkh, 20_001));
+        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 1, &home_pkh, 20_000));
+        assert!(!home_output_spend_proven(&spend_raw, &tx(0x0e), 0, &home_pkh, 20_000));
+        // another home, a damaged signature, junk
+        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 0, &"cc".repeat(20), 20_000));
+        let mut damaged = spend_raw.clone();
+        let at = damaged.len() / 3; // inside input 0's unlocking script (the DER signature)
+        damaged[at] ^= 0x01;
+        assert!(!home_output_spend_proven(&damaged, &sweep_txid, 0, &home_pkh, 20_000));
+        assert!(!home_output_spend_proven(&[], &sweep_txid, 0, &home_pkh, 20_000));
+        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 0, "nothex", 20_000));
+    }
+
+    /// bsv-low #485: a courier-proven payout row (a sweep the index never held, courier outputs carry `spent: null`)
+    /// never retired. It now retires when EVERY home output's spend is `Proven` (the home key's signature, verified
+    /// by this crate over bytes any courier may carry), and on nothing weaker: a chain word of spent without the
+    /// proof, a corroborated unspent, or no look at all leave the row standing, claimable false, saying what was seen.
+    /// To red: drop the `home_proven` arm of `swept_home`'s `output_spent`.
+    #[test]
+    fn a_courier_proven_payout_retires_when_the_home_key_signed_the_sats_away_and_on_no_couriers_word() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]); // the issue's shape: courier outputs carry spent: null
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        spent.spent_confirmed = Some(true);
+        let hops = [spent];
+        let courier: HashSet<String> = [sweep.clone()].into_iter().collect();
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let home_key = format!("{sweep}:0");
+        let word = |w: Option<HomeSpendWord>| -> HashMap<String, HomeSpendWord> { w.map(|w| (home_key.clone(), w)).into_iter().collect() };
+        let derive = |outs: &HashMap<String, Vec<SpenderOutput>>, words: &HashMap<String, HomeSpendWord>, courier: &HashSet<String>| {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = outs;
+            i.spender_inputs = &spends_it;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = courier;
+            i.home_spends = words;
+            (derive_owed_rows(&i), courier_home_outputs(&i))
+        };
+        // not looked yet: the row of 2026-09-20, unchanged, and the walk's one candidate
+        let (rows, candidates) = derive(&mine, &word(None), &courier);
+        assert_eq!((rows.len(), rows[0].family), (1, OwedFamily::Payout));
+        assert_eq!(rows[0].facts["creditKind"], "courier-bytes");
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert!(rows[0].facts.get("homeSpend").is_none());
+        assert_eq!(candidates, vec![CourierHomeOutput { sweep_txid: sweep.clone(), vout: 0, pkh_hex: my_pkh.clone(), sats: 20_000 }]);
+        // the chain rung's corroborated unspent: the row stands and says the sats were SEEN at the home
+        let (rows, _) = derive(&mine, &word(Some(HomeSpendWord::Unspent)), &courier);
+        assert_eq!((rows.len(), rows[0].facts["claimable"].clone(), rows[0].facts["homeSpend"].clone()), (1, json!(false), json!("unspent")));
+        assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
+        // a courier's word of spent WITHOUT the proof retires nothing
+        let (rows, _) = derive(&mine, &word(Some(HomeSpendWord::Unproven)), &courier);
+        assert_eq!((rows.len(), rows[0].facts["claimable"].clone(), rows[0].facts["homeSpend"].clone()), (1, json!(false), json!("unproven")));
+        // THE RETIREMENT: the home key signed the output away
+        let (rows, candidates) = derive(&mine, &word(Some(HomeSpendWord::Proven)), &courier);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(candidates.is_empty(), "a retired output is not walked again inside the pass");
+        // two home outputs: one proven is not enough
+        let two = pays(&sweep, &[(0, &my_pkh, 20_000, None), (1, &my_pkh, 190, None)]);
+        let (rows, candidates) = derive(&two, &word(Some(HomeSpendWord::Proven)), &courier);
+        assert_eq!((rows.len(), rows[0].sats), (1, Some(20_190)));
+        assert_eq!(candidates.len(), 2);
+        let mut both = word(Some(HomeSpendWord::Proven));
+        both.insert(format!("{sweep}:1"), HomeSpendWord::Proven);
+        assert!(derive(&two, &both, &courier).0.is_empty());
+        // a word for ANOTHER outpoint (a stranger's sweep, a planted key) retires nothing of mine
+        let other: HashMap<String, HomeSpendWord> = [(format!("{}:0", tx(0x0f)), HomeSpendWord::Proven)].into_iter().collect();
+        assert_eq!(derive(&mine, &other, &courier).0.len(), 1);
+        // an UNCONFIRMED courier payout is not a candidate (the pointer may yet be displaced) and keeps its waiting word
+        let mut unconfirmed = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        unconfirmed.spent_confirmed = Some(false);
+        let hops_u = [unconfirmed];
+        let mut i = inputs(&[], &[], &hops_u, &v, &c, &no_pots, Some(900_000));
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        assert!(courier_home_outputs(&i).is_empty());
+        assert_eq!(derive_owed_rows(&i)[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        // the index's own bytes are not this walk's business (the index's spend word retires those, as before)
+        let none: HashSet<String> = HashSet::new();
+        let (rows, candidates) = derive(&mine, &word(None), &none);
+        assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
+        assert!(candidates.is_empty());
     }
 }

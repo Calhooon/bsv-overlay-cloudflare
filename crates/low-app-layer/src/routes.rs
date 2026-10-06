@@ -3326,7 +3326,8 @@ pub(crate) async fn owed_recompute(
 
     // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
     //    thousands of `unbound` rows; the actionable ones are written first, the list is CUT and says so)
-    let mut rows = derive_owed_rows(&OwedInputs {
+    let no_home_words: HashMap<String, crate::owed::HomeSpendWord> = HashMap::new();
+    let mut inputs = OwedInputs {
         identity_lc,
         tip,
         now_ms,
@@ -3346,7 +3347,14 @@ pub(crate) async fn owed_recompute(
         spender_inputs: &spender_inputs,
         courier_spenders: &courier_spenders,
         my_pkh_by_game: &my_pkh_by_game,
-    });
+        home_spends: &no_home_words,
+    };
+    // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
+    //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
+    //     this crate decides: the home key's signature over a spender's bytes (`owed_home_spend_walk`).
+    let home_spends = owed_home_spend_walk(env, db, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
+    inputs.home_spends = &home_spends;
+    let mut rows = derive_owed_rows(&inputs);
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
     crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
     sort_rows_for_service(&mut rows);
@@ -3413,6 +3421,124 @@ pub(crate) async fn owed_recompute(
         walk_cut
     );
     Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded })
+}
+
+/// bsv-low #485: what the brain can establish about the home outputs of a courier-proven payout, per outpoint
+/// (`<sweepTxid>:<vout>`). In order: (1) the durable LATCH of an earlier proof (`hop_chain_probes` under
+/// `owed::HOME_SPEND_LATCH_PREFIX`, written here alone); (2) the chain rung's word for the rest (the `/spent-any`
+/// ladder: a positive is a pointer plus raw verification, a negative needs a second provider's clean answer),
+/// memoised like the hops' and bounded per pass; (3) for a named spender, its BYTES (the index's stored BEEF first,
+/// else the isolate's tx-any answer, else one resolver ask) and THE PROOF: the input consuming the home output must
+/// verify against the home's own lock, executed here (`owed::home_output_spend_proven`). Only (1) and (3) say
+/// `Proven`; a courier's word of spent alone is `Unproven` and retires nothing. Every fault leaves the outpoint
+/// unnamed (the row stands: the safe direction).
+async fn owed_home_spend_walk(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    candidates: &[crate::owed::CourierHomeOutput],
+    now_ms: i64,
+    started_ms: i64,
+) -> std::collections::HashMap<String, crate::owed::HomeSpendWord> {
+    use crate::owed::{outpoint_key, HomeSpendWord, HOME_SPEND_LATCH_PREFIX};
+    let mut words: std::collections::HashMap<String, HomeSpendWord> = std::collections::HashMap::new();
+    // a lived-in identity holds a handful at most; the bound keeps one read inside D1's bind limit
+    let candidates = &candidates[..candidates.len().min(crate::logic::D1_CHUNK_OUTPOINTS)];
+    if candidates.is_empty() {
+        return words;
+    }
+    let over_budget = || worker::Date::now().as_millis() as i64 - started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS;
+    // (1) the latches
+    let latch_keys: Vec<(String, u32)> = candidates.iter().map(|c| (format!("{HOME_SPEND_LATCH_PREFIX}{}", c.sweep_txid), c.vout)).collect();
+    let latched: std::collections::HashSet<String> =
+        read_probe_memos(db, &latch_keys).await.into_iter().filter(|m| m.spent && m.spending_txid.is_some()).map(|m| m.outpoint).collect();
+    let mut targets: Vec<(String, u32)> = Vec::new();
+    for c in candidates {
+        if latched.contains(&format!("{HOME_SPEND_LATCH_PREFIX}{}.{}", c.sweep_txid, c.vout)) {
+            words.insert(outpoint_key(&c.sweep_txid, c.vout), HomeSpendWord::Proven);
+        } else {
+            targets.push((c.sweep_txid.clone(), c.vout));
+        }
+    }
+    if targets.is_empty() {
+        return words;
+    }
+    // (2) the chain rung: the memoised words first, a bounded ladder for the rest
+    let memos = read_probe_memos(db, &targets).await;
+    let (mut seen, to_probe) = crate::hops_view::split_probe_targets_with(
+        &targets,
+        &memos,
+        now_ms,
+        crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
+        crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
+    );
+    let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
+    for (t, v) in to_probe.into_iter().take(crate::owed::OWED_HOME_PROBES_PER_RECOMPUTE) {
+        if over_budget() {
+            break;
+        }
+        let row = spent_any_resolve_cached(&t, v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
+        let probe = crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed };
+        if let Some(m) = crate::hops_view::probe_memo_of(&t, v, &probe, now_ms) {
+            fresh.push(m);
+        }
+        seen.push((t, v, probe));
+    }
+    // (3) the proof, per named spender
+    let mut latches: Vec<crate::hops_view::ProbeMemo> = Vec::new();
+    let mut resolver_asks = 0usize;
+    for (t, v, probe) in seen {
+        if !probe.known {
+            continue;
+        }
+        let key = outpoint_key(&t, v);
+        match probe.spent {
+            Some(false) => {
+                words.insert(key, HomeSpendWord::Unspent);
+            }
+            Some(true) => {
+                let mut word = HomeSpendWord::Unproven;
+                let home = candidates.iter().find(|c| c.vout == v && c.sweep_txid.eq_ignore_ascii_case(&t));
+                if let (Some(home), Some(sp)) = (home, probe.spending_txid.as_deref().map(str::to_ascii_lowercase)) {
+                    let mut raw: Option<Vec<u8>> = match load_stored_beef(env, db, &sp).await {
+                        Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
+                            .ok()
+                            .and_then(|beef| beef.find_txid(&sp).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
+                        _ => None,
+                    };
+                    if raw.is_none() {
+                        let now_f = worker::Date::now().as_millis() as f64;
+                        let answer = match tx_any_cached(&sp, now_f) {
+                            Some(a) => Some(a),
+                            None if resolver_asks < crate::owed::OWED_HOME_PROBES_PER_RECOMPUTE && !over_budget() => {
+                                resolver_asks += 1;
+                                Some(resolve_tx_any(None, None, &sp, now_f, "owed", env).await)
+                            }
+                            None => None,
+                        };
+                        raw = answer.and_then(|a| a.raw_hex).and_then(|h| hex::decode(h).ok());
+                    }
+                    if raw.is_some_and(|raw| crate::owed::home_output_spend_proven(&raw, &t, v, &home.pkh_hex, home.sats)) {
+                        word = HomeSpendWord::Proven;
+                        worker::console_log!("[owed] home output {t}:{v} is proven spent by {sp} (the home key's signature verified): the courier-proven payout retires");
+                        latches.push(crate::hops_view::ProbeMemo {
+                            outpoint: format!("{HOME_SPEND_LATCH_PREFIX}{}.{v}", t.to_ascii_lowercase()),
+                            probed_at_ms: now_ms,
+                            spent: true,
+                            spending_txid: Some(sp),
+                            spent_confirmed: probe.spent_confirmed,
+                        });
+                    }
+                }
+                words.insert(key, word);
+            }
+            None => {}
+        }
+    }
+    fresh.extend(latches);
+    if !fresh.is_empty() {
+        write_probe_memos(db, &fresh).await;
+    }
+    words
 }
 
 /// ONE recompute for ONE identity, then the page told (`owed-changed` on its durable box). A fault is counted and
