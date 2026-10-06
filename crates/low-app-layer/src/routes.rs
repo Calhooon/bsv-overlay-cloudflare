@@ -2878,6 +2878,9 @@ pub(crate) async fn owed_recompute(
     //     probe for the rest (counted per caller `owed`), the fresh memos written back; a hop past the budget keeps
     //     its last memo's word, named stale.
     let mut hop_chain: HashMap<String, crate::owed::HopChainWord> = HashMap::new();
+    // bsv-low #484 (delta fold, D-M1): the hops whose chain word is a "confirmed" taken inside the reorg grace; their
+    // payout rows are OPEN for the read's rule (`hops_view::mark_reorg_grace_rows`, step 7)
+    let mut grace_words: HashSet<String> = HashSet::new();
     let mut chain_spenders: Vec<String> = Vec::new();
     {
         let candidates: Vec<(String, u32)> = hops
@@ -2918,6 +2921,7 @@ pub(crate) async fn owed_recompute(
                 crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
                 crate::hops_view::reorg_clear_at(&memos),
             );
+            let reorg_clear = crate::hops_view::reorg_clear_at(&memos);
             let marker_at: HashMap<String, i64> = hops
                 .iter()
                 .filter_map(|h| h.marker_created_at.map(|c| (format!("{}.{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), c)))
@@ -2930,6 +2934,9 @@ pub(crate) async fn owed_recompute(
                 }
                 // the memo's age rides the word (the gate's L5): the newest memo for the key, as the split judged it
                 let age_ms = memos.iter().filter(|m| m.outpoint == format!("{t}.{v}")).map(|m| now_ms - m.probed_at_ms).min();
+                if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) {
+                    grace_words.insert(outpoint_key(&t, v));
+                }
                 hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, spent_confirmed: p.spent_confirmed, stale: false, age_ms });
             }
             let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
@@ -2944,7 +2951,8 @@ pub(crate) async fn owed_recompute(
                         if let Some(s) = m.spending_txid.as_deref() {
                             chain_spenders.push(s.to_ascii_lowercase());
                         }
-                        hop_chain.insert(key, crate::owed::HopChainWord { looked: true, spent: Some(m.spent), spending_txid: m.spending_txid.clone(), spent_confirmed: m.spent_confirmed, stale: true, age_ms: Some(now_ms - m.probed_at_ms) });
+                        // D-M1: a confirmed memo the grace refused its window is not served as confirmed
+                        hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));
                     }
                     continue;
                 }
@@ -2957,6 +2965,9 @@ pub(crate) async fn owed_recompute(
                 }
                 if let Some(s) = row.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
+                }
+                if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) {
+                    grace_words.insert(key.clone());
                 }
                 hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed, stale: false, age_ms: None });
             }
@@ -3385,6 +3396,7 @@ pub(crate) async fn owed_recompute(
     });
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
     crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
+    crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words);
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {
         rows.truncate(crate::owed::OWED_MAX_ROWS);

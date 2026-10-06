@@ -830,6 +830,56 @@ pub fn split_probe_targets_after_reorg(
     (answered, to_probe)
 }
 
+/// PURE (bsv-low #484, delta fold, D-M1): a word TAKEN at `taken_at_ms` (a memo's `probedAtMs`, or this walk's
+/// clock for a probe it just made) was taken inside the grace after the overlay's last reorg clear. No lower
+/// bound, as in [`split_probe_targets_after_reorg`].
+pub fn in_reorg_grace(taken_at_ms: i64, reorg_clear_at_ms: Option<i64>) -> bool {
+    reorg_clear_at_ms.is_some_and(|at| taken_at_ms < at.saturating_add(PROBE_MEMO_REORG_GRACE_MS))
+}
+
+/// PURE (D-M1): the chain rung said CONFIRMED and said it inside the grace: the word the owed list may serve but
+/// must ask again by the five-minute rule ([`mark_reorg_grace_rows`]).
+pub fn confirmed_in_reorg_grace(spent_confirmed: Option<bool>, taken_at_ms: i64, reorg_clear_at_ms: Option<i64>) -> bool {
+    spent_confirmed == Some(true) && in_reorg_grace(taken_at_ms, reorg_clear_at_ms)
+}
+
+/// PURE (D-M1, the budget half): THE WORD OF A HOP PAST THE WALK'S PROBE BUDGET, its last memo's, named stale.
+/// A CONFIRMED memo read inside the reorg grace has already been refused its window by the split (that is why the
+/// hop is here and not among the answered), so its confirmation is NOT served: the word keeps the spend and the
+/// spender and says nothing of the block (`spent_confirmed: None`), and the row reads "not mined yet" until a
+/// probe says otherwise. It used to ride with `spent_confirmed` intact, and `owed::swept_home` reads that field
+/// and never `stale`: with more candidates than the budget (after a clear every confirmed hop of an identity is
+/// one) a row stayed `claimable: true` on the refused word until the rotation reached it, several walks on.
+/// Any other memo is served as before.
+pub fn stale_memo_word(m: &ProbeMemo, now_ms: i64, reorg_clear_at_ms: Option<i64>) -> crate::owed::HopChainWord {
+    let refused = m.spent && confirmed_in_reorg_grace(m.spent_confirmed, m.probed_at_ms, reorg_clear_at_ms);
+    crate::owed::HopChainWord {
+        looked: true,
+        spent: Some(m.spent),
+        spending_txid: m.spending_txid.clone(),
+        spent_confirmed: if refused { None } else { m.spent_confirmed },
+        stale: true,
+        age_ms: Some(now_ms - m.probed_at_ms),
+    }
+}
+
+/// The owed row fact [`mark_reorg_grace_rows`] writes and `owed::row_is_open` reads.
+pub const OWED_FACT_REORG_GRACE_WORD: &str = "chainWordInReorgGrace";
+
+/// PURE (D-M1, the cadence half): a PAYOUT row whose hop's chain word was a "confirmed" taken inside the reorg
+/// grace (`grace_words`: the hop outpoints, `txid:vout`, the walk judged with [`confirmed_in_reorg_grace`]) carries
+/// [`OWED_FACT_REORG_GRACE_WORD`], which makes it an OPEN row for the read's rule: its list is re-derived after
+/// five minutes, not fifteen. A courier behind the reorg answers "confirmed", the row says `claimable: true`, and
+/// the walk that re-derives it finds the memo past its short window and asks again (or, past the budget, serves
+/// [`stale_memo_word`]). A row whose word was taken at or after the grace's end is not marked: the normal rule.
+/// The fact is set on every such payout whatever made it claimable (the index's own proof outranks the word and
+/// the row is right; marking it costs a recompute cadence for the grace, never a wrong word).
+pub fn mark_reorg_grace_rows(rows: &mut [crate::owed::OwedRow], grace_words: &std::collections::HashSet<String>) {
+    for r in rows.iter_mut().filter(|r| r.family == crate::owed::OwedFamily::Payout && grace_words.contains(&r.outpoint)) {
+        r.facts[OWED_FACT_REORG_GRACE_WORD] = json!(true);
+    }
+}
+
 /// PURE (bsv-low #469, the stranded cell's run 5): the order the OWED walk asks the outpoints no memo answered, under
 /// its per-recompute budget. Never probed first, the NEWEST marker first (a hop that just crossed the stranded window is
 /// the one a player is waiting on), then the expired memos OLDEST first (a round robin: every candidate gets its turn
@@ -2344,6 +2394,138 @@ mod tests {
         assert!(routes.contains(&squash(
             "crate::hops_view::split_probe_targets_after_reorg( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, crate::hops_view::reorg_clear_at(&memos), )"
         )));
+    }
+
+    /// bsv-low #484 (delta fold, D-M1): INSIDE THE GRACE A LAGGING COURIER'S "CONFIRMED" DRIVES `claimable: true`
+    /// FOR ONE FIVE-MINUTE RECOMPUTE, NOT FIFTEEN MINUTES AND NOT THE ROTATION. Through the real derivation
+    /// (`owed::derive_owed_rows`), the read's one rule (`owed::should_recompute`) and the walk's own words:
+    /// 1. the walk the clear's push triggers asks a courier behind the reorg; the row says `claimable: true` and is
+    ///    an OPEN row, so its list is re-derived after five minutes (it was a closed row: fifteen);
+    /// 2. that re-derivation finds the memo past its short window; past the probe budget the memo's word is served
+    ///    WITHOUT its confirmation and the row reads "not mined yet" (it rode with the confirmation intact and
+    ///    stayed claimable until the rotation reached it);
+    /// 3. past the grace a confirmed word is the normal rule again: a closed row, fifteen minutes, and a stale
+    ///    memo keeps its word; the index's own proof outranks the refused word throughout.
+    ///
+    /// To red: drop the grace clause from `owed::row_is_open`, or serve `m.spent_confirmed` in `stale_memo_word`.
+    #[test]
+    fn inside_the_reorg_grace_a_lagging_confirmed_word_is_claimable_for_one_five_minute_recompute() {
+        use crate::owed::{derive_owed_rows, outpoint_key, should_recompute, HopChainWord, OwedFamily, OwedInputs, OwedRow};
+        use std::collections::{HashMap, HashSet};
+        let t0: i64 = 1_800_000_000_000;
+        let min = 60_000i64;
+        let clear = Some(t0);
+        let me = format!("02{}", "aa".repeat(32));
+        let (hop_txid, sweep) = ("a1".repeat(32), "e5".repeat(32));
+        let key = outpoint_key(&hop_txid, 0);
+        // an index-unspent hop past the stranded window whose FILED sweep the chain rung names (the orphaned sweep)
+        let mut hop = index_unspent(&hop_txid, 0);
+        hop.marker_created_at = Some(t0 - 24 * 60 * min);
+        let hops = [hop];
+        let filing = |index_proven: bool| -> HashMap<String, crate::hopsweep::FiledHopSweep> {
+            HashMap::from([(key.clone(), crate::hopsweep::FiledHopSweep { sweep_txid: sweep.clone(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven, index_proof_height: None })])
+        };
+        let (none, no_refunds, no_spenders, no_inputs, no_pkhs) = (HashSet::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
+        // THE WALK'S STEP 7: derive over the chain word, then mark the rows whose word was a grace "confirmed"
+        let derive = |now_ms: i64, word: HopChainWord, grace_words: &HashSet<String>, index_proven: bool| -> OwedRow {
+            let chain = HashMap::from([(key.clone(), word)]);
+            let sweeps = filing(index_proven);
+            let mut rows = derive_owed_rows(&OwedInputs {
+                identity_lc: &me,
+                tip: Some(900_000),
+                now_ms,
+                results: &[],
+                refunds: &[],
+                hops: &hops,
+                valid_refunds: &no_refunds,
+                collected_verified: &none,
+                collected_present: &none,
+                pot_spenders: &none,
+                pot_spenders_faulted: false,
+                hop_chain: &chain,
+                hop_sweeps: &sweeps,
+                evicted_pots: &none,
+                evicted_hop_outpoints: &none,
+                spender_outputs: &no_spenders,
+                spender_inputs: &no_inputs,
+                courier_spenders: &none,
+                my_pkh_by_game: &no_pkhs,
+            });
+            mark_reorg_grace_rows(&mut rows, grace_words);
+            assert_eq!(rows.len(), 1);
+            rows.remove(0)
+        };
+        // a probe the walk makes at `now` (the fresh arm), and the hops it judges as grace words
+        let fresh = |confirmed: bool| HopChainWord { looked: true, spent: Some(true), spending_txid: Some(sweep.clone()), spent_confirmed: Some(confirmed), stale: false, age_ms: None };
+        let grace_of = |confirmed: Option<bool>, taken_at: i64| -> HashSet<String> {
+            if confirmed_in_reorg_grace(confirmed, taken_at, clear) { HashSet::from([key.clone()]) } else { HashSet::new() }
+        };
+        let recompute = |age_ms: i64, row: &OwedRow| should_recompute(false, age_ms, Some(900_000), Some(900_000), std::slice::from_ref(row));
+
+        // 1. FIVE SECONDS AFTER THE CLEAR: the courier behind the reorg says "confirmed"
+        let w1 = t0 + 5_000;
+        let row = derive(w1, fresh(true), &grace_of(Some(true), w1), false);
+        assert_eq!((row.family, row.facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)), "the lagging word is served, as it always was");
+        assert_eq!(row.facts[OWED_FACT_REORG_GRACE_WORD], true);
+        assert!(!recompute(4 * min, &row));
+        assert!(recompute(5 * min + 1, &row), "an OPEN row: re-derived by the five-minute rule, not left for fifteen");
+        // the memo that walk wrote
+        let memo = probe_memo_of(&hop_txid, 0, &ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(sweep.clone()), spent_confirmed: Some(true) }, w1).expect("a known answer is memoised");
+
+        // 2. THE RE-DERIVATION, six minutes on: the split refuses the memo its window (the lens fold's M2) ...
+        let w2 = w1 + 6 * min;
+        let target = [(hop_txid.clone(), 0u32)];
+        let (answered, to_probe) = split_probe_targets_after_reorg(&target, std::slice::from_ref(&memo), w2, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, clear);
+        assert!(answered.is_empty() && to_probe.len() == 1, "asked again");
+        // ... and PAST THE PROBE BUDGET the memo's word is served without the confirmation the grace refused
+        let stale = stale_memo_word(&memo, w2, clear);
+        assert_eq!((stale.stale, stale.spent, stale.spent_confirmed, stale.age_ms), (true, Some(true), None, Some(6 * min)));
+        let row = derive(w2, stale.clone(), &grace_of(stale.spent_confirmed, memo.probed_at_ms), false);
+        assert_eq!(row.facts["claimable"], false, "NOT claimable on a word the grace refused");
+        assert_eq!(row.facts["claimReason"], crate::owed::UNCONFIRMED_PAYOUT_REASON);
+        assert!(recompute(5 * min + 1, &row), "and open, so the walk comes back for it");
+        // asked again within the budget, the courier has caught up: not mined
+        let row = derive(w2, fresh(false), &grace_of(Some(false), w2), false);
+        assert_eq!(row.facts["claimable"], false);
+        // still behind: the same one-recompute word, never a longer one
+        let row = derive(w2, fresh(true), &grace_of(Some(true), w2), false);
+        assert!(row.facts["claimable"] == true && recompute(5 * min + 1, &row));
+        // a memo answering inside its short window (a recompute a push triggered two minutes on) is the same word
+        let (answered, _) = split_probe_targets_after_reorg(&target, std::slice::from_ref(&memo), w1 + 2 * min, PROBE_MEMO_MAX_AGE_MS, PROBE_MEMO_CONFIRMED_MAX_AGE_MS, clear);
+        assert_eq!(answered.len(), 1);
+        assert!(confirmed_in_reorg_grace(answered[0].2.spent_confirmed, memo.probed_at_ms, clear), "judged by when it was read");
+        // the index's own verified proof outranks the refused word (untouched: `owed::swept_home`)
+        let row = derive(w2, stale, &HashSet::new(), true);
+        assert_eq!((row.facts["claimable"].as_bool(), row.facts["confirmedSource"].as_str()), (Some(true), Some("index-proof")));
+
+        // 3. PAST THE GRACE: the normal rule
+        let w3 = t0 + PROBE_MEMO_REORG_GRACE_MS;
+        assert!(in_reorg_grace(w3 - 1, clear) && !in_reorg_grace(w3, clear) && !in_reorg_grace(w1, None));
+        let row = derive(w3, fresh(true), &grace_of(Some(true), w3), false);
+        assert_eq!(row.facts["claimable"], true);
+        assert!(row.facts[OWED_FACT_REORG_GRACE_WORD].is_null());
+        assert!(!recompute(5 * min + 1, &row), "a closed row again");
+        assert!(recompute(15 * min + 1, &row), "the fifteen-minute rule");
+        let late = ProbeMemo { probed_at_ms: w3, ..memo.clone() };
+        assert_eq!(stale_memo_word(&late, w3 + 3 * 60 * min, clear).spent_confirmed, Some(true), "a memo read past the grace keeps its word when stale, as before");
+        assert_eq!(stale_memo_word(&memo, w2, None).spent_confirmed, Some(true), "no reorg: as before");
+        let unconfirmed = ProbeMemo { spent_confirmed: Some(false), ..memo.clone() };
+        assert_eq!(stale_memo_word(&unconfirmed, w2, clear).spent_confirmed, Some(false), "only a confirmation is refused");
+
+        // THE WALK USES THESE WORDS (source): the three arms and the mark before the write
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = include_str!("routes.rs");
+        let routes = squash(&code_only(&routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())]));
+        for needle in [
+            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos);",
+            "if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) { grace_words.insert(outpoint_key(&t, v)); }",
+            "hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));",
+            "if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) { grace_words.insert(key.clone()); }",
+            "crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words); sort_rows_for_service(&mut rows);",
+        ] {
+            assert!(routes.contains(&squash(needle)), "the owed walk no longer runs: {needle}");
+        }
     }
 
     /// bsv-low #451 slice C: the memo split — fresh answers, stale/missing/future asked, a fault never remembered.

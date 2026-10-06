@@ -35,10 +35,17 @@
 //!    sweep never deletes it (a memo read in the grace's last minute is still inside its two hours when the
 //!    tombstone would age out).
 //!
-//! Residual, stated: the word a recompute reads FRESH from a courier is served by that recompute as it always
-//! was (a courier behind the reorg says "confirmed" and the row says "ready to collect" until the next walk
-//! asks again, at most the short window later; a wrong word and a failing press, never sats), and a hop past
-//! the walk's probe budget keeps its last memo's word, named stale. The memo's age rides the row
+//! Residual, stated with the read rule's numbers (the delta lens's D-M1, 2026-10-06): the word a recompute
+//! reads FRESH from a courier is served by that recompute as it always was. A courier behind the reorg says
+//! "confirmed" and the row says "ready to collect"; inside the grace that payout is an OPEN row for the owed
+//! read's rule (`low-app-layer` `hops_view::mark_reorg_grace_rows`, `owed::row_is_open`), so its list is
+//! re-derived after five minutes, on the read that finds it that old (it was a closed row: fifteen minutes),
+//! and that walk asks again. A memo that answers a walk inside its short window re-serves the word, so one
+//! lagging answer can stand for under ten minutes plus that read in the worst interleaving (a walk at the
+//! memo's fifth minute, its list re-derived five minutes later), five plus the read in the plain one. A hop
+//! past the walk's probe budget keeps its last memo's word, named stale, EXCEPT a confirmed memo read inside
+//! the grace, whose confirmation is not served (`hops_view::stale_memo_word`: the row reads "not mined yet").
+//! Always a wrong word and a failing press, never sats. The memo's age rides the row
 //! (`facts.chainProbeAgeMs`).
 use worker::wasm_bindgen::JsValue;
 use worker::{console_log, D1Database};
