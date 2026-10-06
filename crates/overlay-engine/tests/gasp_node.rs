@@ -36,7 +36,7 @@ impl TopicManager for AdmitAllTM {
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions {
             outputs_to_admit: vec![0],

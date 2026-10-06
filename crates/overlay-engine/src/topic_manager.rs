@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bsv_rs::transaction::Transaction;
 
 use crate::types::{
-    AdmissionOptions, AdmittanceInstructions, Outpoint, ServiceMetadata, SubmitMode,
+    AdmittanceInstructions, Outpoint, ServiceMetadata, SubmitMode, TopicAdmittanceContext,
 };
 
 /// Validates transactions and decides which outputs to admit into a topic.
@@ -38,7 +38,8 @@ pub trait TopicManager {
     ///   the transaction (not on-chain).
     /// - `mode` — Submission mode: CurrentTx (broadcast + SPV), HistoricalTx
     ///   (no broadcast), HistoricalTxNoSpv (GASP sync).
-    /// - `options`: the reference's fifth argument. `options.dry_run` is
+    /// - `context`: the reference's fifth argument (`context?:
+    ///   TopicAdmittanceContext`, `dryRun`). `context.dry_run` is
     ///   `true` when the engine only asks what WOULD be admitted and admits
     ///   nothing on this call: the GASP walk asks it of every proven node a
     ///   peer sends, and the anchor check replays a peer's whole graph that
@@ -61,7 +62,7 @@ pub trait TopicManager {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        options: &AdmissionOptions,
+        context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError>;
 
     /// Identify which inputs are needed to validate this transaction for GASP sync.
@@ -128,7 +129,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
-            _options: &AdmissionOptions,
+            _context: &TopicAdmittanceContext,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions {
                 outputs_to_admit: vec![0, 1, 2],
@@ -161,7 +162,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
-            _options: &AdmissionOptions,
+            _context: &TopicAdmittanceContext,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions::default())
         }
@@ -187,7 +188,7 @@ mod tests {
                 &[],
                 None,
                 SubmitMode::CurrentTx,
-                &AdmissionOptions::default(),
+                &TopicAdmittanceContext::default(),
             )
             .await
             .unwrap();
@@ -204,7 +205,7 @@ mod tests {
                 &[],
                 None,
                 SubmitMode::CurrentTx,
-                &AdmissionOptions::default(),
+                &TopicAdmittanceContext::default(),
             )
             .await
             .unwrap();
@@ -240,7 +241,7 @@ mod tests {
                 &[],
                 None,
                 SubmitMode::HistoricalTx,
-                &AdmissionOptions::default(),
+                &TopicAdmittanceContext::default(),
             )
             .await
             .unwrap();

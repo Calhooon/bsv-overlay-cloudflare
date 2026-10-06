@@ -45,7 +45,7 @@ use crate::gasp::{GASPError, GASPStorage};
 use crate::storage::Storage;
 use crate::topic_manager::TopicManager;
 use crate::types::{
-    AdmissionOptions, GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode,
+    GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode, TopicAdmittanceContext,
 };
 
 /// A GASP node stored during in-progress graph construction.
@@ -594,7 +594,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     &[],
                     node.tx_metadata.as_deref().map(str::as_bytes),
                     SubmitMode::HistoricalTx,
-                    &AdmissionOptions::DRY_RUN,
+                    &TopicAdmittanceContext::DRY_RUN,
                 )
                 .await
                 .map_err(|e| GASPError::Other(e.to_string()))?;
@@ -951,7 +951,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     &previous_coins,
                     None,
                     SubmitMode::HistoricalTx,
-                    &AdmissionOptions::DRY_RUN,
+                    &TopicAdmittanceContext::DRY_RUN,
                 )
                 .await
                 .map_err(|e| unavailable(format!("the topic manager failed on {txid}: {e}")))?;

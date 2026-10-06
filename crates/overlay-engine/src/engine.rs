@@ -762,7 +762,7 @@ impl Engine {
     /// mutations are applied via a queue consumer or `ctx.wait_until()`.
     ///
     /// The topic managers are called with `dry_run: true`
-    /// (`AdmissionOptions::DRY_RUN`): nothing is admitted on this call, so a
+    /// (`TopicAdmittanceContext::DRY_RUN`): nothing is admitted on this call, so a
     /// manager that writes on admission leaves no trace of it.
     pub async fn submit_validate_only(
         &self,
@@ -773,7 +773,7 @@ impl Engine {
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
         let (_validations, steak, _tx, _txid) = self
-            .run_validation(tagged_beef, mode, &AdmissionOptions::DRY_RUN)
+            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::DRY_RUN)
             .await?;
         Ok(steak)
     }
@@ -829,7 +829,7 @@ impl Engine {
     ) -> Result<(Steak, MutationReport), EngineError> {
         // A submit is a real admission, never a dry run.
         let (validations, mut steak, tx, txid) = self
-            .run_validation(tagged_beef, mode, &AdmissionOptions::default())
+            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::default())
             .await?;
         let mut report = MutationReport::default();
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
@@ -1533,7 +1533,7 @@ impl Engine {
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
-        options: &AdmissionOptions,
+        context: &TopicAdmittanceContext,
     ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
@@ -1662,8 +1662,9 @@ impl Engine {
                         .collect::<Vec<u8>>(),
                     tagged_beef.off_chain_values.as_deref(),
                     mode,
-                    // `false` on a submit, `true` on a validate-only call.
-                    options,
+                    // `dry_run` is `false` on a submit, `true` on a
+                    // validate-only call.
+                    context,
                 )
                 .await
             {
@@ -3852,7 +3853,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
-            _options: &AdmissionOptions,
+            _context: &TopicAdmittanceContext,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions {
                 outputs_to_admit: self.admit_indices.clone(),
@@ -4047,7 +4048,7 @@ mod tests {
                 _previous_coins: &[u8],
                 _off_chain_values: Option<&[u8]>,
                 _mode: SubmitMode,
-                _options: &AdmissionOptions,
+                _context: &TopicAdmittanceContext,
             ) -> Result<AdmittanceInstructions, TopicManagerError> {
                 *self.0.borrow_mut() = Some(tx.id());
                 Ok(AdmittanceInstructions {

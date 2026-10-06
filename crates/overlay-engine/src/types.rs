@@ -187,16 +187,17 @@ pub enum SyncTarget {
 // Submit mode
 // ============================================================================
 
-/// Options of one `TopicManager::identify_admissible_outputs` call: the
-/// reference's fifth argument (`TopicAdmittanceContext`, ts-stack
-/// `packages/overlays/overlay/src/TopicManager.ts`).
+/// The context of one `TopicManager::identify_admissible_outputs` call: the
+/// reference's fifth argument, under its name (`context?:
+/// TopicAdmittanceContext`, ts-stack
+/// `packages/overlays/overlay/src/TopicManager.ts` at `f999e0c1a`).
 ///
-/// `#[non_exhaustive]`: build it from `AdmissionOptions::default()` (a real
-/// admission) or `AdmissionOptions::DRY_RUN`, so a later option is not a
-/// breaking change for a manager.
+/// `#[non_exhaustive]`: build it from `TopicAdmittanceContext::default()` (a
+/// real admission) or `TopicAdmittanceContext::DRY_RUN`, so a later field is
+/// not a breaking change for a manager.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct AdmissionOptions {
+pub struct TopicAdmittanceContext {
     /// `true`: the engine is only ASKING what the manager would admit (the
     /// GASP walk over a peer's node, the anchor replay of a peer's graph) and
     /// nothing is admitted on this call. The manager must leave NO durable
@@ -208,8 +209,8 @@ pub struct AdmissionOptions {
     pub dry_run: bool,
 }
 
-impl AdmissionOptions {
-    /// The options of a dry run (`dry_run: true`).
+impl TopicAdmittanceContext {
+    /// The context of a dry run (`dry_run: true`).
     pub const DRY_RUN: Self = Self { dry_run: true };
 }
 

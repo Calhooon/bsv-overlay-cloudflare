@@ -171,7 +171,7 @@ impl TopicManager for HeadChainManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx {
             assert!(tx.merkle_path.is_some(), "the dry run carries the proof");
@@ -383,7 +383,7 @@ impl TopicManager for DefaultInputsManager {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions::default())
     }
@@ -510,7 +510,7 @@ impl TopicManager for ProbeManager {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.admissions.borrow_mut().push(AdmissionCall {
             txid: tx.id(),
@@ -1006,7 +1006,7 @@ impl TopicManager for DecoyHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         // The same rule in every mode (bsv-low #551): the anchor replay runs
         // it under `historical-tx` with the coins of its own set.
@@ -1597,7 +1597,7 @@ impl TopicManager for AdmitsOutputZero {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTxNoSpv {
             self.0.borrow_mut().admitted.push(tx.id());
@@ -2007,7 +2007,7 @@ impl TopicManager for RetainingHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx && !previous_coins.is_empty() {
             self.replay
@@ -2530,7 +2530,7 @@ impl TopicManager for RecordedHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let extends_head = previous_coins
             .chunks_exact(4)
@@ -2998,7 +2998,7 @@ async fn i552_f_one_graph_deeper_than_the_budget_is_dropped_whole_every_tick() {
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-struct OptionsCall {
+struct ContextCall {
     txid: String,
     mode: SubmitMode,
     dry_run: bool,
@@ -3006,15 +3006,15 @@ struct OptionsCall {
 
 #[derive(Default)]
 struct HeadLedger {
-    // Every admission call, in order, with the options it carried.
-    calls: Vec<OptionsCall>,
+    // Every admission call, in order, with the context it carried.
+    calls: Vec<ContextCall>,
     // The manager's own durable state: the head, and every advance of it.
     head: Option<String>,
-    advances: Vec<OptionsCall>,
+    advances: Vec<ContextCall>,
 }
 
 // A STATEFUL manager over the rule of `M`: it records every call with its
-// options, and when the rule admits it ADVANCES ITS HEAD, unless the call is
+// context, and when the rule admits it ADVANCES ITS HEAD, unless the call is
 // a dry run.
 struct StatefulHead<M> {
     rule: M,
@@ -3029,19 +3029,19 @@ impl<M: TopicManager> TopicManager for StatefulHead<M> {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        options: &AdmissionOptions,
+        context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
-        let call = OptionsCall {
+        let call = ContextCall {
             txid: tx.id(),
             mode,
-            dry_run: options.dry_run,
+            dry_run: context.dry_run,
         };
         self.ledger.borrow_mut().calls.push(call.clone());
         let admittance = self
             .rule
-            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, options)
+            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, context)
             .await?;
-        if !admittance.outputs_to_admit.is_empty() && !options.dry_run {
+        if !admittance.outputs_to_admit.is_empty() && !context.dry_run {
             let mut ledger = self.ledger.borrow_mut();
             ledger.head = Some(call.txid.clone());
             ledger.advances.push(call);
@@ -3071,8 +3071,8 @@ impl<M: TopicManager> TopicManager for StatefulHead<M> {
 // What one sync of a chain must ask, in order: the walk's dry run of every
 // proven node (tip to genesis), the anchor replay's dry run of every ordered
 // BEEF (genesis to tip), then one real admission per finalize submit.
-fn expected_calls(nodes: &[GASPNode]) -> (Vec<OptionsCall>, Vec<OptionsCall>) {
-    let call = |node: &GASPNode, mode, dry_run| OptionsCall {
+fn expected_calls(nodes: &[GASPNode]) -> (Vec<ContextCall>, Vec<ContextCall>) {
+    let call = |node: &GASPNode, mode, dry_run| ContextCall {
         txid: node_txid(node),
         mode,
         dry_run,
@@ -3169,11 +3169,15 @@ async fn dryrun_b_a_graph_the_anchor_check_refuses_never_moves_the_head() {
     println!("dry-run PIN B: 5 dry runs on a fabricated BUMP, 0 advances, 0 admitted");
 }
 
-// PIN C. The options themselves: a real admission by default, and the one
+// PIN C. The context itself: a real admission by default, and the one
 // constant of a dry run.
 #[test]
 fn dryrun_c_the_default_is_a_real_admission() {
-    let dry_runs = [AdmissionOptions::default(), AdmissionOptions::DRY_RUN].map(|o| o.dry_run);
+    let dry_runs = [
+        TopicAdmittanceContext::default(),
+        TopicAdmittanceContext::DRY_RUN,
+    ]
+    .map(|o| o.dry_run);
     assert_eq!(dry_runs, [false, true]);
 }
 
@@ -3540,10 +3544,10 @@ impl<M: TopicManager> TopicManager for NotNow<M> {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        options: &AdmissionOptions,
+        context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let this_call = if self.in_replay {
-            options.dry_run && !previous_coins.is_empty()
+            context.dry_run && !previous_coins.is_empty()
         } else {
             mode == SubmitMode::HistoricalTxNoSpv
         };
@@ -3551,7 +3555,7 @@ impl<M: TopicManager> TopicManager for NotNow<M> {
             return Err(TopicManagerError::Other("the head lags: not now".into()));
         }
         self.rule
-            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, options)
+            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, context)
             .await
     }
 

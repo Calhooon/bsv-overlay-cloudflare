@@ -193,10 +193,11 @@ gasp_topic_manager i551` (and `fold_medium`).
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
 `TopicManager::identify_admissible_outputs` takes the reference's fifth
-argument, `options: &AdmissionOptions` (`types.rs`; the reference's
-`TopicAdmittanceContext { dryRun }`). The two GASP calls pass
-`AdmissionOptions::DRY_RUN`: the needed-input walk over every proven node of a
-peer (`find_needed_inputs`) and the anchor replay of #551
+argument under the reference's own name, `context: &TopicAdmittanceContext`
+(`types.rs`; the reference's `context?: TopicAdmittanceContext`, `dryRun`).
+The two GASP calls pass `TopicAdmittanceContext::DRY_RUN`: the needed-input
+walk over every proven node of a peer (`find_needed_inputs`) and the anchor
+replay of #551
 (`validate_graph_anchor`). `Engine::submit` passes `dry_run: false` (the queue
 replay, `/submit`, `/arc-ingest`, the peer crawler and the GASP finalize all go
 through it), and `Engine::submit_validate_only`, the only other caller, passes

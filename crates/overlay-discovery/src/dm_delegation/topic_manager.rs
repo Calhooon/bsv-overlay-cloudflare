@@ -8,7 +8,7 @@ use bsv_rs::script::templates::PushDrop;
 use bsv_rs::transaction::Transaction;
 use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
 use overlay_engine::types::{
-    AdmissionOptions, AdmittanceInstructions, ServiceMetadata, SubmitMode,
+    AdmittanceInstructions, ServiceMetadata, SubmitMode, TopicAdmittanceContext,
 };
 use tracing::{debug, warn};
 
@@ -45,7 +45,7 @@ impl TopicManager for DmDelegationTopicManager {
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
         // Pure: this manager holds no state, so a dry run is the same work.
-        _options: &AdmissionOptions,
+        _context: &TopicAdmittanceContext,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
 
