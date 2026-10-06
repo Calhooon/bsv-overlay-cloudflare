@@ -884,7 +884,17 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         // bsv-low #436: the pot-changed flush's losses read 0 until one happens (the app layer writes the third).
         crate::pot_changes::COUNTER_POT_CHANGED_UNDELIVERED,
         crate::pot_changes::COUNTER_POT_CHANGED_DEFERRED,
-        "pot_changed_dropped_total",
+        crate::pot_changes::COUNTER_POT_CHANGED_RETRIED,
+        crate::pot_changes::COUNTER_POT_CHANGED_DROPPED,
+        // the lens fold: the hop-changed and lobby-changed flushes keep the same account
+        crate::hop_changes::COUNTER_HOP_CHANGED_UNDELIVERED,
+        crate::hop_changes::COUNTER_HOP_CHANGED_DEFERRED,
+        crate::hop_changes::COUNTER_HOP_CHANGED_RETRIED,
+        crate::hop_changes::COUNTER_HOP_CHANGED_DROPPED,
+        crate::lobby_changes::COUNTER_LOBBY_CHANGED_UNDELIVERED,
+        crate::lobby_changes::COUNTER_LOBBY_CHANGED_DEFERRED,
+        crate::lobby_changes::COUNTER_LOBBY_CHANGED_RETRIED,
+        crate::lobby_changes::COUNTER_LOBBY_CHANGED_DROPPED,
     ] {
         obj[name] = json!(0);
     }

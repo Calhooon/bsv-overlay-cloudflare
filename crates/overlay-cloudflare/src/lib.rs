@@ -12,6 +12,7 @@ pub mod arcade_reorg;
 pub mod ban_storage;
 pub mod broadcaster;
 pub mod chain_tracker;
+pub mod change_flush;
 pub mod d1;
 pub mod d1_discovery;
 pub mod d1_storage;
@@ -410,8 +411,8 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
         _ => not_found(),
     };
 
-    // bsv-low #523 (M26): the dispatch's ONE exit ships whatever pot (and hop, and lobby) rows this request
-    // changed, off the critical path. The routes that already flush have drained the set (a no-op here); the
+    // bsv-low #523 (M26): the dispatch's ONE exit ships whatever pot (and hop, via the pot flush, and lobby) rows
+    // this request changed, off the critical path. The routes that already flush have drained the set (a no-op here); the
     // ones that never did (`/admin/complete-proofs` confirmed a tower-broadcast refund's spend and pushed
     // nothing, `/admin/readmit`'s discovery, a `/lookup` whose serve-time rung latches a spend) ride this one.
     crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));

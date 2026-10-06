@@ -2446,9 +2446,26 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
-    let identities = crate::internal_events::parse_hop_changed(&raw);
+    let (identities, dropped) = crate::internal_events::parse_hop_changed_counted(&raw);
     if identities.is_empty() {
         return Response::error("body must be {\"identities\":[\"02…\"]}", 400);
+    }
+    // bsv-low #436 (lens fold): the overlay chunks its flush at `HOP_CHANGED_MAX`, so nothing is over the cap from
+    // our own producer. A body that still carries more is never trimmed silently: logged, counted, and answered.
+    if dropped > 0 {
+        console_warn!(
+            "[hop-changed] body carried {} identity(ies) past the cap of {}: {dropped} NOT marked stale and NOT re-derived (the producer must chunk)",
+            identities.len() + dropped,
+            crate::internal_events::HOP_CHANGED_MAX
+        );
+        let counter_db = env.d1("OVERLAY_DB").ok();
+        ctx.wait_until(async move {
+            crate::courier::flush(
+                counter_db,
+                vec![(crate::internal_events::COUNTER_HOP_CHANGED_DROPPED.to_string(), dropped as u64)],
+            )
+            .await;
+        });
     }
     let db = env.d1("OVERLAY_DB")?;
     for id in &identities {
@@ -2463,7 +2480,7 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
             owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip).await;
         }
     });
-    json_response(serde_json::json!({ "ok": true, "identities": identities }).to_string(), 200)
+    json_response(serde_json::json!({ "ok": true, "identities": identities, "dropped": dropped }).to_string(), 200)
 }
 
 /// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The

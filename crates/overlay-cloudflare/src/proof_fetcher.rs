@@ -1715,7 +1715,8 @@ async fn discover_spend_for_row(
         Ok(()) => {
             summary.discovered += 1;
             // bsv-low #523 (M26): a spend this pass DISCOVERED is a pot change in this pass (the spender came
-            // from outside our own broadcast); the caller's flush ships it (`pot_changes`)
+            // from outside our own broadcast); the caller's flush ships it (`pot_changes`). `D1PotStorage` notes
+            // the same write (the set dedupes): the pass's own note makes the rule hold over any storage.
             crate::pot_changes::note(&rec.txid, rec.output_index);
             if via_script {
                 summary.by_script += 1;
