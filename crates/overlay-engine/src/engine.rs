@@ -695,7 +695,8 @@ impl Engine {
         beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<WalkStats, EngineError> {
-        self.verify_beef_linear_with(
+        Self::verify_beef_linear_with(
+            self.chain_tracker.as_deref(),
             beef_bytes,
             subject_txid,
             WalkPolicy {
@@ -1087,11 +1088,12 @@ impl Engine {
     /// its memory on beta (zanaadu, 2026-09-08). A map keyed by txid is what the
     /// TypeScript SDK effectively has (its inputs share one object), in O(n).
     async fn verify_beef_linear(
-        &self,
+        chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<(), EngineError> {
-        self.verify_beef_linear_with(
+        Self::verify_beef_linear_with(
+            chain_tracker,
             beef_bytes,
             subject_txid,
             WalkPolicy {
@@ -1110,8 +1112,12 @@ impl Engine {
     /// structural faults become [`EngineError::ScriptWalkInconclusive`] and a
     /// bound breach [`EngineError::ScriptWalkOverBudget`], each naming whether
     /// the subject was judged; without one they are `SpvError`, as before.
+    ///
+    /// The tracker is an ARGUMENT, not `self`'s: the GASP anchor check
+    /// ([`verify_spv_like_the_reference`]) runs this same walk from
+    /// `OverlayGASPStorage`, which borrows the engine's tracker.
     async fn verify_beef_linear_with(
-        &self,
+        chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
         subject_txid: &str,
         policy: WalkPolicy,
@@ -1180,7 +1186,7 @@ impl Engine {
                 let root = mp
                     .compute_root(Some(&txid))
                     .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
-                if let Some(tracker) = self.chain_tracker.as_deref() {
+                if let Some(tracker) = chain_tracker {
                     match tracker
                         .is_valid_root_for_height(&root, mp.block_height)
                         .await
@@ -1433,8 +1439,11 @@ impl Engine {
     /// [`Engine::set_script_verification`] `false` escape hatch: BEEF
     /// structural validity plus every root against the chain tracker, and
     /// NOTHING when no tracker is configured. It never executes a script.
-    async fn verify_spv_structurally(&self, beef_bytes: &[u8]) -> Result<(), EngineError> {
-        let Some(chain_tracker) = self.chain_tracker.as_deref() else {
+    async fn verify_spv_structurally(
+        chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+        beef_bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        let Some(chain_tracker) = chain_tracker else {
             return Ok(());
         };
         let mut beef = Beef::from_binary(beef_bytes)
@@ -1494,15 +1503,23 @@ impl Engine {
         let txid = tx.id();
 
         // SPV verification, skipped ONLY for HistoricalTxNoSpv, exactly the
-        // reference's `if (mode !== 'historical-tx-no-spv') tx.verify(...)`
-        // (that mode exists for GASP `finalizeGraph`, whose graphs
-        // `validateGraphAnchor` already verified).
+        // reference's `if (mode !== 'historical-tx-no-spv') tx.verify(...)`.
+        // That mode exists for GASP `finalizeGraph`, whose graphs
+        // `validateGraphAnchor` already verified, and since bsv-low #551 that
+        // is TRUE here: `OverlayGASPStorage::validate_graph_anchor` runs this
+        // same check ([`verify_spv_like_the_reference`], the same tracker and
+        // the same switch) over the ROOT node's BEEF and replays the graph
+        // through the topic manager before a single BEEF of it reaches this
+        // door. Before #551 the anchor check was a no-op and this skip
+        // admitted a peer's graph on structure alone.
         if mode != SubmitMode::HistoricalTxNoSpv {
-            if self.verify_scripts {
-                self.verify_beef_linear(&tagged_beef.beef, &txid).await?;
-            } else {
-                self.verify_spv_structurally(&tagged_beef.beef).await?;
-            }
+            verify_spv_like_the_reference(
+                self.chain_tracker.as_deref(),
+                self.verify_scripts,
+                &tagged_beef.beef,
+                &txid,
+            )
+            .await?;
         }
 
         let mut steak = Steak::new();
@@ -3036,6 +3053,7 @@ impl Engine {
 
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
+            let mut discarded_graphs: u64 = 0;
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -3086,9 +3104,17 @@ impl Engine {
                     // Create storage adapter and remote
                     let mut gasp_storage =
                         OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone())
-                            .with_strict_beef(hydration_on);
+                            .with_strict_beef(hydration_on)
+                            .with_script_verification(self.verify_scripts);
                     if let Some(manager) = self.managers.get(topic) {
                         gasp_storage = gasp_storage.with_topic_manager(manager.as_ref());
+                    }
+                    // bsv-low #551: the anchor check verifies each graph's
+                    // root against THIS engine's tracker, with this engine's
+                    // script switch, before finalize. No tracker is the
+                    // reference's 'scripts only'.
+                    if let Some(tracker) = self.chain_tracker.as_deref() {
+                        gasp_storage = gasp_storage.with_chain_tracker(tracker);
                     }
                     let gasp_remote = factory.create_remote(peer_url, topic);
 
@@ -3126,6 +3152,11 @@ impl Engine {
                     // Summed over peers: one decoy seen through two peers
                     // counts twice.
                     pruned_inputs += sync.pruned_inputs();
+                    // bsv-low #551: graphs the anchor check refused. Counted
+                    // apart from `errors` for the same reason as a prune: a
+                    // refused graph is not a failed sync (the reference
+                    // discards it and carries on).
+                    discarded_graphs += sync.discarded_graphs();
                     match sync_outcome {
                         None => {
                             let budget_ms = self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
@@ -3143,6 +3174,17 @@ impl Engine {
                                 .drain(..)
                                 .collect();
 
+                            // Each graph here passed the anchor check: its
+                            // root verified and the replay admitted it, so
+                            // these submits rest on a checked premise and are
+                            // not expected to fail. If one does (a storage
+                            // fault), the REST OF THAT GRAPH is not submitted:
+                            // the reference's `finalizeGraph` awaits each
+                            // submit in order and its throw ends the loop
+                            // (the BEEFs already submitted stay, it has no
+                            // rollback either). A later BEEF would otherwise
+                            // be judged without the coin its ancestor failed
+                            // to leave. Other graphs carry on.
                             let mut any_submitted = false;
                             for graph in &finalized {
                                 for beef_bytes in &graph.beefs {
@@ -3153,10 +3195,13 @@ impl Engine {
                                     match self.submit(&tagged, SubmitMode::HistoricalTxNoSpv).await
                                     {
                                         Ok(_) => any_submitted = true,
-                                        Err(e) => warn!(
-                                            "[GASP SYNC] Failed to submit BEEF for topic {}: {e}",
-                                            graph.topic
-                                        ),
+                                        Err(e) => {
+                                            warn!(
+                                                "[GASP SYNC] Failed to submit BEEF for topic {}: {e}; the rest of its graph is not submitted",
+                                                graph.topic
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -3225,6 +3270,7 @@ impl Engine {
                     sync_type,
                     errors,
                     pruned_inputs,
+                    discarded_graphs,
                 },
             );
         }
@@ -3303,6 +3349,31 @@ impl Engine {
     }
 }
 
+/// The SPV check of [`Engine::submit`], as one function over a BORROWED
+/// tracker: the reference's `tx.verify(chainTracker)` (roots against the
+/// tracker, every unproven input's script executed, the value rule), its
+/// `tx.verify('scripts only')` when `chain_tracker` is `None` (roots accepted
+/// unchecked, scripts still run), and the pre-2026-09-08 structural check when
+/// `verify_scripts` is `false` ([`Engine::set_script_verification`]'s escape
+/// hatch).
+///
+/// There is ONE verifier. `Engine::submit` calls this with its own tracker
+/// and switch; the GASP anchor check
+/// (`OverlayGASPStorage::validate_graph_anchor`, bsv-low #551) calls it with
+/// the same two, handed over by `Engine::start_gasp_sync`.
+pub(crate) async fn verify_spv_like_the_reference(
+    chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+    verify_scripts: bool,
+    beef_bytes: &[u8],
+    subject_txid: &str,
+) -> Result<(), EngineError> {
+    if verify_scripts {
+        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid).await
+    } else {
+        Engine::verify_spv_structurally(chain_tracker, beef_bytes).await
+    }
+}
+
 /// Result of a GASP sync operation.
 ///
 /// Returned by `Engine::start_gasp_sync()` to summarize what happened.
@@ -3332,6 +3403,12 @@ pub struct TopicSyncResult {
     /// graphs completed without those branches.
     #[serde(default)]
     pub pruned_inputs: u64,
+    /// Graphs the anchor check REFUSED and discarded whole (bsv-low #551,
+    /// `GASPSync::discarded_graphs`): a root whose BEEF does not verify, or
+    /// one the topic manager does not admit at the end of the replay. Summed
+    /// over this topic's peers. Not errors, and nothing of them was admitted.
+    #[serde(default)]
+    pub discarded_graphs: u64,
 }
 
 /// Get current time in milliseconds (for output scores).
@@ -5060,6 +5137,7 @@ mod tests {
                 sync_type: "ship".to_string(),
                 errors: vec![],
                 pruned_inputs: 0,
+                discarded_graphs: 0,
             },
         );
 

@@ -173,15 +173,16 @@ impl TopicManager for HeadChainManager {
         mode: SubmitMode,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx {
-            assert!(previous_coins.is_empty(), "GASP admission is a dry run");
             assert!(tx.merkle_path.is_some(), "the dry run carries the proof");
         }
         // The engine encodes the reference's previousCoins: number[] as
-        // little-endian u32 input indices. Finalize must supply the first input.
-        let extends_head = mode == SubmitMode::HistoricalTxNoSpv
-            && previous_coins
-                .chunks_exact(4)
-                .any(|index| u32::from_le_bytes(index.try_into().unwrap()) == 0);
+        // little-endian u32 input indices. The rule is the same in every
+        // mode (bsv-low #551): the needed-input dry run passes no coins, the
+        // anchor replay (`historical-tx`) passes the coins of its own set,
+        // and finalize (`historical-tx-no-spv`) the coins of the storage.
+        let extends_head = previous_coins
+            .chunks_exact(4)
+            .any(|index| u32::from_le_bytes(index.try_into().unwrap()) == 0);
         if !tx.inputs.is_empty() && !extends_head {
             return Ok(AdmittanceInstructions::default());
         }
@@ -297,6 +298,28 @@ async fn synchronize_remote(
     store: &dyn Storage,
     fetcher: Option<Rc<dyn AncestorFetcher>>,
 ) -> (Vec<Request>, Vec<FinalizedGraph>, u64, u64) {
+    let synced = synchronize_tracked(remote, manager, store, fetcher, None).await;
+    (synced.requests, synced.graphs, synced.cursor, synced.pruned)
+}
+
+struct Synced {
+    requests: Vec<Request>,
+    graphs: Vec<FinalizedGraph>,
+    cursor: u64,
+    pruned: u64,
+    // `GASPSync::discarded_graphs`: graphs the anchor check refused (#551).
+    discarded: u64,
+}
+
+// The same sync, with the anchor check's chain tracker (`None`: the
+// reference's 'scripts only') and the count of graphs it refused.
+async fn synchronize_tracked(
+    remote: RecordingRemote,
+    manager: Option<&dyn TopicManager>,
+    store: &dyn Storage,
+    fetcher: Option<Rc<dyn AncestorFetcher>>,
+    tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+) -> Synced {
     let requests = remote.requests.clone();
     let sink = new_finalized_graph_sink();
     let mut adapter =
@@ -304,17 +327,21 @@ async fn synchronize_remote(
     if let Some(manager) = manager {
         adapter = adapter.with_topic_manager(manager);
     }
+    if let Some(tracker) = tracker {
+        adapter = adapter.with_chain_tracker(tracker);
+    }
     let mut sync = GASPSync::new(Box::new(adapter), Box::new(remote), 0, "[E1]", true)
         .with_ancestor_fetcher(fetcher);
     sync.sync(None).await.unwrap();
     let graphs = sink.lock().unwrap().clone();
     let requests = requests.borrow().clone();
-    (
+    Synced {
         requests,
         graphs,
-        sync.last_interaction,
-        sync.pruned_inputs(),
-    )
+        cursor: sync.last_interaction,
+        pruned: sync.pruned_inputs(),
+        discarded: sync.discarded_graphs(),
+    }
 }
 
 fn graph_txids(graph: &FinalizedGraph) -> Vec<String> {
@@ -406,37 +433,49 @@ fn workspace_managers() -> Vec<(&'static str, Box<dyn TopicManager>)> {
     ]
 }
 
+// E1 pin B, as it stands since bsv-low #551. A manager that names nothing
+// leaves the WALK exactly as it was (the requests and the cursor of the
+// manager-less adapter). What changed is the end of it: none of these managers
+// admits the fixture's plain output, so the anchor check refuses the graph and
+// NOTHING is finalized, where the base pushed BEEFs the engine then admitted
+// nothing from. The bytes of what IS finalized are frozen by `i551_e`.
 #[tokio::test]
-async fn b_empty_input_managers_preserve_requests_and_finalized_beef_bytes() {
+async fn b_empty_input_managers_preserve_requests_and_finalize_nothing_they_refuse() {
+    let (_logs, _guard) = capture_logs();
     let managers = workspace_managers();
     // A proven tip and an unproven two-hop tip ending at a proven ancestor.
-    for unproven_tip in [false, true] {
-        let mut nodes = chain(3);
-        if unproven_tip {
-            nodes[1].proof = None;
-            nodes[2].proof = None;
-        }
+    for unproven_from in [3, 1] {
+        let nodes = scripted_chain(3, "51", unproven_from);
         let store = MemoryStorage::new();
         let (baseline_requests, baseline_graphs, baseline_cursor) =
             synchronize(&nodes, &[2], None, &store, None).await;
-        assert_eq!(baseline_requests.len(), if unproven_tip { 3 } else { 1 });
+        assert_eq!(
+            baseline_requests.len(),
+            if unproven_from == 1 { 3 } else { 1 }
+        );
         assert_eq!(baseline_graphs.len(), 1);
         for (name, manager) in &managers {
-            let (requests, graphs, cursor) =
-                synchronize(&nodes, &[2], Some(manager.as_ref()), &store, None).await;
+            let synced = synchronize_tracked(
+                RecordingRemote::new(&nodes, &[2]),
+                Some(manager.as_ref()),
+                &store,
+                None,
+                None,
+            )
+            .await;
             assert_eq!(
-                requests, baseline_requests,
+                synced.requests, baseline_requests,
                 "{name}: requested outpoints and metadata"
             );
-            assert_eq!(cursor, baseline_cursor, "{name}: cursor");
-            assert_eq!(graphs.len(), baseline_graphs.len(), "{name}: graph count");
-            assert_eq!(
-                graphs[0].beefs, baseline_graphs[0].beefs,
-                "{name}: BEEF bytes"
+            assert_eq!(synced.cursor, baseline_cursor, "{name}: cursor");
+            assert!(
+                synced.graphs.is_empty(),
+                "{name}: a refused root finalizes nothing"
             );
+            assert_eq!(synced.discarded, 1, "{name}: the discard is counted");
         }
     }
-    println!("PIN B: 17 managers x 2 sync shapes = 34 byte-identical comparisons");
+    println!("PIN B: 17 managers x 2 sync shapes = 34 walks identical, 34 refused roots discarded");
 }
 
 #[derive(Debug)]
@@ -451,6 +490,8 @@ struct AdmissionCall {
 #[derive(Default)]
 struct ProbeManager {
     outputs: Vec<u32>,
+    // Outputs admitted for one transaction only (the rest get `outputs`).
+    outputs_by_txid: HashMap<String, Vec<u32>>,
     named: Vec<Outpoint>,
     named_by_txid: HashMap<String, Vec<Outpoint>>,
     admission_error_txid: Option<String>,
@@ -479,7 +520,11 @@ impl TopicManager for ProbeManager {
             return Err(TopicManagerError::Other("admission failed".to_string()));
         }
         Ok(AdmittanceInstructions {
-            outputs_to_admit: self.outputs.clone(),
+            outputs_to_admit: self
+                .outputs_by_txid
+                .get(&tx.id())
+                .unwrap_or(&self.outputs)
+                .clone(),
             ..Default::default()
         })
     }
@@ -547,6 +592,8 @@ async fn c_needed_input_error_logs_outpoint_and_only_cuts_off_that_node() {
             node_txid(&nodes[2]),
             vec![Outpoint::new(node_txid(&nodes[1]), 0)],
         )]),
+        // The independent genesis is admitted on sight.
+        outputs_by_txid: HashMap::from([(node_txid(&nodes[0]), vec![0])]),
         ..Default::default()
     };
     let logs = Arc::new(Mutex::new(Vec::new()));
@@ -561,18 +608,17 @@ async fn c_needed_input_error_logs_outpoint_and_only_cuts_off_that_node() {
             (node_txid(&nodes[0]), 0, true)
         ]
     );
-    assert_eq!(
-        graphs.len(),
-        2,
-        "both the cutoff and independent graph finalize"
-    );
-    assert_eq!(
-        graph_txids(&graphs[0]),
-        vec![node_txid(&nodes[1]), node_txid(&nodes[2])]
-    );
-    assert_eq!(graph_txids(&graphs[1]), vec![node_txid(&nodes[0])]);
+    // The error cuts off node 1 only: the walk goes on to the independent
+    // graph, which finalizes. The cut-off graph itself is refused by the
+    // anchor replay (bsv-low #551): a manager that would not admit node 1 or
+    // node 2 without their history does not admit them without it at the end
+    // either, so the root is not a coin and nothing of that graph is
+    // finalized. (Before #551 its two BEEFs reached the sink, and the engine
+    // then admitted nothing from them.)
+    assert_eq!(graphs.len(), 1, "only the independent graph finalizes");
+    assert_eq!(graph_txids(&graphs[0]), vec![node_txid(&nodes[0])]);
     assert_eq!(cursor, 2);
-    assert_eq!(manager.needed.borrow().len(), 3);
+    assert_eq!(manager.needed.borrow().len(), 2);
     let outpoint = format!("{}.0", node_txid(&nodes[1]));
     assert!(
         logs.lock()
@@ -720,6 +766,9 @@ async fn admission_error_propagates_from_storage_and_skips_only_the_failed_graph
     let nodes = chain(3);
     let manager = ProbeManager {
         admission_error_txid: Some(node_txid(&nodes[2])),
+        // The independent genesis is admitted on sight (its graph must pass
+        // the anchor replay to finalize, bsv-low #551).
+        outputs_by_txid: HashMap::from([(node_txid(&nodes[0]), vec![0])]),
         ..Default::default()
     };
     let store = MemoryStorage::new();
@@ -811,7 +860,12 @@ async fn ancestor_fetcher_honors_named_history_and_empty_managers_still_stop() {
                 RefCell::new(HeadState::default()),
             )))
         } else {
-            Box::new(DefaultInputsManager)
+            // Names nothing (the trait default) and admits what it is shown:
+            // a manager that refused the tip would have its graph discarded
+            // by the anchor replay (bsv-low #551).
+            Box::new(AdmitsOutputZero(Rc::new(
+                RefCell::new(HeadState::default()),
+            )))
         };
         let (requests, graphs, _) = synchronize(
             &nodes,
@@ -950,19 +1004,23 @@ impl TopicManager for DecoyHeadManager {
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
-        let extends_head = mode == SubmitMode::HistoricalTxNoSpv
-            && previous_coins.chunks_exact(4).any(|index| {
-                let index = u32::from_le_bytes(index.try_into().unwrap()) as usize;
-                tx.inputs.get(index).is_some_and(witness_shaped)
-            });
+        // The same rule in every mode (bsv-low #551): the anchor replay runs
+        // it under `historical-tx` with the coins of its own set.
+        let extends_head = previous_coins.chunks_exact(4).any(|index| {
+            let index = u32::from_le_bytes(index.try_into().unwrap()) as usize;
+            tx.inputs.get(index).is_some_and(witness_shaped)
+        });
         if !tx.inputs.is_empty() && !extends_head {
             return Ok(AdmittanceInstructions::default());
         }
         if mode == SubmitMode::HistoricalTxNoSpv {
             self.0.borrow_mut().admitted.push(tx.id());
         }
+        // Every output of a head transaction is a coin of the topic (pin F
+        // syncs two UTXOs of one tip; a root the manager does not admit is
+        // discarded by the anchor replay, bsv-low #551).
         Ok(AdmittanceInstructions {
-            outputs_to_admit: vec![0],
+            outputs_to_admit: (0..tx.outputs.len() as u32).collect(),
             ..Default::default()
         })
     }
@@ -1171,46 +1229,13 @@ async fn d8_c_unproven_parent_with_a_missing_spv_input_still_fails_that_utxo() {
         .any(|log| log.contains("Error ingesting UTXO") && log.contains("node not found")));
 }
 
-// SHA-256 over everything pin B compares, for every manager and both shapes.
-// Captured on the base (4965995, before the prune existed) and frozen here:
-// managers that name nothing sync byte-for-byte as they did.
-const D8_D_BASE_DIGEST: &str = "2b24dda6f8dfe6aee74e1211c6128680f3d6657376fbbe3c9a444bd156a76ba9";
-
-#[tokio::test]
-async fn d8_d_managers_naming_nothing_sync_byte_for_byte_as_on_the_base() {
-    let mut transcript = Vec::new();
-    let mut comparisons = 0;
-    for unproven_tip in [false, true] {
-        let mut nodes = chain(3);
-        if unproven_tip {
-            nodes[1].proof = None;
-            nodes[2].proof = None;
-        }
-        let store = MemoryStorage::new();
-        for (name, manager) in &workspace_managers() {
-            let (requests, graphs, cursor, pruned) =
-                synchronize_counting(&nodes, &[2], Some(manager.as_ref()), &store, None).await;
-            assert_eq!(pruned, 0, "{name}: nothing named, nothing pruned");
-            transcript.extend_from_slice(
-                format!(
-                    "{name}|{unproven_tip}|{requests:?}|{cursor}|{}|",
-                    graphs.len()
-                )
-                .as_bytes(),
-            );
-            for graph in &graphs {
-                for beef in &graph.beefs {
-                    transcript.extend_from_slice(&(beef.len() as u64).to_le_bytes());
-                    transcript.extend_from_slice(beef);
-                }
-            }
-            comparisons += 1;
-        }
-    }
-    let digest = hex::encode(bsv_rs::primitives::hash::sha256(&transcript));
-    println!("D8 PIN D: {comparisons} syncs, transcript sha256 {digest}");
-    assert_eq!(digest, D8_D_BASE_DIGEST);
-}
+// D8 pin D (managers that name nothing sync byte for byte as on the base)
+// froze, per manager, the BEEFs pushed to the sink. Since bsv-low #551 a root
+// its manager refuses pushes none, so that digest cannot hold as it was; the
+// same claim is frozen by `i551_e_managers_naming_nothing_walk_and_finalize_
+// byte_for_byte`, captured on 39081dd: every workspace manager's requests and
+// cursor on both shapes, nothing pruned, and the finalized bytes wherever a
+// graph is finalized.
 
 // Serves the chain's own transactions and fails for every other txid, with
 // the class the worker's chain fetcher gives "all providers failed"
@@ -1425,4 +1450,907 @@ async fn d8_g_a_transient_fault_on_the_real_head_input_fails_the_utxo_and_the_ne
         "D8 PIN G: tick 1 {tick_one} requests, 0 admitted, pruned_inputs=0, cursor 0; tick 2 {} requests, 5 admitted, cursor 1",
         requests.borrow().len() - tick_one
     );
+}
+
+// ============================================================================
+// bsv-low #551: the anchor check. `validate_graph_anchor` verifies the ROOT
+// node's BEEF like the reference (`spvTx.verify(this.engine.chainTracker)`),
+// then replays the ordered BEEFs through the topic manager over a set of
+// coins; a graph whose root is not a coin at the end is discarded whole.
+// ============================================================================
+
+use bsv_rs::transaction::{ChainTracker, ChainTrackerError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// A chain tracker that knows exactly the (height, root) pairs it was given,
+// and counts what it is asked.
+#[derive(Clone, Default)]
+struct KnownRoots {
+    roots: Arc<Mutex<HashSet<(u32, String)>>>,
+    asked: Arc<AtomicUsize>,
+    // While set, every lookup FAILS (an outage), it never answers.
+    down: Arc<Mutex<bool>>,
+}
+
+impl KnownRoots {
+    // The root of every proven node's OWN merkle path.
+    fn of(nodes: &[GASPNode]) -> Self {
+        let tracker = Self::default();
+        for node in nodes {
+            if let Some(proof) = &node.proof {
+                let path = MerklePath::from_hex(proof).unwrap();
+                let root = path.compute_root(Some(&node_txid(node))).unwrap();
+                tracker
+                    .roots
+                    .lock()
+                    .unwrap()
+                    .insert((path.block_height, root));
+            }
+        }
+        tracker
+    }
+}
+
+#[async_trait]
+impl ChainTracker for KnownRoots {
+    async fn is_valid_root_for_height(
+        &self,
+        root: &str,
+        height: u32,
+    ) -> Result<bool, ChainTrackerError> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        if *self.down.lock().unwrap() {
+            return Err(ChainTrackerError::NetworkError(
+                "chaintracks unreachable".into(),
+            ));
+        }
+        Ok(self
+            .roots
+            .lock()
+            .unwrap()
+            .contains(&(height, root.to_string())))
+    }
+    async fn current_height(&self) -> Result<u32, ChainTrackerError> {
+        Ok(1_000)
+    }
+}
+
+// A merkle path that PARSES and names the transaction, in a two-leaf block
+// whose other leaf nobody mined: its root is one no chain tracker knows.
+fn fabricated_proof(txid: &str, height: u32) -> String {
+    MerklePath::new(
+        height,
+        vec![vec![
+            MerklePathLeaf::new_txid(0, txid.to_string()),
+            MerklePathLeaf::new(1, "ab".repeat(32)),
+        ]],
+    )
+    .unwrap()
+    .to_hex()
+}
+
+fn honest_proof(txid: &str, height: u32) -> String {
+    MerklePath::new(
+        height,
+        vec![vec![MerklePathLeaf::new_txid(0, txid.to_string())]],
+    )
+    .unwrap()
+    .to_hex()
+}
+
+fn node_of(tx: &Transaction, output_index: u32, proof: Option<String>) -> GASPNode {
+    GASPNode {
+        graph_id: String::new(),
+        raw_tx: tx.to_hex(),
+        output_index,
+        proof,
+        tx_metadata: None,
+        output_metadata: None,
+        inputs: None,
+    }
+}
+
+// An input that REALLY spends an output locked by `OP_1` (an empty unlocking
+// script), so an unproven spend of it passes the interpreter.
+fn spending(txid: String, output_index: u32) -> TransactionInput {
+    let mut input = TransactionInput::new(txid, output_index);
+    input.set_unlocking_script(UnlockingScript::from_hex("").unwrap());
+    input
+}
+
+// A chain like `chain`, but every output is locked by `locking` (hex) and
+// every spend carries an empty unlocking script; nodes from `unproven_from`
+// up carry no proof. With `51` (OP_1) the unproven spends are valid; with
+// `00` (OP_0) the interpreter refuses them.
+fn scripted_chain(length: usize, locking: &str, unproven_from: usize) -> Vec<GASPNode> {
+    let mut nodes = Vec::new();
+    let mut previous = None;
+    for height in 0..length {
+        let mut tx = Transaction::new();
+        if let Some(txid) = previous {
+            tx.inputs.push(spending(txid, 0));
+        }
+        tx.outputs.push(TransactionOutput::new(
+            1000,
+            LockingScript::from_hex(locking).unwrap(),
+        ));
+        let txid = tx.id();
+        let proof = (height < unproven_from).then(|| honest_proof(&txid, 100 + height as u32));
+        nodes.push(node_of(&tx, 0, proof));
+        previous = Some(txid);
+    }
+    nodes
+}
+
+// Admits output 0 of everything and names no inputs (the trait default).
+struct AdmitsOutputZero(Rc<RefCell<HeadState>>);
+
+#[async_trait(?Send)]
+impl TopicManager for AdmitsOutputZero {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        _previous_coins: &[u8],
+        _off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if mode == SubmitMode::HistoricalTxNoSpv {
+            self.0.borrow_mut().admitted.push(tx.id());
+        }
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: vec![0],
+            ..Default::default()
+        })
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+struct EngineSync {
+    result: bsv_overlay_engine::engine::GASPSyncResult,
+    requests: Vec<Request>,
+    store: Rc<MemoryStorage>,
+    // SHA-256 over the topic's UTXOs (outpoint, script, sats, stored BEEF),
+    // sorted by outpoint: what the sync ADMITTED, byte for byte.
+    digest: String,
+}
+
+async fn admitted_digest(store: &MemoryStorage) -> String {
+    let mut utxos = store
+        .find_utxos_for_topic(TOPIC, None, None, true)
+        .await
+        .unwrap();
+    utxos.sort_by(|a, b| (&a.txid, a.output_index).cmp(&(&b.txid, b.output_index)));
+    let mut transcript = Vec::new();
+    for utxo in &utxos {
+        transcript.extend_from_slice(
+            format!("{}.{}|{}|", utxo.txid, utxo.output_index, utxo.satoshis).as_bytes(),
+        );
+        transcript.extend_from_slice(&utxo.output_script);
+        let beef = utxo.beef.clone().unwrap_or_default();
+        transcript.extend_from_slice(&(beef.len() as u64).to_le_bytes());
+        transcript.extend_from_slice(&beef);
+    }
+    hex::encode(bsv_rs::primitives::hash::sha256(&transcript))
+}
+
+// One engine sync of `tips` against a peer that serves `nodes`.
+async fn engine_sync(
+    remote: RecordingRemote,
+    manager: Box<dyn TopicManager>,
+    store: Rc<MemoryStorage>,
+    tracker: Option<Box<dyn ChainTracker>>,
+) -> EngineSync {
+    let requests = remote.requests.clone();
+    let mut engine = Engine::with_chain_tracker(
+        HashMap::from([(TOPIC.to_string(), manager)]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        None,
+        tracker,
+        EngineConfig {
+            sync_configuration: HashMap::from([(
+                TOPIC.to_string(),
+                SyncTarget::Peers(vec!["mock://head-chain".to_string()]),
+            )]),
+            ..Default::default()
+        },
+    );
+    engine.set_gasp_remote_factory(Box::new(remote));
+    let result = engine.start_gasp_sync().await.unwrap();
+    let digest = admitted_digest(&store).await;
+    let requests = requests.borrow().clone();
+    EngineSync {
+        result,
+        requests,
+        store,
+        digest,
+    }
+}
+
+async fn utxo_txids(store: &MemoryStorage) -> Vec<String> {
+    let mut txids: Vec<_> = store
+        .find_utxos_for_topic(TOPIC, None, None, false)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.txid)
+        .collect();
+    txids.sort();
+    txids
+}
+
+// PIN A. Five proven head transactions; the tracker knows the HONEST root of
+// every one of them, and the peer serves the TIP with a fabricated BUMP.
+#[tokio::test]
+async fn i551_a_a_fabricated_bump_on_the_tip_discards_the_whole_chain() {
+    let (_logs, _guard) = capture_logs();
+    let mut nodes = chain(5);
+    let tracker = KnownRoots::of(&nodes);
+    nodes[4].proof = Some(fabricated_proof(&node_txid(&nodes[4]), 104));
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let synced = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(tracker.clone())),
+    )
+    .await;
+    assert_eq!(synced.requests.len(), 5, "the walk still reaches genesis");
+    assert!(
+        state.borrow().admitted.is_empty(),
+        "nothing of the chain is admitted: {:?}",
+        state.borrow().admitted
+    );
+    assert!(utxo_txids(&synced.store).await.is_empty());
+    let topic = &synced.result.topics_synced[TOPIC];
+    assert_eq!(topic.discarded_graphs, 1, "the discard is counted");
+    assert!(
+        topic.errors.is_empty(),
+        "a refused graph is not a peer error"
+    );
+    assert_eq!(
+        tracker.asked.load(Ordering::SeqCst),
+        1,
+        "a proven root is one question: its own root"
+    );
+
+    // The same sync at the adapter: the sink stays EMPTY, and the warn names
+    // the root and the reason.
+    let (logs, _guard) = capture_logs();
+    let manager = HeadChainManager(Rc::new(RefCell::new(HeadState::default())));
+    let synced = synchronize_tracked(
+        RecordingRemote::new(&nodes, &[4]),
+        Some(&manager),
+        &MemoryStorage::new(),
+        None,
+        Some(&tracker),
+    )
+    .await;
+    assert!(synced.graphs.is_empty(), "the sink is empty");
+    assert_eq!((synced.discarded, synced.cursor), (1, 1));
+    let root = format!("{}.0", node_txid(&nodes[4]));
+    assert!(
+        logs.lock().unwrap().iter().any(|log| log.contains(&root)
+            && log.contains("not well-anchored according to the rules of Bitcoin")
+            && log.contains("is not valid for block height 104")),
+        "the warn names the root and the reason"
+    );
+    println!("#551 PIN A: 5 requests, 1 tracker question, 0 admitted, discarded_graphs=1");
+}
+
+// The head chain of `chain(4)` whose last head also carries a second, plain
+// output, and a proven TIP that spends THAT output: it does not extend the head.
+fn chain_with_a_tip_off_the_head() -> Vec<GASPNode> {
+    let mut nodes = chain(3);
+    let mut head = Transaction::new();
+    head.inputs
+        .push(TransactionInput::new(node_txid(&nodes[2]), 0));
+    for _ in 0..2 {
+        head.outputs.push(TransactionOutput::new(
+            1000,
+            LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+        ));
+    }
+    nodes.push(node_of(&head, 0, Some(honest_proof(&head.id(), 103))));
+    let mut tip = Transaction::new();
+    tip.inputs.push(TransactionInput::new(head.id(), 1));
+    tip.outputs.push(TransactionOutput::new(
+        1000,
+        LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+    ));
+    nodes.push(node_of(&tip, 0, Some(honest_proof(&tip.id(), 104))));
+    nodes
+}
+
+// PIN B. Every BUMP is honest and known; the manager admits the four heads
+// behind the tip and REFUSES the tip at the end of the replay.
+#[tokio::test]
+async fn i551_b_a_root_the_manager_refuses_at_the_end_admits_nothing() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain_with_a_tip_off_the_head();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let synced = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(KnownRoots::of(&nodes))),
+    )
+    .await;
+    assert_eq!(synced.requests.len(), 5, "the walk reaches genesis");
+    assert!(
+        state.borrow().admitted.is_empty(),
+        "the four heads behind a refused root are not admitted: {:?}",
+        state.borrow().admitted
+    );
+    assert!(utxo_txids(&synced.store).await.is_empty());
+    assert_eq!(synced.result.topics_synced[TOPIC].discarded_graphs, 1);
+
+    let (logs, _guard) = capture_logs();
+    let manager = HeadChainManager(Rc::new(RefCell::new(HeadState::default())));
+    let tracker = KnownRoots::of(&nodes);
+    let synced = synchronize_tracked(
+        RecordingRemote::new(&nodes, &[4]),
+        Some(&manager),
+        &MemoryStorage::new(),
+        None,
+        Some(&tracker),
+    )
+    .await;
+    assert!(synced.graphs.is_empty(), "the sink is empty");
+    assert_eq!(synced.discarded, 1);
+    let root = format!("{}.0", node_txid(&nodes[4]));
+    assert!(
+        logs.lock().unwrap().iter().any(|log| log.contains(&root)
+            && log.contains("did not result in topical admittance of the root node")),
+        "the warn names the root and the reason"
+    );
+    println!("#551 PIN B: 5 requests, 4 heads replayed as coins, root refused, 0 admitted");
+}
+
+// PIN C. The E1 head chain and the D8 decoy chain under a tracker that knows
+// the fixture roots: the same walk, the same admission order, and the admitted
+// set byte for byte what the base (39081dd, no anchor check) admitted.
+const I551_C_HEAD_BASE_DIGEST: &str =
+    "8615f5ec72dcbf835876a5065b6a507ac220b30fb230738b8fbaa0a4d896e864";
+const I551_C_DECOY_BASE_DIGEST: &str =
+    "47e0ff752b9c7220194f6448673bc13995fb3ada7104923b0e9ea7b02d9bb7a8";
+
+#[tokio::test]
+async fn i551_c_head_chain_and_decoy_chain_admit_byte_for_byte_under_a_tracker() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(5);
+    let tracker = KnownRoots::of(&nodes);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let head = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(tracker.clone())),
+    )
+    .await;
+    let expected: Vec<_> = nodes.iter().map(node_txid).collect();
+    assert_eq!(head.requests, tip_to_genesis(&nodes));
+    assert_eq!(state.borrow().admitted, expected, "admit oldest first");
+    assert_eq!(utxo_txids(&head.store).await, vec![expected[4].clone()]);
+    println!("#551 PIN C head digest {}", head.digest);
+    assert_eq!(head.digest, I551_C_HEAD_BASE_DIGEST);
+
+    let decoy = decoy_outpoint(0xd0);
+    let nodes = decoy_chain(5, &[(4, decoy.clone())]);
+    let manager = DecoyHeadManager::new();
+    let state = manager.0.clone();
+    let decoyed = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(manager),
+        Rc::new(MemoryStorage::new()),
+        Some(Box::new(KnownRoots::of(&nodes))),
+    )
+    .await;
+    let expected: Vec<_> = nodes.iter().map(node_txid).collect();
+    let (decoy_requests, chain_requests) = split_requests(&decoyed.requests, &decoy);
+    assert_eq!(decoy_requests, 1);
+    assert_eq!(chain_requests, tip_to_genesis(&nodes));
+    assert_eq!(state.borrow().admitted, expected, "admit oldest first");
+    assert_eq!(decoyed.result.topics_synced[TOPIC].pruned_inputs, 1);
+    println!("#551 PIN C decoy digest {}", decoyed.digest);
+    assert_eq!(decoyed.digest, I551_C_DECOY_BASE_DIGEST);
+}
+
+// PIN D. No chain tracker: the reference's `'scripts only'` walk. An unproven
+// node whose unlocking script the interpreter refuses discards its graph; the
+// same graph with a valid spend is admitted; a proven node is accepted on its
+// BUMP unchecked (the fabricated BUMP of pin A, with nobody to ask).
+#[tokio::test]
+async fn i551_d_no_tracker_runs_the_scripts_only_walk() {
+    let (_logs, _guard) = capture_logs();
+    for (locking, admitted) in [("00", 0), ("51", 2)] {
+        let nodes = scripted_chain(2, locking, 1);
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let synced = engine_sync(
+            RecordingRemote::new(&nodes, &[1]),
+            Box::new(AdmitsOutputZero(state.clone())),
+            Rc::new(MemoryStorage::new()),
+            None,
+        )
+        .await;
+        assert_eq!(synced.requests.len(), 2);
+        assert_eq!(
+            state.borrow().admitted.len(),
+            admitted,
+            "an unproven spend of a `{locking}` output"
+        );
+        assert_eq!(utxo_txids(&synced.store).await.len(), admitted.min(1));
+    }
+
+    let mut nodes = chain(5);
+    nodes[4].proof = Some(fabricated_proof(&node_txid(&nodes[4]), 104));
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        Rc::new(MemoryStorage::new()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        state.borrow().admitted.len(),
+        5,
+        "'scripts only': a BUMP is accepted unchecked"
+    );
+}
+
+// PIN E. Managers that name nothing, the E1 pin B shapes (a proven tip, and an
+// unproven two-hop tip over a proven ancestor, here with spends the
+// interpreter accepts). Frozen on the base (39081dd): the requests and the
+// cursor of every workspace manager, and the finalized BEEF bytes of the
+// manager-less adapter and of a manager that admits what it is shown.
+const I551_E_BASE_DIGEST: &str = "500553a385745ca37de407de5d03e6f89d2ce262531b3542108fda86423fac74";
+
+#[tokio::test]
+async fn i551_e_managers_naming_nothing_walk_and_finalize_byte_for_byte() {
+    let (_logs, _guard) = capture_logs();
+    let mut transcript = Vec::new();
+    for unproven_from in [3, 1] {
+        let nodes = scripted_chain(3, "51", unproven_from);
+        let tracker = KnownRoots::of(&nodes);
+        let store = MemoryStorage::new();
+        let admits = AdmitsOutputZero(Rc::new(RefCell::new(HeadState::default())));
+        let finalizing: [(&str, Option<&dyn TopicManager>); 2] =
+            [("none", None), ("admits", Some(&admits))];
+        for (name, manager) in finalizing {
+            let synced = synchronize_tracked(
+                RecordingRemote::new(&nodes, &[2]),
+                manager,
+                &store,
+                None,
+                Some(&tracker),
+            )
+            .await;
+            assert_eq!(synced.graphs.len(), 1, "{name}: one finalized graph");
+            assert_eq!((synced.pruned, synced.discarded), (0, 0), "{name}");
+            transcript.extend_from_slice(
+                format!(
+                    "{name}|{unproven_from}|{:?}|{}|",
+                    synced.requests, synced.cursor
+                )
+                .as_bytes(),
+            );
+            for beef in &synced.graphs[0].beefs {
+                transcript.extend_from_slice(&(beef.len() as u64).to_le_bytes());
+                transcript.extend_from_slice(beef);
+            }
+        }
+        for (name, manager) in &workspace_managers() {
+            let synced = synchronize_tracked(
+                RecordingRemote::new(&nodes, &[2]),
+                Some(manager.as_ref()),
+                &store,
+                None,
+                Some(&tracker),
+            )
+            .await;
+            assert_eq!(synced.pruned, 0, "{name}: nothing named, nothing pruned");
+            // None of them admits the fixture's `OP_1` output: on the base
+            // the sink carried BEEFs the engine admitted nothing from, now
+            // the refused root is discarded and the sink stays empty.
+            assert!(synced.graphs.is_empty(), "{name}: a refused root");
+            assert_eq!(synced.discarded, 1, "{name}: the discard is counted");
+            transcript.extend_from_slice(
+                format!(
+                    "{name}|{unproven_from}|{:?}|{}|",
+                    synced.requests, synced.cursor
+                )
+                .as_bytes(),
+            );
+        }
+        // One question per merkle path of each ROOT BEEF: a proven tip asks
+        // once per sync, the unproven two-hop tip asks for its one proven
+        // ancestor.
+        assert_eq!(
+            tracker.asked.load(Ordering::SeqCst),
+            19,
+            "tracker questions"
+        );
+    }
+    let digest = hex::encode(bsv_rs::primitives::hash::sha256(&transcript));
+    println!("#551 PIN E: transcript sha256 {digest}");
+    assert_eq!(digest, I551_E_BASE_DIGEST);
+}
+
+// A head manager that RETAINS (or not) the head coin it spends, and records
+// what the anchor replay showed it: (txid, previous coins) per call that
+// carried coins under `historical-tx`.
+type Replay = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
+
+struct RetainingHeadManager {
+    retain: bool,
+    state: Rc<RefCell<HeadState>>,
+    replay: Replay,
+}
+
+#[async_trait(?Send)]
+impl TopicManager for RetainingHeadManager {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous_coins: &[u8],
+        _off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if mode == SubmitMode::HistoricalTx && !previous_coins.is_empty() {
+            self.replay
+                .borrow_mut()
+                .push((tx.id(), previous_coins.to_vec()));
+        }
+        if !tx.inputs.is_empty() && previous_coins.is_empty() {
+            return Ok(AdmittanceInstructions::default());
+        }
+        if mode == SubmitMode::HistoricalTxNoSpv {
+            self.state.borrow_mut().admitted.push(tx.id());
+        }
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: vec![0],
+            coins_to_retain: if self.retain && !tx.inputs.is_empty() {
+                vec![0]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        _off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        let tx = Transaction::from_beef(beef, None).unwrap();
+        Ok(tx
+            .inputs
+            .iter()
+            .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
+            .collect())
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// PIN F. `coins_to_retain` in the replay, as the reference at f999e0c1a has
+// it: `admitHistoricalBEEF` reads `outputsToAdmit` alone and its set only
+// grows, so whether a manager RETAINS the coin it spends changes nothing the
+// replay shows a later transaction or decides about the root. It changes what
+// FINALIZE leaves behind: the engine keeps a retained coin (spent) and
+// deletes one that is not retained. And where a coin WOULD be shown twice (two
+// transactions of one graph spending it) the graph is refused, retained or
+// not: finalize could admit only one of them.
+#[tokio::test]
+async fn i551_f_coins_to_retain_does_not_move_the_replay_and_a_double_spend_is_refused() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    let txids: Vec<_> = nodes.iter().map(node_txid).collect();
+    let first_input = 0u32.to_le_bytes().to_vec();
+    let mut replays = Vec::new();
+    for retain in [false, true] {
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let replay = Rc::new(RefCell::new(Vec::new()));
+        let synced = engine_sync(
+            RecordingRemote::new(&nodes, &[3]),
+            Box::new(RetainingHeadManager {
+                retain,
+                state: state.clone(),
+                replay: replay.clone(),
+            }),
+            Rc::new(MemoryStorage::new()),
+            Some(Box::new(KnownRoots::of(&nodes))),
+        )
+        .await;
+        assert_eq!(state.borrow().admitted, txids, "retain={retain}: all four");
+        assert_eq!(
+            *replay.borrow(),
+            txids[1..]
+                .iter()
+                .map(|txid| (txid.clone(), first_input.clone()))
+                .collect::<Vec<_>>(),
+            "retain={retain}: each spend is shown the head coin before it"
+        );
+        for spent_head in &txids[..3] {
+            let kept = synced
+                .store
+                .find_output(spent_head, 0, Some(TOPIC), None, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                kept.is_some(),
+                retain,
+                "retain={retain}: finalize keeps a spent head only when it is retained"
+            );
+        }
+        replays.push(replay.borrow().clone());
+    }
+    assert_eq!(replays[0], replays[1], "the replay is the same either way");
+
+    // A (genesis) is spent by BOTH X and Y, and the root R spends them both.
+    let coin = |sats: u64| {
+        TransactionOutput::new(
+            sats,
+            LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+        )
+    };
+    let mut a = Transaction::new();
+    a.outputs.push(coin(1000));
+    let mut x = Transaction::new();
+    x.inputs.push(TransactionInput::new(a.id(), 0));
+    x.outputs.push(coin(900));
+    let mut y = Transaction::new();
+    y.inputs.push(TransactionInput::new(a.id(), 0));
+    y.outputs.push(coin(800));
+    let mut r = Transaction::new();
+    r.inputs.push(TransactionInput::new(x.id(), 0));
+    r.inputs.push(TransactionInput::new(y.id(), 0));
+    r.outputs.push(coin(700));
+    let nodes: Vec<_> = [&a, &x, &y, &r]
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| node_of(tx, 0, Some(honest_proof(&tx.id(), 100 + i as u32))))
+        .collect();
+    for retain in [false, true] {
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let synced = engine_sync(
+            RecordingRemote::new(&nodes, &[3]),
+            Box::new(RetainingHeadManager {
+                retain,
+                state: state.clone(),
+                replay: Rc::new(RefCell::new(Vec::new())),
+            }),
+            Rc::new(MemoryStorage::new()),
+            Some(Box::new(KnownRoots::of(&nodes))),
+        )
+        .await;
+        assert!(
+            state.borrow().admitted.is_empty(),
+            "retain={retain}: nothing of a graph that spends {}.0 twice: {:?}",
+            a.id(),
+            state.borrow().admitted
+        );
+        assert_eq!(synced.result.topics_synced[TOPIC].discarded_graphs, 1);
+    }
+    println!("#551 PIN F: retain or not, one replay; a double spend in the graph admits nothing");
+}
+
+// PIN G (an addition to the reference, see `validate_graph_anchor`). The next
+// head, synced one tick after the last: its head input is already HELD, so the
+// walk strips it and the graph is the tip alone. The replay counts the coin
+// the storage holds, exactly as the finalize submit will; the reference's own
+// set would be empty and the tip refused on every tick, forever.
+#[tokio::test]
+async fn i551_g_the_next_head_over_a_held_head_is_admitted() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(5);
+    let tracker = KnownRoots::of(&nodes);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    engine_sync(
+        RecordingRemote::new(&nodes[..4], &[3]),
+        Box::new(HeadChainManager(state.clone())),
+        store.clone(),
+        Some(Box::new(tracker.clone())),
+    )
+    .await;
+    assert_eq!(state.borrow().admitted.len(), 4);
+    let tick_two = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        store.clone(),
+        Some(Box::new(tracker.clone())),
+    )
+    .await;
+    assert_eq!(
+        tick_two.requests,
+        vec![(node_txid(&nodes[4]), 0, true)],
+        "the held head is stripped: the graph is the tip alone"
+    );
+    assert_eq!(
+        state.borrow().admitted,
+        nodes.iter().map(node_txid).collect::<Vec<_>>()
+    );
+    assert_eq!(utxo_txids(&store).await, vec![node_txid(&nodes[4])]);
+    assert_eq!(tick_two.result.topics_synced[TOPIC].discarded_graphs, 0);
+}
+
+// PIN H (an addition). The root R spends two history inputs its manager names:
+// X (real) and W. The peer answers the request for W with ANOTHER transaction,
+// a forged Z under a BUMP nobody mined. Z is not in the root's BEEF, so the
+// Bitcoin check never sees it; the rule that every node is an input of its
+// parent refuses the graph. Without it Z would be finalized and admitted.
+#[tokio::test]
+async fn i551_h_a_transaction_served_in_place_of_a_named_input_refuses_the_graph() {
+    let (_logs, _guard) = capture_logs();
+    let coin = |sats: u64| {
+        TransactionOutput::new(
+            sats,
+            LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+        )
+    };
+    let mut x = Transaction::new();
+    x.outputs.push(coin(1000));
+    let mut w = Transaction::new();
+    w.outputs.push(coin(999));
+    let mut forged = Transaction::new();
+    forged.outputs.push(coin(777));
+    let mut r = Transaction::new();
+    r.inputs.push(TransactionInput::new(x.id(), 0));
+    r.inputs.push(TransactionInput::new(w.id(), 0));
+    r.outputs.push(coin(500));
+    let honest: Vec<_> = [&x, &w, &r]
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| node_of(tx, 0, Some(honest_proof(&tx.id(), 100 + i as u32))))
+        .collect();
+    let tracker = KnownRoots::of(&honest);
+    for forge in [false, true] {
+        let mut remote = RecordingRemote::new(&honest, &[2]);
+        if forge {
+            let mut served = (*remote.nodes).clone();
+            served.insert(
+                w.id(),
+                node_of(&forged, 0, Some(fabricated_proof(&forged.id(), 101))),
+            );
+            remote.nodes = Rc::new(served);
+        }
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let synced = engine_sync(
+            remote,
+            Box::new(RetainingHeadManager {
+                retain: false,
+                state: state.clone(),
+                replay: Rc::new(RefCell::new(Vec::new())),
+            }),
+            Rc::new(MemoryStorage::new()),
+            Some(Box::new(tracker.clone())),
+        )
+        .await;
+        let mut admitted = state.borrow().admitted.clone();
+        admitted.sort();
+        if forge {
+            assert!(admitted.is_empty(), "nothing, the forged Z least of all");
+            assert_eq!(synced.result.topics_synced[TOPIC].discarded_graphs, 1);
+        } else {
+            let mut all = vec![x.id(), w.id(), r.id()];
+            all.sort();
+            assert_eq!(admitted, all, "the honest graph is admitted whole");
+        }
+    }
+}
+
+// PIN I (an addition). A chain tracker that cannot ANSWER is not a verdict:
+// the graph is discarded, nothing is admitted, but the UTXO FAILS, so the
+// cursor does not pass it, and the next tick, with the tracker back, admits
+// the chain. The reference would discard and advance, losing it for good.
+#[tokio::test]
+async fn i551_i_a_tracker_outage_fails_the_utxo_and_the_next_tick_recovers() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(5);
+    let tracker = KnownRoots::of(&nodes);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    *tracker.down.lock().unwrap() = true;
+    let tick_one = engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        store.clone(),
+        Some(Box::new(tracker.clone())),
+    )
+    .await;
+    assert!(state.borrow().admitted.is_empty());
+    let topic = &tick_one.result.topics_synced[TOPIC];
+    assert_eq!(topic.discarded_graphs, 0, "no verdict, so not a refusal");
+    assert_eq!(
+        store
+            .get_last_interaction("mock://head-chain", TOPIC)
+            .await
+            .unwrap(),
+        0,
+        "the cursor does not pass a graph nobody judged"
+    );
+
+    *tracker.down.lock().unwrap() = false;
+    engine_sync(
+        RecordingRemote::new(&nodes, &[4]),
+        Box::new(HeadChainManager(state.clone())),
+        store.clone(),
+        Some(Box::new(tracker.clone())),
+    )
+    .await;
+    assert_eq!(state.borrow().admitted.len(), 5, "tick 2 admits the chain");
+    assert_eq!(
+        store
+            .get_last_interaction("mock://head-chain", TOPIC)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+// PIN J (an addition). An UNPROVEN tip over a coin the storage already holds:
+// the walk strips the held input, so the graph does not carry its source. The
+// stored BEEF of that coin is merged into the CHECKED copy and the spend is
+// executed against its real source (the reference throws in `getBEEFForNode`
+// and discards). `51` (OP_1) is a spend the interpreter accepts; `00` (OP_0)
+// one it refuses, which shows the script really ran.
+#[tokio::test]
+async fn i551_j_an_unproven_tip_over_a_held_coin_is_executed_against_the_stored_source() {
+    let (_logs, _guard) = capture_logs();
+    for (locking, admitted) in [("51", 2), ("00", 1)] {
+        let nodes = scripted_chain(3, locking, 2);
+        let tracker = KnownRoots::of(&nodes);
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let store = Rc::new(MemoryStorage::new());
+        engine_sync(
+            RecordingRemote::new(&nodes[..2], &[1]),
+            Box::new(AdmitsOutputZero(state.clone())),
+            store.clone(),
+            Some(Box::new(tracker.clone())),
+        )
+        .await;
+        // A manager that names nothing stops at the proven tip: tick 1 admits
+        // node 1 alone, with its proof.
+        assert_eq!(state.borrow().admitted.len(), 1, "`{locking}`: tick 1");
+        let asked = tracker.asked.load(Ordering::SeqCst);
+        let tick_two = engine_sync(
+            RecordingRemote::new(&nodes, &[2]),
+            Box::new(AdmitsOutputZero(state.clone())),
+            store.clone(),
+            Some(Box::new(tracker.clone())),
+        )
+        .await;
+        assert_eq!(tick_two.requests, vec![(node_txid(&nodes[2]), 0, true)]);
+        assert_eq!(
+            state.borrow().admitted.len(),
+            admitted,
+            "`{locking}`: tick 2"
+        );
+        assert_eq!(
+            tick_two.result.topics_synced[TOPIC].discarded_graphs,
+            (2 - admitted) as u64
+        );
+        // The walk runs a spend before it descends into its source: an
+        // accepted spend goes on to check the stored source's own BUMP, a
+        // refused one ends there.
+        assert_eq!(
+            tracker.asked.load(Ordering::SeqCst) > asked,
+            locking == "51",
+            "`{locking}`: the stored source's own BUMP"
+        );
+    }
 }

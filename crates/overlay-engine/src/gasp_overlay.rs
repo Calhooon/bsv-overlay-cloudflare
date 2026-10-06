@@ -20,14 +20,24 @@
 //! - If no proof, all transaction inputs are requested (minus any already
 //!   known in local storage).
 //!
+//! ## validate_graph_anchor (bsv-low #551)
+//!
+//! Before a graph is finalized it is checked the way the reference checks it
+//! (`OverlayGASPStorage.ts` `validateGraphAnchor`): the ROOT node's BEEF is
+//! verified by the engine's own SPV check, then the ordered BEEFs are replayed
+//! through the topic manager over a set of coins, and the graph is discarded
+//! WHOLE unless its root is a coin at the end. That is what makes the
+//! `HistoricalTxNoSpv` submits of `finalize_graph` rest on a true premise.
+//!
 //! Ported from `~/bsv/overlay-services/src/GASP/OverlayGASPStorage.ts` (388 lines).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use bsv_rs::transaction::{MerklePath, Transaction};
+use bsv_rs::transaction::{Beef, ChainTracker, ChainTrackerError, MerklePath, Transaction};
 use tracing::{debug, error, warn};
 
 use crate::gasp::{GASPError, GASPStorage};
@@ -93,6 +103,54 @@ pub struct OverlayGASPStorage<'a> {
     /// `true` when ancestor hydration is enabled, so post-hydration
     /// completeness is enforced.
     strict_beef: bool,
+    /// The engine's chain tracker, for the anchor's Bitcoin check. `None` is
+    /// the reference's `'scripts only'`: a merkle path is accepted unchecked,
+    /// every unproven input's script still runs.
+    chain_tracker: Option<&'a dyn ChainTracker>,
+    /// [`crate::engine::Engine::set_script_verification`], handed over so the
+    /// anchor check obeys the same switch as `Engine::submit`. Default `true`.
+    verify_scripts: bool,
+}
+
+/// Lends the engine's tracker to the anchor check and notes whether it
+/// FAULTED: a tracker that could not answer is a fault of the moment, not a
+/// verdict on the graph (see `validate_graph_anchor`). Noted here, on the
+/// call, so no error text is matched.
+struct FaultNotingTracker<'a> {
+    inner: &'a dyn ChainTracker,
+    faulted: AtomicBool,
+}
+
+#[async_trait]
+impl ChainTracker for FaultNotingTracker<'_> {
+    async fn is_valid_root_for_height(
+        &self,
+        root: &str,
+        height: u32,
+    ) -> Result<bool, ChainTrackerError> {
+        let answer = self.inner.is_valid_root_for_height(root, height).await;
+        if answer.is_err() {
+            self.faulted.store(true, Ordering::Relaxed);
+        }
+        answer
+    }
+
+    async fn current_height(&self) -> Result<u32, ChainTrackerError> {
+        self.inner.current_height().await
+    }
+}
+
+/// What the anchor check needs of a pending graph, assembled under the lock.
+struct AnchorInput {
+    /// The root node's transaction id.
+    root_txid: String,
+    /// The root node's BEEF (tolerant: a source the graph does not carry is
+    /// absent, and merged from local storage or refused by the verifier).
+    root_beef: Vec<u8>,
+    /// Inputs of the root's UNPROVEN ancestry that the graph does not carry.
+    absent_sources: Vec<(String, u32)>,
+    /// The graph's BEEFs, ancestors first, root last.
+    ordered_beefs: Vec<Vec<u8>>,
 }
 
 impl<'a> OverlayGASPStorage<'a> {
@@ -112,7 +170,28 @@ impl<'a> OverlayGASPStorage<'a> {
             pending_graphs: Mutex::new(HashMap::new()),
             finalized_sink: sink,
             strict_beef: false,
+            chain_tracker: None,
+            verify_scripts: true,
         }
+    }
+
+    /// Check merkle roots of the anchor against this chain tracker (the
+    /// engine's: `Engine::start_gasp_sync` wires it). Without one the anchor
+    /// check is the reference's `'scripts only'` walk.
+    #[must_use]
+    pub fn with_chain_tracker(mut self, tracker: &'a dyn ChainTracker) -> Self {
+        self.chain_tracker = Some(tracker);
+        self
+    }
+
+    /// Carry [`crate::engine::Engine::set_script_verification`] into the
+    /// anchor check. `false` is that switch's escape hatch, not a mode: the
+    /// pre-2026-09-08 structural check (roots only, and nothing without a
+    /// tracker). Default `true`.
+    #[must_use]
+    pub fn with_script_verification(mut self, enabled: bool) -> Self {
+        self.verify_scripts = enabled;
+        self
     }
 
     /// Consult the topic manager when a proven node needs overlay history.
@@ -265,6 +344,101 @@ impl<'a> OverlayGASPStorage<'a> {
 
         hydrate(graph_id, refs, &mut beefs, &mut visited, strict_beef)?;
         Ok(beefs)
+    }
+
+    /// Everything `validate_graph_anchor` needs of the pending graph, read in
+    /// one pass under the lock (nothing awaits while the guard is held).
+    ///
+    /// It also enforces the one structural rule the rest relies on: every
+    /// node hangs off its parent by an input the parent REALLY spends. The
+    /// walk asks the peer for an outpoint and files the answer under the
+    /// answer's own txid, so a peer that answers with some other transaction
+    /// would otherwise ride into the ordered BEEFs unlinked to anything the
+    /// Bitcoin check covers. With the rule, every node of the graph is tied
+    /// to the verified root by a chain of txids. (A divergence by addition
+    /// from the reference at f999e0c1a, which has no such rule; upstream added
+    /// it later in `appendToGraph`: "The GASP child node is not an input of
+    /// its declared parent".)
+    ///
+    /// A graph that cannot be ASSEMBLED (a raw transaction or a proof that
+    /// does not parse, or under `strict_beef` a missing ancestor) is
+    /// `GASPError::AnchorUnavailable`, not a refusal: before #551 that error
+    /// surfaced from `finalize_graph` and failed the UTXO, so the cursor gap
+    /// guard asked for it again (#43), and it still does.
+    fn read_anchor_input(
+        graph_id: &str,
+        refs: &HashMap<String, PendingNode>,
+        strict_beef: bool,
+    ) -> Result<AnchorInput, GASPError> {
+        let unassembled = |e: GASPError| {
+            GASPError::AnchorUnavailable(format!("graph {graph_id} cannot be assembled: {e}"))
+        };
+        if !refs.contains_key(graph_id) {
+            return Err(GASPError::ValidationFailed(format!(
+                "Graph node with ID {graph_id} not found"
+            )));
+        }
+
+        let mut absent_sources: Vec<(String, u32)> = Vec::new();
+        let mut visited: HashSet<&str> = HashSet::new();
+        // (node key, whether a path of UNPROVEN nodes leads from the root to it)
+        let mut stack: Vec<(&str, bool)> = vec![(graph_id, true)];
+        while let Some((key, in_root_beef)) = stack.pop() {
+            if !visited.insert(key) {
+                continue;
+            }
+            let Some(pending) = refs.get(key) else {
+                continue;
+            };
+            let tx = Transaction::from_hex(&pending.node.raw_tx).map_err(|e| {
+                unassembled(GASPError::Other(format!(
+                    "Failed to parse raw_tx for {key}: {e}"
+                )))
+            })?;
+            let spends: HashSet<String> = tx
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    let source_txid = input.get_source_txid().ok()?;
+                    Some(format!("{}.{}", source_txid, input.source_output_index))
+                })
+                .collect();
+            for child in &pending.children {
+                if !spends.contains(child) {
+                    return Err(GASPError::ValidationFailed(format!(
+                        "node {child} is not an input of its declared parent {key}"
+                    )));
+                }
+            }
+            let unproven = pending.node.proof.is_none();
+            if in_root_beef && unproven {
+                for outpoint in &spends {
+                    if !refs.contains_key(outpoint) {
+                        if let Some(source) = crate::gasp::parse_outpoint(outpoint) {
+                            absent_sources.push(source);
+                        }
+                    }
+                }
+            }
+            for child in &pending.children {
+                stack.push((child.as_str(), in_root_beef && unproven));
+            }
+        }
+
+        // The root's CHECKED copy is assembled tolerant whatever `strict_beef`
+        // says: it is never stored, sources the storage holds are merged into
+        // it, and the verifier refuses any source still missing. The ordered
+        // BEEFs are assembled exactly as `finalize_graph` will assemble them.
+        let (root_tx, root_beef) =
+            Self::get_beef_for_node(graph_id, refs, false).map_err(unassembled)?;
+        let ordered_beefs =
+            Self::compute_ordered_beefs(graph_id, refs, strict_beef).map_err(unassembled)?;
+        Ok(AnchorInput {
+            root_txid: root_tx.id(),
+            root_beef,
+            absent_sources,
+            ordered_beefs,
+        })
     }
 }
 
@@ -568,13 +742,204 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         Ok(())
     }
 
-    /// Validate that the graph's anchor references proven or known transactions.
+    /// Check a completed graph before anything of it is finalized (bsv-low
+    /// #551). The reference's `validateGraphAnchor`
+    /// (`OverlayGASPStorage.ts` at f999e0c1a, lines 261 to 297), in its two
+    /// steps. An `Err` is a discard: `GASPSync::complete_graph` drops the
+    /// graph and NOTHING of it reaches the sink.
     ///
-    /// For the minimal implementation, we accept all anchors.
-    /// A full implementation would verify merkle proofs against a chain tracker.
-    async fn validate_graph_anchor(&self, _graph_id: &str) -> Result<(), GASPError> {
-        // Accept all anchors for now. When SPV validation is needed per-graph,
-        // this should verify the root node's proof against the chain tracker.
+    /// **1. Bitcoin.** The ROOT node's BEEF (`get_beef_for_node`) is verified
+    /// by the engine's own check, `verify_spv_like_the_reference`: the
+    /// reference's `spvTx.verify(this.engine.chainTracker)`. With a tracker
+    /// every merkle root in that BEEF is checked against it and every unproven
+    /// input's script is executed; with none it is `'scripts only'` (roots
+    /// accepted unchecked, scripts still run). One verifier, the same switch
+    /// (`with_script_verification`) as `Engine::submit`.
+    ///
+    /// **2. Overlay, all or nothing.** The ordered BEEFs (ancestors first, root
+    /// last) are replayed through the topic manager as the reference's
+    /// `admitHistoricalBEEF` does: mode `historical-tx`, no off-chain values,
+    /// `previous_coins` the inputs whose source outpoint is a coin (the
+    /// engine's little-endian u32 input indices), and every output the manager
+    /// admits joins the coins. If the ROOT's outpoint is not a coin at the
+    /// end, the graph is refused. The set only GROWS, as in the reference at
+    /// f999e0c1a: it reads `outputsToAdmit` alone, never `coinsToRetain`, and
+    /// removes nothing ("a Set of all historical coins to retain (no need to
+    /// remove them)"). The reference passes `{ dryRun: true }`; the managers
+    /// of this workspace are pure (they evaluate what they are shown and
+    /// write nothing), so the trait needs no flag for it (D13).
+    ///
+    /// WITHOUT a topic manager step 2 does not run: there is nothing to
+    /// replay, and `Engine::submit` refuses such a topic (`UnsupportedTopic`),
+    /// so nothing can be admitted. `Engine::start_gasp_sync` always wires the
+    /// manager of a topic it can admit.
+    ///
+    /// **Divergences by addition** (each with its why):
+    ///
+    /// - *Coins the storage already holds count.* `find_needed_inputs` strips
+    ///   an input the local storage already holds (as the reference does), so
+    ///   its node is not in the graph and the replay's own set never sees it.
+    ///   The reference then refuses a root that extends a coin it already
+    ///   holds: the next head of a head chain, synced one tick after the
+    ///   last, would be discarded forever. A previous coin is therefore an
+    ///   input in the set OR in the storage for this topic, the exact lookup
+    ///   `Engine::submit` makes when finalize submits the same BEEF.
+    /// - *Sources the storage already holds are merged for step 1.* For the
+    ///   same reason an UNPROVEN node may lack an input's source transaction
+    ///   (the reference throws in `getBEEFForNode` and discards). The stored
+    ///   BEEF of that output is merged into the checked copy, so the spend is
+    ///   executed against its real source and that source's own ancestry is
+    ///   verified too. If the stored BEEF is itself incomplete the verifier
+    ///   refuses, and the graph is discarded as in the reference. Only the
+    ///   CHECKED copy is merged; the finalized bytes are untouched.
+    /// - *Every node is an input of its parent* (`read_anchor_input`).
+    /// - *A conflicting spend refuses the graph.* Two transactions of one
+    ///   graph that spend the same outpoint cannot both be admitted by the
+    ///   finalize submits (the first one consumes the coin), so a replay that
+    ///   showed the coin to both would promise an admission finalize cannot
+    ///   keep. Upstream added the same rule after f999e0c1a (`spentOutpoints`,
+    ///   "Historical GASP graph contains a conflicting spend").
+    /// - *A fault of the moment is not a verdict.* A chain tracker that could
+    ///   not answer, or a storage read that failed, says nothing about the
+    ///   graph: the error is `GASPError::AnchorUnavailable`, the graph is
+    ///   still discarded, but `complete_graph` FAILS the UTXO so the cursor
+    ///   gap guard asks for it again. The reference discards and moves on,
+    ///   which here would lose the UTXO for good behind an advanced cursor.
+    ///
+    /// **Cost.** Step 1 runs the script of every input of every unproven
+    /// transaction in the root's BEEF and asks the tracker once per merkle
+    /// path in it (a proven root: one question, no script). The ancestors a
+    /// manager named BEHIND a proven node are not in that BEEF: their own
+    /// merkle paths are not checked, here or in the reference; they are bound
+    /// to the verified root by txid instead. Step 2 is one manager call per
+    /// transaction and one storage read per input that is not already a coin
+    /// of the set, which is what the finalize submits cost again. The walk is
+    /// the unbudgeted reference walk, the one `Engine::submit` runs on a
+    /// client's BEEF: `DoorBudget` is NOT applied. That budget belongs to the
+    /// `broadcast-gated` door, whose breach means "inconclusive, the network
+    /// judges"; there is no stronger bar behind this check, so a breach could
+    /// only be a refusal, and a refusal here is final for that UTXO. What
+    /// bounds a peer's graph is what bounded it before: the per-peer sync
+    /// budget (which cannot interrupt a script already running). The
+    /// reference serialises this method behind `acquireAnchorValidationSlot`
+    /// (at most 4 at once); here graphs are completed one at a time by one
+    /// sync on one thread, so there is nothing to serialise.
+    async fn validate_graph_anchor(&self, graph_id: &str) -> Result<(), GASPError> {
+        let anchor = {
+            let refs = self
+                .pending_graphs
+                .lock()
+                .map_err(|e| GASPError::Other(format!("Lock poisoned: {e}")))?;
+            Self::read_anchor_input(graph_id, &refs, self.strict_beef)?
+        };
+        let unavailable =
+            |what: String| GASPError::AnchorUnavailable(format!("graph {graph_id}: {what}"));
+        let refused = |why: String| GASPError::ValidationFailed(format!("graph {graph_id}: {why}"));
+
+        // ── 1. Bitcoin ──────────────────────────────────────────────────
+        let mut root_beef = anchor.root_beef;
+        if !anchor.absent_sources.is_empty() {
+            let mut merged = Beef::from_binary(&root_beef)
+                .map_err(|e| refused(format!("root BEEF does not parse: {e}")))?;
+            for (txid, output_index) in &anchor.absent_sources {
+                let held = self
+                    .storage
+                    .find_output(txid, *output_index, Some(&self.topic), None, true)
+                    .await
+                    .map_err(|e| unavailable(format!("reading {txid}.{output_index}: {e}")))?;
+                if let Some(stored) = held.and_then(|output| output.beef) {
+                    if let Ok(stored) = Beef::from_binary(&stored) {
+                        merged.merge_beef(&stored);
+                    }
+                }
+            }
+            root_beef = merged.to_binary();
+        }
+        let tracker = self.chain_tracker.map(|inner| FaultNotingTracker {
+            inner,
+            faulted: AtomicBool::new(false),
+        });
+        let verdict = crate::engine::verify_spv_like_the_reference(
+            tracker.as_ref().map(|t| t as &dyn ChainTracker),
+            self.verify_scripts,
+            &root_beef,
+            &anchor.root_txid,
+        )
+        .await;
+        if let Err(e) = verdict {
+            if tracker
+                .as_ref()
+                .is_some_and(|t| t.faulted.load(Ordering::Relaxed))
+            {
+                return Err(unavailable(format!("the chain tracker faulted: {e}")));
+            }
+            return Err(refused(format!(
+                "The graph is not well-anchored according to the rules of Bitcoin: {e}"
+            )));
+        }
+
+        // ── 2. Overlay ──────────────────────────────────────────────────
+        let Some(manager) = self.topic_manager else {
+            return Ok(());
+        };
+        let mut coins: HashSet<String> = HashSet::new();
+        let mut spent: HashSet<String> = HashSet::new();
+        let mut replayed: HashSet<String> = HashSet::new();
+        for beef in &anchor.ordered_beefs {
+            // The parse `Engine::submit` makes of the same bytes at finalize.
+            let subject = Beef::from_binary(beef)
+                .map(|mut b| crate::subject::subject_txid_of(&mut b))
+                .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
+            let tx = Transaction::from_beef(beef, subject.as_deref())
+                .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
+            let txid = tx.id();
+            // Two outputs of one transaction are two nodes with one BEEF.
+            if !replayed.insert(txid.clone()) {
+                continue;
+            }
+            let mut previous_coins: Vec<u8> = Vec::new();
+            for (input_index, input) in tx.inputs.iter().enumerate() {
+                let source_txid = input.get_source_txid().unwrap_or_default();
+                if source_txid.is_empty() {
+                    continue;
+                }
+                let outpoint = format!("{}.{}", source_txid, input.source_output_index);
+                if !spent.insert(outpoint.clone()) {
+                    return Err(refused(format!(
+                        "the graph contains a conflicting spend of {outpoint}"
+                    )));
+                }
+                let is_coin = coins.contains(&outpoint)
+                    || self
+                        .storage
+                        .find_output(
+                            &source_txid,
+                            input.source_output_index,
+                            Some(&self.topic),
+                            None,
+                            false,
+                        )
+                        .await
+                        .map_err(|e| unavailable(format!("reading {outpoint}: {e}")))?
+                        .is_some();
+                if is_coin {
+                    previous_coins.extend_from_slice(&(input_index as u32).to_le_bytes());
+                }
+            }
+            let admittance = manager
+                .identify_admissible_outputs(&tx, &previous_coins, None, SubmitMode::HistoricalTx)
+                .await
+                .map_err(|e| refused(format!("the topic manager failed on {txid}: {e}")))?;
+            for output_index in admittance.outputs_to_admit {
+                coins.insert(format!("{txid}.{output_index}"));
+            }
+        }
+        if !coins.contains(graph_id) {
+            return Err(refused(
+                "This graph did not result in topical admittance of the root node. Rejecting."
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -584,7 +949,9 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// Computes ordered BEEF byte arrays (ancestors first, root last) from the
     /// temporary graph nodes and stores them in the `FinalizedGraphSink`. The
     /// Engine retrieves these after sync completes and submits each one with
-    /// `HistoricalTxNoSpv` mode.
+    /// `HistoricalTxNoSpv` mode, which skips SPV because
+    /// `validate_graph_anchor` has already done it (the reference's
+    /// `finalizeGraph`, lines 317 to 333).
     async fn finalize_graph(&self, graph_id: &str) -> Result<(), GASPError> {
         let refs = self
             .pending_graphs
@@ -1064,15 +1431,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_graph_anchor_always_succeeds() {
+    async fn validate_graph_anchor_refuses_an_unknown_graph() {
         let store = MemoryStorage::new();
         let gasp_storage = OverlayGASPStorage::new(&store, "tm_test", make_sink());
 
-        // Should not error even for unknown graph IDs
-        gasp_storage
+        // The reference throws `Graph node with ID ... not found`.
+        let error = gasp_storage
             .validate_graph_anchor("nonexistent.0")
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, GASPError::ValidationFailed(_)), "{error}");
     }
 
     #[tokio::test]
@@ -1232,11 +1600,21 @@ mod tests {
                 output_index: u32,
                 _: bool,
             ) -> Result<GASPNode, GASPError> {
+                // Served PROVEN: since bsv-low #551 the anchor check refuses
+                // an unproven transaction that creates satoshis (this one has
+                // no inputs). With no chain tracker a merkle path is accepted
+                // unchecked, the reference's 'scripts only'.
+                let txid = Transaction::from_hex(&self.tx_hex).unwrap().id();
+                let proof = MerklePath::new(
+                    100,
+                    vec![vec![bsv_rs::transaction::MerklePathLeaf::new_txid(0, txid)]],
+                )
+                .unwrap();
                 Ok(GASPNode {
                     graph_id: graph_id.to_string(),
                     raw_tx: self.tx_hex.clone(),
                     output_index,
-                    proof: None,
+                    proof: Some(proof.to_hex()),
                     tx_metadata: None,
                     output_metadata: None,
                     inputs: None,

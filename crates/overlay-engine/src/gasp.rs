@@ -407,6 +407,9 @@ pub struct GASPSync<'a> {
     pruned: std::cell::RefCell<std::collections::HashSet<String>>,
     /// Distinct outpoints pruned in the last `sync` (the size of `pruned`).
     pruned_inputs: std::cell::Cell<u64>,
+    /// Graphs REFUSED by `validate_graph_anchor` and discarded in the last
+    /// `sync` (bsv-low #551). Cleared at the start of each `sync`.
+    discarded_graphs: std::cell::Cell<u64>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -430,7 +433,20 @@ impl<'a> GASPSync<'a> {
             ancestor_fetcher: None,
             pruned: std::cell::RefCell::new(std::collections::HashSet::new()),
             pruned_inputs: std::cell::Cell::new(0),
+            discarded_graphs: std::cell::Cell::new(0),
         }
+    }
+
+    /// How many graphs this orchestrator's last `sync` discarded because
+    /// `validate_graph_anchor` REFUSED them (a root that does not verify, or
+    /// one the topic manager does not admit at the end of the replay; bsv-low
+    /// #551). Nothing of a discarded graph is finalized. As in the reference
+    /// a refused graph is not a failed UTXO: the cursor advances past it. A
+    /// graph whose anchor could not be CHECKED
+    /// (`GASPError::AnchorUnavailable`) is not counted here: that one fails
+    /// its UTXO and is asked for again.
+    pub fn discarded_graphs(&self) -> u64 {
+        self.discarded_graphs.get()
     }
 
     /// How many manager-named inputs this orchestrator pruned because the
@@ -471,6 +487,7 @@ impl<'a> GASPSync<'a> {
         );
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
+        self.discarded_graphs.set(0);
 
         // Track what we already know
         let local_utxos = self.storage.find_known_utxos(0, None).await?;
@@ -900,10 +917,19 @@ impl<'a> GASPSync<'a> {
             }
             Err(e) => {
                 warn!(
-                    "{} Graph validation failed: {}. Discarding.",
-                    self.log_prefix, e
+                    "{} Graph validation failed for {}: {}. Discarding.",
+                    self.log_prefix, graph_id, e
                 );
                 self.storage.discard_graph(graph_id).await?;
+                // The anchor could not be checked (a tracker outage, a
+                // storage fault): no verdict. Fail the UTXO so the gap guard
+                // re-requests it, instead of advancing the cursor past a
+                // graph nobody judged (a divergence by addition, bsv-low
+                // #551: the reference discards and moves on either way).
+                if matches!(e, GASPError::AnchorUnavailable(_)) {
+                    return Err(e);
+                }
+                self.discarded_graphs.set(self.discarded_graphs.get() + 1);
                 Ok(())
             }
         }
@@ -950,6 +976,13 @@ pub enum GASPError {
     /// Storage error.
     #[error("storage error: {0}")]
     StorageError(String),
+
+    /// A graph's anchor could not be CHECKED right now (the chain tracker or
+    /// a storage read faulted): a fault of the moment, not a verdict on the
+    /// graph. `GASPSync::complete_graph` discards the graph and fails the
+    /// UTXO, so the cursor gap guard asks for it again (bsv-low #551).
+    #[error("anchor unavailable: {0}")]
+    AnchorUnavailable(String),
 
     /// Generic error.
     #[error("{0}")]
