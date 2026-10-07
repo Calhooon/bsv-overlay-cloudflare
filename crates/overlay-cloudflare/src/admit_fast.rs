@@ -1293,6 +1293,8 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
     let remarked = remark_spends(db, &txid, &released, now_ms).await;
+    // bsv-low #486 (lens fold): the spends are back on the hops, so the door's refusal of an earlier copy is stale
+    crate::submit_refusals::retire_admitted(db, &txid).await;
     // the stamp is THIS moment's clock (round 3, residual A): a pass whose clock read predates this restore but
     // whose marker lands after it must read the readmission as newer
     let stamp_ms = worker::Date::now().as_millis();

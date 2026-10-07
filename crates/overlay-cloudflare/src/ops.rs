@@ -480,6 +480,18 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
     }
 }
 
+/// PURE (bsv-low #484): the reorg view carries how many CONFIRMED hop probe memos the reorg passes have cleared
+/// (`hop_probe_memos`; the lifetime counter, 0 until the first), beside the cursor that says where the judge is.
+pub fn with_probe_memos_cleared(mut view: serde_json::Value, counters: &serde_json::Value) -> serde_json::Value {
+    if view.is_object() {
+        view["probeMemosCleared"] = json!(counters
+            .get(crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0));
+    }
+    view
+}
+
 /// PURE (round 3, review MED): the released events on record, each with the
 /// `/internal/reorg` body that heals its height, newest last.
 pub fn unresolved_json(
@@ -775,6 +787,22 @@ async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
     row.map(|r| r.c.max(0.0) as u64).unwrap_or(0)
 }
 
+/// The three change webhooks' flush accounts (bsv-low #436): each set's five counters are seeded 0.
+pub const CHANGE_FLUSH_SETS: [&crate::change_flush::FlushCounters; 3] =
+    [&crate::pot_changes::COUNTERS, &crate::hop_changes::COUNTERS, &crate::lobby_changes::COUNTERS];
+
+/// PURE (the delta lens's D-L2): each set's note-backs NEVER RE-SENT, derived from the served counters
+/// (`retried + deferred - resent`, [`crate::change_flush::noted_back_unresent`]): `(name, value)` per set.
+/// `*_undelivered_total = 0` proves delivery only together with this figure at its recorded baseline: the totals
+/// are cumulative across isolates, so after one loss the figure never reads 0 again (D2-L2, `change_flush`'s doc).
+pub fn change_flush_unresent(counters: &serde_json::Value) -> Vec<(&'static str, u64)> {
+    let read = |name: &str| counters[name].as_u64().unwrap_or(0);
+    CHANGE_FLUSH_SETS
+        .iter()
+        .map(|set| (set.noted_back_unresent, crate::change_flush::noted_back_unresent(read(set.retried), read(set.deferred), read(set.resent))))
+        .collect()
+}
+
 /// Read the persistent counters into a JSON object (missing ⇒ 0).
 ///
 /// The #366 census rows share `ops_counters` but are EXCLUDED here — they are
@@ -866,6 +894,16 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_YIELDED,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
+        // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
+        // the merged lens's LOW-3: the app layer's faulted memo reads (it writes the row)
+        crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
+        // bsv-low #436: the app layer's own counts of what a body carried past its cap (it writes these rows);
+        // the flushes' own accounts are seeded below (`CHANGE_FLUSH_SETS`)
+        crate::pot_changes::COUNTER_POT_CHANGED_DROPPED,
+        crate::hop_changes::COUNTER_HOP_CHANGED_DROPPED,
+        crate::lobby_changes::COUNTER_LOBBY_CHANGED_DROPPED,
     ] {
         obj[name] = json!(0);
     }
@@ -875,8 +913,17 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
             obj[courier_counter_name(rung, kind)] = json!(0);
         }
     }
+    for set in CHANGE_FLUSH_SETS {
+        for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] {
+            obj[name] = json!(0);
+        }
+    }
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);
+    }
+    // the delta lens's D-L2: the note-backs never re-sent, derived from the rows just read
+    for (name, value) in change_flush_unresent(&obj) {
+        obj[name] = json!(value);
     }
     obj
 }
@@ -1098,7 +1145,7 @@ pub async fn health_invariants(
             .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
-    let arcade_reorg = arcade_reorg_view(db).await;
+    let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
@@ -1190,6 +1237,40 @@ mod tests {
             courier_counter_name("woc_history", "fault"),
             "courier_woc_history_fault_total"
         );
+    }
+
+    /// The delta lens's D-L2 on the surface: each webhook's note-backs never re-sent are served under their own
+    /// name, derived from the three counters `read_counters` serves; a set whose retried and deferred entries
+    /// were all POSTed again reads 0, one that lost eight with an isolate reads 8 while its `undelivered` is 0.
+    /// To red: serve the counters without the derived figure, or derive it without `resent`.
+    #[test]
+    fn the_note_backs_never_resent_are_served_by_name_beside_an_undelivered_of_zero() {
+        let c = json!({
+            "pot_changed_undelivered_total": 0, "pot_changed_retried_total": 16, "pot_changed_deferred_total": 3, "pot_changed_resent_total": 11,
+            "hop_changed_retried_total": 4, "hop_changed_deferred_total": 0, "hop_changed_resent_total": 4,
+        });
+        assert_eq!(
+            change_flush_unresent(&c),
+            vec![("pot_changed_noted_back_unresent", 8), ("hop_changed_noted_back_unresent", 0), ("lobby_changed_noted_back_unresent", 0)]
+        );
+        let names: Vec<&str> = CHANGE_FLUSH_SETS.iter().flat_map(|s| [s.undelivered, s.retry_failed, s.deferred, s.retried, s.resent]).collect();
+        assert_eq!(
+            names,
+            [
+                "pot_changed_undelivered_total", "pot_changed_retry_failed_total", "pot_changed_deferred_total", "pot_changed_retried_total", "pot_changed_resent_total",
+                "hop_changed_undelivered_total", "hop_changed_retry_failed_total", "hop_changed_deferred_total", "hop_changed_retried_total", "hop_changed_resent_total",
+                "lobby_changed_undelivered_total", "lobby_changed_retry_failed_total", "lobby_changed_deferred_total", "lobby_changed_retried_total", "lobby_changed_resent_total",
+            ]
+        );
+        // the read seeds every one at 0 and derives the figure after the rows (source)
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("ops.rs");
+        let start = src.find("async fn read_counters(").expect("read_counters");
+        let body = squash(&src[start..start + src[start..].find("\n}\n").expect("its end")]);
+        assert!(body.contains(&squash("for set in CHANGE_FLUSH_SETS { for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] { obj[name] = json!(0); } }")));
+        let rows_at = body.find(&squash("for r in rows {")).expect("the rows");
+        let derive_at = body.find(&squash("for (name, value) in change_flush_unresent(&obj) { obj[name] = json!(value); }")).expect("the derived figure");
+        assert!(derive_at > rows_at, "derived from the rows just read");
     }
 
     /// bsv-low M19B-G1: the consumer's state on the health surface: the

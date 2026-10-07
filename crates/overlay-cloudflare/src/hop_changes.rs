@@ -46,44 +46,90 @@ pub fn body_json(identities: &[String]) -> String {
     serde_json::json!({ "identities": identities }).to_string()
 }
 
-/// Ship one notification. Unconfigured (`APP_LAYER_URL` / `INTERNAL_TOKEN`) ⇒ logs and no-ops. Meant to run under
-/// `wait_until` (the pot shipper's twin; the same service binding, the same bearer).
-pub async fn ship(env: Env, identities: Vec<String>) {
+/// bsv-low #436 (lens fold, L6): the app layer's bound on one `/internal/hop-changed` body
+/// (`internal_events::HOP_CHANGED_MAX`, pinned equal from its tests). One flush used to ship EVERY drained
+/// identity in one POST and the app layer kept the first eight and broke, with no log line and no count: the
+/// ninth identity onward kept its owed rows until its read cadence (the #436 class exactly, on the owed list's
+/// hop rows).
+pub const HOP_CHANGED_CHUNK: usize = crate::change_flush::CHANGE_CHUNK;
+
+/// Identities the app layer answered it REFUSED (`dropped` in its answer), or whose POST failed twice.
+pub const COUNTER_HOP_CHANGED_UNDELIVERED: &str = "hop_changed_undelivered_total";
+/// Identities past one flush's bound, noted back for the next flush.
+pub const COUNTER_HOP_CHANGED_DEFERRED: &str = "hop_changed_deferred_total";
+/// Identities of a POST the app layer did not accept, noted back to be retried once.
+pub const COUNTER_HOP_CHANGED_RETRIED: &str = "hop_changed_retried_total";
+/// The part of the undelivered whose retry failed too (the delta lens's D-L2: retried and still failed).
+pub const COUNTER_HOP_CHANGED_RETRY_FAILED: &str = "hop_changed_retry_failed_total";
+/// Noted-back entries (retried or deferred) a later flush POSTed again, whatever that POST answered.
+pub const COUNTER_HOP_CHANGED_RESENT: &str = "hop_changed_resent_total";
+/// Served on `/health/invariants`, derived on the read: `retried + deferred - resent`, the note-backs never
+/// re-sent (lost with an isolate when it stays above 0; see [`crate::change_flush`]).
+pub const HOP_CHANGED_NOTED_BACK_UNRESENT: &str = "hop_changed_noted_back_unresent";
+/// The app layer's own count of the identities a body carried past its cap (it writes this row; pinned equal
+/// to its `COUNTER_HOP_CHANGED_DROPPED` from its tests).
+pub const COUNTER_HOP_CHANGED_DROPPED: &str = "hop_changed_dropped_total";
+
+pub(crate) const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
+    undelivered: COUNTER_HOP_CHANGED_UNDELIVERED,
+    deferred: COUNTER_HOP_CHANGED_DEFERRED,
+    retried: COUNTER_HOP_CHANGED_RETRIED,
+    retry_failed: COUNTER_HOP_CHANGED_RETRY_FAILED,
+    resent: COUNTER_HOP_CHANGED_RESENT,
+    noted_back_unresent: HOP_CHANGED_NOTED_BACK_UNRESENT,
+};
+
+thread_local! {
+    /// The identities noted back once after a failed POST (the retry is bounded at one), and those deferred past a
+    /// flush's bound, until a later flush POSTs them again (the delta lens's D-L2).
+    static NOTED_BACK: RefCell<crate::change_flush::NotedBack<String>> = const { RefCell::new(crate::change_flush::NotedBack::new()) };
+}
+
+/// THE FLUSH of the hop set, transport injected (`ship` runs exactly this, and so do the pins, through a fake
+/// `post`): the identities in POSTs of at most [`HOP_CHANGED_CHUNK`], each body built by [`body_json`], under
+/// the bounds of [`crate::change_flush::ship_chunks`].
+pub async fn ship_with<P, Fut, C>(identities: Vec<String>, post: P, now_ms: C, deadline_ms: u64) -> crate::change_flush::Shipped<String>
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<usize, ()>>,
+    C: Fn() -> u64,
+{
+    crate::change_flush::ship_chunks(identities, body_json, post, now_ms, deadline_ms).await
+}
+
+/// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
+/// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
+pub fn settle(shipped: &crate::change_flush::Shipped<String>) -> crate::change_flush::Tally {
+    let (back, tally) = NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    CHANGES.with(|c| c.borrow_mut().extend(back));
+    tally
+}
+
+/// Ship one flush: the identities in POSTs of at most [`HOP_CHANGED_CHUNK`], one after another, no POST started
+/// at or past `deadline_ms`. Unconfigured (`APP_LAYER_URL` / `INTERNAL_TOKEN`) ⇒ logs and no-ops. Meant to run
+/// under `wait_until` (the pot shipper's twin; the same service binding, the same bearer, the same account:
+/// nothing is lost silently).
+pub async fn ship(env: Env, identities: Vec<String>, deadline_ms: u64) {
     if identities.is_empty() {
         return;
     }
-    let (Ok(url), Ok(token)) = (
-        env.var("APP_LAYER_URL").map(|v| v.to_string()),
-        env.secret("INTERNAL_TOKEN").map(|v| v.to_string()),
-    ) else {
-        console_log!("[hop-changes] not configured (APP_LAYER_URL / INTERNAL_TOKEN) — {} identity(ies) not notified", identities.len());
+    let Some((url, token)) = crate::change_flush::configured(&env) else {
+        console_log!("[hop-changes] not configured (APP_LAYER_URL / INTERNAL_TOKEN): {} identity(ies) not notified", identities.len());
         return;
     };
-    let body = body_json(&identities);
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post);
-    let headers = Headers::new();
-    let _ = headers.set("Authorization", &format!("Bearer {}", token.trim()));
-    let _ = headers.set("content-type", "application/json");
-    init.with_headers(headers);
-    init.with_body(Some(body.into()));
-    let Ok(req) = Request::new_with_init(&format!("{}/internal/hop-changed", url.trim_end_matches('/')), &init) else {
-        return;
-    };
-    let sent = match env.service("APP_LAYER") {
-        Ok(svc) => svc.fetch_request(req).await,
-        Err(_) => Fetch::Request(req).send().await,
-    };
-    match sent {
-        Ok(r) if (200..300).contains(&r.status_code()) => console_log!("[hop-changes] notified {} identity(ies)", identities.len()),
-        Ok(mut r) => {
-            let status = r.status_code();
-            let body = r.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ");
-            console_log!("[hop-changes] app-layer HTTP {status} {excerpt}")
-        }
-        Err(e) => console_log!("[hop-changes] notify failed: {e}"),
+    let total = identities.len();
+    let shipped = ship_with(
+        identities,
+        |body| crate::change_flush::post_body(&env, &url, &token, "/internal/hop-changed", "hop-changes", body),
+        || Date::now().as_millis(),
+        deadline_ms,
+    )
+    .await;
+    if !shipped.delivered.is_empty() {
+        console_log!("[hop-changes] notified {} identity(ies) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
+    let tally = settle(&shipped);
+    crate::change_flush::account(&env, "hop-changes", &COUNTERS, total, tally).await;
 }
 
 #[cfg(test)]
@@ -101,5 +147,38 @@ mod tests {
         assert_eq!(d, vec![a.clone(), b.clone()]);
         assert!(drain().is_empty());
         assert_eq!(body_json(&d), format!("{{\"identities\":[\"{a}\",\"{b}\"]}}"));
+    }
+
+    /// bsv-low #436 (lens fold, L6) through the real flush and a fake transport: nineteen identities ride three
+    /// bodies of at most eight, each identity in exactly one; a failed POST's identities are noted back once.
+    #[test]
+    fn a_hop_flush_is_chunked_at_the_bound_and_a_failed_chunk_is_noted_back_once() {
+        drain();
+        let ids: Vec<String> = (0..19u32).map(|i| format!("02{i:064x}")).collect();
+        let bodies: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let shipped = crate::change_flush::run(ship_with(
+            ids.clone(),
+            |b: String| {
+                bodies.borrow_mut().push(b);
+                let n = bodies.borrow().len();
+                async move { if n == 3 { Err(()) } else { Ok(0) } }
+            },
+            || 0,
+            1,
+        ));
+        assert_eq!(bodies.borrow().len(), 3);
+        let mut seen: Vec<String> = Vec::new();
+        for b in bodies.borrow().iter() {
+            let v: serde_json::Value = serde_json::from_str(b).unwrap();
+            let arr = v["identities"].as_array().unwrap();
+            assert!(!arr.is_empty() && arr.len() <= HOP_CHANGED_CHUNK);
+            seen.extend(arr.iter().map(|x| x.as_str().unwrap().to_string()));
+        }
+        assert_eq!(seen, ids, "every identity in exactly one body");
+        assert_eq!(settle(&shipped), crate::change_flush::Tally { retried: 3, ..Default::default() });
+        assert_eq!(drain(), ids[16..].to_vec(), "the failed chunk rides the next flush");
+        let again = crate::change_flush::run(ship_with(ids[16..].to_vec(), |_b: String| async { Err(()) }, || 0, 1));
+        assert_eq!(settle(&again), crate::change_flush::Tally { undelivered: 3, retry_failed: 3, resent: 3, ..Default::default() }, "a second failure is counted and let go");
+        assert!(drain().is_empty());
     }
 }
