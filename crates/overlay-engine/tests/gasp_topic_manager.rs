@@ -5644,7 +5644,8 @@ async fn delta2_559_m2_y2_proven_and_landed_bodies_do_not_count_against_the_read
         ("17 landed parents", strangers(17, 1), true),
         ("six proven single-input parents", strangers(6, 1), false),
         ("one proven parent with 15 inputs", strangers(1, 15), false),
-        // Wider than any bound: the uncounted reads follow the BEEF.
+        // Wider than the 16: these reads are not counted against it. They
+        // are 40 of the submit's allowance of 256 (`delta3_559_m1_*`).
         ("40 landed parents", strangers(40, 1), true),
     ] {
         let store = Rc::new(MemoryStorage::new());
@@ -5673,6 +5674,158 @@ async fn delta2_559_m2_y2_proven_and_landed_bodies_do_not_count_against_the_read
         not_recorded.is_empty(),
         "recorded, as in the reference, every shape but: {not_recorded:?}"
     );
+}
+
+// ============================================================================
+// The third delta fold of 2026-10-07 (bsv-low #559,
+// `docs/audit/E559-delta-3-2026-10-07.md` in bsv-low), M1: the store's
+// predecessor question has a hard allowance of 256 reads per SUBMIT, over
+// every read it makes (those of proven and landed bodies, which the 16 do
+// not count, included) and over every topic of the submit; past it the
+// answer is "not now", never "landed". Pins (a) and (c) are RED on 5ecf49c.
+// ============================================================================
+
+// One submit of `subject` under `topics`, each hosted by a head manager:
+// the report and the store reads the engine made.
+async fn counted_submit(
+    store: &Rc<MemoryStorage>,
+    topics: &[&str],
+    subject: &Transaction,
+) -> (bsv_overlay_engine::engine::MutationReport, usize) {
+    let storage = ScriptedStore::plain(store);
+    let reads = storage.reads.clone();
+    let engine = Engine::new(
+        topics
+            .iter()
+            .map(|topic| {
+                (
+                    topic.to_string(),
+                    Box::new(HeadChainManager(Rc::new(RefCell::new(HeadState::default()))))
+                        as Box<dyn TopicManager>,
+                )
+            })
+            .collect(),
+        HashMap::new(),
+        Box::new(storage),
+        None,
+        EngineConfig::default(),
+    );
+    let beef = TaggedBEEF::new(
+        subject.to_beef(false).unwrap(),
+        topics.iter().map(|topic| topic.to_string()).collect(),
+    );
+    let report = submitted(&engine, &beef).await;
+    (report, reads.get())
+}
+
+// M1 (a), the delta-3 lens's measured shape: a transaction that admits
+// nothing over 256 PROVEN single-input parents nobody holds. A proven,
+// unlanded body costs the question three reads (its applied row, its outputs,
+// its one input) and none of them is counted against the 16, so on 5ecf49c
+// the question read all 768 (1,025 reads with the submit's own 257) and the
+// transaction was recorded: one read per 41 bytes of a stranger's BEEF, with
+// no bound of ours. Now the question stops at its 256th read and answers
+// "not now": the submit costs `1 + 256 + 256` reads (the dedup read, the
+// previous coin of each input, the allowance) and records nothing. The
+// boundary, to the read: 85 such parents cost 255 and are recorded, the 86th
+// is refused at its second read.
+#[tokio::test]
+async fn delta3_559_m1_a_the_question_stops_at_256_reads_of_one_submit_and_answers_not_now() {
+    let (_logs, _guard) = capture_logs();
+    for (width, recorded) in [(85usize, true), (86, false), (256, false)] {
+        let store = Rc::new(MemoryStorage::new());
+        let subject = noop_over(&strangers(width, 1));
+        let (r, reads) = counted_submit(&store, &[TOPIC], &subject).await;
+        // The submit's own reads: the dedup read and one previous coin per
+        // input. The rest are the question's.
+        let asked = reads - 1 - width;
+        println!(
+            "#559 delta-3 M1 (a): {width} proven parents: {reads} reads, {asked} the question's, durable {} ({})",
+            r.is_durable(),
+            r.summary()
+        );
+        assert_eq!(asked, (3 * width).min(256), "{width} parents");
+        assert!(reads <= 1 + 256 + 256, "{width} parents: {reads} reads");
+        assert_eq!(r.is_durable(), recorded, "{width} parents: {}", r.summary());
+        let subject_row = AppliedTransaction {
+            txid: subject.id(),
+            topic: TOPIC.to_string(),
+        };
+        assert_eq!(
+            store
+                .does_applied_transaction_exist(&subject_row)
+                .await
+                .unwrap(),
+            recorded,
+            "{width} parents: recorded only when the store answered"
+        );
+        if recorded {
+            assert_eq!(r.applied_topics, vec![TOPIC.to_string()], "{width} parents");
+        } else {
+            assert!(r.applied_topics.is_empty(), "{width} parents");
+            assert_eq!(r.faults.len(), 1, "{width} parents: {}", r.summary());
+            assert_eq!(r.faults[0].site, "predecessor_not_landed");
+            assert!(
+                r.faults[0]
+                    .error
+                    .contains("the question ran out of the submit's 256 reads"),
+                "{width} parents: {}",
+                r.summary()
+            );
+        }
+    }
+}
+
+// M1 (c): the allowance is the SUBMIT's, not a topic's. A transaction that
+// admits nothing over 50 proven single-input parents costs the question 150
+// reads in one topic. Under one topic it is recorded. Under two, the first
+// topic's question spends 150 and is recorded, the second starts from the
+// remaining 106 and runs out: "not now" for that topic alone, the submit
+// faults and the replay asks again. On 5ecf49c each topic asked its own 150
+// and both were recorded: the cost was per named topic.
+#[tokio::test]
+async fn delta3_559_m1_c_two_topics_of_one_submit_share_the_allowance() {
+    let (_logs, _guard) = capture_logs();
+    const SECOND: &str = "tm_head_chain_second";
+    let subject = noop_over(&strangers(50, 1));
+
+    let store = Rc::new(MemoryStorage::new());
+    let (r, reads) = counted_submit(&store, &[TOPIC], &subject).await;
+    assert!(r.is_durable(), "one topic: {}", r.summary());
+    assert_eq!(reads, 1 + 50 + 150, "one topic");
+
+    let store = Rc::new(MemoryStorage::new());
+    let (r, reads) = counted_submit(&store, &[TOPIC, SECOND], &subject).await;
+    println!(
+        "#559 delta-3 M1 (c): two topics: {reads} reads, applied {:?} ({})",
+        r.applied_topics,
+        r.summary()
+    );
+    // Each topic's own reads (the dedup read, 50 previous coins), then the
+    // question: 150 in the first topic, the remaining 106 in the second.
+    assert_eq!(reads, 2 * (1 + 50) + 256, "two topics");
+    assert_eq!(r.applied_topics, vec![TOPIC.to_string()]);
+    assert_eq!(r.faults.len(), 1, "{}", r.summary());
+    assert_eq!(r.faults[0].topic, SECOND);
+    assert_eq!(r.faults[0].site, "predecessor_not_landed");
+    assert!(
+        r.faults[0]
+            .error
+            .contains("the question ran out of the submit's 256 reads"),
+        "{}",
+        r.summary()
+    );
+    for (topic, recorded) in [(TOPIC, true), (SECOND, false)] {
+        let row = AppliedTransaction {
+            txid: subject.id(),
+            topic: topic.to_string(),
+        };
+        assert_eq!(
+            store.does_applied_transaction_exist(&row).await.unwrap(),
+            recorded,
+            "{topic}"
+        );
+    }
 }
 
 // Admits output 0 of a transaction whose output 0 carries 777 satoshis, on
@@ -5818,7 +5971,9 @@ async fn delta2_559_m2_a_finalize_over_a_node_with_seventeen_landed_parents_comp
 // M2 under GASP, depth: a finalize over a 20-deep unproven chain of
 // transactions the manager admits nothing of, below a listed tip, completes
 // in one tick, and no node's applied row is read by a question (each is read
-// once, by its own dedup read). "Completes" held on e24f962 too (a
+// once, by its own dedup read; the pin counts applied-row reads ONLY, which
+// is enough: the question's first read of a body is always that row).
+// "Completes" held on e24f962 too (a
 // single-input chain cost the question one read per node there, its parent
 // having landed a moment before); what is new is that the question is not
 // asked.

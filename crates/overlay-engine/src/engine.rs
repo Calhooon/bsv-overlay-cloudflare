@@ -219,8 +219,22 @@ async fn hooked(
 /// Counted are the reads spent on a body the BEEF does not prove and the
 /// store does not hold as landed (the second delta fold of 2026-10-07, M2);
 /// the 17th of those is never made: out of reads is "not now" (the delta
-/// fold of 2026-10-07, M2).
+/// fold of 2026-10-07, M2). An unproven body still needs room under it for
+/// the reads that find it landed (one for an applied row, two for a held
+/// output): each is tested before it is made.
 const PREDECESSOR_READS: usize = 16;
+
+/// The most store reads [`Engine::unlanded_predecessor`] makes for one
+/// SUBMIT (the third delta fold of 2026-10-07, M1): every read of the
+/// question, counted against [`PREDECESSOR_READS`] or not (those of proven
+/// and landed bodies included), in every topic of the submit together. The
+/// 257th is never made: past the allowance the answer is "not now", never
+/// "landed". Without it the question read as far as the BEEF reached (one
+/// read per 41 bytes: 66,305 reads measured from one 2.7 MB BEEF), on a
+/// public route. Per submit and not per topic because what it protects, the
+/// invocation's D1 allowance, is per invocation; 256 is the door's own unit
+/// ([`DoorBudget`]'s inputs per transaction), no derived figure.
+const PREDECESSOR_READS_PER_SUBMIT: usize = 256;
 
 /// Summary of an [`Engine::complete_missing_proofs`] pass.
 ///
@@ -1016,6 +1030,9 @@ impl Engine {
             .run_validation(tagged_beef, mode, &TopicAdmittanceContext::default(), bound)
             .await?;
         let mut report = MutationReport::default();
+        // The reads the store's predecessor question has made in this
+        // submit, every topic together ([`PREDECESSOR_READS_PER_SUBMIT`]).
+        let mut question_reads = 0usize;
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
         // atomic prefix over the WHOLE submitted body — bsv-rs's
         // `to_binary_atomic` sorts, names, never prunes). Lookup services
@@ -1094,8 +1111,14 @@ impl Engine {
                     Some(predecessor) => Some(format!("{predecessor} has not landed")),
                     None if finalize => None,
                     None => {
-                        self.unlanded_predecessor(&tx, &tagged_beef.beef, topic, bound)
-                            .await
+                        self.unlanded_predecessor(
+                            &tx,
+                            &tagged_beef.beef,
+                            topic,
+                            &mut question_reads,
+                            bound,
+                        )
+                        .await
                     }
                 };
                 if let Some(not_now) = waits_on {
@@ -1470,8 +1493,10 @@ impl Engine {
                         "no delete of a stale coin was started: the coins are held, its outputs taken out"
                     } else if unanswered {
                         "the delete of a stale coin did not answer: nothing undone, its outputs stay"
-                    } else {
+                    } else if delete_started {
                         "the delete of a stale coin faulted: nothing undone, its outputs stay"
+                    } else {
+                        "no delete was started and a stale coin was not read back held: nothing undone, its outputs stay"
                     },
                 );
                 continue;
@@ -1634,25 +1659,48 @@ impl Engine {
     /// body with no coins: admitted means an unlanded opener) is not built.
     ///
     /// "Landed" needs a clean answer (the delta fold of 2026-10-07, M1 and
-    /// M2): a read that faults, or the question running out of its reads,
-    /// answers "not now" too, naming the transaction it could not settle.
+    /// M2): a read that faults, or the question running out of its reads
+    /// (the 16 of a topic or the 256 of the submit), answers "not now" too, naming the transaction it could not settle.
     /// Recording the successor there made its replay a dupe and stopped the
     /// chain behind it for good; a retried no-op is the lesser cost.
     ///
     /// What the bound counts (the second delta fold of 2026-10-07, M2): the
     /// reads spent on a body that is NEITHER proven in the BEEF NOR found
-    /// landed, [`PREDECESSOR_READS`] of them. A body the BEEF proves, and
-    /// one whose applied row or held output answers "landed", is read and
-    /// costs nothing against the bound: counted, they made a transaction
-    /// that admits nothing over 17 landed parents, over six proven parents
-    /// the topic never saw, or over one proven parent with 15 inputs "not
-    /// now" on every submit, with no unlanded predecessor anywhere. The
-    /// costs, stated. The uncounted reads are bounded by the BEEF alone
-    /// (two per such body and one per input of a proven one). And a
-    /// transaction that admits nothing, found no coin and carries more
-    /// UNPROVEN, UNLANDED bodies than 16 reads settle (five single-input
-    /// ancestors, fewer with more inputs) is never recorded, where the
-    /// reference records it: each submit of it is a fault and a replay.
+    /// landed, [`PREDECESSOR_READS`] of them per topic. A body the BEEF
+    /// proves, and one whose applied row or held output answers "landed", is
+    /// read and costs nothing against that bound: counted, they made a
+    /// transaction that admits nothing over 17 landed parents, over six
+    /// proven parents the topic never saw, or over one proven parent with 15
+    /// inputs "not now" on every submit, with no unlanded predecessor
+    /// anywhere. A landed body still needs ROOM under it: each read of an
+    /// unproven body is tested before it is made, so with 15 counted reads
+    /// spent one that landed by a held output (no applied row) is refused at
+    /// its second read, and with 16 spent any unproven body at its first.
+    ///
+    /// "Proven" is the BEEF's word here: a body that carries a merkle path
+    /// (a bump index) is counted as proven for the read bound ONLY. No proof
+    /// is checked at this question; the SPV walk of the submit and the GASP
+    /// anchor check are where proofs are checked, and under
+    /// `historical-tx-no-spv` or the scripts-only walk nothing checked this
+    /// one, so the 16 are the caller's to switch off. Nothing is recorded on
+    /// that word (a proven body is walked like any other), and the allowance
+    /// below does not ask it.
+    ///
+    /// The hard allowance (the third delta fold of 2026-10-07, M1):
+    /// `question_reads`, owned by the submit, counts EVERY read of the
+    /// question, those of proven and landed bodies included, over every
+    /// topic of the submit, and stops it at
+    /// [`PREDECESSOR_READS_PER_SUBMIT`]; the 16 stay inside it. A later
+    /// topic's question starts from what the earlier ones left.
+    ///
+    /// The costs, stated. A transaction that admits nothing, found no coin
+    /// and carries more UNPROVEN, UNLANDED bodies than 16 reads settle (five
+    /// single-input ancestors, fewer with more inputs), or a BEEF whose
+    /// question needs more than 256 reads over the submit's topics (a
+    /// landed body costs one read by its applied row or two by a held
+    /// output, a proven, unlanded one two and one per input), is never
+    /// recorded, where the reference records it: each submit of it is a
+    /// fault and a replay.
     ///
     /// A GASP finalize submit does not ask this question at all (see the
     /// call).
@@ -1663,10 +1711,12 @@ impl Engine {
         tx: &Transaction,
         beef_bytes: &[u8],
         topic: &str,
+        question_reads: &mut usize,
         bound: Option<&CallBound>,
     ) -> Option<String> {
         let beef = Beef::from_binary(beef_bytes).ok()?;
-        // Each body the BEEF carries, and whether the BEEF proves it.
+        // Each body the BEEF carries, and whether the BEEF says it is
+        // proven (a bump index: its word, no proof is checked here).
         let bodies: HashMap<String, (&Transaction, bool)> = beef
             .txs
             .iter()
@@ -1699,6 +1749,13 @@ impl Engine {
                     "{candidate} is not known to have landed: the question ran out of its {PREDECESSOR_READS} reads"
                 ))
             };
+            // The submit's allowance, over every read: proven or landed,
+            // this topic or an earlier one.
+            let out_of_allowance = || {
+                Some(format!(
+                    "{candidate} is not known to have landed: the question ran out of the submit's {PREDECESSOR_READS_PER_SUBMIT} reads"
+                ))
+            };
             let unread = |e: StorageError| {
                 Some(format!(
                     "{candidate} is not known to have landed: the store could not say ({e})"
@@ -1713,7 +1770,11 @@ impl Engine {
             if out_of(spent) {
                 return out_of_reads();
             }
+            if *question_reads >= PREDECESSOR_READS_PER_SUBMIT {
+                return out_of_allowance();
+            }
             spent += 1;
+            *question_reads += 1;
             match stored(bound, self.storage.does_applied_transaction_exist(&record)).await {
                 Ok(false) => {}
                 Ok(true) => continue,
@@ -1722,7 +1783,11 @@ impl Engine {
             if out_of(spent) {
                 return out_of_reads();
             }
+            if *question_reads >= PREDECESSOR_READS_PER_SUBMIT {
+                return out_of_allowance();
+            }
             spent += 1;
+            *question_reads += 1;
             match stored(
                 bound,
                 self.storage.find_outputs_for_transaction(&candidate, false),
@@ -1741,7 +1806,11 @@ impl Engine {
                 if out_of(spent) {
                     return out_of_reads();
                 }
+                if *question_reads >= PREDECESSOR_READS_PER_SUBMIT {
+                    return out_of_allowance();
+                }
                 spent += 1;
+                *question_reads += 1;
                 let coin = stored(
                     bound,
                     self.storage.find_output(

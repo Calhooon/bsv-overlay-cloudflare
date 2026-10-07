@@ -192,7 +192,7 @@ gasp_topic_manager i551` (and `fold_medium`).
 
 The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
 
-## A faulted submit leaves one head (bsv-low #559, lens fold and two delta folds of 2026-10-07)
+## A faulted submit leaves one head (bsv-low #559, lens fold and three delta folds of 2026-10-07)
 
 `Engine::submit` inserts the admitted outputs BEFORE it deletes the stale
 coins, and deletes them once EVERY insert of that topic landed. The reference
@@ -265,10 +265,20 @@ fault (one invocation's memory), or the store says so
 the submitted BEEF carries, with no applied row, no output held, spending a
 coin the topic holds (or a coin of another such transaction). "Landed" needs
 a clean answer, so a read that faults or the question running out of its
-reads is "not now" too (the delta fold, M1 and M2). The bound is 16 reads
-spent on bodies the BEEF does not prove and the store does not hold as landed
-(the second delta fold, M2): a proven body and one whose applied row or held
-output answers "landed" are read and cost nothing against it. A GASP finalize
+reads is "not now" too (the delta fold, M1 and M2). Two bounds, both ours.
+The question costs at most 256 store reads per SUBMIT over every body it
+reads, in every topic of the submit together (the third delta fold, M1:
+`PREDECESSOR_READS_PER_SUBMIT`; a later topic's question starts from what the
+earlier ones left). Inside that, at most 16 per topic are spent on bodies the
+BEEF does not prove and the store does not hold as landed (the second delta
+fold, M2): a proven body and one whose applied row or held output answers
+"landed" are read and cost nothing against the 16, though an unproven body
+needs room under it for the reads that find it landed (with 15 spent, one
+landed by a held output and no applied row is refused at its second read).
+"Proven" is the BEEF's word here (a body carrying a merkle path): no proof is
+checked at this question (the SPV walk and the anchor check are where proofs
+are checked), it switches the 16 off for that body and nothing else, and the
+256 do not ask it. A GASP finalize
 submit does not ask the store at all (its graph passed the anchor check, its
 in-graph parents were submitted just before it and the sequence stops at the
 first that does not land); it keeps the engine's own memory.
@@ -285,7 +295,9 @@ bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`,
 `fold559`, `delta559` (the delta lens's X4 to X9, each RED on `33e78fb`),
 `delta2_559` (the delta-2 lens's Y1 and Y2, a finalize over a node with 17
 landed parents, rows 2 and 6 of its table; the M1 and M2 pins RED on
-`e24f962`) and `limit_opener` (its Y4, a limit pinned as it is).
+`e24f962`), `limit_opener` (its Y4, a limit pinned as it is) and `delta3_559`
+(the delta-3 lens's M1: the 256 reads of one submit to the read, and two
+topics sharing them; RED on `5ecf49c`).
 
 The limits, stated. (1) Two faults in one submit: an undo is separate calls,
 and one that faults too leaves the inserted output beside the kept coin
@@ -317,9 +329,12 @@ yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
 reads settle (five single-input ancestors, fewer with more inputs) is "not
 now" on every submit, where the reference records it: three retries and a
-dead letter each; the reads of proven and landed bodies are not counted, so
-their number follows the BEEF (two per body, one more per input of a proven
-one). (5) What D1 does with a statement whose caller stopped waiting, or was
+dead letter each. So is one whose question needs more than 256 reads over
+the submit's topics, whatever its bodies are (a landed body costs one read by
+its applied row or two by a held output; a proven, unlanded one two and one
+more per input: 86 proven single-input parents nobody holds, or 43 under two
+topics): the reads of proven and landed bodies are free of the 16 and not of
+the 256, so the question never follows the BEEF past a constant. (5) What D1 does with a statement whose caller stopped waiting, or was
 answered an error, is not known here; the engine assumes it may still land,
 at every door. A delete that never lands leaves the stale coin's spent row
 until that transaction's replay at the door finishes it (GASP does not replay
