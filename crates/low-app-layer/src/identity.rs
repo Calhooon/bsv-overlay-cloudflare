@@ -276,14 +276,15 @@ pub fn is_normalized_name(s: &str) -> bool {
 /// The image type the MAGIC BYTES declare, as its canonical mime, or `None`.
 /// Only png, jpeg, webp, gif and avif; SVG (text) and everything else is `None`.
 pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
-    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    // Zanaadu's `sniff_image_kind` and the client's sniff: the 4-byte PNG prefix and `GIF8` (M29-3b fold lens LOW-1, 2026-10-07).
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G'];
     if bytes.starts_with(PNG) {
         return Some("image/png");
     }
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some("image/jpeg");
     }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+    if bytes.starts_with(b"GIF8") {
         return Some("image/gif");
     }
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {

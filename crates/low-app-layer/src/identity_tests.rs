@@ -399,7 +399,10 @@ fn the_magic_bytes_decide_the_type() {
     assert_eq!(sniff_image(b"RIFF\x10\x00\x00\x00WAVEfmt "), None);
     assert_eq!(sniff_image(b"<?xml version=\"1.0\"?><svg/>"), None);
     assert_eq!(sniff_image(b"<!doctype html><html>"), None);
-    assert_eq!(sniff_image(&[0x89, b'P', b'N', b'G']), None, "a truncated signature is not a png");
+    // The 4-byte prefix IS the png rule, as Zanaadu's `sniff_image_kind` and the client's sniff (M29-3b fold lens LOW-1).
+    assert_eq!(sniff_image(&[0x89, b'P', b'N', b'G']), Some("image/png"));
+    assert_eq!(sniff_image(b"GIF8"), Some("image/gif"), "GIF8 alone is the gif rule");
+    assert_eq!(sniff_image(&[0x89, b'P', b'N']), None, "three bytes are not a png");
     // AVIF: Zanaadu's own header fixture, the one the client lane pins.
     assert_eq!(sniff_image(AVIF), Some("image/avif"));
     assert_eq!(sniff_image(b"\x00\x00\x00\x1cftypheicmif1"), None, "an ftyp box, not avif");
