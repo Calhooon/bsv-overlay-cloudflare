@@ -2548,6 +2548,7 @@ mod tests {
             valid_refunds: &no_refunds,
             collected_verified: &none,
             collected_present: &none,
+            held_verified: &none,
             pot_spenders: &none,
             pot_spenders_faulted: false,
             hop_chain: chain,

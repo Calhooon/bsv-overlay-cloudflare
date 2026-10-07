@@ -74,7 +74,13 @@
 //!   6. CAPS what one identity can file: per `(poster, family, game, pot)` the
 //!      honest need ([`filed_rows_cap`]: one row per family, two for
 //!      `potparty` (v1 + v2 share a table) and `result` (the claim, then its
-//!      countersigned upgrade)) — a distinct content past the cap is `409`;
+//!      countersigned upgrade), and for `collected` the v1 marker and,
+//!      COUNTED APART, [`HELD_FILINGS_PER_GAME`] held filings (bsv-low #492,
+//!      below: one per payout transaction of the game; each shape counts its
+//!      own rows only ([`filed_rows_cap_of`]), so held filings can never
+//!      refuse the v1 marker nor the marker a held filing; five rows in all,
+//!      under the 8 rows per pair the overlay's `ls_collected` serves)); a
+//!      distinct content past the cap is `409`;
 //!      and per `(poster, family)` a day's budget
 //!      ([`RECORD_FILINGS_PER_IDENTITY_PER_DAY`], `429`). Both count FILED rows
 //!      only (`txid LIKE 'filed:%'`), never chain admissions. And a marker the
@@ -199,7 +205,29 @@ impl RecordKind {
 pub const fn filed_rows_cap(kind: RecordKind) -> i64 {
     match kind {
         RecordKind::Potparty | RecordKind::Result | RecordKind::Hopsweep => 2,
+        // `collected` is the v1 marker's cap: one per game. The held filings of the same door share the table and
+        // are counted APART ([`filed_rows_cap_of`], [`HELD_FILED_ROWS_SQL`]).
         RecordKind::Potrefund | RecordKind::Collected => 1,
+    }
+}
+
+/// bsv-low #492: held filings (`LOW/collected/v2`) one identity may hold per game: one per payout transaction the
+/// game can pay it (the pot's settle or refund, a hop's sweep, a re-funded pot's). A game with more payout
+/// transactions than this keeps the rows past the cap served (the pre-#492 state of those rows, never a wrong row).
+pub const HELD_FILINGS_PER_GAME: i64 = 4;
+
+/// The per-game cap of ONE verified record (the B3 lens fold L1): a held filing counts held rows only, up to
+/// [`HELD_FILINGS_PER_GAME`]; every other record its family's [`filed_rows_cap`]. The v1 `collected` marker and
+/// the held filings share a table and a door, never a count: five held rows cannot refuse the v1 marker, and the
+/// marker takes no held slot.
+pub const fn filed_rows_cap_of(v: &VerifiedRecord) -> i64 {
+    match v {
+        VerifiedRecord::Held(..) => HELD_FILINGS_PER_GAME,
+        VerifiedRecord::Potparty(..) => filed_rows_cap(RecordKind::Potparty),
+        VerifiedRecord::Potrefund(..) => filed_rows_cap(RecordKind::Potrefund),
+        VerifiedRecord::Result(..) => filed_rows_cap(RecordKind::Result),
+        VerifiedRecord::Collected(_) => filed_rows_cap(RecordKind::Collected),
+        VerifiedRecord::Hopsweep(..) => filed_rows_cap(RecordKind::Hopsweep),
     }
 }
 
@@ -490,6 +518,171 @@ pub fn collected_challenge(game_id_lc: &str, identity_lc: &str) -> Vec<u8> {
     format!("LOW-collected\nv1\ngid={game_id_lc}\nid={identity_lc}").into_bytes()
 }
 
+// ── bsv-low #492 / #512: the HELD filing (`LOW/collected/v2`) ───────────────
+//
+// The v1 marker names (identity, game): "I collected this game's credit". It cannot say WHICH payout when a game
+// pays the identity twice (the pot's payout and a swept hop's, a re-funded game's two pots: the owed list's N10),
+// so there a filed marker retired nothing and the rows were served claimable for good. The held filing names the
+// PAYING TRANSACTION: "my wallet holds the payout of game G that transaction T pays". It is filed by the device
+// whose wallet ledger already holds T (the live credit of a hand whose `collected` filing a closing page dropped,
+// a press the wallet answered as already known), with no credit and no press, and the owed list retires exactly
+// the payout row T pays (`owed::OwedInputs::held_verified`).
+//
+// FILED ONLY: the chain's topic manager admits the v1 tag alone (`parse_collected_marker`), so every stored row of
+// this shape passed this door's signature bar. The table is the v1 marker's plus ONE column, `payTxid` (overlay
+// migration 163; the B3 lens fold M1): this door, the only writer of the column, writes T there in the same INSERT
+// as the row, after the signature over (game, identity, T) verified. The owed walk retires by matching the column
+// (`owed::CollectedFold`), and re-derives the row's own content key from (game, identity, T) first, so a row can
+// only ever retire the transaction its key was filed for; no stored signature is checked again at the read.
+//
+// ── THE CLIENT CONTRACT (the device's half; bsv-low #492 / #512, the B3 lens fold M2) ──
+//
+// 1. THE HOLD RULE. A held filing is IRREVERSIBLE: rows are never deleted and there is no un-file door, so a
+//    filed row is never offered to a press again. File it ONLY when the wallet OWNS THE PAYING OUTPUT: the
+//    outpoint `facts.payTxid`:`facts.payVout` of the served row (spent or unspent), by the wallet's own OUTPUT
+//    record, or by an internalize of that output that answered (a fresh credit or a merge). NEVER because the
+//    wallet merely KNOWS the txid: a wallet lists a transaction it built or co-signed (a sweep its own client
+//    composed, a settle it signed) without holding the home output, and a filing on that word cuts the player's
+//    own drift net for good. `payVout` is the output to the identity's committed home in `payTxid` (`payPkh`);
+//    it is `null` when the server could not name exactly one this pass: then the device finds its home outputs
+//    in the credit BEEF itself (as the press does) and must own EVERY one, or it does not file. The signed
+//    fields name the TRANSACTION; the ownership check is the device's duty and nothing here can make it.
+//    SPENT STILL COUNTS (the B3 delta lens D-L4): a home output the wallet's own next hop already spent is
+//    owned all the same, by the wallet's record of that OUTPUT, spent or unspent. A wallet that lists
+//    spendable outputs only and cannot answer for the outpoint itself: the device does not file; it never
+//    falls back to the txid.
+//    NO SINGLE HOME: `payPkh: null` (no proven seat or no decoded keys on a pot, a hop whose game has no
+//    known home) comes with `payVout: null` on every pass, and nothing is filed from the row alone: the
+//    device finds its home outputs in the credit BEEF and must own every one, as above.
+// 2. THE DOOR. `POST /record?kind=collected&identity=<identity hex>`, body `{ "scriptHex": "<the script>" }`.
+//    The script: `OP_FALSE OP_RETURN`, then five minimal pushes: `LOW/collected/v2`, gameId (32), identityKey
+//    (33), payTxid (32, the byte order of the txid's hex as `facts.payTxid` prints it), sig. The signature: over
+//    `LOW-collected\nv2\ngid=<gid>\nid=<identity>\ntxid=<payTxid>` (lowercase hex), protocol
+//    `[1,'low collected']`, keyID = gameId, counterparty anyone, low-S DER. The answers:
+//      200 `{ filed: true, kind, key, heldTxid }`: written; the row retires on the next read. Memo it, done.
+//      200 `{ filed: false, alreadyFiled: true, kind, key, heldTxid }`: this content was already on file;
+//          nothing was written, staled or pushed. Memo it, done.
+//      400 (the script is not this marker, not canonical, not hex), 403 (the `identity` is not the marker's),
+//          413 (too large), 422 (the signature does not verify under the identity): a client bug; drop the
+//          filing, never retry it unchanged. The body's `error` says which.
+//      409: four held filings already stand for this (identity, game); stop for this game, for good. It
+//          never binds an honest player: a game id is ONE hand (a rematch mints a new id, the client's
+//          `sha256("<gameId>:rematch")`), and one hand pays an identity by one to three transactions (the
+//          pot's spend, a hop's sweep, a re-funded pot).
+//      429: the identity's day (200 `collected` rows in 24 h, v1 and held together) is spent; stop every
+//          `collected` filing until tomorrow. A re-file of content ALREADY on file answers 429 too, not
+//          `alreadyFiled`, once the day is spent (the caps run before the insert): the memo the first 200
+//          wrote stands and nothing is queued again, and a 429 never WRITES that memo (it does not say the
+//          content is on file).
+//      5xx, a timeout, no answer: not an answer; the outbox keeps it and re-files.
+//    BEFORE THE DOOR, the auth seam's own answers (the B3 delta lens D-N3), none of them this door's word on
+//    the filing:
+//      401 `ERR_SESSION_REFUSED` on a LANED call (the session lane refused the call's session or MAC): the
+//          lane is a fast path; the same call goes again by the reference BRC-104 path and only that
+//          answer is judged.
+//      401 with no session under `AUTH_ENFORCE`: authenticate (the BRC-103/104 handshake), then file.
+//      403 naming `authenticatedIdentity` and `queryIdentity` (`routes::view_identity`): the session is not
+//          the `identity` of the query; a client bug, drop the filing. 400 for a body that is not JSON: same.
+// 3. ONCE. One filing per (game, payTxid), remembered in a device memo keyed by both, never one per read of
+//    `/owed`. A row still served after its filing answered 200 is NOT a reason to file again (the read may
+//    simply be older than the write; a replaced spend has another `payTxid`, which is another filing). A
+//    re-file repairs nothing (the B3 delta lens D-L3): if the write's stale mark was missed, the list heals
+//    at the read's age rule (15 minutes, `owed::OWED_RECOMPUTE_ANY_AFTER_MS`), and a re-file answers `alreadyFiled` and
+//    marks nothing. A device that sees a row it already filed for WAITS for the age rule, never re-files.
+// 4. ONE SHAPE. After a FRESH credit (the wallet's internalize answered and the balance rose) file the held
+//    filing ALONE: it is exact, and it is one row of the day budget. The v1 marker is for nothing new.
+// 5. NOTHING TO FILE for a row with `payTxid: null` or `claimable: false`: the wallet cannot hold what has not
+//    landed, and a row that names no transaction names nothing to sign.
+// 6. THE OUTCOME LINE SURVIVES THE ROW. A press that learned "already in your wallet" keeps saying so after
+//    its filing retired the row (bsv-low #515's retired block); the row's absence is not an error to render.
+// 7. THE OUTBOX. The filing rides the record outbox (bsv-low #492 remedy 1), so a closing page does not drop
+//    it; the load-time quiet filing is the repair for one that was dropped before the outbox existed.
+// 8. NO COUNT PER WINDOW. The server checks no stored signature at the read, so every filed row retires its
+//    payout on every recompute, however many an identity holds (the 256-per-recompute cut is gone). The only
+//    limits are the two at this door: four per game, 200 a day.
+
+/// The held filing's tag. Five pushes: tag, gameId (32), identityKey (33), payTxid (32, the byte order of the
+/// txid's hex as every LOW surface prints it, like a marker's `potTxid`), sig (canonical DER).
+pub const HELD_TAG: &[u8] = b"LOW/collected/v2";
+
+/// A decoded held filing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldMarker {
+    pub game_id: [u8; 32],
+    pub identity_key: Vec<u8>,
+    pub pay_txid: [u8; 32],
+    pub sig: Vec<u8>,
+}
+
+/// Parse a held filing: the canonical encoding only (this family has no chain reader), exact tag, exact lengths.
+pub fn parse_held_marker(script: &[u8]) -> Option<HeldMarker> {
+    use overlay_discovery::collected::{
+        COLLECTED_GAME_ID_LEN, COLLECTED_IDENTITY_KEY_LEN, COLLECTED_SIG_MAX_LEN, COLLECTED_SIG_MIN_LEN,
+    };
+    let pushes = canonical_marker_pushes(script)?;
+    let [tag, game_id, identity_key, pay_txid, sig] = pushes.as_slice() else {
+        return None;
+    };
+    if *tag != HELD_TAG
+        || game_id.len() != COLLECTED_GAME_ID_LEN
+        || identity_key.len() != COLLECTED_IDENTITY_KEY_LEN
+        || pay_txid.len() != 32
+        || !(COLLECTED_SIG_MIN_LEN..=COLLECTED_SIG_MAX_LEN).contains(&sig.len())
+    {
+        return None;
+    }
+    Some(HeldMarker {
+        game_id: (*game_id).try_into().ok()?,
+        identity_key: identity_key.to_vec(),
+        pay_txid: (*pay_txid).try_into().ok()?,
+        sig: sig.to_vec(),
+    })
+}
+
+/// A held filing's key: game ‖ identity ‖ the paying txid (one row per payout transaction).
+pub fn held_content_key(m: &HeldMarker) -> String {
+    content_key(HELD_TAG, &[&m.game_id, &m.identity_key, &m.pay_txid])
+}
+
+/// PURE (the B3 lens fold M1): is `row_key` the content key this door files a held filing of (game, identity,
+/// paying txid) under? The owed walk's gate on a stored row's `payTxid` column: only a row whose own key was
+/// derived from that very txid retires its payout, so the column can never name a transaction the row was not
+/// filed for, and a row keyed by a chain outpoint (which this door never writes) names nothing at all. One
+/// sha256, no signature. All hex, any case; anything undecodable or of the wrong length is `false`.
+pub fn is_held_row_key(row_key: &str, game_id: &str, identity: &str, pay_txid: &str) -> bool {
+    let (Ok(game), Ok(id), Ok(txid)) = (hex::decode(game_id), hex::decode(identity), hex::decode(pay_txid)) else {
+        return false;
+    };
+    let (Ok(game), Ok(txid)) = (<[u8; 32]>::try_from(game.as_slice()), <[u8; 32]>::try_from(txid.as_slice())) else {
+        return false;
+    };
+    if id.len() != overlay_discovery::collected::COLLECTED_IDENTITY_KEY_LEN {
+        return false;
+    }
+    row_key == held_content_key(&HeldMarker { game_id: game, identity_key: id, pay_txid: txid, sig: Vec::new() })
+}
+
+/// The client's held challenge: `LOW-collected\nv2\ngid=<gid>\nid=<identity>\ntxid=<payTxid>` (all lowercase
+/// hex), signed under `[1,'low collected']`, keyID = gameId, counterparty anyone (the v1 marker's protocol and
+/// key; the `v2` line and the `txid=` line keep the two challenges apart, so neither signature is the other's).
+pub fn held_challenge(game_id_lc: &str, identity_lc: &str, pay_txid_lc: &str) -> Vec<u8> {
+    format!("LOW-collected\nv2\ngid={game_id_lc}\nid={identity_lc}\ntxid={pay_txid_lc}").into_bytes()
+}
+
+/// bsv-low #492: does this signature verify UNDER the named identity as a held filing of `pay_txid_lc` for the
+/// game (the replay the filing door runs before it writes the row and its `payTxid`)? The owed walk does not call
+/// it (the B3 lens fold M1: the door's check is the only one); a reader of `ls_collected` rows can.
+pub fn held_sig_verifies(identity_lc: &str, game_id_lc: &str, pay_txid_lc: &str, sig_hex: &str) -> bool {
+    let Ok(sig) = hex::decode(sig_hex) else { return false };
+    canonical_anyone_sig_verifies(
+        identity_lc,
+        game_id_lc,
+        &held_challenge(game_id_lc, identity_lc, pay_txid_lc),
+        &sig,
+        collected_protocol(),
+    )
+}
+
 /// `anyone_sig_verifies` behind the canonical-DER gate — the three families
 /// whose serve-time verifier has no such bar get it at the FILING, where a
 /// row is free (the gate's HIGH-2; `canonical_der`'s own doc has the why).
@@ -742,6 +935,9 @@ pub enum VerifiedRecord {
     /// The record and its `claim_tier` (1 = the winner's claim, 2 = countersigned).
     Result(ResultRecord, i64),
     Collected(CollectedRecord),
+    /// bsv-low #492: a held filing (`LOW/collected/v2`), the row it writes to the v1 marker's table and the paying
+    /// txid its signature names (lowercase hex; written to the row's `payTxid` column).
+    Held(CollectedRecord, String),
     /// bsv-low #469: the parsed sweep filing, UNBOUND (the route reads the hop
     /// row and binds with `hopsweep::bind_hop_sweep` after the parse); only a
     /// bound one is written.
@@ -754,7 +950,7 @@ impl VerifiedRecord {
             Self::Potparty(r, _) => &r.txid,
             Self::Potrefund(r, _) => &r.txid,
             Self::Result(r, _) => &r.txid,
-            Self::Collected(r) => &r.txid,
+            Self::Collected(r) | Self::Held(r, _) => &r.txid,
             Self::Hopsweep(_, r) => &r.txid,
         }
     }
@@ -763,7 +959,7 @@ impl VerifiedRecord {
             Self::Potparty(..) => RecordKind::Potparty,
             Self::Potrefund(..) => RecordKind::Potrefund,
             Self::Result(..) => RecordKind::Result,
-            Self::Collected(_) => RecordKind::Collected,
+            Self::Collected(_) | Self::Held(..) => RecordKind::Collected,
             Self::Hopsweep(..) => RecordKind::Hopsweep,
         }
     }
@@ -896,6 +1092,34 @@ pub fn verify_record_post(
             Ok(VerifiedRecord::Result(record, tier))
         }
         RecordKind::Collected => {
+            // bsv-low #492: the held filing (v2) comes through the v1 marker's door; the tags tell them apart
+            if let Some(m) = parse_held_marker(script) {
+                let identity = hex::encode(&m.identity_key);
+                if identity != poster_lc {
+                    return Err(RecordRefusal::PosterMismatch);
+                }
+                let game_id = hex::encode(m.game_id);
+                let pay_txid = hex::encode(m.pay_txid);
+                if !canonical_anyone_sig_verifies(
+                    &identity,
+                    &game_id,
+                    &held_challenge(&game_id, &identity, &pay_txid),
+                    &m.sig,
+                    collected_protocol(),
+                ) {
+                    return Err(RecordRefusal::SignatureInvalid);
+                }
+                return Ok(VerifiedRecord::Held(
+                    CollectedRecord {
+                        identity,
+                        game_id,
+                        txid: held_content_key(&m),
+                        output_index: 0,
+                        sig_hex: Some(hex::encode(&m.sig)),
+                    },
+                    pay_txid,
+                ));
+            }
             let m = parse_collected_marker(script).ok_or(RecordRefusal::NotAMarker)?;
             let identity = hex::encode(&m.identity_key);
             if identity != poster_lc {
@@ -956,9 +1180,12 @@ pub const RESULT_FILE_SQL: &str = "INSERT OR IGNORE INTO result_markers_v2 \
       loserSigHex, cardsHex, txid, outputIndex, createdAt, claimValid) \
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
+/// The `collected` door's ONE insert. `payTxid` (the last bind) is the paying transaction a held filing names
+/// (bsv-low #492, the B3 lens fold M1) and NULL for the v1 marker; this door is the column's only writer, and it
+/// writes it only after the signature over that txid verified. Rows are never updated and never deleted.
 pub const COLLECTED_FILE_SQL: &str = "INSERT OR IGNORE INTO collected_markers_v2 \
-     (identity, gameId, txid, outputIndex, sigHex, createdAt) \
-     VALUES (?, ?, ?, ?, ?, ?)";
+     (identity, gameId, txid, outputIndex, sigHex, createdAt, payTxid) \
+     VALUES (?, ?, ?, ?, ?, ?, ?)";
 
 /// The leaderboard row the overlay writes beside every result marker —
 /// byte-for-byte `result_write::lb_row_insert_sql()` (the overlay crate is a
@@ -993,8 +1220,12 @@ pub const POTREFUND_FILED_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM potrefund_
      WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid LIKE 'filed:%' AND txid <> ?4";
 pub const RESULT_FILED_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM result_markers_v2 \
      WHERE winner = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid LIKE 'filed:%' AND txid <> ?4";
+// `collected` counts its two shapes APART (the B3 lens fold L1): the v1 marker's rows name no transaction
+// (`payTxid IS NULL`), a held filing's do. Same binds for both.
 pub const COLLECTED_FILED_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM collected_markers_v2 \
-     WHERE identity = ?1 AND gameId = ?2 AND txid LIKE 'filed:%' AND txid <> ?3";
+     WHERE identity = ?1 AND gameId = ?2 AND txid LIKE 'filed:%' AND payTxid IS NULL AND txid <> ?3";
+pub const HELD_FILED_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM collected_markers_v2 \
+     WHERE identity = ?1 AND gameId = ?2 AND txid LIKE 'filed:%' AND payTxid IS NOT NULL AND txid <> ?3";
 
 /// The late latch: a refund backup filed at rank 0 (the pot unindexed then)
 /// re-filed once the index holds the pot — the INSERT is the no-op it always
@@ -1019,9 +1250,12 @@ pub const COLLECTED_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM collected_
      WHERE identity = ?1 AND gameId = ?2 AND txid NOT LIKE 'filed:%'";
 
 /// The chain no-op statement and its binds for a verified record (a pure
-/// value, for the same reason as [`cap_queries`]).
-pub fn chain_rows_query(v: &VerifiedRecord) -> (&'static str, Vec<String>) {
-    match v {
+/// value, for the same reason as [`cap_queries`]). `None` for a held filing
+/// (bsv-low #492): the chain never holds one, and the v1 marker a chain row
+/// for its game would be is another marker, never a reason to drop it.
+pub fn chain_rows_query(v: &VerifiedRecord) -> Option<(&'static str, Vec<String>)> {
+    Some(match v {
+        VerifiedRecord::Held(..) => return None,
         VerifiedRecord::Potparty(r, _) => (
             POTPARTY_CHAIN_ROWS_SQL,
             vec![
@@ -1057,7 +1291,7 @@ pub fn chain_rows_query(v: &VerifiedRecord) -> (&'static str, Vec<String>) {
             crate::hopsweep::HOPSWEEP_CHAIN_ROWS_SQL,
             vec![r.identity.clone(), r.game_id.clone(), r.hop_txid.clone()],
         ),
-    }
+    })
 }
 
 pub const POTPARTY_FILED_TODAY_SQL: &str = "SELECT COUNT(*) AS n FROM potparty_records \
@@ -1113,6 +1347,13 @@ pub fn cap_queries(v: &VerifiedRecord) -> (&'static str, Vec<String>, &'static s
             COLLECTED_FILED_TODAY_SQL,
             r.identity.clone(),
         ),
+        // the held rows of the game only (L1); the day is the family's, both shapes together
+        VerifiedRecord::Held(r, _) => (
+            HELD_FILED_ROWS_SQL,
+            vec![r.identity.clone(), r.game_id.clone(), r.txid.clone()],
+            COLLECTED_FILED_TODAY_SQL,
+            r.identity.clone(),
+        ),
         VerifiedRecord::Hopsweep(_, r) => (
             crate::hopsweep::HOPSWEEP_FILED_ROWS_SQL,
             vec![r.identity.clone(), r.game_id.clone(), r.hop_txid.clone(), r.txid.clone()],
@@ -1122,15 +1363,43 @@ pub fn cap_queries(v: &VerifiedRecord) -> (&'static str, Vec<String>, &'static s
     }
 }
 
-/// The pure cap decision from the two counts.
+/// The pure cap decision from the two counts, for a family's own cap.
 pub fn cap_refusal(kind: RecordKind, rows_for_pot: i64, rows_today: i64) -> Option<RecordRefusal> {
-    if rows_for_pot >= filed_rows_cap(kind) {
+    cap_refusal_at(filed_rows_cap(kind), rows_for_pot, rows_today)
+}
+
+/// The pure cap decision for ONE verified record (the route's call): its own per-game cap
+/// ([`filed_rows_cap_of`]) over the count [`cap_queries`] names for it.
+pub fn cap_refusal_for(v: &VerifiedRecord, rows_for_pot: i64, rows_today: i64) -> Option<RecordRefusal> {
+    cap_refusal_at(filed_rows_cap_of(v), rows_for_pot, rows_today)
+}
+
+fn cap_refusal_at(cap: i64, rows_for_pot: i64, rows_today: i64) -> Option<RecordRefusal> {
+    if rows_for_pot >= cap {
         return Some(RecordRefusal::TooManyFiled);
     }
     if rows_today >= RECORD_FILINGS_PER_IDENTITY_PER_DAY {
         return Some(RecordRefusal::DailyCapReached);
     }
     None
+}
+
+/// PURE (the B3 lens fold L2): did the `collected` door's `INSERT OR IGNORE` write a row? `changes` is D1's count
+/// for the statement: 0 = the content key was already on file (a re-file). An unreadable count is read as WRITTEN
+/// (the stale mark and the push run, as before the fold): a missed recompute would be the worse error.
+pub fn insert_wrote_a_row(changes: Option<usize>) -> bool {
+    changes != Some(0)
+}
+
+/// PURE (the B3 lens fold L2): the door's answer to a re-file that wrote nothing. 200 with the EXISTING key (the
+/// shipped client keys on `key` and drops its outbox row), `filed: false` (this request wrote nothing) and
+/// `alreadyFiled: true`; a held filing names its txid as on a first filing.
+pub fn already_filed_body(v: &VerifiedRecord) -> serde_json::Value {
+    let mut body = serde_json::json!({ "filed": false, "kind": v.kind().as_str(), "key": v.key(), "alreadyFiled": true });
+    if let VerifiedRecord::Held(_, pay_txid) = v {
+        body["heldTxid"] = serde_json::json!(pay_txid);
+    }
+    body
 }
 
 // ── counters (per isolate; a soak/monitoring surface on /health, Rule 13) ──
@@ -1140,6 +1409,8 @@ static REFUSED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }
 static TOO_MANY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
 static DAILY_CAP_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
 static ALREADY_INDEXED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+/// Re-files of a `collected` content already on file (the B3 lens fold L2): nothing written, staled or pushed.
+static ALREADY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
 /// Refund backups written at rank 0 (the pot not indexed at filing time).
 static REFUNDS_FILED_UNBOUND: AtomicU64 = AtomicU64::new(0);
 /// Rank-0 refund rows latched to rank 1 by a later re-file.
@@ -1172,6 +1443,7 @@ pub fn record_health_json() -> serde_json::Value {
         "tooManyFiledByKind": by_kind(&TOO_MANY_FILED_BY_KIND),
         "dailyCapByKind": by_kind(&DAILY_CAP_BY_KIND),
         "alreadyIndexedByKind": by_kind(&ALREADY_INDEXED_BY_KIND),
+        "alreadyFiledByKind": by_kind(&ALREADY_FILED_BY_KIND),
         "anonymousFiledByKind": by_kind(&ANONYMOUS_FILED_BY_KIND),
         "refundsFiledUnbound": REFUNDS_FILED_UNBOUND.load(Ordering::Relaxed),
         "refundsLatchedLater": REFUNDS_LATCHED_LATER.load(Ordering::Relaxed),
@@ -1180,6 +1452,7 @@ pub fn record_health_json() -> serde_json::Value {
             "potrefund": filed_rows_cap(RecordKind::Potrefund),
             "result": filed_rows_cap(RecordKind::Result),
             "collected": filed_rows_cap(RecordKind::Collected),
+            "collectedHeld": HELD_FILINGS_PER_GAME,
             "hopsweep": filed_rows_cap(RecordKind::Hopsweep),
         },
         "filingsPerIdentityPerDay": RECORD_FILINGS_PER_IDENTITY_PER_DAY,
@@ -1413,13 +1686,17 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     let now = (worker::Date::now().as_millis() / 1000) as i64;
     // The chain no-op (step 6): the chain already holds this marker for this
     // identity — nothing to add, nothing written, nothing counted.
-    let (chain_sql, chain_binds) = chain_rows_query(&verified);
-    let chain_rows = count(
-        &db,
-        chain_sql,
-        &chain_binds.iter().map(|s| js(s)).collect::<Vec<_>>(),
-    )
-    .await?;
+    let chain_rows = match chain_rows_query(&verified) {
+        Some((chain_sql, chain_binds)) => {
+            count(
+                &db,
+                chain_sql,
+                &chain_binds.iter().map(|s| js(s)).collect::<Vec<_>>(),
+            )
+            .await?
+        }
+        None => 0,
+    };
     if chain_rows > 0 {
         bump(&ALREADY_INDEXED_BY_KIND, kind);
         return crate::routes::json_response(
@@ -1435,6 +1712,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     }
     // The caps (step 6): the poster's rows for this (family, game, pot) —
     // this content excluded — and its day.
+    let mut row_written = true;
     let (rows_sql, rows_binds, day_sql, day_identity) = cap_queries(&verified);
     let rows_for_pot = count(
         &db,
@@ -1448,7 +1726,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         &[js(&day_identity), js_num(now - RECORD_DAY_SECS)],
     )
     .await?;
-    if let Some(r) = cap_refusal(kind, rows_for_pot, rows_today) {
+    if let Some(r) = cap_refusal_for(&verified, rows_for_pot, rows_today) {
         bump(
             if r == RecordRefusal::TooManyFiled {
                 &TOO_MANY_FILED_BY_KIND
@@ -1566,8 +1844,13 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                 .run()
                 .await?;
         }
-        VerifiedRecord::Collected(r) => {
-            db.prepare(COLLECTED_FILE_SQL)
+        VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
+            let pay_txid = match &verified {
+                VerifiedRecord::Held(_, t) => Some(t.as_str()),
+                _ => None,
+            };
+            let done = db
+                .prepare(COLLECTED_FILE_SQL)
                 .bind(&[
                     js(&r.identity),
                     js(&r.game_id),
@@ -1575,9 +1858,17 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js_num(0),
                     js_opt(r.sig_hex.as_deref()),
                     js_num(now),
+                    js_opt(pay_txid),
                 ])?
                 .run()
                 .await?;
+            // The B3 lens fold L2: the INSERT is `OR IGNORE`, so a re-file of content already on file writes
+            // nothing. Then nothing changed in what is owed: no stale mark, no `owed-changed` push, no `filed`
+            // count (a stranger replaying a victim's public filing, or a client re-filing on every read, bought a
+            // recompute and a push per request). `changes` unreadable is read as written (the pre-fold behavior).
+            // NOT lossless (the B3 delta lens D-L3): a first filing whose stale mark faulted or died is no
+            // longer repaired by a re-file; that missed mark heals at the read's 15 minute age rule.
+            row_written = insert_wrote_a_row(done.meta().ok().flatten().and_then(|m| m.changes));
         }
         VerifiedRecord::Hopsweep(_, r) => {
             db.prepare(crate::hopsweep::HOPSWEEP_FILE_SQL)
@@ -1600,12 +1891,16 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
     // party of the pot STALE (their next read recomputes) and tell the filer's page; nothing heavy runs inline on the
     // funding path.
+    if !row_written {
+        bump(&ALREADY_FILED_BY_KIND, kind);
+        return crate::routes::json_response(already_filed_body(&verified).to_string(), 200);
+    }
     {
         use worker::wasm_bindgen::JsValue;
         let (identity, pot): (Option<String>, Option<(String, u32)>) = match &verified {
             VerifiedRecord::Potparty(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
             VerifiedRecord::Potrefund(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
-            VerifiedRecord::Collected(r) => (Some(r.identity.to_ascii_lowercase()), None),
+            VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => (Some(r.identity.to_ascii_lowercase()), None),
             VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
             VerifiedRecord::Result(..) => (None, None),
         };
@@ -1637,12 +1932,15 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     if let VerifiedRecord::Potrefund(_, refund_valid) = &verified {
         body["refundValid"] = serde_json::json!(i64::from(*refund_valid));
     }
+    if let VerifiedRecord::Held(_, pay_txid) = &verified {
+        body["heldTxid"] = serde_json::json!(pay_txid);
+    }
     crate::routes::json_response(body.to_string(), 200)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bsv_rs::primitives::bsv::sighash::{
         build_sighash_preimage, compute_sighash_for_signing, parse_transaction, SighashParams,
@@ -1651,12 +1949,12 @@ mod tests {
     use bsv_rs::primitives::PrivateKey;
     use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet};
 
-    fn wallet(seed: u8) -> ProtoWallet {
+    pub(crate) fn wallet(seed: u8) -> ProtoWallet {
         ProtoWallet::new(Some(
             PrivateKey::from_hex(&hex::encode([seed; 32])).unwrap(),
         ))
     }
-    fn identity(w: &ProtoWallet) -> Vec<u8> {
+    pub(crate) fn identity(w: &ProtoWallet) -> Vec<u8> {
         hex::decode(
             w.get_public_key(GetPublicKeyArgs {
                 identity_key: true,
@@ -1670,7 +1968,7 @@ mod tests {
         )
         .unwrap()
     }
-    fn sign(
+    pub(crate) fn sign(
         w: &ProtoWallet,
         protocol: bsv_rs::wallet::Protocol,
         key_id: &str,
@@ -1700,7 +1998,7 @@ mod tests {
         }
         out.extend_from_slice(data);
     }
-    fn script(pushes: &[&[u8]]) -> Vec<u8> {
+    pub(crate) fn script(pushes: &[&[u8]]) -> Vec<u8> {
         let mut out = vec![0x00, 0x6a];
         for p in pushes {
             push(&mut out, p);
@@ -1945,7 +2243,7 @@ mod tests {
         let (rows_sql, binds, day_sql, day_id) = cap_queries(&v);
         assert!(rows_sql.contains("hopsweep_records") && day_sql.contains("hopsweep_records"));
         assert_eq!((binds.len(), binds[2].as_str(), day_id.as_str()), (4, hex::encode(hop).as_str(), hex::encode(&id).as_str()));
-        let (chain_sql, chain_binds) = chain_rows_query(&v);
+        let (chain_sql, chain_binds) = chain_rows_query(&v).unwrap();
         assert!(chain_sql.contains("hopsweep_records") && chain_binds.len() == 3);
         assert_eq!(cap_refusal(RecordKind::Hopsweep, 2, 0), Some(RecordRefusal::TooManyFiled));
         assert_eq!(cap_refusal(RecordKind::Hopsweep, 1, 0), None);
@@ -2127,6 +2425,98 @@ mod tests {
             )
             .into_bytes()
         );
+    }
+
+    /// bsv-low #492 / #512: the held filing names the PAYING TRANSACTION, verifies under its identity at the door,
+    /// is one row per (game, identity, txid) whatever the signature bytes, and is never the v1 marker (nor the v1
+    /// marker it): the two challenges differ, so a signature over one retires nothing as the other.
+    #[test]
+    fn a_held_filing_names_its_paying_txid_and_files_under_its_signer_only() {
+        let w = wallet(11);
+        let id = identity(&w);
+        let id_lc = hex::encode(&id);
+        let gid = [0x55u8; 32];
+        let gid_lc = hex::encode(gid);
+        let pay = [0x66u8; 32];
+        let pay_lc = hex::encode(pay);
+        assert_eq!(
+            held_challenge(&gid_lc, &id_lc, &pay_lc),
+            format!("LOW-collected\nv2\ngid={gid_lc}\nid={id_lc}\ntxid={pay_lc}").into_bytes()
+        );
+        let sig = sign(&w, collected_protocol(), &gid_lc, &held_challenge(&gid_lc, &id_lc, &pay_lc));
+        let s = script(&[HELD_TAG, &gid, &id, &pay, &sig]);
+        let v = verify_record_post(RecordKind::Collected, &s, &id_lc).unwrap();
+        let VerifiedRecord::Held(r, named) = &v else { panic!("a held filing") };
+        assert_eq!(named, &pay_lc);
+        assert_eq!((r.identity.as_str(), r.game_id.as_str()), (id_lc.as_str(), gid_lc.as_str()));
+        assert_eq!(r.txid, held_content_key(&parse_held_marker(&s).unwrap()));
+        assert!(r.txid.starts_with("filed:"));
+        assert_eq!(v.kind(), RecordKind::Collected);
+        // the chain never holds one: a chain v1 marker of the game must not swallow it as `alreadyIndexed`
+        assert!(chain_rows_query(&v).is_none());
+        // the caps (the B3 lens fold L1): the HELD rows of the (identity, game) window, counted apart from the v1
+        // marker's, up to HELD_FILINGS_PER_GAME; the day is the family's, both shapes together
+        let (rows_sql, binds, day_sql, _) = cap_queries(&v);
+        assert_eq!((rows_sql, day_sql), (HELD_FILED_ROWS_SQL, COLLECTED_FILED_TODAY_SQL));
+        assert!(HELD_FILED_ROWS_SQL.contains("payTxid IS NOT NULL") && COLLECTED_FILED_ROWS_SQL.contains("payTxid IS NULL"));
+        assert_eq!(binds, vec![id_lc.clone(), gid_lc.clone(), r.txid.clone()]);
+        assert_eq!(filed_rows_cap_of(&v), HELD_FILINGS_PER_GAME);
+        assert_eq!(cap_refusal_for(&v, HELD_FILINGS_PER_GAME - 1, 0), None);
+        assert_eq!(cap_refusal_for(&v, HELD_FILINGS_PER_GAME, 0), Some(RecordRefusal::TooManyFiled));
+        assert_eq!(cap_refusal_for(&v, 0, RECORD_FILINGS_PER_IDENTITY_PER_DAY), Some(RecordRefusal::DailyCapReached));
+        // the row's key is the content key of (game, identity, txid), and of nothing else (the owed walk's gate, M1)
+        assert!(is_held_row_key(&r.txid, &gid_lc, &id_lc, &pay_lc));
+        assert!(is_held_row_key(&r.txid, &gid_lc.to_ascii_uppercase(), &id_lc.to_ascii_uppercase(), &pay_lc.to_ascii_uppercase()));
+        assert!(!is_held_row_key(&r.txid, &gid_lc, &id_lc, &"67".repeat(32)));
+        assert!(!is_held_row_key(&r.txid, &"56".repeat(32), &id_lc, &pay_lc));
+        assert!(!is_held_row_key(&r.txid, &gid_lc, &hex::encode(identity(&wallet(12))), &pay_lc));
+        assert!(!is_held_row_key(&"ee".repeat(32), &gid_lc, &id_lc, &pay_lc), "a chain outpoint is no held key");
+        assert!(!is_held_row_key("filed:", &gid_lc, &id_lc, &pay_lc));
+        assert!(!is_held_row_key(&r.txid, &gid_lc, &id_lc, "zz") && !is_held_row_key(&r.txid, &gid_lc[2..], &id_lc, &pay_lc));
+        // the stored signature verifies as a held filing of THAT txid only, and never as the v1 marker
+        let sig_hex = r.sig_hex.clone().unwrap();
+        assert!(held_sig_verifies(&id_lc, &gid_lc, &pay_lc, &sig_hex));
+        assert!(!held_sig_verifies(&id_lc, &gid_lc, &"67".repeat(32), &sig_hex));
+        assert!(!held_sig_verifies(&id_lc, &"56".repeat(32), &pay_lc, &sig_hex));
+        assert!(!collected_sig_verifies(&id_lc, &gid_lc, &sig_hex));
+        // and the v1 marker's signature is no held filing of anything
+        let v1_sig = sign(&w, collected_protocol(), &gid_lc, &collected_challenge(&gid_lc, &id_lc));
+        assert!(!held_sig_verifies(&id_lc, &gid_lc, &pay_lc, &hex::encode(&v1_sig)));
+        assert_eq!(
+            verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, &pay, &v1_sig]), &id_lc).unwrap_err(),
+            RecordRefusal::SignatureInvalid
+        );
+        // a re-signed copy is the same row; another txid is another row; another game another
+        let again = sign(&w, collected_protocol(), &gid_lc, &held_challenge(&gid_lc, &id_lc, &pay_lc));
+        let m = parse_held_marker(&s).unwrap();
+        assert_eq!(held_content_key(&HeldMarker { sig: again, ..m.clone() }), r.txid);
+        assert_ne!(held_content_key(&HeldMarker { pay_txid: [0x67; 32], ..m.clone() }), r.txid);
+        assert_ne!(held_content_key(&HeldMarker { game_id: [0x56; 32], ..m.clone() }), r.txid);
+        // a stranger posting it, a signature over another txid, a stranger's signature: refused
+        let stranger = wallet(12);
+        let stranger_lc = hex::encode(identity(&stranger));
+        assert_eq!(verify_record_post(RecordKind::Collected, &s, &stranger_lc).unwrap_err(), RecordRefusal::PosterMismatch);
+        let other = [0x67u8; 32];
+        assert_eq!(
+            verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, &other, &sig]), &id_lc).unwrap_err(),
+            RecordRefusal::SignatureInvalid
+        );
+        let forged = sign(&stranger, collected_protocol(), &gid_lc, &held_challenge(&gid_lc, &id_lc, &pay_lc));
+        assert_eq!(
+            verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, &pay, &forged]), &id_lc).unwrap_err(),
+            RecordRefusal::SignatureInvalid
+        );
+        // the shape is exact: a short txid, a sixth push, the v1 tag over five pushes are not markers of this kind
+        for bad in [
+            script(&[HELD_TAG, &gid, &id, &pay[..31], &sig]),
+            script(&[HELD_TAG, &gid, &id, &pay, &sig, &[1u8]]),
+            script(&[b"LOW/collected/v1", &gid, &id, &pay, &sig]),
+        ] {
+            assert!(parse_held_marker(&bad).is_none());
+            assert_eq!(verify_record_post(RecordKind::Collected, &bad, &id_lc).unwrap_err(), RecordRefusal::NotAMarker);
+        }
+        // no other door takes it
+        assert_eq!(verify_record_post(RecordKind::Potrefund, &s, &id_lc).unwrap_err(), RecordRefusal::NotAMarker);
     }
 
     #[test]
@@ -2531,7 +2921,8 @@ mod tests {
         assert_eq!(filed_rows_cap(RecordKind::Potparty), 2);
         assert_eq!(filed_rows_cap(RecordKind::Result), 2);
         assert_eq!(filed_rows_cap(RecordKind::Potrefund), 1);
-        assert_eq!(filed_rows_cap(RecordKind::Collected), 1);
+        assert_eq!(filed_rows_cap(RecordKind::Collected), 1, "the v1 marker's; the held filings are counted apart");
+        assert_eq!(HELD_FILINGS_PER_GAME, 4);
         assert_eq!(cap_refusal(RecordKind::Potrefund, 0, 0), None);
         assert_eq!(
             cap_refusal(RecordKind::Potrefund, 1, 0),
@@ -2585,7 +2976,8 @@ mod tests {
                 created_at: 0,
             },
             true,
-        ));
+        ))
+        .unwrap();
         assert_eq!(csql, POTPARTY_CHAIN_ROWS_SQL);
         assert_eq!(
             cbinds,
@@ -2613,6 +3005,7 @@ mod tests {
             POTREFUND_FILED_ROWS_SQL,
             RESULT_FILED_ROWS_SQL,
             COLLECTED_FILED_ROWS_SQL,
+            HELD_FILED_ROWS_SQL,
             POTPARTY_FILED_TODAY_SQL,
             POTREFUND_FILED_TODAY_SQL,
             RESULT_FILED_TODAY_SQL,
@@ -2630,10 +3023,69 @@ mod tests {
         assert_eq!(RecordRefusal::NotCanonical.status(), 400);
         let h = record_health_json();
         assert_eq!(h["filedRowsCap"]["potrefund"], 1);
+        assert_eq!((&h["filedRowsCap"]["collected"], &h["filedRowsCap"]["collectedHeld"]), (&serde_json::json!(1), &serde_json::json!(HELD_FILINGS_PER_GAME)));
+        assert!(h["alreadyFiledByKind"]["collected"].is_u64());
         assert_eq!(
             h["filingsPerIdentityPerDay"],
             RECORD_FILINGS_PER_IDENTITY_PER_DAY
         );
         assert!(h["anonymousFiledByKind"]["result"].is_u64());
+    }
+    /// The B3 delta lens D-N1: `collected_markers_v2.payTxid` has ONE writer, the door's insert, and that insert
+    /// runs behind the signature check. Read over the production source of both workers (each file up to its
+    /// test module, comment lines dropped): one INSERT into the table names the column, it is
+    /// [`COLLECTED_FILE_SQL`], it is prepared once, after `verify_record_post`, and no statement updates,
+    /// replaces or deletes a row of the table. A statement whose table name is built at run time is out of
+    /// this pin's sight; none exists today.
+    #[test]
+    fn i492_dn1_the_door_is_the_only_writer_of_pay_txid() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let production = text.split("\nmod tests {").next().unwrap().split("\npub(crate) mod tests {").next().unwrap();
+                    let code: Vec<&str> = production.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+                    // one line of text: a statement split over source lines (a `\` continuation) reads whole
+                    let flat = code.join(" ").replace('\\', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+                    out.push((path.file_name().unwrap().to_string_lossy().into_owned(), flat));
+                }
+            }
+        }
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&here.join("src"), &mut files);
+        sources(&here.join("../overlay-cloudflare/src"), &mut files);
+        assert!(files.len() > 40, "both workers' sources were read: {}", files.len());
+        let table = "collected_markers_v2";
+        let (mut inserts, mut naming_pay_txid) = (0usize, Vec::new());
+        for (file, flat) in &files {
+            let upper = flat.to_ascii_uppercase();
+            for verb in ["UPDATE ", "DELETE FROM ", "REPLACE INTO ", "INSERT OR REPLACE INTO "] {
+                assert!(!upper.contains(&format!("{verb}{}", table.to_ascii_uppercase())), "{file}: `{verb}{table}`: rows are never rewritten");
+            }
+            let into = format!("INTO {table}");
+            for (at, _) in flat.match_indices(&into) {
+                inserts += 1;
+                // the statement: up to the end of its string literal
+                let stmt = flat[at..].split('"').next().unwrap();
+                if stmt.contains("payTxid") {
+                    naming_pay_txid.push(file.clone());
+                }
+            }
+        }
+        assert!(inserts >= 3, "the door's insert, the overlay's `store_record` and the carry were all seen: {inserts}");
+        assert_eq!(naming_pay_txid, vec!["record_post.rs".to_string()], "one insert names the column, the door's");
+        assert!(COLLECTED_FILE_SQL.contains("INTO collected_markers_v2") && COLLECTED_FILE_SQL.contains("payTxid"));
+        let door = &files.iter().find(|(f, _)| f == "record_post.rs").unwrap().1;
+        let uses: Vec<usize> = door.match_indices("COLLECTED_FILE_SQL").map(|(i, _)| i).collect();
+        assert_eq!(uses.len(), 2, "the const and ONE prepare");
+        let prepare = door.find(".prepare(COLLECTED_FILE_SQL)").expect("the door prepares it");
+        let route = door.find("pub async fn record_post(").expect("the door");
+        let verify = door[route..].find("verify_record_post(kind, &script, &identity)").expect("the door verifies") + route;
+        assert!(route < verify && verify < prepare, "the signature check runs before the one insert");
+        assert_eq!(door.matches("pub async fn ").count(), 1, "the route is the file's only async door, so the insert is inside it");
     }
 }

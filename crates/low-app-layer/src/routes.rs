@@ -3145,8 +3145,10 @@ pub(crate) async fn owed_recompute(
     //    is byte-format admitted, a stranger can plant a row naming any (identity, game); only a signature the
     //    identity itself made retires a payout; presence is display provenance). A read fault is counted and leaves
     //    both sets empty (the rows stay: the safe direction).
-    let mut collected_verified: HashSet<String> = HashSet::new();
-    let mut collected_present: HashSet<String> = HashSet::new();
+    //    bsv-low #492: the same rows carry the identity's held filings (`LOW/collected/v2`), each naming its
+    //    paying transaction in `payTxid` (written by the filing door after it verified the signature): matched by
+    //    string, no signature and no budget here (the B3 lens fold M1); the fold is `owed::CollectedFold`.
+    let mut collected = crate::owed::CollectedFold::default();
     {
         #[derive(Deserialize)]
         struct CollectedRowD1 {
@@ -3154,6 +3156,10 @@ pub(crate) async fn owed_recompute(
             game_id: String,
             #[serde(rename = "sigHex", default)]
             sig_hex: Option<String>,
+            #[serde(default)]
+            txid: Option<String>,
+            #[serde(rename = "payTxid", default)]
+            pay_txid: Option<String>,
         }
         // every spent pot's game AND every hop's game (a swept hop-only game has no pot row; its payout retires by
         // its game's filing too — the collect pass of 2026-09-19 filed five that stood)
@@ -3163,7 +3169,7 @@ pub(crate) async fn owed_recompute(
         );
         for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
             let marks = vec!["?"; chunk.len()].join(", ");
-            let sql = format!("SELECT gameId, sigHex FROM collected_markers_v2 WHERE identity = ? AND gameId IN ({marks})");
+            let sql = crate::owed::collected_rows_sql(&marks);
             let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() + 1);
             b.push(JsValue::from_str(identity_lc));
             for g in chunk {
@@ -3176,11 +3182,7 @@ pub(crate) async fn owed_recompute(
             match rows {
                 Ok(rows) => {
                     for r in rows {
-                        let g = r.game_id.to_ascii_lowercase();
-                        collected_present.insert(g.clone());
-                        if r.sig_hex.as_deref().is_some_and(|sig| crate::record_post::collected_sig_verifies(identity_lc, &g, sig)) {
-                            collected_verified.insert(g);
-                        }
+                        collected.row(identity_lc, &r.game_id, r.sig_hex.as_deref(), r.txid.as_deref(), r.pay_txid.as_deref());
                     }
                 }
                 Err(e) => {
@@ -3422,6 +3424,14 @@ pub(crate) async fn owed_recompute(
     // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
     //    thousands of `unbound` rows; the actionable ones are written first, the list is CUT and says so)
     let no_home_words: HashMap<String, crate::owed::HomeSpendWord> = HashMap::new();
+    // 6d. bsv-low #492 / #512: the payouts this identity's wallet ALREADY HOLDS by its own signed word: the
+    //     (game, paying txid) names of its held filings, as step 5 folded them. A row such a filing names is not
+    //     served.
+    let crate::owed::CollectedFold { verified: collected_verified, present: collected_present, held: held_verified, held_key_mismatches } = collected;
+    crate::owed::note_held_filings(held_verified.len(), held_key_mismatches);
+    if held_key_mismatches > 0 {
+        console_warn!("[owed] {held_key_mismatches} collected row(s) carry a payTxid their key was not filed for (they retire nothing)");
+    }
     let mut inputs = OwedInputs {
         identity_lc,
         tip,
@@ -3432,6 +3442,7 @@ pub(crate) async fn owed_recompute(
         valid_refunds: &valid_refunds,
         collected_verified: &collected_verified,
         collected_present: &collected_present,
+        held_verified: &held_verified,
         pot_spenders: &pot_spenders,
         pot_spenders_faulted,
         hop_chain: &hop_chain,
@@ -3459,6 +3470,21 @@ pub(crate) async fn owed_recompute(
     if rows.len() > crate::owed::OWED_MAX_ROWS {
         rows.truncate(crate::owed::OWED_MAX_ROWS);
         walk_cut = true;
+    }
+    // 7b. bsv-low #512 (the B3 lens fold M2): `payVout`, the OUTPUT of the paying transaction a device must own
+    //     before it files a held filing, for the payout rows the derivation could not name it on (a pot's payout).
+    //     The spend's bytes are the index's own (`pot_beefs`: `ls_pot` writes the settle or the refund on spend),
+    //     hash-checked against the paying txid; a (txid, home) answered once is memoised in the isolate (the bytes
+    //     never change), so a warm isolate reads nothing here. The B3 delta lens D-L1: this step is the last one,
+    //     so the recompute's clock does NOT gate it (a heavy identity read `null` on every pass); it has its own
+    //     (`owed::pay_vout_pass`: the first chunk always, the rest inside `OWED_PAY_VOUT_READ_BUDGET_MS`, the
+    //     start chunk turning with the clock), and a row it leaves `null` this pass is asked again on the next.
+    {
+        let wanted = crate::owed::pay_vout_wanted(&rows);
+        let mut world = PayVoutReads { db, started_ms: worker::Date::now().as_millis() as i64 };
+        let pass = crate::owed::pay_vout_pass(&mut world, &wanted, crate::logic::D1_CHUNK_OUTPOINTS, now_ms as u64).await;
+        budget_cut |= pass.cut;
+        crate::owed::mark_pay_vouts(&mut rows, &pass.vouts);
     }
 
     // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 503
@@ -3586,6 +3612,44 @@ async fn owed_home_spend_walk(
     pass.words
 }
 
+/// The Worker behind `owed::PayVoutWorld`: the step's own clock, the isolate's memo and `pot_beefs`. Reads only;
+/// every decision is `owed::pay_vout_pass`'s.
+struct PayVoutReads<'a> {
+    db: &'a worker::D1Database,
+    started_ms: i64,
+}
+impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
+    fn over_own_budget(&self) -> bool {
+        worker::Date::now().as_millis() as i64 - self.started_ms > crate::owed::OWED_PAY_VOUT_READ_BUDGET_MS
+    }
+    fn memo_get(&self, key: &str) -> Option<u32> {
+        owed_pay_vout_memo_get(key)
+    }
+    fn memo_put(&mut self, key: &str, vout: u32) {
+        owed_pay_vout_memo_put(key, vout);
+    }
+    async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let placeholders = vec!["?"; txids.len()].join(",");
+        let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
+        let binds: Vec<JsValue> = txids.iter().map(|t| JsValue::from_str(t)).collect();
+        let read = match self.db.prepare(&sql).bind(&binds) {
+            Ok(stmt) => stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()),
+            Err(e) => Err(e),
+        };
+        let beefs = read.map_err(|e| {
+            console_warn!("[owed] payVout read failed (those rows serve payVout: null this pass): {e}");
+            e.to_string()
+        })?;
+        Ok(beefs
+            .into_iter()
+            .filter_map(|b| {
+                let txid = b.txid.to_ascii_lowercase();
+                let raw = b.beef.and_then(|h| decode_beef_hex(&h)).and_then(|bytes| crate::logic::extract_raw_tx_hex(&bytes, &txid)).and_then(|h| hex::decode(h).ok())?;
+                Some((txid, raw))
+            })
+            .collect())
+    }
+}
 /// The Worker behind `owed::HomeWalkWorld`: the recompute's clock, the `/spent-any` ladder, the stored BEEF and
 /// the tx-any resolver. Fetches only; every decision is `owed::home_walk_pass`'s.
 struct HomeWalkCouriers<'a> {
@@ -6215,6 +6279,26 @@ fn owed_courier_note_asked(txid_lc: &str, now: f64) {
             m.clear();
         }
         m.insert(txid_lc.to_string(), now);
+    });
+}
+thread_local! {
+    /// bsv-low #512 (the B3 lens fold M2): `owed::pay_vout_key` (paying txid, home pkh) to the sole output of that
+    /// transaction paying that home, as its hash-checked bytes showed it. Immutable facts; bounded, cleared
+    /// wholesale when full.
+    static OWED_PAY_VOUT_MEMO: std::cell::RefCell<std::collections::HashMap<String, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const OWED_PAY_VOUT_MEMO_MAX: usize = 4096;
+fn owed_pay_vout_memo_get(key: &str) -> Option<u32> {
+    OWED_PAY_VOUT_MEMO.with(|m| m.borrow().get(key).copied())
+}
+fn owed_pay_vout_memo_put(key: &str, vout: u32) {
+    OWED_PAY_VOUT_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= OWED_PAY_VOUT_MEMO_MAX {
+            m.clear();
+        }
+        m.insert(key.to_string(), vout);
     });
 }
 fn owed_spender_outputs_memo_get(txid_lc: &str) -> Option<CourierSpenderBytes> {

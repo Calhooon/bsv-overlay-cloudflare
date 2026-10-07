@@ -21,7 +21,8 @@
 //!   claim; the reason rides the row.
 //!
 //! NOT a row, by construction: a decided LOSS; a payout with a `collected`
-//! filing; a written-off era pot (the views' era clause); a pot the identity
+//! filing; a payout whose paying transaction the identity's own held filing
+//! names (bsv-low #492: the wallet already holds it); a written-off era pot (the views' era clause); a pot the identity
 //! is not a party to (the views' party window).
 //!
 //! The derivation is PURE over rows this crate already serves (`ResultEntry`,
@@ -671,6 +672,15 @@ pub struct OwedInputs<'a> {
     pub collected_verified: &'a HashSet<String>,
     /// game ids (lowercase) with ANY `collected` row naming this identity (byte-format admission: plantable; never a gate).
     pub collected_present: &'a HashSet<String>,
+    /// bsv-low #492 / #512: the payouts this identity's WALLET ALREADY HOLDS, by its own signed word: one
+    /// [`held_key`] per (game, paying txid) a held filing (`LOW/collected/v2`, `record_post`) of this identity
+    /// names ([`CollectedFold::held`]: the door verified its signature and wrote the txid). The app layer cannot
+    /// see a wallet; the device can (its wallet owns the paying output the live credit landed, or answered a
+    /// press as already known), and it says so with no press and no credit. A payout row whose paying
+    /// transaction is named here is not a row. Unlike the v1 marker this names the TRANSACTION, so it retires
+    /// exactly one row whatever the game's candidate count (N10), and it stops applying if the pot's spend is
+    /// ever replaced by another transaction.
+    pub held_verified: &'a HashSet<String>,
     /// hop spender txids (lowercase) that ARE LOW pots (`pot_records` holds them).
     pub pot_spenders: &'a HashSet<String>,
     /// True when the pot-spenders read FAULTED: a spent hop is then "could not check", never a story.
@@ -857,6 +867,148 @@ fn my_settle_sats(e: &ResultEntry) -> Option<u64> {
     }
 }
 
+/// MY committed pay home in this pot's lock (the covenant's own commitment, by my proven seat), lowercase hex:
+/// the home the pot's spend pays me at. `None` without a seat or without decoded keys.
+fn my_committed_pay_pkh(e: &ResultEntry) -> Option<String> {
+    let keys = e.committed_keys.as_ref()?;
+    Some(match e.my_seat? {
+        SeatLetter::A => keys.pay_pkh_a.to_ascii_lowercase(),
+        SeatLetter::B => keys.pay_pkh_b.to_ascii_lowercase(),
+    })
+}
+
+/// PURE (bsv-low #512, the B3 lens fold M2): THE output of a transaction that pays `pkh_hex` by a standard P2PKH,
+/// when there is EXACTLY ONE (`outputs` = each output's index and its P2PKH pkh, if it is one). None or several:
+/// `None`, never a pick (a device then reads the transaction itself and must own every home output).
+pub fn sole_home_vout<'a>(outputs: impl Iterator<Item = (u32, Option<&'a str>)>, pkh_hex: &str) -> Option<u32> {
+    let mut mine = outputs.filter(|(_, p)| p.is_some_and(|p| p.eq_ignore_ascii_case(pkh_hex))).map(|(v, _)| v);
+    let first = mine.next()?;
+    mine.next().is_none().then_some(first)
+}
+
+/// PURE: [`sole_home_vout`] over a RAW transaction, which must hash to `txid` (the bytes are content-addressed:
+/// whoever handed them over, an output layout read from bytes that hash to the paying txid is that transaction's).
+pub fn sole_home_vout_of_raw(raw: &[u8], txid: &str, pkh_hex: &str) -> Option<u32> {
+    let tx = bsv_rs::transaction::Transaction::from_binary(raw).ok()?;
+    if !tx.id().eq_ignore_ascii_case(txid) {
+        return None;
+    }
+    let pkhs: Vec<Option<String>> = tx.outputs.iter().map(|o| p2pkh_pkh_hex(&o.locking_script.to_binary())).collect();
+    sole_home_vout(pkhs.iter().enumerate().map(|(v, p)| (v as u32, p.as_deref())), pkh_hex)
+}
+
+/// The served key of one (paying txid, home pkh) pair in the route's `payVout` map, lowercase.
+pub fn pay_vout_key(pay_txid: &str, pkh_hex: &str) -> String {
+    format!("{}:{}", pay_txid.to_ascii_lowercase(), pkh_hex.to_ascii_lowercase())
+}
+
+/// PURE (the B3 lens fold M2): the (paying txid, home pkh) of every derived payout row whose `payVout` the
+/// derivation could not name from what it held (a pot's payout: the index stores the settle's sums per home,
+/// never its output order, and the order depends on whether the spend carries a rake output). The route reads
+/// those transactions' stored bytes and [`mark_pay_vouts`] writes the answer. Sorted, deduplicated.
+pub fn pay_vout_wanted(rows: &[OwedRow]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| r.family == OwedFamily::Payout && r.facts.get("payVout").is_some_and(Value::is_null))
+        .filter_map(|r| Some((r.facts.get("payTxid")?.as_str()?.to_ascii_lowercase(), r.facts.get("payPkh")?.as_str()?.to_ascii_lowercase())))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// PURE (the B3 lens fold M2): write `payVout` on every payout row [`pay_vout_wanted`] named and `vouts`
+/// ([`pay_vout_key`] to the sole home output) answers. A row it does not answer keeps `payVout: null`. Returns the
+/// rows written.
+pub fn mark_pay_vouts(rows: &mut [OwedRow], vouts: &HashMap<String, u32>) -> usize {
+    let mut marked = 0usize;
+    for r in rows.iter_mut().filter(|r| r.family == OwedFamily::Payout && r.facts.get("payVout").is_some_and(Value::is_null)) {
+        let key = match (r.facts.get("payTxid").and_then(Value::as_str), r.facts.get("payPkh").and_then(Value::as_str)) {
+            (Some(t), Some(p)) => pay_vout_key(t, p),
+            _ => continue,
+        };
+        if let Some(vout) = vouts.get(&key) {
+            r.facts["payVout"] = json!(vout);
+            marked += 1;
+        }
+    }
+    marked
+}
+
+/// The `payVout` read's OWN wall clock, counted from the step's start, never the recompute's (the B3 delta lens
+/// D-L1): the step runs last, so behind the recompute's clock a heavy identity read `null` on every pass. The
+/// first chunk is read whatever any clock says; a later chunk is read while the step is inside this budget.
+pub const OWED_PAY_VOUT_READ_BUDGET_MS: i64 = 2_000;
+
+/// What the `payVout` read reaches outside this crate's pure code: its own clock, the isolate's memo, the index's
+/// stored bytes. The route implements it over the Worker; the pins over a table, counting every read.
+#[allow(async_fn_in_trait)]
+pub trait PayVoutWorld {
+    /// Is the step past [`OWED_PAY_VOUT_READ_BUDGET_MS`] of its own start?
+    fn over_own_budget(&self) -> bool;
+    /// The isolate's held answer for one [`pay_vout_key`]. Free.
+    fn memo_get(&self, key: &str) -> Option<u32>;
+    fn memo_put(&mut self, key: &str, vout: u32);
+    /// One indexed read: the raw transaction of each of `txids` the index stores, as (txid lowercase, raw).
+    /// `Err` is a read fault (the chunk's rows serve `payVout: null` this pass).
+    async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String>;
+}
+
+/// What one `payVout` pass answered.
+#[derive(Debug, Default)]
+pub struct PayVoutPass {
+    /// [`pay_vout_key`] to the sole home output, for [`mark_pay_vouts`].
+    pub vouts: HashMap<String, u32>,
+    /// A chunk was left unread at the step's own clock.
+    pub cut: bool,
+    pub reads: usize,
+}
+
+/// One pass of the `payVout` read over [`pay_vout_wanted`]'s pairs (the B3 delta lens D-L1). The memo answers
+/// first; what it does not hold is read in chunks of `chunk`. The FIRST chunk read is never gated on a clock, and
+/// the recompute's clock gates none: a `null` for want of time is a one-pass event, not a steady state. When the
+/// step's own clock cuts a later chunk, the next pass does not start at the same head: an answer is memoised (a
+/// warm isolate asks only for what is left), and the start chunk turns with `turn` (the route passes the
+/// recompute's clock), so a cold isolate, or a head of rows the bytes never answer, cannot starve the tail.
+pub async fn pay_vout_pass(world: &mut impl PayVoutWorld, wanted: &[(String, String)], chunk: usize, turn: u64) -> PayVoutPass {
+    let mut pass = PayVoutPass::default();
+    let mut to_read: Vec<&(String, String)> = Vec::new();
+    for w in wanted {
+        let key = pay_vout_key(&w.0, &w.1);
+        match world.memo_get(&key) {
+            Some(vout) => {
+                pass.vouts.insert(key, vout);
+            }
+            None => to_read.push(w),
+        }
+    }
+    let chunks: Vec<&[&(String, String)]> = to_read.chunks(chunk.max(1)).collect();
+    for i in 0..chunks.len() {
+        if i > 0 && world.over_own_budget() {
+            pass.cut = true;
+            break;
+        }
+        let this = chunks[(turn as usize % chunks.len() + i) % chunks.len()];
+        let txids: Vec<&str> = this.iter().map(|(t, _)| t.as_str()).collect();
+        pass.reads += 1;
+        match world.stored_raws(&txids).await {
+            Ok(raws) => {
+                for (txid, raw) in raws {
+                    for (_, pkh) in this.iter().filter(|(t, _)| *t == txid) {
+                        if let Some(vout) = sole_home_vout_of_raw(&raw, &txid, pkh) {
+                            let key = pay_vout_key(&txid, pkh);
+                            world.memo_put(&key, vout);
+                            pass.vouts.insert(key, vout);
+                        }
+                    }
+                }
+            }
+            Err(_) => note_pay_vout_read_fault(),
+        }
+    }
+    pass
+}
+
 /// The hop's NON-POT spender named by the index (a recorded spend) or the chain rung (a word of spent), with the
 /// confirmation the source carried; `None` when nothing names a spender, or the spender IS a covenant pot (the JOIN
 /// took it: the pot's own row tells the story).
@@ -889,6 +1041,75 @@ pub fn collected_lookup_games<'a>(spent_result_games: impl Iterator<Item = &'a s
     games.dedup();
     games
 }
+
+/// The recompute's read of this identity's `collected_markers_v2` rows over one chunk of games (`marks` is the
+/// chunk's `?, ?, ...`): the v1 markers and, since bsv-low #492, the held filings beside them (`txid` is the row's
+/// own key, `payTxid` the paying transaction a held filing names; NULL on every other row). Binds: the identity,
+/// then the game ids.
+pub fn collected_rows_sql(marks: &str) -> String {
+    format!("SELECT gameId, sigHex, txid, payTxid FROM collected_markers_v2 WHERE identity = ? AND gameId IN ({marks})")
+}
+
+/// What one identity's `collected_markers_v2` rows say, folded (the recompute's step 5).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CollectedFold {
+    /// games whose v1 marker VERIFIED under the identity ([`OwedInputs::collected_verified`]).
+    pub verified: HashSet<String>,
+    /// games with any row at all ([`OwedInputs::collected_present`]).
+    pub present: HashSet<String>,
+    /// [`held_key`]s of the identity's held filings (bsv-low #492): [`OwedInputs::held_verified`]. One per row
+    /// that names a paying transaction under its own content key; no cap, no order, no signature (the B3 lens
+    /// fold M1).
+    pub held: HashSet<String>,
+    /// rows that carry a `payTxid` their own key was NOT filed for (retire nothing; expected zero for good).
+    pub held_key_mismatches: usize,
+}
+
+impl CollectedFold {
+    /// Fold one row (`gameId`, `sigHex`, `txid`, `payTxid` as [`collected_rows_sql`] reads them) of `identity_lc`.
+    ///
+    /// A row that names a paying transaction is a HELD FILING and nothing else. It retires that transaction's
+    /// payout by STRING MATCH, on one condition, THE GATE: the row's own key is the content key the filing door
+    /// derives from (game, identity, that txid) (`record_post::is_held_row_key`). The door is the only writer of
+    /// such a key and of the column, and it writes both in one INSERT after it verified the identity's signature
+    /// over the same three fields; so the signature is checked ONCE, at the door, and never again here. The gate
+    /// keeps out every row the door did not write that way: a chain row (keyed by an outpoint; a stranger plants
+    /// those free under lenient submit) and a row whose column and key disagree retire nothing, whatever they
+    /// carry. No signature is spent on a held filing (it is not tried as the v1 marker either).
+    pub fn row(&mut self, identity_lc: &str, game_id: &str, sig_hex: Option<&str>, txid: Option<&str>, pay_txid: Option<&str>) {
+        let g = game_id.to_ascii_lowercase();
+        self.present.insert(g.clone());
+        if let Some(pay) = pay_txid {
+            if txid.is_some_and(|key| crate::record_post::is_held_row_key(key, &g, identity_lc, pay)) {
+                self.held.insert(held_key(&g, pay));
+            } else {
+                self.held_key_mismatches += 1;
+            }
+            return;
+        }
+        if sig_hex.is_some_and(|sig| crate::record_post::collected_sig_verifies(identity_lc, &g, sig)) {
+            self.verified.insert(g);
+        }
+    }
+}
+
+/// The key of [`OwedInputs::held_verified`]: `<gameId>:<payTxid>`, lowercase.
+pub fn held_key(game_id: &str, pay_txid: &str) -> String {
+    format!("{}:{}", game_id.to_ascii_lowercase(), pay_txid.to_ascii_lowercase())
+}
+
+/// The fact a payout row carries beside `payTxid` (bsv-low #492): the filing a device whose wallet already OWNS
+/// that transaction's output to its home (`payVout`) signs and posts to `/record?kind=collected` to retire the
+/// row with no press (the client contract is at the door: `record_post`, "THE CLIENT CONTRACT").
+///
+/// WHAT REMAINS after the B3 lens fold M1 (there is no signature budget and no sorted cut any more: every held
+/// filing the read returns retires its payout on every recompute, however many the identity holds): a held filing
+/// retires nothing while (a) the `collected` read FAULTS (counted, `collectedReadFaults`; every row stays served
+/// that pass, the safe direction), (b) its game is outside the identity's walk window (the row it would retire is
+/// not derived either), or (c) the paying transaction of the row is no longer the one it names (a replaced spend:
+/// the row is served again, by design). A fifth payout transaction of one game cannot be filed (the door's 409)
+/// and its row stays served.
+pub const HELD_FILING_TAG: &str = "LOW/collected/v2";
 
 /// PURE (#517, the gate's LOW-1): the hop's own row or the chain rung names a DIFFERENT tx as its CONFIRMED spender.
 /// The index's proof of the filed sweep never outranks that word (a reorg replaced the sweep's block with a competing
@@ -1010,6 +1231,9 @@ pub fn courier_home_outputs(i: &OwedInputs) -> Vec<CourierHomeOutput> {
         let Some(swept) = swept_home(i, h) else { continue };
         if swept.source != "courier-bytes" || !swept.confirmed || swept.output_spent {
             continue;
+        }
+        if i.held_verified.contains(&held_key(&game, &swept.sweep_txid)) {
+            continue; // bsv-low #492: retired by the identity's held filing, nothing to walk
         }
         let Some(pkh) = i.my_pkh_by_game.get(&game) else { continue };
         for (vout, sats) in &swept.home_outputs {
@@ -1141,6 +1365,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
                 let pays_me = matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund);
                 if pays_me && e.verdict.is_some() {
+                    // bsv-low #492 / #512: the identity's wallet ALREADY HOLDS this payout, by its own verified held
+                    // filing naming the paying transaction (the live credit landed it and the closing page dropped
+                    // the v1 filing; 118 presses of the two collect passes said "Collected" over such rows). Not a
+                    // row: there is nothing to collect and so nothing to press. It names the TRANSACTION, so the
+                    // candidate count (N10) does not matter, and a pot whose spend becomes another transaction is
+                    // served again.
+                    if e.settle_txid.as_deref().is_some_and(|t| i.held_verified.contains(&held_key(&game, t))) {
+                        continue;
+                    }
                     let mut facts = base_facts.clone();
                     facts["claim"] = json!("internalize");
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
@@ -1155,6 +1388,16 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
                     facts["collectedSigVerified"] = json!(verified_collected);
                     facts["creditBeef"] = json!(e.settle_txid.as_ref().map(|t| format!("/credit-beef/{t}")));
+                    // bsv-low #492 / #512: WHAT a device asks its own wallet about before it offers the press (does
+                    // the ledger already hold this transaction?) and what its held filing names when it does
+                    facts["payTxid"] = json!(e.settle_txid.as_ref().map(|t| t.to_ascii_lowercase()));
+                    facts["heldFiling"] = json!(HELD_FILING_TAG);
+                    // the B3 lens fold M2: the OUTPUT the device must own before it files (`payTxid`:`payVout`, the
+                    // spend's output to my committed home `payPkh`). The spend's output order is not in the index
+                    // (a rake output may lead it), so the vout is `null` here and the route names it from the
+                    // spend's stored bytes (`pay_vout_wanted`, `mark_pay_vouts`); `null` stays when it could not.
+                    facts["payPkh"] = json!(my_committed_pay_pkh(e));
+                    facts["payVout"] = Value::Null;
                     facts["payASats"] = json!(e.money.settle.as_ref().and_then(|s| s.pay_a_sats));
                     facts["payBSats"] = json!(e.money.settle.as_ref().and_then(|s| s.pay_b_sats));
                     rows.push(OwedRow {
@@ -1340,6 +1583,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1 {
                 continue;
             }
+            // bsv-low #492 / #512: the wallet already holds this sweep's payout (the identity's held filing names
+            // the sweep): not a row, whichever proof named the sweep (a courier-proven one included)
+            if i.held_verified.contains(&held_key(&game, &swept.sweep_txid)) {
+                continue;
+            }
             let mut facts = facts_base.clone();
             facts["claim"] = json!("internalize");
             facts["claimable"] = json!(swept.confirmed);
@@ -1384,6 +1632,23 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
             }
             facts["creditBeef"] = json!(format!("/credit-beef/{}", swept.sweep_txid));
+            // bsv-low #492 / #512: the paying transaction a device asks its wallet about and names in a held filing
+            facts["payTxid"] = json!(swept.sweep_txid.to_ascii_lowercase());
+            facts["heldFiling"] = json!(HELD_FILING_TAG);
+            // the B3 lens fold M2: the sweep's output to my home, the OUTPUT the device must own before it files:
+            // the home outputs the sweep's bytes showed, else the filed sweep's own raw (it hashes to `sweepTxid`),
+            // and only when exactly one output pays the home (`null` otherwise: never a pick)
+            let pay_pkh = i.my_pkh_by_game.get(&game).map(|p| p.to_ascii_lowercase());
+            let pay_vout = match swept.home_outputs.as_slice() {
+                [(vout, _)] => Some(*vout),
+                [] => match (swept.raw_hex.as_deref().and_then(|h| hex::decode(h).ok()), pay_pkh.as_deref()) {
+                    (Some(raw), Some(pkh)) => sole_home_vout_of_raw(&raw, &swept.sweep_txid, pkh),
+                    _ => None,
+                },
+                _ => None,
+            };
+            facts["payPkh"] = json!(pay_pkh);
+            facts["payVout"] = json!(pay_vout);
             facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
             facts["collectedSigVerified"] = json!(verified_collected);
             rows.push(OwedRow {
@@ -1897,6 +2162,19 @@ pub fn note_read_refresh(kicked: bool) {
 pub fn note_collected_read_fault() {
     COLLECTED_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+static HELD_FILINGS_KEY_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static HELD_FILINGS_MATCHED: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #492: one recompute's held filings: how many (game, txid) names the read matched, and how many rows
+/// carried a `payTxid` their own key was not filed for (these retire nothing; nothing writes one).
+pub fn note_held_filings(matched: usize, key_mismatches: usize) {
+    HELD_FILINGS_MATCHED.fetch_add(matched as u64, Ordering::Relaxed);
+    HELD_FILINGS_KEY_MISMATCH.fetch_add(key_mismatches as u64, Ordering::Relaxed);
+}
+static PAY_VOUT_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #512: a chunk of the `payVout` read faulted (its rows serve `payVout: null` that pass).
+pub fn note_pay_vout_read_fault() {
+    PAY_VOUT_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
 pub fn note_pot_spenders_read_fault() {
     POT_SPENDERS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -1979,6 +2257,9 @@ pub fn owed_health_json() -> Value {
         "recomputeLockTakeovers": RECOMPUTE_LOCK_TAKEOVERS.load(Ordering::Relaxed),
         "recomputeWritesSuperseded": RECOMPUTE_WRITES_SUPERSEDED.load(Ordering::Relaxed),
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
+        "heldFilingsMatched": HELD_FILINGS_MATCHED.load(Ordering::Relaxed),
+        "heldFilingsKeyMismatch": HELD_FILINGS_KEY_MISMATCH.load(Ordering::Relaxed),
+        "payVoutReadFaults": PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed),
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofsReadFaults": SWEEP_PROOFS_READ_FAULTS.load(Ordering::Relaxed),
@@ -2348,6 +2629,7 @@ mod tests {
             valid_refunds: valid,
             collected_verified,
             collected_present: &NONE,
+            held_verified: &NONE,
             pot_spenders: pots,
             pot_spenders_faulted: false,
             hop_chain: &NO_CHAIN,
@@ -3194,6 +3476,555 @@ mod tests {
         let mut i = inputs(&paid, &[], &hops, &v, &verified, &no_pots, Some(900_200));
         i.hop_sweeps = &sweeps;
         assert_eq!(derive_owed_rows(&i).len(), 2);
+    }
+
+    /// bsv-low #492 / #512 (the collect pass's class: "collected N but the wallet read X to X"): a payout whose
+    /// paying transaction the identity's wallet ALREADY HOLDS, said by its own verified held filing, is not a row,
+    /// so there is nothing to press. The filing names the transaction: another transaction's payout stays.
+    #[test]
+    fn i492_a_payout_the_wallet_already_holds_is_not_served_and_the_filing_names_one_transaction_only() {
+        let won = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        // before any filing: the row is served claimable, and it names what a device asks its wallet about
+        let rows = derive_owed_rows(&inputs(&won, &[], &[], &v, &c, &p, Some(900_200)));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["payTxid"], tx(0x03));
+        assert_eq!(rows[0].facts["heldFiling"], HELD_FILING_TAG);
+        // the wallet holds the settle (the live credit landed it): not a row
+        let held: HashSet<String> = [held_key(&tx(0x01), &tx(0x03))].into_iter().collect();
+        let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
+        i.held_verified = &held;
+        assert!(derive_owed_rows(&i).is_empty(), "held: nothing to collect, nothing to press");
+        // a filing naming ANOTHER transaction (a spend of the pot that was replaced, another game's) retires nothing
+        for other in [held_key(&tx(0x01), &tx(0x04)), held_key(&tx(0x09), &tx(0x03))] {
+            let held: HashSet<String> = [other].into_iter().collect();
+            let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
+            i.held_verified = &held;
+            let rows = derive_owed_rows(&i);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].facts["claimable"], true);
+        }
+        // a decided loss stays no row, an unspent pot is untouched by a filing naming a txid it does not have
+        let open = [entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let mut i = inputs(&open, &[], &[], &v, &c, &p, Some(899_000));
+        i.held_verified = &held;
+        assert_eq!(derive_owed_rows(&i).len(), 1);
+    }
+
+    /// N10 closed for a device that says WHICH: two payouts under one game (the pot paid AND a hop's sweep came
+    /// home). The v1 marker retires neither (it cannot say which); a held filing retires exactly the one it names,
+    /// and the other stays claimable until its own.
+    #[test]
+    fn i492_a_held_filing_retires_exactly_its_payout_when_the_game_has_two() {
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let v1: HashSet<String> = [tx(0x01)].into_iter().collect();
+        let rows_with = |held: &HashSet<String>| {
+            let mut i = inputs(&paid, &[], &hops, &v, &v1, &no_pots, Some(900_200));
+            i.hop_sweeps = &sweeps;
+            i.held_verified = held;
+            derive_owed_rows(&i)
+        };
+        assert_eq!(rows_with(&HashSet::new()).len(), 2, "the v1 marker alone cannot say which");
+        // the swept hop's row names its sweep as the paying transaction
+        let both = rows_with(&HashSet::new());
+        let sweep_row = both.iter().find(|r| r.outpoint == key).unwrap();
+        assert_eq!(sweep_row.facts["payTxid"], sweep);
+        assert_eq!(sweep_row.facts["heldFiling"], HELD_FILING_TAG);
+        // the wallet holds the pot's payout: the sweep's row stays
+        let held_pot: HashSet<String> = [held_key(&tx(0x01), &tx(0x03))].into_iter().collect();
+        let rows = rows_with(&held_pot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outpoint, key);
+        assert_eq!(rows[0].facts["claimable"], true);
+        // the wallet holds the sweep: the pot's row stays
+        let held_sweep: HashSet<String> = [held_key(&tx(0x01), &sweep)].into_iter().collect();
+        let rows = rows_with(&held_sweep);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outpoint, format!("{}:0", tx(0x02)));
+        // both held: nothing is served
+        let held_both: HashSet<String> = held_pot.union(&held_sweep).cloned().collect();
+        assert!(rows_with(&held_both).is_empty());
+        // a swept hop's payout that is the game's only one retires by its held filing with no v1 marker at all
+        let mut i = inputs(&[], &[], &hops, &v, &NONE, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        i.held_verified = &held_sweep;
+        assert!(derive_owed_rows(&i).is_empty());
+    }
+
+    /// The production schema on real SQLite (every overlay migration, the re-run "duplicate column" ignored).
+    fn production_sqlite() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "production migration failed under real SQLite: {e}");
+            }
+        }
+        conn
+    }
+
+    /// The recompute's read (`collected_rows_sql`, one game per call here) and fold of `me`'s rows, as the route
+    /// runs them: the statement, the four columns, `CollectedFold::row`.
+    fn fold_collected(conn: &rusqlite::Connection, me: &str, games: &[String]) -> CollectedFold {
+        let mut fold = CollectedFold::default();
+        let mut stmt = conn.prepare(&collected_rows_sql("?")).unwrap();
+        for game in games {
+            let rows = stmt
+                .query_map(rusqlite::params![me, game], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?))
+                })
+                .unwrap();
+            for r in rows {
+                let (g, sig, txid, pay) = r.unwrap();
+                fold.row(me, &g, sig.as_deref(), txid.as_deref(), pay.as_deref());
+            }
+        }
+        fold
+    }
+
+    /// The filing door for a held filing, as the route runs it on the table: the verdict (`verify_record_post`),
+    /// the record's own cap statement and cap (`cap_queries`, `cap_refusal_for`), the ONE insert with its bind
+    /// order. Answers the row's key and whether the insert WROTE a row.
+    fn file_held(
+        conn: &rusqlite::Connection,
+        signer: &bsv_rs::wallet::ProtoWallet,
+        id: &[u8],
+        gid: &[u8; 32],
+        pay: &[u8; 32],
+        created_at: i64,
+    ) -> std::result::Result<(String, bool), crate::record_post::RecordRefusal> {
+        use crate::record_post::tests::{script, sign};
+        use crate::record_post::{cap_queries, cap_refusal_for, collected_protocol, held_challenge, insert_wrote_a_row, verify_record_post, RecordKind, VerifiedRecord, COLLECTED_FILE_SQL, HELD_TAG};
+        let (me, game) = (hex::encode(id), hex::encode(gid));
+        let sig = sign(signer, collected_protocol(), &game, &held_challenge(&game, &me, &hex::encode(pay)));
+        let verified = verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, gid, id, pay, &sig]), &me)?;
+        let VerifiedRecord::Held(r, pay_txid) = &verified else { panic!("a held filing") };
+        let (rows_sql, binds, _, _) = cap_queries(&verified);
+        let others: i64 = conn.query_row(rows_sql, rusqlite::params![binds[0], binds[1], binds[2]], |row| row.get(0)).unwrap();
+        if let Some(refusal) = cap_refusal_for(&verified, others, 0) {
+            return Err(refusal);
+        }
+        let changes = conn.execute(COLLECTED_FILE_SQL, rusqlite::params![r.identity, r.game_id, r.txid, 0i64, r.sig_hex, created_at, pay_txid]).unwrap();
+        Ok((r.txid.clone(), insert_wrote_a_row(Some(changes))))
+    }
+
+    /// THE B3 LENS FOLD M1 (the bounded-walk starvation class, ledger 2026-09-19): an identity with 300 held
+    /// filings in its window, one per game, on real SQLite with real signatures through the door. EVERY one
+    /// retires its payout row, on EVERY recompute. On `f9fd009` the read replayed each stored signature inside a
+    /// budget of 256 per recompute over the games in sorted order: the same 44 games past the cut kept their rows
+    /// served claimable on every pass, for good. Now the door writes the txid it verified and the read matches
+    /// it: no signature, no budget, no order.
+    #[test]
+    fn i492_m1_three_hundred_held_filings_retire_every_row_on_every_recompute() {
+        use crate::record_post::tests::{identity, wallet};
+        const N: usize = 300;
+        let conn = production_sqlite();
+        let w = wallet(31);
+        let id = identity(&w);
+        let me = hex::encode(&id);
+        // game k: its own pot, its own settle, this seat the winner
+        let b32 = |tag: u8, k: usize| -> [u8; 32] {
+            let mut b = [tag; 32];
+            b[30] = (k >> 8) as u8;
+            b[31] = k as u8;
+            b
+        };
+        let paid: Vec<ResultEntry> = (0..N)
+            .map(|k| {
+                let mut e = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+                e.game_id = hex::encode(b32(0xa0, k));
+                e.pot_txid = hex::encode(b32(0xb0, k));
+                e.settle_txid = Some(hex::encode(b32(0xc0, k)));
+                e
+            })
+            .collect();
+        let games: Vec<String> = paid.iter().map(|e| e.game_id.clone()).collect();
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let served = || -> Vec<OwedRow> {
+            let fold = fold_collected(&conn, &me, &games);
+            assert_eq!(fold.held_key_mismatches, 0);
+            let mut i = inputs(&paid, &[], &[], &v, &fold.verified, &no_pots, Some(900_200));
+            i.identity_lc = &me;
+            i.collected_present = &fold.present;
+            i.held_verified = &fold.held;
+            derive_owed_rows(&i)
+        };
+        assert_eq!(served().len(), N, "nothing filed: every payout is served");
+        for k in 0..N {
+            let (_, written) = file_held(&conn, &w, &id, &b32(0xa0, k), &b32(0xc0, k), 1_000 + k as i64).unwrap();
+            assert!(written);
+        }
+        assert_eq!(fold_collected(&conn, &me, &games).held.len(), N, "every filing is read as held: no cut at 256");
+        // every recompute, not only the first: three passes, each from the table
+        for pass in 0..3 {
+            let rows = served();
+            assert!(rows.is_empty(), "pass {pass}: {} of {N} held payouts are still served", rows.len());
+        }
+        // and the retire is exact at this scale too: a game whose spend is replaced is served again, alone
+        let mut replaced = paid.clone();
+        replaced[N - 1].settle_txid = Some(tx(0xee));
+        let fold = fold_collected(&conn, &me, &games);
+        let mut i = inputs(&replaced, &[], &[], &v, &fold.verified, &no_pots, Some(900_200));
+        i.identity_lc = &me;
+        i.held_verified = &fold.held;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].game_id, games[N - 1]);
+    }
+
+    /// THE B3 LENS FOLD L3: THE GATE of the fold (`CollectedFold::row`: a row retires by its `payTxid` only when
+    /// its own key is the content key the door files that (game, identity, txid) under). Five rows a stranger
+    /// planted through the chain's byte-format admission (keyed by a chain outpoint, unsigned junk, free under
+    /// lenient submit), here given every advantage: each one even carries the victim's real paying txid in the
+    /// column, which no writer but the door ever sets. They retire NOTHING, and they do not crowd the real
+    /// filing out: filed after them, it retires its row. Remove the gate and the first half turns RED (the
+    /// planted rows retire the victim's payout with no signature of the victim anywhere).
+    #[test]
+    fn i492_l3_planted_chain_rows_never_retire_a_payout_nor_crowd_out_the_real_filing() {
+        use crate::record_post::tests::{identity, wallet};
+        let conn = production_sqlite();
+        let w = wallet(41);
+        let id = identity(&w);
+        let me = hex::encode(&id);
+        let (gid, settle) = ([0x01u8; 32], [0x03u8; 32]);
+        let game = tx(0x01);
+        let won = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let served = || -> (Vec<OwedRow>, CollectedFold) {
+            let fold = fold_collected(&conn, &me, std::slice::from_ref(&game));
+            let mut i = inputs(&won, &[], &[], &v, &fold.verified, &no_pots, Some(900_200));
+            i.identity_lc = &me;
+            i.collected_present = &fold.present;
+            i.held_verified = &fold.held;
+            (derive_owed_rows(&i), fold)
+        };
+        // five planted chain rows naming (me, the game), read BEFORE any real filing (lower rowids)
+        for b in 0..5u8 {
+            conn.execute(
+                "INSERT INTO collected_markers_v2 (identity, gameId, txid, outputIndex, sigHex, createdAt, payTxid) VALUES (?1, ?2, ?3, 0, ?4, 50, ?5)",
+                rusqlite::params![me, game, tx(0xe0 + b), "30060201010201".to_string() + &hex::encode([b]), tx(0x03)],
+            )
+            .unwrap();
+        }
+        let (rows, fold) = served();
+        assert_eq!(rows.len(), 1, "planted rows retire nothing, whatever their column says");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["collectedMarkerPresent"], true, "they are provenance, as before");
+        assert!(fold.held.is_empty());
+        assert_eq!(fold.held_key_mismatches, 5, "and they are counted");
+        // three more with a `filed:` key that is not this content's key (no writer makes one; three, so the door's
+        // own held cap still admits the real filing below): still nothing (the key is derived, not a prefix)
+        for b in 0..3u8 {
+            conn.execute(
+                "INSERT INTO collected_markers_v2 (identity, gameId, txid, outputIndex, sigHex, createdAt, payTxid) VALUES (?1, ?2, ?3, 0, NULL, 60, ?4)",
+                rusqlite::params![me, game, format!("filed:{}", hex::encode([0xd0 + b; 28])), tx(0x03)],
+            )
+            .unwrap();
+        }
+        assert_eq!(served().0.len(), 1);
+        // the real filing, the ninth row of the pair: it retires its payout
+        assert!(file_held(&conn, &w, &id, &gid, &settle, 100).unwrap().1);
+        let (rows, fold) = served();
+        assert!(rows.is_empty(), "the identity's own filing is not crowded out");
+        assert_eq!(fold.held, [held_key(&game, &tx(0x03))].into_iter().collect::<HashSet<String>>());
+    }
+
+    /// bsv-low #492 / #512 END TO END on real SQLite and real signatures: the door's verdict on a device's held
+    /// filing, the production table's row with the txid the door verified, the recompute's read and fold, and
+    /// the row gone. The shape is the collect pass's: the wallet holds the settle (the live credit), no v1 marker
+    /// was ever filed, the row was served claimable and a press said "Collected". With it: the two caps counted
+    /// APART (the B3 lens fold L1) and the re-file that writes nothing (L2).
+    #[test]
+    fn i492_a_devices_held_filing_retires_its_payout_through_the_door_the_table_and_the_read_on_real_sqlite() {
+        use crate::record_post::tests::{identity, script, sign, wallet};
+        use crate::record_post::{
+            already_filed_body, cap_queries, cap_refusal_for, collected_challenge, collected_protocol, held_challenge, insert_wrote_a_row, verify_record_post, RecordKind,
+            RecordRefusal, VerifiedRecord, COLLECTED_FILED_ROWS_SQL, COLLECTED_FILE_SQL, HELD_FILED_ROWS_SQL, HELD_FILINGS_PER_GAME,
+        };
+        let conn = production_sqlite();
+        let w = wallet(21);
+        let id = identity(&w);
+        let me = hex::encode(&id);
+        let (gid, settle, sweep_b) = ([0x01u8; 32], [0x03u8; 32], [0x0cu8; 32]);
+        let (game, sweep) = (tx(0x01), tx(0x0c));
+        // the game pays this seat twice: the pot's payout (settle 03..) and a swept hop's (sweep 0c..)
+        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let hop_key = format!("{}:0", tx(0x07));
+        let sweeps = filed(&hop_key, &sweep);
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let file = |pay: &[u8; 32], signer: &bsv_rs::wallet::ProtoWallet, created_at: i64| file_held(&conn, signer, &id, &gid, pay, created_at);
+        // the recompute's read and fold, then the derivation
+        let served = || -> Vec<OwedRow> {
+            let fold = fold_collected(&conn, &me, std::slice::from_ref(&game));
+            let mut i = inputs(&paid, &[], &hops, &v, &fold.verified, &no_pots, Some(900_200));
+            i.identity_lc = &me;
+            i.collected_present = &fold.present;
+            i.held_verified = &fold.held;
+            i.hop_sweeps = &sweeps;
+            derive_owed_rows(&i)
+        };
+        // RED's shape: nothing filed, both payouts served claimable (the press that said "Collected")
+        let rows = served();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.family == OwedFamily::Payout && r.facts["claimable"] == true));
+        // a stranger cannot retire it: its signature is refused at the door, and a row it plants through the
+        // chain's byte-format admission (any signature bytes, a chain txid) is presence only
+        assert_eq!(file(&settle, &wallet(22), 100).unwrap_err(), RecordRefusal::SignatureInvalid);
+        let planted = hex::encode(sign(&wallet(22), collected_protocol(), &game, &held_challenge(&game, &me, &tx(0x03))));
+        conn.execute(COLLECTED_FILE_SQL, rusqlite::params![me, game, tx(0xee), 0i64, planted, 100i64, Option::<String>::None]).unwrap();
+        assert_eq!(served().len(), 2);
+        // the device's wallet holds the settle: it files, and the pot's payout is gone; the sweep's stays
+        let (key, written) = file(&settle, &w, 200).unwrap();
+        assert!(written);
+        let stored: Option<String> = conn.query_row("SELECT payTxid FROM collected_markers_v2 WHERE txid = ?1", rusqlite::params![key], |r| r.get(0)).unwrap();
+        assert_eq!(stored, Some(tx(0x03)), "the door writes the txid it verified, in the row's own insert");
+        let rows = served();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outpoint, hop_key);
+        assert_eq!(rows[0].facts["payTxid"], sweep);
+        assert_eq!(rows[0].facts["collectedMarkerPresent"], true, "the planted row is provenance, as before");
+        // L2: filed again (a fresh signature, another device of the identity, a stranger's replay): the same key,
+        // NO row written, so the door stales nothing, pushes nothing and counts no filing (`insert_wrote_a_row`
+        // is the route's own test of the insert), and it answers 200 with the existing key and `filed: false`
+        let (again, written) = file(&settle, &w, 300).unwrap();
+        assert_eq!(again, key);
+        assert!(!written, "a re-file is a no-op insert");
+        assert!(insert_wrote_a_row(Some(1)) && insert_wrote_a_row(None) && !insert_wrote_a_row(Some(0)));
+        let sig = sign(&w, collected_protocol(), &game, &held_challenge(&game, &me, &tx(0x03)));
+        let refiled = verify_record_post(RecordKind::Collected, &script(&[crate::record_post::HELD_TAG, &gid, &id, &settle, &sig]), &me).unwrap();
+        assert_eq!(already_filed_body(&refiled), json!({ "filed": false, "kind": "collected", "key": key, "alreadyFiled": true, "heldTxid": tx(0x03) }));
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM collected_markers_v2 WHERE identity = ?1 AND txid LIKE 'filed:%'", rusqlite::params![me], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(served().len(), 1);
+        // the wallet holds the sweep too: nothing is served
+        file(&sweep_b, &w, 400).unwrap();
+        assert!(served().is_empty());
+        // L1, the held cap: HELD_FILINGS_PER_GAME held rows per game, counted apart from the v1 marker
+        for b in 0..(HELD_FILINGS_PER_GAME - 2) as u8 {
+            file(&[0x90 + b; 32], &w, 500).unwrap();
+        }
+        assert_eq!(file(&[0xa0; 32], &w, 500).unwrap_err(), RecordRefusal::TooManyFiled, "a fifth held filing of the game");
+        assert!(file(&settle, &w, 600).is_ok(), "a re-file of a held filing on file is never the cap's (its own key is excluded)");
+        // L1, the other way (the lens's scenario): the game's four held rows do NOT refuse the identity's v1 marker
+        let v1_sig = sign(&w, collected_protocol(), &game, &collected_challenge(&game, &me));
+        let v1 = verify_record_post(RecordKind::Collected, &script(&[b"LOW/collected/v1", &gid, &id, &v1_sig]), &me).unwrap();
+        let VerifiedRecord::Collected(r) = &v1 else { panic!("the v1 marker") };
+        let (rows_sql, binds, _, _) = cap_queries(&v1);
+        assert_eq!(rows_sql, COLLECTED_FILED_ROWS_SQL);
+        let count = |sql: &str, key: &str| -> i64 { conn.query_row(sql, rusqlite::params![me, game, key], |row| row.get(0)).unwrap() };
+        assert_eq!(count(rows_sql, &binds[2]), 0, "the v1 marker counts v1 rows only");
+        assert_eq!(cap_refusal_for(&v1, 0, 0), None);
+        assert_eq!(conn.execute(COLLECTED_FILE_SQL, rusqlite::params![r.identity, r.game_id, r.txid, 0i64, r.sig_hex, 700i64, Option::<String>::None]).unwrap(), 1);
+        // and the v1 marker takes no held slot: the held count is still four, a second v1 content is the v1 cap's
+        assert_eq!(count(HELD_FILED_ROWS_SQL, "filed:none"), HELD_FILINGS_PER_GAME);
+        assert_eq!(count(COLLECTED_FILED_ROWS_SQL, "filed:none"), 1);
+        assert_eq!(cap_refusal_for(&v1, 1, 0), Some(RecordRefusal::TooManyFiled));
+        assert!(served().is_empty(), "filings that name no payout transaction of the game change nothing");
+    }
+
+    /// THE B3 LENS FOLD M2: every payout row names the OUTPUT a device must own before it files a held filing:
+    /// `payTxid`:`payVout`, the paying transaction's output to the identity's committed home `payPkh`. The pot's
+    /// payout gets it from the spend's own bytes (the index keeps sums per home, never the output order, and a
+    /// rake output may lead); a swept hop's from the sweep's home outputs or the filed sweep's raw. Exactly one
+    /// output to the home, or `null`: never a pick, and never from bytes that do not hash to the paying txid.
+    /// The table behind the `payVout` pins: the stored bytes by txid, the step's own clock as one word, the
+    /// isolate's memo (kept across passes by the caller, or dropped: a cold isolate), every read recorded.
+    struct PayVoutTable {
+        raws: HashMap<String, Vec<u8>>,
+        memo: HashMap<String, u32>,
+        /// `over_own_budget` answers true (the step's clock is spent the moment it is first asked).
+        slow: bool,
+        fault: bool,
+        asked: Vec<Vec<String>>,
+    }
+    impl PayVoutWorld for PayVoutTable {
+        fn over_own_budget(&self) -> bool {
+            self.slow
+        }
+        fn memo_get(&self, key: &str) -> Option<u32> {
+            self.memo.get(key).copied()
+        }
+        fn memo_put(&mut self, key: &str, vout: u32) {
+            self.memo.insert(key.to_string(), vout);
+        }
+        async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+            self.asked.push(txids.iter().map(|t| t.to_string()).collect());
+            if self.fault {
+                return Err("d1 down".into());
+            }
+            Ok(txids.iter().filter_map(|t| Some((t.to_string(), self.raws.get(*t)?.clone()))).collect())
+        }
+    }
+
+    /// bsv-low #512, the B3 delta lens D-L1: the `payVout` read is not behind the recompute's clock. A recompute
+    /// that ran out of its budget before this step still reads the first chunk (the pass takes no recompute
+    /// clock at all), and when the step's OWN clock cuts the rest, the next pass serves what the last one left:
+    /// by the memo in a warm isolate, by the turning start chunk in a cold one. A `null` is a one-pass event.
+    #[test]
+    fn i512_dl1_a_payvout_left_null_by_the_clock_is_served_on_the_next_pass() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction, TransactionOutput};
+        let run = |world: &mut PayVoutTable, wanted: &[(String, String)], chunk: usize, turn: u64| {
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(pay_vout_pass(world, wanted, chunk, turn))
+        };
+        let home = [0x11u8; 20];
+        let home_hex = hex::encode(home);
+        // seven paying transactions, each paying the home at vout 1 behind a distinct first output
+        let mut raws = HashMap::new();
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for n in 0..7u64 {
+            let mut t = Transaction::new();
+            for (sats, pkh) in [(100 + n, [0x33u8; 20]), (39_000, home)] {
+                t.outputs.push(TransactionOutput { satoshis: Some(sats), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)).unwrap(), change: false });
+            }
+            raws.insert(t.id(), t.to_binary());
+            wanted.push((t.id(), home_hex.clone()));
+        }
+        wanted.sort_unstable();
+        let table = |slow: bool| PayVoutTable { raws: raws.clone(), memo: HashMap::new(), slow, fault: false, asked: Vec::new() };
+
+        // the step's clock spent at once (the heaviest case): the first chunk is read all the same
+        let mut world = table(true);
+        let one = run(&mut world, &wanted, 3, 0);
+        assert_eq!((one.vouts.len(), one.cut, one.reads), (3, true, 1), "pass one: one chunk whatever the clock says, the rest cut");
+        assert!(one.vouts.values().all(|v| *v == 1));
+        // WARM isolate, the clock spent on every pass, the SAME turn: the memo carries, the next chunk is the first
+        let two = run(&mut world, &wanted, 3, 0);
+        assert_eq!((two.vouts.len(), two.cut, two.reads), (6, true, 1), "pass two serves what pass one left");
+        assert!(wanted[3..6].iter().all(|(t, p)| two.vouts.contains_key(&pay_vout_key(t, p))));
+        let three = run(&mut world, &wanted, 3, 0);
+        assert_eq!((three.vouts.len(), three.cut, three.reads), (7, false, 1));
+        let four = run(&mut world, &wanted, 3, 0);
+        assert_eq!((four.vouts.len(), four.cut, four.reads), (7, false, 0), "a warm isolate that holds every answer reads nothing");
+        assert_eq!(world.asked.len(), 3);
+
+        // COLD isolates (no memo carried), the clock spent on every pass: the start chunk turns, so three passes
+        // cover the three chunks and no row is `null` on all of them
+        let mut served: HashSet<String> = HashSet::new();
+        let mut heads: HashSet<String> = HashSet::new();
+        for turn in 100..103u64 {
+            let mut cold = table(true);
+            let pass = run(&mut cold, &wanted, 3, turn);
+            assert_eq!(pass.reads, 1);
+            heads.insert(cold.asked[0][0].clone());
+            served.extend(pass.vouts.into_keys());
+        }
+        assert_eq!(heads.len(), 3, "each pass started at another chunk");
+        assert_eq!(served.len(), 7, "every row was served on one of the three passes");
+
+        // inside its own clock the step reads every chunk in one pass; a fault is counted and names nothing
+        let mut quick = table(false);
+        let all = run(&mut quick, &wanted, 3, 5);
+        assert_eq!((all.vouts.len(), all.cut, all.reads), (7, false, 3));
+        let mut down = table(false);
+        down.fault = true;
+        let before = PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed);
+        let none = run(&mut down, &wanted, 3, 0);
+        assert!(none.vouts.is_empty() && !none.cut && down.memo.is_empty(), "a fault answers nothing and memoises nothing");
+        assert!(PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed) >= before + 3);
+        // never wrong: bytes that do not hash to the asked txid name nothing
+        let mut lying = table(false);
+        let swapped = raws[&wanted[1].0].clone();
+        lying.raws.insert(wanted[0].0.clone(), swapped);
+        let pass = run(&mut lying, &wanted[..1], 3, 0);
+        assert!(pass.vouts.is_empty() && lying.memo.is_empty());
+        assert!(run(&mut table(true), &[], 3, 9).vouts.is_empty(), "nothing wanted: no read, no divide by zero");
+    }
+
+    #[test]
+    fn i512_m2_a_payout_row_names_the_owned_paying_output() {
+        use crate::results::CommittedKeys;
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction, TransactionOutput};
+        let (home, other, rake) = ([0x11u8; 20], [0x22u8; 20], [0x33u8; 20]);
+        let out = |sats: u64, pkh: &[u8; 20]| TransactionOutput { satoshis: Some(sats), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(pkh)).unwrap(), change: false };
+        let raw_of = |outs: &[(u64, &[u8; 20])]| -> (String, Vec<u8>) {
+            let mut t = Transaction::new();
+            for (sats, pkh) in outs {
+                t.outputs.push(out(*sats, pkh));
+            }
+            (t.id(), t.to_binary())
+        };
+        let home_hex = hex::encode(home);
+        // the three settle shapes: a winner-claim behind a rake output, the same with no rake, a tie
+        let (claim, claim_raw) = raw_of(&[(800, &rake), (39_200, &home)]);
+        let (bare, bare_raw) = raw_of(&[(900, &home)]);
+        let (tie, tie_raw) = raw_of(&[(800, &rake), (19_600, &other), (19_600, &home)]);
+        assert_eq!(sole_home_vout_of_raw(&claim_raw, &claim, &home_hex), Some(1));
+        assert_eq!(sole_home_vout_of_raw(&bare_raw, &bare, &home_hex), Some(0), "no rake output: the order moves, so it is read, never assumed");
+        assert_eq!(sole_home_vout_of_raw(&tie_raw, &tie, &home_hex), Some(2));
+        assert_eq!(sole_home_vout_of_raw(&tie_raw, &tie, &hex::encode(other)), Some(1), "the tie's other seat: its own output");
+        // never a pick: no output to the home, two outputs to the home, bytes of another transaction, junk
+        let (twice, twice_raw) = raw_of(&[(1, &home), (2, &home)]);
+        assert_eq!(sole_home_vout_of_raw(&claim_raw, &claim, &hex::encode([0x44u8; 20])), None);
+        assert_eq!(sole_home_vout_of_raw(&twice_raw, &twice, &home_hex), None);
+        assert_eq!(sole_home_vout_of_raw(&bare_raw, &claim, &home_hex), None, "the bytes must hash to the paying txid");
+        assert_eq!(sole_home_vout_of_raw(&[0u8; 4], &claim, &home_hex), None);
+
+        // THE POT'S ROW: `payPkh` is my committed home by my seat; `payVout` is null until the route read the bytes
+        let mut won = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        won.settle_txid = Some(claim.clone());
+        won.committed_keys = Some(CommittedKeys { pub_a: "02".repeat(33), pub_b: "03".repeat(33), pay_pkh_a: home_hex.clone(), pay_pkh_b: hex::encode(other) });
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let paid = [won.clone()];
+        let mut rows = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
+        assert_eq!(rows.len(), 1);
+        assert_eq!((&rows[0].facts["payTxid"], &rows[0].facts["payPkh"]), (&json!(claim), &json!(home_hex)));
+        assert!(rows[0].facts["payVout"].is_null());
+        assert_eq!(pay_vout_wanted(&rows), vec![(claim.clone(), home_hex.clone())]);
+        // the route's answer for that (txid, home), and only that: another home's answer marks nothing
+        let mut vouts: HashMap<String, u32> = HashMap::new();
+        vouts.insert(pay_vout_key(&claim, &hex::encode(other)), 7);
+        assert_eq!(mark_pay_vouts(&mut rows, &vouts), 0);
+        assert!(rows[0].facts["payVout"].is_null());
+        vouts.insert(pay_vout_key(&claim, &home_hex), sole_home_vout_of_raw(&claim_raw, &claim, &home_hex).unwrap());
+        assert_eq!(mark_pay_vouts(&mut rows, &vouts), 1);
+        assert_eq!(rows[0].facts["payVout"], 1);
+        assert!(pay_vout_wanted(&rows).is_empty(), "a named row is asked for no more");
+        // seat B of the same pot is paid at ITS home; a seat the binding does not prove names no home and is not asked
+        let mut tied = won.clone();
+        (tied.verdict, tied.outcome, tied.my_seat) = (Some(PotVerdict::Tie), Outcome::Tie, Some(SeatLetter::B));
+        let tied = [tied];
+        let rows_b = derive_owed_rows(&inputs(&tied, &[], &[], &v, &c, &p, Some(900_200)));
+        assert_eq!(rows_b[0].facts["payPkh"], hex::encode(other));
+        let mut keyless = won.clone();
+        keyless.committed_keys = None;
+        let keyless = [keyless];
+        let rows_k = derive_owed_rows(&inputs(&keyless, &[], &[], &v, &c, &p, Some(900_200)));
+        assert!(rows_k[0].facts["payPkh"].is_null() && rows_k[0].facts["payVout"].is_null());
+        assert!(pay_vout_wanted(&rows_k).is_empty());
+
+        // THE SWEPT HOP'S ROW: the filed sweep's own raw names the output (it hashes to the sweep's txid)
+        let (sweep, sweep_raw) = raw_of(&[(19_800, &home)]);
+        let hop_key = format!("{}:0", tx(0x07));
+        let mut sweeps = filed(&hop_key, &sweep);
+        sweeps.get_mut(&hop_key).unwrap().raw_hex = hex::encode(&sweep_raw);
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let pkhs: HashMap<String, String> = [(tx(0x01), home_hex.clone())].into_iter().collect();
+        let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        i.my_pkh_by_game = &pkhs;
+        let rows_s = derive_owed_rows(&i);
+        assert_eq!(rows_s.len(), 1);
+        assert_eq!((&rows_s[0].facts["payTxid"], &rows_s[0].facts["payPkh"], &rows_s[0].facts["payVout"]), (&json!(sweep), &json!(home_hex), &json!(0)));
+        // a home this list does not know, or a raw that is not the sweep: `null`, and the route is not asked (a sweep is not in `pot_beefs`' contract)
+        let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        let rows_n = derive_owed_rows(&i);
+        assert!(rows_n[0].facts["payVout"].is_null() && rows_n[0].facts["payPkh"].is_null());
+        assert!(pay_vout_wanted(&rows_n).is_empty());
     }
 
     #[test]

@@ -452,7 +452,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 155 → 157 for bsv-low #469 (2026-09-19): `owed_rows` + `owed_state` (the owed list, computed on write).
 /// 157 → 160 for bsv-low #469 decision 3 (2026-09-19): `hopsweep_records` + its two indexes (the filed hop sweeps).
 /// 160 → 162 for bsv-low #486 (2026-10-06): `submit_refusals` + its age index (the door's refusal ledger).
-pub const OVERLAY_MIGRATION_COUNT: usize = 162;
+/// 162 → 163 for bsv-low #492 (2026-10-07, the B3 lens fold M1): `collected_markers_v2.payTxid` (one additive ALTER).
+pub const OVERLAY_MIGRATION_COUNT: usize = 163;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1698,6 +1699,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // the table names nothing), pruned by age with every write.
     crate::submit_refusals::SUBMIT_REFUSALS_CREATE,
     crate::submit_refusals::SUBMIT_REFUSALS_INDEX,
+    // bsv-low #492 (2026-10-07, the B3 lens fold M1): the PAYING TRANSACTION a held filing (`LOW/collected/v2`)
+    // names, written by the app layer's door (`POST /record?kind=collected`) in the same INSERT as the row, after
+    // the door verified the identity's signature over it. The owed walk retires a payout row by matching this
+    // column, so no stored signature is checked again at the read. NULL on every row this worker writes (a chain
+    // marker and the v1 filing name a game, never a transaction): a NULL retires nothing by transaction. Additive
+    // ALTER; the runner ignores the re-run "duplicate column" error. The app layer READS and WRITES it, so it
+    // issues the byte-identical catch-up (`low-app-layer/src/schema.rs`).
+    "ALTER TABLE collected_markers_v2 ADD COLUMN payTxid TEXT",
 ];
 
 // =============================================================================

@@ -31,7 +31,7 @@ use low_app_layer::logic::{
 };
 use low_app_layer::record_post::{
     lb_row_file_sql, COLLECTED_CHAIN_ROWS_SQL, COLLECTED_FILED_ROWS_SQL, COLLECTED_FILED_TODAY_SQL,
-    COLLECTED_FILE_SQL, POTPARTY_CHAIN_ROWS_SQL, POTPARTY_FILED_ROWS_SQL, POTPARTY_FILED_TODAY_SQL,
+    COLLECTED_FILE_SQL, HELD_FILED_ROWS_SQL, POTPARTY_CHAIN_ROWS_SQL, POTPARTY_FILED_ROWS_SQL, POTPARTY_FILED_TODAY_SQL,
     POTPARTY_FILE_SQL, POTREFUND_CHAIN_ROWS_SQL, POTREFUND_FILED_ROWS_SQL,
     POTREFUND_FILED_TODAY_SQL, POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL, RESULT_CHAIN_ROWS_SQL,
     RESULT_FILED_ROWS_SQL, RESULT_FILED_TODAY_SQL, RESULT_FILE_SQL,
@@ -131,6 +131,8 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "POTREFUND_FILED_ROWS_SQL", POTREFUND_FILED_ROWS_SQL);
     assert_prepares(&conn, "RESULT_FILED_ROWS_SQL", RESULT_FILED_ROWS_SQL);
     assert_prepares(&conn, "COLLECTED_FILED_ROWS_SQL", COLLECTED_FILED_ROWS_SQL);
+    assert_prepares(&conn, "HELD_FILED_ROWS_SQL", HELD_FILED_ROWS_SQL);
+    assert_prepares(&conn, "collected_rows_sql", &low_app_layer::owed::collected_rows_sql("?, ?"));
     assert_prepares(&conn, "POTPARTY_FILED_TODAY_SQL", POTPARTY_FILED_TODAY_SQL);
     assert_prepares(
         &conn,
