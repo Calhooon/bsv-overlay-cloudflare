@@ -897,6 +897,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
+        // the merged lens's LOW-3: the app layer's faulted memo reads (it writes the row)
+        crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
         // bsv-low #436: the app layer's own counts of what a body carried past its cap (it writes these rows);
         // the flushes' own accounts are seeded below (`CHANGE_FLUSH_SETS`)
         crate::pot_changes::COUNTER_POT_CHANGED_DROPPED,

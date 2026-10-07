@@ -903,9 +903,23 @@ pub fn set_aside_proofs_a_refused_word_contradicts(
 /// The owed row fact [`mark_refused_word_rows`] writes: the row's "not mined yet" is a BUDGET WAIT, not a chain word.
 pub const OWED_FACT_CHAIN_WORD_AWAITS_PROBE: &str = "chainWordAwaitsProbe";
 
-/// The reason such a row carries in place of `owed::UNCONFIRMED_PAYOUT_REASON` (D2-L1).
+/// The reason such a row carries in place of `owed::UNCONFIRMED_PAYOUT_REASON` (D2-L1), when this list CAN offer
+/// its credit (an index-held sweep whose proof was not set aside). The merged lens's LOW-1 (2026-10-06): this
+/// sentence promises a credit, so it goes on no other row; the two shapes below have their own true words.
 pub const CHAIN_WORD_AWAITS_PROBE_REASON: &str =
     "the chain's last answer for this spend was read just after a reorg and is being asked again in turn: the credit is offered once the answer is fresh";
+/// The budget wait on a COURIER-BYTES payout: the index holds no proof for the transaction, so `/credit-beef`
+/// assembles nothing for it whatever the fresh answer says (`owed::COURIER_BYTES_NO_CREDIT_REASON` is the row's
+/// word once the chain confirmed it). It read "the credit is offered once the answer is fresh" before.
+pub const CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON: &str =
+    "the chain's last answer for this spend was read just after a reorg and is being asked again in turn: if it stands the sats sit at your home on chain, and no credit can be assembled here (the index holds no proof for that transaction): a wallet resync finds them";
+/// The budget wait on a payout whose hop had its index proof SET ASIDE this pass (the refused word names a rival
+/// of the filed sweep): the fresh answer may be that the rival took the hop, so the row promises nothing.
+pub const CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON: &str =
+    "the chain's last answer for this stake was read just after a reorg and names a different spend than the sweep on file: it is being asked again in turn, and this row is judged again once the answer is fresh";
+/// `facts.chainWait` on a row [`mark_refused_word_rows`] rewrote (the merged lens's N3): the wait is for the walk's
+/// next ask of this hop, not for a block (`"block"`, which the row carried from the derivation).
+pub const OWED_CHAIN_WAIT_PROBE: &str = "probe";
 
 /// PURE (delta fold 2, D2-M1 and D2-L1): the walk's past-budget refusals, named on the rows they shaped.
 /// 1. A hop in `proofs_set_aside` ([`set_aside_proofs_a_refused_word_contradicts`]) carries
@@ -918,6 +932,14 @@ pub const CHAIN_WORD_AWAITS_PROBE_REASON: &str =
 ///    (eight a walk) outlasts the grace itself: a memo is "inside the grace" by when it was READ until it is
 ///    read again (96 hops: an hour or more past the grace's end). The safe direction, accepted by name: a
 ///    refused word never claims, and the row is open, so every five-minute walk moves the rotation on.
+///    The same rotation bounds item 1 (the merged lens's LOW-2, accepted as shipped): a WRONG in-grace rival
+///    word sets an honest proven sweep's proof aside on every walk that finds the hop past its budget, so that
+///    seat's credit is not offered until the rotation asks the hop again, at the outside until the overlay's
+///    two-hour TTL deletes the memo; the couriers alone can write such a word, and it only ever withholds.
+///    The sentence is one of three (the merged lens's LOW-1): [`CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON`]
+///    on a hop of `proofs_set_aside`, else [`CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON`] on a `courier-bytes`
+///    row, else [`CHAIN_WORD_AWAITS_PROBE_REASON`], the only one that speaks of a credit. `chainWait` reads
+///    [`OWED_CHAIN_WAIT_PROBE`] on all three (N3).
 pub fn mark_refused_word_rows(
     rows: &mut [crate::owed::OwedRow],
     refused_words: &std::collections::HashMap<String, Option<String>>,
@@ -933,7 +955,14 @@ pub fn mark_refused_word_rows(
             && r.facts["claimReason"] == json!(crate::owed::UNCONFIRMED_PAYOUT_REASON)
         {
             r.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE] = json!(true);
-            r.facts["claimReason"] = json!(CHAIN_WORD_AWAITS_PROBE_REASON);
+            r.facts["claimReason"] = json!(if proofs_set_aside.contains(&r.outpoint) {
+                CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON
+            } else if r.facts["creditKind"] == json!("courier-bytes") {
+                CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON
+            } else {
+                CHAIN_WORD_AWAITS_PROBE_REASON
+            });
+            r.facts["chainWait"] = json!(OWED_CHAIN_WAIT_PROBE);
         }
     }
 }
@@ -2617,6 +2646,7 @@ mod tests {
         assert_eq!((row.family, row.facts["claimable"].as_bool()), (OwedFamily::Payout, Some(false)));
         assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_REASON);
         assert_eq!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE], true);
+        assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE, "a budget wait by machine too, never a block wait (the merged lens's N3)");
         assert_ne!(CHAIN_WORD_AWAITS_PROBE_REASON, crate::owed::UNCONFIRMED_PAYOUT_REASON);
         assert!(row_is_open(&row));
         // a spend the courier itself called unconfirmed keeps the chain's own sentence
@@ -2713,6 +2743,8 @@ mod tests {
         assert!(body.contains(&squash("for keys in crate::hops_view::probe_memo_read_chunks(targets) {")));
         assert!(body.contains(&squash("db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds)")));
         assert_eq!(body.matches("returnVec::new();").count(), 2, "a failed statement empties the whole read: the tombstone is never the only part lost");
+        // the merged lens's LOW-3: each of the two fault arms is counted before it answers empty
+        assert_eq!(body.matches("probe_memo_read_faulted(db).await;returnVec::new();").count(), 2, "a faulted read is counted, never only logged");
         assert!(!body.contains("targets.len())).bind"), "no statement binds every target");
     }
 

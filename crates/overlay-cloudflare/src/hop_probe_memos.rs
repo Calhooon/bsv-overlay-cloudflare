@@ -35,6 +35,13 @@
 //!    sweep never deletes it (a memo read in the grace's last minute is still inside its two hours when the
 //!    tombstone would age out).
 //!
+//! 4. **The table holds two kinds of row that are not memos (bsv-low #485, the merged lens's MEDIUM-1,
+//!    2026-10-07).** The app layer's home latch and home-walk cursor live here under their own key prefixes
+//!    ([`HOP_PROBE_MEMO_APP_LAYER_PREFIXES`]). Rules 1 and 2 spare them by prefix: before, the clear deleted a
+//!    latch written from a confirmed probe and the TTL sweep deleted every latch and the cursor two hours on, so
+//!    a retired courier-proven row came back and was bought again from the couriers. They are not swept by
+//!    anyone: one latch per retired home output and one cursor per identity, for the table's life.
+//!
 //! Residual, stated with the read rule's numbers (the delta lens's D-M1, 2026-10-06): the word a recompute
 //! reads FRESH from a courier is served by that recompute as it always was. A courier behind the reorg says
 //! "confirmed" and the row says "ready to collect"; inside the grace that payout is an OPEN row for the owed
@@ -55,12 +62,24 @@ use crate::reorg_sweep::{ProofLegSummary, ReorgSweepSummary, ReverifyPassSummary
 /// The longest window any reader passes for a memo (the app layer's `PROBE_MEMO_CONFIRMED_MAX_AGE_MS`): two hours.
 pub const HOP_PROBE_MEMO_TTL_MS: i64 = 2 * 60 * 60_000;
 
-/// Rule 1: every memo that recorded a CONFIRMED spend.
-pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str = "DELETE FROM hop_chain_probes WHERE spentConfirmed = 1";
+/// The rows of `hop_chain_probes` that are NOT probe memos (bsv-low #485, the merged lens's MEDIUM-1): the app
+/// layer keeps its home latch (`homeproof:<txid>.<vout>`, the home key's signature verified over a spender's
+/// bytes: a proof, never a chain word, so no reorg unmakes it and no window ages it) and its home-walk cursor
+/// (`homecursor:<identity>.0`, a position in a ring) in the same table, under these key prefixes
+/// (`low-app-layer` `owed::HOME_SPEND_LATCH_PREFIX`, `owed::HOME_WALK_CURSOR_PREFIX`, pinned equal from its
+/// tests, which link this crate). Neither rule below touches them, nor counts them.
+pub const HOP_PROBE_MEMO_APP_LAYER_PREFIXES: [&str; 2] = ["homeproof:", "homecursor:"];
+
+/// Rule 1: every memo that recorded a CONFIRMED spend, never the app layer's own rows (a latch written from a
+/// confirmed probe carries `spentConfirmed = 1` too).
+pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
+    "DELETE FROM hop_chain_probes WHERE spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%'";
 
 /// Rule 2: every memo no reader honours (bind: `now - HOP_PROBE_MEMO_TTL_MS`; the reader refuses
-/// `age >= window`, so the row read exactly at the bound goes too: the lens's N2), never the reorg tombstone.
-pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str = "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0'";
+/// `age >= window`, so the row read exactly at the bound goes too: the lens's N2), never the reorg tombstone,
+/// never the app layer's own rows.
+pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str =
+    "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%'";
 
 /// Rule 3: the tombstone's key in `hop_chain_probes.outpoint`. It has the memo key's shape (`<txid>.<vout>`)
 /// with a txid no transaction has, so the app layer reads it in the same `IN` read as the memos it judges (one
@@ -81,6 +100,12 @@ pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (o
 pub const COUNTER_HOP_PROBE_MEMOS_CLEARED: &str = "hop_probe_memos_cleared_by_reorg_total";
 /// Memos the TTL sweep deleted.
 pub const COUNTER_HOP_PROBE_MEMOS_EXPIRED: &str = "hop_probe_memos_expired_total";
+
+/// Memo reads of the APP LAYER that faulted (the merged lens's LOW-3): it writes this row, the overlay seeds it at
+/// 0 and serves it on `/health/invariants.counters` with the rest (`low-app-layer`
+/// `owed::COUNTER_PROBE_MEMO_READ_FAULTS`, pinned equal from its tests). A faulted read is an empty answer for
+/// that pass: no memo, no reorg tombstone (so no grace mark), no latch and no cursor.
+pub const COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS: &str = "applayer_probe_memo_read_faults_total";
 
 /// PURE: the spenders leg re-judged a row (demoted it, blind or on a refuted proof, or moved its anchor).
 pub fn reverify_rejudged(s: &ReverifyPassSummary) -> bool {
@@ -233,6 +258,38 @@ mod tests {
         assert_eq!(held(&conn), vec![HOP_PROBE_MEMO_REORG_MARK, "young.0"]);
     }
 
+    /// bsv-low #485 (merge fold, the merged lens's MEDIUM-1), over the SHIPPED schema (real SQLite): neither
+    /// DELETE takes a row under the app layer's prefixes, whatever its age and whatever its `spentConfirmed`
+    /// (a latch written from a confirmed probe carries 1), and neither counts one; the memos beside them go as
+    /// before. The app layer's own pin writes these rows through its shipped statements and reads the latch back
+    /// (`low-app-layer` `owed`, `the_overlays_reorg_clear_and_ttl_sweep_leave_the_home_latch_...`).
+    /// To red: drop a prefix from either DELETE.
+    #[test]
+    fn neither_delete_takes_the_app_layers_latch_or_cursor_rows_real_sqlite() {
+        let conn = db();
+        let now: i64 = 1_800_000_000_000;
+        let latch = format!("{}{}.0", HOP_PROBE_MEMO_APP_LAYER_PREFIXES[0], "ab".repeat(32));
+        let unconfirmed_latch = format!("{}{}.1", HOP_PROBE_MEMO_APP_LAYER_PREFIXES[0], "cd".repeat(32));
+        let cursor = format!("{}02{}.0", HOP_PROBE_MEMO_APP_LAYER_PREFIXES[1], "aa".repeat(32));
+        plant(&conn, &latch, 5, true, Some(true));
+        plant(&conn, &unconfirmed_latch, 5, true, None);
+        plant(&conn, &cursor, 5, false, None);
+        plant(&conn, "a.0", 5, true, Some(true));
+        plant(&conn, "b.0", 5, true, None);
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1, "the confirmed memo, not the confirmed latch");
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now]).unwrap(), 1, "the memo past the window, not the rows beside it");
+        let mut left = vec![cursor, latch, unconfirmed_latch];
+        left.sort();
+        assert_eq!(held(&conn), left);
+        for sql in [HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_EXPIRE_SQL] {
+            for prefix in HOP_PROBE_MEMO_APP_LAYER_PREFIXES {
+                assert!(sql.contains(&format!("outpoint NOT LIKE '{prefix}%'")), "{sql}");
+                assert!(!prefix.contains(['%', '_']), "no LIKE wildcard in a prefix");
+            }
+        }
+        assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES.iter().any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
+    }
+
     /// bsv-low #484 (lens fold, M2), the tombstone over the SHIPPED schema (real SQLite): the clear stamps one
     /// reserved row, the stamp only grows, the reorg clear and the TTL sweep both leave it, and its key is the
     /// one the SQL strings carry. To red: let either DELETE take it, or let an older stamp overwrite a newer.
@@ -315,6 +372,9 @@ mod tests {
         assert_eq!(some["everRan"], true, "the view's own keys stand");
         let ops = include_str!("ops.rs");
         assert!(ops.contains("let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);"));
+        // the merged lens's LOW-3: the app layer's faulted memo reads are a seeded row of the same surface
+        assert!(ops.contains("crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,"), "seeded at 0 in `read_counters`");
+        assert_eq!(COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS, "applayer_probe_memo_read_faults_total");
     }
 
     /// SOURCE PIN (bsv-low #484): BOTH reorg judges invalidate, each where it has its outcome in hand: the D7

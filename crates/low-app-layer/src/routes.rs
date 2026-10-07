@@ -3536,7 +3536,9 @@ pub(crate) async fn owed_recompute(
 /// cursor (`owed::home_walk_window`), and the cursor moves to the first output the pass withheld a look from, so
 /// the window cut, the chain probes and the stored reads all rotate. Cost per pass: one memo read (the cursor,
 /// the window's latches and chain memos), one more for the cursor alone when the identity holds more than
-/// `OWED_HOME_WINDOW` candidates, and one batch of upserts (the fresh memos, the latches, the cursor).
+/// `OWED_HOME_WINDOW` candidates, and one batch of upserts (the fresh memos, the latches, the cursor). The one
+/// read is two STATEMENTS at exactly `OWED_HOME_WINDOW` candidates (the merged lens's N4: `1 + 2 * 45` keys is
+/// one over `PROBE_MEMO_READ_CHUNK`); it stays all or nothing.
 async fn owed_home_spend_walk(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -4984,7 +4986,8 @@ struct ProbeMemoRow {
 /// The memos for `targets`, read in statements of at most `hops_view::PROBE_MEMO_READ_CHUNK` binds (delta fold 2,
 /// D-L5: D1 refuses more than 100 a statement). Fail-soft and ALL-OR-NOTHING: a bind/query fault in any statement
 /// is an empty answer (every target asked; the owed walk's reorg tombstone rides this read and must never be the
-/// only part lost).
+/// only part lost). A fault is COUNTED (the merged lens's LOW-3, `probe_memo_read_faulted`): the empty answer costs
+/// the pass its grace mark, its latches and its cursor.
 async fn read_probe_memos(
     db: &worker::D1Database,
     targets: &[(String, u32)],
@@ -4997,11 +5000,13 @@ async fn read_probe_memos(
                 Ok(chunk) => rows.extend(chunk),
                 Err(e) => {
                     console_warn!("[spent-any] probe memo read failed ({} targets): {e}", targets.len());
+                    probe_memo_read_faulted(db).await;
                     return Vec::new();
                 }
             },
             Err(e) => {
                 console_warn!("[spent-any] probe memo bind failed ({} targets): {e}", targets.len());
+                probe_memo_read_faulted(db).await;
                 return Vec::new();
             }
         }
@@ -5015,6 +5020,23 @@ async fn read_probe_memos(
             spent_confirmed: r.spent_confirmed.map(|v| v != 0),
         })
         .collect()
+}
+
+/// The merged lens's LOW-3: one faulted memo read, counted under its own name: on this isolate
+/// (`/health.owed.probeMemoReadFaults`) and in the overlay's `ops_counters`
+/// (`owed::COUNTER_PROBE_MEMO_READ_FAULTS`, on the overlay's `/health/invariants.counters`). One write per fault,
+/// on the fault arm only; a counter write that fails too is logged and the isolate's count stands.
+async fn probe_memo_read_faulted(db: &worker::D1Database) {
+    crate::owed::note_probe_memo_read_fault();
+    let binds = [JsValue::from_str(crate::owed::COUNTER_PROBE_MEMO_READ_FAULTS), JsValue::from_f64(1.0)];
+    match db.prepare(crate::beef_guard::BUMP_COUNTER_SQL).bind(&binds) {
+        Ok(stmt) => {
+            if let Err(e) = stmt.run().await {
+                console_warn!("[spent-any] probe memo read fault counter write failed: {e}");
+            }
+        }
+        Err(e) => console_warn!("[spent-any] probe memo read fault counter bind failed: {e}"),
+    }
 }
 
 /// The fresh memos, ONE batch of upserts. Fail-soft: a failure only forgets (logged).

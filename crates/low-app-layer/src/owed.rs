@@ -236,8 +236,12 @@ pub enum HomeSpendWord {
     Unspent,
 }
 /// The durable latch of a `Proven` word: a `hop_chain_probes` row under this key prefix (`homeproof:<txid>.<vout>`),
-/// written by this crate alone, only after the signature verified here. The table is the app layer's own probe memo
-/// (the overlay never writes it); `/spent-any` keys its rows `<txid>.<vout>`, so the prefix cannot collide.
+/// written by this crate alone, only after the signature verified here. The table is the app layer's own probe memo;
+/// `/spent-any` keys its rows `<txid>.<vout>`, so the prefix cannot collide. The overlay DELETES from the table
+/// (bsv-low #484: its reorg clear and its TTL sweep of the probe memos) and spares this prefix and the cursor's by
+/// name (`bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_APP_LAYER_PREFIXES`, pinned equal and executed
+/// on real SQLite here: the merged lens's MEDIUM-1, where both took the latch and the retirement lasted two hours).
+/// So the latch is durable: no reorg unmakes a signature and no window ages it.
 pub const HOME_SPEND_LATCH_PREFIX: &str = "homeproof:";
 /// The courier probes ONE recompute may buy for the home outputs of its courier-proven payouts (each is one
 /// spent-any ladder, memoised like the hops', plus one tx-any read for a named spender's bytes).
@@ -1902,6 +1906,20 @@ pub fn note_hop_sweeps_read_fault() {
 pub fn note_sweep_proofs_read_fault() {
     SWEEP_PROOFS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+/// The merged lens's LOW-3 (2026-10-06): a probe memo read faulted (`routes::read_probe_memos`, all or nothing: the
+/// answer is empty). It was a `console_warn` only, and it is not free: the hop walk gets no memo and no reorg
+/// tombstone for that pass (every candidate is "never probed", and a fresh "confirmed" taken inside a real grace
+/// is not marked `chainWordInReorgGrace`), the home walk gets no latch (every retired courier-proven row is back
+/// for the pass) and no cursor (the ring is walked from its head). Always the safe direction, now counted: here
+/// for the isolate (`/health.owed.probeMemoReadFaults`) and in the overlay's `ops_counters` under
+/// [`COUNTER_PROBE_MEMO_READ_FAULTS`], served on the overlay's `/health/invariants.counters`.
+static PROBE_MEMO_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+pub fn note_probe_memo_read_fault() {
+    PROBE_MEMO_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+/// The durable row of [`note_probe_memo_read_fault`] (the overlay seeds it at 0:
+/// `bsv_overlay_cloudflare::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS`, pinned equal).
+pub const COUNTER_PROBE_MEMO_READ_FAULTS: &str = "applayer_probe_memo_read_faults_total";
 /// The route counts the rows that carry `sweepProofContradicted` (one per hop per recompute).
 pub fn note_sweep_proof_contradictions(n: u64) {
     if n > 0 {
@@ -1964,6 +1982,7 @@ pub fn owed_health_json() -> Value {
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofsReadFaults": SWEEP_PROOFS_READ_FAULTS.load(Ordering::Relaxed),
+        "probeMemoReadFaults": PROBE_MEMO_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofContradictions": SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
@@ -3832,6 +3851,189 @@ mod tests {
     }
     fn unspent_probe() -> crate::hops_view::ChainSpendProbe {
         crate::hops_view::ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None }
+    }
+
+    /// bsv-low #484 (merge fold, the merged lens's LOW-1 and N3): THE BUDGET-WAIT SENTENCE PROMISES A CREDIT ONLY
+    /// WHERE ONE CAN BE OFFERED. `hops_view::mark_refused_word_rows` wrote "the credit is offered once the answer
+    /// is fresh" on every payout it renamed, and two of those can be offered none: a COURIER-BYTES payout (the
+    /// index holds no proof, `/credit-beef` assembles nothing: with a fresh confirmed word the same row says so)
+    /// and a payout whose hop had its index proof set aside by a rival word (the fresh answer may be that the
+    /// rival took the hop). This is where the two lanes' facts meet (#485's `creditKind`, #484's refused word),
+    /// through the walk's own words and the full derivation. Each shape has its own sentence, the fact
+    /// `chainWordAwaitsProbe` stands on all three, and `chainWait` no longer says "block" on a budget wait.
+    /// To red: write `CHAIN_WORD_AWAITS_PROBE_REASON` on every renamed row again.
+    #[test]
+    fn the_budget_wait_promises_a_credit_only_on_a_row_that_can_be_offered_one() {
+        use crate::hops_view::{
+            confirmation_refused, mark_refused_word_rows, probe_memo_of, set_aside_proofs_a_refused_word_contradicts, stale_memo_word, ChainSpendProbe, ProbeMemo,
+            CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON, CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON, CHAIN_WORD_AWAITS_PROBE_REASON, OWED_CHAIN_WAIT_PROBE,
+            OWED_FACT_CHAIN_WORD_AWAITS_PROBE,
+        };
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let now: i64 = 1_800_000_000_000;
+        let (clear, read_at) = (now - 7 * 60_000, now - 6 * 60_000); // the memo was read one minute into the grace
+        let (sweep, rival, my_pkh) = (tx(0x0e), tx(0x9b), "cc".repeat(20));
+        let key = outpoint_key(&tx(0x07), 0);
+        let hops = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let pkhs: HashMap<String, String> = [(tx(0x01), my_pkh.clone())].into_iter().collect();
+        let memo_naming = |spender: &str| -> ProbeMemo {
+            probe_memo_of(&tx(0x07), 0, &ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.to_string()), spent_confirmed: Some(true) }, read_at).expect("a known answer is memoised")
+        };
+        // THE WALK past the budget, in the route's order: the stale word, the refusal remembered, the set-aside,
+        // the derivation, the mark
+        let walk = |memo: &ProbeMemo, spender: &str, courier: bool, filed: Option<&str>| -> OwedRow {
+            let mut refused_words: HashMap<String, Option<String>> = HashMap::new();
+            assert!(confirmation_refused(memo, Some(clear)));
+            refused_words.insert(key.clone(), memo.spending_txid.as_deref().map(str::to_ascii_lowercase));
+            let chain: HashMap<String, HopChainWord> = [(key.clone(), stale_memo_word(memo, now, Some(clear)))].into_iter().collect();
+            let mut sweeps: HashMap<String, crate::hopsweep::FiledHopSweep> = filed
+                .map(|f| (key.clone(), crate::hopsweep::FiledHopSweep { sweep_txid: f.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven: true, index_proof_height: Some(899_990) }))
+                .into_iter()
+                .collect();
+            let set_aside = set_aside_proofs_a_refused_word_contradicts(&mut sweeps, &refused_words);
+            let outs = pays(spender, &[(0, &my_pkh, 20_000, None)]);
+            let ins: HashMap<String, Vec<(String, u32)>> = [(spender.to_string(), vec![(tx(0x07), 0)])].into_iter().collect();
+            let couriers: HashSet<String> = if courier { [spender.to_string()].into_iter().collect() } else { HashSet::new() };
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.hop_chain = &chain;
+            i.hop_sweeps = &sweeps;
+            i.spender_outputs = &outs;
+            i.spender_inputs = &ins;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &couriers;
+            let mut rows = derive_owed_rows(&i);
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool(), rows[0].facts["claimReason"].as_str()), (OwedFamily::Payout, Some(false), Some(UNCONFIRMED_PAYOUT_REASON)), "the row the mark renames");
+            assert_eq!(rows[0].facts["chainWait"], "block");
+            mark_refused_word_rows(&mut rows, &refused_words, &set_aside);
+            rows.remove(0)
+        };
+        // 1. COURIER BYTES: no credit can be assembled here, and the row never says one is coming
+        let row = walk(&memo_naming(&sweep), &sweep, true, None);
+        assert_eq!(row.facts["creditKind"], "courier-bytes");
+        assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON);
+        assert_eq!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE], true);
+        assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE);
+        assert!(row.facts.get("sweepProofContradicted").is_none());
+        //    the same row on a FRESH confirmed word: the sentence the wait now agrees with
+        let fresh = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let outs = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let ins: HashMap<String, Vec<(String, u32)>> = [(sweep.clone(), vec![(tx(0x07), 0)])].into_iter().collect();
+        let couriers: HashSet<String> = [sweep.clone()].into_iter().collect();
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &fresh;
+        i.spender_outputs = &outs;
+        i.spender_inputs = &ins;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &couriers;
+        assert_eq!(derive_owed_rows(&i)[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
+        // 2. THE PROOF SET ASIDE: a proven filing, a refused word naming a rival whose bytes pay this home
+        let row = walk(&memo_naming(&rival), &rival, false, Some(&sweep));
+        assert_eq!(row.facts["sweepProofContradicted"], true);
+        assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON);
+        assert_eq!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE], true);
+        assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE);
+        //    and it outranks the courier-bytes word (the filed sweep's credit may yet stand)
+        let row = walk(&memo_naming(&rival), &rival, true, Some(&sweep));
+        assert_eq!((row.facts["creditKind"].as_str(), row.facts["claimReason"].as_str()), (Some("courier-bytes"), Some(CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON)));
+        // 3. AN INDEX-HELD SWEEP, nothing set aside: the one row a credit can be offered on keeps the promise
+        let row = walk(&memo_naming(&sweep), &sweep, false, None);
+        assert!(row.facts.get("creditKind").is_none() && row.facts.get("sweepProofContradicted").is_none());
+        assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_REASON);
+        assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE);
+        // the words: only the third speaks of a credit being offered; all three name the reorg and the re-ask
+        assert!(CHAIN_WORD_AWAITS_PROBE_REASON.contains("the credit is offered"));
+        for other in [CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON, CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON] {
+            assert!(!other.contains("offered"), "{other}");
+            assert!(other.contains("read just after a reorg") && other.contains("asked again in turn"), "{other}");
+        }
+        assert!(CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON.contains("no credit can be assembled here"));
+        assert_ne!(OWED_CHAIN_WAIT_PROBE, "block");
+    }
+
+    /// The merged lens's LOW-3: A FAULTED PROBE MEMO READ IS COUNTED UNDER ITS OWN NAME, on the isolate's `/health`
+    /// and as a durable row the overlay seeds and serves on `/health/invariants.counters`. The row is written with
+    /// the shipped counter upsert over the shipped schema (real SQLite); the route's two fault arms call the
+    /// counter before they answer empty (the source pin in `hops_view`, beside the all-or-nothing one).
+    /// To red: drop `probe_memo_read_faulted` from either fault arm, or rename either constant alone.
+    #[test]
+    fn a_faulted_probe_memo_read_is_counted_on_health_and_in_the_overlays_counters_real_sqlite() {
+        assert_eq!(COUNTER_PROBE_MEMO_READ_FAULTS, bsv_overlay_cloudflare::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS, "the overlay seeds the row this worker writes");
+        let before = owed_health_json()["probeMemoReadFaults"].as_u64().expect("the count is on /health.owed");
+        note_probe_memo_read_fault();
+        assert_eq!(owed_health_json()["probeMemoReadFaults"].as_u64().unwrap(), before + 1);
+        let conn = memo_db();
+        for _ in 0..2 {
+            conn.execute(crate::beef_guard::BUMP_COUNTER_SQL, rusqlite::params![COUNTER_PROBE_MEMO_READ_FAULTS, 1i64]).unwrap();
+        }
+        let held: i64 = conn.query_row("SELECT value FROM ops_counters WHERE name = ?1", [COUNTER_PROBE_MEMO_READ_FAULTS], |r| r.get(0)).unwrap();
+        assert_eq!(held, 2, "one per faulted read");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        assert!(routes.contains(&squash("crate::owed::note_probe_memo_read_fault(); let binds = [JsValue::from_str(crate::owed::COUNTER_PROBE_MEMO_READ_FAULTS), JsValue::from_f64(1.0)];")));
+    }
+
+    /// bsv-low #485 (merge fold, the merged lens's MEDIUM-1): THE OVERLAY'S TWO DELETES NEVER TAKE THE HOME LATCH
+    /// OR THE HOME CURSOR. All three kinds of row live in `hop_chain_probes`, and the overlay's reorg clear
+    /// (`DELETE ... WHERE spentConfirmed = 1`) and TTL sweep (`DELETE ... WHERE probedAtMs <= ?`) took them with
+    /// the memos: a latch written from a confirmed probe went on the first reorg evidence, any latch and the
+    /// cursor two hours and one block event after they were written, so a retired courier-proven row came back
+    /// and was bought again from the couriers, two a recompute, and the ring started at its head for a seat that
+    /// reads less often than two hours. Executed here on real SQLite over the shipped migrations: the latches are
+    /// `home_word`'s own (a real signature, one probe confirmed and one not), the cursor is `home_cursor_memo`'s,
+    /// all written through `PROBE_MEMO_UPSERT_SQL`; then the overlay's shipped statements run, far past every
+    /// window; the latches are read back through the route's read and `latched_home_words`, the cursor through
+    /// `home_cursor_of`. The chain memos beside them still go (the sweep and the clear keep their job) and the
+    /// tombstone keeps its own exemption.
+    /// To red: drop either prefix from either DELETE (on `7868785` the clear took the confirmed latch and the
+    /// sweep took the other latch and the cursor).
+    #[test]
+    fn the_overlays_reorg_clear_and_ttl_sweep_leave_the_home_latch_and_the_home_cursor_real_sqlite() {
+        use crate::hops_view::{probe_memo_key, ChainSpendProbe, ProbeMemo};
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_APP_LAYER_PREFIXES, HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_REORG_MARK, HOP_PROBE_MEMO_REORG_MARK_SQL,
+        };
+        assert_eq!(HOP_PROBE_MEMO_APP_LAYER_PREFIXES, [HOME_SPEND_LATCH_PREFIX, HOME_WALK_CURSOR_PREFIX], "the overlay spares exactly the prefixes this crate writes");
+        let conn = memo_db();
+        let t0: i64 = 1_800_000_000_000;
+        let home = bsv_rs::primitives::PrivateKey::random();
+        let pkh = hex::encode(home.public_key().hash160());
+        let (sweep_a, spend_a) = sweep_and_home_spend(&home, &home, 20_000);
+        let (sweep_b, spend_b) = sweep_and_home_spend(&home, &home, 30_000);
+        let candidates = [
+            CourierHomeOutput { sweep_txid: sweep_a.clone(), vout: 0, pkh_hex: pkh.clone(), sats: 20_000 },
+            CourierHomeOutput { sweep_txid: sweep_b.clone(), vout: 0, pkh_hex: pkh.clone(), sats: 30_000 },
+        ];
+        let spent = |confirmed: Option<bool>| ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(tx(0x5a)), spent_confirmed: confirmed };
+        // the latch of a CONFIRMED probe (`spentConfirmed = 1`: the reorg clear's own predicate) and of an unconfirmed one
+        let (_, latch_a) = home_word(&spent(Some(true)), Some(&spend_a), &candidates[0], t0).expect("a word");
+        let (_, latch_b) = home_word(&spent(None), Some(&spend_b), &candidates[1], t0).expect("a word");
+        let (latch_a, latch_b) = (latch_a.expect("a proof latches"), latch_b.expect("a proof latches"));
+        assert_eq!(latch_a.spent_confirmed, Some(true));
+        let cursor = home_cursor_memo(ME, &candidates[1], t0);
+        // the chain rung's own memos of the same two outputs, and the tombstone
+        let chain = |sweep: &str, confirmed: Option<bool>| ProbeMemo { outpoint: probe_memo_key(sweep, 0), probed_at_ms: t0, spent: true, spending_txid: Some(tx(0x5a)), spent_confirmed: confirmed };
+        write_memos(&conn, &[latch_a, latch_b, cursor, chain(&sweep_a, Some(true)), chain(&sweep_b, None)]);
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0]).unwrap();
+        let held = |conn: &rusqlite::Connection| -> usize { conn.query_row("SELECT COUNT(*) FROM hop_chain_probes", [], |r| r.get::<_, i64>(0)).unwrap() as usize };
+        assert_eq!(held(&conn), 6);
+        let latch_targets: Vec<(String, u32)> = candidates.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
+        let both_latched = |conn: &rusqlite::Connection| -> bool {
+            let (words, targets) = latched_home_words(&candidates, &read_memos(conn, &latch_targets));
+            targets.is_empty() && words.len() == 2 && words.values().all(|w| *w == HomeSpendWord::Proven)
+        };
+        let cursor_at_b = |conn: &rusqlite::Connection| -> bool { home_cursor_of(&read_memos(conn, &[home_cursor_target(ME)]), ME) == Some(probe_memo_key(&sweep_b, 0)) };
+        // THE REORG CLEAR: the confirmed chain memo goes, nothing else (it took the confirmed latch too)
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1, "the one confirmed chain memo: a signature proof is not a chain word, a reorg does not unmake it");
+        assert!(both_latched(&conn), "the reorg clear took a latch");
+        assert!(cursor_at_b(&conn));
+        // THE TTL SWEEP, with a bound past every row: the other chain memo goes, nothing else (it took both latches and the cursor)
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX]).unwrap(), 1, "the one chain memo left");
+        assert!(both_latched(&conn), "the TTL sweep took a latch: the retired row is back and is bought again from the couriers");
+        assert!(cursor_at_b(&conn), "the TTL sweep took the cursor: the ring starts at its head again");
+        assert_eq!(read_memos(&conn, &[crate::hops_view::reorg_mark_target()]).len(), 1, "the tombstone keeps its own exemption");
+        assert_eq!(held(&conn), 4, "two latches, the cursor, the tombstone");
+        assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES.iter().any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
     }
 
     /// The delta fold's LOW-1 (cut 1) and LOW-2 (the stored-read cap), EXECUTED on real SQLite: twelve home outputs
