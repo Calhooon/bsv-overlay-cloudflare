@@ -3198,6 +3198,9 @@ enum InsertEvent {
     DeadlineFallsDue(RequestClock),
     // The write faults (a D1 outage) until the test disarms the store.
     Faults,
+    // The write never answers (a hung D1 call) until the test disarms the
+    // store (bsv-low #559, DELTA-3).
+    Hangs,
 }
 
 type Armed = Rc<RefCell<Option<(String, u32, InsertEvent)>>>;
@@ -3226,6 +3229,14 @@ impl ScriptedStore {
 #[async_trait(?Send)]
 impl Storage for ScriptedStore {
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+        let hangs = matches!(
+            self.armed.borrow().as_ref(),
+            Some((txid, output_index, InsertEvent::Hangs))
+                if *txid == output.txid && *output_index == output.output_index
+        );
+        if hangs {
+            return std::future::pending().await;
+        }
         let hit = {
             let mut armed = self.armed.borrow_mut();
             let is_hit = armed.as_ref().is_some_and(|(txid, output_index, _)| {
@@ -3783,4 +3794,231 @@ async fn fold_low1_submit_validate_only_is_a_dry_run() {
     );
     assert!(!ledger.borrow().advances[0].dry_run);
     assert_eq!(utxo_txids(&store).await, vec![node_txid(&nodes[0])]);
+}
+
+// ============================================================================
+// bsv-low #559: a storage fault inside `Engine::submit` loses no head. The
+// new outputs are inserted BEFORE the stale coin is deleted, and the delete
+// waits for a submit with no fault, so a faulted topic leaves its previous
+// coins where the replay finds them. The delta lens's executed recipe
+// (`docs/audit/ingest-delta-2026-10-06.md`, DELTA-1).
+// ============================================================================
+
+async fn row_exists(store: &MemoryStorage, node: &GASPNode) -> bool {
+    store
+        .find_output(&node_txid(node), 0, Some(TOPIC), None, false)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+async fn applied_rows(store: &MemoryStorage, nodes: &[GASPNode]) -> Vec<bool> {
+    let mut rows = Vec::new();
+    for n in nodes {
+        rows.push(applied(store, n).await);
+    }
+    rows
+}
+
+// The recipe. Four heads, the tip listed, a manager that does not retain a
+// spent head; the insert of head 1 FAULTS (a D1 outage that lasts the tick).
+// On 1821f73 head 0 was deleted before that insert: the store held nothing,
+// every later head was judged with no coin, admitted nothing and was recorded
+// as applied, and no later tick placed the chain. With a budget and without.
+#[tokio::test]
+async fn i559_a_a_storage_fault_on_a_mid_chain_insert_keeps_the_old_head_and_the_next_tick_resumes()
+{
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    for budgeted in [true, false] {
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let store = Rc::new(MemoryStorage::new());
+        let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
+        let outage = scripted.armed.clone();
+        let node = Budgeted::over(
+            RecordingRemote::new(&nodes, &[3]),
+            Box::new(HeadChainManager(state.clone())),
+            RequestClock::allowing(u64::MAX - 1),
+            store,
+            Box::new(scripted),
+            budgeted,
+        );
+        let case = format!("budgeted={budgeted}");
+
+        // Tick 1, the outage on.
+        node.tick().await;
+        let old_head = row_exists(&node.store, &nodes[0]).await;
+        let rows = applied_rows(&node.store, &nodes).await;
+        println!(
+            "#559 {case}: after the faulted insert of head 1: old head row held {old_head}, \
+             utxos {:?}, applied {rows:?}, cursor {}",
+            held(&node.store, &nodes).await,
+            node.cursor().await
+        );
+        assert!(old_head, "{case}: the old head stays held on the fault");
+        assert_eq!(
+            rows,
+            [true, false, false, false],
+            "{case}: no applied row for a head that was not placed"
+        );
+        assert!(!row_exists(&node.store, &nodes[1]).await, "{case}");
+        assert_eq!(node.cursor().await, 0, "{case}: the cursor stays");
+
+        // The outage ends: the next tick resumes from the held head.
+        outage.borrow_mut().take();
+        let (topic, sent) = node.tick().await;
+        assert_eq!(
+            sent,
+            txids(&nodes, &[3, 2, 1]),
+            "{case}: the walk stops at the held head"
+        );
+        assert_eq!(held(&node.store, &nodes).await, vec![(3, 0)], "{case}");
+        assert!(
+            !row_exists(&node.store, &nodes[0]).await,
+            "{case}: the old head is deleted once the new one is in"
+        );
+        assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4], "{case}");
+        assert_eq!(topic.cursor_moves, moved(0, 1), "{case}");
+
+        // And it stays so.
+        node.tick().await;
+        assert_eq!(held(&node.store, &nodes).await, vec![(3, 0)], "{case}");
+    }
+}
+
+fn proven_beef(node: &GASPNode) -> TaggedBEEF {
+    let mut tx = Transaction::from_hex(&node.raw_tx).unwrap();
+    tx.merkle_path = Some(MerklePath::from_hex(node.proof.as_ref().unwrap()).unwrap());
+    TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![TOPIC.to_string()])
+}
+
+// The same fault at the `/submit` door (the queue's shape: one engine, each
+// transaction its own submit). Head 2 arrives while head 1 has not landed: it
+// finds no coin and the manager admits nothing. On 1821f73 that wrote its
+// applied row, so its replay was a dupe and the chain ended at head 1 for
+// good. Now it is reported as not durable and recorded nowhere, and the
+// replays place both.
+#[tokio::test]
+async fn i559_b_a_successor_of_a_faulted_submit_is_not_recorded_as_applied() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
+    let outage = scripted.armed.clone();
+    let engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(HeadChainManager(state.clone())) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(scripted),
+        None,
+        EngineConfig::default(),
+    );
+    let submit = |i: usize| {
+        let beef = proven_beef(&nodes[i]);
+        let engine = &engine;
+        async move {
+            engine
+                .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap()
+                .1
+        }
+    };
+
+    assert!(submit(0).await.is_durable());
+    let faulted = submit(1).await;
+    assert!(!faulted.is_durable(), "the insert of head 1 faulted");
+    assert!(
+        row_exists(&store, &nodes[0]).await,
+        "the old head stays held on the fault"
+    );
+    let successor = submit(2).await;
+    println!(
+        "#559 /submit: head 2 after the faulted head 1: durable {}, applied {:?}, rows {:?}",
+        successor.is_durable(),
+        successor.applied_topics,
+        applied_rows(&store, &nodes).await
+    );
+    assert!(
+        !successor.is_durable() && successor.applied_topics.is_empty(),
+        "head 2 found no coin because head 1 did not land: not now, never applied"
+    );
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+
+    // The outage ends and the queue replays both, in order.
+    outage.borrow_mut().take();
+    assert!(submit(1).await.is_durable());
+    let replayed = submit(2).await;
+    assert!(replayed.is_durable());
+    assert_eq!(replayed.applied_topics, vec![TOPIC.to_string()]);
+    assert_eq!(held(&store, &nodes).await, vec![(2, 0)]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
+}
+
+// DELTA-3. The insert of head 1 never ANSWERS (a hung D1 call) inside a
+// finalize write section, which no deadline drops. On 1821f73 that held the
+// per-peer budget and the worker's belt for as long as the call hung: the
+// tick never returned (RED there with this pin less its one call to
+// `set_finalize_submit_budget`, which the base does not have). Now one
+// transaction's finalize submit has a budget of its own; past it the submit
+// is dropped (safe since the insert comes before the delete), the UTXO fails
+// and the cursor stays.
+#[tokio::test]
+async fn i559_c_a_hung_storage_call_inside_a_finalize_submit_is_timed_out_and_fails_the_utxo() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Hangs);
+    let hang = scripted.armed.clone();
+    let mut node = Budgeted::over(
+        RecordingRemote::new(&nodes, &[3]),
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(u64::MAX - 1),
+        store,
+        Box::new(scripted),
+        true,
+    );
+    // The submit's own deadline falls due after a few polls, as a timer
+    // does; the peer's deadline is never due here.
+    node.engine.set_finalize_submit_budget(
+        Rc::new(|_ms| {
+            let mut polls = 0;
+            Box::pin(std::future::poll_fn(move |cx| {
+                polls += 1;
+                if polls > 3 {
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }))
+        }),
+        1,
+    );
+
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), node.tick()).await;
+    assert!(
+        ticked.is_ok(),
+        "the hung write held the tick: nothing bounds a storage call inside a write section"
+    );
+    let rows = applied_rows(&node.store, &nodes).await;
+    println!(
+        "#559 DELTA-3: after the hung insert of head 1: old head row held {}, applied {rows:?}, cursor {}",
+        row_exists(&node.store, &nodes[0]).await,
+        node.cursor().await
+    );
+    assert!(row_exists(&node.store, &nodes[0]).await);
+    assert_eq!(rows, [true, false, false, false]);
+    assert_eq!(node.cursor().await, 0, "the UTXO failed: the cursor stays");
+
+    // The call answers again: the next tick places the chain.
+    hang.borrow_mut().take();
+    let (topic, _) = node.tick().await;
+    assert_eq!(held(&node.store, &nodes).await, vec![(3, 0)]);
+    assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4]);
+    assert_eq!(topic.cursor_moves, moved(0, 1));
 }

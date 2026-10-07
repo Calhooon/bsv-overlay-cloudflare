@@ -1038,6 +1038,17 @@ fn build_engine_with_storage(
         }),
         GASP_PEER_SYNC_BUDGET_MS,
     );
+    // bsv-low #559 (the delta lens's DELTA-3): no deadline drops a finalize
+    // submit between its writes, so a D1 call that never answers inside one
+    // held the 30 s peer budget AND the 240 s belt. Each transaction's
+    // finalize submit now has a bound of its own; past it the submit is
+    // dropped, its UTXO fails and the cursor stays.
+    engine.set_finalize_submit_budget(
+        std::rc::Rc::new(|ms| {
+            Box::pin(crate::broadcaster::sleep_ms(ms)) as overlay_engine::engine::SleepFuture
+        }),
+        GASP_FINALIZE_SUBMIT_BUDGET_MS,
+    );
 
     // Chain-backed proof fetcher (#192/#193): the courier ladder
     // (Arcade→WoC→Bitails) with a MANDATORY chaintracks re-verify before any
@@ -1084,7 +1095,7 @@ use overlay_engine::gasp::race_or_deadline;
 /// submits are dupe-checked, janitor evictions retry) and the tick moves
 /// on. Budgets sum to ≤ 9 min of network steps, leaving headroom for the
 /// bounded passes inside the 15-min cap.
-const GASP_SYNC_BUDGET_MS: u64 = 240_000;
+pub(crate) const GASP_SYNC_BUDGET_MS: u64 = 240_000;
 const PEER_CRAWL_BUDGET_MS: u64 = 120_000;
 const JANITOR_BUDGET_MS: u64 = 180_000;
 
@@ -1100,6 +1111,12 @@ const ADVERT_LIFECYCLE_BUDGET_MS: u64 = 60_000;
 /// 240 s step survive several dead peers AND still reach live ones; the
 /// step-level GASP_SYNC_BUDGET_MS stays as the outer belt.
 const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
+
+/// The bound of ONE transaction's GASP finalize submit (bsv-low #559): a
+/// handful of D1 calls and the lookup hooks, milliseconds when D1 answers.
+/// The per-peer budget and the step belt both WAIT for a submit in flight,
+/// so this is what keeps a hung D1 call from holding them.
+const GASP_FINALIZE_SUBMIT_BUDGET_MS: u64 = 30_000;
 
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {

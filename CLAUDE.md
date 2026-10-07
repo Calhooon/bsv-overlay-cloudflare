@@ -190,7 +190,40 @@ budget its UTXO fails; with none the peer's whole cursor stays for the tick).
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551` (and `fold_medium`).
 
-The limit, stated (bsv-low #559): a finalize submit that does not land stops its graph and holds the cursor below it, which recovers a transaction that had deleted nothing; a storage FAULT on the insert of a mid-chain head of a NON-retaining chain still loses that chain, because `Engine::submit` deletes the old head before it inserts the new one. The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
+The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
+
+## A faulted submit keeps its previous coins (bsv-low #559)
+
+`Engine::submit` inserts the admitted outputs BEFORE it deletes the stale
+coins, and deletes them only when no write or notification of that topic
+faulted before the delete. The reference deletes first
+(`applyTopicStorageMutation`: `removeStaleOutputs`, then `admitOutput`) and
+has no fault path, a throw ends its submit; here a fault is survived and
+replayed, so the order is ours, an addition. Before it, one transient D1
+fault on the insert of a mid-chain head of a non-retaining chain left the
+chain with no head, the replay found no coin, admitted nothing and was
+recorded as applied: lost for good. Now the old head stays (marked spent, so
+not listed as a UTXO; its lookup services were told and are told again by the
+replay), no applied row is written, and the replay that lands deletes it.
+
+Two more additions ride with it. A transaction that found no previous coin
+and admits nothing, while a transaction it spends from faulted in THIS engine
+and has not landed since, is reported as a fault (`predecessor_not_landed`)
+and not recorded as applied; the memory is the engine's own (one invocation),
+so a successor that arrives in a later invocation before the predecessor's
+replay is still recorded, as in the reference. And
+`Engine::set_finalize_submit_budget` bounds ONE transaction's finalize submit
+(the write section no deadline drops): a storage call that never answers
+inside it is dropped past the budget, the UTXO fails and the cursor stays
+(the worker sets 30 s). `/admin/startGASPSync` runs under the same guarded
+240 s race as the scheduled step and answers 504 when it is dropped. Pins:
+`cargo test -p bsv-overlay-engine --features memory-storage --test
+gasp_topic_manager i559`.
+
+The limit, stated: a lookup service that faults on EVERY notification keeps
+the topic unapplied, so its stale coin is never deleted (a spent row left in
+the store) and every replay re-inserts and re-notifies. Not pinned: the
+record and notify variants of the fault (by reading, the same reorder).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

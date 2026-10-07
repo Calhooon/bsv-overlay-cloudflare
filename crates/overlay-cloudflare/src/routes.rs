@@ -2942,10 +2942,33 @@ pub async fn admin_sync_advertisements(engine: &Engine) -> worker::Result<Respon
 /// Discovers peers for each configured topic (via SHIP lookup or hardcoded
 /// peer URLs), then runs the GASP sync protocol with each peer to exchange
 /// UTXOs. Returns the sync results including any errors encountered.
+///
+/// Raced like the scheduled step (bsv-low #559, the delta lens's DELTA-2):
+/// the same belt, with the GUARDED race over the engine's finalize gate, so
+/// the route answers at a transaction boundary instead of running until the
+/// caller hangs up inside a submit (it ran 114 s and 240 s live, #257). A
+/// sync the belt drops answers 504: what it finalized before that is
+/// admitted and its cursors are persisted per peer, as on the cron.
 pub async fn admin_start_gasp_sync(engine: &Engine) -> worker::Result<Response> {
     worker::console_log!("POST /admin/startGASPSync");
 
-    match engine.start_gasp_sync().await {
+    let Some(outcome) = overlay_engine::gasp::race_or_deadline_guarded(
+        engine.start_gasp_sync(),
+        crate::broadcaster::sleep_ms(crate::GASP_SYNC_BUDGET_MS),
+        engine.finalize_submit_gate(),
+    )
+    .await
+    else {
+        worker::console_log!("POST /admin/startGASPSync -> 504 (budget exceeded)");
+        return json_error(
+            &format!(
+                "GASP sync exceeded its {} ms budget and was dropped; what it finalized is admitted",
+                crate::GASP_SYNC_BUDGET_MS
+            ),
+            504,
+        );
+    };
+    match outcome {
         Ok(result) => {
             let topic_count = result.topics_synced.len();
             let peer_count: usize = result.topics_synced.values().map(|t| t.peers.len()).sum();
