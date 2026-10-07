@@ -192,7 +192,7 @@ gasp_topic_manager i551` (and `fold_medium`).
 
 The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
 
-## A faulted submit leaves one head (bsv-low #559, lens fold of 2026-10-07)
+## A faulted submit leaves one head (bsv-low #559, lens fold and delta fold of 2026-10-07)
 
 `Engine::submit` inserts the admitted outputs BEFORE it deletes the stale
 coins, and deletes them once EVERY insert of that topic landed. The reference
@@ -203,31 +203,51 @@ order is ours, an addition. With the delete first, one transient D1 fault on
 the insert of a mid-chain head of a non-retaining chain left the chain with no
 head, for good.
 
-The invariant, per topic of one submit: whatever SINGLE call faults, a
-non-retaining chain is left with exactly one head row, the old one or the new
-one, and no applied row.
+The invariant, per topic of one submit, for a non-retaining chain: whatever
+SINGLE storage call, lookup hook or manager call faults, a call that lands
+after its timeout included, the store holds exactly one UNSPENT head, the old
+one or the new one, and no applied row for the faulted submit, and the queue's
+replay converges to the new head. (One head ROW too, except the two leftovers
+named under the limits: a stale coin whose delete or whose spender's insert
+did not answer can stay behind as a SPENT row, no UTXO.)
 
-- A fault BEFORE every insert landed (a validation read, the spent mark of a
-  coin the manager retains, an insert) leaves the previous coins and NOTHING
-  of the transaction: the outputs that did get inserted are taken out again
-  (`undo_inserts`: only a row still unspent and consumed by nothing). The
-  kept stale coin is marked spent, so it is not listed as a UTXO until the
-  replay (a state the reference does not have: its kept spent rows are
-  retained coins).
+- A fault BEFORE every insert landed leaves the previous coins and NOTHING
+  of the transaction. A validation read (the dedup read, since the delta
+  fold: a faulted `does_applied_transaction_exist` is the topic's read fault,
+  as the reference fails the topic; or a previous coin's `find_output`)
+  writes nothing at all, so the kept coin is NOT marked spent. The spent mark
+  of a coin the manager retains, or an insert: the outputs that did get
+  inserted are taken out again (`undo_inserts`: only a row still unspent and
+  consumed by nothing), and the kept stale coin IS marked spent by then, so
+  it is not listed as a UTXO until the replay (a state the reference does not
+  have: its kept spent rows are retained coins).
 - A fault AFTER them (the spent mark of a stale coin, a lookup notification,
   the consumed-by update, the applied row) leaves the transaction's outputs
   and deletes the stale coins all the same, as the reference does. `c9921ee`
   skipped the delete on any fault and left two unspent heads.
-- A fault of the DELETE: if every stale coin is read back still held, the
-  inserts are undone (the first case); if one is gone or cannot be read, the
-  outputs stay.
+- A submit that deletes a stale coin FIRST records that coin's transaction as
+  applied (the delta fold, H2; `record_spent_coin_applied` in the report when
+  that write faults, and the coin is then not deleted). A held coin proves
+  its transaction's inserts landed; without the row, the replay of a
+  transaction the manager admits with NO previous coin (the opener of a
+  chain: every one of this workspace's 16 managers admits on output shape
+  alone, and Zanaadu's pf head manager admits a configured genesis) inserted
+  it a second time, unspent, beside the output that had spent it.
+- A fault of the DELETE that ANSWERED: if every stale coin is read back still
+  held, the inserts are undone (the first case); if one is gone or cannot be
+  read, the outputs stay. A delete that did NOT answer (a finalize submit's
+  bounded call) never undoes (the delta fold, H1): a call dropped at its
+  timeout is not cancelled, the coin can be read back held and be deleted a
+  moment later, and the undo then left no head. The outputs stay beside the
+  stale coin (marked spent), with no applied row.
 
-Who replays: the queue (`/submit`, `/arc-ingest`) replays every faulted
-submit. GASP replays only a transaction whose outputs are NOT held (its UTXO
+Who replays: the queue (`/submit`, `/arc-ingest`) replays a faulted submit
+up to 3 times (`max_retries`), then the message goes to the dead letter
+queue where one is configured (`wrangler.low.toml`); nothing replays it after
+that. GASP replays only a transaction whose outputs are NOT held (its UTXO
 failed, the cursor stayed, the next tick walks it again): one whose outputs
-landed is known to the walk and is never submitted again, so in the second
-case its applied row is never written (harmless: a later submit of it finds
-no coin, admits nothing and is recorded).
+landed is known to the walk and is never submitted again, so its applied row
+is written by its spender (H2) or by a later submit of it at the door.
 
 A successor that found no previous coin and admits nothing while a
 predecessor has NOT LANDED is reported as a fault (`predecessor_not_landed`)
@@ -235,7 +255,10 @@ and not recorded as applied. Known two ways: the engine saw the predecessor
 fault (one invocation's memory), or the store says so
 (`Engine::unlanded_predecessor`, any invocation): a transaction whose body
 the submitted BEEF carries, with no applied row, no output held, spending a
-coin the topic holds (or a coin of another such transaction).
+coin the topic holds (or a coin of another such transaction). The question
+makes at most 16 reads; "landed" needs a clean answer, so a read that faults
+or the question running out of its reads is "not now" too (the delta fold,
+M1 and M2).
 
 `Engine::set_finalize_submit_budget` bounds each storage call, lookup hook
 and manager call of ONE transaction's finalize submit (the write section no
@@ -245,23 +268,45 @@ runs to its end (never a drop between two writes); the undo has one more
 allowance. The UTXO fails and the cursor stays (the worker sets 30 s).
 `/admin/startGASPSync` runs under the same guarded 240 s race as the scheduled
 step and answers 504 when it is dropped. Pins: `cargo test -p
-bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`
-and `fold559`.
+bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`,
+`fold559` and `delta559` (the delta lens's X4 to X9, each RED on `33e78fb`).
 
 The limits, stated. (1) Two faults in one submit: an undo is separate calls,
 and one that faults too leaves the inserted output beside the kept coin
-(`undo_insert_output` in the report); a successor that spends it before the
-replay brings the double head back. (2) A lookup hook that faulted is told
+(`undo_insert_output` in the report). A successor that spends it before the
+replay no longer brings a double head back (the replay is a dupe, H2); the
+kept coin's spent row stays behind. (2) A lookup hook that faulted is told
 again only if the manager admits again on the replay: a manager whose rule
-needs the previous coin admits nothing there (the coin is deleted), and under
-GASP there is no replay; the reference tells nobody twice either. (3) The
-store's answer needs the predecessor's body in the BEEF: an unproven successor
-carries it, a PROVEN one does not, and one that arrives in a later invocation
-before the replay is recorded as in the reference, the chain then one behind
-its tip. It makes at most 16 reads, and it cannot tell a faulted predecessor
-from one nobody submitted yet: the successor is "not now" until it lands.
-(4) What D1 does with a statement whose caller stopped waiting is not known
-here: a write that lands after its timeout is not seen by that submit.
+needs the previous coin admits nothing there (the coin is deleted), under
+GASP there is no replay, and since H2 the replay is a dupe once a successor
+spent ANY output of that transaction, so a sibling output whose hook faulted
+is not told again either; the reference tells nobody twice. (3) The lookup
+services are told of a stale coin's spend, and of each inserted output,
+BEFORE the transaction has landed (the mark and `output_spent` run before
+the inserts, as in the reference): on an insert fault the store keeps the old
+head while every lookup service was told it is spent, and an output that was
+inserted and undone was told as admitted, with no retraction. The replay
+heals it; after the dead letter the split stays until the next head. (4) The
+store's answer needs the predecessor's body in the BEEF: an unproven
+successor carries it, a PROVEN one does not, and one that arrives in a later
+invocation before the replay is recorded as in the reference, the chain then
+one behind its tip. It cannot tell a faulted predecessor from one nobody
+submitted yet: the successor is "not now" until it lands. And a transaction
+that admits nothing, found no coin and carries more unlanded bodies than 16
+reads settle (five single-input ancestors, fewer with more inputs) is "not
+now" on every submit, where the reference records it: three retries and a
+dead letter each. (5) What D1 does with a statement whose caller stopped
+waiting is not known here; the engine assumes it may still land. A delete
+that never lands leaves the stale coin's spent row until that transaction's
+replay at the door finishes it (GASP does not replay a held head); an insert
+that lands late leaves it the same way. Only a BOUNDED call can be seen not
+to answer: at the unbounded doors (`/submit`, the queue) every D1 error is an
+answer, and a delete that answers an error, is read back held and lands
+afterwards is the no-head case still. (6) H2's row is per transaction, not
+per output: a transaction with several admitted outputs of which only some
+landed (a second insert that landed after its timeout) is a dupe once a
+successor spent one of them, and the output its undo took out is not put
+back.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

@@ -154,6 +154,12 @@ impl CallBound {
         self.due.set(false);
     }
 
+    /// Whether a call under this bound went unanswered (or was not started
+    /// because one had) since the last [`CallBound::renew`].
+    fn is_due(&self) -> bool {
+        self.due.get()
+    }
+
     /// `call`, or `None` when the deadline fell due first.
     async fn call<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
         if self.due.get() {
@@ -210,6 +216,8 @@ async fn hooked(
 /// The most store reads [`Engine::unlanded_predecessor`] makes for one
 /// topic of one submit (bsv-low #559, F3): the question is asked of every
 /// transaction that admits nothing and found no coin, so it is kept cheap.
+/// Each read is counted, and the 17th is never made: out of reads is "not
+/// now" (the delta fold of 2026-10-07, M2).
 const PREDECESSOR_READS: usize = 16;
 
 /// Summary of an [`Engine::complete_missing_proofs`] pass.
@@ -337,8 +345,11 @@ struct TopicValidation {
     /// spend look like it consumes nothing — the settle's spend pointer is
     /// then never written — so it is carried into the [`MutationReport`]
     /// and blocks the `applied_transactions` record for this topic: a
-    /// replay re-reads instead of being deduplicated away.
-    read_fault: Option<String>,
+    /// replay re-reads instead of being deduplicated away. With the read
+    /// that faulted: `find_output` (a previous coin) or
+    /// `does_applied_transaction_exist` (the dedup read, the delta fold of
+    /// 2026-10-07, H3).
+    read_fault: Option<(&'static str, String)>,
 }
 
 /// One Phase-3 write — or the validation read it depends on — that FAILED
@@ -357,9 +368,11 @@ pub struct MutationFault {
     /// The write (or read) that failed: `insert_output`,
     /// `mark_utxo_as_spent`, `update_consumed_by`, `delete_utxo_deep`,
     /// `insert_applied_transaction`, `find_output` (validation read),
+    /// `does_applied_transaction_exist` (the dedup read),
     /// `lookup_service.output_spent`, `lookup_service.output_admitted_by_topic`,
     /// `undo_insert_output` (the undo of a faulted submit's inserts),
-    /// `predecessor_not_landed`.
+    /// `record_spent_coin_applied` (the applied row a spender writes for the
+    /// transaction of a coin it deletes), `predecessor_not_landed`.
     pub site: &'static str,
     /// The backend's own error text.
     pub error: String,
@@ -965,7 +978,10 @@ impl Engine {
     /// after it (a lookup notification, the consumed-by update, the applied
     /// row) leaves the transaction's outputs and no previous coin. A fault
     /// in the delete itself is the first case if the coins are read back
-    /// still held, the second if not. So a non-retaining chain never has
+    /// still held, the second if not, and always the second when the delete
+    /// did not answer (it may land yet). A submit that deletes a stale coin
+    /// first records that coin's transaction as applied, so a replay of it
+    /// after its successor is a dupe. So a non-retaining chain never has
     /// two unspent heads and never none, whatever single call faults. The
     /// applied row is withheld on ANY fault. And a successor that was
     /// judged without the coin an unlanded predecessor has yet to leave is
@@ -1028,8 +1044,8 @@ impl Engine {
             // judgement (the lens fold of 2026-10-07). Writing its outputs
             // would leave them beside the unseen coin, for a successor to
             // spend before the replay deletes it.
-            if let Some(err) = &v.read_fault {
-                report.fault(topic, "find_output", err.clone());
+            if let Some((read, err)) = &v.read_fault {
+                report.fault(topic, read, err.clone());
                 self.hold_unapplied(&txid, topic, "a validation read faulted, nothing written");
                 continue;
             }
@@ -1056,22 +1072,18 @@ impl Engine {
                             .contains(&(source.clone(), topic.clone()))
                     });
                 let waits_on = match remembered {
-                    Some(predecessor) => Some(predecessor),
+                    Some(predecessor) => Some(format!("{predecessor} has not landed")),
                     None => {
                         self.unlanded_predecessor(&tx, &tagged_beef.beef, topic, bound)
                             .await
                     }
                 };
-                if let Some(predecessor) = waits_on {
-                    report.fault(
-                        topic,
-                        "predecessor_not_landed",
-                        format!("{predecessor} has not landed"),
-                    );
+                if let Some(not_now) = waits_on {
+                    report.fault(topic, "predecessor_not_landed", not_now.clone());
                     self.hold_unapplied(
                         &txid,
                         topic,
-                        &format!("found no coin and its predecessor {predecessor} has not landed"),
+                        &format!("found no coin and its predecessor {not_now}"),
                     );
                     continue;
                 }
@@ -1305,8 +1317,42 @@ impl Engine {
             // after the insert then left the stale coin beside the new
             // output for good: two unspent heads): a fault of the mark, of
             // a notification, deletes as the reference does.
+            //
+            // Before a stale coin is deleted its transaction is recorded as
+            // applied in the topic (the delta fold of 2026-10-07, H2; an
+            // addition, one idempotent write per deleted coin). A held coin
+            // proves the inserts of its transaction landed, but that
+            // transaction may have no applied row (a fault after its
+            // inserts withheld it, or its insert landed after its timeout),
+            // and then its replay is judged again: a manager that admits it
+            // with NO previous coin (the opener of a chain) had it inserted
+            // a second time, unspent, beside the output that spent it, for
+            // good. With the row its replay is a dupe. A record that faults
+            // leaves its coin undeleted: that is a delete fault, below.
+            let due_before_the_delete = bound.is_some_and(CallBound::is_due);
             let mut delete_faulted = false;
             for stale in &stale_coins {
+                let spent_coin_tx = AppliedTransaction {
+                    txid: stale.txid.clone(),
+                    topic: topic.clone(),
+                };
+                if let Err(e) = stored(
+                    bound,
+                    self.storage.insert_applied_transaction(&spent_coin_tx),
+                )
+                .await
+                {
+                    error!(
+                        "Error recording {} as applied before its coin is deleted from topic {topic}: {e}",
+                        stale.txid
+                    );
+                    report.fault(topic, "record_spent_coin_applied", e.to_string());
+                    delete_faulted = true;
+                    continue;
+                }
+                self.not_landed
+                    .borrow_mut()
+                    .remove(&(stale.txid.clone(), topic.clone()));
                 match stored(
                     bound,
                     self.storage.find_output(
@@ -1343,12 +1389,36 @@ impl Engine {
             // the inserts are undone, the replay does the whole transaction.
             // If a coin is gone or cannot be read the outputs stay: taking
             // them out could leave no head at all.
+            //
+            // And a call of the delete that did not ANSWER is not certain
+            // either (the delta fold of 2026-10-07, H1): a call dropped at
+            // its timeout is not cancelled, so the coin can be read back
+            // held now and be deleted a moment later. Undoing the inserts
+            // then left the chain with no head, for good. So an unanswered
+            // delete never undoes: the outputs stay, the stale coin stays
+            // (marked spent) until its delete lands or is done again, and
+            // there is no applied row. What the replay of this transaction
+            // then sees, in both orders. The delete landed late: no
+            // previous coin, so a manager that needs one admits nothing and
+            // the transaction is recorded with its outputs held. The delete
+            // never landed: the coin is found, the manager admits again, the
+            // inserts are no-ops, the delete is done and the row written.
+            // And if a successor spent the outputs first, it recorded this
+            // transaction as applied (H2) and the replay is a dupe: the
+            // stale coin's spent row is then left behind, no UTXO. A
+            // deadline that was already due BEFORE the delete started
+            // nothing here, so the coins are certainly held and the store is
+            // put back as for an answered fault.
             if delete_faulted {
+                let unanswered = !due_before_the_delete && bound.is_some_and(CallBound::is_due);
                 if let Some(bound) = bound {
                     bound.renew();
                 }
-                let mut all_held = true;
+                let mut all_held = !unanswered;
                 for stale in &stale_coins {
+                    if unanswered {
+                        break;
+                    }
                     let read = stored(
                         bound,
                         self.storage.find_output(
@@ -1374,6 +1444,8 @@ impl Engine {
                     topic,
                     if all_held {
                         "the delete of a stale coin faulted: the coins are held, its outputs taken out"
+                    } else if unanswered {
+                        "the delete of a stale coin did not answer: nothing undone, its outputs stay"
                     } else {
                         "the delete of a stale coin faulted: its outputs stay"
                     },
@@ -1521,14 +1593,26 @@ impl Engine {
     /// outputs is held there, and it spends a coin the topic HOLDS (or, the
     /// same question one step up, a coin of another such transaction): it is
     /// a spend of this topic that the store has not taken yet, and `tx` was
-    /// judged without what it will leave. Returns that transaction's txid.
+    /// judged without what it will leave.
     ///
     /// The limits, stated. It sees only bodies in the BEEF: an unproven
     /// successor carries its parent (the live `/submit` case), a PROVEN one
     /// does not, and is then recorded as in the reference. It asks the store
-    /// at most [`PREDECESSOR_READS`] times and answers "landed" past that.
-    /// And it cannot tell a faulted predecessor from one nobody submitted
-    /// yet: a successor is "not now" in both until the predecessor lands.
+    /// at most [`PREDECESSOR_READS`] times. And it cannot tell a faulted
+    /// predecessor from one nobody submitted yet: a successor is "not now"
+    /// in both until the predecessor lands.
+    ///
+    /// "Landed" needs a clean answer (the delta fold of 2026-10-07, M1 and
+    /// M2): a read that faults, or the question running out of its reads,
+    /// answers "not now" too, naming the transaction it could not settle.
+    /// Recording the successor there made its replay a dupe and stopped the
+    /// chain behind it for good; a retried no-op is the lesser cost. That
+    /// cost, stated: a transaction that admits nothing, found no coin and
+    /// carries more unlanded bodies than 16 reads settle (five single-input
+    /// ancestors, fewer with more inputs) is never recorded, where the
+    /// reference records it: each submit of it is a fault and a replay.
+    ///
+    /// Returns why the submit must wait, for the report.
     async fn unlanded_predecessor(
         &self,
         tx: &Transaction,
@@ -1556,28 +1640,44 @@ impl Engine {
             let Some(body) = bodies.get(&candidate) else {
                 continue;
             };
-            if reads + 2 > PREDECESSOR_READS {
-                return None;
-            }
-            reads += 2;
+            let out_of_reads = || {
+                Some(format!(
+                    "{candidate} is not known to have landed: the question ran out of its {PREDECESSOR_READS} reads"
+                ))
+            };
+            let unread = |e: StorageError| {
+                Some(format!(
+                    "{candidate} is not known to have landed: the store could not say ({e})"
+                ))
+            };
             let record = AppliedTransaction {
                 txid: candidate.clone(),
                 topic: topic.to_string(),
             };
-            // Anything but a clean "no applied row" and "no output held"
-            // ends the question for this transaction: it landed, or the
-            // store cannot say.
-            let applied = stored(bound, self.storage.does_applied_transaction_exist(&record)).await;
-            if !matches!(applied, Ok(false)) {
-                continue;
+            // An applied row, or an output held, ends the question for this
+            // transaction: it landed.
+            if reads >= PREDECESSOR_READS {
+                return out_of_reads();
             }
-            let held = stored(
+            reads += 1;
+            match stored(bound, self.storage.does_applied_transaction_exist(&record)).await {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(e) => return unread(e),
+            }
+            if reads >= PREDECESSOR_READS {
+                return out_of_reads();
+            }
+            reads += 1;
+            match stored(
                 bound,
                 self.storage.find_outputs_for_transaction(&candidate, false),
             )
-            .await;
-            if !matches!(&held, Ok(outputs) if outputs.iter().all(|o| o.topic != topic)) {
-                continue;
+            .await
+            {
+                Ok(outputs) if outputs.iter().all(|o| o.topic != topic) => {}
+                Ok(_) => continue,
+                Err(e) => return unread(e),
             }
             for input in &body.inputs {
                 let source = input.get_source_txid().unwrap_or_default();
@@ -1585,7 +1685,7 @@ impl Engine {
                     continue;
                 }
                 if reads >= PREDECESSOR_READS {
-                    return None;
+                    return out_of_reads();
                 }
                 reads += 1;
                 let coin = stored(
@@ -1600,11 +1700,11 @@ impl Engine {
                 )
                 .await;
                 match coin {
-                    Ok(Some(_)) => return Some(candidate),
+                    Ok(Some(_)) => return Some(format!("{candidate} has not landed")),
                     // Not held: its own transaction may be the one that has
                     // not landed.
                     Ok(None) => ask.push(source),
-                    Err(_) => {}
+                    Err(e) => return unread(e),
                 }
             }
         }
@@ -2076,12 +2176,36 @@ impl Engine {
                 txid: txid.clone(),
                 topic: topic.clone(),
             };
-            let is_dupe = stored(
+            // A dedup read that FAULTS is the topic's read fault (the delta
+            // fold of 2026-10-07, H3): nothing is judged and nothing is
+            // written for the topic, the fault rides the report and the
+            // replay asks again. The reference fails the topic there
+            // (`Engine.ts` `submit`: the throw lands in the per-topic catch,
+            // `failedTopics.add`). Read as "not a dupe", as it was, a
+            // re-presented transaction the manager admits with no previous
+            // coin was inserted a second time, unspent, beside the output
+            // that had spent it, under a durable report.
+            let is_dupe = match stored(
                 bound,
                 self.storage.does_applied_transaction_exist(&tx_record),
             )
             .await
-            .unwrap_or(false);
+            {
+                Ok(is_dupe) => is_dupe,
+                Err(e) => {
+                    error!("Error reading the applied row of {txid} for topic {topic}: {e}");
+                    validations.push(TopicValidation {
+                        topic: topic.clone(),
+                        is_dupe: false,
+                        previous_coins: vec![],
+                        previous_outputs: vec![],
+                        admittance: AdmittanceInstructions::default(),
+                        failed: false,
+                        read_fault: Some(("does_applied_transaction_exist", e.to_string())),
+                    });
+                    continue;
+                }
+            };
 
             if is_dupe {
                 validations.push(TopicValidation {
@@ -2098,7 +2222,7 @@ impl Engine {
 
             let mut previous_coins: Vec<u32> = Vec::new();
             let mut previous_outputs: Vec<Output> = Vec::new();
-            let mut read_fault: Option<String> = None;
+            let mut read_fault: Option<(&'static str, String)> = None;
 
             for (input_idx, input) in tx.inputs.iter().enumerate() {
                 let source_txid = input.get_source_txid().unwrap_or_default();
@@ -2133,7 +2257,7 @@ impl Engine {
                             input.source_output_index
                         );
                         if read_fault.is_none() {
-                            read_fault = Some(e.to_string());
+                            read_fault = Some(("find_output", e.to_string()));
                         }
                     }
                 }

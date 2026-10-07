@@ -3212,6 +3212,14 @@ type Armed = Rc<RefCell<Option<(String, u32, InsertEvent)>>>;
 enum Call {
     MarkSpent,
     Delete,
+    // The reads and the applied-row write the delta fold of 2026-10-07
+    // scripts (bsv-low #559): `does_applied_transaction_exist`,
+    // `insert_applied_transaction`, `find_output` and
+    // `find_outputs_for_transaction`.
+    Applied,
+    RecordApplied,
+    FindOutput,
+    OutputsOf,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -3234,6 +3242,8 @@ struct ScriptedStore {
     inner: Rc<MemoryStorage>,
     armed: Armed,
     calls: Calls,
+    // Every read the engine made of an applied row or of an output.
+    reads: Rc<Cell<usize>>,
 }
 
 impl ScriptedStore {
@@ -3247,6 +3257,7 @@ impl ScriptedStore {
             inner: inner.clone(),
             armed: Rc::new(RefCell::new(Some((txid, output_index, event)))),
             calls: Calls::default(),
+            reads: Rc::default(),
         }
     }
 
@@ -3256,6 +3267,7 @@ impl ScriptedStore {
             inner: inner.clone(),
             armed: Rc::new(RefCell::new(None)),
             calls: Calls::default(),
+            reads: Rc::default(),
         }
     }
 
@@ -3360,12 +3372,15 @@ impl Storage for ScriptedStore {
         &self,
         tx: &AppliedTransaction,
     ) -> Result<(), StorageError> {
+        self.scripted(Call::RecordApplied, &tx.txid).await?;
         self.inner.insert_applied_transaction(tx).await
     }
     async fn does_applied_transaction_exist(
         &self,
         tx: &AppliedTransaction,
     ) -> Result<bool, StorageError> {
+        self.reads.set(self.reads.get() + 1);
+        self.scripted(Call::Applied, &tx.txid).await?;
         self.inner.does_applied_transaction_exist(tx).await
     }
     async fn delete_applied_transaction(
@@ -3382,6 +3397,8 @@ impl Storage for ScriptedStore {
         spent: Option<bool>,
         include_beef: bool,
     ) -> Result<Option<Output>, StorageError> {
+        self.reads.set(self.reads.get() + 1);
+        self.scripted(Call::FindOutput, txid).await?;
         self.inner
             .find_output(txid, output_index, topic, spent, include_beef)
             .await
@@ -3391,6 +3408,8 @@ impl Storage for ScriptedStore {
         txid: &str,
         include_beef: bool,
     ) -> Result<Vec<Output>, StorageError> {
+        self.reads.set(self.reads.get() + 1);
+        self.scripted(Call::OutputsOf, txid).await?;
         self.inner
             .find_outputs_for_transaction(txid, include_beef)
             .await
@@ -4626,9 +4645,12 @@ fn due_after_a_few_polls() -> bsv_overlay_engine::engine::SleepFactory {
 // dropped the whole submit there, between two writes: the old head stayed
 // (spent) beside the new one, with no applied row, and no later tick replayed
 // it (the new head is held). Now the hung CALL is that call's fault and the
-// submit runs on: the old head is read back held, the new one is taken out,
-// the UTXO fails within the budget and the cursor stays; the next tick
-// places the chain. One head row at every step, never none, never two.
+// submit runs on to its end: the UTXO fails within the budget and the cursor
+// stays; the next tick places the chain. Since the delta fold of 2026-10-07
+// (H1) nothing is undone on a delete that did not answer, it may land yet:
+// the new head stays beside the old one, which is marked spent. One UNSPENT
+// head at every step, never none, never two (the late landing itself is
+// `delta559_h1_x4`).
 #[tokio::test]
 async fn fold559_f2_a_hung_delete_inside_a_finalize_submit_is_a_fault_of_that_call_not_a_drop() {
     let (_logs, _guard) = capture_logs();
@@ -4663,8 +4685,8 @@ async fn fold559_f2_a_hung_delete_inside_a_finalize_submit_is_a_fault_of_that_ca
     );
     assert_eq!(
         rows(&node.store, &nodes).await,
-        ["0:spent=true"],
-        "exactly one head row: the submit ran on past the hung call and took head 1 out again"
+        ["0:spent=true", "1:spent=false"],
+        "one unspent head: the submit ran on past the hung call and undid nothing"
     );
     assert_eq!(
         applied_rows(&node.store, &nodes).await,
@@ -4676,8 +4698,11 @@ async fn fold559_f2_a_hung_delete_inside_a_finalize_submit_is_a_fault_of_that_ca
     // The call answers again: the next tick resumes from the held head.
     calls.borrow_mut().clear();
     let (topic, sent) = node.tick().await;
-    assert_eq!(sent, txids(&nodes, &[3, 2, 1]));
-    assert_eq!(rows(&node.store, &nodes).await, ["3:spent=false"]);
+    assert_eq!(sent, txids(&nodes, &[3, 2]));
+    assert_eq!(
+        rows(&node.store, &nodes).await,
+        ["0:spent=true", "3:spent=false"]
+    );
     assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4]);
     assert_eq!(topic.cursor_moves, moved(0, 1));
 }
@@ -4842,4 +4867,560 @@ async fn fold559_f3_a_successor_in_a_later_invocation_is_not_recorded_before_its
     let recorded = submitted(&again, &stranger).await;
     assert!(recorded.is_durable(), "{}", recorded.summary());
     assert_eq!(recorded.applied_topics, vec![TOPIC.to_string()]);
+}
+
+// ============================================================================
+// The delta fold of 2026-10-07 (bsv-low #559, `docs/audit/E559-delta-2026-10-07.md`
+// in bsv-low): the one-head invariant made true for the six recipes the delta
+// lens executed (X4 to X9) and for the first fold's two-fault residual. H1: a
+// delete that did not answer never undoes the inserts. H2: the spender of a
+// coin records that coin's transaction as applied. H3: a faulted dedup read
+// is the topic's read fault. M1, M2: a read fault or the read bound inside
+// the predecessor question answers "not now". Each pin is RED on 33e78fb.
+// ============================================================================
+
+// Head 1's finalize submit of a four-head chain whose tip is listed, with the
+// delete of the genesis hung: the node and the script, after that tick.
+async fn after_a_hung_delete_of_the_genesis(nodes: &[GASPNode]) -> (Budgeted, Calls) {
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::plain(&store);
+    let calls = scripted.calls.clone();
+    calls
+        .borrow_mut()
+        .push((Call::Delete, node_txid(&nodes[0]), CallEvent::Hangs));
+    let mut node = Budgeted::over(
+        RecordingRemote::new(nodes, &[3]),
+        Box::new(HeadChainManager(Rc::new(
+            RefCell::new(HeadState::default()),
+        ))),
+        RequestClock::allowing(u64::MAX - 1),
+        store,
+        Box::new(scripted),
+        true,
+    );
+    node.engine
+        .set_finalize_submit_budget(due_after_a_few_polls(), 1);
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), node.tick()).await;
+    assert!(ticked.is_ok(), "the hung delete held the tick");
+    (node, calls)
+}
+
+// H1, the delta lens's X4. A call dropped at its timeout is not cancelled: the
+// delete of the genesis that did not answer inside head 1's finalize submit
+// may land later. On 33e78fb the genesis was read back "held" and head 1 was
+// taken out again; when the delete then landed the chain had NO head, every
+// later head found no coin, admitted nothing and was recorded, for good. Now
+// an unanswered delete leaves the inserts standing. Both orders, under GASP
+// (which does not replay a held head) and under the queue's replay of head 1:
+// the delete lands late, the delete never lands.
+#[tokio::test]
+async fn delta559_h1_x4_a_delete_that_lands_after_its_timeout_never_leaves_the_chain_headless() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    for lands_late in [true, false] {
+        for queue_replays in [false, true] {
+            let (node, calls) = after_a_hung_delete_of_the_genesis(&nodes).await;
+            println!(
+                "#559 H1 (lands late {lands_late}, queue {queue_replays}): after the hung delete: rows {:?} applied {:?} cursor {}",
+                rows(&node.store, &nodes).await,
+                applied_rows(&node.store, &nodes).await,
+                node.cursor().await
+            );
+            assert_eq!(
+                held(&node.store, &nodes).await,
+                vec![(1, 0)],
+                "one unspent head, the new one: nothing is undone on a delete that did not answer"
+            );
+            assert!(
+                !applied(&node.store, &nodes[1]).await,
+                "no applied row for the faulted submit"
+            );
+            assert_eq!(node.cursor().await, 0, "the UTXO failed: the cursor stays");
+
+            if lands_late {
+                node.store
+                    .delete_output(&node_txid(&nodes[0]), 0, TOPIC)
+                    .await
+                    .unwrap();
+            }
+            calls.borrow_mut().clear();
+            assert_eq!(held(&node.store, &nodes).await, vec![(1, 0)]);
+
+            if queue_replays {
+                // The replay re-judges head 1. Landed late: no coin, nothing
+                // admitted, recorded. Never landed: the genesis is found,
+                // head 1's insert is a no-op and the delete is finished.
+                let replay =
+                    submitted(&head_door(&node.store, &calls), &proven_beef(&nodes[1])).await;
+                assert!(replay.is_durable(), "{}", replay.summary());
+                assert_eq!(rows(&node.store, &nodes).await, ["1:spent=false"]);
+                assert_eq!(
+                    applied_rows(&node.store, &nodes).await,
+                    [true, true, false, false]
+                );
+            }
+            let (_, sent) = node.tick().await;
+            assert_eq!(sent, txids(&nodes, &[3, 2]), "resumed from the held head");
+            println!(
+                "#559 H1 (lands late {lands_late}, queue {queue_replays}): after the next tick: rows {:?} applied {:?}",
+                rows(&node.store, &nodes).await,
+                applied_rows(&node.store, &nodes).await
+            );
+            assert_eq!(held(&node.store, &nodes).await, vec![(3, 0)], "one head");
+            // The genesis row outlives a delete that never landed only where
+            // nothing replays head 1 (GASP): spent, so no UTXO.
+            let expected: &[&str] = if lands_late || queue_replays {
+                &["3:spent=false"]
+            } else {
+                &["0:spent=true", "3:spent=false"]
+            };
+            assert_eq!(rows(&node.store, &nodes).await, expected);
+            assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4]);
+            assert_eq!(node.cursor().await, 1);
+        }
+    }
+}
+
+// What a `ToldLookup` was told: the admitted outputs, the spent ones.
+type Told = (Rc<RefCell<Vec<String>>>, Rc<RefCell<Vec<String>>>);
+
+// One engine of the `/submit` door with a lookup service that faults once on
+// the admission of `faults_on`.
+fn told_door(store: &Rc<MemoryStorage>, told: &Told, faults_on: Option<String>) -> Engine {
+    Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(HeadChainManager(Rc::new(
+                RefCell::new(HeadState::default()),
+            ))) as Box<dyn TopicManager>,
+        )]),
+        HashMap::from([(
+            "ls_told".to_string(),
+            Box::new(ToldLookup {
+                admitted: told.0.clone(),
+                spent: told.1.clone(),
+                faults_on: RefCell::new(faults_on),
+            }) as Box<dyn bsv_overlay_engine::lookup_service::LookupService>,
+        )]),
+        Box::new(ScriptedStore::plain(store)),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+// H2, the delta lens's X6: one fault, no model. The admission hook of the
+// chain-OPENING transaction (the manager admits it with no previous coin)
+// faults once after its insert: no applied row, the replay is queued. Head 1
+// lands in another invocation and deletes the genesis. On 33e78fb the replay
+// of the genesis then admitted it AGAIN, unspent, beside the real tip, for
+// good. Now head 1's submit recorded the genesis as applied before deleting
+// its coin, so the replay is a dupe.
+#[tokio::test]
+async fn delta559_h2_x6_a_replayed_opener_is_not_inserted_again_after_its_successor() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    let told = Told::default();
+
+    let faulted = submitted(
+        &told_door(&store, &told, Some(node_txid(&nodes[0]))),
+        &proven_beef(&nodes[0]),
+    )
+    .await;
+    assert!(!faulted.is_durable());
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [false; 3]);
+
+    let successor = submitted(&told_door(&store, &told, None), &proven_beef(&nodes[1])).await;
+    assert!(successor.is_durable(), "{}", successor.summary());
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+
+    let replay = submitted(&told_door(&store, &told, None), &proven_beef(&nodes[0])).await;
+    println!(
+        "#559 H2 X6: after the replay of the genesis: durable {} deduped {:?} rows {:?} applied {:?}",
+        replay.is_durable(),
+        replay.deduped_topics,
+        rows(&store, &nodes).await,
+        applied_rows(&store, &nodes).await
+    );
+    assert_eq!(
+        rows(&store, &nodes).await,
+        ["1:spent=false"],
+        "the spent opener is not back beside the tip"
+    );
+    assert!(replay.is_durable());
+    assert_eq!(replay.deduped_topics, vec![TOPIC.to_string()]);
+
+    assert!(
+        submitted(&told_door(&store, &told, None), &proven_beef(&nodes[2]))
+            .await
+            .is_durable()
+    );
+    assert_eq!(rows(&store, &nodes).await, ["2:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
+}
+
+// H2, row 13 of the delta lens's table (by reading there, executed here): the
+// APPLIED-ROW write of the opener faults once. Same road as X6.
+#[tokio::test]
+async fn delta559_h2_a_faulted_applied_row_of_an_opener_does_not_bring_it_back() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(2);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    calls.borrow_mut().push((
+        Call::RecordApplied,
+        node_txid(&nodes[0]),
+        CallEvent::FaultsOnce,
+    ));
+    let faulted = submitted(&head_door(&store, &calls), &proven_beef(&nodes[0])).await;
+    assert!(
+        faulted
+            .faults
+            .iter()
+            .any(|f| f.site == "insert_applied_transaction"),
+        "{}",
+        faulted.summary()
+    );
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[1]))
+            .await
+            .is_durable()
+    );
+    let replay = submitted(&head_door(&store, &calls), &proven_beef(&nodes[0])).await;
+    assert!(replay.is_durable(), "{}", replay.summary());
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 2]);
+}
+
+// H2, the delta lens's X5 (on the model: a statement lands after its caller
+// stopped waiting). The insert of head 1 does not answer inside its finalize
+// submit, the undo finds no row, and then the insert LANDS: the genesis
+// (spent) beside head 1 (unspent), no applied row, and GASP never replays a
+// held head. The chain moves on; then anyone submits head 1 at the door. On
+// 33e78fb that submit found the genesis and inserted head 1 again beside the
+// tip. Now head 2's submit recorded head 1 as applied.
+#[tokio::test]
+async fn delta559_h2_x5_an_insert_that_lands_after_its_timeout_is_not_replayed_beside_the_tip() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Hangs);
+    let outage = scripted.armed.clone();
+    let mut node = Budgeted::over(
+        RecordingRemote::new(&nodes, &[3]),
+        Box::new(HeadChainManager(Rc::new(
+            RefCell::new(HeadState::default()),
+        ))),
+        RequestClock::allowing(u64::MAX - 1),
+        store.clone(),
+        Box::new(scripted),
+        true,
+    );
+    node.engine
+        .set_finalize_submit_budget(due_after_a_few_polls(), 1);
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), node.tick()).await;
+    assert!(ticked.is_ok(), "the hung insert held the tick");
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=true"]);
+
+    // The statement lands late.
+    outage.borrow_mut().take();
+    let tx = Transaction::from_hex(&nodes[1].raw_tx).unwrap();
+    store
+        .insert_output(&Output {
+            txid: node_txid(&nodes[1]),
+            output_index: 0,
+            output_script: tx.outputs[0].locking_script.to_binary(),
+            satoshis: tx.outputs[0].get_satoshis(),
+            topic: TOPIC.to_string(),
+            spent: false,
+            outputs_consumed: Vec::new(),
+            consumed_by: Vec::new(),
+            beef: Some(proven_beef(&nodes[1]).beef),
+            block_height: None,
+            score: Some(1.0),
+        })
+        .await
+        .unwrap();
+    assert_eq!(held(&store, &nodes).await, vec![(1, 0)], "one unspent head");
+
+    node.tick().await;
+    assert_eq!(held(&store, &nodes).await, vec![(3, 0)]);
+
+    // Anyone submits head 1 again at the door.
+    let calls = Calls::default();
+    let replay = submitted(&head_door(&store, &calls), &proven_beef(&nodes[1])).await;
+    println!(
+        "#559 H2 X5: after a /submit of head 1: durable {} deduped {:?} rows {:?} applied {:?}",
+        replay.is_durable(),
+        replay.deduped_topics,
+        rows(&store, &nodes).await,
+        applied_rows(&store, &nodes).await
+    );
+    assert_eq!(held(&store, &nodes).await, vec![(3, 0)], "one head");
+    assert_eq!(replay.deduped_topics, vec![TOPIC.to_string()]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 4]);
+}
+
+// H2, the first fold's own two-fault residual: the delete of the genesis
+// faults AND the undo of head 1's insert faults, so head 1 stays beside the
+// kept genesis with no applied row. Head 2 spends it before the replay. On
+// 33e78fb the replay of head 1 then found the genesis and inserted head 1 a
+// second time. Now it is a dupe.
+#[tokio::test]
+async fn delta559_h2_the_undo_faulting_too_does_not_bring_a_spent_head_back() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[0]))
+            .await
+            .is_durable()
+    );
+    for node in &nodes[0..=1] {
+        calls
+            .borrow_mut()
+            .push((Call::Delete, node_txid(node), CallEvent::FaultsOnce));
+    }
+    let faulted = submitted(&head_door(&store, &calls), &proven_beef(&nodes[1])).await;
+    assert!(
+        faulted
+            .faults
+            .iter()
+            .any(|f| f.site == "undo_insert_output"),
+        "{}",
+        faulted.summary()
+    );
+    assert_eq!(
+        rows(&store, &nodes).await,
+        ["0:spent=true", "1:spent=false"]
+    );
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[2]))
+            .await
+            .is_durable()
+    );
+    let replay = submitted(&head_door(&store, &calls), &proven_beef(&nodes[1])).await;
+    assert!(replay.is_durable(), "{}", replay.summary());
+    assert_eq!(held(&store, &nodes).await, vec![(2, 0)], "one head");
+    assert_eq!(replay.deduped_topics, vec![TOPIC.to_string()]);
+}
+
+// H2's own write: recording the spent coin's transaction faults. The coin is
+// then NOT deleted (its transaction is not yet a dupe for a replay), it is
+// read back held and the inserts are undone: the old head, and the replay
+// does the whole transaction.
+#[tokio::test]
+async fn delta559_h2_a_fault_of_the_spent_coins_record_keeps_the_old_head() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(2);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[0]))
+            .await
+            .is_durable()
+    );
+    calls.borrow_mut().push((
+        Call::RecordApplied,
+        node_txid(&nodes[0]),
+        CallEvent::FaultsOnce,
+    ));
+    let faulted = submitted(&head_door(&store, &calls), &proven_beef(&nodes[1])).await;
+    assert!(
+        faulted
+            .faults
+            .iter()
+            .any(|f| f.site == "record_spent_coin_applied"),
+        "{}",
+        faulted.summary()
+    );
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=true"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false]);
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[1]))
+            .await
+            .is_durable()
+    );
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 2]);
+}
+
+// H3, the delta lens's X8. The genesis and head 1 are applied; the genesis is
+// presented again (a client retry, the crawler) and its dedup read faults
+// once. On 33e78fb the fault was read as "not a dupe": the opener came back
+// unspent beside head 1 with a DURABLE report. Now it is the topic's read
+// fault, as the reference fails the topic: nothing written, reported, and
+// the replay is a dupe.
+#[tokio::test]
+async fn delta559_h3_x8_a_faulted_dedup_read_is_a_read_fault_not_a_first_sight() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    for node in &nodes[0..=1] {
+        assert!(submitted(&head_door(&store, &calls), &proven_beef(node))
+            .await
+            .is_durable());
+    }
+    calls
+        .borrow_mut()
+        .push((Call::Applied, node_txid(&nodes[0]), CallEvent::FaultsOnce));
+    let again = submitted(&head_door(&store, &calls), &proven_beef(&nodes[0])).await;
+    println!(
+        "#559 H3 X8: the re-presented genesis: durable {} ({}) rows {:?}",
+        again.is_durable(),
+        again.summary(),
+        rows(&store, &nodes).await
+    );
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"], "one head");
+    assert!(
+        again
+            .faults
+            .iter()
+            .any(|f| f.site == "does_applied_transaction_exist"),
+        "{}",
+        again.summary()
+    );
+    assert!(again.applied_topics.is_empty() && again.deduped_topics.is_empty());
+
+    let replay = submitted(&head_door(&store, &calls), &proven_beef(&nodes[0])).await;
+    assert!(replay.is_durable());
+    assert_eq!(replay.deduped_topics, vec![TOPIC.to_string()]);
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+}
+
+// M1, the delta lens's X9. Head 1's insert faults; head 2 arrives in a later
+// invocation and ONE read of the predecessor question faults: the applied row
+// of head 1, its held outputs, or the coin it spends. On 33e78fb each was
+// read as "landed": head 2 was recorded, its replay was a dupe, and the chain
+// stopped at head 1 for good. Now a question the store cannot answer is "not
+// now".
+#[tokio::test]
+async fn delta559_m1_x9_a_read_fault_inside_the_predecessor_question_is_not_now() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    for (read, of) in [
+        (Call::Applied, 1),
+        (Call::OutputsOf, 1),
+        (Call::FindOutput, 0),
+    ] {
+        let store = Rc::new(MemoryStorage::new());
+        let calls = Calls::default();
+        let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
+        let a = door(
+            HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+            scripted,
+        );
+        assert!(submitted(&a, &proven_beef(&nodes[0])).await.is_durable());
+        assert!(!submitted(&a, &proven_beef(&nodes[1])).await.is_durable());
+        drop(a);
+
+        calls
+            .borrow_mut()
+            .push((read, node_txid(&nodes[of]), CallEvent::FaultsOnce));
+        let successor = submitted(&head_door(&store, &calls), &unproven_beef(&nodes, 2, 1)).await;
+        println!(
+            "#559 M1 X9 ({read:?}): head 2: durable {} ({}) applied {:?}",
+            successor.is_durable(),
+            successor.summary(),
+            applied_rows(&store, &nodes).await
+        );
+        assert!(calls.borrow().is_empty(), "{read:?}: the fault was hit");
+        assert!(
+            successor
+                .faults
+                .iter()
+                .any(|f| f.site == "predecessor_not_landed"),
+            "{read:?}: {}",
+            successor.summary()
+        );
+        assert_eq!(
+            applied_rows(&store, &nodes).await,
+            [true, false, false, false],
+            "{read:?}"
+        );
+
+        // The queue replays head 1 and head 2; head 3 follows.
+        assert!(
+            submitted(&head_door(&store, &calls), &proven_beef(&nodes[1]))
+                .await
+                .is_durable()
+        );
+        for k in 2..=3 {
+            assert!(
+                submitted(&head_door(&store, &calls), &unproven_beef(&nodes, k, 1))
+                    .await
+                    .is_durable()
+            );
+        }
+        assert_eq!(rows(&store, &nodes).await, ["3:spent=false"], "{read:?}");
+        assert_eq!(applied_rows(&store, &nodes).await, [true; 4]);
+    }
+}
+
+// M2, the delta lens's X7: the read bound of the predecessor question, at its
+// boundary. Head 1's insert faults; heads 2 to 7 arrive unproven before its
+// replay, each in its own invocation. A single-input ancestor costs three
+// reads, so head 6 is answered by the store on its 15th read and head 7 runs
+// out at the 16th. On 33e78fb the question stopped at 15, answered "landed"
+// and head 7 was recorded: after every replay the chain stopped at head 6 for
+// good. Now out of reads is "not now", and the bound is the 16 reads stated.
+#[tokio::test]
+async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_and_not_now() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(9);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
+    let a = door(
+        HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+        scripted,
+    );
+    assert!(submitted(&a, &proven_beef(&nodes[0])).await.is_durable());
+    assert!(!submitted(&a, &proven_beef(&nodes[1])).await.is_durable());
+    drop(a);
+
+    for k in 2..=7 {
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let engine = door(
+            HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+            storage,
+        );
+        let r = submitted(&engine, &unproven_beef(&nodes, k, 1)).await;
+        // Two reads are the submit's own: the dedup read and the previous
+        // coin of its one input. The rest are the question's.
+        let asked = reads.get() - 2;
+        println!(
+            "#559 M2 X7: head {k} before the replay: {asked} reads, durable {} ({})",
+            r.is_durable(),
+            r.summary()
+        );
+        assert!(
+            r.faults.iter().any(|f| f.site == "predecessor_not_landed"),
+            "head {k}: {}",
+            r.summary()
+        );
+        assert_eq!(asked, (3 * (k - 1)).min(16), "head {k}");
+        assert_eq!(
+            applied_rows(&store, &nodes).await[1..],
+            [false; 8],
+            "head {k} is not recorded"
+        );
+    }
+
+    // The queue replays everything not durable, in order, then head 8 comes.
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[1]))
+            .await
+            .is_durable()
+    );
+    for k in 2..=8 {
+        let r = submitted(&head_door(&store, &calls), &unproven_beef(&nodes, k, 1)).await;
+        assert!(r.is_durable(), "head {k}: {}", r.summary());
+    }
+    assert_eq!(rows(&store, &nodes).await, ["8:spent=false"], "the tip");
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 9]);
 }
