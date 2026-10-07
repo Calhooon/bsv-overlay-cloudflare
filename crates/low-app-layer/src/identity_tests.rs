@@ -743,6 +743,126 @@ async fn rows_read_ceiling_499_store_calls_per_route() {
     assert_eq!((r.calls.borrow().len(), kill.reads.borrow().clone()), (1, vec![1]));
 }
 
+// -- inside the D1 rows ledger (the merge over #499) -------------------------
+
+/// Every identity route has its own ledger key, the picture apart from the
+/// JSON views and the kill route apart from the other `/internal` hooks
+/// (`route_of` takes the first head that matches, so order is the pin).
+#[test]
+fn rows_read_ceiling_499_every_identity_route_has_its_ledger_key() {
+    let key = |p: &str| crate::d1_ledger::route_of(p, crate::D1_LEDGER_ROUTES);
+    assert_eq!(key(BATCH_ROUTE), "/identities");
+    assert_eq!(key(&format!("{IDENTITY_ROUTE_PREFIX}{ALICE}")), "/identity");
+    assert_eq!(key(&format!("{IDENTITY_ROUTE_PREFIX}{VERIFY_ROUTE_PREFIX}{ALICE}")), "/identity");
+    assert_eq!(key(&format!("{PICTURE_ROUTE_PREFIX}{ALICE_PIC}")), "/identity/pic");
+    assert_eq!(key(KILL_ROUTE), "/internal/identity/kill");
+    assert_eq!(key("/internal/pot-changed"), "/internal", "the other hooks keep their key");
+}
+
+/// What `fetch` does to a finished answer, on its header list: the identity
+/// CORS (applied inside the body), then `d1_ledger::stamp`'s two values
+/// (stamped last, outside any signature). The body is never touched.
+fn stamped(a: &Answer, origin: Option<&str>, t: crate::d1_ledger::Tally) -> Vec<(String, String)> {
+    let mut h: Vec<(String, String)> = a.headers.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    for (k, v) in cors_headers(origin) {
+        h.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
+        h.push((k.to_string(), v));
+    }
+    let get = |h: &Vec<(String, String)>, n: &str| {
+        h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone())
+    };
+    let timing = crate::d1_ledger::with_d1_segment(get(&h, "Server-Timing").as_deref(), t);
+    let expose = crate::d1_ledger::expose_server_timing(get(&h, "Access-Control-Expose-Headers").as_deref());
+    h.retain(|(n, _)| !n.eq_ignore_ascii_case("Server-Timing") && !n.eq_ignore_ascii_case("Access-Control-Expose-Headers"));
+    h.push(("Server-Timing".to_string(), timing));
+    h.push(("Access-Control-Expose-Headers".to_string(), expose));
+    h
+}
+
+fn header_of<'a>(h: &'a [(String, String)], n: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str())
+}
+
+/// A JSON identity view, through the fake binding, under the request's
+/// ledger: it costs D1 nothing and its answer carries `d1;desc=` exposed to
+/// the app origin beside the identity CORS's own exposes.
+#[tokio::test]
+async fn an_identity_json_answer_carries_server_timing() {
+    let r = FakeResolver::with_batch(DISPLAY_FIXTURE, ALICE);
+    let (a, t) = crate::d1_ledger::scoped(batch_answer(&r, &FakeKill::default(), &[ALICE.to_string()], ORIGIN)).await;
+    assert_eq!((a.status, t), (200, crate::d1_ledger::Tally::default()), "served, no D1 statement");
+    let body = a.body.clone();
+    let h = stamped(&a, Some(ORIGIN), t);
+    let timing = header_of(&h, "Server-Timing").expect("stamped");
+    assert_eq!(crate::d1_ledger::parse_segment(timing, "d1"), Some(t));
+    let expose = header_of(&h, "Access-Control-Expose-Headers").unwrap();
+    assert!(expose.contains("Server-Timing") && expose.contains("ETag"), "{expose}");
+    assert_eq!(header_of(&h, "Access-Control-Allow-Origin"), Some(ORIGIN));
+    assert_eq!(a.body, body);
+}
+
+/// The picture, through the fake binding, under the request's ledger: the
+/// stamp adds `d1;desc=` and leaves the bytes and their hardening headers as
+/// they were (the picture is served before the front door, so nothing signs
+/// it: no BRC-103 header on it).
+#[tokio::test]
+async fn an_identity_picture_answer_carries_server_timing_and_its_bytes_untouched() {
+    let bytes = png(1000);
+    let h = hash_of(&bytes);
+    let r = FakeResolver::default();
+    r.serve(&format!("{RESOLVER_PICTURE_PATH}{h}"), 200, &bytes);
+    let (a, t) = crate::d1_ledger::scoped(picture_answer(&r, &FakeKill::default(), &h)).await;
+    assert_eq!((a.status, t), (200, crate::d1_ledger::Tally::default()));
+    let hs = stamped(&a, Some(ORIGIN), t);
+    assert_eq!(crate::d1_ledger::parse_segment(header_of(&hs, "Server-Timing").unwrap(), "d1"), Some(t));
+    assert_eq!(a.body, bytes, "the bytes as fetched");
+    assert_eq!(header_of(&hs, "Content-Type"), Some("image/png"));
+    assert_eq!(header_of(&hs, "Content-Security-Policy"), Some("sandbox"));
+    assert!(hs.iter().all(|(k, _)| !k.to_ascii_lowercase().starts_with("x-bsv-auth")), "unsigned");
+}
+
+/// The order of the body (`lib.rs`), pinned on its source: `fetch` scopes
+/// `serve`; inside `serve` the before-door identity routes are answered
+/// BEFORE the front door, so the picture bytes never reach the signing or
+/// the lane seal; the JSON identity views stay in the router, behind the
+/// door. And the kill route's bearer is still the first check of its arm.
+#[test]
+fn the_identity_routes_run_inside_the_ledger_and_the_picture_before_the_door() {
+    fn squash(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect()
+    }
+    let lib = squash(include_str!("lib.rs"));
+    let at = |n: &str| lib.find(&squash(n)).unwrap_or_else(|| panic!("lib.rs: {n}"));
+    let scoped = at("d1_ledger::scoped(serve(req, env, ctx)).await;");
+    let serve = at("async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {");
+    let exempt = at("identity::serve_exempt(req, &env).await?;");
+    let door = at("auth::front_door(req, &env).await?");
+    let run = at("router(state, schema_ready).run(req, env).await?;");
+    let seal = at("seal_lane_response_text(");
+    let sign = at("sign_json_response(");
+    let end = at("pub const D1_LEDGER_ROUTES");
+    assert!(scoped < serve, "fetch scopes serve");
+    assert!(serve < exempt && exempt < door, "the picture and the kill route are answered before the door");
+    assert!(lib[exempt..door].contains("returnOk(resp);"), "the exempt arm returns");
+    assert!(door < run && run < seal && run < sign && seal < end && sign < end, "the JSON views behind the door");
+    assert!(lib.contains(&squash(".get_async(identity::BATCH_ROUTE, identity::get_batch)")));
+    assert!(lib.contains(&squash(".get_async(\"/identity/*rest\", identity::get_identity)")));
+
+    let id = squash(include_str!("identity.rs"));
+    let f = id.find(&squash("pub async fn serve_exempt(mut req: Request, env: &Env) -> Result<Response> {")).unwrap();
+    let arm = &id[f..];
+    let post = arm.find(&squash("if req.method() == Method::Post {")).unwrap();
+    let bearer = arm.find(&squash("if !crate::internal_events::internal_bearer_ok(&req, env) {")).unwrap();
+    let read = arm.find(&squash("req.bytes().await")).unwrap();
+    assert!(post < bearer && bearer < read, "the bearer is checked before the body is read");
+    assert!(arm[bearer..read].contains(&squash("Answer::error(401, \"unauthorized\", Outcome::Unauthorized)")));
+}
+
 // -- the origins per env (the M29-3b lens, L6) ------------------------------
 
 /// `localhost` is an app origin on beta only (the dev server), never in the

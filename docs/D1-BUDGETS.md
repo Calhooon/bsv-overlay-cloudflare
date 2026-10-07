@@ -73,8 +73,14 @@ case writes beside it), and the figures on wasm at RUNTIME on Cloudflare's D1 (t
 SQLite, whose `rows_read` counts the same way as far as the platform documents it; the census below is what reads
 the real ones).
 
-The identity routes of M29-3 do not exist yet. Their rows carry a budget from birth: each lands with a scenario
-here and in `ceilings.json` in the change that adds the route.
+The identity routes of M29-3 (bsv-low #532) are inside the ledger: the picture (`/identity/pic/:hash`) and the
+kill route (`POST /internal/identity/kill`) are answered before the front door but inside `serve()`, so they are
+counted and stamped like every other answer. Their keys: `/identities`, `/identity` (the single and verify
+forms), `/identity/pic`, `/internal/identity/kill` (listed before `/identity` and `/internal`, whose heads they
+start with). They hold no D1 handle (`rows_read_ceiling_499_no_identity_route_reads_d1`, a source pin), so each
+reads 0 / 0 / 0; their other stores (the resolver, the kill list) are bounded by
+`rows_read_ceiling_499_store_calls_per_route`. The rows below get a tier scenario once the tier mounts a
+resolver binding (it mounts none today).
 
 | scenario (to fill) | route | measured reads / writes / stmts | ceiling reads / writes / stmts |
 |---|---|---|---|
