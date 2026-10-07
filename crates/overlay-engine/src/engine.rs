@@ -216,8 +216,10 @@ async fn hooked(
 /// The most store reads [`Engine::unlanded_predecessor`] makes for one
 /// topic of one submit (bsv-low #559, F3): the question is asked of every
 /// transaction that admits nothing and found no coin, so it is kept cheap.
-/// Each read is counted, and the 17th is never made: out of reads is "not
-/// now" (the delta fold of 2026-10-07, M2).
+/// Counted are the reads spent on a body the BEEF does not prove and the
+/// store does not hold as landed (the second delta fold of 2026-10-07, M2);
+/// the 17th of those is never made: out of reads is "not now" (the delta
+/// fold of 2026-10-07, M2).
 const PREDECESSOR_READS: usize = 16;
 
 /// Summary of an [`Engine::complete_missing_proofs`] pass.
@@ -977,9 +979,11 @@ impl Engine {
     /// is the same judgement and no successor can spend half of it. A fault
     /// after it (a lookup notification, the consumed-by update, the applied
     /// row) leaves the transaction's outputs and no previous coin. A fault
-    /// in the delete itself is the first case if the coins are read back
-    /// still held, the second if not, and always the second when the delete
-    /// did not answer (it may land yet). A submit that deletes a stale coin
+    /// before any delete was started (the record of the spent coin's
+    /// transaction, the read of the coin) is the first case if the coins
+    /// are read back still held; once a delete was started its fault never
+    /// undoes, answered or not (it may land yet): the outputs stay beside
+    /// the stale coin, marked spent. A submit that deletes a stale coin
     /// first records that coin's transaction as applied, so a replay of it
     /// after its successor is a dupe. So a non-retaining chain never has
     /// two unspent heads and never none, whatever single call faults. The
@@ -992,17 +996,20 @@ impl Engine {
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<(Steak, MutationReport), EngineError> {
-        self.submit_bounded(tagged_beef, mode, None).await
+        self.submit_bounded(tagged_beef, mode, None, false).await
     }
 
     /// [`Engine::submit_with_report`] with every storage call, lookup hook
     /// and topic manager call under `bound` (the GASP finalize submit,
     /// [`CallBound`]); `None` is the unbounded submit of every other door.
+    /// `finalize` is `true` for the GASP finalize submit alone, bounded or
+    /// not: it does not ask the store's predecessor question.
     async fn submit_bounded(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
         bound: Option<&CallBound>,
+        finalize: bool,
     ) -> Result<(Steak, MutationReport), EngineError> {
         // A submit is a real admission, never a dry run.
         let (validations, mut steak, tx, txid) = self
@@ -1031,6 +1038,11 @@ impl Engine {
                 report.deduped_topics.push(v.topic.clone());
                 continue;
             }
+            // A failed topic comes first, a read fault of it included: a
+            // previous-coin read that faulted and a manager that then ERRED
+            // is a failed topic with a durable report, no fault and no
+            // replay. Parity: the reference fails the topic and never
+            // replays. Nothing was written, so the store is as it was.
             if v.failed {
                 continue;
             }
@@ -1060,7 +1072,14 @@ impl Engine {
             // topic. "Has not landed" is known two ways: this engine saw it
             // fault (`not_landed`, one invocation), or the store says so
             // ([`Engine::unlanded_predecessor`], any invocation, when the
-            // submitted BEEF carries the predecessor's body).
+            // submitted BEEF carries the predecessor's body). A GASP
+            // finalize submit asks only the first (the second delta fold of
+            // 2026-10-07, M2): its graph passed the anchor check, every
+            // parent inside the graph was submitted just before it and the
+            // sequence stops at the first that does not land, and a parent
+            // outside the graph is one the store held. The store's question
+            // there bought nothing and, at its read bound, held the graph's
+            // cursor.
             if v.previous_outputs.is_empty() && admittance.outputs_to_admit.is_empty() {
                 let remembered = tx
                     .inputs
@@ -1073,6 +1092,7 @@ impl Engine {
                     });
                 let waits_on = match remembered {
                     Some(predecessor) => Some(format!("{predecessor} has not landed")),
+                    None if finalize => None,
                     None => {
                         self.unlanded_predecessor(&tx, &tagged_beef.beef, topic, bound)
                             .await
@@ -1331,6 +1351,7 @@ impl Engine {
             // leaves its coin undeleted: that is a delete fault, below.
             let due_before_the_delete = bound.is_some_and(CallBound::is_due);
             let mut delete_faulted = false;
+            let mut delete_started = false;
             for stale in &stale_coins {
                 let spent_coin_tx = AppliedTransaction {
                     txid: stale.txid.clone(),
@@ -1366,6 +1387,7 @@ impl Engine {
                 .await
                 {
                     Ok(Some(stale_output)) => {
+                        delete_started = true;
                         if let Err(e) = self.delete_utxo_deep(&stale_output, bound).await {
                             error!("Error deleting stale output for topic {topic}: {e}");
                             report.fault(topic, "delete_utxo_deep", e.to_string());
@@ -1381,42 +1403,44 @@ impl Engine {
                 }
             }
 
-            // The delete itself faulted. A stale coin left beside the new
-            // outputs is the double head again by another road (the replay
-            // finds the coin and re-inserts whatever a successor has spent
-            // since). So the store is put back as it was found, when that
-            // is certain: EVERY stale coin is read back still held, and then
-            // the inserts are undone, the replay does the whole transaction.
-            // If a coin is gone or cannot be read the outputs stay: taking
-            // them out could leave no head at all.
+            // A fault here, and what it leaves. The store is put back as it
+            // was found (the inserts undone, the replay does the whole
+            // transaction) only when NO delete was started: the fault is of
+            // H2's record or of the read before the delete, the call
+            // answered, and EVERY stale coin is read back still held.
             //
-            // And a call of the delete that did not ANSWER is not certain
-            // either (the delta fold of 2026-10-07, H1): a call dropped at
-            // its timeout is not cancelled, so the coin can be read back
-            // held now and be deleted a moment later. Undoing the inserts
-            // then left the chain with no head, for good. So an unanswered
-            // delete never undoes: the outputs stay, the stale coin stays
-            // (marked spent) until its delete lands or is done again, and
-            // there is no applied row. What the replay of this transaction
-            // then sees, in both orders. The delete landed late: no
-            // previous coin, so a manager that needs one admits nothing and
-            // the transaction is recorded with its outputs held. The delete
-            // never landed: the coin is found, the manager admits again, the
-            // inserts are no-ops, the delete is done and the row written.
-            // And if a successor spent the outputs first, it recorded this
-            // transaction as applied (H2) and the replay is a dupe: the
-            // stale coin's spent row is then left behind, no UTXO. A
-            // deadline that was already due BEFORE the delete started
-            // nothing here, so the coins are certainly held and the store is
-            // put back as for an answered fault.
+            // Once a delete was STARTED nothing is undone, whether it
+            // answered or not (the delta fold of 2026-10-07, H1, for a call
+            // that did not answer; the second delta fold, M1, for one that
+            // answered an error). A statement can land after its caller was
+            // told it failed, as after its caller stopped waiting: the coin
+            // is read back held now and is deleted a moment later, and the
+            // undo then left the chain with no head, for good, for a manager
+            // that needs the previous coin. So the outputs stay, the stale
+            // coin stays (marked spent) until its delete lands or is done
+            // again, and there is no applied row. Since H2 every order from
+            // there converges. The replay first, the delete never landed:
+            // the coin is found, the manager admits again, the inserts are
+            // no-ops, the delete is done and the row written. The replay
+            // first, the delete landed late: no previous coin, so a manager
+            // that needs one admits nothing and the transaction is recorded
+            // with its outputs held. A successor first: it recorded this
+            // transaction as applied (H2) and the replay is a dupe; the
+            // stale coin's spent row is then left behind, no UTXO.
+            //
+            // A call that did not ANSWER before any delete (the record, the
+            // read) undoes nothing either: it is not known what it did. A
+            // deadline that was already due BEFORE the first of these calls
+            // started nothing here, so the coins are certainly held and the
+            // store is put back.
             if delete_faulted {
                 let unanswered = !due_before_the_delete && bound.is_some_and(CallBound::is_due);
                 if let Some(bound) = bound {
                     bound.renew();
                 }
-                let mut all_held = !unanswered;
+                let mut all_held = !unanswered && !delete_started;
                 for stale in &stale_coins {
-                    if unanswered {
+                    if !all_held {
                         break;
                     }
                     let read = stored(
@@ -1443,11 +1467,11 @@ impl Engine {
                     &txid,
                     topic,
                     if all_held {
-                        "the delete of a stale coin faulted: the coins are held, its outputs taken out"
+                        "no delete of a stale coin was started: the coins are held, its outputs taken out"
                     } else if unanswered {
                         "the delete of a stale coin did not answer: nothing undone, its outputs stay"
                     } else {
-                        "the delete of a stale coin faulted: its outputs stay"
+                        "the delete of a stale coin faulted: nothing undone, its outputs stay"
                     },
                 );
                 continue;
@@ -1597,20 +1621,41 @@ impl Engine {
     ///
     /// The limits, stated. It sees only bodies in the BEEF: an unproven
     /// successor carries its parent (the live `/submit` case), a PROVEN one
-    /// does not, and is then recorded as in the reference. It asks the store
-    /// at most [`PREDECESSOR_READS`] times. And it cannot tell a faulted
-    /// predecessor from one nobody submitted yet: a successor is "not now"
-    /// in both until the predecessor lands.
+    /// does not, and is then recorded as in the reference. It cannot tell a
+    /// faulted predecessor from one nobody submitted yet: a successor is
+    /// "not now" in both until the predecessor lands. And it never sees an
+    /// OPENER as unlanded (the delta-2 lens of 2026-10-07, L1): "unlanded"
+    /// needs a coin the topic holds somewhere up the walk, and a predecessor
+    /// that spends no coin of the topic (the first transaction of a chain,
+    /// one the manager admits on its outputs alone) has none. Its successor
+    /// in a later invocation, before the opener's replay, is recorded as in
+    /// the reference, its own replay is then a dupe and the chain stops at
+    /// the opener. The cure (a dry run of the manager over the candidate
+    /// body with no coins: admitted means an unlanded opener) is not built.
     ///
     /// "Landed" needs a clean answer (the delta fold of 2026-10-07, M1 and
     /// M2): a read that faults, or the question running out of its reads,
     /// answers "not now" too, naming the transaction it could not settle.
     /// Recording the successor there made its replay a dupe and stopped the
-    /// chain behind it for good; a retried no-op is the lesser cost. That
-    /// cost, stated: a transaction that admits nothing, found no coin and
-    /// carries more unlanded bodies than 16 reads settle (five single-input
+    /// chain behind it for good; a retried no-op is the lesser cost.
+    ///
+    /// What the bound counts (the second delta fold of 2026-10-07, M2): the
+    /// reads spent on a body that is NEITHER proven in the BEEF NOR found
+    /// landed, [`PREDECESSOR_READS`] of them. A body the BEEF proves, and
+    /// one whose applied row or held output answers "landed", is read and
+    /// costs nothing against the bound: counted, they made a transaction
+    /// that admits nothing over 17 landed parents, over six proven parents
+    /// the topic never saw, or over one proven parent with 15 inputs "not
+    /// now" on every submit, with no unlanded predecessor anywhere. The
+    /// costs, stated. The uncounted reads are bounded by the BEEF alone
+    /// (two per such body and one per input of a proven one). And a
+    /// transaction that admits nothing, found no coin and carries more
+    /// UNPROVEN, UNLANDED bodies than 16 reads settle (five single-input
     /// ancestors, fewer with more inputs) is never recorded, where the
     /// reference records it: each submit of it is a fault and a replay.
+    ///
+    /// A GASP finalize submit does not ask this question at all (see the
+    /// call).
     ///
     /// Returns why the submit must wait, for the report.
     async fn unlanded_predecessor(
@@ -1621,11 +1666,16 @@ impl Engine {
         bound: Option<&CallBound>,
     ) -> Option<String> {
         let beef = Beef::from_binary(beef_bytes).ok()?;
-        let bodies: HashMap<String, &Transaction> = beef
+        // Each body the BEEF carries, and whether the BEEF proves it.
+        let bodies: HashMap<String, (&Transaction, bool)> = beef
             .txs
             .iter()
-            .filter_map(|btx| btx.tx().map(|body| (btx.txid(), body)))
+            .filter_map(|btx| {
+                btx.tx()
+                    .map(|body| (btx.txid(), (body, btx.bump_index().is_some())))
+            })
             .collect();
+        // The reads spent on bodies neither proven nor found landed.
         let mut reads = 0usize;
         let mut asked: HashSet<String> = HashSet::new();
         let mut ask: Vec<String> = tx
@@ -1637,9 +1687,13 @@ impl Engine {
             if candidate.is_empty() || !asked.insert(candidate.clone()) {
                 continue;
             }
-            let Some(body) = bodies.get(&candidate) else {
+            let Some(&(body, proven)) = bodies.get(&candidate) else {
                 continue;
             };
+            // This candidate's own reads: they join `reads` once it is
+            // found not landed, and never if the BEEF proves it.
+            let mut spent = 0usize;
+            let out_of = |spent: usize| !proven && reads + spent >= PREDECESSOR_READS;
             let out_of_reads = || {
                 Some(format!(
                     "{candidate} is not known to have landed: the question ran out of its {PREDECESSOR_READS} reads"
@@ -1656,19 +1710,19 @@ impl Engine {
             };
             // An applied row, or an output held, ends the question for this
             // transaction: it landed.
-            if reads >= PREDECESSOR_READS {
+            if out_of(spent) {
                 return out_of_reads();
             }
-            reads += 1;
+            spent += 1;
             match stored(bound, self.storage.does_applied_transaction_exist(&record)).await {
                 Ok(false) => {}
                 Ok(true) => continue,
                 Err(e) => return unread(e),
             }
-            if reads >= PREDECESSOR_READS {
+            if out_of(spent) {
                 return out_of_reads();
             }
-            reads += 1;
+            spent += 1;
             match stored(
                 bound,
                 self.storage.find_outputs_for_transaction(&candidate, false),
@@ -1684,10 +1738,10 @@ impl Engine {
                 if source.is_empty() {
                     continue;
                 }
-                if reads >= PREDECESSOR_READS {
+                if out_of(spent) {
                     return out_of_reads();
                 }
-                reads += 1;
+                spent += 1;
                 let coin = stored(
                     bound,
                     self.storage.find_output(
@@ -1706,6 +1760,9 @@ impl Engine {
                     Ok(None) => ask.push(source),
                     Err(e) => return unread(e),
                 }
+            }
+            if !proven {
+                reads += spent;
             }
         }
         None
@@ -3436,7 +3493,8 @@ impl Engine {
                 .await
                 .map_err(|e| EngineError::StorageError(e.to_string()))?;
 
-                // Notify lookup services
+                // Notify lookup services. A hook error is dropped, not
+                // reported (parity: the reference catches it, best effort).
                 for ls in self.lookup_services.values() {
                     let _ = hooked(
                         bound,
@@ -4075,8 +4133,13 @@ impl Engine {
                         .finalize_submit_budget
                         .as_ref()
                         .map(|(sleep, budget_ms)| CallBound::new(sleep, *budget_ms));
-                    self.submit_bounded(&tagged, SubmitMode::HistoricalTxNoSpv, bound.as_ref())
-                        .await
+                    self.submit_bounded(
+                        &tagged,
+                        SubmitMode::HistoricalTxNoSpv,
+                        bound.as_ref(),
+                        true,
+                    )
+                    .await
                 };
                 let not_landed = match outcome {
                     Ok((_, report)) => {

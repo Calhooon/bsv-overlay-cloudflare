@@ -192,7 +192,7 @@ gasp_topic_manager i551` (and `fold_medium`).
 
 The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
 
-## A faulted submit leaves one head (bsv-low #559, lens fold and delta fold of 2026-10-07)
+## A faulted submit leaves one head (bsv-low #559, lens fold and two delta folds of 2026-10-07)
 
 `Engine::submit` inserts the admitted outputs BEFORE it deletes the stale
 coins, and deletes them once EVERY insert of that topic landed. The reference
@@ -205,11 +205,14 @@ head, for good.
 
 The invariant, per topic of one submit, for a non-retaining chain: whatever
 SINGLE storage call, lookup hook or manager call faults, a call that lands
-after its timeout included, the store holds exactly one UNSPENT head, the old
-one or the new one, and no applied row for the faulted submit, and the queue's
-replay converges to the new head. (One head ROW too, except the two leftovers
-named under the limits: a stale coin whose delete or whose spender's insert
-did not answer can stay behind as a SPENT row, no UTXO.)
+after its timeout or after it answered an error included, the store never
+holds two unspent heads and never no head row: the new head unspent, or the
+old one (unspent after a validation read fault, marked spent from the mark
+on, so no UTXO is listed until the replay), and no applied row for the
+faulted submit, and the queue's replay converges to the new head. (One head
+ROW too, except the leftovers named under the limits: a stale coin whose
+delete faulted or whose spender's insert did not answer can stay behind as a
+SPENT row beside the new head, no UTXO.)
 
 - A fault BEFORE every insert landed leaves the previous coins and NOTHING
   of the transaction. A validation read (the dedup read, since the delta
@@ -233,13 +236,18 @@ did not answer can stay behind as a SPENT row, no UTXO.)
   chain: every one of this workspace's 16 managers admits on output shape
   alone, and Zanaadu's pf head manager admits a configured genesis) inserted
   it a second time, unspent, beside the output that had spent it.
-- A fault of the DELETE that ANSWERED: if every stale coin is read back still
-  held, the inserts are undone (the first case); if one is gone or cannot be
-  read, the outputs stay. A delete that did NOT answer (a finalize submit's
-  bounded call) never undoes (the delta fold, H1): a call dropped at its
-  timeout is not cancelled, the coin can be read back held and be deleted a
-  moment later, and the undo then left no head. The outputs stay beside the
-  stale coin (marked spent), with no applied row.
+- A fault at the delete. BEFORE any delete was started (H2's record, or the
+  read of the coin, answered an error): if every stale coin is read back
+  still held, the inserts are undone (the first case); if one is gone or
+  cannot be read, the outputs stay. Once a delete was STARTED nothing is
+  undone, whether it answered an error (the second delta fold, M1) or did not
+  answer (a finalize submit's bounded call; the delta fold, H1): a statement
+  can land after its caller was told it failed or stopped waiting, the coin
+  can be read back held and be deleted a moment later, and the undo then left
+  no head. The outputs stay beside the stale coin (marked spent), with no
+  applied row, and every order converges: the replay first finds the coin and
+  finishes the delete (or finds none and is recorded with its outputs held);
+  a successor first makes the replay a dupe (H2).
 
 Who replays: the queue (`/submit`, `/arc-ingest`) replays a faulted submit
 up to 3 times (`max_retries`), then the message goes to the dead letter
@@ -255,10 +263,15 @@ and not recorded as applied. Known two ways: the engine saw the predecessor
 fault (one invocation's memory), or the store says so
 (`Engine::unlanded_predecessor`, any invocation): a transaction whose body
 the submitted BEEF carries, with no applied row, no output held, spending a
-coin the topic holds (or a coin of another such transaction). The question
-makes at most 16 reads; "landed" needs a clean answer, so a read that faults
-or the question running out of its reads is "not now" too (the delta fold,
-M1 and M2).
+coin the topic holds (or a coin of another such transaction). "Landed" needs
+a clean answer, so a read that faults or the question running out of its
+reads is "not now" too (the delta fold, M1 and M2). The bound is 16 reads
+spent on bodies the BEEF does not prove and the store does not hold as landed
+(the second delta fold, M2): a proven body and one whose applied row or held
+output answers "landed" are read and cost nothing against it. A GASP finalize
+submit does not ask the store at all (its graph passed the anchor check, its
+in-graph parents were submitted just before it and the sequence stops at the
+first that does not land); it keeps the engine's own memory.
 
 `Engine::set_finalize_submit_budget` bounds each storage call, lookup hook
 and manager call of ONE transaction's finalize submit (the write section no
@@ -269,7 +282,10 @@ allowance. The UTXO fails and the cursor stays (the worker sets 30 s).
 `/admin/startGASPSync` runs under the same guarded 240 s race as the scheduled
 step and answers 504 when it is dropped. Pins: `cargo test -p
 bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`,
-`fold559` and `delta559` (the delta lens's X4 to X9, each RED on `33e78fb`).
+`fold559`, `delta559` (the delta lens's X4 to X9, each RED on `33e78fb`),
+`delta2_559` (the delta-2 lens's Y1 and Y2, a finalize over a node with 17
+landed parents, rows 2 and 6 of its table; the M1 and M2 pins RED on
+`e24f962`) and `limit_opener` (its Y4, a limit pinned as it is).
 
 The limits, stated. (1) Two faults in one submit: an undo is separate calls,
 and one that faults too leaves the inserted output beside the kept coin
@@ -290,19 +306,25 @@ heals it; after the dead letter the split stays until the next head. (4) The
 store's answer needs the predecessor's body in the BEEF: an unproven
 successor carries it, a PROVEN one does not, and one that arrives in a later
 invocation before the replay is recorded as in the reference, the chain then
-one behind its tip. It cannot tell a faulted predecessor from one nobody
-submitted yet: the successor is "not now" until it lands. And a transaction
-that admits nothing, found no coin and carries more unlanded bodies than 16
+one behind its tip. And it never sees an OPENER as unlanded: "unlanded" needs
+a coin the topic holds somewhere up the walk, so a predecessor that spends no
+coin of the topic (a chain's genesis, the JOIN under `tm_pot`) is not one,
+its successor in a later invocation before the opener's replay is recorded,
+and the chain stops at the opener (pin `limit_opener`; the cure, a dry run of
+the manager over the candidate body with no coins, is the owner's call and is
+not built). It cannot tell a faulted predecessor from one nobody submitted
+yet: the successor is "not now" until it lands. And a transaction that admits
+nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
 reads settle (five single-input ancestors, fewer with more inputs) is "not
 now" on every submit, where the reference records it: three retries and a
-dead letter each. (5) What D1 does with a statement whose caller stopped
-waiting is not known here; the engine assumes it may still land. A delete
-that never lands leaves the stale coin's spent row until that transaction's
-replay at the door finishes it (GASP does not replay a held head); an insert
-that lands late leaves it the same way. Only a BOUNDED call can be seen not
-to answer: at the unbounded doors (`/submit`, the queue) every D1 error is an
-answer, and a delete that answers an error, is read back held and lands
-afterwards is the no-head case still. (6) H2's row is per transaction, not
+dead letter each; the reads of proven and landed bodies are not counted, so
+their number follows the BEEF (two per body, one more per input of a proven
+one). (5) What D1 does with a statement whose caller stopped waiting, or was
+answered an error, is not known here; the engine assumes it may still land,
+at every door. A delete that never lands leaves the stale coin's spent row
+until that transaction's replay at the door finishes it (GASP does not replay
+a held head), or for good once a successor spent the new head first; an
+insert that lands late leaves it the same way. (6) H2's row is per transaction, not
 per output: a transaction with several admitted outputs of which only some
 landed (a second insert that landed after its timeout) is a dupe once a
 successor spent one of them, and the output its undo took out is not put
