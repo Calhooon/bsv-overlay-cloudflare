@@ -547,6 +547,13 @@ pub fn collected_challenge(game_id_lc: &str, identity_lc: &str) -> Vec<u8> {
 //    it is `null` when the server could not name exactly one this pass: then the device finds its home outputs
 //    in the credit BEEF itself (as the press does) and must own EVERY one, or it does not file. The signed
 //    fields name the TRANSACTION; the ownership check is the device's duty and nothing here can make it.
+//    SPENT STILL COUNTS (the B3 delta lens D-L4): a home output the wallet's own next hop already spent is
+//    owned all the same, by the wallet's record of that OUTPUT, spent or unspent. A wallet that lists
+//    spendable outputs only and cannot answer for the outpoint itself: the device does not file; it never
+//    falls back to the txid.
+//    NO SINGLE HOME: `payPkh: null` (no proven seat or no decoded keys on a pot, a hop whose game has no
+//    known home) comes with `payVout: null` on every pass, and nothing is filed from the row alone: the
+//    device finds its home outputs in the credit BEEF and must own every one, as above.
 // 2. THE DOOR. `POST /record?kind=collected&identity=<identity hex>`, body `{ "scriptHex": "<the script>" }`.
 //    The script: `OP_FALSE OP_RETURN`, then five minimal pushes: `LOW/collected/v2`, gameId (32), identityKey
 //    (33), payTxid (32, the byte order of the txid's hex as `facts.payTxid` prints it), sig. The signature: over
@@ -558,13 +565,30 @@ pub fn collected_challenge(game_id_lc: &str, identity_lc: &str) -> Vec<u8> {
 //      400 (the script is not this marker, not canonical, not hex), 403 (the `identity` is not the marker's),
 //          413 (too large), 422 (the signature does not verify under the identity): a client bug; drop the
 //          filing, never retry it unchanged. The body's `error` says which.
-//      409: four held filings already stand for this (identity, game); stop for this game, for good.
+//      409: four held filings already stand for this (identity, game); stop for this game, for good. It
+//          never binds an honest player: a game id is ONE hand (a rematch mints a new id, the client's
+//          `sha256("<gameId>:rematch")`), and one hand pays an identity by one to three transactions (the
+//          pot's spend, a hop's sweep, a re-funded pot).
 //      429: the identity's day (200 `collected` rows in 24 h, v1 and held together) is spent; stop every
-//          `collected` filing until tomorrow.
+//          `collected` filing until tomorrow. A re-file of content ALREADY on file answers 429 too, not
+//          `alreadyFiled`, once the day is spent (the caps run before the insert): the memo the first 200
+//          wrote stands and nothing is queued again, and a 429 never WRITES that memo (it does not say the
+//          content is on file).
 //      5xx, a timeout, no answer: not an answer; the outbox keeps it and re-files.
+//    BEFORE THE DOOR, the auth seam's own answers (the B3 delta lens D-N3), none of them this door's word on
+//    the filing:
+//      401 `ERR_SESSION_REFUSED` on a LANED call (the session lane refused the call's session or MAC): the
+//          lane is a fast path; the same call goes again by the reference BRC-104 path and only that
+//          answer is judged.
+//      401 with no session under `AUTH_ENFORCE`: authenticate (the BRC-103/104 handshake), then file.
+//      403 naming `authenticatedIdentity` and `queryIdentity` (`routes::view_identity`): the session is not
+//          the `identity` of the query; a client bug, drop the filing. 400 for a body that is not JSON: same.
 // 3. ONCE. One filing per (game, payTxid), remembered in a device memo keyed by both, never one per read of
 //    `/owed`. A row still served after its filing answered 200 is NOT a reason to file again (the read may
-//    simply be older than the write; a replaced spend has another `payTxid`, which is another filing).
+//    simply be older than the write; a replaced spend has another `payTxid`, which is another filing). A
+//    re-file repairs nothing (the B3 delta lens D-L3): if the write's stale mark was missed, the list heals
+//    at the read's age rule (15 minutes, `owed::OWED_RECOMPUTE_ANY_AFTER_MS`), and a re-file answers `alreadyFiled` and
+//    marks nothing. A device that sees a row it already filed for WAITS for the age rule, never re-files.
 // 4. ONE SHAPE. After a FRESH credit (the wallet's internalize answered and the balance rose) file the held
 //    filing ALONE: it is exact, and it is one row of the day budget. The v1 marker is for nothing new.
 // 5. NOTHING TO FILE for a row with `payTxid: null` or `claimable: false`: the wallet cannot hold what has not
@@ -1842,6 +1866,8 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             // nothing. Then nothing changed in what is owed: no stale mark, no `owed-changed` push, no `filed`
             // count (a stranger replaying a victim's public filing, or a client re-filing on every read, bought a
             // recompute and a push per request). `changes` unreadable is read as written (the pre-fold behavior).
+            // NOT lossless (the B3 delta lens D-L3): a first filing whose stale mark faulted or died is no
+            // longer repaired by a re-file; that missed mark heals at the read's 15 minute age rule.
             row_written = insert_wrote_a_row(done.meta().ok().flatten().and_then(|m| m.changes));
         }
         VerifiedRecord::Hopsweep(_, r) => {
@@ -3004,5 +3030,62 @@ pub(crate) mod tests {
             RECORD_FILINGS_PER_IDENTITY_PER_DAY
         );
         assert!(h["anonymousFiledByKind"]["result"].is_u64());
+    }
+    /// The B3 delta lens D-N1: `collected_markers_v2.payTxid` has ONE writer, the door's insert, and that insert
+    /// runs behind the signature check. Read over the production source of both workers (each file up to its
+    /// test module, comment lines dropped): one INSERT into the table names the column, it is
+    /// [`COLLECTED_FILE_SQL`], it is prepared once, after `verify_record_post`, and no statement updates,
+    /// replaces or deletes a row of the table. A statement whose table name is built at run time is out of
+    /// this pin's sight; none exists today.
+    #[test]
+    fn i492_dn1_the_door_is_the_only_writer_of_pay_txid() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let production = text.split("\nmod tests {").next().unwrap().split("\npub(crate) mod tests {").next().unwrap();
+                    let code: Vec<&str> = production.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+                    // one line of text: a statement split over source lines (a `\` continuation) reads whole
+                    let flat = code.join(" ").replace('\\', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+                    out.push((path.file_name().unwrap().to_string_lossy().into_owned(), flat));
+                }
+            }
+        }
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&here.join("src"), &mut files);
+        sources(&here.join("../overlay-cloudflare/src"), &mut files);
+        assert!(files.len() > 40, "both workers' sources were read: {}", files.len());
+        let table = "collected_markers_v2";
+        let (mut inserts, mut naming_pay_txid) = (0usize, Vec::new());
+        for (file, flat) in &files {
+            let upper = flat.to_ascii_uppercase();
+            for verb in ["UPDATE ", "DELETE FROM ", "REPLACE INTO ", "INSERT OR REPLACE INTO "] {
+                assert!(!upper.contains(&format!("{verb}{}", table.to_ascii_uppercase())), "{file}: `{verb}{table}`: rows are never rewritten");
+            }
+            let into = format!("INTO {table}");
+            for (at, _) in flat.match_indices(&into) {
+                inserts += 1;
+                // the statement: up to the end of its string literal
+                let stmt = flat[at..].split('"').next().unwrap();
+                if stmt.contains("payTxid") {
+                    naming_pay_txid.push(file.clone());
+                }
+            }
+        }
+        assert!(inserts >= 3, "the door's insert, the overlay's `store_record` and the carry were all seen: {inserts}");
+        assert_eq!(naming_pay_txid, vec!["record_post.rs".to_string()], "one insert names the column, the door's");
+        assert!(COLLECTED_FILE_SQL.contains("INTO collected_markers_v2") && COLLECTED_FILE_SQL.contains("payTxid"));
+        let door = &files.iter().find(|(f, _)| f == "record_post.rs").unwrap().1;
+        let uses: Vec<usize> = door.match_indices("COLLECTED_FILE_SQL").map(|(i, _)| i).collect();
+        assert_eq!(uses.len(), 2, "the const and ONE prepare");
+        let prepare = door.find(".prepare(COLLECTED_FILE_SQL)").expect("the door prepares it");
+        let route = door.find("pub async fn record_post(").expect("the door");
+        let verify = door[route..].find("verify_record_post(kind, &script, &identity)").expect("the door verifies") + route;
+        assert!(route < verify && verify < prepare, "the signature check runs before the one insert");
+        assert_eq!(door.matches("pub async fn ").count(), 1, "the route is the file's only async door, so the insert is inside it");
     }
 }

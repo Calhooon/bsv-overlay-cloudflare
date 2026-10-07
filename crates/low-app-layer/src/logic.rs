@@ -865,7 +865,12 @@ pub struct RecoveryEntry {
     /// (admission is byte-format with no server-side sig verify — see the
     /// overlay's collected storage docs): the client's Collect surface still
     /// verifies marker signatures under its own wallet before treating a game
-    /// as collected. `None` = could not ask (query fault / racing migration)
+    /// as collected. Since bsv-low #492 the row may be a HELD filing
+    /// (`LOW/collected/v2`, `record_post`): door-verified, it says the wallet
+    /// holds ONE named payout of the game, it fails a v1 verify by design, and
+    /// it is `true` here all the same (the B3 delta lens D-N4): "a collected
+    /// row of either shape names this game", never "every payout of it is
+    /// collected". `None` = could not ask (query fault / racing migration)
     /// — never conflated with `Some(false)` ("asked, no row"). Display /
     /// dedup hint only; NEVER a money gate.
     pub collected: Option<bool>,
@@ -962,7 +967,8 @@ pub fn assemble_recovery_view(rows: Vec<RecoveryRow>) -> (Vec<RecoveryEntry>, bo
 
 /// The `collected_markers_v2` PRESENCE query for one identity over a chunk of
 /// gameIds: which of these games carry at least one admitted collected
-/// marker naming this identity? `DISTINCT gameId` — presence, never rows
+/// marker naming this identity (a v1 marker OR, since bsv-low #492, a held
+/// filing: either shape counts)? `DISTINCT gameId`: presence, never rows
 /// (the marker sig is verified CLIENT-side only; see [`RecoveryEntry::collected`]).
 /// Binds: identity, then `n` gameIds (all lowercase hex by write convention).
 pub fn collected_presence_sql(n: usize) -> String {

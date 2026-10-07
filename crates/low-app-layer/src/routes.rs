@@ -3475,56 +3475,16 @@ pub(crate) async fn owed_recompute(
     //     before it files a held filing, for the payout rows the derivation could not name it on (a pot's payout).
     //     The spend's bytes are the index's own (`pot_beefs`: `ls_pot` writes the settle or the refund on spend),
     //     hash-checked against the paying txid; a (txid, home) answered once is memoised in the isolate (the bytes
-    //     never change), so a warm isolate reads nothing here. No cap and no order: every wanted row is asked in
-    //     one chunked read over the rows the list keeps. Only the recompute's time budget skips it, and then `payVout` stays `null` that pass.
+    //     never change), so a warm isolate reads nothing here. The B3 delta lens D-L1: this step is the last one,
+    //     so the recompute's clock does NOT gate it (a heavy identity read `null` on every pass); it has its own
+    //     (`owed::pay_vout_pass`: the first chunk always, the rest inside `OWED_PAY_VOUT_READ_BUDGET_MS`, the
+    //     start chunk turning with the clock), and a row it leaves `null` this pass is asked again on the next.
     {
         let wanted = crate::owed::pay_vout_wanted(&rows);
-        let mut vouts: HashMap<String, u32> = HashMap::new();
-        let mut to_read: Vec<&(String, String)> = Vec::new();
-        for w in &wanted {
-            let key = crate::owed::pay_vout_key(&w.0, &w.1);
-            match owed_pay_vout_memo_get(&key) {
-                Some(vout) => {
-                    vouts.insert(key, vout);
-                }
-                None => to_read.push(w),
-            }
-        }
-        for chunk in to_read.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-            if over_budget() {
-                budget_cut = true;
-                break;
-            }
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
-            let binds: Vec<JsValue> = chunk.iter().map(|(t, _)| JsValue::from_str(t)).collect();
-            let read = match db.prepare(&sql).bind(&binds) {
-                Ok(stmt) => stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()),
-                Err(e) => Err(e),
-            };
-            match read {
-                Ok(beefs) => {
-                    for b in beefs {
-                        let txid = b.txid.to_ascii_lowercase();
-                        let Some(raw) = b.beef.and_then(|h| decode_beef_hex(&h)).and_then(|bytes| crate::logic::extract_raw_tx_hex(&bytes, &txid)).and_then(|h| hex::decode(h).ok()) else {
-                            continue;
-                        };
-                        for (_, pkh) in chunk.iter().filter(|(t, _)| *t == txid) {
-                            if let Some(vout) = crate::owed::sole_home_vout_of_raw(&raw, &txid, pkh) {
-                                let key = crate::owed::pay_vout_key(&txid, pkh);
-                                owed_pay_vout_memo_put(&key, vout);
-                                vouts.insert(key, vout);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    crate::owed::note_pay_vout_read_fault();
-                    console_warn!("[owed] payVout read failed (those rows serve payVout: null this pass): {e}");
-                }
-            }
-        }
-        crate::owed::mark_pay_vouts(&mut rows, &vouts);
+        let mut world = PayVoutReads { db, started_ms: worker::Date::now().as_millis() as i64 };
+        let pass = crate::owed::pay_vout_pass(&mut world, &wanted, crate::logic::D1_CHUNK_OUTPOINTS, now_ms as u64).await;
+        budget_cut |= pass.cut;
+        crate::owed::mark_pay_vouts(&mut rows, &pass.vouts);
     }
 
     // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 503
@@ -3652,6 +3612,44 @@ async fn owed_home_spend_walk(
     pass.words
 }
 
+/// The Worker behind `owed::PayVoutWorld`: the step's own clock, the isolate's memo and `pot_beefs`. Reads only;
+/// every decision is `owed::pay_vout_pass`'s.
+struct PayVoutReads<'a> {
+    db: &'a worker::D1Database,
+    started_ms: i64,
+}
+impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
+    fn over_own_budget(&self) -> bool {
+        worker::Date::now().as_millis() as i64 - self.started_ms > crate::owed::OWED_PAY_VOUT_READ_BUDGET_MS
+    }
+    fn memo_get(&self, key: &str) -> Option<u32> {
+        owed_pay_vout_memo_get(key)
+    }
+    fn memo_put(&mut self, key: &str, vout: u32) {
+        owed_pay_vout_memo_put(key, vout);
+    }
+    async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let placeholders = vec!["?"; txids.len()].join(",");
+        let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
+        let binds: Vec<JsValue> = txids.iter().map(|t| JsValue::from_str(t)).collect();
+        let read = match self.db.prepare(&sql).bind(&binds) {
+            Ok(stmt) => stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()),
+            Err(e) => Err(e),
+        };
+        let beefs = read.map_err(|e| {
+            console_warn!("[owed] payVout read failed (those rows serve payVout: null this pass): {e}");
+            e.to_string()
+        })?;
+        Ok(beefs
+            .into_iter()
+            .filter_map(|b| {
+                let txid = b.txid.to_ascii_lowercase();
+                let raw = b.beef.and_then(|h| decode_beef_hex(&h)).and_then(|bytes| crate::logic::extract_raw_tx_hex(&bytes, &txid)).and_then(|h| hex::decode(h).ok())?;
+                Some((txid, raw))
+            })
+            .collect())
+    }
+}
 /// The Worker behind `owed::HomeWalkWorld`: the recompute's clock, the `/spent-any` ladder, the stored BEEF and
 /// the tx-any resolver. Fetches only; every decision is `owed::home_walk_pass`'s.
 struct HomeWalkCouriers<'a> {

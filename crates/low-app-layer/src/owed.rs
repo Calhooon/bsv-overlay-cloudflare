@@ -676,9 +676,10 @@ pub struct OwedInputs<'a> {
     /// [`held_key`] per (game, paying txid) a held filing (`LOW/collected/v2`, `record_post`) of this identity
     /// names ([`CollectedFold::held`]: the door verified its signature and wrote the txid). The app layer cannot
     /// see a wallet; the device can (its wallet owns the paying output the live credit landed, or answered a
-    /// press as already known), and it says so with no press and no credit. A payout row whose paying transaction is named here is not a row. Unlike the
-    /// v1 marker this names the TRANSACTION, so it retires exactly one row whatever the game's candidate count
-    /// (N10), and it stops applying if the pot's spend is ever replaced by another transaction.
+    /// press as already known), and it says so with no press and no credit. A payout row whose paying
+    /// transaction is named here is not a row. Unlike the v1 marker this names the TRANSACTION, so it retires
+    /// exactly one row whatever the game's candidate count (N10), and it stops applying if the pot's spend is
+    /// ever replaced by another transaction.
     pub held_verified: &'a HashSet<String>,
     /// hop spender txids (lowercase) that ARE LOW pots (`pot_records` holds them).
     pub pot_spenders: &'a HashSet<String>,
@@ -932,6 +933,80 @@ pub fn mark_pay_vouts(rows: &mut [OwedRow], vouts: &HashMap<String, u32>) -> usi
         }
     }
     marked
+}
+
+/// The `payVout` read's OWN wall clock, counted from the step's start, never the recompute's (the B3 delta lens
+/// D-L1): the step runs last, so behind the recompute's clock a heavy identity read `null` on every pass. The
+/// first chunk is read whatever any clock says; a later chunk is read while the step is inside this budget.
+pub const OWED_PAY_VOUT_READ_BUDGET_MS: i64 = 2_000;
+
+/// What the `payVout` read reaches outside this crate's pure code: its own clock, the isolate's memo, the index's
+/// stored bytes. The route implements it over the Worker; the pins over a table, counting every read.
+#[allow(async_fn_in_trait)]
+pub trait PayVoutWorld {
+    /// Is the step past [`OWED_PAY_VOUT_READ_BUDGET_MS`] of its own start?
+    fn over_own_budget(&self) -> bool;
+    /// The isolate's held answer for one [`pay_vout_key`]. Free.
+    fn memo_get(&self, key: &str) -> Option<u32>;
+    fn memo_put(&mut self, key: &str, vout: u32);
+    /// One indexed read: the raw transaction of each of `txids` the index stores, as (txid lowercase, raw).
+    /// `Err` is a read fault (the chunk's rows serve `payVout: null` this pass).
+    async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String>;
+}
+
+/// What one `payVout` pass answered.
+#[derive(Debug, Default)]
+pub struct PayVoutPass {
+    /// [`pay_vout_key`] to the sole home output, for [`mark_pay_vouts`].
+    pub vouts: HashMap<String, u32>,
+    /// A chunk was left unread at the step's own clock.
+    pub cut: bool,
+    pub reads: usize,
+}
+
+/// One pass of the `payVout` read over [`pay_vout_wanted`]'s pairs (the B3 delta lens D-L1). The memo answers
+/// first; what it does not hold is read in chunks of `chunk`. The FIRST chunk read is never gated on a clock, and
+/// the recompute's clock gates none: a `null` for want of time is a one-pass event, not a steady state. When the
+/// step's own clock cuts a later chunk, the next pass does not start at the same head: an answer is memoised (a
+/// warm isolate asks only for what is left), and the start chunk turns with `turn` (the route passes the
+/// recompute's clock), so a cold isolate, or a head of rows the bytes never answer, cannot starve the tail.
+pub async fn pay_vout_pass(world: &mut impl PayVoutWorld, wanted: &[(String, String)], chunk: usize, turn: u64) -> PayVoutPass {
+    let mut pass = PayVoutPass::default();
+    let mut to_read: Vec<&(String, String)> = Vec::new();
+    for w in wanted {
+        let key = pay_vout_key(&w.0, &w.1);
+        match world.memo_get(&key) {
+            Some(vout) => {
+                pass.vouts.insert(key, vout);
+            }
+            None => to_read.push(w),
+        }
+    }
+    let chunks: Vec<&[&(String, String)]> = to_read.chunks(chunk.max(1)).collect();
+    for i in 0..chunks.len() {
+        if i > 0 && world.over_own_budget() {
+            pass.cut = true;
+            break;
+        }
+        let this = chunks[(turn as usize % chunks.len() + i) % chunks.len()];
+        let txids: Vec<&str> = this.iter().map(|(t, _)| t.as_str()).collect();
+        pass.reads += 1;
+        match world.stored_raws(&txids).await {
+            Ok(raws) => {
+                for (txid, raw) in raws {
+                    for (_, pkh) in this.iter().filter(|(t, _)| *t == txid) {
+                        if let Some(vout) = sole_home_vout_of_raw(&raw, &txid, pkh) {
+                            let key = pay_vout_key(&txid, pkh);
+                            world.memo_put(&key, vout);
+                            pass.vouts.insert(key, vout);
+                        }
+                    }
+                }
+            }
+            Err(_) => note_pay_vout_read_fault(),
+        }
+    }
+    pass
 }
 
 /// The hop's NON-POT spender named by the index (a recorded spend) or the chain rung (a word of spent), with the
@@ -3762,6 +3837,110 @@ mod tests {
     /// payout gets it from the spend's own bytes (the index keeps sums per home, never the output order, and a
     /// rake output may lead); a swept hop's from the sweep's home outputs or the filed sweep's raw. Exactly one
     /// output to the home, or `null`: never a pick, and never from bytes that do not hash to the paying txid.
+    /// The table behind the `payVout` pins: the stored bytes by txid, the step's own clock as one word, the
+    /// isolate's memo (kept across passes by the caller, or dropped: a cold isolate), every read recorded.
+    struct PayVoutTable {
+        raws: HashMap<String, Vec<u8>>,
+        memo: HashMap<String, u32>,
+        /// `over_own_budget` answers true (the step's clock is spent the moment it is first asked).
+        slow: bool,
+        fault: bool,
+        asked: Vec<Vec<String>>,
+    }
+    impl PayVoutWorld for PayVoutTable {
+        fn over_own_budget(&self) -> bool {
+            self.slow
+        }
+        fn memo_get(&self, key: &str) -> Option<u32> {
+            self.memo.get(key).copied()
+        }
+        fn memo_put(&mut self, key: &str, vout: u32) {
+            self.memo.insert(key.to_string(), vout);
+        }
+        async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+            self.asked.push(txids.iter().map(|t| t.to_string()).collect());
+            if self.fault {
+                return Err("d1 down".into());
+            }
+            Ok(txids.iter().filter_map(|t| Some((t.to_string(), self.raws.get(*t)?.clone()))).collect())
+        }
+    }
+
+    /// bsv-low #512, the B3 delta lens D-L1: the `payVout` read is not behind the recompute's clock. A recompute
+    /// that ran out of its budget before this step still reads the first chunk (the pass takes no recompute
+    /// clock at all), and when the step's OWN clock cuts the rest, the next pass serves what the last one left:
+    /// by the memo in a warm isolate, by the turning start chunk in a cold one. A `null` is a one-pass event.
+    #[test]
+    fn i512_dl1_a_payvout_left_null_by_the_clock_is_served_on_the_next_pass() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction, TransactionOutput};
+        let run = |world: &mut PayVoutTable, wanted: &[(String, String)], chunk: usize, turn: u64| {
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(pay_vout_pass(world, wanted, chunk, turn))
+        };
+        let home = [0x11u8; 20];
+        let home_hex = hex::encode(home);
+        // seven paying transactions, each paying the home at vout 1 behind a distinct first output
+        let mut raws = HashMap::new();
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for n in 0..7u64 {
+            let mut t = Transaction::new();
+            for (sats, pkh) in [(100 + n, [0x33u8; 20]), (39_000, home)] {
+                t.outputs.push(TransactionOutput { satoshis: Some(sats), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)).unwrap(), change: false });
+            }
+            raws.insert(t.id(), t.to_binary());
+            wanted.push((t.id(), home_hex.clone()));
+        }
+        wanted.sort_unstable();
+        let table = |slow: bool| PayVoutTable { raws: raws.clone(), memo: HashMap::new(), slow, fault: false, asked: Vec::new() };
+
+        // the step's clock spent at once (the heaviest case): the first chunk is read all the same
+        let mut world = table(true);
+        let one = run(&mut world, &wanted, 3, 0);
+        assert_eq!((one.vouts.len(), one.cut, one.reads), (3, true, 1), "pass one: one chunk whatever the clock says, the rest cut");
+        assert!(one.vouts.values().all(|v| *v == 1));
+        // WARM isolate, the clock spent on every pass, the SAME turn: the memo carries, the next chunk is the first
+        let two = run(&mut world, &wanted, 3, 0);
+        assert_eq!((two.vouts.len(), two.cut, two.reads), (6, true, 1), "pass two serves what pass one left");
+        assert!(wanted[3..6].iter().all(|(t, p)| two.vouts.contains_key(&pay_vout_key(t, p))));
+        let three = run(&mut world, &wanted, 3, 0);
+        assert_eq!((three.vouts.len(), three.cut, three.reads), (7, false, 1));
+        let four = run(&mut world, &wanted, 3, 0);
+        assert_eq!((four.vouts.len(), four.cut, four.reads), (7, false, 0), "a warm isolate that holds every answer reads nothing");
+        assert_eq!(world.asked.len(), 3);
+
+        // COLD isolates (no memo carried), the clock spent on every pass: the start chunk turns, so three passes
+        // cover the three chunks and no row is `null` on all of them
+        let mut served: HashSet<String> = HashSet::new();
+        let mut heads: HashSet<String> = HashSet::new();
+        for turn in 100..103u64 {
+            let mut cold = table(true);
+            let pass = run(&mut cold, &wanted, 3, turn);
+            assert_eq!(pass.reads, 1);
+            heads.insert(cold.asked[0][0].clone());
+            served.extend(pass.vouts.into_keys());
+        }
+        assert_eq!(heads.len(), 3, "each pass started at another chunk");
+        assert_eq!(served.len(), 7, "every row was served on one of the three passes");
+
+        // inside its own clock the step reads every chunk in one pass; a fault is counted and names nothing
+        let mut quick = table(false);
+        let all = run(&mut quick, &wanted, 3, 5);
+        assert_eq!((all.vouts.len(), all.cut, all.reads), (7, false, 3));
+        let mut down = table(false);
+        down.fault = true;
+        let before = PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed);
+        let none = run(&mut down, &wanted, 3, 0);
+        assert!(none.vouts.is_empty() && !none.cut && down.memo.is_empty(), "a fault answers nothing and memoises nothing");
+        assert!(PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed) >= before + 3);
+        // never wrong: bytes that do not hash to the asked txid name nothing
+        let mut lying = table(false);
+        let swapped = raws[&wanted[1].0].clone();
+        lying.raws.insert(wanted[0].0.clone(), swapped);
+        let pass = run(&mut lying, &wanted[..1], 3, 0);
+        assert!(pass.vouts.is_empty() && lying.memo.is_empty());
+        assert!(run(&mut table(true), &[], 3, 9).vouts.is_empty(), "nothing wanted: no read, no divide by zero");
+    }
+
     #[test]
     fn i512_m2_a_payout_row_names_the_owned_paying_output() {
         use crate::results::CommittedKeys;
