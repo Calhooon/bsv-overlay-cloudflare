@@ -1,0 +1,151 @@
+# Storage ownership (bsv-low #474)
+
+Who may write and who may read every persistent store of the LOW stack, with each table's rebuild class and its never-wipe flag. The machine-readable twin is `storage-ownership.json` at the repository root; `scripts/check-storage-ownership.py` (run by `make ci`) holds every SQL statement of `crates/overlay-cloudflare`, `crates/overlay-discovery` and `crates/low-app-layer` to it. This page and the JSON change together, in the same commit as the code that needs the change.
+
+The columns are those of bsv-low `docs/DECISION-470-DATA-WIPE-2026-09-19.md` section 2, kept current from now on. The never-wipe set is the owner's ruling of 2026-10-07 (bsv-low `docs/STATE.md`, "Owner decisions RULED 2026-10-07"): a never-wipe set exists, and any wipe moves LOW's own era cutoff only.
+
+## The model
+
+- **The shared D1.** The overlay and the app layer share ONE D1 per environment, binding `OVERLAY_DB`. The overlay owns the schema: its `OVERLAY_MIGRATIONS` (`crates/overlay-cloudflare/src/d1/mod.rs`) create every table. The app layer issues additive catch-up DDL for the columns and tables it reads (`crates/low-app-layer/src/schema.rs`, `LATCH_COLUMN_ALTERS` and `CREATE_TABLE_CATCHUPS`), each one byte-identical to an overlay migration; those are its CREATE and ALTER grants below.
+- **owner**: the crate whose statements own the rows; it may issue any statement on its table. **further writers**: every other write grant, by crate and statement. **readers**: read grants (a writer may read what it writes). The schema owner (`overlay-cloudflare`) may CREATE, ALTER and DROP every table of the shared D1.
+- **rebuild class** (#470 section 2): `chain` (the bytes are on chain; a re-index, a courier or a GASP peer can rebuild the row), `filings` (only the app layer's filed rows hold it), `transient` (a restart or the next read recomputes it), `lost` (nothing else holds it).
+- **never-wipe**: a table whose loss cannot be rebuilt from the chain, or whose rows are money evidence. A wipe of the shared D1 leaves every such table untouched.
+- **Crates and workers.** `overlay-cloudflare` is the `low-overlay` / `low-overlay-beta` worker (`wrangler.low.toml`) and the generic `bsv-overlay-cloudflare` (`wrangler.toml`). `low-app-layer` is `low-app-layer` / `low-app-layer-beta`. `overlay-discovery` is a library linked into both and issues no SQL of its own.
+
+## The databases
+
+| database | environments | owner | writers | readers | rebuild class | never-wipe | why |
+|---|---|---|---|---|---|---|---|
+| `low-overlay-db` | prod `low-overlay-db`, beta `low-overlay-db-beta` | low-overlay (the schema) | low-overlay, low-app-layer | low-overlay, low-app-layer | per table | **partial**: the 22 table rows marked below | the shared D1 (#470 section 2.1) |
+| `low-identity-db` | prod `low-identity-db`, beta `low-identity-db-beta` | `low-identity-node` | `low-identity-node` | `low-identity-resolver`; LOW's app layer through a service binding (never the database) | GASP resync from Zanaadu's peer | **yes, the whole database** | M29-2's identity node, a separate D1 per environment; the owner's ruling of 2026-10-07 |
+| the operator's own (`wrangler.toml`) | any | bsv-overlay-cloudflare | bsv-overlay-cloudflare | bsv-overlay-cloudflare | chain | no | the generic, non-LOW deployment of the same schema |
+
+`low-identity-db`'s tables are the identity node's (M29-2) and are listed in that node's repository; this manifest carries the database row so the never-wipe set is in one place.
+
+## The tables of `low-overlay-db`
+
+55 rows: 50 owned by `overlay-cloudflare`, 5 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `hop_chain_probes`). 22 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (a duplicate-offer fence) and `banned_hosts` (the operator's word, held nowhere else).
+
+The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` repeats it): INSERT `potparty_records`, INSERT and UPDATE `potrefund_records`, INSERT `hopsweep_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`, `lb_marker_rows`, `tx_any_verdicts`, `hop_chain_probes`, `ops_counters`, INSERT and DELETE `owed_rows`, INSERT and UPDATE `owed_state`; and the catch-up DDL (ALTER on `pot_records`, `potparty_records`, `hopparty_records`, `result_markers_v2`, `hand_markers`, `collected_markers_v2`; CREATE IF NOT EXISTS on `network_seen`, `collected_markers_v2`, `hand_markers`, `proof_posts`, `hopsweep_records`, `owed_rows`, `owed_state`).
+
+| table | owner | further writers | readers | rebuild class | never-wipe | why |
+|---|---|---|---|---|---|---|
+| `outputs` | overlay-cloudflare | none | none | chain | no | re-admission or a GASP peer re-feeds it; chain bytes |
+| `transactions` | overlay-cloudflare | none | low-app-layer | chain | no | the BEEF ancestry `/beef` and `/credit-beef` serve; a wipe is a re-fetch, not a loss |
+| `applied_transactions` | overlay-cloudflare | none | none | chain | no | dedup marks, re-derived on re-admission |
+| `low_records` | overlay-cloudflare | none | none | chain | no | lobby ads ride on chain |
+| `reveal_records` | overlay-cloudflare | none | none | chain | no | on chain; the tower's reveal scan falls back to the couriers, a wipe degrades, never concedes |
+| `pot_records` | overlay-cloudflare | low-app-layer: ALTER | low-app-layer | chain | **yes** | THE landing proof every credit reads (#470 section 3 item 7); every column re-derives from chain bytes only with a re-scan nobody has |
+| `pot_beefs` | overlay-cloudflare | none | low-app-layer | chain | no | liveness, not custody: the wallet's ancestry is re-fetchable |
+| `potparty_records` | overlay-cloudflare | low-app-layer: INSERT, ALTER | low-app-layer | filings | **yes** | filings since D11 (`filed:` rows never touch the chain): identity to pot, a fresh device's enumeration and `/owed`'s attribution (#470 section 3 item 4) |
+| `potrefund_records` | overlay-cloudflare | low-app-layer: INSERT, UPDATE | low-app-layer | filings | **yes** | the PRE-SIGNED refund raws, filed before the JOIN; `/internal/armed-pots` rebuilds the tower's alarm population from them (#470 section 3 item 3) |
+| `hopsweep_records` | low-app-layer | none | none | filings | **yes** | the seat's pre-signed sweep of its own funding hop, never on chain: the one claim path for a stranded hop from a new device (#470 section 3 item 5) |
+| `hopparty_records` | overlay-cloudflare | low-app-layer: ALTER | low-app-layer | chain | **yes** | money evidence: `/hops-view` and `/owed`'s hop-stranded / in-progress families read it; chain in principle, nothing re-scans for it (#470 section 3 item 6) |
+| `result_markers_v2` | overlay-cloudflare | low-app-layer: INSERT, ALTER | low-app-layer | filings | **yes** | filings since D11: the results' claims cannot be rebuilt from the chain |
+| `hand_markers` | overlay-cloudflare | low-app-layer: CREATE, ALTER | low-app-layer | chain | no | on chain (tm_hand); display only |
+| `proof_markers` | overlay-cloudflare | none | low-app-layer | chain | no | on chain; display only |
+| `collected_markers_v2` | overlay-cloudflare | low-app-layer: INSERT, CREATE, ALTER | low-app-layer | filings | **yes** | filings since D11 and money evidence: the "already collected" mark that suppresses a duplicate payout offer |
+| `proof_posts` | low-app-layer | none | none | filings | **yes** | the filed LOW/proof/v1 bundle; the winner's device held it once, nothing else does |
+| `lb_marker_rows` | overlay-cloudflare | low-app-layer: INSERT | low-app-layer | transient | no | the windowed query backfills it |
+| `network_seen` | overlay-cloudflare | low-app-layer: CREATE | low-app-layer | chain | no | re-ask Arcade; bar-lowering only |
+| `arc_terminal` | overlay-cloudflare | none | none | chain | no | re-askable |
+| `tx_any_verdicts` | overlay-cloudflare | low-app-layer: INSERT | low-app-layer | chain | no | re-askable negative memos (courier calls to rebuild) |
+| `hop_chain_probes` | low-app-layer | overlay-cloudflare: INSERT, DELETE | none | chain | no | courier memos, re-askable; the overlay expires them and marks them on a reorg |
+| `pot_evictions` | overlay-cloudflare | none | low-app-layer | lost | **yes** | admit-fast's eviction ledger: a readmission re-marks released spends FROM this row; nothing else holds it (#470 section 3 item 8) |
+| `owed_rows` | low-app-layer | none | none | transient | no | a pure derivation over the money tables; the next read recomputes |
+| `owed_state` | low-app-layer | none | none | transient | no | recomputed on the next read |
+| `chain_headers_seen` | overlay-cloudflare | none | none | transient | no | a cursor |
+| `reorg_sweep_state` | overlay-cloudflare | none | none | transient | no | a cursor |
+| `arcade_reorg_state` | overlay-cloudflare | none | none | transient | no | a cursor |
+| `relatch_cursors` | overlay-cloudflare | none | none | transient | no | a cursor |
+| `rebroadcast_state` | overlay-cloudflare | none | none | transient | no | a watch list |
+| `proofless_watch` | overlay-cloudflare | none | none | transient | no | a watch list, re-enrolled from transactions / pot_beefs |
+| `host_sync_state` | overlay-cloudflare | none | none | transient | no | a GASP cursor; the next sync walks again |
+| `gasp_peer_health` | overlay-cloudflare | none | none | transient | no | counters |
+| `ops_counters` | overlay-cloudflare | low-app-layer: INSERT | none | transient | no | operator counters |
+| `ops_heartbeat` | overlay-cloudflare | none | none | transient | no | a heartbeat |
+| `submit_refusals` | overlay-cloudflare | none | low-app-layer | transient | no | a census window (#366) |
+| `banned_hosts` | overlay-cloudflare | none | none | lost | **yes** | the operator's bans: nothing else holds them (export first) |
+| `ship_records` | overlay-cloudflare | none | none | chain | no | other overlays' adverts; tm_ship is not registered on LOW (empty) |
+| `slap_records` | overlay-cloudflare | none | none | chain | no | as ship_records |
+| `uhrp_records` | overlay-cloudflare | none | none | chain | no | not registered on LOW (empty) |
+| `agent_records` | overlay-cloudflare | none | none | chain | no | not registered on LOW (empty) |
+| `agent_capabilities` | overlay-cloudflare | none | none | chain | no | not registered on LOW (empty) |
+| `dm_delegation_records` | overlay-cloudflare | none | none | chain | no | not registered on LOW (empty) |
+| `result_markers` | overlay-cloudflare | none | none | chain | no | dead v1 shape, write-frozen, old-era rows on chain; display only |
+| `collected_markers` | overlay-cloudflare | none | none | chain | **yes** | dead v1 shape, write-frozen; kept because its rows are money evidence (a duplicate-offer fence for the old era) |
+| `pot_records_evicted` | overlay-cloudflare | none | low-app-layer | lost | **yes** | admit-fast's shadow twin of `pot_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `outputs_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `outputs`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `applied_transactions_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `applied_transactions`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `transactions_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `transactions`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `low_records_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `low_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `potparty_records_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `potparty_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `potrefund_records_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `potrefund_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `result_markers_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `result_markers`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `result_markers_v2_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `result_markers_v2`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `hand_markers_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `hand_markers`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+| `lb_marker_rows_evicted` | overlay-cloudflare | none | none | lost | **yes** | admit-fast's shadow twin of `lb_marker_rows`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8) |
+
+### Where this differs from the #470 write-up
+
+- #470 section 2.1 names "the app layer's record path" as a writer of `pot_records`. No production statement of `crates/low-app-layer` writes `pot_records` (its only statement there is the catch-up ALTER); the block-event pass the app layer drives reaches the overlay through the `OVERLAY` service binding, and the overlay writes the row.
+- `submit_refusals` (the #366 census window) is not in #470's inventory; it is listed here as `transient`.
+- `hop_chain_probes` is owned here by the app layer (it writes the memos); the overlay holds INSERT and DELETE on it (the reorg mark and the expiry, `hop_probe_memos.rs`).
+
+## Dynamic sites (string-built table names)
+
+A statement whose table name is not in the same string literal as its keyword (`FROM {table}`, `INSERT INTO "{}"`, a literal ending in `FROM `) cannot be resolved by the check. Each such site is pinned in `storage-ownership.json` `dynamic_sites` by file, statement and COUNT, with the tables it reaches named by hand and granted like any statement. A new dynamic site, or one fewer, is a red until the pin is re-read.
+
+| file | statement | count | tables reached |
+|---|---|---|---|
+| `crates/overlay-cloudflare/src/admit_fast.rs` | CREATE, ALTER | 1, 1 | the 11 `_evicted` twins |
+| `crates/overlay-cloudflare/src/admit_fast.rs` | INSERT, DELETE, SELECT | 2, 2, 5 | `MOVED_TABLES` (11) and their twins |
+| `crates/overlay-cloudflare/src/d1/mod.rs` | ALTER | 1 | none: `migration_error_is_benign`'s prefix test |
+| `crates/overlay-cloudflare/src/ops.rs` | SELECT | 1 | `pot_beefs`, `transactions` (`proofless_watch_enrol_sql`) |
+| `crates/low-app-layer/src/txany.rs` | SELECT | 1 | `pot_beefs`, `transactions` (`tx_any_index_leg_batch_sql`) |
+| `crates/low-app-layer/src/{logic,refund_backups,refund_view,results}.rs` | SELECT | 1 each | `potparty_records`, `hopparty_records`, `pot_records` (`FROM {party}`, the `party_candidates_sql` subquery) |
+
+## The check and its limits
+
+`python3 scripts/check-storage-ownership.py` reads every Rust string literal of the three crates (production code only: `tests/`, `examples/`, `benches/` and `#[cfg(test)]` items are skipped) and is red, naming the file, the line and the table, on: a write to a table the crate holds no grant for; a read the manifest does not grant; a table the manifest does not list (so a migration that adds a table must add its row here and in the JSON); an unpinned or miscounted dynamic site; a manifest row nothing creates; a non-owner grant no statement exercises; a table row this page does not name. One statement may be allowed in place by `// storage-ok(<table>): <reason>` on the literal's first line or the line above it. `--self-test` (also in `make ci`) plants a write into a table the crate only reads (red) and the same write under an allow (green), and pins each limit below.
+
+1. **String-built SQL.** Only SQL inside a string literal is seen; a table name built from a const or an argument is a dynamic site (above), never resolved.
+2. **Case.** Reads are seen by the UPPERCASE keywords `FROM` and `JOIN` only (prose in messages would flood a case-blind match); a lowercase read is unseen. Writes are matched case-blind but need their full shape (`INSERT INTO t`, `UPDATE t SET`, `DELETE FROM t`).
+3. **Joins and CTEs.** A comma join is followed; a CTE name (`name AS (`) defined anywhere in the same file is not a table; an upsert's `DO UPDATE SET` is not an UPDATE.
+4. **Files.** Only `.rs` and `.sql` files are read; SQL received at run time (none today) is out of reach.
+5. **Tests.** `#[cfg(test)]` is recognised on an item whose body is a brace block or ends at `;`; a test-only helper outside such an item is scanned as production code (which errs toward red).
+
+## The other stores (owners only)
+
+No cross-worker access exists today: each store below is read and written only by its owning worker; any other worker reaches it through that worker's routes or a service binding, never the store itself.
+
+### The app layer (`low-app-layer`)
+
+| store | owner | holds |
+|---|---|---|
+| `BoardView` DO | low-app-layer | an in-memory cache of the board and the results bodies (no `state.storage` call) |
+| `AuthSessionStore` DO + `AUTH_SESSIONS` KV | low-app-layer | BRC-103 sessions and the origin lanes |
+
+### The tower (bsv-low `workers/low-watchtower`)
+
+| store | owner | holds | never-wipe |
+|---|---|---|---|
+| `LowTower` DO key `record` + its storage alarm | low-watchtower | the parked pre-signed refund, lock height, watched outpoint, give-up height, state | **yes** |
+| `LowTower` DO key `candidates` | low-watchtower | the validated candidate set | **yes** |
+| `CoSigner` DO keys `case:{txid}:{vout}` (legacy `case`, `legacyCaseMigrated`) | low-watchtower | open and finalized cases | **yes** |
+| `CoSigner` DO keys `settledPot:{txid}:{vout}` | low-watchtower | the permanent already-co-signed fence | **yes** |
+| `CoSigner` DO keys `justification`, `cosignSeq`, `pending:{deadline}:{txid}:{vout}`, `pendingIndexMigrated`, `rateCount`, `rateWindowStart`, `nonceSeen:`, `nonceExp:`, `idSeen:`, `metric429Bucket:` | low-watchtower | the emitted J, the pending index, rate, nonce and identity housekeeping | **yes** (the class is never deleted) |
+| `MONITOR_KV` prefixes `pot:` (30-day TTL), `legacyFallback:`, `metric429:` | low-watchtower (read by `low-monitor`) | armed-pot breadcrumbs, legacy-fallback marks, 429 metrics | no (`pot:` is rebuilt from `potrefund_records` by `/internal/armed-pots`) |
+| `AuthSessionStore` DO + `AUTH_SESSIONS` KV | low-watchtower | BRC-103 sessions | no |
+
+### The relay (`~/bsv/rust-message-box`, `low-relay`)
+
+| store | owner | holds |
+|---|---|---|
+| D1 `low-relay-prod` / `low-relay-beta`: `messages`, `message_boxes` | low-relay | the hand transcripts (`low_game_*` retained 14 days), the events boxes |
+| D1: `transcript_tombstones`, `message_permissions`, `server_fees`, `device_registrations` | low-relay | purge marks, per-sender config, the fee table, push registrations |
+| `MessageHub`, `EngineIoSession`, `BroadcastRegistry` DOs; `AUTH_SESSIONS` KV; R2 `BEEF_BLOBS` (unused) | low-relay | socket, session and presence state |
+
+## Changing this
+
+A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.json` and in the table above, in one commit; the check is red until all three agree. A new cross-crate write or read: the grant in the JSON with the reason in the row's `why`, reviewed like code. A table that leaves the never-wipe set needs the owner's word.
