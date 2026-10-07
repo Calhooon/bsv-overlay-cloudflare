@@ -3145,8 +3145,9 @@ pub(crate) async fn owed_recompute(
     //    is byte-format admitted, a stranger can plant a row naming any (identity, game); only a signature the
     //    identity itself made retires a payout; presence is display provenance). A read fault is counted and leaves
     //    both sets empty (the rows stay: the safe direction).
-    let mut collected_verified: HashSet<String> = HashSet::new();
-    let mut collected_present: HashSet<String> = HashSet::new();
+    //    bsv-low #492: the same rows carry the identity's held filings (`LOW/collected/v2`), matched to their
+    //    paying transactions below (step 6d); the fold is `owed::CollectedFold`.
+    let mut collected = crate::owed::CollectedFold::default();
     {
         #[derive(Deserialize)]
         struct CollectedRowD1 {
@@ -3154,6 +3155,8 @@ pub(crate) async fn owed_recompute(
             game_id: String,
             #[serde(rename = "sigHex", default)]
             sig_hex: Option<String>,
+            #[serde(default)]
+            txid: Option<String>,
         }
         // every spent pot's game AND every hop's game (a swept hop-only game has no pot row; its payout retires by
         // its game's filing too — the collect pass of 2026-09-19 filed five that stood)
@@ -3163,7 +3166,7 @@ pub(crate) async fn owed_recompute(
         );
         for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
             let marks = vec!["?"; chunk.len()].join(", ");
-            let sql = format!("SELECT gameId, sigHex FROM collected_markers_v2 WHERE identity = ? AND gameId IN ({marks})");
+            let sql = crate::owed::collected_rows_sql(&marks);
             let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() + 1);
             b.push(JsValue::from_str(identity_lc));
             for g in chunk {
@@ -3176,11 +3179,7 @@ pub(crate) async fn owed_recompute(
             match rows {
                 Ok(rows) => {
                     for r in rows {
-                        let g = r.game_id.to_ascii_lowercase();
-                        collected_present.insert(g.clone());
-                        if r.sig_hex.as_deref().is_some_and(|sig| crate::record_post::collected_sig_verifies(identity_lc, &g, sig)) {
-                            collected_verified.insert(g);
-                        }
+                        collected.row(identity_lc, &r.game_id, r.sig_hex.as_deref(), r.txid.as_deref());
                     }
                 }
                 Err(e) => {
@@ -3422,6 +3421,23 @@ pub(crate) async fn owed_recompute(
     // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
     //    thousands of `unbound` rows; the actionable ones are written first, the list is CUT and says so)
     let no_home_words: HashMap<String, crate::owed::HomeSpendWord> = HashMap::new();
+    // 6d. bsv-low #492 / #512: the payouts this identity's wallet ALREADY HOLDS by its own signed word: each held
+    //     filing's signature tried against its game's payout transactions (`owed::payout_pay_txids`), the door's
+    //     own replay, inside a signature budget. A row such a filing names is not served.
+    let crate::owed::CollectedFold { verified: collected_verified, present: collected_present, held_sigs } = collected;
+    let held_verified: HashSet<String> = if held_sigs.is_empty() {
+        HashSet::new()
+    } else {
+        let names = crate::owed::payout_pay_txids(&results, &hops, &hop_sweeps, &hop_chain, &pot_spenders);
+        let (held, untried) = crate::owed::held_filings_verified(&held_sigs, &names, crate::owed::OWED_HELD_VERIFIES_PER_RECOMPUTE, |g, t, sig| {
+            crate::record_post::held_sig_verifies(identity_lc, g, t, sig)
+        });
+        crate::owed::note_held_filings(held.len(), untried);
+        if untried > 0 {
+            console_warn!("[owed] {untried} held filing(s) left untried by the signature budget (their rows stay served this pass)");
+        }
+        held
+    };
     let mut inputs = OwedInputs {
         identity_lc,
         tip,
@@ -3432,6 +3448,7 @@ pub(crate) async fn owed_recompute(
         valid_refunds: &valid_refunds,
         collected_verified: &collected_verified,
         collected_present: &collected_present,
+        held_verified: &held_verified,
         pot_spenders: &pot_spenders,
         pot_spenders_faulted,
         hop_chain: &hop_chain,

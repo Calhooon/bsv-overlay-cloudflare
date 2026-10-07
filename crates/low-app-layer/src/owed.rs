@@ -21,7 +21,8 @@
 //!   claim; the reason rides the row.
 //!
 //! NOT a row, by construction: a decided LOSS; a payout with a `collected`
-//! filing; a written-off era pot (the views' era clause); a pot the identity
+//! filing; a payout whose paying transaction the identity's own held filing
+//! names (bsv-low #492: the wallet already holds it); a written-off era pot (the views' era clause); a pot the identity
 //! is not a party to (the views' party window).
 //!
 //! The derivation is PURE over rows this crate already serves (`ResultEntry`,
@@ -671,6 +672,14 @@ pub struct OwedInputs<'a> {
     pub collected_verified: &'a HashSet<String>,
     /// game ids (lowercase) with ANY `collected` row naming this identity (byte-format admission: plantable; never a gate).
     pub collected_present: &'a HashSet<String>,
+    /// bsv-low #492 / #512: the payouts this identity's WALLET ALREADY HOLDS, by its own signed word: one
+    /// [`held_key`] per (game, paying txid) a held filing (`LOW/collected/v2`, `record_post`) of this identity
+    /// verified over ([`held_filings_verified`]). The app layer cannot see a wallet; the device can (its ledger
+    /// holds the txid the live credit landed, or its wallet answered a press as already known), and it says so
+    /// with no press and no credit. A payout row whose paying transaction is named here is not a row. Unlike the
+    /// v1 marker this names the TRANSACTION, so it retires exactly one row whatever the game's candidate count
+    /// (N10), and it stops applying if the pot's spend is ever replaced by another transaction.
+    pub held_verified: &'a HashSet<String>,
     /// hop spender txids (lowercase) that ARE LOW pots (`pot_records` holds them).
     pub pot_spenders: &'a HashSet<String>,
     /// True when the pot-spenders read FAULTED: a spent hop is then "could not check", never a story.
@@ -890,6 +899,141 @@ pub fn collected_lookup_games<'a>(spent_result_games: impl Iterator<Item = &'a s
     games
 }
 
+/// The recompute's read of this identity's `collected_markers_v2` rows over one chunk of games (`marks` is the
+/// chunk's `?, ?, ...`): the v1 markers and, since bsv-low #492, the held filings beside them (`txid` tells a
+/// FILED row from a chain one). Binds: the identity, then the game ids.
+pub fn collected_rows_sql(marks: &str) -> String {
+    format!("SELECT gameId, sigHex, txid FROM collected_markers_v2 WHERE identity = ? AND gameId IN ({marks})")
+}
+
+/// What one identity's `collected_markers_v2` rows say, folded (the recompute's step 5).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CollectedFold {
+    /// games whose v1 marker VERIFIED under the identity ([`OwedInputs::collected_verified`]).
+    pub verified: HashSet<String>,
+    /// games with any row at all ([`OwedInputs::collected_present`]).
+    pub present: HashSet<String>,
+    /// game to the signatures of its FILED rows that are not the v1 marker: the held filings (bsv-low #492),
+    /// matched to their paying transactions by [`held_filings_verified`]. A chain row is never one (the topic
+    /// manager admits the v1 tag alone), so a stranger's planted rows add nothing here; at most
+    /// `HELD_FILINGS_PER_GAME + 1` per game are kept (the door's cap on what the identity can file).
+    pub held_sigs: HashMap<String, Vec<String>>,
+}
+
+impl CollectedFold {
+    /// Fold one row (`gameId`, `sigHex`, `txid` as [`collected_rows_sql`] reads them) of `identity_lc`.
+    pub fn row(&mut self, identity_lc: &str, game_id: &str, sig_hex: Option<&str>, txid: Option<&str>) {
+        let g = game_id.to_ascii_lowercase();
+        self.present.insert(g.clone());
+        let Some(sig) = sig_hex else { return };
+        if crate::record_post::collected_sig_verifies(identity_lc, &g, sig) {
+            self.verified.insert(g);
+        } else if txid.is_some_and(|t| t.starts_with("filed:")) {
+            let sigs = self.held_sigs.entry(g).or_default();
+            if sigs.len() < crate::record_post::HELD_FILINGS_PER_GAME as usize + 1 && !sigs.iter().any(|s| s == sig) {
+                sigs.push(sig.to_string());
+            }
+        }
+    }
+}
+
+/// The key of [`OwedInputs::held_verified`]: `<gameId>:<payTxid>`, lowercase.
+pub fn held_key(game_id: &str, pay_txid: &str) -> String {
+    format!("{}:{}", game_id.to_ascii_lowercase(), pay_txid.to_ascii_lowercase())
+}
+
+/// The fact a payout row carries beside `payTxid` (bsv-low #492): the filing a device whose wallet already holds
+/// that transaction signs and posts to `/record?kind=collected` to retire the row with no press.
+pub const HELD_FILING_TAG: &str = "LOW/collected/v2";
+
+/// Signature checks one recompute spends on held filings (each is one key derivation and one ECDSA verify). A
+/// filing is tried against its game's payout transactions only, and stops at the first it verifies over, so the
+/// honest cost is one check per filing. Past the budget the remaining filings retire nothing THIS pass (their rows
+/// stay served, the pre-#492 state; counted, `heldVerifiesOverBudget`). STATED RESIDUAL: the order is the sorted
+/// games', so an identity whose window holds more filings than this keeps its last games' rows served.
+pub const OWED_HELD_VERIFIES_PER_RECOMPUTE: usize = 256;
+
+/// PURE (bsv-low #492): every (game, transaction) that can pay this identity a payout row, lowercase: a spent
+/// pot's spender (`settle_txid`: the settle or the refund), and a hop's NON-POT spender as the index, the chain
+/// rung or the identity's filed sweep names it (the JOIN that took a hop pays nobody's home). A superset of the
+/// derivation's rows on purpose (it only bounds what a held filing's signature is tried against; a filing that
+/// verifies over a transaction no row rests on retires nothing). Sorted, deduplicated.
+pub fn payout_pay_txids(
+    results: &[ResultEntry],
+    hops: &[HopEntry],
+    hop_sweeps: &HashMap<String, crate::hopsweep::FiledHopSweep>,
+    hop_chain: &HashMap<String, HopChainWord>,
+    pot_spenders: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for e in results {
+        if let (Some(true), Some(t)) = (e.spent, e.settle_txid.as_deref()) {
+            out.push((e.game_id.to_ascii_lowercase(), t.to_ascii_lowercase()));
+        }
+    }
+    for h in hops {
+        let game = h.game_id.to_ascii_lowercase();
+        let outpoint = outpoint_key(&h.hop_txid, h.hop_vout);
+        let named = [
+            h.spending_txid.as_deref(),
+            hop_chain.get(&outpoint).and_then(|w| w.spending_txid.as_deref()),
+            hop_sweeps.get(&outpoint).map(|f| f.sweep_txid.as_str()),
+        ];
+        for t in named.into_iter().flatten().map(str::to_ascii_lowercase) {
+            if !pot_spenders.contains(&t) {
+                out.push((game.clone(), t));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// PURE (bsv-low #492): the [`held_key`]s this identity's stored held filings verify over. `held_sigs` is game id
+/// (lowercase) to the signatures of its FILED rows that are not the v1 marker; `verify(game, txid, sig)` is the
+/// door's own replay (`record_post::held_sig_verifies` under the walking identity). Returns the set and the count
+/// of filings the budget left untried.
+pub fn held_filings_verified(
+    held_sigs: &HashMap<String, Vec<String>>,
+    pay_txids: &[(String, String)],
+    budget: usize,
+    verify: impl Fn(&str, &str, &str) -> bool,
+) -> (HashSet<String>, usize) {
+    let mut verified: HashSet<String> = HashSet::new();
+    let (mut spent, mut untried) = (0usize, 0usize);
+    let mut games: Vec<&String> = held_sigs.keys().collect();
+    games.sort_unstable();
+    for game in games {
+        let txids: Vec<&str> = pay_txids.iter().filter(|(g, _)| g == game).map(|(_, t)| t.as_str()).collect();
+        if txids.is_empty() {
+            continue;
+        }
+        for sig in &held_sigs[game] {
+            let mut tried_all = true;
+            for t in &txids {
+                let key = held_key(game, t);
+                if verified.contains(&key) {
+                    continue; // another filing of this game already named it
+                }
+                if spent >= budget {
+                    tried_all = false;
+                    break;
+                }
+                spent += 1;
+                if verify(game, t, sig) {
+                    verified.insert(key);
+                    break;
+                }
+            }
+            if !tried_all {
+                untried += 1;
+            }
+        }
+    }
+    (verified, untried)
+}
+
 /// PURE (#517, the gate's LOW-1): the hop's own row or the chain rung names a DIFFERENT tx as its CONFIRMED spender.
 /// The index's proof of the filed sweep never outranks that word (a reorg replaced the sweep's block with a competing
 /// spend and the latch was missed): the ladder below follows the chain's spender, as before the proof existed.
@@ -1010,6 +1154,9 @@ pub fn courier_home_outputs(i: &OwedInputs) -> Vec<CourierHomeOutput> {
         let Some(swept) = swept_home(i, h) else { continue };
         if swept.source != "courier-bytes" || !swept.confirmed || swept.output_spent {
             continue;
+        }
+        if i.held_verified.contains(&held_key(&game, &swept.sweep_txid)) {
+            continue; // bsv-low #492: retired by the identity's held filing, nothing to walk
         }
         let Some(pkh) = i.my_pkh_by_game.get(&game) else { continue };
         for (vout, sats) in &swept.home_outputs {
@@ -1141,6 +1288,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
                 let pays_me = matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund);
                 if pays_me && e.verdict.is_some() {
+                    // bsv-low #492 / #512: the identity's wallet ALREADY HOLDS this payout, by its own verified held
+                    // filing naming the paying transaction (the live credit landed it and the closing page dropped
+                    // the v1 filing; 118 presses of the two collect passes said "Collected" over such rows). Not a
+                    // row: there is nothing to collect and so nothing to press. It names the TRANSACTION, so the
+                    // candidate count (N10) does not matter, and a pot whose spend becomes another transaction is
+                    // served again.
+                    if e.settle_txid.as_deref().is_some_and(|t| i.held_verified.contains(&held_key(&game, t))) {
+                        continue;
+                    }
                     let mut facts = base_facts.clone();
                     facts["claim"] = json!("internalize");
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
@@ -1155,6 +1311,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
                     facts["collectedSigVerified"] = json!(verified_collected);
                     facts["creditBeef"] = json!(e.settle_txid.as_ref().map(|t| format!("/credit-beef/{t}")));
+                    // bsv-low #492 / #512: WHAT a device asks its own wallet about before it offers the press (does
+                    // the ledger already hold this transaction?) and what its held filing names when it does
+                    facts["payTxid"] = json!(e.settle_txid.as_ref().map(|t| t.to_ascii_lowercase()));
+                    facts["heldFiling"] = json!(HELD_FILING_TAG);
                     facts["payASats"] = json!(e.money.settle.as_ref().and_then(|s| s.pay_a_sats));
                     facts["payBSats"] = json!(e.money.settle.as_ref().and_then(|s| s.pay_b_sats));
                     rows.push(OwedRow {
@@ -1340,6 +1500,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1 {
                 continue;
             }
+            // bsv-low #492 / #512: the wallet already holds this sweep's payout (the identity's held filing names
+            // the sweep): not a row, whichever proof named the sweep (a courier-proven one included)
+            if i.held_verified.contains(&held_key(&game, &swept.sweep_txid)) {
+                continue;
+            }
             let mut facts = facts_base.clone();
             facts["claim"] = json!("internalize");
             facts["claimable"] = json!(swept.confirmed);
@@ -1384,6 +1549,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
             }
             facts["creditBeef"] = json!(format!("/credit-beef/{}", swept.sweep_txid));
+            // bsv-low #492 / #512: the paying transaction a device asks its wallet about and names in a held filing
+            facts["payTxid"] = json!(swept.sweep_txid.to_ascii_lowercase());
+            facts["heldFiling"] = json!(HELD_FILING_TAG);
             facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
             facts["collectedSigVerified"] = json!(verified_collected);
             rows.push(OwedRow {
@@ -1897,6 +2065,14 @@ pub fn note_read_refresh(kicked: bool) {
 pub fn note_collected_read_fault() {
     COLLECTED_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+static HELD_VERIFIES_OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
+static HELD_FILINGS_VERIFIED: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #492: one recompute's held filings: how many (game, txid) names verified, how many filings the
+/// signature budget left untried.
+pub fn note_held_filings(verified: usize, untried: usize) {
+    HELD_FILINGS_VERIFIED.fetch_add(verified as u64, Ordering::Relaxed);
+    HELD_VERIFIES_OVER_BUDGET.fetch_add(untried as u64, Ordering::Relaxed);
+}
 pub fn note_pot_spenders_read_fault() {
     POT_SPENDERS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -1979,6 +2155,9 @@ pub fn owed_health_json() -> Value {
         "recomputeLockTakeovers": RECOMPUTE_LOCK_TAKEOVERS.load(Ordering::Relaxed),
         "recomputeWritesSuperseded": RECOMPUTE_WRITES_SUPERSEDED.load(Ordering::Relaxed),
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
+        "heldFilingsVerified": HELD_FILINGS_VERIFIED.load(Ordering::Relaxed),
+        "heldVerifiesOverBudget": HELD_VERIFIES_OVER_BUDGET.load(Ordering::Relaxed),
+        "heldVerifiesPerRecompute": OWED_HELD_VERIFIES_PER_RECOMPUTE,
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofsReadFaults": SWEEP_PROOFS_READ_FAULTS.load(Ordering::Relaxed),
@@ -2348,6 +2527,7 @@ mod tests {
             valid_refunds: valid,
             collected_verified,
             collected_present: &NONE,
+            held_verified: &NONE,
             pot_spenders: pots,
             pot_spenders_faulted: false,
             hop_chain: &NO_CHAIN,
@@ -3194,6 +3374,217 @@ mod tests {
         let mut i = inputs(&paid, &[], &hops, &v, &verified, &no_pots, Some(900_200));
         i.hop_sweeps = &sweeps;
         assert_eq!(derive_owed_rows(&i).len(), 2);
+    }
+
+    /// bsv-low #492 / #512 (the collect pass's class: "collected N but the wallet read X to X"): a payout whose
+    /// paying transaction the identity's wallet ALREADY HOLDS, said by its own verified held filing, is not a row,
+    /// so there is nothing to press. The filing names the transaction: another transaction's payout stays.
+    #[test]
+    fn i492_a_payout_the_wallet_already_holds_is_not_served_and_the_filing_names_one_transaction_only() {
+        let won = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        // before any filing: the row is served claimable, and it names what a device asks its wallet about
+        let rows = derive_owed_rows(&inputs(&won, &[], &[], &v, &c, &p, Some(900_200)));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["payTxid"], tx(0x03));
+        assert_eq!(rows[0].facts["heldFiling"], HELD_FILING_TAG);
+        // the wallet holds the settle (the live credit landed it): not a row
+        let held: HashSet<String> = [held_key(&tx(0x01), &tx(0x03))].into_iter().collect();
+        let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
+        i.held_verified = &held;
+        assert!(derive_owed_rows(&i).is_empty(), "held: nothing to collect, nothing to press");
+        // a filing naming ANOTHER transaction (a spend of the pot that was replaced, another game's) retires nothing
+        for other in [held_key(&tx(0x01), &tx(0x04)), held_key(&tx(0x09), &tx(0x03))] {
+            let held: HashSet<String> = [other].into_iter().collect();
+            let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
+            i.held_verified = &held;
+            let rows = derive_owed_rows(&i);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].facts["claimable"], true);
+        }
+        // a decided loss stays no row, an unspent pot is untouched by a filing naming a txid it does not have
+        let open = [entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let mut i = inputs(&open, &[], &[], &v, &c, &p, Some(899_000));
+        i.held_verified = &held;
+        assert_eq!(derive_owed_rows(&i).len(), 1);
+    }
+
+    /// N10 closed for a device that says WHICH: two payouts under one game (the pot paid AND a hop's sweep came
+    /// home). The v1 marker retires neither (it cannot say which); a held filing retires exactly the one it names,
+    /// and the other stays claimable until its own.
+    #[test]
+    fn i492_a_held_filing_retires_exactly_its_payout_when_the_game_has_two() {
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let v1: HashSet<String> = [tx(0x01)].into_iter().collect();
+        let rows_with = |held: &HashSet<String>| {
+            let mut i = inputs(&paid, &[], &hops, &v, &v1, &no_pots, Some(900_200));
+            i.hop_sweeps = &sweeps;
+            i.held_verified = held;
+            derive_owed_rows(&i)
+        };
+        assert_eq!(rows_with(&HashSet::new()).len(), 2, "the v1 marker alone cannot say which");
+        // the swept hop's row names its sweep as the paying transaction
+        let both = rows_with(&HashSet::new());
+        let sweep_row = both.iter().find(|r| r.outpoint == key).unwrap();
+        assert_eq!(sweep_row.facts["payTxid"], sweep);
+        assert_eq!(sweep_row.facts["heldFiling"], HELD_FILING_TAG);
+        // the wallet holds the pot's payout: the sweep's row stays
+        let held_pot: HashSet<String> = [held_key(&tx(0x01), &tx(0x03))].into_iter().collect();
+        let rows = rows_with(&held_pot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outpoint, key);
+        assert_eq!(rows[0].facts["claimable"], true);
+        // the wallet holds the sweep: the pot's row stays
+        let held_sweep: HashSet<String> = [held_key(&tx(0x01), &sweep)].into_iter().collect();
+        let rows = rows_with(&held_sweep);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outpoint, format!("{}:0", tx(0x02)));
+        // both held: nothing is served
+        let held_both: HashSet<String> = held_pot.union(&held_sweep).cloned().collect();
+        assert!(rows_with(&held_both).is_empty());
+        // a swept hop's payout that is the game's only one retires by its held filing with no v1 marker at all
+        let mut i = inputs(&[], &[], &hops, &v, &NONE, &no_pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        i.held_verified = &held_sweep;
+        assert!(derive_owed_rows(&i).is_empty());
+    }
+
+    /// The names a held filing's signature is tried against, and the trial: only FILED signatures of a game, only
+    /// that game's payout transactions (never the JOIN that took a hop), first hit wins, the budget counted.
+    #[test]
+    fn i492_held_filings_verify_over_their_games_payout_transactions_within_a_budget() {
+        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A)), entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let join = tx(0x0d);
+        let hops = [hop(HopStatus::Spent, Some(&join), Some(10_000_000))];
+        let sweeps = filed(&key, &sweep);
+        let chain_word = chain(&key, true, Some(true), Some(&tx(0x0e)));
+        let pots: HashSet<String> = [join.clone()].into_iter().collect();
+        let names = payout_pay_txids(&paid, &hops, &sweeps, &chain_word, &pots);
+        assert_eq!(names, vec![(tx(0x01), tx(0x03)), (tx(0x01), sweep.clone()), (tx(0x01), tx(0x0e))], "the settle, the filed sweep, the chain rung's spender; never the JOIN, never an unspent pot");
+        // a signature is "valid" here for exactly one (game, txid); the closure counts its calls
+        let calls = std::cell::Cell::new(0usize);
+        let verify = |g: &str, t: &str, sig: &str| {
+            calls.set(calls.get() + 1);
+            sig == format!("sig-{g}-{t}")
+        };
+        let mut sigs: HashMap<String, Vec<String>> = HashMap::new();
+        sigs.insert(tx(0x01), vec![format!("sig-{}-{}", tx(0x01), sweep), "junk".to_string()]);
+        sigs.insert(tx(0x09), vec![format!("sig-{}-{}", tx(0x09), tx(0x03))]); // a game with no payout transaction: never tried
+        let (held, untried) = held_filings_verified(&sigs, &names, OWED_HELD_VERIFIES_PER_RECOMPUTE, verify);
+        assert_eq!(held, [held_key(&tx(0x01), &sweep)].into_iter().collect::<HashSet<String>>());
+        assert_eq!(untried, 0);
+        assert_eq!(calls.get(), 2 + 2, "the hit stops at its txid (2 tries); the junk signature tries the two names left");
+        // the budget: one check buys nothing here (the first name is the settle), and the filings left are counted
+        calls.set(0);
+        let (held, untried) = held_filings_verified(&sigs, &names, 1, verify);
+        assert!(held.is_empty());
+        assert_eq!((untried, calls.get()), (2, 1));
+    }
+
+    /// bsv-low #492 / #512 END TO END on real SQLite and real signatures: the door's verdict on a device's held
+    /// filing, the production table's row, the recompute's read and fold, the signature matched to the game's
+    /// payout transactions, and the row gone. The shape is the collect pass's: the wallet holds the settle (the
+    /// live credit), no v1 marker was ever filed, the row was served claimable and a press said "Collected".
+    #[test]
+    fn i492_a_devices_held_filing_retires_its_payout_through_the_door_the_table_and_the_read_on_real_sqlite() {
+        use crate::record_post::tests::{identity, script, sign, wallet};
+        use crate::record_post::{
+            cap_refusal, collected_protocol, held_challenge, held_sig_verifies, verify_record_post, RecordKind, RecordRefusal, VerifiedRecord,
+            COLLECTED_FILED_ROWS_SQL, COLLECTED_FILE_SQL, HELD_FILINGS_PER_GAME, HELD_TAG,
+        };
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "production migration failed under real SQLite: {e}");
+            }
+        }
+        let w = wallet(21);
+        let id = identity(&w);
+        let me = hex::encode(&id);
+        let (gid, settle, sweep_b) = ([0x01u8; 32], [0x03u8; 32], [0x0cu8; 32]);
+        let (game, sweep) = (tx(0x01), tx(0x0c));
+        // the game pays this seat twice: the pot's payout (settle 03..) and a swept hop's (sweep 0c..)
+        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let hop_key = format!("{}:0", tx(0x07));
+        let sweeps = filed(&hop_key, &sweep);
+        let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        mined.spent_confirmed = Some(true);
+        let hops = [mined];
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        // the door, then the table (the route's own statements and bind order)
+        let file = |pay: &[u8; 32], signer: &bsv_rs::wallet::ProtoWallet, created_at: i64| -> std::result::Result<String, RecordRefusal> {
+            let sig = sign(signer, collected_protocol(), &game, &held_challenge(&game, &me, &hex::encode(pay)));
+            let verified = verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, pay, &sig]), &me)?;
+            let VerifiedRecord::Held(r, _) = &verified else { panic!("a held filing") };
+            let others: i64 = conn.query_row(COLLECTED_FILED_ROWS_SQL, rusqlite::params![r.identity, r.game_id, r.txid], |row| row.get(0)).unwrap();
+            if let Some(refusal) = cap_refusal(RecordKind::Collected, others, 0) {
+                return Err(refusal);
+            }
+            conn.execute(COLLECTED_FILE_SQL, rusqlite::params![r.identity, r.game_id, r.txid, 0i64, r.sig_hex, created_at]).unwrap();
+            Ok(r.txid.clone())
+        };
+        // the recompute's read and fold, then the match and the derivation
+        let served = || -> Vec<OwedRow> {
+            let mut fold = CollectedFold::default();
+            let mut stmt = conn.prepare(&collected_rows_sql("?")).unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![me, game], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))
+                .unwrap();
+            for r in rows {
+                let (g, sig, txid) = r.unwrap();
+                fold.row(&me, &g, sig.as_deref(), txid.as_deref());
+            }
+            let names = payout_pay_txids(&paid, &hops, &sweeps, &NO_CHAIN, &no_pots);
+            let (held, untried) = held_filings_verified(&fold.held_sigs, &names, OWED_HELD_VERIFIES_PER_RECOMPUTE, |g, t, sig| held_sig_verifies(&me, g, t, sig));
+            assert_eq!(untried, 0);
+            let mut i = inputs(&paid, &[], &hops, &v, &fold.verified, &no_pots, Some(900_200));
+            i.identity_lc = &me;
+            i.collected_present = &fold.present;
+            i.held_verified = &held;
+            i.hop_sweeps = &sweeps;
+            derive_owed_rows(&i)
+        };
+        // RED's shape: nothing filed, both payouts served claimable (the press that said "Collected")
+        let rows = served();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.family == OwedFamily::Payout && r.facts["claimable"] == true));
+        // a stranger cannot retire it: its signature is refused at the door, and a row it plants through the
+        // chain's byte-format admission (any signature bytes, a chain txid) is presence only
+        assert_eq!(file(&settle, &wallet(22), 100).unwrap_err(), RecordRefusal::SignatureInvalid);
+        let planted = hex::encode(sign(&wallet(22), collected_protocol(), &game, &held_challenge(&game, &me, &tx(0x03))));
+        conn.execute(COLLECTED_FILE_SQL, rusqlite::params![me, game, tx(0xee), 0i64, planted, 100i64]).unwrap();
+        assert_eq!(served().len(), 2);
+        // the device's wallet holds the settle: it files, and the pot's payout is gone; the sweep's stays
+        let key = file(&settle, &w, 200).unwrap();
+        let rows = served();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outpoint, hop_key);
+        assert_eq!(rows[0].facts["payTxid"], sweep);
+        assert_eq!(rows[0].facts["collectedMarkerPresent"], true, "the planted row is provenance, as before");
+        // filed again (a fresh signature, another device of the identity): the same row, nothing changes
+        assert_eq!(file(&settle, &w, 300).unwrap(), key);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM collected_markers_v2 WHERE identity = ?1 AND txid LIKE 'filed:%'", rusqlite::params![me], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(served().len(), 1);
+        // the wallet holds the sweep too: nothing is served
+        file(&sweep_b, &w, 400).unwrap();
+        assert!(served().is_empty());
+        // the cap: the identity's own filings for one game are bounded (v1 + HELD_FILINGS_PER_GAME rows)
+        for b in 0..(HELD_FILINGS_PER_GAME - 1) as u8 {
+            file(&[0x90 + b; 32], &w, 500).unwrap();
+        }
+        assert_eq!(file(&[0xa0; 32], &w, 500).unwrap_err(), RecordRefusal::TooManyFiled);
+        assert!(served().is_empty(), "filings that name no payout transaction of the game change nothing");
     }
 
     #[test]
