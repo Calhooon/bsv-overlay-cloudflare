@@ -24,7 +24,9 @@
  *  4. the brain's recompute ceiling: identity B's pot is announced 13 times inside one minute through
  *     `/internal/pot-changed` (each waited out, so none is folded into an in-flight one). The announcement names
  *     BOTH seats (B and B's opponent), so each ask is two recomputes, one per identity, and each identity's 13th
- *     is shed: `recomputeBySource.pot-changed` moves by 24 and `/health.owed.recomputeShed` by exactly 2.
+ *     is shed: `recomputeBySource.pot-changed` moves by 24 and `/health.owed.recomputeShed` by exactly 2. Each
+ *     hook answer carries its `d1` segment, the hooks are keyed `/internal` and every walk after the answer
+ *     `owed-recompute` on `d1Budget` (the lens fold's M2 and M3).
  *
  * Exit 0 = every expectation held.
  */
@@ -200,6 +202,8 @@ const measured = {}
   const t0 = Date.now()
   const asks = (ceiling ?? 12) + 1
   const SEATS = 2 // the announcement names both seats of B's pot: one recompute per identity per ask
+  const b0 = (await appHealth()).d1Budget
+  let hookUnstamped = 0 // the lens fold's M2: a hook's own answer carries its D1 figures too
   for (let i = 0; i < asks; i++) {
     const r = await get(APP, '/internal/pot-changed', {
       method: 'POST',
@@ -210,6 +214,7 @@ const measured = {}
       fail(`pot-changed ask ${i + 1} answers`, `${r.status}: ${r.text.slice(0, 200)}`)
       break
     }
+    if (!segment(r.timing, 'd1')) hookUnstamped++
     // the recompute runs after the answer: wait it out, so the next ask is a recompute and not a folded one
     const settled = await pollFor(async () => {
       const o = (await appHealth()).owed
@@ -228,6 +233,16 @@ const measured = {}
   else if (ran === SEATS * ceiling && shed === SEATS && h1.recomputeFaults === h0.recomputeFaults && h1.recomputeAtCeiling >= SEATS)
     pass(`the ceiling sheds: ${asks} announcements of B's pot in ${elapsed} ms, ${ran} recomputes ran (${ceiling} per seat), each seat's ${asks}th shed (recomputeShed +${shed}, recomputeAtCeiling ${h1.recomputeAtCeiling})`)
   else fail('the ceiling sheds the 13th recompute of each identity inside a minute', `ran ${ran} (want ${SEATS * ceiling}), shed ${shed} (want ${SEATS}), atCeiling ${h1.recomputeAtCeiling}, faults +${h1.recomputeFaults - h0.recomputeFaults}`)
+  // the lens fold's M2 and M3: the hooks run under the ledger (`/internal`), and each walk after the answer is
+  // keyed `owed-recompute` (before, both landed only in `unscoped`)
+  if (hookUnstamped === 0) pass(`every /internal/pot-changed answer carries d1;desc= (${asks} of ${asks})`)
+  else fail('a hook route answers with its D1 figures', `${hookUnstamped} of ${asks} answers carry no d1 segment`)
+  const b1 = (await appHealth()).d1Budget
+  const moved = (route) => (b1?.routes?.[route]?.requests ?? 0) - (b0?.routes?.[route]?.requests ?? 0)
+  if (moved('/internal') >= asks) pass(`d1Budget keys the hooks under /internal (+${moved('/internal')} requests)`)
+  else fail('d1Budget keys the hooks under /internal', `+${moved('/internal')} requests (want at least ${asks})`)
+  if (moved('owed-recompute') >= ran && ran > 0) pass(`d1Budget keys each detached walk under owed-recompute (+${moved('owed-recompute')}, max reads ${b1.routes['owed-recompute'].max.reads})`)
+  else fail('d1Budget keys each detached walk under owed-recompute', `+${moved('owed-recompute')} (want at least ${ran})`)
 }
 
 console.log('\n── bsv-low #499 D1 budget tier ──')

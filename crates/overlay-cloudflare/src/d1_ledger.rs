@@ -143,6 +143,31 @@ pub fn record(route: &'static str, t: Tally) {
     ROUTES.with(|m| m.borrow_mut().entry(route).or_default().record(t));
 }
 
+/// bsv-low #499 (lens fold L2): the key of the once-per-isolate schema work (the overlay's migrations, the app
+/// layer's latch columns). That work runs inside the FIRST request a fresh isolate serves; keyed apart, it no longer
+/// inflates whichever route happened to wake the isolate (the fixture's `/listTopicManagers` read 5909 rows by it).
+pub const BOOT_KEY: &str = "(boot)";
+
+/// Run the once-per-isolate schema work `fut` under its own ledger, recorded under [`BOOT_KEY`] when it issued a
+/// statement (a warm isolate's call issues none and records nothing).
+pub async fn boot<F: Future>(fut: F) -> F::Output {
+    let (out, t) = scoped(fut).await;
+    if t.stmts > 0 {
+        record(BOOT_KEY, t);
+    }
+    out
+}
+
+/// bsv-low #499 (lens fold L5): the answer to a handler error that escaped the fetch body, built HERE so it carries
+/// the request's figures. It is the runtime's own answer (`#[event(fetch)]` logs the error and answers
+/// `INTERNAL SERVER ERROR` with 500), so status and body are what they were; only the `Server-Timing` is added.
+pub fn escaped(e: &worker::Error, t: Tally) -> worker::Result<worker::Response> {
+    worker::console_error!("{e}");
+    let mut resp = worker::Response::error("INTERNAL SERVER ERROR", 500)?;
+    stamp(&mut resp, t);
+    Ok(resp)
+}
+
 /// The `Server-Timing` segment of one request.
 pub fn server_timing_segment(t: Tally) -> String {
     named_segment("d1", t)
@@ -197,7 +222,9 @@ pub fn expose_server_timing(existing: Option<&str>) -> String {
     }
 }
 
-/// Stamp the d1 segment (and its CORS expose) on a finished response.
+/// Stamp the d1 segment (and its CORS expose) on a finished response. Stamped LAST, after any signing or sealing
+/// built the response, so the segment rides OUTSIDE the BRC-103 signature and the lane's MAC: a diagnostic, never
+/// an attested figure.
 pub fn stamp(resp: &mut worker::Response, t: Tally) {
     let h = resp.headers_mut();
     let timing = with_d1_segment(h.get("Server-Timing").ok().flatten().as_deref(), t);
@@ -239,7 +266,8 @@ pub fn budget_json() -> serde_json::Value {
 
 /// The counted forms of a prepared statement's three awaits (the app layer's seam; the overlay's is `d1::Query`).
 /// `counted_first` runs the statement with `all()` and takes the first row: D1 executes the whole statement for a
-/// `first()` too, so the rows read are the same, and `all()` is the call whose answer carries the meta.
+/// `first()` too, so the rows read are the same, and `all()` is the call whose answer carries the meta. Every row
+/// it answers is marshalled to wasm, though, so first-shaped SQL keeps its `LIMIT 1` (or a key that holds one row).
 #[allow(async_fn_in_trait)]
 pub trait Counted {
     async fn counted_all(&self) -> worker::Result<worker::D1Result>;
@@ -348,6 +376,45 @@ mod tests {
         note(7, 0);
         let after = UNSCOPED.with(|u| u.get());
         assert_eq!((after.reads - before.reads, after.stmts - before.stmts), (7, 1));
+    }
+
+    /// bsv-low #499 (lens fold L1): NO D1 STATEMENT IS AWAITED OUTSIDE THE COUNTED SEAM. Every await form of the
+    /// `worker` D1 API (`all()`, `run()`, `raw()`, `first(..)`, `batch(..)`) appears in this file only; the crate under
+    /// test is walked (this file is compiled into both workers, so each crate's run walks its own `src`). Building a
+    /// statement (`prepare(..)`, `bind(..)`) issues nothing and is not forbidden: the cost is the await. RED on
+    /// `a0db9fb`: the `/tx-any` index leg awaited `stmt.first(None)` (low-app-layer `routes.rs`, 2 statements a
+    /// request uncounted). Not pinned: `D1Database::exec` (its name is the overlay's `ShadowDb` method too, which goes
+    /// through `d1::Query`); no production code calls it.
+    #[test]
+    fn no_d1_statement_is_awaited_outside_the_ledger() {
+        const BARE: &[&str] = &[".all()", ".run()", ".raw()", ".raw::<", ".first(None", ".first(Some", ".first::<", ".batch("];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 5, "the crate's sources are walked");
+        let mut holes = Vec::new();
+        for f in files.iter().filter(|f| f.file_name().is_some_and(|n| n != "d1_ledger.rs")) {
+            let text = std::fs::read_to_string(f).expect("read source");
+            for (i, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if BARE.iter().any(|b| code.contains(b)) {
+                    holes.push(format!("{}:{}: {}", f.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(holes.is_empty(), "D1 awaited outside the counted seam (use d1_ledger::Counted / counted_batch):\n{}", holes.join("\n"));
+        // the pin bites on the form it was written for
+        assert!(BARE.iter().any(|b| "let row: Option<BeefTrustRow> = match stmt.first(None).await {".contains(b)));
     }
 
     #[test]

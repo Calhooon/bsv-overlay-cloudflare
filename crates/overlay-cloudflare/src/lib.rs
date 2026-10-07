@@ -151,7 +151,11 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
     let route = crate::d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
     let (out, tally) = crate::d1_ledger::scoped(dispatch(req, env, ctx)).await;
     crate::d1_ledger::record(route, tally);
-    let mut resp = out?;
+    // lens fold L5: an escaped handler error is answered as the runtime would, with the figures stamped
+    let mut resp = match out {
+        Ok(resp) => resp,
+        Err(e) => return crate::d1_ledger::escaped(&e, tally),
+    };
     crate::d1_ledger::stamp(&mut resp, tally);
     Ok(resp)
 }
@@ -189,7 +193,8 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
 
     // Apply migrations once per isolate (idempotent — CREATE IF NOT EXISTS;
     // unguarded per-request execution was 63 D1 round-trips/request, #255)
-    ensure_overlay_migrations(&db)
+    // bsv-low #499 (lens fold L2): under its own ledger key, `(boot)`, not the route that woke the isolate
+    crate::d1_ledger::boot(ensure_overlay_migrations(&db))
         .await
         .map_err(|e| worker::Error::from(format!("Migration failed: {e}")))?;
 
@@ -460,7 +465,8 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         env.d1("OVERLAY_DB")
             .map_err(|e| format!("D1 binding error: {e}"))?,
     );
-    ensure_overlay_migrations(&db)
+    // bsv-low #499 (lens fold L2): under its own ledger key, `(boot)`, not the route that woke the isolate
+    crate::d1_ledger::boot(ensure_overlay_migrations(&db))
         .await
         .map_err(|e| format!("Migration failed: {e}"))?;
     let ship_storage: Rc<dyn SHIPStorage> = Rc::new(D1SHIPStorage::new(db.clone()));

@@ -16,15 +16,28 @@ Every D1 statement answers `meta.rows_read` and `meta.rows_written`. Both worker
   overlay's `/submit` segments stay), exposed to the browser by CORS;
 - on the health surface: `d1Budget` on the overlay's `/health/invariants` and the app layer's `/health`, per route
   the request count and the running maximum of each figure since the isolate booted, plus `unscoped` (statements
-  awaited outside every request: the `wait_until` refreshes, the courier flush).
+  awaited outside every request and every keyed scope: the courier flush, the overlay's queue and scheduled
+  handlers). Three keys are not routes: `owed-recompute` (each `/owed` walk that runs after the answer, in
+  `wait_until`: the hooks', the claims' and the stale read's refresh), `(boot)` (the once-per-isolate schema
+  work, below) and `/results:view` / `/leaderboard:view` (the view actor).
+
+The WHOLE fetch body of each worker runs under the ledger: in the app layer the internal hooks
+(`/internal/pot-changed`, `/internal/hop-changed`, `/internal/tip-changed`, `/internal/lobby-changed`,
+`/internal/armed-pots`, keyed `/internal`) and the BRC-103 front door's own replies too, so every answer carries
+the segment. A handler error that escapes the body is answered as the runtime would (500, `INTERNAL SERVER
+ERROR`) with its figures stamped. The segment is stamped after signing and sealing, so it rides outside the
+signature and the lane's MAC: a diagnostic, never an attested figure.
 
 The seam is one place per worker: the overlay's `d1::Query` (every engine and discovery statement) and the app
 layer's `d1_ledger::Counted` calls (`counted_all`, `counted_first`, `counted_run`, `counted_batch`). A statement
 awaited through the bare `worker` API is not counted, so a new bare call is a hole no ceiling sees: count a D1
-read or it did not happen.
+read or it did not happen. The pin `no_d1_statement_is_awaited_outside_the_ledger` (`d1_ledger.rs`, run in both
+crates) reds on any `all()`, `run()`, `raw()`, `first(..)` or `batch(..)` outside that file.
 
-The overlay applies its migrations once per isolate inside the first request it serves, so that request's figures
-carry them (thousands of rows read on a fresh database); the tier warms each worker before it measures.
+The overlay applies its migrations (and the app layer its latch columns) once per isolate inside the first
+request it serves. That work is keyed `(boot)`, not under the route that woke the isolate (the fixture's first
+request read 5909 rows by it), so a cold isolate's `/submit` or `/lookup` is not inflated; the tier still warms
+each worker before it measures.
 
 The view actor (`BoardView`) computes `/results` and `/leaderboard` DETACHED from any request and serves a held
 copy, so the forwarding request costs D1 nothing and the compute's figures ride the answer as a second segment,
@@ -55,7 +68,8 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 
 A ceiling is raised only with a new measurement (`D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the table and
 enforces nothing) and its reason written here. Not in this tier: the tower's case reads (`low-watchtower` lives in
-bsv-low, its D1 is its own), and the figures on wasm at RUNTIME on Cloudflare's D1 (the tier is workerd's local
+bsv-low, its D1 is its own: a bsv-low follow-up, filed by CAP, for `GET /case/:gameId/:potTxid/:vout` and the
+case writes beside it), and the figures on wasm at RUNTIME on Cloudflare's D1 (the tier is workerd's local
 SQLite, whose `rows_read` counts the same way as far as the platform documents it; the census below is what reads
 the real ones).
 
@@ -75,12 +89,25 @@ recompute at most 12 times a minute on one isolate (`owed::OWED_RECOMPUTES_PER_I
 fixed from its first recompute). Past it the ask is SHED to the served snapshot: nothing walks, the reader gets the
 rows `owed_rows` holds, and `/health.owed.recomputeShed` counts it (`recomputeAtCeiling` names how many identities
 sit at the ceiling now). The levers are the ones the brain already had: the hook marks the identity stale before it
-asks and a shed walk never clears the mark, so the first read past the window recomputes; the in-flight lock still
-folds twins. Nothing new is persisted. The first read of an identity always runs (no snapshot exists to serve) and
-counts. What a shed costs: a change that lands while its identity is over the ceiling reaches the page at that
-identity's next read past the window, not by a push. Pins: `the_thirteenth_recompute_of_one_identity_inside_a_minute_is_shed_to_the_snapshot`,
+asks, and a shed marks it stale AGAIN (`owed::owed_shed_plan`, one one-row UPDATE), so the first read past the
+window recomputes; the in-flight lock still folds twins. The second mark is the lens fold's M1: a walk in flight
+when the 13th hook marked stale writes `stale = 0` over that mark (its stamp is its start), and the folded rerun
+is the one shed; without the re-mark a new claimable row stayed off the page up to 15 minutes plus the next read.
+Nothing new is persisted. The first read of an identity always runs (no snapshot exists to serve) and counts.
+What a shed costs: a shed sends no push, so a change that lands while its identity is over the ceiling reaches the
+page at the page's next read past the window (mount, a tip, a socket reconnect, an event; the page has no timer).
+B4: a claimable row may be delayed, never lost. The ceiling is PER ISOLATE: hooks reach whichever isolate the
+platform picks, so the fleet bound is 12 times the live isolates, and a storm is when more spin up; it brakes one
+isolate's herd, it is not a D1 budget (`/health.owed.recomputesPerIdentityPerMinute` is this isolate's). A walk on
+another isolate that began before a shed and lands after it can still clear the re-mark; the 5 and 15 minute age
+rules then recompute. With #567 (a read-aged read serves the stored snapshot and refreshes after): that refresh can
+itself be shed, with no push, so the two delays stack on one read; an inline compute that fixes #567 is a new
+`owed_recompute(` caller and must ask the ceiling (the two-caller pin reds until it does). Pins:
+`the_thirteenth_recompute_of_one_identity_inside_a_minute_is_shed_to_the_snapshot`,
+`a_shed_rerun_after_a_walk_cleared_the_hooks_mark_leaves_the_identity_stale_for_the_next_read`,
 `every_owed_recompute_caller_asks_the_ceiling_before_it_walks` (`owed.rs`), and the tier's route leg (13
-announcements of B's pot inside a minute: 12 recomputes run per seat, each seat's 13th shed).
+announcements of B's pot inside a minute: 12 recomputes run per seat, each seat's 13th shed, every hook answer
+stamped, the walks keyed `owed-recompute`).
 
 ## The split
 
@@ -90,7 +117,13 @@ materialized row (M23's storage split), never to a bigger D1. A bigger D1 raises
 leaves the curve as it is; a per-identity object or a row written on change makes the read's cost a function of
 one identity's rows, which is the only quantity a consumer-scale stack can hold flat. The census is the evidence:
 the same route's maximum read at two populations, with the request held fixed, is the test (the CI fixture runs it
-at 300 and 1200 strangers: no hot route moved).
+at 300 and 1200 strangers: no hot route moved). What that evidence covers: the fixture's noise fills
+`pot_records` and `potparty_records` only, so it says nothing of the result and collected markers, hops,
+refusals, evictions or `pot_beefs`. One `/owed` read does grow with the FLEET: `OWED_EVICTIONS_WINDOW_SQL` reads
+every unreadmitted eviction of the last 24 hours (the fixture holds none). And `/owed` grows with ONE identity's
+history by design (its pots, hops and filings, read in chunked IN lists): a 2,000-pot identity's first read sits
+far above the advisory 528, which the split allows (a function of one identity's rows); read a census figure over
+it against that identity's history before calling it a fleet curve.
 
 ## The census (before every promotion)
 
@@ -100,5 +133,8 @@ scripts/d1-census.py --overlay https://<overlay> --app https://<app-layer> --sam
 
 prints, per surface, each route's request count and maxima beside its CI ceiling (advisory against production
 rows). A ledger is one isolate's since it booted; `--samples` reads again to reach more isolates and keeps the
-largest maxima. The promotion checklist carries the table, taken on beta at the fleet's load after a loop, and
+largest maxima. This is a SUBSTITUTE for the issue's census, accepted by CAP for now: it misses every isolate it
+does not land on and reads `unscoped` as one running total. The platform's query insights
+(`d1QueriesAdaptiveGroups`) are the promotion-time read, and the beta census TABLE is written by CAP after the
+deploy, at the fleet's load after a loop. The promotion checklist carries the table, taken on beta at the fleet's load after a loop, and
 any route over its fixture ceiling is read against the split above before the promotion goes.

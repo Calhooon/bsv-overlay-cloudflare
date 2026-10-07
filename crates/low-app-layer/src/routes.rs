@@ -3703,11 +3703,18 @@ pub(crate) async fn owed_recompute_and_push(
     source: &str,
     tip_hint: Option<u64>,
 ) {
-    // bsv-low #499: past the identity's ceiling the walk is shed (the stale mark its hook wrote stays for the read)
+    // bsv-low #499: past the identity's ceiling the walk is shed, and the shed marks the identity stale AGAIN (the
+    // lens fold's M1: a walk in flight when the hook marked stale cleared that mark with its own write, and this
+    // folded rerun is the one shed; without the re-mark the next read served the older rows as fresh)
     if !owed_recompute_admit(identity_lc, source, true) {
+        owed_shed_remark(db, identity_lc).await;
         return;
     }
-    match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+    // bsv-low #499 (lens fold M3): the walk runs under its own ledger, keyed `owed-recompute` in `d1Budget` (it runs
+    // after the answer, in `wait_until`, where no request's scope holds it; before, it landed only in `unscoped`)
+    let (walked, d1) = crate::d1_ledger::scoped(owed_recompute(env, db, identity_lc, source, tip_hint)).await;
+    crate::d1_ledger::record(OWED_RECOMPUTE_LEDGER_KEY, d1);
+    match walked {
         // bsv-low #487: a snapshot the write refused is not announced (the newer walk's own push stands)
         Ok(c) if c.superseded => {}
         Ok(c) => {
@@ -3726,6 +3733,17 @@ pub(crate) async fn owed_recompute_and_push(
             );
         }
     }
+}
+
+/// bsv-low #499 (lens fold M3): the `d1Budget` key of one detached recompute (the hooks', the claims' and the stale
+/// read's refresh; the first read's compute is the `/owed` request's own).
+pub(crate) const OWED_RECOMPUTE_LEDGER_KEY: &str = "owed-recompute";
+
+/// bsv-low #499 (lens fold M1): what a shed writes, `owed::owed_shed_plan` (the identity marked stale again). A fault
+/// is logged: the age rules still recompute the list later.
+async fn owed_shed_remark(db: &worker::D1Database, identity_lc: &str) {
+    let (sql, bind) = crate::owed::owed_shed_plan(identity_lc);
+    owed_mark_stale(db, sql, &[JsValue::from_str(&bind)], "shed").await;
 }
 
 thread_local! {
@@ -4079,6 +4097,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                         // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing;
                         // bsv-low #499: so does one the identity's ceiling sheds
                         if !owed_recompute_admit(&identity, source, true) {
+                            owed_shed_remark(&db, &identity).await;
                             (rows, prev_tip, st.computed_at_ms as i64, cut)
                         } else {
                             match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now).await {
@@ -6426,7 +6445,7 @@ async fn tx_any_index_leg(
         let Ok(stmt) = db.prepare(sql).bind(&[JsValue::from_str(txid_lc)]) else {
             continue;
         };
-        let row: Option<BeefTrustRow> = match stmt.first(None).await {
+        let row: Option<BeefTrustRow> = match stmt.counted_first::<BeefTrustRow>().await {
             Ok(row) => row,
             Err(e) => {
                 console_warn!("[tx-any] {table} query failed: {e}");
