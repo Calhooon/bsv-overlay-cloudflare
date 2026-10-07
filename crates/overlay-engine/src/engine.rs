@@ -88,7 +88,9 @@ pub struct Engine {
     finalize_gate: crate::gasp::SubmitGate,
     /// (txid, topic) pairs whose Phase-3 writes FAULTED in this engine and
     /// have not landed since (bsv-low #559): a successor that finds no coin
-    /// while its predecessor is in here is not recorded as applied.
+    /// while its predecessor is in here is not recorded as applied. One
+    /// invocation's memory; across invocations the same question is put to
+    /// the store ([`Engine::unlanded_predecessor`]).
     not_landed: std::cell::RefCell<HashSet<(String, String)>>,
     /// Reference-parity spend verification on submit (2026-09-08). `true`
     /// (DEFAULT): every submit outside `HistoricalTxNoSpv` runs the
@@ -114,6 +116,101 @@ pub type SleepFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 /// tests pass `ready(())` (instant deadline) or `pending()` (no deadline)
 /// to drive the race deterministically.
 pub type SleepFactory = std::rc::Rc<dyn Fn(u64) -> SleepFuture>;
+
+/// The bound of ONE GASP finalize submit's storage calls and hooks (bsv-low
+/// #559, the lens fold of 2026-10-07, F2). The submit itself is never
+/// dropped: it is the write section no deadline drops, and c9921ee, which
+/// raced the whole submit against its budget inside the section, dropped it
+/// between two writes all the same. Each storage call, lookup hook and topic
+/// manager call inside it is raced against the section's ONE deadline
+/// instead, and a call that has not answered when the deadline falls due is
+/// dropped ALONE and reported as that call's fault: the submit runs on to
+/// its end as for any storage fault. Once the deadline is due no further
+/// call is started (each answers "no answer" at once), so a transaction
+/// costs at most its budget, and once more for the undo
+/// ([`CallBound::renew`]).
+struct CallBound {
+    sleep: SleepFactory,
+    budget_ms: u64,
+    deadline: std::cell::RefCell<SleepFuture>,
+    due: std::cell::Cell<bool>,
+}
+
+impl CallBound {
+    fn new(sleep: &SleepFactory, budget_ms: u64) -> Self {
+        Self {
+            deadline: std::cell::RefCell::new(sleep(budget_ms)),
+            sleep: sleep.clone(),
+            budget_ms,
+            due: std::cell::Cell::new(false),
+        }
+    }
+
+    /// A fresh allowance of the same length, for the undo of a faulted
+    /// submit: the calls that put the store back as it was found must not be
+    /// refused because the deadline the fault answered to has passed.
+    fn renew(&self) {
+        *self.deadline.borrow_mut() = (self.sleep)(self.budget_ms);
+        self.due.set(false);
+    }
+
+    /// `call`, or `None` when the deadline fell due first.
+    async fn call<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
+        if self.due.get() {
+            return None;
+        }
+        let mut call = std::pin::pin!(call);
+        std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(v) = call.as_mut().poll(cx) {
+                return std::task::Poll::Ready(Some(v));
+            }
+            if self.deadline.borrow_mut().as_mut().poll(cx).is_ready() {
+                self.due.set(true);
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+/// `call` under `bound` (or unbounded with none); `Err` is "no answer".
+async fn bounded<T>(
+    bound: Option<&CallBound>,
+    call: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    match bound {
+        Some(bound) => bound
+            .call(call)
+            .await
+            .ok_or_else(|| format!("no answer within {} ms", bound.budget_ms)),
+        None => Ok(call.await),
+    }
+}
+
+/// A storage call under `bound`: no answer in time is that call's fault.
+async fn stored<T>(
+    bound: Option<&CallBound>,
+    call: impl std::future::Future<Output = Result<T, StorageError>>,
+) -> Result<T, StorageError> {
+    match bounded(bound, call).await {
+        Ok(answer) => answer,
+        Err(no_answer) => Err(StorageError::Database(no_answer)),
+    }
+}
+
+/// A lookup hook under `bound`, its error as the report carries it.
+async fn hooked(
+    bound: Option<&CallBound>,
+    call: impl std::future::Future<Output = Result<(), LookupServiceError>>,
+) -> Result<(), String> {
+    bounded(bound, call).await?.map_err(|e| e.to_string())
+}
+
+/// The most store reads [`Engine::unlanded_predecessor`] makes for one
+/// topic of one submit (bsv-low #559, F3): the question is asked of every
+/// transaction that admits nothing and found no coin, so it is kept cheap.
+const PREDECESSOR_READS: usize = 16;
 
 /// Summary of an [`Engine::complete_missing_proofs`] pass.
 ///
@@ -260,7 +357,9 @@ pub struct MutationFault {
     /// The write (or read) that failed: `insert_output`,
     /// `mark_utxo_as_spent`, `update_consumed_by`, `delete_utxo_deep`,
     /// `insert_applied_transaction`, `find_output` (validation read),
-    /// `lookup_service.output_spent`, `lookup_service.output_admitted_by_topic`.
+    /// `lookup_service.output_spent`, `lookup_service.output_admitted_by_topic`,
+    /// `undo_insert_output` (the undo of a faulted submit's inserts),
+    /// `predecessor_not_landed`.
     pub site: &'static str,
     /// The backend's own error text.
     pub error: String,
@@ -681,13 +780,19 @@ impl Engine {
     /// lens's DELTA-3). That submit is the write section no deadline drops
     /// ([`Engine::finalize_submit_gate`]), so a storage call or lookup hook
     /// that never answers inside it held the per-peer budget and any outer
-    /// race for as long as it hung. With this set the submit is raced
-    /// against `sleep(budget_ms)` INSIDE its section and dropped past it:
-    /// the transaction did not land, the rest of its graph is not submitted,
-    /// its UTXO fails and the cursor stays below it, exactly as for a
-    /// storage fault. The drop can fall between two writes of the submit;
-    /// that loses nothing since the insert comes before the delete (#559).
-    /// A peer then costs at most its budget plus one such wait.
+    /// race for as long as it hung. With this set EACH storage call, lookup
+    /// hook and topic manager call of that submit is raced against one
+    /// `sleep(budget_ms)` of the section (the lens fold of 2026-10-07, F2):
+    /// a call still unanswered when it falls due is dropped alone and is
+    /// that call's FAULT, and no call is started after it. The SUBMIT is
+    /// never dropped: it runs to its end and leaves what a fault leaves
+    /// ([`Engine::submit_with_report`]: nothing of the transaction, or all
+    /// of it), the transaction did not land, the rest of its graph is not
+    /// submitted, its UTXO fails and the cursor stays below it. The undo of
+    /// a faulted submit has one more `sleep(budget_ms)` of its own, so a
+    /// peer costs at most its budget plus twice this one. What the backend
+    /// does with a statement whose caller stopped waiting is its own: a
+    /// write that lands after its timeout is not seen by this submit.
     ///
     /// DEFAULT: none (a native engine has no clock). A caller that sets a
     /// per-peer budget should set this too.
@@ -800,7 +905,7 @@ impl Engine {
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
         let (_validations, steak, _tx, _txid) = self
-            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::DRY_RUN)
+            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::DRY_RUN, None)
             .await?;
         Ok(steak)
     }
@@ -850,22 +955,42 @@ impl Engine {
     /// re-validated and re-written (every backend write is idempotent:
     /// `INSERT OR IGNORE` / `OR REPLACE` / `UPDATE`).
     ///
-    /// The replay is the SAME judgement because a faulted topic keeps its
-    /// previous coins (bsv-low #559): the admitted outputs are inserted
-    /// first and the stale coins are deleted only when nothing before that
-    /// faulted, so a faulted insert never leaves a head chain with no head.
-    /// The kept coin is marked spent and its lookup services were told so;
-    /// the replay tells them again. And a successor that was judged without
-    /// the coin a faulted predecessor failed to leave is reported as a fault
-    /// (`predecessor_not_landed`), not recorded as applied.
+    /// What a fault leaves (bsv-low #559 and its lens fold of 2026-10-07):
+    /// a topic's previous coins are deleted once EVERY admitted output of
+    /// the transaction is inserted, and only then. A fault before that
+    /// (a validation read, the spent mark of a coin the manager retains, an
+    /// insert) leaves the previous coins held and nothing of the
+    /// transaction: what did get inserted is taken out again, so the replay
+    /// is the same judgement and no successor can spend half of it. A fault
+    /// after it (a lookup notification, the consumed-by update, the applied
+    /// row) leaves the transaction's outputs and no previous coin. A fault
+    /// in the delete itself is the first case if the coins are read back
+    /// still held, the second if not. So a non-retaining chain never has
+    /// two unspent heads and never none, whatever single call faults. The
+    /// applied row is withheld on ANY fault. And a successor that was
+    /// judged without the coin an unlanded predecessor has yet to leave is
+    /// reported as a fault (`predecessor_not_landed`), not recorded as
+    /// applied.
     pub async fn submit_with_report(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<(Steak, MutationReport), EngineError> {
+        self.submit_bounded(tagged_beef, mode, None).await
+    }
+
+    /// [`Engine::submit_with_report`] with every storage call, lookup hook
+    /// and topic manager call under `bound` (the GASP finalize submit,
+    /// [`CallBound`]); `None` is the unbounded submit of every other door.
+    async fn submit_bounded(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        bound: Option<&CallBound>,
+    ) -> Result<(Steak, MutationReport), EngineError> {
         // A submit is a real admission, never a dry run.
         let (validations, mut steak, tx, txid) = self
-            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::default())
+            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::default(), bound)
             .await?;
         let mut report = MutationReport::default();
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
@@ -897,23 +1022,31 @@ impl Engine {
             let topic = &v.topic;
             let admittance = &v.admittance;
             let faults_before = report.faults.len();
+
+            // A validation read that faulted: the manager judged without a
+            // coin the store may hold, so NOTHING is written on that
+            // judgement (the lens fold of 2026-10-07). Writing its outputs
+            // would leave them beside the unseen coin, for a successor to
+            // spend before the replay deletes it.
             if let Some(err) = &v.read_fault {
                 report.fault(topic, "find_output", err.clone());
+                self.hold_unapplied(&txid, topic, "a validation read faulted, nothing written");
+                continue;
             }
 
             // bsv-low #559: a transaction that found NO previous coin and
-            // admits nothing, while a transaction it spends from faulted in
-            // this engine and has not landed since, was judged without the
-            // coin its predecessor failed to leave. Recording it as applied
-            // would make its replay a dupe for good (the chain ends at the
-            // predecessor). It is reported as a fault instead and recorded
-            // nowhere: "not now". An addition to the reference, which
-            // records every non-failed topic. The memory is this engine's
-            // own (one worker invocation, one queue batch, one sync): a
-            // successor that arrives in a LATER invocation, before the
-            // predecessor's replay, is still recorded as the reference does.
+            // admits nothing, while a transaction it spends from has not
+            // landed, was judged without the coin its predecessor has yet
+            // to leave. Recording it as applied would make its replay a
+            // dupe for good (the chain ends at the predecessor). It is
+            // reported as a fault instead and recorded nowhere: "not now".
+            // An addition to the reference, which records every non-failed
+            // topic. "Has not landed" is known two ways: this engine saw it
+            // fault (`not_landed`, one invocation), or the store says so
+            // ([`Engine::unlanded_predecessor`], any invocation, when the
+            // submitted BEEF carries the predecessor's body).
             if v.previous_outputs.is_empty() && admittance.outputs_to_admit.is_empty() {
-                let waits_on = tx
+                let remembered = tx
                     .inputs
                     .iter()
                     .map(|input| input.get_source_txid().unwrap_or_default())
@@ -922,33 +1055,82 @@ impl Engine {
                             .borrow()
                             .contains(&(source.clone(), topic.clone()))
                     });
+                let waits_on = match remembered {
+                    Some(predecessor) => Some(predecessor),
+                    None => {
+                        self.unlanded_predecessor(&tx, &tagged_beef.beef, topic, bound)
+                            .await
+                    }
+                };
                 if let Some(predecessor) = waits_on {
-                    warn!(
-                        "topic {topic}: {txid} found no coin and its predecessor {predecessor} \
-                         has not landed; applied_transactions NOT recorded (bsv-low #559)"
-                    );
                     report.fault(
                         topic,
                         "predecessor_not_landed",
-                        format!("{predecessor} faulted and has not landed"),
+                        format!("{predecessor} has not landed"),
                     );
-                    self.not_landed
-                        .borrow_mut()
-                        .insert((txid.clone(), topic.clone()));
+                    self.hold_unapplied(
+                        &txid,
+                        topic,
+                        &format!("found no coin and its predecessor {predecessor} has not landed"),
+                    );
                     continue;
                 }
             }
 
+            // ── Handle stale vs retained previous coins ──
+            let mut outputs_consumed: Vec<Outpoint> = Vec::new();
+            let mut stale_coins: Vec<&Output> = Vec::new();
+
+            for (coin_idx, prev_output) in v.previous_outputs.iter().enumerate() {
+                let input_index = v.previous_coins[coin_idx];
+                if admittance.coins_to_retain.contains(&input_index) {
+                    // Retained: track as consumed (will update consumedBy later)
+                    outputs_consumed
+                        .push(Outpoint::new(&prev_output.txid, prev_output.output_index));
+                } else {
+                    // Not retained: mark as stale for deletion
+                    stale_coins.push(prev_output);
+                }
+            }
+
+            // Update STEAK with removed coins
+            if let Some(steak_entry) = steak.get_mut(topic) {
+                steak_entry.coins_removed = Some(
+                    stale_coins
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, _)| {
+                            // Map back to input indices
+                            v.previous_coins.get(i).copied()
+                        })
+                        .collect(),
+                );
+            }
+
             // ── Mark previous outputs as spent + notify lookup services ──
+            // A mark that faults does not skip the notification (the
+            // reference skips it): the coin is spent whatever the row says,
+            // a stale one is deleted below and its lookup services must
+            // know. The mark of a RETAINED coin is part of what landed: that
+            // row stays, and left unspent it would be listed as a UTXO
+            // beside the output that consumed it.
+            let mut retained_mark_faulted = false;
             for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
-                if let Err(e) = self
-                    .storage
-                    .mark_utxo_as_spent(&prev_output.txid, prev_output.output_index, topic)
-                    .await
+                if let Err(e) = stored(
+                    bound,
+                    self.storage.mark_utxo_as_spent(
+                        &prev_output.txid,
+                        prev_output.output_index,
+                        topic,
+                    ),
+                )
+                .await
                 {
                     error!("Error marking UTXO as spent: {e}");
                     report.fault(topic, "mark_utxo_as_spent", e.to_string());
-                    continue;
+                    retained_mark_faulted |= admittance
+                        .coins_to_retain
+                        .contains(&v.previous_coins[prev_idx]);
                 }
 
                 // The input index within tx.inputs that spends this previous output.
@@ -995,45 +1177,27 @@ impl Engine {
                             off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                     };
-                    if let Err(e) = ls.output_spent(&payload).await {
+                    if let Err(e) = hooked(bound, ls.output_spent(&payload)).await {
                         error!("Error notifying lookup service of spent output: {e}");
-                        report.fault(topic, "lookup_service.output_spent", e.to_string());
+                        report.fault(topic, "lookup_service.output_spent", e);
                     }
                 }
             }
-
-            // ── Handle stale vs retained previous coins ──
-            let mut outputs_consumed: Vec<Outpoint> = Vec::new();
-            let mut stale_coins: Vec<&Output> = Vec::new();
-
-            for (coin_idx, prev_output) in v.previous_outputs.iter().enumerate() {
-                let input_index = v.previous_coins[coin_idx];
-                if admittance.coins_to_retain.contains(&input_index) {
-                    // Retained: track as consumed (will update consumedBy later)
-                    outputs_consumed
-                        .push(Outpoint::new(&prev_output.txid, prev_output.output_index));
-                } else {
-                    // Not retained: mark as stale for deletion
-                    stale_coins.push(prev_output);
-                }
-            }
-
-            // Update STEAK with removed coins
-            if let Some(steak_entry) = steak.get_mut(topic) {
-                steak_entry.coins_removed = Some(
-                    stale_coins
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, _)| {
-                            // Map back to input indices
-                            v.previous_coins.get(i).copied()
-                        })
-                        .collect(),
+            if retained_mark_faulted {
+                self.hold_unapplied(
+                    &txid,
+                    topic,
+                    "the spent mark of a retained coin faulted, nothing inserted",
                 );
+                continue;
             }
 
             // ── Insert admitted outputs ──
+            // The inserts stop at the first one that faults: what follows is
+            // the undo, not the rest of the transaction.
             let mut new_utxos: Vec<Outpoint> = Vec::new();
+            let mut attempted: Vec<u32> = Vec::new();
+            let mut insert_faulted = false;
 
             for &output_index in &admittance.outputs_to_admit {
                 let (script_bytes, sats) =
@@ -1060,9 +1224,12 @@ impl Engine {
                     score: Some(current_timestamp_ms()),
                 };
 
-                if let Err(e) = self.storage.insert_output(&output).await {
+                attempted.push(output_index);
+                if let Err(e) = stored(bound, self.storage.insert_output(&output)).await {
                     error!("Error inserting output for topic {topic}: {e}");
                     report.fault(topic, "insert_output", e.to_string());
+                    insert_faulted = true;
+                    break;
                 }
 
                 new_utxos.push(Outpoint::new(&txid, output_index));
@@ -1093,72 +1260,140 @@ impl Engine {
                         },
                     };
 
-                    if let Err(e) = ls.output_admitted_by_topic(&payload).await {
+                    if let Err(e) = hooked(bound, ls.output_admitted_by_topic(&payload)).await {
                         error!("Error notifying lookup service: {e}");
-                        report.fault(
-                            topic,
-                            "lookup_service.output_admitted_by_topic",
-                            e.to_string(),
-                        );
+                        report.fault(topic, "lookup_service.output_admitted_by_topic", e);
                     }
                 }
             }
 
+            // An insert faulted: the transaction did not land, so NOTHING of
+            // it stays (the lens fold of 2026-10-07, F1). The previous coins
+            // are kept (#559: with the delete first, one faulted insert left
+            // a non-retaining head chain with NO head) and the outputs that
+            // were inserted are taken out again, the faulted one included (a
+            // backend's insert can fault after its row landed). Left in,
+            // they could be spent and deleted by a successor before the
+            // replay, and the replay, which still finds the previous coin,
+            // would insert them a second time: a spent head back among the
+            // UTXOs for good.
+            if insert_faulted {
+                if let Some(bound) = bound {
+                    bound.renew();
+                }
+                self.undo_inserts(&txid, topic, &attempted, bound, &mut report)
+                    .await;
+                self.hold_unapplied(
+                    &txid,
+                    topic,
+                    &format!(
+                        "an insert faulted: {} previous coin(s) kept, nothing of it held",
+                        stale_coins.len()
+                    ),
+                );
+                continue;
+            }
+
             // ── Delete stale outputs recursively ──
-            // AFTER the inserts, and only when nothing above faulted
-            // (bsv-low #559). The reference deletes first
-            // (`applyTopicStorageMutation`: `removeStaleOutputs`, then
-            // `admitOutput`) and has no fault path: a write that throws there
-            // ends the submit. Here a fault is survived and the submit is
-            // replayed, and the replay is only the same judgement if the
-            // previous coins are still held: with the delete first, one
-            // faulted insert left a non-retaining head chain with NO head
-            // (the old one deleted, the new one not written), the replay
-            // found no coin, admitted nothing and was recorded as applied.
-            // So the order is ours, an addition: a faulted topic keeps its
-            // stale coins (marked spent, so they are not listed as UTXOs)
-            // and the replay that lands deletes them. A fault in the delete
-            // itself, or after it, loses nothing: the new outputs are in.
-            if report.faults.len() == faults_before {
-                for stale in &stale_coins {
-                    match self
-                        .storage
-                        .find_output(&stale.txid, stale.output_index, Some(topic), None, false)
-                        .await
-                    {
-                        Ok(Some(stale_output)) => {
-                            if let Err(e) = self.delete_utxo_deep(&stale_output).await {
-                                error!("Error deleting stale output for topic {topic}: {e}");
-                                report.fault(topic, "delete_utxo_deep", e.to_string());
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("Error reading stale output for topic {topic}: {e}");
-                            report.fault(topic, "find_output", e.to_string());
+            // AFTER the inserts, and once every one of them landed (bsv-low
+            // #559 and the lens fold of 2026-10-07, F1). The reference
+            // deletes first (`applyTopicStorageMutation`: `removeStaleOutputs`,
+            // then `admitOutput`), catches a throw per topic and never
+            // replays; here a fault is survived and replayed, so the order
+            // is ours, an addition. The delete does NOT wait for a clean
+            // report (c9921ee did, and one faulted mark or notification
+            // after the insert then left the stale coin beside the new
+            // output for good: two unspent heads): a fault of the mark, of
+            // a notification, deletes as the reference does.
+            let mut delete_faulted = false;
+            for stale in &stale_coins {
+                match stored(
+                    bound,
+                    self.storage.find_output(
+                        &stale.txid,
+                        stale.output_index,
+                        Some(topic),
+                        None,
+                        false,
+                    ),
+                )
+                .await
+                {
+                    Ok(Some(stale_output)) => {
+                        if let Err(e) = self.delete_utxo_deep(&stale_output, bound).await {
+                            error!("Error deleting stale output for topic {topic}: {e}");
+                            report.fault(topic, "delete_utxo_deep", e.to_string());
+                            delete_faulted = true;
                         }
                     }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Error reading stale output for topic {topic}: {e}");
+                        report.fault(topic, "find_output", e.to_string());
+                        delete_faulted = true;
+                    }
                 }
-            } else {
-                warn!(
-                    "topic {topic}: {} stale coin(s) kept, a write of this submit faulted; \
-                     the replay deletes them",
-                    stale_coins.len()
+            }
+
+            // The delete itself faulted. A stale coin left beside the new
+            // outputs is the double head again by another road (the replay
+            // finds the coin and re-inserts whatever a successor has spent
+            // since). So the store is put back as it was found, when that
+            // is certain: EVERY stale coin is read back still held, and then
+            // the inserts are undone, the replay does the whole transaction.
+            // If a coin is gone or cannot be read the outputs stay: taking
+            // them out could leave no head at all.
+            if delete_faulted {
+                if let Some(bound) = bound {
+                    bound.renew();
+                }
+                let mut all_held = true;
+                for stale in &stale_coins {
+                    let read = stored(
+                        bound,
+                        self.storage.find_output(
+                            &stale.txid,
+                            stale.output_index,
+                            Some(topic),
+                            None,
+                            false,
+                        ),
+                    )
+                    .await;
+                    if !matches!(read, Ok(Some(_))) {
+                        all_held = false;
+                        break;
+                    }
+                }
+                if all_held {
+                    self.undo_inserts(&txid, topic, &attempted, bound, &mut report)
+                        .await;
+                }
+                self.hold_unapplied(
+                    &txid,
+                    topic,
+                    if all_held {
+                        "the delete of a stale coin faulted: the coins are held, its outputs taken out"
+                    } else {
+                        "the delete of a stale coin faulted: its outputs stay"
+                    },
                 );
+                continue;
             }
 
             // ── Update consumedBy on retained previous outputs ──
             for consumed_outpoint in &outputs_consumed {
-                let consumed_output = match self
-                    .storage
-                    .find_output(
+                let consumed_output = match stored(
+                    bound,
+                    self.storage.find_output(
                         &consumed_outpoint.txid,
                         consumed_outpoint.output_index,
                         Some(topic),
                         None,
                         false,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(Some(o)) => o,
                     Ok(None) => continue,
@@ -1177,15 +1412,16 @@ impl Engine {
                             new_consumed_by.push(new_utxo.clone());
                         }
                     }
-                    if let Err(e) = self
-                        .storage
-                        .update_consumed_by(
+                    if let Err(e) = stored(
+                        bound,
+                        self.storage.update_consumed_by(
                             &consumed_outpoint.txid,
                             consumed_outpoint.output_index,
                             topic,
                             &new_consumed_by,
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
                         error!("Error updating consumedBy: {e}");
                         report.fault(topic, "update_consumed_by", e.to_string());
@@ -1197,21 +1433,21 @@ impl Engine {
             // landed. A faulted topic stays unrecorded so the Phase-1 dedup
             // cannot turn its replay into a no-op (S2).
             if report.faults.len() > faults_before {
-                warn!(
-                    "topic {topic}: {} mutation fault(s) — applied_transactions NOT recorded; \
-                     a replay of these bytes re-applies",
-                    report.faults.len() - faults_before
+                self.hold_unapplied(
+                    &txid,
+                    topic,
+                    &format!(
+                        "{} mutation fault(s); a replay of these bytes re-applies",
+                        report.faults.len() - faults_before
+                    ),
                 );
-                self.not_landed
-                    .borrow_mut()
-                    .insert((txid.clone(), topic.clone()));
                 continue;
             }
             let tx_record = AppliedTransaction {
                 txid: txid.clone(),
                 topic: topic.clone(),
             };
-            match self.storage.insert_applied_transaction(&tx_record).await {
+            match stored(bound, self.storage.insert_applied_transaction(&tx_record)).await {
                 Ok(()) => {
                     report.applied_topics.push(topic.clone());
                     self.not_landed
@@ -1229,6 +1465,150 @@ impl Engine {
         }
 
         Ok((steak, report))
+    }
+
+    /// A topic of a submit that is NOT recorded as applied: logged, and
+    /// remembered for the successor rule (`not_landed`).
+    fn hold_unapplied(&self, txid: &str, topic: &str, why: &str) {
+        warn!("topic {topic}: {txid}: {why}; applied_transactions NOT recorded (bsv-low #559)");
+        self.not_landed
+            .borrow_mut()
+            .insert((txid.to_string(), topic.to_string()));
+    }
+
+    /// Take out again the outputs a faulted submit inserted (bsv-low #559,
+    /// the lens fold of 2026-10-07, F1), so that nothing of a transaction
+    /// that did not land is held. Only a row nobody has touched since is
+    /// deleted: unspent and consumed by nothing. A plain delete, not the
+    /// deep one: the row's retained inputs were not pointed at it yet. A
+    /// fault here is reported (`undo_insert_output`) and the row stays: the
+    /// limit of an undo made of separate calls.
+    async fn undo_inserts(
+        &self,
+        txid: &str,
+        topic: &str,
+        output_indices: &[u32],
+        bound: Option<&CallBound>,
+        report: &mut MutationReport,
+    ) {
+        for &output_index in output_indices {
+            let row = stored(
+                bound,
+                self.storage
+                    .find_output(txid, output_index, Some(topic), None, false),
+            )
+            .await;
+            let undone = match row {
+                Ok(Some(row)) if !row.spent && row.consumed_by.is_empty() => {
+                    stored(bound, self.storage.delete_output(txid, output_index, topic)).await
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = undone {
+                error!("Error taking {txid}.{output_index} out of topic {topic} again: {e}");
+                report.fault(topic, "undo_insert_output", e.to_string());
+            }
+        }
+    }
+
+    /// The store's own answer to "has a predecessor of `tx` not landed?"
+    /// (bsv-low #559, the lens fold of 2026-10-07, F3), for a transaction
+    /// that found no previous coin and admits nothing. The engine's memory
+    /// of a faulted submit (`not_landed`) dies with the invocation; this
+    /// does not. A transaction the submitted BEEF carries the body of has
+    /// not landed in `topic` when it has no applied row there, none of its
+    /// outputs is held there, and it spends a coin the topic HOLDS (or, the
+    /// same question one step up, a coin of another such transaction): it is
+    /// a spend of this topic that the store has not taken yet, and `tx` was
+    /// judged without what it will leave. Returns that transaction's txid.
+    ///
+    /// The limits, stated. It sees only bodies in the BEEF: an unproven
+    /// successor carries its parent (the live `/submit` case), a PROVEN one
+    /// does not, and is then recorded as in the reference. It asks the store
+    /// at most [`PREDECESSOR_READS`] times and answers "landed" past that.
+    /// And it cannot tell a faulted predecessor from one nobody submitted
+    /// yet: a successor is "not now" in both until the predecessor lands.
+    async fn unlanded_predecessor(
+        &self,
+        tx: &Transaction,
+        beef_bytes: &[u8],
+        topic: &str,
+        bound: Option<&CallBound>,
+    ) -> Option<String> {
+        let beef = Beef::from_binary(beef_bytes).ok()?;
+        let bodies: HashMap<String, &Transaction> = beef
+            .txs
+            .iter()
+            .filter_map(|btx| btx.tx().map(|body| (btx.txid(), body)))
+            .collect();
+        let mut reads = 0usize;
+        let mut asked: HashSet<String> = HashSet::new();
+        let mut ask: Vec<String> = tx
+            .inputs
+            .iter()
+            .map(|input| input.get_source_txid().unwrap_or_default())
+            .collect();
+        while let Some(candidate) = ask.pop() {
+            if candidate.is_empty() || !asked.insert(candidate.clone()) {
+                continue;
+            }
+            let Some(body) = bodies.get(&candidate) else {
+                continue;
+            };
+            if reads + 2 > PREDECESSOR_READS {
+                return None;
+            }
+            reads += 2;
+            let record = AppliedTransaction {
+                txid: candidate.clone(),
+                topic: topic.to_string(),
+            };
+            // Anything but a clean "no applied row" and "no output held"
+            // ends the question for this transaction: it landed, or the
+            // store cannot say.
+            let applied = stored(bound, self.storage.does_applied_transaction_exist(&record)).await;
+            if !matches!(applied, Ok(false)) {
+                continue;
+            }
+            let held = stored(
+                bound,
+                self.storage.find_outputs_for_transaction(&candidate, false),
+            )
+            .await;
+            if !matches!(&held, Ok(outputs) if outputs.iter().all(|o| o.topic != topic)) {
+                continue;
+            }
+            for input in &body.inputs {
+                let source = input.get_source_txid().unwrap_or_default();
+                if source.is_empty() {
+                    continue;
+                }
+                if reads >= PREDECESSOR_READS {
+                    return None;
+                }
+                reads += 1;
+                let coin = stored(
+                    bound,
+                    self.storage.find_output(
+                        &source,
+                        input.source_output_index,
+                        Some(topic),
+                        None,
+                        false,
+                    ),
+                )
+                .await;
+                match coin {
+                    Ok(Some(_)) => return Some(candidate),
+                    // Not held: its own transaction may be the one that has
+                    // not landed.
+                    Ok(None) => ask.push(source),
+                    Err(_) => {}
+                }
+            }
+        }
+        None
     }
 
     /// The reference's `tx.verify(chainTracker)` on submit, walked LINEARLY
@@ -1641,6 +2021,7 @@ impl Engine {
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
         context: &TopicAdmittanceContext,
+        bound: Option<&CallBound>,
     ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
@@ -1695,11 +2076,12 @@ impl Engine {
                 txid: txid.clone(),
                 topic: topic.clone(),
             };
-            let is_dupe = self
-                .storage
-                .does_applied_transaction_exist(&tx_record)
-                .await
-                .unwrap_or(false);
+            let is_dupe = stored(
+                bound,
+                self.storage.does_applied_transaction_exist(&tx_record),
+            )
+            .await
+            .unwrap_or(false);
 
             if is_dupe {
                 validations.push(TopicValidation {
@@ -1723,16 +2105,17 @@ impl Engine {
                 if source_txid.is_empty() {
                     continue;
                 }
-                match self
-                    .storage
-                    .find_output(
+                match stored(
+                    bound,
+                    self.storage.find_output(
                         &source_txid,
                         input.source_output_index,
                         Some(topic),
                         None,
                         false,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(Some(prev_output)) => {
                         previous_coins.push(input_idx as u32);
@@ -1757,24 +2140,31 @@ impl Engine {
             }
 
             let manager = &self.managers[topic];
-            match manager
-                .identify_admissible_outputs(
+            let previous_coin_bytes = previous_coins
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect::<Vec<u8>>();
+            // Under a finalize submit's bound a manager that does not answer
+            // is a manager that failed: nothing is written for the topic.
+            let judged = bounded(
+                bound,
+                manager.identify_admissible_outputs(
                     // The ONE engine parse of the submitted BEEF, shared by
                     // every topic on this submit (bsv-low #289 — managers
                     // used to re-parse the same bytes independently).
                     &tx,
-                    &previous_coins
-                        .iter()
-                        .flat_map(|i| i.to_le_bytes())
-                        .collect::<Vec<u8>>(),
+                    &previous_coin_bytes,
                     tagged_beef.off_chain_values.as_deref(),
                     mode,
                     // `dry_run` is `false` on a submit, `true` on a
                     // validate-only call.
                     context,
-                )
-                .await
-            {
+                ),
+            )
+            .await
+            .map_err(TopicManagerError::Other)
+            .and_then(|judged| judged);
+            match judged {
                 Ok(admittance) => {
                     validations.push(TopicValidation {
                         topic: topic.clone(),
@@ -2903,60 +3293,72 @@ impl Engine {
     /// Then recurses into outputsConsumed, removing the deleted output from their
     /// consumedBy lists and deleting them if they become unreferenced.
     #[allow(dead_code)] // Used by submit() once BEEF parsing is wired up
+    ///
+    /// `bound` is a finalize submit's [`CallBound`] over each call here
+    /// (bsv-low #559); `None` everywhere else.
     fn delete_utxo_deep<'a>(
         &'a self,
         output: &'a Output,
+        bound: Option<&'a CallBound>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EngineError>> + 'a>> {
         Box::pin(async move {
             // Only delete if nothing consumes this output
             if output.consumed_by.is_empty() {
-                self.storage
-                    .delete_output(&output.txid, output.output_index, &output.topic)
-                    .await
-                    .map_err(|e| EngineError::StorageError(e.to_string()))?;
+                stored(
+                    bound,
+                    self.storage
+                        .delete_output(&output.txid, output.output_index, &output.topic),
+                )
+                .await
+                .map_err(|e| EngineError::StorageError(e.to_string()))?;
 
                 // Notify lookup services
                 for ls in self.lookup_services.values() {
-                    let _ = ls
-                        .output_no_longer_retained_in_history(
+                    let _ = hooked(
+                        bound,
+                        ls.output_no_longer_retained_in_history(
                             &output.txid,
                             output.output_index,
                             &output.topic,
-                        )
-                        .await;
+                        ),
+                    )
+                    .await;
                 }
             }
 
             // Recurse into consumed outputs
             for consumed in &output.outputs_consumed {
-                if let Ok(Some(mut stale_output)) = self
-                    .storage
-                    .find_output(
+                if let Ok(Some(mut stale_output)) = stored(
+                    bound,
+                    self.storage.find_output(
                         &consumed.txid,
                         consumed.output_index,
                         Some(&output.topic),
                         None,
                         false,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     // Remove the deleted output from consumedBy
                     stale_output.consumed_by.retain(|c| {
                         !(c.txid == output.txid && c.output_index == output.output_index)
                     });
 
-                    self.storage
-                        .update_consumed_by(
+                    stored(
+                        bound,
+                        self.storage.update_consumed_by(
                             &consumed.txid,
                             consumed.output_index,
                             &output.topic,
                             &stale_output.consumed_by,
-                        )
-                        .await
-                        .map_err(|e| EngineError::StorageError(e.to_string()))?;
+                        ),
+                    )
+                    .await
+                    .map_err(|e| EngineError::StorageError(e.to_string()))?;
 
                     // Recurse
-                    let _ = self.delete_utxo_deep(&stale_output).await;
+                    let _ = self.delete_utxo_deep(&stale_output, bound).await;
                 }
             }
 
@@ -3534,31 +3936,23 @@ impl Engine {
                     submitted.set(submitted.get() + 1);
                 }
                 let tagged = TaggedBEEF::new(beef_bytes.clone(), vec![graph.topic.clone()]);
-                // No deadline drops a write section, so the section bounds
-                // ITSELF (bsv-low #559, the delta lens's DELTA-3,
-                // `set_finalize_submit_budget`). A storage call or lookup
-                // hook that never answers is dropped there, the transaction
+                // No deadline drops a write section, and the section does
+                // not drop ITSELF either (bsv-low #559, the delta lens's
+                // DELTA-3 and the lens fold of 2026-10-07, F2,
+                // `set_finalize_submit_budget`): the submit always runs to
+                // its end. What is bounded is each storage call and hook
+                // inside it ([`CallBound`]): one that never answers is that
+                // call's FAULT, the submit handles it as any fault (nothing
+                // of the transaction held, or all of it), the transaction
                 // did not land, its UTXO fails and the cursor stays.
-                // Dropping a submit between its writes is safe since #559:
-                // the insert comes before the delete and there is no applied
-                // row, so the replay finds the old head or the new one.
                 let outcome = {
                     let _writing = self.finalize_gate.write_section();
-                    let submit = self.submit_with_report(&tagged, SubmitMode::HistoricalTxNoSpv);
-                    match &self.finalize_submit_budget {
-                        Some((sleep, budget_ms)) => {
-                            crate::gasp::race_or_deadline(submit, sleep(*budget_ms))
-                                .await
-                                .ok_or(*budget_ms)
-                        }
-                        None => Ok(submit.await),
-                    }
-                };
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(budget_ms) => Err(EngineError::StorageError(format!(
-                        "no answer within {budget_ms} ms inside the submit: dropped"
-                    ))),
+                    let bound = self
+                        .finalize_submit_budget
+                        .as_ref()
+                        .map(|(sleep, budget_ms)| CallBound::new(sleep, *budget_ms));
+                    self.submit_bounded(&tagged, SubmitMode::HistoricalTxNoSpv, bound.as_ref())
+                        .await
                 };
                 let not_landed = match outcome {
                     Ok((_, report)) => {
@@ -4484,7 +4878,7 @@ mod tests {
             .unwrap();
 
         // Delete it
-        engine.delete_utxo_deep(&output).await.unwrap();
+        engine.delete_utxo_deep(&output, None).await.unwrap();
 
         // Should be gone
         let found = engine

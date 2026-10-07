@@ -3205,11 +3205,35 @@ enum InsertEvent {
 
 type Armed = Rc<RefCell<Option<(String, u32, InsertEvent)>>>;
 
-// `MemoryStorage` with one scripted `insert_output`. Every other call
-// delegates.
+// A storage call other than `insert_output` that a `ScriptedStore` can
+// script (the lens fold of 2026-10-07, bsv-low #559), keyed by the txid the
+// call names.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Call {
+    MarkSpent,
+    Delete,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CallEvent {
+    // The call faults once and answers from then on (a transient D1 fault).
+    FaultsOnce,
+    // The call does its write and THEN faults, once (D1's `delete_output` is
+    // a delete and a cleanup: the second can fault after the first landed).
+    LandsThenFaultsOnce,
+    // The call never answers until the test clears the script.
+    Hangs,
+}
+
+type Calls = Rc<RefCell<Vec<(Call, String, CallEvent)>>>;
+
+// `MemoryStorage` with one scripted `insert_output` and any number of
+// scripted `mark_utxo_as_spent` and `delete_output` calls.
+// Every other call delegates.
 struct ScriptedStore {
     inner: Rc<MemoryStorage>,
     armed: Armed,
+    calls: Calls,
 }
 
 impl ScriptedStore {
@@ -3222,7 +3246,41 @@ impl ScriptedStore {
         Self {
             inner: inner.clone(),
             armed: Rc::new(RefCell::new(Some((txid, output_index, event)))),
+            calls: Calls::default(),
         }
+    }
+
+    // No insert armed: only what the test pushes on `calls`.
+    fn plain(inner: &Rc<MemoryStorage>) -> Self {
+        Self {
+            inner: inner.clone(),
+            armed: Rc::new(RefCell::new(None)),
+            calls: Calls::default(),
+        }
+    }
+
+    // What the script says of this call: `Ok(false)` to delegate,
+    // `Ok(true)` to delegate and fault after, `Err` to fault before.
+    async fn scripted(&self, call: Call, txid: &str) -> Result<bool, StorageError> {
+        let event = {
+            let mut calls = self.calls.borrow_mut();
+            let hit = calls.iter().position(|(c, t, _)| *c == call && t == txid);
+            match hit {
+                Some(i) if calls[i].2 == CallEvent::Hangs => Some(calls[i].2),
+                Some(i) => Some(calls.remove(i).2),
+                None => None,
+            }
+        };
+        match event {
+            Some(CallEvent::Hangs) => std::future::pending().await,
+            Some(CallEvent::FaultsOnce) => Err(Self::overloaded(call)),
+            Some(CallEvent::LandsThenFaultsOnce) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    fn overloaded(call: Call) -> StorageError {
+        StorageError::Database(format!("D1_ERROR: storage overloaded ({call:?})"))
     }
 }
 
@@ -3264,7 +3322,12 @@ impl Storage for ScriptedStore {
         output_index: u32,
         topic: &str,
     ) -> Result<(), StorageError> {
-        self.inner.delete_output(txid, output_index, topic).await
+        let faults_after = self.scripted(Call::Delete, txid).await?;
+        self.inner.delete_output(txid, output_index, topic).await?;
+        if faults_after {
+            return Err(Self::overloaded(Call::Delete));
+        }
+        Ok(())
     }
     async fn mark_utxo_as_spent(
         &self,
@@ -3272,6 +3335,9 @@ impl Storage for ScriptedStore {
         output_index: u32,
         topic: &str,
     ) -> Result<(), StorageError> {
+        if self.scripted(Call::MarkSpent, txid).await? {
+            unreachable!("only a delete lands and then faults");
+        }
         self.inner
             .mark_utxo_as_spent(txid, output_index, topic)
             .await
@@ -3959,10 +4025,11 @@ async fn i559_b_a_successor_of_a_faulted_submit_is_not_recorded_as_applied() {
 // finalize write section, which no deadline drops. On 1821f73 that held the
 // per-peer budget and the worker's belt for as long as the call hung: the
 // tick never returned (RED there with this pin less its one call to
-// `set_finalize_submit_budget`, which the base does not have). Now one
-// transaction's finalize submit has a budget of its own; past it the submit
-// is dropped (safe since the insert comes before the delete), the UTXO fails
-// and the cursor stays.
+// `set_finalize_submit_budget`, which the base does not have). Now each
+// storage call of a finalize submit is bounded by the submit's budget; the
+// call that does not answer is that call's fault (the submit itself is never
+// dropped: the lens fold of 2026-10-07, F2), the UTXO fails and the cursor
+// stays.
 #[tokio::test]
 async fn i559_c_a_hung_storage_call_inside_a_finalize_submit_is_timed_out_and_fails_the_utxo() {
     let (_logs, _guard) = capture_logs();
@@ -4068,4 +4135,711 @@ async fn i554_a_failing_utxo_at_the_page_boundary_is_requested_once_per_sync() {
     assert_eq!(sent, txids(&nodes, &[2, 1, 0]));
     assert_eq!(held(&node.store, &nodes).await, vec![(2, 0)]);
     assert_eq!(topic.cursor_moves, moved(0, 1));
+}
+
+// ============================================================================
+// The lens fold of 2026-10-07 (bsv-low #559, `docs/audit/E559-lens-2026-10-07.md`
+// in bsv-low). F1: a fault AFTER the insert never leaves two unspent heads.
+// F2: no finalize submit is dropped between its writes, each storage call is
+// bounded instead. F3: a successor that arrives in a later invocation, before
+// its predecessor's replay, is not recorded as applied.
+// ============================================================================
+
+// Every row of the chain's output 0 the store holds: "index:spent".
+async fn rows(store: &MemoryStorage, nodes: &[GASPNode]) -> Vec<String> {
+    let mut rows = Vec::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if let Some(o) = store
+            .find_output(&node_txid(n), 0, Some(TOPIC), None, false)
+            .await
+            .unwrap()
+        {
+            rows.push(format!("{i}:spent={}", o.spent));
+        }
+    }
+    rows
+}
+
+// One engine of the `/submit` door over `store` (a worker invocation).
+fn door<M: TopicManager + 'static>(manager: M, storage: ScriptedStore) -> Engine {
+    Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(manager) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(storage),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+fn head_door(store: &Rc<MemoryStorage>, calls: &Calls) -> Engine {
+    let mut storage = ScriptedStore::plain(store);
+    storage.calls = calls.clone();
+    door(
+        HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+        storage,
+    )
+}
+
+async fn submitted(
+    engine: &Engine,
+    beef: &TaggedBEEF,
+) -> bsv_overlay_engine::engine::MutationReport {
+    engine
+        .submit_with_report(beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap()
+        .1
+}
+
+// F1, the lens's X2 (GASP, one transient D1 fault, no other condition). Two
+// heads, the tip listed; the mark-spent of the genesis faults once inside the
+// finalize submit of head 1. On c9921ee the insert of head 1 landed and the
+// delete of the genesis was skipped because a fault had been reported: both
+// stayed, both unspent, and no later tick changed it (the new head is held,
+// so the peer's listing of it is known and the cursor passes).
+#[tokio::test]
+async fn fold559_f1_x2_a_mark_fault_at_the_tip_never_leaves_two_unspent_heads() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(2);
+    for budgeted in [true, false] {
+        let store = Rc::new(MemoryStorage::new());
+        let scripted = ScriptedStore::plain(&store);
+        scripted.calls.borrow_mut().push((
+            Call::MarkSpent,
+            node_txid(&nodes[0]),
+            CallEvent::FaultsOnce,
+        ));
+        let node = Budgeted::over(
+            RecordingRemote::new(&nodes, &[1]),
+            Box::new(HeadChainManager(Rc::new(
+                RefCell::new(HeadState::default()),
+            ))),
+            RequestClock::allowing(u64::MAX - 1),
+            store,
+            Box::new(scripted),
+            budgeted,
+        );
+        for tick in 1..=4 {
+            node.tick().await;
+            let utxos = held(&node.store, &nodes).await;
+            println!(
+                "#559 F1 X2 budgeted={budgeted} tick {tick}: rows {:?} utxos {utxos:?} applied {:?} cursor {}",
+                rows(&node.store, &nodes).await,
+                applied_rows(&node.store, &nodes).await,
+                node.cursor().await
+            );
+            assert_eq!(
+                utxos.len(),
+                1,
+                "budgeted={budgeted} tick {tick}: exactly one unspent head, never two, never none"
+            );
+        }
+        assert_eq!(held(&node.store, &nodes).await, vec![(1, 0)]);
+        assert_eq!(
+            rows(&node.store, &nodes).await,
+            ["1:spent=false"],
+            "budgeted={budgeted}: the genesis row is gone"
+        );
+        assert_eq!(node.cursor().await, 1, "budgeted={budgeted}");
+    }
+}
+
+// F1, the lens's X1 (the `/submit` door, the queue's order). Head 1's submit
+// faults after its insert (the same mark fault) and its replay is queued;
+// head 2 lands first in another invocation; the queue then replays head 1.
+// On c9921ee the genesis was still held (the delete had been skipped), the
+// manager admitted head 1 again and it was RE-INSERTED unspent beside head 2,
+// every row applied: permanent. Three engines over one store, then one.
+#[tokio::test]
+async fn fold559_f1_x1_a_replay_after_the_successor_does_not_resurrect_a_spent_head() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    for one_engine in [false, true] {
+        let store = Rc::new(MemoryStorage::new());
+        let calls = Calls::default();
+        let shared = head_door(&store, &calls);
+        let invocation = || head_door(&store, &calls);
+        let case = format!("one_engine={one_engine}");
+
+        assert!(submitted(&shared, &proven_beef(&nodes[0]))
+            .await
+            .is_durable());
+        calls
+            .borrow_mut()
+            .push((Call::MarkSpent, node_txid(&nodes[0]), CallEvent::FaultsOnce));
+        let faulted = submitted(&shared, &proven_beef(&nodes[1])).await;
+        assert!(!faulted.is_durable(), "{case}: the mark fault is reported");
+        println!(
+            "#559 F1 X1 {case}: after the faulted head 1: rows {:?} applied {:?}",
+            rows(&store, &nodes).await,
+            applied_rows(&store, &nodes).await
+        );
+        assert_eq!(held(&store, &nodes).await.len(), 1, "{case}: one head");
+
+        // Head 2 arrives before the replay of head 1.
+        let later = invocation();
+        let successor = submitted(
+            if one_engine { &shared } else { &later },
+            &proven_beef(&nodes[2]),
+        )
+        .await;
+        println!(
+            "#559 F1 X1 {case}: after head 2: durable {} rows {:?} applied {:?}",
+            successor.is_durable(),
+            rows(&store, &nodes).await,
+            applied_rows(&store, &nodes).await
+        );
+        assert_eq!(held(&store, &nodes).await.len(), 1, "{case}: one head");
+
+        // The queue replays head 1, then anything not durable so far.
+        let queue = invocation();
+        let queue = if one_engine { &shared } else { &queue };
+        submitted(queue, &proven_beef(&nodes[1])).await;
+        if !successor.is_durable() {
+            assert!(submitted(queue, &proven_beef(&nodes[2])).await.is_durable());
+        }
+        println!(
+            "#559 F1 X1 {case}: after the replay of head 1: rows {:?} applied {:?}",
+            rows(&store, &nodes).await,
+            applied_rows(&store, &nodes).await
+        );
+        assert_eq!(
+            rows(&store, &nodes).await,
+            ["2:spent=false"],
+            "{case}: head 2 is the only row, head 1 is not resurrected"
+        );
+        assert_eq!(applied_rows(&store, &nodes).await, [true; 3], "{case}");
+    }
+}
+
+// A lookup service that records what it is told and faults ONCE on the
+// admission of `faults_on`.
+struct ToldLookup {
+    admitted: Rc<RefCell<Vec<String>>>,
+    spent: Rc<RefCell<Vec<String>>>,
+    faults_on: RefCell<Option<String>>,
+}
+
+#[async_trait(?Send)]
+impl bsv_overlay_engine::lookup_service::LookupService for ToldLookup {
+    fn admission_mode(&self) -> AdmissionMode {
+        AdmissionMode::LockingScript
+    }
+    fn spend_notification_mode(&self) -> SpendNotificationMode {
+        SpendNotificationMode::Txid
+    }
+    async fn output_admitted_by_topic(
+        &self,
+        payload: &OutputAdmittedByTopic,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        let OutputAdmittedByTopic::LockingScript { txid, .. } = payload else {
+            unreachable!("the mode is the locking script");
+        };
+        if self.faults_on.borrow().as_deref() == Some(txid) {
+            self.faults_on.borrow_mut().take();
+            return Err(
+                bsv_overlay_engine::lookup_service::LookupServiceError::Other(
+                    "D1_ERROR: the index is overloaded".into(),
+                ),
+            );
+        }
+        self.admitted.borrow_mut().push(txid.clone());
+        Ok(())
+    }
+    async fn output_spent(
+        &self,
+        payload: &OutputSpent,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        let OutputSpent::Txid { txid, .. } = payload else {
+            unreachable!("the mode is the txid");
+        };
+        self.spent.borrow_mut().push(txid.clone());
+        Ok(())
+    }
+    async fn output_evicted(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(())
+    }
+    async fn lookup(
+        &self,
+        _question: &LookupQuestion,
+    ) -> Result<LookupResult, bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(LookupResult::OutputList(Vec::new()))
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// F1, the notification variant the lens read but did not run (its NIT: "F1
+// lives in exactly that gap"). The lookup hook faults on the admission of
+// head 1, after its insert. On c9921ee that kept the genesis beside head 1
+// and the replay after head 2 put head 1 back. Now the store is complete at
+// the fault (the genesis deleted, the spent mark told), and the replay finds
+// no coin. The limit this pins too: a manager whose rule needs the previous
+// coin admits nothing on that replay, so the hook that faulted is NOT told of
+// head 1 again (the reference tells nobody twice either).
+#[tokio::test]
+async fn fold559_f1_a_notification_fault_after_the_insert_leaves_one_head() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    let (admitted, spent) = (
+        Rc::new(RefCell::new(Vec::new())),
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let invocation = |faults_on: Option<String>| {
+        Engine::new(
+            HashMap::from([(
+                TOPIC.to_string(),
+                Box::new(HeadChainManager(Rc::new(
+                    RefCell::new(HeadState::default()),
+                ))) as Box<dyn TopicManager>,
+            )]),
+            HashMap::from([(
+                "ls_told".to_string(),
+                Box::new(ToldLookup {
+                    admitted: admitted.clone(),
+                    spent: spent.clone(),
+                    faults_on: RefCell::new(faults_on),
+                }) as Box<dyn bsv_overlay_engine::lookup_service::LookupService>,
+            )]),
+            Box::new(ScriptedStore::plain(&store)),
+            None,
+            EngineConfig::default(),
+        )
+    };
+
+    let first = invocation(Some(node_txid(&nodes[1])));
+    assert!(submitted(&first, &proven_beef(&nodes[0]))
+        .await
+        .is_durable());
+    let faulted = submitted(&first, &proven_beef(&nodes[1])).await;
+    assert!(
+        faulted
+            .faults
+            .iter()
+            .any(|f| f.site == "lookup_service.output_admitted_by_topic"),
+        "{}",
+        faulted.summary()
+    );
+    assert_eq!(
+        rows(&store, &nodes).await,
+        ["1:spent=false"],
+        "the store is complete at the fault: head 1 in, the genesis deleted"
+    );
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+
+    // Head 2 lands in a later invocation, then the queue replays head 1.
+    assert!(submitted(&invocation(None), &proven_beef(&nodes[2]))
+        .await
+        .is_durable());
+    let replay = submitted(&invocation(None), &proven_beef(&nodes[1])).await;
+    assert!(replay.is_durable(), "{}", replay.summary());
+    println!(
+        "#559 F1 notify: rows {:?} applied {:?}; the hook was told of {} admission(s) and {} spend(s)",
+        rows(&store, &nodes).await,
+        applied_rows(&store, &nodes).await,
+        admitted.borrow().len(),
+        spent.borrow().len()
+    );
+    assert_eq!(rows(&store, &nodes).await, ["2:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
+    assert_eq!(
+        *admitted.borrow(),
+        txids(&nodes, &[0, 2]),
+        "the limit: the admission that faulted is not told again"
+    );
+    assert_eq!(*spent.borrow(), txids(&nodes, &[0, 1]));
+}
+
+// F1: an insert that faults after another output of the same transaction
+// landed. On c9921ee the output that landed stayed beside the kept previous
+// coin; a successor could spend and delete it before the replay, and the
+// replay (the previous coin still held) inserted it again. Now nothing of a
+// transaction that did not land is held.
+#[tokio::test]
+async fn fold559_f1_an_insert_fault_after_a_landed_output_holds_nothing_of_the_transaction() {
+    let (_logs, _guard) = capture_logs();
+    // Head 1 carries a record at output 1; its insert faults.
+    let nodes = recorded_chain(3, &[1]);
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 1, InsertEvent::Faults);
+    let outage = scripted.armed.clone();
+    let engine = door(
+        RecordedHeadManager(Rc::new(RefCell::new(HeadState::default()))),
+        scripted,
+    );
+
+    assert!(submitted(&engine, &proven_beef(&nodes[0]))
+        .await
+        .is_durable());
+    let faulted = submitted(&engine, &proven_beef(&nodes[1])).await;
+    assert!(!faulted.is_durable());
+    println!(
+        "#559 F1 partial: after the faulted insert of the record: rows {:?} utxos {:?}",
+        rows(&store, &nodes).await,
+        held(&store, &nodes).await
+    );
+    assert_eq!(
+        rows(&store, &nodes).await,
+        ["0:spent=true"],
+        "the previous coin is kept and the output that landed is taken out again"
+    );
+    assert!(held(&store, &nodes).await.is_empty());
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+
+    outage.borrow_mut().take();
+    assert!(submitted(&engine, &proven_beef(&nodes[1]))
+        .await
+        .is_durable());
+    assert_eq!(held(&store, &nodes).await, vec![(1, 0), (1, 1)]);
+    assert!(!row_exists(&store, &nodes[0]).await);
+}
+
+// A transaction that does not carry a proof, in a BEEF with the bodies of the
+// ancestors it spends from down to `proven`, which carries its proof: what a
+// client submits for a spend whose parents are not all mined yet.
+fn unproven_beef(nodes: &[GASPNode], subject: usize, proven: usize) -> TaggedBEEF {
+    let mut tx = Transaction::from_hex(&nodes[proven].raw_tx).unwrap();
+    tx.merkle_path = Some(MerklePath::from_hex(nodes[proven].proof.as_ref().unwrap()).unwrap());
+    for node in &nodes[proven + 1..=subject] {
+        let mut child = Transaction::from_hex(&node.raw_tx).unwrap();
+        child.inputs[0].source_transaction = Some(Box::new(tx));
+        tx = child;
+    }
+    TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![TOPIC.to_string()])
+}
+
+// F1: the DELETE of the stale coin faults, after the insert. Left as it is
+// (the new head in, the old one still held, no applied row) the replay after
+// a successor finds the old head and inserts the new one a second time. So
+// the store is put back as it was found: the old head is read back held, the
+// new one is taken out, and the replay does the whole transaction.
+#[tokio::test]
+async fn fold559_f1_a_delete_fault_puts_the_store_back_and_the_replay_lands_whole() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    let first = head_door(&store, &calls);
+    assert!(submitted(&first, &proven_beef(&nodes[0]))
+        .await
+        .is_durable());
+    calls
+        .borrow_mut()
+        .push((Call::Delete, node_txid(&nodes[0]), CallEvent::FaultsOnce));
+    let faulted = submitted(&first, &proven_beef(&nodes[1])).await;
+    assert!(
+        faulted.faults.iter().any(|f| f.site == "delete_utxo_deep"),
+        "{}",
+        faulted.summary()
+    );
+    println!(
+        "#559 F1 delete: after the faulted delete of the genesis: rows {:?} applied {:?}",
+        rows(&store, &nodes).await,
+        applied_rows(&store, &nodes).await
+    );
+    assert_eq!(
+        rows(&store, &nodes).await,
+        ["0:spent=true"],
+        "one head row: the old one, the new one taken out again"
+    );
+
+    // Head 2 arrives in a later invocation, before the replay: not now.
+    let successor = submitted(&head_door(&store, &calls), &unproven_beef(&nodes, 2, 1)).await;
+    assert!(!successor.is_durable() && successor.applied_topics.is_empty());
+    // The queue replays both.
+    let queue = head_door(&store, &calls);
+    assert!(submitted(&queue, &proven_beef(&nodes[1]))
+        .await
+        .is_durable());
+    assert!(submitted(&queue, &unproven_beef(&nodes, 2, 1))
+        .await
+        .is_durable());
+    assert_eq!(rows(&store, &nodes).await, ["2:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
+}
+
+// F1, the other end of a delete fault: the delete LANDED and its cleanup
+// faulted (D1's shape). The old head is read back gone, so the new one stays
+// (taking it out would leave no head at all); there is no applied row, and
+// the replay, which finds no coin and admits nothing, writes it.
+#[tokio::test]
+async fn fold559_f1_a_delete_that_landed_and_then_faulted_keeps_the_new_head() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(2);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    let engine = head_door(&store, &calls);
+    assert!(submitted(&engine, &proven_beef(&nodes[0]))
+        .await
+        .is_durable());
+    calls.borrow_mut().push((
+        Call::Delete,
+        node_txid(&nodes[0]),
+        CallEvent::LandsThenFaultsOnce,
+    ));
+    let faulted = submitted(&engine, &proven_beef(&nodes[1])).await;
+    assert!(!faulted.is_durable());
+    assert_eq!(
+        rows(&store, &nodes).await,
+        ["1:spent=false"],
+        "never no head: the old one is gone, so the new one stays"
+    );
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false]);
+    assert!(submitted(&engine, &proven_beef(&nodes[1]))
+        .await
+        .is_durable());
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 2]);
+}
+
+// The submit's own deadline of the F2 pins: due after a few polls, as a timer
+// is; a fresh one for every call of the factory (the undo has its own).
+fn due_after_a_few_polls() -> bsv_overlay_engine::engine::SleepFactory {
+    Rc::new(|_ms| {
+        let mut polls = 0;
+        Box::pin(std::future::poll_fn(move |cx| {
+            polls += 1;
+            if polls > 3 {
+                std::task::Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }))
+    })
+}
+
+// F2, the lens's X3. Inside a finalize submit the delete of the old head
+// never ANSWERS, after the new head's insert landed. On c9921ee the budget
+// dropped the whole submit there, between two writes: the old head stayed
+// (spent) beside the new one, with no applied row, and no later tick replayed
+// it (the new head is held). Now the hung CALL is that call's fault and the
+// submit runs on: the old head is read back held, the new one is taken out,
+// the UTXO fails within the budget and the cursor stays; the next tick
+// places the chain. One head row at every step, never none, never two.
+#[tokio::test]
+async fn fold559_f2_a_hung_delete_inside_a_finalize_submit_is_a_fault_of_that_call_not_a_drop() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::plain(&store);
+    let calls = scripted.calls.clone();
+    calls
+        .borrow_mut()
+        .push((Call::Delete, node_txid(&nodes[0]), CallEvent::Hangs));
+    let mut node = Budgeted::over(
+        RecordingRemote::new(&nodes, &[3]),
+        Box::new(HeadChainManager(Rc::new(
+            RefCell::new(HeadState::default()),
+        ))),
+        RequestClock::allowing(u64::MAX - 1),
+        store,
+        Box::new(scripted),
+        true,
+    );
+    node.engine
+        .set_finalize_submit_budget(due_after_a_few_polls(), 1);
+
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), node.tick()).await;
+    let (topic, _) = ticked.expect("the hung delete held the tick");
+    println!(
+        "#559 F2: after the hung delete of the genesis: rows {:?} applied {:?} cursor {} errors {:?}",
+        rows(&node.store, &nodes).await,
+        applied_rows(&node.store, &nodes).await,
+        node.cursor().await,
+        topic.errors
+    );
+    assert_eq!(
+        rows(&node.store, &nodes).await,
+        ["0:spent=true"],
+        "exactly one head row: the submit ran on past the hung call and took head 1 out again"
+    );
+    assert_eq!(
+        applied_rows(&node.store, &nodes).await,
+        [true, false, false, false]
+    );
+    assert_eq!(node.cursor().await, 0, "the UTXO failed: the cursor stays");
+    assert!(topic.cursor_moves.is_empty());
+
+    // The call answers again: the next tick resumes from the held head.
+    calls.borrow_mut().clear();
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3, 2, 1]));
+    assert_eq!(rows(&node.store, &nodes).await, ["3:spent=false"]);
+    assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4]);
+    assert_eq!(topic.cursor_moves, moved(0, 1));
+}
+
+// F2: EVERY storage call hangs (the store is gone for the tick). The first
+// read of the finalize submit takes the budget and no call is started after
+// it: the tick returns, nothing is written, the cursor stays.
+#[tokio::test]
+async fn fold559_f2_a_store_that_never_answers_costs_one_budget_and_writes_nothing() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::plain(&store);
+    let calls = scripted.calls.clone();
+    let mut node = Budgeted::over(
+        RecordingRemote::new(&nodes, &[2]),
+        Box::new(HeadChainManager(Rc::new(
+            RefCell::new(HeadState::default()),
+        ))),
+        RequestClock::allowing(u64::MAX - 1),
+        store,
+        Box::new(scripted),
+        true,
+    );
+    node.engine
+        .set_finalize_submit_budget(due_after_a_few_polls(), 1);
+    // The genesis is placed by a first sync of a one-link peer listing.
+    assert!(submitted(&node.engine, &proven_beef(&nodes[0]))
+        .await
+        .is_durable());
+    // From here the mark of the genesis hangs, and so does every later call
+    // that names it or head 1.
+    for call in [Call::MarkSpent, Call::Delete] {
+        calls
+            .borrow_mut()
+            .push((call, node_txid(&nodes[0]), CallEvent::Hangs));
+    }
+
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), node.tick()).await;
+    assert!(ticked.is_ok(), "the hung calls held the tick");
+    println!(
+        "#559 F2 all hung: rows {:?} applied {:?} cursor {}",
+        rows(&node.store, &nodes).await,
+        applied_rows(&node.store, &nodes).await,
+        node.cursor().await
+    );
+    assert_eq!(rows(&node.store, &nodes).await.len(), 1, "one head row");
+    assert_eq!(node.cursor().await, 0);
+
+    calls.borrow_mut().clear();
+    node.tick().await;
+    assert_eq!(rows(&node.store, &nodes).await, ["2:spent=false"]);
+    assert_eq!(node.cursor().await, 1);
+}
+
+// F3. Head 1's insert faults in one invocation (the old head is kept); head 2
+// arrives in ANOTHER invocation, a new engine over the same store, before the
+// replay. On c9921ee the memory of the fault had died with the first engine:
+// head 2 found no coin, admitted nothing and was recorded as applied, and the
+// chain then stopped at head 1 for good. Now the store itself answers: head
+// 1, whose body head 2's BEEF carries, has no applied row, holds no output
+// and spends a coin the topic holds. And head 3, over an unlanded head 2
+// over an unlanded head 1, is "not now" the same way.
+#[tokio::test]
+async fn fold559_f3_a_successor_in_a_later_invocation_is_not_recorded_before_its_predecessor_lands()
+{
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+
+    // Invocation A: the genesis lands, the insert of head 1 faults.
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
+    let a = door(
+        HeadChainManager(Rc::new(RefCell::new(HeadState::default()))),
+        scripted,
+    );
+    assert!(submitted(&a, &proven_beef(&nodes[0])).await.is_durable());
+    assert!(!submitted(&a, &proven_beef(&nodes[1])).await.is_durable());
+    drop(a);
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=true"]);
+
+    // Invocation B: head 2, its parent's body in the BEEF.
+    let b = head_door(&store, &calls);
+    let successor = submitted(&b, &unproven_beef(&nodes, 2, 1)).await;
+    println!(
+        "#559 F3: head 2 in a later invocation: durable {}, faults {}, applied {:?}",
+        successor.is_durable(),
+        successor.summary(),
+        applied_rows(&store, &nodes).await
+    );
+    assert!(
+        successor
+            .faults
+            .iter()
+            .any(|f| f.site == "predecessor_not_landed"),
+        "{}",
+        successor.summary()
+    );
+    assert_eq!(
+        applied_rows(&store, &nodes).await,
+        [true, false, false, false]
+    );
+    drop(b);
+
+    // Invocation C: head 3, over head 2 (not landed, holds no coin) over
+    // head 1 (not landed, spends the held genesis).
+    let c = head_door(&store, &calls);
+    let third = submitted(&c, &unproven_beef(&nodes, 3, 1)).await;
+    assert!(
+        third
+            .faults
+            .iter()
+            .any(|f| f.site == "predecessor_not_landed"),
+        "{}",
+        third.summary()
+    );
+    assert_eq!(
+        applied_rows(&store, &nodes).await,
+        [true, false, false, false]
+    );
+    drop(c);
+
+    // The queue replays the three, each in an invocation of its own.
+    assert!(
+        submitted(&head_door(&store, &calls), &proven_beef(&nodes[1]))
+            .await
+            .is_durable()
+    );
+    assert!(
+        submitted(&head_door(&store, &calls), &unproven_beef(&nodes, 2, 1))
+            .await
+            .is_durable()
+    );
+    assert!(
+        submitted(&head_door(&store, &calls), &unproven_beef(&nodes, 3, 1))
+            .await
+            .is_durable()
+    );
+    assert_eq!(rows(&store, &nodes).await, ["3:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 4]);
+
+    // A transaction that admits nothing over a LANDED parent is recorded, as
+    // before and as in the reference: the rule asks only about a parent the
+    // store has not taken.
+    let again = head_door(&store, &calls);
+    let stranger = {
+        let mut tx = Transaction::new();
+        tx.inputs
+            .push(TransactionInput::new(node_txid(&nodes[2]), 0));
+        tx.inputs[0].source_transaction = Some(Box::new({
+            let mut parent = Transaction::from_hex(&nodes[2].raw_tx).unwrap();
+            parent.merkle_path =
+                Some(MerklePath::from_hex(nodes[2].proof.as_ref().unwrap()).unwrap());
+            parent
+        }));
+        // Two outputs: with one it would BE head 3.
+        tx.outputs.push(plain_output());
+        tx.outputs.push(plain_output());
+        TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![TOPIC.to_string()])
+    };
+    let recorded = submitted(&again, &stranger).await;
+    assert!(recorded.is_durable(), "{}", recorded.summary());
+    assert_eq!(recorded.applied_topics, vec![TOPIC.to_string()]);
 }

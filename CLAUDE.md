@@ -192,38 +192,76 @@ gasp_topic_manager i551` (and `fold_medium`).
 
 The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
 
-## A faulted submit keeps its previous coins (bsv-low #559)
+## A faulted submit leaves one head (bsv-low #559, lens fold of 2026-10-07)
 
 `Engine::submit` inserts the admitted outputs BEFORE it deletes the stale
-coins, and deletes them only when no write or notification of that topic
-faulted before the delete. The reference deletes first
-(`applyTopicStorageMutation`: `removeStaleOutputs`, then `admitOutput`) and
-has no fault path, a throw ends its submit; here a fault is survived and
-replayed, so the order is ours, an addition. Before it, one transient D1
-fault on the insert of a mid-chain head of a non-retaining chain left the
-chain with no head, the replay found no coin, admitted nothing and was
-recorded as applied: lost for good. Now the old head stays (marked spent, so
-not listed as a UTXO; its lookup services were told and are told again by the
-replay), no applied row is written, and the replay that lands deletes it.
+coins, and deletes them once EVERY insert of that topic landed. The reference
+deletes first (`applyTopicStorageMutation`: `removeStaleOutputs`, then
+`admitOutput`), catches a throw per topic (`applyStorageMutations`) and
+carries on, and never replays; here a fault is survived and replayed, so the
+order is ours, an addition. With the delete first, one transient D1 fault on
+the insert of a mid-chain head of a non-retaining chain left the chain with no
+head, for good.
 
-Two more additions ride with it. A transaction that found no previous coin
-and admits nothing, while a transaction it spends from faulted in THIS engine
-and has not landed since, is reported as a fault (`predecessor_not_landed`)
-and not recorded as applied; the memory is the engine's own (one invocation),
-so a successor that arrives in a later invocation before the predecessor's
-replay is still recorded, as in the reference. And
-`Engine::set_finalize_submit_budget` bounds ONE transaction's finalize submit
-(the write section no deadline drops): a storage call that never answers
-inside it is dropped past the budget, the UTXO fails and the cursor stays
-(the worker sets 30 s). `/admin/startGASPSync` runs under the same guarded
-240 s race as the scheduled step and answers 504 when it is dropped. Pins:
-`cargo test -p bsv-overlay-engine --features memory-storage --test
-gasp_topic_manager i559`.
+The invariant, per topic of one submit: whatever SINGLE call faults, a
+non-retaining chain is left with exactly one head row, the old one or the new
+one, and no applied row.
 
-The limit, stated: a lookup service that faults on EVERY notification keeps
-the topic unapplied, so its stale coin is never deleted (a spent row left in
-the store) and every replay re-inserts and re-notifies. Not pinned: the
-record and notify variants of the fault (by reading, the same reorder).
+- A fault BEFORE every insert landed (a validation read, the spent mark of a
+  coin the manager retains, an insert) leaves the previous coins and NOTHING
+  of the transaction: the outputs that did get inserted are taken out again
+  (`undo_inserts`: only a row still unspent and consumed by nothing). The
+  kept stale coin is marked spent, so it is not listed as a UTXO until the
+  replay (a state the reference does not have: its kept spent rows are
+  retained coins).
+- A fault AFTER them (the spent mark of a stale coin, a lookup notification,
+  the consumed-by update, the applied row) leaves the transaction's outputs
+  and deletes the stale coins all the same, as the reference does. `c9921ee`
+  skipped the delete on any fault and left two unspent heads.
+- A fault of the DELETE: if every stale coin is read back still held, the
+  inserts are undone (the first case); if one is gone or cannot be read, the
+  outputs stay.
+
+Who replays: the queue (`/submit`, `/arc-ingest`) replays every faulted
+submit. GASP replays only a transaction whose outputs are NOT held (its UTXO
+failed, the cursor stayed, the next tick walks it again): one whose outputs
+landed is known to the walk and is never submitted again, so in the second
+case its applied row is never written (harmless: a later submit of it finds
+no coin, admits nothing and is recorded).
+
+A successor that found no previous coin and admits nothing while a
+predecessor has NOT LANDED is reported as a fault (`predecessor_not_landed`)
+and not recorded as applied. Known two ways: the engine saw the predecessor
+fault (one invocation's memory), or the store says so
+(`Engine::unlanded_predecessor`, any invocation): a transaction whose body
+the submitted BEEF carries, with no applied row, no output held, spending a
+coin the topic holds (or a coin of another such transaction).
+
+`Engine::set_finalize_submit_budget` bounds each storage call, lookup hook
+and manager call of ONE transaction's finalize submit (the write section no
+deadline drops) against one deadline: a call that has not answered is dropped
+ALONE and is that call's fault, no call is started after it, and the SUBMIT
+runs to its end (never a drop between two writes); the undo has one more
+allowance. The UTXO fails and the cursor stays (the worker sets 30 s).
+`/admin/startGASPSync` runs under the same guarded 240 s race as the scheduled
+step and answers 504 when it is dropped. Pins: `cargo test -p
+bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`
+and `fold559`.
+
+The limits, stated. (1) Two faults in one submit: an undo is separate calls,
+and one that faults too leaves the inserted output beside the kept coin
+(`undo_insert_output` in the report); a successor that spends it before the
+replay brings the double head back. (2) A lookup hook that faulted is told
+again only if the manager admits again on the replay: a manager whose rule
+needs the previous coin admits nothing there (the coin is deleted), and under
+GASP there is no replay; the reference tells nobody twice either. (3) The
+store's answer needs the predecessor's body in the BEEF: an unproven successor
+carries it, a PROVEN one does not, and one that arrives in a later invocation
+before the replay is recorded as in the reference, the chain then one behind
+its tip. It makes at most 16 reads, and it cannot tell a faulted predecessor
+from one nobody submitted yet: the successor is "not now" until it lands.
+(4) What D1 does with a statement whose caller stopped waiting is not known
+here: a write that lands after its timeout is not seen by that submit.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

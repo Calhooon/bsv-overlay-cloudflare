@@ -65,8 +65,9 @@ where
 /// closes, so the wait is bounded by the writes of one transaction. What the
 /// deadline leaves is then a prefix of whole transactions, never part of one.
 /// The race does not bound a write that never answers: the writer does
-/// (bsv-low #559, `Engine::set_finalize_submit_budget`: the engine races
-/// each section's submit against a budget of its own and drops it past it).
+/// (bsv-low #559, `Engine::set_finalize_submit_budget`: the engine bounds
+/// each storage call and hook inside the section, and a call that never
+/// answers is that call's fault; the submit itself is never dropped).
 #[derive(Debug, Default)]
 pub struct SubmitGate {
     writing: std::cell::Cell<u32>,

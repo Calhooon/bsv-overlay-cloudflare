@@ -1041,8 +1041,10 @@ fn build_engine_with_storage(
     // bsv-low #559 (the delta lens's DELTA-3): no deadline drops a finalize
     // submit between its writes, so a D1 call that never answers inside one
     // held the 30 s peer budget AND the 240 s belt. Each transaction's
-    // finalize submit now has a bound of its own; past it the submit is
-    // dropped, its UTXO fails and the cursor stays.
+    // finalize submit now has a bound of its own over every storage call
+    // and hook inside it (the lens fold of 2026-10-07, F2): a call still
+    // unanswered past it is that call's fault, the submit is NEVER dropped
+    // between its writes, its UTXO fails and the cursor stays.
     engine.set_finalize_submit_budget(
         std::rc::Rc::new(|ms| {
             Box::pin(crate::broadcaster::sleep_ms(ms)) as overlay_engine::engine::SleepFuture
