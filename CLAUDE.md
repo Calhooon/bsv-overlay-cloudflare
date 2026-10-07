@@ -413,6 +413,23 @@ carries the totals and the per-topic line the cursors (`discarded_graphs` is
 on the first totals line). Pins: `cargo test -p bsv-overlay-engine --features
 memory-storage --test gasp_topic_manager i552` (and `fold_high1`).
 
+## Storage ownership (bsv-low #474)
+
+The overlay and the app layer share ONE D1 per environment (`OVERLAY_DB`).
+`storage-ownership.json` names every table's owner, further writers (by
+crate and statement), readers, rebuild class and never-wipe flag;
+`docs/STORAGE-OWNERSHIP.md` is its prose (with the never-wipe set of the
+owner's ruling of 2026-10-07, `low-identity-db`, and the tower's and the
+relay's stores, owners only). `make ci` runs
+`scripts/check-storage-ownership.py`: a statement the manifest does not
+grant, a table it does not list (a migration adding a table must add its
+row in the JSON and on the page), or an unpinned string-built table name is
+red with the file, the line and the table. A never-wipe table is enforced for
+every crate, its owner included (the lens fold of 2026-10-07): no DROP,
+TRUNCATE, destructive ALTER or DELETE with no WHERE, and a DELETE with a
+WHERE only under the row's `delete_scope` (crate, file, statement). Its
+parser limits are in the script's header and pinned by its `--self-test`.
+
 ## Testing
 
 ```bash

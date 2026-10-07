@@ -1,0 +1,1319 @@
+{
+ "_doc": "bsv-low #474. Prose and the rules of change: docs/STORAGE-OWNERSHIP.md. Checked by scripts/check-storage-ownership.py (make ci). owner = the crate whose statements own the rows (it may issue any statement but the never-wipe rule's); writers = further write grants by crate and op; readers = read grants (an INSERT / UPDATE / DELETE / REPLACE grant implies a read, a DDL grant does not); schema_owner may CREATE / ALTER / DROP every table of the shared database (its migrations own the schema). never_wipe = true: no crate, the owner and the schema owner included, may DROP or TRUNCATE the table, ALTER it with DROP COLUMN or RENAME, or DELETE from it with no WHERE; a DELETE with a WHERE only where the row's delete_scope names the crate, the file and the statement (the literal, whitespace collapsed, at most 120 characters). not_tables = words the scanner reads as a table, scoped to one crate and its ops. dynamic_sites = string-built table names, each site named by its statement.",
+ "issue": "bsv-low #474",
+ "updated": "2026-10-07",
+ "shared_database": "low-overlay-db",
+ "schema_owner": "overlay-cloudflare",
+ "scanned_crates": {
+  "overlay-cloudflare": "crates/overlay-cloudflare",
+  "overlay-discovery": "crates/overlay-discovery",
+  "low-app-layer": "crates/low-app-layer"
+ },
+ "crates_to_workers": {
+  "overlay-cloudflare": [
+   "low-overlay",
+   "low-overlay-beta",
+   "bsv-overlay-cloudflare"
+  ],
+  "low-app-layer": [
+   "low-app-layer",
+   "low-app-layer-beta"
+  ],
+  "overlay-discovery": [
+   "a library linked into both workers; it issues no SQL"
+  ]
+ },
+ "databases": [
+  {
+   "name": "low-overlay-db",
+   "environments": {
+    "prod": "low-overlay-db",
+    "beta": "low-overlay-db-beta"
+   },
+   "binding": "OVERLAY_DB",
+   "owner": "low-overlay (overlay-cloudflare: the schema, by OVERLAY_MIGRATIONS)",
+   "writers": [
+    "low-overlay",
+    "low-app-layer"
+   ],
+   "readers": [
+    "low-overlay",
+    "low-app-layer"
+   ],
+   "rebuild_class": "mixed: per table below",
+   "never_wipe": "partial: every table row with never_wipe true",
+   "why": "the shared D1 of the overlay and the app layer (#470 section 2.1); a wipe moves LOW's own era cutoff only (owner ruling 2026-10-07)"
+  },
+  {
+   "name": "low-identity-db",
+   "environments": {
+    "prod": "low-identity-db",
+    "beta": "low-identity-db-beta"
+   },
+   "binding": "DB",
+   "owner": "low-identity-node",
+   "writers": [
+    "low-identity-node"
+   ],
+   "readers": [
+    "low-identity-resolver (bsv-low workers/low-identity-resolver, lane M29-3a: a reader of this D1; not built yet, unverified)",
+    "low-app-layer (through a service binding, never the database)"
+   ],
+   "rebuild_class": "GASP resync from Zanaadu's peer",
+   "never_wipe": true,
+   "why": "M29-2's identity node (bsv-low workers/low-identity-node), a separate D1 per environment; the whole database is in the never-wipe set of the owner's ruling of 2026-10-07 (bsv-low docs/STATE.md, Owner decisions RULED 2026-10-07), WITH the node's R2 bucket, KV and queue below: the node's stores are kept or lost together, never one alone"
+  },
+  {
+   "name": "bsv-overlay (wrangler.toml)",
+   "environments": {
+    "any": "the operator's own name"
+   },
+   "binding": "OVERLAY_DB",
+   "owner": "bsv-overlay-cloudflare (the generic, non-LOW deployment)",
+   "writers": [
+    "bsv-overlay-cloudflare"
+   ],
+   "readers": [
+    "bsv-overlay-cloudflare"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "why": "the same schema on an operator's own database; no LOW data"
+  }
+ ],
+ "not_tables": {
+  "funding": {
+   "crate": "overlay-discovery",
+   "ops": [
+    "SELECT"
+   ],
+   "why": "prose in a topic manager's description string (overlay-discovery hopparty/topic_manager.rs): `funding hop is enumerable`"
+  },
+  "or": {
+   "crate": "overlay-discovery",
+   "ops": [
+    "SELECT"
+   ],
+   "why": "prose in a topic manager's description string (overlay-discovery pot/lowfund_topic_manager.rs)"
+  }
+ },
+ "dynamic_sites": [
+  {
+   "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+   "op": "CREATE",
+   "count": 1,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "CREATE TABLE IF NOT EXISTS \"{}\" (af_evictedAt INTEGER NOT NULL, af_reason TEXT NOT NULL, {body})"
+   ],
+   "tables": [
+    "pot_records_evicted",
+    "outputs_evicted",
+    "applied_transactions_evicted",
+    "transactions_evicted",
+    "low_records_evicted",
+    "potparty_records_evicted",
+    "potrefund_records_evicted",
+    "result_markers_evicted",
+    "result_markers_v2_evicted",
+    "hand_markers_evicted",
+    "lb_marker_rows_evicted"
+   ],
+   "why": "create_shadow_sql: one twin per MOVED_TABLES entry"
+  },
+  {
+   "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+   "op": "ALTER",
+   "count": 1,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}{default}"
+   ],
+   "tables": [
+    "pot_records_evicted",
+    "outputs_evicted",
+    "applied_transactions_evicted",
+    "transactions_evicted",
+    "low_records_evicted",
+    "potparty_records_evicted",
+    "potrefund_records_evicted",
+    "result_markers_evicted",
+    "result_markers_v2_evicted",
+    "hand_markers_evicted",
+    "lb_marker_rows_evicted"
+   ],
+   "why": "heal_shadow_sql: a twin catches up a column its source gained"
+  },
+  {
+   "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+   "op": "INSERT",
+   "count": 2,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "INSERT INTO \"{}\" (af_evictedAt, af_reason, {q}) SELECT ?, ?, {q} FROM \"{table}\" WHERE \"{key}\" = ?",
+    "INSERT OR IGNORE INTO \"{table}\" ({q}) SELECT {sel} FROM \"{}\" WHERE \"{key}\" = ?"
+   ],
+   "tables": [
+    "pot_records",
+    "outputs",
+    "applied_transactions",
+    "transactions",
+    "low_records",
+    "potparty_records",
+    "potrefund_records",
+    "result_markers",
+    "result_markers_v2",
+    "hand_markers",
+    "lb_marker_rows",
+    "pot_records_evicted",
+    "outputs_evicted",
+    "applied_transactions_evicted",
+    "transactions_evicted",
+    "low_records_evicted",
+    "potparty_records_evicted",
+    "potrefund_records_evicted",
+    "result_markers_evicted",
+    "result_markers_v2_evicted",
+    "hand_markers_evicted",
+    "lb_marker_rows_evicted"
+   ],
+   "why": "move_sql into the twin, restore_sql back into the source"
+  },
+  {
+   "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+   "op": "DELETE",
+   "count": 2,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "DELETE FROM \"{table}\" WHERE \"{key}\" = ?",
+    "DELETE FROM \"{}\" WHERE \"{key}\" = ?"
+   ],
+   "tables": [
+    "pot_records",
+    "outputs",
+    "applied_transactions",
+    "transactions",
+    "low_records",
+    "potparty_records",
+    "potrefund_records",
+    "result_markers",
+    "result_markers_v2",
+    "hand_markers",
+    "lb_marker_rows",
+    "pot_records_evicted",
+    "outputs_evicted",
+    "applied_transactions_evicted",
+    "transactions_evicted",
+    "low_records_evicted",
+    "potparty_records_evicted",
+    "potrefund_records_evicted",
+    "result_markers_evicted",
+    "result_markers_v2_evicted",
+    "hand_markers_evicted",
+    "lb_marker_rows_evicted"
+   ],
+   "why": "move_sql out of the source, restore_sql out of the twin"
+  },
+  {
+   "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+   "op": "SELECT",
+   "count": 5,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "INSERT INTO \"{}\" (af_evictedAt, af_reason, {q}) SELECT ?, ?, {q} FROM \"{table}\" WHERE \"{key}\" = ?",
+    "INSERT OR IGNORE INTO \"{table}\" ({q}) SELECT {sel} FROM \"{}\" WHERE \"{key}\" = ?",
+    "SELECT \"outputIndex\" FROM \"{table}\" WHERE \"txid\" = ?",
+    "SELECT COUNT(*) AS c FROM \"{table}\" WHERE \"{key}\" = ?",
+    "SELECT \"outputIndex\" FROM \"{table}\" WHERE \"txid\" = ?"
+   ],
+   "tables": [
+    "pot_records",
+    "outputs",
+    "applied_transactions",
+    "transactions",
+    "low_records",
+    "potparty_records",
+    "potrefund_records",
+    "result_markers",
+    "result_markers_v2",
+    "hand_markers",
+    "lb_marker_rows",
+    "pot_records_evicted",
+    "outputs_evicted",
+    "applied_transactions_evicted",
+    "transactions_evicted",
+    "low_records_evicted",
+    "potparty_records_evicted",
+    "potrefund_records_evicted",
+    "result_markers_evicted",
+    "result_markers_v2_evicted",
+    "hand_markers_evicted",
+    "lb_marker_rows_evicted"
+   ],
+   "why": "the move / restore selects and the ledger reads over MOVED_TABLES and their twins"
+  },
+  {
+   "file": "crates/overlay-cloudflare/src/d1/mod.rs",
+   "op": "ALTER",
+   "count": 1,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "ALTER TABLE"
+   ],
+   "tables": [],
+   "why": "migration_error_is_benign's `ALTER TABLE` prefix test, not a statement"
+  },
+  {
+   "file": "crates/overlay-cloudflare/src/ops.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "INSERT OR IGNORE INTO proofless_watch (txid, first_seen_ms) SELECT txid, ? FROM {table} WHERE has_proof = 0{unprovable_c"
+   ],
+   "tables": [
+    "pot_beefs",
+    "transactions"
+   ],
+   "why": "proofless_watch_enrol_sql(table): its callers pass pot_beefs and transactions"
+  },
+  {
+   "file": "crates/low-app-layer/src/txany.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "low-app-layer",
+   "statements": [
+    "SELECT txid, hex(beef) AS beef, {proof_col} AS proofVerified FROM {table} WHERE txid IN ({marks}) AND length(beef) <= {T"
+   ],
+   "tables": [
+    "pot_beefs",
+    "transactions"
+   ],
+   "why": "tx_any_index_leg_batch_sql(table, ..): routes.rs passes pot_beefs and transactions"
+  },
+  {
+   "file": "crates/low-app-layer/src/logic.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "low-app-layer",
+   "statements": [
+    "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, w.recoveryHeight AS recoveryHeight, w.covRecovery"
+   ],
+   "tables": [
+    "potparty_records",
+    "hopparty_records",
+    "pot_records"
+   ],
+   "why": "`FROM {party}`: logic::party_candidates_sql(), a subquery over these tables whose own statements are scanned in logic.rs"
+  },
+  {
+   "file": "crates/low-app-layer/src/refund_backups.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "low-app-layer",
+   "statements": [
+    "SELECT pr.potTxid AS potTxid, pr.potVout AS potVout, pr.gameId AS gameId, pr.identity AS identity, pr.refundRawHex AS re"
+   ],
+   "tables": [
+    "potparty_records",
+    "hopparty_records",
+    "pot_records"
+   ],
+   "why": "`FROM {party}`: logic::party_candidates_sql(), a subquery over these tables whose own statements are scanned in logic.rs"
+  },
+  {
+   "file": "crates/low-app-layer/src/refund_view.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "low-app-layer",
+   "statements": [
+    "SELECT w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, w.recoveryHeight AS recoveryHeight, w.covRecovery"
+   ],
+   "tables": [
+    "potparty_records",
+    "hopparty_records",
+    "pot_records"
+   ],
+   "why": "`FROM {party}`: logic::party_candidates_sql(), a subquery over these tables whose own statements are scanned in logic.rs"
+  },
+  {
+   "file": "crates/low-app-layer/src/results.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "low-app-layer",
+   "statements": [
+    "SELECT w.identity AS identity, w.gameId AS gameId, w.potTxid AS potTxid, w.potVout AS potVout, w.recoveryHeight AS recov"
+   ],
+   "tables": [
+    "potparty_records",
+    "hopparty_records",
+    "pot_records"
+   ],
+   "why": "`FROM {party}`: logic::party_candidates_sql(), a subquery over these tables whose own statements are scanned in logic.rs"
+  }
+ ],
+ "tables": [
+  {
+   "name": "outputs",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the admitted UTXO set (outpoint+topic)",
+   "why": "re-admission or a GASP peer re-feeds it; chain bytes"
+  },
+  {
+   "name": "transactions",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "BEEF blobs + proof state",
+   "why": "the BEEF ancestry `/beef` and `/credit-beef` serve; a wipe is a re-fetch, not a loss"
+  },
+  {
+   "name": "applied_transactions",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the engine's applied-transaction marks",
+   "why": "dedup marks, re-derived on re-admission"
+  },
+  {
+   "name": "low_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the lobby's table / game-utxo ads (tm_low)",
+   "why": "lobby ads ride on chain"
+  },
+  {
+   "name": "reveal_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "break-glass reveal artifacts (tm_reveal)",
+   "why": "on chain; the tower's reveal scan falls back to the couriers, a wipe degrades, never concedes"
+  },
+  {
+   "name": "pot_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "ALTER"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": true,
+   "holds": "spent / spender / confirmed / height, the covenant params, the verdict, settleSigners, spenderFinal",
+   "why": "THE landing proof every credit reads (#470 section 3 item 7); every column re-derives from chain bytes only with a re-scan nobody has",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{table}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's eviction move (move_sql): the row is copied into its `_evicted` twin by the INSERT before it, keyed, then taken out of the source; the pot_evictions ledger holds the move"
+    }
+   ]
+  },
+  {
+   "name": "pot_beefs",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the durable BEEF of a pot's funding and spend, proof state",
+   "why": "liveness, not custody: the wallet's ancestry is re-fetchable"
+  },
+  {
+   "name": "potparty_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT",
+     "ALTER"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "identity, opponent, gameId, pot outpoint, recoveryHeight, the settle pubkey, the signatures",
+   "why": "filings since D11 (`filed:` rows never touch the chain): identity to pot, a fresh device's enumeration and `/owed`'s attribution (#470 section 3 item 4)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{table}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's eviction move (move_sql): the row is copied into its `_evicted` twin by the INSERT before it, keyed, then taken out of the source; the pot_evictions ledger holds the move"
+    }
+   ]
+  },
+  {
+   "name": "potrefund_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT",
+     "UPDATE"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "the refund raw + refundValid",
+   "why": "the PRE-SIGNED refund raws, filed before the JOIN; `/internal/armed-pots` rebuilds the tower's alarm population from them (#470 section 3 item 3)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{table}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's eviction move (move_sql): the row is copied into its `_evicted` twin by the INSERT before it, keyed, then taken out of the source; the pot_evictions ledger holds the move"
+    }
+   ]
+  },
+  {
+   "name": "hopsweep_records",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "`filed:` hop sweep raws (sweepRawHex)",
+   "why": "the seat's pre-signed sweep of its own funding hop, never on chain: the one claim path for a stranded hop from a new device (#470 section 3 item 5)"
+  },
+  {
+   "name": "hopparty_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "ALTER"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": true,
+   "holds": "the hop-in-flight marker (identity, opponent, gameId, the hop's lock and sats, markerValid)",
+   "why": "money evidence: `/hops-view` and `/owed`'s hop-stranded / in-progress families read it; chain in principle, nothing re-scans for it (#470 section 3 item 6)"
+  },
+  {
+   "name": "result_markers_v2",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT",
+     "ALTER"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "the leaderboard claim per pot",
+   "why": "filings since D11: the results' claims cannot be rebuilt from the chain",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{table}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's eviction move (move_sql): the row is copied into its `_evicted` twin by the INSERT before it, keyed, then taken out of the source; the pot_evictions ledger holds the move"
+    }
+   ]
+  },
+  {
+   "name": "hand_markers",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "CREATE",
+     "ALTER"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the showdown cards",
+   "why": "on chain (tm_hand); display only"
+  },
+  {
+   "name": "proof_markers",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the transcript bundle markers",
+   "why": "on chain; display only"
+  },
+  {
+   "name": "collected_markers_v2",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT",
+     "CREATE",
+     "ALTER"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "the collected mark per pot (payTxid since #492)",
+   "why": "filings since D11 and money evidence: the \"already collected\" mark that suppresses a duplicate payout offer"
+  },
+  {
+   "name": "proof_posts",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "the filed proof bundle + its replay verdict",
+   "why": "the filed LOW/proof/v1 bundle; the winner's device held it once, nothing else does"
+  },
+  {
+   "name": "lb_marker_rows",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the leaderboard spine (denormalised)",
+   "why": "the windowed query backfills it"
+  },
+  {
+   "name": "network_seen",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the overlay's own witness that the network accepted a txid",
+   "why": "re-ask Arcade; bar-lowering only"
+  },
+  {
+   "name": "arc_terminal",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the broadcaster's terminal verdicts",
+   "why": "re-askable"
+  },
+  {
+   "name": "tx_any_verdicts",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT"
+    ]
+   },
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "the `/tx-any` negative memos",
+   "why": "re-askable negative memos (courier calls to rebuild)"
+  },
+  {
+   "name": "hop_chain_probes",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "overlay-cloudflare": [
+     "INSERT",
+     "DELETE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "courier memos per hop outpoint; `homeproof:` rows, the durable latch of a verified Proven word (low-app-layer owed.rs); `homecursor:` rows, the home walk's cursor (owed.rs). The overlay's expiry spares both prefixes (hop_probe_memos.rs)",
+   "why": "courier memos, re-askable; the overlay expires the memos and marks them on a reorg. A wipe loses no money: every `homeproof:` latch becomes a courier re-probe again, 2 per recompute (OWED_HOME_PROBES_PER_RECOMPUTE), and the home walk restarts from its first cursor"
+  },
+  {
+   "name": "pot_evictions",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "what was evicted, which spend pointers were released, the readmission",
+   "why": "admit-fast's eviction ledger: a readmission re-marks released spends FROM this row; nothing else holds it (#470 section 3 item 8)"
+  },
+  {
+   "name": "owed_rows",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the owed list",
+   "why": "a pure derivation over the money tables; the next read recomputes"
+  },
+  {
+   "name": "owed_state",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the owed list's read state per identity",
+   "why": "recomputed on the next read"
+  },
+  {
+   "name": "chain_headers_seen",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "headers seen by the block-event pass",
+   "why": "a cursor"
+  },
+  {
+   "name": "reorg_sweep_state",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the reorg sweep cursor",
+   "why": "a cursor"
+  },
+  {
+   "name": "arcade_reorg_state",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the Arcade reorg cursor",
+   "why": "a cursor"
+  },
+  {
+   "name": "relatch_cursors",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the relatch pass cursors",
+   "why": "a cursor"
+  },
+  {
+   "name": "rebroadcast_state",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the rebroadcast watch",
+   "why": "a watch list"
+  },
+  {
+   "name": "proofless_watch",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "proofless txids under watch",
+   "why": "a watch list, re-enrolled from transactions / pot_beefs"
+  },
+  {
+   "name": "host_sync_state",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "GASP per-peer cursors",
+   "why": "a GASP cursor; the next sync walks again"
+  },
+  {
+   "name": "gasp_peer_health",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "GASP peer health and quarantine",
+   "why": "counters"
+  },
+  {
+   "name": "ops_counters",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "INSERT"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "named counters (the app layer bumps its own rows)",
+   "why": "operator counters"
+  },
+  {
+   "name": "ops_heartbeat",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "cron heartbeats",
+   "why": "a heartbeat"
+  },
+  {
+   "name": "submit_refusals",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "refused submits by class",
+   "why": "a census window (#366)"
+  },
+  {
+   "name": "banned_hosts",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "banned hosts / domains (`/admin/ban`)",
+   "why": "the operator's bans: nothing else holds them (export first)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/ban_storage.rs",
+     "statement": "DELETE FROM banned_hosts WHERE type = ? AND value = ?",
+     "why": "/admin/unban: the operator's own word takes one ban back (the reference's BanService.unban)"
+    }
+   ]
+  },
+  {
+   "name": "ship_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "SHIP adverts",
+   "why": "other overlays' adverts; tm_ship is not registered on LOW (empty)"
+  },
+  {
+   "name": "slap_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "SLAP adverts",
+   "why": "as ship_records"
+  },
+  {
+   "name": "uhrp_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "UHRP adverts",
+   "why": "not registered on LOW (empty)"
+  },
+  {
+   "name": "agent_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "agent registry adverts",
+   "why": "not registered on LOW (empty)"
+  },
+  {
+   "name": "agent_capabilities",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "agent capabilities",
+   "why": "not registered on LOW (empty)"
+  },
+  {
+   "name": "dm_delegation_records",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "DM delegation revocations",
+   "why": "not registered on LOW (empty)"
+  },
+  {
+   "name": "result_markers",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": false,
+   "holds": "v1 result markers",
+   "why": "dead v1 shape, write-frozen, old-era rows on chain; display only"
+  },
+  {
+   "name": "collected_markers",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "chain",
+   "never_wipe": true,
+   "holds": "v1 collected markers",
+   "why": "dead v1 shape, write-frozen; the copy source of collected_markers_v2 (the carry migration, d1/mod.rs, re-runs on every start); its NULL-txid rows were never carried and exist nowhere else. The duplicate-offer fence is v2's"
+  },
+  {
+   "name": "pot_records_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [
+    "low-app-layer"
+   ],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `pot_records` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `pot_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "outputs_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `outputs` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `outputs`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "applied_transactions_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `applied_transactions` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `applied_transactions`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "transactions_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `transactions` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `transactions`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "low_records_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `low_records` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `low_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "potparty_records_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `potparty_records` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `potparty_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "potrefund_records_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `potrefund_records` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `potrefund_records`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "result_markers_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `result_markers` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `result_markers`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "result_markers_v2_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `result_markers_v2` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `result_markers_v2`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "hand_markers_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `hand_markers` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `hand_markers`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  },
+  {
+   "name": "lb_marker_rows_evicted",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "rows of `lb_marker_rows` evicted by admit_fast, with af_evictedAt / af_reason",
+   "why": "admit-fast's shadow twin of `lb_marker_rows`: an evicted row lives ONLY here until readmitted; part of the eviction ledger (#470 section 3 item 8)",
+   "delete_scope": [
+    {
+     "crate": "overlay-cloudflare",
+     "file": "crates/overlay-cloudflare/src/admit_fast.rs",
+     "statement": "DELETE FROM \"{}\" WHERE \"{key}\" = ?",
+     "why": "admit_fast's readmission (restore_sql): the row is copied back into its source by the INSERT OR IGNORE before it, keyed, then taken out of the twin"
+    }
+   ]
+  }
+ ],
+ "other_stores_owners_only": {
+  "_note": "No cross-worker access to any of these exists today: each store below is read and written only by its owning worker; other workers reach it through that worker's HTTP routes or service bindings, never the store.",
+  "low-app-layer": [
+   {
+    "store": "BoardView DO",
+    "owner": "low-app-layer",
+    "holds": "an in-memory cache of the board and results bodies (no state.storage call)"
+   },
+   {
+    "store": "AuthSessionStore DO + AUTH_SESSIONS KV",
+    "owner": "low-app-layer",
+    "holds": "BRC-103 sessions and origin lanes"
+   }
+  ],
+  "low-watchtower": [
+   {
+    "store": "LowTower DO, key `record` (+ its storage alarm)",
+    "owner": "low-watchtower",
+    "holds": "the parked pre-signed refund, its lock height, the watched outpoint, the give-up height, the state",
+    "never_wipe": true
+   },
+   {
+    "store": "LowTower DO, key `candidates`",
+    "owner": "low-watchtower",
+    "holds": "the validated candidate set",
+    "never_wipe": true
+   },
+   {
+    "store": "CoSigner DO, keys `case:{txid}:{vout}` (and the legacy `case`, `legacyCaseMigrated`)",
+    "owner": "low-watchtower",
+    "holds": "an open or finalized case",
+    "never_wipe": true
+   },
+   {
+    "store": "CoSigner DO, keys `settledPot:{txid}:{vout}`",
+    "owner": "low-watchtower",
+    "holds": "the permanent already-co-signed fence",
+    "never_wipe": true
+   },
+   {
+    "store": "CoSigner DO, keys `justification`, `cosignSeq`, `pending:{deadline}:{txid}:{vout}`, `pendingIndexMigrated`, `rateCount`, `rateWindowStart`, `nonceSeen:`, `nonceExp:`, `idSeen:`, `metric429Bucket:`",
+    "owner": "low-watchtower",
+    "holds": "the emitted J, the pending index (rebuilt from `case:`), rate, nonce and identity housekeeping",
+    "never_wipe": true
+   },
+   {
+    "store": "MONITOR_KV prefixes `pot:` (30-day TTL), `legacyFallback:`, `metric429:`",
+    "owner": "low-watchtower (read by low-monitor)",
+    "holds": "the armed-pot breadcrumbs, the legacy-fallback marks, the 429 metrics",
+    "never_wipe": false
+   },
+   {
+    "store": "AuthSessionStore DO + AUTH_SESSIONS KV",
+    "owner": "low-watchtower",
+    "holds": "BRC-103 sessions",
+    "never_wipe": false
+   }
+  ],
+  "low-relay (rust-message-box)": [
+   {
+    "store": "D1 low-relay-prod / low-relay-beta: messages, message_boxes",
+    "owner": "low-relay",
+    "holds": "hand transcripts (low_game_* retained 14 days), events boxes"
+   },
+   {
+    "store": "D1: transcript_tombstones, message_permissions, server_fees, device_registrations",
+    "owner": "low-relay",
+    "holds": "purge marks, per-sender config, the fee table, push registrations"
+   },
+   {
+    "store": "MessageHub, EngineIoSession, BroadcastRegistry DOs; AUTH_SESSIONS KV; R2 BEEF_BLOBS (unused)",
+    "owner": "low-relay",
+    "holds": "socket, session and presence state"
+   }
+  ],
+  "rust-chaintracks": [
+   {
+    "store": "the header store of the account's shared `rust-chaintracks` service (the CHAINTRACKS binding of the overlay and the identity node)",
+    "owner": "rust-chaintracks",
+    "holds": "the block headers every merkle proof is checked against (#470 section 3 item 9)",
+    "never_wipe": true
+   }
+  ]
+ },
+ "identity_node_stores": {
+  "_note": "bsv-low workers/low-identity-node (M29-2, wrangler.toml / wrangler.beta.toml), Zanaadu's overlay-lib at 2de902a under Profile::PfOnly. Every row is in the never-wipe set with low-identity-db: a wipe of one store alone leaves the others pointing at nothing.",
+  "stores": [
+   {
+    "store": "R2 bucket `low-identity-beefs` (prod) / `low-identity-beefs-beta` (beta), binding BEEF",
+    "owner": "low-identity-node",
+    "readers": [
+     "low-identity-node"
+    ],
+    "holds": "each admitted transaction's BEEF as `beef/<txid>.bin` (overlay-lib beef.rs) and ancestry as `beef-ancestry/<txid>.beef` (ancestor_fetcher.rs)",
+    "rebuild_class": "lost while the D1 is kept",
+    "never_wipe": true,
+    "why": "wiped alone, the mirror cannot be rebuilt: the D1 says every row is held, so GASP never re-fetches its BEEF"
+   },
+   {
+    "store": "KV `low-identity-kv` (prod) / `low-identity-kv-beta` (beta), binding KV",
+    "owner": "low-identity-node",
+    "readers": [
+     "low-identity-node"
+    ],
+    "holds": "the GASP rotation mark (overlay-lib lib.rs, GASP_ROTATION_KEY): which topic the next tick syncs first",
+    "rebuild_class": "transient",
+    "never_wipe": true,
+    "why": "in the set with the node's other stores (lane 474-fold, CAP); in itself a cursor: lost, the rotation starts from its first topic"
+   },
+   {
+    "store": "queue `low-identity-events` (prod) / `low-identity-events-beta` (beta), producer binding EVENTS_OUT",
+    "owner": "low-identity-node",
+    "readers": [
+     "low-identity-resolver (M29-3a, the consumer to be; none today)"
+    ],
+    "holds": "the pf lookup services' admitted envelopes, kept 4 days by Cloudflare",
+    "rebuild_class": "lost after its 4 days",
+    "never_wipe": true,
+    "why": "in the set with the node's other stores: a purge drops envelopes the resolver has not consumed, and nothing re-emits them"
+   }
+  ],
+  "resolver_writes": {
+   "crate": "low-identity-resolver (bsv-low workers/low-identity-resolver, lane M29-3a)",
+   "writes": "to be filled by M29-3a: which of these tables it writes, and into which D1",
+   "app_layer_lib_storage_at_2de902a": [
+    "chain_state",
+    "identity_events",
+    "identity_contests",
+    "identity_evictions",
+    "identity_number_spends",
+    "identity_preferences",
+    "xana_user_proofs",
+    "xana_evictions",
+    "xana_posts",
+    "pf_names",
+    "pf_registry_pictures",
+    "pf_content",
+    "pf_content_kill",
+    "the engagement tables (engagement.rs, `UPDATE {table}`, dynamic)"
+   ]
+  }
+ }
+}

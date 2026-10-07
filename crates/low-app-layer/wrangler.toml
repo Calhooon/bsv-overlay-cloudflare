@@ -4,8 +4,8 @@
 # Serves /utxo-status, /beef/:txid, /tip, /health straight from the
 # low-overlay's D1 database (the same `low-overlay-db` the low-overlay
 # worker writes) plus the rust-chaintracks service binding for the tip.
-# STRICTLY READ-ONLY: this worker never writes to the DB — the overlay
-# owns the schema and every mutation. Deploy with:
+# It is NOT read-only (bsv-low #474): its write set is listed at the
+# `d1_databases` block below and in docs/STORAGE-OWNERSHIP.md. Deploy with:
 #
 #   npx wrangler deploy   # from crates/low-app-layer/
 #
@@ -111,9 +111,28 @@ binding = "AUTH_SESSIONS"
 id = "__LOW_APPLAYER_DEFAULT_KV_AUTH_SESSIONS_ID__"  # injected at deploy time from the private secrets store by name
 
 # The SAME D1 database the low-overlay worker writes (wrangler.low.toml uses
-# the identical binding name + database_name). This worker only ever SELECTs
-# from it. database_id is a placeholder by repo convention — the real id is
-# injected at deploy time and never committed.
+# the identical binding name + database_name). database_id is a placeholder by
+# repo convention, the real id injected at deploy time and never committed.
+#
+# Ownership (bsv-low #474; the manifest is storage-ownership.json, the prose
+# docs/STORAGE-OWNERSHIP.md, and `make ci` refuses any statement it does not
+# grant). The overlay owns the schema and 50 of the 55 tables. This worker:
+#   OWNS hopsweep_records, proof_posts, owed_rows, owed_state, hop_chain_probes
+#   WRITES INSERT potparty_records; INSERT, UPDATE potrefund_records;
+#     INSERT hopsweep_records, result_markers_v2, collected_markers_v2,
+#     proof_posts, lb_marker_rows, tx_any_verdicts, hop_chain_probes,
+#     ops_counters; INSERT, DELETE owed_rows; INSERT, UPDATE owed_state
+#   CATCH-UP DDL (schema.rs, each byte-identical to an overlay migration):
+#     ALTER pot_records, potparty_records, hopparty_records,
+#     result_markers_v2, hand_markers, collected_markers_v2; CREATE IF NOT
+#     EXISTS network_seen, collected_markers_v2, hand_markers, proof_posts,
+#     hopsweep_records, owed_rows, owed_state
+#   READS the money tables, the markers, transactions / pot_beefs, the
+#     eviction ledger (pot_evictions, pot_records_evicted), network_seen,
+#     submit_refusals (the manifest's `readers` lists every one)
+# Never-wipe (the owner's ruling of 2026-10-07): the money tables and the
+# filings, the eviction ledger and its twins, collected_markers and
+# banned_hosts; a wipe moves LOW's own era cutoff only.
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
