@@ -692,6 +692,21 @@ impl<'a> GASPSync<'a> {
         // the next sync re-requests the failed graph. (Without this, a single
         // blipped graph fetch silently drops that UTXO from continuous sync.)
         let mut min_failed_score: Option<u64> = None;
+        // The UTXOs whose ingest FAILED this run (bsv-low #554). The cursor
+        // moves to a UTXO's score before its ingest and the responder serves
+        // `score >= since`, so the row at a page boundary is served again on
+        // the next page of this same sync. A completed one is in
+        // `shared_outpoints` and skipped; a failed one was in no set and was
+        // walked a second time, at twice the requests and twice the per-peer
+        // budget. An addition to the reference: `GASP.ts sync` keeps only
+        // `sharedOutpoints` (added on success), so a failed UTXO served
+        // again by a later page is ingested again there. Here a UTXO is
+        // ingested at most once per sync; the retry is the next sync's, which
+        // the gap guard below makes sure is served it. Kept apart from
+        // `shared_outpoints`, which also decides what a bidirectional sync
+        // pushes.
+        let mut failed_outpoints: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Paginated pull from remote
         loop {
@@ -731,7 +746,9 @@ impl<'a> GASPSync<'a> {
                 if known_outpoints.contains(&outpoint) {
                     shared_outpoints.insert(outpoint.clone());
                     known_outpoints.remove(&outpoint);
-                } else if !shared_outpoints.contains(&outpoint) {
+                } else if !shared_outpoints.contains(&outpoint)
+                    && !failed_outpoints.contains(&outpoint)
+                {
                     // New UTXO — request and ingest the graph
                     let lowest_unfinished = min_failed_score
                         .map_or(lowest_ahead[position], |f| f.min(lowest_ahead[position]));
@@ -761,6 +778,8 @@ impl<'a> GASPSync<'a> {
                             // cursor cannot skip past it (see cap below).
                             let s = utxo.score as u64;
                             min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
+                            // Not again in this sync (bsv-low #554).
+                            failed_outpoints.insert(outpoint);
                         }
                     }
                 }

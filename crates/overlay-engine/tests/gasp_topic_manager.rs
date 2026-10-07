@@ -3647,14 +3647,11 @@ async fn fold_medium1_a_finalize_submit_that_did_not_land_stops_its_graph_and_ho
             assert!(held(&node.store, &nodes).await.is_empty(), "{case}");
             assert_eq!(node.cursor().await, 0, "{case}: the cursor stays");
             assert!(topic.cursor_moves.is_empty(), "{case}");
-            // Handed to submit: once after the sync, or, under the hook, once
-            // per page that served it (the boundary row is served again and
-            // the failed UTXO tried again inside the same sync).
-            assert_eq!(
-                topic.finalized_graphs,
-                if budgeted { 2 } else { 1 },
-                "{case}"
-            );
+            // Handed to submit once: after the sync, or under the hook as it
+            // finalized. (Before bsv-low #554 the hook's count was 2: the
+            // boundary row was served again and the failed UTXO was tried a
+            // second time inside the same sync.)
+            assert_eq!(topic.finalized_graphs, 1, "{case}");
 
             // The outage ends (the manager catches up): the next tick submits
             // the graph whole.
@@ -4020,5 +4017,55 @@ async fn i559_c_a_hung_storage_call_inside_a_finalize_submit_is_timed_out_and_fa
     let (topic, _) = node.tick().await;
     assert_eq!(held(&node.store, &nodes).await, vec![(3, 0)]);
     assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4]);
+    assert_eq!(topic.cursor_moves, moved(0, 1));
+}
+
+// ============================================================================
+// bsv-low #554: a UTXO is ingested at most once per sync. The cursor moves to
+// a UTXO's score before its ingest and the responder serves `score >= since`,
+// so the row at the page boundary is served again on the next page; one whose
+// ingest FAILED was in no set and was ingested a second time.
+// ============================================================================
+
+#[tokio::test]
+async fn i554_a_failing_utxo_at_the_page_boundary_is_requested_once_per_sync() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(3);
+    let tip = node_txid(&nodes[2]);
+    let remote = RecordingRemote::new(&nodes, &[2]);
+    // The peer cannot serve the listed tip right now (a timeout, a 500).
+    remote.faults.borrow_mut().insert(tip.clone());
+    let faults = remote.faults.clone();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let node = Budgeted::over(
+        remote,
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(u64::MAX - 1),
+        store.clone(),
+        Box::new(store),
+        false,
+    );
+
+    for tick in 1..=2 {
+        let (_, sent) = node.tick().await;
+        println!(
+            "#554: tick {tick}: the failing tip was requested {} time(s)",
+            sent.len()
+        );
+        assert_eq!(
+            sent,
+            vec![tip.clone()],
+            "tick {tick}: the failing UTXO is requested once per sync"
+        );
+        assert_eq!(node.cursor().await, 0, "the cursor does not pass it");
+    }
+
+    // The peer heals: the gap guard kept the cursor below it, so the next
+    // tick is served it and admits the chain.
+    faults.borrow_mut().clear();
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1, 0]));
+    assert_eq!(held(&node.store, &nodes).await, vec![(2, 0)]);
     assert_eq!(topic.cursor_moves, moved(0, 1));
 }
